@@ -480,6 +480,28 @@ pub(crate) fn a_text_only_the_store_holds(
   name: &str,
   bytes: &[u8],
 ) -> (TestStore, crate::Daemon, slates_db::catalog::RepositoryId) {
+  a_stored_text_let_go(owner, name, bytes, false)
+}
+
+/// [`a_text_only_the_store_holds`], but the content store keeps the text's object, every window of it let go (each
+/// marked landed and `ContentStore::let_go`): its name held, its bytes in the store alone (codex-review's siblings of
+/// 2026-11-22, a reader that took a held name for held bytes).
+pub(crate) fn a_text_whose_windows_are_away(
+  owner: &slates_db::catalog::Principal,
+  name: &str,
+  bytes: &[u8],
+) -> (TestStore, crate::Daemon, slates_db::catalog::RepositoryId) {
+  a_stored_text_let_go(owner, name, bytes, true)
+}
+
+/// The daemon of [`a_text_only_the_store_holds`]: the content store's object released whole, or kept with every
+/// window let go where `away`.
+fn a_stored_text_let_go(
+  owner: &slates_db::catalog::Principal,
+  name: &str,
+  bytes: &[u8],
+  away: bool,
+) -> (TestStore, crate::Daemon, slates_db::catalog::RepositoryId) {
   use slates_svn::commit::drive::TextSink;
   let (store, daemon) = crate::test_store::audit_daemon_stored();
   let asked = (
@@ -530,6 +552,26 @@ pub(crate) fn a_text_only_the_store_holds(
       let landed = crate::repository::svn_commit::land_work((&landing, id), work, &texts)
         .await
         .map(|landed| landed.map(|committed| committed.revision));
+      // Away: the content store holds the text's object once more, every window of it landed and let go, so its name
+      // stands while its bytes are in the store alone.
+      if away {
+        crate::state::with_state(|state| {
+          let len = u64::try_from(committed.len()).unwrap_or(u64::MAX);
+          crate::vcs_store::within_budget(state, len, |stores| {
+            let content = stores.content_mut().unwrap();
+            assert_eq!(
+              content.put_object(&committed).unwrap(),
+              slates_vcs::ContentId(text.identity)
+            );
+            let window = content.window();
+            for piece in committed.chunks(window) {
+              let window = slates_vcs::ContentId::of(piece);
+              assert!(content.mark_landed(&window), "a window of the text");
+              content.let_go(&window).unwrap();
+            }
+          });
+        });
+      }
       // Every hold RAM has on the text let go: the green's held table's and the content store's.
       crate::state::with_state(|state| {
         if let Some(mut engine) = state.greens.get_mut(&green) {
@@ -540,7 +582,7 @@ pub(crate) fn a_text_only_the_store_holds(
         crate::vcs_store::within_budget(state, 0, |stores| {
           if let Some(content) = stores.content_mut() {
             let content_id = slates_vcs::ContentId(text.identity);
-            while content.contains(&content_id) {
+            while !away && content.contains(&content_id) {
               if content.release(&content_id).is_err() {
                 break;
               }

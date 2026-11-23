@@ -29,9 +29,14 @@ it whole (`holds_whole`), not when it has no entry. Bringing an object back that
 which brings back those let go and adds one hold. The caller gives that hold back after the step (`release_texts`), as
 for any text brought.
 
-## Siblings found (reported to main, not changed here)
-- `crates/server/src/vcs_store/svn_texts.rs` `named_lacking` (A-760's recovery pre-pass) uses `contains` the same way. A
-  recovery whose restored content store keeps a named text with a window away (`restore_away`) would bring nothing
-  back, and the green's replay would be fenced `ContentMissing` (`PlaneObjects` reads through `window_range_in`).
-- `crates/server/src/vcs_store/svn_presenter.rs` (a hook view's stored texts brought back before its files are
-  written) uses `contains` the same way.
+## Siblings found, fixed in a second change (main's order of 2026-11-22)
+Both asked `contains` where a reader needs every byte, and now ask `holds_whole`.
+- `crates/server/src/vcs_store/svn_texts.rs` `named_lacking`, A-760's recovery pre-pass. A restored content store
+  keeping a named text with one window away brought nothing back, and the green's replay was fenced `ContentMissing`.
+  codex-review's red: `repository::store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`
+  (the second repository fenced `ContentMissing { version: 1 }`; with it, the resident control
+  `a_subversion_restart_replays_two_named_texts_whose_windows_are_resident`).
+- `crates/server/src/vcs_store/svn_presenter.rs`, a hook view's bring-back before its files are written. A text held with
+  its windows let go was taken as held, and reading the view's file was refused `ReferenceUnresolved`. Red:
+  `vcs_store::svn_presenter::tests::a_hook_view_brings_back_a_stored_text_whose_windows_were_let_go`, over
+  `test_store::a_text_whose_windows_are_away`.

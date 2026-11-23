@@ -395,3 +395,63 @@ fn a_hook_view_brings_back_a_stored_text_the_content_store_let_go() {
   assert!(fetched >= 1, "no piece read through the store");
   assert_eq!(brought, Some(0), "the view kept what it brought");
 }
+
+/// The sibling of the test above (codex-review's sweep of 2026-11-22, main 01a20182's order: a held name is not held
+/// bytes). Do: as above, but the content store keeps the text's object with every window let go
+/// (`crate::test_store::a_text_whose_windows_are_away`). Expect the same: the view shown, the file carrying the text
+/// whole, the text read through the store, and the view holding nothing it brought beyond its file's own hold. Before,
+/// the layout found the name held and brought nothing back.
+#[test]
+fn a_hook_view_brings_back_a_stored_text_whose_windows_were_let_go() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, id) = crate::test_store::a_text_whose_windows_are_away(
+    &crate::repository::svn_commit::tests::owner(),
+    "viewed",
+    &bytes,
+  );
+  let shown = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      show(shard, shard, id).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(shown, Ok(()));
+  let (file, brought, fetched) = crate::daemon::observe_first(&daemon, move |state| {
+    let fetched = state
+      .refusals
+      .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+      .copied()
+      .unwrap_or(0);
+    let read = crate::vcs_store::lent_state(state, |state| {
+      let slot = state.svn_views.get(&id)?;
+      let handle = *state.by_id.get(&slot.volume)?;
+      let held = state.volumes.get(handle).ok()?;
+      let records = state.vcs_stores.subversion_records(id)?;
+      let texts = HeadTexts {
+        green: None,
+        store: state.vcs_stores.content(),
+        records,
+        pieces: None,
+      };
+      let root = held.volume.root_inode(&state.store).ok()?;
+      let path = fsfs::revision_file_path(1);
+      let file = read_path(&held.volume, &state.store, root, &path, &ViewTexts(&texts));
+      Some((file, slot.brought.len()))
+    });
+    let (file, brought) = read.unzip();
+    (file, brought, fetched)
+  });
+  daemon.stop();
+  let carried = file
+    .as_ref()
+    .is_some_and(|file| file.windows(bytes.len()).any(|window| window == bytes));
+  assert!(
+    carried,
+    "revision 1's file does not carry the text: {:?} bytes",
+    file.map(|file| file.len())
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(brought, Some(0), "the view kept what it brought");
+}

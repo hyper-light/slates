@@ -9310,7 +9310,10 @@
 >   asks nothing (`a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline`; the driver
 >   suite's `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline`, main's to run). Still owed for the async
 >   loops: the departure as an event (Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge
->   thread waiting beside the process handle could each tell the loop at once). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
+>   thread waiting beside the process handle could each tell the loop at once). What that costs now, measured (w-perf, 2026-11-23): a call outstanding at its daemon's exit ends at the doubling's next
+>   look, up to the time already waited after the exit: a look due at 35.0 s against an exit at 26.3 s under
+>   ThreadSanitizer (nightly 45017186325, window 25.2 s), 14.1 s against 7.2 s on plain macOS (`lone_daemon`, ea3240fd8).
+>   Not built (main's close order, 2026-11-23). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
 >   part): the mount's MOUNT call for the root handle (`slates_bridge_nfs::client::exchange`) bounded each of its
 >   connect, send and receive by one liveness budget, so a live daemon that answered later failed the mount; it now
 >   waits while its connection lives, as the hard NFS mount it makes does (Apple's `mount_nfs(8)`), a daemon gone

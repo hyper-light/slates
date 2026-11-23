@@ -160,6 +160,11 @@ fn agent(agent: usize, requests: SyncSender<Request>) {
       Outcome::CopyRefused { path, case } => {
         panic!("the shuttle green's works declare no copy: {path} {case:?}")
       }
+      // A-760: a work naming a run not read yet is refused before any verdict. The shuttle green's works carry every
+      // byte they add in their post-state and name no run, so none is ever unread.
+      Outcome::ContentUnread { identity } => {
+        panic!("the shuttle green's works name no run, so none is unread: {identity:?}")
+      }
     }
   }
   requests.send(Request::Done).unwrap();

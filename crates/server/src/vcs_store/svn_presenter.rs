@@ -865,12 +865,16 @@ fn present_slice(
           .map_err(|refusal| format!("{refusal:?}"))?
       }
     };
-    // A stored text the content store let go is brought back before the files naming it are written and held.
+    // A stored text the content store let go is brought back before the files naming it are written and held: one it
+    // lacks, or holds with a window let go, whose name stands with no bytes (codex-review's sweep of 2026-11-22: the
+    // view's file read refused `ReferenceUnresolved`).
     let content = vcs_stores.content();
     let lacking = laid
       .stored()
       .iter()
-      .filter(|identity| !content.is_some_and(|content| content.contains(&ContentId(**identity))))
+      .filter(|identity| {
+        !content.is_some_and(|content| content.holds_whole(&ContentId(**identity)))
+      })
       .find_map(|identity| Some((*identity, records.stored_len(identity)?)));
     if let Some((identity, len)) = lacking {
       slot.pending = Some(laid);

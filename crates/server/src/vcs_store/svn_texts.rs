@@ -236,9 +236,9 @@ fn finish_brought(
 pub(crate) const NAMED_BROUGHT_BACK: &str = "vcs_store.svn_texts.named_brought_back";
 
 /// A-760's recovery pre-pass (main 01a20182's rulings of 2026-11-22 ~11:35 and ~11:50, (i)): the texts that the entries of
-/// green `green`'s chain name (A-760) and the content store lacks, brought back whole from the node's changeset store
-/// before the green's replay, a text a recovery unit, so the replay finds every name and its `ContentMissing` stays a
-/// true fence. What it brought, each holding one count of the content store, for the caller to give back once the green
+/// green `green`'s chain name (A-760) and the content store does not hold whole, brought back whole from the node's
+/// changeset store before the green's replay, a text a recovery unit, so the replay finds every name and its
+/// `ContentMissing` stays a true fence. What it brought, each holding one count of the content store, for the caller to give back once the green
 /// is replayed. Nothing but for a Subversion repository's member.
 ///
 /// **Bound.** The chain holds the entries past the green's checkpoint alone, and an import's batch checkpoints its green
@@ -289,7 +289,8 @@ fn subversion_of(
   (record.tool == slates_db::catalog::VcsTool::Subversion).then_some(member.repository)
 }
 
-/// The texts green `green`'s chain entries name that the content store does not hold, each once, with its length.
+/// The texts green `green`'s chain entries name that the content store does not hold whole (lacks, or holds with a
+/// window let go), each once, with its length.
 fn named_lacking(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
@@ -313,10 +314,12 @@ fn named_lacking(
       continue;
     };
     for run in &entry.increment.named.runs {
+      // Held whole, or brought: a restored store keeps the name of a text whose window was let go, and the replay
+      // reads every byte (codex-review's restart of 2026-11-22: r1 fenced `ContentMissing` for one six-byte window).
       let held = state
         .vcs_stores
         .content()
-        .is_some_and(|content| content.contains(&slates_vcs::ContentId(run.identity.hash)));
+        .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(run.identity.hash)));
       if !held
         && !wanted
           .iter()
