@@ -124,6 +124,13 @@ pub trait ExtentSource: Send {
   /// share cap): a source shared with other arenas tells them, so one holding more than its demand gives back. A
   /// source with no other arena has no one to tell.
   fn want(&mut self, _bytes: usize) {}
+  /// The bytes of free extents this source cannot hand out yet but will once work already under way ends: an extent
+  /// given back and being made again (A-789, Windows: its section closed so its commit returns, then made and held
+  /// again by the anchor). Not in [`ExtentSource::available`]; an admission short of room that these would cover
+  /// waits for them rather than being refused. A source whose extents are always ready has none.
+  fn pending(&self) -> usize {
+    0
+  }
 }
 
 /// Who holds an arena's block (goal 93; main 01a20182's order of 2026-11-23 on arena-13: 373 MB of the content arena
@@ -648,6 +655,12 @@ impl ChunkArena {
   /// The bytes this arena could still claim from its source ([`ExtentSource::available`]); zero without a source.
   pub fn claimable(&self) -> usize {
     self.source.as_ref().map_or(0, |source| source.available())
+  }
+
+  /// The bytes its source will be able to hand out once the work under way on its extents ends
+  /// ([`ExtentSource::pending`]); zero without a source.
+  pub fn pending_claimable(&self) -> usize {
+    self.source.as_ref().map_or(0, |source| source.pending())
   }
 
   /// Opens or closes the source's pressure hold to this arena's growth ([`ExtentSource::open_hold`]); nothing without a
