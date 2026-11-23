@@ -3780,6 +3780,16 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node, as a forwarded verb's owner, wait `delay_ns` after the verb ran and deferred its
+  /// reply before its exchange asks where the reply stands (`None` restores asking at once), as an exchange whose owner
+  /// shard was busy does: a reply that is recorded meanwhile must be the answer. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_forward_answer_delay(&self, delay_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_forward_answer_delay_ns = delay_ns;
+    })
+  }
+
   /// Test support: makes this node, as a content holder, hold each acknowledgement of a placement `delay_ns` before it
   /// leaves (`None` restores immediate answers). The hold has already taken the content, so an owner whose round stops
   /// collecting at its hedge delay first receives the acknowledgement as a straggler's, as it does from a holder whose
@@ -5171,6 +5181,7 @@ async fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_forward_answer_delay_ns: None,
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
