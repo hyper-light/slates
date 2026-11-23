@@ -1,0 +1,52 @@
+name: diag measurer
+# w-interop (2026-11-23, main 01a20182's order, A-875): the Node SDK's async lifecycle failed on both Windows legs of
+# the `sdk` job (CI run 45176536354: `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`, Node adopting the
+# bridge's loopback socket by descriptor). This runs only that leg's Node steps on windows-latest, as ci.yml's `sdk`
+# job runs them, after slates-ipc's Windows completion and pipe tests. Runs only from `diag-measurer-*` branches, never
+# main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  NAPI_CLI_VERSION: 3.7.2 # keep in sync with publish-node.yml
+  AWS_LC_SYS_PREBUILT_NASM: "0"
+
+jobs:
+  node-windows:
+    name: the Node SDK suites and ipc's Windows completion tests (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: slates-ipc's Windows completion and pipe tests
+        shell: bash
+        timeout-minutes: 40
+        run: cargo test -p slates-ipc --lib -- windows_tests stream::tests --nocapture
+      - name: The daemon the Node suites spawn
+        if: ${{ !cancelled() }}
+        run: cargo build -p slates-cli
+      - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
+        if: ${{ !cancelled() }}
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+          (cd crates/sdk-node && npm run build)
+          root=$(pwd -W 2>/dev/null || pwd)
+          daemon="$root/target/debug/slates"
+          if [ -e "$daemon.exe" ]; then daemon="$daemon.exe"; fi
+          addon=$(ls crates/sdk-node/slates.*.node)
+          SLATES_NODE_ADDON="$root/$addon" SLATES_DAEMON="$daemon" \
+            node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
