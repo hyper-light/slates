@@ -14,14 +14,15 @@ env:
 
 jobs:
   hg-matrix-loaded:
-    name: hg matrix, loaded (${{ matrix.runner }}, run ${{ matrix.run }})
+    name: hg matrix, loaded (${{ matrix.runner }}, run ${{ matrix.run }}, malloc ${{ matrix.malloc }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest, run: 1 }
-          - { runner: ubuntu-24.04-arm, run: 1 }
+          - { runner: ubuntu-latest, run: 1, malloc: default }
+          - { runner: ubuntu-latest, run: 1, malloc: arena1 }
+          - { runner: ubuntu-24.04-arm, run: 1, malloc: default }
     timeout-minutes: 300
     defaults:
       run:
@@ -53,6 +54,9 @@ jobs:
           done
       - name: The hg matrix with the CPUs oversubscribed twice over
         run: |
+          # main 01a20182 (arena-8): is the RSS floor glibc's retention? One leg runs the daemon with a single arena.
+          if [ "${{ matrix.malloc }}" = arena1 ]; then export MALLOC_ARENA_MAX=1; fi
+          echo "MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-unset}"
           echo "nproc $(nproc); load before $(cat /proc/loadavg)"
           for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
           sleep 20; echo "load with burners $(cat /proc/loadavg)"
@@ -94,7 +98,7 @@ jobs:
           for h in walk(json.load(open(sys.argv[1]))):
               totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
           for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
-          echo "== peak RSS (compare arena-5 6dd799bf0: push-all 2188 x86, 2133 arm64 MiB; floor 1734; arena-6 a6eceece3 churn cut)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
+          echo "== peak RSS (compare arena-6 a6eceece3: push-all 2186 x86, 2179 arm64 MiB; floor 1725-1735; allocated 45.05 GB)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); print a[2] "\t" $0}}' | sort -k1,1nr | head -20 | cut -f2- || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
@@ -102,7 +106,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: hg-matrix-loaded-logs-${{ matrix.runner }}-${{ matrix.run }}
+          name: hg-matrix-loaded-logs-${{ matrix.runner }}-${{ matrix.run }}-${{ matrix.malloc }}
           path: |
             ${{ runner.temp }}/matrix-hg.out
             ${{ runner.temp }}/matrix-hg/anchor.log
