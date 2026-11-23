@@ -60997,6 +60997,20 @@ owed.
   a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
   turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
   windows.
+- **Piece 3 and the readers off the stream** (main 01a20182's r52 and rulings of 2026-11-22). An answer keeps the
+  windows its read-through brought back (`vcs_http::git::upload::Resident`) and hands each to `vcs_store::let_go_read`
+  once its cursor has passed it (a window a home holds stays, `Pinned`), the most held at once gauged
+  (`git_resident.peak_windows`, `let_go_behind`). Before the pack, a refusal whose read met a let-go window (the
+  advertisement's and ls-refs' tag peel, the negotiation's walks, the shallow and filter cuts) is held
+  (`Answer::held_away`), and the edge's driver, both edges, brings the window back and makes the answer again over the
+  same generation within the same room, passing over what it wrote (A-855's rule, byte for byte); the answer's creation
+  is made again likewise, nothing of it written. The same window met twice with nothing written between gives up typed.
+  A stop now waits for the same window once with nothing done between (it may be met again once let go behind), and
+  every bring-back is bounded by `vcs_share::wait::PATIENCE_NS`. So `vcs_store::commit` lets a landed push's pack go
+  again (main's guard c9bb36dc5 lifted). Tests: w-shared's
+  `a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed` (1,115,127 bytes let go before the
+  listing); `an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`; `t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed`;
+  `a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
 - **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
   pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
   object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's

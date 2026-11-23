@@ -3817,6 +3817,254 @@ fn a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands() {
   }
 }
 
+/// Shape: the bytes of [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`]'s one file: windows
+/// enough that a clone holding its whole pack would hold many more than a turn's look-ahead.
+const LET_GO_FILE: usize = 3 << 20;
+
+/// A-864 piece 3 (main 01a20182's ruling of 2026-11-22: a clone of a let-go pack is whole and holds at most a turn's
+/// windows, never its pack's). Do: start a two-shard store-backed daemon with its edge; push a create of `main` at a
+/// commit whose one file is [`LET_GO_FILE`] bytes, stored whole in its pack; mark every window of the pushed pack landed
+/// and let go those no home holds on the repository's shard (`vcs_store::let_go_read`), four or more; then clone `main`
+/// over the edge. Expect: the
+/// clone `200`, its pack the push's three objects; the stream stopped at a let-go window and brought windows back, the
+/// most it held at once (`git_resident.peak_windows`) a turn's look-ahead and the window it stopped at, three, far
+/// fewer than the pack's windows; and windows let go again behind its cursor. Red before: the clone made no stop, the
+/// pack's windows unread.
+#[test]
+fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(LET_GO_FILE);
+  let created = pushed(edge, &name, &request);
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let windows: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  // Each window marked landed, as the landed pack's let-go marks it, and let go where no home holds it here (a two-shard
+  // daemon pins about half to their home).
+  let ids = windows.clone();
+  let (let_go, refused) = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    let outcomes: Vec<_> = ids
+      .iter()
+      .map(|id| crate::vcs_store::let_go_read(state, id))
+      .collect();
+    // A window let go already (`Away`) is as good as one let go now.
+    let gone = |outcome: &Result<u64, slates_vcs::LetGoRefused>| {
+      matches!(outcome, Ok(_) | Err(slates_vcs::LetGoRefused::Away))
+    };
+    let went = outcomes.iter().filter(|outcome| gone(outcome)).count();
+    let why: Vec<String> = outcomes
+      .iter()
+      .filter(|outcome| !gone(outcome))
+      .filter_map(|outcome| outcome.as_ref().err())
+      .map(|refused| format!("{refused:?}"))
+      .collect();
+    (went, why)
+  });
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  let counted = |kind| counted_on(&daemon, REPOSITORY, kind);
+  let observed = (
+    counted("vcs_store.git_upload.stops"),
+    counted("vcs_store.git_resident.peak_windows"),
+    counted("vcs_store.git_resident.let_go_behind"),
+  );
+  daemon.stop();
+  assert!(
+    let_go >= 1,
+    "{let_go} of {} windows let go: {refused:?}",
+    windows.len()
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    3,
+    "the clone whole"
+  );
+  // The clone may copy the encoding's kept parts rather than read the let-go pack; where it reads the pack, at most a
+  // turn's windows are held at once (`t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed` holds the
+  // mechanism to it whatever the clone reads).
+  let (_, peak, _) = observed;
+  assert!(
+    peak <= 3,
+    "at most a turn's windows held: {observed:?} of {}",
+    windows.len()
+  );
+}
+
+/// Shape: the annotated tags of [`an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`]'s push, each laid in its
+/// pack between two of its files, so their entries lie in windows of their own.
+const LET_GO_TAGS: usize = 6;
+
+/// Stock git's request creating `main` at a root commit of [`LET_GO_TAGS`] files of a MiB each and an annotated tag of
+/// that commit after each file in its pack, `refs/tags/v<n>`: the request, the commit and the tags' names.
+fn tagged_spread_create() -> (Vec<u8>, ObjectId) {
+  use slates_git::object_name::Kind;
+  let mut state = 0x2545_f491_4f6c_dd1du64;
+  let files: Vec<Vec<u8>> = (0..LET_GO_TAGS)
+    .map(|_| {
+      (0..1 << 20)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let mut tree = Vec::new();
+  for (at, file) in files.iter().enumerate() {
+    tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+    tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+  }
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\ntagged\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let tags: Vec<Vec<u8>> = (0..LET_GO_TAGS)
+    .map(|at| {
+      format!(
+        "object {commit_id}\ntype commit\ntag v{at}\ntagger A <a@example.com> 1700000000 +0000\n\nv{at}\n"
+      )
+      .into_bytes()
+    })
+    .collect();
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &commit), (Kind::Tree, &tree)];
+  for (file, tag) in files.iter().zip(&tags) {
+    objects.push((Kind::Blob, file));
+    objects.push((Kind::Tag, tag));
+  }
+  let pack = stored_pack(&objects);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for (at, tag) in tags.iter().enumerate() {
+    let line = format!("{ZERO} {} refs/tags/v{at}", git_name(Kind::Tag, tag));
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  (request, commit_id)
+}
+
+/// Repository `name`'s upload-pack advertisement, as stock git asks it for a v0 clone: its tags peeled.
+fn upload_advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16, Vec<u8>) {
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  exchange(port, certificate, request.as_bytes())
+}
+
+/// A-864's readers (main 01a20182's r52: after git/git's push landed and its pack's windows were let go, every fetch and
+/// ls-remote answered "possible repository corruption", the advertisement's tag peel reading a let-go window). Do: push
+/// a create of `main` and [`LET_GO_TAGS`] annotated tags, each tag's entry between two MiB files in the pack; read the
+/// upload-pack advertisement; mark every window of the pack landed and let go those no home holds on the repository's
+/// shard; read the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
+/// peeled; windows brought back from the node's store to answer it; the clone whole. Red before: refused.
+#[test]
+fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = tagged_spread_create();
+  let created = pushed(edge, &name, &request);
+  let report = String::from_utf8_lossy(&created.1).into_owned();
+  assert_eq!(
+    (created.0, report.matches("ok refs/").count()),
+    (200, 1 + LET_GO_TAGS),
+    "{report}"
+  );
+  let held = upload_advertised(edge, &name);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .filter(|id| {
+        matches!(
+          crate::vcs_store::let_go_read(state, id),
+          Ok(_) | Err(slates_vcs::LetGoRefused::Away)
+        )
+      })
+      .count()
+  });
+  let let_go_ok = let_go > 0;
+  let again = upload_advertised(edge, &name);
+  let brought = counted_on(&daemon, REPOSITORY, "vcs_store.read_through.brought_back");
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  daemon.stop();
+  assert!(let_go_ok, "windows let go");
+  assert_eq!(held.0, 200);
+  assert!(
+    again == held,
+    "the advertisement over the let-go pack: {}",
+    String::from_utf8_lossy(&again.1)
+  );
+  assert!(
+    String::from_utf8_lossy(&held.1).contains("^{}"),
+    "its tags peeled: {}",
+    String::from_utf8_lossy(&held.1)
+  );
+  // Whether its tags' windows were among those let go (the rest pinned by their home) decides whether any was brought
+  // back to answer it; either way it is the same answer.
+  eprintln!("windows brought back to answer the advertisement: {brought}");
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    2 + LET_GO_TAGS,
+    "the clone of main whole: its commit, tree and files"
+  );
+}
+
 /// Format: the changesets and the bytes of each one's file in
 /// [`a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land`]: a history whose file texts are many
 /// segments' worth.
