@@ -644,6 +644,9 @@ mod tests {
       let under_push = (whole(state), counted(state), owed(state));
       drop(pushing);
       crate::vcs_store::git_encode::give_back_idle(state, id);
+      // The let-go is queued and turned a slice at a time by a task of the shard's (`vcs_store::let_go_turn`), which a
+      // synchronous history turns itself.
+      while crate::vcs_store::let_go_turn(state) {}
       (under_push, (counted(state), owed(state)))
     });
     daemon.stop();

@@ -31,11 +31,23 @@ use crate::task::{AdmissionReceipt, SpawnRequest};
 /// (a submitter that may outlive the runtime — an observation still pending while its daemon stops),
 /// and returns the receipt of its admission; refused `ShardGone` when the slot is free or held by a
 /// later registration, `ControlFull` when the holder's control channel is full.
+/// Labelled with where it was called from (A-740).
+#[track_caller]
 pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
   holder: registry::SlotHolder,
   future: F,
 ) -> Result<AdmissionReceipt, RtError> {
-  let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+  submit_to_holder_at(holder, future, core::panic::Location::caller())
+}
+
+/// [`submit_to_holder`], the task labelled `site`: where the work it carries was asked for, which a submitter that
+/// keeps a question to submit later (an observation, its retries) took when it was asked.
+pub fn submit_to_holder_at<F: Future<Output = ()> + Send + 'static>(
+  holder: registry::SlotHolder,
+  future: F,
+  site: &'static core::panic::Location<'static>,
+) -> Result<AdmissionReceipt, RtError> {
+  let (request, receipt) = SpawnRequest::with_receipt_at(Box::pin(future), None, site);
   registry::send_control_to_holder(holder, Control::Spawn(Box::new(request)))?;
   Ok(receipt)
 }

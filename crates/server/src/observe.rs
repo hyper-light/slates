@@ -234,6 +234,8 @@ pub struct Observation<T, Q> {
   /// it looks, never a bound.
   patient: bool,
   question: Q,
+  /// Where the question was asked: its task's label (A-740), so a shard stuck in it names the asker, not this module.
+  site: &'static core::panic::Location<'static>,
   answer: PhantomData<fn() -> T>,
 }
 
@@ -442,12 +444,14 @@ where
 {
   /// An observation of the shard `holder` names with `budget_ns` to answer; nothing is submitted
   /// until it is run.
+  #[track_caller]
   pub(crate) fn new(holder: SlotHolder, budget_ns: u64, question: Q) -> Self {
     Observation {
       holder,
       budget_ns,
       patient: false,
       question,
+      site: core::panic::Location::caller(),
       answer: PhantomData,
     }
   }
@@ -458,12 +462,14 @@ where
   /// does not end it; a stuck shard is its watchdog's to end, and with it the daemon. Until 2026-11-20 every default
   /// observation had the observe budget (ten liveness windows, a fixed 10 s), and a shard that stepped busy past that
   /// budget's CPU without reaching the question ended it, the hazard w-interop's stop watch met (`Daemon::observe`).
+  #[track_caller]
   pub(crate) fn patient(holder: SlotHolder, window_ns: u64, question: Q) -> Self {
     Observation {
       holder,
       budget_ns: window_ns,
       patient: true,
       question,
+      site: core::panic::Location::caller(),
       answer: PhantomData,
     }
   }
@@ -536,14 +542,18 @@ where
   ) -> Attempt<T> {
     let (reply_sender, reply) = channel::<Result<T, StateAccess>>();
     let question = self.question.clone();
-    let submitted = slates_rt::runtime::submit_to_holder(self.holder, async move {
-      let answer = question();
-      if reply_sender.send(answer).is_err() {
-        // The asker's wait ended first: the answer is late, discarded, and counted on the shard's
-        // ledger while its state is there to count on.
-        let _ = state::with_state_counted(|s| s.count(OBSERVE_LATE_REPLY, 1));
-      }
-    });
+    let submitted = slates_rt::runtime::submit_to_holder_at(
+      self.holder,
+      async move {
+        let answer = question();
+        if reply_sender.send(answer).is_err() {
+          // The asker's wait ended first: the answer is late, discarded, and counted on the shard's
+          // ledger while its state is there to count on.
+          let _ = state::with_state_counted(|s| s.count(OBSERVE_LATE_REPLY, 1));
+        }
+      },
+      self.site,
+    );
     let receipt = match submitted {
       Ok(receipt) => receipt,
       Err(refusal) => return self.submission_refused(refusal, attempts, began, *deadline),
