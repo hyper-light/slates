@@ -4322,7 +4322,6 @@ fn pack_with_offsets(
 /// both pushes `200` with every ref `ok`, the second's base brought back from the node's store. Red before: the second
 /// declined, its base unread ("an object it names cannot be read").
 #[test]
-#[ignore = "waits on reader (a), w-shared's: the first commit's deferred green build reads its files from let-go windows (\"a green's owed push was refused building: Object { .., why: Malformed }\"), so the thin push's ref update fails after its pack unpacks"]
 fn a_thin_push_whose_base_was_let_go_lands() {
   use slates_git::object_name::Kind;
   let (identity, certificate) = identity();
