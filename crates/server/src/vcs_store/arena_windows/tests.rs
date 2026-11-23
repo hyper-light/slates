@@ -371,12 +371,18 @@ fn windows_row_checked(
   seen
 }
 
-/// Goal 93's slabs across a restart (w-shared's condition (c)). Do: lend a shard chunk store, put 40 windows of
-/// arena-15's mean length and one of a whole window, take the shard image's window pieces, then restore them into a
-/// fresh arena over a region of the same layout, copy the arena's bytes across as the anchor's content object carries
-/// them, and read every window back; restore also a piece of the version before the slabs. Expect: each slab's block
-/// claimed once (as many chunks as the first store held, fewer than the windows), every window read back byte for byte
-/// in its slot, the restored row asking the windows' bytes, and the old piece refused typed (`OldVersion(1)`), counted.
+/// Goal 93's slabs across a restart (w-shared's condition (c); and main's Windows red of 2026-11-23, w-win2's run
+/// 45269168513: a window in a chunk of its own whose block the seal trimmed was refused `Malformed` at every restart,
+/// since its record names a head shorter than its bytes, so a Windows shard, whose granule is a 4 KiB page, lost every
+/// window of a page or more). Do: lend a shard chunk store, put 40 windows of arena-15's mean length, one of a whole
+/// window and one of [`TRIMMED_WINDOW`], take the shard image's window pieces, then restore them into a fresh arena
+/// over a region of the same layout, copy the arena's bytes across as the anchor's content object carries them, and
+/// read every window back; restore also a piece of the version before the slabs. Expect: each slab's block claimed
+/// once (as many chunks as the first store held, fewer than the windows); the old piece refused typed (`OldVersion(1)`),
+/// counted, the only piece refused; every window's piece encoded again from the restored windows as it was, the
+/// trimmed one's naming a head shorter than its bytes; every window read back byte for byte in its slot (the trimmed
+/// one's tail lies past the head the test can copy, so its piece holds it); and the restored row asking the windows'
+/// bytes. Failing first: the trimmed window's piece refused too, two refused.
 #[test]
 fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
   use slates_vcs::WindowStorage;
@@ -398,6 +404,18 @@ fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
   let mut successor = shard_chunks(64);
   let (mut restored, refused) = ChunkWindows::restore(PAGE, &pieces, &mut successor);
   assert_eq!(refused, 1, "the old piece alone refused");
+  let trimmed = pieces
+    .iter()
+    .filter_map(|(_, bytes)| super::read_piece(bytes).ok())
+    .filter_map(|(_, _, chunk)| chunk)
+    .any(|chunk| u64::from(chunk.used) > chunk.block);
+  assert!(trimmed, "a piece names a trimmed chunk's head");
+  let original: Vec<(u64, Vec<u8>)> = pieces[..pieces.len() - 1].to_vec();
+  assert_eq!(
+    restored.pieces_in(0, u64::MAX),
+    original,
+    "every piece encoded again as it was"
+  );
   assert_eq!(
     super::read_piece(&old),
     Err(super::PieceRefused::OldVersion(1))
@@ -417,13 +435,21 @@ fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
   );
 }
 
-/// Puts 40 windows of arena-15's mean length and one of a whole window into `windows`, lent its chunk store, each named
-/// by an identity of its number: each window and its bytes.
+/// Shape: a window of two and a half pages: a chunk of its own whose block the seal trims (A-118), its record naming a
+/// head shorter than its bytes.
+const TRIMMED_WINDOW: usize = 2 * PAGE + PAGE / 2;
+
+/// Puts 40 windows of arena-15's mean length, one of a whole window and one of [`TRIMMED_WINDOW`] into `windows`, lent
+/// its chunk store, each named by an identity of its number: each window and its bytes.
 fn put_restart_windows(windows: &mut ChunkWindows) -> Vec<(slates_vcs::StoredWindow, Vec<u8>)> {
   use slates_vcs::WindowStorage;
   let mut put = Vec::new();
-  for n in 0..41u64 {
-    let len = if n == 40 { WINDOW } else { MEAN_WINDOW };
+  for n in 0..42u64 {
+    let len = match n {
+      40 => WINDOW,
+      41 => TRIMMED_WINDOW,
+      _ => MEAN_WINDOW,
+    };
     let bytes = window_bytes(n, len);
     let window = windows.put(&bytes).unwrap();
     let identity = slates_vcs::ContentId([u8::try_from(n).unwrap(); 32]);
@@ -467,7 +493,8 @@ fn read_back_in_slots(
 ) {
   use slates_vcs::WindowStorage;
   assert!(restored.lend_in(successor));
-  for (window, bytes) in put {
+  // A trimmed window's tail lies past the head this test can copy across; its placement is held by its piece.
+  for (window, bytes) in put.iter().filter(|(_, bytes)| bytes.len() <= WINDOW) {
     let read = restored.read(*window).unwrap();
     assert_eq!(
       &read[..],
