@@ -1880,6 +1880,22 @@ impl ContentStore {
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
   }
 
+  /// The windows of the object `identity` names, in order, each with its offset in the object (itself at 0 where it is
+  /// one window), let go or not: where a home that holds the object finds each window in the pack it landed in (goal 93
+  /// item 2b(b)).
+  pub fn object_layout(&self, identity: &ContentId) -> Vec<(ContentId, u64)> {
+    let mut offset = 0u64;
+    self
+      .object_windows(identity)
+      .into_iter()
+      .map(|window| {
+        let at = offset;
+        offset = offset.saturating_add(self.len_of(&window).unwrap_or(0));
+        (window, at)
+      })
+      .collect()
+  }
+
   /// Whether the store holds the object `identity` names whole in memory: held, and none of its windows let go
   /// ([`ContentStore::let_go`]). A reader that needs its bytes and finds it not whole reads it again from where it was
   /// landed, and its put brings the windows let go back.
