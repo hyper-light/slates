@@ -1431,3 +1431,83 @@ fn a_held_marker_in_the_other_format_is_not_kept_again() {
     ]
   );
 }
+
+/// The push of `b'` (node 4, on `a`), as one changegroup part and, where `marker` names one, an `obsmarkers` part of its
+/// predecessor `marker` rewritten as it.
+fn rewrite_push(marker: Option<Node>) -> Unbundle {
+  let mut parts = vec![part(0, changegroup())];
+  if let Some(predecessor) = marker {
+    parts.push(part(
+      1,
+      Asks::Obsmarkers(marker_payload(&predecessor, &[4; 20])),
+    ));
+  }
+  Unbundle { parts }
+}
+
+/// §4.17.3 decision 3 (goal 93, changeset evolution's last item): a version whose head does not descend from the line's
+/// previous head is a rewrite, admitted only when every changeset it drops from the line's history is a draft a marker
+/// obsoletes. Do: over `a` (public) and `b` (a draft on it, `default`'s line head), push `b'` on `a` on a repository
+/// that does not publish: with a marker of `b` rewritten as `b'`; without one; and over a view whose line head is a
+/// draft `c` on `b` with a marker of `c` alone. Expect: with the marker, `default`'s line moved to `b'` and no line
+/// made; without it, the line where it was and a line made for `b'`, as before; over `c`, the same, since the move
+/// would drop `b`, a draft no marker obsoletes. Red before: every rewrite made a line, the obsolete `b` keeping its own.
+#[test]
+fn a_rewrite_moves_its_line_only_when_it_drops_obsolete_drafts_alone() {
+  let view = two();
+  let rewritten = [arrived([4; 20], ([1; 20], NULL_NODE), b"default", false)];
+  let place = |view: &View, lines: &[LineRead], marker| {
+    classify(
+      &rewrite_push(marker),
+      (&rewritten, &[]),
+      view,
+      (lines, &[]),
+      false,
+      &mut room(),
+    )
+    .unwrap()
+  };
+  let amended = place(&view, &line_at_b(), Some([2; 20]));
+  assert_eq!(
+    (amended.lines, amended.created),
+    (
+      vec![LineMove::Moved {
+        line: 0,
+        head: [4; 20]
+      }],
+      Vec::new()
+    ),
+    "a rewrite of an obsolete draft moves its line"
+  );
+  let unmarked = place(&view, &line_at_b(), None);
+  assert_eq!(unmarked.lines, Vec::new(), "no marker, the line stays");
+  assert_eq!(
+    unmarked
+      .created
+      .iter()
+      .map(|line| (line.number, line.head))
+      .collect::<Vec<_>>(),
+    vec![(1, [4; 20])],
+    "no marker, a line made"
+  );
+  let mut three = two();
+  three.changesets.push(Old {
+    node: [3; 20],
+    parents: [Some(1), None],
+    branch: b"default".to_vec(),
+    closes: false,
+    phase: Phase::Draft,
+  });
+  let at_c = [LineRead {
+    branch: b"default".to_vec(),
+    number: 0,
+    head: Some([3; 20]),
+  }];
+  let dropping = place(&three, &at_c, Some([3; 20]));
+  assert_eq!(
+    dropping.lines,
+    Vec::new(),
+    "the move would drop b, obsoleted by no marker"
+  );
+  assert_eq!(dropping.created.len(), 1, "a line made for b' instead");
+}

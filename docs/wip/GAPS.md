@@ -945,7 +945,12 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   Decision 3's rewrite admission BUILT (2026-11-23, w-hg): a new head may take a line it does not descend from (an
+>   amend's or a rebase's successor) after every line it does, only where every changeset the move drops from the
+>   line's history is a draft a held or pushed marker obsoletes, its public history kept (`classify::rewrites`,
+>   `rewrite_admitted`); else it makes a line, as before. Held by
+>   `a_rewrite_moves_its_line_only_when_it_drops_obsolete_drafts_alone` (red: the amend's `b'` made `default:1`, the
+>   obsolete `b` keeping `default:0`). Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
 >   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
 >   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
 >   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
