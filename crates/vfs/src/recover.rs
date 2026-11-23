@@ -24,6 +24,7 @@
 //! whose records survived (a FUSE mount the anchor held) and releasing every other holder's, so an orphan whose
 //! holders all died with the process is reclaimed rather than kept forever.
 
+use slates_mem::Owner;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::Discriminant;
 
@@ -3676,7 +3677,7 @@ impl Claims {
         let block = store.content.claim_chunk_blocks(
           chunk.block.region,
           (chunk.block.offset, chunk.block.len),
-          chunk.used,
+          (chunk.used, Owner::Volume),
         )?;
         let sealed = match &chunk.seal {
           Some(seal) => {
@@ -3735,10 +3736,11 @@ impl Claims {
       }
       Some(_) => Err(VfsError::RecoveryIncomplete),
       None => {
-        let block =
-          store
-            .content
-            .claim_block(open.block.region, open.block.offset, open.block.len)?;
+        let block = store.content.claim_block(
+          open.block.region,
+          (open.block.offset, open.block.len),
+          Owner::Volume,
+        )?;
         // The bytes past the imaged length (writes made after this image) are never served: every read stops
         // at the length and every write zero-fills a gap it extends over (`ChunkStore::write_open`).
         self.held.insert(key, Held::Open(block, *open));
@@ -3780,6 +3782,7 @@ impl Claims {
         born: Epoch(open.born),
         // Writes made after the image may have reached anywhere in the block (A-118).
         dirty_to: u64::try_from(block.len()).unwrap_or(u64::MAX),
+        owner: Owner::Volume,
       }),
       _ => Err(VfsError::RecoveryIncomplete),
     }

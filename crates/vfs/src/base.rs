@@ -27,6 +27,7 @@ mod recovery;
 pub use recovery::BaseImage;
 #[path = "base_versions.rs"]
 mod versions;
+use slates_mem::Owner;
 use versions::{Version, Versioned};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -3223,9 +3224,10 @@ impl Overlay<'_> {
       let handle = self.vol.make_current_inode(store, no)?;
       let before = crate::volume::content_by_epoch(store, handle);
       let epoch = self.vol.epoch;
-      let mut open = store
-        .content
-        .open(start, bytes.len(), epoch, self.vol.locked)?;
+      let mut open =
+        store
+          .content
+          .open(start, bytes.len(), epoch, (self.vol.locked, Owner::Volume))?;
       store.content.write_open(&mut open, 0, &bytes)?;
       if let Some(extent) = store.content.seal(open, self.vol.seal_key)?
         && let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body
