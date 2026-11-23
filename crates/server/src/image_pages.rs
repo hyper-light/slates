@@ -429,4 +429,162 @@ mod tests {
     versioned[0] = PAGE_VERSION.wrapping_add(1);
     assert!(decode_page(&versioned).is_none());
   }
+
+  /// Shape: how many objects the paged-image tests let go and note: enough that one piece an entry is thousands.
+  const ENTRIES: usize = 3_000;
+
+  /// Puts `count` distinct one-window objects in the shard's content store and lets each go landed, then notes a landed
+  /// record for each: the shard's windows let go and their records, as a whole-history push leaves them.
+  fn let_go_and_note(
+    state: &mut crate::state::ShardState,
+    (from, count): (usize, usize),
+  ) -> Vec<slates_vcs::ContentId> {
+    let window = state.store.content.chunk_bytes();
+    state.vcs_stores.content_made(window).unwrap();
+    let texts: Vec<Vec<u8>> = (from..from + count)
+      .map(|at| format!("a text let go once its segment landed, number {at}\n").into_bytes())
+      .collect();
+    let need: u64 = texts.iter().map(|text| text.len() as u64).sum();
+    let ids: Vec<slates_vcs::ContentId> = crate::vcs_store::within_budget(state, need, |stores| {
+      let content = stores.content_mut().unwrap();
+      texts
+        .iter()
+        .map(|text| {
+          let id = content.put_object(text).unwrap();
+          assert!(content.mark_landed(&id));
+          content.let_go_landed(&id, None).unwrap();
+          id
+        })
+        .collect()
+    });
+    for (at, id) in ids.iter().enumerate() {
+      crate::vcs_store::homes::note_landed(
+        *id,
+        crate::vcs_store::homes::Landed::Pack(crate::vcs_store::homes::LandedAt {
+          pack: *id,
+          len: 1 << 20,
+          offset: u64::try_from(at).unwrap(),
+        }),
+      );
+    }
+    ids
+  }
+
+  /// A-870 piece 1 (main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30; arena-4: 138,989 windows let go and as
+  /// many landed records, one image piece each). Do: on a shard, let [`ENTRIES`] one-window objects go landed and note a
+  /// landed record for each; take the shard's checkpoint image; read it back as a restore does. Expect: the image's
+  /// pieces far fewer than its entries (a tenth at most), and every window let go and every record read back.
+  /// Failing first: one piece an entry, twice [`ENTRIES`] pieces.
+  #[test]
+  fn a_checkpoint_carries_many_entries_in_few_pieces_and_restores_them_whole() {
+    let (pieces, aways, landed) = crate::daemon::audit_on_shard(|state| {
+      let _ = let_go_and_note(state, (0, ENTRIES));
+      let image = crate::content_holder::held_image(state);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      (image.len(), held.aways.len(), held.landed.len())
+    });
+    assert!(
+      pieces <= ENTRIES / 10,
+      "{pieces} pieces carry {} entries",
+      2 * ENTRIES
+    );
+    assert_eq!((aways, landed), (ENTRIES, ENTRIES), "every entry read back");
+  }
+
+  /// A-870 piece 1. Do: on a shard whose pages are small ([`crate::content_holder::TEST_PAGE_BYTES`]), let many objects
+  /// go and note them, publish a checkpoint (pages planned afresh), then a delta for one window brought back and one more
+  /// let go, then a delta for many more let go; fold each delta over the checkpoint as recovery does. Expect: the one-
+  /// change delta carrying at most two pages of each family it touches, never one an entry; the mass delta splitting
+  /// pages, each page within twice the page size; and the folded image, read entry by entry, the shard's own after
+  /// every step, so a page split or re-encoded never loses or doubles an entry.
+  #[test]
+  fn a_delta_re_encodes_only_its_changes_pages_and_folds_to_the_shards_image() {
+    const PAGE: usize = 4096;
+    let outcome = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let mut outcome: Vec<String> = Vec::new();
+      let ids = let_go_and_note(state, (0, ENTRIES));
+      let (image, pages) = crate::content_holder::held_image_paged(state);
+      let mut journal: BTreeMap<_, _> = image
+        .iter()
+        .map(|piece| (piece.key, piece.bytes.clone()))
+        .collect();
+      crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
+      crate::content_holder::pages_committed(state, pages);
+      let agrees =
+        |journal: &BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>,
+         state: &crate::state::ShardState| {
+          let folded: Vec<slates_vfs::recover::HeldPiece> = journal
+            .iter()
+            .map(|(key, bytes)| slates_vfs::recover::HeldPiece {
+              key: *key,
+              bytes: bytes.clone(),
+            })
+            .collect();
+          crate::content_holder::expanded(&folded)
+            == crate::content_holder::expanded(&crate::content_holder::held_image(state))
+        };
+      // One window brought back, one more let go.
+      let bytes = format!("a text let go once its segment landed, number {}\n", 7).into_bytes();
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        stores
+          .content_mut()
+          .unwrap()
+          .bring_back(&ids[7], &bytes)
+          .unwrap();
+      });
+      let _ = let_go_and_note(state, (ENTRIES, 1));
+      let mut deltas = Vec::new();
+      for step in ["one change", "many changes"] {
+        if step == "many changes" {
+          let _ = let_go_and_note(state, (ENTRIES + 1, ENTRIES));
+        }
+        let changes = crate::content_holder::held_changes(state);
+        let paged: Vec<&slates_vfs::recover::HeldPiece> = changes
+          .put
+          .iter()
+          .filter(|piece| crate::content_holder::page_family(&piece.key).is_some())
+          .collect();
+        for piece in &paged {
+          let entries = decode_page(&piece.bytes).unwrap();
+          let bytes: usize = entries
+            .iter()
+            .map(|(_, bytes)| ENTRY_HEAD + bytes.len())
+            .sum();
+          if bytes > 2 * PAGE && entries.len() > 1 {
+            outcome.push(format!(
+              "{step}: a page of {bytes} bytes past twice the page size"
+            ));
+          }
+        }
+        deltas.push(paged.len());
+        for piece in &changes.put {
+          journal.insert(piece.key, piece.bytes.clone());
+        }
+        for key in &changes.removed {
+          journal.remove(key);
+        }
+        crate::content_holder::held_committed(state, changes.whole, false);
+        crate::content_holder::pages_committed(state, changes.pages);
+        if !agrees(&journal, state) {
+          outcome.push(format!("{step}: the folded image is not the shard's"));
+        }
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (outcome, deltas)
+    });
+    let (outcome, deltas) = outcome;
+    assert!(outcome.is_empty(), "{outcome:#?}");
+    // The one-change delta: the aways' page for the window back, its page for the one let go, and the landed
+    // records' page: a handful, never thousands.
+    assert!(
+      deltas[0] <= 6,
+      "the one-change delta carried {} pages",
+      deltas[0]
+    );
+    assert!(
+      deltas[1] > deltas[0],
+      "the mass delta split pages: {deltas:?}"
+    );
+  }
 }

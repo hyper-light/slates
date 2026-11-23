@@ -250,7 +250,8 @@ impl ChunkWindows {
     self.changed.iter().map(|window| window.0).collect()
   }
 
-  /// [`ChunkWindows::pieces`] of the windows whose handles lie in `lo..=hi` (A-870: one page of the shard image).
+  /// The pieces of the windows kept whose handles lie in `lo..=hi`, each its handle and bytes (A-870: one page of the
+  /// shard image).
   pub(crate) fn pieces_in(&self, lo: u64, hi: u64) -> Vec<(u64, Vec<u8>)> {
     self
       .held

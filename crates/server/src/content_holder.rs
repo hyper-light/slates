@@ -251,6 +251,13 @@ fn page_of_key(key: &PieceKey) -> Option<(crate::image_pages::Family, crate::ima
   Some((family, crate::image_pages::Page { depth, start }))
 }
 
+/// The paged family whose page a piece's key names, none for a piece of no page (A-870 piece 1): what a test sorts a
+/// delta's pieces by.
+#[cfg(test)]
+pub(crate) fn page_family(key: &PieceKey) -> Option<crate::image_pages::Family> {
+  page_of_key(key).map(|(family, _)| family)
+}
+
 /// Whether a piece of `kind` is an entry of a paged family (A-870): what a page carries, and what an image before
 /// A-870 carried one piece each.
 fn is_paged_entry_kind(kind: u8) -> bool {
