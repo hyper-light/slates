@@ -445,3 +445,19 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - For main: clippy and the Windows cross-lint for slates-machine and slates-rt; a jupiter round naming its long
     polls' holders.
   - Queue empty.
+- 2026-11-23 ~10:30 PST: D'' for main's adacachy2 A/B, NOT landed: 71e7945fe on agents/w-perf-84a-linux-rr (on main's
+  933ec74f8; B = 374ce0e8e).
+  - A Linux client's reply wait holds SCHED_RR from its first park until it returns; restored once, exactly.
+  - Red on adacachy2: a_reply_wait_holds_the_real_time_class_from_its_first_park_until_it_returns, 2 raises per wait
+    with the per-park code, now 1, nice back exactly. machine and rt round_robin tests green there.
+  - A-872 claimed (19e433784). Worktree w-perf-diag retired (clean, HEAD on origin's mac-tail branch); w-perf-rr made.
+  - Also saved: Linux 7.3.3 fair.c reading in ~/.cache/w-perf/linux73-notes.md.
+  - Waiting on: main's A/B of A, B, D'' (R9 provisioning p99, load throughput). Queue otherwise empty.
+- 2026-11-23 ~11:30 PST: LANDED A-872, 015dd0f16 (arm B cherry-picked from main's 374ce0e8e) + 2e8ee75f7 (docs).
+  - main's ruling on the adacachy2 A/B: B alone; D'' (71e7945fe, agents/w-perf-84a-linux-rr) measured, not taken.
+  - rt round_robin test green where granted (adacachy2, adacachy), loud at RLIMIT_RTPRIO 0 (ulimit -r 0 on
+    adacachy2), skipped loudly on the Mac.
+  - Docs: §4.3 drivers, amendment A-872, GAPS (84a Linux: bare metal met), BENCHMARKS "84a on Linux bare metal" (A, B,
+    D', D'', E; R9 median cost 12-20 -> 17-27 us).
+  - Not run by me: clippy (Ada's §8; main's wall). Owed: main's confirming round on main.
+  - Queue empty.

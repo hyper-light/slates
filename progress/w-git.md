@@ -595,3 +595,13 @@
   main's call after a round. Owed: encoding's Reading::read_window (no red yet); the push-end let-go is one unsliced
   step in ReceivePack's drop (r165 push 25-69% slower with the lift; main to time). SSH link price built, parked
   (~/.cache/w-git-ssh-paced.patch) pending w-svn's yes on the svn.rs EitherCommand forward.
+
+- 2026-11-23: main's items 1-3 LANDED. (1) let-go sliced off the owing step 3e1588a54 (merge 96cf4a0a7). (2) every
+  read of a let-go window stops, the stream's delta/search/rebuild reads and the encoding's object read and reuse
+  check, under direct-state reds (REUSE_OFF/KEPT_OFF/NO_REUSE switches); slices ended by the quantum alone; R3
+  MOST_KEPT gone, REUSE_COUNTED named: 7f7793c58 (merge b846c8ded). Correction told main: 0c3f42cea's message named
+  the delta/search stops before they were saved. (3) RE-LIFT faafa5651 + test fixes c6dd9473d (merge 4c8b391ec):
+  LANDED_LET_GO on; reds over HTTP (whole + shallow) and SSH (whole + shallow, window-adjusting client), 0 bytes let go
+  with the switch off. Full server lib 1236/1238 (content_ranges timing, svn_commit NotHeld: pre-existing).
+  NEXT: main's git/git whole + verbs A/B on the lift; SSH link price parked (~/.cache/w-git-ssh-paced.patch) pending
+  w-svn's yes on svn.rs EitherCommand::paced.
