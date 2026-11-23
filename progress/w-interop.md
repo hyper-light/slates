@@ -582,3 +582,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   w-win2's). Owed: main's SDK lane rerun after that, then windows-11-arm.
 - LANDED 12a17cd37: GAPS records svnsync over HTTPv2 (r21, 0 differences over git-2000) and http-v1 revprops (r254)
   as proven by use.
+- LANDED c4262e06e (red 756ba95eb), 2026-11-23: the tracer start red (CI 45235122249, 40 ms in, "the anchor is still
+  running"). A start's wait counted the instance's processes by pgrep alone and gave up on its own running strace. Now
+  it counts its anchor while it runs (InstanceWait::look_owning), and a refused start names pgrep's answer and the ps
+  rows (instance_listing). Why pgrep missed is not known; the next miss will say. Owed to main: the conformance lane on
+  ubuntu, and clippy for xtask and cli's tests.
+- QUEUED (main's r110): A-645 (a) and A-681 svn runs on the big Studio.
