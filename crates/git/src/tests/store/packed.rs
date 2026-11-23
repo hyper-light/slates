@@ -16,6 +16,9 @@ use crate::unpack::{self, NoIndex, Outside};
 /// bytes to a few kilobytes).
 const SMALL_WINDOW: usize = 64;
 
+/// Shape: windows small enough that the `create` push's pack lies in several, large enough for its index rows (A-864 piece 2).
+const PIECE2_WINDOW: usize = 256;
+
 /// Shape: room enough for every fixture's object.
 const ROOM: u64 = 1 << 20;
 
@@ -524,10 +527,16 @@ fn a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back() {
 /// The captured `create` push landed in an empty repository as a live push lands it, its objects held where they lie in
 /// its stored pack, every object's row keeping its entry (A-864): the repository, its store and the push's objects.
 fn landed_create() -> (Repository, ContentStore, Vec<unpack::Object>) {
+  let (repository, store, objects, _) = landed_create_in(1 << 12);
+  (repository, store, objects)
+}
+
+/// [`landed_create`] in a content store of `window`-byte windows, with the pack as pushed.
+fn landed_create_in(window: usize) -> (Repository, ContentStore, Vec<unpack::Object>, Vec<u8>) {
   let (_, request, before) = PUSHES[0];
   let (pack, held) = captured(request, before);
   let whole = read_whole(&pack, &held);
-  let mut store = ContentStore::new(1 << 26, 1 << 12).unwrap();
+  let mut store = ContentStore::new(1 << 26, window).unwrap();
   let mut repository = Repository::new(ObjectFormat::Sha1);
   let naming = GitNaming {
     format: ObjectFormat::Sha1,
@@ -551,7 +560,7 @@ fn landed_create() -> (Repository, ContentStore, Vec<unpack::Object>) {
   repository.commit(&mut store, &mut push, &[moved]).unwrap();
   super::derive_all(&repository, &mut store);
   push.abandon(&mut store).unwrap();
-  (repository, store, whole.objects)
+  (repository, store, whole.objects, pack)
 }
 
 /// The objects of `pack`, read whole as `index-pack` reads one, by name with their bytes.
@@ -607,4 +616,166 @@ fn a864_an_entry_whose_crc_misses_is_rebuilt_and_the_clone_is_whole() {
     .map(|object| (object.id, object.content))
     .collect();
   assert_eq!(objects_of(&pack), expected);
+}
+
+/// A-864 piece 2's invariant (main 01a20182's ruling of 2026-11-22: a turn stops cleanly at a unit boundary, nothing of
+/// the unit written, where it meets a let-go window). Do: land the `create` push in a store of 64-byte windows and
+/// stream its clone; then let every window of its pack go and stream the clone again, a turn at a time, bringing back
+/// the window each turn stopped at (`Upload::waiting`, cut from the pack as the node's store gives it) before the next.
+/// Expect: the second clone stopped at least once and is the first byte for byte; each stop named a window of the
+/// pack, and where the next turn reads (`Upload::reading_next`) lies in that pack.
+#[test]
+fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_identical() {
+  use crate::store::{Progress, Turn, Upload};
+  let (repository, mut store, _, pack) = landed_create_in(PIECE2_WINDOW);
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let (whole, _) = super::streamed(&repository, &store, clone.clone(), u64::MAX);
+  let root = repository.packs().next().unwrap();
+  for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+    assert!(store.mark_landed(&window));
+    store.let_go(&window).unwrap();
+  }
+  let mut upload = Upload::new(clone, &repository);
+  let mut clock = super::Ticks(0);
+  let mut admission = Admission::new(u64::MAX);
+  let mut out = Vec::new();
+  let mut stops = 0;
+  for _ in 0..10_000 {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: super::EXCHANGE,
+      quantum_ns: u64::MAX,
+    };
+    if upload
+      .advance(&repository, &store, turn, &mut admission, &mut out)
+      .unwrap()
+      == Progress::Done
+    {
+      break;
+    }
+    if let Some(waited) = upload.waiting() {
+      stops += 1;
+      assert_eq!((waited.pack, waited.len), root);
+      assert!(
+        upload
+          .reading_next()
+          .is_some_and(|next| next.pack == root.0)
+      );
+      let (window, start, len) = store
+        .away_window(&waited.pack, waited.len, waited.offset)
+        .expect("the window met is let go");
+      let from = usize::try_from(start).unwrap();
+      let to = from + usize::try_from(len).unwrap();
+      store.bring_back(&window, &pack[from..to]).unwrap();
+    }
+  }
+  assert!(stops > 0, "a let-go window met");
+  assert!(
+    out == whole,
+    "the clone byte for byte, {} against {} bytes",
+    out.len(),
+    whole.len()
+  );
+}
+
+/// A-864 piece 2's encoding side (main 01a20182's ruling of 2026-11-22: a due version's packs never made resident whole).
+/// Do: land the `create` push twice in stores of 256-byte windows; encode one's version as it lies; let every window of
+/// the other's pack go and encode its version a turn at a time, bringing back the window each turn stopped at
+/// (`Encoding::waiting`) before the next; then clone both. Expect: the second encoding stopped at least once, every
+/// object sent on as its entry lies in both, and the two clones byte for byte the same. Red before: a unit meeting a
+/// let-go window refused the encoding.
+#[test]
+fn a864_an_encoding_that_meets_a_let_go_window_stops_cleanly_and_keeps_the_same_fragments() {
+  use crate::store::{Encoding, Progress, Turn};
+  let encoded = |let_go: bool| {
+    let (mut repository, mut store, objects, pack) = landed_create_in(PIECE2_WINDOW);
+    if let_go {
+      for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+        assert!(store.mark_landed(&window));
+        store.let_go(&window).unwrap();
+      }
+    }
+    let mut encoding = Encoding::fragments(&repository, &store, 1, 0).unwrap();
+    let mut clock = super::Ticks(0);
+    let mut stops = 0;
+    for _ in 0..100_000 {
+      let turn = Turn {
+        clock: &mut clock,
+        exchange: super::EXCHANGE,
+        quantum_ns: u64::MAX,
+      };
+      if encoding.advance(&mut repository, &mut store, turn).unwrap() == Progress::Done {
+        break;
+      }
+      if let Some(waited) = encoding.waiting() {
+        stops += 1;
+        let (window, start, len) = store
+          .away_window(&waited.pack, waited.len, waited.offset)
+          .expect("the window met is let go");
+        let from = usize::try_from(start).unwrap();
+        let to = from + usize::try_from(len).unwrap();
+        store.bring_back(&window, &pack[from..to]).unwrap();
+      }
+    }
+    let counted = encoding.counters();
+    let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+    let (cloned, _) = super::streamed(&repository, &store, clone, u64::MAX);
+    (
+      stops,
+      counted.reused_whole + counted.reused_deltas,
+      crate::to_u64(objects.len()),
+      cloned,
+    )
+  };
+  let (_, reused, objects, kept) = encoded(false);
+  let (stops, reused_again, _, kept_again) = encoded(true);
+  assert!(stops > 0, "a let-go window met");
+  assert_eq!((reused, reused_again), (objects, objects));
+  assert!(kept_again == kept, "the same clone of the same fragments");
+}
+
+/// A-864 piece 2's progress (main 01a20182's r29: git/git's clone stalled after 183 KB on 1930df65d, a stop that never
+/// went on). Do: land the `create` push in a store of 256-byte windows, let every window of its pack go, and stream its
+/// clone a turn at a time, never bringing a window back, for at most a turn a window and a few. Expect: the stream stops
+/// once at the first window it meets, and on the next turn, that window still let go, refuses typed rather than
+/// stopping again: a stop always makes progress or ends. Red before: it stopped every turn, never ending.
+#[test]
+fn a864_a_window_never_brought_back_is_stopped_at_once_then_refused_never_waited_for_again() {
+  use crate::store::{Progress, Turn, Upload};
+  let (repository, mut store, _, pack) = landed_create_in(PIECE2_WINDOW);
+  for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+    assert!(store.mark_landed(&window));
+    store.let_go(&window).unwrap();
+  }
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let mut upload = Upload::new(clone, &repository);
+  let mut clock = super::Ticks(0);
+  let mut admission = Admission::new(u64::MAX);
+  let mut out = Vec::new();
+  let bound = pack.len() / PIECE2_WINDOW + 4;
+  let mut stops = 0;
+  let mut ended = None;
+  for _ in 0..bound {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: super::EXCHANGE,
+      quantum_ns: u64::MAX,
+    };
+    match upload.advance(&repository, &store, turn, &mut admission, &mut out) {
+      Ok(Progress::Done) => {
+        ended = Some(Ok(()));
+        break;
+      }
+      Ok(Progress::More) => stops += usize::from(upload.waiting().is_some()),
+      Err(refused) => {
+        ended = Some(Err(refused));
+        break;
+      }
+    }
+  }
+  assert_eq!(stops, 1, "stopped once at the first window met");
+  assert!(
+    matches!(ended, Some(Err(_))),
+    "then refused, not waited for: {ended:?}"
+  );
 }

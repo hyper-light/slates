@@ -391,7 +391,7 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   assert_eq!(decoded.applied, applied);
   assert_eq!(
-    replica.apply_recorded(&decoded.increment, &decoded.applied),
+    replica.apply_recorded(&mut decoded.increment.clone(), &decoded.applied),
     2
   );
   replica_reads_alike(&mut replica, &mut green);
@@ -811,7 +811,7 @@ fn assert_replays_alike(
   let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   assert_eq!(decoded.applied, applied);
   assert_eq!(
-    replica.apply_recorded(&decoded.increment, &decoded.applied),
+    replica.apply_recorded(&mut decoded.increment.clone(), &decoded.applied),
     green.head()
   );
   assert_eq!(replica.head_identity(), green.head_identity());
@@ -1209,7 +1209,7 @@ fn assert_replay_reads_alike(
     );
     let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
     assert_eq!(&decoded.applied, applied);
-    replica.apply_recorded(&decoded.increment, &decoded.applied);
+    replica.apply_recorded(&mut decoded.increment.clone(), &decoded.applied);
   }
   assert_eq!(replica.head(), green.head());
   for version in 0..=green.head() {
@@ -1381,7 +1381,7 @@ fn replay_entry(
     None,
   );
   let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
-  replica.apply_recorded(&decoded.increment, &decoded.applied)
+  replica.apply_recorded(&mut decoded.increment.clone(), &decoded.applied)
 }
 
 /// A-626 part 3 (the replica's half of the copy oracle's seed `cc ef9d3557…`, found by reading): a green restored at a
@@ -2256,7 +2256,7 @@ impl Oracle {
       );
       let decoded = chain_entry::decode(&entry, &increment_bytes)
         .map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
-      replica.apply_recorded(&decoded.increment, &decoded.applied);
+      replica.apply_recorded(&mut decoded.increment.clone(), &decoded.applied);
       identities.push(replica.head_identity());
     }
     Ok((replica, identities))
@@ -2315,7 +2315,7 @@ impl Oracle {
       );
       let decoded = chain_entry::decode(&entry, &increment_bytes)
         .map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
-      restored.apply_recorded(&decoded.increment, &decoded.applied);
+      restored.apply_recorded(&mut decoded.increment.clone(), &decoded.applied);
       prop_assert_eq!(
         Some(restored.head_identity()),
         expected(version + 1),
@@ -2643,7 +2643,7 @@ fn a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns
   );
   let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   assert_eq!(
-    replica.apply_recorded(&decoded.increment, &decoded.applied),
+    replica.apply_recorded(&mut decoded.increment.clone(), &decoded.applied),
     4
   );
   assert_eq!(linked_reads(&replica), expected);

@@ -134,47 +134,193 @@ pub(crate) async fn bring_whole(
       }
       _ => break,
     };
-    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
-    let put = crate::state::with_state(|state| {
-      state.count(PIECE_FETCHED, 1);
-      state.count(BYTES_BROUGHT, brought);
-      crate::vcs_store::within_budget(state, brought, |stores| {
-        stores.content_mut().is_some_and(|content| {
-          let writing = writing.get_or_insert_with(|| content.begin_object_of_length(len));
-          content.put_window(writing, &piece).is_ok()
-        })
-      })
-    });
+    let put = crate::state::with_state(|state| put_brought(state, (&mut writing, len), &piece));
     if put != Some(true) {
       break;
     }
-    offset = offset.saturating_add(brought);
+    offset = offset.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
   }
-  crate::state::with_state(|state| {
-    let made = crate::vcs_store::within_budget(state, 0, |stores| {
-      let Some(content) = stores.content_mut() else {
-        return false;
-      };
-      let mut writing = writing.unwrap_or_else(|| content.begin_object_of_length(len));
-      if offset != len {
-        content.abandon_object(writing);
-        return false;
+  crate::state::with_state(|state| finish_brought(state, writing, (offset, len), identity))
+    .unwrap_or(false)
+}
+
+/// [`bring_whole`] in a recovery, where the shard's state is its caller's (`verbs::rebuild_recovered`) rather than
+/// installed for its tasks: the same pieces, the same put.
+pub(crate) async fn bring_whole_in(
+  state: &mut ShardState,
+  repository: slates_db::catalog::RepositoryId,
+  identity: ContentIdentity,
+  len: u64,
+) -> bool {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return false;
+  };
+  let from = u128::from_be_bytes(repository.bytes);
+  let mut writing: Option<slates_vcs::Writing> = None;
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = match disk.text(from, identity, offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => piece,
+      Err(slates_store::owner::OwnerError::Busy) => {
+        slates_rt::futures::yield_now().await;
+        continue;
       }
-      match content.finish_object(&mut writing) {
-        Ok(made) if made == slates_vcs::ContentId(identity) => true,
-        Ok(made) => {
-          let _ = content.release(&made);
-          false
-        }
-        Err(_) => false,
-      }
-    });
-    if !made {
-      state.count(PIECE_UNFETCHED, 1);
+      _ => break,
+    };
+    if !put_brought(state, (&mut writing, len), &piece) {
+      break;
     }
-    made
+    offset = offset.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+  }
+  finish_brought(state, writing, (offset, len), identity)
+}
+
+/// One piece of a text being brought whole into the content store ([`bring_whole`]): counted, kept a window at a time
+/// within the room it is lent, the text's object begun with its length at its first piece. Whether it was kept.
+fn put_brought(
+  state: &mut ShardState,
+  (writing, len): (&mut Option<slates_vcs::Writing>, u64),
+  piece: &[u8],
+) -> bool {
+  let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+  state.count(PIECE_FETCHED, 1);
+  state.count(BYTES_BROUGHT, brought);
+  crate::vcs_store::within_budget(state, brought, |stores| {
+    stores.content_mut().is_some_and(|content| {
+      let writing = writing.get_or_insert_with(|| content.begin_object_of_length(len));
+      content.put_window(writing, piece).is_ok()
+    })
   })
-  .unwrap_or(false)
+}
+
+/// The end of a text brought whole ([`bring_whole`]): its object finished with one hold where every byte came and its
+/// bytes are its identity's, else given up, counted. Whether it is held.
+fn finish_brought(
+  state: &mut ShardState,
+  writing: Option<slates_vcs::Writing>,
+  (offset, len): (u64, u64),
+  identity: ContentIdentity,
+) -> bool {
+  let made = crate::vcs_store::within_budget(state, 0, |stores| {
+    let Some(content) = stores.content_mut() else {
+      return false;
+    };
+    let mut writing = writing.unwrap_or_else(|| content.begin_object_of_length(len));
+    if offset != len {
+      content.abandon_object(writing);
+      return false;
+    }
+    match content.finish_object(&mut writing) {
+      Ok(made) if made == slates_vcs::ContentId(identity) => true,
+      Ok(made) => {
+        let _ = content.release(&made);
+        false
+      }
+      Err(_) => false,
+    }
+  });
+  if !made {
+    state.count(PIECE_UNFETCHED, 1);
+  }
+  made
+}
+
+/// Counter: a text a Subversion green's recovery brought back from the node's changeset store before its replay
+/// ([`bring_back_named`]): the cold path alone, 0 in a run with no crash. Format: a counter name in the status report.
+pub(crate) const NAMED_BROUGHT_BACK: &str = "vcs_store.svn_texts.named_brought_back";
+
+/// A-760's recovery pre-pass (main 01a20182's rulings of 2026-11-22 ~11:35 and ~11:50, (i)): the texts that the entries of
+/// green `green`'s chain name (A-760) and the content store lacks, brought back whole from the node's changeset store
+/// before the green's replay, a text a recovery unit, so the replay finds every name and its `ContentMissing` stays a
+/// true fence. What it brought, each holding one count of the content store, for the caller to give back once the green
+/// is replayed. Nothing but for a Subversion repository's member.
+///
+/// **Bound.** The chain holds the entries past the green's checkpoint alone, and an import's batch checkpoints its green
+/// as it lands, so what is brought is at most one batch's texts, bounded by the batch's admission
+/// (`svn_commit::staging`).
+///
+/// **Why it can be found.** An entry naming a text commits only once the changeset holding that text is durable on the
+/// node's store: `staging::Staging::land` awaits `landing::land_changeset` before `ImportBatch::commit` appends the
+/// entry, and a client's commit lands its changeset before its entry likewise (`svn_commit::landed_with`). The texts are
+/// the changeset's `Payload` there.
+pub(crate) async fn bring_back_named(
+  state: &mut ShardState,
+  green: slates_db::catalog::VolumeId,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Vec<ContentIdentity> {
+  let Some(repository) = subversion_of(state, green) else {
+    return Vec::new();
+  };
+  let wanted = named_lacking(state, green);
+  if wanted.is_empty() {
+    return Vec::new();
+  }
+  // Made as a first repository makes it; the image's windows and holds it takes in were set before the replays
+  // (`verbs::restore_held_image`, which runs before the records are rebuilt).
+  let window = state.store.content.chunk_bytes();
+  if state.vcs_stores.content_made(window).is_err() {
+    return Vec::new();
+  }
+  let mut brought = Vec::with_capacity(wanted.len());
+  for (identity, len) in wanted {
+    if bring_whole_in(state, repository, identity, len).await {
+      state.count(NAMED_BROUGHT_BACK, 1);
+      brought.push(identity);
+    }
+    slices.unit_done().await;
+  }
+  brought
+}
+
+/// The Subversion repository green `green` is a member of, if it is one's.
+fn subversion_of(
+  state: &ShardState,
+  green: slates_db::catalog::VolumeId,
+) -> Option<slates_db::catalog::RepositoryId> {
+  let repositories = state.db.partition().repositories();
+  let member = repositories.member(green)?;
+  let record = repositories.repository(member.repository)?;
+  (record.tool == slates_db::catalog::VcsTool::Subversion).then_some(member.repository)
+}
+
+/// The texts green `green`'s chain entries name that the content store does not hold, each once, with its length.
+fn named_lacking(
+  state: &ShardState,
+  green: slates_db::catalog::VolumeId,
+) -> Vec<(ContentIdentity, u64)> {
+  let mut wanted: Vec<(ContentIdentity, u64)> = Vec::new();
+  for bytes in state.db.partition().green_chain(green).iter() {
+    if slates_merge::push::DeferredPush::is_record(bytes) {
+      continue;
+    }
+    let Ok((inputs, carried)) = slates_merge::chain_entry::placement(bytes) else {
+      continue;
+    };
+    let increment = match carried {
+      Some(carried) => Cow::Borrowed(carried),
+      None => match crate::merge_service::increment_of(state, green, &inputs) {
+        Some(increment) => increment,
+        None => continue,
+      },
+    };
+    let Ok(entry) = slates_merge::chain_entry::decode(bytes, &increment) else {
+      continue;
+    };
+    for run in &entry.increment.named.runs {
+      let held = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.contains(&slates_vcs::ContentId(run.identity.hash)));
+      if !held
+        && !wanted
+          .iter()
+          .any(|(identity, _)| *identity == run.identity.hash)
+      {
+        wanted.push((run.identity.hash, run.identity.len));
+      }
+    }
+  }
+  wanted
 }
 
 /// Counter: the bytes a reader that needs a text whole brought through the node's changeset store ([`bring_whole`]: a

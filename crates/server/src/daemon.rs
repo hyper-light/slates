@@ -7948,6 +7948,90 @@ mod tests {
     );
   }
 
+  /// Goal 93 item 2b(a) (main 01a20182's ruling of 2026-11-22 07:33: a region hold is a landed window's pin, and nothing
+  /// tested it across a restart). Do: on a store-backed daemon, hold a window for the region on its shard
+  /// (`homes::keep_for_region`) and publish the shard's image; stop the daemon and start its successor over the same
+  /// segment; on the shard, mark the window landed and ask to let it go landed, among this shard and a second whose
+  /// rendezvous ranks the window's home there (so only the restored region hold can pin it). Expect: the region hold
+  /// taken back (none refused), and the let-go refused `Pinned { by: "homes" }`, the window still held. Failing first:
+  /// a restore that skipped the hold would leave the window unpinned, let go, its bytes lost to the region's readers.
+  #[test]
+  fn t_goal93_a_region_held_window_stays_pinned_across_a_restart() {
+    use slates_anchor::AnchorSegment;
+    let store = crate::test_store::TestStore::start("region-pin");
+    let profile = test_profile();
+    let instance = format!("region-pin-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let bytes = b"a window held for the region, pinned across a restart".to_vec();
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let kept_bytes = bytes.clone();
+    let identity = first
+      .observe(shard, move |state| {
+        let (identity, _) = crate::vcs_store::homes::keep_for_region(state, &kept_bytes).unwrap();
+        crate::verbs::publish_shard(state).unwrap();
+        identity
+      })
+      .unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let answered = second
+      .observe(shard, move |state| {
+        let here = state.shard;
+        // A second shard whose rendezvous ranks the window's home there: only the region hold can pin it.
+        let shards = (1..200u16)
+          .map(|other| vec![here, here.wrapping_add(other)])
+          .find(|shards| crate::vcs_store::homes::home_of(shards, &identity) != Some(here))
+          .unwrap();
+        // The content store made by its first use, as a home's read makes it (`homes::read_here`): the restore of
+        // the region holds the image carried runs there.
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let pin = crate::vcs_store::landed_pin(here, &shards, &identity);
+        let refused = crate::vcs_store::within_budget(state, 0, |stores| {
+          let content = stores.content_mut()?;
+          content.mark_landed(&identity);
+          Some((
+            content.let_go_landed(&identity, pin),
+            content.is_away(&identity),
+          ))
+        });
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          refused,
+          count(crate::vcs_store::REGION_HOLDS_RESTORED),
+          count(crate::vcs_store::REGION_HOLDS_UNRESTORED),
+        )
+      })
+      .unwrap();
+    second.stop();
+    let (refused, restored, unrestored) = answered;
+    assert_eq!(unrestored, 0, "no region hold refused at the restore");
+    assert!(restored >= 1, "the region hold taken back");
+    assert_eq!(
+      refused,
+      Some((Err(slates_vcs::LetGoRefused::Pinned { by: "homes" }), false)),
+      "the region-held window pinned after the restart"
+    );
+  }
+
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
   /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
   /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
@@ -12607,8 +12691,8 @@ mod tests {
       })
       .unwrap();
     let (sent, answered) = std::sync::mpsc::channel();
-    b1_push(&first, repository, bundle, sent.clone());
-    let (outcome, parked) = match crash {
+    b1_push(&first, repository, bundle, sent);
+    let (outcome, unnamed) = match crash {
       Some(segments) => {
         let landed = b1_until(&first, move |state| {
           let count = state
@@ -12619,15 +12703,7 @@ mod tests {
           (count == segments).then_some(())
         });
         assert!(landed.is_some(), "the push landed {segments} segments");
-        b1_push(&first, repository, bundle, sent);
-        let parked = b1_until(&first, |state| {
-          state
-            .refusals
-            .get(crate::repository::hg_run::TURN_WAITS)
-            .copied()
-            .filter(|waits| *waits > 0)
-        });
-        (None, parked.unwrap_or(0))
+        (None, segments)
       }
       None => (answered.recv().ok().flatten(), 0),
     };
@@ -12670,18 +12746,18 @@ mod tests {
       .unwrap();
     second.stop();
     drop(segment);
-    (before, recovered, after, outcome, parked)
+    (before, recovered, after, outcome, unnamed)
   }
 
-  /// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push lands as a run of segment changesets; a crash oracle at
-  /// each segment boundary, `crates/land/tests/oracle.rs`'s pattern, with a second push parked on the turn). Do: push
-  /// four changesets of 1.5 KiB files cut at [`B1_SEGMENT_BYTES`] through [`b1_crash`]: once to its answer, then with a
-  /// crash after each count of segments its run lands, a second push parked on the turn each time. Expect, answered:
-  /// the push accepted, its run named, and a successor holding its four changesets with no replay refused (a second
-  /// push of the same bundle lands nothing new). Each crash: the run's segments landed, the second push parked; a
-  /// successor holding none of the push's changesets, counting its next sequence from the creation's, no replay
-  /// refused; its push again accepted, its four changesets held, and its run beginning at the sequence the crashed one
-  /// began at. Never a push half held.
+  /// Main 01a20182's ruling (b1) of 2026-11-22 04:44 and condition 5 of 12:00 (a push lands as a run of segment
+  /// changesets apart from its repository's landing turn; a crash oracle at each segment boundary,
+  /// `crates/land/tests/oracle.rs`'s pattern, killed with an unnamed run's rows present). Do: push four changesets of 1.5
+  /// KiB files cut at [`B1_SEGMENT_BYTES`] through [`b1_crash`]: once to its answer, then with a crash after each count of
+  /// segments its run lands. Expect, answered: the push accepted, its run named (record v11), and a successor holding its
+  /// four changesets with no replay refused (a second push of the same bundle lands nothing new). Each crash: the run's
+  /// segments landed, unnamed; a successor holding none of the push's changesets, counting its next sequence from the
+  /// creation's, no replay refused; its push again accepted, its four changesets held, and its run beginning at the
+  /// sequence the crashed one began at, the last named plus one. Never a push half held.
   #[test]
   fn t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent() {
     let bundle = b1_four_changeset_bundle();
@@ -12691,13 +12767,13 @@ mod tests {
       "{outcome:?}"
     );
     let named = before.2.expect("the answered push's run is named");
-    let segments = named.last - named.first + 1;
+    let segments = u64::try_from(named.sequences().count()).unwrap();
     assert!(segments > 1, "the push landed as {segments} segments");
     assert_eq!(
       recovered.0, 4,
       "the successor holds the answered push whole"
     );
-    assert_eq!((recovered.2, recovered.3), (Some(named), 0));
+    assert_eq!((recovered.2, recovered.3), (Some(named.clone()), 0));
     assert_eq!(after.0, 4);
     for crash in 1..=segments {
       b1_crash_leaves_none_then_whole(&bundle, crash, segments, &named);
@@ -12733,23 +12809,24 @@ mod tests {
     crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3])
   }
 
-  /// One crash of the oracle, after `crash` of the answered push's `segments` segments: the crashed push never
-  /// answered and a second push parked on the turn; none of the push is held before the crash or after the
-  /// successor's recovery, no replay is refused and no entry names the crashed run; and the push again is held whole,
-  /// its run beginning at the sequence the answered push's run `named` began at.
+  /// One crash of the oracle, after `crash` of the answered push's `segments` segments, their rows on the store and named
+  /// by no entry (main 01a20182's condition 5 of 2026-11-22 12:00): the crashed push never answered; none of the push is
+  /// held before the crash or after the successor's recovery (nothing unnamed applied), no replay is refused and no
+  /// entry names the crashed run; and the push again is held whole, its run beginning at the sequence the answered
+  /// push's run `named` began at, the last named plus one, each row there the newest landing's.
   fn b1_crash_leaves_none_then_whole(
     bundle: &[u8],
     crash: u64,
     segments: u64,
     named: &slates_hg::import::record::Run,
   ) {
-    let (before, recovered, after, outcome, parked) =
+    let (before, recovered, after, outcome, unnamed) =
       b1_crash(&format!("b1-crash-{crash}"), bundle, Some(crash));
     println!(
       "(b1) crash after {crash} of {segments} segments: before {before:?}, recovered {recovered:?}, after {after:?}"
     );
     assert!(outcome.is_none(), "the crashed push never answered");
-    assert!(parked > 0, "a second push parked on the turn");
+    assert_eq!(unnamed, crash, "the crash met that many unnamed segments");
     assert_eq!(
       before.0, 0,
       "the crashed push's fork never replaced the index"
@@ -12763,7 +12840,8 @@ mod tests {
     assert_eq!(after.0, 4, "the push again is held whole");
     let run = after.2.expect("the push again names its run");
     assert_eq!(
-      run.first, named.first,
+      run.first(),
+      named.first(),
       "the push again took the crashed run's sequences"
     );
   }

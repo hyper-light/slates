@@ -994,7 +994,9 @@ impl Import {
     };
     let mut held = Held::default();
     let index = &mut self.imported.index;
+    let mut kept_as = None;
     let outcome = keep_revision(store, &mut held, bytes, block).and_then(|(bytes, block)| {
+      kept_as = Some((bytes, block));
       let row = NewRevision {
         node: entry.node,
         p1,
@@ -1008,6 +1010,12 @@ impl Import {
       append_revision(index, store, &reading, rev, &row)
     });
     held.give_back(store, outcome)?;
+    // A file revision's contents are let go once the segment holding its delta is durable (A-767 C1 step 2b).
+    if let (Log::File(_), Some(emitter), Some((bytes, block))) =
+      (reading.log, self.emitter.as_mut(), kept_as)
+    {
+      emitter.note_contents(bytes, block);
+    }
     log.cached = Some((rev, text));
     self.cut_when_due(store, false)?;
     Ok(())

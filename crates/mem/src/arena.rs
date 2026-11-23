@@ -434,6 +434,75 @@ impl ChunkArena {
     returned
   }
 
+  /// [`ChunkArena::shrink`], and then each wholly free region it kept only for `keep_bytes` traded for the smallest
+  /// extent its source holds that covers the shortfall returning it leaves (A-848's best fit): the smaller extent claimed
+  /// first, the region returned after, so the capacity never falls under `keep_bytes`. The capacity returned, net of what
+  /// was claimed. A region the source has no smaller extent for is kept. Main's ruling of 2026-11-22: a shard whose 256
+  /// MiB burst grew its arena by a 1 GiB extent kept that extent whole after the volume was destroyed, for 10 MiB of
+  /// operation headroom (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`). Only the idle give-back
+  /// trades: a refused growth's rollback ([`ChunkArena::make_room`]) claims nothing.
+  pub fn shrink_trading(&mut self, keep_bytes: usize) -> usize {
+    let mut returned = self.shrink(keep_bytes);
+    let idle: Vec<u16> = self
+      .order
+      .iter()
+      .rev()
+      .copied()
+      .filter(|id| {
+        self.slot(*id).is_some_and(|slot| {
+          slot.buddy.free_bytes() == slot.buddy.region_bytes() && slot.buddy.deferred_bytes() == 0
+        })
+      })
+      .collect();
+    for id in idle {
+      let Some(len) = self.slot(id).map(|slot| slot.buddy.region_bytes()) else {
+        continue;
+      };
+      let left = self.capacity().saturating_sub(len);
+      let short = keep_bytes.saturating_sub(left);
+      if short == 0 || short >= len {
+        continue;
+      }
+      let Some((small, claimed)) = self.claim_smaller(short, len) else {
+        continue;
+      };
+      // The capacity a region adds can fall under its length (whole granules alone): a smaller extent that does not
+      // cover the shortfall goes back, and the region stays.
+      if claimed < short {
+        if let Ok(region) = self.remove_region(small)
+          && let Some(source) = self.source.as_mut()
+        {
+          source.release(small, region);
+        }
+        continue;
+      }
+      if let Ok(region) = self.remove_region(id)
+        && let Some(source) = self.source.as_mut()
+      {
+        source.release(id, region);
+        returned = returned.saturating_add(len.saturating_sub(claimed));
+      }
+    }
+    returned
+  }
+
+  /// Claims from the source an extent that covers `want` and is smaller than `than`, and holds it: its id and the
+  /// capacity it added, or `None` (an extent no smaller is given straight back, unused).
+  fn claim_smaller(&mut self, want: usize, than: usize) -> Option<(u16, usize)> {
+    let (id, region) = self.source.as_mut()?.claim(want)?;
+    if region.len() >= than || region.len() < want {
+      if let Some(source) = self.source.as_mut() {
+        source.release(id, region);
+      }
+      return None;
+    }
+    let before = self.capacity();
+    if self.add_region_at(id, region).is_err() {
+      return None;
+    }
+    Some((id, self.capacity().saturating_sub(before)))
+  }
+
   /// The bytes this arena could still claim from its source ([`ExtentSource::available`]); zero without a source.
   pub fn claimable(&self) -> usize {
     self.source.as_ref().map_or(0, |source| source.available())
@@ -1619,6 +1688,79 @@ mod tests {
       arena.add_region_at(7, Region::map(p * 4, p, false).unwrap()),
       Err(MemError::RegionOccupied { region: 7 })
     ));
+  }
+
+  /// A pool of regions of several lengths that hands out the smallest covering what is wanted, else its largest, as the
+  /// content pool's best fit does (A-848).
+  struct FittingPool {
+    free: Vec<(u16, Region)>,
+  }
+
+  impl ExtentSource for FittingPool {
+    fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
+      let covering = self
+        .free
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, region))| region.len() >= want)
+        .min_by_key(|(_, (_, region))| region.len())
+        .map(|(at, _)| at);
+      let largest = self
+        .free
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, region))| region.len())
+        .map(|(at, _)| at);
+      let at = covering.or(largest)?;
+      Some(self.free.remove(at))
+    }
+    fn release(&mut self, id: u16, region: Region) {
+      self.free.push((id, region));
+    }
+    fn refused(&self) -> u64 {
+      0
+    }
+    fn available(&self) -> usize {
+      self.free.iter().map(|(_, region)| region.len()).sum()
+    }
+  }
+
+  /// Main's ruling of 2026-11-22 (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`: a 1 GiB extent kept
+  /// whole for 10 MiB of headroom). Do: over a pool of one 64-granule region and one 4-granule region, grow an arena by
+  /// what 64 granules need, allocate and free one block, then give back idle capacity keeping one granule, with
+  /// `shrink` and then with `shrink_trading`. Expect: `shrink` returns nothing (the one region is kept whole for the
+  /// granule); `shrink_trading` returns the large region net of the small one it claimed in its place, leaving the
+  /// arena holding the small region alone, never under the granule kept.
+  #[test]
+  fn an_idle_arena_trades_a_large_free_region_for_the_smallest_that_keeps_its_headroom() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena.set_source(Box::new(FittingPool {
+      free: vec![
+        (3, Region::map(p * 4, p, false).unwrap()),
+        (9, Region::map(p * 64, p, false).unwrap()),
+      ],
+    }));
+    assert_eq!(
+      arena.grow(p * 64),
+      p * 64,
+      "the burst's need takes the large region"
+    );
+    assert_eq!(arena.region_ids(), [9]);
+    let block = arena.alloc(p).unwrap();
+    arena.free(block).unwrap();
+    assert_eq!(
+      arena.shrink(p),
+      0,
+      "the one region is kept whole for one granule"
+    );
+    assert_eq!(
+      arena.shrink_trading(p),
+      p * 60,
+      "the large region goes back, net of the small one claimed in its place"
+    );
+    assert_eq!(arena.region_ids(), [3]);
+    assert!(arena.capacity() >= p, "never under what is kept");
   }
 
   /// A pool whose look at its free bytes counts `phantom` more than it can hand out: another arena claiming between an

@@ -123,6 +123,11 @@ enum Request {
     identity: Identity,
     answer: Sender<Result<Option<TextRow>, StoreError>>,
   },
+  Forget {
+    repository: u128,
+    sequence: u64,
+    answer: Sender<Result<u64, StoreError>>,
+  },
   PathTexts {
     repository: u128,
     path: Vec<u8>,
@@ -229,6 +234,15 @@ impl fmt::Debug for Request {
         .field("repository", repository)
         .field("offset", offset)
         .finish_non_exhaustive(),
+      Request::Forget {
+        repository,
+        sequence,
+        ..
+      } => f
+        .debug_struct("Forget")
+        .field("repository", repository)
+        .field("sequence", sequence)
+        .finish_non_exhaustive(),
       Request::TextRow { repository, .. } => f
         .debug_struct("TextRow")
         .field("repository", repository)
@@ -324,6 +338,7 @@ fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
       Request::Read { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Changesets { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::TextRow { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Forget { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::PathTexts { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::TextsByTool { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Places { answer, .. } => drop(answer.try_send(unopened(reason))),
@@ -480,6 +495,13 @@ fn serve(
         answer,
       } => {
         let _ = answer.try_send(store.text_row(repository, &identity));
+      }
+      Request::Forget {
+        repository,
+        sequence,
+        answer,
+      } => {
+        let _ = answer.try_send(store.forget(repository, sequence));
       }
       Request::PathTexts {
         repository,
@@ -829,6 +851,22 @@ impl StoreHandle {
           path,
           from,
           limit,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// Forgets repository `repository`'s changeset `sequence`, one no register named ([`Store::forget`]): the rows forgotten
+  /// or moved, none where no such changeset landed.
+  pub async fn forget(&self, repository: u128, sequence: u64) -> Result<u64, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::Forget {
+          repository,
+          sequence,
           answer,
         },
         answers,

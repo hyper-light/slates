@@ -5374,7 +5374,8 @@ shard it woke needed on a busy machine; its wake estimate, seeded with `spin_ns`
 is still learned), then clear the reply stamp slot this park names (the two
 slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
-(futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
+(futex / `os_sync_wait_on_address(SHARED)` / the Event), or, on macOS where the region came with its reply wake
+semaphore, on that semaphore, its flag saying so (4 or 5 for the slot; A-867). A call that waits while its daemon lives waits on the daemon's
 departure beside its reply (A-456): Linux polls the completion eventfd and the control socket instead of the futex,
 Windows waits on the Event and the daemon's process handle together, and macOS keeps the word; both look at the
 daemon's liveness (its exit watch and the instance's start stamp) on a doubling schedule, since a daemon restarted
@@ -30088,8 +30089,10 @@ The steps' own records follow.
   what a wedged daemon shows: no beat, no CPU, nothing runnable, every thread in a wait (the suspend count is readable
   only through the task port). Past the anchor's window it kills the daemon as frozen, as this rule asks: w-hg's
   `vmmap -summary` of a daemon mapping ~220 GB took 2.42 s and lost the daemon at each look. Read the daemon's memory
-  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap), read in process
-  with nothing suspended (§4.14).
+  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap, large), read in
+  process with nothing suspended (§4.14). `heap` is the system allocator (reserved: what it holds from the OS; resident:
+  what its live blocks hold); `large` is the blocks mapped on their own (reserved: their spans; resident: their pages in
+  RAM). Until 2026-11-22 one `heap` row counted the large blocks' spans as resident (main 01a20182's (b1)).
 
 ### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
 
@@ -58008,6 +58011,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
 > release) and recovered with and without a checkpoint.
 >
+> **2026-11-22, shared payloads.** The `P` lookup names one live payload section. Each additional copy has its log
+> offset appended to the key. Forgetting or replacing the section that supplies reads selects one surviving copy,
+> even across repositories. The last removal drops the lookup. Reads take one point lookup. On its first open with
+> this index, an existing checkpoint rebuilds the places from the changeset rows it still holds. The rebuilt index
+> and its marker commit at the same offset. Subsequent opens replay the tail as before.
+> `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes` exercises both orders of removal.
+>
 > **Status (2026-11-20, piece C3 step 4: the A/B's derived per-path arm, decided).** Main's bar: changesets plus a derived
 > per-path form must meet the per-file arm's old read (91 µs p50) and clone file section (0.27 s). Arm C of
 > `crates/hg/examples/changeset_ab.rs` (BENCHMARKS, "Mercurial's history as changesets with a derived per-file form"):
@@ -58227,17 +58237,18 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
 
-> **Status (2026-11-22, a push lands as a run of segment changesets; main 01a20182's rulings (b1) and (i) of 04:44).**
-> A push's intake cuts its kept texts into segments of an import's size and lands each as it is cut, between its
-> slices: `Record` the segment's rows by identity (record v8, the push's source), `Payload` its slice of the
-> changegroup, `Texts` its texts; what the texts charged the push's admission is given back once each lands. The
-> push's entry names the run (record v9, the push's source byte 1), and a restart replays it as an import's run, rows by
-> identity, no payload read. A run's rows are numbered after the index's, and a replay reads its sequences first to
-> last, so the repository's landing turn (Subversion's, which Mercurial's made changesets hold too) is held from the
-> run's first segment to the entry; a push of the same repository parks for it within the room wait's patience, and a
-> fork made stale before the turn is taken again inside it, never re-based. A run no entry names is abandoned: its
-> sequences are landed again by the next landing, each store row the newest landing at it. A made changeset stays one
-> changeset (record v7). `repository::hg_run`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
+> **Status (2026-11-22, a push lands as a run of segment changesets apart from the landing turn; main 01a20182's
+> rulings (b1) of 04:44, 07:32 and 12:00).** A push's intake cuts its kept texts into segments of an import's size and
+> lands each as it is cut, between its slices: `Record` the segment's rows by node and identity (record v10),
+> `Payload` its slice of the changegroup, `Texts` its texts; what the texts charged the push's admission is given back
+> once each lands. Segments land at the repository's next sequences, which its owner shard allocates, other landings
+> between them; the push's entry names them as ranges (record v11), and a restart replays exactly those, each record's
+> rows by node over the index as it stands then. The repository's landing turn (Subversion's, which Mercurial's made
+> changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
+> first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
+> is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
+> A made changeset stays one changeset (record v7).
+> `repository::hg_run`, `hg_push::rebase`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
 
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
 > makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
@@ -60926,9 +60937,25 @@ owed.
 - Evidence: `a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back` (git: every read of the update push's
   let-go pack refused `Away`, brought back, then the object read whole); `a_let_go_window_is_brought_back_from_the_nodes_store_and_read_whole`
   (server, store-backed: four windows let go, each brought back from the node's store, the object read whole).
-- Open: the let-go after a landing (item 2b), where `ContentStore::let_go` refuses a window more than one holder keeps
-  (`Shared`): a landed push's pack window has several (the push, the repository's pack, its home's region hold), and
-  which may go once the node's store holds the bytes is 2b's.
+- 2b(a) (main 01a20182's rulings of 06:58 and 07:00): once a push's record commits and its changeset landed, its pack
+  as the staging put it in the shard's content store is let go (`vcs_store::let_go_landed_pack`), every window by
+  `ContentStore::let_go_landed`, which lets a landed window go whatever its holders count unless its owner names a
+  holder that pins it, refused `Pinned { by }`. A home pins a window (it reads by the window's identity alone, so it
+  cannot bring it back until 2b(b)): where the window's home is this shard by rendezvous over the node's shards, or the
+  shard holds it for the region (`vcs_store::landed_pin`). The pin is read from where the home is, never a flag, so a
+  restart cannot drop it. A `git_derive` read that meets a let-go window waits (`git_derive::Turned::Waiting`), the
+  window brought back and the derivation begun afresh from the versions still due; in the encoding's turn the wait is
+  put back on the repository for its driver (`Repository::wait_for`). Counted: `vcs_store.landed.let_go_bytes`,
+  `vcs_store.landed.pinned`. Evidence: `a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it` (vcs),
+  `a_landed_packs_windows_go_but_those_a_home_holds_here` (server, store-backed). Never while a fetch of the repository
+  is answered or its encoding is under way (w-git's driver makes the packs resident before either and takes no unit
+  again mid-answer): then the pack is owed (`VcsStores`'s `landed_owed`) and let go at the repository's idle give-back
+  (`vcs_store::let_go_owed` from `git_encode::give_back_idle`). A recovery's region hold that cannot be taken back is
+  counted and logged (`vcs_store.region_holds_unrestored`), never skipped, since it is a window's pin; the counts are
+  taken at the first settle after the content store is made, which may be any step after the recovery. Evidence:
+  `t_goal93_a_region_held_window_stays_pinned_across_a_restart` (a region hold, a stop and start over the same segment,
+  the let-go refused `Pinned { by: "homes" }`).
+- Open: 2b(b), homes' read-through (window -> payload identity and offset), which lifts the homes' pin.
 
 
 ### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)
@@ -60965,5 +60992,164 @@ owed.
   entries it reuses, an offset delta's base always before it, each window wanted once. Counted `backward_reads`.
   `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`: 0 backward reads (88 in position
   order), its streamed clone 17,299 bytes, the pushed pack's own, in 175 turns where 403 went before.
-- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Pieces 2 and 3: a
-  turn's windows brought back ahead of it and let go behind it, residency at its peak a turn's windows.
+- **Piece 2, a fetch's look-ahead** (main 01a20182's ruling of 2026-11-22: residency bounded by a turn's windows). A
+  unit of the stream whose pushed entry lies in a let-go window, or a copy under way that reaches one, stops before it
+  writes or keeps anything; the turn ends there, the window named (`Upload::waiting`), and the unit is taken again on
+  the next turn, so a turn's sideband framing is a turn's as ever. Before each turn, off it, the fetch's driver (both
+  edges) brings back the window the last turn stopped at and the `LOOK_AHEAD_WINDOWS` (two) the next turn reads first
+  (`Upload::reading_next`: a pack is read front to back, piece 1). A fetch no longer makes its repository's packs
+  resident; an encoding does, where one is due (`git_encode::encoding_due`). Counted `ahead_brought` and
+  `stopped_brought`. Tests: `slates-git` `a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_identical`
+  (every window of a landed pack let go: stopped and brought back, the clone byte for byte; red: refused);
+  `slates-server` `t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack` (two of four windows).
+- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Piece 3: the windows
+  a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
+  turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
+  windows.
+- **Piece 3 and the readers off the stream** (main 01a20182's r52 and rulings of 2026-11-22). An answer keeps the
+  windows its read-through brought back (`vcs_http::git::upload::Resident`) and hands each to `vcs_store::let_go_read`
+  once its cursor has passed it (a window a home holds stays, `Pinned`), the most held at once gauged
+  (`git_resident.peak_windows`, `let_go_behind`). Before the pack, a refusal whose read met a let-go window (the
+  advertisement's and ls-refs' tag peel, the negotiation's walks, the shallow and filter cuts) is held
+  (`Answer::held_away`), and the edge's driver, both edges, brings the window back and makes the answer again over the
+  same generation within the same room, passing over what it wrote (A-855's rule, byte for byte); the answer's creation
+  is made again likewise, nothing of it written. The same window met twice with nothing written between gives up typed.
+  A stop now waits for the same window once with nothing done between (it may be met again once let go behind), and
+  every bring-back is bounded by `vcs_share::wait::PATIENCE_NS`. So `vcs_store::commit` lets a landed push's pack go
+  again (main's guard c9bb36dc5 lifted). Tests: w-shared's
+  `a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed` (1,115,127 bytes let go before the
+  listing); `an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`; `t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed`;
+  `a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+- **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
+  pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
+  object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's
+  packs resident whole any more. Test: `slates-git`
+  `a864_an_encoding_that_meets_a_let_go_window_stops_cleanly_and_keeps_the_same_fragments` (every window let go: stopped,
+  every object reused, the clone of its fragments byte for byte the clone of an encoding that met none; red: refused).
+
+### A-865 — A Subversion increment names its stored texts (A-760), and a recovery brings back the names its content store lacks (2026-11-22, w-svn; main 01a20182's rulings of 11:05, ~11:35 and ~11:50 PST, goal 93, P7 finding (2); A-760, A-862, A-863, C2 stage C)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit.rs`: `Building::insert` names a text stored in the content store as a whole
+  `NamedRun` (its op sourced after the inline bytes, `build` patching each such source once their length is known, and
+  checking it against what `Increment::push_named` numbers). It copies into the post-state only a text the revision or
+  the records hold themselves. `read_named` reads every run into its own buffer before the increment is judged, counted
+  (`repository.svn_commit.named_read_bytes`). `Building` keeps no content store.
+- `crates/server/src/repository/svn_commit/staging.rs`: the batch reads its revisions' runs, its holding counts them
+  with the post-state, and `KILL_BEFORE_ENTRY` is a test's kill between the changeset and its entry.
+- `crates/server/src/import_batch.rs`: the scratch member judges with `Green::submit_named`, new in
+  `crates/merge/src/engine.rs` (`judge_named`, then the commit), so each run's buffer becomes its file with no copy.
+- `crates/server/src/repository/push.rs`: `RecordedBatch::apply_slice` reads a version's runs again before the real
+  green applies it. The texts are held until the batch's landing ends; piece (c), adopting the scratch member's files,
+  would drop this read.
+- `crates/server/src/vcs_store/svn_texts.rs`: `bring_back_named`, the recovery's pre-pass; `bring_whole_in`, the bring of a
+  text where the state is the recovery's; `put_brought`, `finish_brought` shared with `bring_whole`; counter
+  `vcs_store.svn_texts.named_brought_back`.
+- `crates/server/src/verbs.rs`: `rebuild_record`'s Green arm runs the pre-pass before a green's replay and gives its
+  texts back after.
+- Tests: `an_increment_names_its_stored_texts_and_carries_none_of_their_bytes`,
+  `an_increments_record_names_its_texts_not_their_bytes` (svn_commit); in store_tests,
+  `a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history` (now asserting texts brought
+  back), `a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole`,
+  `a_cleanly_restarted_import_brings_back_no_named_text` and
+  `a_region_held_window_is_restored_beside_the_named_texts_brought_back`. GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_import_measured` over git-2000) owed.
+- **Why.** After A-862 an import's texts sit in the content store by identity, yet its increments copied each into their
+  post-state (`Building::append_text`), their chain entries carried them (`Increment::encode`), and the scratch member
+  made each file again from that copy. A-760 had built the mechanism: an increment names a run of the content plane,
+  read into a buffer of its own that the commit makes the file. GAPS named the Subversion landing's use of it w-svn's.
+- **What.** Building names every stored text, so the log records names, never bytes. The runs are read in the build
+  step, the same bound as the copy they replace; turns come with piece (c). The scratch member takes the buffers as its
+  files. The real green reads the runs once more at the batch's apply.
+- **The invariant.** An entry naming a text commits only once the changeset holding the text is durable on the node's
+  store. `Staging::land` awaits `landing::land_changeset` before `ImportBatch::commit` appends the entry, and a client's
+  commit lands its changeset before its entry (`svn_commit::landed_with`).
+- **Recovery (main's ruling (i)).** A death between an entry's commit and its checkpoint leaves entries naming texts the
+  content store need not hold. The cold recovery replays greens before it remakes the repositories' stores, so a
+  pre-pass in the green's rebuild brings back, a text a unit, every named text the green's chain past its checkpoint
+  names and the store lacks, from the changeset's `Payload` through `vcs_disk`. That is at most one batch's texts,
+  bounded by its admission. Making the content store there takes in the image's windows and region holds as before,
+  since `restore_held_image` sets them before the greens replay. The replay's `ContentMissing` stays a true fence.
+- **Evidence.**
+  - Red: 5,000 bytes inline and no run named, now 0 inline and three runs. The killed batch's successor fenced its
+    green, `ContentMissing { version: 1 }`; now it recovers, folded, with texts brought back. After a clean restart the
+    count is 0.
+  - w-svn's byte-sampled in-process attribution (500 files of 8 KiB, then 300 revisions of 3 changed, 11.65 MB):
+    130.8 MB allocated before, 108.0 MB after. `Increment::encode`, the post-state and the scratch member's `apply`
+    leave the sites; `read_step` stands twice, for the scratch member and for the real green.
+
+### A-866 — A green's block made whole of a named object keeps the object's name (2026-11-22, w-svn; main 01a20182's order of 17:00 PST, goal 93; A-760 (b) items 3-7, piece 1 of 4; A-760, A-865)
+
+- **Why.** Since A-865 a Subversion version names its texts, and its entry records the names, not the bytes. But the
+  green still holds each text whole on the heap beside the content store, and so do its checkpoint and its history.
+  Items 3-7 (A-760's owed line) take those copies away by holding a file by its content-plane object. That needs the
+  block to know which object it is. The identity space is the content store's object root (w-perf's addendum of
+  2026-11-20 to the block seam), the identity a named run already carries, so no chunk reference enters the engine.
+- **The pieces** (main's ruling: one a piece, smallest first, each with its oracle against `apply_recorded` on
+  generated histories):
+  1. The block keeps its name (this entry).
+  2. A checkpoint names a named file instead of carrying its bytes.
+  3. The history keeps a named version by its name.
+  4. The current block holds no bytes, and every read goes through the plane.
+- **The rule.** A version that makes a file of exactly one named run, which is its object whole (from its first byte,
+  the object's length), names the file's block for that object: `dims::Blocks`' slot carries the identity,
+  `Green::name_of` reads it. A name says what the bytes are, not where they came from. So a file named is named whether
+  its run's buffer moved into it or two files of one run each took a copy. Anything that keeps the block keeps the
+  name: a version that leaves the file alone, a copy's tree grafted by reference, a hold. Every other making gives a
+  new block with no name: a part of an object, carried bytes, a splice, a hard link's hand-over, a copy's fix (a file
+  its source changed since the copied version), a revert, a restore. Appending to a staged block clears any name.
+  Copies, hand-overs and reverts are outside the oracle's histories; the rule holds there by construction, since each
+  makes its block with `Files::insert`, which names nothing.
+- **Where.** `Green::sole_runs` finds each file made of one run. `alone` keeps those whose buffer moves; `named_files`
+  keeps those named. Both are found together, so a verdict made a slice a step (`Making::names`) and its commit agree.
+  The commit hands each effect's name to its staged file (`StagedFile::name`), and `Files::insert_named` makes the
+  block. A judged verdict carries its work's runs (`Judged::runs`).
+- **Oracle.** `engine::named_tests::a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. A fixed history
+  runs first, then 64 generated histories of up to nine versions over three paths and four objects, each version
+  judged and committed on one green (some made a slice a step first) and applied as its entry records it on another.
+  After every version, both greens' bytes and names must equal a model kept by the rule, and the two heads must be one.
+  Census of one run: 355 files named and moved, 20 named and sharing a run, 143 changed away from a name, 87 kept
+  across a later version, 210 versions made in steps. Failing first: the commit named no block (`left: None`).
+- **Not yet.** No memory moves in this piece. A checkpoint carries bytes, so a restored green names nothing (piece 2).
+- **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/copy`, `engine/named_tests`), GAPS,
+  amendments.tsv.
+
+### A-867 — A macOS client's synchronous park waits on its region's Mach semaphore, sent with the region (2026-11-22, w-perf; main 01a20182's order of ~17:40 PST, goal 84a; A-831, A-799, A-44, GAP-A9-9)
+
+- **Why.** Under the time-constraint policy (A-831), a shard's reply wake of a parked client
+  (`os_sync_wake_by_address_any` on the region's shared wake word) cost the shard 1-33 ms of its own CPU in the kernel
+  about once in a hundred loaded requests on CI's macOS runner. Of 1,504 such wakes, 1,451 were on CPU for at least
+  90% of their time (run 45074388808). A spindump put 69 of the wake's 106 samples at one kernel instruction (run
+  45082342692).
+- **What it is.** A probe reproduced the spin where a wake meets its waiter entering its wait. It came in bursts and
+  showed even with no load at all (run 45086631612). That is a lock holder's vCPU descheduled by the VM's host: on
+  bare metal (a Mac Studio, 8 loaded runs) no wake ran 1 ms. The client parks at once (A-799), so its reply meets it
+  entering the wait on most requests. In the probe a Mach semaphore's signal did not spin so.
+- **The rule.** The daemon makes one semaphore with each client region. Its send right goes to the instance's owner
+  with the region's fileport, and the owner hands both to the claimant (`crate::mach_claim`: a keep and a delivery
+  each carry two descriptors).
+  - A synchronous park on a region that came with its semaphore raises a flag of its own, 4 or 5 for the stamp slot
+    (`region::PARKED_SEMAPHORE_SLOT_ZERO`, `_ONE`). It then fences, re-checks its ring as every park does (A-44), and
+    waits on the semaphore. The daemon signals the semaphore for such a flag instead of waking the word.
+  - A semaphore counts its signals, so a signal made before the wait is not lost. One made for a reply the re-check
+    already found ends the next park early, and the loop looks at its ring again.
+  - Every other park keeps the address wake: an async SDK's arm, which its completion bridge waits on, and any mapping
+    that came without the semaphore (a second mapping, a test's open by name).
+  - A semaphore found destroyed (its daemon's region dropped, as a restart does) is let go. That park, and the
+    mapping's later ones, wait on the word, where the look at the daemon's life ends them.
+  - The owner's keep refuses a stranger's keep as before. A message not of the keep's shape is destroyed with its
+    rights, and a right never handed over is given back with its delivery.
+- **Measured.** CI's macOS runner, 8 interleaved rounds against the address wake (run 45091701553):
+  - reply wakes over 1 ms: 3,001 against 36;
+  - the loaded edit and merge's p99, median of rounds: accept 1,766 against 976 µs, conflict 4,301 against 1,363 µs;
+  - quiet no worse.
+  - The p999 stays over 1 ms on that runner, bound by long verbs (BENCHMARKS).
+- **Tests.**
+  - `crates/ipc/tests/rendezvous.rs`
+    `a_parked_client_in_another_process_is_woken_by_its_regions_semaphore`: the client process's park, woken only by a
+    reply made after its flag rose, ends by its semaphore, counted (`ClientEnd::semaphore_wakes`). It failed first
+    with the semaphore named in the region's header (the A/B's arm), whose wait another task refuses
+    (`KERN_INVALID_NAME`).
+  - `mach_claim::tests::a_fetched_wake_right_signals_the_kept_regions_semaphore`.
+- **Applied in the same change to** `crates/ipc` (`mach_semaphore`, `mach_claim`, `region`, `endpoint`, `rendezvous`,
+  `tests/rendezvous.rs`), `unsafe-budget.toml`, GAPS, BENCHMARKS, amendments.tsv.

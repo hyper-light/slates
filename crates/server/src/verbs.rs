@@ -5163,10 +5163,15 @@ fn demux_sum(
 }
 
 /// The daemon's memory by kind (§4.14; A-232's gotcha): every shard's parts summed kind by kind, in the order first seen,
-/// then the heap's (`slates_mem::heap`), read now. A kind is `measured` once every shard's part of it is, and its written
-/// bytes are known only where every part's are.
+/// then the heap's two, read now (`slates_mem::heap`): `heap`, the system allocator (what it holds from the OS, and what
+/// its live blocks hold), and `large`, the blocks mapped on their own (`slates_mem::large`: their spans reserved, their
+/// pages in RAM resident, read only when the status `asked` for the memory report, since it walks their pages). A kind is
+/// `measured` once every shard's part of it is, and its written bytes are known only where every part's are. Until
+/// 2026-11-22 one `heap` row counted the mapped blocks' spans as resident: a daemon holding 1.27 GB of them with 13.7
+/// MB written reported 1.3 GB resident, and was read as 1.3 GB of freed heap kept (main 01a20182's r41).
 fn daemon_memory(
   parts: &[slates_ipc::protocol::MemoryKindReport],
+  asked: bool,
 ) -> Vec<slates_ipc::protocol::MemoryKindReport> {
   let mut kinds: Vec<slates_ipc::protocol::MemoryKindReport> = Vec::new();
   for part in parts {
@@ -5187,11 +5192,25 @@ fn daemon_memory(
   let heap = slates_mem::heap::stats();
   kinds.push(slates_ipc::protocol::MemoryKindReport {
     kind: "heap".to_owned(),
-    mappings: heap.large_mappings,
-    reserved_bytes: heap.reserved,
-    resident_bytes: heap.in_use.min(heap.reserved),
+    mappings: 0,
+    reserved_bytes: heap.system_reserved,
+    resident_bytes: heap.system_in_use.min(heap.system_reserved),
     modified_bytes: None,
     measured: true,
+  });
+  // A mapped block the table has no entry for (past `slates_mem::large::TRACKED`) has its span counted and its pages not.
+  let mapped_resident = if asked {
+    slates_mem::large::heap().mapped_resident
+  } else {
+    0
+  };
+  kinds.push(slates_ipc::protocol::MemoryKindReport {
+    kind: "large".to_owned(),
+    mappings: heap.large_mappings,
+    reserved_bytes: heap.mapped_bytes,
+    resident_bytes: mapped_resident.min(heap.mapped_bytes),
+    modified_bytes: None,
+    measured: asked,
   });
   kinds
 }
@@ -5249,7 +5268,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       dumps_local_full: crate::local_dumps::full(),
       anchor: state.origin_anchor.0,
       recovered,
-      memory: daemon_memory(&shards_memory),
+      memory: daemon_memory(&shards_memory, !shards_memory.is_empty()),
     }),
   }
 }
@@ -10704,7 +10723,7 @@ fn held_outcome(
 /// Applies the verdict `parts` holds to its green (A-805): at the head it was judged at, as its chain entry records it
 /// (`Green::apply_recorded`, the replay a recovery runs). Whether it committed as its version; false, nothing applied,
 /// where the green moved since or is not here.
-pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> bool {
+pub(crate) fn apply_accepted(state: &mut ShardState, parts: &mut AcceptedParts) -> bool {
   let Some(mut engine) = state.greens.get_mut(&parts.green) else {
     return false;
   };
@@ -10712,7 +10731,7 @@ pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> b
     return false;
   }
   let applied = parts.applied.as_deref().unwrap_or_default();
-  engine.apply_recorded(&parts.increment, applied) == parts.version
+  engine.apply_recorded(&mut parts.increment, applied) == parts.version
 }
 
 /// A green's verdict on an increment and what it applied ([`slates_merge::engine`]'s `submit_resolved`).
@@ -19549,10 +19568,14 @@ async fn rebuild_record(
         .repositories()
         .member(record.id)
         .cloned();
+      // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
+      // once it is replayed.
+      let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
       let versions = match member {
         Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
         None => rebuild_green_sliced(state, record, slices).await,
       };
+      crate::repository::svn_commit::release_texts(state, None, &brought);
       for version in versions {
         crate::merge_service::enqueue_recovered_record(state, record.id, version);
         slices.unit_done().await;
@@ -20414,8 +20437,8 @@ fn replay_chain_entry(
       return Ok(false);
     }
   }
-  let entry = *entry;
-  let accepted = green.apply_recorded(&entry.increment, &entry.applied);
+  let mut entry = *entry;
+  let accepted = green.apply_recorded(&mut entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
   }
@@ -22732,6 +22755,45 @@ fn creator_gid() -> u32 {
 #[cfg(test)]
 mod tests {
   use super::{Continued, next_batch};
+
+  /// Main 01a20182's (b1) of 2026-11-22 (r41: a daemon's 12 large blocks, 1.27 GB mapped and 13.7 MB written, reported as
+  /// 1.3 GB of heap resident). Do: map a large block through the `slates` binary's allocator and write none of it, then
+  /// build the daemon's memory report as a status that asks for it does. Expect: a `large` row holding the block's span
+  /// reserved and less than half of it resident (its pages unwritten), and the `heap` row's resident not grown by the
+  /// span. Red before: one `heap` row, its resident grown by the whole span.
+  #[test]
+  fn the_memory_report_counts_a_large_blocks_written_pages_never_its_span() {
+    use std::alloc::{GlobalAlloc, Layout};
+    let span = slates_mem::large::floor().saturating_mul(256);
+    let layout = Layout::from_size_align(span, 1).unwrap();
+    let row = |rows: &[slates_ipc::protocol::MemoryKindReport], kind: &str| {
+      rows.iter().find(|row| row.kind == kind).cloned()
+    };
+    let before = super::daemon_memory(&[], true);
+    // SAFETY: a layout of nonzero size; the block is freed below with the same layout and never read or written.
+    let block = unsafe { slates_mem::large::LargeMapped.alloc(layout) };
+    assert!(!block.is_null(), "the block is mapped");
+    let after = super::daemon_memory(&[], true);
+    // SAFETY: `block` is this allocator's block of `layout`, freed once.
+    unsafe { slates_mem::large::LargeMapped.dealloc(block, layout) };
+    let span = u64::try_from(span).unwrap();
+    let large = row(&after, "large").expect("the report has a large row");
+    assert!(
+      large.reserved_bytes >= span,
+      "the block's span is reserved: {large:?}"
+    );
+    assert!(
+      large.resident_bytes < span / 2,
+      "its unwritten pages are not resident: {large:?}"
+    );
+    let heap = |rows: &[slates_ipc::protocol::MemoryKindReport]| {
+      row(rows, "heap").map_or(0, |row| row.resident_bytes)
+    };
+    assert!(
+      heap(&after) < heap(&before).saturating_add(span / 2),
+      "the heap's resident is not grown by the span: {before:?} then {after:?}"
+    );
+  }
 
   /// A-800 (goal 86b's lost replies; CLAUDE.md §2 item 9). Do: on a shard, while its state is borrowed, finish a
   /// forwarded reply there for a client the shard does not hold (the reply's run meeting a borrowed state). Expect: the

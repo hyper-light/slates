@@ -411,6 +411,8 @@ pub struct Judged {
   post_state: Vec<u8>,
   /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760): a whole text's buffer becomes the file.
   read: Vec<Vec<u8>>,
+  /// Its named runs, which name the objects a file made whole of one is named for (A-760 (b), [`Green::name_of`]).
+  runs: Vec<crate::named::NamedRun>,
   /// Its files made so far, a slice a step before the commit ([`Green::make_step`], A-760).
   making: Making,
 }
@@ -421,6 +423,8 @@ pub struct Judged {
 struct Making {
   /// The files a run makes whole and their runs, once found.
   wholes: Option<Vec<(usize, usize)>>,
+  /// The files named for the object they are made the whole of, once found ([`Green::named_files`]).
+  names: Option<Vec<(usize, crate::named::Identity)>>,
   /// The next effect to look at.
   next: usize,
   /// The file under way.
@@ -1643,7 +1647,7 @@ fn sole_run(base_len: u64, ops: &[Op], post: &crate::named::Post<'_>) -> Option<
   post.whole_run(op.src, op.len)
 }
 
-/// Moves each of `wholes`' runs' buffers into its file (A-760, [`Green::whole_runs`]): last, once every other file is
+/// Moves each of `wholes`' runs' buffers into its file (A-760, [`alone`]): last, once every other file is
 /// made, since a moved buffer shortens the post-state's address space under every later run.
 fn move_whole_runs(effects: &mut [Effect], read: &mut [Vec<u8>], wholes: &[(usize, usize)]) {
   for &(place, run) in wholes {
@@ -1653,6 +1657,32 @@ fn move_whole_runs(effects: &mut [Effect], read: &mut [Vec<u8>], wholes: &[(usiz
       *bytes = Some(core::mem::take(buffer));
     }
   }
+}
+
+/// The files of `sole` ([`Green::sole_runs`]) whose run no other file of the version is made of: the ones that take its
+/// buffer ([`move_whole_runs`]), since a buffer moves into one file.
+fn alone(sole: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+  sole
+    .iter()
+    .copied()
+    .filter(|(_, run)| sole.iter().filter(|(_, other)| other == run).count() == 1)
+    .collect()
+}
+
+/// The files of `sole` ([`Green::sole_runs`]) named for an object (A-760 (b), [`Green::name_of`]): each whose run of
+/// `runs` is its object whole (from its first byte, its length the object's), whether it takes the run's buffer or a
+/// copy of it, since a name says what the bytes are, not where they came from.
+fn named_files(
+  sole: &[(usize, usize)],
+  runs: &[crate::named::NamedRun],
+) -> Vec<(usize, crate::named::Identity)> {
+  sole
+    .iter()
+    .filter_map(|(place, run)| {
+      let run = runs.get(*run)?;
+      (run.offset == 0 && run.len == run.identity.len).then_some((*place, run.identity))
+    })
+    .collect()
 }
 
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
@@ -1801,6 +1831,8 @@ struct StagedFile {
   bytes: Vec<u8>,
   ops: Vec<Op>,
   renamed: bool,
+  /// The object its bytes are the whole of, when a named run made it so (A-760 (b), [`Green::name_of`]).
+  name: Option<crate::named::Identity>,
 }
 
 /// One accepted per-path effect to apply at commit.
@@ -2924,6 +2956,15 @@ impl Green {
   /// A file's current bytes, or `None` when it is absent.
   pub fn content(&self, path: &str) -> Option<&[u8]> {
     self.content.get(path)
+  }
+
+  /// The content-plane object a file's current bytes are the whole of (A-760 (b), item 3's first piece): set when a
+  /// version made the file of exactly one named run spanning its whole object, kept while the file's block stands
+  /// (a version that leaves the file alone, a copy, a hold), gone with any other change. `None` for an absent file or
+  /// one made otherwise. A checkpoint carries a file's bytes, not its name, so a green restored from one names none of
+  /// the files it restored (owed: item 3's second piece, a checkpoint naming them).
+  pub fn name_of(&self, path: &str) -> Option<crate::named::Identity> {
+    self.content.name_of(path)
   }
 
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
@@ -5129,7 +5170,16 @@ impl Green {
     }
   }
 
-  fn commit(&mut self, mut effects: Vec<Effect>, version: u64, post_state: crate::named::Post<'_>) {
+  ///
+  /// `names` are the effects' places whose files are named for the object they are the whole of
+  /// ([`Green::named_files`]).
+  fn commit(
+    &mut self,
+    mut effects: Vec<Effect>,
+    version: u64,
+    post_state: crate::named::Post<'_>,
+    names: &[(usize, crate::named::Identity)],
+  ) {
     // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
     self.make_mapped(&mut effects, post_state, &[]);
     let moves = self.node_moves(&effects);
@@ -5141,8 +5191,13 @@ impl Green {
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
     let mut staged = Staged::default();
-    for effect in effects {
-      self.apply_effect(effect, version, &mut staged);
+    // The effects' places are where the verdict put them: the node moves and links are added after every one.
+    for (place, effect) in effects.into_iter().enumerate() {
+      let name = names
+        .iter()
+        .find(|(named, _)| *named == place)
+        .map(|(_, identity)| *identity);
+      self.apply_effect(effect, version, &mut staged, name);
     }
     for path in staged.removed {
       self.remove_file_now(&path, version);
@@ -5288,7 +5343,15 @@ impl Green {
 
   /// Applies one accepted effect at `version`, but a file's removal or new bytes, which are staged for the end of the
   /// commit ([`Staged`]), and a copy, which `commit_copies` applied first.
-  fn apply_effect(&mut self, effect: Effect, version: u64, staged: &mut Staged) {
+  ///
+  /// A file's new bytes are named `name` when they are the whole of that object ([`Green::named_files`]).
+  fn apply_effect(
+    &mut self,
+    effect: Effect,
+    version: u64,
+    staged: &mut Staged,
+    name: Option<crate::named::Identity>,
+  ) {
     // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-202).
     self.mark_dirty(effect.identity_key());
     match effect {
@@ -5300,6 +5363,7 @@ impl Green {
         bytes: bytes.unwrap_or_default(),
         ops,
         renamed: matches!(source, ContentSource::Copied(..)),
+        name,
       }),
       Effect::RemoveContent(path) => {
         staged.emptied.push(path.clone());
@@ -5450,6 +5514,7 @@ impl Green {
       bytes,
       ops,
       renamed,
+      name,
     } = file;
     // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already. A file
     // this version's own copy brought and its increment edited (A-586) was no other file: nothing was removed.
@@ -5462,7 +5527,7 @@ impl Green {
     self.seed_content(&path, version);
     // The file first, so the value names its block (A-728); the value it supersedes marked so before the path's history
     // is re-anchored on that block (A-793).
-    self.content.insert(&path, bytes);
+    self.content.insert_named(&path, bytes, name);
     self.supersede_latest(&path);
     let value = self.content_value(&path, &ops);
     self.last_changed.insert(path.clone(), version);
@@ -5702,8 +5767,8 @@ impl Green {
     self.owed = None;
     // The versions recorded after the owed one, in order, as a replay applies them.
     let mut head = committed;
-    for (inc, applied) in std::mem::take(&mut self.owed_tail) {
-      head = self.apply_recorded(&inc, &applied);
+    for (mut inc, applied) in std::mem::take(&mut self.owed_tail) {
+      head = self.apply_recorded(&mut inc, &applied);
     }
     // The verdicts recorded while it owed, on the versions now applied.
     for (version, signature) in std::mem::take(&mut self.owed_signatures) {
@@ -5730,6 +5795,17 @@ impl Green {
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
     let judgment = self.judge(inc);
+    self.commit_judgment(judgment)
+  }
+
+  /// [`Green::submit_resolved`] for a work whose named runs are read (A-760): judged by [`Green::judge_named`], so each
+  /// run's buffer is taken from `inc` into the verdict and made its file with no copy, then committed at once. `inc`
+  /// keeps its names, its runs' bytes now the green's.
+  pub fn submit_named(
+    &mut self,
+    inc: &mut Increment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    let judgment = self.judge_named(inc);
     self.commit_judgment(judgment)
   }
 
@@ -5941,6 +6017,7 @@ impl Green {
           applied,
           post_state: inc.post_state.clone(),
           read: Vec::new(),
+          runs: inc.named.runs.clone(),
           making: Making::default(),
         })
       }
@@ -6039,8 +6116,9 @@ impl Green {
     let budget = slice_bytes.max(1);
     let mut copied = 0u64;
     if judged.making.wholes.is_none() {
-      judged.making.wholes =
-        Some(self.whole_runs(&judged.effects, &judged.post_state, &judged.read));
+      let sole = self.sole_runs(&judged.effects, &judged.post_state, &judged.read);
+      judged.making.names = Some(named_files(&sole, &judged.runs));
+      judged.making.wholes = Some(alone(sole));
     }
     while copied < budget {
       if judged.making.current.is_none() {
@@ -6159,6 +6237,7 @@ impl Green {
       applied,
       post_state,
       read,
+      runs,
       making,
       ..
     } = judged;
@@ -6167,9 +6246,13 @@ impl Green {
     // Every file but those a run makes whole is made first, while every run's buffer is in place: a run moved into its
     // file leaves the post-state's later bytes where their ops address them only once nothing reads them any more. The
     // files `make_step` made already are passed over.
-    let wholes = making
-      .wholes
-      .unwrap_or_else(|| self.whole_runs(&effects, &post_state, &read));
+    let (wholes, names) = match (making.wholes, making.names) {
+      (Some(wholes), Some(names)) => (wholes, names),
+      _ => {
+        let sole = self.sole_runs(&effects, &post_state, &read);
+        (alone(sole.clone()), named_files(&sole, &runs))
+      }
+    };
     let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
     self.make_mapped(
       &mut effects,
@@ -6177,15 +6260,21 @@ impl Green {
       &skip,
     );
     move_whole_runs(&mut effects, &mut read, &wholes);
-    self.commit(effects, version, crate::named::Post::of(&post_state, &read));
+    self.commit(
+      effects,
+      version,
+      crate::named::Post::of(&post_state, &read),
+      &names,
+    );
     self.accepted.insert(id, version);
     (version, applied)
   }
 
-  /// The files whose bytes are exactly one named run's, and no other file's (A-760), each with that run: a whole text
-  /// becomes the green's file with its buffer moved, no copy ([`move_whole_runs`]), so a landing holds the text once.
-  /// Every other file is made by [`Green::make_mapped`], before any buffer moves.
-  fn whole_runs(&self, effects: &[Effect], inline: &[u8], read: &[Vec<u8>]) -> Vec<(usize, usize)> {
+  /// The files whose bytes are exactly one named run's, each with that run (A-760). Those whose run makes no other file
+  /// ([`alone`]) take its buffer, moved, no copy ([`move_whole_runs`]), so a landing holds the text once; every other
+  /// file is made by [`Green::make_mapped`], before any buffer moves. Each whose run is its object whole is named for it
+  /// ([`named_files`]).
+  fn sole_runs(&self, effects: &[Effect], inline: &[u8], read: &[Vec<u8>]) -> Vec<(usize, usize)> {
     if read.is_empty() {
       return Vec::new();
     }
@@ -6207,12 +6296,7 @@ impl Green {
         wanted.push((place, run));
       }
     }
-    let alone: Vec<(usize, usize)> = wanted
-      .iter()
-      .copied()
-      .filter(|(_, run)| wanted.iter().filter(|(_, other)| other == run).count() == 1)
-      .collect();
-    alone
+    wanted
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -6223,7 +6307,7 @@ impl Green {
   /// increment already accepted commits nothing and returns the version it was accepted as.
   pub fn apply_recorded(
     &mut self,
-    inc: &Increment,
+    inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
     // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
@@ -6245,12 +6329,30 @@ impl Green {
       return self.head();
     }
     let copies = copy::EntryCopies::of(applied);
-    let effects = applied
+    let mut effects: Vec<Effect> = applied
       .iter()
       .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
       .collect();
+    // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
+    // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
+    let mut read = core::mem::take(&mut inc.named.read.0);
+    let sole = self.sole_runs(&effects, &inc.post_state, &read);
+    let names = named_files(&sole, &inc.named.runs);
+    let wholes = alone(sole);
+    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
+    self.make_mapped(
+      &mut effects,
+      crate::named::Post::of(&inc.post_state, &read),
+      &skip,
+    );
+    move_whole_runs(&mut effects, &mut read, &wholes);
     let version = self.head().saturating_add(1);
-    self.commit(effects, version, inc.post());
+    self.commit(
+      effects,
+      version,
+      crate::named::Post::of(&inc.post_state, &read),
+      &names,
+    );
     self.accepted.insert(inc.id, version);
     version
   }
@@ -6301,21 +6403,15 @@ impl Green {
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
       Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
+      // Left unmade: the commit makes it from the head, or moves a named run's buffer into it whole (A-760).
       Applied::Spliced(path, ops) => {
-        let current = self.content.get(path).unwrap_or_default();
-        Effect::SetContent(
-          path.clone(),
-          Some(apply(current, ops, post_state)),
-          ops.clone(),
-          ContentSource::Mapped,
-        )
+        Effect::SetContent(path.clone(), None, ops.clone(), ContentSource::Mapped)
       }
       Applied::Created(path, declared) => {
-        let bytes = apply(&[], declared, post_state);
-        let ops = vec![insert_whole(bytes.len() as u64)];
+        let ops = vec![insert_whole(made_len(0, declared, post_state.len()))];
         Effect::SetContent(
           path.clone(),
-          Some(bytes),
+          None,
           ops,
           ContentSource::Created(declared.clone()),
         )
@@ -7350,7 +7446,7 @@ mod tests {
       "the entry carries what the verdict resolved"
     );
     assert_eq!(
-      replayed.apply_recorded(&decoded.increment, &decoded.applied),
+      replayed.apply_recorded(&mut decoded.increment.clone(), &decoded.applied),
       2
     );
     assert_eq!(

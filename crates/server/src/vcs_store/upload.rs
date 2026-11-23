@@ -121,6 +121,31 @@ impl StoreLender for ShardStores {
     }
   }
 
+  fn pack_reads(pack: &Streamed) -> crate::vcs_http::git::upload::PackReads {
+    let (next, stopped) = pack.pack_reads();
+    crate::vcs_http::git::upload::PackReads { next, stopped }
+  }
+
+  async fn read_ahead(
+    &mut self,
+    reads: crate::vcs_http::git::upload::PackReads,
+    resident: &mut crate::vcs_http::git::upload::Resident,
+  ) {
+    read_ahead(reads, resident).await;
+  }
+
+  async fn bring_back(&mut self, waited: slates_git::store::packed::Waited) -> bool {
+    bring_back_within(waited).await.is_ok()
+  }
+
+  fn let_go_behind(
+    &mut self,
+    resident: &mut crate::vcs_http::git::upload::Resident,
+    next: Option<slates_git::store::packed::Waited>,
+  ) {
+    let _ = crate::state::with_state_counted(|state| let_go_behind(state, resident, next));
+  }
+
   fn paced(&mut self, taught: (u64, u64)) {
     let _ = crate::state::with_state_counted(|state| learn_link(state, taught));
   }
@@ -131,8 +156,8 @@ impl StoreLender for ShardStores {
   /// amended), every version admitted with no walk has its sets derived, a turn at a time ([`super::git_derive`]), waited
   /// for whole: the answer is made from them.
   async fn encode(&mut self, id: RepositoryId) {
-    // Goal 93 item 2a: the packs the answer reads made resident first, so no read of it meets a let-go window.
-    resident(id).await;
+    // A-864 piece 2: the answer's own reads are brought back a turn ahead (`read_ahead`); its encoding's packs, where
+    // one is due, by the encoding (`git_encode::encode_within`).
     // A-614 amended: the sets of versions admitted with no walk derived first, which the answer and the encoding read.
     super::git_derive::derive_for_read(id).await;
     super::git_encode::encode_for_fetch(id).await;
@@ -140,25 +165,9 @@ impl StoreLender for ShardStores {
 }
 
 /// Counter: a let-go window of a git repository's pack that could not be brought back before a fetch or an encoding
-/// read it (goal 93 item 2a, [`resident`]): its read then refuses typed, as an unreadable object's does. Format: a
-/// counter name.
+/// read it (goal 93 item 2a; A-864 piece 2's look-ahead): its read then refuses typed, as an unreadable object's does.
+/// Format: a counter name.
 pub(crate) const RESIDENT_REFUSED: &str = "vcs_store.git_resident.refused";
-
-/// Makes every pack of git repository `id` resident before a fetch's answer or its encoding reads it (goal 93 item 2a;
-/// main 01a20182's ruling of 2026-11-22 05:45): each let-go window of each pack the repository's objects lie in brought
-/// back from the node's store (`super::read_through::bring_back`), a window at a time off the shard's step. A clone
-/// reads nearly every window of its packs, so bringing them back first costs what reading through would, and no read
-/// of the answer, which cannot be taken again mid-pack byte for byte, meets a let-go window. Its windows are let go
-/// again once the repository is idle. The bytes brought back; a window that could not be counted [`RESIDENT_REFUSED`].
-pub(crate) async fn resident(id: RepositoryId) -> u64 {
-  let away = crate::state::with_state(|state| {
-    let (content, store) = state.vcs_stores.git(id)?;
-    Some(away_in(content, store.repository.packs()))
-  })
-  .flatten()
-  .unwrap_or_default();
-  brought_back_all(away).await
-}
 
 /// The let-go windows of `packs` (each a pack and its length) in `content`, each as the read that would meet it waits
 /// for it: one an away window, none for a pack held whole.
@@ -183,7 +192,7 @@ pub(crate) fn away_in(
 pub(crate) async fn brought_back_all(away: Vec<slates_git::store::packed::Waited>) -> u64 {
   let mut brought = 0_u64;
   for waited in away {
-    match super::read_through::bring_back(waited).await {
+    match bring_back_within(waited).await {
       Ok(bytes) => brought = brought.saturating_add(bytes),
       Err(_) => {
         let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
@@ -193,20 +202,166 @@ pub(crate) async fn brought_back_all(away: Vec<slates_git::store::packed::Waited
   brought
 }
 
+/// Format: the windows a fetch's look-ahead brings back ahead of its next turn (A-864 piece 2): the one it begins to read
+/// in and the next, so a turn reading on into the next window finds it held; one reading past them stops cleanly there.
+const LOOK_AHEAD_WINDOWS: u64 = 2;
+
+/// Counter: windows a fetch's look-ahead brought back ahead of its turn (A-864 piece 2). Format: a counter name.
+pub(crate) const AHEAD_BROUGHT: &str = "vcs_store.git_resident.ahead_brought";
+/// Counter: windows a fetch's turn stopped at, let go, and brought back before its next (A-864 piece 2). Format: a
+/// counter name.
+pub(crate) const STOPPED_BROUGHT: &str = "vcs_store.git_resident.stopped_brought";
+
+/// A fetch's look-ahead (A-864 piece 2; main 01a20182's ruling of 2026-11-22): before its next turn, off the turn, the
+/// let-go window its last turn stopped at, and those of the [`LOOK_AHEAD_WINDOWS`] its next turn reads first, brought
+/// back from the node's store; the turn then reads on without meeting one, and one reading past them stops cleanly at a
+/// unit's boundary, nothing of it written (`slates_git::store::Upload::waiting`).
+pub(crate) async fn read_ahead(
+  reads: crate::vcs_http::git::upload::PackReads,
+  resident: &mut crate::vcs_http::git::upload::Resident,
+) {
+  if let Some(stopped) = reads.stopped
+    && brought_one(stopped, resident).await
+  {
+    let _ = crate::state::with_state_counted(|state| state.count(STOPPED_BROUGHT, 1));
+  }
+  let Some(next) = reads.next else {
+    note_peak(resident);
+    return;
+  };
+  let away = crate::state::with_state(|state| {
+    let content = state.vcs_stores.content()?;
+    let window = to_u64(content.window()).max(1);
+    let first = next.offset / window;
+    Some(
+      (first..first.saturating_add(LOOK_AHEAD_WINDOWS))
+        .map(|index| index.saturating_mul(window).max(next.offset))
+        .filter(|offset| *offset < next.len)
+        .filter(|offset| content.away_window(&next.pack, next.len, *offset).is_some())
+        .map(|offset| slates_git::store::packed::Waited { offset, ..next })
+        .collect::<Vec<_>>(),
+    )
+  })
+  .flatten()
+  .unwrap_or_default();
+  let mut windows = 0_u64;
+  for waited in away {
+    if brought_one(waited, resident).await {
+      windows = windows.saturating_add(1);
+    }
+  }
+  if windows > 0 {
+    let _ = crate::state::with_state_counted(|state| state.count(AHEAD_BROUGHT, windows));
+  }
+  note_peak(resident);
+}
+
+/// Format: the most windows one fetch's answer held brought back at once (A-864 piece 3: a turn's look-ahead and the
+/// window it stopped at, never its pack's). Format: a counter name, a peak, not a sum.
+pub(crate) const PEAK_WINDOWS: &str = "vcs_store.git_resident.peak_windows";
+/// Counter: windows a fetch brought back and let go again once its cursor passed them (A-864 piece 3). Format: a counter
+/// name.
+pub(crate) const LET_GO_BEHIND: &str = "vcs_store.git_resident.let_go_behind";
+
+/// Brings back `waited`'s let-go window for an answer, kept in its `resident` windows to be let go again behind its
+/// cursor: whether it was brought back.
+async fn brought_one(
+  waited: slates_git::store::packed::Waited,
+  resident: &mut crate::vcs_http::git::upload::Resident,
+) -> bool {
+  let window = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()?
+      .away_window(&waited.pack, waited.len, waited.offset)
+  })
+  .flatten();
+  let Some((window, start, len)) = window else {
+    return false;
+  };
+  match bring_back_within(waited).await {
+    Ok(bytes) if bytes > 0 => {
+      resident.push(crate::vcs_http::git::upload::Brought {
+        pack: waited.pack,
+        end: start.saturating_add(len),
+        window,
+      });
+      true
+    }
+    Ok(_) => false,
+    Err(_) => {
+      let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+      false
+    }
+  }
+}
+
+/// Counts the most windows `resident` holds ([`PEAK_WINDOWS`]).
+fn note_peak(resident: &crate::vcs_http::git::upload::Resident) {
+  let held = to_u64(resident.len());
+  let _ = crate::state::with_state_counted(|state| state.count_max(PEAK_WINDOWS, held));
+}
+
+/// Lets go again the windows of `resident` an answer's cursor has passed (A-864 piece 3): those of the pack `next` reads
+/// that end at or before where it reads, and every one of another pack (a pack is read front to back, each in turn);
+/// every one with no `next`. A window a home holds here is kept (`vcs_store::let_go_read`'s `Pinned`); one met again
+/// later is brought back again, its stop and look-ahead as before.
+pub(crate) fn let_go_behind(
+  state: &mut ShardState,
+  resident: &mut crate::vcs_http::git::upload::Resident,
+  next: Option<slates_git::store::packed::Waited>,
+) {
+  resident.retain(|brought| {
+    let behind = next.is_none_or(|next| next.pack != brought.pack || brought.end <= next.offset);
+    if behind && super::let_go_read(state, &brought.window).is_ok() {
+      state.count(LET_GO_BEHIND, 1);
+    }
+    !behind
+  });
+}
+
+/// Counter: a let-go window's bring-back that did not end within its patience, given up (A-864: main 01a20182's r29 and
+/// c9bb36dc5 runs stalled a mirror clone at 183,511 bytes; a bring-back awaits the node's store, which may not answer).
+/// Format: a counter name.
+pub(crate) const BRING_BACK_PAST_PATIENCE: &str = "vcs_store.git_resident.bring_back_past_patience";
+
+/// `read_through::bring_back(waited)`, given up once it has run past the patience every wait for room keeps
+/// (`vcs_share::wait::PATIENCE_NS`), counted [`BRING_BACK_PAST_PATIENCE`]: a read that waits for it then refuses
+/// typed, never a fetch that waits forever.
+async fn bring_back_within(
+  waited: slates_git::store::packed::Waited,
+) -> Result<u64, super::read_through::ReadThroughRefused> {
+  match slates_rt::futures::within(
+    crate::vcs_share::wait::PATIENCE_NS,
+    super::read_through::bring_back(waited),
+  )
+  .await
+  {
+    Ok(Some(brought)) => brought,
+    Ok(None) | Err(_) => {
+      let _ = crate::state::with_state_counted(|state| state.count(BRING_BACK_PAST_PATIENCE, 1));
+      Err(super::read_through::ReadThroughRefused::NoStore)
+    }
+  }
+}
+
 /// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), where one did;
 /// whether one did (goal 93 item 2a: what a driver checks after every turn, so the next turn reads it).
 pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
+  // A-864 piece 2: the window an encoding unit stopped at, else one a read met and noted.
   let waited = crate::state::with_state(|state| {
-    state
-      .vcs_stores
-      .git(id)
-      .and_then(|(_, store)| store.repository.waiting())
+    state.vcs_stores.stopped_encoding(id).or_else(|| {
+      state
+        .vcs_stores
+        .git(id)
+        .and_then(|(_, store)| store.repository.waiting())
+    })
   })
   .flatten();
   let Some(waited) = waited else {
     return false;
   };
-  if super::read_through::bring_back(waited).await.is_err() {
+  if bring_back_within(waited).await.is_err() {
     let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
   }
   true
@@ -590,8 +745,10 @@ pub(crate) type StreamCount = (&'static str, fn(&UploadCounters) -> u64);
 /// Counters: the paths a fetch's stream sent its objects by (`slates_git::store::UploadCounters`, A-859; main 01a20182's
 /// order of 2026-11-22 04:53), counted on its shard as each step of its answer writes, so the daemon's status says which
 /// path a clone's objects took, a clone cut short too. Format: each a counter name and the stream's count it adds.
-pub(crate) const STREAM_COUNTED: [StreamCount; 15] = [
+pub(crate) const STREAM_COUNTED: [StreamCount; 18] = [
   ("vcs_store.git_upload.parts_copied", |c| c.parts_copied),
+  ("vcs_store.git_upload.parts_by_entry", |c| c.parts_by_entry),
+  ("vcs_store.git_upload.entries_judged", |c| c.entries_judged),
   ("vcs_store.git_upload.entries_copied", |c| c.entries_copied),
   ("vcs_store.git_upload.headers_rewritten", |c| {
     c.headers_rewritten
@@ -612,6 +769,7 @@ pub(crate) const STREAM_COUNTED: [StreamCount; 15] = [
   }),
   ("vcs_store.git_upload.reuse_rebuilt", |c| c.reuse_rebuilt),
   ("vcs_store.git_upload.backward_reads", |c| c.backward_reads),
+  ("vcs_store.git_upload.stops", |c| c.stops),
 ];
 
 /// A-639's stream as upload-pack's pack source on the owner shard (the module doc): each turn on the shard's clock, at

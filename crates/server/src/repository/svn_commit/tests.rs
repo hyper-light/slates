@@ -2358,33 +2358,33 @@ fn a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was() {
   assert_eq!(after, before, "the store after the refused put's release");
 }
 
-/// Shape: the texts [`an_increments_post_state_is_sized_once_by_its_texts`] adds, in path order: a larger one first,
-/// so a buffer grown a text at a time doubles past what the next two need.
+/// Shape: the texts [`an_increment_names_its_stored_texts_and_carries_none_of_their_bytes`] adds, in path order.
 const POST_TEXTS: [(&str, usize); 3] = [
   ("/trunk/p", 3_000),
   ("/trunk/q", 1_000),
   ("/trunk/r", 1_000),
 ];
 
-/// Goal 93, P7 finding (2) (main 01a20182's routing of 2026-11-22 06:01: the import's per-text churners, the largest
-/// first): the largest in w-svn's local attribution after A-862 was the increment's post-state, 19.9 MB of 157 MB.
-/// Do: land revision 1, then stage revision 2's three texts as a landing does (`stage_texts`), check it, and build its
-/// green increment. Expect: the post-state holds the three texts, its buffer sized once at exactly their length.
-/// Failing first: the buffer grew a text at a time, doubling (6,000 bytes for 5,000), about twice a revision's texts
-/// over an import.
+/// Goal 93, P7 finding (2), A-760 for the Subversion landing (main 01a20182's rulings of 2026-11-22 11:05 and ~11:35):
+/// a text stored in the content store is named by its increment, never copied into its post-state. Do: land revision 1,
+/// then stage revision 2's three texts as a landing does (`stage_texts`), check it, and build its green increment.
+/// Expect: the post-state carries none of the texts' bytes; the increment names each text whole, in its rows' order, by
+/// its identity and length; every run is read, the read counted once a byte. Failing first: each text was copied into
+/// the post-state (5,000 bytes inline, no run named), the import's largest per-text copy after A-862.
 #[test]
-fn an_increments_post_state_is_sized_once_by_its_texts() {
-  let built = stored(|| async move {
+fn an_increment_names_its_stored_texts_and_carries_none_of_their_bytes() {
+  let made = |at: u8, len: usize| {
+    let mut bytes = vec![b'x'; len];
+    bytes[0] = at;
+    bytes
+  };
+  let built = stored(move || async move {
     let (svn, green) = subversion("svn").await;
     commit((&owner(), svn), first(), None).await.unwrap();
     let texts: Vec<Vec<u8>> = POST_TEXTS
       .iter()
-      .map(|(_, len)| vec![b'x'; *len])
       .zip(1u8..)
-      .map(|(mut bytes, at)| {
-        bytes[0] = at;
-        bytes
-      })
+      .map(|((_, len), at)| made(at, *len))
       .collect();
     let rows = POST_TEXTS
       .iter()
@@ -2398,10 +2398,18 @@ fn an_increments_post_state_is_sized_once_by_its_texts() {
       .unwrap()
       .unwrap();
     on(|state| {
+      let read = |state: &ShardState| {
+        state
+          .refusals
+          .get(super::NAMED_READ_BYTES)
+          .copied()
+          .unwrap_or(0)
+      };
       // The records' room lent for the step, as a landing's check is lent it.
       assert!(crate::vcs_store::lend_svn(state, svn, 0));
       let (checked, record) = super::checked(state, svn, revision, None).unwrap();
       crate::vcs_store::settle_svn(state, svn);
+      let read_before = read(state);
       let built = super::version_of(
         state,
         (svn, green),
@@ -2410,13 +2418,103 @@ fn an_increments_post_state_is_sized_once_by_its_texts() {
       )
       .unwrap();
       super::release_stored(state, storing);
-      (built.post_state.len(), built.post_state.capacity())
+      let named: Vec<([u8; 32], u64, u64)> = built
+        .named
+        .runs
+        .iter()
+        .map(|run| (run.identity.hash, run.identity.len, run.len))
+        .collect();
+      (
+        built.post_state.len(),
+        named,
+        built.unread().is_none(),
+        read(state).saturating_sub(read_before),
+      )
     })
   });
-  let texts: usize = POST_TEXTS.iter().map(|(_, len)| len).sum();
-  assert_eq!(
-    built,
-    (texts, texts),
-    "the post-state's length and capacity"
-  );
+  let expected: Vec<([u8; 32], u64, u64)> = POST_TEXTS
+    .iter()
+    .zip(1u8..)
+    .map(|((_, len), at)| {
+      let len_bytes = u64::try_from(*len).unwrap();
+      (identity(&made(at, *len)), len_bytes, len_bytes)
+    })
+    .collect();
+  let texts: u64 = POST_TEXTS.iter().map(|(_, len)| *len as u64).sum();
+  assert_eq!(built, (0, expected, true, texts));
+}
+
+/// Shape: the lengths of the two texts [`an_increments_record_names_its_texts_not_their_bytes`] builds increments of.
+const RECORDED_TEXTS: [usize; 2] = [1_000, 100_000];
+
+/// A-760 for the Subversion landing, its log's side (main 01a20182's ruling of 2026-11-22 ~11:35, piece (b)). Do: land
+/// revision 1, then build revision 2's green increment twice, each adding one file at the same path, once with a text of
+/// 1,000 bytes and once with one of 100,000. Expect: the two increments' encodings (what the chain entry records, or
+/// names, of its revision) the same length: a text is recorded by its name, never its bytes. Failing first (before
+/// A-760's naming): each encoding carried its text inline, 99,000 bytes apart.
+#[test]
+fn an_increments_record_names_its_texts_not_their_bytes() {
+  let encoded = stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let mut lengths = Vec::new();
+    for len in RECORDED_TEXTS {
+      let bytes = vec![b'r'; len];
+      let rows = vec![file("/trunk/recorded", Action::Add, &bytes)];
+      let mut revision = revision(1, rows, &[&bytes]);
+      let (storing, _) = super::stage_texts(svn, &mut revision, Vec::new())
+        .await
+        .unwrap()
+        .unwrap();
+      let length = on(|state| {
+        assert!(crate::vcs_store::lend_svn(state, svn, 0));
+        let (checked, record) = super::checked(state, svn, revision, None).unwrap();
+        crate::vcs_store::settle_svn(state, svn);
+        let built = super::version_of(
+          state,
+          (svn, green),
+          (&checked, Default::default()),
+          super::identity(&record),
+        )
+        .unwrap();
+        super::release_stored(state, storing);
+        built.encode().len()
+      });
+      lengths.push(length);
+    }
+    lengths
+  });
+  assert_eq!(encoded.first(), encoded.get(1), "{encoded:?}");
+}
+
+/// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~11:50: `judge_named` in the append every push shares,
+/// its own landing). Do: land revision 1, then commit revision 2 adding a file of 50,000 bytes, its text stored and
+/// named (A-865). Expect: its text read once (`NAMED_READ_BYTES`), and its verdict taking the read buffer rather than
+/// cloning it (`push::READ_CLONED_BYTES` 0). Failing first: the append judged with `Green::judge`, which clones every
+/// read buffer into the verdict: 50,000 bytes cloned.
+#[test]
+fn a_named_works_verdict_takes_its_read_texts_and_clones_none() {
+  let counted = stored(|| async move {
+    let (svn, _green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let bytes = vec![b'n'; 50_000];
+    let rows = vec![file("/trunk/named", Action::Add, &bytes)];
+    let read = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let before = on(|state| {
+      (
+        read(state, super::NAMED_READ_BYTES),
+        read(state, crate::repository::push::READ_CLONED_BYTES),
+      )
+    });
+    commit((&owner(), svn), revision(1, rows, &[&bytes]), None)
+      .await
+      .unwrap();
+    on(|state| {
+      (
+        read(state, super::NAMED_READ_BYTES).saturating_sub(before.0),
+        read(state, crate::repository::push::READ_CLONED_BYTES).saturating_sub(before.1),
+      )
+    })
+  });
+  assert_eq!(counted, (50_000, 0), "(read, cloned)");
 }

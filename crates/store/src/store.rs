@@ -17,8 +17,11 @@
 //! changeset's sequence (big-endian, a `u128` and a `u64`, so the order of the bytes is the order of the numbers), whose value
 //! is the record's offset and length in the log, its identity, its tool byte and its work; and `P`, then a payload
 //! section's identity (BLAKE3 of its bytes), whose value is where those bytes are in the log and their length, so a
-//! landed content is read by identity as a staged one is ([`Store::piece`]). The other tables of item 3
+//! landed content is read by identity as a staged one is ([`Store::piece`]). Further copies have the log offset
+//! appended to that key so forgetting any copy preserves reads from the others (A-767 C3). The other tables of item 3
 //! (names, versions, object places, derived values) are each tool's, derived from its sections the same way (C4 to C6).
+
+mod payloads;
 
 use std::fmt;
 
@@ -86,6 +89,8 @@ const VALUE_BYTES: usize = V_WORK + U64;
 /// Format: the engine's framing of one entry beyond its key and value (mantle's memtable entry: a type byte and a
 /// one-byte length varint for each of a key and a value shorter than 128 bytes, as these rows' are).
 const ROW_OVERHEAD: usize = 1 + 1 + 1;
+/// Bytes of a changeset row in a memtable, including the engine's entry framing.
+const CHANGESET_ENTRY_BYTES: usize = KEY_BYTES + VALUE_BYTES + ROW_OVERHEAD;
 
 /// What the store may hold, from its caller: the memory its shard lends it and the disk its grant allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +251,7 @@ impl Store {
     } else {
       (ShardDb::create(rows_file, config, mem_limit, trunk)?, 0)
     };
+    payloads::index_checkpoint(&mut rows, &log_file, applied, config.page_size)?;
     let mut replayed = Ok(());
     let mut value = Vec::new();
     let mut buffer = Vec::new();
@@ -423,7 +429,9 @@ impl Store {
       }
       record.commit()?
     };
-    put_changeset(&mut self.rows, &located, &mut self.value)?;
+    if !put_changeset(&mut self.rows, self.log.file(), &located, &mut self.value)? {
+      return Ok(located);
+    }
     for (kind, contents) in sections {
       if *kind == SectionKind::Texts {
         let bytes = match contents {
@@ -438,7 +446,13 @@ impl Store {
       if section.kind == SectionKind::Payload
         && let Some(identity) = payload.next()
       {
-        put_content(&mut self.rows, identity, section.offset, section.len)?;
+        payloads::keep(
+          &mut self.rows,
+          identity,
+          section.offset,
+          section.len,
+          &mut self.value,
+        )?;
       }
     }
     Ok(located)
@@ -463,12 +477,9 @@ impl Store {
           .map(Cow::Borrowed),
       );
     }
-    let mut key = [0u8; CONTENT_KEY_BYTES];
-    content_key(identity, &mut key);
-    if !self.rows.get(&key, &mut self.value)? {
+    let Some((at, landed_len)) = self.content_place(identity)? else {
       return Ok(None);
-    }
-    let (at, landed_len) = decode_content(&self.value).ok_or(StoreError::BadRow)?;
+    };
     if landed_len != len || offset >= landed_len {
       return Ok(None);
     }
@@ -489,9 +500,7 @@ impl Store {
     &mut self,
     identity: &Identity,
   ) -> Result<Option<(u64, u64)>, StoreError> {
-    let mut key = [0u8; CONTENT_KEY_BYTES];
-    content_key(identity, &mut key);
-    if !self.rows.get(&key, &mut self.value)? {
+    if !self.rows.get(&content_key(identity), &mut self.value)? {
       return Ok(None);
     }
     decode_content(&self.value)
@@ -511,14 +520,7 @@ impl Store {
 
   /// The sections of the landed changeset `row`, in order (its header read from the log).
   pub fn sections(&self, row: &Changeset) -> Result<Vec<crate::log::Section>, StoreError> {
-    let header = self.log.header_at(row.offset)?;
-    let located = Located {
-      offset: row.offset,
-      header,
-      identity: row.identity,
-      len: row.len,
-    };
-    Ok(self.log.sections(&located)?)
+    sections_of(self.log.file(), self.log.end(), row)
   }
 
   /// At most [`PIECE_BYTES`] of the log from `offset` (a section's bytes, by the place [`Store::sections`] gave), as
@@ -553,6 +555,54 @@ impl Store {
       .iter()
       .map(|(key, value)| decode_changeset(key, value))
       .collect()
+  }
+
+  /// Forgets a changeset no register named (A-767 C1, the abandoned push ruling of 2026-11-22).
+  /// It removes the changeset row and its payload places, moving the lookup to a surviving copy when needed.
+  /// Each text or version this changeset supplied moves to another keeper through `texts::forget_rows`.
+  /// The checkpoint at the log's end makes these changes durable. The cleaner can reclaim the abandoned
+  /// record's log space. Returns the number of rows changed, or zero if the changeset was already absent.
+  ///
+  /// # Errors
+  /// [`StoreError::BadRow`] for a row or section that does not decode; the log's and the engine's refusals.
+  pub fn forget(&mut self, repository: u128, sequence: u64) -> Result<u64, StoreError> {
+    let key = changeset_key(repository, sequence);
+    let Some(row) = changeset_row(&mut self.rows, &key)? else {
+      return Ok(0);
+    };
+    let mut forgotten = 0_u64;
+    let mut buffer = Vec::new();
+    for section in self.sections(&row)? {
+      match section.kind {
+        SectionKind::Payload => {
+          let identity =
+            identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
+          forgotten = forgotten.saturating_add(payloads::forget(
+            &mut self.rows,
+            &identity,
+            section.offset,
+            &mut self.value,
+          )?);
+        }
+        SectionKind::Texts => {
+          let entries = section_texts(self.log.file(), &section, &mut buffer)?;
+          let Store { rows, log, .. } = self;
+          let mut entries_of = |rows: &mut ShardDb<DeviceFile>, keeper: u64| {
+            texts_of_changeset(rows, log, repository, keeper)
+          };
+          forgotten = forgotten.saturating_add(crate::texts::forget_rows(
+            rows,
+            (repository, sequence),
+            &entries,
+            &mut entries_of,
+          )?);
+        }
+        _ => {}
+      }
+    }
+    self.rows.delete(&key)?;
+    self.rows.checkpoint(self.log.end())?;
+    Ok(forgotten.saturating_add(1))
   }
 
   /// Checkpoints the engine at the log's end, so a recovery replays only what lands after.
@@ -601,12 +651,9 @@ fn engine_sizing(
     .ok_or(StoreError::Sizing(
       "a disk allowance under two extents (the superblocks' and one of rows)",
     ))?;
-  let row_bytes = KEY_BYTES
-    .saturating_add(VALUE_BYTES)
-    .saturating_add(ROW_OVERHEAD);
   let leaf_entries = sizing
     .memory
-    .checked_div(row_bytes)
+    .checked_div(CHANGESET_ENTRY_BYTES)
     .and_then(|entries| u64::try_from(entries).ok())
     .filter(|entries| *entries > 0)
     .ok_or(StoreError::Sizing("no memory for a row"))?;
@@ -644,6 +691,70 @@ fn memtable_bytes(memory: usize) -> usize {
   memory.min(usize::try_from(u32::MAX).unwrap_or(usize::MAX))
 }
 
+/// The changeset row at `key`, decoded; none where no changeset landed there.
+fn changeset_row<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  key: &[u8],
+) -> Result<Option<Changeset>, StoreError> {
+  let mut value = Vec::new();
+  if !rows.get(key, &mut value)? {
+    return Ok(None);
+  }
+  decode_changeset(key, &value).map(Some)
+}
+
+/// The `Texts` entries of a committed record's section `section`, read whole from `file` into `buffer`.
+fn section_texts<F: BlockFile>(
+  file: &F,
+  section: &crate::log::Section,
+  buffer: &mut Vec<u8>,
+) -> Result<Vec<crate::texts::TextEntry>, StoreError> {
+  buffer.clear();
+  buffer.resize(
+    usize::try_from(section.len).map_err(|_| StoreError::Sizing("a texts section past memory"))?,
+    0,
+  );
+  file
+    .read_exact_at(buffer, section.offset)
+    .map_err(LogError::from)?;
+  crate::texts::decode(buffer).map_err(|_| StoreError::BadRow)
+}
+
+/// The `Texts` entries of repository `repository`'s changeset `sequence`, read back from `log` (none where it landed
+/// none, or no such changeset is held).
+fn texts_of_changeset<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log: &ChangesetLog<F>,
+  repository: u128,
+  sequence: u64,
+) -> Result<Vec<crate::texts::TextEntry>, StoreError> {
+  let Some(row) = changeset_row(rows, &changeset_key(repository, sequence))? else {
+    return Ok(Vec::new());
+  };
+  let mut buffer = Vec::new();
+  for section in sections_of(log.file(), log.end(), &row)? {
+    if section.kind == SectionKind::Texts {
+      return section_texts(log.file(), &section, &mut buffer);
+    }
+  }
+  Ok(Vec::new())
+}
+
+/// The sections named by a changeset row within a committed prefix of the log.
+fn sections_of<F: BlockFile>(
+  file: &F,
+  end: u64,
+  row: &Changeset,
+) -> Result<Vec<crate::log::Section>, StoreError> {
+  let located = Located {
+    offset: row.offset,
+    header: crate::log::header_in(file, row.offset, end)?,
+    identity: row.identity,
+    len: row.len,
+  };
+  Ok(sections_in(file, &located)?)
+}
+
 /// The changeset row's key.
 fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   let mut key = [0u8; KEY_BYTES];
@@ -662,11 +773,13 @@ fn put_rows_from_log<F: BlockFile>(
   located: &Located,
   (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
 ) -> Result<(), StoreError> {
-  put_changeset(rows, located, value)?;
+  if !put_changeset(rows, file, located, value)? {
+    return Ok(());
+  }
   for section in sections_in(file, located)? {
     if section.kind == SectionKind::Payload {
       let identity = identity_of_range(file, section.offset, section.len, buffer)?;
-      put_content(rows, &identity, section.offset, section.len)?;
+      payloads::keep(rows, &identity, section.offset, section.len, value)?;
     }
     if section.kind == SectionKind::Texts {
       buffer.clear();
@@ -684,13 +797,36 @@ fn put_rows_from_log<F: BlockFile>(
   Ok(())
 }
 
-/// Puts the changeset row of the committed record `located`.
+/// Names this record at its sequence and releases the payload places of any record it replaces.
+/// Returns false when a later landing already owns the sequence, so retrying the older apply writes no rows.
 fn put_changeset<F: BlockFile>(
   rows: &mut ShardDb<F>,
+  file: &F,
   located: &Located,
   value: &mut Vec<u8>,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
   let header = &located.header;
+  let key = changeset_key(header.repository, header.sequence);
+  if rows.get(&key, value)? {
+    let previous = decode_changeset(&key, value)?;
+    match previous.offset.cmp(&located.offset) {
+      std::cmp::Ordering::Greater => return Ok(false),
+      std::cmp::Ordering::Equal => return Ok(true),
+      std::cmp::Ordering::Less => {
+        // A retried creation can reuse a sequence. Only the newly named record can keep payloads there.
+        payloads::visit(
+          file,
+          located.offset,
+          &previous,
+          &mut Vec::new(),
+          |identity, offset, _| {
+            payloads::forget(rows, identity, offset, value)?;
+            Ok(())
+          },
+        )?;
+      }
+    }
+  }
   value.clear();
   value.resize(VALUE_BYTES, 0);
   put(value, 0, &located.offset.to_le_bytes());
@@ -698,30 +834,16 @@ fn put_changeset<F: BlockFile>(
   put(value, V_IDENTITY, &located.identity);
   put(value, V_TOOL, &[header.tool.byte()]);
   put(value, V_WORK, &header.work.to_le_bytes());
-  rows.put(&changeset_key(header.repository, header.sequence), value)?;
-  Ok(())
+  rows.put(&key, value)?;
+  Ok(true)
 }
 
 /// The content row's key of `identity`.
-fn content_key(identity: &Identity, key: &mut [u8; CONTENT_KEY_BYTES]) {
-  put(key, 0, &[CONTENTS]);
-  put(key, AFTER_TAG, identity);
-}
-
-/// Puts the content row: `identity`'s bytes are `len` bytes at `offset` in the log.
-fn put_content<F: BlockFile>(
-  rows: &mut ShardDb<F>,
-  identity: &Identity,
-  offset: u64,
-  len: u64,
-) -> Result<(), StoreError> {
+fn content_key(identity: &Identity) -> [u8; CONTENT_KEY_BYTES] {
   let mut key = [0u8; CONTENT_KEY_BYTES];
-  content_key(identity, &mut key);
-  let mut value = [0u8; CONTENT_VALUE_BYTES];
-  put(&mut value, 0, &offset.to_le_bytes());
-  put(&mut value, U64, &len.to_le_bytes());
-  rows.put(&key, &value)?;
-  Ok(())
+  put(&mut key, 0, &[CONTENTS]);
+  put(&mut key, AFTER_TAG, identity);
+  key
 }
 
 /// A content row's value: the offset and length.

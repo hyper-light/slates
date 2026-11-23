@@ -1946,3 +1946,98 @@ fn assert_refused_giving_its_hold_back(
     "a hold no entry names is given back"
   );
 }
+
+/// A work creating `path` from the whole of the content-store object `object`, named (A-760), based at `base`.
+fn named_create(
+  path: &str,
+  object: slates_merge::named::Identity,
+  (id, base): (u8, u64),
+) -> Increment {
+  use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
+  let journal = vec![
+    VolumeOp::Create {
+      path: path.to_owned(),
+    },
+    VolumeOp::Extend {
+      path: path.to_owned(),
+      at: 0,
+      len: object.len,
+    },
+  ];
+  let (doc, _) = compose_volume_planned(&Base::of_files(Vec::new()), &journal).expect("composed");
+  let mut work = Increment {
+    id: [id; 32],
+    base,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  work.push_named(slates_merge::named::NamedRun {
+    identity: object,
+    offset: 0,
+    len: object.len,
+  });
+  work
+}
+
+/// `bytes` put into the shard's content store, held once: its identity.
+fn stored_object(state: &mut ShardState, bytes: &[u8]) -> slates_merge::named::Identity {
+  let room = u64::try_from(bytes.len()).unwrap().saturating_mul(2);
+  let id = crate::vcs_store::within_budget(state, room, |stores| {
+    stores
+      .content_mut()
+      .expect("the content store")
+      .put_object(bytes)
+      .expect("put")
+  });
+  slates_merge::named::Identity {
+    hash: id.0,
+    len: u64::try_from(bytes.len()).unwrap(),
+  }
+}
+
+/// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~13:30: a work reused after a refused append must be
+/// impossible by construction). `append` takes its changes by value and a refusal gives none back, so a caller retries
+/// only with a work it builds again, its runs read again; never one whose runs a refused verdict took. Do: append a named
+/// work creating `a`; then a stale named work creating `a` again, based before it, which the verdict refuses; then the
+/// change built again against the new head, creating `b`, its runs read, appended. Expect: the first accepted, the stale
+/// one refused, the rebuilt one accepted with its text's bytes; every work's runs read once each, none cloned by a
+/// verdict (`READ_CLONED_BYTES` 0).
+#[test]
+fn a_refused_named_append_is_retried_only_with_a_work_built_again() {
+  crate::test_store::audit_on_stored_shard("push-named-retry", |state| {
+    let (repository, green) = repository(state, "named");
+    let first = vec![b'1'; 20_000];
+    let second = vec![b'2'; 30_000];
+    let (first_object, second_object) =
+      (stored_object(state, &first), stored_object(state, &second));
+    let cloned = |state: &ShardState| {
+      state
+        .refusals
+        .get(super::READ_CLONED_BYTES)
+        .copied()
+        .unwrap_or(0)
+    };
+    let append = |state: &mut ShardState, mut work: Increment| {
+      crate::repository::svn_commit::read_named(state, &mut work).expect("read");
+      push(
+        state,
+        &owner(),
+        repository,
+        vec![BranchChange::Update { green, work }],
+        EntryParts::default(),
+      )
+    };
+    let landed = append(state, named_create("a", first_object, (1, 0)));
+    let stale = append(state, named_create("a", second_object, (2, 0)));
+    // The stale work was moved into the append and is gone with its refusal: the retry is a work built again.
+    let retried = append(state, named_create("b", second_object, (3, 1)));
+    assert!(landed.is_ok(), "{landed:?}");
+    assert!(matches!(stale, Err(AppendRefused::Changes(_))), "{stale:?}");
+    assert!(retried.is_ok(), "{retried:?}");
+    assert_eq!(file(state, green, "a"), Some(first));
+    assert_eq!(file(state, green, "b"), Some(second));
+    assert_eq!(cloned(state), 0, "read bytes cloned by a verdict");
+  });
+}

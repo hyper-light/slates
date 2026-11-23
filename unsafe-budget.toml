@@ -191,6 +191,11 @@
 #   own boxed storage with its `assume_init` (2) and each one's destroy on drop (2), `adddup2` and `addopen` for the
 #   standard streams (2), `addchdir_np` (1), `setflags` (1), the signal sets made and set (1), `setpgroup` (1), and
 #   `posix_spawn` itself (1) (12). 147 → 159.
+#   The macOS reply wake semaphore (`mach_semaphore.rs`, 2026-11-22, 84a: the address wake of a parked client spun the
+#   shard 1-33 ms in the kernel on CI's VM, the semaphore 83 times less often, run 45091701553), Mach calls with no safe
+#   wrapper: the `extern` block (1), `semaphore_create` (1), `semaphore_signal` (1), `semaphore_wait` and
+#   `semaphore_timedwait` (2), and on drop `semaphore_destroy` for the daemon's and `mach_port_deallocate` for a
+#   client's received right (2) (7). 160 → 167.
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -521,7 +526,11 @@ slates-db = 0
 # SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
 # (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
 # after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
-slates-ipc = 159
+slates-ipc = 167
+# 2026-11-22 (+1, main 01a20182's ruling of ~17:30, the hook drain): `group_holders::group_has_others`, compiled only for
+#   macOS, lists a hook's process group with `proc_listpgrppids` (libc exposes it without a safe wrapper, and rustix has
+#   none), into a two-pid array it owns for the call, so a run can tell that nothing but the hook's exited leader is
+#   left in its group: a words stream still open then is held by a process the hook never started.
 # 2026-11-18 (+1, A-452, `mach_claim.rs` compiled only for macOS; the budget raised by g251b, which found it over): the
 #   region fetch's receive ends on the kernel's send-once notification when the owner went away holding the fetch's
 #   reply right, and `fetch` destroys that notification with `mach_msg_destroy` (1), as every other refused or

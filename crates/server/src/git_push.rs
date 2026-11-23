@@ -1346,6 +1346,13 @@ impl<P> Drop for ReceivePack<P> {
         );
       }
     }
+    // Goal 93 item 2b: the landed packs its entries' commits owed a let-go, let go now that it decides no more refs
+    // (where nothing else of the repository is under way; else what ends last, or its going idle). A drop the state is
+    // not lent to leaves them owed to the repository's going idle.
+    let repository = self.repository;
+    let _ = crate::state::with_state(|state| {
+      crate::vcs_store::let_go_owed_as_push_ends(state, repository);
+    });
   }
 }
 

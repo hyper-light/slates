@@ -97,8 +97,17 @@
 > back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
 > fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
 > encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
-> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
-> next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
+> pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
+> holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
+> daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
+> since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
+> ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
+> `StoreGraph::named`, shallow and filter tree walks), and stock git read "possible repository corruption" on ls-remote
+> and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
+> made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
+> push ended, idle, then ls-remote and a clone byte-identical to stock.
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.
@@ -219,6 +228,11 @@
 >   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
 >   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
 >   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
+>   The reply wake on its region's Mach semaphore (A-867, w-perf, 2026-11-22; BENCHMARKS "84a on macOS: the reply
+>   wake"): LANDED. CI's VM spun the address wake 1-33 ms of the shard's CPU when it met the client entering its wait
+>   (none on bare metal). The semaphore took reply wakes over 1 ms from 3,001 to 36 in 8 rounds, and the loaded p99
+>   median from 1,766 to 976 µs (accept) and from 4,301 to 1,363 µs (conflict). The p999 stays over 1 ms on that runner,
+>   held by long verbs (codex-review's list).
 >   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
 >   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
@@ -282,7 +296,9 @@
 > object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
 > object, a held extent's free pages. **Windows' section per extent written (A-789, main 18:40):** the anchor holds
 > each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
-> (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> (run-requests; red: commit kept after a destroyed volume's burst). **Closed 2026-11-22 (w-interop):** the burst test's
+> red below was a shard keeping its burst's 1 GiB extent for 10 MiB of headroom, and the test measuring process RSS;
+> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
@@ -292,7 +308,16 @@
 > daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
 > STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
 > heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
-> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). **The row FIXED
+> (w-interop, 2026-11-22, main's (b1); `docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md`):**
+> the row's resident added the large path's live mappings' whole spans; `heap` is now the system allocator alone and
+> `large` the mapped blocks, resident by their pages in RAM. The ~900 MB never touched is those spans (main's r41: 12
+> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2). **(b2) FIXED (w-interop,
+> 2026-11-22; `docs/bugs/2026-11-22-each-partition-reserved-a-lease-timer-for-every-volume-it-could-hold.md`):** two of
+> the 12 were the partitions' lease-expiry wheels, 595 MiB each, a slot for every volume a partition could hold; the
+> wheel now grows with its leases (`Wheel::growing`), and an idle two-shard daemon's `large` row fell from 1,298,595,840
+> to 12,353,536 bytes reserved. The rest (the runtime's wheels, 2 MiB each; 1 MiB mark sets and control channels) are
+> fixed or deliberately preallocated sizes. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
 > read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
 > shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
 > arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
@@ -601,9 +626,43 @@
 >   **Measured** (`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`, MacBook arm64, debug, one run):
 >   a one-changeset push waited 537 ms behind a 200-changeset push cut into 32 segments that took 729 ms; 4,047 ms
 >   behind a 500-changeset push of 488 segments (4 KiB bound) that took 4,358 ms. A small push waits out a long push's
->   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
->   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
->   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+>   whole run, past the patience for a long enough one (release, main's r20: 69 to 80% of the long push's span).
+> - Staging BUILT (2026-11-22, w-hg; main 01a20182's rulings of 07:32 and 12:00): a push lands its segments apart from
+>   its repository's landing turn, at sequences its owner shard allocates (serialized with no lock), other landings
+>   between them; its entry names them as ranges (record v11, `record::write_push_runs_reference`, at most one range a
+>   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`), and the turn is taken
+>   for the entry's commit alone. A fork another landing made stale is re-based by node (`hg_push::rebase`) before its
+>   works are planned, off the turn; stale again once the turn is taken, re-based holding it, the turn held to the end,
+>   so at most one re-base off it and one in it (counted `vcs.hg.push_rebased`, `..._rebased_in_turn`). The live
+>   re-base and a restart's v10 replay make the same index (e72a3d97f). An abandoned run is forgotten as it ends: each
+>   sequence's rows dropped (`StoreHandle::forget`, c2ef17856; counted `vcs.hg.push_run_rows_forgotten`), its log bytes
+>   the owed cleaner's (below). Held by `a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named` (a
+>   one-changeset push took 13 ms during a 500-changeset push in debug, no turn waited; `heads` the small push's tip
+>   alone, the long push's tip unknown though its segments are on the store; the long push then re-based and landed),
+>   `a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`,
+>   `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`, and the crash oracle killed with an unnamed run's rows
+>   present (`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`).
+> - An import's file texts let go BUILT (2026-11-22, w-hg; C1 2b, main 01a20182's ruling of 02:52): each segment carries
+>   its file revisions' contents (`import::emit::Segment::contents`); once the segment is durable its windows are let
+>   go through the push's one path (`hg_run::let_go_windows`, pin-guarded by `vcs_store::landed_pin`), and once more when
+>   the import lands, since its bookmark works (2b (1), 609c1f03c) bring back what they read. A test's one-call landing
+>   builds the works over the same read-through (`built_works_whole`, each want answered on a thread of its own).
+>   Counted `vcs_store.hg_import.file_text_bytes_let_go`, `..._file_texts_pinned`. Held by
+>   `an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land` (`states`: 4 of 5 windows let
+>   go, the fifth pinned; the clone served). The pin's open question below holds for it too.
+> - A landed push's file texts let go BUILT (2026-11-22, w-hg; main 01a20182's order of 14:00, CI 45065911852: 4.7 GB
+>   of arena held on the repository's shard after Mercurial's history landed, the content store keeping every text).
+>   Each segment carries its file revisions' content identities (`PushSegment::contents`, counted in the bound); once
+>   it is durable on the changeset store its windows are let go (`hg_run::let_go_landed`, `let_go_object_landed` with
+>   `vcs_store::landed_pin`, as a landed git pack's), and once more when the entry commits, since the push's works
+>   bring back the texts they read between. Entries stay; a read brings a text back from the store, the works' own
+>   included (`brought_back`, now within a lent budget and the chunk store's lend: its bring-back was refused
+>   `OverBudget { room: 0 }` outside them). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
+>   `a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land` (120 files of 8 KiB: every window let go
+>   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
+>   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
+>   share of the texts stays, and on a one-shard node all of them; a home that brings an away window back, or a pin of
+>   only what homes keep, would let them go.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
@@ -769,6 +828,13 @@
 > edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
 > SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
 > `fsck --strict`.
+> A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
+> and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
+> brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
+> pack's let-go in `vcs_store::commit` stays guarded (main 01a20182, 2026-11-22: lifted at 01ae9fc26, put back) until
+> the readers still synchronous are covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
+> bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git). Owed too: the git/git mirror
+> clone's stall at 183,511 bytes (main's sample), before the pack.
 > A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
 > itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
 > raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
@@ -840,7 +906,14 @@
 > successor mints a killed creation's id again; its new changeset 0 is the row the store gives, the orphan's never
 > (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, green unchanged: a `(repository,
 > sequence)` row is the newest landing at it, the only one the register can name). The orphan's log bytes stay until
-> the cleaner of unnamed log space (owed).
+> the cleaner of unnamed log space (owed). Its rows can be forgotten now (2026-11-22, w-hg; main 01a20182's ruling of
+> 12:00, for an abandoned push's run): `Store::forget` / `StoreHandle::forget` drops an unnamed changeset's `C`, `H`
+> and `K` rows. Forgetting or replacing a changeset removes its payload places. The `P` lookup moves to a surviving
+> copy even across repositories (2026-11-22, `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes`).
+> Checkpoints written before this fix rebuild payload places once from their live changesets. Each `T` and `I` row moves to the next
+> changeset that kept the same text (the new `K` keeper rows, by text), the engine checkpointed after so a replay
+> never puts them back (`a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it`,
+> `a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart`); its log bytes stay this cleaner's.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -1505,6 +1578,14 @@
 > run's bytes: a file spliced from one was made of the wrong bytes). A-760 is whole. Not A-760's: the svn landing's
 > turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
 > no copy; w-engine's queue).
+>
+> **A-866 (2026-11-22, w-svn; main 01a20182's order of 17:00, items 3-7 while w-engine is paused):** items 3-7 cut into
+> four pieces (`inbox/main-from-w-svn-a760b-plan.md` on the fan-out ledger). Piece 1 BUILT: a block made of the whole of
+> one named run spanning its object keeps that object's identity (`Green::name_of`), through a judged commit, `make_step`
+> and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
+> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. OWED: piece 2, a checkpoint naming a named file
+> instead of carrying its bytes (a restored green names nothing until then); piece 3, the history keeping a named
+> version by its name; piece 4, the current block holding no bytes, read through the plane.
 >
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
@@ -3007,6 +3088,30 @@
 > session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
 > w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
 > part), so it has no seam to change.
+> **The hook drain held by a foreign holder (2026-11-22, w-svn; main 01a20182's rulings of ~17:20 and ~17:30): FIXED.**
+> `daemon_edge`'s `a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks` failed once in w-git's
+> batch at load ~40 (its reader, "the answer ended inside a line"): a stock client the test binary spawned with
+> `std::process::Command`, not confined, inherited a hook's words pipe in the macOS window between `pipe()` and its
+> close-on-exec (std makes a pipe so on macOS, `library/std/src/sys/pipe/unix.rs`), and the hook's first run, with no
+> deadline, waited until its client gave up. Now a run's words end once nothing of the hook's can write them: the hook
+> has exited and its group holds nothing but it (`slates_ipc::group_holders`, `proc_listpgrppids` on macOS; Linux's
+> `pipe2(O_CLOEXEC)` and Windows' non-inheritable `CreatePipe` handles leave nothing foreign to hold one), whatever
+> still holds the stream; a child that left the group with `setsid` is told the same, as the group's kill never reached
+> it. Red: `a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds` took 4,151,291,875 ns, held by a plain std
+> child; now it ends at the hook's exit with its words.
+> **OPEN (w-svn, noted for main 2026-11-22): a hook's first run has no deadline but its client's connection.** Before
+> any run of a hook has finished, `HookTimes::bound_ns` answers none (the module docs: "a run has no deadline but its
+> client's connection"), so a hook that never exits on its first run holds that run, and the client's request, for the
+> client's lifetime. The learned bound starts only from a finished run; a bound the design may owe.
+> **OPEN (w-svn, the sibling sweep for main, 2026-11-22): every descriptor the daemon makes on macOS is marked
+> close-on-exec a call after it is made,** since Apple has no `pipe2`, `accept4` or `SOCK_CLOEXEC`: a foreign spawner in
+> the same process (a test binary's stock client, an embedder) inherits it in that window. Pipes: `hook_driver.rs`
+> 224-227 (std), `ipc` `completion.rs` 293 (std), `delivery.rs` 392 (its doc says so). Socket pairs: `ipc` `stream.rs`
+> 32 and 62, `endpoint.rs` 1528 and 2024, `rendezvous.rs` 2377, server `reap.rs` 575, `hangup.rs` 437 and 590,
+> `fuse.rs` 1908. Sockets and accepts: `rt` `netsys.rs` (the listeners every edge binds through `slates_rt::tcp`, and
+> its `accept`, 568), `ipc` `route.rs` 473, `completion.rs` 577-580 (std). A connection inherited so stays half open
+> after the daemon closes it, its peer seeing no end while the holder lives. `kqueue` descriptors are not inherited by
+> a child. Not fixed here.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -3779,11 +3884,40 @@
 > The engine's splice sizes its file once at what it makes (`engine::made_len`;
 > `a_splice_makes_its_bytes_in_one_buffer_of_their_length`, 6,000 bytes held for 4,000, now 4,000): dead even on the
 > import, which replaces files whole (130.7 to 130.8 MB sampled), and on 300 partial splices over 200 files of 64 KiB
-> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). Next (main's ruling):
-> the svn landing names its stored texts as A-760 runs, in three pieces.
+> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). A-865 (w-svn): the
+> svn landing names its stored texts as A-760 runs, its entries recording names, and a cold recovery brings back what
+> its content store lacks before the green's replay; sampled 130.8 MB to 108.0 MB. The append every push shares judges
+> with `judge_named` (w-svn, main's ruling of ~11:50, w-git and w-hg told first and clear), so a named work's read
+> buffers move into its verdict, never cloned (`repository.push.read_cloned_bytes`;
+> `a_named_works_verdict_takes_its_read_texts_and_clones_none`: 50,000 bytes cloned, now 0). Reusing a judged work
+> after a refused append is impossible by construction: `append` takes its changes by value and a refusal gives none
+> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). main's r29 (big Studio, load ~2, git-2000):
+> A-865's parent passed the give-back check 1 of 2 (499,712 · 300,032 KiB footprint at idle 30 s); 43a6df642 2 of 2
+> (302,080 · 303,104 KiB), RSS at idle 775 MB against 155 MB live, the peak 1.13 GB. Piece (c) ruled out as a swap (the
+> scratch member numbers its own versions; a fast-forward would be w-engine's, paused); option 2 instead: a recorded
+> version's whole-run file takes the run's read buffer with no copy (`Green::apply_recorded` takes its work mutably and
+> moves whole runs as `commit_held` does; `a_recorded_versions_whole_run_becomes_the_file_with_no_copy`), sampled
+> 108.0 MB to 96.2 MB. The content store's release no longer reads a freed window back (w-svn, main's routing of ~14:20,
+> w-shared told first): `ContentStore::release` answers `Freed` (held, gone, or a freed table's bytes, which the index
+> gives back the rows of), and `release_one` reads a stored entry only where its form names what is given back next (a
+> list, a derived node, a table) (`a_released_objects_windows_are_freed_without_being_read_back`: 5 windows read back,
+> now 0); sampled 96.2 MB to 84.3 MB. Owed: the two `read_step`s (the batch's re-read goes with w-engine's paused
+> fast-forward). Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> failed at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`). **Closed (w-interop, 2026-11-22):**
+> A-833's lazy reopen made a gone base directory's first use, its attributes, refuse the directory itself; it now
+> answers from the volume's node, and a reopen that meets the descriptor limit no longer records a live directory gone
+> (`docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
+> **An idle heap give-back measured and rejected (w-interop, 2026-11-22; main's ruling; BENCHMARKS "An idle heap
+> give-back for the import's freed small blocks"):** `malloc_zone_pressure_relief` releases 0 bytes at every block size;
+> `MallocSpaceEfficient=1` takes 515 MB of freed blocks down to 3 MB but makes 64 B to 64 KiB alloc-and-free pairs 5 to
+> 8 times slower. The pages are libmalloc's cache, reused by the next work.
+> **OPEN, upstream (main's ruling of 2026-11-22): the import churns about 500 MB of small blocks it frees again**, a
+> working set that grows with the dump (owed: a bounded working set per push). main's r80 (big Studio, git-2000.dump at
+> b79b54350, idle 30 s, a shared box): RSS 1.14 GB, footprint 670 MB; `MALLOC_SMALL (empty)` 512 MB virtual, 507.7 MB
+> resident, 235.0 MB dirty in 128 regions; `MALLOC_SMALL` 452 MB virtual, 415 MB resident, 334.5 MB dirty.
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
 > Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
 > A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under
@@ -25389,7 +25523,14 @@ after every takeover (Goal 85b C3: 5 of 5 replays stalled at `live_chaos.rs:2465
 `live_ship::tests::the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes` (2 queued, 1 refused
 before; 3 queued, none refused after); this fleet test passes again (fleet `a_live_` 11/11).
 
-### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
+### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — closed 2026-11-22 (w-interop; `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`)
+> **Closed:** the shard kept its burst's 1 GiB extent whole for its 10 MiB of operation headroom
+> (`ChunkArena::shrink` skips a region whose return leaves capacity under what it keeps); an idle give-back now trades
+> it for the smallest extent that keeps the headroom (`ChunkArena::shrink_trading`, 1,024 MiB held to 16 MiB after the
+> destroy). The test measured process RSS, which in its one process counts the test's own payload and its copies (1.0
+> GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
+> the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
+> live) is its own piece, the idle heap give-back.
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a

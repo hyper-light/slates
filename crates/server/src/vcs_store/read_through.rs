@@ -14,6 +14,13 @@
 //! from the node's store a piece at a time (`StoreHandle::piece`); then on the shard again, the window put back
 //! (`ContentStore::bring_back`, which checks its identity), within the room its step is lent. The driver then takes the
 //! same unit again. A window already back is nothing to do.
+//!
+//! **Bounded.** Each read of the node's store waits at most [`PATIENCE_NS`], past which the bring-back is refused
+//! [`ReadThroughRefused::Unanswered`] and counted [`UNANSWERED`], so a store or owner that never answers fails the read
+//! that waited on it, which its caller refuses as it refuses any other, never a wait without end (banned items 8 and 9;
+//! main 01a20182's ruling of 2026-11-22 17:00). The bound is not a fix for what made the store not answer. A read of a
+//! landed pack answers within a disk read, far inside the bound, so a refusal here names a defect of the store's read
+//! path (its owner's queue, a piece read that never completes), counted so it is seen, never retried away.
 
 use slates_git::store::packed::Waited;
 
@@ -35,6 +42,70 @@ pub(crate) enum ReadThroughRefused {
   },
   /// The content store refused the bytes back (another identity, or no room in its step).
   Refused(slates_vcs::ContentRefused),
+  /// The node's store did not answer the read of the pack at `at` within [`PATIENCE_NS`] (module docs, "Bounded").
+  Unanswered {
+    /// The offset in the pack the read asked from.
+    at: u64,
+  },
+}
+
+/// How long a bring-back waits for each read of the node's store before it is refused `Unanswered` (module docs,
+/// "Bounded"). Derived: `vcs_share::wait::PATIENCE_NS`, the daemon's observation budget
+/// (`crate::daemon::OBSERVE_BUDGET_NS`, ten liveness budgets, `slates_machine::budgets::observe_budget_ns`): the longest
+/// the daemon waits on any party before judging it, as a fetch held past its room waits. A piece is one disk read of at
+/// most `slates_store::store::PIECE_BYTES`, so a store that answers at all answers far inside it.
+pub(crate) const PATIENCE_NS: u64 = crate::vcs_share::wait::PATIENCE_NS;
+
+/// Format: the status counter of bring-backs refused because the node's store did not answer a read within
+/// [`PATIENCE_NS`] ([`ReadThroughRefused::Unanswered`]).
+pub(crate) const UNANSWERED: &str = "vcs_store.read_through.unanswered";
+
+// The tests' hooks, kept on the shard that brings back, so a test's daemon alone meets them.
+#[cfg(test)]
+thread_local! {
+  /// A test's patience for each read of the node's store in place of [`PATIENCE_NS`], where more than none.
+  pub(crate) static TEST_PATIENCE_NS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+  /// Whether a test's node store never answers a bring-back's read (a store or owner wedged).
+  pub(crate) static TEST_UNANSWERED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The patience for one read of the node's store: [`PATIENCE_NS`], or a test's on this shard's thread.
+fn patience_ns() -> u64 {
+  #[cfg(test)]
+  {
+    let test = TEST_PATIENCE_NS.with(core::cell::Cell::get);
+    if test > 0 {
+      return test;
+    }
+  }
+  PATIENCE_NS
+}
+
+/// One read of the landed pack `identity` (`len` bytes) from `at` on the node's store `disk`, waited for at most
+/// [`patience_ns`]: refused `Unanswered` past it, counted [`UNANSWERED`].
+async fn piece_within(
+  disk: &slates_store::owner::StoreHandle,
+  (identity, len, at): (slates_vcs::ContentId, u64, u64),
+) -> Result<Vec<u8>, ReadThroughRefused> {
+  let read = async {
+    #[cfg(test)]
+    if TEST_UNANSWERED.with(core::cell::Cell::get) {
+      std::future::pending::<()>().await;
+    }
+    disk.piece(identity.0, len, at).await
+  };
+  match slates_rt::futures::within(patience_ns(), read).await {
+    Ok(Some(answered)) => answered
+      .map_err(|refused| ReadThroughRefused::Owner(format!("{refused:?}")))?
+      .filter(|piece| !piece.is_empty())
+      .ok_or(ReadThroughRefused::Missing { at }),
+    Ok(None) => {
+      let _ = with_state(|state| state.count(UNANSWERED, 1));
+      Err(ReadThroughRefused::Unanswered { at })
+    }
+    // No deadline can be kept (polled off a shard): refused as the owner's, never waited for without one.
+    Err(refused) => Err(ReadThroughRefused::Owner(format!("{refused:?}"))),
+  }
 }
 
 /// Format: the status counter of windows a git read brought back from the node's store ([`bring_back`]).
@@ -64,12 +135,7 @@ pub(crate) async fn bring_back(waited: Waited) -> Result<u64, ReadThroughRefused
     .map_err(|_| ReadThroughRefused::Refused(slates_vcs::ContentRefused::CountExhausted))?;
   let mut at = start;
   while at < end {
-    let piece = disk
-      .piece(identity.0, waited.len, at)
-      .await
-      .map_err(|refused| ReadThroughRefused::Owner(format!("{refused:?}")))?
-      .filter(|piece| !piece.is_empty())
-      .ok_or(ReadThroughRefused::Missing { at })?;
+    let piece = piece_within(&disk, (identity, waited.len, at)).await?;
     let want = usize::try_from(end.saturating_sub(at)).unwrap_or(usize::MAX);
     let taken = piece.get(..want.min(piece.len())).unwrap_or_default();
     bytes.extend_from_slice(taken);
@@ -200,5 +266,254 @@ mod tests {
     assert_eq!(again, Ok(0), "a window back already is nothing to do");
     assert!(whole, "the object read whole as it was put");
     assert_eq!(counted, Some(4));
+  }
+
+  /// Goal 93 item 2b(a) (main 01a20182's rulings of 2026-11-22 06:58 and 07:00 (ii)). Do: on a store-backed daemon, put
+  /// a pack of six windows and a part in the shard's content store, held twice more a window (a landed push's holders:
+  /// its staged pack, its repository's), its bytes landed on the node's store; let it go as a landed push's pack is let
+  /// go, among this shard and one more (a second home), the second picked so the windows' homes split between them; then
+  /// bring each window let go back and read the object whole. Expect: every window whose home is this shard kept,
+  /// refused `Pinned { by: "homes" }` on a let-go asked again (its pin read from where its home is, never from a flag a
+  /// restart would lose); every other window let go whatever its holders, counted with its bytes; the pinned ones
+  /// counted; the object read whole once brought back. Failing first: no landed let-go, every window held in RAM.
+  #[test]
+  fn a_landed_packs_windows_go_but_those_a_home_holds_here() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let (sent, got) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      let _ = crate::git_push::tests::git_repository(state, "landed-pins");
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(1 << 18, slates_vcs::ContentStore::window);
+      let bytes: Vec<u8> = (0..6 * window + 100)
+        .map(|at| u8::try_from(at % 253).unwrap())
+        .collect();
+      let len = u64::try_from(bytes.len()).unwrap();
+      let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+      let root = crate::vcs_store::within_budget(state, len, |stores| {
+        let content = stores.content_mut().unwrap();
+        let root = content.put_object(&bytes).unwrap();
+        for id in &ids {
+          content.hold(id).unwrap();
+          content.hold(id).unwrap();
+        }
+        root
+      });
+      let header = slates_store::log::Header {
+        tool: slates_store::log::Tool::Git,
+        repository: 2,
+        sequence: 0,
+        judged_over: 0,
+        grant: 0,
+        work: 0,
+        time_ns: slates_rt::futures::now_ns(),
+        sections: 0,
+      };
+      let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+      assert!(crate::test_store::land_blocking(
+        state.vcs_disk.clone().unwrap(),
+        header,
+        parts
+      ));
+      let here = state.shard;
+      let shards = (1..200u16)
+        .map(|other| vec![here, here.wrapping_add(other)])
+        .find(|shards| {
+          let homed = ids
+            .iter()
+            .filter(|id| crate::vcs_store::homes::home_of(shards, id) == Some(here))
+            .count();
+          homed > 0 && homed < ids.len()
+        })
+        .expect("a second home that splits the windows");
+      let pinned: Vec<ContentId> = ids
+        .iter()
+        .copied()
+        .filter(|id| crate::vcs_store::homes::home_of(&shards, id) == Some(here))
+        .collect();
+      crate::vcs_store::let_go_landed_pack_among(state, &root, &shards);
+      let (kept, refused, gone) = crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        let kept = pinned.iter().all(|id| !content.is_away(id));
+        let refused: Vec<_> = pinned
+          .iter()
+          .map(|id| content.let_go_landed(id, crate::vcs_store::landed_pin(here, &shards, id)))
+          .collect();
+        let gone = ids.iter().filter(|id| content.is_away(id)).count();
+        (kept, refused, gone)
+      });
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let let_go_bytes = counted(crate::vcs_store::LANDED_LET_GO_BYTES);
+      let pinned_count = counted(crate::vcs_store::LANDED_PINNED);
+      let expected = ids.len() - pinned.len();
+      let task = slates_rt::futures::spawn(async move {
+        for index in 0..ids.len() {
+          let offset = u64::try_from(index * window).unwrap();
+          let _ = super::bring_back(Waited {
+            pack: root,
+            len,
+            offset,
+          })
+          .await;
+        }
+        let read = crate::state::with_state(|state| {
+          crate::vcs_store::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+            stores
+              .content()
+              .and_then(|content| content.object_bytes(&root, len))
+          })
+        })
+        .flatten();
+        let _ = sent.send((
+          kept,
+          refused,
+          (gone, expected),
+          (let_go_bytes, pinned_count, pinned.len()),
+          read == Some(bytes),
+        ));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let (kept, refused, (gone, expected), (let_go_bytes, pinned_count, pinned), whole) =
+      got.recv().expect("the let-go answered");
+    daemon.stop();
+    assert!(kept, "a window a home holds here stays");
+    assert!(
+      refused
+        .iter()
+        .all(|refused| *refused == Err(slates_vcs::LetGoRefused::Pinned { by: "homes" })),
+      "{refused:?}"
+    );
+    assert_eq!(gone, expected, "every window no home holds here let go");
+    assert!(let_go_bytes > 0);
+    assert_eq!(pinned_count, u64::try_from(pinned).unwrap());
+    assert!(whole, "the object read whole once brought back");
+  }
+
+  /// w-git's fetch look-ahead (goal 93): a window a read brought back is let go again once passed
+  /// ([`crate::vcs_store::let_go_read`]). Do: on a store-backed daemon, put a one-window object held twice, its bytes
+  /// landed on the node's store, mark it landed, let it go landed, bring it back, then let it go again through
+  /// `let_go_read` among this shard and one more that is its home; then once more with this shard its home. Expect: the
+  /// bring-back puts it back and it reads; `let_go_read` lets it go again (still landed, whatever its holders); with
+  /// this shard its home, refused `Pinned { by: "homes" }`.
+  #[test]
+  fn a_window_brought_back_is_let_go_again_once_read() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let answered = crate::daemon::observe_first(&daemon, |state| {
+      let _ = crate::git_push::tests::git_repository(state, "read-again");
+      let bytes = b"one window, read and let go again".to_vec();
+      let id = ContentId::of(&bytes);
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        let content = stores.content_mut().unwrap();
+        content.put_object(&bytes).unwrap();
+        content.hold(&id).unwrap();
+        content.mark_landed(&id);
+        content.let_go_landed(&id, None).unwrap();
+        content.bring_back(&id, &bytes).unwrap();
+      });
+      let here = state.shard;
+      let elsewhere = (1..200u16)
+        .map(|other| vec![here, here.wrapping_add(other)])
+        .find(|shards| crate::vcs_store::homes::home_of(shards, &id) != Some(here))
+        .unwrap();
+      let homed = state.shards.clone();
+      state.shards = elsewhere;
+      let again = crate::vcs_store::let_go_read(state, &id);
+      let away = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.is_away(&id));
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        stores
+          .content_mut()
+          .unwrap()
+          .bring_back(&id, &bytes)
+          .unwrap();
+      });
+      state.shards = vec![here];
+      let pinned = crate::vcs_store::let_go_read(state, &id);
+      state.shards = homed;
+      (again, away, pinned)
+    });
+    daemon.stop();
+    let (again, away, pinned) = answered;
+    assert!(matches!(again, Ok(bytes) if bytes > 0), "{again:?}");
+    assert!(away, "let go again");
+    assert_eq!(
+      pinned,
+      Err(slates_vcs::LetGoRefused::Pinned { by: "homes" })
+    );
+  }
+
+  /// Goal 93 item 2b(a)'s window (main 01a20182, 2026-11-22: a fetch that starts while a push of the same repository is
+  /// still deciding its refs reads every object). Do: on a store-backed daemon, put a landed pack of several windows in a
+  /// git repository's content store and owe its let-go (the commit of a push's first entry deferred it), with a push of
+  /// the repository under way (`vcs_share::Live::begin`, as `ReceivePack` holds one); let a fetch end, as its going idle
+  /// runs (`git_encode::give_back_idle`); then end the push and go idle again. Expect: while the push is under way the
+  /// pack held whole and still owed, nothing of it let go or pinned, so its later refs read every object; once the push
+  /// has ended its let-go run (each window let go, or kept where a home holds it here: on this one-shard daemon every
+  /// window's home is here) and owed no more. Failing first: the fetch's going idle ran the let-go under the push.
+  #[test]
+  fn a_landed_pack_owed_its_let_go_stays_whole_while_a_push_of_it_is_under_way() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let answered = crate::daemon::observe_first(&daemon, |state| {
+      let id = crate::git_push::tests::git_repository(state, "owed-under-push");
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(1 << 18, slates_vcs::ContentStore::window);
+      let bytes: Vec<u8> = (0..3 * window + 11)
+        .map(|at| u8::try_from(at % 247).unwrap())
+        .collect();
+      let len = u64::try_from(bytes.len()).unwrap();
+      let pack = crate::vcs_store::within_budget(state, len, |stores| {
+        stores.content_mut().unwrap().put_object(&bytes).unwrap()
+      });
+      state
+        .vcs_stores
+        .landed_owed
+        .entry(id)
+        .or_default()
+        .push(pack);
+      let whole = |state: &crate::state::ShardState| {
+        state
+          .vcs_stores
+          .content()
+          .is_some_and(|content| content.holds_whole(&pack))
+      };
+      let counted = |state: &crate::state::ShardState| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        count(crate::vcs_store::LANDED_LET_GO_BYTES) + count(crate::vcs_store::LANDED_PINNED)
+      };
+      let owed = |state: &crate::state::ShardState| {
+        state
+          .vcs_stores
+          .landed_owed
+          .get(&id)
+          .is_some_and(|owed| owed.contains(&pack))
+      };
+      let pushing = crate::vcs_share::Live::begin(id);
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+      let under_push = (whole(state), counted(state), owed(state));
+      drop(pushing);
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+      (under_push, (counted(state), owed(state)))
+    });
+    daemon.stop();
+    let ((whole_under_push, let_go_under_push, owed_under_push), (let_go_after, owed_after)) =
+      answered;
+    assert!(
+      whole_under_push,
+      "the pack held whole while a push of it is under way"
+    );
+    assert_eq!(
+      let_go_under_push, 0,
+      "nothing let go or pinned under the push"
+    );
+    assert!(owed_under_push, "its let-go still owed under the push");
+    assert!(let_go_after > 0, "its let-go run once the push ended");
+    assert!(!owed_after, "owed no more");
   }
 }

@@ -464,6 +464,11 @@ pub enum LetGoRefused {
   Shared,
   /// Already let go.
   Away,
+  /// A holder of it cannot bring it back by its own read path ([`ContentStore::let_go_landed`]): it stays.
+  Pinned {
+    /// The holder that pins it.
+    by: &'static str,
+  },
 }
 
 /// A byte count as the store keeps it.
@@ -587,7 +592,22 @@ fn held_window(held: &Held) -> Option<StoredWindow> {
 }
 
 /// What giving back a content's last count frees: its bytes and its form, or nothing while other holders remain.
-type Released = Option<(Box<[u8]>, Form)>;
+/// What one count given back freed, if it was the last: the content's form, and its bytes where someone reads them (a
+/// list's and a derived node's, what the cascade frees next; a table's, whose rows its holder gives back); a window's
+/// bytes are no one's once it is freed, so none.
+type Released = Option<(Option<Box<[u8]>>, Form)>;
+
+/// What [`ContentStore::release`] did (goal 93, P7 finding (2): it read every freed window back out of its storage and
+/// copied it for an answer no caller used).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Freed {
+  /// A holder is left: nothing was freed.
+  Held,
+  /// The content is freed with everything it named; its bytes are no one's.
+  Gone,
+  /// A table is freed: its bytes, whose rows its holder gives back (`crate::index`).
+  Table(Box<[u8]>),
+}
 
 impl ContentStore {
   /// An empty store whose budget is `budget` bytes and whose window, the longest content it holds, is `window` bytes:
@@ -1100,31 +1120,38 @@ impl ContentStore {
     DerivedNode::open(held.here()?)
   }
 
-  /// Gives back one holder's count of `identity`; the content's bytes when that was its last holder, which frees it. A
-  /// freed list gives back what it named, and a freed derived node what it names, and each list or node freed by that
-  /// what it names, until nothing more is freed; past a refusal there the rest is given back still, and the first
-  /// refusal is the answer. The cascade is one call, as long as what it frees (slicing it is owed with A-581's).
-  pub fn release(&mut self, identity: &ContentId) -> Result<Option<Box<[u8]>>, ContentRefused> {
+  /// Gives back one holder's count of `identity`: whether that was its last holder, which frees it. A freed list gives
+  /// back what it named, and a freed derived node what it names, and each list or node freed by that what it names,
+  /// until nothing more is freed; past a refusal there the rest is given back still, and the first refusal is the
+  /// answer. The cascade is one call, as long as what it frees (slicing it is owed with A-581's). A freed window is
+  /// never read back (goal 93, P7 finding (2): every one was copied out of its storage for an answer no caller used).
+  pub fn release(&mut self, identity: &ContentId) -> Result<Freed, ContentRefused> {
     let identity = &self.resolve(identity);
     let Some((bytes, form)) = self.release_one(identity)? else {
-      return Ok(None);
+      return Ok(Freed::Held);
     };
     let mut named: Vec<ContentId> = Vec::new();
-    given_back(form, &bytes, &mut named);
+    given_back(form, bytes.as_deref().unwrap_or_default(), &mut named);
     let mut first = Ok(());
     while let Some(next) = named.pop() {
       // A derived node names an object by its identity; a list names its own windows and lists.
       let next = self.resolve(&next);
       match self.release_one(&next) {
-        Ok(Some((freed, form))) => given_back(form, &freed, &mut named),
+        Ok(Some((freed, form))) => {
+          given_back(form, freed.as_deref().unwrap_or_default(), &mut named)
+        }
         Ok(None) => {}
         Err(refused) => first = first.and(Err(refused)),
       }
     }
-    first.map(|()| Some(bytes))
+    first.map(|()| match (form, bytes) {
+      (Form::Table, Some(bytes)) => Freed::Table(bytes),
+      _ => Freed::Gone,
+    })
   }
 
-  /// One count of `identity` given back; its bytes and form when it was the last.
+  /// One count of `identity` given back; its form, and its bytes where the cascade reads them ([`Released`]), when it was
+  /// the last.
   fn release_one(&mut self, identity: &ContentId) -> Result<Released, ContentRefused> {
     let held = self
       .entries
@@ -1151,16 +1178,18 @@ impl ContentStore {
     let len = width(freed.len())?;
     self.content_bytes = self.content_bytes.saturating_sub(len);
     self.counters.freed = self.counters.freed.saturating_add(1);
+    // Only a list's, a derived node's and a table's bytes are read: they name what is given back next.
+    let named = matches!(freed.form, Form::List | Form::Derived | Form::Table);
     let bytes = match freed.kept {
-      Kept::Here(bytes) => bytes,
+      Kept::Here(bytes) => named.then_some(bytes),
       // Its bytes are the node's store's: nothing kept here to free or to give back.
-      Kept::Away { .. } => Box::default(),
+      Kept::Away { .. } => None,
       Kept::Stored { window, .. } => {
-        let bytes = self
-          .storage
-          .read(window)
-          .map(|read| Box::from(&*read))
-          .unwrap_or_default();
+        let bytes = if named {
+          self.storage.read(window).map(|read| Box::from(&*read))
+        } else {
+          None
+        };
         self.storage.release(window);
         bytes
       }
@@ -1229,13 +1258,85 @@ impl ContentStore {
     if held.holders > 1 {
       return Err(LetGoRefused::Shared);
     }
-    held.kept = Kept::Away { len };
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Lets go of the window `identity` names, marked landed ([`ContentStore::mark_landed`]: a landed changeset on the
+  /// node's store holds its bytes), whatever its holders count, unless `pinned_by` names a holder of it that cannot bring
+  /// it back by its own read path (main 01a20182's ruling of 2026-11-22 06:58: a landed window may go only where every
+  /// holder of it can). What [`ContentStore::let_go`] refuses `Shared` this lets go: the holders are a landed push's own
+  /// (its staged pack, its repository's pack), each a reader that brings the window back by its pack's identity. The
+  /// store keeps no holder's kind, so its owner names the pinning one (a home, read by the window's identity alone, by
+  /// where the identity's home is: `slates-server`'s homes), which holds across a restart. The bytes freed.
+  ///
+  /// # Errors
+  /// `NotHeld`, `NotAWindow`, `Away` and `NotLanded` as [`ContentStore::let_go`]; `Pinned` naming the holder.
+  pub fn let_go_landed(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: Option<&'static str>,
+  ) -> Result<u64, LetGoRefused> {
+    let identity = self.resolve(identity);
+    let held = self
+      .entries
+      .get_mut(&identity)
+      .ok_or(LetGoRefused::NotHeld)?;
+    let (window, len) = match held.kept {
+      Kept::Stored { window, len } if held.form == Form::Window => (window, len),
+      Kept::Away { .. } => return Err(LetGoRefused::Away),
+      _ => return Err(LetGoRefused::NotAWindow),
+    };
+    if !held.landed {
+      return Err(LetGoRefused::NotLanded);
+    }
+    if let Some(by) = pinned_by {
+      return Err(LetGoRefused::Pinned { by });
+    }
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Every window of the object `identity` names marked landed and let go ([`ContentStore::let_go_landed`]), each but
+  /// those `pinned_by` names a pinning holder of: the bytes freed and the windows kept pinned.
+  pub fn let_go_object_landed(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: &dyn Fn(&ContentId) -> Option<&'static str>,
+  ) -> (u64, u64) {
+    let (mut freed, mut pinned) = (0u64, 0u64);
+    for window in self.object_windows(identity) {
+      if !self.mark_landed(&window) {
+        continue;
+      }
+      match self.let_go_landed(&window, pinned_by(&window)) {
+        Ok(bytes) => freed = freed.saturating_add(bytes),
+        Err(LetGoRefused::Pinned { .. }) => pinned = pinned.saturating_add(1),
+        Err(_) => {}
+      }
+    }
+    (freed, pinned)
+  }
+
+  /// The windows of the object `identity` names, in order: itself where it is one window.
+  fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
+    let mut windows = Vec::new();
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      windows.push(window);
+    }
+    windows
+  }
+
+  /// Marks the window `identity` (kept as `window`, `len` bytes) let go, its storage given back: the bytes freed.
+  fn released_away(&mut self, identity: ContentId, window: StoredWindow, len: usize) -> u64 {
+    if let Some(held) = self.entries.get_mut(&identity) {
+      held.kept = Kept::Away { len };
+    }
     self.away_changed.insert(identity);
     self.storage.release(window);
     let freed = u64::try_from(len).unwrap_or(u64::MAX);
     self.content_bytes = self.content_bytes.saturating_sub(freed);
     self.counters.let_go = self.counters.let_go.saturating_add(1);
-    Ok(freed)
+    freed
   }
 
   /// Brings back a window let go, from `bytes` its reader read from the node's store (A-724 piece 4; the tools'
@@ -1803,6 +1904,17 @@ impl ContentStore {
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
   }
 
+  /// Whether the store holds the object `identity` names whole in memory: held, and none of its windows let go
+  /// ([`ContentStore::let_go`]). A reader that needs its bytes and finds it not whole reads it again from where it was
+  /// landed, and its put brings the windows let go back.
+  pub fn holds_whole(&self, identity: &ContentId) -> bool {
+    self.contains(identity)
+      && self
+        .object_windows(identity)
+        .iter()
+        .all(|window| !self.is_away(window))
+  }
+
   /// Whether the store holds the content `identity` names.
   pub fn contains(&self, identity: &ContentId) -> bool {
     let identity = &self.resolve(identity);
@@ -2067,16 +2179,20 @@ mod tests {
 
   /// A-581, §4.17.1 "Objects" item 1. Do: put the same bytes three times and other bytes once, then release the first
   /// three times. Expect: one content for the repeated bytes with three holders and its bytes counted once, two
-  /// deduplicated puts counted, and the content freed only with its third release, its bytes handed back then.
+  /// deduplicated puts counted, and the content freed only with its third release, answered freed then.
   #[test]
   fn the_same_bytes_put_three_times_are_one_content_freed_with_its_last_holder() {
     let mut store = ContentStore::new(1 << 20, 1 << 10).unwrap();
     let bytes: &[u8] = b"fn main() {}\n";
     let first = put_three_times(&mut store, bytes);
-    assert_eq!(store.release(&first).unwrap(), None);
-    assert_eq!(store.release(&first).unwrap(), None);
+    assert_eq!(store.release(&first).unwrap(), Freed::Held);
+    assert_eq!(store.release(&first).unwrap(), Freed::Held);
     assert_eq!(store.bytes_of(&first).as_deref(), Some(bytes));
-    assert_eq!(store.release(&first).unwrap().as_deref(), Some(bytes));
+    assert_eq!(
+      store.release(&first).unwrap(),
+      Freed::Gone,
+      "freed with its last holder"
+    );
     assert!(!store.contains(&first));
     assert_eq!(store.used(), 5);
     assert_eq!(store.release(&first), Err(ContentRefused::NotHeld));
@@ -2372,6 +2488,63 @@ mod tests {
     store.release(&root).unwrap();
     assert_eq!(store.object_bytes(&root, len), None);
     assert_eq!(store.bytes_of(&short).as_deref(), Some(&b"short"[..]));
+  }
+
+  thread_local! {
+    /// The windows [`CountingWindows`] read out on this thread.
+    static WINDOW_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  }
+
+  /// A storage that counts the windows read out of it (goal 93, P7 finding (2): what a release reads back).
+  #[derive(Debug, Default)]
+  struct CountingWindows {
+    inner: HeapWindows,
+  }
+
+  impl WindowStorage for CountingWindows {
+    fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
+      self.inner.put(bytes)
+    }
+
+    fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
+      WINDOW_READS.with(|reads| reads.set(reads.get() + 1));
+      self.inner.read(window)
+    }
+
+    fn release(&mut self, window: StoredWindow) {
+      self.inner.release(window);
+    }
+  }
+
+  /// Goal 93, P7 finding (2) (main 01a20182's routing of 2026-11-22 ~14:20: `release_one`'s copy, 11.5 MB of the import's
+  /// sampled allocations). Do: in a store whose windows a storage keeps, put an object of five windows twice, release
+  /// it twice. Expect: the first release frees nothing and reads nothing; the second frees the object (answered true),
+  /// every list and window it held, and reads no window back out of the storage: a freed window's bytes are no one's.
+  /// Failing first: each freed window was read out and copied into a buffer only `release`'s answer carried, which no
+  /// caller used.
+  #[test]
+  fn a_released_objects_windows_are_freed_without_being_read_back() {
+    let reads = || WINDOW_READS.with(std::cell::Cell::get);
+    let mut store =
+      ContentStore::with_storage(1 << 20, NARROW, Box::new(CountingWindows::default())).unwrap();
+    let bytes: Vec<u8> = (0..5 * NARROW)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let root = store.put_object(&bytes).unwrap();
+    assert_eq!(store.put_object(&bytes).unwrap(), root);
+    let before = reads();
+    assert_eq!(
+      store.release(&root).unwrap(),
+      Freed::Held,
+      "freed with a holder left"
+    );
+    assert_eq!(
+      store.release(&root).unwrap(),
+      Freed::Gone,
+      "not freed with its last holder"
+    );
+    assert_eq!(reads() - before, 0, "windows read back as they were freed");
+    assert_eq!(store.len(), 0, "something of the object is still held");
   }
 
   /// A storage that kept windows from before a restart (A-727 slice a3): the windows `kept` names, by identity, handed
@@ -2893,6 +3066,50 @@ mod tests {
       "a window another holds stays"
     );
     assert!(!store.is_away(&shared));
+    assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
+    assert_eq!(
+      store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),
+      Some(bytes)
+    );
+  }
+
+  /// Goal 93 item 2b (main 01a20182's ruling of 2026-11-22 06:58: a landed window may go whatever its holders count, but
+  /// only where every holder of it can bring it back). Do: put an object of three windows and a part, hold each window
+  /// twice more (a landed push's holders: its staged pack, its repository's), then let it go landed with the second window named
+  /// pinned by a home; then let it go landed with none pinned; bring every window back by the object's bytes. Expect:
+  /// `let_go` refuses each `Shared`; the first landed let-go frees every window but the pinned one, which is refused
+  /// `Pinned { by: "homes" }` and stays; the second frees that one too; the object read whole once brought back.
+  #[test]
+  fn a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+    for id in &windows {
+      store.hold(id).unwrap();
+      store.hold(id).unwrap();
+      assert!(store.mark_landed(id));
+      assert_eq!(store.let_go(id), Err(LetGoRefused::Shared));
+    }
+    let pinned = windows[1];
+    assert_eq!(
+      store.let_go_landed(&pinned, Some("homes")),
+      Err(LetGoRefused::Pinned { by: "homes" })
+    );
+    let (freed, kept) =
+      store.let_go_object_landed(&object, &|id| (*id == pinned).then_some("homes"));
+    assert_eq!(kept, 1, "the pinned window kept");
+    assert_eq!(freed, u64::try_from(bytes.len() - window).unwrap());
+    assert!(!store.is_away(&pinned));
+    assert!(
+      windows
+        .iter()
+        .filter(|id| **id != pinned)
+        .all(|id| store.is_away(id))
+    );
+    let (freed, kept) = store.let_go_object_landed(&object, &|_| None);
+    assert_eq!((freed, kept), (u64::try_from(window).unwrap(), 0));
     assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
     assert_eq!(
       store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),

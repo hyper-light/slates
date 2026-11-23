@@ -52,6 +52,10 @@ pub(crate) const UPLOAD_REFUSED: &str = "vcs_http.git.upload_refused";
 /// name.
 pub(crate) const ANSWERED_AGAIN: &str = "vcs_http.git.answered_again";
 
+/// Counter: a fetch's answer made again once the let-go window a read of it met was brought back (A-864's readers;
+/// main 01a20182's r52). Format: a counter name.
+pub(crate) const READ_THROUGH_AGAIN: &str = "vcs_http.git.read_through_again";
+
 /// How long a fetch held past its room waits for its repository's shard to give it more (A-855): the daemon's
 /// observation budget, the longest it waits on any party before judging it, git's keepalive written meanwhile; past it
 /// the refusal is answered as it was before.
@@ -110,10 +114,62 @@ pub(crate) trait StoreLender {
   /// nothing.
   fn paced(&mut self, _taught: (u64, u64)) {}
 
+  /// Where an answer's `pack` reads next and the let-go window its last turn stopped at (A-864 piece 2): none by
+  /// default, for a source that reads no let-go window.
+  fn pack_reads(_pack: &<Self::Packs as PackSource>::Pack) -> PackReads {
+    PackReads::default()
+  }
+
+  /// Brings back, before an answer's next turn, the let-go window its last turn stopped at and those its next turn
+  /// reads first (A-864 piece 2). Nothing by default.
+  async fn read_ahead(&mut self, _reads: PackReads, _resident: &mut Resident) {}
+
+  /// Lets go again the windows of `resident` the answer's cursor has passed (A-864 piece 3): those of its pack before
+  /// where `next` reads, and those of a pack it has left; every one with no `next` (the answer ended). Nothing by
+  /// default.
+  fn let_go_behind(
+    &mut self,
+    _resident: &mut Resident,
+    _next: Option<slates_git::store::packed::Waited>,
+  ) {
+  }
+
+  /// Brings back the let-go window `waited` names (A-864's readers): whether it is back. False by default, for a lender
+  /// whose store lets nothing go.
+  async fn bring_back(&mut self, _waited: slates_git::store::packed::Waited) -> bool {
+    false
+  }
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
   async fn encode(&mut self, _id: RepositoryId) {}
+}
+
+/// A window an answer's read-through brought back (A-864 piece 3): its pack, where it ends there, and its identity, let
+/// go again once the answer's cursor has passed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Brought {
+  /// The pack.
+  pub(crate) pack: slates_vcs::ContentId,
+  /// Where the window ends in the pack.
+  pub(crate) end: u64,
+  /// The window.
+  pub(crate) window: slates_vcs::ContentId,
+}
+
+/// The windows an answer brought back and has not let go (A-864 piece 3): at most a turn's look-ahead and the window it
+/// stopped at, the cursor passing each.
+pub(crate) type Resident = Vec<Brought>;
+
+/// Where an answer's pack reads next and the let-go window its last turn stopped at (A-864 piece 2,
+/// `slates_git::upload::Streamed::pack_reads`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PackReads {
+  /// Where its next turn begins to read a pushed pack.
+  pub(crate) next: Option<slates_git::store::packed::Waited>,
+  /// The let-go window its last turn stopped at.
+  pub(crate) stopped: Option<slates_git::store::packed::Waited>,
 }
 
 /// git's services with upload-pack served from the stores `lender` lends, each request admitted the room its stores'
@@ -178,6 +234,8 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       held_since: None,
       room_patience_ns: self.room_patience_ns,
       pacing: crate::vcs_store::upload::Pacing::default(),
+      resident: Resident::new(),
+      last_away: None,
     })
   }
 }
@@ -221,6 +279,10 @@ pub(crate) struct Upload<L: StoreLender> {
   room_patience_ns: u64,
   /// What its answer's writes have taught of its link (A-859 part A).
   pacing: crate::vcs_store::upload::Pacing,
+  /// The windows its answer brought back and has not let go (A-864 piece 3).
+  resident: Resident,
+  /// The let-go window its answer was last held for, until it writes again (A-864's readers' progress).
+  last_away: Option<slates_git::store::packed::Waited>,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
@@ -258,28 +320,54 @@ impl<L: StoreLender> Exchange for Upload<L> {
       ..
     } = self;
     let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
+    // A-864's readers: an answer refused where a read of it met a let-go window is made again once the window is back,
+    // nothing of it written yet; the same window met twice with none brought back between ends the retries.
+    let mut last = None;
     let made = if *advertise {
-      lender.lend((*repository, reader), |served, packs| {
-        upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission)
-      })
+      loop {
+        let (made, away) = lender
+          .lend((*repository, reader), |served, packs| {
+            let made = upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission);
+            let away = made.refusal().and(served.repository.waiting());
+            (made, away)
+          })
+          .ok_or(unavailable)?;
+        match away {
+          Some(waited) if last != Some(waited) && lender.bring_back(waited).await => {
+            last = Some(waited)
+          }
+          _ => break made,
+        }
+      }
     } else {
       lender.encode(*repository).await;
       let held = lender.hold(*repository, reader).ok_or(unavailable)?;
       // A-855: a negotiation run past its room is held, not answered, until the room grows (`Upload::wait_for_room`).
-      let made = lender.lend_held(&held, |served, packs| {
-        upload::serve_in_turns(
-          served,
-          *version,
-          Asked::Request(request.as_slice()),
-          packs,
-          admission,
-        )
-        .holding()
-      });
+      let made = loop {
+        let (made, away) = lender
+          .lend_held(&held, |served, packs| {
+            let made = upload::serve_in_turns(
+              served,
+              *version,
+              Asked::Request(request.as_slice()),
+              packs,
+              admission,
+            )
+            .holding();
+            let away = made.refusal().and(served.repository.waiting());
+            (made, away)
+          })
+          .ok_or(unavailable)?;
+        match away {
+          Some(waited) if last != Some(waited) && lender.bring_back(waited).await => {
+            last = Some(waited)
+          }
+          _ => break made,
+        }
+      };
       *generation = Some(held);
       made
-    }
-    .ok_or(unavailable)?;
+    };
     *answer = Some(made);
     Ok(())
   }
@@ -293,11 +381,22 @@ impl<L: StoreLender> Exchange for Upload<L> {
       generation,
       keepalive_ns,
       last_written_ns,
+      resident,
+      last_away,
       ..
     } = self;
     let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
+    // A-864 pieces 2 and 3: the windows the next turn reads brought back first, off the turn, so it never meets one let
+    // go; those its cursor has passed let go again.
+    if let Some(pack) = made.pack_source() {
+      let reads = L::pack_reads(pack);
+      lender.read_ahead(reads, resident).await;
+      if reads.next.is_some() {
+        lender.let_go_behind(resident, reads.next);
+      }
+    }
     let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
       let mut spent = packs.turn();
@@ -315,6 +414,9 @@ impl<L: StoreLender> Exchange for Upload<L> {
       );
     }
     let now = slates_rt::futures::now_ns();
+    if out.len() > before {
+      *last_away = None;
+    }
     if out.len() > before
       || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))
     {
@@ -324,9 +426,14 @@ impl<L: StoreLender> Exchange for Upload<L> {
       self.wait_for_room().await?;
       return Ok(true);
     }
+    if let Some(waited) = made.held_away() {
+      self.read_through_held(waited).await?;
+      return Ok(true);
+    }
     if written != Written::More {
-      // The answer is written: its generation is given back.
+      // The answer is written: its generation is given back, and every window it brought back let go again.
       *generation = None;
+      lender.let_go_behind(resident, None);
       // A refused answer (a pack the store could not finish ends with git's abort words, A-639) is counted and named in
       // the log by its typed refusal, so a client's "possible repository corruption" has its cause on the server.
       if let Some(refusal) = made.refusal() {
@@ -341,6 +448,59 @@ impl<L: StoreLender> Exchange for Upload<L> {
 }
 
 impl<L: StoreLender> Upload<L> {
+  /// A turn of an answer held for a let-go window its read met before its pack (A-864's readers; main 01a20182's r52):
+  /// the window brought back and the answer made again over the same generation within the same room, passing over what
+  /// it wrote ([`Answer::skip_written`]: the same answer byte for byte, A-855's rule), counted [`READ_THROUGH_AGAIN`].
+  /// The same window met again with nothing written between, or one that cannot be brought back, gives up: the refusal
+  /// answered as it was made, typed.
+  async fn read_through_held(
+    &mut self,
+    waited: slates_git::store::packed::Waited,
+  ) -> Result<(), Failed> {
+    let Self {
+      lender,
+      version,
+      request,
+      answer,
+      generation,
+      admitted,
+      admission,
+      last_away,
+      ..
+    } = self;
+    let Some(made) = answer.as_mut() else {
+      return Err(Failed(Status::INTERNAL_SERVER_ERROR));
+    };
+    let Some(held) = generation.as_ref() else {
+      made.give_up();
+      return Ok(());
+    };
+    if *last_away == Some(waited) || !lender.bring_back(waited).await {
+      made.give_up();
+      return Ok(());
+    }
+    *last_away = Some(waited);
+    let skip = made.written();
+    let mut again_room = Admission::new(*admitted);
+    let again = lender
+      .lend_held(held, |served, packs| {
+        upload::serve_in_turns(
+          served,
+          *version,
+          Asked::Request(request.as_slice()),
+          packs,
+          &mut again_room,
+        )
+        .holding()
+        .skip_written(skip)
+      })
+      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    *made = again;
+    *admission = again_room;
+    let _ = crate::state::with_state_counted(|state| state.count(READ_THROUGH_AGAIN, 1));
+    Ok(())
+  }
+
   /// A turn of an answer held past its room (A-855, main's ruling of 2026-11-21: a refusal costs time, never an
   /// answer). Where the repository's shard can give more room than the answer was made within, it is made again within
   /// it over the same generation, passing over what it wrote, which the answer made again writes alike byte for byte

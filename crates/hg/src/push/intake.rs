@@ -302,7 +302,9 @@ impl Intake {
       .saturating_mul(to_u64(size_of::<(LogOf, u32)>()));
     // Each file revision once more for the new manifests awaiting it ([`Taker::awaited`]): its path and node, however
     // many snapshots name it.
-    let awaited = to_u64(size_of::<(Vec<u8>, Node)>());
+    // And, cut into segments, its bytes' and block's content identities until its segment lands ([`PushSegment`]).
+    let awaited = to_u64(size_of::<(Vec<u8>, Node)>())
+      .saturating_add(to_u64(size_of::<ContentId>()).saturating_mul(2));
     let files = framed.files.iter().fold(0u64, |total, (name, revisions)| {
       let path = name.end.saturating_sub(name.start);
       total
@@ -397,13 +399,20 @@ struct Cutting {
 impl Cutting {
   /// Notes `kept`, revision `rev` of `log` in the fork, its text charged `charged`; cuts the segment once its slice
   /// reaches the bound.
-  fn kept(&mut self, log: LogOf, rev: u32, kept: KeptText, charged: u64) {
+  fn kept(
+    &mut self,
+    (log, rev): (LogOf, u32),
+    kept: KeptText,
+    (charged, contents): (u64, Vec<ContentId>),
+  ) {
     let open = self.open.get_or_insert_with(|| Open {
       slice: kept.place.start..kept.place.end,
       ranges: Vec::new(),
       texts: Vec::new(),
       charged: 0,
+      contents: Vec::new(),
     });
+    open.contents.extend(contents);
     open.slice.end = open.slice.end.max(kept.place.end);
     match open.ranges.last_mut() {
       Some((last, _, end)) if *last == log && *end == rev => *end = rev.saturating_add(1),
@@ -435,6 +444,7 @@ impl Cutting {
       ranges: open.ranges,
       texts,
       charged: open.charged,
+      contents: open.contents,
     });
   }
 }
@@ -449,6 +459,8 @@ struct Open {
   texts: Vec<KeptText>,
   /// What their texts charged the push's admission.
   charged: u64,
+  /// The content store's identities its file revisions are kept as.
+  contents: Vec<ContentId>,
 }
 
 /// A segment of a push's kept revisions, cut ([`Intake::take_segment`]): its slice of the changegroup (its changeset's
@@ -465,6 +477,10 @@ pub struct PushSegment {
   pub texts: Vec<KeptText>,
   /// What their texts charged the push's admission.
   pub charged: u64,
+  /// The content store's identities its file revisions' bytes and metadata blocks are kept as: what its driver lets go
+  /// of the content store once the segment is durable on the node's changeset store, which then serves them (main
+  /// 01a20182's order of 2026-11-22 14:00, the arena a whole-history push left held).
+  pub contents: Vec<ContentId>,
 }
 
 /// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
@@ -1355,8 +1371,18 @@ impl Taker {
     match self.cutting.as_mut() {
       Some(cutting) => {
         let rev = self.fork.len(store, log).saturating_sub(1);
-        let charged = to_u64(size_of::<KeptText>()).saturating_add(to_u64(path.len()));
-        cutting.kept(log_of(log), rev, kept, charged);
+        let contents: Vec<ContentId> = match log {
+          Log::File(_) => self
+            .fork
+            .revision(store, log, rev)
+            .map(|row| core::iter::once(row.bytes).chain(row.block).collect())
+            .unwrap_or_default(),
+          Log::Changelog | Log::Manifest => Vec::new(),
+        };
+        let charged = to_u64(size_of::<KeptText>())
+          .saturating_add(to_u64(path.len()))
+          .saturating_add(to_u64(size_of::<ContentId>()).saturating_mul(to_u64(contents.len())));
+        cutting.kept((log_of(log), rev), kept, (charged, contents));
       }
       None => self.intaken.texts.push(kept),
     }

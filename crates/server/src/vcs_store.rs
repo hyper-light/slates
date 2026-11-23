@@ -120,8 +120,6 @@ pub(crate) mod lfs_record;
 pub(crate) mod named_objects;
 pub(crate) mod owed;
 pub(crate) mod paths;
-#[cfg_attr(not(test), allow(dead_code))]
-// Owed caller: w-git's C5 (the push landed on the store, its replay).
 pub(crate) mod read_through;
 pub(crate) mod record;
 #[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
@@ -129,6 +127,8 @@ pub(crate) mod record_names;
 // Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod referenced;
+#[cfg_attr(not(test), allow(dead_code))]
+// Owed caller: w-git's C5 (the push landed on the store, its replay).
 pub(crate) mod store_packs;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
@@ -169,6 +169,12 @@ pub(crate) const WINDOWS_UNHELD: &str = "vcs_store.windows_unheld";
 pub(crate) const NODES_RESTORED: &str = "vcs_store.nodes_restored";
 /// Counter (A-727 slice a3b): lists and names of the shard image a recovery could not take back.
 pub(crate) const NODES_UNRESTORED: &str = "vcs_store.nodes_unrestored";
+/// Counter (A-724 piece 8c): region holds of the shard image a recovery held again.
+pub(crate) const REGION_HOLDS_RESTORED: &str = "vcs_store.region_holds_restored";
+/// Counter (goal 93 item 2b; main 01a20182's ruling of 2026-11-22 07:33): region holds of the shard image a recovery
+/// could not take back (its window gone, its hold refused, or the set borrowed), logged: never skipped unseen, since a
+/// region hold pins a landed window in RAM.
+pub(crate) const REGION_HOLDS_UNRESTORED: &str = "vcs_store.region_holds_unrestored";
 /// Counter: a store a recovery could not make again from its records: zero in every correct use. Format: a counter name.
 pub(crate) const REPLAY_REFUSED: &str = "vcs_store.replay_refused";
 /// Counter: a store made again from the log after its commit's entry was not made durable. Format: a counter name.
@@ -264,6 +270,13 @@ pub(crate) struct VcsStores {
   nodes_restored: (u64, u64),
   /// A recovery's region holds (A-724 piece 8c), held again when the content store is made over the restored windows.
   restored_region: Vec<slates_vcs::ContentId>,
+  /// What the content store took back of them: held, and the ones it could not take (counted and logged by the
+  /// recovery, [`REGION_HOLDS_UNRESTORED`]).
+  region_restored: (u64, Vec<slates_vcs::ContentId>),
+  /// Landed pushes' packs owed a let-go (goal 93 item 2b), by repository: committed while a fetch of it was answered or
+  /// its encoding was under way, let go once it goes idle ([`let_go_owed`]); bounded by the repository's landed pushes
+  /// since then.
+  landed_owed: BTreeMap<RepositoryId, Vec<slates_vcs::ContentId>>,
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -678,6 +691,17 @@ impl VcsStores {
       return None;
     }
     self.entries.get(&id)
+  }
+
+  /// The repositories whose git store this shard holds: a test's way to its repository's id from the shard.
+  #[cfg(test)]
+  pub(crate) fn git_repositories(&self) -> Vec<RepositoryId> {
+    self
+      .entries
+      .iter()
+      .filter(|(_, store)| matches!(store, RepositoryStore::Git(_)))
+      .map(|(id, _)| *id)
+      .collect()
   }
 
   /// Repository `id`'s git store with the content store, lent for one step.
@@ -1302,6 +1326,30 @@ pub(crate) fn settle(state: &mut ShardState) {
   if !settle_in(&mut state.store, &mut state.vcs_stores) {
     state.count(CHARGE_SHORT, 1);
   }
+  count_region_restored(state);
+}
+
+/// Counts what the content store's making took back of a recovery's region holds ([`VcsStores::content_made`], which may
+/// run in any step after the recovery: the store is made by its first use), and logs the ones it could not: a region
+/// hold is the pin that keeps a landed window in RAM (goal 93 item 2b, main 01a20182's ruling of 2026-11-22 07:33).
+fn count_region_restored(state: &mut ShardState) {
+  if state.vcs_stores.region_restored.0 == 0 && state.vcs_stores.region_restored.1.is_empty() {
+    return;
+  }
+  let (held, unheld) = std::mem::take(&mut state.vcs_stores.region_restored);
+  state.count(REGION_HOLDS_RESTORED, held);
+  if let Some(first) = unheld.first() {
+    state.count(
+      REGION_HOLDS_UNRESTORED,
+      u64::try_from(unheld.len()).unwrap_or(u64::MAX),
+    );
+    slates_machine::log_line!(
+      "slates-server: partition {}: {} region holds of the shard image not taken back (the first {first:?}): their windows \
+       are no longer pinned for the region",
+      state.partition,
+      unheld.len()
+    );
+  }
 }
 
 /// The room a Subversion repository's records may grow into now: what they hold, charged, and every byte the shard's
@@ -1457,7 +1505,8 @@ impl VcsStores {
       }
       if let Some(content) = self.content.as_mut() {
         let region = std::mem::take(&mut self.restored_region);
-        homes::restore_region_holds(content, &region);
+        let (held, refused) = homes::restore_region_holds(content, &region);
+        self.region_restored = (held, refused);
       }
     }
     Ok(())
@@ -2328,8 +2377,120 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
+  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
+  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
+  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
+  // tag peel among the reads), so stock git read "possible repository corruption" on ls-remote and every clone. So no
+  // landed pack is let go or owed here until w-git's read-through covers every reader; the let-go itself
+  // (`let_go_landed_pack`, `let_go_owed`) is unchanged and tested directly (read_through's tests), and nothing reaches it
+  // from a push. GAPS: goal 93 item 2b.
   Ok(())
 }
+
+/// Lets go again the window `window` a read brought back ([`read_through::bring_back`]) once the read has passed it (w-git's
+/// fetch look-ahead, goal 93): by the same rules as a landed pack's let-go, a landed window whatever its holders, unless a
+/// home holds it here ([`landed_pin`], refused `Pinned`, which its caller leaves). The bytes freed. A window a second
+/// fetch still needs is brought back again by that fetch's own read: a read again, never another's bytes.
+pub(crate) fn let_go_read(
+  state: &mut ShardState,
+  window: &slates_vcs::ContentId,
+) -> Result<u64, slates_vcs::LetGoRefused> {
+  let pin = landed_pin(state.shard, &state.shards, window);
+  let freed = within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .ok_or(slates_vcs::LetGoRefused::NotHeld)?
+      .let_go_landed(window, pin)
+  });
+  if let Ok(bytes) = freed {
+    state.count(LANDED_LET_GO_BYTES, bytes);
+  }
+  freed
+}
+
+/// Whether repository `id`'s landed packs may be let go now (goal 93 item 2b): no fetch of it answered, no encoding of
+/// it under way, and no intake of it under way but `own` (a push's own, as it ends): a push still deciding its refs
+/// reads the objects its pack staged (w-git and main 01a20182, 2026-11-22: a non-atomic many-ref push's later refs).
+fn landed_let_go_may(state: &ShardState, id: RepositoryId, own: u64) -> bool {
+  crate::vcs_share::fetches_live(id) == 0
+    && !git_encode::ahead_under_way(state, id)
+    && crate::vcs_share::intakes_live(id) <= own
+}
+
+/// Lets go of the landed packs repository `id` owes a let-go ([`VcsStores`]'s `landed_owed`): what its going idle runs
+/// (`git_encode::give_back_idle`), no fetch of it answered and no encoding under way. Kept owed while a push of it is
+/// under way, whose later refs read their objects: its end lets them go ([`let_go_owed_as_push_ends`]).
+pub(crate) fn let_go_owed(state: &mut ShardState, id: RepositoryId) {
+  if crate::vcs_share::intakes_live(id) > 0 {
+    return;
+  }
+  let_go_owed_now(state, id);
+}
+
+/// Lets go of the landed packs repository `id` owes a let-go as a push of it ends (its `ReceivePack` dropped, its own
+/// intake still counted): where no other intake, no fetch and no encoding of it is under way; else the last of them to
+/// end does, or its going idle.
+pub(crate) fn let_go_owed_as_push_ends(state: &mut ShardState, id: RepositoryId) {
+  if state.vcs_stores.landed_owed.contains_key(&id) && landed_let_go_may(state, id, 1) {
+    let_go_owed_now(state, id);
+  }
+}
+
+/// [`let_go_owed`]'s let-go, its conditions met.
+fn let_go_owed_now(state: &mut ShardState, id: RepositoryId) {
+  let owed = state.vcs_stores.landed_owed.remove(&id).unwrap_or_default();
+  for pack in owed {
+    let_go_landed_pack(state, &pack);
+  }
+}
+
+/// Lets go of the windows of `pack`, a landed push's pack as its staging put it in the shard's content store, now that
+/// the node's store holds it as the push's changeset (goal 93 item 2b; main 01a20182's rulings of 2026-11-22 05:45 and
+/// 06:58): every window but those a home holds here ([`landed_pin`]), each brought back by its pack's identity when a
+/// read meets it ([`read_through::bring_back`]). Counted with its bytes, and the windows kept pinned.
+fn let_go_landed_pack(state: &mut ShardState, pack: &slates_vcs::ContentId) {
+  let shards = state.shards.clone();
+  let_go_landed_pack_among(state, pack, &shards);
+}
+
+/// [`let_go_landed_pack`] with the node's shards `shards`, which rank each window's home ([`landed_pin`]).
+pub(crate) fn let_go_landed_pack_among(
+  state: &mut ShardState,
+  pack: &slates_vcs::ContentId,
+  shards: &[u16],
+) {
+  let shard = state.shard;
+  let (freed, pinned) = within_budget(state, 0, |stores| {
+    stores.content_mut().map_or((0, 0), |content| {
+      content.let_go_object_landed(pack, &|window| landed_pin(shard, shards, window))
+    })
+  });
+  if freed > 0 {
+    state.count(LANDED_LET_GO_BYTES, freed);
+  }
+  if pinned > 0 {
+    state.count(LANDED_PINNED, pinned);
+  }
+}
+
+/// The holder of `window` on shard `shard` (of the node's `shards`) that pins it once landed: a home, which reads it by
+/// its identity alone and cannot bring it back (`homes::read_here`, the region's serve and the healer; main 01a20182's
+/// ruling of 2026-11-22 07:00 (ii)), where the window's home is this shard or the shard holds it for the region. Read by
+/// where the identity's home is, so it holds across a restart, whatever was held before it. None for any other window.
+pub(crate) fn landed_pin(
+  shard: u16,
+  shards: &[u16],
+  window: &slates_vcs::ContentId,
+) -> Option<&'static str> {
+  let homed_here = homes::home_of(shards, window) == Some(shard);
+  (homed_here || homes::region_holds_here(window) > 0).then_some("homes")
+}
+
+/// Format: the status counter of the bytes of landed pushes' packs let go from the shard's content store (goal 93 item
+/// 2b), each brought back by a read that meets it.
+pub(crate) const LANDED_LET_GO_BYTES: &str = "vcs_store.landed.let_go_bytes";
+/// Format: the status counter of landed packs' windows kept because a home holds them here ([`landed_pin`]).
+pub(crate) const LANDED_PINNED: &str = "vcs_store.landed.pinned";
 
 /// A-614's commit of `push` with `moves`, each green's version kept with its key, charged first ([`versions_cost`]), then
 /// each moved green's newest value of the reach sets kept ([`keep_values`]). Refused, the charge is given back and
@@ -3090,7 +3251,9 @@ fn changeset_wanted(
     named,
     packed,
     names_held: holds(&named.0),
-    pack_held: holds(&packed.0),
+    // A pack whose windows a landed push let go (goal 93 item 2b) is not held whole: read again from the node's store,
+    // its put bringing them back, so its replay reads every object.
+    pack_held: content.is_some_and(|content| content.holds_whole(&packed.0)),
   };
   (always || !wanted.names_held || !wanted.pack_held).then_some(wanted)
 }
@@ -3687,6 +3850,7 @@ fn release_unheld_windows(state: &mut ShardState) {
   let (restored, refused) = std::mem::take(&mut state.vcs_stores.nodes_restored);
   state.count(NODES_RESTORED, restored);
   state.count(NODES_UNRESTORED, refused);
+  count_region_restored(state);
   let freed = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     lent
@@ -3829,7 +3993,7 @@ async fn replay_hg_run(
 ) -> Result<(), ReplayRefused> {
   let disk = state.vcs_disk.clone().ok_or(ReplayRefused::Unlanded)?;
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.first..=run.last {
+  for sequence in run.sequences() {
     let bytes = segment_record(&disk, repository, sequence)
       .await
       .ok_or(ReplayRefused::Unlanded)?;
@@ -3846,7 +4010,9 @@ async fn replay_hg_run(
       slices.unit_done().await;
     }
   }
-  state.vcs_stores.landed_changeset(id, run.last);
+  if let Some(last) = run.last() {
+    state.vcs_stores.landed_changeset(id, last);
+  }
   Ok(())
 }
 
@@ -3856,7 +4022,7 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.first..=run.last {
+  for sequence in run.sequences() {
     let Some(bytes) = segment_record(&disk, repository, sequence).await else {
       return Unit::Refused(ReplayRefused::Unlanded);
     };
@@ -3883,8 +4049,10 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
       slates_rt::futures::yield_now().await;
     }
   }
-  crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, run.last))
-    .unwrap_or_default();
+  if let Some(last) = run.last() {
+    crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, last))
+      .unwrap_or_default();
+  }
   Unit::Replayed
 }
 

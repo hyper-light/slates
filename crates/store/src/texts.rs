@@ -339,6 +339,12 @@ const ORDINAL: usize = 4;
 /// Format: a history row's key: the tag, the repository, the path's BLAKE3, the sequence and the entry's place in the
 /// changeset's section (each big-endian, so in order: a push's several versions of one path are each a row).
 const HISTORY_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG + ORDINAL;
+/// Format: the keepers table's tag: each changeset that kept a repository's text, by the text, so a forgotten
+/// changeset's `T` and `I` rows go to another keeper of the same text ([`forget_rows`]), whatever its path.
+const KEEPERS: u8 = b'K';
+/// Format: a keeper row's key: the tag, the repository, the text's identity, the sequence and the entry's place in its
+/// changeset's section (each big-endian, so a text's keepers are one range, oldest first). Its value is empty.
+const KEEPER_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG + ORDINAL;
 /// Format: the tool id table's tag: a repository's version of a path by its tool's id (Mercurial's node), to the version
 /// as it landed: its text's identity and its own row (its base is a version of the same path, as a revlog's is).
 const TOOLS: u8 = b'I';
@@ -443,6 +449,10 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
   for (ordinal, entry) in entries.into_iter().enumerate() {
     let ordinal = u32::try_from(ordinal).map_err(|_| StoreError::BadRow)?;
     rows.put(
+      &keeper_key(header.repository, &entry.text, (header.sequence, ordinal)),
+      &[],
+    )?;
+    rows.put(
       &history_key(
         header.repository,
         blake3::hash(&entry.path).as_bytes(),
@@ -509,6 +519,153 @@ fn text_key(repository: u128, text: &Identity) -> [u8; TEXT_KEY_BYTES] {
   repo.copy_from_slice(&repository.to_be_bytes());
   identity.copy_from_slice(text);
   key
+}
+
+/// A keeper row's key.
+fn keeper_key(
+  repository: u128,
+  text: &Identity,
+  (sequence, ordinal): (u64, u32),
+) -> [u8; KEEPER_KEY_BYTES] {
+  let mut key = [0u8; KEEPER_KEY_BYTES];
+  if let Some(tag) = key.first_mut() {
+    *tag = KEEPERS;
+  }
+  let at = 1;
+  key[at..at + REPOSITORY].copy_from_slice(&repository.to_be_bytes());
+  let at = at + REPOSITORY;
+  key[at..at + IDENTITY].copy_from_slice(text);
+  let at = at + IDENTITY;
+  key[at..at + LONG].copy_from_slice(&sequence.to_be_bytes());
+  let at = at + LONG;
+  key[at..at + ORDINAL].copy_from_slice(&ordinal.to_be_bytes());
+  key
+}
+
+/// The keepers of repository `repository`'s text `text` other than `forgotten`'s, oldest first: each changeset's
+/// sequence and its entry's place in its section.
+fn keepers_of<F: hyper_block::block::BlockFile>(
+  rows: &mut mantle_engine::shard_db::ShardDb<F>,
+  (repository, text): (u128, &Identity),
+  forgotten: u64,
+) -> Result<Vec<(u64, u32)>, StoreError> {
+  let prefix = &keeper_key(repository, text, (0, 0))[..1 + REPOSITORY + IDENTITY];
+  let end = prefix_end(prefix);
+  let (mut found, mut start, mut next) = (Vec::new(), prefix.to_vec(), Vec::new());
+  loop {
+    let mut page = mantle_engine::rows::Rows::default();
+    let more = rows.scan(&start, end.as_deref(), KEEPERS_A_SCAN, &mut page, &mut next)?;
+    for (key, _) in page.iter() {
+      let at = 1 + REPOSITORY + IDENTITY;
+      let sequence = key
+        .get(at..at + LONG)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or(StoreError::BadRow)?;
+      let ordinal = key
+        .get(at + LONG..at + LONG + ORDINAL)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(StoreError::BadRow)?;
+      if sequence != forgotten {
+        found.push((sequence, ordinal));
+      }
+    }
+    if !more {
+      return Ok(found);
+    }
+    core::mem::swap(&mut start, &mut next);
+  }
+}
+
+/// Format: the keeper rows a scan's page reads: a page of the engine's scan, not a tuning of the forgetting.
+const KEEPERS_A_SCAN: usize = 256;
+
+/// Forgets the rows the `Texts` section `entries` of repository `repository`'s changeset `sequence` put ([`put_rows`]):
+/// its history and keeper rows; and its `T` and `I` rows where they are its own (the first keeper's), each moved to the
+/// next keeper of the same text (and, an `I` row, of the same path and tool id), read back by `entries_of`, or
+/// forgotten where none other kept it. The rows forgotten or moved.
+///
+/// # Errors
+/// [`StoreError::BadRow`] for a row that does not decode; `entries_of`'s and the engine's refusals.
+pub(crate) fn forget_rows<F: hyper_block::block::BlockFile>(
+  rows: &mut mantle_engine::shard_db::ShardDb<F>,
+  (repository, sequence): (u128, u64),
+  entries: &[TextEntry],
+  entries_of: &mut dyn FnMut(
+    &mut mantle_engine::shard_db::ShardDb<F>,
+    u64,
+  ) -> Result<Vec<TextEntry>, StoreError>,
+) -> Result<u64, StoreError> {
+  let mut forgotten = 0_u64;
+  let mut held = Vec::with_capacity(TEXT_VALUE_BYTES);
+  for (ordinal, entry) in entries.iter().enumerate() {
+    let ordinal = u32::try_from(ordinal).map_err(|_| StoreError::BadRow)?;
+    let path = *blake3::hash(&entry.path).as_bytes();
+    rows.delete(&keeper_key(repository, &entry.text, (sequence, ordinal)))?;
+    rows.delete(&history_key(repository, &path, (sequence, ordinal)))?;
+    forgotten = forgotten.saturating_add(2);
+    let keepers = keepers_of(rows, (repository, &entry.text), sequence)?;
+    let text = text_key(repository, &entry.text);
+    if rows.get(&text, &mut held)? && decode_row(&held).is_some_and(|row| row.sequence == sequence)
+    {
+      let next = next_keeper(rows, &keepers, entries_of, |kept| kept.text == entry.text)?;
+      match next {
+        Some((keeper, kept)) => {
+          held.clear();
+          put_row_value(&mut held, keeper, &kept);
+          rows.put(&text, &held)?;
+        }
+        None => rows.delete(&text)?,
+      }
+      forgotten = forgotten.saturating_add(1);
+    }
+    if entry.tool_id.is_empty() {
+      continue;
+    }
+    let tool = tool_key(repository, &path, &entry.tool_id);
+    if rows.get(&tool, &mut held)?
+      && decode_tool_value(&held).is_ok_and(|(_, row)| row.sequence == sequence)
+    {
+      let next = next_keeper(rows, &keepers, entries_of, |kept| {
+        kept.text == entry.text && kept.path == entry.path && kept.tool_id == entry.tool_id
+      })?;
+      match next {
+        Some((keeper, kept)) => {
+          held.clear();
+          held.extend_from_slice(&kept.text);
+          put_row_value(&mut held, keeper, &kept);
+          rows.put(&tool, &held)?;
+        }
+        None => rows.delete(&tool)?,
+      }
+      forgotten = forgotten.saturating_add(1);
+    }
+  }
+  Ok(forgotten)
+}
+
+/// The first of `keepers` whose entry is `wanted`: its sequence and its entry, read back by `entries_of`.
+fn next_keeper<F: hyper_block::block::BlockFile>(
+  rows: &mut mantle_engine::shard_db::ShardDb<F>,
+  keepers: &[(u64, u32)],
+  entries_of: &mut dyn FnMut(
+    &mut mantle_engine::shard_db::ShardDb<F>,
+    u64,
+  ) -> Result<Vec<TextEntry>, StoreError>,
+  wanted: impl Fn(&TextEntry) -> bool,
+) -> Result<Option<(u64, TextEntry)>, StoreError> {
+  for (keeper, ordinal) in keepers {
+    let entries = entries_of(rows, *keeper)?;
+    if let Some(kept) = usize::try_from(*ordinal)
+      .ok()
+      .and_then(|at| entries.into_iter().nth(at))
+      .filter(|kept| wanted(kept))
+    {
+      return Ok(Some((*keeper, kept)));
+    }
+  }
+  Ok(None)
 }
 
 /// A history row's key.

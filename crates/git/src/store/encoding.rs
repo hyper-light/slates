@@ -323,6 +323,12 @@ pub struct Encoding {
   /// base written before it): an object whose pushed entry is a delta against one still in the order, and that base
   /// above it; as deep as the deepest chain any push carried (`Repository::learned_depth`).
   ahead: Vec<Key>,
+  /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (A-864 piece
+  /// 2's encoding side): taken by [`Encoding::waiting`].
+  waiting: core::cell::Cell<Option<packed::Waited>>,
+  /// The let-go windows the encoding has stopped at, each by its pack and index: one stop a window (A-864 piece 2's
+  /// progress).
+  stopped_at: BTreeSet<(ContentId, u64)>,
   /// The commits, trees and tags' part, once encoded.
   objects: Option<Encoded>,
   stage: Stage,
@@ -377,6 +383,8 @@ impl Encoding {
       others: BTreeSet::new(),
       blobs: BTreeSet::new(),
       ahead: Vec::new(),
+      waiting: core::cell::Cell::new(None),
+      stopped_at: BTreeSet::new(),
       objects: None,
       stage,
       spent_ns: 0,
@@ -472,10 +480,51 @@ impl Encoding {
       if progress == Progress::Done {
         return Ok(Progress::Done);
       }
-      if clock.now_ns().saturating_sub(start) >= quantum_ns {
+      if self.stopped() || clock.now_ns().saturating_sub(start) >= quantum_ns {
         return Ok(Progress::More);
       }
     }
+  }
+
+  /// Stops the turn where `refused`, a read's refusal, met a let-go window, the first time the encoding meets that window
+  /// ([`Encoding::waiting`]): `Err(Stopped)` then. A window met again after it was to be brought back is read on, its
+  /// read refusing as one that cannot be read does, so a stop always makes progress or ends (A-864 piece 2).
+  fn stopped_by(
+    &mut self,
+    store: &ContentStore,
+    refused: &packed::PackedRefused,
+  ) -> Result<(), Stopped> {
+    match refused.waited() {
+      Some(waited) if self.stop_at(store, waited) => Err(Stopped),
+      _ => Ok(()),
+    }
+  }
+
+  /// Notes `waited`'s window to be brought back, the first time it is met: whether the encoding stops for it.
+  fn stop_at(&mut self, store: &ContentStore, waited: packed::Waited) -> bool {
+    let window = to_u64(store.window()).max(1);
+    if !self
+      .stopped_at
+      .insert((waited.pack, waited.offset / window))
+    {
+      return false;
+    }
+    self.waiting.set(Some(waited));
+    true
+  }
+
+  /// Whether a unit stopped at a let-go window ([`Encoding::waiting`]) not yet taken: its driver ends the turn there.
+  pub fn stopped(&self) -> bool {
+    let waiting = self.waiting.take();
+    self.waiting.set(waiting);
+    waiting.is_some()
+  }
+
+  /// The let-go window the encoding's last turn stopped at, its unit kept to be taken again once the window is brought
+  /// back (A-864 piece 2's encoding side; a pack's windows brought back as the encoding reads them, never all at once):
+  /// taken. None where the turn met none.
+  pub fn waiting(&self) -> Option<packed::Waited> {
+    self.waiting.take()
   }
 
   /// The encoding driven to its end in one turn whose quantum is never spent: the one-call form of
@@ -684,9 +733,24 @@ impl Encoding {
         }
       }
       Current::Copy(ref mut copying) => {
-        let lent = store
-          .piece(&copying.place.pack, copying.place.len, copying.from)
-          .ok_or(StoreRefused::FragmentUnreadable)?;
+        let Some(lent) = store.piece(&copying.place.pack, copying.place.len, copying.from) else {
+          // A piece let go stops the unit, nothing copied, to be taken again once it is brought back.
+          let waited = packed::Waited {
+            pack: copying.place.pack,
+            len: copying.place.len,
+            offset: copying.from,
+          };
+          if store.away(&copying.place.pack, copying.place.len, copying.from)
+            && self.stop_at(store, waited)
+          {
+            return Ok(Stage::Encode {
+              blobs,
+              part: Box::new(part),
+              current: Some(current),
+            });
+          }
+          return Err(StoreRefused::FragmentUnreadable);
+        };
         let want = usize::try_from(copying.end.saturating_sub(copying.from)).unwrap_or(usize::MAX);
         let piece = lent
           .get(..want.min(lent.len()).min(window))
@@ -832,13 +896,48 @@ impl Encoding {
       rows::PackedRow,
     ),
     at: u64,
-  ) -> Option<(Vec<u8>, Copying)> {
+  ) -> Result<Option<(Vec<u8>, Copying)>, Stopped> {
     let room = repository.largest_object();
-    let (header, data) = packed::entry_header(store, (place, repository.format()), room).ok()?;
-    if packed::raw_crc(store, place, packed.len).ok() != Some(packed.crc) {
+    let (header, data) = match packed::entry_header(store, (place, repository.format()), room) {
+      Ok(found) => found,
+      Err(refused) => {
+        self.stopped_by(store, &refused)?;
+        return Ok(None);
+      }
+    };
+    let crc = match packed::raw_crc(store, place, packed.len) {
+      Ok(crc) => Some(crc),
+      Err(refused) => {
+        self.stopped_by(store, &refused)?;
+        None
+      }
+    };
+    if crc != Some(packed.crc) {
       self.counters.reuse_crc_missed = self.counters.reuse_crc_missed.saturating_add(1);
-      return None;
+      return Ok(None);
     }
+    Ok(self.kept_copy(
+      repository,
+      store,
+      (part, (id, position, kind), place, packed),
+      (header, data, at),
+    ))
+  }
+
+  /// [`Encoding::reused_as_kept`]'s entry, its header read and its CRC32 held: placed, its header written at `at`, and
+  /// its data to copy; none where its base is not placed.
+  fn kept_copy(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+    (part, (id, position, kind), place, packed): (
+      &Part,
+      (ObjectId, u64, Kind),
+      InPack,
+      rows::PackedRow,
+    ),
+    (header, data, at): (entry::Header, u64, u64),
+  ) -> Option<(Vec<u8>, Copying)> {
     let base_id = match (header.representation, packed.base) {
       (Representation::Whole(whole), None) if whole == kind => None,
       (Representation::OfsDelta { .. } | Representation::RefDelta { .. }, Some(base)) => {
@@ -990,21 +1089,33 @@ impl Encoding {
     if let Some(packed) = row.pack {
       let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
       let place = repository.stored_of(&row, content);
-      if let StoredAt::InPack(place) = place
-        && let Some((header, copying)) = self.reused_as_kept(
+      if let StoredAt::InPack(place) = place {
+        match self.reused_as_kept(
           repository,
           store,
           (&part, (id, position, row.kind), place, packed),
           at,
-        )
-      {
-        let mut part = part;
-        part.bytes.extend_from_slice(&header);
-        return Ok(Stage::Encode {
-          blobs,
-          part: Box::new(part),
-          current: Some(Box::new(Current::Copy(Box::new(copying)))),
-        });
+        ) {
+          // One whose entry's read met a let-go window stops before anything of it is kept, to be taken again.
+          Err(Stopped) => {
+            self.ahead.push(key);
+            return Ok(Stage::Encode {
+              blobs,
+              part: Box::new(part),
+              current: None,
+            });
+          }
+          Ok(Some((header, copying))) => {
+            let mut part = part;
+            part.bytes.extend_from_slice(&header);
+            return Ok(Stage::Encode {
+              blobs,
+              part: Box::new(part),
+              current: Some(Box::new(Current::Copy(Box::new(copying)))),
+            });
+          }
+          Ok(None) => {}
+        }
       }
     }
     let object = Reading {
@@ -1143,3 +1254,6 @@ impl Encoding {
     Ok(Stage::Done)
   }
 }
+
+/// An encoding unit stopped at a let-go window (A-864 piece 2, [`Encoding::waiting`]).
+struct Stopped;

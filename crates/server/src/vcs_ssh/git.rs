@@ -116,6 +116,14 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   keepalive_ns: u64,
   /// When the session last wrote.
   last_written_ns: u64,
+  /// The windows its answer brought back and has not let go (A-864 piece 3).
+  resident: crate::vcs_http::git::upload::Resident,
+  /// The request its answer answers, kept to make it again (A-864's readers).
+  request: Vec<u8>,
+  /// The room its answer was made within.
+  admitted: u64,
+  /// The let-go window its answer was last held for, until it writes again (A-864's readers' progress).
+  last_away: Option<slates_git::store::packed::Waited>,
 }
 
 impl<L: StoreLender> UploadCommand<L> {
@@ -143,13 +151,84 @@ impl<L: StoreLender> UploadCommand<L> {
       after: After::Next,
       keepalive_ns,
       last_written_ns: slates_rt::futures::now_ns(),
+      resident: Vec::new(),
+      request: Vec::new(),
+      admitted: 0,
+      last_away: None,
     }
   }
 
   /// Answers `asked` over the lent store in turns (A-745: a fetch's pack's objects chosen as the answer is written),
   /// within a fresh admission of what its repository's shard could admit now (A-855), kept for the
   /// answer's writing; refused when the store is no longer held.
-  fn serve(&mut self, asked: Asked<'_>) -> Result<(), Refused> {
+  /// Answers `asked` as [`UploadCommand::serve_once`] does, made again while a read of it met a let-go window, once the
+  /// window is back (A-864's readers; main 01a20182's r52): nothing of it is written yet. The same window met twice with
+  /// none brought back between ends the retries, the refusal answered.
+  async fn serve(&mut self, asked: Option<&[u8]>) -> Result<(), Refused> {
+    let mut last = None;
+    loop {
+      let away = match asked {
+        None => self.serve_once(Asked::Advertise)?,
+        Some(request) => self.serve_once(Asked::Request(request))?,
+      };
+      match away {
+        Some(waited) if last != Some(waited) && self.lender.bring_back(waited).await => {
+          last = Some(waited)
+        }
+        _ => return Ok(()),
+      }
+    }
+  }
+
+  /// A turn of an answer held for a let-go window its read met before its pack (A-864's readers): the window brought back
+  /// and the answer made again over the same generation within the same room, passing over what it wrote (A-855's rule);
+  /// the same window again with nothing written between, or one not brought back, gives up, the refusal answered typed.
+  async fn read_through_held(
+    &mut self,
+    waited: slates_git::store::packed::Waited,
+  ) -> Result<(), Refused> {
+    let Some(made) = self.answer.as_mut() else {
+      return Ok(());
+    };
+    if self.last_away == Some(waited)
+      || self.generation.is_none()
+      || !self.lender.bring_back(waited).await
+    {
+      made.give_up();
+      return Ok(());
+    }
+    self.last_away = Some(waited);
+    let skip = made.written();
+    let mut again_room = Admission::new(self.admitted);
+    let request = self.request.clone();
+    let version = self.version;
+    let Some(held) = self.generation.as_ref() else {
+      return Ok(());
+    };
+    let again = self
+      .lender
+      .lend_held(held, |served, packs| {
+        upload::serve_in_turns(
+          served,
+          version,
+          Asked::Request(&request),
+          packs,
+          &mut again_room,
+        )
+        .skip_written(skip)
+      })
+      .ok_or_else(unheld)?;
+    self.answer = Some(again);
+    self.admission = again_room;
+    Ok(())
+  }
+
+  /// Answers `asked` once over the lent store (the module doc): the let-go window a read of its refused answer met, if
+  /// one did.
+  fn serve_once(
+    &mut self,
+    asked: Asked<'_>,
+  ) -> Result<Option<slates_git::store::packed::Waited>, Refused> {
     let Self {
       lender,
       repository,
@@ -159,22 +238,29 @@ impl<L: StoreLender> UploadCommand<L> {
       generation,
       admission,
       after,
+      admitted,
+      request: kept,
       ..
     } = self;
     // A-855: an answer is admitted what its repository's shard admits it (A-724's share), never one region: its walk's
     // tables grow with the repository's objects and wants (A-745 rule 1), past a region's room at git/git's 1,019 tags.
     let shard = lender.room(*repository).ok_or_else(unheld)?;
     *admission = Admission::new(shard);
-    let made = match asked {
+    *admitted = shard;
+    let answered = |served: &Served<'_>, packs: &mut L::Packs, admission: &mut Admission| {
+      let made = upload::serve_in_turns(served, *version, asked, packs, admission);
+      let away = made.refusal().and(served.repository.waiting());
+      (made, away)
+    };
+    let (made, away) = match asked {
       Asked::Advertise => lender.lend((*repository, reader), |served, packs| {
-        upload::serve_in_turns(served, *version, asked, packs, admission)
+        answered(served, packs, admission)
       }),
-      Asked::Request(_) => {
+      Asked::Request(request) => {
         let held = lender.hold(*repository, reader).ok_or_else(unheld)?;
-        let made = lender.lend_held(&held, |served, packs| {
-          upload::serve_in_turns(served, *version, asked, packs, admission)
-        });
+        let made = lender.lend_held(&held, |served, packs| answered(served, packs, admission));
         *generation = Some(held);
+        *kept = request.to_vec();
         made
       }
     }
@@ -185,7 +271,7 @@ impl<L: StoreLender> UploadCommand<L> {
       After::Next
     };
     *answer = Some(made);
-    Ok(())
+    Ok(away)
   }
 
   /// Writes one step of the answer, a whole pkt-line's room at most; what follows once it has ended.
@@ -200,6 +286,7 @@ impl<L: StoreLender> UploadCommand<L> {
       after,
       keepalive_ns,
       last_written_ns,
+      last_away,
       ..
     } = self;
     let Some(made) = answer.as_mut() else {
@@ -222,6 +309,9 @@ impl<L: StoreLender> UploadCommand<L> {
       );
     }
     let now = slates_rt::futures::now_ns();
+    if out.len() > before {
+      *last_away = None;
+    }
     if out.len() > before
       || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))
     {
@@ -261,7 +351,7 @@ impl<L: StoreLender> UploadCommand<L> {
   }
 
   /// Serves the next whole request the input begins with: what it consumed, and what follows.
-  fn next_request(&mut self) -> Result<Stepped, Refused> {
+  async fn next_request(&mut self) -> Result<Stepped, Refused> {
     let length = match whole_len(&self.input) {
       Ok(Some(length)) => length.min(self.input.len()),
       Ok(None) if self.input_ended => return self.ended(),
@@ -275,7 +365,7 @@ impl<L: StoreLender> UploadCommand<L> {
       Err(_) => self.input.len(),
     };
     let request: Vec<u8> = self.input.drain(..length).collect();
-    self.serve(Asked::Request(&request))?;
+    self.serve(Some(&request)).await?;
     Ok(Stepped {
       consumed: length,
       next: Next::More,
@@ -309,8 +399,28 @@ impl<L: StoreLender> Command for UploadCommand<L> {
   }
 
   async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
+    // A-864's readers: an answer held for a let-go window is made again once it is back.
+    if let Some(waited) = self.answer.as_ref().and_then(|made| made.held_away()) {
+      self.read_through_held(waited).await?;
+      return Ok(Stepped {
+        consumed: 0,
+        next: Next::More,
+      });
+    }
     if self.answer.is_some() {
+      // A-864 piece 2: the windows the next turn reads brought back first, off the turn.
+      if let Some(pack) = self.answer.as_ref().and_then(|made| made.pack_source()) {
+        let reads = L::pack_reads(pack);
+        self.lender.read_ahead(reads, &mut self.resident).await;
+        if reads.next.is_some() {
+          self.lender.let_go_behind(&mut self.resident, reads.next);
+        }
+      }
       let next = self.write_answer()?;
+      // A-864 piece 3: an answer written lets go every window it brought back.
+      if self.answer.is_none() {
+        self.lender.let_go_behind(&mut self.resident, None);
+      }
       return Ok(Stepped { consumed: 0, next });
     }
     if !self.advertised {
@@ -320,13 +430,13 @@ impl<L: StoreLender> Command for UploadCommand<L> {
       }
       // A-718: the store's versions encoded and kept once, before any of the session's fetches is answered.
       self.lender.encode(self.repository).await;
-      self.serve(Asked::Advertise)?;
+      self.serve(None).await?;
       return Ok(Stepped {
         consumed: 0,
         next: Next::More,
       });
     }
-    self.next_request()
+    self.next_request().await
   }
 
   fn output(&self) -> (&[u8], &[u8]) {
