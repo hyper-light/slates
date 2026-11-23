@@ -180,12 +180,15 @@ pub struct Awaiting {
   pub target: String,
   /// The principal it was presented to.
   pub principal: Principal,
-  /// The client that presented it: its retirement abandons the presentation (AUD-29-07).
+  /// The client that presented it, whose own re-presentation of the volume into the target replaces it (AUD-29-07).
+  /// The presentation outlives the client (A-874): it is a volume's changes against a target, granted and landed by
+  /// whoever holds the grant.
   pub client: u32,
   /// Its manifest's entries, in the manifest's order: the full entry list a person may ask for (§4.15 step 2;
   /// `LandingEntries` pages them, `crate::landing_entries`). Moved from the plan, never copied, and held as long as the
-  /// presentation is, which A-46 bounds: consumed by its landing, replaced by its client's next, abandoned with its
-  /// client, at most one a client seat. Their size is the plan's, which the volume's diverged set bounds.
+  /// presentation is, which A-46 bounds: consumed by its landing, superseded by any client's next of the same volume and
+  /// target (A-779), or gone with its volume (A-874), at most `landings_awaiting_per_shard` a shard. Their size is the
+  /// plan's, which the volume's diverged set bounds.
   pub entries: Vec<slates_land::manifest::LandingEntry>,
   /// The conflict classes the preliminary verdict pass found among them, by path (the conflicting entries alone).
   pub conflicts: std::collections::BTreeMap<Box<str>, slates_land::verdict::ConflictClass>,
@@ -413,14 +416,14 @@ pub(crate) fn join_in_flight(
   true
 }
 
-/// Drops every landing `client` presented on this shard and never landed: its retirement abandons them
-/// (AUD-29-07), so a presentation does not outlive the client waiting on it. Bounded by the shard's
-/// presentations.
-pub fn abandon_presentations(state: &mut ShardState, client: u32) {
+/// Drops the landings awaiting a grant of `volume`, as it is destroyed (A-874): a presentation lives until it is landed,
+/// superseded (A-779) or its volume goes, never past its volume, so a destroyed volume's never holds a place in the bound.
+/// Bounded by the shard's presentations.
+pub fn forget_presentations_of(state: &mut ShardState, volume: DbVolumeId) {
   state
     .landing
     .awaiting
-    .retain(|_, awaiting| awaiting.client != client);
+    .retain(|_, awaiting| awaiting.volume != volume);
 }
 
 /// A landing observer (§4.14) that records one `land.entry` timing per entry into a bounded buffer, so
