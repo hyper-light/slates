@@ -3992,8 +3992,9 @@ fn upload_advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16,
 /// A-864's readers (main 01a20182's r52: after git/git's push landed and its pack's windows were let go, every fetch and
 /// ls-remote answered "possible repository corruption", the advertisement's tag peel reading a let-go window). Do: push
 /// a create of `main` and [`LET_GO_TAGS`] annotated tags, each tag's entry between two MiB files in the pack; read the
-/// upload-pack advertisement; mark every window of the pack landed and let go those no home holds on the repository's
-/// shard; read the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
+/// upload-pack advertisement; let the pack's home on the repository's shard record its windows and let them go, as a
+/// landed pack's let-go tells it, then mark every window of the pack landed and let go those no home holds there; read
+/// the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
 /// peeled; windows brought back from the node's store to answer it; the clone whole. Red before: refused.
 #[test]
 fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
@@ -4027,7 +4028,12 @@ fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
   .expect("the repository's content store");
   let ids: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The pack's home here, where it holds the pack for the region, records where each window lies on the node's store
+    // and lets it go first (A-724 piece 8c, goal 93 item 2b(b)), as a landed pack's let-go tells it: a window of an
+    // object the region holds is pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
