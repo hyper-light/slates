@@ -1,0 +1,15 @@
+--- a/crates/server/src/idle_sweep.rs
++++ b/crates/server/src/idle_sweep.rs
+@@ -78,7 +78,11 @@
+     if state::with_state(|s| s.count(PASSES_STARTED, 1)).is_none() {
+       return;
+     }
+-    let mut ended = crate::daemon::seal_idle_content().await;
++    // DIAG RED (never merged): an interrupted give-back owes the next pass an interval on, as before A-881.
++    let mut ended = match crate::daemon::seal_idle_content().await {
++      PassEnd::GiveBackLeft { .. } => PassEnd::Owed,
++      ended => ended,
++    };
+     while let PassEnd::GiveBackLeft { directories_idle } = ended {
+       if state::with_state(|s| s.give_back_waits_idle = true).is_none() {
+         return;

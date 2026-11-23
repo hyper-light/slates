@@ -1,0 +1,142 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), item 2, run 6. A diagnostics lane run only from `diag-measurer-w-win2-*`
+# branches, never main. Item 2 now has two parts: the Windows give-back step timed by its cycles (A-491's follow-up) and
+# an interrupted give-back resumed at the shard's next idle point (A-881, main's ruling (c)). On both Windows runners:
+# the idle sweep's tests red with A-881 turned off, then with the cycle clock turned off, then five times green with
+# both, then the whole server unit suite as CI runs it, and the server's Windows clippy. Every run's output goes to a
+# file, printed in an always() step. On Linux: the idle sweep tests red with A-881 off, then five times green.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  item2:
+    name: item 2 with A-881 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Item 2, red: the idle sweep's tests with A-881 turned off"
+        timeout-minutes: 45
+        run: |
+          git apply .github/diag-w-win2/a881-red.patch
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests:: > "$RUNNER_TEMP/item2-red-a881.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a881-red.patch
+          grep -a '^test \|test result\|panicked at' "$RUNNER_TEMP/item2-red-a881.log" | sed 's/slates daemon: descriptor_limit.*$//'
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the idle sweep's tests passed with A-881 off"; exit 1; fi
+      - name: "Item 2, the cycle clock turned off (A-881 on): the idle sweep's tests"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          git apply .github/diag-w-win2/a491-red.patch
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests:: > "$RUNNER_TEMP/item2-red-a491.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a491-red.patch
+          grep -a '^test \|test result\|panicked at' "$RUNNER_TEMP/item2-red-a491.log" | sed 's/slates daemon: descriptor_limit.*$//'
+          echo "clock-off arm exit $code"
+      - name: "Item 2, green: the idle sweep's tests, five times"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          set +e
+          failed=0
+          for round in 1 2 3 4 5; do
+            cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests:: > "$RUNNER_TEMP/item2-green-$round.log" 2>&1
+            code=$?
+            echo "round $round: exit $code, $(grep -a 'test result' "$RUNNER_TEMP/item2-green-$round.log" | tail -1)"
+            if [ "$code" -ne 0 ]; then failed=1; fi
+          done
+          exit $failed
+      - name: "Item 2, green: the server's unit tests, one test at a time, as CI runs them"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 > "$RUNNER_TEMP/item2-suite.log" 2>&1
+          code=$?
+          grep -a 'test result\|^failures:\|^    [a-z_:]*$\|panicked at' "$RUNNER_TEMP/item2-suite.log" | tail -40
+          exit $code
+      - name: Clippy the server on Windows, alone
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p slates-server --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling \|^warning: aws-lc-sys'
+      - name: "Item 2: the test logs, whatever happened"
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/item2-*.log; do echo "=== $f"; grep -a '^test \|panicked at\|test result\|^thread \|assert' "$f" | sed 's/slates daemon: descriptor_limit.*$//' | tail -60; done
+
+  linux:
+    name: item 2 with A-881 (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: "Item 2, red: the idle sweep's tests with A-881 turned off"
+        timeout-minutes: 45
+        run: |
+          git apply .github/diag-w-win2/a881-red.patch
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests:: > "$RUNNER_TEMP/item2-red-a881.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a881-red.patch
+          grep -a '^test \|test result\|panicked at' "$RUNNER_TEMP/item2-red-a881.log" | sed 's/slates daemon: descriptor_limit.*$//'
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the idle sweep's tests passed with A-881 off"; exit 1; fi
+      - name: "Item 2, green: the idle sweep's tests, five times"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          set +e
+          failed=0
+          for round in 1 2 3 4 5; do
+            cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests:: > "$RUNNER_TEMP/item2-green-$round.log" 2>&1
+            code=$?
+            echo "round $round: exit $code, $(grep -a 'test result' "$RUNNER_TEMP/item2-green-$round.log" | tail -1)"
+            if [ "$code" -ne 0 ]; then failed=1; fi
+          done
+          exit $failed
+      - name: "Item 2: the test logs, whatever happened"
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/item2-*.log; do echo "=== $f"; grep -a '^test \|panicked at\|test result\|^thread \|assert' "$f" | sed 's/slates daemon: descriptor_limit.*$//' | tail -60; done

@@ -1266,6 +1266,9 @@ pub struct ShardState {
   /// Whether a sweep pass is asked for or under way (A-715): set by the keeper at `idle_sweep_at`, cleared by the sweep
   /// as its pass ends, so nothing arms another while one runs.
   pub(crate) idle_sweep_running: bool,
+  /// Whether a pass's give-back, which other work interrupted (A-226), waits for the shard's next idle point, where the
+  /// shard's idle work wakes the sweep to resume it ([`crate::idle_sweep::idle_work`]). The pass is under way meanwhile.
+  pub(crate) give_back_waits_idle: bool,
   /// The content arena's allocation count and allocated bytes as the last sweep pass ended (A-715): a borrow that finds
   /// either changed owes a sweep (a write's allocation, a delete's free once published).
   pub(crate) idle_sweep_seen: (u64, usize),

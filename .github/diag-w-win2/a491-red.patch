@@ -1,0 +1,12 @@
+--- a/crates/server/src/daemon.rs
++++ b/crates/server/src/daemon.rs
+@@ -5572,7 +5572,8 @@
+ /// steps in the first pass, then one a pass).
+ #[cfg(windows)]
+ fn shard_thread_cpu_ns() -> Option<u64> {
+-  slates_machine::own_cpu::own_cpu_ns()
++  // DIAG RED (never merged): the thread's charged time, as before the cycle clock.
++  registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+ }
+ 
+ /// The CPU a step spent between the readings `started` and `ended`, `None` unless both were read.
