@@ -1444,7 +1444,9 @@ impl ShardContext {
     self
       .with_inner(|inner| {
         let mut completions = std::mem::take(&mut inner.completions);
+        let g222_at = slates_machine::clock::monotonic_ns();
         let result = inner.driver.wait(Some(0), &mut completions);
+        crate::g222_parks::harvested(slates_machine::clock::monotonic_ns().saturating_sub(g222_at));
         let harvested = !completions.is_empty();
         for c in completions.drain(..) {
           inner.counters.completions = inner.counters.completions.saturating_add(1);
@@ -1691,6 +1693,12 @@ impl ShardContext {
     self.waited_for_ns.set(deadline_ns);
     self.update_attribution(Tracker::wait_began);
     let mut lost = false;
+    let g222_began = slates_machine::clock::monotonic_ns();
+    let g222_began_driver = self.now_ns();
+    let mut g222_kicked = 2u64;
+    let mut g222_kick = (u64::MAX, u64::MAX);
+    let mut g222_kicked_at = 0u64;
+    let mut g222_returned_at = 0u64;
     match self.entry {
       Some(entry) => {
         // A tracking shard counts its voluntary switches as the wait begins, so a kicked park can tell a
@@ -1707,12 +1715,47 @@ impl ShardContext {
             lost = self.wait_in_driver(deadline_ns);
           },
         );
+        g222_kicked = match parked {
+          Parked::Pending => 3,
+          Parked::Waited(Some(woken)) => u64::from(woken.kicked_ns.is_some()),
+          Parked::Waited(None) => 2,
+        };
+        // When the kick came after the wait began, and how long the wake took after it.
+        if let Parked::Waited(Some(woken)) = parked {
+          g222_kicked_at = woken.kicked_ns.unwrap_or(0);
+          g222_returned_at = woken.returned_ns;
+        }
+        if let Parked::Waited(Some(woken)) = parked
+          && let Some(kicked) = woken.kicked_ns
+        {
+          g222_kick = (
+            kicked.saturating_sub(woken.waiting_ns),
+            woken.returned_ns.saturating_sub(kicked),
+          );
+        }
         if let Parked::Waited(Some(woken)) = parked {
           self.note_wake(entry, woken, switches_before_wait);
         }
       }
       None => lost = self.wait_in_driver(deadline_ns),
     }
+    if let Some(slot) = crate::g222_parks::LAST.get(usize::from(self.id)) {
+      use std::sync::atomic::Ordering::Relaxed;
+      let returned = if g222_returned_at == 0 {
+        slates_machine::clock::monotonic_ns()
+      } else {
+        g222_returned_at
+      };
+      slot[0].store(g222_began, Relaxed);
+      slot[1].store(g222_kicked_at, Relaxed);
+      slot[2].store(returned, Relaxed);
+    }
+    crate::g222_park(
+      deadline_ns.map_or(u64::MAX, |d| d.saturating_sub(g222_began_driver)),
+      slates_machine::clock::monotonic_ns().saturating_sub(g222_began),
+      g222_kicked,
+      g222_kick,
+    );
     self.wait_ended();
     if lost {
       self.fail_all();

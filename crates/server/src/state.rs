@@ -1740,7 +1740,9 @@ pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
 
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
 /// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
+#[track_caller]
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
+  crate::g222_diag::delivered(request, std::panic::Location::caller());
   let server = try_with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
     // away on another shard; it ends when this reply is written into the client's ring.

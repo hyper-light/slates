@@ -40,6 +40,8 @@ mod content_holder;
 mod content_pool;
 pub(crate) mod content_ranges;
 pub mod content_retention;
+#[doc(hidden)]
+pub mod g222_diag;
 mod idle_sweep;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;

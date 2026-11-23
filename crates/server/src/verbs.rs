@@ -3707,9 +3707,11 @@ fn send_forward(
     request,
     refused(Refusal::Overloaded { shard: owner }),
   );
+  crate::g222_diag::fwd_sent(request);
   let task = SpawnRequest::new(
     Box::pin(async move {
       unstarted.started();
+      crate::g222_diag::fwd_started(request);
       // The closed loop this forward was made for comes back to this shard only after going round the others: the
       // owner holds its window for it (A-326).
       if hold_ns > 0 {
@@ -3787,7 +3789,9 @@ fn send_forward(
       let Some(reply) = reply else {
         return;
       };
+      crate::g222_diag::fwd_replied(request);
       crate::xshard::send_reply_home(origin, move || {
+        crate::g222_diag::fwd_home(request);
         // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
         // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
         if let Some(carried) = carried {
@@ -13002,8 +13006,24 @@ fn refinement_owed(
 }
 
 /// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
+#[track_caller]
 pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
+  let g222_at = std::panic::Location::caller();
+  let g222_now = state.clock.monotonic_ns();
+  for submit in &parked {
+    if let Some(route) = submit.route.as_ref() {
+      crate::g222_diag::resumed(
+        route.request,
+        g222_now.saturating_sub(submit.parked_ns),
+        g222_at,
+      );
+    }
+  }
+  crate::g222_diag::resumes_done();
   for submit in parked {
+    let g222_cpu = slates_rt::g222_parks::thread_cpu_ns();
+    let _ = crate::g222_diag::take_flags();
+    let _ = crate::g222_diag::take_verb_cpu();
     let ParkedSubmit {
       origin,
       id,
@@ -13044,6 +13064,14 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
         reply
       }
     };
+    if let Some(route) = route.as_ref() {
+      crate::g222_diag::resume_ran(
+        route.request,
+        slates_rt::g222_parks::thread_cpu_ns().saturating_sub(g222_cpu),
+        crate::g222_diag::take_verb_cpu(),
+        crate::g222_diag::take_flags(),
+      );
+    }
     if let (Some(reply), Some(route)) = (reply, route)
       && !answered_on(route, (origin, id), reply)
     {
@@ -13093,7 +13121,9 @@ fn resumed_local(
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = route;
+  let g222_cpu = slates_rt::g222_parks::thread_cpu_ns();
   let reply = submit(state, principal, work, carried, approval);
+  crate::g222_diag::verb_ran(slates_rt::g222_parks::thread_cpu_ns().saturating_sub(g222_cpu));
   state.current_request = None;
   state.reply_route = None;
   let deferred = std::mem::take(&mut state.acceptance_deferred);
@@ -18949,6 +18979,17 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     if !to_serve(state, index, handle, &request) {
       continue;
     }
+    let g222_taken = slates_machine::clock::monotonic_ns();
+    let g222_landed = slates_ipc::slot::landed_ns(
+      u32::try_from(
+        slates_ipc::endpoint::G222_LAST_STAMP.load(std::sync::atomic::Ordering::Relaxed),
+      )
+      .unwrap_or(0),
+      g222_taken,
+    );
+    if let Some(landed) = g222_landed {
+      crate::g222_diag::took(request.request, landed, g222_taken);
+    }
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
     // is the entry point, its request id the replay identity. `now` (this round's single clock read,
     // §4.7) stands for the read time — a small, conservative over-estimate within one batch, not a
@@ -18965,9 +19006,13 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     state.forward_hold_ns = 0;
     match served {
       Served::Reply(mut reply) => {
+        crate::g222_diag::forget(request.request);
         if send_reply(state, index, request.request, &mut reply) {
           // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
+          if let Some(landed) = g222_landed {
+            crate::g222_diag::ring(landed, g222_taken, slates_machine::clock::monotonic_ns());
+          }
           let label = u32::from(state.partition);
           crate::telemetry::emit(state, ring.end(label, written_ns));
         } else {
@@ -19067,7 +19112,10 @@ pub(crate) fn send_reply(
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
-    Ok(()) => true,
+    Ok(()) => {
+      crate::g222_diag::deferred_written(request);
+      true
+    }
     Err(IpcError::RingFull) => false,
     Err(_) => {
       let fallback = ReplyBody::Refused {
@@ -21153,6 +21201,7 @@ impl Published {
 /// Efficiency gate: it re-images
 /// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
 pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  crate::g222_diag::mark(crate::g222_diag::PUBLISHED);
   let (start, end) = state.content_range;
   if state.content.is_none() || end <= start {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);

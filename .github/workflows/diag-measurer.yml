@@ -1,0 +1,78 @@
+name: diag measurer
+# w-perf 84a (main 01a20182's order, 2026-11-21 22:43 PST): g222's macOS split re-run on main with TB (A-831, 6865fe121,
+# the shards under THREAD_TIME_CONSTRAINT_POLICY), each forwarded verdict also split by how its owner and its origin
+# met their message: running, parked and kicked (the kick's lateness after the send, kick -> run, run -> stamp), or
+# parked and woken otherwise (.github/g222/fwdsplit.py). Step 1: name the wait the p999 requests spend their time in.
+# g222's macOS split, take 2 (84a, main's step 4): replies written after their taking step (resumed or forwarded) now stamped too (deferred flag). Was: main with B (A-799) and the busy path's zero-timeout kevent nap, stamped by
+# hop (diag-g222-hops-mac 2e30acc9a): per reply the client's send -> shard taken (queued), taken -> written (served),
+# written -> the client saw it (wake), with the client's parks; every shard park's timeout and lateness; the
+# zero-timeout harvests' durations; and the runner's timer lateness (nanosleep and kevent, 200 us) quiet and under the
+# loaded form, against the launchd timer finding. Loaded = the harness's spinners, two a core (-20's macOS form).
+# A diagnostics lane run only from `diag-measurer-*` branches (never main); every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  ROUNDS: "3"
+
+jobs:
+  mac-split:
+    name: split (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build
+        run: |
+          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
+          cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
+          cp target/release/examples/edit_merge_bench "$W/bench"; shasum -a 256 "$W/bench"
+          if [ "$(uname)" = Darwin ]; then echo "runner cpus $(sysctl -n hw.ncpu) memory $(($(sysctl -n hw.memsize) / 1073741824)) GiB"; fi
+          echo "runner cpus $(nproc 2>/dev/null)"; uname -a; echo "kernel $(uname -r)"
+          if [ "$(uname)" = Linux ]; then
+            echo "sched features: $(sudo cat /sys/kernel/debug/sched/features 2>/dev/null || echo unreadable)"
+            echo "base slice ns: $(sudo cat /sys/kernel/debug/sched/base_slice_ns 2>/dev/null || echo unreadable)"
+            echo "config HZ: $(grep -E '^CONFIG_HZ=|^CONFIG_PREEMPT' /boot/config-$(uname -r) 2>/dev/null | tr '\n' ' ')"
+            echo "rtprio limit: $(ulimit -r)"
+          fi
+          sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null || true; sw_vers 2>/dev/null || true; launchctl print system 2>/dev/null | grep -i -m3 timer || true
+      - name: Rounds, loaded then quiet, split by hop
+        run: |
+          W="$RUNNER_TEMP/msr"; B="$W/bench"; set +e +o pipefail
+          [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py idle
+          for round in $(seq 1 "$ROUNDS"); do
+            L="$W/logs/loaded-r$round.log"; echo "== loaded round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            ( sleep 60; [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py "loaded-r$round" ) > "$W/logs/timers-loaded-r$round.log" 2>&1 &
+            G222_DIAG="$W/logs/loaded-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; wait; cat "$W/logs/timers-loaded-r$round.log"
+            grep -E "f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+            python3 .github/g222/macsplit.py "$W/logs/loaded-r$round.tsv"
+            python3 .github/g222/fwdsplit.py "$W/logs/loaded-r$round.tsv"
+            L="$W/logs/quiet-r$round.log"; echo "== quiet round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            G222_DIAG="$W/logs/quiet-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; grep -E "f10_quiet_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+            python3 .github/g222/macsplit.py "$W/logs/quiet-r$round.tsv"
+            python3 .github/g222/fwdsplit.py "$W/logs/quiet-r$round.tsv"
+          done
+          [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py idle-end
+          true
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn

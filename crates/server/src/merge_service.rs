@@ -822,6 +822,7 @@ pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldI
 /// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
 /// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
 pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+  crate::g222_diag::mark(crate::g222_diag::CHECKPOINT);
   let Some(mut hold) = CheckpointHold::begin(state, green, doubling) else {
     return;
   };
@@ -4416,6 +4417,9 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
   };
   let object = ObjectId(green.bytes);
   let route = state.reply_route.take();
+  if let Some(route) = route.as_ref() {
+    crate::g222_diag::acc_waiting(route.request);
+  }
   state
     .merge
     .awaiting
@@ -4660,7 +4664,9 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
         continue;
       };
       let (origin, id) = (entry.origin, entry.id);
+      crate::g222_diag::acc_resolved(route.request);
       if crate::xshard::hand_reply_home(route.shard, move || {
+        crate::g222_diag::fwd_home(route.request);
         if route.through_work {
           let _ = crate::state::with_state_counted(|s| {
             crate::work_home::answered_late(s, origin, id, recorded);

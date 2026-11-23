@@ -408,6 +408,23 @@ fn run_worker(
   ready: std::sync::mpsc::SyncSender<(u16, Result<(), RtError>)>,
 ) -> Result<Counters, RtError> {
   let id = seed.id;
+  #[cfg(target_os = "macos")]
+  #[allow(clippy::disallowed_methods, unsafe_code)]
+  if std::env::var_os("G222_QOS").is_some() {
+    // SAFETY: diagnostic only (g222, never main); sets this thread's own QoS class.
+    unsafe {
+      libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+  }
+  #[cfg(target_os = "linux")]
+  crate::g222_slice();
+  // Diagnostic only (g222, never main): G222_NO_PIN leaves the shard thread unpinned.
+  #[allow(clippy::disallowed_methods)]
+  let core = if std::env::var_os("G222_NO_PIN").is_some() {
+    None
+  } else {
+    core
+  };
   let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
   let ctx = match ShardContext::build(seed) {
     Ok(ctx) => ctx,
