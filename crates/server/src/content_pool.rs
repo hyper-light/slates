@@ -432,8 +432,12 @@ impl ContentPool {
   /// by the next daemon's `held`).
   fn hand_out(&mut self, id: u16) -> Option<(u16, Region)> {
     match self.map(id) {
-      Ok(region) => Some((id, region)),
-      Err(_) => {
+      Ok(region) => {
+        slates_machine::diag!("pool hand_out: extent {id} mapped, {} bytes", region.len());
+        Some((id, region))
+      }
+      Err(error) => {
+        slates_machine::diag!("pool hand_out: extent {id} MAP REFUSED: {error:?}");
         self.refused = self.refused.saturating_add(1);
         let _released = self.segment.pool_release(usize::from(id), self.partition);
         None
@@ -500,6 +504,32 @@ impl ContentPool {
 
 impl ExtentSource for ContentPool {
   fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
+    {
+      let (mut total, mut unready, mut owned, mut free_ready, mut free_ready_bytes) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+      for id in self.candidates() {
+        total = total.saturating_add(1);
+        #[cfg(windows)]
+        let is_ready = !crate::content_extents::installed() || crate::content_extents::ready(id);
+        #[cfg(not(windows))]
+        let is_ready = true;
+        let free = matches!(self.segment.pool_owner(usize::from(id)), Ok(None));
+        if !free {
+          owned = owned.saturating_add(1);
+        } else if !is_ready {
+          unready = unready.saturating_add(1);
+        } else {
+          free_ready = free_ready.saturating_add(1);
+          free_ready_bytes =
+            free_ready_bytes.saturating_add(self.part(id).map_or(0, |(_, (_, len))| len));
+        }
+      }
+      slates_machine::diag!(
+        "pool claim: partition {} want {want}: candidates {total}, owned {owned}, free but unready {unready}, free and ready {free_ready} ({free_ready_bytes} bytes); best_fit {}",
+        self.partition,
+        self.best_fit(want).len()
+      );
+    }
     for id in self.best_fit(want) {
       match self.segment.pool_claim(usize::from(id), self.partition) {
         Ok(true) => return self.hand_out(id),
@@ -509,6 +539,7 @@ impl ExtentSource for ContentPool {
         Err(_) => self.refused = self.refused.saturating_add(1),
       }
     }
+    slates_machine::diag!("pool claim: partition {} want {want}: NOTHING claimed", self.partition);
     if self.hold_open {
       return self.claim_from_hold();
     }

@@ -79,3 +79,33 @@ pub mod wake;
 pub use derived::Derived;
 pub use error::MachineError;
 pub use profile::{DerivedConstants, MachineProfile, ProfileOptions};
+
+/// DIAG ONLY (the diagnostics branch `diag-measurer-w-win2-*`, never merged): a timestamped line on stderr, and
+/// appended to the file `SLATES_DIAG_LOG` names when that is set, so a daemon whose stderr is dropped still reports.
+#[doc(hidden)]
+pub fn diag_note(line: std::fmt::Arguments<'_>) {
+  use std::io::Write;
+  let stamp = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|since| since.as_micros())
+    .unwrap_or(0);
+  let text = format!("DIAG {stamp} pid {} {line}\n", std::process::id());
+  let _ = std::io::stderr().write_all(text.as_bytes());
+  if let Some(path) = std::env::var_os("SLATES_DIAG_LOG")
+    && let Ok(mut file) = std::fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(path)
+  {
+    let _ = file.write_all(text.as_bytes());
+  }
+}
+
+/// DIAG ONLY: [`diag_note`] with `format!`'s arguments.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! diag {
+  ($($arg:tt)*) => {
+    $crate::diag_note(format_args!($($arg)*))
+  };
+}

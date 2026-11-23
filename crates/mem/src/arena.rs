@@ -511,13 +511,28 @@ impl ChunkArena {
     // `budget::Pressure`): the arena grows by it too, and the budget holds it once grown.
     let needed = deficit.saturating_add(budget.debt());
     let needed_bytes = usize::try_from(needed).unwrap_or(usize::MAX);
+    slates_machine::diag!(
+      "make_room: bytes {bytes} deficit {deficit} debt {} needed {needed} claimable {} capacity {} committed {} headroom {} hold {} refused_so_far {}",
+      budget.debt(),
+      self.claimable(),
+      self.capacity(),
+      budget.committed(),
+      budget.headroom(),
+      budget.hold(),
+      self.source_refusals()
+    );
     if u64::try_from(self.claimable()).unwrap_or(u64::MAX) < needed {
+      slates_machine::diag!("make_room: REFUSED claimable < needed");
       self.post_want(needed_bytes);
       return 0;
     }
     let before = self.capacity();
     let added =
       u64::try_from(self.grow(usize::try_from(needed).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
+    slates_machine::diag!(
+      "make_room: grew {added} of {needed}; refused_so_far {}",
+      self.source_refusals()
+    );
     if added < needed {
       // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
       // returned first), down to the capacity the arena had before.

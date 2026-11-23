@@ -204,7 +204,11 @@ mod tests {
     let pause = Duration::from_nanos(super::interval_ns());
     let begun = Instant::now();
     loop {
-      if crate::daemon::observe_first(daemon, look.clone()) {
+      let asked = look.clone();
+      let (done, seen) =
+        crate::daemon::observe_first(daemon, move |state| (asked(state), diag_state(state)));
+      println!("DIAG look at {:?}: {done} | {seen}", begun.elapsed());
+      if done {
         return true;
       }
       if begun.elapsed() > bound {
@@ -226,7 +230,8 @@ mod tests {
     let daemon = crate::daemon::audit_daemon_of(1);
     // What a start leaves to give back (the recovery memory no restart reads, gigabytes on a large host) is given back
     // first, so the first pass settles the shard rather than leave slices for a pass each heartbeat interrupts.
-    let _ = daemon.give_back_recovery_on_every_shard();
+    let gave = daemon.give_back_recovery_on_every_shard();
+    println!("DIAG give_back_recovery_on_every_shard: {gave:?}");
     let first = look_until(&daemon, interval * FIRST_SETTLE_INTERVALS, |state| {
       passes(state) > 0 && settled(state)
     });
@@ -402,6 +407,58 @@ mod tests {
     println!(
       "{LISTED_DIRECTORIES} idle directories closed {took:?} after their last use (a sweep's interval is {interval:?})"
     );
+  }
+
+  /// DIAG ONLY (diag-measurer-w-win2, never merged): the sweep's whole state, one line.
+  fn diag_state(state: &mut crate::state::ShardState) -> String {
+    let count = |state: &crate::state::ShardState, kind: &str| {
+      state.refusals.get(kind).copied().unwrap_or(0)
+    };
+    let counts = [
+      crate::daemon::TICKS_SEALING,
+      crate::daemon::TICKS_DEFERRED,
+      crate::daemon::TICKS_BUSY,
+      crate::daemon::TICKS_IDLE,
+      crate::daemon::GIVE_BACK_LEFT,
+      crate::daemon::CONTENT_PURGED,
+      crate::daemon::RECOVERY_RETURNED,
+      crate::daemon::CONTENT_PURGE_KEPT_SHORT,
+    ]
+    .map(|kind| format!("{kind}={}", count(state, kind)))
+    .join(" ");
+    let (slots_start, slots_end) = state.content_range;
+    let (log_start, log_end) = state.delta_range;
+    let recovery_left = state
+      .journal
+      .dead_ranges(
+        slots_end.saturating_sub(slots_start),
+        log_end.saturating_sub(log_start),
+      )
+      .map_or(0, |dead| {
+        dead.stale_slot.1.saturating_add(dead.log_past_tail.1)
+      });
+    let now = state.clock.monotonic_ns();
+    let at = state.idle_sweep_at.map(|at| at.saturating_sub(now));
+    let running = state.idle_sweep_running;
+    let seen = state.idle_sweep_seen;
+    let purge_seen = state.purge_seen_allocations;
+    let slice = state.give_back_rate.slice_bytes;
+    let arena = state.store.content.arena();
+    let (allocations, allocated, resident_free, deferred) = (
+      arena.allocations(),
+      arena.allocated_bytes(),
+      arena.resident_free_bytes(),
+      arena.deferred_bytes(),
+    );
+    let sweep_owed = state.store.sweep_owed;
+    let dirs_owed = state.store.base_dirs_owed.get();
+    let owes = state
+      .volumes
+      .iter_mut_all()
+      .any(|(_, slot)| slot.volume.sweep_owes());
+    format!(
+      "{counts} | armed_in {at:?} running {running} | arena allocations {allocations} allocated {allocated} seen {seen:?} purge_seen {purge_seen} resident_free {resident_free} deferred {deferred} | owes {owes} sweep_owed {sweep_owed} dirs_owed {dirs_owed} | slice {slice} | recovery_left {recovery_left}"
+    )
   }
 
   /// What the shard's sweep has done and owes, for a failure's message.

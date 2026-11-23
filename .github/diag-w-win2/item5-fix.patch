@@ -1,0 +1,92 @@
+--- a/crates/ipc/src/rendezvous.rs
++++ b/crates/ipc/src/rendezvous.rs
+@@ -4212,10 +4212,16 @@
+     /// stamp. No live anchor holds the rendezvous.
+     #[cfg(windows)]
+     WithDaemon(crate::exit_watch::ExitWatch),
+-    /// When the anchor that holds the rendezvous exits (Windows, A-468), opened by its mark as the daemon's is: its
+-    /// daemon may restart any number of times meanwhile, and the next one answers the claim (A-114).
++    /// When the anchor that holds the rendezvous goes (Windows, A-468): its process exits, opened by its mark as the
++    /// daemon's is, or it lets go inside its live process, which clears its mark from the header. Its daemon may restart
++    /// any number of times meanwhile, and the next one answers the claim (A-114).
+     #[cfg(windows)]
+-    WithAnchor(crate::exit_watch::ExitWatch),
++    WithAnchor {
++      /// The anchor's process.
++      watch: crate::exit_watch::ExitWatch,
++      /// The anchor's mark as the claim read it: while the header holds it, the anchor holds the rendezvous.
++      mark: ProcessMark,
++    },
+   }
+ 
+   /// How a claim on macOS ends unanswered: with the rendezvous's owner, whose bootstrap name launchd takes back at its
+@@ -4236,7 +4242,10 @@
+     if let Some(anchor) = ProcessMark::anchor_of(&header) {
+       let watch = crate::exit_watch::ExitWatch::on_created(anchor.pid, anchor.created)?;
+       if !watch.exited() {
+-        return Ok(Ends::WithAnchor(watch));
++        return Ok(Ends::WithAnchor {
++          watch,
++          mark: anchor,
++        });
+       }
+     }
+     let mark = ProcessMark::daemon_of(&header).ok_or(IpcError::Layout {
+@@ -4394,10 +4403,14 @@
+           }
+         }
+         #[cfg(windows)]
+-        Ends::WithAnchor(anchor) => {
+-          if anchor.exited() {
++        Ends::WithAnchor { watch, mark } => {
++          if watch.exited() {
+             self.daemon_went(
+               "the anchor that holds the rendezvous exited before the claim was answered",
++            )
++          } else if ProcessMark::anchor_of(&marks_image(&self.object)?) != Some(*mark) {
++            self.daemon_went(
++              "the anchor that held the rendezvous let go of it before the claim was answered",
+             )
+           } else {
+             Ok(None)
+@@ -4407,7 +4420,8 @@
+     }
+ 
+     /// The claim's holder went with the claim unanswered (Windows, A-447, A-468): the daemon's process exited, or it
+-    /// stopped inside the process and took back its start stamp, or the anchor that holds the rendezvous exited. The
++    /// stopped inside the process and took back its start stamp, or the anchor that holds the rendezvous exited or let
++    /// go of it inside its process. The
+     /// claim is taken back if the daemon never took it (one that took it went mid-answer, its slot left to a successor's
+     /// stale reclaim) and reported unavailable, saying `why`.
+     #[cfg(windows)]
+@@ -4499,18 +4513,22 @@
+       }
+     }
+ 
+-    /// One wait for the answer's Event beside the holder's process (Windows). Beside the daemon's, or as long again as
+-    /// the claim has waited, when the poll reads the start stamp, which a daemon stopped inside its own process takes
+-    /// back (A-443's doubling, so the looks cost the logarithm of the wait). Beside the anchor's with no timeout: its
+-    /// daemon's restarts change nothing the claim waits on. A process already gone is read at the poll.
++    /// One wait for the answer's Event beside the holder's process (Windows), the daemon's or the anchor's, or as long
++    /// again as the claim has waited, when the poll looks at what a holder stopping inside its own process leaves: the
++    /// daemon takes back its start stamp, the anchor clears its mark (A-443's doubling, so the looks cost the logarithm
++    /// of the wait). The anchor's daemon's restarts change nothing the claim waits on. Until 2026-11-23 the wait beside
++    /// the anchor's process had no timeout, so a claim waiting there when the anchor let go inside its live process
++    /// waited until that process exited. A process already gone is read at the poll.
+     #[cfg(windows)]
+     fn wait_on_holder(&self, elapsed: u64) -> Result<(), IpcError> {
+-      let (process, timeout_ns) = match &self.ends {
+-        Ends::WithDaemon(daemon) => (daemon.handle(), Some(elapsed.max(1))),
+-        Ends::WithAnchor(anchor) => (anchor.handle(), None),
++      let process = match &self.ends {
++        Ends::WithDaemon(daemon) => daemon.handle(),
++        Ends::WithAnchor { watch, .. } => watch.handle(),
+       };
+       if let Some(process) = process {
+-        self.ready_event.wait_or_exit(process, timeout_ns)?;
++        self
++          .ready_event
++          .wait_or_exit(process, Some(elapsed.max(1)))?;
+       }
+       Ok(())
+     }

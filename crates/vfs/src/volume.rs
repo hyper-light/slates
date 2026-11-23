@@ -287,11 +287,21 @@ impl Store {
     &mut self,
     bytes: u64,
   ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
-    self.make_room(bytes);
-    self
-      .budget
-      .reserve(bytes)
-      .map_err(|e| self.with_admittable(e))
+    let grew = self.make_room(bytes);
+    let reserved = self.budget.reserve(bytes);
+    if let Err(refusal) = &reserved {
+      slates_machine::diag!(
+        "store reserve REFUSED: bytes {bytes} grew {grew} refusal {refusal:?}; capacity {} committed {} headroom {} hold {} debt {} claimable {} admittable {}",
+        self.budget.capacity(),
+        self.budget.committed(),
+        self.budget.headroom(),
+        self.budget.hold(),
+        self.budget.debt(),
+        self.content.arena().claimable(),
+        self.admittable()
+      );
+    }
+    reserved.map_err(|e| self.with_admittable(e))
   }
 
   /// Grows a dynamic charge by `bytes` against the shard budget, growing the arena from its pool first when the

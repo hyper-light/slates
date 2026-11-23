@@ -1,0 +1,198 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), main's remaining Windows reds. A diagnostics lane run only from
+# `diag-measurer-w-win2-*` branches, never main. Lines marked DIAG are this branch's instrumentation (never merged).
+# - item3: a Windows daemon's first create refused `BudgetExceeded`. On both Windows runners: the CLI's first create at
+#   once after the daemon serves, then a moment later; the Node SDK's sync suite alone, then beside its async suite as
+#   CI runs them; every DIAG line of each daemon printed (the budget at the refusal, the pool's extents and their holds).
+# - items: on both Windows runners, item 2's idle sweep tests with each look's state; item 4's spin label test red
+#   (main's file) then green; item 5's claim tests red (the fix reversed) then green; item 1's two tests green.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  item3:
+    name: item 3, the first create (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      NAPI_CLI_VERSION: 3.7.2
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: The machine's memory and commit
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_ComputerSystem | Format-List NumberOfLogicalProcessors,TotalPhysicalMemory
+          Get-CimInstance Win32_OperatingSystem | Format-List TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize,FreeVirtualMemory,SizeStoredInPagingFiles,FreeSpaceInPagingFiles
+          Get-CimInstance Win32_PageFileUsage | Format-List Name,AllocatedBaseSize,CurrentUsage,PeakUsage
+      - name: The daemon
+        run: cargo build -p slates-cli 2>&1 | grep -v '^\s*Compiling '
+      - name: "Item 3: the CLI's first create at once after the daemon serves, then a moment later"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          set +e -u
+          slates="$PWD/target/debug/slates.exe"
+          inst="diag3-cli-$$"
+          log="$RUNNER_TEMP/anchor-$inst.log"
+          ms() { echo $(( $(date +%s%N) / 1000000 )); }
+          started=$(ms)
+          "$slates" --instance "$inst" anchor --quick --shards 1 > /dev/null 2> "$log" &
+          anchor=$!
+          for i in $(seq 1 600); do grep -q "serving on" "$log" && break; sleep 0.1; done
+          t0=$(ms)
+          echo "serving $(( t0 - started )) ms after the anchor's start"
+          "$slates" --instance "$inst" bootstrap root; echo "bootstrap exit $? at $(( $(ms) - t0 )) ms"
+          "$slates" --instance "$inst" volume create first --bounded 8MiB; echo "create 1 exit $? at $(( $(ms) - t0 )) ms"
+          "$slates" --instance "$inst" volume create second --bounded 8MiB; echo "create 2 exit $? at $(( $(ms) - t0 )) ms"
+          sleep 5
+          "$slates" --instance "$inst" volume create third --bounded 8MiB; echo "create 3 exit $? at $(( $(ms) - t0 )) ms"
+          "$slates" --instance "$inst" status --memory; echo "status exit $?"
+          winpid=$(cat "/proc/$anchor/winpid" 2>/dev/null || echo "")
+          if [ -n "$winpid" ]; then taskkill //T //F //PID "$winpid" > /dev/null 2>&1 || true; fi
+          wait "$anchor" 2>/dev/null || true
+          echo "=== the anchor's and daemon's DIAG lines"
+          grep 'DIAG ' "$log" | cut -c1-600 | head -300
+          echo "=== the rest of their stderr, derived values left out"
+          grep -v 'DIAG \|slates daemon: [a-z_0-9]* = ' "$log" | cut -c1-400 | head -120
+          echo "=== the derived values naming memory, budget, capacity, commit, pool, extent, reserve or pressure"
+          grep 'slates daemon: [a-z_0-9]* = ' "$log" | grep -iE 'memory|budget|capacity|commit|pool|extent|reserve|pressure|content' | cut -c1-500 | head -60
+      - name: "Item 3: the Node SDK's addon"
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+          (cd crates/sdk-node && npm run build) 2>&1 | grep -v '^\s*Compiling '
+      - name: "Item 3: the Node sync suite alone, each daemon's DIAG lines"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: |
+          set +e -u
+          root=$(pwd -W 2>/dev/null || pwd)
+          daemon="$root/target/debug/slates.exe"
+          addon=$(ls crates/sdk-node/slates.*.node)
+          diag="$(cygpath -m "$RUNNER_TEMP")/node-sync.diag"
+          SLATES_DIAG_LOG="$diag" SLATES_NODE_ADDON="$root/$addon" SLATES_DAEMON="$daemon" \
+            node --test crates/sdk-node/tests/sdk.test.mjs
+          echo "sync suite alone: exit $?"
+          echo "=== DIAG lines"
+          cut -c1-600 "$diag" 2>/dev/null | head -400
+      - name: "Item 3: both Node suites as CI runs them, each daemon's DIAG lines"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: |
+          set +e -u
+          root=$(pwd -W 2>/dev/null || pwd)
+          daemon="$root/target/debug/slates.exe"
+          addon=$(ls crates/sdk-node/slates.*.node)
+          diag="$(cygpath -m "$RUNNER_TEMP")/node-both.diag"
+          SLATES_DIAG_LOG="$diag" SLATES_NODE_ADDON="$root/$addon" SLATES_DAEMON="$daemon" \
+            node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
+          echo "both suites: exit $?"
+          echo "=== DIAG lines"
+          cut -c1-600 "$diag" 2>/dev/null | head -400
+
+  items:
+    name: items 1, 2, 4 and 5 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Item 4, red: the spin label test as main has it"
+        run: |
+          git show HEAD~1:crates/rt/tests/spin_label.rs > crates/rt/tests/spin_label.rs
+          set +e
+          cargo test -p slates-rt --test spin_label 2>&1 | grep -v '^\s*Compiling '
+          code=${PIPESTATUS[0]}
+          set -e
+          git show HEAD:crates/rt/tests/spin_label.rs > crates/rt/tests/spin_label.rs
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: main's spin label test passed on Windows"; exit 1; fi
+      - name: "Item 4, green: the spin label test compared with file!()"
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-rt --test spin_label
+      - name: "Item 5, red: the claim tests with the fix reversed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          git apply -R .github/diag-w-win2/item5-fix.patch
+          set +e
+          cargo test -p slates-ipc --lib -- rendezvous::platform::tests::a_claim_under_an_anchor_ends_at_the_anchors_going rendezvous::platform::tests::a_waiting_claim_under_an_anchor_ends_at_its_going_inside_a_live_process --nocapture 2>&1 | grep -v '^\s*Compiling '
+          code=${PIPESTATUS[0]}
+          set -e
+          git apply .github/diag-w-win2/item5-fix.patch
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the claim tests passed without the fix"; exit 1; fi
+      - name: "Item 5, green: the claim tests and the rest of the rendezvous's"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: 'cargo test -p slates-ipc --lib -- rendezvous:: --nocapture'
+      - name: "Item 1, green: the hg push and the repository policy tests"
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-server --lib -- --test-threads=1 repository::hg_push::tests::a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits repository::tests::a_repositorys_policy_is_read_and_set_by_its_owner_alone
+      - name: "Item 2: the idle sweep's two tests, each look's state"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 --nocapture idle_sweep::tests::an_idle_shard_runs_no_sweep_pass idle_sweep::tests::a_write_on_a_settled_shard_arms_a_pass 2>&1 | grep -v 'descriptor_limit = \|the watchdog beats every'
+          echo "idle sweep tests exit ${PIPESTATUS[0]}"

@@ -134,6 +134,18 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
       "slates-server: {refused} content extents were not made; their ids stay unready until a release makes them"
     );
   }
+  let made = slots
+    .iter()
+    .filter(|slot| slot.handle.load(Ordering::Acquire) != 0)
+    .count();
+  let held = slots
+    .iter()
+    .filter(|slot| slot.held.load(Ordering::Acquire))
+    .count();
+  slates_machine::diag!(
+    "extents install: {} slots, {made} made ({held} handed back held), {refused} refused",
+    slots.len()
+  );
   let _ = SLOTS.set(slots);
 }
 
@@ -210,6 +222,7 @@ pub(crate) fn take(id: u16) -> Option<OwnedHandle> {
 
 /// Has the anchor hold every made, unheld extent of `partition`'s slice: a task of the shard's, at its start.
 pub(crate) async fn hold_slice(config: DaemonConfig, partition: u16) {
+  slates_machine::diag!("extents hold_slice: partition {partition} begins");
   let first = usize::from(partition).saturating_mul(POOL_EXTENTS_PER_PARTITION);
   for index in first..first.saturating_add(POOL_EXTENTS_PER_PARTITION) {
     let Ok(id) = u16::try_from(index) else {
@@ -220,6 +233,7 @@ pub(crate) async fn hold_slice(config: DaemonConfig, partition: u16) {
     }
     hold(id).await;
   }
+  slates_machine::diag!("extents hold_slice: partition {partition} ends");
 }
 
 /// Lets the anchor's duplicate of released extent `id` go, which closes its section and returns its commit, then makes
@@ -265,8 +279,12 @@ async fn hold(id: u16) {
     return;
   }
   match crate::anchor_hold::hold_extent(hold_id(id), value, record(id)).await {
-    Ok(()) => slot.held.store(true, Ordering::Release),
-    Err(_) => {
+    Ok(()) => {
+      slates_machine::diag!("extents hold: extent {id} held");
+      slot.held.store(true, Ordering::Release);
+    }
+    Err(refusal) => {
+      slates_machine::diag!("extents hold: extent {id} HOLD REFUSED: {refusal:?}");
       let _ = crate::state::with_state_counted(|s| s.count(EXTENT_REFUSED, 1));
     }
   }
