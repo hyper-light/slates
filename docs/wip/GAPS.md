@@ -836,10 +836,9 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: the hidden view under a non-publishing repository (`PUBLISHING` is const true, so a pushed draft lands
->   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
->   `obsolete` pushkey namespace, and the reply's `N new obsolescence markers` output. The kept heads for a view with
->   left-out changesets: BUILT (piece 2, below).
+>   Still owed: decision 3's rewrite admission and the `obsolete` pushkey namespace. BUILT since: the reply's `N new
+>   obsolescence markers` output; the kept heads for a view with left-out changesets (piece 2, below); a
+>   non-publishing repository and its hidden view (piece 3, below).
 >   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
 >   import, an old client's push) refused every clone that asked for markers, the format 1 encoder unable to write it
 >   (`markers_held_in_format_0_are_sent_in_format_1`, red: `Unencodable`). `marker_tuple` makes 7.2's in-memory tuple of
@@ -893,6 +892,15 @@
 >   phase, prunes and rewrites, publishing or not: red, the kept heads answered none) and
 >   `a_long_views_kept_heads_read_back_past_sealed_endings` (9,000 changesets, the first not public inside the second
 >   sealed chunk). The cost: about 8 bytes a changeset held, measured nowhere yet (main's).
+>   A non-publishing repository BUILT (2026-11-23, w-hg, evolution piece 3; main's ruling): its policy's
+>   `hg_publishing` (7.2's `phases.publish`; appended to `RepositoryPolicy`, `SetRepositoryPolicy` and its reply, true by
+>   default as 7.2's is, refused for any tool but Mercurial as `DatabaseRefusal::PolicyPublishingNotMercurial`, set by
+>   `slates repository policy NAME --hg-publish false`). The register's copy carries it and the push reads the view's
+>   (`Repository::publishing`), the const gone. `hg_evolution`'s
+>   `a_non_publishing_repository_keeps_drafts_and_hides_a_rewritten_one` (real hg): a pushed draft amended and pushed
+>   again, the clone holding both as drafts, the pushed one the amend rewrote hidden, its one marker served (red under
+>   the const: "abort: cannot amend public changesets"). Still owed: decision 3's rewrite admission, the `obsolete`
+>   pushkey namespace.
 >   An append's walk through other branches is one append's work: counted (`BranchHeads::longest_walk`, the status
 >   counter `vcs.hg.branch_heads_longest_walk`, read from each index a landing puts in place) and held by
 >   `a_branch_taken_again_after_a_long_line_counts_its_walk` (a `stable` revision on a 400-revision `default` line:

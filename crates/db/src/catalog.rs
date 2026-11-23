@@ -1528,7 +1528,7 @@ pub struct RepositoryRecord {
 /// repository's own rule decides everything (its owner holds every right, A-575) and no hook runs. Bounded by the
 /// partition's merge byte budget, which its rules', hooks', hooks-env sections' and trusted signers' encoded bytes are
 /// charged to, and by one log record, since it is set whole.
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryPolicy {
   /// How many times it has been set: a setting names the version after the one its setter read, so one made from a
   /// stale read is refused and changes nothing.
@@ -1545,6 +1545,25 @@ pub struct RepositoryPolicy {
   /// a commit a rule requires signed verifies under one of them (A-321's verifier, under git's namespace). Kept only as
   /// the server's verb accepted them, and only for a git repository. Appended.
   pub signers: Vec<Vec<u8>>,
+  /// Whether a Mercurial repository publishes (7.2's `phases.publish`, §4.17.3 decision 3): every changeset a push
+  /// brings is public when its version commits; else it stays draft until a `phase-heads` part, a `phases` pushkey or
+  /// a publishing push moves it, and its view hides what markers obsolete. True by default, as 7.2's is; false only
+  /// for a Mercurial repository. Appended.
+  pub hg_publishing: bool,
+}
+
+impl Default for RepositoryPolicy {
+  /// The policy at creation: no rule, hook, hooks-env section or signer, and publishing, as 7.2's default is.
+  fn default() -> Self {
+    Self {
+      version: 0,
+      rules: Vec::new(),
+      hooks: Vec::new(),
+      hooks_env: Vec::new(),
+      signers: Vec::new(),
+      hg_publishing: true,
+    }
+  }
 }
 
 /// What a policy rule's pattern names (§4.17.1; A-597): the names its repository's tool has, each in its tool's form.

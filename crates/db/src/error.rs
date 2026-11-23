@@ -176,6 +176,9 @@ pub enum DbError {
     /// The section's index among the policy's hooks-env sections.
     index: u32,
   },
+  /// A repository policy that does not publish for a repository that is not Mercurial's (`phases.publish` is
+  /// Mercurial's alone). Never entered in the log.
+  PolicyPublishingNotMercurial,
 }
 
 /// The rule a review record's change broke (§4.17.1 "Works over works", shared piece 6; A-596; `crate::review`).
@@ -299,6 +302,9 @@ impl fmt::Display for DbError {
           f,
           "a repository policy's hooks-env section {index} is malformed"
         )
+      }
+      Self::PolicyPublishingNotMercurial => {
+        write!(f, "only a Mercurial repository's policy may not publish")
       }
     }
   }
