@@ -4359,6 +4359,11 @@
 > stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
 > `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
 > `SLATES_SVN_USE_VERBS=svnsync` over `http`).
+> **(B)'s one difference was the harness's (w-interop, 2026-11-23):** main's round failed on the mirrors' `UUID:` line
+> alone. Stock `svnsync` never sets a mirror's UUID (`svnsync.c` `do_initialize`), so each `svnadmin create` mirror
+> held a random one. The HTTP edge reports the imported dump's UUID (OPTIONS and PROPFIND, checked). `mirror_dump_of`
+> now gives each mirror `MIRROR_UUID`, as `svn-matrix.sh` does
+> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). Owed: main's rerun of (B).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
