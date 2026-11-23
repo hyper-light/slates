@@ -189,14 +189,14 @@ fn apart(ranges: &[(u64, u64)]) -> bool {
     })
 }
 
-/// The run a register record names, where it is an import's or a push's run reference ([`RUN_VERSION`], a push's
-/// [`RUNS_VERSION`]); `None` for any other record, ranges not ascending and apart, and a reference that does not read
-/// whole.
+/// The run a register record names, where it is an import's run reference ([`RUN_VERSION`]) or a push's
+/// ([`RUNS_VERSION`]); `None` for any other record (a push's [`RUN_VERSION`] among them: no push writes one), ranges
+/// not ascending and apart, and a reference that does not read whole.
 pub fn run_of(bytes: &[u8]) -> Option<Run> {
   let mut reader = Reader { rest: bytes };
   let (version, source, room) = head(&mut reader).ok()?;
   let ranges = match (version, source) {
-    (RUN_VERSION, Source::Import | Source::Push) => {
+    (RUN_VERSION, Source::Import) => {
       vec![(reader.long().ok()?, reader.long().ok()?)]
     }
     (RUNS_VERSION, Source::Push) => {

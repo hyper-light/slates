@@ -307,7 +307,12 @@
 > (w-interop, 2026-11-22, main's (b1); `docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md`):**
 > the row's resident added the large path's live mappings' whole spans; `heap` is now the system allocator alone and
 > `large` the mapped blocks, resident by their pages in RAM. The ~900 MB never touched is those spans (main's r41: 12
-> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2), open. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2). **(b2) FIXED (w-interop,
+> 2026-11-22; `docs/bugs/2026-11-22-each-partition-reserved-a-lease-timer-for-every-volume-it-could-hold.md`):** two of
+> the 12 were the partitions' lease-expiry wheels, 595 MiB each, a slot for every volume a partition could hold; the
+> wheel now grows with its leases (`Wheel::growing`), and an idle two-shard daemon's `large` row fell from 1,298,595,840
+> to 12,353,536 bytes reserved. The rest (the runtime's wheels, 2 MiB each; 1 MiB mark sets and control channels) are
+> fixed or deliberately preallocated sizes. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
 > read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
 > shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
 > arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
@@ -632,6 +637,19 @@
 >   `a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`,
 >   `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`, and the crash oracle killed with an unnamed run's rows
 >   present (`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`).
+> - A landed push's file texts let go BUILT (2026-11-22, w-hg; main 01a20182's order of 14:00, CI 45065911852: 4.7 GB
+>   of arena held on the repository's shard after Mercurial's history landed, the content store keeping every text).
+>   Each segment carries its file revisions' content identities (`PushSegment::contents`, counted in the bound); once
+>   it is durable on the changeset store its windows are let go (`hg_run::let_go_landed`, `let_go_object_landed` with
+>   `vcs_store::landed_pin`, as a landed git pack's), and once more when the entry commits, since the push's works
+>   bring back the texts they read between. Entries stay; a read brings a text back from the store, the works' own
+>   included (`brought_back`, now within a lent budget and the chunk store's lend: its bring-back was refused
+>   `OverBudget { room: 0 }` outside them). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
+>   `a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land` (120 files of 8 KiB: every window let go
+>   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
+>   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
+>   share of the texts stays, and on a one-shard node all of them; a home that brings an away window back, or a pin of
+>   only what homes keep, would let them go.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
