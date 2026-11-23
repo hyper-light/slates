@@ -10925,6 +10925,11 @@ stays in the overlay.
 > presentation past the bound is refused with nothing allocated or recorded. Record:
 > `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`.
 >
+> **Corrected 2026-11-23 (A-874).** A presentation is no longer abandoned with its client: it lives until it is
+> landed, superseded (A-779) or its volume goes. "Abandoned with its client" broke R10's own three-step flow (present,
+> a person's grant, land under it, each its own CLI process) once a client was reclaimed at its hang-up (076746072);
+> the bound is unchanged.
+>
 > **Reconciled 2026-11-06 (VFS plan Step 15).** The shard-step percentile lane is built (b111244e; AUD-29-25 closed).
 
 > **Status (2026-09-29, A-45, AUD-29-05).** A landing advances only entries that reached the durability
@@ -19326,6 +19331,8 @@ state change; `config.rs`: `landings_awaiting_per_shard`; `reap.rs`: abandonment
   audit log and the id counter unchanged.
 - What it does not change: the grant's own lifecycle (its states, its term) and the grant verb; durable
   presentation records written before this change; the unpruned grant table (its own gap).
+- **Corrected by A-874 (2026-11-23):** the rule "retiring a client abandons its presentations on every owner shard" is
+  withdrawn; a presentation outlives its client, and goes with its volume instead.
 
 ### A-47 — One host target has one landing lease, owned by the control partition and fenced by its term (2026-09-29)
 Applied in the same change to: §4.15 (the data model, "Ownership facts", step 4, the failure matrix, its
@@ -61494,3 +61501,25 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/{copy,branch,copy_checkpoint}`,
   `identity` docs, `tests/origin.rs`, `tests/identity.golden`), `crates/anchor` (`layout`, `tests/anchor.rs`),
   `crates/vcs` (`ContentStore::object_id`'s doc), GAPS, amendments.tsv.
+
+### A-874 — A landing's presentation outlives the client that presented it, and goes with its volume (2026-11-23, w-interop; main 01a20182's ruling of 2026-11-23; corrects A-46 and AUD-29-07; A-779)
+Applied in the same change to: §4.15 (step 3's status), `slates-server` (`reap.rs`: no abandonment at a client's
+retirement; `landing.rs`: `abandon_presentations` removed, `forget_presentations_of`, `Awaiting`'s docs; `verbs.rs`'s
+`destroy`; `landing_entries.rs` and `session_log.rs`' docs), `slates-api` (`Missing::Presentation`'s words), the tests
+(`crates/client/tests/presentation.rs` replaced; `crates/server/tests/presentations.rs`), and GAPS.
+- Why: R10's documented flow is three processes: `slates land` presents and exits, a person runs `slates grant
+  LANDING MANIFEST`, and `slates land --grant` lands. A-46 abandoned a client's presentations at its retirement, and
+  since 076746072 (2026-11-18) a client is retired at its hang-up, the moment its process exits. So the grant always
+  found the presentation gone ("not found: presentation 1 (replaced, landed, or its client went away)"): CI's
+  hermeticity lane on Linux and macOS, and the CLI's own `a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target`
+  (`docs/bugs/2026-11-23-a-landings-presentation-went-with-its-presenting-client.md`). Before 076746072 a dead CLI
+  client lingered until a lapse, which hid it.
+- The rule: a presentation describes a volume's changes against a target, not the process that asked. It lives until
+  it is landed (consumed, A-46), superseded by any client's presentation of the same volume and target (A-779), or its
+  volume is destroyed; nothing time-based ends it (an expiry could drop it while a person reviews it).
+- The bound is unchanged (banned item 8): one presentation per volume and target, and `LandingsAwaitingFull`, typed,
+  at the derived `landings_awaiting_per_shard`.
+- Evidence: `a_presentation_outlives_the_process_that_presented_it` (a real presenter process exits and is reaped,
+  then another client grants and lands; refused `NotFound` before), `a_presentation_goes_with_its_volume` (one
+  awaiting after a destroy before, none after), `another_clients_presentation_still_replaces_and_the_bound_still_refuses`,
+  and the CLI's session-grant test, red before and green after.
