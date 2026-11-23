@@ -505,7 +505,7 @@ impl Encoding {
     let window = to_u64(store.window()).max(1);
     if !self
       .stopped_at
-      .insert((waited.pack, waited.offset / window))
+      .insert((waited.pack, waited.offset.checked_div(window).unwrap_or(0)))
     {
       return false;
     }
