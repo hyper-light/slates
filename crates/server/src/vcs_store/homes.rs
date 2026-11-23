@@ -847,11 +847,14 @@ pub(crate) const LANDED_BROUGHT_BACK: &str = "vcs_store.homes.landed_brought_bac
 /// it holds. True where it is held here whole after (brought back, or never let go).
 pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
   let (disk, (away, revisions)) = crate::state::with_state(|state| {
+    // Each physical window once: an object may hold the same window at several offsets (two identical windows are one
+    // entry), and the first bring-back puts it back for all of them (codex-review, 2026-11-22).
+    let mut seen = std::collections::BTreeSet::new();
     let mut away: Vec<(ContentId, LandedAt, u64)> = Vec::new();
     let mut revisions: Vec<HgLanded> = Vec::new();
     if let Some(content) = state.vcs_stores.content() {
       for (window, _) in content.object_layout(&identity) {
-        if !content.is_away(&window) {
+        if !content.is_away(&window) || !seen.insert(window) {
           continue;
         }
         match landed(&window) {
@@ -884,19 +887,32 @@ pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
   }
   if let Some(disk) = disk {
     for (window, at, len) in away {
+      // One another read brought back meanwhile is back: nothing to read.
+      let still_away = crate::state::with_state(|state| {
+        state
+          .vcs_stores
+          .content()
+          .is_some_and(|content| content.is_away(&window))
+      })
+      .unwrap_or(false);
+      if !still_away {
+        continue;
+      }
       let Some(bytes) = landed_bytes(&disk, at, len).await else {
         return false;
       };
       let back = crate::state::with_state(|state| {
-        let back = super::within_budget(state, len, |stores| {
-          stores
-            .content_mut()
-            .is_some_and(|content| content.bring_back(&window, &bytes).is_ok())
+        // Put back, or back already (another read put it back while this one read the store): either way it is held.
+        let (put, held) = super::within_budget(state, len, |stores| {
+          stores.content_mut().map_or((false, false), |content| {
+            let put = content.bring_back(&window, &bytes).is_ok();
+            (put, put || !content.is_away(&window))
+          })
         });
-        if back {
+        if put {
           state.count(LANDED_BROUGHT_BACK, 1);
         }
-        back
+        held
       })
       .unwrap_or(false);
       if !back {
