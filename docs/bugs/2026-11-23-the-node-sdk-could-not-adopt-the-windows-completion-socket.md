@@ -40,8 +40,11 @@ a selector) were not affected, and nothing was written wrongly.
   three Windows tests, one with a reader from another process (the test binary run again).
 - `crates/ipc/src/stream_pipe.rs`: `fresh_name(prefix)`, `OwnerOnly`, `last_error` and `os` shared with the crate.
 - `crates/client/src/client.rs`: `enable_async_completion_pipe` on Windows.
-- `crates/sdk-node/src/lib.rs`: `completionPipe()` on Windows in place of `completionFd()`. `async.mjs` opens the
-  pipe with `net.connect` on Windows. The two suites name the Windows method.
+- `crates/sdk-node/src/lib.rs`: `completionPipe()` beside `completionFd()`, each on every platform and refusing where
+  its signal is not the platform's. `async.mjs` opens the pipe with `net.connect` on Windows. The suites name both.
+  A first version compiled `completion_fd` out on Windows, and the addon's Windows build failed `cannot find value
+  __napi__completion_fd` (diag run 45226402571). napi-rs registers a `#[napi] impl`'s methods by name whatever their
+  `cfg`; before A-875 the two cfg'd arms shared that one name.
 - `unsafe-budget.toml` (`slates-ipc` 169 → 179), `docs/wip/SLATES_DESIGN.md` (A-875), GAPS.
 
 ## Evidence

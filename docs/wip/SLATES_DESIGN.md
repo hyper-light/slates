@@ -61611,8 +61611,9 @@ Applied in the same change to: Phase 5's TypeScript task, GAPS ("The Node SDK su
 (`slates-ipc` 169 → 179), `crates/ipc` (`completion_pipe.rs`, new; `completion.rs`, the Windows bridge's `Signal`,
 `start_pipe`, `run_pipe`; `endpoint.rs`, `enable_async_completion_pipe` in place of the Windows
 `enable_async_completion_dup`, and two tests; `stream_pipe.rs`, the name, descriptor and error helpers shared;
-`lib.rs`), `crates/client` (`enable_async_completion_pipe`), `crates/sdk-node` (`src/lib.rs` `completionPipe` on
-Windows in place of `completionFd`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.test.mjs`), and
+`lib.rs`), `crates/client` (`enable_async_completion_pipe`), `crates/sdk-node` (`src/lib.rs` `completionPipe` beside
+`completionFd`, each on every platform and refusing off its own, since napi-rs registers a `#[napi] impl`'s methods by
+name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.test.mjs`), and
 `docs/bugs/2026-11-23-the-node-sdk-could-not-adopt-the-windows-completion-socket.md`.
 - **What failed.** CI run 45176536354, `sdk` job, both Windows legs: `async lifecycle over a live daemon` died at
   `AsyncClient.create` with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. The Windows bridge's signal
