@@ -34187,6 +34187,23 @@ Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (t
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.
 
+**Amended 2026-11-23 (w-fleet; `live_chaos`'s cut-off owner): the detection term times only periods whose probe was
+answered.** The member plane took every period, from its probe to the next, as a sample of the detector's pace however
+it ended. A period whose probe went unanswered ends at the probe's retransmission timer, which doubles at each expiry
+(hyper-swim's `Rto`, RFC 6298 §5.5), so on a node cut off from every peer each period was twice the last and each was
+folded in. On adacachy2 a cut-off owner's `D` rose from 2.4 s before the cut to 95.6 s 19 s into it, and the failover
+delay with it, so a reply held for its log's durability, refused at that delay from its hold (A-354, A-375), was held
+until the heal, 20.8 s, in 4 of 40 runs under CPU contention (the flow's bound: the delay before the cut and a liveness
+budget, 5.2 to 5.7 s). Where the unanswered periods were short instead, the same fault took `D` down to 0.02 s. Now the
+plane folds a period only when an answer to its own probe came, directly or through a relay
+(`MemberPlane::period_probed`, `note_period_answered`): the timer's setting is not the period, Karn's rule, which
+`RunningDuration` leaves to its caller. A member no peer answers keeps the term it measured while they did, as
+Lifeguard has it condemn no one. Applied in the same change to: `crates/cluster/src/{member_plane,failover}.rs`,
+`crates/cluster/tests/member_plane.rs`
+(`a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut`: 14.7 ms before the cut and 124.2 s after
+40 s of it on main, unchanged with the fix), GAPS, and
+`docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
+
 ### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
 Applied in the same change to:
 - §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
