@@ -1698,7 +1698,12 @@ impl ContentHold {
         requested: scratch,
         available: 0,
       })?;
-      Some(space.arena.alloc(len).map_err(|e| no_capacity(&e))?)
+      Some(
+        space
+          .arena
+          .alloc(len, slates_mem::Owner::ContentHold)
+          .map_err(|e| no_capacity(&e))?,
+      )
     } else {
       None
     };
@@ -1743,7 +1748,9 @@ impl ContentHold {
 
   /// Allocates a block for `bytes` and copies them in; `NoCapacity` when the arena has no block that fits.
   fn store_bytes(arena: &mut ChunkArena, bytes: &[u8]) -> Result<Extent, ContentRefusal> {
-    let extent = arena.alloc(bytes.len()).map_err(|e| no_capacity(&e))?;
+    let extent = arena
+      .alloc(bytes.len(), slates_mem::Owner::ContentHold)
+      .map_err(|e| no_capacity(&e))?;
     let Some(block) = arena
       .bytes_mut(extent)
       .and_then(|block| block.get_mut(..bytes.len()))
@@ -2256,7 +2263,9 @@ impl ContentHold {
         .then(|| {
           let offset = usize::try_from(block.offset).ok()?;
           let len = usize::try_from(block.block_len).ok()?;
-          arena.claim(block.region, offset, len).ok()
+          arena
+            .claim(block.region, offset, len, slates_mem::Owner::ContentHold)
+            .ok()
         })
         .flatten();
       let Some(extent) = extent else {

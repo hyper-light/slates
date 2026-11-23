@@ -38,8 +38,6 @@
 
 mod vm;
 
-#[path = "support/process_wait.rs"]
-mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 
@@ -52,7 +50,8 @@ use slates_client::{Client, Intent, VolumeId};
 use slates_guest_probe::protocol::{Command as Ask, Mount, Reply};
 use vm::{
   Anchor, Guest, MountPoint, QUIT_WAIT, created_volume, daemon_of, initramfs, kill_daemon,
-  kill_the_daemon, pause, run, start_anchor, start_anchor_with, write_at, write_whole,
+  kill_the_daemon, pause, process_wait, run, start_anchor, start_anchor_with, write_at,
+  write_whole,
 };
 
 /// Shape: the pages the guest maps; the file never grows past them, so every byte of it lies in the map.

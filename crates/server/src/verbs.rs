@@ -928,16 +928,27 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
 }
 
 /// The shard of this node that owns `volume`, a forwarded verb's: refused `HomedElsewhere` where this node has learned
-/// another home, `NotFound` where no shard of it holds the volume's partition, or by the state's refusal.
+/// another home; where no shard of it holds the volume's partition, `NotFound` from the volume's creator and a retryable
+/// `Overloaded` from any other node (the rule by authority, [`refusal_of_unheld_forward`]); or by the state's refusal.
 fn forwarded_to(volume: VolumeId, control: u16) -> Result<u16, Box<ReplyBody>> {
   if let Some(region) = forward_redirect(volume) {
     return Err(Box::new(refused(Refusal::HomedElsewhere { region })));
   }
   let owner = owner_of(volume);
-  match crate::state::try_with_state(|s| shard_of_partition(s, owner)) {
-    Ok(Some(shard)) => Ok(shard),
-    // No shard of this node holds the partition the id names: no such volume here.
-    Ok(None) => Err(Box::new(refused(Refusal::NotFound))),
+  match crate::state::try_with_state(|s| {
+    shard_of_partition(s, owner).ok_or_else(|| {
+      // No shard of this node holds the partition the id names, so it holds no record of the volume: its creator never
+      // made it, and any other node cannot say whether it exists.
+      if ObjectId(volume.bytes).creator() == s.fleet.host() {
+        Box::new(refused(Refusal::NotFound))
+      } else {
+        s.count(FORWARD_NOT_OWNER_HERE, 1);
+        Box::new(refused(Refusal::Overloaded { shard: control }))
+      }
+    })
+  }) {
+    Ok(Ok(shard)) => Ok(shard),
+    Ok(Err(refusal)) => Err(refusal),
     Err(access) => Err(Box::new(refusal_of_access(&access, control))),
   }
 }
@@ -1284,7 +1295,11 @@ async fn forward_placement(
     Ok(named) => named.unwrap_or(shard),
     Err(access) => return Err(Box::new(refusal_of_access(&access, control))),
   };
-  match call_owner(control, shard, move |s| forwarded_before_made(s, volume)).await {
+  match call_owner(control, shard, move |s| {
+    refusal_of_unheld_forward(s, volume)
+  })
+  .await
+  {
     Ok(None) => Ok((named, None)),
     Ok(Some(refusal)) => Err(Box::new(refusal)),
     Err(refusal) => Err(refusal),
@@ -1342,38 +1357,59 @@ async fn call_owner<T: Send + 'static>(
   }
 }
 
-/// A read forwarded from another node, on its volume's owner shard: refused while this node owns the volume by its own
-/// routing but has not made it yet ([`forwarded_before_made`]), else dispatched as a local read is.
+/// A read forwarded from another node, on its volume's owner shard: refused retryably where this node holds no record of
+/// the volume and is not the one that may answer for it ([`refusal_of_unheld_forward`]), else dispatched as a local read
+/// is.
 fn serve_forwarded_read(
   state: &mut ShardState,
   principal: &Principal,
   body: RequestBody,
   volume: VolumeId,
 ) -> ReplyBody {
-  forwarded_before_made(state, volume)
+  refusal_of_unheld_forward(state, volume)
     .unwrap_or_else(|| dispatch(state, FORWARDED_CLIENT, principal, body))
 }
 
 /// Format: the status count of verbs forwarded from another node to this one as `volume`'s owner by this node's routing
-/// (a takeover's successor) before it made the volume, refused `Overloaded` ([`forwarded_before_made`]).
+/// (a takeover's successor) before it made the volume, refused `Overloaded` ([`refusal_of_unheld_forward`]).
 const FORWARD_BEFORE_MADE: &str = "fleet.forward.refused.before_made";
 
-/// The refusal a verb forwarded from another node meets on `volume`'s owner shard when this node owns the volume by its
-/// own routing (a takeover's successor) but its catalog does not hold it yet: `Overloaded`, retryable, the answer a local
-/// client's verb gets here ([`owned_unmaterialized`]). Dispatched, the verb found no volume and answered `NotFound`,
-/// telling a reader its acknowledged write did not exist (the chaos nemesis at seed 6876545201569229162, ReadSafety:
-/// reads through a holder during the owner's isolation, forwarded to the successor its routing named, `NotFound` five
-/// times a run), and a forwarded write had that `NotFound` recorded as its completion. A volume this shard records
-/// unrecovered is dispatched, so its typed refusal names why (A-394).
-fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<ReplyBody> {
+/// Format: the status count of verbs forwarded from another node to this one for a volume its catalog holds no record
+/// of and its routing names another owner or none, refused `Overloaded` ([`refusal_of_unheld_forward`]).
+const FORWARD_NOT_OWNER_HERE: &str = "fleet.forward.refused.not_owner_here";
+
+/// The refusal a verb forwarded from another node meets on `volume`'s owner shard when this node's catalog holds no
+/// record of the volume (§4.8 "Lookup", the rule by authority): only the volume's owner may answer that it does not
+/// exist, so a node without the record answers only where it is that owner by the rule a local client's verb is routed
+/// by ([`owned_by_another_host`]): its creator, which no routing here sends elsewhere and which did not lose it to a
+/// successor. Dispatched there, a volume it never made or destroyed is `NotFound`. Anywhere else the verb is refused
+/// `Overloaded`, retryable and recorded nowhere, so the origin locates the owner again on the resend:
+/// - This node owns the volume by its own routing (a takeover's successor) but has not made it yet: the answer a local
+///   client's verb gets here ([`owned_unmaterialized`]), counted [`FORWARD_BEFORE_MADE`]. Dispatched, the verb found no
+///   volume and answered `NotFound`, telling a reader its acknowledged write did not exist (the chaos nemesis at seed
+///   6876545201569229162, ReadSafety: reads through a holder during the owner's isolation, forwarded to the successor
+///   its routing named, `NotFound` five times a run), and a forwarded write had that `NotFound` recorded as its
+///   completion.
+/// - Its routing names another member, or no owner while this node is not the creator (or lost the volume to a
+///   successor), counted [`FORWARD_NOT_OWNER_HERE`]: the origin's configuration and this node's disagree. Until
+///   2026-11-23 such a verb was dispatched too: at seed 8173581894251929445 an origin at configuration 7 forwarded reads
+///   to the successor its routing named, which at configuration 8 routed the volume to no owner, and answered five
+///   acknowledged writes `NotFound` (the nemesis's ReadSafety, 2026-11-23).
+///
+/// A volume this shard records unrecovered is dispatched, so its typed refusal names why (A-394).
+fn refusal_of_unheld_forward(state: &mut ShardState, volume: VolumeId) -> Option<ReplyBody> {
   let id = to_db_volume(volume);
-  if state.fleet.object_owner(ObjectId(volume.bytes)) != Some(state.fleet.host())
-    || state.db.partition().volume(id).is_some()
-    || state.unrecovered.contains_key(&id)
-  {
+  if state.db.partition().volume(id).is_some() || state.unrecovered.contains_key(&id) {
     return None;
   }
-  state.count(FORWARD_BEFORE_MADE, 1);
+  let object = ObjectId(volume.bytes);
+  let host = state.fleet.host();
+  let counter = match state.fleet.object_owner(object) {
+    Some(owner) if owner == host => FORWARD_BEFORE_MADE,
+    None if object.creator() == host && !lost_to_a_successor(state, id) => return None,
+    _ => FORWARD_NOT_OWNER_HERE,
+  };
+  state.count(counter, 1);
   Some(refused(Refusal::Overloaded { shard: state.shard }))
 }
 
@@ -1389,7 +1425,7 @@ async fn forwarded_write(
 ) -> ReplyBody {
   let forwarded = call_owner(control, shard, move |s| {
     // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-    if let Some(refusal) = made_on.and_then(|volume| forwarded_before_made(s, volume)) {
+    if let Some(refusal) = made_on.and_then(|volume| refusal_of_unheld_forward(s, volume)) {
       return (Some(refusal), None);
     }
     if let Some(up_to) = ack_up_to {
@@ -27864,6 +27900,51 @@ mod tests {
       "a volume made here is answered: {made:?}"
     );
     assert_eq!(counted, 1, "counted once");
+  }
+
+  /// The chaos nemesis at seed 8173581894251929445 (ReadSafety; §4.8 "Lookup", the rule by authority: only the node
+  /// whose routing names itself a volume's owner may answer that the volume does not exist): a verb forwarded to this
+  /// node for a volume its catalog holds no record of, while its own routing names no owner or another member, is
+  /// refused `Overloaded`, retryable, never answered `NotFound`. Do: a volume another member created and this node never
+  /// made, routed here to no owner, as a configuration that has settled or lost the volume's line routes it; serve a
+  /// forwarded status read of it as `serve_forward` does on its owner shard; route it to its creator and serve the read
+  /// again. Expect both refused `Overloaded`. Before, each was dispatched and answered `NotFound`: an origin at
+  /// configuration 7 forwarded reads to the successor its routing named, which at configuration 8 routed the volume to no
+  /// owner, and a reader was told five acknowledged writes did not exist (2026-11-23).
+  #[test]
+  fn a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably() {
+    let (unrouted, routed_elsewhere) = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let creator = slates_db::HostId(state.fleet.host().0 ^ 1);
+      let id = super::VolumeId {
+        bytes: slates_db::register::ObjectId::new(creator, 7).0,
+      };
+      let status = || super::RequestBody::Status { volume: id };
+      let unrouted = super::serve_forwarded_read(state, &principal, status(), id);
+      state
+        .fleet
+        .track_object_owner(slates_db::register::ObjectId(id.bytes), creator);
+      let routed_elsewhere = super::serve_forwarded_read(state, &principal, status(), id);
+      (unrouted, routed_elsewhere)
+    });
+    for (case, reply) in [
+      ("routed to no owner", &unrouted),
+      ("routed to its creator", &routed_elsewhere),
+    ] {
+      assert!(
+        matches!(
+          reply,
+          super::ReplyBody::Refused {
+            refusal: Refusal::Overloaded { .. }
+          }
+        ),
+        "a forwarded read of a volume neither held nor owned here, {case}, is refused retryably, never NotFound: \
+         {reply:?}"
+      );
+    }
   }
 
   /// Shape: the uid of the second principal the write-lease tests share a volume with.
