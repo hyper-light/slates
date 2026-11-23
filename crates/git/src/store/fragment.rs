@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use flate2::{Compress, Compression, FlushCompress, Status};
+use flate2::{Compress, FlushCompress, Status};
 
 use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
 use crate::object_name::{Kind, ObjectId};
@@ -149,7 +149,7 @@ enum PutStage {
   /// Deflating the data a window a step: the stream, the entry's CRC so far, the next byte to
   /// feed, and the entry's header, written with the first step.
   Deflate {
-    compress: Compress,
+    compress: super::deflaters::Deflater,
     crc: crc32fast::Hasher,
     next: usize,
     header: Vec<u8>,
@@ -212,7 +212,7 @@ impl Putting {
     let mut written = Vec::new();
     entry::write(header, self.at, &mut written).map_err(FragmentRefused::Entry)?;
     Ok(PutStage::Deflate {
-      compress: Compress::new(Compression::new(level), true),
+      compress: super::deflaters::deflater(level),
       crc: crc32fast::Hasher::new(),
       next: 0,
       header: written,
@@ -516,7 +516,7 @@ impl Encoder {
     let to = from.saturating_add(window).min(data.len());
     let last = to >= data.len();
     bytes.extend_from_slice(&deflate_more(
-      compress,
+      compress.state()?,
       data.get(from..to).unwrap_or_default(),
       last,
     )?);
@@ -651,8 +651,7 @@ fn to_u64(len: usize) -> u64 {
 
 /// `data` deflated as a zlib stream at `level`, through flate2.
 pub(crate) fn deflate(data: &[u8], level: u32) -> Result<Vec<u8>, FragmentRefused> {
-  let mut compress = Compress::new(Compression::new(level), true);
-  deflate_more(&mut compress, data, true)
+  deflate_more(super::deflaters::deflater(level).state()?, data, true)
 }
 
 /// `data` fed to `compress` whole, and what it gave out: all of it once `last`, the stream ended;

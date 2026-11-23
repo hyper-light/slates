@@ -866,6 +866,9 @@
 > the readers still synchronous are covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
 > bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git). Owed too: the git/git mirror
 > clone's stall at 183,511 bytes (main's sample), before the pack.
+> A-868 BUILT (2026-11-22, w-git; main's queue item 4): every deflate made its own zlib state, an object or a level
+> sampled (72 for a 42-object clone); now it takes its shard thread's kept state, reset and set to its level, given back
+> on drop (1 made, 71 taken again), counted `vcs_store.git_deflate.states_*`, let go idle. Owed: nothing in git's crate.
 > A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
 > itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
 > raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
