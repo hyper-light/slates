@@ -26246,7 +26246,7 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
 - **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
   left against the claimed capacity, which a publication's give-back trims to the demand (A-853): 6 of 10.5 MiB failed on
-  CI, 6 of 12.5 passed here.
+  CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
 - **One poll past the budget.** `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
   held the control shard 1,540 ms in one poll here (the daemon's near-miss line); under TSan the watchdog ended the
   library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran.
