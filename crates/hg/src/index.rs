@@ -370,6 +370,9 @@ pub struct BranchHeads {
   /// How many times they answered for a view (`crate::serve::Repository::maintained_branch_heads`): the non-vacuity
   /// count a test reads, so a fallback to the walk cannot pass silently.
   answered: core::cell::Cell<u64>,
+  /// The most revisions one append's walk through other branches read (main's order of 2026-11-23: a walk down to an
+  /// old head is one append's work, so it is counted, and sliced where it runs past a step's worth).
+  longest_walk: u64,
 }
 
 impl BranchHeads {
@@ -384,6 +387,11 @@ impl BranchHeads {
   /// How many times they answered.
   pub fn answered(&self) -> u64 {
     self.answered.get()
+  }
+
+  /// The most revisions one append's walk through other branches read, over the index's life (its forks' included).
+  pub fn longest_walk(&self) -> u64 {
+    self.longest_walk
   }
 
   /// Notes changeset `rev` on `branch` with parents `p1` and `p2` (numbers, [`NONE`] for none) appended to `index`,
@@ -413,10 +421,12 @@ impl BranchHeads {
         .copied()
         .filter(|parent| *parent >= floor)
         .collect();
+      let mut walked = 0_u64;
       while let Some(at) = reach.pop_last() {
         if at < floor {
           break;
         }
+        walked = walked.saturating_add(1);
         heads.remove(&at);
         let row = index
           .changeset(store, at)
@@ -430,8 +440,9 @@ impl BranchHeads {
           break;
         }
       }
+      self.longest_walk = self.longest_walk.max(walked);
     }
-    heads.insert(rev);
+    self.heads.entry(branch.to_vec()).or_default().insert(rev);
     Ok(())
   }
 }
@@ -482,6 +493,7 @@ impl HgIndex {
       branch_heads: BranchHeads {
         heads: self.branch_heads.heads.clone(),
         answered: core::cell::Cell::new(0),
+        longest_walk: self.branch_heads.longest_walk,
       },
     })
   }

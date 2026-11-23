@@ -1297,6 +1297,7 @@ fn replace_index(
   repository: RepositoryId,
   fork: HgIndex,
 ) -> Result<(), IndexRefused> {
+  hg_view::walks_noted(state, &fork);
   vcs_store::within_budget(state, 0, |stores| {
     let replaced = match stores.mercurial(repository) {
       Some((content, store)) => core::mem::replace(&mut store.index, fork).release(content),

@@ -133,6 +133,19 @@ impl HgStores for ServedViews {
 /// yielding at its first quantum took one step, so a stream of hg-src was about 460,000 of them. Format: a counter name
 /// in the status report.
 pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+/// Counter: the most revisions one changeset's append walked through other branches to keep its branch's heads
+/// (`slates_hg::index::BranchHeads::longest_walk`), read from each index a landing puts in place (main's order of
+/// 2026-11-23: a walk down to an old head is one append's work; sliced if it runs past a step's worth). Format: a
+/// counter name in the status report.
+pub(crate) const BRANCH_HEADS_LONGEST_WALK: &str = "vcs.hg.branch_heads_longest_walk";
+
+/// Notes the longest walk `index`'s branch heads took ([`BRANCH_HEADS_LONGEST_WALK`]), as a landing puts it in place.
+pub(crate) fn walks_noted(state: &mut crate::state::ShardState, index: &slates_hg::index::HgIndex) {
+  state.count_max(
+    BRANCH_HEADS_LONGEST_WALK,
+    index.branch_heads().longest_walk(),
+  );
+}
 
 /// Counter: the asks a fetch's streamed answer made of the node's changeset store ([`answer_store_wants`]), each a
 /// batch of rows or of chunks. Format: a counter name in the status report.

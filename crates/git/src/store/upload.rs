@@ -865,11 +865,16 @@ impl<A: Answered> Upload<A> {
       .placed
       .get(index.saturating_add(1))
       .map_or(kept.len, |after| after.offset);
-    self.send_entry(cx, kept, &mut by_entry, (index, entry, end), out)?;
+    if !self.send_entry(cx, kept, &mut by_entry, (index, entry, end), out)? {
+      // r165: its object's read met a let-go window and the turn stopped; the entry is judged again next.
+      by_entry.next = index;
+      self.counters.entries_judged = self.counters.entries_judged.saturating_sub(1);
+    }
     Ok(Some(by_entry))
   }
 
-  /// Sends a kept entry that ends at `end` in its part (module docs, **What the client can read**).
+  /// Sends a kept entry that ends at `end` in its part (module docs, **What the client can read**): whether it did; not
+  /// where an entry sent whole read its object at a let-go window and the turn stopped, nothing of it written.
   fn send_entry(
     &mut self,
     cx: &mut Context<'_>,
@@ -877,17 +882,24 @@ impl<A: Answered> Upload<A> {
     by_entry: &mut ByEntry,
     (index, entry, end): (usize, Placed, u64),
     out: &mut impl Out,
-  ) -> Result<(), StoreRefused> {
+  ) -> Result<bool, StoreRefused> {
     let (header, kept_header) = read_header(cx.store, kept, entry.offset, self.format)?;
-    by_entry.moved.push((index, self.at));
-    self.entries = self.entries.saturating_add(1);
     let Some(representation) = self.readable(cx, kept, by_entry, &entry, header.representation)?
     else {
-      self.counters.made_whole = self.counters.made_whole.saturating_add(1);
       let found = cx.repository.stored_at(cx.store, entry.position)?;
-      self.pending = Some(self.send_whole(cx, found, out)?);
-      return Ok(());
+      // Its place noted before it is sent, as for every entry, and given back where it stops.
+      let at = self.at;
+      let Some(pending) = self.send_whole(cx, found, out)? else {
+        return Ok(false);
+      };
+      by_entry.moved.push((index, at));
+      self.entries = self.entries.saturating_add(1);
+      self.counters.made_whole = self.counters.made_whole.saturating_add(1);
+      self.pending = Some(pending);
+      return Ok(true);
     };
+    by_entry.moved.push((index, self.at));
+    self.entries = self.entries.saturating_add(1);
     let mut written = Vec::new();
     let header = Header {
       representation,
@@ -906,7 +918,7 @@ impl<A: Answered> Upload<A> {
       from: entry.offset.saturating_add(to_u64(kept_header.len())),
       to: end,
     });
-    Ok(())
+    Ok(true)
   }
 
   /// How the client reads a kept entry, kept as `kept_as`; `None` when it must be sent whole.
@@ -977,7 +989,7 @@ impl<A: Answered> Upload<A> {
     cx: &mut Context<'_>,
     (id, row, stored): (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
-  ) -> Result<Pending, StoreRefused> {
+  ) -> Result<Option<Pending>, StoreRefused> {
     let mut written = Vec::new();
     let header = Header {
       representation: Representation::Whole(row.kind),
@@ -992,11 +1004,11 @@ impl<A: Answered> Upload<A> {
         Deflated::Content(content),
       ),
       StoredAt::InPack(_) => {
-        let bytes = cx
-          .repository
-          .read_stored(cx.store, &stored, row.len)
-          .ok_or(StoreRefused::Unreadable { id })?
-          .into_owned();
+        // Nothing of it written yet: a stop takes it again whole.
+        let Some(bytes) = self.read_or_stop(cx, &stored, (id, row.len))? else {
+          return Ok(None);
+        };
+        let bytes = bytes.into_owned();
         let first = bytes.get(..cx.store.window()).unwrap_or(&bytes).to_vec();
         (Cow::Owned(first), Deflated::Read(bytes))
       }
@@ -1009,12 +1021,12 @@ impl<A: Answered> Upload<A> {
     };
     let level = fragment::level(row.kind, &first, &mut learning).map_err(StoreRefused::Encoding)?;
     self.emit(&written, out);
-    Ok(Pending::Deflate(Deflating {
+    Ok(Some(Pending::Deflate(Deflating {
       from,
       len: row.len,
       next: 0,
       compress: super::deflaters::deflater(level),
-    }))
+    })))
   }
 
   /// One unit of what is owed: a window of kept bytes copied, a window of an object or a delta deflated, or a unit of
@@ -1228,6 +1240,46 @@ impl<A: Answered> Upload<A> {
     true
   }
 
+  /// A search's next read of the object `(id, len, stored)` into `bytes` ([`read_window`]): one lying in its pack read
+  /// whole at once, or, where that read met a let-go window, the turn stopped and nothing read, so the search reads it
+  /// again next turn (r165); whether a read is still due.
+  fn read_window(
+    &mut self,
+    cx: &Context<'_>,
+    (id, len, stored): (ObjectId, u64, StoredAt),
+    bytes: &mut Vec<u8>,
+  ) -> Result<bool, StoreRefused> {
+    if matches!(stored, StoredAt::InPack(_)) && to_u64(bytes.len()) < len {
+      if let Some(read) = self.read_or_stop(cx, &stored, (id, len))? {
+        *bytes = read.into_owned();
+      }
+      return Ok(true);
+    }
+    read_window(cx, (id, len, stored), bytes)
+  }
+
+  /// `stored`'s `len` bytes, the object `id`, read where it lies; none where the read met a let-go window and the turn
+  /// stopped at it ([`Upload::stop_at`]), so the unit reading it is taken again once it is brought back (main 01a20182's
+  /// r165: git/git's mirror clone after the push's let-go refused `Unreadable` 16,270,345 bytes in, an object read to be
+  /// encoded afresh where only a reused entry's read stopped). Refused where the read met no let-go window, or the same
+  /// one again with nothing done since.
+  fn read_or_stop<'s>(
+    &mut self,
+    cx: &Context<'s>,
+    stored: &StoredAt,
+    (id, len): (ObjectId, u64),
+  ) -> Result<Option<Cow<'s, [u8]>>, StoreRefused> {
+    // A note an earlier read left is not this read's: the window stopped at is the one this read met.
+    let _ = cx.repository.waiting();
+    if let Some(bytes) = cx.repository.read_stored(cx.store, stored, len) {
+      return Ok(Some(bytes));
+    }
+    match cx.repository.waiting() {
+      Some(waited) if self.stop_at(cx.store, waited) => Ok(None),
+      _ => Err(StoreRefused::Unreadable { id }),
+    }
+  }
+
   /// Whether a unit stopped at a let-go window ([`Upload::waiting`]) not yet taken.
   fn is_waiting(&self) -> bool {
     let waiting = self.waiting.take();
@@ -1299,6 +1351,17 @@ impl<A: Answered> Upload<A> {
     })
   }
 
+  /// The loose stage after the object at `position`, taken at `from` with `next` after it, stopped at a let-go window
+  /// (A-864 piece 2; r165): nothing of it written or kept, it is taken again next, its charge kept for it.
+  fn retaken(&mut self, position: u64, (from, next): (u64, Stage)) -> Stage {
+    self.loose_at.remove(&position);
+    self.prepaid.insert(position);
+    if matches!(next, Stage::Loose { from: after } if after == from) {
+      self.ahead.push(position);
+    }
+    Stage::Loose { from }
+  }
+
   /// One object no part covered (module docs, **What it sends** 3): encoded with the fragments' encoder when it is a
   /// window long at most; past a window, searched against the earlier ones past a window when the request's admission
   /// holds the search, and sent whole otherwise (`loose_large`).
@@ -1348,28 +1411,24 @@ impl<A: Answered> Upload<A> {
         self.ahead.push(base);
         return Ok(Stage::Loose { from });
       }
-      Reuse::Stopped => {
-        // A-864 piece 2: its entry's read met a let-go window; nothing of it written or kept, it is taken again next, its
-        // charge kept for it.
-        self.loose_at.remove(&position);
-        self.prepaid.insert(position);
-        if matches!(next, Stage::Loose { from: after } if after == from) {
-          self.ahead.push(position);
-        }
-        return Ok(Stage::Loose { from });
-      }
+      // A-864 piece 2: its entry's read met a let-go window.
+      Reuse::Stopped => return Ok(self.retaken(position, (from, next))),
       Reuse::Encode => {}
     }
-    self.entries = self.entries.saturating_add(1);
     if row.len > to_u64(cx.store.window()) {
-      self.pending = Some(self.loose_large(cx, (id, row, stored), out)?);
+      let Some(pending) = self.loose_large(cx, (id, row, stored), out)? else {
+        return Ok(self.retaken(position, (from, next)));
+      };
+      self.entries = self.entries.saturating_add(1);
+      self.pending = Some(pending);
       return Ok(next);
     }
-    let bytes = cx
-      .repository
-      .read_stored(cx.store, &stored, row.len)
-      .ok_or(StoreRefused::Unreadable { id })?
-      .into_owned();
+    // r165: an object encoded afresh is read where it lies; a let-go window stops the turn, as a reused entry's does.
+    let Some(bytes) = self.read_or_stop(cx, &stored, (id, row.len))? else {
+      return Ok(self.retaken(position, (from, next)));
+    };
+    self.entries = self.entries.saturating_add(1);
+    let bytes = bytes.into_owned();
     let object = ToEncode {
       id,
       position,
@@ -1670,14 +1729,14 @@ impl<A: Answered> Upload<A> {
     cx: &mut Context<'_>,
     target: (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
-  ) -> Result<Pending, StoreRefused> {
+  ) -> Result<Option<Pending>, StoreRefused> {
     let candidates = self.candidates(target.1.kind, cx.exchange);
     if !candidates.is_empty() {
       match cx.admission.hold(search_charge(target.1.len, &candidates)) {
         Ok(hold) => {
-          return Ok(Pending::Search(Box::new(searching(
+          return Ok(Some(Pending::Search(Box::new(searching(
             target, candidates, hold,
-          ))));
+          )))));
         }
         // The admission cannot hold the search: the object goes whole, and the fall-back is counted.
         Err(PastAdmission { .. }) => {
@@ -1694,8 +1753,7 @@ impl<A: Answered> Upload<A> {
     cx: &mut Context<'_>,
     target: (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
-  ) -> Result<Pending, StoreRefused> {
-    self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
+  ) -> Result<Option<Pending>, StoreRefused> {
     let large = Large {
       id: target.0,
       kind: target.1.kind,
@@ -1704,9 +1762,12 @@ impl<A: Answered> Upload<A> {
       at: self.at,
       depth: 0,
     };
-    let pending = self.send_whole(cx, target, out)?;
+    let Some(pending) = self.send_whole(cx, target, out)? else {
+      return Ok(None);
+    };
+    self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
     self.remember_large(large, cx.exchange);
-    Ok(pending)
+    Ok(Some(pending))
   }
 
   /// The objects past a window of `kind` a search tries (module docs): none where the learned depth makes no delta,
@@ -1812,7 +1873,21 @@ impl<A: Answered> Upload<A> {
     let found = best.and_then(|(index, delta)| Some((candidates.get(index).copied()?, delta)));
     let Some((base, delta)) = found else {
       cx.admission.release(hold);
-      return self.large_whole(cx, target, out);
+      let again = target.clone();
+      if let Some(pending) = self.large_whole(cx, target, out)? {
+        return Ok(pending);
+      }
+      // r165: its read to be sent whole met a let-go window and the turn stopped; taken again as a search of no
+      // candidates, which reads it and sends it whole.
+      let hold = cx
+        .admission
+        .hold(search_charge(again.1.len, &[]))
+        .map_err(|_| StoreRefused::PackTooLarge)?;
+      return Ok(Pending::Search(Box::new(self::searching(
+        again,
+        Vec::new(),
+        hold,
+      ))));
     };
     let (id, row, stored) = target;
     let representation = if self.answer.ofs_delta() {
