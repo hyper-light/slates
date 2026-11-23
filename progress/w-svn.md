@@ -628,3 +628,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - codex bring room: finish_brought abandons its writer on a refused finish. Red a_refused_subversion_text_bring_returns_its_completed_windows
   ((262144, true) -> (0, false)). Landed bc026ec5a (merge 96e6f2170). Sibling NOT changed: hg push/intake.rs:1276 (w-hg's).
 - A-760 (b) piece 2 WIP set aside as ~/.cache/w-svn-wip/a760b-piece2.patch (checkpoint named table, codec only); resumes next.
+- contains siblings fixed (main's order): named_lacking + svn_presenter ask holds_whole. e5cdfda3f (merge 35657c523).
+  Reds: codex a_subversion_restart_replays_a_named_text_with_one_released_window; mine
+  a_hook_view_brings_back_a_stored_text_whose_windows_were_let_go (test_store::a_text_whose_windows_are_away).
+- shuttle_green ContentUnread arm (E0004 in the nightly lane): 3241ae61e; compiles under --cfg shuttle.
+- NEXT: A-760 (b) piece 2 (patch at ~/.cache/w-svn-wip/a760b-piece2.patch).
