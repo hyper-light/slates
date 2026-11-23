@@ -3864,9 +3864,13 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   let windows: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
   // Each window marked landed, as the landed pack's let-go marks it, and let go where no home holds it here (a two-shard
-  // daemon pins about half to their home).
+  // daemon pins about half to their home). The pack's home here, where it holds the pack for the region, records its
+  // windows and lets them go first, as a landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of
+  // an object the region holds is pinned until then (`vcs_store::landed_pin`).
   let ids = windows.clone();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let (let_go, refused) = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
