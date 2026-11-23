@@ -1727,18 +1727,39 @@ pub(crate) struct SealedPush {
 /// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
 /// 8c), lent the room the shard can admit for the step and settled after: its identity; none where refused.
 pub(crate) fn put_names(state: &mut ShardState, bytes: &[u8]) -> Option<slates_vcs::ContentId> {
+  put_rows(state, bytes, slates_vcs::rows::put)
+}
+
+/// [`put_names`], each window of it the store holds let go brought back from `bytes` (`rows::put_whole`): what a
+/// recovery that read the content from the node's store or the region puts, so it reads whole by its identity
+/// (codex-review, 2026-11-22: a pack read from disk was put, answered its identity, and read as none). A record's replay
+/// over content the image restored puts it with [`put_names`], which keeps the windows the image let go out of RAM
+/// (A-767 C1 step 2b).
+pub(crate) fn put_names_whole(
+  state: &mut ShardState,
+  bytes: &[u8],
+) -> Option<slates_vcs::ContentId> {
+  put_rows(state, bytes, slates_vcs::rows::put_whole)
+}
+
+/// [`put_names`]' body, its put `put`.
+fn put_rows(
+  state: &mut ShardState,
+  bytes: &[u8],
+  put: fn(&mut ContentStore, &[u8]) -> Result<slates_vcs::ContentId, slates_vcs::rows::RowsRefused>,
+) -> Option<slates_vcs::ContentId> {
   let need = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   lend(&mut state.store, &mut state.vcs_stores, need);
-  let put = {
+  let kept = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     lent
       .stores
       .content
       .as_mut()
-      .map(|content| slates_vcs::rows::put(content, bytes))
+      .map(|content| put(content, bytes))
   };
   settle(state);
-  put.and_then(Result::ok)
+  kept.and_then(Result::ok)
 }
 
 /// Takes a hold of the content `identity` for the record that will name it (A-722's record v4: the push's pack, held by
@@ -3420,7 +3441,7 @@ fn put_changeset(
 ) -> Result<(), ReplayRefused> {
   for (bytes, identity) in [(read.names, wanted.named.0), (read.pack, wanted.packed.0)] {
     if let Some(bytes) = bytes
-      && put_names(state, &bytes) != Some(identity)
+      && put_names_whole(state, &bytes) != Some(identity)
     {
       return Err(ReplayRefused::Unlanded);
     }
@@ -4288,7 +4309,7 @@ async fn rebuild_turns(id: RepositoryId, generation: u64) {
       let fetched =
         homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
       let put = crate::state::with_state(|state| match fetched {
-        Some(bytes) if put_names(state, &bytes) == Some(identity) => {
+        Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
           state.count(NAMES_FETCHED, 1);
           true
         }
