@@ -76,6 +76,9 @@ pub struct State<'a> {
   pub bookmarks: &'a [(Vec<u8>, Node)],
   /// Whether the repository publishes (7.2's `phases.publish`).
   pub publishing: bool,
+  /// The obsolescence markers the register's markers log holds (`StateLog::Markers`, a push's): each alone in its
+  /// format, as the index's marker rows hold theirs, served after those.
+  pub markers: &'a [Vec<u8>],
 }
 
 /// Why a changeset the changelog holds is not served: one of the two filters 7.2's `served` joins.
@@ -189,7 +192,7 @@ impl<'a> Indexed<'a> {
     room: &mut Admission,
   ) -> Result<Indexed<'a>, Refusal> {
     let lends = Cell::new(Lends::default());
-    let markers = lend_markers(index, store, &lends, room)?;
+    let markers = lend_markers(index, store, state.markers, &lends, room)?;
     let predecessors = predecessors(&markers, room)?;
     let pins = pins(state.bookmarks, room)?;
     let len = index.len(store, Log::Changelog);
@@ -394,6 +397,15 @@ impl<'a> Indexed<'a> {
 }
 
 impl Repository for Indexed<'_> {
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    self.markers.iter().flat_map(|payload| {
+      obsmarkers::decode(payload)
+        .ok()
+        .into_iter()
+        .flat_map(|markers| markers.iter())
+    })
+  }
+
   fn count(&self) -> Rev {
     let tail = u32::try_from(self.tail.len()).unwrap_or(u32::MAX);
     self.first.saturating_add(tail)
@@ -554,15 +566,6 @@ impl Store for Indexed<'_> {
     })
   }
 
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    self.markers.iter().flat_map(|payload| {
-      obsmarkers::decode(payload)
-        .ok()
-        .into_iter()
-        .flat_map(|markers| markers.iter())
-    })
-  }
-
   /// A manifest kept as a delta (A-729) lent as it is kept: its base's number, its parents' nodes, its flags and its
   /// delta's bytes, in place where the store holds them in one window.
   fn manifest_delta(
@@ -642,16 +645,21 @@ fn unreadable_marker() -> Refusal {
   }
 }
 
-/// Every marker the index holds, in its order, each lent whole and checked (module docs).
+/// Every marker the index holds, in its order, each lent whole and checked (module docs); then each the register holds
+/// (`held`), borrowed and checked.
 fn lend_markers<'a>(
   index: &HgIndex,
   store: &'a ContentStore,
+  held: &'a [Vec<u8>],
   lends: &Cell<Lends>,
   room: &mut Admission,
 ) -> Result<Vec<Cow<'a, [u8]>>, Refusal> {
   let count = index.markers_len(store);
-  room.charge_items::<Cow<'_, [u8]>>(usize::try_from(count).unwrap_or(usize::MAX))?;
-  let mut markers = Vec::with_capacity(usize::try_from(count).unwrap_or_default());
+  let all = usize::try_from(count)
+    .unwrap_or(usize::MAX)
+    .saturating_add(held.len());
+  room.charge_items::<Cow<'_, [u8]>>(all)?;
+  let mut markers = Vec::with_capacity(all);
   for number in 0..count {
     let content = index.marker(store, number).ok_or_else(unreadable_marker)?;
     let len = store.windows(&content).fold(0_u64, |total, window| {
@@ -660,6 +668,10 @@ fn lend_markers<'a>(
     let lent = lend(store, &content, len, lends, room)?.ok_or_else(unreadable_marker)?;
     obsmarkers::decode(&lent).map_err(|_| unreadable_marker())?;
     markers.push(lent);
+  }
+  for marker in held {
+    obsmarkers::decode(marker).map_err(|_| unreadable_marker())?;
+    markers.push(Cow::Borrowed(marker.as_slice()));
   }
   Ok(markers)
 }

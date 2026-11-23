@@ -762,6 +762,19 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+>   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
+>   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
+>   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
+>   `a` refused in 7.2's `createmarkers` words (red before: "obsolescence markers are not accepted by this server").
+>   `classify` keeps an `obsmarkers` part's markers each alone in its format, less those the view holds or the push
+>   carried before (compared whole, one pass over the held ones keyed by predecessor), `reply:obsmarkers` counting
+>   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
+>   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
+>   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
+>   Still owed: the hidden view under a non-publishing repository (`PUBLISHING` is const true, so a pushed draft lands
+>   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
+>   `obsolete` pushkey namespace, the reply's `N new obsolescence markers` output, and the kept heads for a view with
+>   left-out changesets.
 > - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset

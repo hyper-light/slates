@@ -104,6 +104,7 @@ fn state_of(imported: &Imported) -> State<'_> {
     roots: &imported.phase_roots,
     bookmarks: &imported.bookmarks,
     publishing: false,
+    markers: &[],
   }
 }
 
@@ -456,6 +457,7 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     roots: &[],
     bookmarks: &[],
     publishing: true,
+    markers: &[],
   };
   let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
@@ -765,6 +767,7 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing,
+    markers: &[],
   };
   Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
 }
@@ -1021,6 +1024,7 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing: false,
+    markers: &[],
   };
   let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
   assert_eq!(
@@ -1869,6 +1873,9 @@ impl ReadCounted<'_> {
 impl Repository for ReadCounted<'_> {
   fn count(&self) -> Rev {
     self.view.count()
+  }
+  fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>> {
+    self.view.markers()
   }
   fn node(&self, rev: Rev) -> Option<Node> {
     self.read();

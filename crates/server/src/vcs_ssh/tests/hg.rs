@@ -212,6 +212,10 @@ impl Probed {
 }
 
 impl Repository for Probed {
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    core::iter::empty()
+  }
+
   fn count(&self) -> Rev {
     Rev::try_from(self.changesets.len()).expect("a revision count")
   }
@@ -313,10 +317,6 @@ impl Store for Probed {
     _node: &Node,
   ) -> Option<slates_hg::serve::getbundle::FileEntry> {
     None
-  }
-
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    std::iter::empty()
   }
 
   fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
@@ -1446,6 +1446,10 @@ impl Grown {
 }
 
 impl Repository for Grown {
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    core::iter::empty()
+  }
+
   fn count(&self) -> Rev {
     Rev::try_from(self.changesets.len()).unwrap()
   }
@@ -1586,10 +1590,6 @@ impl Store for Grown {
       link: self.changesets[at],
       flags: 0,
     })
-  }
-
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    std::iter::empty()
   }
 
   fn manifest_linked(&self, position: u64) -> Option<slates_hg::serve::getbundle::Linked> {

@@ -144,6 +144,10 @@ impl Repositories for Held {
 struct Empty;
 
 impl Repository for Empty {
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    core::iter::empty()
+  }
+
   fn count(&self) -> Rev {
     0
   }
@@ -221,10 +225,6 @@ impl Store for Empty {
     _node: &Node,
   ) -> Option<slates_hg::serve::getbundle::FileEntry> {
     None
-  }
-
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    std::iter::empty()
   }
 
   fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
@@ -832,6 +832,10 @@ struct Charging;
 const CHARGING_NODE: Node = [7; 20];
 
 impl Repository for Charging {
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    core::iter::empty()
+  }
+
   fn count(&self) -> Rev {
     1
   }
@@ -910,10 +914,6 @@ impl Store for Charging {
     _node: &Node,
   ) -> Option<slates_hg::serve::getbundle::FileEntry> {
     None
-  }
-
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    std::iter::empty()
   }
 
   fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {

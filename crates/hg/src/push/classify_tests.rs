@@ -12,6 +12,7 @@ use super::{
 use crate::bundle2::Bundle2;
 use crate::changegroup::Version;
 use crate::fixtures::{CG03, LOG, node};
+use crate::obsmarkers::{self, Date, Format, Marker, Metadata};
 use crate::phases::{Phase, PhaseHead};
 use crate::push::reply::{Refused, Replied, heads_changed};
 use crate::push::verify::{Arrived, Held, verify};
@@ -30,6 +31,8 @@ fn room() -> Admission {
 struct View {
   /// The changesets.
   changesets: Vec<Old>,
+  /// The obsolescence markers it holds, each a payload.
+  markers: Vec<Vec<u8>>,
 }
 
 /// A changeset of a [`View`].
@@ -49,6 +52,13 @@ impl View {
 }
 
 impl Repository for View {
+  fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>> {
+    self
+      .markers
+      .iter()
+      .flat_map(|payload| obsmarkers::decode(payload).unwrap().iter())
+  }
+
   fn count(&self) -> Rev {
     Rev::try_from(self.changesets.len()).unwrap()
   }
@@ -192,8 +202,10 @@ fn logged(rev: u32) -> Node {
 
 /// A-657, AC-HG.3 (T-HG.3). Do: read, verify and place stock 7.2's bundle of a history with two branches, a merge and
 /// an amended draft (`fixtures/cg03.hg`, changegroup 03 with its `phase-heads` and `obsmarkers` parts) on an empty
-/// repository whose one line is `default`'s, empty. Expect: its `obsmarkers` part refused by kind (piece 7's); without
-/// it, `default`'s empty line moves to revision 7 and a line of `stable` is made at revision 2 from that line, as 7.2's
+/// repository whose one line is `default`'s, empty; then over a view holding its markers. Expect: its markers kept,
+/// each alone in the part's format, and its `reply:obsmarkers` counting them (the amend's predecessor was never
+/// pushed, so the repository does not hold it); over the view holding them, none kept and the reply 0 (§4.17.3
+/// decision 4; red before: the part was refused by kind). `default`'s empty line moves to revision 7 and a line of `stable` is made at revision 2 from that line, as 7.2's
 /// branchmap lists the two heads; the change in heads is 7.2's `return` 1 (one head added, the empty repository's null
 /// head removed); every changeset the `phase-heads` part names public is public and the amended draft is the one new
 /// draft root; the hooks' first and last changesets are revisions 0 and 7.
@@ -213,16 +225,143 @@ fn a_stock_history_lands_on_an_empty_repository_as_7_2_lists_it() {
     verified.changesets.as_slice(),
     verified.held_changesets.as_slice(),
   );
-  let refused = classify(&unbundle, brought, &view, (&lines, &[]), false, &mut room());
-  assert!(
-    matches!(refused, Err(Unclassified::Markers { .. })),
-    "{refused:?}"
+  let plan = classify(&unbundle, brought, &view, (&lines, &[]), false, &mut room()).unwrap();
+  let (id, payload) = unbundle
+    .parts
+    .iter()
+    .find_map(|taken| match &taken.asks {
+      Asks::Obsmarkers(payload) => Some((taken.id, payload.clone())),
+      _ => None,
+    })
+    .unwrap();
+  let decoded = obsmarkers::decode(&payload).unwrap();
+  let alone: Vec<Vec<u8>> = decoded
+    .iter()
+    .map(|marker| {
+      let mut out = Vec::new();
+      obsmarkers::encode(decoded.format(), &[marker], &mut out).unwrap();
+      out
+    })
+    .collect();
+  assert!(!alone.is_empty(), "the fixture carries a marker");
+  assert_eq!(plan.markers, alone);
+  assert_eq!(
+    plan.replied.last(),
+    Some(&Replied::Obsmarkers {
+      in_reply_to: id,
+      new: u64::try_from(alone.len()).unwrap(),
+    })
+  );
+  let holding = View {
+    markers: vec![payload],
+    ..view.clone()
+  };
+  let again = classify(
+    &unbundle,
+    brought,
+    &holding,
+    (&lines, &[]),
+    false,
+    &mut room(),
+  )
+  .unwrap();
+  assert!(again.markers.is_empty(), "{:?}", again.markers);
+  assert_eq!(
+    again.replied.last(),
+    Some(&Replied::Obsmarkers {
+      in_reply_to: id,
+      new: 0
+    })
   );
   unbundle
     .parts
     .retain(|taken| !matches!(taken.asks, Asks::Obsmarkers(_)));
   let plan = classify(&unbundle, brought, &view, (&lines, &[]), false, &mut room()).unwrap();
   assert_stock_placement(&plan, &unbundle);
+}
+
+/// A format 1 marker obsoleting `predecessor` with `successor`, as its payload.
+fn marker_payload(predecessor: &Node, successor: &Node) -> Vec<u8> {
+  let marker = Marker {
+    flags: 0,
+    predecessor,
+    successors: successor,
+    parents: None,
+    date: Some(Date {
+      seconds_bits: 0,
+      offset_minutes: 0,
+    }),
+    metadata: Metadata::Sized {
+      sizes: &[],
+      bytes: &[],
+    },
+  };
+  let mut out = Vec::new();
+  obsmarkers::encode(Format::V1, &[marker], &mut out).unwrap();
+  out
+}
+
+/// §4.17.3 decision 4 (goal 93, changeset evolution). Do: over `a` (public) and `b` (draft), push an `obsmarkers` part
+/// obsoleting `b` and one the repository does not hold, the first marker twice, in a second part too; then a part
+/// obsoleting `a`. Expect: the two markers kept once each, in arrival order, the first part's reply counting 2 and the
+/// second's 0; the marker obsoleting public `a` refuses the push in 7.2's `createmarkers` words, `a`'s short hex and
+/// its hint.
+#[test]
+fn markers_are_kept_once_and_refused_on_a_public_predecessor() {
+  let view = two();
+  let on_b = marker_payload(&[2; 20], &[3; 20]);
+  let unheld = marker_payload(&[9; 20], &[3; 20]);
+  let mut first = on_b.clone();
+  first.extend_from_slice(&unheld[1..]);
+  first.extend_from_slice(&on_b[1..]);
+  let mut unbundle = Unbundle {
+    parts: vec![
+      part(0, Asks::Obsmarkers(first)),
+      part(1, Asks::Obsmarkers(on_b.clone())),
+    ],
+  };
+  let plan = classify(
+    &unbundle,
+    (&[] as &[Arrived], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  )
+  .unwrap();
+  assert_eq!(plan.markers, vec![on_b, unheld]);
+  assert_eq!(
+    plan.replied,
+    vec![
+      Replied::Obsmarkers {
+        in_reply_to: 0,
+        new: 2
+      },
+      Replied::Obsmarkers {
+        in_reply_to: 1,
+        new: 0
+      },
+    ]
+  );
+  unbundle.parts.push(part(
+    2,
+    Asks::Obsmarkers(marker_payload(&[1; 20], &[3; 20])),
+  ));
+  let refused = classify(
+    &unbundle,
+    (&[] as &[Arrived], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  );
+  assert_eq!(
+    refused.map_err(|refused| refused.refused()),
+    Err(Refused::Abort {
+      message: b"cannot obsolete public changeset: 010101010101".to_vec(),
+      hint: Some(b"see 'hg help phases' for details".to_vec()),
+    })
+  );
 }
 
 fn assert_stock_placement(plan: &Plan, unbundle: &Unbundle) {
