@@ -124,6 +124,13 @@ pub trait ExtentSource: Send {
   /// share cap): a source shared with other arenas tells them, so one holding more than its demand gives back. A
   /// source with no other arena has no one to tell.
   fn want(&mut self, _bytes: usize) {}
+  /// The bytes of free extents this source cannot hand out yet but will once work already under way ends: an extent
+  /// given back and being made again (A-789, Windows: its section closed so its commit returns, then made and held
+  /// again by the anchor). Not in [`ExtentSource::available`]; an admission short of room that these would cover
+  /// waits for them rather than being refused. A source whose extents are always ready has none.
+  fn pending(&self) -> usize {
+    0
+  }
 }
 
 /// Who holds an arena's block (goal 93; main 01a20182's order of 2026-11-23 on arena-13: 373 MB of the content arena
@@ -650,6 +657,12 @@ impl ChunkArena {
     self.source.as_ref().map_or(0, |source| source.available())
   }
 
+  /// The bytes its source will be able to hand out once the work under way on its extents ends
+  /// ([`ExtentSource::pending`]); zero without a source.
+  pub fn pending_claimable(&self) -> usize {
+    self.source.as_ref().map_or(0, |source| source.pending())
+  }
+
   /// Opens or closes the source's pressure hold to this arena's growth ([`ExtentSource::open_hold`]); nothing without a
   /// source.
   pub fn open_hold(&mut self, open: bool) {
@@ -882,6 +895,32 @@ impl ChunkArena {
     let extent = self.alloc_block(len)?;
     self.record(extent, owner, extent.len(), asked.min(extent.len()));
     Ok(extent)
+  }
+
+  /// Sets the bytes the block whose head is `head` is asked for to `asked`, at most the head's length, and its owner's
+  /// asked bytes with it: a block several callers share (a slab of repository windows, goal 93) asks what its live
+  /// callers need, so its owner's asked against its held names the slots let go as well as the rounding. A head no
+  /// owner holds changes nothing.
+  pub fn reask(&mut self, head: Extent, asked: usize) {
+    let granule = self.granule.max(1);
+    let asked = u32::try_from(asked.min(head.len())).unwrap_or(u32::MAX);
+    let Some(slot) = self.slot_mut(head.region) else {
+      return;
+    };
+    let at = head.offset().checked_div(granule).unwrap_or(0);
+    let Some(owner) = slot.heads.get(at).copied().and_then(Owner::of_code) else {
+      return;
+    };
+    let Some(kept) = slot.asked.get_mut(at) else {
+      return;
+    };
+    let was = core::mem::replace(kept, asked);
+    if let Some(total) = self.owned.get_mut(owner.index()) {
+      total.asked = total
+        .asked
+        .saturating_sub(u64::from(was))
+        .saturating_add(u64::from(asked));
+    }
   }
 
   /// [`ChunkArena::alloc`] before the block is recorded as its owner's.

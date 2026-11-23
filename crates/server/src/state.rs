@@ -892,6 +892,9 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
+  /// Creates parked until a remake of the pool's extents makes their room (`crate::room_wait`; A-789, Windows), bounded
+  /// by the shard's client credit.
+  pub(crate) room_waiters: crate::room_wait::RoomWaiters,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
   /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).

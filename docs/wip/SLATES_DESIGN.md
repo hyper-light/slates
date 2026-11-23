@@ -34187,6 +34187,23 @@ Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (t
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.
 
+**Amended 2026-11-23 (w-fleet; `live_chaos`'s cut-off owner): the detection term times only periods whose probe was
+answered.** The member plane took every period, from its probe to the next, as a sample of the detector's pace however
+it ended. A period whose probe went unanswered ends at the probe's retransmission timer, which doubles at each expiry
+(hyper-swim's `Rto`, RFC 6298 §5.5), so on a node cut off from every peer each period was twice the last and each was
+folded in. On adacachy2 a cut-off owner's `D` rose from 2.4 s before the cut to 95.6 s 19 s into it, and the failover
+delay with it, so a reply held for its log's durability, refused at that delay from its hold (A-354, A-375), was held
+until the heal, 20.8 s, in 4 of 40 runs under CPU contention (the flow's bound: the delay before the cut and a liveness
+budget, 5.2 to 5.7 s). Where the unanswered periods were short instead, the same fault took `D` down to 0.02 s. Now the
+plane folds a period only when an answer to its own probe came, directly or through a relay
+(`MemberPlane::period_probed`, `note_period_answered`): the timer's setting is not the period, Karn's rule, which
+`RunningDuration` leaves to its caller. A member no peer answers keeps the term it measured while they did, as
+Lifeguard has it condemn no one. Applied in the same change to: `crates/cluster/src/{member_plane,failover}.rs`,
+`crates/cluster/tests/member_plane.rs`
+(`a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut`: 14.7 ms before the cut and 124.2 s after
+40 s of it on main, unchanged with the fix), GAPS, and
+`docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
+
 ### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
 Applied in the same change to:
 - §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
@@ -58671,10 +58688,11 @@ on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-lin
   of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of
   its own (`HoldBounds::extents`, `DaemonConfig::held_extent_bound`, partitions × 64). The daemon keeps one table of
   section handles for the process (`crate::content_extents`, atomic words written only by the holder of an extent's
-  owner word), made at its start before any claim and held by each shard's start; a claim takes only a made and held
-  extent and maps a duplicate committed whole; a release closes the table's handle and has the anchor let its duplicate
-  go, which closes the section, then makes and holds the extent again. A successor places the extents the handoff
-  table hands back before any shard claims.
+  owner word), made at its start before any claim and held by the control loop before it answers a claim (since
+  2026-11-23; each shard's start held its own slice before, below); a claim takes only a made and held extent and maps a
+  duplicate committed whole; a release closes the table's handle and has the anchor let its duplicate go, which closes
+  the section, then makes and holds the extent again. A successor places the extents the handoff table hands back
+  before any shard claims.
 - Why: a released extent was a range of the anchor's one content object. Its pages stayed in the object: a page given
   back with `MADV_FREE_REUSABLE` only leaves the footprint, and stayed resident 10 s under pressure. A 256 MiB burst's
   volume destroyed left the object at 259 MiB and the process at 1,362 MiB (adas-macbook-pro-2).
@@ -58686,6 +58704,30 @@ on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-lin
 - After: the same burst's volume destroyed left the object at 0 MiB and the process at 123 MiB.
 - Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
   still only leave the footprint.
+- **Held before the first claim, and the remake window (w-win2 for main 01a20182, 2026-11-23; main's rulings of the
+  day).** Each shard's start spawned its slice's holds as a task and the daemon answered claims at once, so a create
+  the moment it served met its extents made but not yet held, and was refused `BudgetExceeded` with the pool's count
+  of every free extent, held or not, as its room: every Node SDK sync suite on CI's Windows runners (diag run
+  45238179939: 2 of 25 extents held when the first create came, the holds taking 117.5 ms on windows-latest; 1 of 22
+  and 141.9 ms on windows-11-arm). Now:
+  - The control loop, which answers every claim, has the anchor hold every extent before its first
+    (`content_extents::hold_before_serving`, right after the loop's `boot_before_claims`), each hold one exchange
+    within the learned answer bound (A-552). Not in a shard's start: that runs alone (`spawn_alone`), so the
+    holds' exchanges, tasks of the same shard, could not run there, and the daemon never served (diag run
+    45251289894).
+  - The pool counts as free only the extents a claim can take (`content_pool::claimable_now`, the rule `best_fit`
+    keeps), and the free ones being made again after a release as pending (`ExtentSource::pending`).
+  - A bounded create refused for room that only those remakes would make is parked, not refused (`crate::room_wait`,
+    on `crate::lease_wait`'s pattern). It runs again as each remake ends, told across shards while any waits. Its
+    deadline is one remake's bound, its two exchanges at the learned answer bound, for each remake in flight when it
+    parked. A create that would not fit even then is refused at once with the room there is.
+  - Held by `a_create_the_moment_the_daemon_serves_is_admitted_on_windows` and
+    `a_create_during_the_released_extents_remakes_waits_for_them_on_windows`, on a real one-shard anchor; red with the
+    fix reversed and green with it on both runners (diag run 45260798132, the first create refused `BudgetExceeded { available: 5722144768 }` on windows-latest (5,720,506,368 on windows-11-arm) and the create during the remakes refused `{ available: 5713756160 }` (5,712,117,760) with the fix reversed, both admitted with it, and the Node SDK suites 8 of 8 on both). Applied in the same change to:
+    `crates/server/src/content_extents_windows.rs`, `content_pool.rs`, `room_wait.rs` (new), `daemon.rs`, `verbs.rs`,
+    `lease_wait.rs`, `state.rs`, `crates/mem/src/arena.rs`, `crates/vfs/src/volume.rs`, the CLI test, CI's Windows
+    lanes (the extents file run for the first time), GAPS (A-789),
+    `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`.
 
 ### A-839 — On macOS a shard's content slice reserves nothing for its arena (2026-11-21, w-sizing; the sweep's conversions, largest first; A-789)
 Applied in the same change to: `crates/server/src/config.rs` (`shard_content_layout`: the stride ends where the arena's
@@ -61818,3 +61860,79 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   export (two exports of two walks each: 15 fetches of a bound of 16).
 - **Applied in the same change to** `crates/server` (`vcs_store/svn_view`, `vcs_store/svn_texts`'s `Pieces` doc,
   `vcs_svn`, `vcs_ssh/svn`, `vcs_http/svn`, and the tests named above), GAPS, amendments.tsv.
+
+### A-877 — A repository's windows shorter than a granule share slabs of one granule (2026-11-23, w-perf; main 01a20182's order on arena-15, goal 93; A-727 a2/a3, A-64, A-105, A-870)
+
+- **Why.** arena-15 (CI 45224166925) held 556,367,872 bytes of the arena for 114,200 repository windows of 131,425,429
+  bytes: one 4 KiB page for each window of about 1,151 bytes. The arena's rows had shown asked equal to held, since
+  the chunk store had passed the arena its page-rounded block as the asked length. Since bbd4693c2 a window asks its
+  own length (`ChunkArena::alloc_asking`).
+- **The rule.** `vcs_store::arena_windows::ChunkWindows` writes a window shorter than the arena's granule into a slab:
+  one chunk of one granule, sealed over its whole length, that windows fill end to end, each window holding a slot
+  (the chunk and its offset in it). The filling slab is whichever has more room left. A slab's slots are never
+  written twice: a window let go leaves its slot unused, and the slab's chunk is freed with its last window through
+  the chunk store's one free, which the arena defers while a committed image names the block (A-64). So:
+  - no committed image names a slot that holds another window's bytes (A-870's oracle, by slot);
+  - the idle purge (A-105) meets a slab only once all its slots are free;
+  - a slab that one live window keeps holds the granule that window held alone before, so the slabs never hold more
+    than a chunk a window did.
+  The slab's block asks its live windows' bytes (`ChunkArena::reask`), so the windows' row names, as held against
+  asked, the rounding and the slots let go. A window of a granule or more takes a chunk of its own, as before.
+  Volumes never share a block: a volume's chunks are the copies a guest maps (DAX).
+- **Across a restart.** A window piece (`KIND_VCS_WINDOW`) is version 2 and carries its slot's offset. A recovery
+  groups the pieces by block and claims each block once, refusing as `Malformed` a group whose pieces disagree on the
+  chunk or whose slots overlap. Version 1 is refused typed (`PieceRefused::OldVersion(1)`) and counted unrestored. Its
+  window is put again by the record replay that holds its bytes.
+- **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
+- **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
+  - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
+    of 1,151 bytes at a 16 KiB granule; now at most 245,760.
+  - `slab_windows_read_back_byte_for_byte_through_let_go_bring_back_and_purge`: 3,000 seeded steps against a model.
+  - `a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots`.
+  - `slates-vfs`'s `a_volumes_small_extents_each_keep_a_block_of_their_own`.
+- **Owed.** Main's arena-17, judged on the windows row's held approaching its asked, push-all still passing, and RSS
+  below arena-16's. When the shard's cipher comes to repository windows (A-99), a slab can no longer be filled in
+  place: its chunk carries no seal today (`ChunkStore::seal` with no key), and its later slots are written into the
+  sealed chunk's unused bytes. So that work seals a slab when it closes, or each slot alone (w-shared's review).
+
+### A-878 — A Linux daemon's children inherit nothing of the daemon's; a hand-off names the object's own descriptor (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the descriptor sweep; A-858, §2.6, §4.7, §4.13)
+
+- **Why.** A-858 holds that every child the daemon spawns is handed only its three streams. That held on macOS, whose
+  spawn closes what it does not name. On Linux the spawn hands a child every descriptor not marked close-on-exec, and
+  the daemon held many:
+  - the anchor's segment and content object, inherited at the daemon's start, and duplicates of both, one per shard and
+    one for the control loop: a Linux hand-off was a duplicate made inheritable, which nothing owned;
+  - the anchor's listeners and its hold table, inherited at the start;
+  - a plain `dup` of each client's completion eventfd.
+  A start-commit hook listed 17 such descriptors. The segment holds the issuer secret, the authority under which the
+  issuer's verbs prove a human's grant. The content object holds every volume's bytes.
+  The same duplicates grew the anchor by two descriptors per daemon start (8 of each object after 7 starts), and a
+  claim refused for want of a descriptor leaked its region's duplicate.
+- **The rule.**
+  - A descriptor is close-on-exec everywhere except in the one exec that needs it.
+  - A hand-off names the object's own descriptor. An open duplicates it and owns the duplicate. A spawn that hands it to
+    a child clears close-on-exec in that child alone: the anchor's `hand_on_in_child`, between the fork and the exec.
+  - The daemon's first step at its start makes every descriptor it inherited close-on-exec
+    (`confined_spawn::close_inherited_on_exec`); a daemon that cannot does not start.
+  - Its own copies are made with `fcntl_dupfd_cloexec`, never a plain `dup`.
+  - The anchor records a start before the spawn and its pid after. Recorded after, the record could wipe a quick
+    daemon's first beat and serving mark, and show it the last start's restart count.
+- **Tests** (adacachy2; red on main, green with the change):
+  - `a_hook_holds_no_descriptor_of_its_daemon` (`crates/cli/tests/svn_interop.rs`, a real anchor, daemon and hook):
+    17 descriptors past the streams, then none.
+  - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once` (`crates/anchor/tests/anchor.rs`): `[8, 8]`
+    and children holding 2, 4, … 12; then `[1, 1]` and 2 each.
+  - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region` (`crates/ipc/tests/rendezvous.rs`, the descriptor
+    limit capped as the claim is prepared): `remaining=1`, then 0.
+  - The anchor's test file: 5 of 6 runs on main, 2 of 6 with the forked spawn alone, 6 of 6 with the record's order.
+- **Applied in the same change to:**
+  - `crates/mem/src/shared.rs`: `handoff`, `Handoff`'s doc.
+  - `crates/anchor`: `segment.rs` (`handed_descriptors`, `record_pid`, `record_start`'s doc) and `supervise.rs`
+    (`hand_on_in_child`, the start's order).
+  - `crates/api/src/role/daemon.rs`: the start's first step.
+  - `crates/ipc`: `confined_spawn.rs` (`close_inherited_on_exec`, the module doc), `rendezvous.rs` (the claim's
+    borrowed send, the kick, `completion_dup`), `completion.rs` and `endpoint.rs` (the client's copies).
+  - The three tests above.
+  - `unsafe-budget.toml`: anchor +1, ipc ±0.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
