@@ -336,3 +336,19 @@ CI 45065911852: 24/24 on three legs, clone spins gone. RSS: arena 4.7 GB held af
 main reruns. Open for main's ruling: landed_pin keeps 1/shards of texts (all on a one-shard node).
 Next: 2b (1) (~/.cache/w-hg-2b-1-works.patch, owes the >1-turn non-vacuity test), then 2b let-go for the import, then
 changelog/manifest off the content store.
+
+## 2026-11-22 ~19:40 PST (w-hg, main's ruling of 18:43; w-shared's seam 1)
+Landed ee1c9005b (piece 23e2789e7): `hg_push::bring_back(repository, (path, node)) -> bool`, the hg half of 2b(b),
+part 1. It reads the row, asks the changeset store for the text off the step (`slates_hg::push::held::TextAsk`, the
+work builder's ask moved there), and puts it back within the lent room. Counter `vcs.hg.landed_texts_brought_back`.
+Test a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node: red via a stub (49/120 let
+go, none back), green. Marked `cfg_attr(not(test), expect(dead_code))` until homes' Hg arm calls it.
+w-shared's types landed fc42f581c (note_landed, Landed::Hg, HgLanded).
+Next, in main's order (18:5x):
+(1) After w-shared's region-object hold fix: hg's red at the edge. A landing whose file shares a window with an
+object another repository holds must have its release free only what the push owns (codex-review's
+region-object-pin note).
+(2) Then seam part 2, in one landing: note_landed per window (object_layout) in let_go_windows, plus the Landed::Hg
+arm in homes::bring_back_landed awaiting bring_back per distinct key. Drop the expect. The let-go reds flip to every
+window let go.
+(3) Then the changelog/manifest move off the content store; main reruns the arena lane after the pin goes.
