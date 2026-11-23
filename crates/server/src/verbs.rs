@@ -2953,6 +2953,7 @@ pub fn serve(
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
+        || crate::room_wait::join(state, origin, id)
         || crate::work_home::join(state, origin, id)
       {
         return Served::Forwarded;
@@ -3511,6 +3512,7 @@ fn run_forwarded(
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
+        || crate::room_wait::join(state, origin, id)
         || crate::work_home::join(state, origin, id)
       {
         return None;
@@ -5643,7 +5645,16 @@ pub(crate) fn dispatch(
     Ok(fenced) => fenced,
     Err(refusal) => return refused(refusal),
   };
+  // A bounded create refused for room that a remake of the pool's extents owes it waits for the remake (A-789,
+  // `crate::room_wait`): parked with its body, it runs again as each remake ends, and is answered then.
+  let parkable = crate::room_wait::parkable(&body).then(|| body.clone());
+  crate::room_wait::begin(state);
   let reply = dispatch_inner(state, client_id, principal, body);
+  if let Some(body) = parkable
+    && crate::room_wait::park_if_owed(state, client_id, principal, body)
+  {
+    return crate::lease_wait::parked_reply();
+  }
   if let Some(volume) = fenced
     && matches!(reply, ReplyBody::Destroyed)
   {
@@ -7433,7 +7444,11 @@ pub(crate) fn admit_over(
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        report_first_budget_refusal(state, "bytes", limit, available);
+        // Room the remakes of the pool's extents in flight would make is waited for (`crate::room_wait`, A-789), so
+        // only a refusal that waits for nothing is the shard's first to report.
+        if !crate::room_wait::note_refusal(state, limit) {
+          report_first_budget_refusal(state, "bytes", limit, available);
+        }
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {

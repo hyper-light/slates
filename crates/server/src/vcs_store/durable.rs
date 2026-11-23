@@ -122,4 +122,69 @@ mod tests {
     let outcome = got.recv().unwrap();
     assert!(outcome.is_empty(), "{outcome:?}");
   }
+
+  /// Shape: the objects kept before the ticket's wait, so its publication finds more pages dirty than one encoder turn
+  /// re-encodes at the test's small page and leaves a catch-up owed.
+  const KEPT_BEFORE: usize = 2_000;
+  /// Shape: how many sweep intervals the test waits for the ticket before it calls the wait lost.
+  const SWEEPS_WAITED: u32 = 6;
+
+  /// A-870 piece 2, a refused catch-up (main 01a20182's ruling of 2026-11-23: no swallowed error, banned item 9). Do: on
+  /// one shard whose paged image's pages are small, keep [`KEPT_BEFORE`] objects for the region, so the next publication
+  /// finds pages dirty and owes a catch-up, and refuse that catch-up's first publication; keep one more, take its ticket
+  /// and wait for it. Expect: durable after all, the refusal counted and the publication begun again by the shard's sweep
+  /// (counted). Failing first: the wait never answered, the publication owed with no catch-up left to make it.
+  #[test]
+  fn a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused() {
+    use crate::vcs_store::{content_durable, content_ticket};
+    let daemon = crate::daemon::audit_daemon();
+    let (sent, got) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(4096));
+      crate::content_holder::CATCH_UP_REFUSALS.with(|refusals| refusals.set(1));
+      let origin = state.shard;
+      for at in 0..KEPT_BEFORE {
+        let bytes = format!("an object kept before the wait, number {at}").into_bytes();
+        let _ = crate::vcs_store::homes::keep_for_region(
+          state,
+          &bytes,
+          &[crate::vcs_store::homes::TEST_OWNER],
+        );
+      }
+      let _ = crate::vcs_store::homes::keep_for_region(
+        state,
+        b"the object a homing waits on",
+        &[crate::vcs_store::homes::TEST_OWNER],
+      );
+      let ticket = content_ticket(state);
+      let waiter = slates_rt::futures::spawn(async move {
+        let outcome = content_durable(origin, ticket, crate::daemon::LIVENESS_BUDGET_NS).await;
+        let counts = crate::state::with_state(|state| {
+          let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          [
+            counted(crate::content_holder::IMAGE_CATCH_UP_PUBLISH_REFUSED),
+            counted(crate::content_holder::IMAGE_CATCH_UP_RETRIED),
+          ]
+        });
+        let _ = sent.send((outcome, counts));
+      })
+      .unwrap();
+      slates_rt::futures::detach(waiter).unwrap();
+    });
+    let patience =
+      std::time::Duration::from_nanos(crate::idle_sweep::interval_ns()) * SWEEPS_WAITED;
+    let answered = got.recv_timeout(patience);
+    daemon.stop();
+    let (outcome, counts) = answered.expect("the ticket's wait answered within a few sweeps");
+    assert_eq!(outcome, Ok(()), "durable after all");
+    let [refused, retried] = counts.expect("the shard's state");
+    assert_eq!(
+      refused, 1,
+      "the catch-up's publication refused once, counted"
+    );
+    assert!(
+      retried >= 1,
+      "the sweep began the publication again, counted"
+    );
+  }
 }
