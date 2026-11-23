@@ -658,3 +658,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   scratch oracle hashes bytes. Goldens: tests/identity.golden + ignored writer + determinism gate; named == carried.
 - Anchor layout 19 refuses 18 typed. Side finding withdrawn: object_id is plain BLAKE3 at every length (doc fixed).
 - NEXT: 4b (one read seam Bytes|Named), w-git and w-hg told first.
+## A-760 (b) 4b LANDED c9c6b6c04 (merge 8ba209cbf), 2026-11-23: one read seam
+- engine::Content (current: Bytes(&[u8]) | Named) and ContentAt (at a version: Bytes(Cow) | Named); engine + tests use
+  *_bytes readers. 25 server sites moved; git StepRefused::Named, hg Unmade::Named, mount EAGAIN/ERROR_RETRY, work
+  BaseGone, page/checkout Unsupported, svn_made Unreadable; svn held texts fall through to the store.
+- No producer, so no red (main's ruling). svnsync counters + slowdowns handed to w-svnperf (inbox patch).
+- NEXT: 4c+4d (holds + dropped bytes + history through the plane + refuse-and-bring-back + reanchor by identity).
