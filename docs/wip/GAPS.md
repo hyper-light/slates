@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (w-interop, 2026-11-23, A-874): a landing's presentation went with its presenting client, so R10's
+> three-step grant flow could not run.** CI's hermeticity suite (Linux and macOS) and the CLI's session-grant test met
+> "not found: presentation 1 (replaced, landed, or its client went away)": `slates land` presents and exits, and since
+> 076746072 its client is retired at that exit, where A-46 abandoned its presentations. Now a presentation lives until it
+> is landed, superseded (A-779) or its volume goes; the bound is unchanged
+> (`docs/bugs/2026-11-23-a-landings-presentation-went-with-its-presenting-client.md`;
+> `a_presentation_outlives_the_process_that_presented_it`, `a_presentation_goes_with_its_volume`,
+> `another_clients_presentation_still_replaces_and_the_bound_still_refuses`). Owed: the hermeticity suite rerun on CI.
 > **Closed (main, 2026-11-21, A-832): a daemon kept one file descriptor per base file it had ever read, and never closed
 > it.** kiln's daemon on adacachy reached 1,048,575 of its 1,048,576 descriptors over ~/Projects/kiln (731 worktrees)
 > and refused every open (`EMFILE`); this MacBook's held 4,574 (3,995 regular files of ~/Projects/slates). Now an

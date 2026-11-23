@@ -131,7 +131,7 @@ pub enum Missing {
     /// The snapshot.
     snapshot: SnapshotId,
   },
-  /// A presentation awaiting approval: it was replaced, landed, or its client went away (A-46). Present it again.
+  /// A presentation awaiting approval: it was replaced, landed, or its volume went (A-46, A-874). Present it again.
   Presentation {
     /// The presentation's id.
     id: u64,
@@ -1227,7 +1227,7 @@ impl fmt::Display for Missing {
       ),
       Self::Presentation { id } => write!(
         f,
-        "presentation {id} (replaced, landed, or its client went away: present it again)"
+        "presentation {id} (replaced, landed, or its volume went: present it again)"
       ),
       Self::Attachment { attachment } => write!(f, "attachment {attachment}"),
       Self::Entry { volume, path } => {
