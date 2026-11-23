@@ -776,6 +776,14 @@
 >   member's engine in the lineage's slot for the one out (`Lineage::lent`), the guard only the lineage and a handle,
 >   so `GreenRef`/`GreenMut` box nothing. Push: 362,278 B a changeset now 49,909, the lend's 300,292 B (red) now none.
 >   OPEN: the cuts by size, then bounds in this test.
+> - A node prefix's `lookup` read by node BUILT (2026-11-23, w-hg; main's order on CI arena-7: the last `begin` over
+>   10 ms of CPU, `cmd=lookup`, 91 ms wall / 30 ms CPU on x86, `lookup::prefixed` hex-encoding every node). The index's
+>   node rows are keyed by node first, so `HgIndex::changesets_prefixed` walks them from the prefix's bytes (and an odd
+>   digit's high four bits) to where it ends, passing other logs' rows over, two served matches settling it
+>   (`Repository::changesets_prefixed`; a view that cannot is walked, as before). Held by
+>   `a_node_prefixs_lookup_read_by_node_is_the_walks` (prefixes of one to twelve digits, the null node's zeros, one
+>   nothing has: the same answers, ambiguous ones among them) and
+>   `a_node_prefixs_lookup_reads_its_matches_not_the_history` (at most 8 reads, where the walk reads every revision).
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps

@@ -408,6 +408,29 @@ fn prefixed(repo: &impl Repository, prefix: &[u8]) -> Result<Resolved, Refusal> 
     return Ok(Resolved::Unknown);
   }
   let lowered = prefix.to_ascii_lowercase();
+  // Read by node where the view can (goal 93): the prefix's whole bytes and its odd digit's high four bits, two
+  // matches at most (two settle it as ambiguous), the null node beside them.
+  let digit = |byte: u8| {
+    char::from(byte)
+      .to_digit(16)
+      .and_then(|value| u8::try_from(value).ok())
+  };
+  let pairs = lowered.chunks_exact(2);
+  let nibble = pairs.remainder().first().copied().and_then(digit);
+  let bytes: Option<Vec<u8>> = pairs
+    .map(|pair| Some(digit(*pair.first()?)? << 4 | digit(*pair.get(1)?)?))
+    .collect();
+  if let Some(bytes) = bytes
+    && let Some(nodes) = repo.changesets_prefixed((&bytes, nibble), 2)
+  {
+    let null = lowered.iter().all(|byte| *byte == b'0');
+    let mut matched = null.then_some(NULL_NODE).into_iter().chain(nodes);
+    return Ok(match (matched.next(), matched.next()) {
+      (None, _) => Resolved::Unknown,
+      (Some(node), None) => Resolved::Node(node),
+      (Some(_), Some(_)) => Resolved::Ambiguous(prefix.to_vec()),
+    });
+  }
   let mut found = None;
   let mut hex = Vec::with_capacity(NODE_HEX_LEN);
   let candidates =
