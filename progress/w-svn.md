@@ -584,3 +584,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   42-82); git_push, hg_push, store_tests, made_commit green.
 - Left per text: two `read_step`s (the batch's re-read would go with w-engine's fast-forward); the content store's
   `release_one` copy (w-shared's).
+- a5aa2d576 landed: `ContentStore::release` answers `Freed` (Held, Gone, or Table(bytes)). A freed window is never
+  read back out of its storage. Red: 5 windows read back, now 0. Sampled 96.2 MB to 84.3 MB. w-shared was told first.
+- Found: the afternoon's watchdog stops in the svn and vcs_store suites were my own uncommitted local probe
+  (`finding_2_probe_what_an_import_leaves_held` spawns `ps` blocking on the shard), not load. It's #[ignore]d locally.
+- Left per text in-process: the two `read_step`s (~11 MB each); the batch's re-read goes with w-engine's paused
+  fast-forward.
