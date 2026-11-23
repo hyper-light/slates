@@ -49,6 +49,8 @@ pub(crate) struct Served {
   pub(crate) url: String,
   /// The hgrc every [`Served::hg`] reads.
   hgrc: String,
+  /// The daemon's instance name, which a client connects by.
+  instance: String,
 }
 
 impl Served {
@@ -66,6 +68,14 @@ impl Served {
       .env("HGUSER", "slates-test")
       .current_dir(format!("{}/{dir}", self.base()));
     command
+  }
+
+  /// Sets whether `project` publishes (its policy's `hg_publishing`, 7.2's `phases.publish`), as its owner.
+  pub(crate) fn set_publishing(&self, publishing: bool) {
+    let mut client = connect(&self.instance);
+    let mut policy = client.describe_repository_policy("project").unwrap();
+    policy.hg_publishing = publishing;
+    client.set_repository_policy("project", &policy).unwrap();
   }
 
   /// The daemon serving.
@@ -157,5 +167,6 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
     scratch,
     url: format!("http://127.0.0.1:{port}/project"),
     hgrc,
+    instance,
   }
 }

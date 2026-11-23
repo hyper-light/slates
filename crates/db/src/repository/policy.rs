@@ -14,6 +14,8 @@
 //! holding no NUL; any other repository holds none, since git's and Mercurial's hooks inherit the server's environment.
 //! A policy is charged its rules', hooks', hooks-env sections' and trusted signers' encoded bytes, so an empty one costs
 //! nothing. The signers are the server's to read (each an SSH key its verb parsed, A-644), as a volume's are (A-321).
+//! Only a Mercurial repository's policy may not publish (`phases.publish`, §4.17.3 decision 3); any other's publishes,
+//! the default, which nothing reads.
 
 use std::collections::BTreeSet;
 
@@ -29,7 +31,8 @@ use crate::error::DbError;
 const GLOB_FORM: &str = ":glob:";
 
 /// Refuses a policy for a repository serving `tool` that the log must never record: the first malformed rule, then the
-/// first malformed hook, then the first malformed hooks-env section, by index.
+/// first malformed hook, then the first malformed hooks-env section, by index; then one that does not publish for a
+/// repository that is not Mercurial's.
 pub(super) fn check(tool: VcsTool, policy: &RepositoryPolicy) -> Result<(), DbError> {
   if let Some(index) = policy.rules.iter().position(|rule| !rule_holds(tool, rule)) {
     return Err(DbError::PolicyRuleMalformed {
@@ -52,6 +55,9 @@ pub(super) fn check(tool: VcsTool, policy: &RepositoryPolicy) -> Result<(), DbEr
     return Err(DbError::PolicyHooksEnvMalformed {
       index: index_of(index),
     });
+  }
+  if !policy.hg_publishing && tool != VcsTool::Mercurial {
+    return Err(DbError::PolicyPublishingNotMercurial);
   }
   Ok(())
 }
@@ -182,6 +188,7 @@ mod tests {
       hooks,
       hooks_env: Vec::new(),
       signers: Vec::new(),
+      hg_publishing: true,
     }
   }
 
@@ -299,6 +306,34 @@ mod tests {
         refused,
         "{tool:?}"
       );
+    }
+  }
+
+  /// Goal 93 (§4.17.3 decision 3; 7.2's `phases.publish`). Do: check a default policy, then one that does not
+  /// publish, for each tool. Expect the default to publish and be held by every tool; the one that does not publish held
+  /// by a Mercurial repository alone, every other refused by kind.
+  #[test]
+  fn only_a_mercurial_repository_may_not_publish() {
+    assert!(
+      RepositoryPolicy::default().hg_publishing,
+      "7.2's default publishes"
+    );
+    let not = RepositoryPolicy {
+      hg_publishing: false,
+      ..RepositoryPolicy::default()
+    };
+    for tool in [VcsTool::Git, VcsTool::Mercurial, VcsTool::Subversion] {
+      assert_eq!(
+        check(tool, &RepositoryPolicy::default()),
+        Ok(()),
+        "{tool:?}"
+      );
+      let expected = if tool == VcsTool::Mercurial {
+        Ok(())
+      } else {
+        Err(DbError::PolicyPublishingNotMercurial)
+      };
+      assert_eq!(check(tool, &not), expected, "{tool:?}");
     }
   }
 

@@ -10,8 +10,9 @@
 //! filter serves of them. The register is the record: an imported repository's phase roots and bookmarks are served
 //! once its import records them there (A-687), and every changeset is public until then.
 //!
-//! **Publishing.** A repository's record carries no `phases.publish` yet, so every repository publishes, as a
-//! Mercurial repository does by default (§4.17.3 decision 3).
+//! **Publishing.** Whether a repository publishes is its policy's `hg_publishing` (7.2's `phases.publish`, §4.17.3
+//! decision 3; true by default, as 7.2's is), copied with the register's state, so a view and the push judged over it
+//! read the same answer (`Repository::publishing`).
 //!
 //! **Not lent.** A repository whose store the map does not hold here; one an import is filling, whose index is put in
 //! place when the import ends (A-675), so no client is served a history that is half there; and one whose view cannot
@@ -45,10 +46,6 @@ use crate::vcs_http::hg::HgStores;
 /// Counter: a Mercurial repository whose view could not be made (a marker or changelog row its store cannot read, or a
 /// view past the request's room), answered as not served. Format: a counter name in the status report.
 pub(crate) const UNMADE: &str = "vcs_store.hg_view.unmade";
-
-/// Decided (module docs, "Publishing"): whether a repository publishes, until its record carries 7.2's `phases.publish`;
-/// a push lands on the same terms (`hg_push::unbundle`).
-pub(crate) const PUBLISHING: bool = true;
 
 /// The daemon's lender (module docs): the served views of the Mercurial repositories this shard's map holds.
 #[derive(Clone, Copy, Debug, Default)]
@@ -572,6 +569,8 @@ struct Register {
   bookmarks: BookmarkHeads,
   /// The obsolescence markers, each alone in its format, in the markers log's order.
   markers: Vec<Vec<u8>>,
+  /// Whether the repository publishes (module docs, "Publishing").
+  publishing: bool,
 }
 
 impl Register {
@@ -580,14 +579,14 @@ impl Register {
     State {
       roots: &self.roots,
       bookmarks: &self.bookmarks,
-      publishing: PUBLISHING,
+      publishing: self.publishing,
       markers: &self.markers,
     }
   }
 }
 
-/// The phase roots, bookmarks and obsolescence markers repository `id`'s register holds now, copied and charged to
-/// `room` (module docs): a root whose phase or node Mercurial does not have, a name under the bookmarks' tag that no
+/// The phase roots, bookmarks and obsolescence markers repository `id`'s register holds now and whether it publishes,
+/// copied and charged to `room` (module docs): a root whose phase or node Mercurial does not have, a name under the bookmarks' tag that no
 /// bookmark's name is, and a bookmark whose green names no head are not read, since the register holds none of them
 /// for a push it took.
 fn register_of(
@@ -622,10 +621,15 @@ fn register_of(
     room.charge(u64::try_from(marker.len()).unwrap_or(u64::MAX))?;
     markers.push(marker.to_vec());
   }
+  // A repository whose record is gone has no store either, so no view reads this; 7.2's default is kept for it.
+  let publishing = repositories
+    .repository(id)
+    .is_none_or(|record| record.policy.hg_publishing);
   Ok(Register {
     roots,
     bookmarks,
     markers,
+    publishing,
   })
 }
 

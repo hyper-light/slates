@@ -1271,6 +1271,7 @@ pub(crate) type PolicyParts<'a> = (
   &'a [slates_ipc::protocol::HookConfig],
   &'a [slates_ipc::protocol::HooksEnvSection],
   &'a [Vec<u8>],
+  bool,
 );
 
 /// Sets repository `repository`'s policy whole (§4.17.1 "Policy", A-622): its owner's verb, made from policy version
@@ -1284,7 +1285,7 @@ pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks, hooks_env, signers): PolicyParts<'_>,
+  (rules, hooks, hooks_env, signers, hg_publishing): PolicyParts<'_>,
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "set_repository_policy") {
     Ok(record) => record,
@@ -1305,6 +1306,7 @@ pub(crate) fn set_policy(
     hooks: hooks.iter().map(db_hook).collect(),
     hooks_env: hooks_env.iter().map(db_hooks_env_section).collect(),
     signers,
+    hg_publishing,
   };
   let op = Op::RepositoryPolicySet {
     repository: record.id,
@@ -1347,6 +1349,7 @@ pub(crate) fn describe_policy(
       .map(wire_hooks_env_section)
       .collect(),
     signers: policy.signers.clone(),
+    hg_publishing: policy.hg_publishing,
   }
 }
 
@@ -2524,6 +2527,7 @@ mod tests {
         hooks,
         hooks_env: Vec::new(),
         signers: Vec::new(),
+        hg_publishing: true,
       },
     )
   }
@@ -2650,6 +2654,7 @@ mod tests {
             hooks,
             hooks_env,
             signers: Vec::new(),
+            hg_publishing: true,
           },
         )
       };
@@ -2727,6 +2732,7 @@ mod tests {
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers,
+      hg_publishing: true,
     };
     ask(state, &owner(), body)
   }
@@ -2906,6 +2912,7 @@ mod tests {
             hooks: vec![hook.clone()],
             hooks_env: Vec::new(),
             signers: Vec::new(),
+            hg_publishing: true,
           },
         )
       };
@@ -2916,7 +2923,7 @@ mod tests {
       let foreign_set = refusal(set(state, &stranger(), 1));
       let stale = refusal(set(state, &owner(), 0));
       let empty = |reply: &ReplyBody| {
-        matches!(reply, ReplyBody::RepositoryPolicy { version: 0, rules, hooks, hooks_env, signers }
+        matches!(reply, ReplyBody::RepositoryPolicy { version: 0, rules, hooks, hooks_env, signers, hg_publishing: true }
           if rules.is_empty() && hooks.is_empty() && hooks_env.is_empty() && signers.is_empty())
       };
       let hooked = |reply: &ReplyBody| matches!(reply, ReplyBody::RepositoryPolicy { version: 1, hooks, .. } if hooks == &vec![hook.clone()]);

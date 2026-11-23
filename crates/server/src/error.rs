@@ -286,6 +286,9 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::PolicyHooksEnvMalformed { index } => {
       database(DatabaseRefusal::PolicyHooksEnvMalformed { index: *index })
     }
+    DbError::PolicyPublishingNotMercurial => {
+      database(DatabaseRefusal::PolicyPublishingNotMercurial)
+    }
     DbError::IndexCutStep { current } => {
       database(DatabaseRefusal::IndexCutStep { current: *current })
     }

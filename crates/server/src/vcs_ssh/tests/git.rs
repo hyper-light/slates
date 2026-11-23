@@ -334,6 +334,7 @@ fn record(id: RepositoryId) -> RepositoryRecord {
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers: Vec::new(),
+      hg_publishing: true,
     },
   }
 }
