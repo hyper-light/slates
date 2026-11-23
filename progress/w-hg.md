@@ -490,3 +490,13 @@ Waiting: main's route; arena-7 and arena-8.
 - Flagged to main: the watchdog's per-beat allocation (several GB over a push-all); push::phase_heads collected per
   step; the HTTP exchange's buffering.
 - Next (unless main routes otherwise): phase_heads and the HTTP exchange site.
+
+## 2026-11-23 ~15:30 PST (w-hg, worktree w-hg-b)
+- Landed dcf71036e: six R3 literals. The record versions end with a Format: line; homes' 16/20 are named; the test
+  hook's 1 ms poll is replaced by a waker (release_parked).
+- Landed f14ea81bb: the heap sampler no longer counts its own allocations (a thread's first symbolization was being
+  charged to its next allocation); its counter is per thread. Corrected push: 362 KB a changeset, 86% Greens::lend
+  (Green::default's 2 KiB SetHash plus a Box per lend). phase_heads and the watchdog were artifacts.
+- Told main arena-9's diag sampler shares the guard flaw; it's minor at full scale.
+- Asked main whether I take the greens lend cut or route it. Next: (c) the HgExchange site (likely also an artifact),
+  then lookup's `prefixed` 91 ms begin.
