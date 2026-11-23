@@ -844,7 +844,11 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission and the `obsolete` pushkey namespace. BUILT since: the reply's `N new
+>   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
+>   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
+>   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
+>   names it. BUILT since: the reply's `N new
 >   obsolescence markers` output; the kept heads for a view with left-out changesets (piece 2, below); a
 >   non-publishing repository and its hidden view (piece 3, below).
 >   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
@@ -937,12 +941,29 @@
 >   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
 >   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
 >   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   The intake's rebuilt file texts cut BUILT (2026-11-23, w-hg; main's order, C1 first by bytes): a file revision was
+>   rebuilt into a buffer of its own and every text of its group kept in the push's cache until the group ended, so a
+>   push allocated each file text it brought once (`intake::rebuilt`, 3.76 GB freed within a second over Mercurial's
+>   own push, 1.07 GB in the [128 KiB, 256 KiB) band). Now the cache keeps only a text a delta past the next one rests
+>   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
+>   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
+>   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
+>   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
+>   (`hg_push_lifetimes`, w-perf's) after them.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
 >   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
 >   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
 >   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
+> - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
+>   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
+>   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
+>   Every append's rows now go in through `HgIndex::insert`, which seals when due; import's own seal is gone. A seal the
+>   store refuses leaves the append standing and is counted (`HgIndex::seals_refused`). Held by
+>   `every_append_seals_the_tail_when_due_and_a_released_fork_gives_its_seals_back` (`crates/hg/src/tests/index.rs`: red
+>   due after group 26 of 200; now never due, the fork sealed, and its release gives its seals back).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
