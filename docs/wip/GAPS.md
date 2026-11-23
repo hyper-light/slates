@@ -4485,6 +4485,15 @@
 >   (r21).
 > - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
 >   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **The use test over HTTP, every verb (main's r202, 2026-11-23, big Studio, main 2e375de89):** the svn matrix over
+> svn:// and with `ROUTE=http` both passed 66 of 66 (blame, diff and merge over HTTP among them, and the revision
+> property rows with the store: A-681's HTTP rows and A-645 (a)'s revprop rows by use). The use test met two of the
+> harness's own faults, now fixed:
+> - `info`'s entries compared in stock svn's hash order, which APR seeds afresh each run;
+> - a working copy's symbolic link read through as a file (`IsADirectory` over git-2000).
+>
+> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Owed:** main's rerun of the
+> use test over HTTP with reads.dump and git-2000.dump.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
