@@ -4402,6 +4402,17 @@
 >   (r21).
 > - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
 >   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **OPEN, svnsync over svn:// at 255.2 ms a revision against 135 ms (w-svnperf for main 01a20182, 2026-11-23; goal
+> 93):** main's round of `an_svnsync_measured` on the big Studio (main 1d06ab306, release, git-2000, stock 1.15.0):
+> svn:// import 5.9 s, then svnsync 510.4 s, daemon RSS 854 MB before and 1,032 MB at peak; HTTP import 111.1 s, then
+> svnsync 301.8 s (150.9 ms a revision). The 2026-11-21 figure above was 270.7 s. To find where the time went, the
+> test now prints every counter the daemon's shards report after the import, and what the sync added to each, whole and
+> a revision. The daemon counts an svn:// conversation's answers and their nanoseconds (`vcs_svn.answers`,
+> `vcs_svn.answer_ns`) against its waits: for a piece through the node's store, for a write, for the client's bytes,
+> and for a poll after a yield (`vcs_svn.fetch_wait_ns`, `write_wait_ns`, `read_wait_ns`, `yield_wait_ns`). It counts
+> an import's turns, landing waits and yields (`vcs_store.svn_import.turn_ns`, `land_wait_ns`, `yield_wait_ns`), and
+> the content store's reads, stored, freed, let-go and brought-back figures (`vcs_store.content.*`). Owed: main's quiet
+> rerun with them.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
