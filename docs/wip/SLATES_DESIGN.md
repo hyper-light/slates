@@ -21523,7 +21523,7 @@ Status: built on macOS 2026-10-06; Linux built 2026-11-19 by A-550 (its unit tes
 - The rule: a restart is a slow reply, never a dropped connection.
   1. The daemon hands the anchor a duplicate of each accepted connection before reading its first request, over the
      hold channel A-61 made for FUSE devices (now Unix-wide: a sequenced-packet pair on Linux, a datagram pair on
-     macOS). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
+     macOS, whose send into a full channel waits for room rather than failing `ENOBUFS`, 2026-11-22). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
      shut down before its hold is released.
   2. A request leaves the kernel only once its reply is in it: records are peeked, served, their replies sent, then
      consumed. The receive low-water mark wakes a connection only when a whole record is queued. A successor finds
