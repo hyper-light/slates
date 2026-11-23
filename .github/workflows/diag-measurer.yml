@@ -1,0 +1,36 @@
+name: diag-measurer
+
+# main 01a20182 (2026-11-22): is RealtimeKit on CI's Ubuntu runners, and does it grant SCHED_RR to an unprivileged
+# thread? Read-only probe: no install, nothing of slates built. Diagnostics only: never main.
+
+on:
+  push:
+    branches: ["diag-measurer-main-rtkit-probe"]
+
+jobs:
+  probe:
+    name: rtkit probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: What the runner has
+        run: |
+          set +e
+          uname -r; cat /etc/os-release | grep -E '^(NAME|VERSION)='
+          echo "rtprio $(ulimit -r) rttime $(ulimit -R)"
+          dpkg -l rtkit 2>&1 | tail -1
+          ls -la /usr/libexec/rtkit-daemon /usr/lib/rtkit/rtkit-daemon 2>&1
+          systemctl status rtkit-daemon --no-pager 2>&1 | head -5
+          busctl --system list 2>&1 | grep -iE 'RealtimeKit|rtkit' || echo "no RealtimeKit on the system bus"
+          ls -la /usr/share/dbus-1/system-services/ 2>&1 | grep -i rtkit || echo "no rtkit D-Bus activation file"
+          echo "== a grant attempt for this shell, through the bus as an unprivileged user"
+          ulimit -R 200000 2>&1; echo "rttime now $(ulimit -R)"
+          busctl --system call org.freedesktop.RealtimeKit1 /org/freedesktop/RealtimeKit1 org.freedesktop.RealtimeKit1 MaxRealtimePriority 2>&1 | head -2
+          busctl --system get-property org.freedesktop.RealtimeKit1 /org/freedesktop/RealtimeKit1 org.freedesktop.RealtimeKit1 MaxRealtimePriority 2>&1 | head -2
+          busctl --system call org.freedesktop.RealtimeKit1 /org/freedesktop/RealtimeKit1 org.freedesktop.RealtimeKit1 MakeThreadRealtimeWithPID ttu $$ $$ 1 2>&1 | head -3
+          chrt -p $$ 2>&1
+          true
