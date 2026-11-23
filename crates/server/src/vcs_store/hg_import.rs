@@ -96,6 +96,12 @@ pub(crate) struct Importing {
   /// The segments of its changegroup cut and not yet landed on the changeset store (A-767 C1 step 3), oldest first: a
   /// turn's, landed before the next turn ([`segment_changeset`], [`segment_landed`]).
   segments: std::collections::VecDeque<slates_hg::import::emit::Segment>,
+  /// Each segment handed to the store to land and not yet landed, oldest first: its file revisions' contents, let go of
+  /// the content store once it is durable (A-767 C1 step 2b, [`segment_landed`]).
+  landing: std::collections::VecDeque<Vec<slates_vcs::ContentId>>,
+  /// The file revisions' contents of every segment landed so far, let go once more once the import lands: its works
+  /// bring back what they read between (A-767 C1 step 2b, as a push's run, `hg_run`).
+  landed_contents: Vec<slates_vcs::ContentId>,
   /// The run of segment changesets landed so far: the first's sequence and the last's.
   run: Option<(u64, u64)>,
   /// The last changeset the register named when the import began: what the repository's next sequence is counted from
@@ -279,6 +285,8 @@ pub(crate) fn begin(
         },
         reserved: holding,
         segments: std::collections::VecDeque::new(),
+        landing: std::collections::VecDeque::new(),
+        landed_contents: Vec::new(),
         run: None,
         named,
         name: blake3::Hasher::new_derive_key(NAME_CONTEXT),
@@ -385,12 +393,11 @@ pub(crate) fn segment_changeset(
   id: RepositoryId,
 ) -> Option<SegmentLanding> {
   let disk = state.vcs_disk.clone()?;
-  let segment = state
-    .vcs_stores
-    .imports
-    .get_mut(&id)?
-    .segments
-    .pop_front()?;
+  let importing = state.vcs_stores.imports.get_mut(&id)?;
+  let mut segment = importing.segments.pop_front()?;
+  importing
+    .landing
+    .push_back(core::mem::take(&mut segment.contents));
   let sequence = state.vcs_stores.next_changeset(id)?;
   let payload_identity = *blake3::hash(&segment.payload).as_bytes();
   let texts: Vec<slates_store::texts::TextEntry> = segment
@@ -457,9 +464,27 @@ pub(crate) fn segment_landed(
     None => (sequence, sequence),
   });
   importing.name.update(&payload_identity);
+  let contents = importing.landing.pop_front().unwrap_or_default();
   state.count(SEGMENTS_LANDED, 1);
+  // Durable on the changeset store, which serves them from here: the segment's file texts leave the content store, their
+  // entries kept, so the rows still name them by identity (A-767 C1 step 2b): every window but those a home pins, as a
+  // push's (`hg_run::let_go_windows`). Kept for the second let-go once it lands, since its works bring back what they
+  // read in between.
+  let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, &contents);
+  state.count(FILE_TEXT_BYTES_LET_GO, freed);
+  state.count(FILE_TEXTS_PINNED, pinned);
+  if let Some(importing) = state.vcs_stores.imports.get_mut(&id) {
+    importing.landed_contents.extend(contents);
+  }
   Ok(())
 }
+
+/// Counter: the bytes of an import's file texts let go of the content store once the segment carrying them was durable
+/// on the changeset store (A-767 C1 step 2b), and again once it landed. Format: a counter name in the status report.
+pub(crate) const FILE_TEXT_BYTES_LET_GO: &str = "vcs_store.hg_import.file_text_bytes_let_go";
+/// Counter: an import's landed file window kept because a home holds it here (`vcs_store::landed_pin`). Format: a
+/// counter name.
+pub(crate) const FILE_TEXTS_PINNED: &str = "vcs_store.hg_import.file_texts_pinned";
 
 /// [`land`] for a test that holds the shard's state: the segments its import cut landed first
 /// ([`land_segments_blocking`]), as [`run`] lands them between turns.
@@ -595,6 +620,8 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
     stage,
     reserved,
     segments,
+    landing,
+    landed_contents,
     run,
     named,
     name,
@@ -608,6 +635,8 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
           stage: done,
           reserved,
           segments,
+          landing,
+          landed_contents,
           run,
           named,
           name,
@@ -634,6 +663,8 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
       },
       reserved: 0,
       segments,
+      landing,
+      landed_contents,
       run,
       named,
       name,
@@ -728,7 +759,7 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   state.store.budget.credit_retention(reserved);
   // Its segments landed unnamed: the next landing takes the last the register names, plus one (decision 2).
   state.vcs_stores.set_landed(id, named);
-  let whole = match (state.vcs_stores.content.as_mut(), stage) {
+  let whole = match (state.vcs_stores.content_mut(), stage) {
     (Some(content), Stage::Running { import, .. }) => (*import).abandon(content).is_ok(),
     (Some(content), Stage::Done { imported, .. }) => {
       let Imported { index, .. } = *imported;
@@ -745,7 +776,7 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 
 /// Gives back an index a landing did not place, then settles.
 fn give_back(state: &mut ShardState, index: HgIndex) {
-  let whole = match state.vcs_stores.content.as_mut() {
+  let whole = match state.vcs_stores.content_mut() {
     Some(content) => index.release(content).is_ok(),
     None => true,
   };
@@ -760,7 +791,7 @@ fn give_back(state: &mut ShardState, index: HgIndex) {
 /// the entry's apply. Refused, nothing is recorded, and the index and everything it held are given back. `Busy` while
 /// the import is still under way, `NoStore` when none is held for `id`.
 pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  let (mut imported, room, mut works, (run, named, name)) =
+  let (mut imported, room, mut works, (run, named, name), landed_contents) =
     match state.vcs_stores.imports.remove(&id) {
       Some(Importing {
         stage: Stage::Done {
@@ -772,8 +803,9 @@ pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), Impor
         run: Some(run),
         named,
         name,
+        landed_contents,
         ..
-      }) if segments.is_empty() => (imported, room, works, (run, named, name)),
+      }) if segments.is_empty() => (imported, room, works, (run, named, name), landed_contents),
       Some(running) => {
         state.vcs_stores.imports.insert(id, running);
         return Err(ImportFailed::Busy);
@@ -803,6 +835,10 @@ pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), Impor
   match appended {
     Ok(_) => {
       state.count(LANDED, 1);
+      // Landed, its texts let go once more: its works brought back what they read (A-767 C1 step 2b).
+      let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, &landed_contents);
+      state.count(FILE_TEXT_BYTES_LET_GO, freed);
+      state.count(FILE_TEXTS_PINNED, pinned);
       Ok(())
     }
     Err(refusal) => {
@@ -1121,12 +1157,15 @@ fn keep_work(
 }
 
 /// Repository `id`'s done import's bookmark works built whole, for a test that holds the shard's state and lands it in
-/// one call ([`land_imported`]); [`built_works`] builds them a unit a turn.
+/// one call ([`land_imported`]): [`built_works`]' units at once, a text not at hand read from the node's changeset store
+/// on a thread of its own (`test_store::answer_wants_blocking`) and brought back.
 #[cfg(test)]
 fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
+  let unavailable = || ImportFailed::Landing(Refusal::ContentUnavailable);
   let Some(wanted) = wanted_works(state, id) else {
     return Ok(());
   };
+  let verified = Verified::default();
   let mut admission = Admission::new(wanted.room);
   for (mark, node) in &wanted.marks {
     let moved = Move {
@@ -1135,21 +1174,56 @@ fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), Imp
       base: wanted.head.as_ref(),
       head: node,
     };
-    let built = super::lent_state(state, |state| {
-      let engine = state.greens.get(&wanted.root)?;
+    let begun = super::lent_state(state, |state| {
+      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
       done_held(state, id, |held| {
-        tree::work(
+        tree::begin_work(
           &moved,
-          &engine,
-          (&Verified::default(), held),
-          admission.left(),
+          (&verified, held),
+          (admission.left(), pace),
           &mut admission,
         )
       })
     })
-    .ok_or(ImportFailed::Landing(Refusal::ContentUnavailable))?
-    .map_err(|refused| ImportFailed::Landing(work_refused(&refused, wanted.room)))?;
-    keep_work(state, id, mark.clone(), built.increment);
+    .ok_or_else(unavailable)?;
+    let mut building =
+      begun.map_err(|refused| ImportFailed::Landing(work_refused(&refused, wanted.room)))?;
+    loop {
+      // Whole: every unit at once, a text not at hand read from the store on a thread of its own and brought back.
+      building.pace().turn(u64::MAX);
+      let advanced = super::lent_state(state, |state| {
+        let engine = state.greens.get(&wanted.root)?;
+        done_held(state, id, |held| {
+          building.advance(&engine, (&verified, held))
+        })
+      })
+      .ok_or_else(unavailable)?;
+      match advanced {
+        None if building.ask_waited(admission.left()) => {
+          let disk = state.vcs_disk.clone().ok_or_else(unavailable)?;
+          if !crate::test_store::answer_wants_blocking(
+            &disk,
+            u128::from_be_bytes(id.bytes),
+            &mut building,
+          ) {
+            return Err(unavailable());
+          }
+          super::lent_state(state, |state| brought_back(state, id, &mut building))
+            .ok_or_else(unavailable)?;
+        }
+        None => {}
+        Some(Ok(built)) => {
+          admission
+            .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
+            .map_err(|_| ImportFailed::Landing(past_room(wanted.room)))?;
+          keep_work(state, id, mark.clone(), built.increment);
+          break;
+        }
+        Some(Err(refused)) => {
+          return Err(ImportFailed::Landing(work_refused(&refused, wanted.room)));
+        }
+      }
+    }
   }
   Ok(())
 }

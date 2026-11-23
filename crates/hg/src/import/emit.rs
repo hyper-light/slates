@@ -38,6 +38,9 @@ pub struct Segment {
   pub texts: Vec<KeptText>,
   /// Its record: the index rows of those revisions, by identity, and the markers in the last segment.
   pub record: Vec<u8>,
+  /// The content store's identities of its file revisions' bytes and metadata blocks (A-767 C1 step 2b): what its owner
+  /// lets go of the content store once the segment is durable on the node's changeset store, which then serves them.
+  pub contents: Vec<slates_vcs::ContentId>,
 }
 
 /// Why a revision could not be written.
@@ -105,6 +108,8 @@ pub struct Emitter {
   ranges: Vec<(Logged, u32, u32)>,
   /// The bytes of the segments cut so far.
   cut: u64,
+  /// The content identities of the file revisions the segment being written holds ([`Segment::contents`]).
+  contents: Vec<slates_vcs::ContentId>,
 }
 
 impl Emitter {
@@ -119,7 +124,18 @@ impl Emitter {
       named: false,
       ranges: Vec::new(),
       cut: 0,
+      contents: Vec::new(),
     }
+  }
+
+  /// Notes the content identities a file revision of the segment being written was kept as ([`Segment::contents`]).
+  pub(crate) fn note_contents(
+    &mut self,
+    bytes: slates_vcs::ContentId,
+    block: Option<slates_vcs::ContentId>,
+  ) {
+    self.contents.push(bytes);
+    self.contents.extend(block);
   }
 
   /// A log opened: what the last one kept let go.
@@ -283,6 +299,7 @@ impl Emitter {
       payload: core::mem::take(&mut self.segment),
       texts: core::mem::take(&mut self.texts),
       record,
+      contents: core::mem::take(&mut self.contents),
     });
   }
 }
