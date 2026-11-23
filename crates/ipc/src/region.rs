@@ -90,6 +90,11 @@ pub const PARKED_STAMP_SLOT_ONE: u32 = 2;
 /// value but slot one's; the async path reads no stamp.
 /// Format: the next value after the two stamp slots' flags (1 and 2).
 pub const PARKED_ASYNC: u32 = 3;
+/// Format: the client's parked flag while it waits in a synchronous park that stamps slot 0 on its region's reply wake
+/// semaphore (macOS, `crate::mach_semaphore`): the daemon signals the semaphore for it rather than waking the word.
+pub const PARKED_SEMAPHORE_SLOT_ZERO: u32 = 4;
+/// Format: as [`PARKED_SEMAPHORE_SLOT_ZERO`], for a park that stamps slot 1.
+pub const PARKED_SEMAPHORE_SLOT_ONE: u32 = 5;
 /// Format: the reply stamp's confirmed bit, the top one: set by the daemon after its wake found the
 /// client asleep in its wait (the kernel had a sleeper to wake), so the stamp times a sleeper woken — the
 /// event the boot probe measures. The low 63 bits are the stamp's nanoseconds (292 years of uptime).
@@ -218,6 +223,12 @@ pub struct ClientRegion {
   /// Event instead. Absent on Linux/macOS, where the futex / `os_sync` wake word crosses processes.
   #[cfg(windows)]
   wake_event: crate::wake::Event,
+  /// The reply wake on macOS (`crate::mach_semaphore`): made by the daemon with the region, whose send right reaches the
+  /// client with the region's fileport (`crate::mach_claim`); a client's synchronous park waits on it, says so in its
+  /// parked flag ([`PARKED_SEMAPHORE_SLOT_ZERO`]), and the daemon signals it for such a park. `None` for a mapping made
+  /// any other way (a second mapping, a test's open by name), whose parks wait on the wake word as before.
+  #[cfg(target_os = "macos")]
+  wake_semaphore: Option<crate::mach_semaphore::Semaphore>,
 }
 
 impl std::fmt::Debug for ClientRegion {
@@ -269,6 +280,8 @@ impl ClientRegion {
       geometry.bulk_offset(),
       usize::try_from(geometry.bulk_bytes).unwrap_or(0),
     );
+    #[cfg(target_os = "macos")]
+    let wake_semaphore = crate::mach_semaphore::Semaphore::create()?;
     {
       let mut header = [0u8; HEADER_BYTES];
       let bytes = &mut header[..];
@@ -326,6 +339,8 @@ impl ClientRegion {
       bulk,
       #[cfg(windows)]
       wake_event,
+      #[cfg(target_os = "macos")]
+      wake_semaphore: Some(wake_semaphore),
     })
   }
 
@@ -340,6 +355,19 @@ impl ClientRegion {
   pub fn from_descriptor(fd: std::os::fd::OwnedFd, len: usize) -> Result<ClientRegion, IpcError> {
     Self::check_len(len)?;
     Self::from_object(SharedObject::from_descriptor(fd, len, Words::new())?)
+  }
+
+  /// The client maps the region the daemon handed over with its reply wake semaphore's send right (macOS: both from the
+  /// instance's owner, `crate::mach_claim::fetch`), so its synchronous parks wait on the semaphore.
+  #[cfg(target_os = "macos")]
+  pub(crate) fn from_descriptor_with_wake(
+    fd: std::os::fd::OwnedFd,
+    len: usize,
+    wake: crate::mach_semaphore::Semaphore,
+  ) -> Result<ClientRegion, IpcError> {
+    let mut region = Self::from_descriptor(fd, len)?;
+    region.wake_semaphore = Some(wake);
+    Ok(region)
   }
 
   /// A second, independent mapping of this region, through a duplicate of its descriptor: what a holder of the region
@@ -435,6 +463,8 @@ impl ClientRegion {
       bulk: (bulk_at, bulk_len),
       #[cfg(windows)]
       wake_event,
+      #[cfg(target_os = "macos")]
+      wake_semaphore: None,
     })
   }
 
@@ -527,6 +557,46 @@ impl ClientRegion {
   #[cfg(windows)]
   pub fn wake_signal(&self) -> Result<(), IpcError> {
     self.wake_event.signal()
+  }
+
+  /// Whether this mapping holds the reply wake semaphore (macOS), so its synchronous parks wait on it.
+  #[cfg(target_os = "macos")]
+  pub fn has_wake_semaphore(&self) -> bool {
+    self.wake_semaphore.is_some()
+  }
+
+  /// The reply wake semaphore's port name in this task, for the daemon's keep (`crate::mach_claim::keep`).
+  #[cfg(target_os = "macos")]
+  pub(crate) fn wake_semaphore_port(&self) -> Option<u32> {
+    self
+      .wake_semaphore
+      .as_ref()
+      .map(crate::mach_semaphore::Semaphore::port)
+  }
+
+  /// Waits on the reply wake semaphore up to `timeout_ns` (macOS; `crate::mach_semaphore`): `None` when the region has
+  /// none, else whether it was signaled. The caller has published its parked flag and re-checked its ring. A semaphore
+  /// found gone (its daemon's region dropped, as a restart does) is let go, so this mapping's parks wait on the wake
+  /// word from then on, and the caller's park waits there too, where its look at the daemon's life ends it.
+  #[cfg(target_os = "macos")]
+  pub fn semaphore_wait(&mut self, timeout_ns: Option<u64>) -> Result<Option<bool>, IpcError> {
+    let Some(semaphore) = self.wake_semaphore.as_ref() else {
+      return Ok(None);
+    };
+    let waited = semaphore.wait(timeout_ns)?;
+    if waited.is_none() {
+      self.wake_semaphore = None;
+    }
+    Ok(waited)
+  }
+
+  /// Signals the reply wake semaphore (macOS): whether the region has one to signal.
+  #[cfg(target_os = "macos")]
+  pub fn semaphore_signal(&self) -> Result<bool, IpcError> {
+    match &self.wake_semaphore {
+      Some(semaphore) => semaphore.signal().map(|()| true),
+      None => Ok(false),
+    }
   }
 
   /// The wake word.

@@ -3924,11 +3924,16 @@ pub mod platform {
     ) -> Result<(String, usize), IpcError> {
       region.unlink_name()?;
       let len = region.object().len();
+      // The region's reply wake semaphore goes with it (`crate::mach_semaphore`); a daemon region always makes one.
+      let wake = region.wake_semaphore_port().ok_or(IpcError::Layout {
+        reason: "a daemon's region with no reply wake semaphore to hand over",
+      })?;
       crate::mach_claim::keep(
         &owner_token_name(&self.instance),
         index,
         pid,
         region.object().as_fd(),
+        wake,
       )?;
       Ok((String::new(), len))
     }
@@ -4543,12 +4548,12 @@ pub mod platform {
     #[cfg(target_os = "macos")]
     fn region(&self, _name: String, len: usize) -> Result<ClientRegion, IpcError> {
       // Waited for while the owner lives (A-452).
-      let fd = crate::mach_claim::fetch(
+      let (fd, wake) = crate::mach_claim::fetch(
         &self.instance,
         &owner_token_name(&self.instance),
         self.index,
       )?;
-      ClientRegion::from_descriptor(fd, len)
+      ClientRegion::from_descriptor_with_wake(fd, len, wake)
     }
 
     /// The answered claim's region (Windows): opened by the name the answer carries.

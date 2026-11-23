@@ -17298,6 +17298,48 @@ ubuntu-24.04-arm:
 - In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
   daemon and the client fair.
 
+## 84a on macOS: the reply wake on its region's Mach semaphore, landed (A-867; w-perf; 2026-11-22)
+
+**What was measured first.** The reply write was the serve loop's long hold, timed by parts (runs 45072617323,
+45072811313, 45074388808). Of the reply write's wakes over 1 ms, 1,451 of 1,504 were on CPU for at least 90% of their
+wall time, inside `os_sync_wake_by_address_any`.
+- A spindump (run 45082342692): 69 of the wake's 106 samples sat at one kernel instruction.
+- Probes on the same runner (runs 45078071137, 45079961886, 45086631612):
+  - an address wake of an already-sleeping waiter: p999 15-72 µs;
+  - a wake that meets the waiter entering its wait: 13-24 wakes over 1 ms in one pass of three, up to 14 ms, mostly on
+    CPU, even with no spinners;
+  - a pipe: the same shape;
+  - a Mach semaphore: at most 2, worst 1.7 ms, mostly off CPU.
+- Bare metal (a Mac Studio, 32 cores, 64 spinners, 8 runs, main's check): no reply wake ran 1 ms. The loaded p99 was
+  0.16-0.19 ms. The spin is the VM's: a lock holder's vCPU descheduled.
+
+**The run.** Run 45091701553 (`diag-measurer-w-perf-84a-mac-tail`): A = 0ce3b100d (the address wake) against B =
+947239f7d (the semaphore, then named in the region's header, which only an in-process daemon could use). One
+macos-latest runner, 8 rounds, the arms alternating. Each arm had a quiet run and a stamped loaded run, with the
+time-constraint control beside it. Cells are the pooled goal lines (3 × 1,000 samples), µs, rounds in order.
+
+| | A | B |
+|---|---|---|
+| loaded accept p99 | 1082 · 1870 · 1662 · 1878 · 1314 · 3342 · 1596 · 2719 | 1094 · 1233 · 1317 · 894 · 633 · 1048 · 903 · 823 |
+| loaded conflict p99 | 944 · 4728 · 7450 · 7246 · 8496 · 3874 · 3541 · 529 | 1485 · 720 · 1585 · 1240 · 386 · 1486 · 2132 · 641 |
+| loaded accept p999 | 6671 · 6383 · 10188 · 8041 · 5817 · 12689 · 6396 · 8455 | 4132 · 7346 · 5555 · 6675 · 1331 · 2362 · 1796 · 2376 |
+| loaded conflict p999 | 5922 · 12391 · 13063 · 17737 · 20546 · 8297 · 9517 · 3049 | 11664 · 3635 · 17168 · 18291 · 1220 · 9610 · 7914 · 3997 |
+| quiet accept p50 | 284 · 234 · 295 · 281 · 274 · 386 · 380 · 245 | 295 · 287 · 300 · 303 · 219 · 176 · 198 · 374 |
+| quiet accept p99 | 1813 · 1216 · 918 · 502 · 541 · 1190 · 1556 · 966 | 535 · 793 · 606 · 1072 · 593 · 301 · 655 · 1079 |
+| reply wakes >= 1 ms | 194 · 373 · 636 · 599 · 409 · 305 · 383 · 102 | 4 · 13 · 3 · 6 · 0 · 7 · 2 · 1 |
+
+**Landed** (A-867), with the semaphore's send right carried to the client with its region's fileport.
+- The runner was slow: A's p99 ran 1-3 ms against 0.3-0.6 ms in earlier runs.
+- B took reply wakes over 1 ms from 3,001 to 36.
+- B won accept p99 in 7 of 8 rounds and conflict p99 in 6 of 8. Median p99: 1,766 against 976 µs (accept), 4,301
+  against 1,363 µs (conflict).
+- B won accept p999 in 7 of 8 rounds. Conflict p999 was mixed (3 of 8).
+- Quiet was no worse: p50 even, p99 better.
+- B's remaining tail is long verbs inside the serve loop (ReadRange 10-22 ms, Destroy 13.6 ms, CreateWork 12.6 ms,
+  Telemetry and Acknowledge about 11 ms), on codex-review's list. One semaphore signal also ran 27.7 ms: rarer, not
+  immune.
+- Confirming rounds run on the landed code (main).
+
 ## 84a on Linux: a client's request pinned to its shard's CPU (arm F, on E), measured and rejected (w-perf; 2026-11-22)
 
 **The arm** (F b44f0904f on E 0b568ac91, branch `agents/w-perf-84a-arm-f`, never main; stamped F_diag 9ad9d4cc9 against

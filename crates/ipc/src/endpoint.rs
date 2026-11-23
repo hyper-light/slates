@@ -106,6 +106,8 @@ pub struct ClientEnd {
   request_stamp: u32,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
   parks: u64,
+  /// Parks its region's wake semaphore ended (macOS, `crate::mach_semaphore`): the semaphore wake's non-vacuity count.
+  semaphore_wakes: u64,
   /// Replies taken.
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
@@ -201,6 +203,7 @@ impl ClientEnd {
       next_reply: 0,
       request_stamp: 0,
       parks: 0,
+      semaphore_wakes: 0,
       replies: 0,
       unanswered_wakes: 0,
       parks_ended_by_looks: 0,
@@ -554,6 +557,11 @@ impl ClientEnd {
     (self.parks, self.replies)
   }
 
+  /// Parks its region's wake semaphore ended (macOS; see the field).
+  pub fn semaphore_wakes(&self) -> u64 {
+    self.semaphore_wakes
+  }
+
   /// Parks a wake ended with no reply waiting, so the client parked again (see the field).
   pub fn unanswered_wakes(&self) -> u64 {
     self.unanswered_wakes
@@ -814,10 +822,10 @@ impl ClientEnd {
     self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
     // A running completion bridge waits where this park does: the flag's value, a stamp slot's and never the async
     // arm's, has it pass on a wake it takes while this park waits (see `crate::completion`).
-    self
-      .region
-      .client_parked()?
-      .store(parked_flag(slot), Ordering::Release);
+    self.region.client_parked()?.store(
+      parked_flag(slot, parks_on_semaphore_here(&self.region)),
+      Ordering::Release,
+    );
     // The park protocol's client half: the word's value and the re-check after it are ordered after the flag, so a
     // reply the re-check misses is one the daemon sees the flag for (§4.7; `crate::park`).
     crate::park::after_arming();
@@ -923,9 +931,31 @@ impl ClientEnd {
     })
   }
 
-  /// A deadline's park (and macOS's departure park between its looks): the wake word's wait, whose wake confirms a
-  /// sleeper found (Linux's futex, macOS's ulock), up to `timeout_ns` (`None`: until woken).
-  #[cfg(not(windows))]
+  /// A deadline's park on macOS (and its departure park between looks): the region's wake semaphore
+  /// (`crate::mach_semaphore`), which cannot say whether its signal met a sleeper, so the client judges its own sleep;
+  /// counted when a signal ended it. Up to `timeout_ns` (`None`: until woken).
+  #[cfg(target_os = "macos")]
+  fn park_until(&mut self, expected: u32, timeout_ns: Option<u64>) -> Result<Parked, IpcError> {
+    if let Some(woken) = self.region.semaphore_wait(timeout_ns)? {
+      if woken {
+        self.semaphore_wakes = self.semaphore_wakes.saturating_add(1);
+      }
+      return Ok(Parked {
+        woken,
+        departed: false,
+        waker_confirms: false,
+      });
+    }
+    Ok(Parked {
+      woken: wake::wait(self.region.wake_word()?, expected, timeout_ns)?,
+      departed: false,
+      waker_confirms: true,
+    })
+  }
+
+  /// A deadline's park: the wake word's wait, whose wake confirms a sleeper found (Linux's futex), up to `timeout_ns`
+  /// (`None`: until woken).
+  #[cfg(not(any(windows, target_os = "macos")))]
   fn park_until(&self, expected: u32, timeout_ns: Option<u64>) -> Result<Parked, IpcError> {
     Ok(Parked {
       woken: wake::wait(self.region.wake_word()?, expected, timeout_ns)?,
@@ -1158,17 +1188,38 @@ fn wait_may_teach(
 }
 
 /// The client's parked flag for a park that names `slot`.
-fn parked_flag(slot: usize) -> u32 {
-  if slot == 0 {
-    PARKED_STAMP_SLOT_ZERO
-  } else {
-    PARKED_STAMP_SLOT_ONE
+fn parked_flag(slot: usize, on_semaphore: bool) -> u32 {
+  match (slot == 0, on_semaphore) {
+    (true, false) => PARKED_STAMP_SLOT_ZERO,
+    (false, false) => PARKED_STAMP_SLOT_ONE,
+    (true, true) => crate::region::PARKED_SEMAPHORE_SLOT_ZERO,
+    (false, true) => crate::region::PARKED_SEMAPHORE_SLOT_ONE,
   }
 }
 
-/// The reply stamp slot a parked flag's value names (any armed value other than slot one's names slot 0).
+/// The reply stamp slot a parked flag's value names (any armed value other than slot one's two names slot 0).
 fn stamp_slot(parked: u32) -> usize {
-  usize::from(parked == PARKED_STAMP_SLOT_ONE)
+  usize::from(parked == PARKED_STAMP_SLOT_ONE || parked == crate::region::PARKED_SEMAPHORE_SLOT_ONE)
+}
+
+/// Whether a parked flag's value is a synchronous park on the region's reply wake semaphore (macOS).
+#[cfg(target_os = "macos")]
+fn parks_on_semaphore(parked: u32) -> bool {
+  parked == crate::region::PARKED_SEMAPHORE_SLOT_ZERO
+    || parked == crate::region::PARKED_SEMAPHORE_SLOT_ONE
+}
+
+/// Whether this end's synchronous parks wait on its region's reply wake semaphore (macOS, when the region came with one).
+fn parks_on_semaphore_here(region: &ClientRegion) -> bool {
+  #[cfg(target_os = "macos")]
+  {
+    region.has_wake_semaphore()
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    let _ = region;
+    false
+  }
 }
 
 impl ClientEnd {
@@ -1357,8 +1408,16 @@ impl DaemonEnd {
       // confirmation then left a bare confirmed bit that refused the following park's stamp).
       #[cfg(windows)]
       self.region.wake_signal()?;
+      // A client whose flag says it parks on its region's semaphore (macOS, `crate::mach_semaphore`) is woken by it,
+      // which a wake meeting the waiter mid-entry does not spin on; every other park (a mapping with no semaphore, an
+      // async SDK's arm its bridge waits for) keeps the address wake. The semaphore cannot say whether it met a sleeper,
+      // so nothing is confirmed.
+      #[cfg(target_os = "macos")]
+      let by_semaphore = parks_on_semaphore(armed) && self.region.semaphore_signal()?;
+      #[cfg(not(any(target_os = "macos", windows)))]
+      let by_semaphore = false;
       #[cfg(not(windows))]
-      if wake::wake_one(word)? && stamped {
+      if !by_semaphore && wake::wake_one(word)? && stamped {
         // A failed exchange is this slot armed again before the confirmation, which the ring's order
         // rules out but for a client that gave the reply up past its deadline: nothing left to confirm.
         let _ = stamp.compare_exchange(
