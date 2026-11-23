@@ -636,6 +636,9 @@ pub(crate) struct SvnExchange<S: SvnStores> {
   path: String,
   /// The `Depth` header's value, if one was sent.
   depth: Option<String>,
+  /// The `Label` header's value, if one was sent: DeltaV v1 names a revision of the VCC by it (`slates_svn::dav::site`'s
+  /// `labelled`).
+  label: Option<String>,
   /// The request's body.
   body: Vec<u8>,
   /// The room the exchange may still hold.
@@ -752,7 +755,9 @@ impl<S: SvnStores> SvnExchange<S> {
       timeout: text(b"Timeout"),
       lock_token: text(b"Lock-Token"),
     };
+    let label = text(b"Label");
     let held = [
+      &label,
       &commit_headers.destination,
       &commit_headers.version_text,
       &commit_headers.presented,
@@ -776,6 +781,7 @@ impl<S: SvnStores> SvnExchange<S> {
       method,
       path: asked.routed.path,
       depth,
+      label,
       body: Vec::new(),
       room: admission,
       request_room: room,
@@ -2084,6 +2090,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
       method: &self.method,
       path: &self.path,
       depth: self.depth.as_deref(),
+      label: self.label.as_deref(),
       body: &self.body,
     };
     let bounds = xml_bounds(self.request_room);

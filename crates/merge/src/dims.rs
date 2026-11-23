@@ -226,6 +226,25 @@ impl Blocks {
       .and_then(|slot| slot.name)
   }
 
+  /// The bytes of the live blocks named for each object `wanted` holds (A-866), one each, in one pass over the blocks: a
+  /// block named for an object holds that object's bytes, whichever file or version holds it.
+  pub(crate) fn named_bytes(
+    &self,
+    wanted: &std::collections::BTreeSet<crate::named::Identity>,
+  ) -> Vec<(crate::named::Identity, Vec<u8>)> {
+    let mut found: std::collections::BTreeMap<crate::named::Identity, Vec<u8>> =
+      std::collections::BTreeMap::new();
+    for slot in self.slots.iter().flatten() {
+      if let Some(name) = slot.name
+        && wanted.contains(&name)
+        && !found.contains_key(&name)
+      {
+        found.insert(name, slot.bytes.clone());
+      }
+    }
+    found.into_iter().collect()
+  }
+
   /// One more holder of `block`.
   pub(crate) fn hold(&mut self, block: Block) {
     if let Some(Some(slot)) = self.slots.get_mut(block.0) {

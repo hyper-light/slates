@@ -65,6 +65,7 @@ impl Fixture {
       method,
       path,
       depth: None,
+      label: None,
       body,
     };
     answer(&self.served(), &request, &BOUNDS, ROOM)

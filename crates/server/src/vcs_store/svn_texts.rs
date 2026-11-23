@@ -297,7 +297,7 @@ fn subversion_of(
 
 /// The texts green `green`'s checkpoint (A-869) and chain entries name that the content store does not hold whole
 /// (lacks, or holds with a window let go), each once, with its length.
-fn named_lacking(
+pub(crate) fn named_lacking(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
 ) -> Vec<(ContentIdentity, u64)> {
