@@ -1,0 +1,16 @@
+--- a/crates/cli/src/verbs.rs
++++ b/crates/cli/src/verbs.rs
+@@ -1646,7 +1646,12 @@
+   (path, mode): (&str, u32),
+   json: bool,
+ ) -> Result<(), ClientError> {
+-  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?;
++  // DIAG RED (never merged): the hold disabled, as before A-879.
++  let held: Option<slates_client::Hold> = if instance.is_empty() {
++    slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?
++  } else {
++    None
++  };
+   let written = write_stdin(client, (volume, attachment), path, mode);
+   if let Some(lost) = held.and_then(slates_client::Hold::end) {
+     slates_machine::log_line!(

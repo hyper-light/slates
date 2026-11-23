@@ -1214,6 +1214,21 @@ fn mapped_access_refused(call: &'static str, error: &slates_mem::MemError) -> Cl
   })
 }
 
+/// What a renewal answered ([`Client::renew`], A-384, A-879).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renewal {
+  /// A CLI attachment's term, renewed.
+  Renewed {
+    /// The term now in force, nanoseconds: the attachment lapses this long after its last use.
+    term_ns: u64,
+    /// How soon its holder renews again, nanoseconds.
+    renew_every_ns: u64,
+  },
+  /// The attachment has no term (a mount's, which lives by its own activity; an SDK client's, which lives with its
+  /// client): nothing was renewed, and nothing need hold it.
+  NoTerm,
+}
+
 /// Where a volume's move stands after one ask ([`Client::move_volume`], A-291).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveState {
@@ -5121,14 +5136,18 @@ impl Client {
   }
 
   /// Renews a CLI attachment's term from its holder (A-230, A-384), and nothing else: the term now in force and how soon
-  /// to renew again, nanoseconds, as `(term, renew_every)`. Refused as any use of the attachment is (`AttachmentExpired`
-  /// once its term lapsed).
-  pub fn renew(&mut self, attachment: u64) -> Result<(u64, u64), ClientError> {
+  /// to renew again, or that the attachment has no term to renew (A-879). Refused as any use of the attachment is
+  /// (`AttachmentExpired` once its term lapsed).
+  pub fn renew(&mut self, attachment: u64) -> Result<Renewal, ClientError> {
     match self.call(&RequestBody::Renew { attachment })? {
       ReplyBody::Renewed {
         term_ns,
         renew_every_ns,
-      } => Ok((term_ns, renew_every_ns)),
+      } => Ok(Renewal::Renewed {
+        term_ns,
+        renew_every_ns,
+      }),
+      ReplyBody::NoTerm => Ok(Renewal::NoTerm),
       _ => Err(ClientError::UnexpectedReply { verb: "renew" }),
     }
   }

@@ -87,6 +87,35 @@ fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>,
   )
 }
 
+/// Runs the command, giving it `input` on its stdin only `after` it started: the exit code and both outputs, the stderr
+/// naming a failure to feed the input (a command that ended before its input came).
+fn run_with_late_stdin(
+  instance: &str,
+  args: &[&str],
+  input: &[u8],
+  after: Duration,
+) -> (i32, Vec<u8>, String) {
+  use std::io::Write;
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  #[allow(clippy::disallowed_methods)] // the input's lateness is what the test gives the command
+  std::thread::sleep(after);
+  let fed = child.stdin.take().unwrap().write_all(input);
+  let output = child.wait_with_output().unwrap();
+  let mut err = String::from_utf8_lossy(&output.stderr).into_owned();
+  if let Err(error) = fed {
+    err.push_str(&format!("\n(the input could not be fed: {error})"));
+  }
+  (output.status.code().unwrap_or(-1), output.stdout, err)
+}
+
 fn value_of(text: &str, key: &str) -> String {
   text
     .lines()
@@ -1409,6 +1438,61 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   std::thread::sleep(PAST_THE_REAPER);
   let (code, _, err) = run(&instance, &["detach", &attachment]);
   assert_eq!(code, 0, "detach: {err}");
+  drop(anchor);
+}
+
+/// Shape: how many failover delays the late-input test's stdin arrives after its command starts: two, past a fresh CLI
+/// attachment's term, which is the failover delay the daemon reports rounded up to its heartbeat period (A-230,
+/// `fleet::failover_in_periods`).
+const LATE_INPUT_DELAYS: u32 = 2;
+
+/// A-879 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; start `slates write` under the
+/// attachment at once and give it its stdin only [`LATE_INPUT_DELAYS`] failover delays later (the delay read from
+/// `slates status`, `fleet_failover: total_ns=`), longer than the attachment's term; then read the file back. Expect: the
+/// write succeeds and the file reads back as written: the command held its attachment from before it read its input
+/// until its write was answered. Before A-879 nothing renewed the attachment while the command waited for its input,
+/// and the write was refused `AttachmentExpired` (macOS, 2026-11-23, an 8 s pause; both Windows runners for the 256 MiB
+/// write of `a_freed_content_extent_gives_its_commit_back_on_windows`, diag run 45260798132).
+#[test]
+fn a_write_whose_input_outlasts_its_attachments_term_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the late-input write: set SLATES_TEST_CLI=1 to run it (a real anchor and daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-late-input-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let id = created_volume(&instance, "late-input");
+  let (code, status, err) = run(&instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  let failover_ns = status
+    .lines()
+    .find_map(|line| line.strip_prefix("fleet_failover: "))
+    .and_then(|fields| {
+      fields
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("total_ns=")?.parse::<u64>().ok())
+    })
+    .expect("the daemon reports its failover delay");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "attach: {err}");
+  let attachment = value_of(&out, "attachment");
+  let input = b"arrived after the attachment's term\n";
+  let late = Duration::from_nanos(failover_ns).saturating_mul(LATE_INPUT_DELAYS);
+  let (code, _, err) = run_with_late_stdin(
+    &instance,
+    &["write", &id, &attachment, "late.txt"],
+    input,
+    late,
+  );
+  assert_eq!(
+    code, 0,
+    "a write whose input came {late:?} after it started: {err}"
+  );
+  let (code, read, err) = run_with_stdin(&instance, &["read", &id, "late.txt"], b"");
+  assert_eq!(code, 0, "read: {err}");
+  assert!(read == input, "late.txt reads back as written");
   drop(anchor);
 }
 
