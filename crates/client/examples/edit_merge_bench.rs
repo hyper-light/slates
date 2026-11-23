@@ -677,9 +677,9 @@ fn measure(
       }
     }
     println!(
-      "client real-time parks\t{}_f{files}_{load}: {:?}",
+      "client real-time waits\t{}_f{files}_{load}: {:?}",
       form.key(),
-      fixture.client.real_time_parks()
+      fixture.client.real_time_waits()
     );
     fixture.client.destroy(fixture.leader).unwrap();
     fixture.client.destroy(fixture.follower).unwrap();

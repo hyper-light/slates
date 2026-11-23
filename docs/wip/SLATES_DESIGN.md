@@ -1542,7 +1542,11 @@ server. Windows: IOCP with `PostQueuedCompletionStatus` kicks, a blocked wait ra
 blocks (A-361: a completion port's waiter gets none of the wake boost an event's waiter gets, so a kicked shard waited
 out its neighbours' turns), and a client's reply wait one level above normal for the wait (A-871: woken by its Event at
 the shards' own level, a client queued behind them); WinFsp requests arrive on WinFsp's threads and are routed to the
-owning shard by handle. Simulation: a driver that replaces time,
+owning shard by handle. Linux, where the account's limits grant it (`RLIMIT_RTPRIO` at least the class's lowest and
+`RLIMIT_RTTIME` unlimited; grant or skip, never a privilege, R10): a latency-tracking runtime's shards in `SCHED_RR`,
+parking at once when idle so none spins at real-time priority, and a client's synchronous reply wait in `SCHED_RR`
+from its first park until the wait returns, its thread's own scheduling put back exactly then (A-872, measured on
+bare metal; not landed until main's A/B). Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
@@ -61368,3 +61372,34 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   Windows test), `unsafe-budget.toml` (slates-ipc 167 -> 169), §4.3 (the placement paragraph and its status, the
   Windows driver sentence), GAPS (84a, Windows), BENCHMARKS ("84a on Windows bare metal").
 
+### A-872 — On Linux, where the account grants it, the shards run in SCHED_RR and a client's reply wait holds it from its first park until it returns (2026-11-23, w-perf for main 01a20182; goal 84a; A-799, A-831, A-871)
+
+- **Why.** 84a's 1 ms loaded bar is bare metal's (Ada, 2026-11-23). On adacachy2 (CachyOS 7.3.3, `CONFIG_PREEMPT=y`,
+  `HZ=1000`, `RLIMIT_RTPRIO` 99 by `limits.d/20-audio.conf`; main's bench in a user scope at CPUWeight 100, other load
+  about 5) main's loaded accept p99 was 551 µs-1.11 ms and p999 0.98-1.59 ms. In the fair class a woken shard or client
+  waits out a time-share neighbour's protected run (`wakeup_preempt_fair` picks with the running task's slice
+  protected, kernel 7.3.3 `kernel/sched/fair.c`), and EEVDF's requested slice (arm E) is clamped to 100 µs
+  (`__setparam_fair`) and cost the p50 2-4x. A thread in `SCHED_RR` runs ahead of every time-share thread once
+  runnable.
+- **The change.**
+  - Shards: where `slates_machine::round_robin::take_current` is granted (the class's lowest priority, reset on fork,
+    `RLIMIT_RTTIME` unlimited so no `SIGXCPU` can end the process), a latency-tracking runtime's shard takes the class
+    at its start and parks at once when idle (`ShardContext`'s `parks_at_once`: no idle window, closed-loop holds
+    declined). Elsewhere it stays time-share and says why (`Declined`). CI's rejection of these arms (2026-11-22) was
+    the runners' `RLIMIT_RTPRIO` 0 and lazy preemption, not the arms.
+  - Client: `ClientEnd::wait_ending` raises the waiting thread to `SCHED_RR` at the wait's first park, after any spin
+    its caller named, and puts its whole scheduling back (`sched_setattr` of what `sched_getattr` read) as the wait
+    returns. Raised a park at a time (arm D'), the thread went back to time-share as each park returned, before it had
+    taken its reply, and bare metal's misses sat one tick over. A refused restore lowers the thread to time-share, is
+    counted (`RealTimeWaits::restore_failed`) and logged once, and keeps the reply already taken.
+- **Evidence.** main's interleaved A/B on adacachy2, 2026-11-23 02:45-02:50: B (shards only) p99 223-378 µs in 7 of 7
+  rounds and p999 under 1 ms in 12 of 14; D' (B and the per-park client) p99 296-530 µs and p999 under 1 ms in 13 of
+  14; quiet p50 37 µs in every arm. D'' is owed main's A/B (A, B, D'') with R9's provisioning p99 and the load's
+  throughput, before it lands. Held by `a_reply_wait_holds_the_real_time_class_from_its_first_park_until_it_returns`
+  (`crates/ipc/src/endpoint.rs`, Linux; on adacachy2 red with the per-park wait, 2 raises for one wait, now 1, the
+  thread back to time-share at its nice of 3; where the account grants nothing it counts the wait declined once and
+  says so), `crates/rt/tests/round_robin.rs` and `crates/machine/tests/round_robin.rs`.
+- **Applied in the same change to:** `crates/machine/src/round_robin.rs` (`raise_for_wait`, `WaitClass`,
+  `WaitSkipped`), `crates/ipc/src/endpoint.rs` (`wait_ending`, `Raised`, `RealTimeWaits`, `restore_wait_class`, the
+  test), `crates/client/src/client.rs` and `crates/client/examples/edit_merge_bench.rs` (`real_time_waits`), §4.3 (the
+  drivers paragraph), GAPS (84a, Linux).

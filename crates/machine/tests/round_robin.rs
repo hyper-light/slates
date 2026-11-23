@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use slates_machine::round_robin::{
-  ParkSkipped, granted_priority, holds, raise_for_park, take_current,
+  WaitSkipped, granted_priority, holds, raise_for_wait, take_current,
 };
 
 /// The calling thread's nice value (Linux keeps one a thread).
@@ -47,11 +47,11 @@ fn a_parks_real_time_class_is_put_back_exactly_after_it() {
     set_nice(own);
     if granted_priority().is_err() {
       eprintln!("this account grants no real-time class: the park must stay as it is");
-      assert!(matches!(raise_for_park(), Err(ParkSkipped::Declined(_))));
+      assert!(matches!(raise_for_wait(), Err(WaitSkipped::Declined(_))));
       assert_eq!((holds(), nice()), (Some(false), own));
       return;
     }
-    let class = raise_for_park().expect("a granted park takes the class");
+    let class = raise_for_wait().expect("a granted park takes the class");
     assert_eq!(holds(), Some(true), "in the class during the park");
     class.restore().expect("the thread's own class put back");
     assert_eq!(
@@ -75,8 +75,8 @@ fn a_thread_already_real_time_keeps_its_own_class() {
   std::thread::spawn(|| {
     take_current().expect("a granted thread takes the class");
     assert_eq!(
-      raise_for_park().map(|_| ()),
-      Err(ParkSkipped::AlreadyRealTime)
+      raise_for_wait().map(|_| ()),
+      Err(WaitSkipped::AlreadyRealTime)
     );
     assert_eq!(holds(), Some(true), "its own class kept");
   })

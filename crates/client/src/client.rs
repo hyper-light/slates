@@ -1690,10 +1690,10 @@ impl Client {
     self.end.parks_ended_by_looks()
   }
 
-  /// The synchronous reply wait's parks in Linux's round-robin real-time class, and those it skipped by why (84a;
-  /// `ClientEnd::real_time_parks`).
-  pub fn real_time_parks(&self) -> slates_ipc::endpoint::RealTimeParks {
-    self.end.real_time_parks()
+  /// The synchronous reply waits in Linux's round-robin real-time class, and those it skipped by why (84a;
+  /// `ClientEnd::real_time_waits`).
+  pub fn real_time_waits(&self) -> slates_ipc::endpoint::RealTimeWaits {
+    self.end.real_time_waits()
   }
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.

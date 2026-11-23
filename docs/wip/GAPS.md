@@ -325,6 +325,15 @@
 >   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
 >   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
 >   hop, 1.3-2.0 ms p99.
+>   **Bare metal, the round-robin arms again (A-872, w-perf for main 01a20182, 2026-11-23; branch
+>   `agents/w-perf-84a-linux-rr`, not landed).** The bar is bare metal's (Ada, 2026-11-23), and on adacachy2
+>   (CachyOS 7.3.3, `CONFIG_PREEMPT=y`, `HZ=1000`, `RLIMIT_RTPRIO` 99 by the audio group) main's interleaved A/B put the
+>   shards in `SCHED_RR` (B) at loaded p99 223-378 µs in 7 of 7 rounds and p999 under 1 ms in 12 of 14, against main's
+>   551 µs-1.11 ms and 0.98-1.59 ms; quiet p50 even at 37 µs. The misses sat one tick over: the client went back to
+>   time-share as each park returned, before it had taken its reply. D'' holds the client's reply wait in the class
+>   from its first park until the wait returns (`a_reply_wait_holds_the_real_time_class_from_its_first_park_until_it_returns`:
+>   red 2 raises for a wait with one wake and no reply, now 1; the thread's nice put back exactly). Owed: main's
+>   adacachy2 A/B of A, B and D'' with R9's provisioning p99 and the load's throughput, before any landing.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >

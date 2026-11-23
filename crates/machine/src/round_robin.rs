@@ -121,22 +121,22 @@ const SCHED_ATTR_SIZE: u32 = 48;
 #[cfg(target_os = "linux")]
 const SCHED_DEADLINE: u32 = 6;
 
-/// A thread's own scheduling, read before a real-time park, and put back exactly by [`ParkClass::restore`].
+/// A thread's own scheduling, read before a real-time reply wait, and put back exactly by [`WaitClass::restore`].
 #[derive(Debug)]
-pub struct ParkClass {
-  /// The thread's whole scheduling before the park.
+pub struct WaitClass {
+  /// The thread's whole scheduling before the wait.
   #[cfg(target_os = "linux")]
   prior: SchedAttr,
 }
 
-/// Why a park stayed in its thread's own class.
+/// Why a reply wait stayed in its thread's own class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParkSkipped {
+pub enum WaitSkipped {
   /// The account's limits grant no real-time class, or the kernel refused it ([`Declined`]).
   Declined(Declined),
   /// The thread is in a real-time class of its own already, which it keeps.
   AlreadyRealTime,
-  /// The thread's scheduling could not be read, so it could not be put back: the park stays as it is.
+  /// The thread's scheduling could not be read, so it could not be put back: the wait stays as it is.
   Unreadable {
     /// The `errno`.
     errno: i32,
@@ -145,23 +145,26 @@ pub enum ParkSkipped {
 
 #[cfg(target_os = "linux")]
 std::thread_local! {
-  /// This thread's grant, decided at its first park: the priority, or why none.
+  /// This thread's grant, decided at its first real-time wait: the priority, or why none.
   static GRANT: std::cell::Cell<Option<Result<i32, Declined>>> = const { std::cell::Cell::new(None) };
 }
 
-/// Raises the calling thread to `SCHED_RR` for one park (a client's synchronous reply wait, 84a's Linux half): its whole
-/// scheduling read first (`sched_getattr`), to be put back exactly once the park returns ([`ParkClass::restore`]). A thread
-/// already in a real-time class keeps its own; one the account's limits deny stays as it is (decided once a thread).
-/// A woken time-share thread behind busy neighbours waited out their slices for its reply: on CI's Linux runners, with
-/// the shards in the class, the client's wake was 2.5-3.0 ms in the p999 tail (run 45020845000).
+/// Raises the calling thread to `SCHED_RR` for one reply wait (a client's synchronous wait, 84a's Linux half, A-872):
+/// its whole scheduling read first (`sched_getattr`), to be put back exactly once the wait returns
+/// ([`WaitClass::restore`]). A thread already in a real-time class keeps its own; one the account's limits deny stays as
+/// it is (decided once a thread). A woken time-share thread behind busy neighbours waited out their slices for its
+/// reply: on CI's Linux runners, with the shards in the class, the client's wake was 2.5-3.0 ms in the p999 tail (run
+/// 45020845000). Held for the whole wait, not a park: raised a park at a time, the thread went back to time-share as
+/// each park returned, before it had taken its reply, and on bare metal the loaded tail's misses sat one tick over
+/// (adacachy2, main's A/B of 2026-11-23).
 #[cfg(target_os = "linux")]
-pub fn raise_for_park() -> Result<ParkClass, ParkSkipped> {
+pub fn raise_for_wait() -> Result<WaitClass, WaitSkipped> {
   let grant = GRANT.with(|cell| {
     let grant = cell.get().unwrap_or_else(granted_priority);
     cell.set(Some(grant));
     grant
   });
-  let priority = grant.map_err(ParkSkipped::Declined)?;
+  let priority = grant.map_err(WaitSkipped::Declined)?;
   let mut prior = SchedAttr {
     size: SCHED_ATTR_SIZE,
     ..SchedAttr::default()
@@ -178,24 +181,24 @@ pub fn raise_for_park() -> Result<ParkClass, ParkSkipped> {
     )
   };
   if read != 0 {
-    return Err(ParkSkipped::Unreadable {
+    return Err(WaitSkipped::Unreadable {
       errno: last_errno(),
     });
   }
   let rr = u32::try_from(libc::SCHED_RR).unwrap_or(u32::MAX);
   let fifo = u32::try_from(libc::SCHED_FIFO).unwrap_or(u32::MAX);
   if [rr, fifo, SCHED_DEADLINE].contains(&prior.sched_policy) {
-    return Err(ParkSkipped::AlreadyRealTime);
+    return Err(WaitSkipped::AlreadyRealTime);
   }
-  // Without `SCHED_RESET_ON_FORK`: an unprivileged thread cannot clear that flag once set (sched(7)), so a park raised
+  // Without `SCHED_RESET_ON_FORK`: an unprivileged thread cannot clear that flag once set (sched(7)), so a wait raised
   // with it could never be put back (CI ubuntu-24.04-arm, run 45023871879: every restore refused EPERM). The thread is
   // blocked in its wait for the whole raise and forks nothing meanwhile, so the flag buys nothing here.
-  set_round_robin(priority, false).map_err(ParkSkipped::Declined)?;
-  Ok(ParkClass { prior })
+  set_round_robin(priority, false).map_err(WaitSkipped::Declined)?;
+  Ok(WaitClass { prior })
 }
 
-impl ParkClass {
-  /// Puts the thread's own scheduling back exactly as [`raise_for_park`] read it. A refusal is the `errno`, and the
+impl WaitClass {
+  /// Puts the thread's own scheduling back exactly as [`raise_for_wait`] read it. A refusal is the `errno`, and the
   /// thread is then lowered to the plain time-share class, so it never runs its caller's code at real-time priority;
   /// lowering one's own thread asks no privilege.
   #[cfg(target_os = "linux")]
@@ -229,8 +232,8 @@ impl ParkClass {
 
 /// Off Linux: no class to raise to.
 #[cfg(not(target_os = "linux"))]
-pub fn raise_for_park() -> Result<ParkClass, ParkSkipped> {
-  Err(ParkSkipped::Declined(Declined::Unsupported))
+pub fn raise_for_wait() -> Result<WaitClass, WaitSkipped> {
+  Err(WaitSkipped::Declined(Declined::Unsupported))
 }
 
 /// Whether the calling thread is in `SCHED_RR` now; `None` where it cannot be read (off Linux).
