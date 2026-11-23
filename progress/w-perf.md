@@ -473,3 +473,15 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     360 MB of mapped chunks held at the push's end.
   - Split with w-hg: intake::rebuilt, HgIndex::revision_text, Taker::file_base are w-hg's (C1).
   - Pushed once before rerunning after a merge that brought crates/mem/src/arena.rs; reran the store tests after: green.
+- 2026-11-23 ~08:30 PST:
+  - LANDED 0cd8ef36a + d0183b7c1 (merge 121dbf6b5): every hg append seals the index's tail when due through one
+    HgIndex::insert; import's own seal gone (red: due after group 26 of 200; w-hg's three conditions). Plus the spare-
+    chunk measurement (#[ignore]d): Mac 1 MiB chunk 240 us fresh vs 85 us kept; x86 not measured (adacachy run timed out
+    building at 40 min).
+  - REGRESSION found by main's arena-13 (CI 45193998198): b04cdef7f's for_reads(waiting) bound kept the distinct texts
+    of hundreds of reads, 646 MB of chunks resident after push-all and idle.
+  - LANDED cc95e92c4 (merge 67d3d866d): the cache holds the walks in flight, in whole chunks, plus one chunk; red 7.3 MB
+    -> 1 MiB with room for 1,000 reads. Sampler strip fixed (::h + 16 hex, four frames).
+  - Sent: w-shared inbox (image pages 22 MB); w-hg the revision_text frames (push::held::IndexHeld).
+  - Owed: main's arena-14 on CI. Next per main: the content store's tables (3)(4); one rerun after w-hg's cut 3.
+  - Worktree w-perf-rr removed (D'' on origin). Target dir was deleted by the disk cleanup.
