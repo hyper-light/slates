@@ -26328,7 +26328,9 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   piece ends its slice whatever the yields have cost,
   `docs/bugs/2026-11-23-a-starts-heavy-pieces-ran-in-one-slice-where-yields-cost-more.md`); ipc's
   `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
-  wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
+  wake: Linux trusted `futex_wake`'s count, which counts a waiter woken before it blocked; **fixed**, a Linux park
+  teaches only if its thread switched out, the test judged by the client's held wakes,
+  `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`).
 - **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
   left against the claimed capacity, which a publication's give-back trims to the demand (A-853): 6 of 10.5 MiB failed on
   CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
@@ -26344,6 +26346,9 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   took 166 to 186 ms. In debug: 16.7 and 7.5 ms against 8.9 µs. Tied to the push hot path w-git is rebuilding: once
   w-git's index fix lands, main measures an edit's p99 on a shard during a concurrent git/git push, and the step
   granularity is decided from that (84a's under-1 ms p99).
+- **A flaky bench assertion.** `crates/ipc/examples/ipc_bench.rs`'s parked row asserts "every trip woke the client"; it
+  aborted 1 run in 12 under load on adacachy2 (2026-11-23, BENCHMARKS' A/B of the switch-count reads). Its spinning row
+  had failed every run since A-799 (85b88770e): **fixed**, it names its spin.
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).

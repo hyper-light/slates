@@ -18797,3 +18797,35 @@ Every run: oracle failures 0, refusals 0, lost 0.
     Not measured.
 - **Kept:** the pages are libmalloc's own cache, which the next work reuses; not a leak. The cause is upstream: the
   import churns about 500 MB of small blocks it frees again (GAPS, w-svn's import, P7's finding (2)).
+
+## What a Linux park's two switch-count reads cost: about 200 ns a park (w-tsan; main 01a20182's ruling; 2026-11-23)
+
+- **Why asked.** A Linux client now judges whether a park slept by its own voluntary switch count across the wait, as
+  Windows does (`wait_may_teach`, `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`).
+  `ClientEnd::park_once` already read the count, `getrusage(RUSAGE_THREAD)`, before and after every wait on every
+  platform, and Linux ignored both readings. So the fix adds no call. This records what the two reads cost, as the
+  baseline a cheaper witness of a blocked thread would have to beat.
+- **Machine and method.** adacachy2 (CachyOS, x86_64, 32 cores, 126 GiB), 2026-11-23 ~14:29 PST, load average 11 to 17
+  (shared, not quiesced). `crates/ipc/examples/ipc_bench.rs` in release, two binaries built from one tree: A as on main,
+  and B with both reads removed (`switches_before` and the after-read `None`). They ran in 6 interleaved rounds (A then
+  B), each binary 5 runs of 2,000 parked trips a round. Command: `cargo build --release -p slates-ipc --example
+  ipc_bench` for each, then each binary run alternately.
+
+| round | A least (ns) | A median | B least (ns) | B median | least, A − B |
+|---|---|---|---|---|---|
+| 1 | 579 | 1,105 | 315 | 416 | 264 |
+| 2 | (aborted) | | 368 | 643 | |
+| 3 | 523 | 550 | 355 | 641 | 168 |
+| 4 | 515 | 806 | 451 | 862 | 64 |
+| 5 | 553 | 1,208 | 326 | 352 | 227 |
+| 6 | 550 | 645 | 350 | 445 | 200 |
+
+- **Read.** The two reads cost about 200 ns a park, least time against least time (64 to 264 ns, median 200). The
+  medians spread with the row's race: its daemon replies the instant the client's flag rises, so most parks never
+  sleep (1 to 1,274 of 2,000 slept a run). Against a park that sleeps, 200 ns is 1 to 4% of the sleepers' estimates on
+  the same box (5.9 to 30.7 µs); against this row's race, about 40%. Kept: dropping the reads would bring back the
+  race the count closes.
+- **Two bench faults found running it.** The spinning row failed on main since A-799 (85b88770e): a sync wait parks at
+  once unless its caller names a spin, so 17,753 to 18,726 of its 20,000 trips parked and its zero-wakes assertion
+  aborted every run. It now names its spin (`set_spin_ns(Some(u64::MAX))`). The parked row's "every trip woke the
+  client" assertion aborted 1 run of the 12 above (round 2's A, under load): GAPS.

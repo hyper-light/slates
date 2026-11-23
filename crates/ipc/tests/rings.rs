@@ -222,14 +222,6 @@ const RACING_TRIP_CAP: u64 = 4 * RACING_PARKS;
 /// stops early, and there no reply races the client anyway.
 const RACING_WALL: Duration = Duration::from_nanos(REPLY_DEADLINE_NS);
 
-/// The one wake a client's estimate learned between two reads of it, from the mean before and after
-/// (`WakeEstimate::record`: the scaled sum loses a `2^shift`-th of itself and gains the wake), to within the
-/// `2^shift` nanoseconds the mean's truncation hides.
-fn learned_wake_ns(mean_before_ns: u64, mean_after_ns: u64) -> i128 {
-  ((i128::from(mean_after_ns) - i128::from(mean_before_ns)) << SPIN_SHIFT)
-    + i128::from(mean_before_ns)
-}
-
 /// The racing test's daemon: replies to each request [`ASLEEP_AFTER`] after the client raised its parked flag
 /// ([`ASLEEP`]), or the instant the flag rises, spinning on it ([`RACE`]), until an empty request ends it. A
 /// client spinning for nothing raises its flag on every trip, so every trip has a flag to wait for.
@@ -278,11 +270,15 @@ fn reply_asleep_or_racing(mut daemon: DaemonEnd) -> std::thread::JoinHandle<()> 
 /// replies the instant the client's parked flag rises, until the client has parked 16,384 more times (or five
 /// seconds pass), reading the test thread's own switch count (the client's) around each racing trip. Expect: the
 /// sleepers taught the estimate (the non-vacuity count), and no racing trip that parked without the thread ever
-/// switching out taught a wake. Where the OS counts no switches for the thread (Linux, macOS, whose daemon
-/// confirms the sleeper instead), or no racing trip parked without switching (a machine too loaded for the
-/// daemon to reply first), the test skips loudly. Before A-223's switch count reached the client, Windows learned
-/// such parks as on-CPU handoffs of 0.4–1.0 µs, since its auto-reset Event carries a signal set before the wait
-/// and the daemon cannot confirm a sleeper there.
+/// switching out had its wake held to be learned (`ClientEnd::wakes_held`, the gate every learned wake passes). Where
+/// the OS counts no switches for the thread (macOS, whose daemon confirms the sleeper instead), or no racing trip
+/// parked without switching (a machine too loaded for the daemon to reply first), the test skips loudly. Before
+/// A-223's switch count reached the client, Windows learned such parks as on-CPU handoffs of 0.4–1.0 µs, since its
+/// auto-reset Event carries a signal set before the wait and the daemon cannot confirm a sleeper there; and until
+/// 2026-11-23 Linux held every such park whose `futex_wake` confirmed a waiter set running again before it blocked,
+/// and learned a few (4 of 5,341 such parks on adacachy2). Judged by the held count, not the samples: a Linux park's
+/// wake is folded when its stamp is confirmed, which can land at the next park's arming, so a sample read across one
+/// trip can be the trip before's (1 and 2 such on adacachy2 once Linux held no unswitched park).
 #[test]
 fn a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing() {
   let region = ClientRegion::create(
@@ -321,15 +317,15 @@ fn a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing() {
     server.join().unwrap();
     return;
   }
-  let parks_before_racing = client.park_ratio().0;
-  let (mut racing_trips, mut unjudged, mut unswitched_parks, mut taught) = (0, 0, 0, Vec::new());
+  let (parks_before_racing, held_before_racing) = (client.park_ratio().0, client.wakes_held());
+  let (mut racing_trips, mut unjudged, mut unswitched_parks, mut held) = (0, 0, 0, 0);
   let racing_started = Instant::now();
   while client.park_ratio().0 - parks_before_racing < RACING_PARKS
     && racing_trips < RACING_TRIP_CAP
     && racing_started.elapsed() < RACING_WALL
   {
-    let (samples_before, mean_before) = (client.wake_samples(), client.wake_estimate_ns());
-    let (parks_before, switches_before) = (client.park_ratio().0, switches_now());
+    let (held_before, parks_before, switches_before) =
+      (client.wakes_held(), client.park_ratio().0, switches_now());
     round_trip(&mut client, RACE);
     racing_trips += 1;
     let Some((before, after)) = switches_before.zip(switches_now()) else {
@@ -338,9 +334,7 @@ fn a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing() {
     };
     if after == before && client.park_ratio().0 > parks_before {
       unswitched_parks += 1;
-      if client.wake_samples() > samples_before {
-        taught.push(learned_wake_ns(mean_before, client.wake_estimate_ns()));
-      }
+      held += client.wakes_held() - held_before;
     }
   }
   client.send(&Slot::inline(0, &[]).unwrap()).unwrap();
@@ -348,9 +342,9 @@ fn a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing() {
   let racing_parks = client.park_ratio().0 - parks_before_racing;
   eprintln!(
     "sleepers: {slept_samples} samples in {sleeper_trips} trips, estimate {slept_ns} ns; racing: {racing_parks} \
-     parks in {racing_trips} trips, {unswitched_parks} parked and never switched out, {} of them taught a wake \
-     {taught:?} ns, {unjudged} trips unjudged, estimate {} ns",
-    taught.len(),
+     parks in {racing_trips} trips, {} wakes held, {unswitched_parks} parked and never switched out, {held} of them \
+     held, {unjudged} trips unjudged, estimate {} ns",
+    client.wakes_held() - held_before_racing,
     client.wake_estimate_ns()
   );
   if unswitched_parks == 0 {
@@ -359,10 +353,9 @@ fn a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing() {
     );
     return;
   }
-  assert!(
-    taught.is_empty(),
-    "{} of {unswitched_parks} parks that never switched out taught a wake: {taught:?} ns",
-    taught.len()
+  assert_eq!(
+    held, 0,
+    "{held} of {unswitched_parks} parks that never switched out had their wake held to be learned"
   );
 }
 
