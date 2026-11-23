@@ -554,3 +554,8 @@
   `<remote>.git/info/lfs` reaches the repository named without `.git` (main's r28 lfs row). The many-ref push red
   (daemon_edge) is 2b(a)'s, settled by main (green at 7240125cf), w-shared fixing. NEXT: piece 3 on let_go_read
   (646de255c), peak gauge; deflate reuse.
+- 2026-11-22 ~18:30 PST: A-864 readers + piece 3 + bring-back bound + guard lift LANDED 0fefc86e2 (merge 01ae9fc26):
+  answers before the pack held for a let-go window and made again once it is back (HTTP, SSH; creation too); windows
+  let go behind a fetch's cursor; vcs_store::commit lets the landed pack go again. w-shared's annotated-tags red green
+  (1,115,127 B let go). Focused: server 361, git 202. OPEN: git/git mirror stall at 183,511 B (before the pack, with
+  the guard in; main's sample pending); push decision reads; LFS object 404; mirror pack 554 vs 218 KB (made_whole).
