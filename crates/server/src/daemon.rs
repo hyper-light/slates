@@ -2095,6 +2095,24 @@ impl Daemon {
     })
   }
 
+  /// What the membership plane's detector recorded of condemning `host` by its own probes (A-67 H-2,
+  /// [`slates_cluster::member_plane::Condemnation`]): how many times, how long after `host`'s last answer, and the bound
+  /// the detector stated for it. A one-shot control-shard question ([`Self::observation`]). Exposed so a fleet test
+  /// holds a detection to the bound its detector promised, whichever verdict judged the pair: before a member's pool
+  /// has a verdict, its own retransmission timer's, which took 7.2 s where an estimator's took under one
+  /// (`a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again`, adacachy2, 2026-11-23).
+  pub fn fleet_condemnation(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<Option<slates_cluster::member_plane::Condemnation>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.plane
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.condemnation(host))
+    })
+  }
+
   /// The bound one record-plane exchange runs under on the control shard now (`fleet::record_exchange_budget_ns`):
   /// derived from the slowest measured path tail, so it grows with load. A test that waits for an exchange to end at
   /// its deadline reads it, rather than assuming its own wait outlasts it (2026-10-10: an interrupted discovery

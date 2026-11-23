@@ -5498,11 +5498,26 @@
 >   contention, 40 of 40 with the fix where main failed 4 of 40: the first held write given up at 3.8 to 4.7 s, the
 >   bound its owner judged by never past 5.6 s. Record:
 >   `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
->   - **Open (a sibling, measured 2026-11-23):** A-351's
+>   - **FIXED 2026-11-23 (w-fleet; the sibling of the entry above, a defect of the test's wait):** A-351's
 >     `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` timed out its wait for the
->     successor's give-up in 2 of 6 runs on main under four-CPU contention, and once in 10 with this fix, in a loaded
->     run of eight fleet tests. Its budget reads the largest failover delay across the nodes, and the round it waits on
->     restarted 4 times in the failed run.
+>     successor's give-up in 7 of 40 runs on adacachy2, the test alone on two or four CPUs (`taskset`). Logged once a
+>     second from the cut: each failure came where both survivors judged the cut-off leader by their pair's own
+>     retransmission timer at the cut, which comes 0.9 s into the test, before either survivor's pool had a verdict. The
+>     leader was condemned 7.2 s after its last answer, where an estimator took under one second. No failover estimate
+>     counts that timer, and the wait's one budget was three failover delays from the cut. The wait is now judged in two
+>     parts by the fleet's own measures. The detection is held to the bound each survivor's detector stated
+>     (`Daemon::fleet_condemnation`). The give-up, from the death held, is held to the departure's confirmation and the
+>     round's promise wait. With it, 40 of 40 passed under the same contention. Sixteen of those runs met a detection
+>     of 7.2 to 15.3 s, and the give-up then came 53 to 89 periods after the death was held, against a budget of about
+>     144 to 177. Record:
+>     `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`.
+>   - **Open (found with it, measured 2026-11-23):** the failover delay's detection term (A-363) leaves out a detection
+>     the timer judges. While a member's pool has no verdict, its timer-judged pairs take about 7 s to condemn in a
+>     three-node fleet, where its delay said 2.2 to 5.1 s, so every wait that reads the delay reads the smaller figure
+>     for those seconds. A fix would count a crashed peer's two unanswered probes at the run the detector bounds them by
+>     now (hyper-swim's `longest_unanswered`), which falls back once the pool has a verdict. That is an amendment of A-363
+>     and of each consumer. In the same regime `lease::horizon_ns`'s doc ("the longest a peer can go unanswered before
+>     this node's detector declares it dead", 0.9 s) is untrue, though the lease's safety rests on answers, not on it.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
