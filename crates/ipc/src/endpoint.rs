@@ -21,6 +21,19 @@
 //! already waited. Until A-456 every wait re-armed at the client's reply deadline, the anchor's liveness budget (a
 //! second), and asked the daemon's liveness there, so a call whose daemon died waited up to that second to learn it.
 //! [`ClientEnd::wait`] keeps its caller's deadline and asks nothing of the daemon.
+//!
+//! **A Windows client waits for its reply one priority level above normal (A-871, 84a).** Windows wakes the waiter of an
+//! Event one level above its base, so a normal-level client woke at the level of the shards that answer it (one above
+//! normal since A-361 and A-834), and Windows lets neither of two threads at one level take the other's CPU. A woken
+//! client queued behind whatever thread at its level held the CPU it was readied on, a shard still serving or load of
+//! its own level, until that one stopped or a quantum ended elsewhere. On a 32-thread Ryzen desktop (jupiter, Windows 11,
+//! 64 spinning threads in the bench's own process, 2026-11-23) 245-492 replies a round were taken over a millisecond
+//! after their publication, up to 70.8 ms, and the loaded edit-and-merge p999 was 5.5-6.5 ms. Waiting one level above
+//! normal, the woken client stands one above the shards: 2 such replies a round, loaded p999 192-293 µs, p99 132-182
+//! µs (interleaved, BENCHMARKS "84a on Windows bare metal"). The level is the waiting thread's own, raised as the wait
+//! begins and put back when it ends, so the caller's thread runs its own work at the level it had; a thread at any
+//! other level is left as it is, and a job that fixes its threads' levels leaves the call a no-op. No privilege is asked
+//! (R10).
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
@@ -730,6 +743,9 @@ impl ClientEnd {
 
   /// The wait both forms share: the spin, then one park at a time until the reply, the end `ends` names, or a refusal.
   fn wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
+    // Windows: the waiting thread one level above normal until this wait returns (A-871, the module doc).
+    #[cfg(windows)]
+    let _raised = RaisedForTheWait::now();
     let started = Instant::now();
     // A caller that names a spin gets it; by default the wait parks at once (A-799): a client spinning for its reply holds
     // the CPU the shard it just woke needs whenever the cores are all busy, so the shard ran only when the spin ended
@@ -1746,6 +1762,91 @@ mod departure {
     })
   }
 
+  /// A-871 (84a). Do: on Windows, wait on a live daemon whose thread, once the client has parked, reads the waiting
+  /// thread's priority level through that thread's own handle, then replies. Expect: the level normal before the wait,
+  /// one above normal while it waited, and normal again once the reply is taken, so the woken client outranks the
+  /// shards at their level and its caller's own work keeps the level it had.
+  #[cfg(windows)]
+  #[test]
+  fn a_windows_clients_reply_wait_stands_one_level_above_normal_and_then_returns_to_normal() {
+    use windows_sys::Win32::Foundation::{
+      CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+      GetCurrentProcess, GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+      THREAD_PRIORITY_NORMAL,
+    };
+    let _gate = crate::descriptor_test_gate();
+    let instance = unique_name("slates-endpoint-raised-wait-daemon");
+    let _rendezvous = published(&instance).unwrap();
+    let (life, liveness) = daemon_life(&instance).unwrap();
+    let mut rings = rings("slates-endpoint-raised-wait", liveness).unwrap();
+    let open_daemon = rings.daemon_end();
+    // SAFETY: the calling thread's pseudo-handle.
+    let before = unsafe { GetThreadPriority(GetCurrentThread()) };
+    let mut real: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicates this thread's pseudo-handle into a real one of this process with the same access; `real` is
+    // written by the call and closed by the daemon's thread.
+    let duplicated = unsafe {
+      DuplicateHandle(
+        GetCurrentProcess(),
+        GetCurrentThread(),
+        GetCurrentProcess(),
+        &raw mut real,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS,
+      )
+    };
+    assert_ne!(duplicated, 0, "the waiting thread's handle duplicated");
+    // A kernel handle is a process-wide value: it crosses to the daemon's thread as its address, closed there once.
+    let waiter = real.expose_provenance();
+    rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let replier = std::thread::spawn(move || -> Result<i32, IpcError> {
+      let waiter: HANDLE = std::ptr::with_exposed_provenance_mut(waiter);
+      let mut daemon = open_daemon()?;
+      let request = loop {
+        if let Some(request) = daemon.try_take()? {
+          break request;
+        }
+        std::thread::yield_now();
+      };
+      while daemon.region().client_parked()?.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+      }
+      // SAFETY: the waiting thread's real handle, live until it is closed just below.
+      let level = unsafe { GetThreadPriority(waiter) };
+      // SAFETY: the handle duplicated for this thread, closed once.
+      unsafe { CloseHandle(waiter) };
+      daemon.reply(&Slot::inline(request.request, b"raised")?)?;
+      Ok(level)
+    });
+    let waited = rings.client.wait_while_daemon_lives().unwrap();
+    let while_waiting = replier.join().unwrap().unwrap();
+    // SAFETY: the calling thread's pseudo-handle.
+    let after = unsafe { GetThreadPriority(GetCurrentThread()) };
+    drop(life);
+    println!(
+      "the waiting thread's level: before {before}, while waiting {while_waiting}, after {after}"
+    );
+    assert!(
+      matches!(waited, Waited::Reply(_)),
+      "the wait ended {waited:?} with its daemon alive"
+    );
+    assert_eq!(
+      before, THREAD_PRIORITY_NORMAL,
+      "a test thread starts at the normal level"
+    );
+    assert_eq!(
+      while_waiting, THREAD_PRIORITY_ABOVE_NORMAL,
+      "the waiting thread stood one level above normal"
+    );
+    assert_eq!(
+      after, THREAD_PRIORITY_NORMAL,
+      "the caller's thread is back at the level it had"
+    );
+  }
+
   /// A-506 (A-456's accounting). Do: wait on a live daemon for the reply it sends half again the old reply deadline after
   /// the request, and read how each park ended. Expect: every park counted, ended by the reply, by a wake that brought
   /// none, or at its look at the daemon's life; on macOS and Windows at least one park a look ended (its timeout came,
@@ -2338,6 +2439,43 @@ mod tests {
     // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
     drop(dup);
     drop(client);
+  }
+}
+
+/// The calling thread raised from normal to one level above for one reply wait, put back to normal when dropped (A-871,
+/// the module doc). Whether it moved: a thread at another level is left as it is, and so is one whose job fixes its
+/// level (`SetThreadPriority` answers success there and the level stays).
+#[cfg(windows)]
+struct RaisedForTheWait(bool);
+
+#[cfg(windows)]
+impl RaisedForTheWait {
+  /// Raises the calling thread when it stands at the normal level.
+  fn now() -> RaisedForTheWait {
+    use windows_sys::Win32::System::Threading::{
+      GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+      THREAD_PRIORITY_NORMAL,
+    };
+    // SAFETY: the calling thread's pseudo-handle, valid for both calls; a thread reads and sets its own level within its
+    // process's priority class without any privilege.
+    RaisedForTheWait(unsafe {
+      GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_NORMAL
+        && SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0
+    })
+  }
+}
+
+#[cfg(windows)]
+impl Drop for RaisedForTheWait {
+  fn drop(&mut self) {
+    use windows_sys::Win32::System::Threading::{
+      GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_NORMAL,
+    };
+    if self.0 {
+      // SAFETY: the calling thread's pseudo-handle; the thread puts back the level it raised itself from. A refusal
+      // leaves it one level up until its next wait puts it back, which no caller can tell from a slower clock.
+      let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+    }
   }
 }
 
