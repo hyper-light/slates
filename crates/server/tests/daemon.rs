@@ -4057,7 +4057,12 @@ const RECORD_PROBES: usize = 16;
 /// version slots plainly remain, and admits again once a destroy returns the records — and the daemon's status is
 /// answered with the ledger full, from the observation room no record may take (red on Linux's 4 KiB pages before
 /// 2026-10-05: the full ledger refused the report itself, `BudgetExceeded { available: 1516 }`). Non-vacuous:
-/// uncharged, every create here lands (the byte budget and the version slab are far larger).
+/// uncharged, every create here lands (the byte budget and the version slab are far larger). The bytes that remain are
+/// judged against the shard's slice of the pool, the room it can claim, not the status's `reserve`: since A-98 that is
+/// what the shard has claimed so far, and since A-853 a publication gives back all but its demand, so on Linux six
+/// volumes' 6 MiB held 10.5 to 12.5 MiB of claims (committed and a 2.5 MiB headroom, in best-fit parts) and the test
+/// passed or failed on whether a give-back ran before the status (2026-11-23: red on CI's TSan lane, 6 of 10.5 MiB;
+/// green on adacachy2, 6 of 12.5).
 #[test]
 fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
   let profile = common::machine_profile();
@@ -4068,6 +4073,8 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
   config.store.metadata_class_bytes = slab_footprint_of(&config)
     + slates_ipc::status::snapshot_capacity_of(config.region.bulk_bytes)
     + RECORDS_ROOM;
+  // The one shard's slice is the whole pool its arena can claim (A-98).
+  let slice = config.reserve_per_shard;
   let daemon = Daemon::start(
     &profile,
     config,
@@ -4086,16 +4093,17 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
     "at least one volume's records fit the room"
   );
   // The refusal is the metadata ledger's: bytes and version slots are plainly roomy, the ledger is
-  // committed up to its capacity.
+  // committed up to its capacity. Read after a publication, whose give-back leaves the shard only its demand claimed
+  // (A-853): the state that failed the claimed-capacity judgement.
+  daemon.publish_every_shard().unwrap();
   let reply = client.call(&RequestBody::DaemonStatus { memory: false });
   let ReplyBody::DaemonStatus { report } = reply else {
     panic!("daemon status: {reply:?}");
   };
   let shard = &report.shards[0];
   assert!(
-    shard.committed_bytes < shard.reserve_bytes / 2
-      && shard.committed_versions < shard.version_slots / 2,
-    "bytes ({} of {}) and version slots ({} of {}) plainly remain",
+    shard.committed_bytes < slice / 2 && shard.committed_versions < shard.version_slots / 2,
+    "bytes ({} of the {slice}-byte slice, {} claimed) and version slots ({} of {}) plainly remain",
     shard.committed_bytes,
     shard.reserve_bytes,
     shard.committed_versions,

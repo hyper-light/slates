@@ -1354,8 +1354,9 @@ pub(crate) struct Forked {
   pub(crate) changegroup: (Version, Vec<u8>),
   /// The room the push's intake began within, which its record names so a replay's intake runs within it too.
   pub(crate) room: u64,
-  /// Its kept texts' segments cut and not yet landed, each with its record written as it was cut ([`hg_run`]): a test's
-  /// driver's, landed at its landing ([`store_blocking`]); the daemon's driver lands each as it is cut.
+  /// Its kept texts' segments cut and not yet landed, each with its record written as it was cut
+  /// ([`hg_run`](super::hg_run)): a test's driver's, landed at its landing (`store_blocking`, the tests'); the daemon's
+  /// driver lands each as it is cut.
   pub(crate) segments: Vec<RecordedSegment>,
 }
 
@@ -1504,8 +1505,8 @@ async fn settle_run(run: super::hg_run::Run, outcome: Option<&PushOutcome>) {
 }
 
 /// [`unbundle`]'s landing: its works built and held ahead, then `forked` recorded and landed in one step against the
-/// index as it is then, its repository's landing turn taken for that step alone ([`hg_run`], [`Committing`]); a fork
-/// another landing made stale meanwhile re-based first, and its works built again.
+/// index as it is then, its repository's landing turn taken for that step alone ([`hg_run`](super::hg_run),
+/// [`Committing`]); a fork another landing made stale meanwhile re-based first, and its works built again.
 async fn landed_after_builds(
   repository: RepositoryId,
   (principal, name): (&Principal, [u8; 32]),
@@ -1952,10 +1953,11 @@ pub(crate) const LANDED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_texts_brought_
 
 /// Brings back the windows of the file revision `node` of `path` that repository `repository` holds (goal 93 item 2b(b);
 /// w-shared's seam 1, main's ruling of 2026-11-22 18:43): where any was let go once its segment landed
-/// ([`hg_run::let_go_windows`]), its whole text is read from the node's changeset store off the shard's step
-/// ([`hg_view::answer_store_wants`]), then put back by the identities the repository's index names, within the room its
-/// bytes take. True where its block and bytes are held whole after (brought back, or never let go); false where the
-/// repository holds no such revision here, the store gave no text, or the content store refused it.
+/// ([`hg_run::let_go_windows`](super::hg_run::let_go_windows)), its whole text is read from the node's changeset store
+/// off the shard's step ([`hg_view::answer_store_wants`]), then put back by the identities the repository's index
+/// names, within the room its bytes take. True where its block and bytes are held whole after (brought back, or never
+/// let go); false where the repository holds no such revision here, the store gave no text, or the content store
+/// refused it.
 pub(crate) async fn bring_back(repository: RepositoryId, (path, node): (Vec<u8>, Node)) -> bool {
   let Some((len, whole)) =
     crate::state::with_state(|state| held_whole(state, repository, (&path, &node))).flatten()
@@ -2018,10 +2020,10 @@ fn held_over<'s>(
   Some(IndexHeld::new(index, content))
 }
 
-/// A push's record once its run of segment changesets landed ([`hg_run`]; main's ruling (b1)): the run's reference
-/// (record v9), so its entry names the run, counted landed. A push that kept no revision records none; one that kept
-/// some with no run landed is refused `UNLANDED`, nothing of it in the register (main's ruling of 2026-11-20, decision
-/// 1: no changeset store, no history).
+/// A push's record once its run of segment changesets landed ([`hg_run`](super::hg_run); main's ruling (b1)): the run's
+/// reference (record v9), so its entry names the run, counted landed. A push that kept no revision records none; one
+/// that kept some with no run landed is refused `UNLANDED`, nothing of it in the register (main's ruling of 2026-11-20,
+/// decision 1: no changeset store, no history).
 fn recorded(
   state: &mut ShardState,
   forked: &mut Forked,
@@ -2074,9 +2076,10 @@ async fn hashed_sliced(mut hasher: blake3::Hasher, bytes: &[u8]) -> blake3::Hash
   }
 }
 
-/// [`changeset_of`] for a changeset the server made of `green`'s `version` (`made`, a green's key and the version;
-/// A-767 C1, `vcs_store::hg_made`): its record and reference name the made green and version, so a replay puts the made
-/// node back, and it lands as a push's does otherwise.
+/// The [`Changeset`] of `forked`'s push to `repository`, its sequence taken now; or, given `made` (a green's key and
+/// the version), of a changeset the server made of that green's version (A-767 C1, `vcs_store::hg_made`): its record
+/// and reference name the made green and version, so a replay puts the made node back, and it lands as a push's does
+/// otherwise.
 pub(crate) fn changeset_landing(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -2119,9 +2122,9 @@ pub(crate) fn changeset_landing(
 }
 
 /// [`recorded`]'s landing for a test on a shard: `forked`'s segments landed on the shard's store as a run, apart from
-/// its repository's landing turn as the daemon's driver lands them ([`hg_run`]), each through
-/// [`hg_run::segment_changeset`] and the store's own `land`, waited for on a thread of its own
-/// (`crate::test_store::land_blocking`); its record the run's reference (v11). A fork that brought no revision, or
+/// its repository's landing turn as the daemon's driver lands them ([`hg_run`](super::hg_run)), each through
+/// [`hg_run::segment_changeset`](super::hg_run::segment_changeset) and the store's own `land`, waited for on a thread
+/// of its own (`crate::test_store::land_blocking`); its record the run's reference (v11). A fork that brought no revision, or
 /// already names its run, lands nothing. A refused segment is the landing's refusal. The run is kept whatever the
 /// landing then answers: its caller settles it once its landing answers ([`settled_whole`]), as the driver does.
 #[cfg(test)]
@@ -2196,8 +2199,8 @@ pub(crate) fn land_stored(
   landed
 }
 
-/// A push's segment changeset `sequence` landed (`ok`) or refused by the store ([`hg_run`]): counted; landed, the run
-/// grows; refused, the push is answered `UNLANDED`, and its run, never named, is abandoned with it.
+/// A push's segment changeset `sequence` landed (`ok`) or refused by the store ([`hg_run`](super::hg_run)): counted;
+/// landed, the run grows; refused, the push is answered `UNLANDED`, and its run, never named, is abandoned with it.
 fn landed_segment(
   state: &mut ShardState,
   (run, segment): (&mut super::hg_run::Run, &PushSegment),
@@ -2335,7 +2338,8 @@ impl Taking {
     }
   }
 
-  /// Its kept texts cut into segments of at least `bound` bytes of its changegroup from here on ([`hg_run`]).
+  /// Its kept texts cut into segments of at least `bound` bytes of its changegroup from here on
+  /// ([`hg_run`](super::hg_run)).
   fn cut_at(&mut self, bound: u64) {
     self.intake = self.intake.take().map(|intake| intake.cutting(bound));
   }
@@ -2413,13 +2417,13 @@ fn begin_intake(
 }
 
 /// `changegroup` taken into its fork a slice at a time, a yield between slices (A-720), its kept texts cut into segments
-/// and each landed as it is cut, apart from its repository's landing turn ([`hg_run`]; main's rulings (b1) and of
-/// 2026-11-22 07:32): the fork, and the run its landing settles. A begin or a step past the push's admission waits for
-/// room (main 01a20182's ruling of 2026-11-22 03:03, the wait shared with git's, `vcs_share::wait`) and is taken again in
-/// the room the wait gives, what the push already holds charged to it first: a stock client's push of a long history is
-/// taken whole, never refused for its own earlier revisions' bookkeeping. A step past the most the repository could
-/// ever be lent, or a wait past its patience, is refused as before; its run, dropped, forgets its segments. None when
-/// the store went away.
+/// and each landed as it is cut, apart from its repository's landing turn ([`hg_run`](super::hg_run); main's rulings
+/// (b1) and of 2026-11-22 07:32): the fork, and the run its landing settles. A begin or a step past the push's admission
+/// waits for room (main 01a20182's ruling of 2026-11-22 03:03, the wait shared with git's, `vcs_share::wait`) and is
+/// taken again in the room the wait gives, what the push already holds charged to it first: a stock client's push of a
+/// long history is taken whole, never refused for its own earlier revisions' bookkeeping. A step past the most the
+/// repository could ever be lent, or a wait past its patience, is refused as before; its run, dropped, forgets its
+/// segments. None when the store went away.
 async fn take_sliced(
   repository: RepositoryId,
   changegroup: (Version, Vec<u8>),
@@ -2459,8 +2463,9 @@ async fn take_sliced(
   Some(Ok((forked, run)))
 }
 
-/// `take_sliced`'s begin: the intake begun after any waits, cutting its kept texts into segments ([`hg_run`]), then
-/// admitted its known need (`admitted_its_need`), its first room the step's working set. The taking, or the push's refusal; none where the store went away.
+/// `take_sliced`'s begin: the intake begun after any waits, cutting its kept texts into segments
+/// ([`hg_run`](super::hg_run)), then admitted its known need (`admitted_its_need`), its first room the step's working
+/// set. The taking, or the push's refusal; none where the store went away.
 async fn taking_begun(
   repository: RepositoryId,
   changegroup: (Version, Vec<u8>),
@@ -2549,9 +2554,9 @@ async fn stepped_to_end(
   }
 }
 
-/// Lands each segment `taking` has cut, oldest first, at its repository's next sequences ([`hg_run`], apart from the
-/// landing turn), noted in `run`, what its texts charged given back to `room` once it lands. The push's refusal where a
-/// segment was refused; none where the store went away.
+/// Lands each segment `taking` has cut, oldest first, at its repository's next sequences ([`hg_run`](super::hg_run),
+/// apart from the landing turn), noted in `run`, what its texts charged given back to `room` once it lands. The push's
+/// refusal where a segment was refused; none where the store went away.
 async fn segments_landed(
   repository: RepositoryId,
   taking: &mut Taking,
@@ -2571,8 +2576,8 @@ async fn segments_landed(
 }
 
 /// `segment` of `taking` landed on the node's store as a changeset at its repository's next sequence
-/// ([`hg_run::segment_changeset`]), noted in `run` ([`landed_segment`]); `UNLANDED` where it could not be made or the
-/// store refused it; none where the store went away.
+/// ([`hg_run::segment_changeset`](super::hg_run::segment_changeset)), noted in `run` ([`landed_segment`]); `UNLANDED`
+/// where it could not be made or the store refused it; none where the store went away.
 async fn segment_landed(
   repository: RepositoryId,
   taking: &Taking,
@@ -2837,12 +2842,23 @@ pub(crate) const BASE_REBUILDS: &str = "vcs.hg.push_base_rebuilds";
 /// counter name in the status report.
 pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
 
+/// Counter: the most runs only a push's fork held after any of its steps (goal 93, the index seal's reland), the most of
+/// every push's: what a lookup of a new row walked past its parent's runs, within `slates_vcs::Index::tiered_due`'s
+/// bound of ⌊log₃(the fork's own rows ÷ the fewest a seal writes)⌋ + 1. Format: a counter name in the status report.
+pub(crate) const MOST_OWN_RUNS: &str = "vcs.hg.push_most_own_runs";
+
+/// Counter: a push's fork's runs merged by the size-tiered rule as it sealed them (goal 93, the index seal's reland),
+/// so [`MOST_OWN_RUNS`] is not met by sealing nothing. Format: a counter name in the status report.
+pub(crate) const TIERED_MERGES: &str = "vcs.hg.push_tiered_merges";
+
 /// Counts what a push's intake did to find its file delta bases ([`BASE_HITS`], [`BASE_REBUILDS`],
-/// [`BASE_STORE_READS`]).
+/// [`BASE_STORE_READS`]) and how its fork's runs were kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
 fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
   state.count(BASE_HITS, intaken.base_hits);
   state.count(BASE_REBUILDS, intaken.base_rebuilds);
   state.count(BASE_STORE_READS, intaken.base_store_reads);
+  state.count_max(MOST_OWN_RUNS, intaken.most_own_runs);
+  state.count(TIERED_MERGES, intaken.tiered_merges);
 }
 
 /// The refusal of a whole changegroup's intake that wanted bytes `range` (`slates_hg::framing`): past its end, a
@@ -2860,8 +2876,9 @@ fn whole_wanted(payload: &[u8], range: core::ops::Range<u64>) -> IntakeRefused {
   ))
 }
 
-/// `changegroup` taken into its fork every slice at once, its kept texts cut into segments ([`hg_run`]'s, landed by
-/// [`store_blocking`]): [`take_sliced`]'s steps for a caller that holds the shard's state, the tests'.
+/// `changegroup` taken into its fork every slice at once, its kept texts cut into segments
+/// ([`hg_run`](super::hg_run)'s, landed by [`store_blocking`]): [`take_sliced`]'s steps for a caller that holds the
+/// shard's state, the tests'.
 #[cfg(test)]
 pub(crate) fn take_whole(
   state: &mut ShardState,
@@ -2884,7 +2901,7 @@ pub(crate) fn take_made(
   taken_whole(state, repository, changegroup, (room, None))
 }
 
-/// [`take_whole`] and [`take_made`]: cut at `cut` where given, the segments in the fork for its landing.
+/// [`take_made`] and the tests' `take_whole`: cut at `cut` where given, the segments in the fork for its landing.
 fn taken_whole(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -3442,8 +3459,8 @@ fn push_name(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
   *hasher.finalize().as_bytes()
 }
 
-/// A push's name as [`push_name`] hashes it, hashed once a quantum at a time (A-767 C1, the push spin: a 96 MiB bundle
-/// hashed in each judging's one step held the shard for seconds), so its judgings take it, never hash it again.
+/// A push's name as the tests' `push_name` hashes it, hashed once a quantum at a time (A-767 C1, the push spin: a 96 MiB
+/// bundle hashed in each judging's one step held the shard for seconds), so its judgings take it, never hash it again.
 async fn named_push(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
   let mut hasher = blake3::Hasher::new_derive_key(PUSH_NAME_CONTEXT);
   hasher.update(&repository.bytes);

@@ -1758,6 +1758,89 @@ fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
   );
 }
 
+/// The descriptors a `ls -l /proc/self/fd/` listing names past the standard streams, each with what it resolves to,
+/// leaving out the listing's own directory: what a process holds beyond what it was handed.
+#[cfg(target_os = "linux")]
+fn descriptors_beyond_the_standard_streams(listing: &str) -> Vec<(u32, String)> {
+  listing
+    .lines()
+    .filter_map(|line| {
+      let (head, target) = line.split_once(" -> ")?;
+      let number = head.split_whitespace().last()?.parse::<u32>().ok()?;
+      Some((number, target.to_owned()))
+    })
+    .filter(|(number, target)| *number > 2 && !target.starts_with("/proc/"))
+    .collect()
+}
+
+/// main 01a20182's ruling of 2026-11-23 (the sweep in
+/// docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md): a hook holds nothing of the
+/// daemon's. Do: as [`a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory`], start an anchor with
+/// its HTTP edge and a store and configure a start-commit hook, here one that becomes `ls -l /proc/self/fd/` writing
+/// to a file, so the listing is the hook's own descriptors with what each resolves to; POST a commit, then unmount the
+/// view. Expect the listing to hold the standard streams and the listing's own directory alone. Before, Linux's spawn
+/// handed the hook every descriptor of the daemon's not marked close-on-exec: the anchor's segment, which holds the
+/// issuer secret, and its content object, inherited at the daemon's start; the daemon's duplicates of both, one a shard;
+/// the listeners the anchor held for it; and a duplicate of every connected client's completion eventfd.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_hook_holds_no_descriptor_of_its_daemon() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-hook-fds-{}", std::process::id());
+  let scratch = Scratch::new("svn-hook-fds");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (_anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "the hook's descriptors") else {
+    return;
+  };
+  create_repository(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
+  let listing = format!("{}/hook-descriptors", scratch.path);
+  let hook = format!("{}/start-commit", scratch.path);
+  // A Subversion hook starts with an empty environment, so `ls` is named by its path; `exec` makes the listing the
+  // hook's own process, whose shell kept its script open.
+  std::fs::write(
+    &hook,
+    format!("#!/bin/sh\nexec /bin/ls -l /proc/self/fd/ > \"{listing}\"\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let answer = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let listed = std::fs::read_to_string(&listing).unwrap_or_default();
+  let view = format!("{store}/{REPOSITORY}.svn");
+  let unmounted = slates(&instance, &["unmount", &view]);
+  assert!(
+    listed.contains(" 0 -> ") && listed.contains(" 2 -> "),
+    "the hook ran and listed its descriptors: {listed:?}; answer: {answer}"
+  );
+  assert_eq!(
+    (
+      descriptors_beyond_the_standard_streams(&listed),
+      unmounted.0
+    ),
+    (Vec::new(), 0),
+    "the hook's descriptors past its standard streams (left; its whole listing: {listed}); unmount: {unmounted:?}"
+  );
+}
+
 /// main 01a20182's constraint of 2026-11-22 03:22 (a kernel NFS mount whose daemon died under it panicked a Mac twice,
 /// 2026-10-06): a test that fails with a hook's view still mounted must have its guard let the view go while its daemon
 /// still serves it. Do: as [`a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory`], start an
@@ -2605,6 +2688,7 @@ fn an_svnsync_measured() {
 
 /// Shape: the revisions [`an_svn_update_measured`] updates across where `SLATES_SVN_UPDATE_SPAN` names none: the 500
 /// w-bugs' P6 runs updated back and forward over git-1000 (diag-w-bugs-svnfetch-8 and -13).
+#[cfg(unix)]
 const UPDATE_SPAN: u64 = 500;
 
 /// P6 of Ada's close list (goal 93: svn:// update 5.6 s at w-bugs' run 13 against 2.7 s at run 8, stock svn 1.15 on

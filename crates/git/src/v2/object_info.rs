@@ -44,7 +44,7 @@ use crate::store::Repository;
 /// "object-info": `attr = "size"`].
 const SIZE: &[u8] = b"size";
 
-/// Format: the word before an argument's object id [gitprotocol-v2 "object-info": `oid <oid>`].
+/// Format: the word before an argument's object id \[gitprotocol-v2 "object-info": `oid <oid>`\].
 const OID: &[u8] = b"oid";
 
 /// Format: the most parts an answer line is written in: an id, a space, a size and its ending.

@@ -101,7 +101,8 @@ pub struct TransportConfig {
   pub banner: Vec<String>,
   /// The identification line's comments, if any.
   pub comments: Option<String>,
-  /// How long a key serves before the server rekeys ([`crate::keylife::key_time_limit_ns`]).
+  /// How long a key serves before the server rekeys (the daemon's is RFC 4253 §9's hour,
+  /// [`crate::keylife::RECOMMENDED_KEY_TIME_NS`]).
   pub key_time_ns: u64,
   /// An operator's cap on a key's use, below its cipher's limits.
   pub usage_cap: UsageCap,

@@ -1199,6 +1199,10 @@ struct Awaiting {
   /// fence's refusal ([`refuse_awaiting`]), the yield's ([`yielded`]) or the destroy's ([`forget`]). It delivers
   /// nothing more and is never told again.
   told: bool,
+  /// For a request forwarded from another node: the forward's exchange waiting on this node's control shard, as (that
+  /// shard, its awaited call), answered where the hold ends ([`answer`], [`tell_given_up`]); attached by
+  /// [`await_forwarded`], `None` before and for every other request.
+  forwarded: Option<(u16, u64)>,
 }
 
 impl Awaiting {
@@ -1211,6 +1215,7 @@ impl Awaiting {
       reply,
       held_since_ns: now_ns,
       told: false,
+      forwarded: None,
     }
   }
 
@@ -2059,10 +2064,61 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
     return;
   }
   state.count(LIVE_RESOLVED, 1);
+  if let Some((control, call)) = entry.forwarded {
+    crate::xshard::answer_awaited(control, call, recorded.clone());
+    state.count(LIVE_FORWARD_ANSWERED, 1);
+  }
   if let Some(route) = entry.route {
     hand_home(state, route, recorded);
   }
 }
+
+/// Attaches a forwarded request's exchange to the reply `(origin, id)` holds here for its volume's durability or its
+/// tombstone's placement (A-200, AUD-29-43): `waiter` is the exchange's control shard and its awaited call, answered
+/// where the hold ends. That is the verb's own reply once durable ([`resolve`], [`resolve_destroys`]),
+/// `DurabilityPending` when it is told at the failover SLO ([`tell_given_up`]), or the fence's, the yield's or the
+/// destroy's refusal ([`refuse_awaiting`], [`yielded`], [`forget`]); every decided one through [`answer`]. An entry told
+/// already waits for its decision. A later exchange for the request, its origin's resend, takes the place of an earlier
+/// one, which ends at its own bound. Answers whether the request is held here.
+///
+/// Until 2026-11-23 nothing attached it: since 1fc1da1fb (2026-11-20) a forward's exchange waited only for a deferred
+/// acceptance (`merge_service::await_forwarded`), and answered a write held here `Overloaded` at once. So no forwarded
+/// write on a live-shipped volume was ever answered at its durability, though it ran and became durable: a superseded
+/// owner's clients met `Overloaded` on every write for good (the fleet's A-338 and A-349 tests).
+pub(crate) fn await_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, slates_wire::request::RequestId),
+  waiter: (u16, u64),
+) -> bool {
+  let request = (origin, id.client, id.sequence);
+  let held = if let Some(key) = state.live.awaiting_by_request.get(&request).copied() {
+    state
+      .live
+      .awaiting
+      .get_mut(&key)
+      .and_then(|waiting| waiting.iter_mut().find(|entry| entry.request() == request))
+  } else if let Some(volume) = state.live.destroys_by_request.get(&request).copied() {
+    state
+      .live
+      .destroys
+      .get_mut(&volume)
+      .and_then(|(_, waiting)| waiting.iter_mut().find(|entry| entry.request() == request))
+  } else {
+    None
+  };
+  let Some(entry) = held else {
+    return false;
+  };
+  entry.forwarded = Some(waiter);
+  state.count(LIVE_FORWARD_ATTACHED, 1);
+  true
+}
+
+/// Counter: a forwarded request's exchange attached to the reply held here for its volume's durability
+/// ([`await_forwarded`]): the non-vacuity count of a forwarded write answered at its durability.
+const LIVE_FORWARD_ATTACHED: &str = "fleet.live.forward_attached";
+/// Counter: an attached forward's exchange answered where its hold ended ([`answer`], [`tell_given_up`]).
+const LIVE_FORWARD_ANSWERED: &str = "fleet.live.forward_answered";
 
 /// Tells one waiting verb held past the failover SLO `DurabilityPending { held_ns }` (A-354), recorded nowhere: its
 /// effect stands on this owner, but it is not known durable, and only a durable outcome may be its completion (an owner
@@ -2078,6 +2134,10 @@ fn tell_given_up(
 ) -> Option<Awaiting> {
   if let Some(route) = entry.route.take() {
     hand_home(state, route, durability_pending(held_ns));
+  }
+  if let Some((control, call)) = entry.forwarded.take() {
+    crate::xshard::answer_awaited(control, call, durability_pending(held_ns));
+    state.count(LIVE_FORWARD_ANSWERED, 1);
   }
   let placed = kept
     .iter()
@@ -4283,8 +4343,9 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
   Some(VolumeRecord::Full { image }.to_bytes())
 }
 
-/// The plain body of a publication of `record` (A-377 split it from [`payload`]): the record and its content runs, read
-/// from the volume now, so it is captured in the publication's own turn whenever it is sealed.
+/// The plain body of a publication of `record` (A-377 split this capture from the seal, [`sealed_payload`]): the record
+/// and its content runs, read from the volume now, so it is captured in the publication's own turn whenever it is
+/// sealed.
 fn plain_body(
   state: &ShardState,
   id: slates_db::catalog::VolumeId,
