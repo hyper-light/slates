@@ -446,13 +446,24 @@ impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
   }
 }
 
+/// Whether `head` is a Git LFS request (the batch, locks and transfer API under `<repo>/info/lfs`), read within `room`:
+/// git's, whatever its method. Git LFS's basic transfer uploads by `PUT` (main 01a20182's r95: git-lfs 3.8.1's every
+/// upload to the batch's href answered `404`, routed to Subversion's WebDAV site as every method git's and Mercurial's
+/// smart HTTP never send is), so a request git's LFS routes name is told git's before WebDAV's method test.
+fn lfs_transfer(head: &Head<'_>, room: u64) -> bool {
+  !matches!(
+    slates_git::lfs::serve::route(head, &mut slates_http::Admission::new(room)),
+    Err(slates_git::lfs::serve::RouteRefused::NotFound)
+  )
+}
+
 impl<G: Site, H: Site, S: Site> Site for ToolSites<G, H, S> {
   type Exchange = ToolExchange<G::Exchange, H::Exchange, S::Exchange>;
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
     if hg::wire_request(head, self.room) {
       self.hg.decide(head, secure).await.map(ToolExchange::Hg)
-    } else if svn::dav_request(head) {
+    } else if svn::dav_request(head) && !lfs_transfer(head, self.room) {
       self.svn.decide(head, secure).await.map(ToolExchange::Svn)
     } else {
       self.git.decide(head, secure).await.map(ToolExchange::Git)
