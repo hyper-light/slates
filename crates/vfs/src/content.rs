@@ -1483,6 +1483,34 @@ mod tests {
     );
   }
 
+  /// Goal 93's slabs (main 01a20182's condition; w-shared's (f)): repository windows share a slab's block in the
+  /// server's window storage, a volume's content never does, since a volume's chunks are what a guest maps (DAX). Do:
+  /// open, write and seal four volume extents of 100 bytes. Expect: four distinct blocks, the volume's row holding a
+  /// page each and asking 100 bytes each.
+  #[test]
+  fn a_volumes_small_extents_each_keep_a_block_of_their_own() {
+    let mut s = store();
+    let mut blocks = std::collections::BTreeSet::new();
+    for n in 0..4u8 {
+      let mut open = s.open(0, 100, Epoch(0), (false, Owner::Volume)).unwrap();
+      s.write_open(&mut open, 0, &[n; 100]).unwrap();
+      let sealed = s.seal(open, None).unwrap().unwrap();
+      let ExtentSrc::Chunk { chunk, at } = sealed.src else {
+        panic!("a sealed extent names a chunk");
+      };
+      assert_eq!(at, 0, "the extent starts its chunk");
+      let block = s.chunk(chunk).unwrap().block;
+      blocks.insert((block.region(), block.offset()));
+    }
+    assert_eq!(blocks.len(), 4, "a block each");
+    let owned = s.arena().owned(Owner::Volume);
+    assert_eq!(
+      (owned.asked, owned.held),
+      (400, 4 * 4096),
+      "a page each held"
+    );
+  }
+
   #[test]
   fn an_open_extent_grows_by_pages_and_zero_fills_gaps() {
     let mut s = store();
