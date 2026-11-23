@@ -472,9 +472,13 @@ pub struct Upload<A> {
   /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (goal 93
   /// item 2a's look-ahead, A-864 piece 2): taken by [`Upload::waiting`].
   waiting: core::cell::Cell<Option<packed::Waited>>,
-  /// The let-go windows the stream has stopped at, each by its pack and index: one stop a window, so a window that is
-  /// not brought back is read and refused rather than waited for again (A-864 piece 2's progress).
-  stopped_at: BTreeSet<(ContentId, u64)>,
+  /// The let-go window the stream last stopped at, by its pack and index, until a unit is done after it: a stop at the
+  /// same window with nothing done between is read and refused rather than waited for again, so a stop always makes
+  /// progress or ends (A-864 piece 2's progress); a window let go again behind the stream (piece 3) may be stopped at
+  /// again once the stream has gone on.
+  last_stop: Option<(ContentId, u64)>,
+  /// Whether the stream has stopped at a let-go window at all: its look-ahead begins then ([`Upload::reading_next`]).
+  stopped_any: bool,
   /// Where the loose stage last read a pushed entry: its pack and offset (counting [`UploadCounters::backward_reads`]).
   last_read: Option<(ContentId, u64)>,
   by_entry: Option<ByEntry>,
@@ -514,7 +518,8 @@ impl<A: Answered> Upload<A> {
       packs: BTreeMap::new(),
       pack_lens: Vec::new(),
       waiting: core::cell::Cell::new(None),
-      stopped_at: BTreeSet::new(),
+      last_stop: None,
+      stopped_any: false,
       last_read: None,
       by_entry: None,
       pending: None,
@@ -557,7 +562,8 @@ impl<A: Answered> Upload<A> {
         Ok(Progress::Done) => return Ok(Progress::Done),
         // A unit met a let-go window and stopped, nothing of it written: the turn ends, the window to be brought back.
         Ok(Progress::More) if self.is_waiting() => return Ok(Progress::More),
-        Ok(Progress::More) => {}
+        // A unit done: a later stop, at any window, is waited for again.
+        Ok(Progress::More) => self.last_stop = None,
         Err(refused) => {
           self.stage = Stage::Refused(refused);
           return Err(refused);
@@ -1200,17 +1206,17 @@ impl<A: Answered> Upload<A> {
       .is_some_and(|waited| self.stop_at(store, waited))
   }
 
-  /// Stops the turn at `waited`'s let-go window, named for its driver to bring back ([`Upload::waiting`]), the first time
-  /// the stream meets that window; whether it stopped. A window met again after it was to be brought back is not stopped
-  /// at: the read refuses typed, as one of a window that cannot be read does, so a stop always makes progress or ends.
+  /// Stops the turn at `waited`'s let-go window, named for its driver to bring back ([`Upload::waiting`]); whether it
+  /// stopped. The same window met again with no unit done since it was to be brought back is not stopped at: the read
+  /// refuses typed, as one of a window that cannot be read does, so a stop always makes progress or ends.
   fn stop_at(&mut self, store: &ContentStore, waited: packed::Waited) -> bool {
     let window = to_u64(store.window()).max(1);
-    if !self
-      .stopped_at
-      .insert((waited.pack, waited.offset / window))
-    {
+    let at = (waited.pack, waited.offset / window);
+    if self.last_stop == Some(at) {
       return false;
     }
+    self.last_stop = Some(at);
+    self.stopped_any = true;
     self.counters.stops = self.counters.stops.saturating_add(1);
     self.waiting.set(Some(waited));
     true
@@ -1234,7 +1240,7 @@ impl<A: Answered> Upload<A> {
   /// the stage reads each pack front to back from there. None where it reads no pack next.
   pub fn reading_next(&self) -> Option<packed::Waited> {
     // Only once the stream has met a let-go window: a pack held whole has nothing to bring back.
-    if self.stopped_at.is_empty() {
+    if !self.stopped_any {
       return None;
     }
     if let Some(Pending::Copy {

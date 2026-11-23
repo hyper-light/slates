@@ -1064,16 +1064,23 @@ fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
         len,
         offset,
       };
-      super::read_ahead(crate::vcs_http::git::upload::PackReads {
-        next: Some(at(0)),
-        stopped: None,
-      })
+      let mut resident = Vec::new();
+      super::read_ahead(
+        crate::vcs_http::git::upload::PackReads {
+          next: Some(at(0)),
+          stopped: None,
+        },
+        &mut resident,
+      )
       .await;
       let ahead = crate::state::with_state(away);
-      super::read_ahead(crate::vcs_http::git::upload::PackReads {
-        next: None,
-        stopped: Some(at(3 * step + 7)),
-      })
+      super::read_ahead(
+        crate::vcs_http::git::upload::PackReads {
+          next: None,
+          stopped: Some(at(3 * step + 7)),
+        },
+        &mut resident,
+      )
       .await;
       let stopped = crate::state::with_state(away);
       let counted = crate::state::with_state(|state| {
