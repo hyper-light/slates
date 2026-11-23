@@ -213,6 +213,56 @@ fn a_refused_intake_leaves_the_index_and_the_store_as_they_were() {
   assert_eq!(store.len(), 0, "a refused intake kept a hold");
 }
 
+/// Main's routing of 2026-11-22 (w-svn's sibling sweep of codex-review's refused-bring leak, svn's fixed in its own
+/// writer). Do: take a changeset whose one file is two windows and a byte into a store whose budget is met once the
+/// file's two whole windows are written, so its last step's finish is refused; give the intake back. Expect the step
+/// refused by kind, and the store holding neither window, nor anything, once the fork is given back. Red before: the
+/// finish's writer was dropped with its two windows held, and nothing read them.
+#[test]
+fn a_refused_finish_gives_its_written_windows_back() {
+  let text: Vec<u8> = (0..2 * WINDOW + 1)
+    .map(|at| u8::try_from(at % 251).unwrap().saturating_add(2))
+    .collect();
+  let (made, _) = crate::push::work_tests::Made3::one(&crate::NULL_NODE, &[("big", &text, "")]);
+  let part = made.part();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut intake = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  let windows = [
+    slates_vcs::ContentId::of(&text[..WINDOW]),
+    slates_vcs::ContentId::of(&text[WINDOW..2 * WINDOW]),
+  ];
+  let refused = loop {
+    // Both whole windows written: no room for the last byte's.
+    if store.contains(&windows[1]) {
+      store.set_budget(store.used());
+    }
+    match intake.step(&part.payload, &mut store, &mut admission) {
+      Ok(Stepped::More) => {}
+      Ok(other) => panic!("the intake went on past its room: {other:?}"),
+      Err(refused) => break refused,
+    }
+  };
+  intake.abandon(&mut store).unwrap();
+  assert!(matches!(refused, Refused::Unindexed(_)), "{refused:?}");
+  assert_eq!(
+    (
+      store.contains(&windows[0]),
+      store.contains(&windows[1]),
+      store.len()
+    ),
+    (false, false, 0),
+    "a refused finish kept its windows"
+  );
+}
+
 /// A-720 part 2 (the record from the fork). Do: take stock 7.2's bundle through the intake, then write its record from
 /// the fork (`record::write_kept`) and from the whole verification (`record::write_push`), and read its changesets back
 /// from the fork's rows. Expect the two records equal byte for byte, and each changeset read back with the parents and

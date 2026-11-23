@@ -1269,17 +1269,30 @@ impl Taker {
       ..
     } = *pending;
     let log = log.log();
-    checking.finish().map_err(|fault| Unverified::Node {
-      log: log_of(log),
-      node,
-      fault,
-    })?;
+    // Taken out of the intake, the writer's windows are this step's to give back on any refusal: the intake's own give
+    // back (`Intake::abandon`) no longer reaches them.
+    if let Err(fault) = checking.finish() {
+      if let Some(writing) = writing {
+        store.abandon_object(writing);
+      }
+      return Err(
+        Unverified::Node {
+          log: log_of(log),
+          node,
+          fault,
+        }
+        .into(),
+      );
+    }
     let kept = match writing {
-      Some(mut writing) => Some(
-        store
-          .finish_object(&mut writing)
-          .map_err(|refused| Refused::Unindexed(Unindexed::from(refused)))?,
-      ),
+      Some(mut writing) => match store.finish_object(&mut writing) {
+        Ok(kept) => Some(kept),
+        // A refused finish leaves the windows it acquired with the writer for its caller to give back.
+        Err(refused) => {
+          store.abandon_object(writing);
+          return Err(Refused::Unindexed(Unindexed::from(refused)));
+        }
+      },
       None => None,
     };
     let revision = Revision {
