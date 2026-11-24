@@ -672,3 +672,9 @@
   amendment + amendment log + GAPS + refusal table), owner keeps latest per holder per record, barrier window from
   record plane live estimates with progress = placed/acks/slices_done rising; expiry -> report-status ng "unable to
   commit". Then strip W-GIT-DIAG, f=1 double-push test, release+debug v3 runs (main's gate), land as one piece.
+- 2026-11-23 ~21:30: A-886 BUILT on agents/w-git-push-barrier = d72b7324b (main merged): barrier waits for moved
+  greens (07b384f4c), ls-refs fix (bb4bb182b), holder replica store + lazy replica build + ReplicaBuilding reply +
+  progress-aware barrier + ng on expiry (1b30ea732). Local v3_takeover passes (debug, macOS) and asserts the builds
+  (made_ns 14.2/17.3 ms, 877/1,468 slices). Main runs the v3 gate (GitHub, before bbe4a27e0 vs after d72b7324b,
+  3 release + 2 debug). On green: merge main, rerun focused, push HEAD:main. Then (iii) Repository::plan head-map clone +
+  footprint walk (O(G) a push), then B1 (~/.cache/w-git-b1-wip.patch) / B2, pack shape vs stock, LANDED_LET_GO.
