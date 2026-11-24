@@ -22,6 +22,31 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 12:22 on 11-24:
+- Landed since 11:38: A-906 (w-git, 4664f8d26: the content pool's free room counted once a generation), w-svn's
+  RunTable and step slicing (1efdd7b45: the 9,000-file import's longest step 1,208 -> 473 ms), w-perf's (a) (31bf5e5c7:
+  a submit over a taken-over green not yet rebuilt is refused Overloaded, Taken::Unbuilt), w-interop's BENCHMARKS
+  entry for r935 and r940 (e9544ef7f).
+- Lint wall: main has five lint commits, unlanded, in ~/slates-work/main-ci-disk (detached; merged with main 31bf5e5c7):
+  e7f18e4d1, c5c3fcc9b, e6706aef9, 485252318, f25942ea1 (ten sites in all; each diag run stopped at the next crate
+  that failed, so new sites keep appearing behind fixed ones, several from commits landed this hour). Lint diag 6 =
+  45479683218. Land when a run is clean, then confirm on a main CI run.
+- New red, Subversion on Linux: matrices run 3 (45445378898, c53777733) passed git but 26 of 33 svn rows on both
+  routes; four commits refused "E160004: Corrupt" (a text or property list neither the repository nor the revision
+  holds). Run 1 had 33 of 33. Sent to w-svn. Run 4 at current main = 45477825824 (svn legs only).
+- TSan lane: the measurement (45411303175) took 234 min, 13,127 s of it slates-server's whole lib under TSan (xtask's
+  SERVER_TARGETS runs --lib; 155 tests on 10-03, thousands now). Main CI's TSan step limit is 62 min, so the lane
+  times out (45461883678: failed at 62.6 min) and holds each main run an hour. Owed by main: per-test TSan times,
+  then the lane's shape (the server lib off the per-push lane, run nightly in shards whose limit derives from them).
+- Gate 11 (45470507096, a30ffbdb8) is past its stop-after-three: some runs pass at current main. Read it when it ends.
+- Chaos destroy flows: 6 of 6 on both Linux arches (45456083682). Sent to w-shared.
+- kiln: its server times out on and off since about 11:40; the big Studio's runner restarted around 12:10 and lost
+  r958 (a lint check that never ran; r950 before it the same; relaunched as r965, start unconfirmed). adacachy2's
+  runner takes runs and never starts them (a two-line `cat`, r955, never ran), so 84a's Linux bare-metal re-check at
+  current main (r954) is blocked on Ada. Only Ada restarts kiln or runners.
+- Disk: mantle's parallel builds took this Mac to 2.5 GiB at 11:54; mantle's coordinator trimmed and keeps three
+  targets under 8 GB each; 84 GiB free at 12:02. w-git sits on a kiln approval (rm -rf its own target) only Ada can give.
+
 Updates at 11:38 on 11-24:
 - REGRESSION, owned: gate 10 (45450874392, v3_takeover at d48863ddb = A-902) failed 31 of 31, "no survivor served the
   repository" (both survivors 404, takeovers 0, pages_unsent ~1,650); gate 9 was 37/40. w-shared's cause: A-902's home
