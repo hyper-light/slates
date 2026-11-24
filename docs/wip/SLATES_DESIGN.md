@@ -63011,3 +63011,21 @@ its serve tests, `crates/server/src/virtiofs.rs`, `crates/server/src/vcs_store/n
 
 Applied in the same change to: GAPS (GAP-A9-14's row), `crates/server/src/{virtiofs,mounted_work}.rs`,
 `crates/server/tests/virtiofs.rs`.
+
+### A-900 — A lineage member is lent in place: no engine moved by value, none made or dropped for a lend (2026-11-24, w-svn for main 01a20182, its order of 2026-11-23 and approval of 2026-11-24 04:42; goal 93's speed list; amends A-575's `Lent`)
+
+- **What was there.** A lend of a lineage's member (`Lent`, A-575) took the member's engine out of its seat by value
+  into the lineage's slot for the one member out, with the arenas swapped into it, and its drop put it back by value
+  after taking an empty engine into the slot (`mem::take`). Every lend, a read-only one too (`Greens::is_owing`,
+  `repository::branch_version`), moved a `Green` twice and made and dropped an empty one: w-git's push profile counted
+  about 10,000 memmove samples in 30 s there.
+- **The rule.** A lend is made in place: `Lent::new` swaps the lineage's arenas into the seated engine and marks it out,
+  the guard reads and writes it where it sits, and its drop swaps the arenas back. No engine is moved by value, and
+  none is made or dropped for a lend. `Lineage::take` and `put_back`, which move an engine out by value, stay for a
+  replay that holds one across slices. `Lineage::lend_counts` counts engines taken by value, lends made in place and
+  engines dropped making a lend, the non-vacuity counters of the rule.
+- **Evidence.** `a_lend_moves_no_engine_and_drops_none` (`crates/merge/src/engine/branch/tests.rs`): one lend counted
+  `(taken, dropped, borrowed) = (1, 1, 0)` before, `(0, 0, 1)` after (macOS, debug, 2026-11-24); the merge crate's
+  tests and the server's lend-heavy filters pass (counts in the commit). Owed: main's push profile again.
+
+Applied in the same change to: `crates/merge/src/engine/branch.rs` and its tests.
