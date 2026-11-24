@@ -665,7 +665,7 @@ thread_local! {
   pub(crate) static TEST_ENTRY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`make_deferred`]'s task: the commit made and landed before its step, then the step (`made_commit::commit`), the
+/// [`make_deferred`]'s task: the commit made and landed before its step, then the step (`made_commit::commit_guarded`), the
 /// turn given back after.
 async fn made_landing(
   turn: crate::repository::svn_commit::landing::Turn,
