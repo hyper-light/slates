@@ -1,5 +1,5 @@
 name: diag main f2
-# main 01a20182 (2026-11-23): w-shared's F2 (2cdd88fa3 on agents/w-shared-f2, over main ddfb469ee). Its run request: the
+# main 01a20182 (2026-11-24, rerun 2): w-shared's F2 fix 427ad2389 (on 2cdd88fa3, agents/w-shared-f2). Its run request: the
 # starvation test, a ticket's wait answered while the shard keeps dirtying its image, ten times in release and ten in
 # debug, on two hosts (CI's runners give it fewer cores than the big Studio, which is booked tonight). Every run's verdict
 # is printed; a red is Err(Unanswered) with its counters in the message. A diagnostics branch, never merged.
