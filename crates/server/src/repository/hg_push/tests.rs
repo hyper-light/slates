@@ -808,10 +808,8 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
   assert_eq!(readopted, Some(true), "re-adopted");
   assert_eq!(brought, 1, "the splice's base brought back first");
   assert_eq!(read.as_deref(), Some(&b"bx\n"[..]), "the edited file");
-  assert!(
-    matches!(&edited, Some(reply) if !matches!(reply, ReplyBody::Refused { .. })),
-    "{edited:?}"
-  );
+  let edited = edited.expect("the second edit submitted");
+  assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
   assert_eq!(after.as_deref(), Some(&b"bxx\n"[..]), "edited again");
 }
 
