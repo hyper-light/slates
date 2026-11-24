@@ -1,0 +1,98 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), item 2, run 14: the rt gates for the shard loop's change (2697686f5), kiln's
+# runners having dropped the runs. On ubuntu: the new rt test red with the run loop's change reverted, then every rt
+# test binary (no fail-fast), idle_spin five rounds with and without the change (adacachy at load 35 failed two of
+# its tests with it), CI's Miri set on slates-rt, and rt clippy for x86_64 and aarch64 Linux and x86_64 and aarch64
+# Windows from a clean runner. On macOS: every rt test binary and the daemon's deadlines, sweep and clock tests.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    name: rt gates (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+          targets: aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
+      - name: "rt, red: the idle-work test with the run loop's change reverted"
+        timeout-minutes: 30
+        run: |
+          git apply .github/diag-w-win2/rt-red.patch
+          set +e
+          cargo test -p slates-rt --test idle_work > "$RUNNER_TEMP/rt-red.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/rt-red.patch
+          grep -a '^test \|test result\|panicked' "$RUNNER_TEMP/rt-red.log"
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the idle-work test passed without the run loop's change"; exit 1; fi
+      - name: "rt, green: every rt test binary"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          set +e
+          cargo test -p slates-rt --no-fail-fast > "$RUNNER_TEMP/rt-all.log" 2>&1
+          code=$?
+          grep -a 'Running\|test result\|panicked' "$RUNNER_TEMP/rt-all.log" | tail -80
+          exit $code
+      - name: "rt: idle_spin five rounds with the change, then five without"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          set +e
+          for round in 1 2 3 4 5; do echo "with, round $round: $(cargo test -p slates-rt --test idle_spin 2>&1 | grep -a 'test result')"; done
+          git apply .github/diag-w-win2/rt-red.patch
+          for round in 1 2 3 4 5; do echo "without, round $round: $(cargo test -p slates-rt --test idle_spin 2>&1 | grep -a 'test result')"; done
+          git apply -R .github/diag-w-win2/rt-red.patch
+      - name: "rt: clippy on four targets"
+        if: ${{ !cancelled() }}
+        run: |
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            cargo clippy -p slates-rt --all-targets --target $t --features slates-machine/pure-hash -- -D warnings > "$RUNNER_TEMP/clippy-$t.log" 2>&1
+            echo "rt clippy $t exit $?"
+            grep -a '^error\|^warning: [a-z]' -A6 "$RUNNER_TEMP/clippy-$t.log" | head -12
+          done
+  miri:
+    name: rt Miri (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: CI's Miri set on slates-rt
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness --test alone
+  macos:
+    name: rt and the daemon's tests (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: "rt: every test binary"
+        timeout-minutes: 45
+        run: |
+          set +e
+          cargo test -p slates-rt --no-fail-fast > "$RUNNER_TEMP/rt-all.log" 2>&1
+          code=$?
+          grep -a 'Running\|test result\|panicked' "$RUNNER_TEMP/rt-all.log" | tail -80
+          exit $code
+      - name: "The daemon's deadlines, sweep and clock tests"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          cargo test -p slates-server --lib -- --test-threads=1 deadlines::tests:: idle_sweep::tests:: the_give_back_clock_reads_a_step_of_microseconds 2>&1 | grep -a '^test \|test result\|panicked' | sed 's/slates daemon: descriptor_limit.*$//'
