@@ -63213,3 +63213,27 @@ Applied in the same change to: §4.10 "Content homed by identity" (piece 6's ser
 
 Applied in the same change to: `crates/server/src/live_ship.rs`, `crates/server/src/repository.rs`,
 `crates/server/src/fleet.rs`, `crates/server/src/verbs.rs`, `crates/server/tests/fleet.rs` (`git_fleet`), GAPS.
+
+### A-903 — A successor writes its adopted state logs' parts at the epoch they were adopted under, so a push to a repository it took over commits (2026-11-24, w-shared for main 01a20182, its order of 2026-11-24 10:07; found by A-894's takeover test; A-636 part 2b, AUD-29-17's epoch rule for heads)
+
+- **Why.** After a repository's owner died and a survivor took it over and rebuilt it, every push to the successor
+  was refused `unable to commit` (git's `[remote rejected]`). The push's barrier logged its names log at position 3,
+  acknowledged by no candidate, every green placed. The other survivor had refused each of the successor's parts
+  `StaleEpoch`, 19 a run. At the takeover its holders fence the dead owner's registers at the takeover's epoch, and the
+  successor keeps that epoch with the adopted register (`takeover::record_adoption`'s `placed_heads`). A head ships at
+  the greater of the two (`fleet::owed_record`), but a state log's parts shipped at the successor's own host epoch
+  (`fleet::owed_state_log_parts`), below the fence. No fleet test had pushed after a repository's takeover.
+- **The change.** `owed_state_log_parts` writes each part at the greater of the host's epoch and the epoch its log's
+  register was adopted under: the rule heads follow. A log this node made itself has no adopted entry and ships at its
+  host epoch, as before.
+- **Test** (macOS arm64, debug, 2026-11-24). A-894's takeover test pushes to the successor's edge too
+  (`a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_served_by_a_survivor`). Red: `unable
+  to commit`, names log acknowledged by none, the other survivor's `fleet.record.refused.stale_epoch` 19. Green: the
+  push lands, the other survivor's `fleet.ship.state_log.placed` 1 (9.4 s). Focused: `t_a727` (5), and the
+  `state_log` and `takeover` lib tests (39).
+- **Found, not changed (GAPS).** The other survivor's edge answers "repository not found". That is not the takeover's
+  doing: an edge serves only the repositories its own node holds (`vcs_http::git::Repositories::locate` looks over this
+  node's shards alone), so a repository is reachable only at its owner's edge, before a death as after.
+
+Applied in the same change to: `crates/server/src/fleet.rs` (`owed_state_log_parts`), `crates/server/tests/fleet.rs`,
+GAPS.

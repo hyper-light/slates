@@ -36612,9 +36612,12 @@ fn t_a727_d1a3_an_owner_killed_after_homing_before_its_entry_has_its_homes_let_t
 /// A-894 (NoLoss for a repository's creation; main 01a20182's order of 2026-11-24 02:17). Do: create a git repository
 /// on node a of a three-node `f = 1` fleet ([`git_fleet`], which holds the creation to have its record at another node
 /// as it answers), kill a at once, and once a survivor has taken the repository over, list its refs by name at each
-/// survivor's edge (`git ls-remote`). Expect: a survivor takes the repository over and rebuilds it, and a survivor's edge
-/// serves it by its name. Red before A-894 at `git_fleet`'s own check: the creation answered before any other node held
-/// its record (0 of 2).
+/// survivor's edge (`git ls-remote`) and push to its successor's edge. Expect: a survivor takes the repository over and
+/// rebuilds it, a survivor's edge serves it by its name, and its successor takes the push. Red before A-894 at
+/// `git_fleet`'s own check: the creation answered before any other node held its record (0 of 2). Red before A-903 at
+/// the push, `unable to commit`: the successor wrote its names log's parts at its own host epoch, below the takeover's
+/// epoch its holders fenced the log at, and the other survivor refused every one `StaleEpoch` (19 a run), so the push's
+/// barrier never saw its names log held.
 #[test]
 fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_served_by_a_survivor()
  {
@@ -36653,11 +36656,31 @@ fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_
       )
     })
     .collect();
+  // The successor: the survivor that rebuilt the repository.
+  let successor = views.iter().position(|view| {
+    view
+      .as_ref()
+      .is_ok_and(|(_, [_, rebuilt, _])| *rebuilt >= 1)
+  });
+  let pushed = successor.map(|node| {
+    fleet.push(
+      node,
+      (
+        "after.txt",
+        b"pushed to its successor after its creator died\n",
+      ),
+    )
+  });
   fleet.stop();
   assert!(taken, "a survivor took the repository over: {views:?}");
   assert!(
     listed.iter().any(|(served, _)| *served),
     "a survivor's edge served the repository by its name: {listed:?}; {views:?}"
+  );
+  assert_eq!(
+    pushed,
+    Some(Ok(())),
+    "its successor took a push to it: {views:?}"
   );
 }
 
