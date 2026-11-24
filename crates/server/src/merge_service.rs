@@ -145,6 +145,12 @@ pub struct MergeShardState {
   /// branches made from it; their works wait as a work over a green awaiting adoption does (`work_home.unbuilt`).
   /// Bounded by the greens this shard owns; empty once the recovery has rebuilt them, in the same recovery.
   pub(crate) after_stores: BTreeSet<DbVolumeId>,
+  /// During a boot: each branch member whose source awaits its re-adoption here (A-333; main 01a20182's item (2) of
+  /// 2026-11-24 08:52), with the source and the version it was branched at: begun over the source once that is
+  /// re-adopted (`verbs::begin_waiting_branches`), fenced with it if it is fenced, and fenced at the boot's end if still
+  /// here, so none waits past the boot. Its works wait as a work over a green awaiting adoption does
+  /// (`work_home.unbuilt`). Bounded by the greens this shard owns.
+  pub(crate) after_source: BTreeMap<DbVolumeId, (DbVolumeId, u64)>,
   /// Each mounted work's pin (A-774, `crate::mounted_work::MountPin`): the green version its mount's base reads, kept
   /// readable while the mount lives ([`reachable_floor`]). One entry a mounted work, dropped with its slot.
   pub(crate) mounted: crate::mounted_work::MountedPins,

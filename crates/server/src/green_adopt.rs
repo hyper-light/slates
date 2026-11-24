@@ -474,6 +474,24 @@ pub(crate) async fn readopt_at_boot(control: u16, shards: &[ShardId]) {
     .await
     .unwrap_or_default();
     for (id, through) in awaiting {
+      // A branch begun over a source re-adopted before it is stepped by that source's re-adoption, not rebuilt here.
+      let begun = crate::xshard::call_in_shard_time(
+        control,
+        shard.0,
+        move |s| {
+          s.merge
+            .awaiting_adoption
+            .get(&id)
+            .is_some_and(|awaiting| awaiting.replay.is_some())
+            || !s.merge.awaiting_adoption.contains_key(&id)
+        },
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await
+      .unwrap_or(false);
+      if begun {
+        continue;
+      }
       let readopted = readopt_one(control, shard.0, id, through).await;
       if !readopted {
         let _ = crate::xshard::call_in_shard_time(
@@ -486,6 +504,14 @@ pub(crate) async fn readopt_at_boot(control: u16, shards: &[ShardId]) {
         let _ = crate::state::with_state_counted(|s| s.count(READOPTION_FENCED, 1));
       }
     }
+    // A branch still waiting for a source the boot did not re-adopt is fenced: none waits past the boot.
+    let _ = crate::xshard::call_in_shard_time(
+      control,
+      shard.0,
+      crate::verbs::fence_stranded_branches,
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
   }
 }
 
@@ -545,6 +571,21 @@ pub(crate) async fn readopt_with(
     Some(false) => Some(false),
     None => None,
   };
+  // The branches that waited for it, rebuilt over it now it stands, and theirs over them in turn; fenced with it where
+  // it did not stand (main's item (2) of 2026-11-24 08:52).
+  match readopted {
+    Some(true) => rebuild_waiting_branches(control, owner, id).await,
+    Some(false) => {
+      let _ = crate::xshard::call_in_shard_time(
+        control,
+        owner,
+        move |s| crate::verbs::fence_waiting_branches(s, id),
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await;
+    }
+    None => {}
+  }
   if !brought.is_empty() {
     let _ = crate::xshard::call_in_shard_time(
       control,
@@ -565,6 +606,37 @@ pub(crate) async fn readopt_with(
     .await;
   }
   readopted
+}
+
+/// Rebuilds over `source`, re-adopted on `owner`, each branch member that waited for it, then those that waited on each in
+/// turn: each begun over its source ([`crate::verbs::begin_waiting_branches`]) and stepped as a re-adoption is
+/// ([`stepped_through`]); a branch whose replay is fenced takes those waiting on it with it. Bounded by the branches
+/// waiting, each begun once.
+async fn rebuild_waiting_branches(control: u16, owner: u16, source: DbVolumeId) {
+  let mut sources = vec![source];
+  while let Some(source) = sources.pop() {
+    let begun = crate::xshard::call_in_shard_time(
+      control,
+      owner,
+      move |s| crate::verbs::begin_waiting_branches(s, source),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .unwrap_or_default();
+    for branch in begun {
+      if stepped_through(control, owner, branch).await {
+        sources.push(branch);
+      } else {
+        let _ = crate::xshard::call_in_shard_time(
+          control,
+          owner,
+          move |s| crate::verbs::fence_waiting_branches(s, branch),
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await;
+      }
+    }
+  }
 }
 
 /// The engine of `object` rebuilt from this node's ledger through `through`, a slice at a time on this shard: version 0

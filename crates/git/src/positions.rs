@@ -9,7 +9,10 @@
 //! and one push's objects stay one run. A position is below `u64::MAX`, which the repository never gives.
 //!
 //! The form is chosen when a set is made whole (`of`, `from_runs`, a union, an intersection, a difference): each costs
-//! one pass over the runs it holds. An insert keeps the set's form (a walk inserts an object at a time and is never made
+//! one pass over the runs it holds, and a bit table's a pass over its words, never its positions: a union, an
+//! intersection or a difference with a table on either side is taken a word at a time, and a table's runs, counts and
+//! bounds are read with a word's own counts (gate r870, main 01a20182 2026-11-24: a clone of git/git spent about 100 s
+//! before its first pack byte deriving 1,027 refs' sets, its set work position by position through iterator chains). An insert keeps the set's form (a walk inserts an object at a time and is never made
 //! to convert), but for a bit table it would grow past what the list form costs, where it becomes the list. Two sets are
 //! equal when they hold the same positions, whatever their forms; a set is encoded as its runs (`run_pairs`), so what
 //! is kept as content is the same whatever form a set was in.
@@ -123,15 +126,7 @@ impl Positions {
   /// Puts the set in its cheapest form (module docs): the runs, the list or the bit table, whichever costs fewest bytes,
   /// runs before the list and the list before the table where two tie.
   fn settle(&mut self) {
-    let (mut runs, mut count) = (0_u64, 0_u64);
-    let (mut first, mut last) = (None, None);
-    for (start, end) in self.runs_iter() {
-      runs = runs.saturating_add(1);
-      count = count.saturating_add(end.saturating_sub(start));
-      first.get_or_insert(start);
-      last = Some(end.saturating_sub(1));
-    }
-    let (Some(first), Some(last)) = (first, last) else {
+    let Some((runs, count, first, last)) = self.stats() else {
       self.form = Form::Runs(Vec::new());
       return;
     };
@@ -146,26 +141,152 @@ impl Positions {
     let cheapest = (0..costs.len())
       .min_by_key(|at| costs.get(*at).copied().unwrap_or(u64::MAX))
       .unwrap_or(0);
+    let start = first.saturating_sub(first % WORD_BITS);
     let form = match (cheapest, &self.form) {
-      (0, Form::Runs(_)) | (1, Form::List(_)) | (2, Form::Bits { .. }) => return,
+      (0, Form::Runs(_)) | (1, Form::List(_)) => return,
+      // A table already the cheapest is kept, its words outside the set's span let go.
+      (2, Form::Bits { .. }) => Form::Bits {
+        start,
+        words: self.table(start, usize::try_from(span_words).unwrap_or(0)),
+      },
+      (0, Form::Bits { start, words }) => Form::Runs(runs_of_bits(*start, words)),
       (0, _) => Form::Runs(self.runs_iter().collect()),
       (1, _) => Form::List(self.iter().collect()),
-      _ => {
-        let start = first.saturating_sub(first % WORD_BITS);
-        let mut words = vec![0_u64; usize::try_from(span_words).unwrap_or(0)];
-        for position in self.iter() {
-          let offset = position.saturating_sub(start);
-          if let Some(word) = usize::try_from(offset / WORD_BITS)
-            .ok()
-            .and_then(|at| words.get_mut(at))
-          {
-            *word |= 1u64 << (offset % WORD_BITS);
-          }
-        }
-        Form::Bits { start, words }
-      }
+      _ => Form::Bits {
+        start,
+        words: self.table(start, usize::try_from(span_words).unwrap_or(0)),
+      },
     };
     self.form = form;
+  }
+
+  /// The set's runs, its positions, its first and its last position; none when empty. Each form's own way, a word at a
+  /// time for a bit table (gate r870: a clone's derivation spent most of its 100 s settling sets position by position).
+  fn stats(&self) -> Option<(u64, u64, u64, u64)> {
+    match &self.form {
+      Form::Runs(runs) => {
+        let first = runs.first()?.0;
+        let last = runs.last()?.1.saturating_sub(1);
+        let count = runs.iter().fold(0_u64, |count, run| {
+          count.saturating_add(run.1.saturating_sub(run.0))
+        });
+        Some((crate::to_u64(runs.len()), count, first, last))
+      }
+      Form::List(list) => {
+        let (first, last) = (*list.first()?, *list.last()?);
+        let breaks = list
+          .windows(2)
+          .filter(|pair| matches!(pair, [left, right] if right.saturating_sub(*left) > 1))
+          .count();
+        Some((
+          crate::to_u64(breaks).saturating_add(1),
+          crate::to_u64(list.len()),
+          first,
+          last,
+        ))
+      }
+      Form::Bits { start, words } => {
+        let first_at = words.iter().position(|word| *word != 0)?;
+        let last_at = words.iter().rposition(|word| *word != 0)?;
+        let base = |at: usize| start.saturating_add(crate::to_u64(at).saturating_mul(WORD_BITS));
+        let first = base(first_at).saturating_add(u64::from(words.get(first_at)?.trailing_zeros()));
+        let last = base(last_at)
+          .saturating_add(WORD_BITS - 1)
+          .saturating_sub(u64::from(words.get(last_at)?.leading_zeros()));
+        let (mut runs, mut count, mut carry) = (0_u64, 0_u64, 0_u64);
+        for word in words {
+          // A run begins at a set bit whose lower neighbour (the word before's top bit, for bit 0) is clear.
+          let starts = word & !((word << 1) | carry);
+          runs = runs.saturating_add(u64::from(starts.count_ones()));
+          count = count.saturating_add(u64::from(word.count_ones()));
+          carry = word >> (WORD_BITS - 1);
+        }
+        Some((runs, count, first, last))
+      }
+    }
+  }
+
+  /// The set's first position and the position past its last; none when empty.
+  fn bounds(&self) -> Option<(u64, u64)> {
+    match &self.form {
+      Form::Runs(runs) => Some((runs.first()?.0, runs.last()?.1)),
+      Form::List(list) => Some((*list.first()?, list.last()?.saturating_add(1))),
+      Form::Bits { .. } => self
+        .stats()
+        .map(|(_, _, first, last)| (first, last.saturating_add(1))),
+    }
+  }
+
+  /// The set as a bit table of `len` words from `start` (a word's first position), a word at a time where it is runs or
+  /// a table, positions outside the table left out.
+  fn table(&self, start: u64, len: usize) -> Vec<u64> {
+    let mut words = vec![0_u64; len];
+    match &self.form {
+      Form::Runs(runs) => {
+        for run in runs {
+          fill(&mut words, start, *run);
+        }
+      }
+      Form::List(list) => {
+        for position in list {
+          fill(&mut words, start, (*position, position.saturating_add(1)));
+        }
+      }
+      Form::Bits {
+        start: from,
+        words: theirs,
+      } => {
+        // Both tables begin at a word's first position, so a word of one is a word of the other.
+        let shift = |position: u64| crate::to_u64(usize::MAX).min(position / WORD_BITS);
+        for (at, word) in theirs.iter().enumerate() {
+          let Some(target) = shift(*from)
+            .checked_add(crate::to_u64(at))
+            .and_then(|at| at.checked_sub(shift(start)))
+            .and_then(|at| usize::try_from(at).ok())
+          else {
+            continue;
+          };
+          if let Some(slot) = words.get_mut(target) {
+            *slot = *word;
+          }
+        }
+      }
+    }
+    words
+  }
+
+  /// This set and `other` combined a word at a time by `op` over the positions `[from, to)` (both sets read as bit
+  /// tables there), in its cheapest form.
+  fn combined(
+    &self,
+    other: &Positions,
+    (from, to): (u64, u64),
+    op: impl Fn(u64, u64) -> u64,
+  ) -> Positions {
+    if to <= from {
+      return Positions::new();
+    }
+    let start = from.saturating_sub(from % WORD_BITS);
+    let len = to
+      .saturating_sub(1)
+      .saturating_sub(start)
+      .checked_div(WORD_BITS)
+      .unwrap_or(0)
+      .saturating_add(1);
+    let len = usize::try_from(len).unwrap_or(0);
+    let (mine, theirs) = (self.table(start, len), other.table(start, len));
+    let words = mine
+      .iter()
+      .zip(&theirs)
+      .map(|(mine, theirs)| op(*mine, *theirs))
+      .collect();
+    Positions::of_bits(start, words)
+  }
+
+  /// Whether this set or `other` is a bit table: their union, intersection and difference are then taken a word at a
+  /// time (gate r870: position by position, a clone's derivation over git/git's 1,027 refs took about 100 s).
+  fn either_bits(&self, other: &Positions) -> bool {
+    matches!(self.form, Form::Bits { .. }) || matches!(other.form, Form::Bits { .. })
   }
 
   /// Whether the set holds `position`.
@@ -183,8 +304,20 @@ impl Positions {
     }
   }
 
-  /// The union of this set and `other`: the two sets' runs merged in one pass over both.
+  /// The union of this set and `other`: the two sets' runs merged in one pass over both, or their words where either is
+  /// a bit table.
   pub fn union(&self, other: &Positions) -> Positions {
+    if self.either_bits(other) {
+      return match (self.bounds(), other.bounds()) {
+        (Some(mine), Some(theirs)) => self.combined(
+          other,
+          (mine.0.min(theirs.0), mine.1.max(theirs.1)),
+          |mine, theirs| mine | theirs,
+        ),
+        (Some(_), None) => self.clone(),
+        (None, _) => other.clone(),
+      };
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let (mut mine, mut theirs) = (self.runs_iter().peekable(), other.runs_iter().peekable());
     loop {
@@ -229,7 +362,10 @@ impl Positions {
   pub fn runs(&self) -> usize {
     match &self.form {
       Form::Runs(runs) => runs.len(),
-      _ => self.runs_iter().count(),
+      Form::Bits { .. } => self
+        .stats()
+        .map_or(0, |(runs, ..)| usize::try_from(runs).unwrap_or(usize::MAX)),
+      Form::List(_) => self.runs_iter().count(),
     }
   }
 
@@ -237,7 +373,9 @@ impl Positions {
   pub(crate) fn run_pairs(&self) -> Cow<'_, [(u64, u64)]> {
     match &self.form {
       Form::Runs(runs) => Cow::Borrowed(runs),
-      _ => Cow::Owned(self.runs_iter().collect()),
+      // A table's runs read a word at a time (gate r870: a derived value's put read them position by position).
+      Form::Bits { start, words } => Cow::Owned(runs_of_bits(*start, words)),
+      Form::List(_) => Cow::Owned(self.runs_iter().collect()),
     }
   }
 
@@ -344,6 +482,16 @@ impl Positions {
   /// The positions both this set and `other` hold (A-639): each run of one met with the runs of the other it overlaps,
   /// in one pass over both. Two runs out never touch, since a gap of either set lies between them.
   pub fn intersection(&self, other: &Positions) -> Positions {
+    if self.either_bits(other) {
+      return match (self.bounds(), other.bounds()) {
+        (Some(mine), Some(theirs)) => self.combined(
+          other,
+          (mine.0.max(theirs.0), mine.1.min(theirs.1)),
+          |mine, theirs| mine & theirs,
+        ),
+        _ => Positions::new(),
+      };
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let (mut mine, mut theirs) = (self.runs_iter().peekable(), other.runs_iter().peekable());
     while let (Some(&(start, end)), Some(&(from, to))) = (mine.peek(), theirs.peek()) {
@@ -363,6 +511,12 @@ impl Positions {
   /// The positions this set holds and `other` does not (A-639): each run cut by the runs of `other` it overlaps, in one
   /// pass over both.
   pub fn difference(&self, other: &Positions) -> Positions {
+    if self.either_bits(other) {
+      return match self.bounds() {
+        Some(mine) => self.combined(other, mine, |mine, theirs| mine & !theirs),
+        None => Positions::new(),
+      };
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut cuts = other.runs_iter().peekable();
     for (start, end) in self.runs_iter() {
@@ -506,6 +660,91 @@ fn insert_run(runs: &mut Vec<(u64, u64)>, position: u64) -> bool {
   true
 }
 
+/// The bits `low..=high` of a word set, the rest clear (`high` at most the word's last bit).
+fn mask(low: u64, high: u64) -> u64 {
+  let below_high = u64::MAX
+    .checked_shr(
+      u32::try_from(WORD_BITS.saturating_sub(1).saturating_sub(high)).unwrap_or(u32::MAX),
+    )
+    .unwrap_or(0);
+  let from_low = u64::MAX
+    .checked_shl(u32::try_from(low).unwrap_or(u32::MAX))
+    .unwrap_or(0);
+  below_high & from_low
+}
+
+/// Sets the positions `[from, to)` in the bit table `words` from `start` (a word's first position), a word at a time;
+/// positions outside the table are left out.
+fn fill(words: &mut [u64], start: u64, (from, to): (u64, u64)) {
+  let past = start.saturating_add(crate::to_u64(words.len()).saturating_mul(WORD_BITS));
+  let (from, to) = (from.max(start), to.min(past));
+  if to <= from {
+    return;
+  }
+  let (first, last) = (
+    from.saturating_sub(start),
+    to.saturating_sub(1).saturating_sub(start),
+  );
+  let (first_word, last_word) = (first / WORD_BITS, last / WORD_BITS);
+  for word_at in first_word..=last_word {
+    let low = if word_at == first_word {
+      first % WORD_BITS
+    } else {
+      0
+    };
+    let high = if word_at == last_word {
+      last % WORD_BITS
+    } else {
+      WORD_BITS - 1
+    };
+    if let Some(word) = usize::try_from(word_at)
+      .ok()
+      .and_then(|at| words.get_mut(at))
+    {
+      *word |= mask(low, high);
+    }
+  }
+}
+
+/// The runs `[start, end)` of the bit table `words` from `start`, ascending, found a word at a time by counting each
+/// stretch of ones and of zeros.
+fn runs_of_bits(start: u64, words: &[u64]) -> Vec<(u64, u64)> {
+  let mut runs: Vec<(u64, u64)> = Vec::new();
+  let mut open: Option<u64> = None;
+  for (at, word) in words.iter().enumerate() {
+    let base = start.saturating_add(crate::to_u64(at).saturating_mul(WORD_BITS));
+    let mut bit = 0_u64;
+    while bit < WORD_BITS {
+      let rest = word
+        .checked_shr(u32::try_from(bit).unwrap_or(u32::MAX))
+        .unwrap_or(0);
+      match open {
+        Some(from) => {
+          bit = bit
+            .saturating_add(u64::from(rest.trailing_ones()))
+            .min(WORD_BITS);
+          if bit < WORD_BITS {
+            runs.push((from, base.saturating_add(bit)));
+            open = None;
+          }
+        }
+        None if rest == 0 => break,
+        None => {
+          bit = bit.saturating_add(u64::from(rest.trailing_zeros()));
+          open = Some(base.saturating_add(bit));
+        }
+      }
+    }
+  }
+  if let Some(from) = open {
+    runs.push((
+      from,
+      start.saturating_add(crate::to_u64(words.len()).saturating_mul(WORD_BITS)),
+    ));
+  }
+  runs
+}
+
 /// Whether the bit table of `words` from `start` holds `position`.
 fn bit(start: u64, words: &[u64], position: u64) -> bool {
   let Some(offset) = position.checked_sub(start) else {
@@ -592,6 +831,85 @@ mod tests {
       let set = Positions::of(model.iter().copied().collect());
       for from in 0..700 {
         prop_assert_eq!(set.next_from(from), model.range(from..).next().copied(), "from {}", from);
+      }
+    }
+  }
+
+  /// `model` as a bit table from the word holding its first position to the word holding its last, kept a table
+  /// whatever would cost least: what the word-wise paths read.
+  fn as_table(model: &BTreeSet<u64>) -> Positions {
+    let first = model.first().copied().unwrap_or(0);
+    let start = first - first % super::WORD_BITS;
+    let end = model.last().map_or(start, |last| last + 1);
+    let mut words = vec![0_u64; usize::try_from((end - start).div_ceil(super::WORD_BITS)).unwrap()];
+    for position in model {
+      let offset = position - start;
+      words[usize::try_from(offset / super::WORD_BITS).unwrap()] |=
+        1u64 << (offset % super::WORD_BITS);
+    }
+    Positions {
+      form: super::Form::Bits { start, words },
+    }
+  }
+
+  /// The runs `[start, end)` an ordered set makes.
+  fn runs_of(model: &BTreeSet<u64>) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for position in model {
+      match runs.last_mut() {
+        Some(last) if last.1 == *position => last.1 += 1,
+        _ => runs.push((*position, position + 1)),
+      }
+    }
+    runs
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+    /// Gate r870 (main 01a20182, 2026-11-24: a clone of git/git spent about 100 s before its first pack byte in its
+    /// derivation's set work, position by position). Do: draw two sets over a few hundred words, runs and scattered
+    /// positions alike, each from a drawn offset (so neither begins at the other's word) and kept as a bit table, and the
+    /// second also as its runs; take their union, intersection and difference (table with table, table with runs),
+    /// settle each, and read the first's runs. Expect: everything the ordered sets beside them answer, each result's runs
+    /// the model's runs, and each within its bound.
+    #[test]
+    fn r870_bit_tables_combined_a_word_at_a_time_are_the_sets_they_make(
+      left in proptest::collection::vec((0u64..3, 1u64..200, 1u64..90), 0..80),
+      right in proptest::collection::vec((0u64..3, 1u64..200, 1u64..90), 0..80),
+      left_from in 0u64..300,
+      right_from in 0u64..300,
+    ) {
+      let model = |steps: &[(u64, u64, u64)], from: u64| {
+        let mut at = from;
+        let mut set = BTreeSet::new();
+        for (kind, gap, run) in steps {
+          at += gap;
+          let length = if *kind == 0 { *run } else { 1 };
+          set.extend(at..at + length);
+          at += length;
+        }
+        set
+      };
+      let (model_mine, model_theirs) = (model(&left, left_from), model(&right, right_from));
+      let mine = as_table(&model_mine);
+      let theirs_table = as_table(&model_theirs);
+      let theirs_runs = Positions::of_runs(runs_of(&model_theirs));
+      prop_assert_eq!(mine.run_pairs().into_owned(), runs_of(&model_mine));
+      prop_assert_eq!(mine.len(), crate::to_u64(model_mine.len()));
+      prop_assert_eq!(mine.runs(), runs_of(&model_mine).len());
+      for theirs in [&theirs_table, &theirs_runs] {
+        let checks = [
+          (mine.union(theirs), model_mine.union(&model_theirs).copied().collect::<BTreeSet<_>>()),
+          (mine.intersection(theirs), model_mine.intersection(&model_theirs).copied().collect()),
+          (mine.difference(theirs), model_mine.difference(&model_theirs).copied().collect()),
+          (theirs.difference(&mine), model_theirs.difference(&model_mine).copied().collect()),
+        ];
+        for (got, want) in checks {
+          prop_assert_eq!(got.iter().collect::<BTreeSet<_>>(), want.clone());
+          prop_assert_eq!(got.run_pairs().into_owned(), runs_of(&want));
+          prop_assert!(within_bound(&got), "{:?}: {} bytes", got, got.bytes());
+        }
       }
     }
   }

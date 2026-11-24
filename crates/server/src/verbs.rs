@@ -20627,6 +20627,15 @@ fn begin_member_branch(
   record: &VolumeRecord,
   (from, version): (DbVolumeId, u64),
 ) -> Option<slates_merge::engine::Green> {
+  // A source awaiting its re-adoption here, or itself waiting on one, stands only once the boot re-adopts it: the branch
+  // waits for it rather than being fenced (main's item (2) of 2026-11-24 08:52).
+  if state.merge.awaiting_adoption.contains_key(&from)
+    || state.merge.after_source.contains_key(&from)
+  {
+    state.merge.after_source.insert(record.id, (from, version));
+    state.count(BRANCHES_AFTER_SOURCE, 1);
+    return None;
+  }
   let seeded = state
     .greens
     .branch(&from, version, record.id)
@@ -20641,6 +20650,106 @@ fn begin_member_branch(
       );
       None
     }
+  }
+}
+
+/// Counted: a boot's branch member that waited for its source's re-adoption before it was rebuilt over it
+/// ([`begin_member_branch`], [`begin_waiting_branches`]). Format: a counter name in the status report.
+const BRANCHES_AFTER_SOURCE: &str = "merge.recovery.branches_after_source";
+
+/// Begins, over `source` now re-adopted here, the replay of each branch member that waited for it
+/// ([`begin_member_branch`]): branched again at its version, its own checkpoint and chain to be replayed as a
+/// re-adoption's ([`step_readoption`], which puts its engine back in its lineage). The branches begun, for the boot to
+/// step; one that cannot be begun is fenced `SourceUnavailable`.
+pub(crate) fn begin_waiting_branches(
+  state: &mut ShardState,
+  source: DbVolumeId,
+) -> Vec<DbVolumeId> {
+  let waiting: Vec<(DbVolumeId, u64)> = state
+    .merge
+    .after_source
+    .iter()
+    .filter(|(_, (from, _))| *from == source)
+    .map(|(branch, (_, version))| (*branch, *version))
+    .collect();
+  let mut begun = Vec::with_capacity(waiting.len());
+  for (branch, version) in waiting {
+    state.merge.after_source.remove(&branch);
+    let replay = branched_again(state, branch, (source, version)).map(|seeded| {
+      GreenReplay::seeded(state, branch, seeded).map_err(|(fence, engine)| {
+        give_back_to_lineage(state, branch, *engine);
+        fence
+      })
+    });
+    match replay {
+      Some(Ok(replay)) => {
+        state.merge.awaiting_adoption.insert(
+          branch,
+          crate::green_adopt::AwaitingAdoption {
+            through: 0,
+            identity: None,
+            replay: Some(Box::new(replay)),
+          },
+        );
+        begun.push(branch);
+      }
+      Some(Err(fence)) => fence_branch(state, branch, fence),
+      None => fence_branch(
+        state,
+        branch,
+        crate::merge_service::GreenFence::SourceUnavailable,
+      ),
+    }
+  }
+  begun
+}
+
+/// Fences every branch member waiting for `source` (its re-adoption fenced, A-333), and every one waiting on those in
+/// turn: none waits past the boot.
+pub(crate) fn fence_waiting_branches(state: &mut ShardState, source: DbVolumeId) {
+  let mut sources = vec![source];
+  while let Some(source) = sources.pop() {
+    let waiting: Vec<DbVolumeId> = state
+      .merge
+      .after_source
+      .iter()
+      .filter(|(_, (from, _))| *from == source)
+      .map(|(branch, _)| *branch)
+      .collect();
+    for branch in waiting {
+      state.merge.after_source.remove(&branch);
+      fence_branch(
+        state,
+        branch,
+        crate::merge_service::GreenFence::SourceUnavailable,
+      );
+      sources.push(branch);
+    }
+  }
+}
+
+/// Fences every branch member still waiting for its source once the boot has re-adopted all it could: none waits past
+/// the boot.
+pub(crate) fn fence_stranded_branches(state: &mut ShardState) {
+  let stranded: Vec<DbVolumeId> = state.merge.after_source.keys().copied().collect();
+  state.merge.after_source.clear();
+  for branch in stranded {
+    fence_branch(
+      state,
+      branch,
+      crate::merge_service::GreenFence::SourceUnavailable,
+    );
+  }
+}
+
+/// Fences branch member `branch` with `fence`, by its record.
+fn fence_branch(
+  state: &mut ShardState,
+  branch: DbVolumeId,
+  fence: crate::merge_service::GreenFence,
+) {
+  if let Some(record) = state.db.partition().volume(branch).cloned() {
+    fence_green(state, &record, fence);
   }
 }
 
@@ -21426,17 +21535,75 @@ pub(crate) fn begin_readoption(
   {
     return false;
   }
-  let Ok(phase) = chain_phase(state, id, Some(engine)) else {
-    return false;
+  // A branch member whose source stands in its lineage here is rebuilt over that source, as a recovery rebuilds one
+  // (`rebuild_member_sliced`): branched again at its version, then its own checkpoint and chain replayed, so it joins its
+  // lineage and a server-made commit's preview over it is made through the lineage (A-891). The handed engine, the
+  // replica's over arenas of its own, goes.
+  let replay = match branch_source(state, id) {
+    Some(source) => {
+      drop(engine);
+      let Some(seeded) = branched_again(state, id, source) else {
+        return false;
+      };
+      match GreenReplay::seeded(state, id, seeded) {
+        Ok(replay) => replay,
+        Err((_, engine)) => {
+          give_back_to_lineage(state, id, *engine);
+          return false;
+        }
+      }
+    }
+    None => {
+      let Ok(phase) = chain_phase(state, id, Some(engine)) else {
+        return false;
+      };
+      GreenReplay {
+        id,
+        phase,
+        load_steps: 0,
+      }
+    }
   };
   if let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) {
-    awaiting.replay = Some(Box::new(GreenReplay {
-      id,
-      phase,
-      load_steps: 0,
-    }));
+    awaiting.replay = Some(Box::new(replay));
   }
   true
+}
+
+/// The source green `id` was branched from and the version it was branched at, where `id` is a lineage's branch member
+/// and that source stands in the lineage here (A-575): what a re-adoption rebuilds it over ([`begin_readoption`]).
+fn branch_source(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, u64)> {
+  let member = state.db.partition().repositories().member(id).cloned()?;
+  let slates_db::catalog::MemberOrigin::Branch { from, version } = member.origin else {
+    return None;
+  };
+  (state.greens.lineage_of(&from) == Some(member.repository)).then_some((from, version))
+}
+
+/// Green `id` branched again from `source` at its version, its engine taken out of the lineage for its own replay; none
+/// where the lineage refuses it.
+fn branched_again(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  (from, version): (DbVolumeId, u64),
+) -> Option<slates_merge::engine::Green> {
+  state
+    .greens
+    .branch(&from, version, id)
+    .and_then(|()| state.greens.take(&id))
+    .ok()
+}
+
+/// Gives green `id`'s engine back to its lineage after its replay, where it was taken out of one; counted where the
+/// lineage refuses it ([`MEMBER_ENGINE_LOST`]).
+fn give_back_to_lineage(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  engine: slates_merge::engine::Green,
+) {
+  if state.greens.lineage_of(&id).is_some() && state.greens.put_back(&id, engine).is_err() {
+    state.count(MEMBER_ENGINE_LOST, 1);
+  }
 }
 
 /// What one call of a green's re-adoption replay did ([`step_readoption`]).
@@ -21477,6 +21644,9 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
       }
       Err(fence) => {
         state.merge.awaiting_adoption.remove(&id);
+        if let Some(engine) = replay.into_engine() {
+          give_back_to_lineage(state, id, *engine);
+        }
         if let Some(record) = state.db.partition().volume(id).cloned() {
           fence_green(state, &record, fence);
         }
@@ -21508,9 +21678,10 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
 }
 
 /// Counter: a re-adopted green its lineage's records name as a member that is installed standing alone, outside its
-/// lineage (a branch, whose engine the replica built over arenas of its own, or a root whose repository has a lineage
-/// here already): it serves, but a server-made commit over it is refused, since a held verdict is previewed through the
-/// lineage (`Greens::preview`, A-891; GAPS, owed). Format: a counter name in the daemon's status report.
+/// lineage (a branch whose source does not stand in its lineage here, whose engine the replica built over arenas of its
+/// own, or a root whose repository has a lineage here already): it serves, but a server-made commit over it is refused,
+/// since a held verdict is previewed through the lineage (`Greens::preview`, A-891). A branch whose source stands is
+/// rebuilt over it instead ([`begin_readoption`]). Format: a counter name in the daemon's status report.
 pub(crate) const READOPTED_OUTSIDE_LINEAGE: &str = "merge.readoption.outside_lineage";
 
 /// Installs a re-adopted green's replay ([`step_readoption`]) the way its lineage's records say it joined, as a
@@ -21537,6 +21708,19 @@ fn install_readopted(
     {
       install_member_root(state, record, &member, replayed)
     }
+    // A branch rebuilt over its source ([`begin_readoption`]): its engine back in its lineage, as a recovery's.
+    Some(member)
+      if matches!(
+        member.origin,
+        slates_db::catalog::MemberOrigin::Branch { .. }
+      ) && state.greens.lineage_of(&record.id) == Some(member.repository) =>
+    {
+      let (replayed, engine) = match replayed {
+        Ok((engine, versions)) => (Ok(versions), Some(Box::new(engine))),
+        Err(fence) => (Err(fence), None),
+      };
+      finish_member_branch(state, record, replayed, engine)
+    }
     Some(_) => {
       state.count(READOPTED_OUTSIDE_LINEAGE, 1);
       install_green(state, record, replayed)
@@ -21548,6 +21732,8 @@ fn install_readopted(
 /// Fences green `id`, awaiting its re-adoption here, whose boot could not re-adopt it from this node's ledger (A-333):
 /// every verb on it refused typed from here, its records left as the evidence (AUD-29-18).
 pub(crate) fn fence_awaiting_adoption(state: &mut ShardState, id: DbVolumeId) {
+  // The branches waiting for it are fenced with it (main's item (2) of 2026-11-24 08:52).
+  fence_waiting_branches(state, id);
   if state.merge.awaiting_adoption.remove(&id).is_none() {
     return;
   }
@@ -21576,6 +21762,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
     || owner_of(to_wire_volume(green)) != state.partition
     || state.merge.awaiting_adoption.contains_key(&green)
     || state.merge.after_stores.contains(&green)
+    || state.merge.after_source.contains_key(&green)
   {
     let created_at = match record.policy.role {
       Role::Work { base_version, .. } => base_version,
