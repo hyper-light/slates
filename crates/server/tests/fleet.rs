@@ -158,10 +158,14 @@ fn shard_steps(shard: u16) -> u64 {
   slates_rt::registry::with_entry(shard, |entry| entry.pulse.steps()).unwrap_or(0)
 }
 
+/// The fleet coordinators of this process as [`coordinators`] reads them: each slot's holder with the periods it had
+/// counted.
+type Coordinators = Vec<(slates_rt::registry::SlotHolder, u64)>;
+
 /// Every fleet coordinator registered in this process, with the periods it has counted: each shard slot whose pulse has
 /// counted a period, which only a daemon's control shard does (`Daemon::fleet_progress`), named by its slot's holder so
 /// that a slot a later daemon takes is never read as the same coordinator.
-fn coordinators() -> Vec<(slates_rt::registry::SlotHolder, u64)> {
+fn coordinators() -> Coordinators {
   (0..slates_rt::registry::MAX_SHARDS)
     .filter_map(|slot| u16::try_from(slot).ok())
     .filter_map(|shard| {
@@ -11483,7 +11487,7 @@ impl Client {
   /// shard counts no periods unless it is the control shard. The last reply, refused or not.
   fn call_admitted(&mut self, body: &RequestBody) -> ReplyBody {
     let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
-    let mut charge: Option<(Vec<(slates_rt::registry::SlotHolder, u64)>, u64, Instant)> = None;
+    let mut charge: Option<(Coordinators, u64, Instant)> = None;
     loop {
       let reply = self.call(body);
       if !matches!(
