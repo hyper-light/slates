@@ -146,6 +146,16 @@ pub(crate) trait StoreLender {
   async fn encode(&mut self, _id: RepositoryId) {}
 }
 
+/// Whether `request`, upload-pack's at `version`, may be a fetch, so its store's versions are derived and encoded before
+/// it is answered (A-718): every request before protocol v2 (its body is a fetch's negotiation), and a v2 request naming
+/// `fetch` or naming no command this crate reads (its answer refuses it). A v2 `ls-refs`, `object-info` or `bundle-uri`
+/// reads neither.
+pub(crate) fn fetches(version: Version, request: &[u8]) -> bool {
+  !matches!(version, Version::V2)
+    || slates_git::v2::request::command_of(request)
+      .is_none_or(|command| command == slates_git::v2::request::Command::Fetch)
+}
+
 /// A window an answer's read-through brought back (A-864 piece 3): its pack, where it ends there, and its identity, let
 /// go again once the answer's cursor has passed it; or, for a window a read stopped at, once the cursor has moved off the
 /// object that read was for (`pinned`).
@@ -348,7 +358,11 @@ impl<L: StoreLender> Exchange for Upload<L> {
         }
       }
     } else {
-      lender.encode(*repository).await;
+      // A-718: the store's versions derived and encoded before a fetch is answered; a protocol v2 command other than
+      // `fetch` reads neither (goal 93, r405: `git ls-remote` after a whole push waited 29 to 54 s for them).
+      if fetches(*version, request) {
+        lender.encode(*repository).await;
+      }
       let held = lender.hold(*repository, reader).ok_or(unavailable)?;
       // A-855: a negotiation run past its room is held, not answered, until the room grows (`Upload::wait_for_room`).
       let made = loop {

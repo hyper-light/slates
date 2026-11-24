@@ -247,14 +247,17 @@ async fn answer_step<S: ShardLender>(
   // The client's going ends a hook's run alone, and no hook runs off unix.
   #[cfg(not(unix))]
   let _ = gone;
+  let before = out.len();
   let answering = lent(lender, |state| push.answer_step(state, &mut *out))?
     .map_err(|failed| refused(failed, name))?;
   match answering {
-    Answering::Answered(_) => {
-      // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c).
+    Answering::Answered(received) => {
+      // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c); past the barrier's
+      // window with nothing moving, each command it applied is reported `ng <ref> unable to commit` in its report's stead.
       drop(turn);
       if !crate::state_log::names_committed_within(push.repository()).await {
-        return Err(died(NOT_SERVED));
+        out.truncate(before);
+        out.extend_from_slice(&crate::git_push::uncommitted_report(&received));
       }
       Ok((Next::Exited(0), None))
     }

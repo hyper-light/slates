@@ -661,7 +661,9 @@ fn main() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-provision-bench".to_owned(),
+      // A name of this process's own: on macOS a content extent's object is named from the segment's and outlives its
+      // daemon until released, so a fixed name met the objects another run had made (main 01a20182's r633).
+      name: format!("slates-seg-provision-bench-{}", std::process::id()),
     },
   )
   .unwrap();
@@ -821,12 +823,12 @@ mod scheduling {
     let mut role = 0i32;
     let mut count = TASK_CATEGORY_POLICY_COUNT;
     let mut get_default = 0u32;
-    // SAFETY: this task's own port, a one-integer policy buffer and its count, and the default flag, all locals the call
-    // writes within the count it is given.
     #[allow(
       deprecated,
       reason = "libc's mach_task_self works; the mach2 crate it points to is no dependency of this workspace"
     )]
+    // SAFETY: this task's own port, a one-integer policy buffer and its count, and the default flag, all locals the call
+    // writes within the count it is given.
     let rc = unsafe {
       task_policy_get(
         libc::mach_task_self(),
