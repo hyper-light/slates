@@ -1608,7 +1608,7 @@ thread_local! {
 /// P2's preview lifetime (main's ruling of 2026-11-21 07:30, for w-git's C5 2b piece 3: a made commit's path map is
 /// built a slice a turn against the version the held verdict makes). Do: on a git green at version 1, judge a second
 /// work and hold its verdict's preview with a pending accept (`made_commit::hold_preview`); in a later step of the shard,
-/// read through it (`with_held_preview`); in a third, commit the accept (`made_commit::commit`). Expect:
+/// read through it (`with_held_preview`); in a third, commit the accept (`made_commit::commit_guarded`). Expect:
 /// - while held, the preview reads as version 2 (the work's bytes), the green still at version 1 with its own bytes,
 ///   and its lineage holds one member more (the preview);
 /// - the read in a later step counts `vcs.made.preview_held_across_turns` once;
@@ -1685,7 +1685,15 @@ fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
     let pending = HELD_PENDING
       .with(|held| held.borrow_mut().take())
       .expect("the pending accept");
-    let made = crate::made_commit::commit(state, pending, |_| Ok::<(), ()>(()));
+    let made = crate::made_commit::commit_guarded(
+      state,
+      pending,
+      |_| Ok(()),
+      (
+        |_: &mut ShardState, ()| Ok::<(), ()>(()),
+        |_: &mut ShardState, ()| {},
+      ),
+    );
     let green = state
       .greens
       .get(&main)

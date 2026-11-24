@@ -20,7 +20,7 @@
 //!    retired in the submit's step (`Lineage::preview`, `Greens::preview`). The submit's step takes the request's route,
 //!    marks it deferred, and hands the version's durable parts (`verbs::AcceptedParts`) to the made task ([`defer`]).
 //! 3. **One step after the landing.** The task lands the revision's changeset on the store at the register's next
-//!    sequence, then, in one step ([`commit`]): the verdict applied to the green as its chain entry records it
+//!    sequence, then, in one step ([`commit_guarded`]): the verdict applied to the green as its chain entry records it
 //!    (`verbs::apply_accepted`, the replay a recovery runs), the version's chain entry and what goes with it
 //!    (`verbs::commit_accepted`), the register's entry naming the sequence (the tool's commit), the local work's settle
 //!    (`verbs::settle_submit`) and the request's completion, in one transaction. Then the answer goes on the request's
@@ -132,7 +132,8 @@ pub(crate) enum Taken {
   Held,
   /// Held by another landing: the submit parks.
   Busy(RepositoryId),
-  /// A Subversion repository's green, with no recorded request running (a bare dispatch, which no answer can wait on):
+  /// A Subversion, git or Mercurial repository's green, with no recorded request running (a bare dispatch, which no
+  /// answer can wait on):
   /// its version, its revision on the node's store and the register's entry are one step whose answer waits for the
   /// store, so the submit is refused `RecordedSubmitRequired`, nothing judged (main's rulings of 2026-11-23: the store
   /// is the truth, with no second path).
@@ -157,8 +158,9 @@ pub(crate) fn take_turn(
       // git's too (main 01a20182's ruling of 2026-11-24 01:36, A-888's git half): its commit is made only through the
       // held verdict, never after a version committed alone.
       Tool::Git => Taken::Unrecorded(VcsTool::Git),
-      // GAPS (main's sweep of 2026-11-23): Mercurial's made commits outside a recorded request, their owner's.
-      Tool::Mercurial => Taken::Unhooked,
+      // Mercurial's too (main 01a20182's ruling of 2026-11-24 04:59, A-888's Mercurial half): its changeset is made
+      // only through the held verdict, never after a version committed alone.
+      Tool::Mercurial => Taken::Unrecorded(VcsTool::Mercurial),
     };
   }
   let turn = match state.made_commits.ready.remove(&repository) {
@@ -239,7 +241,7 @@ pub(crate) struct Pending {
   /// The version's durable parts.
   parts: AcceptedParts,
   /// The held verdict's preview, where the tool keeps one across turns ([`hold_preview`]): what its made commit is built
-  /// against while the verdict is held, retired in the one step ([`commit`]) or when the accept is given up.
+  /// against while the verdict is held, retired in the one step ([`commit_guarded`]) or when the accept is given up.
   preview: HeldPreview,
 }
 
@@ -339,7 +341,7 @@ pub(crate) fn with_held_preview_and_stores<R>(
   Some(lent)
 }
 
-/// Whether the running step is a made commit's one step ([`commit`]): the tool's own commit runs in it, so the version's
+/// Whether the running step is a made commit's one step ([`commit_guarded`]): the tool's own commit runs in it, so the version's
 /// commit is not made again by the accept's after-steps (`vcs_store::commits::after_submit`).
 pub(crate) fn committing(state: &ShardState) -> bool {
   state.made_commits.committing
@@ -429,24 +431,6 @@ impl Pending {
   pub(crate) fn authorship(&self) -> &slates_ipc::protocol::Authorship {
     &self.parts.authorship
   }
-}
-
-/// Commits `pending` in one transaction with the tool's register commit `tool` (module docs, 3), then answers it on its
-/// route: the version's parts first, then `tool` (refused, the version stands alone, as a version no commit was made
-/// of does), then the local work's settle and the completion. `tool`'s answer; none where the version's parts were
-/// refused or the green was made again meanwhile (then nothing of the tool's ran). git's and Mercurial's made commits
-/// (GAPS, main's sweep of 2026-11-23: theirs to move to [`commit_guarded`]).
-pub(crate) fn commit<T, E>(
-  state: &mut ShardState,
-  pending: Pending,
-  tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
-) -> Option<Result<T, E>> {
-  commit_guarded(
-    state,
-    pending,
-    |_| Ok::<(), Refusal>(()),
-    (|state, ()| tool(state), |_, ()| {}),
-  )
 }
 
 /// Commits `pending` guard-then-apply (main's ruling of 2026-11-23 20:51; `crates/db/src/partition.rs`'s `check` before

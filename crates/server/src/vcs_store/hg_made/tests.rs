@@ -14,7 +14,7 @@ use super::{MADE, head_of};
 use crate::repository::hg_push::tests::{Made, changegroup};
 use crate::repository::hg_push::{land_in, line_name, take_whole};
 use crate::state::ShardState;
-use crate::vcs_store::paths::tests::{create, version};
+use crate::vcs_store::paths::tests::{create, submitted_recorded};
 use crate::verbs::to_db_volume;
 
 /// Shape: how long a test waits for a shard's task (a rebuild) to end before it fails, as the import tests wait.
@@ -160,10 +160,7 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
   let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
     let (repository, green) = mercurial(state, "made");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
-    assert_eq!(
-      version(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]),
-      1
-    );
+    submitted_recorded(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
     (repository, green)
   });
   made_reaches(&daemon, 1);
@@ -178,14 +175,16 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
     );
     assert_eq!(parent_of(state, repository, &pushed), Some(first));
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
-    assert_eq!(
-      version(state, ipc_green, 2, vec![create("a.txt", b"beta\n")]),
-      3
-    );
+    submitted_recorded(state, ipc_green, 2, vec![create("a.txt", b"beta\n")]);
     (first, pushed)
   });
   made_reaches(&daemon, 2);
   let held = crate::daemon::observe_first(&daemon, move |state| {
+    assert_eq!(
+      state.db.partition().green_head(green),
+      3,
+      "the push's version, then the second submit's"
+    );
     let second = head_of(state, green).expect("the second submit made a changeset");
     assert_eq!(parent_of(state, repository, &second), Some(pushed));
     let references = state.db.partition().repositories();
@@ -235,7 +234,7 @@ fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
   let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
     let (repository, green) = mercurial(state, "copied");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
-    version(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
+    submitted_recorded(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
     (repository, green)
   });
   made_reaches(&daemon, 1);
@@ -247,7 +246,7 @@ fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
       version: None,
       replace: false,
     });
-    assert_eq!(version(state, ipc_green, 2, vec![copy]), 2);
+    submitted_recorded(state, ipc_green, 2, vec![copy]);
   });
   made_reaches(&daemon, 2);
   let (source, row, text) = crate::daemon::observe_first(&daemon, move |state| {
@@ -569,4 +568,120 @@ fn a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset() {
   assert!(first.0 && first.3.is_some(), "the first made: {first:?}");
   assert_eq!((second.0, second.1), (true, 2), "the second answered at 2");
   assert_eq!(parent, first.3, "the second made over the first");
+}
+
+/// Whether `green`'s durable head is a version committed with nothing behind it on the store: past none, and no
+/// changeset made of it (goal 93 correctness, main's ruling of 2026-11-23 22:08; w-svn's A-888 piece 2 found it in
+/// Subversion).
+fn version_alone(state: &ShardState, green: DbVolumeId) -> (u64, bool) {
+  let head = state.db.partition().green_head(green);
+  (
+    head,
+    head > 0 && super::made_at(state, green, head).is_none(),
+  )
+}
+
+/// A deferred submit (`made_commit`) to a new Mercurial repository `name`'s green as a client's recorded request, with
+/// `fault` set on the shard, awaited: whether it was answered, and the green's durable head with whether it stands alone
+/// ([`version_alone`]).
+fn deferred_submit(name: &'static str, fault: super::Fault) -> (bool, u64, bool) {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let green = crate::daemon::observe_first(&daemon, move |state| {
+    let (_, green) = mercurial(state, name);
+    let work = hg_work(state, green, (name, "a.txt", b"alpha\n"));
+    super::TEST_FAULT.with(|set| set.set(Some(fault)));
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, id),
+      &owner(),
+      crate::identities::authored(work, "made"),
+    );
+    green
+  });
+  let after = answered(&daemon, green, id);
+  let (head, alone) =
+    crate::daemon::observe_first(&daemon, move |state| version_alone(state, green));
+  daemon.stop();
+  (after.0, head, alone)
+}
+
+/// Goal 93 correctness, site 1 (main's ruling of 2026-11-23 22:08): a deferred submit whose changeset is not made. Do:
+/// set the made changeset's inputs to refuse (`Fault::Inputs`, `NotHead`, as a store being made again from its records
+/// refuses them; a submit with no Mercurial identity is refused before, so it cannot drive this); submit a work to a
+/// Mercurial repository's green as a client's recorded request; await the answer. Expect: answered, and no version committed with nothing behind it on
+/// the store. Red before: the version committed alone (`made_commit_landing`'s `made` Err or Ok(None)).
+#[test]
+fn a_deferred_submit_whose_changeset_is_not_made_commits_no_version_alone() {
+  let (answered, head, alone) = deferred_submit("unmade-deferred", super::Fault::Inputs);
+  assert!(answered, "the submit answered");
+  assert!(
+    !alone,
+    "version {head} committed with no changeset behind it"
+  );
+}
+
+/// Goal 93 correctness, site 2: a deferred submit whose made changeset's landing is refused other than by the store
+/// (`Unmade` other than `Unlanded`). Do: set the preparation to refuse (`Fault::Prepared`, as a changegroup past its room
+/// is refused `Record`); submit as site 1 does, with identities; await the answer. Expect: answered, and no version
+/// committed alone. Red before: `made_commit_landing` counted it unmade and committed the version alone.
+#[test]
+fn a_deferred_submit_whose_landing_is_refused_commits_no_version_alone() {
+  let (answered, head, alone) = deferred_submit("refused-deferred", super::Fault::Prepared);
+  assert!(answered, "the submit answered");
+  assert!(
+    !alone,
+    "version {head} committed with no changeset behind it"
+  );
+}
+
+/// Goal 93 correctness, site 3: a deferred submit whose made changeset's record is refused at the commit
+/// (`commit_made` Err). Do: set the record to refuse (`Fault::CommitMade`, `Stale`, as a fork a client's push made stale
+/// is); submit as site 2 does; await the answer. Expect: answered, and no version committed alone. Red before:
+/// `made_commit::commit_held` committed the version whatever its tool answered.
+#[test]
+fn a_deferred_submit_whose_record_is_refused_commits_no_version_alone() {
+  let (answered, head, alone) = deferred_submit("stale-deferred", super::Fault::CommitMade);
+  assert!(answered, "the submit answered");
+  assert!(
+    !alone,
+    "version {head} committed with no changeset behind it"
+  );
+}
+
+/// Goal 93 correctness, site 4 (main's ruling of 2026-11-24 04:59; as Subversion's and git's, A-888): a bare dispatch's
+/// submit to a Mercurial repository's green, which no answer can wait on, is refused `RecordedSubmitRequired` before
+/// its verdict, so its version is never committed before its changeset is made. Do: submit a work to a Mercurial
+/// repository's green by a bare dispatch. Expect: refused `RecordedSubmitRequired` naming Mercurial; the green's durable
+/// head 0, no changeset made. Red before: the bare path committed the version in the submit's step and made the
+/// changeset after, in its own transaction, so an unmade one left the version alone.
+#[test]
+fn a_bare_submit_to_a_mercurial_green_is_refused_recorded_submit_required() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (reply, alone, head) = crate::daemon::observe_first(&daemon, |state| {
+    let (_, green) = mercurial(state, "bare-refused");
+    let work = hg_work(state, green, ("bare-refused", "a.txt", b"alpha\n"));
+    let reply =
+      crate::vcs_store::paths::tests::ask(state, crate::identities::authored(work, "made"));
+    let (head, alone) = version_alone(state, green);
+    (reply, alone, (head, head_of(state, green)))
+  });
+  daemon.stop();
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::RecordedSubmitRequired {
+          tool: VcsTool::Mercurial
+        },
+        ..
+      }
+    ),
+    "{reply:?}"
+  );
+  assert!(!alone);
+  assert_eq!(head, (0, None), "nothing committed, nothing made");
 }
