@@ -175,11 +175,19 @@ pub(crate) fn engine_for_adoption(
   if state.merge.seeding.contains(&object) {
     return Engine::Building;
   }
-  match state.merge.replicas.get(&object).map(Green::reached) {
+  match state
+    .merge
+    .replicas
+    .lend(&crate::merge_service::replica_key(object))
+    .map(|replica| replica.reached())
+  {
     Some(head) if head == through => at_adopted(state, object, identity),
     Some(head) if head < through => advance(state, object, (head, through), identity),
     Some(_) => {
-      state.merge.replicas.remove(&object);
+      state
+        .merge
+        .replicas
+        .remove(&crate::merge_service::replica_key(object));
       state.count(REPLICA_PAST_ADOPTION, 1);
       rebuild(state, object, through, identity)
     }
@@ -229,13 +237,16 @@ fn at_adopted(state: &mut ShardState, object: ObjectId, identity: [u8; 32]) -> E
   let reached = state
     .merge
     .replicas
-    .get_mut(&object)
-    .map(|replica| (replica.reached(), replica.head_identity()));
+    .lend_mut(&crate::merge_service::replica_key(object))
+    .map(|mut replica| (replica.reached(), replica.head_identity()));
   match reached {
     Some((_, at)) if at == identity => Engine::Ready,
     Some((head, _)) => {
       state.merge.refused.insert(object);
-      state.merge.replicas.remove(&object);
+      state
+        .merge
+        .replicas
+        .remove(&crate::merge_service::replica_key(object));
       state.count(ADOPTION_MISMATCH, 1);
       slates_machine::log_line!(
         "slates-server: taken-over green {}: this node's replica at version {head} is not the adopted record's \
@@ -250,12 +261,24 @@ fn at_adopted(state: &mut ShardState, object: ObjectId, identity: [u8; 32]) -> E
 
 /// Takes the green's engine, `object`'s replica, out of this node's replicas, for its owner shard.
 pub(crate) fn take_engine(state: &mut ShardState, object: ObjectId) -> Option<Green> {
-  state.merge.replicas.remove(&object)
+  state
+    .merge
+    .replicas
+    .remove(&crate::merge_service::replica_key(object))
 }
 
 /// Gives a refused or unanswered adoption's engine back to this node's replicas, where it waits for the next attempt.
 pub(crate) fn give_back(state: &mut ShardState, object: ObjectId, adopted: AdoptedGreen) {
-  state.merge.replicas.entry(object).or_insert(adopted.engine);
+  if !state
+    .merge
+    .replicas
+    .contains_key(&crate::merge_service::replica_key(object))
+  {
+    state
+      .merge
+      .replicas
+      .insert(crate::merge_service::replica_key(object), adopted.engine);
+  }
   state.merge.adoption_completions.insert(
     object,
     Completions::Gathered {
@@ -660,7 +683,9 @@ async fn rebuild_waiting_branches(control: u16, owner: u16, source: DbVolumeId) 
 /// record's identity (`merge_origin::rebuild_replica_through`). `None` when the ledger cannot build it (counted why).
 async fn rebuilt_engine(object: ObjectId, through: u64) -> Option<Green> {
   let begun = crate::state::with_state(|s| {
-    s.merge.replicas.remove(&object);
+    s.merge
+      .replicas
+      .remove(&crate::merge_service::replica_key(object));
     crate::merge_origin::rebuild_replica_through(s, object, through)
   })?;
   if matches!(begun, Rebuild::Nothing) {
@@ -671,7 +696,11 @@ async fn rebuilt_engine(object: ObjectId, through: u64) -> Option<Green> {
     slates_rt::futures::yield_now().await;
   }
   crate::state::with_state(|s| {
-    let at = s.merge.replicas.get(&object).map(Green::reached);
+    let at = s
+      .merge
+      .replicas
+      .lend(&crate::merge_service::replica_key(object))
+      .map(|replica| replica.reached());
     (at == Some(through))
       .then(|| take_engine(s, object))
       .flatten()
@@ -762,15 +791,28 @@ mod tests {
       let (good, bad) = (ObjectId([41; 16]), ObjectId([42; 16]));
       let mut replica = Green::new();
       let identity = replica.head_identity();
-      state.merge.replicas.insert(good, replica);
-      state.merge.replicas.insert(bad, Green::new());
+      state
+        .merge
+        .replicas
+        .insert(crate::merge_service::replica_key(good), replica);
+      state
+        .merge
+        .replicas
+        .insert(crate::merge_service::replica_key(bad), Green::new());
       let ready = engine_for_adoption(state, good, (0, identity));
       let refused = engine_for_adoption(state, bad, (0, [9; 32]));
       (
         ready,
         refused,
-        state.merge.replicas.contains_key(&good),
-        !state.merge.replicas.contains_key(&bad) && state.merge.refused.contains(&bad),
+        state
+          .merge
+          .replicas
+          .contains_key(&crate::merge_service::replica_key(good)),
+        !state
+          .merge
+          .replicas
+          .contains_key(&crate::merge_service::replica_key(bad))
+          && state.merge.refused.contains(&bad),
         state.refusals.get(ADOPTION_MISMATCH).copied(),
       )
     });

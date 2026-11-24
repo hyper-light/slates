@@ -404,7 +404,11 @@ fn remote_work(state: &ShardState, body: &RequestBody) -> Option<(DbVolumeId, Db
 /// served through it here as any of this node's own greens' are.
 pub(crate) fn green_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
   let object = slates_db::register::ObjectId(green.bytes);
-  (state.merge.replicas.contains_key(&object) || state.work_home.holding.contains_key(&object))
+  (state
+    .merge
+    .replicas
+    .contains_key(&crate::merge_service::replica_key(object))
+    || state.work_home.holding.contains_key(&object))
     && owned_elsewhere(state, green)
 }
 
@@ -1907,13 +1911,16 @@ fn computed_request(
   let Some(replica) = state
     .merge
     .replicas
-    .get(&slates_db::register::ObjectId(green.bytes))
+    .lend(&crate::merge_service::replica_key(
+      slates_db::register::ObjectId(green.bytes),
+    ))
   else {
     state.count(REPLICA_BEHIND, 1);
     return Err(Box::new(behind));
   };
   let compute_start = slates_machine::clock::monotonic_ns();
   let computed = replica.compute(&inc);
+  drop(replica);
   let compute_ns = slates_machine::clock::monotonic_ns().saturating_sub(compute_start);
   crate::merge_service::count_phase(state, SUBMIT_COMPUTE, compute_ns);
   let computed = match computed {
@@ -1945,7 +1952,9 @@ fn computed_request(
   let next = state
     .merge
     .replicas
-    .get(&slates_db::register::ObjectId(green.bytes))
+    .lend(&crate::merge_service::replica_key(
+      slates_db::register::ObjectId(green.bytes),
+    ))
     .map_or(0, |replica| replica.head().saturating_add(1));
   let identity = crate::merge_service::hold_composed_inputs(state, green, &increment, next)
     .map_err(|refusal| Box::new(crate::verbs::refused(refusal)))?;
@@ -2010,7 +2019,7 @@ fn hold_until_replica(
   if state
     .merge
     .replicas
-    .get(&object)
+    .lend(&crate::merge_service::replica_key(object))
     .is_some_and(|replica| replica.head() >= *version)
   {
     return false;
@@ -2047,8 +2056,8 @@ pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::registe
   let Some(head) = state
     .merge
     .replicas
-    .get(&object)
-    .map(slates_merge::engine::Green::head)
+    .lend(&crate::merge_service::replica_key(object))
+    .map(|replica| replica.head())
   else {
     return;
   };
@@ -2105,7 +2114,10 @@ pub(crate) fn holder_replay(
   shard: u16,
 ) -> HolderReplay {
   let object = slates_db::register::ObjectId(green.bytes);
-  if !state.merge.replicas.contains_key(&object)
+  if !state
+    .merge
+    .replicas
+    .contains_key(&crate::merge_service::replica_key(object))
     && !matches!(
       crate::merge_origin::rebuild_replica(state, object),
       crate::merge_origin::Rebuild::Installed(_)
@@ -2122,7 +2134,16 @@ pub(crate) fn holder_replay(
   }
   state.count(REPLAYED_ON_REPLICA, 1);
   HolderReplay::Replayed(
-    crate::work_log::replay(state.merge.replicas.get(&object), created_at, entries).ok(),
+    crate::work_log::replay(
+      state
+        .merge
+        .replicas
+        .lend(&crate::merge_service::replica_key(object))
+        .as_deref(),
+      created_at,
+      entries,
+    )
+    .ok(),
   )
 }
 
@@ -2481,7 +2502,9 @@ fn answer_ask(state: &mut ShardState, item: AskItem) -> Outcome {
     let holds = state
       .merge
       .replicas
-      .get(&slates_db::register::ObjectId(green.bytes))
+      .lend(&crate::merge_service::replica_key(
+        slates_db::register::ObjectId(green.bytes),
+      ))
       .is_some_and(|replica| replica.head() >= version);
     if !holds {
       state.count(REPLICA_BEHIND, 1);

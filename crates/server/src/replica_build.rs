@@ -175,7 +175,11 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
   if state.vcs_stores.is_rebuilding(repository) {
     return Turned::More;
   }
-  let Some(replica) = state.merge.replicas.get(&green) else {
+  let Some(replica) = state
+    .merge
+    .replicas
+    .lend(&crate::merge_service::replica_key(green))
+  else {
     return Turned::Done;
   };
   if replica.is_materialized() {
@@ -191,15 +195,19 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       }
     }
   };
+  drop(replica);
   let quantum = state.config.step_quantum_ns() / 2;
   building
     .pace()
     .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
   let advanced = crate::vcs_store::with_room(state, |state| {
-    let replica = state.merge.replicas.get(&green)?;
+    let replica = state
+      .merge
+      .replicas
+      .lend(&crate::merge_service::replica_key(green))?;
     let mut turned = None;
     crate::vcs_store::with_owed_push_objects(state, Some(repository), &mut |objects| {
-      turned = Some(building.advance(replica, objects));
+      turned = Some(building.advance(&replica, objects));
     });
     turned
   });
@@ -223,8 +231,8 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       let made = state
         .merge
         .replicas
-        .get_mut(&green)
-        .map(|replica| replica.materialize(&built.increment));
+        .lend_mut(&crate::merge_service::replica_key(green))
+        .map(|mut replica| replica.materialize(&built.increment));
       match made {
         Some(Ok(_)) => {
           state.count(MADE, 1);
