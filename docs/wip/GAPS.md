@@ -4538,11 +4538,15 @@
 > joined here yet) is refused `Overloaded`, retryable, counted `merge.made.unbuilt` and logged once a repository
 > (`made_commit::Taken::Unbuilt`; w-perf, 2026-11-24, main's (a) of 09:46): before, it was taken for no repository's
 > green and committed with no commit, revision or changeset made of it. Reds for each tool, each committing bare with
-> the fix out; Mercurial's and git's resend after the rebuild lands. Owed by A-636 part 2c-2 ("the store's objects
-> rebuilt by content identity"), w-perf's next piece: a rebuilt store holds none of its objects, so after a successor's
-> rebuild a Mercurial made changeset lacks its parent's texts (the red keeps them), and a Subversion store made again
-> from its records on one node is refused `Unlanded`, its resend `NotNext`
-> (`svn_commit::tests::a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refused`'s doc). (c) a Mercurial
+> the fix out; each tool's resend after the rebuild lands, its store gone as a successor holds none. A-636 part 2c-2's
+> "the store's objects rebuilt by content identity" BUILT for Mercurial (w-perf, 2026-11-24, main's ruling of 12:25,
+> w-hg's review): a record's replay asks the node's changeset store for a changeset's text, a manifest's or a file
+> revision's whole text whose identity the content store never knew, as for one let go once landed, batched by the
+> record's room, each held to its node (`node::compute`) before it is kept, counted `vcs_store.hg_replay_unknown_asked`
+> (`slates_hg` `a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store`; the hg twin with its store
+> gone). Subversion owed nothing: its rebuild's task reads its records back (the earlier `Unlanded` was a test's
+> one-step settle). Owed (w-hg's review): what a successor's replay puts back stays held, marked landed by nothing, so
+> nothing lets it go, as P5 lets a landed push's go; to be let go once the rebuild ends, as `hg_run`'s let-go does. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

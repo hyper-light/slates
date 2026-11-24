@@ -964,11 +964,14 @@ fn a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it() {
 /// (2)'s second half, from w-hg's sweep for 259b0db84): between a takeover's adoption of a repository's green and the
 /// repository's rebuild (`takeover::rebuild_repository`, which joins its members and makes its store), no membership names
 /// it a repository's here, its record pending (`ShardState::pending_repositories`). Do: on a store-backed daemon,
-/// rebuild the fixtures' repository as one push; leave it awaiting its rebuild (`test_store::awaiting_rebuild`); edit `b` over a
-/// work on its root and submit it as a client's recorded request; then rebuild the repository (`test_store::rebuilt_after_takeover`)
-/// and send the same request again, as a client resends one answered `Overloaded`. Expect: the first refused
-/// `Overloaded`, counted `merge.made.unbuilt`, the root's head unmoved; the resend accepted, a changeset made of it (the
-/// root's Mercurial head moved). Failing first: the first submit committed a version with no changeset made of it.
+/// rebuild the fixtures' repository as one push; leave it awaiting its rebuild, its store and texts gone as a successor
+/// holds none (`test_store::awaiting_rebuild`); edit `b` over a work on its root and submit it as a client's recorded
+/// request; then rebuild the repository (`test_store::rebuilt_after_takeover`) and send the same request again, as a
+/// client resends one answered `Overloaded`. Expect: the first refused `Overloaded`, counted `merge.made.unbuilt`, the
+/// root's head unmoved; the rebuild asked the node's changeset store for the texts its content store never knew
+/// (`vcs_store.hg_replay_unknown_asked`, A-636 part 2c-2); the resend accepted, a changeset made of it (the root's
+/// Mercurial head moved). Failing first: the first submit committed a version with no changeset made of it; then, its
+/// store gone, the rebuild refused `Unheld` at the changelog's revision 0 and the resend `ContentUnavailable`.
 #[test]
 fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
@@ -982,7 +985,8 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
     let _ = rebuild(state, &mut hg, (&[1], 1));
     parts.extend(state.db.take_state_log_records());
     let node = crate::vcs_store::hg_made::head_of(state, hg.root);
-    let record = crate::test_store::awaiting_rebuild(state, hg.repository, false);
+    // Its store gone too: a successor holds none, nor any of its texts, until its rebuild makes them from the log.
+    let record = crate::test_store::awaiting_rebuild(state, hg.repository, true);
     (
       hg.root,
       (record, parts),
@@ -1028,6 +1032,13 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
         );
         slates_rt::futures::yield_now().await;
       }
+      let unknown = on(|state| {
+        state
+          .refusals
+          .get(crate::vcs_store::HG_REPLAY_UNKNOWN_ASKED)
+          .copied()
+          .unwrap_or(0)
+      });
       let _ = on(|state| {
         crate::verbs::run_recorded_for_test(
           state,
@@ -1037,7 +1048,7 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
         )
       });
       let again = recorded_answer(7, submit).await;
-      (first, counted, (head, again))
+      (first, counted, (head, again, unknown))
     },
     NAMED_PATIENCE,
   );
@@ -1058,8 +1069,12 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
     "the first refused Overloaded, retryable: {first:?}"
   );
   assert_eq!(unbuilt, 1, "counted merge.made.unbuilt");
-  let (head_after_first, again) = after_first;
+  let (head_after_first, again, unknown) = after_first;
   assert_eq!(head_after_first, head, "nothing committed while it awaited");
+  assert!(
+    unknown > 0,
+    "the rebuild asked for the texts its store never knew"
+  );
   assert!(
     !matches!(again, ReplyBody::Refused { .. }),
     "the resend after the rebuild: {again:?}"
