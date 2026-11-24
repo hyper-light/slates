@@ -776,3 +776,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Integration case a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered (in-process seam, unix).
 - Scratch moved out of /tmp to ~/.cache/w-svn (CLAUDE.md forbids /tmp).
 - NEXT: item 4 lend items (in-place lend: no by-value move, no Green::default per lend; counters red first); 5 speed.
+## 2026-11-24 ~05:20: A-900 lend in place, 3d65116a6 (item 4 done)
+- Lent::new swaps arenas into the seated engine; drop swaps back; Lineage::lend_counts (taken, borrowed, dropped).
+- A-899 held on Linux (run 45395756328, 32/0/1 twice).
+- NEXT item 5, speed: HTTPv2 writes 24x (0.6 vs 14.7 s); svnsync per-piece room round trip (piece_fetched 14.7/rev);
+  svn:// update (round 3: 0.999 vs 0.891 s); bring-back before the made step (A-891 GAPS note).
