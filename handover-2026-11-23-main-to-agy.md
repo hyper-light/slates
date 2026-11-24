@@ -22,6 +22,22 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 00:17 on 11-24:
+- F2 rerun 2 RUNNING: GitHub run 45354317783 (branch diag-measurer-main-f2-2, worktree ~/slates-work/main-f2diag) at
+  w-shared's fix 427ad2389 (catch-up 1.11 s -> 0.25 s: a family's directory no longer cloned at each mark and page).
+  Four jobs, the starvation test 10x each in release and debug on ubuntu-latest and macos-latest. F2 lands only on 10/10
+  in all four; send w-shared the per-job counts.
+- w-shared found the macOS CI red's cause: A-854's format 7 carries an increment of at most min(1 MiB, the chain's 64th)
+  in its entry, and the test's 64 KiB file sat under the macOS runner's share. The fix edits past CARRIED_INCREMENT_MAX.
+- w-tsan DONE (all landed: 21323f227, 7bb782845, 27131596a, b1c743f3f). Its leftovers for owners are listed in
+  runs.md (dropped error kinds in hg_push and homes; rt spawn_detached's refused detach). It kept its targets on
+  adacachy2 (~/.cache/w-tsan-target 19 GB, w-tsan-probe-target 14 GB); delete them if nobody resumes that work.
+- A-887 rulings: named hg files resolve from the green's head manifest by path, with no per-file record; the push's
+  fork serves the pre-commit window; one resolver for reads and recovery, extending A-760 (b) 4d's park-and-bring-back.
+- This Mac's disk is at 51 GiB free and falling during builds. The current writer is ~/.cache/g121-batch15, a shards
+  batch, not slates. The largest folders aren't slates': amphora-target 24.9 GiB, kiln-move-stuck-target 23.8 GiB.
+  Flagged to Ada.
+
 Updates at 00:08 on 11-24:
 - Gate 3 ENDED: 6 of 7 (release 3/3; debug 1, 2 and 4 passed; debug 3 lost push 0 to "unexpected disconnect while reading
   sideband packet" 2.22 s in). None of w-git's new log lines fired, though daemon lines reach the log, so the cause is on a
