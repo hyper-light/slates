@@ -694,3 +694,18 @@
   run them). Asked main: (a) async harness vs (b) sync refine driver (recommended). Owed records: replay refuses typed
   (main 01:51). Production check: no bare git submit in slates prod; kiln's vendored source not found locally (asked).
   W-GIT-DIAG eprintlns in paths/tests.rs version_saying + commits::held_count: REMOVE before commit.
+
+## 2026-11-24 (slates-work-9a, worktree ~/slates-work/w-git-p2)
+- LANDED d609d6e35: git_interop session encoding report (0417fd1f6), per-step daemon counters. Main runs the round.
+- LANDED 770b7d200: refining RefineJob reshape alone (7d95662b5); behaviour unchanged; refining::HELD_FOR_TEST +
+  refined_now; drift guard refining::tests::t_a787_a_recorded_submits_refinement_by_its_task_and_by_refined_now_agree.
+  green_post_state 8/8; w-svn's two let-go reds green.
+- LANDED eb60e1c3e: Option A (3265d0a42, A-896): bare git submit refused RecordedSubmitRequired{Git}; make / MadeAfter /
+  owed staging+making+resume removed; after_submit = committed_alone bug counter; replay refuses owed record
+  OwedCommit{key,version}; over_preview_step answers Whole for a copy (NoTrees gap, A-626 p4). Tests on recorded
+  submits (paths::tests::submit_as_taken / recorded_git_submit). 390/390 at merge.
+- Reported to main: watchdog exit 4 in t_a238 (git_push/tests.rs:1000) in 1 of 10 local runs (log
+  ~/.cache/w-git-run-7.log); HeldShard dead_code warning on main.
+- NEXT: gate 4 empty receive-pack-result body (run 45363070862, debug-1.log 251-343 on main's Mac): red on a freshly
+  created repository's first push; body must carry a report or typed refusal; edge refuses to complete an empty body,
+  counted+logged. Then hash to main for gate 5. Then the clone speed item (derive+encode behind the push).
