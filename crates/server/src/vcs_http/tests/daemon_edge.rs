@@ -5057,32 +5057,7 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   })
   .expect("the repository's record");
   let before = log_texts(&daemon, repository);
-  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-    crate::vcs_store::lent_state(state, |state| {
-      crate::vcs_store::within_budget(state, 0, |stores| {
-        let (content, store) = stores.mercurial(repository)?;
-        let index = &store.index;
-        let mut identities = Vec::new();
-        for rev in 0..index.len(content, slates_hg::index::Log::Changelog) {
-          identities.push(index.changeset(content, rev)?.text);
-        }
-        for rev in 0..index.len(content, slates_hg::index::Log::Manifest) {
-          identities.push(
-            index
-              .revision(content, slates_hg::index::Log::Manifest, rev)?
-              .bytes,
-          );
-        }
-        Some(
-          identities
-            .iter()
-            .filter(|identity| content.let_go_object(identity) > 0)
-            .count(),
-        )
-      })
-    })
-  })
-  .expect("the repository's rows");
+  let let_go = let_go_logs(&daemon, repository);
   let asks: Vec<(Vec<u8>, slates_hg::Node)> = before
     .0
     .iter()
@@ -5125,6 +5100,33 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
     u64::try_from(let_go).unwrap(),
     "each let go brought back once"
   );
+}
+
+/// Lets go every object `repository`'s changelog and manifest rows name on its shard: how many let any window go.
+fn let_go_logs(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) -> usize {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let (content, store) = stores.mercurial(repository)?;
+        let index = &store.index;
+        let changesets = (0..index.len(content, slates_hg::index::Log::Changelog))
+          .map(|rev| index.changeset(content, rev).map(|row| row.text));
+        let manifests = (0..index.len(content, slates_hg::index::Log::Manifest)).map(|rev| {
+          index
+            .revision(content, slates_hg::index::Log::Manifest, rev)
+            .map(|row| row.bytes)
+        });
+        let identities = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
+        Some(
+          identities
+            .iter()
+            .filter(|identity| content.let_go_object(identity) > 0)
+            .count(),
+        )
+      })
+    })
+  })
+  .expect("the repository's rows")
 }
 
 /// A log's revisions as [`log_texts`] reads them: each one's node and its text, none where it is not held.
