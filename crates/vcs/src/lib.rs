@@ -75,6 +75,7 @@ mod filter;
 pub mod index;
 pub mod mrc;
 pub mod partition;
+pub mod preimage;
 pub mod rate;
 pub mod rows;
 pub mod rule;
@@ -88,8 +89,8 @@ pub use arrival::{
 };
 pub use cold::{Prices, Rebuildable, choose};
 pub use content::{
-  ContentCensus, ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form,
-  Freed, HeapWindows, LetGoRefused, Stored, StoredWindow, WindowStorage, Windows, Writing,
+  ContentCensus, ContentCounters, ContentId, ContentRefused, ContentStore, CutFamily, DerivedNode,
+  Form, Freed, HeapWindows, LetGoRefused, Stored, StoredWindow, WindowStorage, Windows, Writing,
 };
 pub use derived::{
   Derivations, DerivedCounters, DerivedRefused, DerivedType, Fill, Graph, Mode, Progress, Read,

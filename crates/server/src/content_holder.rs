@@ -474,37 +474,71 @@ thread_local! {
   pub(crate) static TEST_PAGE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `family`'s entries whose coordinates lie in `lo..=hi`, in coordinate order, each as the piece it would be alone
-/// (A-870 piece 1).
+/// `family`'s entries whose coordinates lie in `lo..=hi` at the cut in flight, in coordinate order, each as the piece it
+/// would be alone (A-870 piece 1): read through the stores' pre-images (F2), so a page is the cut's moment whatever
+/// changed after it, and only until the entries it visits pass `cap` bytes (where it stopped short of the range, the
+/// coordinate it stopped at: a page a gap left can hold the family's every entry). Where no cut froze the range, the entries now. The entries now whatever
+/// the cut, all of them, where `cap` is none (test support: the oracle's look at the shard).
 fn family_entries(
   state: &ShardState,
   family: crate::image_pages::Family,
   (lo, hi): (u64, u64),
-) -> Vec<crate::image_pages::Entry> {
+  cap: Option<usize>,
+) -> (Vec<crate::image_pages::Entry>, Option<u64>) {
   use crate::image_pages::Family;
+  use crate::vcs_store::homes;
   let content = state.vcs_stores.content();
   match family {
-    Family::Windows => crate::vcs_store::chunk_windows(&state.vcs_stores)
-      .map(|windows| windows.pieces_in(lo, hi))
-      .unwrap_or_default()
-      .into_iter()
-      .map(|(handle, bytes)| (handle, piece_key(KIND_VCS_WINDOW, [0; 16], handle), bytes))
-      .collect(),
-    Family::Lists => content.map_or_else(Vec::new, |content| {
-      content
-        .lists_in(lo, hi)
+    Family::Windows => {
+      let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) else {
+        return (Vec::new(), None);
+      };
+      let (pieces, more) = match cap {
+        Some(cap) => windows.pieces_at_cut((lo, hi), cap),
+        None => (windows.pieces_in(lo, hi), None),
+      };
+      let read = pieces
+        .into_iter()
+        .map(|(handle, bytes)| (handle, piece_key(KIND_VCS_WINDOW, [0; 16], handle), bytes))
+        .collect();
+      (read, more)
+    }
+    Family::Lists => {
+      let Some(content) = content else {
+        return (Vec::new(), None);
+      };
+      let (lists, more) = match cap {
+        Some(cap) => content.lists_at_cut((lo, hi), cap),
+        None => (
+          content
+            .lists_in(lo, hi)
+            .map(|(identity, bytes)| (identity, Box::from(bytes)))
+            .collect(),
+          None,
+        ),
+      };
+      let read = lists
+        .into_iter()
         .map(|(identity, bytes)| {
           (
             coordinate_of(&identity),
             vcs_node_key(KIND_VCS_LIST, &identity),
-            vcs_list_bytes(&identity, bytes),
+            vcs_list_bytes(&identity, &bytes),
           )
         })
-        .collect()
-    }),
-    Family::Names => content.map_or_else(Vec::new, |content| {
-      content
-        .names_in(lo, hi)
+        .collect();
+      (read, more)
+    }
+    Family::Names => {
+      let Some(content) = content else {
+        return (Vec::new(), None);
+      };
+      let (names, more) = match cap {
+        Some(cap) => content.names_at_cut((lo, hi), cap),
+        None => (content.names_in(lo, hi).collect(), None),
+      };
+      let read = names
+        .into_iter()
         .map(|(identity, root)| {
           (
             coordinate_of(&identity),
@@ -512,11 +546,19 @@ fn family_entries(
             vcs_name_bytes(&identity, &root),
           )
         })
-        .collect()
-    }),
-    Family::Aways => content.map_or_else(Vec::new, |content| {
-      content
-        .aways_in(lo, hi)
+        .collect();
+      (read, more)
+    }
+    Family::Aways => {
+      let Some(content) = content else {
+        return (Vec::new(), None);
+      };
+      let (aways, more) = match cap {
+        Some(cap) => content.aways_at_cut((lo, hi), cap),
+        None => (content.aways_in(lo, hi).collect(), None),
+      };
+      let read = aways
+        .into_iter()
         .map(|(identity, len)| {
           (
             coordinate_of(&identity),
@@ -524,33 +566,48 @@ fn family_entries(
             vcs_away_bytes(&identity, len),
           )
         })
-        .collect()
-    }),
-    Family::RegionHolds => crate::vcs_store::homes::region_held_in(lo, hi)
-      .into_iter()
-      .map(|(identity, owners)| {
-        let mut bytes = identity.0.to_vec();
-        for owner in &owners {
-          owner.encode_into(&mut bytes);
-        }
-        (
-          coordinate_of(&identity),
-          vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
-          bytes,
-        )
-      })
-      .collect(),
-    Family::Landed => crate::vcs_store::homes::landed_in(lo, hi)
-      .into_iter()
-      .map(|(identity, landed)| {
-        let (kind, bytes) = landed_kind(&identity, &landed);
-        (
-          coordinate_of(&identity),
-          vcs_node_key(kind, &identity),
-          bytes,
-        )
-      })
-      .collect(),
+        .collect();
+      (read, more)
+    }
+    Family::RegionHolds => {
+      let (holds, more) = match cap {
+        Some(cap) => homes::region_held_at_cut((lo, hi), cap),
+        None => (homes::region_held_in(lo, hi), None),
+      };
+      let read = holds
+        .into_iter()
+        .map(|(identity, owners)| {
+          let mut bytes = identity.0.to_vec();
+          for owner in &owners {
+            owner.encode_into(&mut bytes);
+          }
+          (
+            coordinate_of(&identity),
+            vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
+            bytes,
+          )
+        })
+        .collect();
+      (read, more)
+    }
+    Family::Landed => {
+      let (records, more) = match cap {
+        Some(cap) => homes::landed_at_cut((lo, hi), cap),
+        None => (homes::landed_in(lo, hi), None),
+      };
+      let read = records
+        .into_iter()
+        .map(|(identity, landed)| {
+          let (kind, bytes) = landed_kind(&identity, &landed);
+          (
+            coordinate_of(&identity),
+            vcs_node_key(kind, &identity),
+            bytes,
+          )
+        })
+        .collect();
+      (read, more)
+    }
   }
 }
 
@@ -940,14 +997,26 @@ pub(crate) fn owned_of(
 /// cut may name it, A-64's rule), the publication is counted skipped and owed, and a task encodes on and publishes once
 /// caught up ([`image_catch_up`]).
 pub(crate) fn image_committed(state: &mut ShardState, carried: bool) {
-  state.image_encoder.committed(carried);
+  let carried_cut = state.image_encoder.committed(carried);
   if carried {
     state.published_held.legacy.clear();
-    crate::vcs_store::homes::publication_committed();
-    return;
+    cut_ended(state);
+    // F2: the changes since the cut's moment are the next cut's, begun now and owed, so a ticket kept after the cut is
+    // never left with nothing to publish it (main 01a20182, 2026-11-23).
+    let next = image_begin(state);
+    if let Some(generation) = carried_cut {
+      crate::vcs_store::homes::image_published(generation);
+    }
+    if !next {
+      // Nothing changed since the cut's moment (or none was in flight): the image is the shard's now, so every window
+      // kept before this publication is in it.
+      crate::vcs_store::homes::publication_committed();
+      return;
+    }
+  } else {
+    state.store.content.arena_mut().capture_deferred();
+    state.count(IMAGE_SKIPPED, 1);
   }
-  state.store.content.arena_mut().capture_deferred();
-  state.count(IMAGE_SKIPPED, 1);
   let lag = state.image_encoder.skipped();
   state.count_max(IMAGE_LONGEST_LAG, lag);
   if state.image_encoder.start_catching_up() {
@@ -963,20 +1032,7 @@ pub(crate) fn image_committed(state: &mut ShardState, carried: bool) {
 /// what a publication that found a change not yet encoded leaves owed. Ends where the shard's state is gone.
 async fn image_catch_up() {
   loop {
-    let done = crate::state::with_state(|state| {
-      image_drain(state);
-      if !image_turn(state).caught_up {
-        return false;
-      }
-      state.image_encoder.stop_catching_up();
-      if state.image_encoder.owed() && catch_up_publication(state).is_err() {
-        // Refused (its room, a recovery not complete, …): the publication stays owed, never dropped, and the shard's
-        // sweep, which an owed publication with no catch-up arms (`idle_sweep::after_borrow`), begins it again
-        // (`image_retry_owed`); counted.
-        state.count(IMAGE_CATCH_UP_PUBLISH_REFUSED, 1);
-      }
-      true
-    });
+    let done = crate::state::with_state(image_catch_up_slice);
     if done != Some(false) {
       return;
     }
@@ -984,15 +1040,75 @@ async fn image_catch_up() {
   }
 }
 
+/// One wake of the catch-up ([`image_catch_up`]): its steps until it ends or a copy slice's bytes are spent
+/// (`DaemonConfig::copy_slice_bytes`: the measured memcpy rate times half the step quantum, the share copy-bound work
+/// takes of a step). A turn spends the paged families' page size, which a test sets far below the slice, so the slice,
+/// not the turn, is what a wake spends: the shard's own owed work, a step's share of it a yield, whatever the page size
+/// (main 01a20182's ruling (a) of 2026-11-23 19:16). Whether it ended.
+pub(crate) fn image_catch_up_slice(state: &mut ShardState) -> bool {
+  let slice = state.config.copy_slice_bytes();
+  let mut spent = 0u64;
+  loop {
+    let (ended, bytes) = image_catch_up_step(state);
+    if ended {
+      return true;
+    }
+    spent = spent.saturating_add(bytes);
+    if spent >= slice {
+      return false;
+    }
+  }
+}
+
+/// One step of the catch-up ([`image_catch_up`]): a turn, and where the cut is wholly encoded the catch-up's end and its
+/// publication. Whether it ended, and the bytes the turn spent.
+pub(crate) fn image_catch_up_step(state: &mut ShardState) -> (bool, u64) {
+  image_drain(state);
+  let turned = image_turn(state);
+  if !turned.caught_up {
+    // A turn of no bytes popped pages of no entry: the cut's pages are finite, so the slice still ends.
+    return (false, turned.bytes.max(1));
+  }
+  state.image_encoder.stop_catching_up();
+  if state.image_encoder.owed() && catch_up_publication(state).is_err() {
+    // Refused (its room, a recovery not complete, …): the publication stays owed, never dropped, and the shard's
+    // sweep, which an owed publication with no catch-up arms (`idle_sweep::after_borrow`), begins it again
+    // (`image_retry_owed`); counted.
+    state.count(IMAGE_CATCH_UP_PUBLISH_REFUSED, 1);
+  }
+  (true, turned.bytes)
+}
+
+/// Format: the status counter of image cuts begun (F2).
+pub(crate) const IMAGE_CUTS: &str = "vcs_store.image.cuts";
+/// Format: the status counter of pre-images kept of entries a cut's pages held at its moment (F2: at most E, the
+/// entries in those pages then).
+pub(crate) const IMAGE_CUT_PREIMAGES_OLD: &str = "vcs_store.image.cut_preimages_old";
+/// Format: the status counter of absent markers kept of keys a cut's pages lacked at its moment (F2: at most I, the
+/// inserts into those pages while the cut is encoded).
+pub(crate) const IMAGE_CUT_PREIMAGES_ABSENT: &str = "vcs_store.image.cut_preimages_absent";
+/// Format: the status counter of the most bytes of pre-images the changes between two encoder turns copied: the cost a
+/// cut adds to the steps that change its pages (F2).
+pub(crate) const IMAGE_LONGEST_CUT_STEP_BYTES: &str = "vcs_store.image.longest_cut_step_bytes";
+/// Format: the status counter of frozen ranges and pre-images left when a cut's publication committed: every page is
+/// thawed as it is encoded, so any is a bug signal (F2).
+pub(crate) const IMAGE_CUT_LEFT: &str = "vcs_store.image.cut_left";
 /// Format: the status counter of publications that carried no paged page, a change not yet encoded (A-870 piece 2).
 pub(crate) const IMAGE_SKIPPED: &str = "vcs_store.image.publications_skipped";
 /// Format: the status counter of the longest a publication of the paged families was owed, in encoder turns.
 pub(crate) const IMAGE_LONGEST_LAG: &str = "vcs_store.image.longest_lag_turns";
 /// Format: the status counter of elective changes paused while a publication was owed past its bound.
 pub(crate) const IMAGE_PAUSES: &str = "vcs_store.image.pauses";
+/// Format: the status counter of pages split where a turn's read of them stopped at its cap (F2: a page a gap left).
+pub(crate) const IMAGE_PAGES_SPLIT: &str = "vcs_store.image.pages_split";
+/// Format: the status counter of the bytes those reads read and did not keep, read again in a later turn.
+pub(crate) const IMAGE_SPLIT_DISCARDED_BYTES: &str = "vcs_store.image.split_discarded_bytes";
+/// Format: the status counter of the most bytes one turn's splits read and did not keep: at most the read's cap (twice
+/// the page size) and an entry, a turn splitting once at most.
+pub(crate) const IMAGE_LONGEST_SPLIT_DISCARD: &str = "vcs_store.image.longest_split_discard_bytes";
 /// Format: the status counter of the encoder's turns.
 pub(crate) const IMAGE_TURNS: &str = "vcs_store.image.encode_turns";
-/// Format: the status counter of the bytes the encoder's turns encoded.
+/// Format: the status counter of the bytes the encoder's turns spent: encoded, and read by a split.
 pub(crate) const IMAGE_ENCODED_BYTES: &str = "vcs_store.image.encoded_bytes";
 /// Format: the status counter of the most bytes one encoder turn encoded.
 pub(crate) const IMAGE_LONGEST_TURN_BYTES: &str = "vcs_store.image.longest_turn_bytes";
@@ -1068,18 +1184,130 @@ pub(crate) fn image_drain(state: &mut ShardState) {
   crate::vcs_store::homes::landed_changes_committed();
 }
 
-/// One turn of the encoder (A-870 piece 2): dirty pages re-encoded from what the shard holds, at most the page size
-/// spent (and the one page crossing it), counted.
+/// Begins an image cut where none is in flight and a page is dirty (F2): the changes taken first, so the cut is this
+/// moment's; its pages frozen in their stores, so each reads as now until it is encoded, whatever changes after; its
+/// generation in homes' tickets begun; the chunks the windows free held for it. Whether a cut is in flight after.
+pub(crate) fn image_begin(state: &mut ShardState) -> bool {
+  image_drain(state);
+  if !state.image_encoder.can_begin() {
+    return state.image_encoder.cut_is_in_flight();
+  }
+  let generation = crate::vcs_store::homes::cut_begun();
+  let Some(pages) = state.image_encoder.begin(generation) else {
+    return state.image_encoder.cut_is_in_flight();
+  };
+  state.count(IMAGE_CUTS, 1);
+  if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
+    windows.begin_cut();
+  }
+  for (family, page) in pages {
+    cut_page_frozen(state, family, (page.start, page.last()), true);
+  }
+  true
+}
+
+/// Freezes (`frozen`) or thaws a page of the cut in its family's store (F2).
+fn cut_page_frozen(
+  state: &mut ShardState,
+  family: crate::image_pages::Family,
+  range: (u64, u64),
+  frozen: bool,
+) {
+  use crate::image_pages::Family;
+  use crate::vcs_store::homes;
+  let content = |family| match family {
+    Family::Lists => Some(slates_vcs::CutFamily::Lists),
+    Family::Names => Some(slates_vcs::CutFamily::Names),
+    Family::Aways => Some(slates_vcs::CutFamily::Aways),
+    _ => None,
+  };
+  match family {
+    Family::Windows => {
+      if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
+        if frozen {
+          windows.freeze(range);
+        } else {
+          windows.thaw(range);
+        }
+      }
+    }
+    Family::RegionHolds | Family::Landed => {
+      let family = if family == Family::Landed {
+        homes::CutFamily::Landed
+      } else {
+        homes::CutFamily::RegionHolds
+      };
+      if frozen {
+        homes::cut_freeze(family, range);
+      } else {
+        homes::cut_thaw(family, range);
+      }
+    }
+    Family::Lists | Family::Names | Family::Aways => {
+      if let (Some(store), Some(family)) = (state.vcs_stores.content_mut(), content(family)) {
+        if frozen {
+          store.freeze(family, range);
+        } else {
+          store.thaw(family, range);
+        }
+      }
+    }
+  }
+}
+
+/// The pre-images the stores kept since last asked (F2), counted: old values and absent markers apart, and the most
+/// bytes copied between two turns.
+fn count_cut_preimages(state: &mut ShardState) {
+  let mut counts = crate::vcs_store::homes::take_cut_counts();
+  if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
+    counts += windows.take_cut_counts();
+  }
+  if let Some(content) = state.vcs_stores.content_mut() {
+    counts += content.take_cut_counts();
+  }
+  state.count(IMAGE_CUT_PREIMAGES_OLD, counts.old);
+  state.count(IMAGE_CUT_PREIMAGES_ABSENT, counts.absent);
+  state.count_max(IMAGE_LONGEST_CUT_STEP_BYTES, counts.bytes);
+}
+
+/// The cut's publication committed (F2): the chunks held for it freed, every store's pre-images dropped, any left
+/// counted as a bug signal.
+fn cut_ended(state: &mut ShardState) {
+  count_cut_preimages(state);
+  let mut left = crate::vcs_store::homes::cut_ended();
+  if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
+    left = left.saturating_add(windows.end_cut());
+  }
+  if let Some(content) = state.vcs_stores.content_mut() {
+    left = left.saturating_add(content.end_cut());
+  }
+  state.count(IMAGE_CUT_LEFT, u64::try_from(left).unwrap_or(u64::MAX));
+}
+
+/// One turn of the encoder (A-870 piece 2): a cut begun where none is in flight ([`image_begin`]), then its pages
+/// re-encoded as at its moment, at most the page size spent (and the one page crossing it), each thawed once encoded;
+/// counted.
 pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
+  let _in_flight = image_begin(state);
+  count_cut_preimages(state);
   let limit = page_bytes(state);
   let mut encoder = core::mem::take(&mut state.image_encoder);
-  let turned = encoder.turn((limit, limit), &|family, range| {
-    family_entries(state, family, range)
-  });
+  let mut encoded = Vec::new();
+  let turned = encoder.turn(
+    (limit, limit),
+    &|family, range, cap| family_entries(state, family, range, Some(cap)),
+    &mut encoded,
+  );
   state.image_encoder = encoder;
+  for (family, page) in encoded {
+    cut_page_frozen(state, family, (page.start, page.last()), false);
+  }
   state.count(IMAGE_TURNS, 1);
   state.count(IMAGE_ENCODED_BYTES, turned.bytes);
   state.count_max(IMAGE_LONGEST_TURN_BYTES, turned.bytes);
+  state.count(IMAGE_PAGES_SPLIT, turned.split);
+  state.count(IMAGE_SPLIT_DISCARDED_BYTES, turned.discarded);
+  state.count_max(IMAGE_LONGEST_SPLIT_DISCARD, turned.discarded);
   if turned.paused {
     // The progress rule's assumption, measured (main 01a20182, 2026-11-23): while paused, the encoder's bytes a turn
     // against the never-paused changes' bytes it encoded (the pages they first dirtied in the pause).
@@ -1402,13 +1630,45 @@ pub(crate) fn retired_region_hold_piece(
 /// the encoder), each as (key, bytes), in key order.
 #[cfg(test)]
 pub(crate) fn paged_entries_now(state: &ShardState) -> Vec<(PieceKey, Vec<u8>)> {
-  let mut entries: Vec<(PieceKey, Vec<u8>)> = crate::image_pages::Family::ALL
+  let mut entries: Vec<(PieceKey, Vec<u8>)> = paged_entries_placed(state)
     .into_iter()
-    .flat_map(|family| family_entries(state, family, (0, u64::MAX)))
-    .map(|(_, key, bytes)| (key, bytes))
+    .map(|(_, _, key, bytes)| (key, bytes))
     .collect();
   entries.sort();
   entries
+}
+
+/// Test support (F2's oracle): the paged families' entries the shard holds now, whatever a cut froze, each with its
+/// family and coordinate (which page it lies in), its key and bytes.
+#[cfg(test)]
+pub(crate) fn paged_entries_placed(
+  state: &ShardState,
+) -> Vec<(crate::image_pages::Family, u64, PieceKey, Vec<u8>)> {
+  crate::image_pages::Family::ALL
+    .into_iter()
+    .flat_map(|family| {
+      family_entries(state, family, (0, u64::MAX), None)
+        .0
+        .into_iter()
+        .map(move |(coordinate, key, bytes)| (family, coordinate, key, bytes))
+    })
+    .collect()
+}
+
+/// Test support (F2): the windows let go among a paged family's `entries`, by identity.
+#[cfg(test)]
+pub(crate) fn aways_among(entries: &[(PieceKey, Vec<u8>)]) -> Vec<slates_vcs::ContentId> {
+  entries
+    .iter()
+    .filter(|(key, _)| split_key(key).0 == KIND_VCS_AWAY)
+    .filter_map(|(_, bytes)| {
+      let identity: [u8; slates_vcs::content::IDENTITY_BYTES] = bytes
+        .get(..slates_vcs::content::IDENTITY_BYTES)?
+        .try_into()
+        .ok()?;
+      Some(slates_vcs::ContentId(identity))
+    })
+    .collect()
 }
 
 /// Test support (A-870 piece 2's oracle): the paged families' entries an image's `pieces` carry, each as (key, bytes),

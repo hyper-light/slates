@@ -339,10 +339,12 @@ impl Directories {
 
 /// What a shard's image encoder holds (A-870 piece 2; main 01a20182's ruling of 2026-11-23: the encoding moves off the
 /// publication's step, the image a cut of one moment). The pages of the last committed cut, as their bytes, so a
-/// checkpoint copies them; the pages re-encoded since, a slice a turn ([`Encoder::turn`]), and the directories they
-/// make; the pages a change since lies in and no turn has re-encoded yet. A publication carries the re-encoded pages
-/// only where none is dirty ([`Encoder::cut`]): then they and the committed ones are the shard's entries at that
-/// moment exactly. Otherwise it carries the committed cut again, and the arena keeps every block that cut names.
+/// checkpoint copies them; the cut in flight ([`Encoder::begin`]: the pages dirty at its moment, each frozen in its
+/// store so it reads as at the cut whatever changes after, `slates_vcs::preimage`), its pages re-encoded a slice a turn
+/// ([`Encoder::turn`]) and the directories they make; the pages a change since lies in, the next cut's. A publication
+/// carries the re-encoded pages once every page of the cut is ([`Encoder::cut`]): then they and the committed ones are
+/// the shard's entries at the cut's moment exactly (F2, copy-on-write by entry; main 01a20182's rulings of 2026-11-23).
+/// Otherwise it carries the committed cut again, and the arena keeps every block that cut names.
 #[derive(Debug, Default)]
 pub(crate) struct Encoder {
   /// Each page's bytes in the last committed cut.
@@ -352,8 +354,10 @@ pub(crate) struct Encoder {
   /// The pages re-encoded since the last committed cut: each one's bytes, none for a page now of no entry (its piece
   /// removed).
   pending: BTreeMap<(Family, Page), Option<Vec<u8>>>,
-  /// The pages a change since lies in, not yet re-encoded.
+  /// The pages a change since lies in, not yet in a cut: the next cut's.
   dirty: BTreeSet<(Family, Page)>,
+  /// The cut in flight: begun, its publication not yet committed.
+  cut: Option<Cut>,
   /// Owed since a publication found the pages dirty: the turn it began at and how many turns it may take
   /// ([`Encoder::skipped`]).
   owed: Option<(u64, u64)>,
@@ -370,18 +374,35 @@ pub(crate) struct Encoder {
   dirtied_paused: BTreeSet<(Family, Page)>,
 }
 
-/// What a turn of the encoder did: the bytes it encoded, and whether no page is dirty after it.
+/// An image cut in flight (F2): the pages dirty at its moment not yet re-encoded, and its
+/// generation in homes' tickets (`crate::vcs_store::homes::cut_begun`), published when it is carried.
+#[derive(Debug)]
+struct Cut {
+  /// Its pages not yet re-encoded, each frozen in its store until it is.
+  remaining: BTreeSet<(Family, Page)>,
+  /// Its generation in homes' tickets.
+  generation: u64,
+  /// Test support (F2's oracle): its pages at its moment, which bound its pre-images.
+  #[cfg(test)]
+  frozen: Vec<(Family, Page)>,
+}
+
+/// What a turn of the encoder did: the bytes it encoded, and whether the cut in flight is wholly encoded after it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Turned {
-  /// The bytes encoded.
+  /// The bytes spent: encoded, and read by a split ([`Encoder::split_at_stop`]).
   pub(crate) bytes: u64,
-  /// Whether every change is encoded.
+  /// Whether the cut in flight is wholly encoded, or none is and nothing is dirty: a publication carries it.
   pub(crate) caught_up: bool,
   /// Whether the turn ran while paused.
   pub(crate) paused: bool,
   /// Of the bytes encoded, those of pages first dirtied while paused: the never-paused changes' cost to the encoder,
   /// which the progress rule assumes it outpaces (main 01a20182, 2026-11-23).
   pub(crate) imposed: u64,
+  /// The pages split where a read stopped at its cap ([`Encoder::split_at_stop`]).
+  pub(crate) split: u64,
+  /// The bytes those reads read and did not keep, read again later.
+  pub(crate) discarded: u64,
 }
 
 impl Encoder {
@@ -415,28 +436,93 @@ impl Encoder {
     }
   }
 
-  /// Whether a change is not yet encoded.
-  pub(crate) fn is_dirty(&self) -> bool {
-    !self.dirty.is_empty()
+  /// Whether a publication now carries a cut: the one in flight wholly encoded, or none in flight and nothing dirty.
+  pub(crate) fn complete(&self) -> bool {
+    match &self.cut {
+      Some(cut) => cut.remaining.is_empty(),
+      None => self.dirty.is_empty(),
+    }
   }
 
-  /// Re-encodes dirty pages until `limit` bytes are spent (at least one page), each from what the shard holds now
-  /// (`entries` of a family over a range of coordinates), one past twice `page` bytes split into the pages it now fills.
+  /// Whether a cut may begin: none in flight, and a page dirty.
+  pub(crate) fn can_begin(&self) -> bool {
+    self.cut.is_none() && !self.dirty.is_empty()
+  }
+
+  /// Begins a cut of the pages dirty now, of `generation` in homes' tickets, where one may ([`Encoder::can_begin`]): the
+  /// pages, which the caller freezes in their stores before anything changes. None where none may begin.
+  pub(crate) fn begin(&mut self, generation: u64) -> Option<Vec<(Family, Page)>> {
+    if !self.can_begin() {
+      return None;
+    }
+    let remaining = core::mem::take(&mut self.dirty);
+    let pages: Vec<(Family, Page)> = remaining.iter().copied().collect();
+    self.cut = Some(Cut {
+      remaining,
+      generation,
+      #[cfg(test)]
+      frozen: pages.clone(),
+    });
+    Some(pages)
+  }
+
+  /// Whether a cut is in flight: begun, its publication not yet committed.
+  pub(crate) fn cut_is_in_flight(&self) -> bool {
+    self.cut.is_some()
+  }
+
+  /// Test support (F2's oracle): the cut in flight's generation and its pages at its moment.
+  #[cfg(test)]
+  pub(crate) fn cut_in_flight(&self) -> Option<(u64, Vec<(Family, Page)>)> {
+    self
+      .cut
+      .as_ref()
+      .map(|cut| (cut.generation, cut.frozen.clone()))
+  }
+
+  /// Re-encodes the cut's pages until `limit` bytes are spent (at least one page), each from what the shard held at the
+  /// cut (`entries` of a family over a range of coordinates, read through its pre-images, until their bytes pass a cap,
+  /// [`Encoder::read_cap`]), one past twice `page` bytes split into the pages it now fills; each page re-encoded noted
+  /// in `encoded`, for its store to thaw. A page whose read stopped at the cap ([`Encoder::split_at_stop`]) is split.
   pub(crate) fn turn(
     &mut self,
     (limit, page_bytes): (usize, usize),
-    entries: &dyn Fn(Family, (u64, u64)) -> Vec<Entry>,
+    entries: &dyn Fn(Family, (u64, u64), usize) -> (Vec<Entry>, Option<u64>),
+    encoded: &mut Vec<(Family, Page)>,
   ) -> Turned {
     let paused = self.paused();
     self.turns = self.turns.saturating_add(1);
     let mut spent = 0usize;
     let mut imposed = 0usize;
+    let mut split_at_stop = (0u64, 0usize);
+    let cap = Self::read_cap(page_bytes);
     while spent < limit {
-      let Some((family, page)) = self.dirty.pop_first() else {
+      let Some((family, page)) = self.cut.as_mut().and_then(|cut| cut.remaining.pop_first()) else {
         break;
       };
       let spent_before = spent;
-      let held = entries(family, (page.start, page.last()));
+      let (held, stopped) = entries(family, (page.start, page.last()), cap);
+      if let Some(stop) = stopped.filter(|_| page.halves().is_some()) {
+        // The read visited a cap's bytes at least, kept or passed over.
+        let read = bytes_of(&held).max(cap);
+        spent = spent.saturating_add(read);
+        let kept = self.split_at_stop((family, page), (&held, stop), page_bytes, encoded);
+        split_at_stop = (
+          split_at_stop.0.saturating_add(1),
+          split_at_stop.1.saturating_add(read.saturating_sub(kept)),
+        );
+        if self.dirtied_paused.remove(&(family, page)) {
+          imposed = imposed.saturating_add(kept);
+        }
+        continue;
+      }
+      // A page of one coordinate is read whole: its entries share their first eight bytes, so it cannot split.
+      let held = if stopped.is_some() {
+        entries(family, (page.start, page.last()), usize::MAX).0
+      } else {
+        held
+      };
+      encoded.push((family, page));
       let planned = if bytes_of(&held) > page_bytes.saturating_mul(2) {
         // Its own piece removed, its halves put.
         self.pending.insert((family, page), None);
@@ -452,25 +538,100 @@ impl Encoder {
         spent = spent.saturating_add(bytes.as_ref().map_or(0, Vec::len));
         self.pending.insert((family, *into), bytes);
       }
+      let split: Vec<Page> = planned
+        .iter()
+        .map(|(page, _)| *page)
+        .filter(|into| *into != page)
+        .collect();
       let mut directory = self.working.of(family);
       directory.replace(page, planned.into_iter().map(|(page, _)| page));
       self.working.families.insert(family, directory);
+      // A change since the cut marked the page for the next cut; split, its halves are marked in its place.
+      if !split.is_empty() && self.dirty.remove(&(family, page)) {
+        self.dirty.extend(split.iter().map(|into| (family, *into)));
+      }
       if self.dirtied_paused.remove(&(family, page)) {
         imposed = imposed.saturating_add(spent.saturating_sub(spent_before));
       }
     }
     Turned {
       bytes: u64::try_from(spent).unwrap_or(u64::MAX),
-      caught_up: self.dirty.is_empty(),
+      caught_up: self.complete(),
       paused,
       imposed: u64::try_from(imposed).unwrap_or(u64::MAX),
+      split: split_at_stop.0,
+      discarded: u64::try_from(split_at_stop.1).unwrap_or(u64::MAX),
     }
   }
 
-  /// The pages a publication carries, where no change is left to encode: each page re-encoded since the last committed
-  /// cut, its bytes or none to remove its piece. None while a page is dirty: the publication carries no page then.
+  /// The most bytes a turn reads of one page: twice the page size, the most a page holds before it splits
+  /// ([`Encoder::turn`]). Derived: a page a gap left (a family's first, its directory empty) covers every coordinate the
+  /// gap holds, so it can hold the family's every entry; read whole, one turn's work would be the family's.
+  fn read_cap(page_bytes: usize) -> usize {
+    page_bytes.saturating_mul(2)
+  }
+
+  /// Splits `page` of `family`, whose read (`held`, its entries in coordinate order up to the cap) stopped short of its
+  /// end at coordinate `stop` (A-870 F2; main 01a20182's ruling of 2026-11-23 15:47): the read is planned over the page
+  /// as a whole page's would be ([`plan`]); each planned page that ends before `stop` holds all its entries, so it is
+  /// encoded now and noted in `encoded`; the rest go back to the cut, frozen still, read afresh in a later turn. Where
+  /// the plan is the page whole (the read kept little: what it visited the cut lacks), its halves are planned instead,
+  /// so the page shrinks toward `stop` until a half ends before it. Pages
+  /// stay aligned halves, never cut at the read's stop: a page piece's key names its depth and start (the image's format)
+  /// and a recovered directory is rebuilt from those keys, so an unaligned page would need a new format; and piece 1's
+  /// bound on a family's pages (at most twice its bytes over the page size) rests on halving by bytes. The bytes read
+  /// and kept: what was visited and not kept is read again, at most the read's cap and an entry (a turn splits once at
+  /// most, its read spending the turn's slice): the planned page holding `stop` where the plan split, the whole visit
+  /// where it halved.
+  fn split_at_stop(
+    &mut self,
+    (family, page): (Family, Page),
+    (held, stop): (&[Entry], u64),
+    page_bytes: usize,
+    encoded: &mut Vec<(Family, Page)>,
+  ) -> usize {
+    let mut planned = plan(held, page, page_bytes);
+    if let (true, Some((first, second))) = (planned.len() < 2, page.halves()) {
+      let split = held.partition_point(|(coordinate, _, _)| *coordinate < second.start);
+      planned = vec![(first, 0..split), (second, split..held.len())];
+    }
+    // Its own piece removed, the pages it now is put as they are encoded.
+    self.pending.insert((family, page), None);
+    let mut kept = 0usize;
+    let mut back = 0u64;
+    for (into, range) in &planned {
+      if into.last() < stop {
+        let entries = held.get(range.clone()).filter(|held| !held.is_empty());
+        kept = kept.saturating_add(entries.map_or(0, bytes_of));
+        self
+          .pending
+          .insert((family, *into), entries.map(encode_page));
+        encoded.push((family, *into));
+      } else if let Some(cut) = self.cut.as_mut() {
+        cut.remaining.insert((family, *into));
+        back = back.saturating_add(1);
+      }
+    }
+    let pages: Vec<Page> = planned.iter().map(|(into, _)| *into).collect();
+    let mut directory = self.working.of(family);
+    directory.replace(page, pages.iter().copied());
+    self.working.families.insert(family, directory);
+    // A change since the cut marked the page for the next cut, or first dirtied it in a pause: its pages take its place.
+    if self.dirty.remove(&(family, page)) {
+      self.dirty.extend(pages.iter().map(|into| (family, *into)));
+    }
+    // Each page put back is one more to encode, at most two turns' (the owed bound's rate, `Encoder::skipped`).
+    if let Some((_, bound)) = self.owed.as_mut() {
+      *bound = bound.saturating_add(back.saturating_mul(2));
+    }
+    kept
+  }
+
+  /// The pages a publication carries, where the cut is wholly encoded ([`Encoder::complete`]): each page re-encoded
+  /// since the last committed cut, its bytes or none to remove its piece. None while a page of the cut is not: the
+  /// publication carries no page then.
   pub(crate) fn cut(&self) -> Option<impl Iterator<Item = (FamilyPage, Option<&[u8]>)> + '_> {
-    (!self.is_dirty()).then(|| {
+    self.complete().then(|| {
       self
         .pending
         .iter()
@@ -478,10 +639,10 @@ impl Encoder {
     })
   }
 
-  /// Every page a checkpoint carries with its bytes: the shard's now, where no change is left to encode (the committed
-  /// cut with the re-encoded pages over it), else the committed cut alone; and whether it is the shard's now.
+  /// Every page a checkpoint carries with its bytes: the cut's, where it is wholly encoded (the committed cut with the
+  /// re-encoded pages over it), else the committed cut alone; and whether it carries the cut.
   pub(crate) fn whole(&self) -> (Vec<(FamilyPage, &[u8])>, bool) {
-    if self.is_dirty() {
+    if !self.complete() {
       let pages = self
         .committed
         .iter()
@@ -508,11 +669,13 @@ impl Encoder {
   }
 
   /// A publication committed: where it carried the encoder's cut (`carried`), the re-encoded pages are the committed
-  /// cut now and nothing is owed; else nothing changes.
-  pub(crate) fn committed(&mut self, carried: bool) {
+  /// cut now and nothing is owed; else nothing changes. The carried cut's generation in homes' tickets, none where none
+  /// was in flight (nothing dirty: the image is the shard's now).
+  pub(crate) fn committed(&mut self, carried: bool) -> Option<u64> {
     if !carried {
-      return;
+      return None;
     }
+    let generation = self.cut.take().map(|cut| cut.generation);
     for (page, bytes) in core::mem::take(&mut self.pending) {
       match bytes {
         Some(bytes) => {
@@ -528,13 +691,19 @@ impl Encoder {
     for waker in core::mem::take(&mut self.waiting) {
       waker.wake();
     }
+    generation
   }
 
-  /// A publication found the pages dirty and carried none: owed from this turn, within a bound of turns derived from
-  /// what is dirty (each dirty page is at most twice the page size and a turn encodes at least the page size, so twice
-  /// the dirty pages and one more). The turns it has been owed, none where it was not.
+  /// A publication carried no cut, or one with a cut begun after it: owed from this turn, within a bound of turns
+  /// derived from the cut's pages left (each is at most twice the page size and a turn encodes at least the page size,
+  /// so twice the pages and one more; F2: a turn encodes at least one, so the cut ends within them). The turns it has
+  /// been owed, none where it was not.
   pub(crate) fn skipped(&mut self) -> u64 {
-    let dirty = u64::try_from(self.dirty.len()).unwrap_or(u64::MAX);
+    let left = self
+      .cut
+      .as_ref()
+      .map_or(self.dirty.len(), |cut| cut.remaining.len());
+    let dirty = u64::try_from(left).unwrap_or(u64::MAX);
     let turns = self.turns;
     let (since, _) = *self
       .owed
@@ -561,10 +730,12 @@ impl Encoder {
     self.owed.is_some()
   }
 
-  /// Test support (A-870 piece 2's oracle): the turns run, the pages dirty, and the owed publication's start and bound.
+  /// Test support (A-870 piece 2's oracle): the turns run, the pages left to encode (the cut's and the next's), and the
+  /// owed publication's start and bound.
   #[cfg(test)]
   pub(crate) fn progress(&self) -> (u64, usize, Option<(u64, u64)>) {
-    (self.turns, self.dirty.len(), self.owed)
+    let cut = self.cut.as_ref().map_or(0, |cut| cut.remaining.len());
+    (self.turns, self.dirty.len().saturating_add(cut), self.owed)
   }
 
   /// Notes a task encoding on, where none is: whether this one is to start it.
@@ -919,41 +1090,70 @@ mod tests {
   }
 
   /// A-870 piece 2 (main 01a20182's ruling of 2026-11-23: the encoding moves off the publication's step, the image a cut
-  /// of one moment). Do: on a shard whose pages are small ([`crate::content_holder::TEST_PAGE_BYTES`]), let many objects
-  /// go and note them, publish (`verbs::publish_shard`), then let as many more go and publish again and again, reading
-  /// the bytes each publication encodes in its own step ([`encoded_bytes`]); then read the shard's committed image back
-  /// as a restart would. Expect: no publication's step encodes past three page sizes (a turn's slice and the one page
-  /// that crosses it), and within a bounded number of publications the committed image equals the shard's own, entry by
-  /// entry. Failing first: the publication after the mass let-go encoded every dirty page in its one step.
+  /// of one moment; F2's of 15:47: a page a gap left read a cap at a time). Do: on a shard whose pages are small
+  /// ([`crate::content_holder::TEST_PAGE_BYTES`]), let many objects go and note them, publish (`verbs::publish_shard`:
+  /// every family's first page, its directory empty, is a page of every coordinate), then let as many more go, publish
+  /// once and run the catch-up's steps as its task does (`content_holder::image_catch_up_step`: a turn, and once the cut
+  /// is encoded its publication), reading the bytes each step encodes ([`encoded_bytes`]) and the bytes its splits read
+  /// and did not keep, and after each publication the shard's committed image back as a restart would. Expect: no
+  /// step encodes past three page sizes (a turn's slice and the one page that crosses it); none discards
+  /// past the read's cap and an entry (twice a page: what a split visited and did not keep); pages split (the capped read
+  /// ran); and within a bounded number of publications the committed image equals the shard's entries now, entry by
+  /// entry. Failing first: the publication after the mass let-go encoded every dirty page in its one step; then (F2) a
+  /// family's first page, its every entry, in one turn (327,620 bytes at a 4,096-byte page), unseen before because the
+  /// check compared the journal with the encoder's committed cut, which it always equals while a cut is in flight.
   #[test]
   fn a_publication_encodes_at_most_a_slice_in_its_step_and_its_cuts_catch_up() {
     const PAGE: usize = 4096;
-    let (longest, caught_up) = crate::daemon::audit_on_shard(|state| {
+    /// Shape: the most bytes an entry here takes in a page (a landed record's piece: its key, length and bytes).
+    const ENTRY: usize = 256;
+    let (longest, discarded, split, caught_up) = crate::daemon::audit_on_shard(|state| {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let counted = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
       let _ = let_go_and_note(state, (0, ENTRIES));
       let _ = crate::verbs::publish_shard(state);
       let _ = let_go_and_note(state, (ENTRIES, ENTRIES));
+      let _ = crate::verbs::publish_shard(state);
       let mut longest = 0u64;
+      let mut discarded = 0u64;
       let mut caught_up = None;
       for at in 0..(4 * ENTRIES) {
         let before = encoded_bytes();
-        let _ = crate::verbs::publish_shard(state);
+        let dropped = counted(state, crate::content_holder::IMAGE_SPLIT_DISCARDED_BYTES);
+        let (ended, _) = crate::content_holder::image_catch_up_step(state);
         longest = longest.max(encoded_bytes().saturating_sub(before));
-        if crate::verbs::committed_held_agrees(state) {
+        discarded = discarded.max(
+          counted(state, crate::content_holder::IMAGE_SPLIT_DISCARDED_BYTES)
+            .saturating_sub(dropped),
+        );
+        if !ended {
+          continue;
+        }
+        let committed = crate::verbs::committed_held(state)
+          .map(|held| crate::content_holder::paged_entries_of(&held));
+        if committed == Some(crate::content_holder::paged_entries_now(state)) {
           caught_up = Some(at);
           break;
         }
       }
+      let split = counted(state, crate::content_holder::IMAGE_PAGES_SPLIT);
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
-      (longest, caught_up)
+      (longest, discarded, split, caught_up)
     });
     assert!(
       longest <= u64::try_from(3 * PAGE).unwrap(),
-      "a publication's step encoded {longest} bytes at a {PAGE}-byte page"
+      "a step encoded {longest} bytes at a {PAGE}-byte page"
     );
     assert!(
+      discarded <= u64::try_from(2 * PAGE + ENTRY).unwrap(),
+      "a step's splits read and dropped {discarded} bytes, past the read's cap and an entry"
+    );
+    assert!(split > 0, "no page split: the capped read never ran");
+    assert!(
       caught_up.is_some(),
-      "the committed image caught up with the shard"
+      "the committed image caught up with the shard's entries"
     );
   }
 
@@ -996,6 +1196,210 @@ mod tests {
     assert!(!encoder.paused() && encoder.waiting.is_empty());
   }
 
+  /// Puts `count` distinct one-window objects in the shard's content store, numbered from `from`: their identities, in
+  /// the order put (each window's handle the next).
+  fn put_objects(
+    state: &mut crate::state::ShardState,
+    (from, count): (usize, usize),
+  ) -> Vec<slates_vcs::ContentId> {
+    let window = state.store.content.chunk_bytes();
+    state.vcs_stores.content_made(window).unwrap();
+    let texts: Vec<Vec<u8>> = (from..from + count)
+      .map(|at| format!("a text kept in the shard's store, number {at}\n").into_bytes())
+      .collect();
+    let need: u64 = texts.iter().map(|text| text.len() as u64).sum();
+    crate::vcs_store::within_budget(state, need, |stores| {
+      let content = stores.content_mut().unwrap();
+      texts
+        .iter()
+        .map(|text| content.put_object(text).unwrap())
+        .collect()
+    })
+  }
+
+  /// Lets the objects `ids` go landed, their windows given back.
+  fn let_go(state: &mut crate::state::ShardState, ids: &[slates_vcs::ContentId]) {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      for id in ids {
+        assert!(content.mark_landed(id));
+        content.let_go_landed(id, None).unwrap();
+      }
+    });
+  }
+
+  /// A-870 piece 2, F2 (main 01a20182's ruling of 2026-11-23: the red on the property that matters). Do: on a shard whose
+  /// pages are small, put [`ENTRIES`] objects and carry them; let go every hundredth and the third-last, so a cut's
+  /// windows pages run from the first to the last, dozens of them; begin the cut with one turn, which encodes its first
+  /// page in the encoder's order (by depth, then start: the widest, the last objects') and few more; note the shard's
+  /// entries then; let go an object of the page the hundredth-but-one lies in (the 2,900th's), which the cut has not yet
+  /// encoded; turn until the cut is
+  /// encoded and publish. Expect: the committed image equal, entry for entry, to the shard's entries at the cut; the
+  /// window let go after it placed in the windows page and not in the aways page, as at the cut (the two pages agree);
+  /// an old value kept (the pre-image path ran). Its slab stays held by the windows still in it, so no chunk is freed
+  /// here: the oracle holds the frees a cut holds.
+  /// Failing first (each store's hook turned off): its page encoded after the let-go names the window nowhere,
+  /// placed nor let go, an image of two moments.
+  #[test]
+  fn a_window_let_go_while_its_cut_is_encoded_leaves_the_carried_image_one_moment() {
+    const PAGE: usize = 4096;
+    let outcome = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let ids = put_objects(state, (0, ENTRIES));
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let counted = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      /// Shape: an object in the page of the last hundredth let go, among the narrow pages the cut encodes after its
+      /// first.
+      const GONE: usize = 2_905;
+      let gone = ids[GONE];
+      let mut spread: Vec<slates_vcs::ContentId> = ids.iter().step_by(100).copied().collect();
+      spread.push(ids[ENTRIES - 3]);
+      let_go(state, &spread);
+      let turned = crate::content_holder::image_turn(state);
+      let in_flight = state.image_encoder.cut_in_flight().is_some();
+      let windows_pages = state.image_encoder.cut_in_flight().map_or(0, |(_, pages)| {
+        pages
+          .iter()
+          .filter(|(family, _)| *family == Family::Windows)
+          .count()
+      });
+      let left = state.image_encoder.progress().1;
+      let at_cut = crate::content_holder::paged_entries_now(state);
+      let old = counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_OLD);
+      let_go(state, &[gone]);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let restored =
+        crate::content_holder::paged_entries_of(&crate::verbs::committed_held(state).unwrap());
+      let placed = crate::content_holder::window_blocks(&restored)
+        .iter()
+        .any(|(identity, ..)| *identity == gone);
+      let away = crate::content_holder::aways_among(&restored).contains(&gone);
+      let kept_old = counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_OLD) - old;
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (
+        (turned.caught_up, in_flight),
+        restored == at_cut,
+        (placed, away),
+        (kept_old, windows_pages, left),
+      )
+    });
+    let ((caught_up, in_flight), one_moment, (placed, away), (kept_old, windows_pages, left)) =
+      outcome;
+    assert!(
+      !caught_up && in_flight,
+      "the cut's first turn left a page to encode"
+    );
+    assert!(one_moment, "the committed image is the shard's at the cut");
+    assert!(
+      placed && !away,
+      "the window let go after the cut is placed and not let go, as at the cut (placed {placed}, away {away})"
+    );
+    assert!(
+      kept_old > 0,
+      "an old value kept (the cut's windows pages {windows_pages}, pages left after its first turn {left})"
+    );
+  }
+
+  /// A-870 F2, the catch-up's pacing (main 01a20182's ruling (a) of 2026-11-23 19:16). Do: on a shard whose pages are
+  /// small (a page far below its copy slice, `DaemonConfig::copy_slice_bytes`), put [`ENTRIES`] objects and carry them,
+  /// let every other one go and publish, so a cut of many pages is owed; run one wake of the catch-up
+  /// (`content_holder::image_catch_up_slice`). Expect: the wake ran turns until the cut ended or a copy slice's bytes
+  /// were spent, more than one turn. Failing first (a turn a wake): one turn, a page's bytes, the cut still owed.
+  #[test]
+  fn a_catch_up_wake_spends_a_copy_slice_not_one_turn() {
+    /// Shape: a page far below the copy slice, which follows the shard's live step quantum (5,718 bytes measured on a
+    /// loaded Mac, 41,509 on the next run), so a turn's three pages stay under it.
+    const PAGE: usize = 512;
+    let (slice, turns, spent, ended) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let counted = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      let ids = put_objects(state, (0, ENTRIES));
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
+      let_go(state, &every_other);
+      crate::verbs::publish_shard(state).unwrap();
+      let slice = state.config.copy_slice_bytes();
+      let turns = counted(state, crate::content_holder::IMAGE_TURNS);
+      let spent = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES);
+      let ended = crate::content_holder::image_catch_up_slice(state);
+      let outcome = (
+        slice,
+        counted(state, crate::content_holder::IMAGE_TURNS) - turns,
+        counted(state, crate::content_holder::IMAGE_ENCODED_BYTES) - spent,
+        ended,
+      );
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      outcome
+    });
+    assert!(
+      slice > u64::try_from(3 * PAGE).unwrap(),
+      "the copy slice ({slice} bytes) is past a turn's three pages, or the test asks nothing"
+    );
+    assert!(
+      ended || spent >= slice,
+      "the wake ended the cut or spent its slice: {spent} of {slice} bytes in {turns} turns"
+    );
+    assert!(turns > 1, "the wake ran {turns} turns");
+  }
+
+  /// A-870 piece 2, the pause under refused publications (main 01a20182's ruling of 2026-11-23: with F2 a cut ends within
+  /// its pages, so only a refused publication keeps one owed past its bound). Do: on a shard whose pages are small, put
+  /// [`ENTRIES`] objects and carry them, then let every other one go and publish, so a cut of many pages is owed; refuse the catch-up's publications past the owed bound's turns
+  /// ([`crate::content_holder::CATCH_UP_REFUSALS`]), running the catch-up's steps as its task does, the shard's sweep
+  /// beginning it again after each; ask the elective let-go's question while paused; then let the refusals clear.
+  /// Expect: paused, the pause and its turns counted, while refused; the pause released, nothing owed, once a
+  /// publication goes through.
+  #[test]
+  fn a_cut_owed_past_its_bound_while_its_publications_are_refused_pauses_let_gos_until_one_commits()
+  {
+    const PAGE: usize = 4096;
+    let outcome = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let ids = put_objects(state, (0, ENTRIES));
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
+      let_go(state, &every_other);
+      crate::verbs::publish_shard(state).unwrap();
+      let (_, _, owed) = state.image_encoder.progress();
+      let (_, bound) = owed.expect("a cut owed");
+      let refusals = u32::try_from(bound).unwrap() + 2;
+      crate::content_holder::CATCH_UP_REFUSALS.with(|left| left.set(refusals));
+      let mut paused_seen = false;
+      for _ in 0..=refusals {
+        while !crate::content_holder::image_catch_up_step(state).0 {}
+        paused_seen |= crate::content_holder::image_paused(state);
+      }
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let counts = (
+        counted(crate::content_holder::IMAGE_CATCH_UP_PUBLISH_REFUSED),
+        counted(crate::content_holder::IMAGE_PAUSES),
+        counted(crate::content_holder::IMAGE_PAUSED_TURNS),
+      );
+      let released = !state.image_encoder.paused() && !state.image_encoder.owed();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (refusals, paused_seen, counts, released)
+    });
+    let (refusals, paused_seen, (refused, pauses, paused_turns), released) = outcome;
+    assert_eq!(refused, u64::from(refusals), "each refusal counted");
+    assert!(
+      paused_seen && pauses > 0 && paused_turns > 0,
+      "paused past the bound, counted ({pauses} pauses, {paused_turns} turns)"
+    );
+    assert!(
+      released,
+      "the pause released once a publication went through"
+    );
+  }
+
   /// Shape: the oracle's generated histories (the first continuous) and the steps of each: enough that publications
   /// skip, owe, pause and catch up many times in each.
   const HISTORIES: u64 = 6;
@@ -1029,8 +1433,33 @@ mod tests {
     paused: Option<(u64, u64)>,
     /// The most windows a restored image named (the reuse check is never vacuous).
     named: usize,
+    /// The cut in flight as the oracle saw it begin (F2): its generation, the shard's entries at its moment, the entries
+    /// in its pages then (E), its page count, and the pre-image counters then.
+    begun: Option<Begun>,
+    /// The keys the changes since the last turn inserted into any paged family, and the windows they freed.
+    since_turn: (u64, u64),
+    /// The most keys, and windows freed, the changes between two turns made: I's and the held frees' factor a turn.
+    most_a_turn: (u64, u64),
+    /// The most chunks the windows held for one cut.
+    held_most: usize,
     /// What the checks found.
     found: Vec<String>,
+  }
+
+  /// A cut as the oracle saw it begin (F2).
+  struct Begun {
+    /// Its generation in homes' tickets.
+    generation: u64,
+    /// The shard's paged entries at its moment, as (key, bytes) in key order.
+    entries: Vec<([u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>)>,
+    /// The entries in its pages at its moment: E.
+    in_pages: u64,
+    /// Its pages at its moment.
+    pages: u64,
+    /// The encoder's turns as the oracle saw it begin (the turn that began it among them).
+    turned: u64,
+    /// The old values' and absent markers' counters at its moment.
+    counted: (u64, u64),
   }
 
   impl Oracle {
@@ -1038,6 +1467,118 @@ mod tests {
     fn text(&mut self) -> Vec<u8> {
       self.fresh += 1;
       format!("an oracle's text, number {}\n", self.fresh).into_bytes()
+    }
+
+    /// A counter of the shard's.
+    fn counted(state: &crate::state::ShardState, name: &str) -> u64 {
+      state.refusals.get(name).copied().unwrap_or(0)
+    }
+
+    /// Before a turn (the catch-up's, or a publication's): the changes since the last one closed as an interval.
+    fn turning(&mut self) {
+      self.most_a_turn = (
+        self.most_a_turn.0.max(self.since_turn.0),
+        self.most_a_turn.1.max(self.since_turn.1),
+      );
+      self.since_turn = (0, 0);
+    }
+
+    /// After a turn or a publication: a cut begun since noted with the shard's entries at its moment (nothing changes
+    /// the stores between a cut's begin and the turn or publication returning).
+    fn note_cut(&mut self, state: &crate::state::ShardState) {
+      let Some((generation, pages)) = state.image_encoder.cut_in_flight() else {
+        return;
+      };
+      if self
+        .begun
+        .as_ref()
+        .is_some_and(|begun| begun.generation == generation)
+      {
+        return;
+      }
+      let placed = crate::content_holder::paged_entries_placed(state);
+      let in_pages = placed
+        .iter()
+        .filter(|(family, coordinate, ..)| {
+          pages
+            .iter()
+            .any(|(at, page)| at == family && page.contains(*coordinate))
+        })
+        .count() as u64;
+      let mut entries: Vec<_> = placed
+        .into_iter()
+        .map(|(_, _, key, bytes)| (key, bytes))
+        .collect();
+      entries.sort();
+      self.begun = Some(Begun {
+        generation,
+        entries,
+        in_pages,
+        pages: pages.len() as u64,
+        turned: state.image_encoder.progress().0,
+        counted: (
+          Self::counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_OLD),
+          Self::counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_ABSENT),
+        ),
+      });
+    }
+
+    /// The turns the cut in flight has lasted, the next among them: at most its pages and the pages its splits put back
+    /// (each turn encodes or splits one at least), which the owed lag check bounds.
+    fn turns_lasted(&self, state: &crate::state::ShardState) -> u64 {
+      self.begun.as_ref().map_or(0, |begun| {
+        state
+          .image_encoder
+          .progress()
+          .0
+          .saturating_sub(begun.turned)
+          + 2
+      })
+    }
+
+    /// The held frees' bound (main 01a20182, 2026-11-23): the chunks the windows hold for the cut in flight at most the
+    /// windows a turn's changes free, times the turns it lasts.
+    fn check_held(&mut self, state: &crate::state::ShardState, step: usize) {
+      let held = crate::vcs_store::chunk_windows(&state.vcs_stores).map_or(
+        0,
+        crate::vcs_store::arena_windows::ChunkWindows::held_for_cut,
+      );
+      self.held_most = self.held_most.max(held);
+      let turns = self.turns_lasted(state);
+      let bound = self.most_a_turn.1.max(self.since_turn.1) * turns;
+      if held as u64 > bound {
+        self.found.push(format!(
+          "step {step}: {held} chunks held for the cut, past {bound} (a turn's frees times its {turns} turns)"
+        ));
+      }
+    }
+
+    /// A cut carried (F2): its pre-images within E + I, old values at most the entries in its pages at its moment and
+    /// absent markers at most a turn's inserts times its pages.
+    fn check_carried(&mut self, state: &crate::state::ShardState, begun: &Begun, step: usize) {
+      let old =
+        Self::counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_OLD) - begun.counted.0;
+      let absent =
+        Self::counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_ABSENT) - begun.counted.1;
+      if old > begun.in_pages {
+        self.found.push(format!(
+          "step {step}: {old} old values kept, past the {} entries in the cut's pages (E)",
+          begun.in_pages
+        ));
+      }
+      let turns = state
+        .image_encoder
+        .progress()
+        .0
+        .saturating_sub(begun.turned)
+        + 1;
+      let inserts = self.most_a_turn.0.max(self.since_turn.0) * turns;
+      if absent > inserts {
+        self.found.push(format!(
+          "step {step}: {absent} absent markers kept, past {inserts} (I: a turn's inserts times {turns} turns, of {} pages)",
+          begun.pages
+        ));
+      }
     }
 
     /// The checks at `step` (module test docs): the image a restart reads is the last carried cut, entry for entry; no
@@ -1094,35 +1635,44 @@ mod tests {
       }
     }
 
-    /// A publication (`verbs::publish_shard`), noting the cut where it carried the encoder's, then the checks.
+    /// A publication (`verbs::publish_shard`), noting the cut where it carried the encoder's (F2: the shard's entries at
+    /// the cut's moment, or now where it began and was carried in this one publication), then the checks.
     fn publish(&mut self, state: &mut crate::state::ShardState, step: usize) {
-      let skipped = state
-        .refusals
-        .get(crate::content_holder::IMAGE_SKIPPED)
-        .copied()
-        .unwrap_or(0);
+      let skipped = Self::counted(state, crate::content_holder::IMAGE_SKIPPED);
+      let in_flight = state
+        .image_encoder
+        .cut_in_flight()
+        .map(|(generation, _)| generation);
+      self.turning();
+      let now_before = crate::content_holder::paged_entries_now(state);
       if crate::verbs::publish_shard(state).is_err() {
         self
           .found
           .push(format!("step {step}: the publication refused"));
         return;
       }
-      let now_skipped = state
-        .refusals
-        .get(crate::content_holder::IMAGE_SKIPPED)
-        .copied()
-        .unwrap_or(0);
-      if now_skipped == skipped {
-        self.cut = crate::content_holder::paged_entries_now(state);
+      if Self::counted(state, crate::content_holder::IMAGE_SKIPPED) == skipped {
+        let begun = self.begun.take();
+        match begun {
+          Some(begun) if Some(begun.generation) == in_flight => {
+            self.check_carried(state, &begun, step);
+            self.cut = begun.entries;
+          }
+          // Begun and carried in this one publication, or none in flight: the shard's entries as it began.
+          _ => self.cut = now_before,
+        }
       }
+      self.note_cut(state);
+      self.check_held(state, step);
       self.check(state, step);
     }
 
     /// `count` turns of the encoder as the catch-up task runs them, publishing once caught up where one is owed.
     fn turns(&mut self, state: &mut crate::state::ShardState, (step, count): (usize, u64)) {
       for _ in 0..count {
-        crate::content_holder::image_drain(state);
+        self.turning();
         let turned = crate::content_holder::image_turn(state);
+        self.note_cut(state);
         if turned.caught_up && state.image_encoder.owed() {
           self.publish(state, step);
         }
@@ -1153,6 +1703,29 @@ mod tests {
       if elective && crate::content_holder::image_paused(state) {
         return;
       }
+      let counters = |state: &crate::state::ShardState| {
+        state
+          .vcs_stores
+          .content()
+          .map(slates_vcs::ContentStore::counters)
+          .unwrap_or_default()
+      };
+      let before = counters(state);
+      self.make(state, (kind, count));
+      let after = counters(state);
+      // Each put inserts a window or list and at most a name; a let-go a window let go; a bring-back a window; a
+      // let-go-and-note a landed record a window. A window freed or let go frees at most its chunk.
+      let landed = if kind == 1 { count as u64 } else { 0 };
+      self.since_turn.0 += 2 * (after.stored - before.stored)
+        + (after.let_go - before.let_go)
+        + (after.brought_back - before.brought_back)
+        + landed;
+      self.since_turn.1 += (after.freed - before.freed) + (after.let_go - before.let_go);
+      self.check_held(state, 0);
+    }
+
+    /// The change itself ([`Oracle::change`]).
+    fn make(&mut self, state: &mut crate::state::ShardState, (kind, count): (u64, usize)) {
       match kind {
         0 => self.unpaused(state, |oracle, state| {
           let texts: Vec<Vec<u8>> = (0..count).map(|_| oracle.text()).collect();
@@ -1210,9 +1783,20 @@ mod tests {
     }
   }
 
-  /// One oracle history on a shard (the oracle's test docs): `seed` 0 the continuous one. What it found, the pauses it
-  /// met, and the most windows a restored image named.
-  fn history(state: &mut crate::state::ShardState, seed: u64) -> (Vec<String>, u64, usize) {
+  /// What one oracle history found, and its non-vacuity counts.
+  struct Found {
+    /// What its checks found.
+    found: Vec<String>,
+    /// The most windows a restored image named.
+    named: usize,
+    /// The old values and absent markers the cuts kept.
+    preimages: (u64, u64),
+    /// The most chunks the windows held for one cut.
+    held_most: usize,
+  }
+
+  /// One oracle history on a shard (the oracle's test docs): `seed` 0 the continuous one.
+  fn history(state: &mut crate::state::ShardState, seed: u64) -> Found {
     let window = state.store.content.chunk_bytes();
     state.vcs_stores.content_made(window).unwrap();
     let mut oracle = Oracle {
@@ -1241,9 +1825,10 @@ mod tests {
     }
     // Changes stopped: the encoder catches up within the pages left dirty, and its publication carries the shard's now.
     // The last steps' changes taken first, so the pages left are all of them: a turn encodes one at least.
+    // F2: the cut in flight first, then the next of the pages left, each at most doubled by a split.
     crate::content_holder::image_drain(state);
     let left = state.image_encoder.progress().1 as u64;
-    oracle.turns(state, (STEPS + 1, left + 2));
+    oracle.turns(state, (STEPS + 1, 2 * left + 2));
     oracle.publish(state, STEPS + 1);
     let now = crate::content_holder::paged_entries_now(state);
     if oracle.cut != now {
@@ -1265,6 +1850,16 @@ mod tests {
       ));
     }
     let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    for bug in [
+      crate::vcs_store::homes::HOME_TICKET_STRANDED,
+      crate::content_holder::IMAGE_CUT_LEFT,
+    ] {
+      if counted(bug) > 0 {
+        oracle
+          .found
+          .push(format!("{bug} moved: {}, a bug signal", counted(bug)));
+      }
+    }
     let pauses = counted(crate::content_holder::IMAGE_PAUSES);
     // The progress rule's assumption measured: turns while paused counted, the never-paused changes' bytes within the
     // bytes the encoder encoded then.
@@ -1283,36 +1878,51 @@ mod tests {
         "the never-paused changes' {imposed} bytes past the {encoded} encoded while paused"
       ));
     }
-    (oracle.found, pauses, oracle.named)
+    Found {
+      found: oracle.found,
+      named: oracle.named,
+      preimages: (
+        counted(crate::content_holder::IMAGE_CUT_PREIMAGES_OLD),
+        counted(crate::content_holder::IMAGE_CUT_PREIMAGES_ABSENT),
+      ),
+      held_most: oracle.held_most,
+    }
   }
 
-  /// A-870 piece 2's oracle (main 01a20182's ruling of 2026-11-23). Do: on shards whose pages are small
+  /// A-870 piece 2's oracle (main 01a20182's rulings of 2026-11-23, F2 among them). Do: on shards whose pages are small
   /// ([`crate::content_holder::TEST_PAGE_BYTES`]), run [`HISTORIES`] generated histories of puts, let-gos, bring-backs,
   /// encoder turns (as the catch-up task runs them), publications and crashes (a restart's read of the committed
   /// journal), the first continuous (a change, a turn and a publication every step); the history makes no let-go while
   /// the encoder pauses them, as the shard's let-go sites hold theirs. Expect, at every publication and crash: the image a
-  /// restart reads equal, entry for entry, to the shard's entries at the last publication that carried the encoder's cut
-  /// (one committed cut, never a mix of two); no window that image names with its chunk's block held now by another
-  /// window (the arena reused none); the owed publication's lag within its bound (the bound it was owed with, then a turn
-  /// a page dirty when the pause began and a page the history's other changes dirtied since, and the publication's
-  /// own); and, the changes stopped, the cut caught up with the shard. Some history paused, and the images named windows.
+  /// restart reads equal, entry for entry, to the shard's entries at the moment the last carried cut began (one moment,
+  /// never a mix of two, whatever changed while it was encoded); no window that image names with its chunk's block held
+  /// now by another window (the arena reused none); the owed publication's lag within its bound; each carried cut's old
+  /// values at most the entries in its pages at its moment (E) and its absent markers at most a turn's inserts times its
+  /// pages (I); the chunks held for a cut at most a turn's frees times its pages; no ticket stranded and no pre-image left
+  /// at a cut's end; and, the changes stopped, the cut caught up with the shard. Non-vacuous: the cuts kept old values
+  /// and absent markers, the windows held a chunk for a cut, and the images named windows.
   #[test]
   fn generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound() {
     const PAGE: usize = 4096;
-    let mut paused = 0;
-    let mut named = 0;
+    let (mut old, mut absent, mut held, mut named) = (0, 0, 0, 0);
     for seed in 0..HISTORIES {
-      let (found, pauses, windows) = crate::daemon::audit_on_shard(move |state| {
+      let found = crate::daemon::audit_on_shard(move |state| {
         crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
         let outcome = history(state, seed);
         crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
         outcome
       });
-      assert!(found.is_empty(), "history {seed}: {found:#?}");
-      paused += pauses;
-      named = named.max(windows);
+      assert!(found.found.is_empty(), "history {seed}: {:#?}", found.found);
+      old += found.preimages.0;
+      absent += found.preimages.1;
+      held = held.max(found.held_most);
+      named = named.max(found.named);
     }
-    assert!(paused > 0, "no history paused its let-gos");
+    assert!(
+      old > 0 && absent > 0,
+      "the cuts kept {old} old values and {absent} absent markers"
+    );
+    assert!(held > 0, "no chunk was held for a cut");
     assert!(named > 0, "no restored image named a window");
   }
 }

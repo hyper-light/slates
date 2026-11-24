@@ -33,7 +33,9 @@
 //! into a slab: one chunk of one granule that windows fill end to end, each window its slot (the chunk and its offset
 //! in it). A slab's slots are never written twice: a window let go leaves its slot unused, and the slab's chunk is
 //! freed when its last window goes, through the chunk store's one free, which the arena defers while a committed image
-//! names the block (A-64). So no committed image ever names a slot holding another window's bytes, the idle purge
+//! names the block (A-64), and which the store itself holds while an image cut is in flight (A-870 F2,
+//! [`ChunkWindows::begin_cut`]: the cut may name a block no committed image yet does). So no committed image ever names
+//! a slot holding another window's bytes, the idle purge
 //! (A-105) only meets a slab once all its slots are free, and a slab one live window keeps holds the one granule that
 //! window held alone before. The slab's block asks its live windows' bytes ([`slates_mem::ChunkArena::reask`]), so the
 //! arena's row of repository windows names, held against asked, the granules' rounding and the slots let go. A window
@@ -69,6 +71,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_mem::Handle;
+use slates_vcs::preimage::Preimages;
 use slates_vcs::{ContentId, ContentRefused, StoredWindow, WindowStorage};
 use slates_vfs::content::{Chunk, ChunkStore, Extent, ExtentSrc};
 use slates_vfs::ids::Epoch;
@@ -211,6 +214,17 @@ pub(crate) struct ChunkWindows {
   reask_owed: BTreeSet<(u16, u64)>,
   /// Windows let go from slabs still held, and their bytes.
   freed_kept: (u64, u64),
+  /// The image cut's pre-images of the windows' pieces (A-870 piece 2, F2; `slates_vcs::preimage`): each window's piece
+  /// at the cut, kept before it is put, named or let go in a page the cut has not yet encoded.
+  cut: Preimages<u64, Vec<u8>>,
+  /// Whether an image cut is in flight: begun, its publication not yet committed ([`ChunkWindows::begin_cut`]).
+  cutting: bool,
+  /// The chunks freed while a cut is in flight, held until its publication commits ([`ChunkWindows::end_cut`]): the
+  /// cut may name their blocks, and no committed image does yet, so the arena would not defer their frees (A-64).
+  /// Bound: the windows let go while the cut is in flight. Derived: at most the windows one turn's interval lets go (a
+  /// step's let-gos are bounded by its step budget's bytes), times the turns the cut lasts, at most its pages and the
+  /// pages its splits put back, since a turn encodes or splits one at least (`slates_vcs::preimage`, "Bound").
+  held_for_cut: Vec<Handle<Chunk>>,
 }
 
 impl std::fmt::Debug for ChunkWindows {
@@ -386,7 +400,76 @@ impl ChunkWindows {
       filling: None,
       reask_owed: BTreeSet::new(),
       freed_kept: (0, 0),
+      cut: Preimages::default(),
+      cutting: false,
+      held_for_cut: Vec::new(),
     }
+  }
+
+  /// The piece of the window `handle` as [`ChunkWindows::pieces_in`] reads it: none where it is not kept, or not yet
+  /// named.
+  fn piece_now(&self, handle: u64) -> Option<Vec<u8>> {
+    let kept = self.held.get(&StoredWindow(handle))?;
+    kept.named.then(|| piece_of(kept, self.placed_of(kept)))
+  }
+
+  /// Before the window `handle` is put, named or let go: its piece at the cut kept where its page is frozen (F2).
+  fn before_change(&mut self, handle: u64) {
+    let now = self.piece_now(handle);
+    self.cut.before(handle, || now, Vec::len);
+  }
+
+  /// An image cut begins (A-870 piece 2, F2): a chunk freed from now until its publication commits is held for it.
+  pub(crate) fn begin_cut(&mut self) {
+    self.cutting = true;
+  }
+
+  /// Freezes the handles `lo..=hi`, a windows page of the cut.
+  pub(crate) fn freeze(&mut self, (lo, hi): (u64, u64)) {
+    self.cut.freeze(lo, hi);
+  }
+
+  /// Thaws the handles `lo..=hi`, a windows page of the cut now encoded.
+  pub(crate) fn thaw(&mut self, (lo, hi): (u64, u64)) {
+    self.cut.thaw(lo, hi);
+  }
+
+  /// The cut's publication committed: the chunks held for it freed (now where lent, else at the next lend; the arena
+  /// defers each while the committed image names its block, A-64), its pre-images dropped. How many pre-images and
+  /// ranges were left, none where every page was thawed as it was encoded.
+  pub(crate) fn end_cut(&mut self) -> usize {
+    self.cutting = false;
+    for chunk in core::mem::take(&mut self.held_for_cut) {
+      self.free_or_owe(chunk);
+    }
+    self.cut.end()
+  }
+
+  /// The pre-images kept since this was last asked, the counts started again.
+  pub(crate) fn take_cut_counts(&mut self) -> slates_vcs::preimage::PreimageCounts {
+    self.cut.take_counts()
+  }
+
+  /// The chunks held for the cut in flight (the held frees' bound, [`ChunkWindows::held_for_cut`]).
+  pub(crate) fn held_for_cut(&self) -> usize {
+    self.held_for_cut.len()
+  }
+
+  /// [`ChunkWindows::pieces_in`] as at the cut: the pieces now with their pre-images laid over them (F2), read until
+  /// their bytes pass `cap`; where the read stopped short of the range, the handle it stopped at.
+  pub(crate) fn pieces_at_cut(
+    &self,
+    (lo, hi): (u64, u64),
+    cap: usize,
+  ) -> (Vec<(u64, Vec<u8>)>, Option<u64>) {
+    let now = self
+      .held
+      .range(StoredWindow(lo)..=StoredWindow(hi))
+      .filter(|(_, kept)| kept.named)
+      .map(|(window, kept)| (window.0, piece_of(kept, self.placed_of(kept))));
+    self
+      .cut
+      .overlay_within((lo, hi), now, (cap, &|_, piece: &Vec<u8>| piece.len()))
   }
 
   /// The slabs' census (goal 93): chunks the windows lie in, and the windows let go from slabs still held.
@@ -544,7 +627,9 @@ impl ChunkWindows {
 
   /// Frees a chunk now when the store is lent, at the next lend otherwise.
   fn free_or_owe(&mut self, chunk: Handle<Chunk>) {
-    if self.lent {
+    if self.cutting {
+      self.held_for_cut.push(chunk);
+    } else if self.lent {
       // A chunk the store cannot free stays held until the arena goes; the content store's own counts are settled.
       // A block a committed image names is not reused before a newer one commits: the arena defers it (A-64).
       let _freed = self.chunks.free_chunk(chunk);
@@ -796,6 +881,7 @@ impl WindowStorage for ChunkWindows {
       return Err(ContentRefused::Storage);
     };
     let window = StoredWindow(self.next);
+    self.before_change(window.0);
     self.next = self
       .next
       .checked_add(1)
@@ -868,6 +954,7 @@ impl WindowStorage for ChunkWindows {
   }
 
   fn release(&mut self, window: StoredWindow) {
+    self.before_change(window.0);
     let Some(kept) = self.held.remove(&window) else {
       return;
     };
@@ -938,6 +1025,7 @@ impl WindowStorage for ChunkWindows {
   }
 
   fn named(&mut self, window: StoredWindow, identity: &ContentId) {
+    self.before_change(window.0);
     if let Some(kept) = self.held.get_mut(&window) {
       kept.identity = *identity;
       kept.named = true;

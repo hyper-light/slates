@@ -57,6 +57,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 
+use crate::preimage::{PreimageCounts, Preimages};
+
 /// Format: a content identity's bytes, BLAKE3's output length.
 pub const IDENTITY_BYTES: usize = blake3::OUT_LEN;
 
@@ -416,6 +418,28 @@ impl Writing {
   }
 }
 
+/// A paged family of the content store's, as a shard image's cut freezes it (A-870 piece 2, F2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutFamily {
+  /// The lists, by identity.
+  Lists,
+  /// The names, by the object's identity.
+  Names,
+  /// The windows let go, by identity.
+  Aways,
+}
+
+/// The content store's pre-images of an image cut, a family each ([`crate::preimage`]).
+#[derive(Debug, Default)]
+struct CutPreimages {
+  /// The lists' bytes at the cut.
+  lists: Preimages<ContentId, Box<[u8]>>,
+  /// The names' roots at the cut.
+  names: Preimages<ContentId, ContentId>,
+  /// The windows let go at the cut, by length.
+  aways: Preimages<ContentId, u64>,
+}
+
 /// The content store (module docs).
 #[derive(Debug)]
 pub struct ContentStore {
@@ -432,6 +456,9 @@ pub struct ContentStore {
   /// The windows let go, brought back or freed away since its owner last took the changes (A-767 C1 step 2b): the
   /// shard image carries every window let go, so a restart keeps it as let go, never as absent.
   away_changed: BTreeSet<ContentId>,
+  /// The image cut's pre-images of the lists, names and windows let go (A-870 piece 2, F2; [`crate::preimage`]): each
+  /// entry's value at the cut, kept before it changes in a page the cut has not yet encoded.
+  cut: CutPreimages,
   /// Where the windows' bytes are kept (A-727).
   storage: Box<dyn WindowStorage>,
   /// The longest content the store holds: the content plane's window.
@@ -630,6 +657,7 @@ impl ContentStore {
       lists_changed: BTreeSet::new(),
       names_changed: BTreeSet::new(),
       away_changed: BTreeSet::new(),
+      cut: CutPreimages::default(),
       storage: Box::new(HeapWindows::default()),
       window,
       fanout,
@@ -732,6 +760,9 @@ impl ContentStore {
       .content_bytes
       .checked_add(width(bytes.len())?)
       .ok_or(ContentRefused::CountExhausted)?;
+    if form == Form::List {
+      self.before_list_change(identity);
+    }
     let kept = if form == Form::Window {
       let window = self.storage.put(bytes)?;
       self.storage.named(window, &identity);
@@ -777,7 +808,9 @@ impl ContentStore {
   /// `identity`, the BLAKE3 of an object's bytes, named for `root`, the tree this store keeps it as (module docs, "The
   /// identity rule"): a root that is the identity itself (an object of at most one window) needs no name. The identity.
   fn named_object(&mut self, identity: ContentId, root: ContentId) -> ContentId {
-    if identity != root && self.objects.insert(identity, root).is_none() {
+    if identity != root && !self.objects.contains_key(&identity) {
+      self.before_name_change(identity);
+      self.objects.insert(identity, root);
       self.rooted.insert(root, identity);
       self.names_changed.insert(identity);
     }
@@ -1194,6 +1227,20 @@ impl ContentStore {
       held.holders = held.holders.saturating_sub(1);
       return Ok(None);
     }
+    // Only the families the entry is in change with it, so no other family keeps a marker for it.
+    let (list, away) = (
+      held.form == Form::List,
+      matches!(held.kept, Kept::Away { .. }),
+    );
+    if list {
+      self.before_list_change(*identity);
+    }
+    if away {
+      self.before_away_change(*identity);
+    }
+    if let Some(named) = self.rooted.get(identity).copied() {
+      self.before_name_change(named);
+    }
     let Some(freed) = self.entries.remove(identity) else {
       return Err(ContentRefused::NotHeld);
     };
@@ -1361,6 +1408,7 @@ impl ContentStore {
 
   /// Marks the window `identity` (kept as `window`, `len` bytes) let go, its storage given back: the bytes freed.
   fn released_away(&mut self, identity: ContentId, window: StoredWindow, len: usize) -> u64 {
+    self.before_away_change(identity);
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Away { len };
     }
@@ -1391,6 +1439,7 @@ impl ContentStore {
     self.admit(need, 0)?;
     let window = self.storage.put(bytes)?;
     self.storage.named(window, &identity);
+    self.before_away_change(identity);
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Stored { window, len };
     }
@@ -1599,6 +1648,129 @@ impl ContentStore {
         Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
         _ => None,
       })
+  }
+
+  /// The list `identity` as [`ContentStore::lists_in`] reads it, its bytes copied: none where it is no list kept here.
+  fn list_now(&self, identity: &ContentId) -> Option<Box<[u8]>> {
+    self
+      .entries
+      .get(identity)
+      .filter(|held| held.form == Form::List)
+      .and_then(Held::here)
+      .map(Box::from)
+  }
+
+  /// The window `identity` let go, as [`ContentStore::aways_in`] reads it: its length, none where it is not let go.
+  fn away_now(&self, identity: &ContentId) -> Option<u64> {
+    match self.entries.get(identity).map(|held| &held.kept) {
+      Some(Kept::Away { len }) => Some(u64::try_from(*len).unwrap_or(u64::MAX)),
+      _ => None,
+    }
+  }
+
+  /// Before the list `identity` is kept or freed: its value at the cut kept where its page is frozen (F2).
+  fn before_list_change(&mut self, identity: ContentId) {
+    let now = self.list_now(&identity);
+    self.cut.lists.before(identity, || now, |bytes| bytes.len());
+  }
+
+  /// Before the name `identity` is made or dropped: its root at the cut kept where its page is frozen (F2).
+  fn before_name_change(&mut self, identity: ContentId) {
+    let now = self.objects.get(&identity).copied();
+    self.cut.names.before(identity, || now, |_| IDENTITY_BYTES);
+  }
+
+  /// Before the window `identity` is let go, brought back or freed: whether it was let go at the cut, and its length,
+  /// kept where its page is frozen (F2).
+  fn before_away_change(&mut self, identity: ContentId) {
+    let now = self.away_now(&identity);
+    self
+      .cut
+      .aways
+      .before(identity, || now, |_| core::mem::size_of::<u64>());
+  }
+
+  /// Freezes `family`'s coordinates `lo..=hi`, a page of the shard image's cut (A-870 piece 2, F2): an entry there
+  /// keeps its value at the cut before it changes, until the page is thawed ([`ContentStore::thaw`]).
+  pub fn freeze(&mut self, family: CutFamily, (lo, hi): (u64, u64)) {
+    match family {
+      CutFamily::Lists => self.cut.lists.freeze(lo, hi),
+      CutFamily::Names => self.cut.names.freeze(lo, hi),
+      CutFamily::Aways => self.cut.aways.freeze(lo, hi),
+    }
+  }
+
+  /// Thaws `family`'s coordinates `lo..=hi`, a page of the cut now encoded: its pre-images dropped.
+  pub fn thaw(&mut self, family: CutFamily, (lo, hi): (u64, u64)) {
+    match family {
+      CutFamily::Lists => self.cut.lists.thaw(lo, hi),
+      CutFamily::Names => self.cut.names.thaw(lo, hi),
+      CutFamily::Aways => self.cut.aways.thaw(lo, hi),
+    }
+  }
+
+  /// The cut ended, its publication committed: every range thawed and pre-image dropped. How many were left (none
+  /// where every page was thawed as it was encoded).
+  pub fn end_cut(&mut self) -> usize {
+    self
+      .cut
+      .lists
+      .end()
+      .saturating_add(self.cut.names.end())
+      .saturating_add(self.cut.aways.end())
+  }
+
+  /// The pre-images kept since this was last asked, the counts started again.
+  pub fn take_cut_counts(&mut self) -> PreimageCounts {
+    let mut counts = self.cut.lists.take_counts();
+    counts += self.cut.names.take_counts();
+    counts += self.cut.aways.take_counts();
+    counts
+  }
+
+  /// [`ContentStore::lists_in`] as at the cut: the lists now with their pre-images laid over them (F2), read until
+  /// their bytes (an identity and the list's) pass `cap`; where the read stopped short of the range, the coordinate it
+  /// stopped at (`crate::preimage::Preimages::overlay_within`).
+  pub fn lists_at_cut(
+    &self,
+    (lo, hi): (u64, u64),
+    cap: usize,
+  ) -> (Vec<(ContentId, Box<[u8]>)>, Option<u64>) {
+    self.cut.lists.overlay_within(
+      (lo, hi),
+      self
+        .lists_in(lo, hi)
+        .map(|(identity, bytes)| (identity, Box::from(bytes))),
+      (cap, &|_, bytes: &Box<[u8]>| {
+        IDENTITY_BYTES.saturating_add(bytes.len())
+      }),
+    )
+  }
+
+  /// [`ContentStore::names_in`] as at the cut (F2), read until their bytes (two identities each) pass `cap`.
+  pub fn names_at_cut(
+    &self,
+    (lo, hi): (u64, u64),
+    cap: usize,
+  ) -> (Vec<(ContentId, ContentId)>, Option<u64>) {
+    self.cut.names.overlay_within(
+      (lo, hi),
+      self.names_in(lo, hi),
+      (cap, &|_, _| IDENTITY_BYTES.saturating_mul(2)),
+    )
+  }
+
+  /// [`ContentStore::aways_in`] as at the cut (F2), read until their bytes (an identity and a length each) pass `cap`.
+  pub fn aways_at_cut(
+    &self,
+    (lo, hi): (u64, u64),
+    cap: usize,
+  ) -> (Vec<(ContentId, u64)>, Option<u64>) {
+    self.cut.aways.overlay_within(
+      (lo, hi),
+      self.aways_in(lo, hi),
+      (cap, &|_, _| IDENTITY_BYTES.saturating_add(size_of::<u64>())),
+    )
   }
 
   /// The lists the store keeps, each with its bytes (A-727 slice a3b): what the shard image carries whole beside the
