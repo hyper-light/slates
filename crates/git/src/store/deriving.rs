@@ -172,12 +172,7 @@ impl Repository {
 
   /// Whether any version's sets are not known: whether [`Self::deriving_due`] has anything to do.
   pub fn derivations_due(&self) -> bool {
-    let memo = self.memo.borrow();
-    self.chains.iter().any(|(green, chain)| {
-      chain.versions.iter().enumerate().any(|(version, record)| {
-        record.value.is_none() && !memo.values.contains_key(&(*green, version))
-      })
-    })
+    self.undecided_derivations.get() > 0
   }
 
   /// The generation number of the commit the object at `position` peels to; none for one that peels to no commit.
@@ -227,11 +222,17 @@ impl Repository {
     }
     let shape = reach::shape_of(store.window())?;
     let value = sets.put(store, shape)?;
-    self
+    if self
       .memo
       .borrow_mut()
       .values
-      .insert((green, version), value);
+      .insert((green, version), value)
+      .is_none()
+    {
+      self
+        .undecided_derivations
+        .set(self.undecided_derivations.get().saturating_sub(1));
+    }
     self.count(|counters| counters.derived = counters.derived.saturating_add(1));
     self.note_known(store, (green, version));
     Ok(())
@@ -281,6 +282,12 @@ impl Repository {
         .is_some_and(|record| record.value.is_some())
     });
     drop(memo);
+    self.undecided_derivations.set(
+      self
+        .undecided_derivations
+        .get()
+        .saturating_add(values.len()),
+    );
     let mut first = Ok(());
     for value in values.values() {
       if let Err(refused) = store.release(value) {
@@ -341,17 +348,25 @@ impl Repository {
   }
 
   /// The positions of the tags from the object at `position` to the commit it peels to: what a version reaches that a
-  /// version whose head peels to that commit, or descends from it, need not.
+  /// version whose head peels to that commit, or descends from it, need not. Reads `ObjectRow::tag_target` directly
+  /// when present, avoiding pack decompression.
   fn tag_chain(&self, store: &ContentStore, position: u64) -> Positions {
     let mut chain = Positions::new();
     let mut at = position;
     let push = Push::new(self.format);
     while self.kind_at(at) == Some(Kind::Tag) && chain.insert_new(at) {
+      let Some(id) = self.id_at(store, at) else {
+        break;
+      };
       let next = self
-        .id_at(store, at)
-        .and_then(|id| Some((id, self.locate(store, &push, &id)?)))
-        .and_then(|(id, place)| self.tag_reference(store, &id, &place).ok())
-        .and_then(|target| Some(self.indexed(store, &target)?.0.position));
+        .indexed(store, &id)
+        .and_then(|(row, _)| row.tag_target)
+        .or_else(|| {
+          self
+            .locate(store, &push, &id)
+            .and_then(|place| self.tag_reference(store, &id, &place).ok())
+            .and_then(|target| Some(self.indexed(store, &target)?.0.position))
+        });
       match next {
         Some(next) => at = next,
         None => break,
@@ -397,80 +412,116 @@ impl Repository {
         }
       };
     };
-    let Now {
-      key,
-      head,
-      before,
-      step,
-    } = now;
-    let next = match step {
-      Step::Base(mut descent) => self
-        .base_unit(store, &deriving.push, (key, head), &mut descent)?
-        .map_or(Step::Base(descent), |base| Step::Reached {
-          walk: Walk::from(head, base.clone()),
-          base,
-          made_at: false,
-        }),
-      Step::Reached {
-        base,
-        mut walk,
-        made_at,
-      } => {
-        if self.walk_unit(store, &deriving.push, &mut walk)? {
-          Step::Reached {
+    let mut now = now;
+    let step_result: Result<Option<Sets>, StoreRefused> = match &mut now.step {
+      Step::Base(descent) => {
+        match self.base_unit(store, &deriving.push, (now.key, now.head), descent) {
+          Ok(Some(base)) => {
+            now.step = Step::Reached {
+              walk: Walk::from(now.head, base.clone()),
+              base,
+              made_at: false,
+            };
+            Ok(None)
+          }
+          Ok(None) => Ok(None),
+          Err(refused) => Err(refused),
+        }
+      }
+      Step::Reached { walk, .. } => match self.walk_unit(store, &deriving.push, walk) {
+        Ok(true) => Ok(None),
+        Ok(false) => {
+          let Step::Reached {
             base,
             walk,
             made_at,
-          }
-        } else {
+          } = core::mem::replace(
+            &mut now.step,
+            Step::Reached {
+              base: Positions::new(),
+              walk: Walk::from(now.head, Positions::new()),
+              made_at: false,
+            },
+          )
+          else {
+            return Ok(Unit::Went);
+          };
           let found = indexed_alone(walk)?;
           let reached = base.union(&found);
-          if !before {
+          if !now.before {
             // A green's first version brings what it reaches beyond the version it was made at (A-850: a tag of a held
             // commit brings its tag objects alone), the whole of what it reaches where it was made at none.
             let brought = if made_at { found } else { reached.clone() };
-            deriving.waiting.pop();
-            return Ok(Unit::Sets(key, Sets { brought, reached }));
-          }
-          let previous = self.sets(store, key.0, key.1.saturating_sub(1))?.reached;
-          Step::Brought {
-            reached,
-            walk: Walk::from(head, previous),
+            Ok(Some(Sets { brought, reached }))
+          } else {
+            let previous = self
+              .sets(store, now.key.0, now.key.1.saturating_sub(1))?
+              .reached;
+            now.step = Step::Brought {
+              reached,
+              walk: Walk::from(now.head, previous),
+            };
+            Ok(None)
           }
         }
-      }
-      Step::Grown { previous, mut walk } => {
-        if self.walk_unit(store, &deriving.push, &mut walk)? {
-          Step::Grown { previous, walk }
-        } else {
-          let brought = indexed_alone(walk)?;
-          deriving.waiting.pop();
-          return Ok(Unit::Sets(
-            key,
-            Sets {
-              reached: previous.union(&brought),
-              brought,
+        Err(refused) => Err(refused),
+      },
+      Step::Grown { walk, .. } => match self.walk_unit(store, &deriving.push, walk) {
+        Ok(true) => Ok(None),
+        Ok(false) => {
+          let Step::Grown { previous, walk } = core::mem::replace(
+            &mut now.step,
+            Step::Reached {
+              base: Positions::new(),
+              walk: Walk::from(now.head, Positions::new()),
+              made_at: false,
             },
-          ));
-        }
-      }
-      Step::Brought { reached, mut walk } => {
-        if self.walk_unit(store, &deriving.push, &mut walk)? {
-          Step::Brought { reached, walk }
-        } else {
+          ) else {
+            return Ok(Unit::Went);
+          };
           let brought = indexed_alone(walk)?;
-          deriving.waiting.pop();
-          return Ok(Unit::Sets(key, Sets { reached, brought }));
+          Ok(Some(Sets {
+            reached: previous.union(&brought),
+            brought,
+          }))
         }
-      }
+        Err(refused) => Err(refused),
+      },
+      Step::Brought { walk, .. } => match self.walk_unit(store, &deriving.push, walk) {
+        Ok(true) => Ok(None),
+        Ok(false) => {
+          let Step::Brought { reached, walk } = core::mem::replace(
+            &mut now.step,
+            Step::Reached {
+              base: Positions::new(),
+              walk: Walk::from(now.head, Positions::new()),
+              made_at: false,
+            },
+          ) else {
+            return Ok(Unit::Went);
+          };
+          let brought = indexed_alone(walk)?;
+          Ok(Some(Sets { reached, brought }))
+        }
+        Err(refused) => Err(refused),
+      },
     };
-    deriving.now = Some(Now {
-      key,
-      head,
-      before,
-      step: next,
-    });
-    Ok(Unit::Went)
+    match step_result {
+      Ok(Some(sets)) => {
+        deriving.waiting.pop();
+        Ok(Unit::Sets(now.key, sets))
+      }
+      Ok(None) => {
+        deriving.now = Some(now);
+        Ok(Unit::Went)
+      }
+      Err(refused) => {
+        // Restore `now` so the caller can bring back a let-go pack window and resume the exact
+        // walk unit in place rather than restarting the version's derivation from scratch.
+        deriving.now = Some(now);
+        Err(refused)
+      }
+    }
   }
 
   /// How `key`'s derivation begins (module docs): a version it follows from first, where one is not known.

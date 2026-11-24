@@ -90,6 +90,16 @@ impl Asked {
   }
 }
 
+/// A want paired with the `(green, version)` whose precomputed reachability set answers it.
+struct ReachedTarget<N, G> {
+  /// The wanted object's node.
+  want: N,
+  /// The green whose current head is `want`.
+  green: G,
+  /// The green's current version with a precomputed reachability set.
+  version: u64,
+}
+
 /// The objects a pack carries one by one, chosen a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3: every slice a
 /// turn at a time, the graph lent for that turn alone): each [`Selecting::step`] does units until its owner's quantum is
 /// spent, at least one, a commit taken from the walk's queue or an entry taken from a stack, and keeps its place across
@@ -118,11 +128,32 @@ pub(super) struct Selecting<N, G> {
   chosen: Sets<N>,
   /// What the runs carry, for `include-tag`.
   carried: RunsCarried,
+  /// Wants answered directly from precomputed reachability sets ([`Stage::Reached`]).
+  reached_targets: Vec<ReachedTarget<N, G>>,
+  /// Union of precomputed reachability sets built during [`Stage::Reached`].
+  gathered: Positions,
+  /// Bytes of `gathered` charged to the admission so far.
+  gathered_charged: u64,
 }
 
 /// Where a selection is (the stages of [`Selecting`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
+  /// Precomputed reachability sets unioned for a fresh clone with no haves or depth cuts.
+  Reached {
+    /// The next entry in `reached_targets`.
+    at: usize,
+  },
+  /// Filtering the gathered reachability set by a per-object filter.
+  FilterReached {
+    /// The next position in `gathered` to examine.
+    next: u64,
+  },
+  /// Ensuring wanted tags, trees and blobs themselves are included regardless of the filter.
+  WantsReached {
+    /// The next entry in `reached_targets`.
+    at: usize,
+  },
   /// The commit walk.
   Commits,
   /// The edges' trees marked held: the sent commit at or after this position next.
@@ -239,9 +270,12 @@ fn size_for<S: Graph>(filter: Option<&Filter>, graph: &S, node: S::Node, kind: K
 }
 
 impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
-  /// Begins the selection of what `request` asks over `sides`: the walk seeded with the wants not answered by a run (and
-  /// the parents of commits a cut made whole) as wanted, and the common haves (and the commits a cut made whole, and the
-  /// wants a run answers) as had.
+  /// Begins the selection of what `request` asks over `sides`: when every want is a green head with
+  /// a precomputed reachability set and there are no haves, shallow cuts or depth-dependent filters,
+  /// answers directly from [`Graph::reached_set`] without walking commits or opening trees;
+  /// otherwise seeds the commit walk with the wants not answered by a run (and the parents of
+  /// commits a cut made whole) as wanted, and the common haves (and the commits a cut made whole,
+  /// and the wants a run answers) as had.
   pub(super) fn begin<S: Graph<Node = N, Green = G>>(
     graph: &S,
     asked: Asked,
@@ -249,23 +283,29 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     runs: Vec<Run<G>>,
     admission: &mut Admission,
   ) -> Result<Selecting<N, G>, Refusal> {
+    let reached_targets = Self::precomputed_targets(graph, &asked, &sides, admission)?;
     let mut paint = Paint::new();
-    let walked = sides
-      .wants
-      .iter()
-      .filter(|want| !sides.one_round.contains(want))
-      .chain(&sides.cut.wants);
-    for want in walked.filter_map(|node| commit_of(graph, *node)) {
-      paint.paint(graph, want, WANT, admission)?;
-    }
-    let had = sides
-      .common
-      .iter()
-      .chain(&sides.cut.haves)
-      .chain(&sides.one_round);
-    for have in had.filter_map(|node| commit_of(graph, *node)) {
-      paint.paint(graph, have, HAVE, admission)?;
-    }
+    let stage = if !reached_targets.is_empty() {
+      Stage::Reached { at: 0 }
+    } else {
+      let walked = sides
+        .wants
+        .iter()
+        .filter(|want| !sides.one_round.contains(want))
+        .chain(&sides.cut.wants);
+      for want in walked.filter_map(|node| commit_of(graph, *node)) {
+        paint.paint(graph, want, WANT, admission)?;
+      }
+      let had = sides
+        .common
+        .iter()
+        .chain(&sides.cut.haves)
+        .chain(&sides.one_round);
+      for have in had.filter_map(|node| commit_of(graph, *node)) {
+        paint.paint(graph, have, HAVE, admission)?;
+      }
+      Stage::Commits
+    };
     let depth_decides = asked
       .filter
       .as_ref()
@@ -274,13 +314,16 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       asked,
       sides,
       runs,
-      stage: Stage::Commits,
+      stage,
       paint,
       sent: Held::default(),
       held: Held::default(),
       mark: Vec::new(),
       mark_peak: Peak::default(),
       carried: RunsCarried::default(),
+      reached_targets,
+      gathered: Positions::new(),
+      gathered_charged: 0,
       chosen: Sets {
         objects: Held::default(),
         opened: if depth_decides {
@@ -299,7 +342,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
   }
 
   /// Does units of the selection until `spent` says the owner's quantum is spent, at least one: the objects chosen, as
-  /// runs, once the last is done; `None` while more are left.
+  /// runs, once the last is done; `None` while more are left or a read paused on a let-go pack window.
   pub(super) fn step<S: Graph<Node = N, Green = G>>(
     &mut self,
     graph: &S,
@@ -313,7 +356,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
           core::mem::take(&mut self.chosen.objects).into_positions(),
         ));
       }
-      if spent() {
+      if graph.is_waiting() || spent() {
         return Ok(None);
       }
     }
@@ -340,6 +383,9 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       return Ok(false);
     }
     match self.stage {
+      Stage::Reached { at } => self.step_reached(graph, at, admission, counters)?,
+      Stage::FilterReached { next } => self.step_filter_reached(graph, next, admission)?,
+      Stage::WantsReached { at } => self.step_wants_reached(graph, at, admission)?,
       Stage::Commits => {
         if !self.paint.step(
           graph,
@@ -367,19 +413,22 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       }
       Stage::Choose { next } => match self.sent.next_from(next) {
         Some(position) => {
-          self.stage = Stage::Choose {
-            next: position.saturating_add(1),
-          };
           if let Ok(commit) = N::try_from(position) {
-            if view.admits(Kind::Commit, 0, 0) {
-              self.chosen.objects.insert(commit, admission)?;
-            }
             if let Some(row) = graph.commit(commit) {
               self
                 .chosen
                 .root(graph, &view, row.tree, admission, counters)?;
+              if graph.is_waiting() {
+                return Ok(false);
+              }
+            }
+            if view.admits(Kind::Commit, 0, 0) {
+              self.chosen.objects.insert(commit, admission)?;
             }
           }
+          self.stage = Stage::Choose {
+            next: position.saturating_add(1),
+          };
         }
         None => self.stage = Stage::Wants { at: 0 },
       },
@@ -393,10 +442,13 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
           .find(|(_, want)| !self.sides.one_round.contains(want));
         match want {
           Some((past, want)) => {
+            self.chosen.want(graph, &view, *want, admission, counters)?;
+            if graph.is_waiting() {
+              return Ok(false);
+            }
             self.stage = Stage::Wants {
               at: at.saturating_add(past).saturating_add(1),
             };
-            self.chosen.want(graph, &view, *want, admission, counters)?;
           }
           None => {
             self.stage = if self.asked.include_tag {
@@ -411,6 +463,113 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       Stage::Done => return Ok(true),
     }
     Ok(false)
+  }
+
+  /// One unit of [`Stage::Reached`]: unions the next want's precomputed reachability set into
+  /// `self.gathered`, charging any growth to `admission`.
+  fn step_reached<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    at: usize,
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    let Some(target) = self.reached_targets.get(at) else {
+      if self.asked.filter.is_none() {
+        let gathered = core::mem::take(&mut self.gathered);
+        self.chosen.objects = Held::from_positions(gathered, admission)?;
+        self.stage = if self.asked.include_tag {
+          Stage::Carried { run: 0, version: 0 }
+        } else {
+          Stage::Done
+        };
+      } else {
+        self.stage = Stage::FilterReached { next: 0 };
+      }
+      return Ok(());
+    };
+    let (green, version) = (target.green, target.version);
+    if let Some(reached) = graph.reached_set(green, version) {
+      self.gathered = self.gathered.union(&reached);
+      let bytes = self.gathered.bytes();
+      if bytes > self.gathered_charged {
+        admission
+          .charge(bytes.saturating_sub(self.gathered_charged))
+          .map_err(Refusal::PastAdmission)?;
+        self.gathered_charged = bytes;
+      }
+    }
+    counters.reached = counters.reached.saturating_add(1);
+    self.stage = Stage::Reached {
+      at: at.saturating_add(1),
+    };
+    Ok(())
+  }
+
+  /// One unit of [`Stage::FilterReached`]: admits the next position in `self.gathered` that passes
+  /// the per-object filter.
+  fn step_filter_reached<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    next: u64,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let Some(position) = self.gathered.next_from(next) else {
+      self.gathered = Positions::new();
+      self.stage = Stage::WantsReached { at: 0 };
+      return Ok(());
+    };
+    if let Ok(node) = N::try_from(position) {
+      let kind = graph.kind(node);
+      let filter = self.asked.filter.as_ref();
+      let size = size_for(filter, graph, node, kind);
+      if filter.is_none_or(|filter| filter.admits(kind, size, 0)) {
+        self.chosen.objects.insert(node, admission)?;
+      }
+    }
+    self.stage = Stage::FilterReached {
+      next: position.saturating_add(1),
+    };
+    Ok(())
+  }
+
+  /// One unit of [`Stage::WantsReached`]: ensures each wanted tag chain, tree or blob is sent
+  /// regardless of the per-object filter (rule 4).
+  fn step_wants_reached<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    at: usize,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let Some(target) = self.reached_targets.get(at) else {
+      self.stage = if self.asked.include_tag {
+        Stage::Carried { run: 0, version: 0 }
+      } else {
+        Stage::Done
+      };
+      return Ok(());
+    };
+    let mut current = target.want;
+    loop {
+      match graph.kind(current) {
+        Kind::Tag => {
+          self.chosen.objects.insert(current, admission)?;
+          let Some(next) = graph.target(current) else {
+            break;
+          };
+          current = next;
+        }
+        Kind::Tree | Kind::Blob => {
+          self.chosen.objects.insert(current, admission)?;
+          break;
+        }
+        Kind::Commit => break,
+      }
+    }
+    self.stage = Stage::WantsReached {
+      at: at.saturating_add(1),
+    };
+    Ok(())
   }
 
   /// One unit of `include-tag`: a version of a run joined to what the runs carry, or a tag judged.
@@ -514,16 +673,70 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     self.mark_peak.reach::<N>(self.mark.len(), admission)
   }
 
+  /// Every want not answered by a run, paired with the `(green, version)` whose precomputed
+  /// reachability closure equals that want's closure, when the fast path applies: no common haves,
+  /// no shallow cuts, and no depth-dependent filter. Returns an empty list if any want lacks a
+  /// precomputed reachability set or the fast path does not apply.
+  fn precomputed_targets<S: Graph<Node = N, Green = G>>(
+    graph: &S,
+    asked: &Asked,
+    sides: &Sides<N>,
+    admission: &mut Admission,
+  ) -> Result<Vec<ReachedTarget<N, G>>, Refusal> {
+    if !sides.common.is_empty()
+      || !sides.cut.wants.is_empty()
+      || !sides.cut.haves.is_empty()
+      || !sides.cut.grafts.is_empty()
+      || !asked.filter.as_ref().is_none_or(Filter::is_per_object)
+    {
+      return Ok(Vec::new());
+    }
+    let mut targets = Vec::new();
+    for &want in sides
+      .wants
+      .iter()
+      .filter(|want| !sides.one_round.contains(want))
+    {
+      let Some((green, version)) = graph.reached_head(want) else {
+        return Ok(Vec::new());
+      };
+      targets.push(ReachedTarget {
+        want,
+        green,
+        version,
+      });
+    }
+    if !targets.is_empty() {
+      admission
+        .charge_items::<ReachedTarget<N, G>>(targets.len())
+        .map_err(Refusal::PastAdmission)?;
+    }
+    Ok(targets)
+  }
+
   /// Marks `node` held, and queues what a tree holds: a tree already held is skipped whole.
+  /// Reads the tree's entries before marking it held so a pause on a let-go pack window leaves
+  /// `self.mark` and `self.held` unchanged for in-place resumption.
   fn mark_one<S: Graph<Node = N, Green = G>>(
     &mut self,
     graph: &S,
     node: N,
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
-    if self.held.insert(node, admission)? && graph.kind(node) == Kind::Tree {
-      self.mark.extend(graph.entries(node));
+    if self.held.contains(node) {
+      return Ok(());
+    }
+    if graph.kind(node) == Kind::Tree {
+      let entries: Vec<N> = graph.entries(node).collect();
+      if graph.is_waiting() {
+        self.mark.push(node);
+        return Ok(());
+      }
+      self.held.insert(node, admission)?;
+      self.mark.extend(entries);
       self.mark_peak.reach::<N>(self.mark.len(), admission)?;
+    } else {
+      self.held.insert(node, admission)?;
     }
     Ok(())
   }
@@ -552,7 +765,15 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     let next = self.frames.last_mut().map(|frame| frame.entries.pop());
     match next {
       Some(Some((entry, name))) => match graph.kind(entry) {
-        Kind::Tree => self.enter(graph, view, patterns, entry, &name, admission, counters),
+        Kind::Tree => {
+          self.enter(graph, view, patterns, entry, &name, admission, counters)?;
+          if graph.is_waiting()
+            && let Some(frame) = self.frames.last_mut()
+          {
+            frame.entries.push((entry, name));
+          }
+          Ok(())
+        }
         Kind::Blob => self.blob(view, patterns, entry, &name, admission),
         Kind::Commit | Kind::Tag => Ok(()),
       },
@@ -584,6 +805,7 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
   }
 
   /// Opens `tree`, its entries met at `depth`: each one the filter admits chosen, each tree among them queued.
+  /// Reads entries before mutating `self.opened` so a pause on a let-go pack window leaves the walk unchanged.
   fn open_one<S: Graph<Node = N>>(
     &mut self,
     graph: &S,
@@ -603,6 +825,14 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     if opened_before {
       return Ok(());
     }
+    let entries: Vec<N> = graph
+      .entries(tree)
+      .filter(|entry| !view.held.contains(*entry))
+      .collect();
+    if graph.is_waiting() {
+      self.open.push((tree, depth));
+      return Ok(());
+    }
     match &mut self.opened {
       Opened::Once(opened) => {
         opened.insert(tree, admission)?;
@@ -614,10 +844,7 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       }
     }
     counters.trees = counters.trees.saturating_add(1);
-    for entry in graph
-      .entries(tree)
-      .filter(|entry| !view.held.contains(*entry))
-    {
+    for entry in entries {
       let kind = graph.kind(entry);
       let size = view.size_of(graph, entry, kind);
       if view.admits(kind, size, depth) {
@@ -690,6 +917,10 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     if view.held.contains(tree) || self.done.contains(tree) {
       return Ok(());
     }
+    let mut entries: Vec<(N, Vec<u8>)> = graph.named_entries(tree).collect();
+    if graph.is_waiting() {
+      return Ok(());
+    }
     let base = self.path.len();
     self.path.extend_from_slice(name);
     let inherited = self.frames.last().is_some_and(|frame| frame.matched);
@@ -699,7 +930,6 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       self.path.push(SLASH);
     }
     self.path_peak.reach::<u8>(self.path.len(), admission)?;
-    let mut entries: Vec<(N, Vec<u8>)> = graph.named_entries(tree).collect();
     let bytes = core::mem::size_of::<(N, Vec<u8>)>()
       .saturating_mul(entries.len())
       .saturating_add(entries.iter().map(|(_, name)| name.len()).sum())

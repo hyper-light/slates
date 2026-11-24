@@ -577,6 +577,18 @@ pub struct Repository {
   window: Window,
   levels: Levels,
   depth: Depth,
+  /// Count of committed objects stored whole outside a pack (e.g., VFS-authored commits rather than
+  /// pushed pack entries): zero when every object in the repository already has a packed entry that
+  /// A-859/A-864 streams reuse directly without duplicating the pack into in-RAM fragments.
+  unpacked_objects: u64,
+  /// Total bytes held by kept version fragments across all chains (content + placed + order + runs),
+  /// maintained incrementally in O(1) on `install`/`drop_fragments` so `kept_fragment_bytes()` never
+  /// scans all chains and versions per turn.
+  kept_fragment_bytes: u64,
+  /// Count of committed versions whose reach sets are neither recorded (`record.value.is_some()`)
+  /// nor memoized (`memo.values`), maintained incrementally in O(1) so `derivations_due()` never
+  /// walks all chains per turn.
+  undecided_derivations: Cell<usize>,
   /// The sets derived for versions admitted with no walk (A-614 amended), each held once by the memo, and for each
   /// commit a version whose sets are known peels to, that version: what a derivation searches back for its base. In a
   /// cell because a derivation's reader holds the repository to read (a fork a fetch serves from); a cache of values
@@ -617,6 +629,9 @@ impl Repository {
       window: Window::default(),
       levels: Levels::default(),
       depth: Depth::default(),
+      unpacked_objects: 0,
+      kept_fragment_bytes: 0,
+      undecided_derivations: Cell::new(0),
       memo: RefCell::new(Memo::default()),
     }
   }
@@ -1206,7 +1221,17 @@ impl Repository {
         .ok_or(StoreRefused::Missing { id: at })?;
       match place.kind() {
         Kind::Commit => return Ok(Some(at)),
-        Kind::Tag => at = self.tag_reference(store, &at, &place)?,
+        Kind::Tag => {
+          at = match &place {
+            Place::Indexed { row, .. } if row.tag_target.is_some() => {
+              let pos = row.tag_target.unwrap_or(0);
+              self
+                .id_at(store, pos)
+                .ok_or(StoreRefused::Missing { id: at })?
+            }
+            _ => self.tag_reference(store, &at, &place)?,
+          };
+        }
         Kind::Tree | Kind::Blob => return Ok(None),
       }
     }
@@ -1444,18 +1469,7 @@ impl Repository {
       return Err(refused);
     }
     self.landings.extend(landed);
-    if !positions.is_empty()
-      && let Some((pack, len)) = push.stored_pack()
-    {
-      self.packs.insert(pack, len);
-      self.largest = self.largest.max(push.largest());
-      let largest = self.packs.values().copied().max().unwrap_or(0);
-      self
-        .reading
-        .get_mut()
-        .recent()
-        .set_budget(usize::try_from(largest).unwrap_or(usize::MAX));
-    }
+    self.record_push_packs(push, positions.len());
     self.kinds.extend(
       kinds
         .into_iter()
@@ -1475,6 +1489,23 @@ impl Repository {
         })
       })
       .collect();
+    let added_undecided = chains.iter().fold(0_usize, |acc, (green, chain)| {
+      let old_len = self.chains.get(green).map_or(0, |old| old.versions.len());
+      let added = chain
+        .versions
+        .get(old_len..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|version| version.value.is_none())
+        .count();
+      acc.saturating_add(added)
+    });
+    self.undecided_derivations.set(
+      self
+        .undecided_derivations
+        .get()
+        .saturating_add(added_undecided),
+    );
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
@@ -1511,6 +1542,29 @@ impl Repository {
     // The push's objects read lately go with it, their charge given back (A-861).
     push.release_recent(store);
     Ok(versions)
+  }
+
+  /// Records the pack a committed push brought (adjusting the recent delta-base budget) and notes
+  /// whether any committed objects were stored outside a pack.
+  fn record_push_packs(&mut self, push: &Push, positions: usize) {
+    if positions == 0 {
+      return;
+    }
+    if let Some((pack, len)) = push.stored_pack() {
+      self.packs.insert(pack, len);
+      self.largest = self.largest.max(push.largest());
+      let largest = self.packs.values().copied().max().unwrap_or(0);
+      self
+        .reading
+        .get_mut()
+        .recent()
+        .set_budget(usize::try_from(largest).unwrap_or(usize::MAX));
+    } else {
+      self.unpacked_objects = self.unpacked_objects.saturating_add(to_u64(positions));
+    }
+    if push.has_loose() {
+      self.unpacked_objects = self.unpacked_objects.saturating_add(1);
+    }
   }
 
   /// Goal 93: each version `moves` committed (`versions`, in the same order) noted under its head in the holders' map,
@@ -2064,6 +2118,9 @@ impl Repository {
       window: self.window.clone(),
       levels: self.levels.clone(),
       depth: self.depth,
+      unpacked_objects: self.unpacked_objects,
+      kept_fragment_bytes: self.kept_fragment_bytes,
+      undecided_derivations: Cell::new(self.undecided_derivations.get()),
       memo: RefCell::new(self.memo.borrow().clone()),
     })
   }
@@ -2234,6 +2291,23 @@ type HeadMap = BTreeMap<u64, BTreeSet<u64>>;
 
 /// A tree's entries that are objects of this repository: name, whether a subtree, id.
 pub(super) type TreeEntries = BTreeMap<Vec<u8>, (bool, ObjectId)>;
+
+/// Total bytes a version's two kept fragments hold: their content in `store` plus placed entries,
+/// position-order indexes, and position/reference runs.
+fn fragments_footprint(store: &ContentStore, fragments: &Fragments) -> u64 {
+  [&fragments.objects, &fragments.blobs]
+    .into_iter()
+    .map(|kept| {
+      let content = store.len_of(&kept.content).unwrap_or(0);
+      content
+        .saturating_add(bytes(
+          kept.placed.len(),
+          PLACED_BYTES.saturating_add(ORDER_BYTES),
+        ))
+        .saturating_add(bytes(kept.runs, RUN_BYTES))
+    })
+    .fold(0u64, u64::saturating_add)
+}
 
 /// The slot of `green`'s version `version`'s fragments.
 fn fragments_slot(
@@ -2432,6 +2506,32 @@ impl Repository {
     Some(fragments.objects.len.saturating_add(fragments.blobs.len))
   }
 
+  /// Whether any committed object is stored whole outside a pack (requiring fragment encoding
+  /// rather than A-859/A-864 direct pack reuse).
+  pub fn has_unpacked_objects(&self) -> bool {
+    self.unpacked_objects > 0
+  }
+
+  /// Total bytes held by kept version fragments across all chains in O(1), equal to summing the
+  /// second element of [`Self::kept_fragments`].
+  pub fn kept_fragment_bytes(&self) -> u64 {
+    self.kept_fragment_bytes
+  }
+
+  /// Bytes held by `green`'s version `version`'s kept fragments in O(1); zero while not kept.
+  pub fn version_fragments_bytes(
+    &self,
+    store: &ContentStore,
+    (green, version): (u64, usize),
+  ) -> u64 {
+    self
+      .chains
+      .get(&green)
+      .and_then(|chain| chain.versions.get(version))
+      .and_then(|record| record.fragments.as_ref())
+      .map_or(0, |fragments| fragments_footprint(store, fragments))
+  }
+
   /// Every version whose fragments are kept, by green and then version, with the bytes dropping
   /// them gives back: their content and what their entries are charged (A-724 piece 4): what a repository over its memory share may drop, since a version
   /// whose fragments are gone is encoded again by the next fetch (A-718), as after a recovery.
@@ -2446,20 +2546,7 @@ impl Repository {
           .enumerate()
           .filter_map(move |(version, record)| {
             let fragments = record.fragments.as_ref()?;
-            let bytes = [&fragments.objects, &fragments.blobs]
-              .into_iter()
-              .map(|kept| {
-                let content = store.len_of(&kept.content).unwrap_or(0);
-                let runs = kept.runs;
-                content
-                  .saturating_add(bytes(
-                    kept.placed.len(),
-                    PLACED_BYTES.saturating_add(ORDER_BYTES),
-                  ))
-                  .saturating_add(bytes(runs, RUN_BYTES))
-              })
-              .fold(0u64, u64::saturating_add);
-            Some(((*green, version), bytes))
+            Some(((*green, version), fragments_footprint(store, fragments)))
           })
       })
       .collect()
@@ -2477,6 +2564,8 @@ impl Repository {
     else {
       return Ok(false);
     };
+    let dropped = fragments_footprint(store, &fragments);
+    self.kept_fragment_bytes = self.kept_fragment_bytes.saturating_sub(dropped);
     store.release(&fragments.objects.content)?;
     store.release(&fragments.blobs.content)?;
     self.recharge(store)?;
@@ -2568,6 +2657,7 @@ impl Repository {
     fragments: Fragments,
   ) -> Result<(), StoreRefused> {
     let contents = [fragments.objects.content, fragments.blobs.content];
+    let added = fragments_footprint(store, &fragments);
     self.count_entries(&fragments.objects.placed);
     self.count_entries(&fragments.blobs.placed);
     if let Some(kept) = fragments_slot(&mut self.chains, green, version) {
@@ -2582,6 +2672,7 @@ impl Repository {
       }
       return Err(refused);
     }
+    self.kept_fragment_bytes = self.kept_fragment_bytes.saturating_add(added);
     self.count(|counters| counters.fragments = counters.fragments.saturating_add(2));
     Ok(())
   }

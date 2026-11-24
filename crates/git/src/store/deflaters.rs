@@ -19,7 +19,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use flate2::{Compress, Compression};
+use flate2::{Compress, Compression, Decompress};
 
 /// The deflate states a thread made, took again and let go (the module doc, "Counted").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,6 +34,7 @@ pub struct DeflaterCounts {
 
 thread_local! {
   static KEPT: RefCell<Vec<Compress>> = const { RefCell::new(Vec::new()) };
+  static KEPT_INFLATERS: RefCell<Vec<Decompress>> = const { RefCell::new(Vec::new()) };
   static COUNTS: Cell<DeflaterCounts> = const {
     Cell::new(DeflaterCounts {
       made: 0,
@@ -117,9 +118,53 @@ pub fn take_counts() -> DeflaterCounts {
   COUNTS.with(|counts| counts.replace(DeflaterCounts::default()))
 }
 
-/// Drops the states this thread keeps (a shard gone idle); how many it dropped, counted.
+/// An inflate state taken from its thread's kept states, reset and given back when dropped: eliminates the ~64 KiB
+/// zlib allocation and zeroing on every inflated pack object (`packed::inflate_into`).
+pub(crate) struct Inflater {
+  decompress: Option<Decompress>,
+}
+
+/// An inflate state with a zlib header: one kept on this thread (already reset on return), or one made.
+pub(crate) fn inflater() -> Inflater {
+  let decompress = KEPT_INFLATERS
+    .with(|kept| kept.borrow_mut().pop())
+    .unwrap_or_else(|| Decompress::new(true));
+  Inflater {
+    decompress: Some(decompress),
+  }
+}
+
+impl Inflater {
+  /// Its state, to feed.
+  pub(crate) fn state(&mut self) -> Option<&mut Decompress> {
+    self.decompress.as_mut()
+  }
+}
+
+impl Drop for Inflater {
+  fn drop(&mut self) {
+    let Some(mut decompress) = self.decompress.take() else {
+      return;
+    };
+    decompress.reset(true);
+    let _ = KEPT_INFLATERS.try_with(|kept| {
+      if let Ok(mut kept) = kept.try_borrow_mut() {
+        kept.push(decompress);
+      }
+    });
+  }
+}
+
+/// Drops the deflate and inflate states this thread keeps (a shard gone idle); how many deflate states it dropped,
+/// counted.
 pub fn let_go() -> u64 {
   let dropped = KEPT.with(|kept| crate::to_u64(kept.take().len()));
+  let _ = KEPT_INFLATERS.try_with(|kept| {
+    if let Ok(mut kept) = kept.try_borrow_mut() {
+      kept.clear();
+      kept.shrink_to_fit();
+    }
+  });
   count(|counts| counts.dropped = counts.dropped.saturating_add(dropped));
   dropped
 }

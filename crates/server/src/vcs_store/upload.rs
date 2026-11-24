@@ -138,6 +138,14 @@ impl StoreLender for ShardStores {
     bring_back_within(waited).await.is_ok()
   }
 
+  async fn bring_back_tracked(
+    &mut self,
+    waited: slates_git::store::packed::Waited,
+    resident: &mut crate::vcs_http::git::upload::Resident,
+  ) -> bool {
+    brought_one(waited, resident, None).await
+  }
+
   fn let_go_behind(
     &mut self,
     resident: &mut crate::vcs_http::git::upload::Resident,
@@ -318,6 +326,7 @@ pub(crate) fn let_go_behind(
   resident: &mut crate::vcs_http::git::upload::Resident,
   next: Option<slates_git::store::packed::Waited>,
 ) {
+  let mut released = 0_u64;
   resident.retain(|brought| {
     // A window a read stopped at stays while the stream still reads the object it stopped for.
     let pinned = next.is_some() && brought.pinned == next;
@@ -328,9 +337,13 @@ pub(crate) fn let_go_behind(
     }
     if behind && super::let_go_read(state, &brought.window).is_ok() {
       state.count(LET_GO_BEHIND, 1);
+      released = released.saturating_add(1);
     }
     !behind
   });
+  if next.is_none() && released > 0 {
+    super::release_excess_extents(state);
+  }
 }
 
 /// Counter: a let-go window's bring-back that did not end within its patience, given up (A-864: main 01a20182's r29 and

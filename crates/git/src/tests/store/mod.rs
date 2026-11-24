@@ -402,10 +402,11 @@ fn commit_row() -> ObjectRow {
       generation: 4,
       parents: vec![1, 6],
     }),
+    tag_target: None,
   }
 }
 
-/// A-614, §4.17.2 item 2. Do: write a blob's row and a commit's, read them back, and read hostile payloads: cut, an
+/// A-614, §4.17.2 item 2. Do: write a blob's row, a tag's row (with and without target), and a commit's, read them back, and read hostile payloads: cut, an
 /// unknown type, a byte left over, a commit's part after a blob's type; then order keys. Expect: each row as written;
 /// every hostile payload refused; every object row's key before every position row's, and position rows in order.
 #[test]
@@ -413,6 +414,13 @@ fn an_object_row_reads_back_and_a_hostile_one_is_refused() {
   let blob_row = ObjectRow {
     kind: Kind::Blob,
     commit: None,
+    tag_target: None,
+    ..commit_row()
+  };
+  let tag_row = |target| ObjectRow {
+    kind: Kind::Tag,
+    commit: None,
+    tag_target: target,
     ..commit_row()
   };
   // A-864: a row of an object in a pack keeps its entry's place, raw length, CRC32 and base, a delta's and a whole one's.
@@ -428,6 +436,9 @@ fn an_object_row_reads_back_and_a_hostile_one_is_refused() {
   for row in [
     blob_row.clone(),
     commit_row(),
+    tag_row(None),
+    tag_row(Some(0)),
+    tag_row(Some(42)),
     in_pack(None),
     in_pack(Some(0)),
     in_pack(Some(9)),

@@ -622,3 +622,150 @@ fn an_entry_the_append_refused_for_its_own_reason_is_answered_in_git_words_with_
     Some(message(b"refs/heads/topic: past the shard's budget"))
   );
 }
+
+/// Goal 93 item 2b (A-864 push readers + P2 deferred delete): deleting a ref whose old value is
+/// an annotated tag pointing to a tag in a let-go window must pause in `prepare` (recording
+/// `away_seen`) so the driver brings the window back before `retire` peels it, and once peeled
+/// must reach `greens.read` so a green owing its P2 push enters the door before `retire` compares
+/// `green.head()`.
+#[test]
+fn deleting_a_tag_of_a_let_go_tag_waits_for_its_window_and_reaches_its_green() {
+  use crate::receive::works::{PushedBytes, Verdicts};
+  use crate::receive::{Command, Pushed, Repository as ReceiveRepository};
+  use slates_merge::pace::Slices;
+  use slates_merge::push::{ObjectKey, PushObjects, TreeEntry, Unavailable};
+  use std::borrow::Cow;
+  use std::cell::Cell;
+
+  struct AwayRepo {
+    inner_tag: (ObjectId, Vec<u8>),
+    outer_tag: (ObjectId, Vec<u8>),
+    inner_away: Cell<bool>,
+    away_offset: u64,
+    last_away: Cell<Option<u64>>,
+  }
+  impl ReceiveRepository for AwayRepo {
+    fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+      self.last_away.set(None);
+      if *id == self.outer_tag.0 {
+        return Some((Kind::Tag, &self.outer_tag.1));
+      }
+      if *id == self.inner_tag.0 {
+        if self.inner_away.get() {
+          self.last_away.set(Some(self.away_offset));
+          return None;
+        }
+        return Some((Kind::Tag, &self.inner_tag.1));
+      }
+      None
+    }
+    fn holds(&self, id: &ObjectId) -> bool {
+      *id == self.outer_tag.0 || *id == self.inner_tag.0
+    }
+    fn away(&self) -> Option<u64> {
+      self.last_away.get()
+    }
+  }
+  struct TrackingGreens {
+    green: Green,
+    read_hits: Cell<usize>,
+  }
+  impl Greens for TrackingGreens {
+    fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T> {
+      self.read_hits.set(self.read_hits.get() + 1);
+      (name == b"refs/tags/outer").then(|| {
+        with(GreenRead {
+          id: GREEN,
+          position: 1,
+          green: &self.green,
+        })
+      })
+    }
+    fn version_of(&self, _green: u64, _head: &ObjectId) -> Option<Version> {
+      None
+    }
+    fn base_of_create<T>(
+      &self,
+      _parent: Option<&ObjectId>,
+      _with: impl FnOnce(GreenRead<'_>, Version) -> T,
+    ) -> Option<T> {
+      None
+    }
+  }
+  struct NoObjects;
+  impl PushObjects for NoObjects {
+    fn tree(&self, _key: ObjectKey) -> Result<Vec<TreeEntry>, Unavailable> {
+      Err(Unavailable::Missing)
+    }
+    fn blob(&self, _key: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable> {
+      Err(Unavailable::Missing)
+    }
+    fn blob_len(&self, _key: ObjectKey) -> Result<u64, Unavailable> {
+      Err(Unavailable::Missing)
+    }
+  }
+  impl PushedBytes for NoObjects {
+    fn pushed_object(&self, _id: &ObjectId) -> Option<(Kind, Cow<'_, [u8]>)> {
+      None
+    }
+  }
+
+  let commit_id = id_of(Kind::Commit, &commit_text(id_of(Kind::Tree, b""), &[]));
+  let inner_bytes = format!(
+    "object {commit_id}\ntype commit\ntag inner\ntagger A <a@example.com> 1700000000 +0000\n\ninner\n"
+  )
+  .into_bytes();
+  let inner_id = id_of(Kind::Tag, &inner_bytes);
+  let outer_bytes = format!(
+    "object {inner_id}\ntype tag\ntag outer\ntagger A <a@example.com> 1700000001 +0000\n\nouter\n"
+  )
+  .into_bytes();
+  let outer_id = id_of(Kind::Tag, &outer_bytes);
+  let repo = AwayRepo {
+    inner_tag: (inner_id, inner_bytes),
+    outer_tag: (outer_id, outer_bytes),
+    inner_away: Cell::new(true),
+    away_offset: 4096,
+    last_away: Cell::new(None),
+  };
+  let greens = TrackingGreens {
+    green: Green::new(),
+    read_hits: Cell::new(0),
+  };
+  let command = Command {
+    old: outer_id,
+    new: zero(),
+    name: b"refs/tags/outer".to_vec(),
+  };
+  let pushed = Pushed::new(&[], None, &mut unbounded()).unwrap();
+  let mut preparing = None;
+  let env = slates_pace::Env {
+    clock: || 0,
+    quantum_ns: 1_000_000,
+    ceiling_ns: 1_000_000,
+    waiting: || false,
+    target_ppm: 0,
+  };
+  let slices = Slices {
+    copy_bytes: 1024,
+    hash_bytes: 1024,
+  };
+  let verdicts = Verdicts::new(&greens, &repo, &NoObjects, NAME, ROOM);
+  assert!(
+    !verdicts.prepare(&command, &pushed, &mut preparing, (0, env), slices),
+    "delete of tag-of-let-go-tag must pause in prepare so the window is brought back"
+  );
+  assert_eq!(verdicts.away_seen(), Some(4096));
+  // Once the window is resident (even if the inner tag's commit target is missing or present),
+  // bringing it back advances past the away window and reaches `greens.read` for the delete.
+  repo.inner_away.set(false);
+  let verdicts = Verdicts::new(&greens, &repo, &NoObjects, NAME, ROOM).peeled(verdicts.away_seen());
+  assert!(
+    verdicts.prepare(&command, &pushed, &mut preparing, (0, env), slices),
+    "once the away window is back, prepare completes for delete"
+  );
+  assert!(
+    greens.read_hits.get() >= 1,
+    "delete prepare must reach greens.read so an owing P2 green enters the door"
+  );
+}

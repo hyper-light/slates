@@ -371,16 +371,18 @@ where
     (began, env): (u64, slates_pace::Env),
     slices: Slices,
   ) -> bool {
-    // A delete builds nothing, nor does a create, whose push its green owes until first reached (P2). A create reaches
-    // the greens its verdict will read, so the owner can make any that owes its own push before the verdict reads it.
-    if command.is_delete() {
-      return true;
-    }
     // A-864's push readers (main 01a20182's r18: a push of a tag of a tag declined "an object it names cannot be read",
-    // the tag it names read from a pack let go): a peel of the new value whose read met a let-go window is not ready, so
-    // the push's driver brings the window back (`brought_back_waited`) and the command is prepared again, never declined.
+    // the tag it names read from a pack let go): a peel of the old or new value whose read met a let-go window is not
+    // ready, so the push's driver brings the window back (`brought_back_waited`) and the command is prepared again,
+    // never declined. Runs before `is_delete()` because `retire` peels `command.old` when checking `version_of`.
     if self.peel_away(command, pushed) {
       return false;
+    }
+    // A delete builds nothing, nor does a create, whose push its green owes until first reached (P2). Both reach the
+    // greens their verdict will read, so the owner can make any that owes its own push before the verdict reads it.
+    if command.is_delete() {
+      let _ = self.greens.read(&command.name, |_| ());
+      return true;
     }
     if command.is_create() {
       self.reach_create(command, pushed);
@@ -611,23 +613,26 @@ where
     })
   }
 
-  /// Whether `command`'s new value cannot yet be peeled to its tree because a read of the chain met a let-go window (the
-  /// repository names where, [`Repository::away`]): the window is to be brought back, not the ref declined.
+  /// Whether `command`'s old or new value cannot yet be peeled to its tree because a read of the chain met a let-go
+  /// window (the repository names where, [`Repository::away`]): the window is to be brought back, not the ref declined.
   /// The same window met again with nothing brought back between is not waited for: the command goes on to its refusal,
   /// so a window that cannot be brought back ends the push typed, never holds it.
   fn peel_away(&self, command: &Command, pushed: &Pushed<'_>) -> bool {
-    if self.tree_of(&command.new, pushed, &command.name).is_ok() {
-      self.away_seen.set(None);
-      return false;
+    for target in [&command.old, &command.new] {
+      if target.is_null() || self.tree_of(target, pushed, &command.name).is_ok() {
+        continue;
+      }
+      let Some(at) = self.repository.away() else {
+        continue;
+      };
+      if self.away_seen.get() == Some(at) {
+        return false;
+      }
+      self.away_seen.set(Some(at));
+      return true;
     }
-    let Some(at) = self.repository.away() else {
-      return false;
-    };
-    if self.away_seen.get() == Some(at) {
-      return false;
-    }
-    self.away_seen.set(Some(at));
-    true
+    self.away_seen.set(None);
+    false
   }
 
   /// The tree the object `head` names, as git peels a ref (A-836: a ref may name any object): a commit's; a tree itself;

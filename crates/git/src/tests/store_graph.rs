@@ -286,9 +286,34 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
   let Answer::Pack(pack) = &outcome.answer else {
     panic!("{:?}", outcome.answer)
   };
-  assert!(pack.runs.is_empty() && outcome.counters.walked > 0);
+  assert!(pack.runs.is_empty() && outcome.counters.reached == 1 && outcome.counters.walked == 0);
   let sent: BTreeSet<ObjectId> = pack.objects.iter().map(|node| graph.id(node)).collect();
   assert_eq!(sent, git_pack(FETCH_CLONE_RESPONSE, &served));
+  assert_eq!(graph.fault(), None);
+}
+
+/// Non-vacuity of the commit+tree walk path: wanting a non-head commit without haves falls back
+/// to the graph walk rather than the precomputed reachability fast path.
+#[test]
+fn a_non_head_want_walks_commits_and_trees() {
+  let served = served::served();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
+  let wants = [id(SECOND)];
+  let request = Request {
+    wants: &wants,
+    haves: &[],
+    done: true,
+    wait_for_done: false,
+    shallow: &[],
+    deepen: None,
+    filter: None,
+    sparse: None,
+    include_tag: false,
+    thin: true,
+  };
+  let outcome = negotiate(&graph, &request, &mut Admission::new(u64::MAX)).unwrap();
+  assert_eq!(outcome.counters.reached, 0);
+  assert!(outcome.counters.walked > 0);
   assert_eq!(graph.fault(), None);
 }
 
@@ -357,4 +382,123 @@ fn a_type_is_read_from_its_landing_with_no_row_read() {
   }
   assert_eq!(served.repository.index_visits(), before, "kinds read rows");
   assert_eq!(graph.fault(), None);
+}
+
+/// Oracle for the precomputed `reached_set` clone fast path: do negotiate fresh clones of the
+/// served repository's branch and tag heads across every per-object filter (`None`, `BlobNone`,
+/// `BlobLimit`, `ObjectType`, `Combine`) with and without `include-tag`, both with precomputed
+/// reachability sets and with a wrapper graph that disables `reached_head` (forcing the full
+/// commit+tree walk). Expect: byte-for-byte identical object sets on every combination, with
+/// `counters.reached > 0 && counters.walked == 0 && counters.trees == 0` on the fast path and
+/// `counters.reached == 0` on the walk oracle.
+#[test]
+fn reached_set_fast_path_matches_commit_and_tree_walk_across_all_per_object_filters() {
+  struct WalkOnly<'a>(&'a StoreGraph<'a>);
+  impl Graph for WalkOnly<'_> {
+    type Node = u64;
+    type Green = u64;
+    fn node(&self, id: &ObjectId) -> Option<u64> {
+      self.0.node(id)
+    }
+    fn id(&self, node: u64) -> ObjectId {
+      self.0.id(node)
+    }
+    fn kind(&self, node: u64) -> Kind {
+      self.0.kind(node)
+    }
+    fn commit(&self, node: u64) -> Option<crate::negotiation::CommitRow<u64>> {
+      self.0.commit(node)
+    }
+    fn parents(&self, commit: u64) -> impl Iterator<Item = u64> {
+      self.0.parents(commit)
+    }
+    fn entries(&self, tree: u64) -> impl Iterator<Item = u64> {
+      self.0.entries(tree)
+    }
+    fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {
+      self.0.named_entries(tree)
+    }
+    fn size(&self, blob: u64) -> u64 {
+      self.0.size(blob)
+    }
+    fn target(&self, tag: u64) -> Option<u64> {
+      self.0.target(tag)
+    }
+    fn tips(&self) -> impl Iterator<Item = u64> {
+      self.0.tips()
+    }
+    fn tags(&self) -> impl Iterator<Item = u64> {
+      self.0.tags()
+    }
+    fn greens_at(&self, head: u64) -> impl Iterator<Item = (u64, u64)> {
+      self.0.greens_at(head)
+    }
+    fn versions_at(&self, green: u64, head: u64) -> impl Iterator<Item = u64> {
+      self.0.versions_at(green, head)
+    }
+    fn fast_forward(&self, green: u64, version: u64) -> bool {
+      self.0.fast_forward(green, version)
+    }
+    fn brought(&self, green: u64, version: u64) -> impl Iterator<Item = u64> {
+      self.0.brought(green, version)
+    }
+  }
+
+  let served = served::served();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
+  let oracle = WalkOnly(&graph);
+  let want_sets: [&[ObjectId]; 3] = [&[id(THIRD)], &[id(TAG)], &[id(THIRD), id(TAG)]];
+  let filters: [Option<Filter>; 7] = [
+    None,
+    Some(Filter::BlobNone),
+    Some(Filter::BlobLimit(0)),
+    Some(Filter::BlobLimit(10)),
+    Some(Filter::ObjectType(Kind::Commit)),
+    Some(Filter::ObjectType(Kind::Tree)),
+    Some(Filter::Combine(vec![
+      Filter::BlobNone,
+      Filter::ObjectType(Kind::Tree),
+    ])),
+  ];
+  for wants in want_sets {
+    for filter in &filters {
+      for include_tag in [false, true] {
+        let request = Request {
+          wants,
+          haves: &[],
+          done: true,
+          wait_for_done: false,
+          shallow: &[],
+          deepen: None,
+          filter: filter.as_ref(),
+          sparse: None,
+          include_tag,
+          thin: true,
+        };
+        let fast = negotiate(&graph, &request, &mut Admission::new(u64::MAX)).unwrap();
+        let slow = negotiate(&oracle, &request, &mut Admission::new(u64::MAX)).unwrap();
+        assert_eq!(graph.fault(), None);
+        assert_eq!(
+          fast.counters.reached,
+          u64::try_from(wants.len()).unwrap(),
+          "fast path ran for wants={wants:?} filter={filter:?}"
+        );
+        assert_eq!(fast.counters.walked, 0);
+        assert_eq!(fast.counters.trees, 0);
+        assert_eq!(slow.counters.reached, 0);
+        let Answer::Pack(fast_pack) = fast.answer else {
+          panic!("expected pack on fast path");
+        };
+        let Answer::Pack(slow_pack) = slow.answer else {
+          panic!("expected pack on oracle path");
+        };
+        let fast_ids: BTreeSet<ObjectId> = fast_pack.objects.iter().map(|n| graph.id(n)).collect();
+        let slow_ids: BTreeSet<ObjectId> = slow_pack.objects.iter().map(|n| graph.id(n)).collect();
+        assert_eq!(
+          fast_ids, slow_ids,
+          "mismatch for wants={wants:?} filter={filter:?} include_tag={include_tag}"
+        );
+      }
+    }
+  }
 }

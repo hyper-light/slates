@@ -433,6 +433,10 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn target(&self, tag: u64) -> Option<u64> {
+    let (_, row) = self.row(tag)?;
+    if let Some(target) = row.tag_target {
+      return Some(target);
+    }
     self.named(tag).first().copied()
   }
 
@@ -527,6 +531,31 @@ impl Graph for StoreGraph<'_> {
       .filter(|(_, named)| named.name.starts_with(TAGS))
       .filter_map(|(at, named)| Some((at, self.chain(named.green).and_then(Chain::head)?)))
       .filter(|(_, head)| self.kind(*head) == Kind::Tag)
+  }
+
+  fn reached_head(&self, head: u64) -> Option<(u64, u64)> {
+    self.greens_at(head).find(|&(green, version)| {
+      usize::try_from(version)
+        .ok()
+        .and_then(|index| self.repository.value_of(green, index).ok().flatten())
+        .is_some()
+    })
+  }
+
+  fn reached_set(&self, green: u64, version: u64) -> Option<Positions> {
+    let index = usize::try_from(version).ok()?;
+    match self.repository.reached(self.store, green, index) {
+      Ok(positions) => Some(positions),
+      Err(StoreRefused::Deferred { .. } | StoreRefused::NoVersion { .. }) => None,
+      Err(refused) => {
+        self.failed(GraphFault::Store(refused));
+        None
+      }
+    }
+  }
+
+  fn is_waiting(&self) -> bool {
+    self.repository.peek_waiting().is_some()
   }
 }
 

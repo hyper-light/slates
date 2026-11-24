@@ -1999,16 +1999,10 @@ impl Judge for ServerJudge<'_> {
       return false;
     }
     if command.is_delete() {
-      // A delete builds nothing; it reads only its own green, made first if it owes its push (P2's door).
-      return match bound(self.state, self.record.id, &command.name)
-        .filter(|green| self.state.greens.is_owing(green))
-      {
-        Some(green) => self.door(green),
-        None => {
-          *self.door = None;
-          true
-        }
-      };
+      // A delete peels its old ref (in case it is a tag chain through a let-go pack, A-864) and reaches its own green
+      // so one owing its push enters P2's door before `retire` compares `green.head()`.
+      let began = slates_rt::futures::now_ns();
+      return self.build_turn(command, pushed, began);
     }
     let repository = self.record.id;
     let green = {
@@ -2579,9 +2573,14 @@ impl ShardGreens<'_, '_> {
     let mut target = *head;
     let mut row = git.repository.object(content, &target)?;
     while row.kind == Kind::Tag {
-      let (_, bytes) = self.indexed.object(&target)?;
-      let tag = Tag::parse(bytes, &mut Admission::new(u64::MAX)).ok()?;
-      target = tag.object(head.format())?;
+      target = match row.tag_target {
+        Some(pos) => git.repository.id_at(content, pos)?,
+        None => {
+          let (_, bytes) = self.indexed.object(&target)?;
+          let tag = Tag::parse(bytes, &mut Admission::new(u64::MAX)).ok()?;
+          tag.object(head.format())?
+        }
+      };
       row = git.repository.object(content, &target)?;
     }
     match row.kind {

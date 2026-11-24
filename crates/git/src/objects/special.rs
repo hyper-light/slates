@@ -129,6 +129,15 @@ fn looks_like_option(value: &[u8]) -> bool {
   value.starts_with(b"-")
 }
 
+/// Format: URI scheme delimiter `"://"` checked by Git's `check_submodule_url`.
+const SCHEME_SEPARATOR: &[u8] = b"://";
+
+/// Format: byte length of one RFC 3986 percent-encoded triple `%XX`.
+const PERCENT_ESCAPE_BYTES: usize = 3;
+
+/// Format: hexadecimal value of `'a'`/`'A'` in base 16.
+const HEX_ALPHA_VALUE: u8 = 10;
+
 /// Whether `url` is allowed as a submodule URL (`submodule.c`'s `check_submodule_url`, CVE-2020-5260 /
 /// CVE-2020-11008): not beginning with `-`, free of literal LF/CR/NUL, and (when carrying a `://` scheme) free of
 /// percent-encoded LF/CR/NUL (`%0a`, `%0d`, `%00`).
@@ -136,7 +145,11 @@ pub fn submodule_url_ok(url: &[u8]) -> bool {
   if looks_like_option(url) || url.iter().any(|b| matches!(*b, b'\n' | b'\r' | b'\0')) {
     return false;
   }
-  if url.windows(3).any(|window| window == b"://") && has_percent_encoded_control(url) {
+  if url
+    .windows(SCHEME_SEPARATOR.len())
+    .any(|window| window == SCHEME_SEPARATOR)
+    && has_percent_encoded_control(url)
+  {
     return false;
   }
   true
@@ -154,7 +167,7 @@ fn has_percent_encoded_control(url: &[u8]) -> bool {
       if matches!(decoded, b'\n' | b'\r' | b'\0') {
         return true;
       }
-      at = at.saturating_add(3);
+      at = at.saturating_add(PERCENT_ESCAPE_BYTES);
       continue;
     }
     at = at.saturating_add(1);
@@ -166,8 +179,8 @@ fn has_percent_encoded_control(url: &[u8]) -> bool {
 fn hex_nibble(byte: u8) -> Option<u8> {
   match byte {
     b'0'..=b'9' => Some(byte.saturating_sub(b'0')),
-    b'a'..=b'f' => Some(byte.saturating_sub(b'a').saturating_add(10)),
-    b'A'..=b'F' => Some(byte.saturating_sub(b'A').saturating_add(10)),
+    b'a'..=b'f' => Some(byte.saturating_sub(b'a').saturating_add(HEX_ALPHA_VALUE)),
+    b'A'..=b'F' => Some(byte.saturating_sub(b'A').saturating_add(HEX_ALPHA_VALUE)),
     _ => None,
   }
 }

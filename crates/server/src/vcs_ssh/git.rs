@@ -181,7 +181,13 @@ impl<L: StoreLender> UploadCommand<L> {
         Some(request) => self.serve_once(Asked::Request(request))?,
       };
       match away {
-        Some(waited) if last != Some(waited) && self.lender.bring_back(waited).await => {
+        Some(waited)
+          if last != Some(waited)
+            && self
+              .lender
+              .bring_back_tracked(waited, &mut self.resident)
+              .await =>
+        {
           last = Some(waited)
         }
         _ => return Ok(()),
@@ -190,8 +196,8 @@ impl<L: StoreLender> UploadCommand<L> {
   }
 
   /// A turn of an answer held for a let-go window its read met before its pack (A-864's readers): the window brought back
-  /// and the answer made again over the same generation within the same room, passing over what it wrote (A-855's rule);
-  /// the same window again with nothing written between, or one not brought back, gives up, the refusal answered typed.
+  /// and tracked in `self.resident` so it is released when the fetch ends; resumed in place when paused in `choosing`,
+  /// otherwise rebuilt over the same generation passing over what it wrote (A-855's rule).
   async fn read_through_held(
     &mut self,
     waited: slates_git::store::packed::Waited,
@@ -201,12 +207,18 @@ impl<L: StoreLender> UploadCommand<L> {
     };
     if self.last_away == Some(waited)
       || self.generation.is_none()
-      || !self.lender.bring_back(waited).await
+      || !self
+        .lender
+        .bring_back_tracked(waited, &mut self.resident)
+        .await
     {
       made.give_up();
       return Ok(());
     }
     self.last_away = Some(waited);
+    if made.resume_away() {
+      return Ok(());
+    }
     let skip = made.written();
     let mut again_room = Admission::new(self.admitted);
     let request = self.request.clone();
@@ -224,6 +236,7 @@ impl<L: StoreLender> UploadCommand<L> {
           packs,
           &mut again_room,
         )
+        .holding()
         .skip_written(skip)
       })
       .ok_or_else(unheld)?;
@@ -493,6 +506,14 @@ impl<L: StoreLender> UploadCommand<L> {
       consumed: 0,
       next: Next::Exited(0),
     })
+  }
+}
+
+impl<L: StoreLender> Drop for UploadCommand<L> {
+  fn drop(&mut self) {
+    if !self.resident.is_empty() {
+      self.lender.let_go_behind(&mut self.resident, None);
+    }
   }
 }
 

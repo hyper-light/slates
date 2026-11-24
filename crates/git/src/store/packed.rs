@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
-use flate2::{Decompress, FlushDecompress, Status};
+use flate2::{FlushDecompress, Status};
 use slates_vcs::{ContentId, ContentStore};
 
 use crate::admission::Admission;
@@ -679,7 +679,10 @@ fn inflate_into(
   out.clear();
   out.resize(size, 0);
   let at = link.entry.offset;
-  let mut inflater = Decompress::new(true);
+  let mut inflater_guard = super::deflaters::inflater();
+  let inflater = inflater_guard
+    .state()
+    .ok_or(PackedRefused::Inflate { at })?;
   let (mut filled, mut ended, mut failed) = (0usize, false, false);
   each_window_from(
     store,

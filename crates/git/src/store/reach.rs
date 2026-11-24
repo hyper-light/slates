@@ -56,18 +56,37 @@ use super::{Followed, Repository, StoreRefused, Version};
 use crate::object_name::ObjectId;
 use crate::store::{Positions, Push};
 
-/// Format: the type's name and its format's version (module docs: 3, each set a tree its value names); the window its
-/// trees are shaped by follows, eight bytes, big-endian.
-const TYPE_NAME: &[u8] = b"slates-git reach sets 3 ";
+/// Format: the type's name and its format's version (format 4: word-bitmap persistent tree with
+/// Roaring R/A/B leaves [A: Lemire, Kaser, Kurz 2016]); the window its trees are shaped by follows,
+/// eight bytes, big-endian.
+const TYPE_NAME: &[u8] = b"slates-git reach sets 4 ";
 
-/// Format: the bytes of a count of runs, and of a run's start and of its end, little-endian.
+/// Format: the bytes of a count or shape word, little-endian.
 const WORD_BYTES: usize = size_of::<u64>();
 
-/// Format: the bytes of one run: its start and its end.
-const RUN_BYTES: usize = size_of::<(u64, u64)>();
+/// Format: the bytes of one Roaring run-container pair: `(start: u16, last_inclusive: u16)`.
+const PAIR_BYTES: usize = size_of::<(u16, u16)>();
 
-/// Format: the first byte of a leaf's payload: the runs of one block of positions.
-const LEAF: u8 = b'L';
+/// Format: the bytes of one Roaring array-container element: `pos: u16`.
+const ELEM_BYTES: usize = size_of::<u16>();
+
+/// Format: the width of one `u16` Roaring container domain (`u16::MAX + 1 = 65_536`)
+/// [A: Lemire, Kaser, Kurz 2016, "Consistently faster and smaller compressed bitmaps with Roaring"].
+const MAX_BLOCK: u64 = (u16::MAX as u64) + 1;
+
+/// Derived: an inner node's word-bitmap fanout (`u64::BITS = 64`), so `rank_below` is a single
+/// machine-word `popcnt` and a leaf block of `WORD_FANOUT²` = 4,096 positions has a 512-byte max
+/// bitmap while providing high structural sharing across many refs.
+const WORD_FANOUT: u64 = u64::BITS as u64;
+
+/// Format: the first byte of a Roaring run-container leaf: `(start: u16, last_inclusive: u16)` pairs.
+const LEAF_RUN: u8 = b'R';
+
+/// Format: the first byte of a Roaring array-container leaf: sorted `u16` positions.
+const LEAF_ARRAY: u8 = b'A';
+
+/// Format: the first byte of a Roaring bitmap-container leaf: `block.div_ceil(8)` bit bytes.
+const LEAF_BITMAP: u8 = b'B';
 
 /// Format: the first byte of an inner node's payload: its level, then a bit for each child slot.
 const INNER: u8 = b'I';
@@ -88,30 +107,39 @@ const INNER_HEAD: usize = size_of::<(u8, u8)>();
 /// many slots a byte as a byte has bits.
 const SLOT_BITS: u64 = u8::BITS as u64;
 
-/// A set's tree's shape (module docs), derived from the store's window: the positions a leaf covers and the children an
-/// inner node names, each the most one window holds.
+/// A set's tree's shape (module docs), derived from the store's window and machine word width:
+/// the positions a leaf covers (at most `MAX_BLOCK`) and the children an inner node names (at most
+/// `WORD_FANOUT`, one `u64` bitmap word).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Shape {
-  /// Positions a leaf covers: two for each run a leaf of one window holds, so a block of positions each apart fits.
+  /// Positions a leaf covers: `fanout²` capped to what fits in `window` as a bitmap and in `u16`.
   pub(crate) block: u64,
-  /// Children an inner node names.
+  /// Children an inner node names: `WORD_FANOUT` when a word-fanout inner node fits `window`.
   pub(crate) fanout: u64,
 }
 
 impl Shape {
-  /// The shape for a store of `window`; `None` for a window too short for a leaf of one run or an inner node of two
-  /// children.
+  /// The shape for a store of `window`; `None` for a window too short for a leaf of two positions
+  /// or an inner node of two children.
   pub(crate) fn of(window: usize) -> Option<Shape> {
-    let leaf = encode_derived(&[], &[LEAF])?.len();
-    let runs = window.checked_sub(leaf)?.checked_div(RUN_BYTES)?;
-    let block = u64::try_from(runs).ok()?.checked_mul(2)?;
-    Shape::recorded(block, fanout_for(window)?)
+    let fanout = fanout_for(window)?.min(WORD_FANOUT);
+    let leaf_head = encode_derived(&[], &[LEAF_BITMAP])?.len();
+    let max_bitmap_bits = u64::try_from(window.checked_sub(leaf_head)?)
+      .ok()?
+      .checked_mul(SLOT_BITS)?;
+    let block = fanout
+      .checked_mul(fanout)?
+      .min(max_bitmap_bits)
+      .min(MAX_BLOCK)
+      & !1;
+    Shape::recorded(block, fanout)
   }
 
-  /// The shape a value records, as [`Shape::of`] makes one: a block of an even count of positions, at least two (a
-  /// leaf of at least one run), and at least two children a node; `None` for any other.
+  /// The shape a value records, as [`Shape::of`] makes one: a block of an even count of positions,
+  /// at least two and at most `MAX_BLOCK`, and at least two children a node; `None` for any other.
   fn recorded(block: u64, fanout: u64) -> Option<Shape> {
-    (block >= 2 && block.is_multiple_of(2) && fanout >= 2).then_some(Shape { block, fanout })
+    ((2..=MAX_BLOCK).contains(&block) && block.is_multiple_of(2) && fanout >= 2)
+      .then_some(Shape { block, fanout })
   }
 
   /// The least level whose node, from block 0, covers block `block`: the root's level of a set whose last block it is.
@@ -409,16 +437,25 @@ impl Builder<'_> {
     self.inner(level, &names, bitmap).map(Some)
   }
 
-  /// A leaf of the block from `start`: its runs, each relative to the block (module docs).
+  /// A leaf of the block from `start`: picks the strictly smallest canonical Roaring container
+  /// encoding (`LEAF_RUN`, `LEAF_ARRAY`, or `LEAF_BITMAP`, tie-broken R -> A -> B).
   fn leaf(&mut self, start: u64, runs: &[(u64, u64)]) -> Result<ContentId, ContentRefused> {
-    let mut payload = Vec::with_capacity(runs.len().saturating_mul(RUN_BYTES).saturating_add(1));
-    payload.push(LEAF);
-    for (run_start, run_end) in runs {
-      for at in [run_start, run_end] {
-        let relative = at.checked_sub(start).ok_or_else(exhausted)?;
-        payload.extend_from_slice(&relative.to_le_bytes());
-      }
-    }
+    let count = runs
+      .iter()
+      .try_fold(0_u64, |acc, &(s, e)| acc.checked_add(e.checked_sub(s)?))
+      .ok_or_else(exhausted)?;
+    let run_len = runs.len().saturating_mul(PAIR_BYTES);
+    let array_len = usize::try_from(count)
+      .unwrap_or(usize::MAX)
+      .saturating_mul(ELEM_BYTES);
+    let bmp_len = bitmap_bytes(self.shape.block).ok_or_else(exhausted)?;
+    let payload = if run_len <= array_len && run_len <= bmp_len {
+      encode_run_leaf(start, runs, run_len)?
+    } else if array_len <= bmp_len {
+      encode_array_leaf(start, runs, array_len)?
+    } else {
+      encode_bitmap_leaf(start, runs, bmp_len)?
+    };
     self.put(&[], &payload)
   }
 
@@ -531,7 +568,7 @@ fn tree_contains(
   loop {
     let node = store.derived(&id)?;
     match node.payload().split_first()? {
-      (&LEAF, runs) => {
+      (&tag @ (LEAF_RUN | LEAF_ARRAY | LEAF_BITMAP), payload) => {
         if expected.is_some_and(|level| level != 0) || node.names().next().is_some() {
           return None;
         }
@@ -539,7 +576,7 @@ fn tree_contains(
         return if rel >= shape.block {
           Some(false)
         } else {
-          leaf_contains(runs, rel)
+          leaf_contains(tag, payload, shape.block, rel)
         };
       }
       (&INNER, rest) => match inner_child(rest, node.names(), shape, expected, position, start)? {
@@ -583,8 +620,14 @@ fn inner_child(
   Some(Some((child, next_start, below)))
 }
 
-/// Number of marked slots strictly below `slot` in `bitmap`.
+/// Number of marked slots strictly below `slot` in `bitmap`. Uses a single-instruction `u64`
+/// `count_ones` fast path when the bitmap fits in one machine word (the production `F = 64` shape).
 fn rank_below(bitmap: &[u8], slot: u64) -> Option<usize> {
+  if let Ok(word_bytes) = <[u8; size_of::<u64>()]>::try_from(bitmap) {
+    let shift = u32::try_from(slot).ok()?;
+    let mask = 1_u64.checked_shl(shift)?.wrapping_sub(1);
+    return Some((u64::from_le_bytes(word_bytes) & mask).count_ones() as usize);
+  }
   let (byte, mask) = slot_place(slot)?;
   let before = bitmap.get(..byte)?.iter().fold(0_usize, |acc, b| {
     acc.saturating_add(b.count_ones() as usize)
@@ -594,9 +637,88 @@ fn rank_below(bitmap: &[u8], slot: u64) -> Option<usize> {
   Some(before.saturating_add(in_byte))
 }
 
-/// Whether the sorted, disjoint relative runs in `bytes` contain `rel`, found by binary search.
-fn leaf_contains(bytes: &[u8], rel: u64) -> Option<bool> {
-  let (pairs, left) = bytes.as_chunks::<RUN_BYTES>();
+/// Encodes `runs` relative to `start` as a `LEAF_RUN` payload (`(start: u16, last: u16)` pairs).
+fn encode_run_leaf(
+  start: u64,
+  runs: &[(u64, u64)],
+  body_len: usize,
+) -> Result<Vec<u8>, ContentRefused> {
+  let mut payload = Vec::with_capacity(body_len.saturating_add(1));
+  payload.push(LEAF_RUN);
+  for &(run_start, run_end) in runs {
+    let rel_start = u16::try_from(run_start.checked_sub(start).ok_or_else(exhausted)?)
+      .map_err(|_| exhausted())?;
+    let rel_last = u16::try_from(
+      run_end
+        .checked_sub(1)
+        .and_then(|last| last.checked_sub(start))
+        .ok_or_else(exhausted)?,
+    )
+    .map_err(|_| exhausted())?;
+    payload.extend_from_slice(&rel_start.to_le_bytes());
+    payload.extend_from_slice(&rel_last.to_le_bytes());
+  }
+  Ok(payload)
+}
+
+/// Encodes `runs` relative to `start` as a `LEAF_ARRAY` payload (sorted `u16` elements).
+fn encode_array_leaf(
+  start: u64,
+  runs: &[(u64, u64)],
+  body_len: usize,
+) -> Result<Vec<u8>, ContentRefused> {
+  let mut payload = Vec::with_capacity(body_len.saturating_add(1));
+  payload.push(LEAF_ARRAY);
+  for &(run_start, run_end) in runs {
+    let rel_start = run_start.checked_sub(start).ok_or_else(exhausted)?;
+    let rel_end = run_end.checked_sub(start).ok_or_else(exhausted)?;
+    for rel in rel_start..rel_end {
+      let pos = u16::try_from(rel).map_err(|_| exhausted())?;
+      payload.extend_from_slice(&pos.to_le_bytes());
+    }
+  }
+  Ok(payload)
+}
+
+/// Encodes `runs` relative to `start` as a `LEAF_BITMAP` payload (`bmp_len` bit bytes).
+fn encode_bitmap_leaf(
+  start: u64,
+  runs: &[(u64, u64)],
+  bmp_len: usize,
+) -> Result<Vec<u8>, ContentRefused> {
+  let mut payload = vec![0_u8; bmp_len.saturating_add(1)];
+  if let Some(first) = payload.first_mut() {
+    *first = LEAF_BITMAP;
+  }
+  let bits = payload.get_mut(1..).ok_or_else(exhausted)?;
+  for &(run_start, run_end) in runs {
+    let rel_start = run_start.checked_sub(start).ok_or_else(exhausted)?;
+    let rel_end = run_end.checked_sub(start).ok_or_else(exhausted)?;
+    for rel in rel_start..rel_end {
+      set_bit(bits, rel).ok_or_else(exhausted)?;
+    }
+  }
+  Ok(payload)
+}
+
+/// Whether a Roaring leaf (`tag`, `bytes`) of `block` positions contains `rel` (zero allocations).
+fn leaf_contains(tag: u8, bytes: &[u8], block: u64, rel: u64) -> Option<bool> {
+  match tag {
+    LEAF_RUN => run_leaf_contains(bytes, u16::try_from(rel).ok()?),
+    LEAF_ARRAY => array_leaf_contains(bytes, u16::try_from(rel).ok()?),
+    LEAF_BITMAP => {
+      if bytes.len() != bitmap_bytes(block)? {
+        return None;
+      }
+      bit(bytes, rel)
+    }
+    _ => None,
+  }
+}
+
+/// Binary search for `rel` in a `LEAF_RUN` payload of `(start: u16, last_inclusive: u16)` pairs.
+fn run_leaf_contains(bytes: &[u8], rel: u16) -> Option<bool> {
+  let (pairs, left) = bytes.as_chunks::<PAIR_BYTES>();
   if pairs.is_empty() || !left.is_empty() {
     return None;
   }
@@ -605,12 +727,34 @@ fn leaf_contains(bytes: &[u8], rel: u64) -> Option<bool> {
   while lo < hi {
     let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
     let pair = pairs.get(mid)?;
-    let (s, e) = pair.split_first_chunk::<WORD_BYTES>()?;
-    let run_start = u64::from_le_bytes(*s);
-    let run_end = u64::from_le_bytes(<[u8; WORD_BYTES]>::try_from(e).ok()?);
+    let (s, e) = pair.split_first_chunk::<ELEM_BYTES>()?;
+    let run_start = u16::from_le_bytes(*s);
+    let run_last = u16::from_le_bytes(<[u8; ELEM_BYTES]>::try_from(e).ok()?);
     if rel < run_start {
       hi = mid;
-    } else if rel >= run_end {
+    } else if rel > run_last {
+      lo = mid.saturating_add(1);
+    } else {
+      return Some(true);
+    }
+  }
+  Some(false)
+}
+
+/// Binary search for `rel` in a `LEAF_ARRAY` payload of sorted `u16` positions.
+fn array_leaf_contains(bytes: &[u8], rel: u16) -> Option<bool> {
+  let (elems, left) = bytes.as_chunks::<ELEM_BYTES>();
+  if elems.is_empty() || !left.is_empty() {
+    return None;
+  }
+  let mut lo = 0_usize;
+  let mut hi = elems.len();
+  while lo < hi {
+    let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+    let val = u16::from_le_bytes(*elems.get(mid)?);
+    if rel < val {
+      hi = mid;
+    } else if rel > val {
       lo = mid.saturating_add(1);
     } else {
       return Some(true);
@@ -648,9 +792,9 @@ fn relative(
   }
   let node = store.derived(&id)?;
   let read = match node.payload().split_first()? {
-    (&LEAF, runs) => (
+    (&tag @ (LEAF_RUN | LEAF_ARRAY | LEAF_BITMAP), payload) => (
       0,
-      leaf_runs(runs, shape.block, node.names().next().is_none())?,
+      leaf_runs(tag, payload, shape.block, node.names().next().is_none())?,
     ),
     (&INNER, rest) => {
       let (&level, bitmap) = rest.split_first()?;
@@ -665,20 +809,31 @@ fn relative(
   Some(read)
 }
 
-/// A leaf's runs: pairs of a start and an end, ascending with a gap between each two, none empty, within its block; a
-/// leaf names nothing.
-fn leaf_runs(bytes: &[u8], block: u64, names_nothing: bool) -> Option<Vec<(u64, u64)>> {
-  let (pairs, left) = bytes.as_chunks::<RUN_BYTES>();
-  if !names_nothing || pairs.is_empty() || !left.is_empty() {
+/// A Roaring leaf's runs, validated against `block` and non-emptiness; a leaf names no children.
+fn leaf_runs(tag: u8, bytes: &[u8], block: u64, names_nothing: bool) -> Option<Vec<(u64, u64)>> {
+  if !names_nothing {
+    return None;
+  }
+  match tag {
+    LEAF_RUN => run_leaf_runs(bytes, block),
+    LEAF_ARRAY => array_leaf_runs(bytes, block),
+    LEAF_BITMAP => bitmap_leaf_runs(bytes, block),
+    _ => None,
+  }
+}
+
+/// Decodes and validates a `LEAF_RUN` payload (`(start: u16, last_inclusive: u16)` pairs).
+fn run_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
+  let (pairs, left) = bytes.as_chunks::<PAIR_BYTES>();
+  if pairs.is_empty() || !left.is_empty() {
     return None;
   }
   let mut runs: Vec<(u64, u64)> = Vec::with_capacity(pairs.len());
   for pair in pairs {
-    let (start, end) = pair.split_first_chunk::<WORD_BYTES>()?;
-    let (start, end) = (
-      u64::from_le_bytes(*start),
-      u64::from_le_bytes(<[u8; WORD_BYTES]>::try_from(end).ok()?),
-    );
+    let (s, e) = pair.split_first_chunk::<ELEM_BYTES>()?;
+    let start = u64::from(u16::from_le_bytes(*s));
+    let end =
+      u64::from(u16::from_le_bytes(<[u8; ELEM_BYTES]>::try_from(e).ok()?)).checked_add(1)?;
     let after = runs.last().is_none_or(|(_, previous)| start > *previous);
     if start >= end || end > block || !after {
       return None;
@@ -686,6 +841,75 @@ fn leaf_runs(bytes: &[u8], block: u64, names_nothing: bool) -> Option<Vec<(u64, 
     runs.push((start, end));
   }
   Some(runs)
+}
+
+/// Decodes and validates a `LEAF_ARRAY` payload (strictly ascending `u16` elements), coalescing
+/// contiguous positions into runs.
+fn array_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
+  let (elems, left) = bytes.as_chunks::<ELEM_BYTES>();
+  if elems.is_empty() || !left.is_empty() {
+    return None;
+  }
+  let mut runs: Vec<(u64, u64)> = Vec::new();
+  let mut previous: Option<u64> = None;
+  for raw in elems {
+    let pos = u64::from(u16::from_le_bytes(*raw));
+    if pos >= block || previous.is_some_and(|prev| pos <= prev) {
+      return None;
+    }
+    previous = Some(pos);
+    let end = pos.checked_add(1)?;
+    match runs.last_mut() {
+      Some(last) if last.1 == pos => last.1 = end,
+      _ => runs.push((pos, end)),
+    }
+  }
+  Some(runs)
+}
+
+/// Decodes and validates a `LEAF_BITMAP` payload (`block.div_ceil(8)` bytes, non-empty, zero
+/// padding bits at or past `block`).
+fn bitmap_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
+  if bytes.len() != bitmap_bytes(block)? {
+    return None;
+  }
+  let rem = block.checked_rem(SLOT_BITS)?;
+  if rem != 0
+    && let Some(&last) = bytes.last()
+    && (last & !((1_u8.checked_shl(u32::try_from(rem).ok()?)?).wrapping_sub(1))) != 0
+  {
+    return None;
+  }
+  let mut runs: Vec<(u64, u64)> = Vec::new();
+  for (byte_idx, &byte) in bytes.iter().enumerate() {
+    if byte == 0 {
+      continue;
+    }
+    let base = u64::try_from(byte_idx).ok()?.checked_mul(SLOT_BITS)?;
+    append_byte_runs(&mut runs, base, byte)?;
+  }
+  (!runs.is_empty()).then_some(runs)
+}
+
+/// Appends the set-bit runs of `byte` at bit offset `base` to `runs`, joining adjacent runs.
+fn append_byte_runs(runs: &mut Vec<(u64, u64)>, base: u64, mut byte: u8) -> Option<()> {
+  while byte != 0 {
+    let tz = u64::from(byte.trailing_zeros());
+    let shifted = byte >> tz;
+    let ones = u64::from((!shifted).trailing_zeros());
+    let start = base.checked_add(tz)?;
+    let end = start.checked_add(ones)?;
+    match runs.last_mut() {
+      Some(last) if last.1 == start => last.1 = end,
+      _ => runs.push((start, end)),
+    }
+    byte = shifted
+      .checked_shr(u32::try_from(ones).ok()?)
+      .unwrap_or(0)
+      .checked_shl(u32::try_from(tz.saturating_add(ones)).ok()?)
+      .unwrap_or(0);
+  }
+  Some(())
 }
 
 /// An inner node's runs: each child's, of the level below, shifted to its slot, a run met at a slot's bound joined; the

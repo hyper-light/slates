@@ -140,6 +140,16 @@ pub(crate) trait StoreLender {
     false
   }
 
+  /// Brings back the let-go window `waited` names and records it in `resident` so it is let go
+  /// again once the fetch ends (or is dropped): defaults to [`Self::bring_back`].
+  async fn bring_back_tracked(
+    &mut self,
+    waited: slates_git::store::packed::Waited,
+    _resident: &mut Resident,
+  ) -> bool {
+    self.bring_back(waited).await
+  }
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
@@ -335,6 +345,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
       request,
       answer,
       generation,
+      resident,
       ..
     } = self;
     let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
@@ -351,7 +362,9 @@ impl<L: StoreLender> Exchange for Upload<L> {
           })
           .ok_or(unavailable)?;
         match away {
-          Some(waited) if last != Some(waited) && lender.bring_back(waited).await => {
+          Some(waited)
+            if last != Some(waited) && lender.bring_back_tracked(waited, resident).await =>
+          {
             last = Some(waited)
           }
           _ => break made,
@@ -381,7 +394,9 @@ impl<L: StoreLender> Exchange for Upload<L> {
           })
           .ok_or(unavailable)?;
         match away {
-          Some(waited) if last != Some(waited) && lender.bring_back(waited).await => {
+          Some(waited)
+            if last != Some(waited) && lender.bring_back_tracked(waited, resident).await =>
+          {
             last = Some(waited)
           }
           _ => break made,
@@ -477,12 +492,20 @@ async fn read_ahead_of<L: StoreLender>(
   }
 }
 
+impl<L: StoreLender> Drop for Upload<L> {
+  fn drop(&mut self) {
+    if !self.resident.is_empty() {
+      self.lender.let_go_behind(&mut self.resident, None);
+    }
+  }
+}
+
 impl<L: StoreLender> Upload<L> {
   /// A turn of an answer held for a let-go window its read met before its pack (A-864's readers; main 01a20182's r52):
-  /// the window brought back and the answer made again over the same generation within the same room, passing over what
-  /// it wrote ([`Answer::skip_written`]: the same answer byte for byte, A-855's rule), counted [`READ_THROUGH_AGAIN`].
-  /// The same window met again with nothing written between, or one that cannot be brought back, gives up: the refusal
-  /// answered as it was made, typed.
+  /// the window brought back and tracked in `self.resident` so it is released when the fetch ends;
+  /// when the negotiation paused in place, resumes it without restarting; otherwise rebuilds the
+  /// answer over the same generation passing over what it wrote ([`Answer::skip_written`]), counted
+  /// [`READ_THROUGH_AGAIN`].
   async fn read_through_held(
     &mut self,
     waited: slates_git::store::packed::Waited,
@@ -495,6 +518,7 @@ impl<L: StoreLender> Upload<L> {
       generation,
       admitted,
       admission,
+      resident,
       last_away,
       ..
     } = self;
@@ -505,11 +529,14 @@ impl<L: StoreLender> Upload<L> {
       made.give_up();
       return Ok(());
     };
-    if *last_away == Some(waited) || !lender.bring_back(waited).await {
+    if *last_away == Some(waited) || !lender.bring_back_tracked(waited, resident).await {
       made.give_up();
       return Ok(());
     }
     *last_away = Some(waited);
+    if made.resume_away() {
+      return Ok(());
+    }
     let skip = made.written();
     let mut again_room = Admission::new(*admitted);
     let again = lender

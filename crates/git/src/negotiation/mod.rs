@@ -119,6 +119,21 @@ pub trait Graph {
   fn tags_from(&self, from: usize) -> impl Iterator<Item = (usize, Self::Node)> {
     self.tags().enumerate().skip(from)
   }
+  /// A `(green, version)` whose head is `head` and whose precomputed reachability closure
+  /// ([`Graph::reached_set`]) is already available without walking trees; `None` otherwise.
+  fn reached_head(&self, _head: Self::Node) -> Option<(Self::Green, u64)> {
+    None
+  }
+  /// The full precomputed set of objects reachable from `green`'s version `version` (commits,
+  /// trees, blobs, and the head's tag chain), when available.
+  fn reached_set(&self, _green: Self::Green, _version: u64) -> Option<Positions> {
+    None
+  }
+  /// Whether the most recent read on this graph paused on a let-go pack window that the caller
+  /// must bring back before resuming the same unit in place.
+  fn is_waiting(&self) -> bool {
+    false
+  }
 }
 
 /// What a commit's row holds of what the negotiation reads (§4.17.2 "The repository in git's terms", item 2).
@@ -242,6 +257,8 @@ pub enum Answer<G, N> {
 pub struct Counters {
   /// Wants answered by a run of versions, in one round.
   pub one_round: u64,
+  /// Wants answered directly from a precomputed reachability set without walking commits or trees.
+  pub reached: u64,
   /// Commits the walk took from its queue.
   pub walked: u64,
   /// Commits the search for `ready` visited.
@@ -335,6 +352,20 @@ const WORD_BITS: u64 = u64::BITS as u64;
 const RUN_BYTES: u64 = (2 * core::mem::size_of::<u64>()) as u64;
 
 impl Held {
+  /// Constructs a `Held` directly from a precomputed `Positions`, charging its kept bytes to
+  /// `admission`.
+  pub(super) fn from_positions(
+    positions: Positions,
+    admission: &mut Admission,
+  ) -> Result<Held, Refusal> {
+    let bytes = positions.bytes();
+    admission.charge(bytes).map_err(Refusal::PastAdmission)?;
+    Ok(Held {
+      form: Form::Runs(positions),
+      charged: bytes,
+    })
+  }
+
   /// Adds `node`: whether it was not held, what the set costs past what was charged before charged now.
   pub(super) fn insert<N: Into<u64>>(
     &mut self,
@@ -416,7 +447,7 @@ impl Held {
   /// What the set costs in its form.
   fn bytes(&self) -> u64 {
     match &self.form {
-      Form::Runs(runs) => RUN_BYTES.saturating_mul(crate::to_u64(runs.runs())),
+      Form::Runs(runs) => runs.bytes(),
       Form::Bits { words, .. } => {
         crate::to_u64(core::mem::size_of::<u64>()).saturating_mul(crate::to_u64(words.len()))
       }

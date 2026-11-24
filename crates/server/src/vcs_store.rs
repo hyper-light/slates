@@ -2649,11 +2649,51 @@ pub(crate) fn let_go_owed(state: &mut ShardState, id: RepositoryId) {
 }
 
 /// Lets go of the landed packs repository `id` owes a let-go as a push of it ends (its `ReceivePack` dropped, its own
-/// intake still counted): where no other intake, no fetch and no encoding of it is under way; else the last of them to
+/// intake still counted): where no other intake, no fetch and no encoding of it is under way, also releases the
+/// repository's recent delta-base cache, kept zlib states, and any excess idle arena extents; else the last of them to
 /// end does, or its going idle.
 pub(crate) fn let_go_owed_as_push_ends(state: &mut ShardState, id: RepositoryId) {
-  if state.vcs_stores.landed_owed.contains_key(&id) && landed_let_go_may(state, id, 1) {
+  if !landed_let_go_may(state, id, 1) {
+    return;
+  }
+  if state.vcs_stores.landed_owed.contains_key(&id) {
     let_go_owed_now(state, id);
+  }
+  let_go_resident_packs(state, id, 1);
+  let recent = state.vcs_stores.git(id).map_or(0, |(content, store)| {
+    store.repository.let_go_recent(content)
+  });
+  if recent > 0 {
+    state.count(git_encode::GIVEN_BACK_IDLE, recent);
+  }
+  slates_git::store::deflaters::let_go();
+  upload::count_deflaters(state);
+  settle(state);
+  release_excess_extents(state);
+}
+
+/// Re-lets-go any landed pack of git repository `id` that still has resident windows in RAM (for example brought back
+/// by `git_derive`, `git_encode`, `ls-refs`, or a subsequent push's `peel_away`/thin-base read), once no fetch,
+/// encoding, or intake past `own` is active on `id`.
+pub(crate) fn let_go_resident_packs(state: &mut ShardState, id: RepositoryId, own: u64) {
+  if !LANDED_LET_GO || !landed_let_go_may(state, id, own) {
+    return;
+  }
+  #[cfg(test)]
+  if KEEP_LANDED.with(core::cell::Cell::get) {
+    return;
+  }
+  let resident: Vec<slates_vcs::ContentId> = match state.vcs_stores.git_ref(id) {
+    Some((content, store)) => store
+      .repository
+      .packs()
+      .map(|(pack, _)| pack)
+      .filter(|pack| content.has_resident_landed_window(pack))
+      .collect(),
+    None => Vec::new(),
+  };
+  for pack in resident {
+    let_go_sliced(state, pack);
   }
 }
 
@@ -3842,12 +3882,11 @@ async fn payload_bytes(
   (bytes.len() == whole).then_some(bytes)
 }
 
-/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held again (main 01a20182's order of
-/// 2026-11-23 after r18: with it on, a push of a tag of a let-go tag was declined by its peel's read, a shallow fetch
-/// over HTTP refused `Pack(Store(Unreadable))`, and git/git's HTTP mirror clone stalled; GAPS). One switch for every
-/// path that lets a landed pack go: a commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole
-/// ([`put_changeset`]).
-pub(crate) const LANDED_LET_GO: bool = false;
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): enabled so landed packs leave RAM on both
+/// the owner shard and the region home shard, brought back on demand from `--vcs-store` via `read_through`. One switch
+/// for every path that lets a landed pack go: a commit's ([`commit`]) and a recovery's or a rebuild's of the pack it
+/// read whole ([`put_changeset`]).
+pub(crate) const LANDED_LET_GO: bool = true;
 
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push

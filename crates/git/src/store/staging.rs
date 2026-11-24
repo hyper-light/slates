@@ -462,12 +462,20 @@ impl Repository {
       }),
       None => None,
     };
+    let tag_target = if kind == Kind::Tag {
+      push
+        .tag_target(&id)
+        .and_then(|target| self.position_of(store, positions, &target).ok())
+    } else {
+      None
+    };
     let row = ObjectRow {
       kind,
       len,
       position,
       pack,
       commit: self.commit_row(store, push, positions, &id, kind)?,
+      tag_target,
     };
     let key = rows::object_key(&id);
     let payload = rows::encode(&row);

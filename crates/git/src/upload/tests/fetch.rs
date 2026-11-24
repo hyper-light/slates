@@ -63,9 +63,12 @@ fn every_fetch_stock_git_answered_is_answered_with_its_sections_and_its_objects(
   }
 }
 
-/// A-640 part 2 (§4.17.2 "A fetch" item 2, the one round on a version head): do the fetch with `first` as its have, and
-/// the clone. Expect: the fetch's want answered in one round with no commit walked (the run of `main`'s versions 1 and
-/// 2), and the clone found by the walk.
+/// A-640 part 2 (§4.17.2 "A fetch" item 2): do the fetch with `first` as its have, the fresh clone
+/// of the current green head `third`, and a fetch of non-head `second` without haves. Expect: the
+/// incremental fetch answered in one round (`one_round == 1, walked == 0`); the fresh clone of a
+/// current green head answered directly from its precomputed reachability set (`reached == 1,
+/// walked == 0`); and a non-head want answered by the commit/tree walk (`one_round == 0,
+/// reached == 0, walked > 0`).
 #[test]
 fn a_client_versions_behind_is_answered_in_one_round_and_a_clone_by_the_walk() {
   let fixture = served::served();
@@ -74,7 +77,15 @@ fn a_client_versions_behind_is_answered_in_one_round_and_a_clone_by_the_walk() {
   assert_eq!((counters.one_round, counters.walked), (1, 0));
   let (_, clone) = answer_v2(&fixture, FETCH_CLONE_REQUEST);
   let counters = clone.counters().unwrap();
-  assert!(counters.one_round == 0 && counters.walked > 0);
+  assert_eq!(
+    (counters.one_round, counters.reached, counters.walked),
+    (0, 1, 0)
+  );
+  let want_second = format!("want {}", id(SECOND));
+  let non_head = command("fetch", &[want_second.as_bytes(), b"done"]);
+  let (_, walked) = answer_v2(&fixture, &non_head);
+  let counters = walked.counters().unwrap();
+  assert!(counters.one_round == 0 && counters.reached == 0 && counters.walked > 0);
 }
 
 /// A-640 part 2 (`sideband-all`; git's `fetch-uris` request, `sideband-all` and `packfile-uris https`): do send it.

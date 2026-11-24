@@ -197,6 +197,11 @@ pub struct Answer<K> {
   /// The refusal held: the answer stopped, nothing more written but git's keepalive, until its caller answers again in
   /// a wider room ([`Answer::skip_written`]) or gives up ([`Answer::give_up`]).
   held: Option<Held>,
+  /// A let-go pack window that paused an active `choosing` negotiation in place (without
+  /// discarding `choosing`): the caller brings back the window, calls [`Answer::resume_away`],
+  /// and continues stepping the same negotiation with zero restarts; [`Answer::give_up`] answers
+  /// the stored refusal if the window cannot be brought back.
+  paused_away: Option<(crate::store::packed::Waited, Refusal)>,
   /// The bytes of its head the client already has from an earlier answer to the same request, which this one passes
   /// over as it makes them (A-855: the answer made again is the same answer, byte for byte, under the generation both
   /// were made from).
@@ -324,6 +329,7 @@ impl<K> Answer<K> {
       choosing: None,
       holds: false,
       held: None,
+      paused_away: None,
       already: 0,
     }
   }
@@ -477,10 +483,25 @@ impl<K> Answer<K> {
     let Some(choosing) = self.choosing.as_mut() else {
       return;
     };
+    // Clear any prior wait before stepping so only a let-go window met by this step triggers a pause.
+    let _ = served.repository.waiting();
     let stepped = choosing
       .negotiating
       .step(&graph, admission, spent)
       .map_err(Refusal::Negotiation);
+    // If the negotiation paused cleanly on a let-go pack window, keep `self.choosing` in place so
+    // the caller can bring back that window and resume the exact unit rather than restarting from
+    // commit 0.
+    if let Ok(None) = stepped
+      && let Some(waited) = served.repository.waiting()
+    {
+      let refusal = graph.fault().map_or(
+        Refusal::Store(crate::store::GraphFault::NoRow { position: 0 }),
+        Refusal::Store,
+      );
+      self.paused_away = Some((waited, refusal));
+      return;
+    }
     let stepped = match graph.fault() {
       Some(fault) => Err(Refusal::Store(fault)),
       None => stepped,
@@ -778,13 +799,26 @@ impl<K> Answer<K> {
     })
   }
 
-  /// The let-go window a held refusal's read met (A-864's readers), if one is held for it: its caller brings it back and
-  /// makes the answer again ([`Answer::skip_written`]), or gives up.
+  /// The let-go window a held refusal's read met (A-864's readers), or that paused an active
+  /// negotiation in place, if one is waiting: its caller brings it back and calls
+  /// [`Answer::resume_away`] (when resumable in place) or makes the answer again
+  /// ([`Answer::skip_written`]), or gives up.
   pub fn held_away(&self) -> Option<crate::store::packed::Waited> {
+    if let Some((waited, _)) = self.paused_away {
+      return Some(waited);
+    }
     self.held.as_ref().and_then(|held| match held.cause {
       HeldFor::Away(waited) => Some(waited),
       HeldFor::Room(_) => None,
     })
+  }
+
+  /// Resumes a negotiation that paused in place on a let-go pack window once the caller has
+  /// brought that window back: returns `true` if resumed in place (no restart needed), `false`
+  /// if the refusal was held after discarding `choosing` and requires a rebuild via
+  /// [`Answer::skip_written`].
+  pub fn resume_away(&mut self) -> bool {
+    self.paused_away.take().is_some()
   }
 
   /// How many bytes of the answer are written: what an answer made again to the same request passes over
@@ -801,9 +835,22 @@ impl<K> Answer<K> {
     self
   }
 
-  /// Gives up a held refusal ([`Answer::holding`]): answered as it would have been had it not been held, its words
-  /// written next. Nothing when nothing is held.
+  /// Gives up a held refusal ([`Answer::holding`]) or an in-place paused wait: answered as it
+  /// would have been had it not been held, its words written next. Nothing when nothing is held.
   pub fn give_up(&mut self) {
+    if let Some((_, refusal)) = self.paused_away.take() {
+      self.holds = false;
+      let undecided = self
+        .choosing
+        .as_ref()
+        .is_some_and(|choosing| choosing.before.is_some());
+      if undecided {
+        self.refuse_before(refusal);
+      } else {
+        self.abandon(refusal);
+      }
+      return;
+    }
     let Some(held) = self.held.take() else {
       return;
     };
@@ -865,7 +912,7 @@ impl<K> Answer<K> {
     if self.head_written < self.head.len() {
       return Written::More;
     }
-    if self.held.is_some() {
+    if self.held.is_some() || self.paused_away.is_some() {
       return Written::More;
     }
     if self.choosing.is_some() {

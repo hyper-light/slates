@@ -242,6 +242,12 @@ impl EngineStats {
   }
 }
 
+/// Shape: number of compression engines tracked by [`CompressionLearner`].
+const ENGINE_SLOTS: usize = 4;
+
+/// Shape: dense slot index for [`Engine::Bzip2`] in [`CompressionLearner::engines`].
+const BZIP2_ENGINE_SLOT: usize = 3;
+
 /// Per-shard learned link price and per-engine compression measurements (§4.17.3 "Learned tunables").
 #[derive(Clone, Copy, Debug, Default)]
 struct CompressionLearner {
@@ -250,7 +256,7 @@ struct CompressionLearner {
   /// Measured wire bytes corresponding to `link_ns`.
   link_bytes: u64,
   /// Observed stats per engine, indexed by [`engine_slot`].
-  engines: [EngineStats; 4],
+  engines: [EngineStats; ENGINE_SLOTS],
 }
 
 /// Dense array slot for each [`Engine`].
@@ -259,7 +265,7 @@ const fn engine_slot(engine: Engine) -> usize {
     Engine::Uncompressed => 0,
     Engine::Zstd => 1,
     Engine::Zlib => 2,
-    Engine::Bzip2 => 3,
+    Engine::Bzip2 => BZIP2_ENGINE_SLOT,
   }
 }
 

@@ -325,38 +325,26 @@ fn turn_lent(
   (turned, kept)
 }
 
-/// The bytes repository `id`'s version at `at` keeps as its fragments (`Repository::kept_fragments`), once encoded.
+/// The bytes repository `id`'s version at `at` keeps as its fragments (`Repository::version_fragments_bytes`), once encoded.
 fn encoded_bytes(stores: &super::VcsStores, id: RepositoryId, at: Option<(u64, usize)>) -> u64 {
   let (Some(at), Some(content), Some(super::RepositoryStore::Git(store))) =
     (at, stores.content.as_ref(), stores.entries.get(&id))
   else {
     return 0;
   };
-  store
-    .repository
-    .kept_fragments(content)
-    .into_iter()
-    .find(|(version, _)| *version == at)
-    .map_or(0, |(_, bytes)| bytes)
+  store.repository.version_fragments_bytes(content, at)
 }
 
 /// Counter: a version's kept fragments dropped for its repository's overrun (A-724 piece 4). Format: a counter name.
 pub(crate) const DROPPED: &str = "vcs_store.git_encode.dropped";
 
-/// The bytes repository `id`'s kept fragments give back if dropped (`Repository::kept_fragments`): what of its holding
-/// is derived and can be made again (A-724 piece 4). Zero for a store not a git store held here.
+/// The bytes repository `id`'s kept fragments give back if dropped (`Repository::kept_fragment_bytes`): O(1), what of
+/// its holding is derived and can be made again (A-724 piece 4). Zero for a store not a git store held here.
 pub(crate) fn kept_bytes(state: &ShardState, id: RepositoryId) -> u64 {
-  let stores = &state.vcs_stores;
-  let (Some(content), Some(super::RepositoryStore::Git(store))) =
-    (stores.content.as_ref(), stores.entries.get(&id))
-  else {
-    return 0;
-  };
-  store
-    .repository
-    .kept_fragments(content)
-    .into_iter()
-    .fold(0u64, |total, (_, bytes)| total.saturating_add(bytes))
+  match state.vcs_stores.entries.get(&id) {
+    Some(super::RepositoryStore::Git(store)) => store.repository.kept_fragment_bytes(),
+    _ => 0,
+  }
 }
 
 /// Gives back up to `overrun` bytes of repository `id`'s kept fragments, chosen by §4.11's cost model at `pressure`
@@ -473,8 +461,10 @@ fn ahead_allowed(state: &mut ShardState, id: RepositoryId) -> bool {
 /// fragments past its learned grant given back by §4.11's cost model ([`relieve`]); counted [`GIVEN_BACK_IDLE`]. A
 /// repository with no grant learned yet keeps its fragments: nothing tells what they are worth.
 pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
-  // Goal 93 item 2b: the landed packs it owes a let-go, now that no fetch of it is answered (`vcs_store::let_go_owed`).
+  // Goal 93 item 2b: the landed packs it owes a let-go, and any landed pack windows brought back by reads
+  // (derivations, encodings, ls-refs tag peels), now that no fetch of it is answered.
   super::let_go_owed(state, id);
+  super::let_go_resident_packs(state, id, 0);
   let under_way = state
     .vcs_stores
     .encodings
@@ -538,9 +528,22 @@ async fn encode_ahead(id: RepositoryId) {
 
 /// A fetch's encoding (A-718 continued): repository `id`'s encoding turned a turn at a time, yielding between, for at most
 /// [`FETCH_WAIT_NS`]; past it the fetch answers, and a task finishes the encoding behind it ([`encode_behind`]).
+/// Skips pre-encoding when every object in the repository already lies packed (`!has_unpacked_objects`): A-859/A-864's
+/// streaming upload reuses those packed entries directly in pack order with bounded window look-ahead, avoiding
+/// duplicating landed packs into un-evictable in-RAM fragments or starving live fetches.
 pub(crate) async fn encode_for_fetch(id: RepositoryId) {
   #[cfg(test)]
   if NO_FETCH_WAIT.with(core::cell::Cell::get) {
+    return;
+  }
+  let needs_encode = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .git_ref(id)
+      .is_some_and(|(_, store)| store.repository.has_unpacked_objects())
+  })
+  .unwrap_or(false);
+  if !needs_encode {
     return;
   }
   encode_within(id, FETCH_WAIT_NS).await;

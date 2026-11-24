@@ -33,9 +33,9 @@ use crate::object_name::{Kind, ObjectFormat, ObjectId};
 
 use super::naming::kind_of;
 
-/// Format: the most bytes of an object row's payload but a commit's part: its type, its length and position, and an
-/// in-pack row's entry, four words (A-722's room; A-864).
-pub const OBJECT_PAYLOAD_BYTES: usize = 1 + 6 * WORD_BYTES;
+/// Format: the most bytes of an object row's payload but a commit's part: its type, its length and position, an
+/// in-pack row's entry (four words), and an annotated tag's target position (one word).
+pub const OBJECT_PAYLOAD_BYTES: usize = 1 + 7 * WORD_BYTES;
 
 /// Format: the bytes of a commit's part but its parents: three words and the parents' count.
 pub const COMMIT_PART_BYTES: usize = 3 * WORD_BYTES + COUNT_BYTES;
@@ -69,6 +69,10 @@ pub struct ObjectRow {
   pub pack: Option<PackedRow>,
   /// A commit's part; `None` for any other type.
   pub commit: Option<CommitRow>,
+  /// For an annotated tag (`Kind::Tag`), the position of the object it names; `None` for any other
+  /// type or a tag whose target is not indexed. Stored in the index row like `CommitRow` so ref
+  /// advertisements, `ls-refs --peel`, `include-tag`, and ref peels never inflate let-go pack data.
+  pub tag_target: Option<u64>,
 }
 
 /// What an object row keeps of its object's entry in the pack the row names (module docs; A-864).
@@ -140,6 +144,10 @@ pub fn encode(row: &ObjectRow) -> Vec<u8> {
       out.extend_from_slice(&parent.to_le_bytes());
     }
   }
+  if row.kind == Kind::Tag {
+    let target = row.tag_target.map_or(0, |pos| pos.saturating_add(1));
+    out.extend_from_slice(&target.to_le_bytes());
+  }
   out
 }
 
@@ -194,12 +202,18 @@ pub fn decode(payload: &[u8]) -> Option<ObjectRow> {
   } else {
     None
   };
+  let tag_target = if kind == Kind::Tag {
+    fields.word()?.checked_sub(1)
+  } else {
+    None
+  };
   fields.bytes.is_empty().then_some(ObjectRow {
     kind,
     len,
     position,
     pack,
     commit,
+    tag_target,
   })
 }
 

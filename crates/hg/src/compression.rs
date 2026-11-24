@@ -756,14 +756,39 @@ fn header_cut(engine: Engine, stream: &[u8]) -> StreamRefusal {
   }
 }
 
-/// zlib's decoder, through flate2 (RFC 1950).
-struct Zlib(ZlibDecompress);
+thread_local! {
+  /// Kept per-thread zlib inflate states (thread-per-core shard reuse, reset on return).
+  static KEPT_ZLIB_DECOMPRESS: core::cell::RefCell<Vec<ZlibDecompress>> =
+    const { core::cell::RefCell::new(Vec::new()) };
+  /// Kept per-thread zlib deflate states (thread-per-core shard reuse, reset on return).
+  static KEPT_ZLIB_COMPRESS: core::cell::RefCell<Vec<ZlibCompress>> =
+    const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// zlib's decoder, through flate2 (RFC 1950), reusing a kept per-thread inflate state.
+struct Zlib(Option<ZlibDecompress>);
 
 impl Zlib {
   /// A decoder, its window charged first.
   fn new(admission: &mut Admission) -> Result<Self, StreamRefusal> {
     charge(Engine::Zlib, ZLIB_WINDOW, admission)?;
-    Ok(Self(ZlibDecompress::new(true)))
+    let state = KEPT_ZLIB_DECOMPRESS
+      .with(|kept| kept.borrow_mut().pop())
+      .unwrap_or_else(|| ZlibDecompress::new(true));
+    Ok(Self(Some(state)))
+  }
+}
+
+impl Drop for Zlib {
+  fn drop(&mut self) {
+    if let Some(mut state) = self.0.take() {
+      state.reset(true);
+      let _ = KEPT_ZLIB_DECOMPRESS.try_with(|kept| {
+        if let Ok(mut kept) = kept.try_borrow_mut() {
+          kept.push(state);
+        }
+      });
+    }
   }
 }
 
@@ -773,9 +798,12 @@ impl Decoder for Zlib {
   }
 
   fn step(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Step, Fault> {
-    let before = self.0.total_in();
-    let status = self.0.decompress_vec(input, out, FlushDecompress::None);
-    let read = consumed(before, self.0.total_in());
+    let Some(decoder) = self.0.as_mut() else {
+      return Err(Fault::Corrupt("zlib decoder state already released"));
+    };
+    let before = decoder.total_in();
+    let status = decoder.decompress_vec(input, out, FlushDecompress::None);
+    let read = consumed(before, decoder.total_in());
     match status {
       Ok(ZlibStatus::StreamEnd) => Ok(Step { read, ended: true }),
       Ok(ZlibStatus::Ok | ZlibStatus::BufError) => Ok(Step { read, ended: false }),
@@ -1047,12 +1075,44 @@ fn stuck(engine: Engine) -> EncodeRefusal {
   }
 }
 
+/// Guard returning a reused per-thread zlib deflate state on drop.
+struct ZlibDeflater(Option<ZlibCompress>);
+
+impl ZlibDeflater {
+  /// Takes a kept deflate state set to `level`, or allocates a fresh one.
+  fn new(level: ZlibLevel) -> Self {
+    let kept = KEPT_ZLIB_COMPRESS.with(|kept| kept.borrow_mut().pop());
+    let encoder = match kept.map(|mut enc| enc.set_level(level).map(|()| enc)) {
+      Some(Ok(enc)) => enc,
+      _ => ZlibCompress::new(level, true),
+    };
+    Self(Some(encoder))
+  }
+}
+
+impl Drop for ZlibDeflater {
+  fn drop(&mut self) {
+    if let Some(mut encoder) = self.0.take() {
+      encoder.reset();
+      let _ = KEPT_ZLIB_COMPRESS.try_with(|kept| {
+        if let Ok(mut kept) = kept.try_borrow_mut() {
+          kept.push(encoder);
+        }
+      });
+    }
+  }
+}
+
 /// One zlib stream, through flate2: the input fed whole, then finished, so no backend's limit on one call's input
 /// ends the stream early.
 fn compress_zlib(level: i32, plain: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
   let engine = Engine::Zlib;
   let level = u32::try_from(level).map_err(|_| EncodeRefusal::Level { engine, level })?;
-  let mut encoder = ZlibCompress::new(ZlibLevel::new(level), true);
+  let mut guard = ZlibDeflater::new(ZlibLevel::new(level));
+  let encoder = guard.0.as_mut().ok_or(EncodeRefusal::Engine {
+    engine,
+    reason: "the zlib compressor state was already released",
+  })?;
   let mut read: usize = 0;
   loop {
     let rest = plain.get(read..).unwrap_or_default();

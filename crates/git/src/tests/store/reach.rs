@@ -291,13 +291,28 @@ fn t_a647_the_reach_type_refuses_by_kind() {
   );
 }
 
-/// A leaf of `runs`, each relative to its block, naming `names`, held once by the caller.
-fn leaf(store: &mut ContentStore, runs: &[(u64, u64)], names: &[ContentId]) -> ContentId {
-  let mut payload = b"L".to_vec();
-  for (start, end) in runs {
+/// A Roaring run-container leaf of `(start, last_inclusive)` pairs, naming `names`, held once by the caller.
+fn leaf(store: &mut ContentStore, runs: &[(u16, u16)], names: &[ContentId]) -> ContentId {
+  let mut payload = b"R".to_vec();
+  for (start, last) in runs {
     payload.extend(start.to_le_bytes());
-    payload.extend(end.to_le_bytes());
+    payload.extend(last.to_le_bytes());
   }
+  store.put_derived(names, &payload).unwrap().identity
+}
+
+/// A Roaring array-container leaf of `u16` positions, naming `names`, held once by the caller.
+fn array_leaf(store: &mut ContentStore, elems: &[u16], names: &[ContentId]) -> ContentId {
+  let mut payload = b"A".to_vec();
+  for pos in elems {
+    payload.extend(pos.to_le_bytes());
+  }
+  store.put_derived(names, &payload).unwrap().identity
+}
+
+/// A Roaring bitmap-container leaf of `bits` bytes, naming `names`, held once by the caller.
+fn bitmap_leaf(store: &mut ContentStore, bits: &[u8], names: &[ContentId]) -> ContentId {
+  let payload = [b"B".as_slice(), bits].concat();
   store.put_derived(names, &payload).unwrap().identity
 }
 
@@ -320,27 +335,31 @@ fn value(
   store.put_derived(names, &payload).unwrap().identity
 }
 
-/// A-647 parts 2 to 4, hostile values. Do: read, in a store of nodes made by hand with a shape of blocks of four
-/// positions and two children a node, a sound value (a reached set of two leaves under a node of level 1, D(k) a leaf),
-/// then values broken one way each: the value's own node (another tag, a bit past the two sets, a set its bits name
-/// missing or one more named, a block odd, a single child a node, a payload cut short), a leaf (runs out of order,
-/// touching, empty, past its block, a byte left over, a name), and an inner node (of level 0, a bitmap of another
-/// length, a bit past the children, a bit with no child, a child of another level, no child at all). Expect: the
-/// sound value reads back as its sets; every broken one is refused, never read past its end.
+/// A-647 parts 2 to 4, hostile values (Format 4 Roaring R/A/B leaves). Do: read, in a store of nodes
+/// made by hand with a shape of blocks of four positions and two children a node, sound values for
+/// run, array, and bitmap leaves, then values broken one way each. Expect: every sound value reads
+/// back identically via both `Sets::read` and `Sets::reached_contains`; every broken one is refused.
 #[test]
 fn t_a647_a_hostile_reach_value_is_refused() {
   let mut store = store();
   let shape = (4, 2);
   let (low, high) = (
-    leaf(&mut store, &[(0, 2)], &[]),
-    leaf(&mut store, &[(1, 3)], &[]),
+    leaf(&mut store, &[(0, 1)], &[]),
+    array_leaf(&mut store, &[1, 2], &[]),
   );
   let tree = inner(&mut store, 1, &[0b11], &[low, high]);
-  let one = leaf(&mut store, &[(1, 2)], &[]);
+  let one = bitmap_leaf(&mut store, &[0b0010], &[]);
   let sound = value(&mut store, &[tree, one], 3, shape);
   let sets = Sets::read(&store, &sound).unwrap();
   assert_eq!(sets.reached.iter().collect::<Vec<_>>(), [0, 1, 5, 6]);
   assert_eq!(sets.brought.iter().collect::<Vec<_>>(), [1]);
+  for pos in 0..8 {
+    assert_eq!(
+      Sets::reached_contains(&store, &sound, pos),
+      Some(sets.reached.contains(pos)),
+      "reached_contains({pos})"
+    );
+  }
   let mut tagged = value(&mut store, &[tree, one], 3, shape);
   let payload = store.derived(&tagged).unwrap().payload().to_vec();
   tagged = store
@@ -352,12 +371,26 @@ fn t_a647_a_hostile_reach_value_is_refused() {
     .unwrap()
     .identity;
   let leaves = [
-    leaf(&mut store, &[(2, 3), (0, 1)], &[]),
-    leaf(&mut store, &[(0, 1), (1, 2)], &[]),
-    leaf(&mut store, &[(1, 1)], &[]),
-    leaf(&mut store, &[(0, 5)], &[]),
-    store.put_derived(&[], b"L\x01").unwrap().identity,
-    leaf(&mut store, &[(0, 1)], &[one]),
+    // Run leaf: out of order, touching, inverted, past block, trailing byte, naming child, empty.
+    leaf(&mut store, &[(2, 2), (0, 0)], &[]),
+    leaf(&mut store, &[(0, 0), (1, 1)], &[]),
+    leaf(&mut store, &[(2, 1)], &[]),
+    leaf(&mut store, &[(0, 4)], &[]),
+    store.put_derived(&[], b"R\x01").unwrap().identity,
+    leaf(&mut store, &[(0, 0)], &[one]),
+    store.put_derived(&[], b"R").unwrap().identity,
+    // Array leaf: duplicate, descending, past block, trailing byte, naming child, empty.
+    array_leaf(&mut store, &[1, 1], &[]),
+    array_leaf(&mut store, &[2, 1], &[]),
+    array_leaf(&mut store, &[4], &[]),
+    store.put_derived(&[], b"A\x01").unwrap().identity,
+    array_leaf(&mut store, &[0], &[one]),
+    store.put_derived(&[], b"A").unwrap().identity,
+    // Bitmap leaf: empty bits, padding bit past block=4, wrong length, naming child.
+    bitmap_leaf(&mut store, &[0], &[]),
+    bitmap_leaf(&mut store, &[0b0001_0001], &[]),
+    bitmap_leaf(&mut store, &[0b0001, 0], &[]),
+    bitmap_leaf(&mut store, &[0b0001], &[one]),
   ];
   let inners = [
     inner(&mut store, 0, &[0b1], &[low]),
@@ -374,6 +407,7 @@ fn t_a647_a_hostile_reach_value_is_refused() {
     value(&mut store, &[tree, one], 1, shape),
     value(&mut store, &[tree, one], 3, (3, 2)),
     value(&mut store, &[tree, one], 3, (4, 1)),
+    value(&mut store, &[tree, one], 3, (65_538, 2)),
     short,
   ];
   for node in leaves.into_iter().chain(inners) {

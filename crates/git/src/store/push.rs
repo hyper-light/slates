@@ -166,6 +166,9 @@ pub struct Push {
   format: ObjectFormat,
   quarantine: Quarantine,
   commits: BTreeMap<ObjectId, Arrived>,
+  /// Each admitted annotated tag's target object id, by tag id: stored in the tag's `ObjectRow` at
+  /// staging time so peeling never inflates pack data after let-go.
+  tags: BTreeMap<ObjectId, ObjectId>,
   /// The parents the held commits name, all together: what their rows' parts take beside their count
   /// ([`Push::commit_parts`], `Repository::stage_room`), kept as each commit arrives so no step of a push's decision
   /// counts them again (it did, every step: git/git's whole history, about 75,000 commits, decided at about 0.5 ms a
@@ -204,6 +207,7 @@ impl Push {
       format,
       quarantine: Quarantine::new(),
       commits: BTreeMap::new(),
+      tags: BTreeMap::new(),
       parents_held: 0,
       sealed: false,
       deepest: 0,
@@ -249,6 +253,8 @@ impl Push {
     if incoming.kind == Kind::Commit && admitted == Admitted::New {
       let room = store.room();
       self.read_commit(id, incoming.content, room)?;
+    } else if incoming.kind == Kind::Tag && admitted == Admitted::New {
+      self.read_tag(id, incoming.content, store.room());
     }
     self.sealed = false;
     self.deepest = self.deepest.max(incoming.depth);
@@ -295,6 +301,8 @@ impl Push {
       .map_err(|_| PushRefused::Content(ContentRefused::CountExhausted))?;
     if incoming.kind == Kind::Commit {
       self.read_commit(id, incoming.content, store.room())?;
+    } else if incoming.kind == Kind::Tag {
+      self.read_tag(id, incoming.content, store.room());
     }
     self.largest = self.largest.max(len);
     self.placed.insert(
@@ -407,6 +415,25 @@ impl Push {
       }
     }
     Ok(new)
+  }
+
+  /// Records an admitted annotated tag's target object id when it parses cleanly.
+  fn read_tag(&mut self, id: ObjectId, content: &[u8], room: u64) {
+    if let Ok(tag) = crate::objects::tag::Tag::parse(content, &mut Admission::new(room))
+      && let Some(target) = tag.object(self.format)
+    {
+      self.tags.insert(id, target);
+    }
+  }
+
+  /// The target object id of an admitted annotated tag, if parsed at admission.
+  pub(crate) fn tag_target(&self, id: &ObjectId) -> Option<ObjectId> {
+    self.tags.get(id).copied()
+  }
+
+  /// Whether this push holds any object admitted loose (outside a pack) in its quarantine.
+  pub(crate) fn has_loose(&self) -> bool {
+    !self.quarantine.is_empty()
   }
 
   /// Reads a commit's tree, parents and committer's date, within an admission of the store's room.

@@ -1458,6 +1458,22 @@ impl ContentStore {
     )
   }
 
+  /// Whether any window of the object `identity` names is currently resident in storage and marked
+  /// landed (i.e. was brought back from the node's store and can be let go again on idle).
+  pub fn has_resident_landed_window(&self, identity: &ContentId) -> bool {
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      let resolved = self.resolve(&window);
+      if let Some(held) = self.entries.get(&resolved)
+        && held.landed
+        && matches!(held.kept, Kept::Stored { .. })
+      {
+        return true;
+      }
+    }
+    false
+  }
+
   /// The store's read count at the last read of the content `identity` names (0 for none since it was kept): the
   /// coldest of a repository's windows is the one with the least ([`ContentStore::let_go`]'s caller orders by it).
   pub fn last_read(&self, identity: &ContentId) -> Option<u64> {

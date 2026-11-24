@@ -532,10 +532,10 @@ struct ShapeEntry {
   shape: Shape,
 }
 
-/// Standard 64-bit FNV-1a offset basis (IETF draft-eastlake-fnv).
+/// Format: standard 64-bit FNV-1a offset basis (IETF draft-eastlake-fnv).
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
-/// Standard 64-bit FNV-1a prime (IETF draft-eastlake-fnv).
+/// Format: standard 64-bit FNV-1a prime (IETF draft-eastlake-fnv).
 const FNV1A_PRIME: u64 = 0x0100_0000_01b3;
 
 /// Empty slot sentinel in [`PathTable`].

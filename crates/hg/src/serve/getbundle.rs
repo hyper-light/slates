@@ -534,24 +534,26 @@ fn write_stream2_head(
 ) -> Result<(), Refusal> {
   let bytecount = crate::decimal::Decimal::unsigned(bytecount);
   let filecount = crate::decimal::Decimal::unsigned(filecount);
+  let params = vec![
+    Param {
+      key: b"bytecount",
+      value: bytecount.as_bytes(),
+    },
+    Param {
+      key: b"filecount",
+      value: filecount.as_bytes(),
+    },
+    Param {
+      key: b"requirements",
+      value: crate::render::STREAM2_REQUIREMENTS,
+    },
+  ];
+  let mandatory_params = params.len();
   let part = Part {
     kind: b"STREAM2",
     id: 0,
-    params: vec![
-      Param {
-        key: b"bytecount",
-        value: bytecount.as_bytes(),
-      },
-      Param {
-        key: b"filecount",
-        value: filecount.as_bytes(),
-      },
-      Param {
-        key: b"requirements",
-        value: crate::render::STREAM2_REQUIREMENTS,
-      },
-    ],
-    mandatory_params: 3,
+    params,
+    mandatory_params,
     depth: 0,
   };
   let mut head = Vec::new();

@@ -403,6 +403,11 @@ impl Repository {
   }
 
   /// One object of `walk` (`Repository::walk`'s loop body): whether more remain.
+  ///
+  /// Reads the object's references before mutating `walk.seen`, `walk.indexed` or `walk.new`,
+  /// pushing `id` back onto `walk.pending` if a read fails (for instance, on a let-go pack
+  /// window). That leaves `walk` unchanged so an incremental derivation can resume in place
+  /// once the window is brought back instead of restarting from the version's head.
   pub(super) fn walk_unit(
     &self,
     store: &ContentStore,
@@ -412,17 +417,32 @@ impl Repository {
     let Some(id) = walk.pending.pop() else {
       return Ok(false);
     };
-    if !walk.seen.insert(id) {
+    if walk.seen.contains(&id) {
       return Ok(true);
     }
-    let place = self
-      .locate(store, push, &id)
-      .ok_or(StoreRefused::Missing { id })?;
-    match &place {
-      Place::Indexed { row, .. } if walk.stop.contains(row.position) => {
-        self.met_reached(row.kind);
-        return Ok(true);
+    let place = match self.locate(store, push, &id) {
+      Some(place) => place,
+      None => {
+        walk.pending.push(id);
+        return Err(StoreRefused::Missing { id });
       }
+    };
+    if let Place::Indexed { row, .. } = &place
+      && walk.stop.contains(row.position)
+    {
+      walk.seen.insert(id);
+      self.met_reached(row.kind);
+      return Ok(true);
+    }
+    let references = match self.references(store, push, &id, &place) {
+      Ok(references) => references,
+      Err(refused) => {
+        walk.pending.push(id);
+        return Err(refused);
+      }
+    };
+    walk.seen.insert(id);
+    match &place {
       Place::Indexed { row, .. } => walk.indexed.push(row.position),
       Place::Pushed { .. } => {
         walk.new.push(id);
@@ -430,9 +450,7 @@ impl Repository {
       }
     }
     self.count(|counters| counters.walked = counters.walked.saturating_add(1));
-    walk
-      .pending
-      .extend(self.references(store, push, &id, &place)?);
+    walk.pending.extend(references);
     Ok(true)
   }
 
