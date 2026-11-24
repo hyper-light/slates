@@ -678,3 +678,11 @@
   (made_ns 14.2/17.3 ms, 877/1,468 slices). Main runs the v3 gate (GitHub, before bbe4a27e0 vs after d72b7324b,
   3 release + 2 debug). On green: merge main, rerun focused, push HEAD:main. Then (iii) Repository::plan head-map clone +
   footprint walk (O(G) a push), then B1 (~/.cache/w-git-b1-wip.patch) / B2, pack shape vs stock, LANDED_LET_GO.
+- 2026-11-23 ~22:30: A-886 LANDED b157eacd1 (gate 2: after 4/5, before 0/5; the fifth fails at :438 push 0 in both
+  arms, older than A-886). Push-0 disconnect: 4 local debug runs back to back pass (macOS); not ports (pid*7 blocks far
+  apart); load-shaped on CI's 2nd debug run. Edge failure logging (connection failed / reply failed / body refused,
+  with cause) landing now so gate 3 names it. QUEUE (main's order): push-0 disconnect -> git commit-alone sites
+  (commits.rs Before::Unmade, record_and_commit Err committed anyway, make_owed; made_commit::commit_held with w-svn's
+  guard-then-apply, A-888) -> speed (interop round a51b627f5 big Studio, stock daemon/http-backend/slates: push
+  11.5/13.1/87.8 s, clone 10.9/10.6/149.4 s, partial 6.2/6.6/73.3 s, incremental fetch 4 of 5 runs ~2.2 s; RSS 1.3 GiB
+  after push, 2.9 GiB end): clone first, then partial, then push; with pack shape vs stock, (iii), B1/B2.
