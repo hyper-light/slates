@@ -3530,7 +3530,7 @@ async fn replay_hg_sliced(
           let _ = with_released(state, more);
           return Some(Err(ReplayRefused::Unlanded));
         };
-        state.count(HG_REPLAY_TEXTS_ASKED, asked);
+        count_asked(state, asked);
         replay = more;
       }
       Ok(HgStep::Stepped(None) | HgStep::Begun(_)) => return Some(Ok(())),
@@ -3556,14 +3556,29 @@ enum HgStep {
 /// reads. Format: a counter name in the status report.
 pub(crate) const HG_REPLAY_TEXTS_ASKED: &str = "vcs_store.hg_replay_texts_asked";
 
+/// Counter: the changesets' texts and the manifests' and file revisions' rows a Mercurial replay asked of the node's
+/// changeset store for identities its content store never knew (A-636 part 2c-2; main 01a20182's ruling of 2026-11-24
+/// 12:25: a takeover's successor makes the store again over a content store that never held them), apart from those let
+/// go once landed ([`HG_REPLAY_TEXTS_ASKED`]). Format: a counter name in the status report.
+pub(crate) const HG_REPLAY_UNKNOWN_ASKED: &str = "vcs_store.hg_replay_unknown_asked";
+
+/// Counts what [`replay_answered`] answered: `(asked, unknown)`, the texts asked and those of them for identities the
+/// store never knew.
+fn count_asked(state: &mut ShardState, (asked, unknown): (u64, u64)) {
+  state.count(HG_REPLAY_TEXTS_ASKED, asked.saturating_sub(unknown));
+  state.count(HG_REPLAY_UNKNOWN_ASKED, unknown);
+}
+
 /// Answers `replay`'s ask of the node's changeset store (`Replay::store_wants`) over `disk`: the texts it asked, counted
-/// by its first want (their rows); none where the store did not answer.
+/// by its first want (their rows), and those of them for identities the content store never knew; none where the store
+/// did not answer.
 async fn replay_answered(
   disk: &slates_store::owner::StoreHandle,
   id: RepositoryId,
   replay: &mut slates_hg::import::record::Replay,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
   let repository = u128::from_be_bytes(id.bytes);
+  let unknown = replay.asked_unknown();
   let wants = replay.store_wants()?;
   let asked = match wants.wants() {
     Some(slates_hg::render::Want::Rows { logs }) => logs.iter().fold(0_u64, |asked, (_, nodes)| {
@@ -3573,7 +3588,7 @@ async fn replay_answered(
   };
   hg_view::answer_wants_over(disk, repository, wants)
     .await
-    .then_some(asked)
+    .then_some((asked, unknown))
 }
 
 /// [`replay_hg_sliced`]'s one unit over the shard's state (its type's docs): the record's steps taken under one lend
@@ -4567,7 +4582,7 @@ async fn replay_hg_run(
             let _ = with_released(state, more);
             return Err(ReplayRefused::Unlanded);
           };
-          state.count(HG_REPLAY_TEXTS_ASKED, asked);
+          count_asked(state, asked);
           replay = Some(more);
         }
         HgStep::Stepped(None) => break,
@@ -4608,8 +4623,7 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
         Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => replay = Some(begun),
         Some(Ok(HgStep::Asked(mut more))) => match replay_answered(&disk, id, &mut more).await {
           Some(asked) => {
-            crate::state::with_state(|state| state.count(HG_REPLAY_TEXTS_ASKED, asked))
-              .unwrap_or_default();
+            crate::state::with_state(|state| count_asked(state, asked)).unwrap_or_default();
             replay = Some(more);
           }
           None => {
@@ -5510,8 +5524,7 @@ async fn record_unit(
       };
       match replay_answered(&disk, id, &mut more).await {
         Some(asked) => {
-          crate::state::with_state(|state| state.count(HG_REPLAY_TEXTS_ASKED, asked))
-            .unwrap_or_default();
+          crate::state::with_state(|state| count_asked(state, asked)).unwrap_or_default();
           *replay = Some(more);
           Unit::More
         }
