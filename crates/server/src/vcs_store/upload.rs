@@ -220,8 +220,10 @@ pub(crate) async fn read_ahead(
   reads: crate::vcs_http::git::upload::PackReads,
   resident: &mut crate::vcs_http::git::upload::Resident,
 ) {
+  // The window a read stopped at is pinned to the object under way (`Brought::pinned`): its read may need it wherever
+  // it lies.
   if let Some(stopped) = reads.stopped
-    && brought_one(stopped, resident).await
+    && brought_one(stopped, resident, reads.next).await
   {
     let _ = crate::state::with_state_counted(|state| state.count(STOPPED_BROUGHT, 1));
   }
@@ -246,7 +248,7 @@ pub(crate) async fn read_ahead(
   .unwrap_or_default();
   let mut windows = 0_u64;
   for waited in away {
-    if brought_one(waited, resident).await {
+    if brought_one(waited, resident, None).await {
       windows = windows.saturating_add(1);
     }
   }
@@ -259,6 +261,9 @@ pub(crate) async fn read_ahead(
 /// Format: the most windows one fetch's answer held brought back at once (A-864 piece 3: a turn's look-ahead and the
 /// window it stopped at, never its pack's). Format: a counter name, a peak, not a sum.
 pub(crate) const PEAK_WINDOWS: &str = "vcs_store.git_resident.peak_windows";
+/// Counter: windows a fetch's read stopped at, held past a let-go behind its cursor because the stream still reads the
+/// object they were brought back for (`Brought::pinned`; goal 93, r130). Format: a counter name.
+pub(crate) const PINNED_HELD: &str = "vcs_store.git_resident.pinned_held";
 /// Counter: windows a fetch brought back and let go again once its cursor passed them (A-864 piece 3). Format: a counter
 /// name.
 pub(crate) const LET_GO_BEHIND: &str = "vcs_store.git_resident.let_go_behind";
@@ -268,6 +273,7 @@ pub(crate) const LET_GO_BEHIND: &str = "vcs_store.git_resident.let_go_behind";
 async fn brought_one(
   waited: slates_git::store::packed::Waited,
   resident: &mut crate::vcs_http::git::upload::Resident,
+  pinned: Option<slates_git::store::packed::Waited>,
 ) -> bool {
   let window = crate::state::with_state(|state| {
     state
@@ -285,6 +291,7 @@ async fn brought_one(
         pack: waited.pack,
         end: start.saturating_add(len),
         window,
+        pinned,
       });
       true
     }
@@ -312,7 +319,13 @@ pub(crate) fn let_go_behind(
   next: Option<slates_git::store::packed::Waited>,
 ) {
   resident.retain(|brought| {
-    let behind = next.is_none_or(|next| next.pack != brought.pack || brought.end <= next.offset);
+    // A window a read stopped at stays while the stream still reads the object it stopped for.
+    let pinned = next.is_some() && brought.pinned == next;
+    let behind =
+      !pinned && next.is_none_or(|next| next.pack != brought.pack || brought.end <= next.offset);
+    if pinned {
+      state.count(PINNED_HELD, 1);
+    }
     if behind && super::let_go_read(state, &brought.window).is_ok() {
       state.count(LET_GO_BEHIND, 1);
     }
