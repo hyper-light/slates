@@ -1124,12 +1124,16 @@
 >   its segment was `min(max_chunks, page)` records, so a shard's first chunk made 2.2 MB of records at a 16 KiB page.
 >   Held by `slates-vfs`'s `tests/chunk_records_heap.rs` (red 2,228,320 bytes, now 8,800). Owed: main's AC-0.4
 >   provisioning A/B on a quiet Studio.
-> - The memory status test's content hold row depends on where the work was computed. OPEN (w-perf, 2026-11-23,
->   main's (2)). `memory_gauges::a_memory_status_names_its_holders_and_a_plain_one_none` asserts
->   `mem.gauge.held.content_manifests`, which exists only when the submit's increment was held at compose, on a holder
->   (`work_home.rs`, `hold_composed_inputs`). Under a counting allocator installed for the library's tests it failed 4
->   of 4, and the probe read `merge.inputs.carried_in_entry=1` and no manifest held: the increment rode its chain entry.
->   Owed: a red pinning each placement, and the test asserting what the product guarantees in both.
+> - The memory status test read its content hold before a checkpoint taken in turns had ended. FIXED (w-perf,
+>   2026-11-23, main's (2)). `memory_gauges::a_memory_status_names_its_holders_and_a_plain_one_none` asserts
+>   `mem.gauge.held.content_manifests`, the green's checkpoint held. A checkpoint is taken in the submit's step only when
+>   its work fits the step's quantum, a measured time; otherwise a task takes it in turns, and the test read the status
+>   in the submit's step. Under a counting allocator installed for the library's tests it failed 4 of 4. Probe:
+>   `merge.checkpoint.in_turns=1` and no manifest held, where passing runs read `merge.checkpoint.taken=1` and one held.
+>   Both carried the increment in its entry (`merge.inputs.carried_in_entry=1`), so where the work was computed is not
+>   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
+>   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
+>   turns, and once as the budget falls.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
