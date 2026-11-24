@@ -219,6 +219,16 @@
 > stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
 > unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
 > served on its own task. Red first (`a907_...`).
+> **OPEN, FOR ADA (w-shared, 2026-11-24; main 01a20182's ruling of 14:54): must a rolling upgrade keep NoLoss across a
+> merge-record format change?** A holder refuses a merge record of another format whole (`MergeRecordValue::decode_record`,
+> `RecordRefused::Version`, counted `merge.record.version_refused`; CLAUDE.md §2 item 7: no second decode path). After an
+> upgrade it therefore cannot rebuild a replica from the old-format records it holds (`merge_origin::rebuild_replica_through`
+> finds nothing), and the owner reships only versions not yet placed. Until each green's next version places at f + 1 in
+> the new format, its acknowledged versions are held only on the owner's own chain, and an owner lost for good in that
+> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 4: A-255, A-288,
+> A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
+> format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
+> Nothing is built on either answer.
 > **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
 > creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
 > (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
