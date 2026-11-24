@@ -1375,7 +1375,8 @@
 > escaped one said 29 for 25 bytes). Swept: the served view and the index frame a block with its markers against the
 > row's length (`indexed.rs`, `index.rs` `framed_text`), and the intake and the work's own texts split through
 > `filerev::split`; this was the one count off.
-> **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). IN FLIGHT.**
+> **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). BUILT
+> (P5, 2026-11-24): an import's and a push's changelog and manifest texts leave the content store once landed.**
 > - 2a BUILT (2026-11-22, w-hg): the read-through. `slates_merge::push::Unavailable::NotYet`, a blob the store holds
 >   but has not at hand: the sliced build (`Building`) takes the unit that read it again once its owner fetched it
 >   (`Building::waiting`); the posting's file reads are taken again, a one-call `build` is refused with it. Mercurial's
@@ -1395,7 +1396,7 @@
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
-> - IN FLIGHT, the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
+> - BUILT (P5), the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
 >   pieces): the changelog's and the manifests' texts off the content store too, read through the store as file texts
 >   are.
 >   In five pieces (main's ruling of 2026-11-23 20:53: readers first, the let-go switched on last, P5; no manifest
@@ -1417,7 +1418,19 @@
 >   with nothing behind it, the held verdict's preview (a branch whose head is its version 1, `Lineage::preview`) read at
 >   the green's own versions; every made-changeset test submitted once, which hid it
 >   (`a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset`). Next: the commit-alone reds with w-svn's
->   `commit_held` guard (A-891), then P5.
+>   `commit_held` guard (A-891), then P5. P5 BUILT (2026-11-24, w-hg): the let-go switched on. The import notes each
+>   changeset's text and manifest's row object under `CHANGELOG_PATH` and `MANIFEST_PATH`, the intake keeps every
+>   log's contents for its segment, and `hg_run` lets them go once the push commits or the import lands, never before.
+>   A reader finding one not at hand reads its whole text from the node's changeset store and is given it in its
+>   object's place (`IndexHeld::with_given`, `HgIndex::revision_text_over`), so no delta chain is brought back link by
+>   link: a work's layout (`hg_push::log_text_read`, `vcs.hg.push_work_log_texts_read`), a made changeset's parent
+>   (`hg_made::parent_texts_read`, `vcs.hg.made_parent_texts_read`) and a named file's resolution
+>   (`hg_named::resolve_at`, `vcs.hg.named_log_texts_read`); a bring-back of a deep chain had looped `NotAtHand`. A
+>   push's asks are counted, the parent manifest's read-back apart (`vcs.hg.push_log_texts_asked`,
+>   `vcs.hg.push_previous_manifests_asked`, each with its most for one push). Held by
+>   `landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify` (an import and a push
+>   in two: every changelog and manifest object let go before and after a clone and a pull, each changegroup verified
+>   by the push's own verifier; red: 10 and 14 held). Owed: stock 7.2's clone, pull and verify (main's `hg_interop`).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty

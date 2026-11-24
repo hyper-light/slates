@@ -12,8 +12,9 @@
 //! version it read, the changeset its root's head attribute names (`slates_merge::push::HEAD_ATTRIBUTE`). That
 //! changeset's text names its manifest, and the manifest names the path's file revision, found by halving its sorted
 //! lines (`slates_hg::manifest::find`). Each path of a parked set is found in one read of the one manifest. A
-//! changeset's or a manifest's text let go itself comes back first through the same bring-back by its log's name
-//! (`hg_push::bring_back` with `CHANGELOG_PATH` or `MANIFEST_PATH`), never a side read. Main chose this over a record
+//! changeset's or a manifest's text let go itself (goal 93, C1 (1)) is read whole from the node's changeset store by its
+//! log's name (`CHANGELOG_PATH` or `MANIFEST_PATH`, `hg_push::log_text_read`) and given to the resolution in its
+//! object's place, so a manifest's delta chain is never brought back link by link. Main chose this over a record
 //! per named file: such a record would keep about 100 bytes and the path for every named file as long as its green
 //! lives, paid always for a cold path's benefit.
 //!
@@ -94,14 +95,26 @@ pub(crate) enum HgNamedRefused {
 enum Resolution {
   /// Each wanted path's revision: its identity, its path's bytes and its node.
   Revisions(Vec<(Identity, Vec<u8>, Node)>),
-  /// A changeset's or a manifest's text let go, which comes back first: its log's name and its node.
-  Bring(Vec<u8>, Node),
+  /// A changeset's or a manifest's text let go, which is read first: its log and its node.
+  Read(slates_hg::index::Log<'static>, Node),
 }
 
 /// Bound: the resolutions one bring-back makes. Derived: a resolution reads a changeset's text and then its
-/// manifest's, and each let go comes back once before the next resolution, so at most two come back and the third
-/// resolution finds every revision. A text let go again in between refuses the read (`NotBroughtBack`), never a loop.
+/// manifest's, and each let go is read once and given to the next resolution, so at most two are read and the third
+/// resolution finds every revision.
 const RESOLUTIONS: usize = 3;
+
+/// Counted: a changeset's or manifest's text a named file's resolution read whole from the node's changeset store, let
+/// go once landed (goal 93, C1 (1)). Format: a counter name in the status report.
+pub(crate) const NAMED_LOG_TEXTS_READ: &str = "vcs.hg.named_log_texts_read";
+
+/// The name a log's kept texts are asked by: the changelog's or the manifest log's.
+fn log_path(log: slates_hg::index::Log<'static>) -> Vec<u8> {
+  match log {
+    slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH.to_vec(),
+    _ => slates_hg::push::intake::MANIFEST_PATH.to_vec(),
+  }
+}
 
 /// The Mercurial repository whose green `green` is, with the store holding it here.
 pub(crate) fn repository_of(state: &ShardState, green: VolumeId) -> Option<RepositoryId> {
@@ -122,22 +135,23 @@ fn changeset_at(state: &ShardState, (green, version): (VolumeId, u64)) -> Option
 }
 
 /// The revisions of `wanted` (each an object a green named and the path it is the file at) in changeset `changeset` of
-/// Mercurial repository `repository`, each checked against its object; or the changeset's or manifest's text to bring
-/// back first. The one resolver of a read's bring-back and a recovery's (main 01a20182's ruling of 2026-11-24 02:17).
+/// Mercurial repository `repository`, each checked against its object; or the changeset's or manifest's text to read
+/// first, those read already `given` by node. The one resolver of a read's bring-back and a recovery's (main 01a20182's
+/// ruling of 2026-11-24 02:17).
 fn resolve_at(
   state: &ShardState,
   repository: RepositoryId,
-  changeset: Node,
+  (changeset, given): (Node, &[(Node, Vec<u8>)]),
   wanted: &[(Identity, String)],
 ) -> Result<Resolution, HgNamedRefused> {
   let (content, store) = state
     .vcs_stores
     .mercurial_ref(repository)
     .ok_or(HgNamedRefused::NoStore { repository })?;
-  let held = slates_hg::push::held::IndexHeld::new(&store.index, content);
+  let held = slates_hg::push::held::IndexHeld::with_given(&store.index, content, given);
   let Some(text) = held.changeset_text(&changeset) else {
-    return Ok(Resolution::Bring(
-      slates_hg::push::intake::CHANGELOG_PATH.to_vec(),
+    return Ok(Resolution::Read(
+      slates_hg::index::Log::Changelog,
       changeset,
     ));
   };
@@ -145,10 +159,7 @@ fn resolve_at(
     .and_then(|decoded| decoded.manifest_node())
     .map_err(|_| HgNamedRefused::Malformed { node: changeset })?;
   let Some(lines) = held.manifest_text(&manifest) else {
-    return Ok(Resolution::Bring(
-      slates_hg::push::intake::MANIFEST_PATH.to_vec(),
-      manifest,
-    ));
+    return Ok(Resolution::Read(slates_hg::index::Log::Manifest, manifest));
   };
   let mut revisions = Vec::with_capacity(wanted.len());
   for (identity, path) in wanted {
@@ -201,31 +212,38 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
   wanted: &[(Identity, String)],
 ) -> Result<(), HgNamedRefused> {
   let unlent = HgNamedRefused::NoStore { repository };
+  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
   for resolution in 1..=RESOLUTIONS {
     // The texts are read from their windows, which live in the shard's chunk store: lent for the read.
     let resolved = lender
       .lend(|state| {
         super::lent_state(state, |state| {
-          resolve_at(state, repository, changeset, wanted)
+          resolve_at(state, repository, (changeset, &given), wanted)
         })
       })
       .ok_or_else(|| unlent.clone())??;
     let revisions = match resolved {
-      Resolution::Bring(path, node) => {
+      Resolution::Read(log, node) => {
         if resolution == RESOLUTIONS {
           return Err(HgNamedRefused::NotBroughtBack {
-            path,
+            path: log_path(log),
             node,
             why: None,
           });
         }
-        crate::repository::hg_push::bring_back_on(lender, repository, (path.clone(), node))
-          .await
-          .map_err(|why| HgNamedRefused::NotBroughtBack {
-            path,
-            node,
-            why: Some(why),
-          })?;
+        let text = crate::repository::hg_push::log_text_read(
+          lender,
+          (repository, crate::repository::hg_push::Committed),
+          (log, node),
+        )
+        .await
+        .ok_or_else(|| HgNamedRefused::NotBroughtBack {
+          path: log_path(log),
+          node,
+          why: Some(crate::repository::hg_push::BringBackRefused::NoText),
+        })?;
+        lender.lend(|state| state.count(NAMED_LOG_TEXTS_READ, 1));
+        given.push((node, text));
         continue;
       }
       Resolution::Revisions(revisions) => revisions,
