@@ -22,6 +22,16 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 00:08 on 11-24:
+- Gate 3 ENDED: 6 of 7 (release 3/3; debug 1, 2 and 4 passed; debug 3 lost push 0 to "unexpected disconnect while reading
+  sideband packet" 2.22 s in). None of w-git's new log lines fired, though daemon lines reach the log, so the cause is on a
+  path the logging doesn't cover. Sent to w-git: log where a connection ends, below the edge, and/or the client's
+  GIT_TRACE_PACKET. Gate 4 runs on its commit, the same way (worktree main-v3diag, branch diag-measurer-main-v3-*).
+- Main CI's first test data (45347644597): macOS failed one test, cli.rs:7340
+  an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill (merge.inputs.held_by_owner absent after an
+  accepted submit), in w-shared's lane (A). `cargo test --workspace` stops at a failing binary, so later crates went unrun.
+  w-shared brackets it before F2. Linux ran out of disk (fixed by 2033268c5; 45352789036 at that commit is pending).
+
 Updates at 00:03 on 11-24:
 - Main CI's Ubuntu tests: the first lint-clean run (45347644597, at 31e0c2596) ran the runner out of disk in
   `cargo test --workspace` (job 138289296963, "No space left on device"). No Ubuntu test build had run on main since at
