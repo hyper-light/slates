@@ -579,3 +579,10 @@ Waiting: main's route; arena-7 and arena-8.
   message). Waiting for: its reading (then fix the biggest long-step kind red first, and restate the bound with the
   seals one merge spans), and arena-19 (if the reland costs time outside the intake: reads of sealed runs, fork fence
   copies, the store's own merge).
+
+## 2026-11-23: push counters for arena-20 landed (fa2d728f2, merge c876434a1)
+- New counters: vcs.hg.push_index_lookups and push_index_runs_visited (counted at settle, from the fork's Index counters); vcs.hg.fork_fences_copied (counted per held generation).
+- Told Slates the DIAG names, plus the existing landed_texts_brought_back, hg_push.intake_slices and vcs.hg.segment_record_turns.
+- Hypothesis: merge_step's last step does the whole merge's landing at once (puts every table, takes their holds, releases the merged runs); r499's 89.7 ms step.
+- Proposed piece: put each table as it is cut. Waiting on r536 and main's ruling.
+- Still to do: (B) the tiered rule and bound stated in bytes; then optimize the pending steps (72% of intake time).
