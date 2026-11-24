@@ -1405,6 +1405,14 @@
 >   the green's own versions; every made-changeset test submitted once, which hid it
 >   (`a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset`). Next: the commit-alone reds with w-svn's
 >   `commit_held` guard (A-891), then P5.
+> Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
+> restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
+> so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
+> delta), which an empty file revision's let-go had marked away with a length of 0: that freed nothing, and an image
+> carries no window let go of no length (`ContentStore::restore_away`), so the restart lost it. The content store now
+> refuses to let the empty window go (`LetGoRefused::Empty`), on both paths a landed text is let go; held by
+> `the_empty_window_is_never_let_go_so_a_restart_never_loses_it` (red: let go of 0 bytes) and the 5,000-revision push and
+> restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
