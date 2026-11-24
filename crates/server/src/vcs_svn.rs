@@ -85,7 +85,7 @@ use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
-use crate::vcs_store::svn_view::{SvnHold, hold_in, lend_held_in, lend_in};
+use crate::vcs_store::svn_view::{FetchedPiece, SvnHold, hold_in, lend_held_in, lend_in};
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -166,6 +166,29 @@ const LOCKS_REFUSED: &str = "vcs_svn.locks_refused";
 /// Counter: a conversation's turn begun in the same poll of its shard as the turn before it, no other task run between
 /// them ([`go_on`]): a bug signal, a long answer or pipelined commands holding the shard (the git/git `svnrdump` spin).
 pub(crate) const TURNS_UNYIELDED: &str = "vcs_svn.turns_unyielded";
+
+/// Counter: a conversation's answers on its shard ([`step`]): each the connection's turn over its repository's sources,
+/// a call's drive (a replay's, an update's, a log's) a quantum of steps at a time.
+const ANSWERS: &str = "vcs_svn.answers";
+/// Counter: the nanoseconds the conversations spent in their answers ([`ANSWERS`]), the shard's clock: the server's own
+/// work of a session, against the waits below (goal 93: which side a slower svnsync's time went to).
+const ANSWER_NS: &str = "vcs_svn.answer_ns";
+/// Counter: the nanoseconds the conversations waited for a text piece through the node's changeset store
+/// (`svn_texts::fetch_piece`, C2 stage B part 2): a read the content store could not lend.
+const FETCH_WAIT_NS: &str = "vcs_svn.fetch_wait_ns";
+/// Counter: the nanoseconds the conversations waited for an answer's bytes to be written: the client not reading them.
+const WRITE_WAIT_NS: &str = "vcs_svn.write_wait_ns";
+/// Counter: the nanoseconds the conversations waited for their clients' bytes.
+const READ_WAIT_NS: &str = "vcs_svn.read_wait_ns";
+/// Counter: the nanoseconds the conversations waited to be polled again after yielding a turn ([`go_on`]): the shard's
+/// other work.
+const YIELD_WAIT_NS: &str = "vcs_svn.yield_wait_ns";
+
+/// Adds the nanoseconds since `since` (the shard's clock, [`now_ns`]) to counter `kind`: one phase of a conversation.
+fn count_since(kind: &'static str, since: u64) {
+  let spent = now_ns().saturating_sub(since);
+  let _ = crate::state::with_state(|state| state.count(kind, spent));
+}
 
 /// Counter: a lock verb whose new token the system's generator could not draw: its landing refused.
 const TOKEN_UNDRAWN: &str = "vcs_svn.token_undrawn";
@@ -718,9 +741,10 @@ struct Conversation {
   /// ([`Connection::fetching`]; A-749, §4.17.1 "A fetch's answer" rule 4): given back as it ends, and before the
   /// conversation moves to another shard.
   held: Option<SvnHold>,
-  /// The text piece a drive waited for and the conversation fetched (C2 stage B part 2), held until the next call has
-  /// read it.
-  fetched: Option<slates_svn::reads::Wanted>,
+  /// The text piece a drive waited for and the conversation fetched (C2 stage B part 2), held while the drive reads on in
+  /// it: given back when the drive waits for another, when the read's answer ends, before the conversation moves to
+  /// another shard, or with the conversation.
+  fetched: Option<FetchedPiece>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -787,7 +811,9 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
     // fast as it is written never makes a write wait either, so without the yield the shard never steps (git/git's
     // last 2,000 commits through `svnrdump dump`: "shard 0 is spinning: 3596 ms" after 53 MB).
     if matches!(went, Stepped::Go) && futures::polls_so_far() == poll {
+      let yielded = now_ns();
       futures::yield_now().await;
+      count_since(YIELD_WAIT_NS, yielded);
     }
     match went {
       Stepped::Go => {}
@@ -795,10 +821,7 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Elsewhere(found, located) => {
         // A hold is given back on the shard that holds its records, and so is a fetched piece.
         conversation.held = None;
-        if let Some(wanted) = conversation.fetched.take() {
-          let _ =
-            crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
-        }
+        conversation.fetched = None;
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -820,16 +843,20 @@ async fn step(
   seat: &Seat,
 ) -> Stepped {
   out.clear();
+  let answering = now_ns();
   let next = {
     // A-740: a shard stuck answering a call (a replay, a log, an update's drive) names it.
     let _doing = slates_rt::futures::doing("vcs_svn::answer");
     answer(conversation, out)
   };
-  // The piece the last wait fetched was read by this call (C2 stage B part 2).
-  if let Some(wanted) = conversation.fetched.take() {
-    let _ = crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
+  count_since(ANSWER_NS, answering);
+  let _ = crate::state::with_state(|state| state.count(ANSWERS, 1));
+  // The piece the last wait fetched stays held while the read goes on, since a call reads only a quantum of the
+  // drive's steps in it (goal 93); its answer ended, the piece goes.
+  if !conversation.connection.fetching() {
+    conversation.fetched = None;
   }
-  if !out.is_empty() && stream.write_all(out).await.is_err() {
+  if !out.is_empty() && !written_timed(stream, out).await {
     return Stepped::End;
   }
   // Written: what follows (a revision property change's hooks, a commit's hook or landing, a lock verb) writes its own
@@ -837,6 +864,14 @@ async fn step(
   // which stock svn read as the change's success).
   out.clear();
   follow(stream, conversation, next, out, seat).await
+}
+
+/// Writes an answer's bytes `out` to `stream`, the wait counted ([`WRITE_WAIT_NS`]): whether they were written.
+async fn written_timed(stream: &TcpStream, out: &[u8]) -> bool {
+  let writing = now_ns();
+  let wrote = stream.write_all(out).await.is_ok();
+  count_since(WRITE_WAIT_NS, writing);
+  wrote
 }
 
 /// What follows the call's output: `next` taken, the bytes it consumed dropped from the input; a commit, lock, hook or
@@ -859,11 +894,16 @@ async fn follow(
       let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
         return Stepped::End;
       };
+      // The drive moved on from the piece held to another.
+      conversation.fetched = None;
+      let fetching = now_ns();
+      let fetched = FetchedPiece::fetch(repository, wanted).await;
+      count_since(FETCH_WAIT_NS, fetching);
       // A piece the node's store cannot give ends the conversation: the drive would wait for it again.
-      if !crate::vcs_store::svn_texts::fetch_piece(repository, wanted).await {
+      let Some(piece) = fetched else {
         return Stepped::End;
-      }
-      conversation.fetched = Some(wanted);
+      };
+      conversation.fetched = Some(piece);
       return Stepped::Go;
     }
     Next::End => return Stepped::End,
@@ -906,6 +946,7 @@ async fn follow(
 
 /// Reads more of the client's bytes into the conversation's input: on, or the end if none came.
 async fn read_step(stream: &TcpStream, conversation: &mut Conversation, seat: &Seat) -> Stepped {
+  let reading = now_ns();
   let read = read_more(
     stream,
     &mut conversation.input,
@@ -914,6 +955,7 @@ async fn read_step(stream: &TcpStream, conversation: &mut Conversation, seat: &S
     seat,
   )
   .await;
+  count_since(READ_WAIT_NS, reading);
   if read { Stepped::Go } else { Stepped::End }
 }
 
@@ -1560,8 +1602,8 @@ pub(crate) struct HookAnswer {
 
 /// What a conversation's hooks need of its repository: its id and its name, and where this shard shows a hook its
 /// repository (`ShardState::hook_views`, A-645 (a)), read when the route that runs the hook began. REPOS is decided when
-/// the hook runs ([`crate::vcs_store::svn_presenter::repos_for_hook`]); where no view can be shown, a configured hook is
-/// refused, typed.
+/// the hook runs (`crate::vcs_store::svn_presenter::repos_for_hook`, unix alone); where no view can be shown, a
+/// configured hook is refused, typed.
 pub(crate) struct Hooked {
   /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
   #[cfg(unix)]

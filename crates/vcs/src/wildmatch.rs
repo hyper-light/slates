@@ -404,7 +404,7 @@ enum Class {
 }
 
 impl Class {
-  /// The class `name` names, or none for a name `dowild` refuses ("malformed [:class:] string").
+  /// The class `name` names, or none for a name `dowild` refuses ("malformed \[:class:\] string").
   fn named(name: &[u8]) -> Option<Self> {
     Some(match name {
       b"alnum" => Self::Alnum,

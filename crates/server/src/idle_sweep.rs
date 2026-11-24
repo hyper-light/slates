@@ -110,6 +110,9 @@ pub(crate) fn after_borrow(s: &mut ShardState) {
     || directories
     || arena_seen(s) != s.idle_sweep_seen
     || s.store.content.arena().deferred_bytes() > 0
+    // An image publication owed with no catch-up making it (its publication refused, its task unspawned): the pass
+    // begins it again (`content_holder::image_retry_owed`, A-870 piece 2).
+    || s.image_encoder.owed_unattended()
   {
     arm(s);
   }

@@ -2,8 +2,9 @@
 // low-level primitives and settles each verb's Promise from the client's driver (AUD-29-19, AUD-29-20). A
 // call is submitted and gets a ticket at once — sent when the client admits it, queued otherwise, never
 // waiting — and the driver hands back events: a reply landed (decoded here by the verb's poll), or the call
-// failed, typed. Two inputs feed it: the completion fd's readiness (wrapped in a net.Socket that libuv polls)
-// and one timer at the driver's next wake (reply deadlines, reconnect attempts). The timer is referenced
+// failed, typed. Two inputs feed it: the completion signal's readiness (a net.Socket libuv reads: the completion fd
+// adopted on Unix, the completion pipe opened by name on Windows, A-875) and one timer at the driver's next wake
+// (reply deadlines, reconnect attempts). The timer is referenced
 // while a call waits, so the process lives until every call has ended; a reader error, the fd closing or a
 // pump exception fails every call. No tokio and no extra thread — the loop is Node's.
 //
@@ -217,11 +218,14 @@ export class AsyncClient {
     });
   }
 
-  // Wraps the current channel's completion fd in a libuv-polled stream; its readable 'data' drives the
-  // pump. Each channel has its own fd: when the daemon goes, its fd reaches end of file — the channel is
-  // gone, not the reader — so the reader is dropped and the timer drives recovery, and once the client has
-  // reconnected the reader attaches to the new channel's fd (and re-arms it). A reader error, or the stream
-  // closing without having reached end of file, is the reader lost: every call fails.
+  // Wraps the current channel's completion signal in a libuv-read stream; its readable 'data' drives the
+  // pump. On Unix the signal is a descriptor the stream adopts. On Windows it is a named pipe the stream opens by
+  // name (A-875): libuv adopts a Windows descriptor only through the C runtime and never as a socket, so the
+  // loopback socket handed here before was refused "Unsupported fd type: UNKNOWN". Each channel has its own signal:
+  // when the daemon goes, it reaches end of file — the channel is gone, not the reader — so the reader is dropped and
+  // the timer drives recovery, and once the client has reconnected the reader attaches to the new channel's signal
+  // (and re-arms it). A reader error (an open of the pipe refused among them), or the stream closing without having
+  // reached end of file, is the reader lost: every call fails.
   _ensureReader() {
     const channel = this._c.reconnects();
     if (this._sock && this._channel === channel) return;
@@ -232,8 +236,9 @@ export class AsyncClient {
       old.destroy();
     }
     this._channel = channel;
-    const fd = this._c.completionFd();
-    const sock = new net.Socket({ fd, readable: true, writable: false });
+    const sock = process.platform === 'win32'
+      ? net.connect(this._c.completionPipe())
+      : new net.Socket({ fd: this._c.completionFd(), readable: true, writable: false });
     let ended = false;
     sock.on('data', () => this._guard(() => this._settle(this._c.pump())));
     sock.on('error', (err) => this._lose(err));

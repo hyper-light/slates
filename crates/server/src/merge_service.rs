@@ -677,7 +677,7 @@ impl CheckpointHold {
 /// The object a green's checkpoint is held under in its owner shard's content store (A-579): its own, derived from the
 /// green's id, so a checkpoint's stage, open across turns, never meets a stage of the green's own object (an owner's
 /// fetch of a holder's increment, A-826), which a content store keeps one of an object. Held on the owner shard only:
-/// no record, retention rule or route reads it, and it goes with the green ([`destroy`]'s release).
+/// no record, retention rule or route reads it, and it goes with the green ([`destroy_merge_volume`]'s release).
 pub(crate) fn checkpoint_object(green: DbVolumeId) -> ObjectId {
   let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_OBJECT_CONTEXT);
   hasher.update(&green.bytes);
@@ -1965,7 +1965,7 @@ pub(crate) fn status_merge_volume(
   let (bytes, head) = match role {
     MergeRole::Green { .. } => state.greens.get(&id).map_or((0, 0), |engine| {
       (
-        engine.files().map(|(_, bytes)| bytes.len() as u64).sum(),
+        engine.files().map(|(_, bytes)| bytes.len()).sum(),
         engine.head(),
       )
     }),

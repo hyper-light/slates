@@ -48,8 +48,8 @@ const UNPUBLISHED: u64 = 0;
 
 /// The bound the next exchange waits for the anchor's answer within: the one the owner shard published last, or before
 /// any, the estimator's own, a liveness window plus nothing measured (no exchange has backed it off, so the ceiling
-/// does not bear on it).
-fn answer_bound_ns() -> u64 {
+/// does not bear on it). An extent's remake is bounded by two of them (`crate::content_extents::remake_bound_ns`).
+pub(crate) fn answer_bound_ns() -> u64 {
   match ANSWER_BOUND_NS.load(Ordering::Relaxed) {
     UNPUBLISHED => crate::anchor_answers::AnchorAnswers::default().bound_ns(u64::MAX),
     published => published,

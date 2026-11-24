@@ -13,9 +13,11 @@
 )]
 
 use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
-use slates_hg::index::HgIndex;
+use slates_hg::index::{HgIndex, Log};
 use slates_hg::manifest::{self, Entry, Flag};
 use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::serve::getbundle::Store;
+use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, NULL_NODE, Node, node};
 use slates_mem::large::{LargeMapped, heap};
 use std::borrow::Cow;
@@ -24,6 +26,15 @@ use slates_vcs::{ContentRefused, ContentStore, StoredWindow, WindowStorage};
 
 #[global_allocator]
 static ALLOCATOR: LargeMapped = LargeMapped;
+
+/// Held by each test while it runs: the heap's figures are the process's, so a test that allocates while another reads
+/// them is counted as the reader's (the long push's test, run without it, failed the cached base's in 4 of 6 runs).
+// D-8 test harness: a lock held in turn by its owners, every test of this binary
+// (`a_pushs_churn_per_changeset_is_its_file_alone`, `a_views_manifest_read_is_one_text`,
+// `a_cached_file_base_is_read_where_it_lies` and `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows`),
+// poison recovered.
+#[allow(clippy::disallowed_types)]
+static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Shape: the changesets after the first, each rewriting one file, in the shorter history; the longer has twice as many,
 /// so their difference is what [`EDITS`] edit changesets allocate alone.
@@ -342,6 +353,9 @@ const SLACK_BYTES: u64 = 16 << 10;
 /// 16 KiB file (0.74) and 13,674 B at the 160 KiB one (0.08): the cache keeps only a text a later delta rests on.
 #[test]
 fn a_pushs_churn_per_changeset_is_its_file_alone() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
   for (files, size) in [
     (100, 64),
     (400, 64),
@@ -376,4 +390,278 @@ fn a_pushs_churn_per_changeset_is_its_file_alone() {
       );
     }
   }
+}
+
+/// `index` with `payload` taken into it whole: the fork the intake made, `index` given back.
+fn taken(mut index: HgIndex, payload: &[u8], store: &mut ContentStore) -> HgIndex {
+  let mut admission = Admission::new(u64::MAX);
+  let mut intake =
+    Intake::begin((Version::V03, payload), &mut index, store, &mut admission).unwrap();
+  loop {
+    match intake.step(payload, store, &mut admission).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      other => panic!("a whole changegroup in memory stepped {other:?}"),
+    }
+  }
+  let Ok((fork, _)) = intake.finish() else {
+    panic!("a whole changegroup taken");
+  };
+  index.release(store).unwrap();
+  fork
+}
+
+/// Goal 93 (main's order: C1's cuts, `HgIndex::revision_text` second by bytes; w-perf's attribution of Mercurial's own
+/// push, 2.57 GB of `revision_text`'s rebuilds freed within a second, 1.24 GB of them in the [128 KiB, 256 KiB) band):
+/// the served view reads a manifest kept as a delta (A-729) by rebuilding it from its chain, as the server reads each
+/// pushed changeset's manifest to build the push's works. Do: take a history of 1,600 files and twice [`EDITS`] edits
+/// into an index, view it, and read the first [`EDITS`] manifests, then all of them. Read the churn per manifest read
+/// (the two readings' difference over [`EDITS`]). Expect at most one copy of a manifest's text and [`SLACK_BYTES`]: the
+/// text read lent out, its chain rebuilt through buffers the view holds. Red before: each read rebuilt into a text, a
+/// next text and a delta of its own, the whole it began from grown from empty: 194,487 B a read of a 91,200 B manifest
+/// (2.13 copies, 2026-11-23, MacBook arm64, debug); now 105,500 B (1.16), the text the read hands out.
+#[test]
+fn a_views_manifest_read_is_one_text() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let (payload, manifest) = history(1_600, 64, 2 * EDITS);
+  let mut store = ContentStore::with_storage(u64::MAX, WINDOW, Box::new(Arena::new())).unwrap();
+  let index = taken(HgIndex::new(), &payload, &mut store);
+  let reading = reading_cost();
+  let state = State {
+    roots: &[],
+    bookmarks: &[],
+    publishing: true,
+    markers: &[],
+  };
+  let view = Indexed::new(&index, &store, state, &mut Admission::new(u64::MAX)).unwrap();
+  let nodes: Vec<Node> = (0..index.len(&store, Log::Manifest))
+    .filter_map(|rev| {
+      index
+        .revision(&store, Log::Manifest, rev)
+        .map(|row| row.node)
+    })
+    .collect();
+  let churn = |count: usize| {
+    let mut room = Admission::new(u64::MAX);
+    let before = heap().system_allocated;
+    for node in &nodes[..count] {
+      let read = view.manifest(node, &mut room).unwrap();
+      assert!(read.is_some(), "the manifest read");
+    }
+    heap()
+      .system_allocated
+      .saturating_sub(before)
+      .saturating_sub(reading)
+  };
+  let per_read = churn(2 * EDITS).saturating_sub(churn(EDITS)) / u64::try_from(EDITS).unwrap();
+  let manifest = u64::try_from(manifest).unwrap();
+  println!(
+    "push_heap: a view's manifest read allocates {per_read} B ({:.2} manifests of {manifest} B)",
+    per_read as f64 / manifest as f64
+  );
+  assert!(
+    per_read <= manifest + SLACK_BYTES,
+    "a manifest read allocated {per_read} B, past one {manifest} B manifest and {SLACK_BYTES} B"
+  );
+}
+
+/// A history of `revisions` changesets on two interleaved lines, each rewriting the one file `f` of `size` bytes: the
+/// first a root, the second on it, every later one on the changeset two before it (its first parent `rev - 2`), each
+/// log's revision sent as its delta against its first parent's text (as a client sends a branchy file history), so a
+/// file delta rests on the revision two back, never the one kept last. Its changegroup (version 03) encoded.
+fn interleaved(size: usize, revisions: usize) -> Vec<u8> {
+  let path = b"f".to_vec();
+  let parent = |rev: usize| match rev {
+    0 => None,
+    1 => Some(0),
+    rev => Some(rev - 2),
+  };
+  let mut file_texts: Vec<Vec<u8>> = Vec::new();
+  let mut file_nodes: Vec<Node> = Vec::new();
+  let mut manifest_texts: Vec<Vec<u8>> = Vec::new();
+  let mut manifest_nodes: Vec<Node> = Vec::new();
+  let mut changeset_texts: Vec<Vec<u8>> = Vec::new();
+  let mut changeset_nodes: Vec<Node> = Vec::new();
+  for rev in 0..revisions {
+    let p1 = parent(rev);
+    let text: Vec<u8> = format!("f generation {rev} ")
+      .bytes()
+      .cycle()
+      .take(size)
+      .collect();
+    let file_node = node::compute(
+      &p1.map_or(NULL_NODE, |at| file_nodes[at]),
+      &NULL_NODE,
+      &text,
+    )
+    .unwrap();
+    let mut manifest_text = Vec::new();
+    manifest::encode(
+      &[Entry {
+        path: &path,
+        node: file_node,
+        flag: Flag::Regular,
+      }],
+      &mut manifest_text,
+    )
+    .unwrap();
+    let manifest_node = node::compute(
+      &p1.map_or(NULL_NODE, |at| manifest_nodes[at]),
+      &NULL_NODE,
+      &manifest_text,
+    )
+    .unwrap();
+    let changeset_text =
+      format!("{}\ntest\n0 0\nf\n\nchangeset {rev}", hex(&manifest_node)).into_bytes();
+    let changeset_node = node::compute(
+      &p1.map_or(NULL_NODE, |at| changeset_nodes[at]),
+      &NULL_NODE,
+      &changeset_text,
+    )
+    .unwrap();
+    file_texts.push(text);
+    file_nodes.push(file_node);
+    manifest_texts.push(manifest_text);
+    manifest_nodes.push(manifest_node);
+    changeset_texts.push(changeset_text);
+    changeset_nodes.push(changeset_node);
+  }
+  let data_of = |texts: &[Vec<u8>]| -> Vec<Vec<u8>> {
+    (0..revisions)
+      .map(|rev| match parent(rev) {
+        Some(at) => delta(&texts[at], &texts[rev]),
+        None => whole(&texts[rev]),
+      })
+      .collect()
+  };
+  let (changeset_data, manifest_data, file_data) = (
+    data_of(&changeset_texts),
+    data_of(&manifest_texts),
+    data_of(&file_texts),
+  );
+  let p1_of = |nodes: &[Node], rev: usize| parent(rev).map_or(NULL_NODE, |at| nodes[at]);
+  let mut revisions_sent = Vec::new();
+  for rev in 0..revisions {
+    revisions_sent.push(revision(
+      changeset_nodes[rev],
+      p1_of(&changeset_nodes, rev),
+      changeset_nodes[rev],
+      &changeset_data[rev],
+    ));
+  }
+  for rev in 0..revisions {
+    revisions_sent.push(revision(
+      manifest_nodes[rev],
+      p1_of(&manifest_nodes, rev),
+      changeset_nodes[rev],
+      &manifest_data[rev],
+    ));
+  }
+  for rev in 0..revisions {
+    revisions_sent.push(revision(
+      file_nodes[rev],
+      p1_of(&file_nodes, rev),
+      changeset_nodes[rev],
+      &file_data[rev],
+    ));
+  }
+  let changegroup = Changegroup {
+    version: Version::V03,
+    revisions: revisions_sent,
+    changelog: 0..revisions,
+    manifests: revisions..2 * revisions,
+    trees: Vec::new(),
+    files: vec![Group {
+      name: &path,
+      revisions: 2 * revisions..3 * revisions,
+    }],
+  };
+  let mut out = Vec::new();
+  changegroup.encode(&mut out).unwrap();
+  out
+}
+
+/// Goal 93 (main's order: C1's cuts, `Taker::file_base` third; w-perf's attribution of Mercurial's own push, its copy of
+/// a cached base in the [128 KiB, 256 KiB) band). Do: take a history of one 160 KiB file on two interleaved lines, each
+/// file delta resting on the revision two back (a base the push's cache holds, never the text kept last), then one of
+/// twice as many revisions. Read the churn per revision (the two histories' difference over [`EDITS`]). Expect less
+/// than one copy of the file's text a revision: a base the cache holds is read where it lies. Red before: each base
+/// found in the cache was copied out of it whole for the step that read it.
+#[test]
+fn a_cached_file_base_is_read_where_it_lies() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let size = 160 << 10;
+  let short = churned(&interleaved(size, EDITS));
+  let long = churned(&interleaved(size, 2 * EDITS));
+  let per_revision = long.saturating_sub(short) / u64::try_from(EDITS).unwrap();
+  let file = u64::try_from(size).unwrap();
+  println!(
+    "push_heap: two lines of a {file} B file, each delta on the revision two back: a revision allocates {per_revision} B \
+     ({:.2} files)",
+    per_revision as f64 / file as f64
+  );
+  assert!(
+    per_revision < file,
+    "a revision allocated {per_revision} B, a copy of its {file} B file's text"
+  );
+}
+
+/// Shape: the edits of the runs test's history: enough appends under its window for hundreds of seals.
+const LONG_EDITS: usize = 1_500;
+
+/// Goal 93 (the index seal's reland, main's ruling of 2026-11-23): every append seals the fork's tail when due, each
+/// seal a run, and a lookup of a new row walks every run; arena-14's push of Mercurial's history spun past the watchdog
+/// in a segment step as the fork's unmerged runs grew. Do: take a history of [`LONG_EDITS`] edits through the intake
+/// under a 4 KiB window, so the fork seals hundreds of times. Expect the most runs only the fork held after any step
+/// within ⌊log₃(its rows)⌋ + 1 (the size-tiered rule's bound, a seal writing a row at least), and merges made (the
+/// counter, so the bound is not met by sealing nothing). Red before: no merge, the fork's own runs one a seal.
+#[test]
+fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let (payload, _) = history(50, 64, LONG_EDITS);
+  let mut store = ContentStore::new(u64::MAX, 4 << 10).unwrap();
+  let mut index = HgIndex::new();
+  let mut admission = Admission::new(u64::MAX);
+  let mut intake = Intake::begin(
+    (Version::V03, &payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  loop {
+    match intake.step(&payload, &mut store, &mut admission).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      other => panic!("a whole changegroup in memory stepped {other:?}"),
+    }
+  }
+  let Ok((mut fork, intaken)) = intake.finish() else {
+    panic!("a whole changegroup taken");
+  };
+  let rows = fork.rows().rows();
+  // In integers: f64's log₃ of a power of three can fall just short of it (243 gives 4.999999999999999).
+  let bound = u64::from(rows.checked_ilog(3).unwrap_or(0)) + 1;
+  println!(
+    "push_heap: {rows} rows, {} seals, {} tiered merges, the most own runs {} (bound {bound})",
+    fork.rows().counters().seals,
+    intaken.tiered_merges,
+    intaken.most_own_runs
+  );
+  assert!(
+    fork.rows().counters().seals > 100,
+    "the fork sealed as it appended"
+  );
+  assert!(intaken.tiered_merges > 0, "the tiered rule merged");
+  assert!(
+    intaken.most_own_runs <= bound,
+    "the fork held {} runs of its own, past the bound {bound} at {rows} rows",
+    intaken.most_own_runs
+  );
 }

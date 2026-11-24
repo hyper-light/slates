@@ -393,6 +393,11 @@ fn a_hook_view_brings_back_a_stored_text_the_content_store_let_go() {
     file.map(|file| file.len())
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert_eq!(brought, Some(0), "the view kept what it brought");
 }
 
@@ -453,5 +458,10 @@ fn a_hook_view_brings_back_a_stored_text_whose_windows_were_let_go() {
     file.map(|file| file.len())
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert_eq!(brought, Some(0), "the view kept what it brought");
 }

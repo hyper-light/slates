@@ -1758,6 +1758,89 @@ fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
   );
 }
 
+/// The descriptors a `ls -l /proc/self/fd/` listing names past the standard streams, each with what it resolves to,
+/// leaving out the listing's own directory: what a process holds beyond what it was handed.
+#[cfg(target_os = "linux")]
+fn descriptors_beyond_the_standard_streams(listing: &str) -> Vec<(u32, String)> {
+  listing
+    .lines()
+    .filter_map(|line| {
+      let (head, target) = line.split_once(" -> ")?;
+      let number = head.split_whitespace().last()?.parse::<u32>().ok()?;
+      Some((number, target.to_owned()))
+    })
+    .filter(|(number, target)| *number > 2 && !target.starts_with("/proc/"))
+    .collect()
+}
+
+/// main 01a20182's ruling of 2026-11-23 (the sweep in
+/// docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md): a hook holds nothing of the
+/// daemon's. Do: as [`a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory`], start an anchor with
+/// its HTTP edge and a store and configure a start-commit hook, here one that becomes `ls -l /proc/self/fd/` writing
+/// to a file, so the listing is the hook's own descriptors with what each resolves to; POST a commit, then unmount the
+/// view. Expect the listing to hold the standard streams and the listing's own directory alone. Before, Linux's spawn
+/// handed the hook every descriptor of the daemon's not marked close-on-exec: the anchor's segment, which holds the
+/// issuer secret, and its content object, inherited at the daemon's start; the daemon's duplicates of both, one a shard;
+/// the listeners the anchor held for it; and a duplicate of every connected client's completion eventfd.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_hook_holds_no_descriptor_of_its_daemon() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-hook-fds-{}", std::process::id());
+  let scratch = Scratch::new("svn-hook-fds");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (_anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "the hook's descriptors") else {
+    return;
+  };
+  create_repository(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
+  let listing = format!("{}/hook-descriptors", scratch.path);
+  let hook = format!("{}/start-commit", scratch.path);
+  // A Subversion hook starts with an empty environment, so `ls` is named by its path; `exec` makes the listing the
+  // hook's own process, whose shell kept its script open.
+  std::fs::write(
+    &hook,
+    format!("#!/bin/sh\nexec /bin/ls -l /proc/self/fd/ > \"{listing}\"\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let answer = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let listed = std::fs::read_to_string(&listing).unwrap_or_default();
+  let view = format!("{store}/{REPOSITORY}.svn");
+  let unmounted = slates(&instance, &["unmount", &view]);
+  assert!(
+    listed.contains(" 0 -> ") && listed.contains(" 2 -> "),
+    "the hook ran and listed its descriptors: {listed:?}; answer: {answer}"
+  );
+  assert_eq!(
+    (
+      descriptors_beyond_the_standard_streams(&listed),
+      unmounted.0
+    ),
+    (Vec::new(), 0),
+    "the hook's descriptors past its standard streams (left; its whole listing: {listed}); unmount: {unmounted:?}"
+  );
+}
+
 /// main 01a20182's constraint of 2026-11-22 03:22 (a kernel NFS mount whose daemon died under it panicked a Mac twice,
 /// 2026-10-06): a test that fails with a hook's view still mounted must have its guard let the view go while its daemon
 /// still serves it. Do: as [`a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory`], start an
@@ -2421,6 +2504,58 @@ fn footprint_kib(pid: u32) -> Option<u64> {
   Some(kib as u64)
 }
 
+/// Every counter the daemon's shards report (`status --json`, each shard's `refusals`), summed over its shards by name:
+/// what [`an_svnsync_measured`] prints after each leg, so a measurement reads where its time went (the svn://
+/// conversation's phases, the content store's reads, pieces fetched through the node's store, the import's turns and
+/// landings). Every counter, not a family: the import's batches count as `repository.*`.
+#[cfg(unix)]
+fn daemon_counters(instance: &str) -> std::collections::BTreeMap<String, u64> {
+  let (code, out, err) = slates(instance, &["status", "--json"]);
+  assert_eq!(code, 0, "status --json: {out}{err}");
+  let status: serde_json::Value = serde_json::from_str(&out).expect("status --json answers JSON");
+  let mut counters = std::collections::BTreeMap::new();
+  for report in status["shards"].as_array().into_iter().flatten() {
+    for counter in report["refusals"].as_array().into_iter().flatten() {
+      let (Some(kind), Some(count)) = (counter["kind"].as_str(), counter["count"].as_u64()) else {
+        continue;
+      };
+      *counters.entry(kind.to_owned()).or_insert(0) += count;
+    }
+  }
+  counters
+}
+
+/// Each counter `after` holds, as `kind=count`, one a line: a leg's counters whole.
+#[cfg(unix)]
+fn counters_listed(after: &std::collections::BTreeMap<String, u64>) -> String {
+  after
+    .iter()
+    .map(|(kind, count)| format!("\n    {kind}={count}"))
+    .collect()
+}
+
+/// What each counter of `after` gained over `before`, those that moved alone, one a line: the gain and the gain divided
+/// by `revisions`, a leg's counters a revision.
+#[cfg(unix)]
+fn counters_added(
+  before: &std::collections::BTreeMap<String, u64>,
+  after: &std::collections::BTreeMap<String, u64>,
+  revisions: f64,
+) -> String {
+  after
+    .iter()
+    .filter_map(|(kind, count)| {
+      let added = count.saturating_sub(before.get(kind).copied().unwrap_or(0));
+      (added > 0).then(|| {
+        format!(
+          "\n    {kind}=+{added} ({:.3} a revision)",
+          added as f64 / revisions
+        )
+      })
+    })
+    .collect()
+}
+
 /// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
 fn daemon_pid(instance: &str) -> Option<u32> {
   let listed = Command::new("ps")
@@ -2438,8 +2573,11 @@ fn daemon_pid(instance: &str) -> Option<u32> {
 /// Subversion repository and import the dump `SLATES_SVN_SYNC_DUMP` names through the CLI; then mirror it with stock
 /// `svnsync` 1.15 into a local FSFS repository (`svnadmin create`, a pre-revprop-change hook allowing every change,
 /// `svnsync init`, then `svnsync sync` timed), sampling the daemon's resident bytes. Expect nothing: print each scheme's
-/// import seconds, the sync's answer, seconds and seconds a revision, the mirror's youngest revision, and the daemon's
-/// resident bytes before and at its peak. Skips loudly without stock Subversion 1.15 or the dump.
+/// import seconds, the sync's answer, seconds and seconds a revision, the mirror's youngest revision, the daemon's
+/// resident bytes before and at its peak, and its counters: every one after the import, and what the sync added to each,
+/// whole and a revision (the svn:// conversation's phases in `vcs_svn.*_ns`, the content store's reads, pieces fetched
+/// through the node's store), so a slower round names where its time went. Skips loudly without stock Subversion 1.15
+/// or the dump.
 #[test]
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // test code: the mirror's hook, in the test's own scratch directory
@@ -2468,6 +2606,7 @@ fn an_svnsync_measured() {
     let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
     assert_eq!(code, 0, "repository import: {out}{err}");
     let imported = importing.elapsed().as_secs_f64();
+    let after_import = daemon_counters(&instance);
     let (id, token) = minted_token(&instance, &issuer);
     let (user, url) = match scheme {
       "svn" => (
@@ -2534,11 +2673,106 @@ fn an_svnsync_measured() {
       .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
       .unwrap_or_default();
     let revisions = youngest.parse::<f64>().unwrap_or(0.0).max(1.0);
+    let after_sync = daemon_counters(&instance);
     println!(
       "an_svnsync_measured {scheme}: import {imported:.1} s; svnsync exit {code} in {seconds:.1} s, {:.1} ms a revision; \
-       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}",
+       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}\n  counters after the \
+       import:{}\n  counters the sync added:{}",
       seconds * 1e3 / revisions,
-      err.join().unwrap().trim()
+      err.join().unwrap().trim(),
+      counters_listed(&after_import),
+      counters_added(&after_import, &after_sync, revisions)
+    );
+  }
+}
+
+/// Shape: the revisions [`an_svn_update_measured`] updates across where `SLATES_SVN_UPDATE_SPAN` names none: the 500
+/// w-bugs' P6 runs updated back and forward over git-1000 (diag-w-bugs-svnfetch-8 and -13).
+#[cfg(unix)]
+const UPDATE_SPAN: u64 = 500;
+
+/// P6 of Ada's close list (goal 93: svn:// update 5.6 s at w-bugs' run 13 against 2.7 s at run 8, stock svn 1.15 on
+/// GitHub's macOS runner over git-1000); a measurement, not a gate. Do: for svn:// and the HTTP edge in turn, start an
+/// anchor whose daemon holds a changeset store, create a Subversion repository and import the dump
+/// `SLATES_SVN_UPDATE_DUMP` names through the CLI; as stock `svn`, check `trunk` out at the youngest revision, update it
+/// back `SLATES_SVN_UPDATE_SPAN` revisions ([`UPDATE_SPAN`] by default), then forward to the youngest again, as w-bugs'
+/// runs did, each timed. Expect nothing: print each scheme's import, checkout and update seconds, and what each update
+/// added to the daemon's counters, whole and a revision (the svn:// conversation's phases, the pieces fetched through
+/// the node's store), so a slower round names where its time went. Skips loudly without stock Subversion 1.15 or the
+/// dump.
+#[test]
+#[cfg(unix)]
+#[ignore = "a measurement: SLATES_SVN_UPDATE_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_svn_update_measured --nocapture"]
+fn an_svn_update_measured() {
+  let Ok(dump) = std::env::var("SLATES_SVN_UPDATE_DUMP") else {
+    eprintln!("skipping svn update's measurement: SLATES_SVN_UPDATE_DUMP names no dump");
+    return;
+  };
+  if !stock_svn() {
+    eprintln!("skipping svn update's measurement: no stock Subversion 1.15 here (svn on the PATH)");
+    return;
+  }
+  let span = std::env::var("SLATES_SVN_UPDATE_SPAN")
+    .ok()
+    .and_then(|span| span.parse().ok())
+    .unwrap_or(UPDATE_SPAN);
+  for scheme in ["svn", "http"] {
+    let instance = format!("svn-update-{scheme}-{}", std::process::id());
+    let edge = format!("--vcs-{scheme}");
+    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+    let Some(issuer) = issuer_or_skip(issuer, "svn update's measurement") else {
+      return;
+    };
+    create_repository(&instance);
+    let importing = Instant::now();
+    let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+    assert_eq!(code, 0, "repository import: {out}{err}");
+    let imported = importing.elapsed().as_secs_f64();
+    let (id, token) = minted_token(&instance, &issuer);
+    let (user, url) = match scheme {
+      "svn" => (
+        id,
+        format!(
+          "svn://127.0.0.1:{}/{REPOSITORY}/trunk",
+          svn_listener_port(&lines)
+        ),
+      ),
+      _ => (
+        USER.to_owned(),
+        format!(
+          "http://127.0.0.1:{}/{REPOSITORY}/trunk",
+          http_edge_port(&lines)
+        ),
+      ),
+    };
+    let scratch = Scratch::new(&format!("svn-update-{scheme}"));
+    let svn = Svn::new(&scratch, "update", credentials(user, token));
+    let copy = svn.copy("trunk");
+    let checking_out = Instant::now();
+    svn.ok(&scratch.path, &["checkout", "-q", &url, &copy]);
+    let checked_out = checking_out.elapsed().as_secs_f64();
+    let youngest: u64 = svn
+      .ok(&copy, &["info", "--show-item", "revision"])
+      .trim()
+      .parse()
+      .unwrap();
+    let back = youngest.saturating_sub(span);
+    let before_back = daemon_counters(&instance);
+    let updating_back = Instant::now();
+    svn.ok(&copy, &["update", "-q", "-r", &back.to_string()]);
+    let updated_back = updating_back.elapsed().as_secs_f64();
+    let before_forward = daemon_counters(&instance);
+    let updating = Instant::now();
+    svn.ok(&copy, &["update", "-q"]);
+    let updated = updating.elapsed().as_secs_f64();
+    let after = daemon_counters(&instance);
+    let revisions = youngest.saturating_sub(back).max(1) as f64;
+    println!(
+      "an_svn_update_measured {scheme}: import {imported:.1} s; checkout r{youngest} {checked_out:.2} s; update \
+       r{youngest}..r{back} {updated_back:.2} s; update r{back}..r{youngest} {updated:.2} s\n  counters the update \
+       back added:{}\n  counters the update forward added:{}",
+      counters_added(&before_back, &before_forward, revisions),
+      counters_added(&before_forward, &after, revisions)
     );
   }
 }

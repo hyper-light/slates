@@ -98,8 +98,11 @@ fn main() {
   let mut slept = Vec::new();
   let mut parked = Vec::new();
   for run in 0..RUNS {
-    // Spinning: a spin window far past any reply, so the client never parks.
+    // Spinning: a spin window far past any reply, named by the caller, so the client never parks. A sync wait parks at
+    // once unless its caller names a spin (A-799), and with the published window alone every trip of this row parked
+    // (17,753 to 18,726 wakes in 20,000 trips on adacachy2, 2026-11-23), failing the row's assertion.
     let (daemon, mut client) = pair(&format!("slates-ipc-bench-spin-{run}"), u32::MAX);
+    client.set_spin_ns(Some(u64::MAX));
     let handle = serve(daemon, TRIPS, false);
     let started = Instant::now();
     for n in 0..TRIPS {

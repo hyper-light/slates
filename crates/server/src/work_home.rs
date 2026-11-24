@@ -2823,17 +2823,19 @@ pub(crate) fn attach_forwarded(
   true
 }
 
-/// Answers a forwarded verb's waiting exchange once its parked verb ran (A-794): with the completion it recorded; else,
-/// parked again here, the exchange waits for that; else, its acceptance deferred to a fleet commit, the exchange waits
-/// for the commit (`merge_service::await_forwarded`); else `Overloaded`, unrecorded, which its origin's resend runs again.
+/// Answers a forwarded verb's waiting exchange once its parked verb ran (A-794): with the completion it recorded; else
+/// the exchange waits where its reply is held, parked again here, its acceptance deferred to a fleet commit, or held for
+/// its live volume's durability (`verbs::attach_deferred_forward`); else the in-doubt refusal, unrecorded
+/// (`verbs::deferred_in_doubt`), since the verb ran: its origin's resend under the id meets the outcome, and never runs
+/// it again. Until 2026-11-23 that last answer was `Overloaded`, which says the verb never ran, and a write held for its
+/// live volume's durability met it at once.
 fn answer_forwarded(state: &mut ShardState, (origin, id): (u64, RequestId), waiter: (u16, u64)) {
   use crate::merge_service::ForwardedAcceptance;
-  let answer = match crate::merge_service::await_forwarded(state, (origin, id), waiter) {
+  let answer = match crate::verbs::attach_deferred_forward(state, (origin, id), waiter) {
     ForwardedAcceptance::Completed(bytes) => <ReplyBody as slates_wire::Wire>::from_bytes(&bytes)
       .unwrap_or_else(|_| crate::verbs::refused(Refusal::DuplicateRequest)),
     ForwardedAcceptance::Waiting => return,
-    ForwardedAcceptance::Gone if attach_forwarded(state, (origin, id), waiter) => return,
-    ForwardedAcceptance::Gone => crate::verbs::refused(Refusal::Overloaded { shard: state.shard }),
+    ForwardedAcceptance::Gone => crate::verbs::deferred_in_doubt(0),
   };
   crate::xshard::answer_awaited(waiter.0, waiter.1, answer);
   state.count(FORWARDED_ANSWERED, 1);

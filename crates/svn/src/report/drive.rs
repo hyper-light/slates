@@ -48,8 +48,9 @@
 //!   and changed back is the same list here, as rep-sharing makes a text.
 //!
 //! **Texts.** A changed text's windows are Subversion's deltifier's against the client's base
-//! (A-652's [`deltas`], `txdelta_next_window` and `xdelta.c`), a window of up to 102,400 bytes at a
-//! time, the very windows a stock server sends, stored or computed; an added text's are new data.
+//! (A-652's [`deltas`](crate::svndiff::deltas), `txdelta_next_window` and `xdelta.c`), a window of up
+//! to 102,400 bytes at a time, the very windows a stock server sends, stored or computed; an added
+//! text's are new data.
 //!
 //! No I/O, no clock, no randomness, no panic.
 

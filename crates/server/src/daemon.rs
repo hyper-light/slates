@@ -2095,6 +2095,24 @@ impl Daemon {
     })
   }
 
+  /// What the membership plane's detector recorded of condemning `host` by its own probes (A-67 H-2,
+  /// [`slates_cluster::member_plane::Condemnation`]): how many times, how long after `host`'s last answer, and the bound
+  /// the detector stated for it. A one-shot control-shard question ([`Self::observation`]). Exposed so a fleet test
+  /// holds a detection to the bound its detector promised, whichever verdict judged the pair: before a member's pool
+  /// has a verdict, its own retransmission timer's, which took 7.2 s where an estimator's took under one
+  /// (`a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again`, adacachy2, 2026-11-23).
+  pub fn fleet_condemnation(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<Option<slates_cluster::member_plane::Condemnation>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.plane
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.condemnation(host))
+    })
+  }
+
   /// The bound one record-plane exchange runs under on the control shard now (`fleet::record_exchange_budget_ns`):
   /// derived from the slowest measured path tail, so it grows with load. A test that waits for an exchange to end at
   /// its deadline reads it, rather than assuming its own wait outlasts it (2026-10-10: an interrupted discovery
@@ -3762,6 +3780,16 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node, as a forwarded verb's owner, wait `delay_ns` after the verb ran and deferred its
+  /// reply before its exchange asks where the reply stands (`None` restores asking at once), as an exchange whose owner
+  /// shard was busy does: a reply that is recorded meanwhile must be the answer. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_forward_answer_delay(&self, delay_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_forward_answer_delay_ns = delay_ns;
+    })
+  }
+
   /// Test support: makes this node, as a content holder, hold each acknowledgement of a placement `delay_ns` before it
   /// leaves (`None` restores immediate answers). The hold has already taken the content, so an owner whose round stops
   /// collecting at its hedge delay first receives the acknowledgement as a straggler's, as it does from a holder whose
@@ -4820,9 +4848,6 @@ async fn init_shard(
   slices
     .piece_done("the pool's segment and its content regions")
     .await;
-  // The anchor holds this slice's content extents (Windows, A-789): a task of the shard, so a claim finds them held.
-  #[cfg(windows)]
-  crate::content_extents::spawn_slice_holds(config, partition);
   let headroom = operation_headroom(config, slice_capacity);
   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
@@ -5101,6 +5126,7 @@ async fn init_shard(
     volume_ids_minted: 0,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
+    room_waiters: crate::room_wait::RoomWaiters::default(),
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
@@ -5162,6 +5188,7 @@ async fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_forward_answer_delay_ns: None,
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
@@ -5417,6 +5444,9 @@ async fn rebuild_and_report(
 /// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
 /// volume owes another pass; otherwise the sweep arms its next.
 pub(crate) async fn seal_idle_content() -> bool {
+  // An image publication owed is begun again where no catch-up makes it, first of all (A-870 piece 2: a refused catch-up
+  // publication is never dropped), and the shard is not settled while it is owed.
+  let image_owed = state::with_state(crate::content_holder::image_retry_owed).unwrap_or(false);
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
@@ -5486,7 +5516,7 @@ pub(crate) async fn seal_idle_content() -> bool {
       .any(|(_, slot)| slot.volume.sweep_owes())
   })
   .unwrap_or(false);
-  purged && !owes && directories_idle
+  purged && !owes && !image_owed && directories_idle
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
@@ -6529,6 +6559,25 @@ fn reserve_client_identity(client: u32, instance: &str) -> Result<bool, slates_i
   }
 }
 
+/// The boot's steps the control loop takes before it answers a claim, every shard recovered and no client admitted
+/// yet: the client ids every shard retained restored into `listener` ([`restore_client_ids`]), then each partition's
+/// greens and works brought whole. Whether the boot may go on; a refused restore stops it.
+async fn boot_before_claims(listener: &mut Listener, control: u16, shards: &[ShardId]) -> bool {
+  if !restore_client_ids(listener, control, shards).await {
+    return false;
+  }
+  // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
+  // reconciled with the clones they name (A-236).
+  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
+  // client meets one half built and every work over one is replayed after it.
+  crate::green_adopt::readopt_at_boot(control, shards).await;
+  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
+  // green's owner, and only then is every floor compared with the work it holds for (A-247).
+  recover_works_across_partitions(control, shards).await;
+  ask_again_for_unbuilt_works(control, shards);
+  true
+}
+
 /// The control shard's loop: the rendezvous, the heartbeat, and a client handed to its shard
 /// as a spawned task (sharing by move). Every client region is named under `region_names`
 /// ([`region_name_key`]).
@@ -6568,21 +6617,20 @@ async fn control_loop(
   if futures::spawn_child(heartbeat_loop(segment, control_life)).is_err() {
     crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
   }
-  if !restore_client_ids(&mut listener, control, &shards).await {
+  if !boot_before_claims(&mut listener, control, &shards).await {
     slates_machine::log_line!(
       "slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon"
     );
     return;
   }
-  // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
-  // reconciled with the clones they name (A-236).
-  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
-  // client meets one half built and every work over one is replayed after it.
-  crate::green_adopt::readopt_at_boot(control, &shards).await;
-  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
-  // green's owner, and only then is every floor compared with the work it holds for (A-247).
-  recover_works_across_partitions(control, &shards).await;
-  ask_again_for_unbuilt_works(control, &shards);
+  // The anchor holds every content extent before the first claim is answered (Windows, A-789): a claim takes only a held
+  // extent, and this loop answers every claim, so no admission meets an extent made but not yet held. Here, a task of
+  // the control shard's that runs beside its others, the holds' exchanges can run: awaited inside the shard's start,
+  // which runs alone, they never did and the daemon never served (diag run 45251289894). Each hold is one exchange
+  // within the learned answer bound (A-552). Until 2026-11-23 each shard's start spawned its slice's holds and the
+  // daemon served at once, so a create the moment it served was refused.
+  #[cfg(windows)]
+  crate::content_extents::hold_before_serving(&config).await;
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the

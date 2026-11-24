@@ -20,11 +20,11 @@
 //! Steps 1 to 4 run in one turn and 6 and 7 in another, the landing between them; the repository's landing turn is
 //! held from the first to the last, so no other landing moves the records meanwhile.
 //!
-//! **A record that moves no version** ([`record`], A-652 part 3): the repository's UUID, or a revision's properties set
-//! whole, as an import names a repository that holds no revision but 0 by its stream's UUID and sets revision 0's
-//! properties to its stream's ([`land_record`]; a lock verb's entries too). Checked against the
-//! records first (a revision they hold, the room), landed on the store, checked again, its growth charged, one entry
-//! holding its reference alone and moving no green, then applied.
+//! **A record that moves no version** ([`land_record`], A-652 part 3): the repository's UUID, or a revision's properties
+//! set whole, as an import names a repository that holds no revision but 0 by its stream's UUID and sets revision 0's
+//! properties to its stream's (a lock verb's entries too, through [`land_record_with`]). Checked against the records
+//! first (a revision they hold, the room), landed on the store, checked again, its growth charged, one entry holding its
+//! reference alone and moving no green, then applied.
 //!
 //! A refusal before the append leaves the records, the green and the logs as they were, and gives back what was
 //! charged; a changeset it landed on the store is named by no entry and is taken again by the next landing. Once the
@@ -1721,10 +1721,7 @@ impl<'b> Building<'b> {
       .beneath(from)
       .into_iter()
       .map(|(found, directory)| {
-        let len = self
-          .engine
-          .content(&found)
-          .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let len = self.engine.content(&found).map_or(0, |bytes| bytes.len());
         let stood = Stood {
           directory,
           len,

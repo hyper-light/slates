@@ -906,6 +906,9 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
+  /// Creates parked until a remake of the pool's extents makes their room (`crate::room_wait`; A-789, Windows), bounded
+  /// by the shard's client credit.
+  pub(crate) room_waiters: crate::room_wait::RoomWaiters,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
   /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
@@ -1161,6 +1164,11 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): how long this node, as a forwarded verb's owner, waits after the verb
+  /// ran and deferred its reply before its exchange asks where the reply stands, as an exchange whose owner shard was
+  /// busy does, so a test sees a reply recorded before its exchange asked (`verbs::await_deferred_completion`). `None`
+  /// in production (`Daemon::inject_forward_answer_delay`).
+  pub injected_forward_answer_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): how long this node, as a content holder, holds each acknowledgement
   /// of a placement before it leaves, after the hold already took the content, so the owner's round stops collecting at
   /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.

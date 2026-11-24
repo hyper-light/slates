@@ -891,9 +891,11 @@ fn agent_channel(instance: &str, launcher: &slates_api::LauncherSecret) -> slate
 /// secret leaked, the worst case). Do: from the client node, an agent's channel (enrolled by the client's own launcher)
 /// sets the server volume's land mode to bypass and approves the server's presentation; then, from an agent's channel on
 /// the server node itself (enrolled by the server's launcher), sets the policy and issues the grant of exactly the
-/// presented manifest. Expect: the client node holds neither the volume nor its presentations, so both are refused
-/// `NotFound` there; on the server node both are refused `Forbidden` (`Denied::Rights`), since a consumer-bound channel
-/// sets no policy and approves no landing (A-285).
+/// presented manifest. Expect: the client node holds neither the volume nor its presentations and knows the volume is
+/// elsewhere, so both are refused `NotOwnerHere` there, at once and never after a retry budget (§4.8 "Lookup", the rule
+/// by authority: only the owner may say a volume does not exist; main's ruling of 2026-11-23); on the server node both
+/// are refused `Forbidden` (`Denied::Rights`), since a consumer-bound channel sets no policy and approves no landing
+/// (A-285). Before 2026-11-23 the client node answered the policy `NotFound` and the approval `NotOwnerHere`.
 fn no_agent_can_set_or_approve(
   (server, client): (&str, &str),
   [server_secret, client_secret]: &[slates_api::LauncherSecret; 2],
@@ -907,12 +909,26 @@ fn no_agent_can_set_or_approve(
   };
   let genuine = slates_api::Issuer::from_launcher_secret(server_secret);
   let mut remote = agent_channel(client, client_secret);
+  let asked = Instant::now();
   let raised = remote.set_write_policy(subject, &bypass, &genuine);
-  eprintln!("fs-server: the client node's agent setting the server's policy: {raised:?}");
-  assert!(absent(&raised, volume), "{raised:?}");
+  let raised_in = asked.elapsed();
+  eprintln!(
+    "fs-server: the client node's agent setting the server's policy: {raised:?} in {raised_in:?}"
+  );
+  assert!(
+    elsewhere(&raised) && raised_in < prompt(),
+    "{raised:?} in {raised_in:?}"
+  );
+  let asked = Instant::now();
   let approved = remote.approve_landing(approval, &genuine);
-  eprintln!("fs-server: the client node's agent approving the server's landing: {approved:?}");
-  assert!(absent(&approved, volume), "{approved:?}");
+  let approved_in = asked.elapsed();
+  eprintln!(
+    "fs-server: the client node's agent approving the server's landing: {approved:?} in {approved_in:?}"
+  );
+  assert!(
+    elsewhere(&approved) && approved_in < prompt(),
+    "{approved:?} in {approved_in:?}"
+  );
   let mut local = agent_channel(server, server_secret);
   let raised = local.set_write_policy(subject, &bypass, &genuine);
   eprintln!("fs-server: the server node's agent setting the policy: {raised:?}");
@@ -930,10 +946,23 @@ fn no_agent_can_set_or_approve(
   assert!(forbidden(&granted), "{granted:?}");
 }
 
-/// Whether `result` is the refusal of a node that does not hold `volume`: `NotFound` naming it.
-fn absent<T>(result: &Result<T, slates_api::Error>, volume: &str) -> bool {
-  matches!(result, Err(slates_api::Error::NotFound(slates_api::Missing::Volume(missing)))
-    if *missing == volume_id(volume))
+/// Whether `result` is the refusal of a node that does not hold a volume and knows it is elsewhere: `NotOwnerHere`, a
+/// retry the caller makes at the owner (§4.8 "Lookup", the rule by authority).
+fn elsewhere<T>(result: &Result<T, slates_api::Error>) -> bool {
+  matches!(
+    result,
+    Err(slates_api::Error::Retry {
+      cause: slates_api::RetryCause::NotOwnerHere { .. },
+      ..
+    })
+  )
+}
+
+/// Derived: the longest a refusal from a node that does not hold the volume may take to reach its caller: one liveness
+/// window (`LIVENESS_BUDGET_NS`), far past one local round trip and short of a client's retry budget (the recovery budget
+/// and a reply deadline), which a client resending a verb that can never succeed there would spend.
+fn prompt() -> Duration {
+  Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS)
 }
 
 /// Whether `result` is a refusal by rights (`Forbidden`, `Denied::Rights`): a consumer-bound channel's.

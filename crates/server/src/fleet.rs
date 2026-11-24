@@ -34,11 +34,11 @@
 //!
 //! **Takeover** (§4.8 "Promotion and takeover"; [`crate::takeover`]): when the council retires a host, every
 //! holder resolves each object it holds to the successor the committed configuration's lineage names
-//! ([`crate::takeover::resolve_held_objects`]) and brings its acceptor's authority into step
-//! ([`reconcile_held_authority`]); each survivor that owes a confirmation runs one phase-one round for the
-//! retired host across its recovery neighbourhoods — holders answering in pages, a holder that holds nothing
-//! answering too — adopts each object once its cohorts have promised, re-commits it under its own placement at
-//! the round's epoch, and confirms its share to the council. The serve loop answers a page from the same
+//! ([`crate::takeover::resolve_held_object`]) and brings its acceptor's authority into step
+//! ([`reconcile_held_copy`]), a copy a turn ([`install_on_copy`], A-398); each survivor that owes a confirmation runs
+//! one phase-one round for the retired host across its recovery neighbourhoods — holders answering in pages, a holder
+//! that holds nothing answering too — adopts each object once its cohorts have promised, re-commits it under its own
+//! placement at the round's epoch, and confirms its share to the council. The serve loop answers a page from the same
 //! durable holds ([`crate::takeover::serve_host_prepare`]).
 //!
 //! **Content replication and serve** (§4.10 "Content replication"; §4.8 mechanism 1): each owned volume's
@@ -2060,9 +2060,11 @@ fn retired_hosts(state: &ShardState) -> std::collections::BTreeSet<HostId> {
     .collect()
 }
 
-/// [`reconcile_held_authority`] for one held copy, `object`'s: its authority moved to the owner this node's routing
-/// names, at `generation`. A move away from a retired owner is recorded with the copy (A-251): once the authority names
-/// the successor, only that record says the copy was the retired owner's, which a takeover round's listing needs.
+/// One held copy's authority brought into step, `object`'s, as an install's walk does it a copy a turn
+/// ([`install_on_copy`]; `reconcile_held_authority`, the unit tests' oracle, does it to every copy at once): moved to
+/// the owner this node's routing names, at `generation`. A move away from a retired owner is recorded with the copy
+/// (A-251): once the authority names the successor, only that record says the copy was the retired owner's, which a
+/// takeover round's listing needs.
 fn reconcile_held_copy(
   state: &mut ShardState,
   object: ObjectId,
@@ -2357,7 +2359,11 @@ pub(crate) fn serve_merge_shipment(
 /// member acting for the object — its current owner, or, once that owner departed, its takeover successor —
 /// and a placement must land on one of the acting owner's candidates for the object. A read is also allowed
 /// to the object's candidate holders (a re-replication among them). The owner is the one this holder's
-/// records name, else the object's creator (content is placed before its first record, §4.16).
+/// records name, the object's own copy's, else its catalog's (A-382: a re-admitted creator holds a successor's
+/// catalog copy before any copy of its head), else the object's creator (content is placed before its first
+/// record, §4.16). Until 2026-11-23 a holder with no copy of the head fell back to the creator, so a re-admitted
+/// creator refused its successor's every live entry `not_the_acting_owner` and its copy of the log never caught up
+/// (the chaos nemesis's convergence, seeds 14946995733817154046 and 8173581894251929445).
 pub(crate) fn content_authorized(
   regional: &slates_db::register::RegionalConfiguration,
   records: &std::collections::BTreeMap<ObjectId, slates_db::register::Acceptor>,
@@ -2387,8 +2393,13 @@ pub(crate) fn content_authority(
   if !regional.members.contains(&peer) {
     return Err("content.refused.not_a_member");
   }
+  // The object's own copy names its owner; a holder with none yet takes the owner its catalog's copy names, which the
+  // same owner writes: a creator admitted again lets its copies go (A-382), and its successor's next catalog record
+  // makes the catalog's afresh while the head's comes only with the head's next change. Only with neither is the
+  // creator the owner, as content placed before its first record is (§4.16).
   let owner = records
     .get(&object)
+    .or_else(|| records.get(&object.catalog()))
     .map_or_else(|| object.creator(), slates_db::register::Acceptor::owner);
   let acting = if regional.members.contains(&owner) {
     Some(owner)
@@ -12888,6 +12899,46 @@ mod tests {
       "the departed owner is refused"
     );
     assert!(!allowed(owner, Place, landing));
+  }
+
+  /// The chaos nemesis at seed 14946995733817154046 (§4.8 "Promotion and takeover"; A-382): a holder whose only copy
+  /// of a volume's registers is its catalog's, under the successor's authority, takes that successor for the volume's
+  /// acting owner, though the holder created the volume. Do: on the creator, hold the catalog's copy naming the
+  /// successor and no copy of the volume's own register (what the creator's re-admission leaves once the successor's
+  /// next catalog record makes it a holder again: the head's record comes only with the head's next change), and ask
+  /// whether the successor may place the volume's content here; then ask with no copy at all. Expect the successor to
+  /// place, and with no copy the creator alone, as content placed before its first record is (§4.16). Before, the
+  /// creator fell back to itself: it refused every live entry of its successor `not_the_acting_owner`, and its copy of
+  /// the log never caught up (the nemesis's convergence, 2026-11-23: 64 and more refusals in one run, 8,826 in another).
+  #[test]
+  fn a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names() {
+    use slates_cluster::content::ContentAccess::Place;
+    let (regional, object, _) = content_region();
+    let creator = HostId(1);
+    let successor = HostId(2);
+    let catalog_only = std::collections::BTreeMap::from([(
+      object.catalog(),
+      slates_db::register::Acceptor::new(
+        creator,
+        slates_db::register::Authority {
+          generation: 1,
+          owner: successor,
+        },
+      ),
+    )]);
+    let none = std::collections::BTreeMap::new();
+    assert!(
+      content_authorized(&regional, &catalog_only, creator, successor, Place, object),
+      "the successor the catalog names places on the creator"
+    );
+    assert!(
+      !content_authorized(&regional, &catalog_only, creator, creator, Place, object),
+      "and the creator no longer acts as owner here"
+    );
+    assert!(
+      !content_authorized(&regional, &none, creator, successor, Place, object),
+      "with no record at all the creator is the acting owner"
+    );
   }
   use super::*;
   use slates_cluster::DispatchWait;

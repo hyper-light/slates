@@ -97,7 +97,7 @@ use slates_svn::commit::revision::StepRefusal;
 use slates_svn::dav::commit::DavCommit;
 use slates_svn::index::Index as SvnIndex;
 use slates_svn::migration::{Repository as SvnRecords, Room as SvnRoom};
-use slates_vcs::{Admitted, ContentRefused, ContentStore, Derivations, Mode};
+use slates_vcs::{Admitted, ContentCounters, ContentRefused, ContentStore, Derivations, Mode};
 use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
@@ -160,6 +160,38 @@ pub(crate) const VALUE_UNKEPT: &str = "vcs_store.value_unkept";
 /// Counter: a record replayed into its store by a recovery or a rebuild: the replay's non-vacuity counter. Format: a
 /// counter name.
 pub(crate) const REPLAYED: &str = "vcs_store.replayed";
+/// Figure: the reads the shard's content store has served by identity (`ContentStore::reads`), a let-go window's among
+/// them: with [`CONTENT_LET_GO`] and `svn_texts::PIECE_FETCHED`, how many of a session's reads the store lent and how
+/// many went to the node's store. Format: a counter name in the status report.
+pub(crate) const CONTENT_READS: &str = "vcs_store.content.reads";
+/// Figure: contents the shard's content store stored new (`ContentCounters::stored`). Format: a counter name.
+pub(crate) const CONTENT_STORED: &str = "vcs_store.content.stored";
+/// Figure: contents the shard's content store freed with their last holder (`ContentCounters::freed`). Format: a counter
+/// name.
+pub(crate) const CONTENT_FREED: &str = "vcs_store.content.freed";
+/// Figure: windows the shard's content store let go to the node's store (`ContentCounters::let_go`): what a later read
+/// finds no bytes of. Format: a counter name.
+pub(crate) const CONTENT_LET_GO: &str = "vcs_store.content.let_go";
+/// Figure: let-go windows the shard's content store brought back (`ContentCounters::brought_back`). Format: a counter
+/// name.
+pub(crate) const CONTENT_BROUGHT_BACK: &str = "vcs_store.content.brought_back";
+
+/// The shard's content store's figures for its status report, each named ([`CONTENT_READS`] and the four after it); none
+/// where the shard made no content store.
+pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 5] {
+  let (reads, counters) = stores
+    .content()
+    .map_or((0, ContentCounters::default()), |content| {
+      (content.reads(), content.counters())
+    });
+  [
+    (CONTENT_READS, reads),
+    (CONTENT_STORED, counters.stored),
+    (CONTENT_FREED, counters.freed),
+    (CONTENT_LET_GO, counters.let_go),
+    (CONTENT_BROUGHT_BACK, counters.brought_back),
+  ]
+}
 /// Counter (A-727 slice a3): repository windows a recovery took back from the shard image, their chunks claimed.
 pub(crate) const WINDOWS_RESTORED: &str = "vcs_store.windows_restored";
 /// Counter (A-727 slice a3): window pieces of the shard image a recovery could not take back (put again by replay).
@@ -386,24 +418,37 @@ impl GitStore {
   }
 
   /// The green's version, and the tree, of the newest of the store's versions of the green keyed `key` whose head is
-  /// `head`: a push's base (§4.17.1 item 1). It reads the green's versions newest first, each one row.
+  /// `head`: a push's base (§4.17.1 item 1). Read from the holders' map (`Repository::holders`), no version walked.
   pub(crate) fn version_of(
     &self,
     content: &ContentStore,
     key: u64,
     head: &ObjectId,
   ) -> Option<(u64, ObjectId)> {
-    let versions = self.versions.get(&key)?;
-    versions.iter().enumerate().rev().find_map(|(at, version)| {
-      (self.repository.head(content, key, at).as_ref() == Some(head))
-        .then(|| {
-          self
-            .repository
-            .tree(content, key, at)
-            .map(|tree| (*version, tree))
-        })
-        .flatten()
-    })
+    let (_, at) = self
+      .repository
+      .holders(content, head)
+      .into_iter()
+      .find(|(green, _)| *green == key)?;
+    self.version_at(content, key, at)
+  }
+
+  /// The greens holding `head` (`Repository::holders`): each one's key and its newest store version whose head is
+  /// `head`, in key order. What a push's search for a create's base reads (goal 93).
+  pub(crate) fn holders(&self, content: &ContentStore, head: &ObjectId) -> Vec<(u64, usize)> {
+    self.repository.holders(content, head)
+  }
+
+  /// The green's version, and the tree, of the store's version `at` of the green keyed `key`.
+  pub(crate) fn version_at(
+    &self,
+    content: &ContentStore,
+    key: u64,
+    at: usize,
+  ) -> Option<(u64, ObjectId)> {
+    let number = *self.versions.get(&key)?.get(at)?;
+    let tree = self.repository.tree(content, key, at)?;
+    Some((number, tree))
   }
 
   /// The green's versions at each of the store's versions of the green keyed `key`.
@@ -651,6 +696,18 @@ impl VcsStores {
         ("mem.gauge.vcs_content.objects", census.objects),
         ("mem.gauge.vcs_content.used_bytes", census.used),
         ("mem.gauge.vcs_content.charged_bytes", census.charged),
+      ]);
+    }
+    // The chunks the windows lie in and the windows let go from slabs still held (goal 93; `arena_windows`, "Slabs").
+    if let Some(windows) = chunk_windows(self) {
+      let slabs = windows.slab_census();
+      rows.extend([
+        ("mem.gauge.vcs_content.slabs", slabs.slabs),
+        ("mem.gauge.vcs_content.slab_freed_kept", slabs.freed_kept),
+        (
+          "mem.gauge.vcs_content.slab_freed_kept_bytes",
+          slabs.freed_kept_bytes,
+        ),
       ]);
     }
     let mut git = slates_git::store::RepositoryHeld::default();
@@ -984,19 +1041,12 @@ fn git_format(format: DbFormat) -> Option<ObjectFormat> {
   }
 }
 
-/// The key a green has in its repository's git store (module docs): its volume id's partition and counter.
+/// The key a green has in its repository's git store (module docs): its volume id's partition and counter, the id's
+/// serial (`slates_db::catalog::VolumeId::serial`), so the repository index finds the member a key names
+/// (`Repositories::member_keyed`) without a walk.
 pub(crate) fn green_key(green: DbVolumeId) -> u64 {
-  green
-    .bytes
-    .get(GREEN_KEY_START..)
-    .and_then(|half| <[u8; GREEN_KEY_BYTES]>::try_from(half).ok())
-    .map_or(0, u64::from_be_bytes)
+  green.serial()
 }
-
-/// Format: where a volume id's partition and counter begin (`verbs::fresh_volume_id`: the host's eight bytes first).
-const GREEN_KEY_START: usize = size_of::<u64>();
-/// Format: the bytes of a green's key: the partition's two and the counter's six.
-const GREEN_KEY_BYTES: usize = size_of::<u64>();
 
 /// Makes `record`'s store on its owner shard, beside its record (module docs): empty, so it charges nothing yet but
 /// the objects its entries hold in the partition's register, which a recovery finds there ([`settle_objects`]). A store
@@ -3745,11 +3795,12 @@ async fn payload_bytes(
   (bytes.len() == whole).then_some(bytes)
 }
 
-/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): on again (main 01a20182's order of
-/// 2026-11-23, after r165's `Pack(Store(Unreadable))` put the guard back in 5d9e81984; every read of a let-go window
-/// now stops and is brought back, and the let-go is sliced). One switch for every path that lets a landed pack go: a
-/// commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]).
-pub(crate) const LANDED_LET_GO: bool = true;
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held again (main 01a20182's order of
+/// 2026-11-23 after r18: with it on, a push of a tag of a let-go tag was declined by its peel's read, a shallow fetch
+/// over HTTP refused `Pack(Store(Unreadable))`, and git/git's HTTP mirror clone stalled; GAPS). One switch for every
+/// path that lets a landed pack go: a commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole
+/// ([`put_changeset`]).
+pub(crate) const LANDED_LET_GO: bool = false;
 
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push

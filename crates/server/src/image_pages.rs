@@ -576,6 +576,12 @@ impl Encoder {
   pub(crate) fn stop_catching_up(&mut self) {
     self.catching_up = false;
   }
+
+  /// Whether a publication is owed and no task is encoding on to make it: a catch-up whose publication was refused, or
+  /// whose task could not be spawned, which the shard's sweep begins again (`content_holder::image_retry_owed`).
+  pub(crate) fn owed_unattended(&self) -> bool {
+    self.owed.is_some() && !self.catching_up
+  }
 }
 
 #[cfg(test)]
@@ -743,28 +749,63 @@ mod tests {
     ids
   }
 
+  /// Shape: the page a loaded machine's copy slice can come to, pinned (w-perf's probe of 2026-11-23: the derived page
+  /// was 15,959 bytes, a step quantum of 28,452 ns; at 2,048 bytes the checkpoint carried 386 pieces, past the
+  /// `ENTRIES / 10` an earlier bound held it to, which failed so once under a load average of 70 to 80).
+  const LOADED_PAGE: usize = 2_048;
+
+  /// Derived: a page splits only past the page size, so the two halves of every split hold more than a page between
+  /// them, and over identities' coordinates (BLAKE3, uniform) a family's pages hold half a page or more on the mean. So a
+  /// family's pages are at most twice its bytes over the page size, and one for a family of less than a page. Measured
+  /// on the Studio, 2026-11-23: 1.43 to 1.47 times, at pages of 15,959, 4,096 and 2,048 bytes.
+  const PAGES_A_PAGE_OF_BYTES: usize = 2;
+
   /// A-870 piece 1 (main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30; arena-4: 138,989 windows let go and as
   /// many landed records, one image piece each). Do: on a shard, let [`ENTRIES`] one-window objects go landed and note a
-  /// landed record for each; take the shard's checkpoint image; read it back as a restore does. Expect: the image's
-  /// pieces far fewer than its entries (a tenth at most), and every window let go and every record read back.
+  /// landed record for each; take the shard's checkpoint image; read it back as a restore does; once at the shard's own
+  /// page size and once at [`LOADED_PAGE`]. Expect, at each: the pieces not pages far fewer than the entries (a tenth at
+  /// most); the page pieces within [`PAGES_A_PAGE_OF_BYTES`] times their bytes over the page size the encoder planned
+  /// by, plus one a family; and every window let go and every record read back. The page size is the machine's copy
+  /// slice, which load shrinks, so the bound is the encoder's own measure, never a count fixed against the wall clock.
   /// Failing first: one piece an entry, twice [`ENTRIES`] pieces.
   #[test]
   fn a_checkpoint_carries_many_entries_in_few_pieces_and_restores_them_whole() {
-    let (pieces, aways, landed) = crate::daemon::audit_on_shard(|state| {
-      let _ = let_go_and_note(state, (0, ENTRIES));
-      // Since piece 2 a checkpoint carries the encoder's cut once its turns have caught up, else the committed one.
-      crate::content_holder::image_drain(state);
-      while !crate::content_holder::image_turn(state).caught_up {}
-      let image = crate::content_holder::held_image(state);
-      let held = crate::content_holder::split_held(&image).unwrap();
-      (image.len(), held.aways.len(), held.landed.len())
-    });
-    assert!(
-      pieces <= ENTRIES / 10,
-      "{pieces} pieces carry {} entries",
-      2 * ENTRIES
-    );
-    assert_eq!((aways, landed), (ENTRIES, ENTRIES), "every entry read back");
+    for pinned in [0, LOADED_PAGE] {
+      let (pieces, (paged, paged_bytes), page, aways, landed) =
+        crate::daemon::audit_on_shard(move |state| {
+          crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(pinned));
+          let _ = let_go_and_note(state, (0, ENTRIES));
+          // Since piece 2 a checkpoint carries the encoder's cut once its turns have caught up, else the committed one.
+          crate::content_holder::image_drain(state);
+          while !crate::content_holder::image_turn(state).caught_up {}
+          let image = crate::content_holder::held_image(state);
+          let page = crate::content_holder::image_page_bytes(state);
+          crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+          let held = crate::content_holder::split_held(&image).unwrap();
+          (
+            image.len(),
+            crate::content_holder::page_pieces_of(&image),
+            page,
+            held.aways.len(),
+            held.landed.len(),
+          )
+        });
+      println!(
+        "checkpoint at a page of {page} bytes: {pieces} pieces, {paged} of them pages of {paged_bytes} bytes"
+      );
+      assert!(
+        pieces - paged <= ENTRIES / 10,
+        "{} pieces not pages carry {} entries",
+        pieces - paged,
+        2 * ENTRIES
+      );
+      let bound = PAGES_A_PAGE_OF_BYTES * paged_bytes.div_ceil(page) + Family::ALL.len();
+      assert!(
+        paged <= bound,
+        "{paged} pages of {paged_bytes} bytes at a page of {page}, past {bound}"
+      );
+      assert_eq!((aways, landed), (ENTRIES, ENTRIES), "every entry read back");
+    }
   }
 
   /// A-870 piece 1. Do: on a shard whose pages are small ([`crate::content_holder::TEST_PAGE_BYTES`]), let many objects

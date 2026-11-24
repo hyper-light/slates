@@ -597,7 +597,8 @@ impl PendingHandshake {
   }
 
   /// Gives the handshake up because the kernel refused to watch the helper's exit, refused with `code` (the owner
-  /// awaits an exit only by its watch, [`Awaiting::Exit`]): kills and reaps the helper, as [`PendingMount::abort`] does.
+  /// awaits an exit only by its watch, [`Awaiting::Exit`]): kills and reaps the helper, as [`PendingHandshake::abort`]
+  /// does.
   pub fn abort_unwatched(mut self, code: Option<i32>) -> MountError {
     MountError::ExitUnwatched {
       code,

@@ -790,6 +790,13 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test overrun
+      # A spinning task's label read from another thread (A-740), so a watchdog's report names the task, not the shard
+      # alone. The label's file is held to `file!()` whole, which a Windows build writes with backslashes: until
+      # 2026-11-23 the test held a `/`-separated suffix, which never matched here, and no lane ran it here.
+      - name: Test a spinning task's label read from another thread (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test spin_label
       # A shard's CPU clock read from another thread (§4.14, A-65): `GetThreadTimes` for the time it ran and
       # `QueryThreadCycleTime` for whether it ran; then the observations that count their budget in it — a starved
       # shard answered past the wall budget, a wedged one ended in one budget
@@ -968,6 +975,18 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
+      # A-789 on Windows: each content pool extent a section of its own, held by the anchor. A freed one gives its
+      # commit back, one outlives a killed daemon, a create the moment the daemon serves is admitted (its extents held
+      # before it answers a claim), and one at once after a destroy waits for the released extents' remakes
+      # (`slates_server`'s `room_wait`). No lane ran the file until 2026-11-23. Gated by `SLATES_TEST_CLI=1`. Its
+      # commit give-back test is skipped, a tracked red (GAPS, A-878): its 256 MiB write through a CLI attachment made by
+      # another `slates attach` process is refused `AttachmentExpired` on both runners (diag run 45260798132).
+      - name: The content pool's extents through the CLI (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture --skip a_freed_content_extent_gives_its_commit_back_on_windows
       # A-209: Win32 semantics through the drive that winfstest found broken (a move not asked to replace, a directory
       # holding a file, SetFileTime's times, an open that truncates), then WinFsp's own two suites over the drive through
       # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
@@ -1200,6 +1219,8 @@ jobs:
         run: cargo test -p slates-rt --test tcp
       - name: Test a shard's lateness after a park (native arm64 Windows)
         run: cargo test -p slates-rt --test overrun
+      - name: Test a spinning task's label read from another thread (native arm64 Windows)
+        run: cargo test -p slates-rt --test spin_label
       - name: Test the shard CPU clock (native arm64 Windows)
         run: 'cargo test -p slates-rt --lib thread_clock::'
       - name: Test the wire codec and its CRC32C on arm64 hardware
@@ -1333,6 +1354,12 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
+      - name: The content pool's extents through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture --skip a_freed_content_extent_gives_its_commit_back_on_windows
       # The WinFsp mount on arm64 (the DAX matrix's bare-metal Windows arm64 mount-route cell, docs/wip/virtiofs.md §8):
       # WinFsp's package carries its arm64 driver and library (`winfsp-a64.sys`, `winfsp-a64.dll`, which the bridge
       # loads by name on this target), and the same tests as the x86_64 lanes run: a cached read follows another path's

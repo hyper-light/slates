@@ -2105,6 +2105,13 @@ impl ContentStore {
   pub fn counters(&self) -> ContentCounters {
     self.counters
   }
+
+  /// The reads so far of a content whose name the store keeps, each a content's bytes or a window of an object, let go
+  /// or not (a let-go window's read finds no bytes): the clock its coldest windows are found by. A read of a name it
+  /// does not keep is not counted.
+  pub fn reads(&self) -> u64 {
+    self.reads.get()
+  }
 }
 
 /// The contents a freed content of `form` held, which freeing it gives back: a list's identities, a derived node's

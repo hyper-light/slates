@@ -10,9 +10,8 @@
 //! a turn at a time (A-719: every object checked as git checks a push, then the connectivity walk, each turn the shard's
 //! step quantum), decides the checked push and writes git's report to the edge's bytes, a step at a time while its
 //! hooks run (A-665 part 3): [`Answering::Turned`] after each turn of the checks or of a hook's view's sealing, and
-//! [`Answering::Hook`] for a hook the edge
-//! runs off the shard's step and hands back through `ReceivePack::hook_ran` (`hooks`, Unix, where the hook driver
-//! runs). Each call is one step on the owner shard; between steps the driver holds only its push's sealed quarantine
+//! `Answering::Hook` for a hook the edge runs off the shard's step and hands back through `ReceivePack::hook_ran`
+//! (`hooks`, Unix, where the hook driver runs). Each call is one step on the owner shard; between steps the driver holds only its push's sealed quarantine
 //! and a hook's view, which a push dropped between them gives back, so an edge's task keeps the driver across its own
 //! awaits. Every read of the store is lent the
 //! room the shard can admit now (`vcs_store::with_room`), since A-614's store parses within its content store's room
@@ -347,6 +346,8 @@ struct DecidingPush {
   restaging: Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time over the turns before its verdict (A-752).
   preparing: Option<slates_git::receive::works::Preparing>,
+  /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
+  peel_away: Option<u64>,
   /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
   /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
   making_room: Option<Vec<DbVolumeId>>,
@@ -869,6 +870,7 @@ impl<P> ReceivePack<P> {
       admitting: None,
       restaging: None,
       preparing: None,
+      peel_away: None,
       making_room: None,
       door: None,
       homing: Homing::Due,
@@ -900,6 +902,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        peel_away,
         making_room,
         door,
         ..
@@ -914,6 +917,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        peel_away,
         making_room,
         door,
       };
@@ -1463,9 +1467,8 @@ fn unheld_key(repository: RepositoryId) -> u64 {
 fn keyed(state: &ShardState, repository: RepositoryId, key: u64) -> Option<DbVolumeId> {
   let repositories = state.db.partition().repositories();
   repositories
-    .members_of(repository)
-    .map(|member| member.green)
-    .find(|green| green_key(*green) == key)
+    .member_keyed(repository, key)
+    .map(|(green, _)| green)
 }
 
 /// The refs a pusher may not read under its repository's policy (module docs, "What is advertised"; A-622's Read).
@@ -1964,6 +1967,8 @@ struct ServerJudge<'j> {
   restaging: &'j mut Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time before its verdict (A-752).
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
+  /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
+  peel_away: &'j mut Option<u64>,
   /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
   making_room: &'j mut Option<Vec<DbVolumeId>>,
   /// The green owing its push that the command under way waits at the door for (P2).
@@ -2152,9 +2157,12 @@ impl ServerJudge<'_> {
       preparing,
       ..
     } = self;
-    with_room(state, |state| {
+    let (entry, examined) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
-        return Err(refused_declined(&command.name, words(&GitRefused::NoStore)));
+        return (
+          Err(refused_declined(&command.name, words(&GitRefused::NoStore))),
+          0,
+        );
       };
       let (content, git) = store;
       let room = state.store.admittable();
@@ -2166,11 +2174,15 @@ impl ServerJudge<'_> {
         store,
         indexed: &indexed,
         owing: std::cell::Cell::new(None),
+        examined: std::cell::Cell::new(0),
       };
-      Verdicts::new(&greens, &indexed, &objects, *name, room)
+      let entry = Verdicts::new(&greens, &indexed, &objects, *name, room)
         .prepared(preparing.take())
-        .judge(command, pushed)
-    })
+        .judge(command, pushed);
+      (entry, greens.examined.get())
+    });
+    state.count(HOLDING_EXAMINED, examined);
+    entry
   }
 
   /// P2's door for the command under way, at `green`, which owes its push: whether the command may go on to its verdict.
@@ -2199,6 +2211,7 @@ impl ServerJudge<'_> {
       record,
       name,
       preparing,
+      peel_away,
       ..
     } = self;
     let quantum = state.config.step_quantum_ns();
@@ -2211,9 +2224,9 @@ impl ServerJudge<'_> {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
       hash_bytes: state.config.archive_slice_bytes_within(quantum).max(1),
     };
-    let (built, owing) = with_room(state, |state| {
+    let (built, owing, examined) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
-        return Ok::<_, Declined>((true, None));
+        return Ok::<_, Declined>((true, None, 0));
       };
       let (content, git) = store;
       let room = state.store.admittable();
@@ -2225,17 +2238,15 @@ impl ServerJudge<'_> {
         store,
         indexed: &indexed,
         owing: std::cell::Cell::new(None),
+        examined: std::cell::Cell::new(0),
       };
-      let built = Verdicts::new(&greens, &indexed, &objects, *name, room).prepare(
-        command,
-        pushed,
-        preparing,
-        (began, env),
-        slices,
-      );
-      Ok((built, greens.owing.get()))
+      let verdicts = Verdicts::new(&greens, &indexed, &objects, *name, room).peeled(**peel_away);
+      let built = verdicts.prepare(command, pushed, preparing, (began, env), slices);
+      **peel_away = verdicts.away_seen();
+      Ok((built, greens.owing.get(), greens.examined.get()))
     })
-    .unwrap_or((true, None));
+    .unwrap_or((true, None, 0));
+    state.count(HOLDING_EXAMINED, examined);
     // A green the command reached that owes its push is made first, through the door, and the command waits for it a
     // turn at a time (P2): its verdict reads it. A turn that only found it builds nothing and is not counted.
     if let Some(green) = owing {
@@ -2464,7 +2475,13 @@ struct ShardGreens<'s, 'v> {
   /// The first green the push reached that owes its push (P2): lent as none, so the push waits at the door for it
   /// (`crate::green_ready`) rather than judge without it.
   owing: std::cell::Cell<Option<DbVolumeId>>,
+  /// The greens [`ShardGreens::holding`] examined, counted [`HOLDING_EXAMINED`] once the reader is done.
+  examined: std::cell::Cell<u64>,
 }
+
+/// Format: the status counter of the greens a push's search for the green holding a commit examined
+/// (`ShardGreens::holding`): each one lent or whose versions were read.
+pub(crate) const HOLDING_EXAMINED: &str = "git_push.holding.examined";
 
 impl works::Greens for ShardGreens<'_, '_> {
   fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T> {
@@ -2559,17 +2576,29 @@ impl ShardGreens<'_, '_> {
     let (content, git) = self.store;
     let repositories = self.state.db.partition().repositories();
     let default = self.default_green();
-    let members = repositories
-      .members_of(self.record.id)
-      .map(|member| member.green);
-    default
+    // Goal 93: only the greens holding `parent` are asked, from the store's holders' map, each placed by the rank it
+    // joined at (the default branch first): what the search costs follows the greens at the commit, never the
+    // repository's greens, where it lent each member and read each one's versions.
+    let mut held: Vec<(Option<u64>, DbVolumeId, u64, usize)> = git
+      .holders(content, parent)
       .into_iter()
-      .chain(members)
-      .filter(|green| Some(*green) == default || !self.state.greens.is_owing(green))
-      .find_map(|green| {
-        let (number, tree) = git.version_of(content, green_key(green), parent)?;
-        self.branchable(green, Version { number, tree })
+      .filter_map(|(key, at)| {
+        if let Some(green) = default.filter(|green| green_key(*green) == key) {
+          return Some((None, green, key, at));
+        }
+        let (green, rank) = repositories.member_keyed(self.record.id, key)?;
+        Some((Some(rank), green, key, at))
       })
+      .collect();
+    held.sort_unstable_by_key(|(rank, ..)| *rank);
+    held.into_iter().find_map(|(_, green, key, at)| {
+      self.examined.set(self.examined.get().saturating_add(1));
+      if Some(green) != default && self.state.greens.is_owing(&green) {
+        return None;
+      }
+      let (number, tree) = git.version_at(content, key, at)?;
+      self.branchable(green, Version { number, tree })
+    })
   }
 
   /// The default branch's green.

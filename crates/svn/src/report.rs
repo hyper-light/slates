@@ -9,7 +9,7 @@
 //! `reporter.c` differs by two comments and a hash constructor, its `serve.c` by a Windows
 //! include):
 //! 1. The command's parameters (`serve.c` `update` 1948, `switch_cmd` 2008, `status` 2064 and
-//!    `diff` 2105), read through `vparse_tuple` ([`tuple`]): `update` `(?r)cb?w3?3`, `switch`
+//!    `diff` 2105), read through `vparse_tuple` ([`tuple`](mod@tuple)): `update` `(?r)cb?w3?3`, `switch`
 //!    `(?r)cbc?w?33`, `status` `cb?(?r)?w`, `diff` `(?r)cbbc` from a client before 1.4 and
 //!    `(?r)cbbcb?w` after. Parameters that do not match end the connection. A depth word Subversion
 //!    does not know is `unknown`; with no word, `recurse` decides. `update` first asks whether the

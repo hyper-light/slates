@@ -26,7 +26,7 @@ use crate::Admission;
 use crate::out::{Measure, Out};
 use crate::pktline::Packet;
 
-/// Format: the byte between a line's key and its value [gitprotocol-v2 "bundle-uri": `<key>=<value>`].
+/// Format: the byte between a line's key and its value \[gitprotocol-v2 "bundle-uri": `<key>=<value>`\].
 const ASSIGN: u8 = b'=';
 
 /// Format: the namespace every key is in [gitprotocol-v2 "bundle-uri": "a config key from the `bundle.*` namespace"].

@@ -1046,6 +1046,55 @@ fn pipelined_commands_are_answered_one_turn_a_shard_poll() {
   assert_eq!(unyielded, vec![0, 0]);
 }
 
+/// Goal 93's attribution of a slower svnsync: a conversation's time is counted by phase. Do: sign in, then send 64
+/// `get-latest-rev` commands in one write and read their 128 answers. Expect: at least one answer a command
+/// (`vcs_svn.answers`), nanoseconds spent answering (`vcs_svn.answer_ns`) and waiting for the client's bytes
+/// (`vcs_svn.read_wait_ns`), the shards' counts together, wherever the conversation ran.
+#[test]
+fn a_conversations_answers_and_its_waits_for_the_client_are_counted() {
+  const COMMANDS: usize = 64;
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-phases-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  let answers = asked(
+    &mut signed.stream,
+    &b"( get-latest-rev ( ) ) ".repeat(COMMANDS),
+    2 * COMMANDS,
+  );
+  assert_eq!(
+    answers,
+    "( success ( ( ) 0: ) ) ( success ( 0 ) ) ".repeat(COMMANDS)
+  );
+  let counted = |kind: &'static str| -> u64 {
+    [LISTENER, OTHER]
+      .into_iter()
+      .map(|partition| {
+        crate::daemon::observe_at(&daemon, partition, |state| {
+          state.refusals.get(kind).copied().unwrap_or(0)
+        })
+      })
+      .sum()
+  };
+  let answered = counted(super::ANSWERS);
+  assert!(
+    answered >= u64::try_from(COMMANDS).unwrap(),
+    "{answered} answers counted for {COMMANDS} commands"
+  );
+  assert!(counted(super::ANSWER_NS) > 0, "no time counted answering");
+  assert!(
+    counted(super::READ_WAIT_NS) > 0,
+    "no time counted waiting for the client"
+  );
+}
+
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`; `hooks.c` `svn_repos__hooks_pre_revprop_change`,
 /// `_post_revprop_change`). Do: commit a file with log `file`; configure a pre-revprop-change hook that records its
 /// arguments and standard input and allows, and a post-revprop-change hook that records its standard input; change
@@ -1207,4 +1256,183 @@ fn an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does() {
     unlocked.contains("( success ( 7:new.txt ) )") && unlocked.ends_with("done ( success ( ) ) "),
     "{unlocked}"
   );
+}
+
+/// Shape: the bytes of the text the stored-text replay commits: several of the node's store's pieces
+/// (`slates_store::store::PIECE_BYTES`, 64 KiB) and of svndiff's windows (100 KiB) long, so a reader that fetches a piece
+/// again for each of its turns shows against one that reads each piece whole.
+const STORED_TEXT_BYTES: usize = 300 << 10;
+/// Shape: how long the stored-text replay waits for its two revisions' import: far past a debug build's import of them
+/// on a loaded Mac, as the import tests' own wait is.
+const IMPORT_PATIENCE: Duration = Duration::from_secs(60);
+/// Shape: the bytes the tests' client reads at a time: a socket buffer's worth.
+const ANSWER_READ_BYTES: usize = 1 << 16;
+
+/// A format-2 dump of two revisions after revision 0: the first adds `/a.bin` holding `first`, the second changes it to
+/// `second`, so the first's text is no longer the head's once both stand.
+fn two_versions(first: &[u8], second: &[u8]) -> Vec<u8> {
+  let props = |entries: &[(&str, &str)]| {
+    let mut section = String::new();
+    for (name, value) in entries {
+      section.push_str(&format!(
+        "K {}\n{name}\nV {}\n{value}\n",
+        name.len(),
+        value.len()
+      ));
+    }
+    section.push_str("PROPS-END\n");
+    section
+  };
+  let mut dump =
+    b"SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000876\n\n".to_vec();
+  let zero = props(&[("svn:date", "2026-11-23T00:00:00.000000Z")]);
+  dump.extend_from_slice(
+    format!(
+      "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+      zero.len()
+    )
+    .as_bytes(),
+  );
+  for (number, text) in [(1, first), (2, second)] {
+    let date = format!("2026-11-23T00:00:0{number}.000000Z");
+    let log = format!("r{number}");
+    let section = props(&[
+      ("svn:author", "alice"),
+      ("svn:date", &date),
+      ("svn:log", &log),
+    ]);
+    dump.extend_from_slice(
+      format!(
+        "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+        section.len()
+      )
+      .as_bytes(),
+    );
+    let node = if number == 1 {
+      let empty = "PROPS-END\n";
+      format!(
+        "Node-path: a.bin\nNode-kind: file\nNode-action: add\nProp-content-length: {}\nText-content-length: {}\n\
+         Content-length: {}\n\n{empty}",
+        empty.len(),
+        text.len(),
+        empty.len() + text.len()
+      )
+    } else {
+      format!(
+        "Node-path: a.bin\nNode-kind: file\nNode-action: change\nText-content-length: {0}\nContent-length: {0}\n\n",
+        text.len()
+      )
+    };
+    dump.extend_from_slice(node.as_bytes());
+    dump.extend_from_slice(text);
+    dump.extend_from_slice(b"\n\n");
+  }
+  dump
+}
+
+/// Reads `stream` until `needle` has come `times` times and what was read ends with `end`: every byte read, and whether
+/// both came before the stream ended or a read waited past its patience.
+fn read_answer(
+  stream: &mut ClientStream,
+  (needle, times): (&[u8], usize),
+  end: &[u8],
+) -> (Vec<u8>, bool) {
+  let mut read = Vec::new();
+  let mut chunk = vec![0u8; ANSWER_READ_BYTES];
+  loop {
+    let taken = match stream.read(&mut chunk) {
+      Ok(0) | Err(_) => return (read, false),
+      Ok(taken) => taken,
+    };
+    read.extend_from_slice(&chunk[..taken]);
+    let seen = read
+      .windows(needle.len())
+      .filter(|window| *window == needle)
+      .count();
+    if seen >= times && read.ends_with(end) {
+      return (read, true);
+    }
+  }
+}
+
+/// Goal 93's svnsync over svn:// (255.2 ms a revision on main 1d06ab306 against 135 ms on 2026-11-21): a replay reads a
+/// stored text through the node's store a piece at a time, each piece fetched once. Do: import a dump whose revision 1
+/// adds `/a.bin`, [`STORED_TEXT_BYTES`] of noise, and whose revision 2 changes it, so revision 1's text is no longer the
+/// head's and no RAM keeps it once its revision stands (`svn_commit::landing`, "A commit's texts"); then, over svn://
+/// signed in as a stock client signs in, ask `replay-range ( 1 1 0 true )` as `svnsync synchronize` asks a revision.
+/// Expect: the replay whole, carrying the text's first KiB (noise, which svndiff0 sends as it is); the text read through
+/// the node's store (`vcs_store.svn_texts.piece_fetched` at least once) at most once a piece
+/// (`STORED_TEXT_BYTES.div_ceil(PIECE_BYTES)`, 5); and every fetched piece let go after.
+#[test]
+fn a_replay_fetches_each_piece_of_a_stored_text_once() {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let name = name_on("svn-pieces-", LISTENER);
+  let first = crate::test_store::noise(STORED_TEXT_BYTES);
+  let dump = two_versions(&first, &crate::test_store::noise(STORED_TEXT_BYTES + 1));
+  let made = name.clone();
+  let loaded = crate::test_store::run_at(
+    &daemon,
+    LISTENER,
+    move || async move {
+      use crate::vcs_store::svn_import::tests::{imported, subversion};
+      let (id, _) = subversion(&made).await;
+      imported(id, dump).await.0.map(|loaded| loaded.youngest)
+    },
+    IMPORT_PATIENCE,
+  );
+  assert_eq!(loaded, Ok(2));
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  signed
+    .stream
+    .write_all(b"( replay-range ( 1 1 0 true ) ) ")
+    .expect("the replay's ask");
+  let (answer, whole) = read_answer(
+    &mut signed.stream,
+    (b"( finish-replay ( ) ) ", 1),
+    b"( success ( ) ) ",
+  );
+  let (fetched, held) = [LISTENER, OTHER]
+    .into_iter()
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        (
+          state
+            .refusals
+            .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+            .copied()
+            .unwrap_or(0),
+          state.vcs_stores.svn_pieces_held(),
+        )
+      })
+    })
+    .fold((0, 0), |(fetched, held), (more, kept)| {
+      (fetched + more, held + kept)
+    });
+  let pieces = u64::try_from(STORED_TEXT_BYTES.div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    whole,
+    "{}",
+    text(
+      answer
+        .get(answer.len().saturating_sub(600)..)
+        .unwrap_or_default()
+    )
+  );
+  assert!(
+    answer.windows(1024).any(|window| window == &first[..1024]),
+    "the text's bytes are not in the replay"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
+  assert_eq!(held, 0, "a fetched piece was kept");
 }

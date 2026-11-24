@@ -34,6 +34,8 @@ pub(crate) struct Judged {
   since: Instant,
   /// The CPU the tree gained over the looks since the wait began (a successor's from its first reading).
   spent: Duration,
+  /// Whether the wait fails once the trees spent [`CPU_BUDGET`] ([`Judged::progressing`] waits on progress alone).
+  budgeted: bool,
 }
 
 /// What a look at a waited-on tree came to.
@@ -65,6 +67,18 @@ impl Judged {
       mark,
       since: Instant::now(),
       spent: Duration::ZERO,
+      budgeted: true,
+    }
+  }
+
+  /// A wait on the trees under `roots` judged by their progress alone, with no [`CPU_BUDGET`]: for a step whose work
+  /// grows with its data (a stock git command over a whole repository), which a correct but slow run must never fail
+  /// (main 01a20182's ruling of 2026-11-23: a bound by speed fails a slow correct run). It fails once the trees are
+  /// gone or have gained no CPU for [`STALL`].
+  pub(crate) fn progressing(roots: Vec<u32>) -> Judged {
+    Judged {
+      budgeted: false,
+      ..Judged::of_all(roots)
     }
   }
 
@@ -91,7 +105,12 @@ impl Judged {
     if let (Some(then), Some(now)) = (self.mark, now) {
       self.spent = self.spent.saturating_add(now.saturating_sub(then));
     }
-    let judged = verdict(self.mark, now, self.since.elapsed(), self.spent);
+    let spent = if self.budgeted {
+      self.spent
+    } else {
+      Duration::ZERO
+    };
+    let judged = verdict(self.mark, now, self.since.elapsed(), spent);
     if judged == (Verdict::Waiting { progressed: true }) {
       self.mark = now;
       self.since = Instant::now();
@@ -180,11 +199,28 @@ impl InstanceWait {
 
   /// [`InstanceWait::look`] over every process of every one of `instances` (a fleet's nodes).
   pub(crate) fn look_all(&mut self, instances: &[impl AsRef<str>]) -> bool {
-    let mut pids: Vec<u32> = instances
+    let pids: Vec<u32> = instances
       .iter()
       .flat_map(|instance| instance_processes(instance.as_ref()))
       .collect();
+    self.look_at(pids, instances.len())
+  }
+
+  /// [`InstanceWait::look`], with `owned` counted among `instance`'s processes whatever a search by command line finds:
+  /// a process the waiter started and knows to be running (a start's anchor, or the tracer it runs under), its CPU
+  /// judged as the others' are. A search by command line can miss it: CI run 45235122249's tracer start found none of
+  /// the instance's processes about 40 ms after its spawn while its anchor, the strace, ran, and the wait judged them
+  /// gone (`xtask`'s `a_start_waits_on_its_own_anchor_while_no_process_search_finds_it`).
+  pub(crate) fn look_owning(&mut self, instance: &str, owned: Option<u32>) -> bool {
+    let mut pids = instance_processes(instance);
+    pids.extend(owned);
+    self.look_at(pids, 1)
+  }
+
+  /// One look at `pids`, the processes of `nodes` instances.
+  fn look_at(&mut self, mut pids: Vec<u32>, nodes: usize) -> bool {
     pids.sort_unstable();
+    pids.dedup();
     if pids.is_empty() {
       self.seen = None;
       return false;
@@ -213,13 +249,49 @@ impl InstanceWait {
       self.seen = now;
       self.moved_at = Instant::now();
     }
-    self.moved_at.elapsed() < STALL && !self.spent_its_budget(instances.len())
+    self.moved_at.elapsed() < STALL && !self.spent_its_budget(nodes)
   }
 
   /// Whether the processes of `nodes` instances spent [`CPU_BUDGET`] each since the wait began.
   fn spent_its_budget(&self, nodes: usize) -> bool {
     self.spent >= CPU_BUDGET.saturating_mul(u32::try_from(nodes).unwrap_or(u32::MAX))
   }
+}
+
+/// What a search for `instance`'s processes answered and what the host runs, for a red's message: `pgrep`'s own exit
+/// and its error words (which [`instance_processes`] cannot keep), then every process `ps` lists whose command line
+/// names the instance or whose parent is `parent` (a start's anchor). So a wait that found nothing says whether the
+/// search failed, or the processes ran under another command line, or none ran.
+pub(crate) fn instance_listing(instance: &str, parent: Option<u32>) -> String {
+  let searched = Command::new("pgrep")
+    .args(["-f", "--", &format!("--instance {instance} ")])
+    .output();
+  let search = match &searched {
+    Ok(out) => format!(
+      "pgrep {}: {:?}{}",
+      out.status,
+      String::from_utf8_lossy(&out.stdout).trim(),
+      String::from_utf8_lossy(&out.stderr).trim()
+    ),
+    Err(error) => format!("pgrep could not run: {error}"),
+  };
+  let listed = Command::new("ps")
+    .args(["-axo", "pid=,ppid=,stat=,args="])
+    .output()
+    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    .unwrap_or_default();
+  let parent = parent.map(|pid| pid.to_string());
+  let rows: Vec<&str> = listed
+    .lines()
+    .filter(|row| {
+      let mut fields = row.split_whitespace();
+      let pid = fields.next();
+      let ppid = fields.next();
+      row.contains(instance)
+        || parent.is_some() && (ppid == parent.as_deref() || pid == parent.as_deref())
+    })
+    .collect();
+  format!("{search}; ps: [{}]", rows.join(" | "))
 }
 
 /// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`. None
@@ -394,7 +466,7 @@ pub(crate) fn await_exit_of(pid: u32) -> bool {
   rustix::event::poll(&mut fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
 }
 
-/// [`Judged::look`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how
+/// [`Judged::judge`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how
 /// long since that progress, and the CPU it spent since the wait began.
 pub(crate) fn verdict(
   then: Option<Duration>,
@@ -528,6 +600,39 @@ fn a_tree_is_waited_on_while_it_gains_cpu_and_given_up_stalled_gone_or_spent() {
   );
 }
 
+/// Shape: the CPU [`a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at`] spends between
+/// its looks: enough for the process clock to see it gain some.
+#[cfg(test)]
+const BURN: Duration = Duration::from_millis(50);
+
+/// Spends about [`BURN`] of this thread's CPU.
+#[cfg(test)]
+fn burn() {
+  let began = Instant::now();
+  let mut spun = 0u64;
+  while began.elapsed() < BURN {
+    spun = std::hint::black_box(spun.wrapping_add(1));
+  }
+}
+
+/// A wait judged by its progress alone (main 01a20182's ruling of 2026-11-23: a stock git command over a whole
+/// repository is judged by progress, never by a budget a correct but slow run can pass). Do: judge this test's own
+/// process, gaining CPU, through two waits that have each spent [`CPU_BUDGET`] already: one made by
+/// [`Judged::progressing`], one by [`Judged::of`]. Expect the first still waited on and the second given up as having
+/// spent its budget: a tree that keeps working is never failed by its CPU under the first.
+#[test]
+fn a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at() {
+  let me = std::process::id();
+  let mut progressing = Judged::progressing(vec![me]);
+  progressing.spent = CPU_BUDGET;
+  burn();
+  assert_eq!(progressing.judge(), Verdict::Waiting { progressed: true });
+  let mut budgeted = Judged::of(me);
+  budgeted.spent = CPU_BUDGET;
+  burn();
+  assert_eq!(budgeted.judge(), Verdict::SpentItsBudget);
+}
+
 /// The mount-table wait (main's ruling of 2026-11-20: a wait on the kernel waits on the kernel's own event, within a
 /// deadline from the liveness budget, never a poll). Do: wait on a reading that holds at once; then wait on one that
 /// never holds, counting its readings. Expect the first answered true with one reading; the second false, no sooner
@@ -564,5 +669,5 @@ fn a_mount_table_wait_reads_the_table_at_the_kernels_word_not_on_a_poll() {
 /// Shape: the most readings a never-holding mount-table wait may take ([`a_mount_table_wait_reads_the_table_at_the_kernels_word_not_on_a_poll`]):
 /// the first and the last, and room for the mounts and unmounts other processes on a busy development machine make in
 /// the wait (each one word), far under a poll's hundreds.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 const MOUNT_TABLE_READINGS: u32 = 20;

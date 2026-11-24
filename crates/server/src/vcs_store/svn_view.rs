@@ -161,12 +161,12 @@ impl SvnStores for ServedRecords {
     .flatten()
   }
 
-  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
-    super::svn_texts::fetch_piece(id, wanted).await
-  }
-
-  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
-    let _ = crate::state::with_state(|state| super::svn_texts::let_go(state, wanted));
+  async fn fetch(
+    &mut self,
+    id: RepositoryId,
+    wanted: slates_svn::reads::Wanted,
+  ) -> Option<FetchedPiece> {
+    FetchedPiece::fetch(id, wanted).await
   }
 
   async fn land(
@@ -332,6 +332,42 @@ impl Drop for SvnHold {
   }
 }
 
+/// A text piece one reader fetched through the node's changeset store (C2 stage B part 2; `svn_texts::fetch_piece`),
+/// held while that reader reads on in it: given back when the reader waits for another piece or its read ends, or by
+/// its drop, on the shard whose pieces hold it, so a reader dropped mid-read leaks nothing. One a reader, the bound
+/// `svn_texts::Pieces` counts. A reader's call reads a quantum of the drive's steps, each at most
+/// `slates_svn::report::drive::STEP_WORK` bytes, so a piece given back after one call was fetched again at the next
+/// (goal 93: svnsync over svn:// at 255.2 ms a revision against 135 ms).
+#[derive(Debug)]
+pub(crate) struct FetchedPiece {
+  /// The piece, until it is given back.
+  wanted: Option<slates_svn::reads::Wanted>,
+}
+
+impl FetchedPiece {
+  /// Fetches the piece `wanted` of repository `id` through the node's store for one reader, held until its drop; none
+  /// where the store could not give it.
+  pub(crate) async fn fetch(id: RepositoryId, wanted: slates_svn::reads::Wanted) -> Option<Self> {
+    // Made only once fetched: its drop gives back the hold the fetch took, so one made for a failed fetch would give
+    // back another reader's.
+    if super::svn_texts::fetch_piece(id, wanted).await {
+      Some(Self {
+        wanted: Some(wanted),
+      })
+    } else {
+      None
+    }
+  }
+}
+
+impl Drop for FetchedPiece {
+  fn drop(&mut self) {
+    if let Some(wanted) = self.wanted.take() {
+      crate::state::with_state(|state| super::svn_texts::let_go(state, wanted)).unwrap_or_default();
+    }
+  }
+}
+
 /// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here or an import
 /// is under way ([`served`]).
 pub(crate) fn hold_in(state: &mut ShardState, id: RepositoryId) -> Option<SvnHold> {
@@ -460,12 +496,12 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
 
   type Turn = svn_commit::landing::Turn;
 
-  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
-    super::svn_texts::fetch_piece(id, wanted).await
-  }
-
-  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
-    let _ = crate::state::with_state(|state| super::svn_texts::let_go(state, wanted));
+  async fn fetch(
+    &mut self,
+    id: RepositoryId,
+    wanted: slates_svn::reads::Wanted,
+  ) -> Option<FetchedPiece> {
+    FetchedPiece::fetch(id, wanted).await
   }
 
   async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn> {

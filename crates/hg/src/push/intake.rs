@@ -31,7 +31,7 @@ use core::ops::Range;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use slates_vcs::{ContentId, ContentStore, IndexRefused};
+use slates_vcs::{ContentId, ContentStore, IndexRefused, Merge, MergeStep};
 
 use super::classify::ReadChangeset;
 use super::commit::{Unindexed, keep_one};
@@ -127,6 +127,11 @@ pub struct Intaken {
   pub longest_step_bytes: u64,
   /// The revisions taken over more than one step, a window a step ([`Pending`]).
   pub spread: u64,
+  /// The fork's runs merged by the size-tiered rule as the push sealed them ([`Taker::merge_step`]).
+  pub tiered_merges: u64,
+  /// The most runs only the fork held after any step: what a lookup of a new row walked past its parent's runs, held
+  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its rows.
+  pub most_own_runs: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -204,9 +209,10 @@ enum Stage {
 }
 
 /// The changegroup's framing as places in its bytes (`crate::framing::Framed`), so the intake borrows nothing between
-/// steps; and which of its revisions a delta past the next one rests on ([`Frame::based_later`]).
+/// steps; which of its revisions a delta past the next one rests on ([`Frame::based_later`]); and which revisions are
+/// the last of their group to rest on their base ([`Frame::last_on_base`]).
 #[derive(Clone, Debug, Default)]
-struct Frame(Framed, Vec<u64>);
+struct Frame(Framed, Vec<u64>, Vec<u64>);
 
 impl Frame {
   /// The framing of `payload`, a whole changegroup of `version` in memory, each plain delta checked, within
@@ -246,24 +252,20 @@ impl Frame {
     if !framed.trees.is_empty() {
       return Err(Unverified::TreeManifests.into());
     }
-    let later = later_bases(&framed);
-    Ok(Frame(framed, later))
+    let (later, last) = later_bases(&framed);
+    Ok(Frame(framed, later, last))
+  }
+
+  /// Whether the revision at `at` of `range` is the last of its group whose delta rests on its base: once it is taken,
+  /// no delta asks for that base again, so the push's cache lets it go.
+  fn last_on_base(&self, range: &Range<usize>, at: usize) -> bool {
+    bit(&self.2, range, at)
   }
 
   /// Whether a delta of `range` past the next one rests on its revision at `at` (goal 93: the push's cache keeps only the
   /// texts such a delta will ask for; the next delta's base is the text kept last).
   fn based_later(&self, range: &Range<usize>, at: usize) -> bool {
-    let Some(index) = range
-      .start
-      .checked_add(at)
-      .filter(|index| *index < range.end)
-    else {
-      return false;
-    };
-    self
-      .1
-      .get(index / BITS)
-      .is_some_and(|word| word & (1 << (index % BITS)) != 0)
+    bit(&self.1, range, at)
   }
 
   /// The revision at `at` of `range`, its delta read from `payload`, with where its delta lies there (A-767 C4: the
@@ -289,30 +291,55 @@ impl Frame {
 /// Format: the bits a word of [`Frame`]'s later bases holds.
 const BITS: usize = u64::BITS as usize;
 
-/// Each revision of `framed` a delta past the next one in its group names as its base, one bit a revision in stream
-/// order (one word for each 64, beside the framing's own record a revision): a walk of each group, its nodes found by a
-/// map the walk drops as the group ends.
-fn later_bases(framed: &Framed) -> Vec<u64> {
-  let mut later = vec![0_u64; framed.revisions.len().div_ceil(BITS)];
+/// Whether the bit of `bits` for the revision at `at` of `range` is set.
+fn bit(bits: &[u64], range: &Range<usize>, at: usize) -> bool {
+  let Some(index) = range
+    .start
+    .checked_add(at)
+    .filter(|index| *index < range.end)
+  else {
+    return false;
+  };
+  bits
+    .get(index / BITS)
+    .is_some_and(|word| word & (1 << (index % BITS)) != 0)
+}
+
+/// Each revision of `framed` a delta past the next one in its group names as its base; and each revision that is the
+/// last of its group whose delta rests on its base. One bit a revision of each, in stream order (one word for each 64,
+/// beside the framing's own record a revision): a walk of each group, its nodes and their last users found by maps the
+/// walk drops as the group ends.
+fn later_bases(framed: &Framed) -> (Vec<u64>, Vec<u64>) {
+  let words = framed.revisions.len().div_ceil(BITS);
+  let mut later = vec![0_u64; words];
+  let mut last = vec![0_u64; words];
   let groups = [framed.changelog.clone(), framed.manifests.clone()]
     .into_iter()
     .chain(framed.files.iter().map(|(_, revisions)| revisions.clone()));
   for group in groups {
     let mut at: BTreeMap<Node, usize> = BTreeMap::new();
+    let mut last_user: BTreeMap<Node, usize> = BTreeMap::new();
     for index in group {
       let Some(placed) = framed.revisions.get(index) else {
         continue;
       };
-      if let Some(base) = at.get(&placed.base).copied()
-        && base.saturating_add(1) != index
-        && let Some(word) = later.get_mut(base / BITS)
-      {
-        *word |= 1 << (base % BITS);
+      if let Some(base) = at.get(&placed.base).copied() {
+        if base.saturating_add(1) != index
+          && let Some(word) = later.get_mut(base / BITS)
+        {
+          *word |= 1 << (base % BITS);
+        }
+        last_user.insert(placed.base, index);
       }
       at.insert(placed.node, index);
     }
+    for index in last_user.into_values() {
+      if let Some(word) = last.get_mut(index / BITS) {
+        *word |= 1 << (index % BITS);
+      }
+    }
   }
-  later
+  (later, last)
 }
 
 /// A push's changegroup being taken into a fork of its repository's index (module docs): the changegroup's framing, as
@@ -435,6 +462,9 @@ struct Taker {
   asked: Option<StoreAsk>,
   /// A revision longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
+  /// The merge of the fork's newest runs the size-tiered rule named, a table a step until it ends
+  /// ([`Taker::merge_step`]).
+  merging: Option<Merge>,
   /// The segments its kept texts are cut into as they are taken, where its driver asks for them ([`Intake::cutting`]).
   cutting: Option<Cutting>,
 }
@@ -669,6 +699,15 @@ impl BaseCache {
     self.held.insert(node, text);
   }
 
+  /// Lets `node`'s text go, handed to `spares`, where the cache holds it (its place in the order is passed over when
+  /// the oldest are let go).
+  fn release(&mut self, node: &Node, spares: &mut Spares) {
+    if let Some(text) = self.held.remove(node) {
+      self.bytes = self.bytes.saturating_sub(to_u64(text.len()));
+      spares.give(text);
+    }
+  }
+
   /// Lets every text go, each handed to `spares`.
   fn clear(&mut self, spares: &mut Spares) {
     for (_, text) in core::mem::take(&mut self.held) {
@@ -797,6 +836,9 @@ enum ReadAs {
 enum Based {
   /// Its text.
   Text(Vec<u8>),
+  /// Its text as the push's cache holds it: read there by the step ([`Taker::base_text`]), never copied out (goal 93,
+  /// C1: each base the cache held was copied whole for its step, 1.08 copies a revision of a 160 KiB file).
+  Cached,
   /// The changegroup's bytes the rebuild needs: put them in and step again.
   Wanted(Range<u64>),
   /// The store is asked: answer it and step again.
@@ -963,6 +1005,7 @@ impl Intake {
         cache: BaseCache::within(room),
         asked: None,
         pending: None,
+        merging: None,
         cutting: None,
       },
     })
@@ -1012,6 +1055,9 @@ impl Intake {
     let Intake { frame, taker } = self;
     if taker.pending.is_some() {
       return taker.advance_pending(store, admission);
+    }
+    if let Some(stepped) = taker.merge_step(store)? {
+      return Ok(stepped);
     }
     match taker.stage {
       Stage::Changelog(at) => {
@@ -1155,6 +1201,7 @@ impl Taker {
         (store, &mut room),
       ) {
         Ok(Based::Text(text)) => Some(text),
+        Ok(Based::Cached) => None,
         Ok(Based::Wanted(range)) => {
           self.path = Some(path);
           return Ok(Stepped::Wanted(range));
@@ -1187,6 +1234,10 @@ impl Taker {
     if taken? {
       if let Some(position) = position {
         self.positions.insert(revision.node, position);
+      }
+      // No delta after this one rests on its base: the cache lets the base go, its buffer a later rebuild's.
+      if frame.last_on_base(&revisions, at) {
+        self.cache.release(&revision.base, &mut self.spares);
       }
       self.stage = after;
     }
@@ -1256,6 +1307,42 @@ impl Taker {
       self.intaken.held_changesets.push(node);
     }
     Ok(true)
+  }
+
+  /// A step of the fork's merge (goal 93, the index seal's reland): a table of the merge the size-tiered rule named
+  /// ([`slates_vcs::Index::tiered_due`]), or its begin, between revisions; none where none is due. Every append seals
+  /// the fork's tail when due (`HgIndex::insert`), each seal a run, and a lookup walks every run: unmerged, a push's
+  /// runs grew a seal at a time and each new row's lookup with them (arena-14: shard 0 spun past 1 s in a segment step).
+  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step. A push refused
+  /// or given back drops its merge with the fork: nothing changes until the merge's last step.
+  fn merge_step(&mut self, store: &mut ContentStore) -> Result<Option<Stepped>, Refused> {
+    let as_refused = |refused: IndexRefused| {
+      Refused::Unindexed(Unindexed::Index(crate::index::Refused::Index(refused)))
+    };
+    if let Some(mut merge) = self.merging.take() {
+      match self
+        .fork
+        .rows()
+        .merge_step(store, &mut merge)
+        .map_err(as_refused)?
+      {
+        MergeStep::More => self.merging = Some(merge),
+        MergeStep::Done(_) => {
+          self.intaken.tiered_merges = self.intaken.tiered_merges.saturating_add(1)
+        }
+        MergeStep::GivenUp => {}
+      }
+      return Ok(Some(Stepped::More));
+    }
+    let own = to_u64(self.fork.rows().own_runs());
+    self.intaken.most_own_runs = self.intaken.most_own_runs.max(own);
+    let Some(runs) = self.fork.rows().tiered_due() else {
+      return Ok(None);
+    };
+    Ok(self.fork.rows().merge_begin(store, runs).map(|merge| {
+      self.merging = Some(merge);
+      Stepped::More
+    }))
   }
 
   /// Takes one revision of `log` (module docs): passed over, or checked, rebuilt and kept.
@@ -1631,6 +1718,10 @@ impl Taker {
       }
       if let Some(text) = self.cache.held.get(&at) {
         self.intaken.base_hits = self.intaken.base_hits.saturating_add(1);
+        // The base itself: the step reads it where the cache holds it.
+        if chain.is_empty() {
+          return Ok(Based::Cached);
+        }
         break text.clone();
       }
       if let Some(index) = self.positions.get(&at).copied() {
@@ -1701,8 +1792,9 @@ impl Taker {
     Ok(Based::Text(text))
   }
 
-  /// The text of `revision`'s delta base: empty for the null node, the text kept last where it is that one, else the
-  /// fork's; `None` where the fork does not hold it.
+  /// The text of `revision`'s delta base: empty for the null node, the text kept last where it is that one, a file's as
+  /// the push's cache holds it where it does (read there, [`Based::Cached`]), else the fork's; `None` where the fork does
+  /// not hold it.
   fn base_text<'s>(
     &'s self,
     log: Log<'_>,
@@ -1714,6 +1806,11 @@ impl Taker {
     }
     if let Some((node, text)) = &self.last
       && *node == revision.base
+    {
+      return Some(Cow::Borrowed(text.as_slice()));
+    }
+    if let Log::File(_) = log
+      && let Some(text) = self.cache.held.get(&revision.base)
     {
       return Some(Cow::Borrowed(text.as_slice()));
     }
