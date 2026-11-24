@@ -7531,7 +7531,11 @@
 > the shard's next idle point.** It had waited for the next pass, a whole interval on, which the test's look once an
 > interval cut short again at its first step, both landing on the same 15.6 ms scheduler tick on windows-latest: 60
 > one-step passes, 680 MB of a 1.43 GB walk left at the 60-interval bound, where one uninterrupted pass walks it in 2.6
-> to 5.9 ms. The shard's idle work now wakes the sweep to resume it; A-226's stop is unchanged. Red then green:
+> to 5.9 ms. The shard's idle work now wakes the sweep to resume it; A-226's stop is unchanged. Registered from the
+> start, that idle work's state borrow runs before every park, and a borrow's hooks may wake a task, which the shard's
+> loop then left ready through the park: a lost wake (a CLI attachment's lapse handled late once on windows-latest).
+> The loop now runs such a task, and the runtime counts every park begun with one ready (`parked_with_ready`), held to
+> 0 by every deadlines and idle-sweep test. Red then green:
 > the drift-free test with the resume off on windows-latest, windows-11-arm and ubuntu, and
 > the idle sweep's tests 5 of 5 rounds on all three, about 10.5 s a round where windows-latest's took 35 to 124 s (diag
 > run 45286588671) (`docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`).

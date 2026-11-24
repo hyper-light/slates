@@ -61998,6 +61998,13 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   the give-back (`resume_give_back`, counted as `content.give_back.resumed_at_idle`), and otherwise advances an armed
   content-range sweep (A-744's `idle_slice`, which until now registered itself in the slot when armed). The pass ends
   when its give-back settles or finds the shard busy. `sweep.passes_started` counts passes.
+- **A lost wake closed in the runtime (the same change).** The idle work borrows the shard's state, and a borrow's
+  hooks may wake a task; the shard's loop parked as soon as the idle work answered that it did nothing, with that task
+  ready on its own queue, to wait out the park's deadline or a kick (none, on a shard with no timer armed). Every park
+  now counts one begun with a task ready (`slates_rt` `Counters::parked_with_ready`), and the loop runs such a task
+  instead (`shard.rs`, `run`). Red without the change: `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_
+  out_a_park` (`crates/rt/tests/idle_work.rs`: the task did not run within 2 s). Every deadlines and idle-sweep test of
+  the daemon asserts the count stays 0 (main's ruling: the hazard answers for itself, not a rate).
 - **Why not the alternatives.** Pacing the test's looks off the interval would have hidden the field's starvation.
   Ending a pass only when other work ran across two yields in a row would have changed A-226's rule and doubled the
   sweep's intrusion under sustained load to buy back a timing coincidence.
@@ -62008,5 +62015,5 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   kept every test but A-877's two store tests.
 
 Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A-491's entry),
-`crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
+`crates/rt/src/shard.rs`, `crates/rt/tests/idle_work.rs`, `crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
 `docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.

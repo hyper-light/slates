@@ -54,6 +54,14 @@ idle-sweep tests kept the Windows server lanes red.
   shard that cannot register it is a typed initialization failure.
 - `crates/server/src/content_ranges.rs`: arming a content-range sweep no longer takes the idle-work slot. It sets the
   sweep running, and `idle_work` advances it through `idle_slice`, as the slot did before.
+- `crates/rt/src/shard.rs`: with the idle work registered from the start, its state borrow runs before every park, and
+  a borrow's hooks may wake a task. The loop parked as soon as the idle work answered that it did nothing, the woken
+  task left ready on the shard's own queue until the park's deadline or a kick, with none on a shard with no timer
+  armed. The loop now runs such a task, and every park begun with a task ready is counted (`parked_with_ready`).
+  Found on run 11's windows-latest suite: `deadlines::tests::a_lapsed_cli_attachment_ends_at_its_term_without_a_tick`
+  failed once ("the attachment ended within half a liveness window"), which only a late keeper fails.
+  `crates/rt/tests/idle_work.rs` gains `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_out_a_park`, and
+  every deadlines and idle-sweep test of the daemon asserts the count stays 0.
 - `crates/server/src/state.rs`: `give_back_waits_idle`.
 - `crates/server/src/deadlines.rs` and `idle_sweep.rs`, test support only: the keeper wakes a test's poller beside each
   pass it starts (`TEST_POLLER`).
@@ -86,6 +94,8 @@ idle-sweep tests kept the Windows server lanes red.
   to 124 s and failed 2 of 5 before), windows-11-arm (10.8 s) and ubuntu (11.4 s); macOS 4 of 4 (25.9 s). The server
   unit suite on both Windows runners: 1,197 passed, the 2 failures A-877's store tests (w-perf's, not this change).
   Windows clippy of the server failed only on A-877's arena_windows lints (fixed on main by 80ef30c1e).
+- Red, the lost wake (2026-11-23, macOS): `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_out_a_park`
+  failed without the run loop's change: the woken task did not run within 2 s (idle_work.rs:194).
 - The first build of the drift-free test's poller was itself the load that held the pass off: it took its baseline
   after the pass's first step and took turns until a second, which a pass waiting for the idle point never took (macOS:
   "running true", one idle step, nothing resumed, at the 60-interval bound). It now stops at the first step since it

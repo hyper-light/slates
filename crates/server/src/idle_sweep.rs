@@ -243,6 +243,14 @@ mod tests {
 
   use slates_vfs::clock::Clock;
 
+  /// A-881's lost-wake signal: parks `daemon`'s shard began with a task ready on its own queue (`parked_with_ready`),
+  /// which a healthy shard never does: such a task waits out the park.
+  fn parked_with_ready(daemon: &crate::daemon::Daemon) -> u64 {
+    crate::daemon::observe_first(daemon, |_state| {
+      slates_rt::registry::with_current(|context| context.counters().parked_with_ready).unwrap_or(0)
+    })
+  }
+
   /// Shape: how many sweep intervals a test allows the first pass to settle the shard in: a start leaves the free
   /// content it sized to be given back a slice a pass whenever another task (the control shard's 100 ms heartbeat)
   /// runs during it, 3.2 GB over about ten passes on the Mac Studio; a look returns as soon as it has settled.
@@ -305,7 +313,12 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(interval * 3);
     let after = crate::daemon::observe_first(&daemon, passes);
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(first, "the first pass ran and settled the shard");
     assert_eq!(after, before, "no pass ran on the idle shard");
   }
@@ -378,7 +391,12 @@ mod tests {
         describe(state),
       )
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(polling, "the poller is on the shard");
     assert!(first, "the first pass ran and settled the shard: {seen}");
     assert!(
@@ -411,7 +429,12 @@ mod tests {
     let armed = crate::daemon::observe_first(&daemon, |state| !settled(state));
     let swept = look_until(&daemon, interval * 10, move |state| passes(state) > before);
     let seen = crate::daemon::observe_first(&daemon, describe);
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(first, "the first pass ran and settled the shard");
     assert!(wrote, "the file was written");
     assert!(armed, "the write armed a pass");
@@ -534,7 +557,12 @@ mod tests {
           .unwrap_or(0),
       )
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(first, "the first pass ran and settled the shard");
     let (rooted, opened) = listed.expect("the overlay was made and its directories listed");
     assert_eq!(
