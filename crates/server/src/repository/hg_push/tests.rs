@@ -627,10 +627,7 @@ fn a_named_pushed_file_let_go_is_read_back_through_its_name() {
 /// The reply recorded for request `id` of `origin`, waited for a step at a time within [`NAMED_PATIENCE`]. A parked
 /// request whose bring-back was refused is answered unrecorded (`verbs::park_on_away`), so the wait fails at once on
 /// one (`verbs.bring_back_refused`).
-async fn recorded_answer(
-  origin: u64,
-  id: slates_wire::request::RequestId,
-) -> ReplyBody {
+async fn recorded_answer(origin: u64, id: slates_wire::request::RequestId) -> ReplyBody {
   use crate::repository::svn_commit::tests::on;
   let deadline = slates_rt::futures::now_ns()
     .saturating_add(u64::try_from(NAMED_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
@@ -665,8 +662,8 @@ const NAMED_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Over a work on green `green`, `x` inserted at offset 1 of `b`, then the work submitted as a client's recorded request
 /// (A-887's in-place edit of a named file): the submit's answer, and how many requests parked on a let-go window meanwhile
-/// (`verbs.parked_on_away`).
-async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64) {
+/// (`verbs.parked_on_away`), and the work.
+async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64, slates_ipc::protocol::VolumeId) {
   use crate::repository::svn_commit::tests::on;
   let parked = || {
     on(|state| {
@@ -716,46 +713,53 @@ async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64) {
     )
   });
   let submitted = recorded_answer(7, submit).await;
-  (submitted, parked().saturating_sub(before))
+  (submitted, parked().saturating_sub(before), work)
 }
 
-/// A-887 (main 01a20182's ruling (B) of 2026-11-24 00:16: a restart's recovery). Do: on a daemon over a segment and a
-/// store, rebuild the fixtures' repository as one push, its root green holding `b` by its object's name and that object
-/// let go, then edit `b` in place over a work and submit it (`edited_named`); stop the daemon and the store's owner,
-/// start both again over the same segment and store, and read `b` through its name. Expect: the submit landed before the
-/// restart; after it, the green recovered at the submit's version and `b` read `bx\n`, its let-go windows brought back
-/// by the revision the recovered green's changeset names. Failing first: the green fenced, or `b` unread.
-#[test]
-fn a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited() {
-  use crate::repository::store_tests::{anchor_of, daemon_over};
-  let instance = format!("vcs-store-hg-named-{}", std::process::id());
-  let mut store = crate::test_store::TestStore::start("hg-named-restart");
-  let anchor = anchor_of(&instance);
-  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+/// A daemon over `instance`'s segment and `store`, the anchor's, with a Mercurial repository rebuilt from the fixtures by
+/// one push to its empty first line: the daemon and the repository's root green.
+fn named_restart_daemon(
+  instance: &str,
+  anchor: &(slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous),
+  store: &crate::test_store::TestStore,
+) -> (crate::Daemon, DbVolumeId) {
+  let daemon = crate::repository::store_tests::daemon_over(instance, (&anchor.0, &anchor.1), store);
   daemon.bootstrap(true).unwrap();
   let green = crate::daemon::observe_first(&daemon, |state| {
     let mut hg = Hg::new(state, "named-restart");
     let _ = rebuild(state, &mut hg, (&[1], 1));
     hg.root
   });
-  let (submitted, _) = crate::test_store::run_on_first(
-    &daemon,
-    move || async move { edited_named(green).await },
-    NAMED_PATIENCE,
-  );
-  assert!(
-    !matches!(submitted, ReplyBody::Refused { .. }),
-    "{submitted:?}"
-  );
-  let version = crate::daemon::observe_first(&daemon, move |state| {
-    state.db.partition().green_head(green)
-  });
+  (daemon, green)
+}
+
+/// A-887 (main 01a20182's ruling of 2026-11-24 02:17, A-760's replay: a run its apply names whole is never read). Do: on
+/// a daemon over a segment and a store, rebuild the fixtures' repository as one push, its root green holding `b` by its
+/// object's name and that object let go; stop the daemon and the store's owner, start both again over the same segment
+/// and store; then read `b` through its name. Expect: the green recovered at the push's version, unfenced, its chain
+/// replayed with no text brought back for it (`merge.name_read.brought_back` 0 before the read); `b` then `b\n`.
+/// Failing first: the green fenced `ContentMissing { version: 1 }`, the replay reading the push's named runs from the
+/// content store before applying its entry, their windows let go.
+#[test]
+fn a_restart_replays_a_push_naming_its_files_without_reading_their_texts() {
+  let instance = format!("vcs-store-hg-replay-{}", std::process::id());
+  let mut store = crate::test_store::TestStore::start("hg-named-replay");
+  let anchor = crate::repository::store_tests::anchor_of(&instance);
+  let (daemon, green) = named_restart_daemon(&instance, &anchor, &store);
+  let version =
+    crate::daemon::observe_first(&daemon, move |state| state.db.partition().green_head(green));
   daemon.stop();
   store.restart_owner();
-  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let daemon =
+    crate::repository::store_tests::daemon_over(&instance, (&anchor.0, &anchor.1), &store);
   let recovered = crate::daemon::observe_first(&daemon, move |state| {
     let head = state.greens.get(&green).map(|engine| engine.head());
-    (head, state.fenced_greens.get(&green).cloned())
+    let brought = state
+      .refusals
+      .get(crate::vcs_store::named_objects::READ_BROUGHT_BACK)
+      .copied()
+      .unwrap_or(0);
+    (head, state.fenced_greens.get(&green).cloned(), brought)
   });
   let file = crate::test_store::run_on_first(
     &daemon,
@@ -765,10 +769,115 @@ fn a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited() {
   daemon.stop();
   assert_eq!(
     recovered,
-    (Some(version), None),
-    "the green recovered at the submit's version, unfenced"
+    (Some(version), None, 0),
+    "recovered at the push's version, unfenced, nothing brought back"
   );
-  assert_eq!(file.as_deref(), Some(&b"bx\n"[..]), "the edited file after the restart");
+  assert_eq!(file.as_deref(), Some(&b"b\n"[..]), "`b` read by its name");
+}
+
+/// A-887 (main 01a20182's rulings (B) of 2026-11-24 00:16 and (A) of 03:00: a restart's recovery, in dependency order).
+/// Do: on a daemon over a segment and a store, rebuild the fixtures' repository as one push, its root green holding `b`
+/// by its object's name and that object let go, then edit `b` in place over a work and submit it (`edited_named`), its
+/// base let go again; stop
+/// the daemon and the store's owner, start both again over the same segment and store; read `b` through the work, as a
+/// client's recorded request, then through the green's name. Expect: the submit landed before the restart; after it, the
+/// green rebuilt after the repositories' stores, with the bookmark `main`'s green branched from it
+/// (`merge.recovery.greens_after_stores` 2), its spliced base brought back
+/// by the revision its chain's changeset names (`vcs.hg.named_recovery_brought_back` 1), recovered at the submit's
+/// version, unfenced; the work, which waited for its green, served `bx\n`, never refused; the green's `b` `bx\n`.
+/// Failing first: the green fenced `ContentMissing { version: 2 }`, the splice's base unread: the greens were rebuilt
+/// before the stores, so no index resolved it.
+#[test]
+fn a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited() {
+  use crate::repository::store_tests::{anchor_of, daemon_over};
+  let instance = format!("vcs-store-hg-named-{}", std::process::id());
+  let mut store = crate::test_store::TestStore::start("hg-named-restart");
+  let anchor = anchor_of(&instance);
+  let (daemon, green) = named_restart_daemon(&instance, &anchor, &store);
+  let base = crate::daemon::observe_first(&daemon, move |state| {
+    let named = state.greens.get(&green).and_then(|engine| match engine.content("b")? {
+      slates_merge::engine::Content::Named(identity) => Some(identity.hash),
+      slates_merge::engine::Content::Bytes(_) => None,
+    });
+    named.expect("`b` named by the push")
+  });
+  let (submitted, _, work) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { edited_named(green).await },
+    NAMED_PATIENCE,
+  );
+  // The base the submit brought back let go again, as a landed text's windows go: the restart must bring it back.
+  let away = crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &[base]);
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| !content.holds_whole(&slates_vcs::ContentId(base)))
+  });
+  assert!(away, "the base let go again");
+  // Published with its base away, so the restart's image holds it away.
+  daemon.publish_every_shard().unwrap();
+  assert!(
+    !matches!(submitted, ReplyBody::Refused { .. }),
+    "{submitted:?}"
+  );
+  let version =
+    crate::daemon::observe_first(&daemon, move |state| state.db.partition().green_head(green));
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let recovered = crate::daemon::observe_first(&daemon, move |state| {
+    let head = state.greens.get(&green).map(|engine| engine.head());
+    let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      head,
+      state.fenced_greens.get(&green).cloned(),
+      counted("merge.recovery.greens_after_stores"),
+      counted(crate::vcs_store::hg_named::RECOVERY_BROUGHT_BACK),
+    )
+  });
+  let (through_work, file) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let read = slates_wire::request::RequestId {
+        client: 7,
+        sequence: 2,
+      };
+      let _ = crate::repository::svn_commit::tests::on(|state| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, read),
+          &owner(),
+          RequestBody::ReadRange {
+            volume: work,
+            path: "b".to_owned(),
+            at: slates_ipc::protocol::ReadAt::Head,
+            offset: 0,
+            max: 64,
+          },
+        )
+      });
+      let through_work = recorded_answer(7, read).await;
+      let file = crate::vcs_store::named_objects::read_file_brought(green, "b").await;
+      (through_work, file)
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(
+    recovered,
+    (Some(version), None, 2, 1),
+    "rebuilt after the stores, its base brought back, recovered at the submit's version, unfenced"
+  );
+  let ReplyBody::ReadPage { bytes, .. } = through_work else {
+    panic!("the work's read was not served a page: {through_work:?}");
+  };
+  assert_eq!(bytes, b"bx\n", "the work, served after its green");
+  assert_eq!(
+    file.as_deref(),
+    Some(&b"bx\n"[..]),
+    "the edited file after the restart"
+  );
 }
 
 /// A-887 (main 01a20182's ruling (B) of 2026-11-24 00:16: an in-place edit after naming). Do: on a store-backed daemon,
@@ -802,7 +911,7 @@ fn a_work_editing_a_named_pushed_file_in_place_brings_its_text_back_and_lands() 
   let (submitted, parked, file) = crate::test_store::run_on_first(
     &daemon,
     move || async move {
-      let (submitted, parked) = edited_named(green).await;
+      let (submitted, parked, _) = edited_named(green).await;
       let file = crate::vcs_store::named_objects::read_file_brought(green, "b").await;
       (submitted, parked, file)
     },
@@ -842,18 +951,23 @@ fn a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back() {
     let unbundle = Unbundle {
       parts: vec![
         taken(0, Asks::Changegroup(changegroup(&made, &[0, 1]))),
-        taken(1, Asks::Bookmarks(vec![at(b"main"), at(b"left"), at(b"right")])),
+        taken(
+          1,
+          Asks::Bookmarks(vec![at(b"main"), at(b"left"), at(b"right")]),
+        ),
       ],
     };
     let answer = hg.push(state, &unbundle, &View::default());
     assert!(answer.is_ok(), "the push was refused: {answer:?}");
-    let greens = [b"main".as_slice(), b"left", b"right"]
-      .map(|name| hg.bound(state, &bookmark_name(name)).expect("a bookmark's green"));
+    let greens = [b"main".as_slice(), b"left", b"right"].map(|name| {
+      hg.bound(state, &bookmark_name(name))
+        .expect("a bookmark's green")
+    });
     let named = greens.map(|green| {
       matches!(
-        state.greens.get(&green).and_then(|engine| engine.content("b").map(|held| {
-          matches!(held, slates_merge::engine::Content::Named(_))
-        })),
+        state.greens.get(&green).and_then(|engine| engine
+          .content("b")
+          .map(|held| { matches!(held, slates_merge::engine::Content::Named(_)) })),
         Some(true)
       )
     });

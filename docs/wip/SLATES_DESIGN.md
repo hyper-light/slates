@@ -58070,6 +58070,18 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
+- **A replay reads only the runs a splice consumes** (2026-11-24, w-perf; main 01a20182's ruling of 02:17 under A-887,
+  one rule for every green's replay). A chain entry's apply names a file made of one run alone, the run its object
+  whole, and keeps none of its bytes (`Green::set_file`'s `insert_named`), so a replay reads that run no more: a restart
+  over a push of thousands of files brought each text back from disk only to drop it. `Increment::replay_reads` names
+  the runs to read, from the entry alone: every run but one a created or spliced file is made of whatever its length
+  before (one operation adds bytes, from the run's first byte to its last, and the length after is the run's from no
+  base and from any), its object whole, and read by no other change nor by a payload of the document (an attribute's,
+  a node's, a link's value). The replay reads those (`read_step_among`), the apply waits on those alone
+  (`unread_among`), and a recovery's pre-pass brings back no other (`svn_texts::named_lacking`). The post-state places
+  each run by its declared length (`named::Post`), so a run never read moves no later run's address. Red:
+  `repository::hg_push::tests::a_restart_replays_a_push_naming_its_files_without_reading_their_texts` (the green fenced
+  `ContentMissing { version: 1 }`, the push's runs read from a content store that had let them go).
 
 ### A-763 — A live write ships the bytes it changed (2026-11-20, w-forming; main's order, item 1; found by use: 32 KiB NFS writes to a 3 MiB live file shipped about 245 KB of delta each, 54 MB over 221 appends; §4.10 "Live shipping"; A-126, A-200)
 
@@ -62618,23 +62630,42 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   named text whose windows are away through the push's fork by its path and node (`hg_push::bring_back_named`,
   `bring_back_file` over the fork's index), pinned until the landing ends; a text it cannot bring back refuses the push
   (`WORK_TEXT_UNREAD`). The tests' driver does the same after its segments land (`bring_back_named_whole`).
-- **Recovery** (owed, main's ruling pending, 2026-11-24): a restart fences the green `ContentMissing` at the push's
-  version, since the replay reads each named run of an entry from the plane before it applies it, and the push's texts
-  are away. Reds: `a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited`.
+- **Recovery: what a replay reads, and in what order** (main's rulings of 2026-11-24 02:17 and 03:00). A replay reads
+  no run its apply names whole (A-760's line of 2026-11-24): a restart over a push brings back none of its texts. What
+  a Mercurial green's replay still reads is a named base a later splice keeps (a work's edit of a pushed file), and the
+  same resolver brings it back (`hg_named::resolve_at`, over the recovery's held state, `vcs_store::HeldShard`): the
+  pre-pass (`hg_named::bring_back_named`) plans from the green's checkpoint and chain alone, its named files and its
+  root's head attribute, then each entry's splices that read a base (`slates_merge::engine::splice_reads_base`), the
+  files it leaves named whole (`Increment::named_whole_files`) and the head attribute it sets. Only the repository's
+  index resolves a revision, and recovery remade the stores after the greens, so recovery orders by dependency, not by
+  mode: the greens whose plan reads no store first, then the stores (`vcs_store::recover`), then the greens whose plan
+  needs an index and the branches made from them (`verbs::rebuilt_after_stores`, counted
+  `merge.recovery.greens_after_stores`), in the same recovery. Their works wait as a work over a green awaiting
+  adoption does (`work_home.unbuilt`), replayed through the green once it is in, before any client is admitted. The
+  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). Rejected: recovering
+  one repository's store before its greens (a store's replay reads greens: an import's bookmarks, a cycle), and a
+  second resolver over the node's store without the index.
 - **Counters.** `repository.push.files_named` (named rather than made); `vcs.hg.pushed_texts_brought_back` (a named
   text brought back through the fork before a landing); `merge.name_read.brought_back` counts a Mercurial set's reads
-  as any other's.
+  as any other's; `vcs.hg.named_recovery_brought_back` (a recovery's pre-pass); `merge.recovery.greens_after_stores`;
+  `merge.recovery.content_unmade_at_order` (the content store refused at the order's decision: the green waits).
 - **Proven.** In `repository::hg_push::tests`: `a_pushed_file_the_content_store_holds_whole_is_held_by_its_name`
   (red: both of the fixtures' files held as bytes, none named); `a_named_pushed_file_let_go_is_read_back_through_its_name`
   (a mount's read; red: none, the read-through finding no object of that identity on the node's store);
   `a_work_editing_a_named_pushed_file_in_place_brings_its_text_back_and_lands` (red: the parked submit's bring-back
   refused `Missing`, its judge's note naming no green or path);
   `a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back` (red: the push refused
-  `ContentUnavailable`, a clone's run unread). w-svn's two reds hold (`svn_commit::tests`).
+  `ContentUnavailable`, a clone's run unread); `a_restart_replays_a_push_naming_its_files_without_reading_their_texts`
+  (red: fenced `ContentMissing { version: 1 }`); `a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited`
+  (red: fenced `ContentMissing { version: 2 }`, the splice's base unread with the greens rebuilt before the stores;
+  green: two greens rebuilt after the stores, the base brought back once, the work served after its green, never
+  refused). w-svn's two reds and its recovery reds hold, and A-866's oracle with restores.
 - **Applied in the same change to:** `crates/merge/src/{push,engine}.rs`, `crates/hg/src/push/{verify,held,tree}.rs`
   and its tests' holders, `crates/server/src/vcs_store/{hg_named,named_objects,name_holds,read_through}.rs`,
   `crates/server/src/repository/{hg_push,hg_run,push}.rs`, the readers that note a site (`green_tree`, `work_files`,
-  `merge_service`, `mounted_work`, `landing`, `fuse`, `nfs`, `winfsp`, `verbs`), GAPS.
+  `merge_service`, `mounted_work`, `landing`, `fuse`, `nfs`, `winfsp`, `verbs`), recovery's order (`verbs`,
+  `merge_service::MergeShardState::after_stores`), `crates/merge/src/{named,engine}.rs` (the replay's runs),
+  `vcs_store::svn_texts::named_lacking`, A-760's line, GAPS.
 
 ### A-889 — The record period publishes a live volume that owes an install image while a change no verb recorded leaves it unpublished (2026-11-24, w-ci for main 01a20182, its approval of 2026-11-23 21:49; amends §4.10 "An install image beside the log (2026-11-07)"; A-377, A-64)
 

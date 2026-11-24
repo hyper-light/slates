@@ -140,6 +140,11 @@ pub struct MergeShardState {
   /// (`crate::green_adopt::readopt_at_boot`). Every verb on it is answered `Overloaded` meanwhile. Bounded by the greens
   /// this shard owns; empty once the boot has re-adopted or fenced each.
   pub(crate) awaiting_adoption: BTreeMap<DbVolumeId, crate::green_adopt::AwaitingAdoption>,
+  /// During a recovery: each green whose replay reads a named base its repository's store resolves (A-887; main
+  /// 01a20182's ruling of 2026-11-24 03:00, a recovery order by dependency), rebuilt once the stores are, with the
+  /// branches made from it; their works wait as a work over a green awaiting adoption does (`work_home.unbuilt`).
+  /// Bounded by the greens this shard owns; empty once the recovery has rebuilt them, in the same recovery.
+  pub(crate) after_stores: BTreeSet<DbVolumeId>,
   /// Each mounted work's pin (A-774, `crate::mounted_work::MountPin`): the green version its mount's base reads, kept
   /// readable while the mount lives ([`reachable_floor`]). One entry a mounted work, dropped with its slot.
   pub(crate) mounted: crate::mounted_work::MountedPins,

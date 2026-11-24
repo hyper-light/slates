@@ -135,7 +135,7 @@ impl Increment {
 
   /// The post-state as the engine reads it: the inline bytes, then each named run's as read (A-760).
   pub fn post(&self) -> crate::named::Post<'_> {
-    crate::named::Post::of(&self.post_state, &self.named.read.0)
+    crate::named::Post::of(&self.post_state, &self.named.read.0, &self.named.runs)
   }
 
   /// The bytes of the `at`th named run read so far (A-760): what a turn's reader measures its progress by.
@@ -153,9 +153,97 @@ impl Increment {
 
   /// The first named run whose bytes are not all read yet (A-760): none once the post-state is whole.
   pub fn unread(&self) -> Option<&crate::named::NamedRun> {
+    self.unread_among(&[])
+  }
+
+  /// Which of its named runs a replay of its chain entry reads (A-887; main 01a20182's ruling of 2026-11-24 02:17, one
+  /// rule for A-760's replay): every run but one the entry's apply names whole, by its place, true where it is read. A
+  /// run is named whole where a file the entry creates or splices is made of it alone whatever the file's length before
+  /// (one operation adds bytes, from the run's first byte to its last, and the file's length after is that run's for
+  /// any base), the run its object whole; and no other change of the entry, nor a payload of its document (an
+  /// attribute's value, a node's, a link's), reads a byte of it. The apply keeps no byte of such a file
+  /// (`Green::set_file`'s `insert_named`), so a replay that read the run would bring its text back only to drop it. A
+  /// file whose length after depends on its base is read, as the apply may make it.
+  pub fn replay_reads(&self, applied: &[crate::chain_entry::Applied]) -> Vec<bool> {
+    let changed = changed_files(applied);
+    let wholes = self.named_wholes(&changed);
+    let overlaps = |op: &Op, (from, to): (u64, u64)| {
+      op.src != u64::MAX && op.src < to && op.src.saturating_add(op.len) > from
+    };
+    self
+      .run_spans()
+      .enumerate()
+      .map(|(at, span)| {
+        let named_whole = wholes.iter().any(|(_, run)| *run == at);
+        let read_elsewhere = changed.iter().enumerate().any(|(change, (_, ops, _))| {
+          !wholes.contains(&(change, at))
+            && ops
+              .iter()
+              .any(|op| adds_content(op.kind) && overlaps(op, span))
+        });
+        let payload = self.doc.ops.iter().any(|op| {
+          matches!(op.kind, OpKind::SetXattr | OpKind::Mknod | OpKind::Symlink)
+            && overlaps(op, span)
+        });
+        !named_whole || read_elsewhere || payload
+      })
+      .collect()
+  }
+
+  /// The files its chain entry's apply names whole ([`Increment::replay_reads`]'s rule), each with the object it is the
+  /// whole of: what a recovery's plan holds named after the entry (A-887).
+  pub fn named_whole_files(
+    &self,
+    applied: &[crate::chain_entry::Applied],
+  ) -> Vec<(String, crate::named::Identity)> {
+    let changed = changed_files(applied);
+    self
+      .named_wholes(&changed)
+      .into_iter()
+      .filter_map(|(change, run)| {
+        let (path, _, _) = changed.get(change)?;
+        let run = self.named.runs.get(run)?;
+        Some(((*path).to_owned(), run.identity))
+      })
+      .collect()
+  }
+
+  /// Each run's place in the post-state's address space, from its first byte to past its last.
+  fn run_spans(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let mut start = u64::try_from(self.post_state.len()).unwrap_or(u64::MAX);
+    self.named.runs.iter().map(move |run| {
+      let span = (start, start.saturating_add(run.len));
+      start = span.1;
+      span
+    })
+  }
+
+  /// Each change of `changed` that makes its file of one run alone whatever its base, the run its object whole: the
+  /// change's place and the run's.
+  fn named_wholes(&self, changed: &[(&str, &[Op], bool)]) -> Vec<(usize, usize)> {
+    let spans: Vec<(u64, u64)> = self.run_spans().collect();
+    let mut wholes = Vec::new();
+    for (change, (_, ops, created)) in changed.iter().enumerate() {
+      let Some(op) = whole_adding_op(ops, *created) else {
+        continue;
+      };
+      let found = spans.iter().zip(&self.named.runs).position(|(span, run)| {
+        op.src == span.0 && op.len == run.len && run.offset == 0 && run.len == run.identity.len
+      });
+      if let Some(run) = found {
+        wholes.push((change, run));
+      }
+    }
+    wholes
+  }
+
+  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]); every run where
+  /// `wanted` does not reach it.
+  pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
     self.named.runs.iter().enumerate().find_map(|(at, run)| {
       let read = self.named.read.0.get(at).map_or(0, Vec::len);
-      (u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
+      let wants = wanted.get(at).copied().unwrap_or(true);
+      (wants && u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
     })
   }
 
@@ -167,9 +255,20 @@ impl Increment {
     objects: &impl crate::named::Objects,
     slice: u64,
   ) -> Result<bool, crate::named::ObjectMissing> {
+    self.read_step_among(objects, slice, &[])
+  }
+
+  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]): whether every
+  /// one of them is read. A run `wanted` does not reach is read.
+  pub fn read_step_among(
+    &mut self,
+    objects: &impl crate::named::Objects,
+    slice: u64,
+    wanted: &[bool],
+  ) -> Result<bool, crate::named::ObjectMissing> {
     let Some(at) = self.named.runs.iter().enumerate().position(|(at, run)| {
       let read = self.named.read.0.get(at).map_or(0, Vec::len);
-      u64::try_from(read).unwrap_or(u64::MAX) < run.len
+      wanted.get(at).copied().unwrap_or(true) && u64::try_from(read).unwrap_or(u64::MAX) < run.len
     }) else {
       return Ok(true);
     };
@@ -199,7 +298,7 @@ impl Increment {
       buffer.truncate(from);
       return Err(refused);
     }
-    Ok(self.unread().is_none())
+    Ok(self.unread_among(wanted).is_none())
   }
 
   /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
@@ -252,7 +351,7 @@ impl Increment {
     let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let post_state = reader.bytes(post_len)?.to_vec();
     for op in doc.ops.iter().filter(|op| op.kind == OpKind::Mknod) {
-      special_payload(&doc, crate::named::Post::of(&post_state, &[]), op)?;
+      special_payload(&doc, crate::named::Post::of(&post_state, &[], &[]), op)?;
     }
     let evidence_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     if evidence_count > reader.remaining() / EVIDENCE_BYTES {
@@ -565,6 +664,11 @@ pub struct Made {
 }
 
 impl Judged {
+  /// Its post-state as the engine reads it: the inline bytes and each named run's (A-760).
+  fn post(&self) -> crate::named::Post<'_> {
+    crate::named::Post::of(&self.post_state, &self.read, &self.runs)
+  }
+
   /// The increment it judged.
   pub fn id(&self) -> [u8; 32] {
     self.id
@@ -1755,6 +1859,51 @@ fn made_len(base_len: u64, ops: &[Op], post_len: u64) -> u64 {
   out.saturating_add(base_len.saturating_sub(pos))
 }
 
+/// The files a chain entry's changes make from the post-state: each one's path, its operations, and whether it is made
+/// from nothing (a copy's destination is read from its source, so it counts as made over a base).
+fn changed_files(applied: &[crate::chain_entry::Applied]) -> Vec<(&str, &[Op], bool)> {
+  use crate::chain_entry::Applied;
+  applied
+    .iter()
+    .filter_map(|change| match change {
+      Applied::Spliced(path, ops) => Some((path.as_str(), ops.as_slice(), false)),
+      Applied::Created(path, ops) => Some((path.as_str(), ops.as_slice(), true)),
+      Applied::Copied { dst, ops, .. } => Some((dst.as_str(), ops.as_slice(), false)),
+      _ => None,
+    })
+    .collect()
+}
+
+/// The one operation that makes a file under `ops` whole from the post-state whatever the file's length before (made
+/// from nothing where `created`): it alone adds bytes, and the file's length after is its length from no base and
+/// from any. None where a byte of the base may survive.
+fn whole_adding_op(ops: &[Op], created: bool) -> Option<&Op> {
+  let mut adding = ops.iter().filter(|op| adds_content(op.kind));
+  let (Some(op), None) = (adding.next(), adding.next()) else {
+    return None;
+  };
+  let bases: &[u64] = if created { &[0] } else { &[0, ANY_BASE_LEN] };
+  bases
+    .iter()
+    .all(|base| applied_len(*base, ops) == op.len)
+    .then_some(op)
+}
+
+/// Whether a splice of `ops` over a file reads its base: unless one operation makes the file whole whatever its length
+/// before (A-887: a recovery brings back a named base only for a change that reads it).
+pub fn splice_reads_base(ops: &[Op]) -> bool {
+  whole_adding_op(ops, false).is_none()
+}
+
+/// Whether an operation of `kind` adds bytes to a file from the post-state.
+fn adds_content(kind: OpKind) -> bool {
+  matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend)
+}
+
+/// Format: a file's length before a splice standing for any length but none ([`Increment::replay_reads`]): a splice
+/// whose length after is the same from no base and from this one is the same from every base its operations reach.
+const ANY_BASE_LEN: u64 = u64::MAX >> 1;
+
 /// The length [`apply`] makes of a base of `base_len` bytes under `ops`, without making it (A-760).
 fn applied_len(base_len: u64, ops: &[Op]) -> u64 {
   let mut out = 0u64;
@@ -1871,7 +2020,7 @@ fn named_files(
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
 #[cfg(test)]
 pub(crate) fn apply_for_tests(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
-  apply(base, ops, crate::named::Post::of(post_state, &[]))
+  apply(base, ops, crate::named::Post::of(post_state, &[], &[]))
 }
 
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.
@@ -3279,7 +3428,7 @@ impl Green {
       {
         let units = self.at_head(inc, (computed.at, computed.floor), units);
         if let Ok(effects) = position::verdict(units) {
-          self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
+          self.commit_reads(&effects, inc.post());
         }
       }
     });
@@ -5610,8 +5759,8 @@ impl Green {
   /// Notes every unlent named file a commit of `effects` reads (`crate::unlent`, A-760 (b) 4d), with no byte read: each
   /// file [`Green::make_mapped`] makes over the head's bytes, all but those a named run makes whole. What a verdict's
   /// judge checks before it is held, so a commit never makes a file over a text the green did not hold.
-  fn commit_reads(&self, effects: &[Effect], (inline, read): (&[u8], &[Vec<u8>])) {
-    let wholes = alone(self.sole_runs(effects, inline, read));
+  fn commit_reads(&self, effects: &[Effect], post: crate::named::Post<'_>) {
+    let wholes = alone(self.sole_runs(effects, post));
     for (place, effect) in effects.iter().enumerate() {
       if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
         effect
@@ -6541,7 +6690,7 @@ impl Green {
     };
     match position::verdict(units) {
       Ok(effects) => {
-        self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
+        self.commit_reads(&effects, inc.post());
         let applied = effects.iter().map(Effect::applied).collect();
         Judgment::Accepted(Judged {
           id: inc.id,
@@ -6643,8 +6792,7 @@ impl Green {
   /// (A-760 (b) 4d): what its owner lends ([`Green::lend`]) before [`Green::commit_judged`] or [`Green::make_step`],
   /// which refuse while any is unlent. Empty for a verdict whose files are made, or that reads no named text.
   pub fn commit_unlent(&self, judged: &Judged) -> BTreeSet<crate::named::Identity> {
-    crate::unlent::scope(|| self.commit_reads(&judged.effects, (&judged.post_state, &judged.read)))
-      .1
+    crate::unlent::scope(|| self.commit_reads(&judged.effects, judged.post())).1
   }
 
   /// Makes `judged`'s files a copy slice of `slice_bytes` a step (A-760; at least a byte), so its commit copies none:
@@ -6669,7 +6817,7 @@ impl Green {
     let budget = slice_bytes.max(1);
     let mut copied = 0u64;
     if judged.making.wholes.is_none() {
-      let sole = self.sole_runs(&judged.effects, &judged.post_state, &judged.read);
+      let sole = self.sole_runs(&judged.effects, judged.post());
       judged.making.names = Some(named_files(&sole, &judged.runs));
       judged.making.wholes = Some(alone(sole));
     }
@@ -6745,7 +6893,7 @@ impl Green {
       // An unlent named base reads as none, noted: the verdict is refused (`crate::unlent`).
       Some(effect) => self.head_bytes(effect.path()).unwrap_or_default(),
     };
-    let post = crate::named::Post::of(&judged.post_state, &judged.read);
+    let post = judged.post();
     let mut copied = 0u64;
     while copied < budget {
       let Some(segment) = file.segments.get(file.segment).copied() else {
@@ -6802,21 +6950,21 @@ impl Green {
     let (wholes, names) = match (making.wholes, making.names) {
       (Some(wholes), Some(names)) => (wholes, names),
       _ => {
-        let sole = self.sole_runs(&effects, &post_state, &read);
+        let sole = self.sole_runs(&effects, crate::named::Post::of(&post_state, &read, &runs));
         (alone(sole.clone()), named_files(&sole, &runs))
       }
     };
     let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
     self.make_mapped(
       &mut effects,
-      crate::named::Post::of(&post_state, &read),
+      crate::named::Post::of(&post_state, &read, &runs),
       &skip,
     );
     move_whole_runs(&mut effects, &mut read, &wholes);
     self.commit(
       effects,
       version,
-      crate::named::Post::of(&post_state, &read),
+      crate::named::Post::of(&post_state, &read, &runs),
       &names,
     );
     self.accepted.insert(id, version);
@@ -6827,11 +6975,10 @@ impl Green {
   /// ([`alone`]) take its buffer, moved, no copy ([`move_whole_runs`]), so a landing holds the text once; every other
   /// file is made by [`Green::make_mapped`], before any buffer moves. Each whose run is its object whole is named for it
   /// ([`named_files`]).
-  fn sole_runs(&self, effects: &[Effect], inline: &[u8], read: &[Vec<u8>]) -> Vec<(usize, usize)> {
-    if read.is_empty() {
+  fn sole_runs(&self, effects: &[Effect], post: crate::named::Post<'_>) -> Vec<(usize, usize)> {
+    if post.runs.is_empty() && post.declared.is_empty() {
       return Vec::new();
     }
-    let post = crate::named::Post::of(inline, read);
     let mut wanted: Vec<(usize, usize)> = Vec::new();
     for (place, effect) in effects.iter().enumerate() {
       let Effect::SetContent(path, None, ops, source) = effect else {
@@ -6874,8 +7021,9 @@ impl Green {
       return *version;
     }
     // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
-    // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees.
-    if inc.unread().is_some() {
+    // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees. A run the
+    // apply names whole, which no op reads, is never read for it (A-887, [`Green::replay_reads`]).
+    if inc.unread_among(&inc.replay_reads(applied)).is_some() {
       return self.head();
     }
     // Nor over a text held by name alone with no bytes lent it (A-760 (b) 4d): nothing commits, and its owner lends the
@@ -6887,13 +7035,17 @@ impl Green {
     // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
     // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
     let mut read = core::mem::take(&mut inc.named.read.0);
-    let sole = self.sole_runs(&effects, &inc.post_state, &read);
-    let names = named_files(&sole, &inc.named.runs);
+    let runs = &inc.named.runs;
+    let sole = self.sole_runs(
+      &effects,
+      crate::named::Post::of(&inc.post_state, &read, runs),
+    );
+    let names = named_files(&sole, runs);
     let wholes = alone(sole);
     let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
     self.make_mapped(
       &mut effects,
-      crate::named::Post::of(&inc.post_state, &read),
+      crate::named::Post::of(&inc.post_state, &read, runs),
       &skip,
     );
     move_whole_runs(&mut effects, &mut read, &wholes);
@@ -6901,7 +7053,7 @@ impl Green {
     self.commit(
       effects,
       version,
-      crate::named::Post::of(&inc.post_state, &read),
+      crate::named::Post::of(&inc.post_state, &read, runs),
       &names,
     );
     self.accepted.insert(inc.id, version);
@@ -6920,7 +7072,7 @@ impl Green {
       .iter()
       .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
       .collect();
-    self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
+    self.commit_reads(&effects, inc.post());
     effects
   }
 
@@ -6932,7 +7084,10 @@ impl Green {
     inc: &Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> BTreeSet<crate::named::Identity> {
-    if self.owed.is_some() || self.accepted.contains_key(&inc.id) || inc.unread().is_some() {
+    if self.owed.is_some()
+      || self.accepted.contains_key(&inc.id)
+      || inc.unread_among(&inc.replay_reads(applied)).is_some()
+    {
       return BTreeSet::new();
     }
     crate::unlent::scope(|| self.recorded_effects(inc, applied)).1
