@@ -945,7 +945,12 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   Decision 3's rewrite admission BUILT (2026-11-23, w-hg): a new head may take a line it does not descend from (an
+>   amend's or a rebase's successor) after every line it does, only where every changeset the move drops from the
+>   line's history is a draft a held or pushed marker obsoletes, its public history kept (`classify::rewrites`,
+>   `rewrite_admitted`); else it makes a line, as before. Held by
+>   `a_rewrite_moves_its_line_only_when_it_drops_obsolete_drafts_alone` (red: the amend's `b'` made `default:1`, the
+>   obsolete `b` keeping `default:0`). Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
 >   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
 >   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
 >   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
@@ -26486,4 +26491,11 @@ Borrows and 3.19 s with them off. **Fixed:** two levels, 512 directories of 512 
 two arrays of 512. The cell test then took 2.74 s of CPU, and the retirement test passed in 3.98 s; with CI's flags,
 `retirement::` and `sync::cell::` passed 4 of 4 in 158 s of CPU. The plain build pays about 2 ns a claim (12 to 14 ns,
 least against least, 8 interleaved rounds at load 79-103), which main accepted (BENCHMARKS). CI's Miri lane is the check
-of the whole crate.
+of the whole crate. Its first run with the fix (45294047051) ran the runtime step 3 min 17 s, through the retirement
+and cell tests, to a red the stall had hidden since 11-20: four channel tests in `sync::tests` run a shard on the OS
+driver, whose epoll `timerfd_create` Miri cannot call ("unsupported operation"). They are left out under Miri with that
+reason, as `driver.rs`'s OS-driver tests are, and run in every plain lane. The lane's loom and Miri steps now carry
+timeouts of about three times their slowest measured pass (6, 52 and 15 minutes; `ci.yml` names each pass), so a
+stall fails the lane in bounded time rather than holding main's CI group: the stall sat 3 h 49 min in main run
+45251228315, and every main run behind it waited and was replaced unrun. Not run on a Mac first: this MacBook was at
+load 87 to 145, kiln's Studios refused the tree's sync, and adacachy2 has no Miri component.

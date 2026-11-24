@@ -16,7 +16,11 @@
 //! log alone; a new head no line is left for makes a line, numbered the lowest number its branch does not use; a line
 //! whose head is no longer a head and that no new head took is retired, its head merged into one another line took.
 //! Only a made or retired line touches the repository's names log, and the matching makes as few of them as the push
-//! allows. A made line is made from the version of a line its head descends from, or else from a line holding the first
+//! allows. A new head may also take a line it does not descend from, after every line it does (a rewrite, §4.17.3
+//! decision 3: an amend's or a rebase's successor), only where every changeset the move drops from the line's history is
+//! a draft a marker the repository holds or the push brings obsoletes, its public history kept ([`rewrite_admitted`]);
+//! so no public changeset is ever dropped, and an obsolete draft does not keep a line of its own. A rewritten line no
+//! head takes stays where it was. A made line is made from the version of a line its head descends from, or else from a line holding the first
 //! changeset the repository held under the new head's first parents, or a line of that changeset's branch: whichever
 //! base is chosen, its work replaces exactly what differs, so the choice costs only the work's size.
 //!
@@ -709,7 +713,8 @@ pub fn classify(
     }
   }
   kept_markers(view, markers, &mut plan, admission)?;
-  let (moves, created, touched) = place_lines(&graph, lines, admission)?;
+  let obsoleted = obsoleted(view, &plan.markers, admission)?;
+  let (moves, created, touched) = place_lines(&graph, lines, &obsoleted, admission)?;
   plan.lines = moves;
   plan.created = created;
   plan.touched = touched;
@@ -1140,6 +1145,7 @@ type Placed = (Vec<LineMove>, Vec<NewLine>, Vec<Vec<u8>>);
 fn place_lines<V: Repository>(
   graph: &Graph<'_, V>,
   lines: &[LineRead],
+  obsoleted: &BTreeSet<Node>,
   admission: &mut Admission,
 ) -> Result<Placed, Unclassified> {
   let heads = new_heads(graph, admission)?;
@@ -1148,7 +1154,7 @@ fn place_lines<V: Repository>(
   let mut touched = Vec::new();
   for (branch, heads) in heads {
     let name = graph.branches.get(branch).cloned().unwrap_or_default();
-    let (moved, made) = place_branch(graph, (&name, &heads), lines, admission)?;
+    let (moved, made) = place_branch(graph, (&name, &heads), (lines, obsoleted), admission)?;
     if moved.is_empty() && made.is_empty() {
       continue;
     }
@@ -1226,7 +1232,7 @@ fn brought_children<V: Repository>(
 fn place_branch<V: Repository>(
   graph: &Graph<'_, V>,
   (branch, heads): (&[u8], &[usize]),
-  lines: &[LineRead],
+  (lines, obsoleted): (&[LineRead], &BTreeSet<Node>),
   admission: &mut Admission,
 ) -> Result<(Vec<LineMove>, Vec<NewLine>), Unclassified> {
   let mut own: Vec<usize> = (0..lines.len())
@@ -1234,7 +1240,15 @@ fn place_branch<V: Repository>(
     .collect();
   own.sort_by_key(|line| lines.get(*line).map(|read| read.number));
   let edges = edges(graph, heads, (&own, lines), admission)?;
-  let matched = matching(&edges, admission)?;
+  let rewrites = rewrites(graph, heads, (&own, lines, &edges), obsoleted, admission)?;
+  // A head may take a line it rewrites (decision 3) only after every line it continues, so a line it descends from is
+  // matched first; a rewritten line no head takes stays, since no head continues it.
+  let choices: Vec<Vec<usize>> = edges
+    .iter()
+    .zip(&rewrites)
+    .map(|(continued, rewritten)| continued.iter().chain(rewritten).copied().collect())
+    .collect();
+  let matched = matching(&choices, admission)?;
   let mut moves = Vec::new();
   let mut superseded: BTreeSet<usize> = BTreeSet::new();
   for lines_of in &edges {
@@ -1318,6 +1332,122 @@ fn edges<V: Repository>(
     edges.push(lines_of);
   }
   Ok(edges)
+}
+
+/// The changesets the repository's markers and the push's kept ones name as predecessors, by node (decision 3: a draft
+/// a rewrite drops must be obsoleted by a marker the repository holds or the push brings), charged as they are kept.
+fn obsoleted<V: Repository>(
+  view: &V,
+  kept: &[Vec<u8>],
+  admission: &mut Admission,
+) -> Result<BTreeSet<Node>, PastAdmission> {
+  let mut nodes = BTreeSet::new();
+  let pushed = kept
+    .iter()
+    .filter_map(|payload| obsmarkers::decode(payload).ok())
+    .flat_map(|markers| {
+      markers
+        .iter()
+        .map(|marker| marker.predecessor)
+        .collect::<Vec<_>>()
+    });
+  for predecessor in view
+    .markers()
+    .map(|marker| marker.predecessor)
+    .chain(pushed)
+  {
+    if let Ok(node) = Node::try_from(predecessor)
+      && nodes.insert(node)
+    {
+      admission.charge_items::<Node>(1)?;
+    }
+  }
+  Ok(nodes)
+}
+
+/// For each new head, the lines of its branch it may rewrite (decision 3, §4.17.3: a version whose head does not
+/// descend from the line's previous head): a line it does not continue whose head is a draft that a marker obsoletes,
+/// and every changeset of whose history the move would drop ([`rewrite_admitted`]) a draft a marker obsoletes, so no
+/// public changeset is ever dropped. A line whose head the view no longer serves (hidden by an earlier push) is not
+/// rewritten: its history cannot be read.
+fn rewrites<V: Repository>(
+  graph: &Graph<'_, V>,
+  heads: &[usize],
+  (own, lines, edges): (&[usize], &[LineRead], &[Vec<usize>]),
+  obsoleted: &BTreeSet<Node>,
+  admission: &mut Admission,
+) -> Result<Vec<Vec<usize>>, PastAdmission> {
+  let mut rewrites = Vec::with_capacity(heads.len());
+  for (head, continued) in heads.iter().zip(edges) {
+    let mut rewritten = Vec::new();
+    for line in own.iter().copied().filter(|line| !continued.contains(line)) {
+      let Some(old) = lines.get(line).and_then(|read| read.head) else {
+        continue;
+      };
+      if obsoleted.contains(&old) && rewrite_admitted(graph, (*head, old), obsoleted, admission)? {
+        admission.charge_items::<usize>(1)?;
+        rewritten.push(line);
+      }
+    }
+    rewrites.push(rewritten);
+  }
+  Ok(rewrites)
+}
+
+/// Whether moving a line from `old` to brought head `head` drops only drafts markers obsolete (decision 3): every
+/// changeset of `old`'s history that is not of `head`'s, walked back from `old` while it is a draft, a draft a marker
+/// obsoletes; and every public changeset that walk meets of `head`'s history. A walk of the drafts alone, and of the
+/// public ones down to the lowest it met.
+fn rewrite_admitted<V: Repository>(
+  graph: &Graph<'_, V>,
+  (head, old): (usize, Node),
+  obsoleted: &BTreeSet<Node>,
+  admission: &mut Admission,
+) -> Result<bool, PastAdmission> {
+  let Some(old) = graph.at(&old) else {
+    return Ok(false);
+  };
+  if graph.phase(Some(old)) != Phase::Draft {
+    return Ok(false);
+  }
+  // The head's draft history: the changesets the move keeps.
+  let mut kept: BTreeSet<At> = BTreeSet::new();
+  let mut stack = vec![At::New(head)];
+  while let Some(at) = stack.pop() {
+    if graph.phase(Some(at)) == Phase::Public || !kept.insert(at) {
+      continue;
+    }
+    let parents = graph.parents(at);
+    admission.charge_items::<At>(parents.len().saturating_add(1))?;
+    stack.extend(parents.into_iter().flatten());
+  }
+  // The old head's history the move drops: each draft must be obsoleted; each public one met, of the head's history.
+  let mut publics: BTreeSet<Rev> = BTreeSet::new();
+  let mut seen: BTreeSet<At> = BTreeSet::new();
+  let mut stack = vec![old];
+  while let Some(at) = stack.pop() {
+    if kept.contains(&at) || !seen.insert(at) {
+      continue;
+    }
+    if graph.phase(Some(at)) == Phase::Public {
+      match at {
+        At::Old(rev) => {
+          admission.charge_items::<Rev>(1)?;
+          publics.insert(rev);
+        }
+        At::New(_) => return Ok(false),
+      }
+      continue;
+    }
+    if !graph.node(at).is_some_and(|node| obsoleted.contains(&node)) {
+      return Ok(false);
+    }
+    let parents = graph.parents(at);
+    admission.charge_items::<At>(parents.len().saturating_add(1))?;
+    stack.extend(parents.into_iter().flatten());
+  }
+  let reached = graph.reached(At::New(head), &publics, admission)?;
+  Ok(reached.len() == publics.len())
 }
 
 /// A maximum matching of new heads to lines (augmenting paths found breadth first, the heads in order): each head's
