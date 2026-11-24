@@ -2252,18 +2252,7 @@ impl GitPush {
     within_budget(state, 0, |stores| {
       let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
       for object in objects {
-        let incoming = Incoming {
-          kind: object.kind,
-          claimed: Some(object.id),
-          content: &object.content,
-          depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
-        };
-        admit_object(
-          content,
-          store,
-          (&mut self.push, &mut self.record),
-          (incoming, Some(object.offset)),
-        )?;
+        admit_unpacked_object(content, store, (&mut self.push, &mut self.record), &object)?;
         self
           .push
           .keep_read(object.offset, object.kind, object.content);
@@ -2469,6 +2458,35 @@ fn abandon_push(state: &mut ShardState, push: Push) {
 /// when an append commits ([`SealedPush::names_now`]), by the predicate that commit gives positions by, since another push can
 /// commit an object this one holds between its admission and its append, and a store made again from the log can lose
 /// one. So the record names exactly the objects its commit positions.
+/// Admits an object already unpacked and named with collision-detecting SHA-1/SHA-256 by
+/// `slates_git::unpack::Reader` without re-hashing its content a second time.
+fn admit_unpacked_object(
+  content: &mut ContentStore,
+  store: &GitStore,
+  (push, record): (&mut Push, &mut RecordWriter),
+  object: &slates_git::unpack::Object,
+) -> Result<(), GitRefused> {
+  if store.repository.object(content, &object.id).is_some() {
+    push.entry_at(object.offset, object.id);
+    return Ok(());
+  }
+  let (id, admitted) = push
+    .admit_unpacked::<Infallible>(content, object)
+    .map_err(GitRefused::Object)?;
+  if admitted == Admitted::New {
+    let held = push
+      .object(&id)
+      .ok_or(GitRefused::Store(StoreRefused::Unreadable { id }))?;
+    record.object(Noted {
+      kind: object.kind,
+      id,
+      identity: held.identity,
+      len: held.len,
+    });
+  }
+  Ok(())
+}
+
 fn admit_object(
   content: &mut ContentStore,
   store: &GitStore,

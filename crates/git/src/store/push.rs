@@ -288,6 +288,36 @@ impl Push {
     {
       return Err(PushRefused::IdMismatch { id: claimed });
     }
+    self.admit_placed_named(store, id, (incoming, offset))
+  }
+
+  /// Admits an object already unpacked and named with collision-detecting SHA-1/SHA-256 by
+  /// [`crate::unpack::Reader`] without hashing its content a second time.
+  pub fn admit_unpacked<R>(
+    &mut self,
+    store: &ContentStore,
+    object: &crate::unpack::Object,
+  ) -> Result<(ObjectId, Admitted), PushRefused<R>> {
+    if object.id.format() != self.format {
+      return Err(PushRefused::IdMismatch { id: object.id });
+    }
+    let incoming = Incoming {
+      kind: object.kind,
+      claimed: Some(object.id),
+      content: &object.content,
+      depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
+    };
+    self.admit_placed_named(store, object.id, (incoming, object.offset))
+  }
+
+  /// Shared placement path once `id` has been verified against `incoming.content`.
+  fn admit_placed_named<R>(
+    &mut self,
+    store: &ContentStore,
+    id: ObjectId,
+    (incoming, offset): (Incoming<'_>, u64),
+  ) -> Result<(ObjectId, Admitted), PushRefused<R>> {
+    let number = incoming.kind.pack_number();
     let identity = store.object_id(incoming.content);
     let again = match (self.placed.get(&id), self.quarantine.object(id.as_bytes())) {
       (Some(placed), _) => Some((placed.number, placed.identity)),
@@ -685,6 +715,8 @@ impl Push {
     self.entries = BTreeMap::new();
     self.passed_over = BTreeMap::new();
     self.pack = Vec::new();
+    // Discharge `recent` before resetting `Scratch` so its `ContentStore` charge is never leaked.
+    self.release_recent(store);
     *self.reading.get_mut() = Scratch::default();
     given
   }

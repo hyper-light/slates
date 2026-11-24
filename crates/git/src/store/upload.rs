@@ -523,7 +523,7 @@ impl<A: Answered> Upload<A> {
       counted: 0,
       entries: 0,
       at: 0,
-      hasher: Some(Hasher::raw(format)),
+      hasher: Some(Hasher::pack_checksum(format)),
       window,
       levels,
       depth,

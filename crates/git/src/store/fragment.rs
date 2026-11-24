@@ -382,7 +382,8 @@ impl Encoder {
       }
       PutStage::Sample { level } => {
         let data = putting.data();
-        let sample = data.get(..window.min(data.len())).unwrap_or_default();
+        let cap = window.min(DEFLATE_WINDOW_BYTES).min(data.len());
+        let sample = data.get(..cap).unwrap_or_default();
         sample_level(putting.object.kind, sample, level, learning)?;
         let next = level.saturating_add(1);
         putting.stage = if next < LEVELS {
@@ -591,6 +592,10 @@ pub(crate) fn in_fragment(mut record: Placed) -> Placed {
   record
 }
 
+/// Format: RFC 1951 §3.2.5 deflate LZ77 sliding window size (32 KiB). Sampling beyond one deflate
+/// window adds no history-window compression accuracy while multiplying cold-sample CPU work.
+const DEFLATE_WINDOW_BYTES: usize = 1 << 15;
+
 /// One level sampled on `sample`: deflated at `level`, timed and taught to `kind`'s levels.
 fn sample_level(
   kind: Kind,
@@ -611,29 +616,10 @@ fn sample_level(
   Ok(())
 }
 
-/// `data` deflated at every level, each timed and taught to `kind`'s levels; the outputs, by level.
-fn sampled(
-  kind: Kind,
-  data: &[u8],
-  learning: &mut Learning<'_>,
-) -> Result<Vec<Vec<u8>>, FragmentRefused> {
-  let mut outputs = Vec::new();
-  for level in 0..LEVELS {
-    let output = deflate(data, level)?;
-    let ns = learning
-      .exchange
-      .rates
-      .deflate_ns(level, to_u64(data.len()));
-    let sizes = (to_u64(data.len()), to_u64(output.len()), ns);
-    learning.levels.record(kind, level, sizes);
-    outputs.push(output);
-  }
-  Ok(outputs)
-}
-
 /// The level to deflate an object of `kind` at whose first bytes are `sample` (A-639: a stream
 /// deflating an object a window at a time): the learned one; with none learned yet, the one its
-/// levels choose once `sample` is deflated at every level, each timed and taught.
+/// levels choose once `sample` (capped to one RFC 1951 deflate window) is deflated at every level,
+/// each timed and taught.
 pub(crate) fn level(
   kind: Kind,
   sample: &[u8],
@@ -642,7 +628,12 @@ pub(crate) fn level(
   if let Some(level) = learning.levels.level(kind, learning.exchange) {
     return Ok(level);
   }
-  sampled(kind, sample, learning)?;
+  let bounded = sample
+    .get(..sample.len().min(DEFLATE_WINDOW_BYTES))
+    .unwrap_or(sample);
+  for trial in 0..LEVELS {
+    sample_level(kind, bounded, trial, learning)?;
+  }
   Ok(learning.levels.level(kind, learning.exchange).unwrap_or(0))
 }
 
@@ -662,47 +653,49 @@ pub(crate) fn deflate_more(
   data: &[u8],
   last: bool,
 ) -> Result<Vec<u8>, FragmentRefused> {
-  // Fed a piece at a time whatever the call's length, so a stream fed by steps of any size is fed as one call feeds it.
+  // Fed a piece at a time whatever the call's length, so a stream fed by steps of any size is fed as one call feeds it,
+  // writing directly into one output buffer with zero per-piece allocations.
   let mut out = Vec::with_capacity(data.len().saturating_add(1));
   let mut pieces = data.chunks(DEFLATE_PIECE).peekable();
   if pieces.peek().is_none() {
-    out.extend(deflate_piece(compress, &[], last)?);
+    deflate_piece(compress, &[], last, &mut out)?;
   }
   while let Some(piece) = pieces.next() {
-    out.extend(deflate_piece(
-      compress,
-      piece,
-      last && pieces.peek().is_none(),
-    )?);
+    deflate_piece(compress, piece, last && pieces.peek().is_none(), &mut out)?;
   }
   Ok(out)
 }
 
-/// One piece of a deflate stream ([`deflate_more`]): `data` fed whole, the stream finished after it where `last`.
+/// One piece of a deflate stream ([`deflate_more`]): `data` fed whole into `out`, the stream finished after it where `last`.
 fn deflate_piece(
   compress: &mut Compress,
   data: &[u8],
   last: bool,
-) -> Result<Vec<u8>, FragmentRefused> {
+  out: &mut Vec<u8>,
+) -> Result<(), FragmentRefused> {
   let flush = if last {
     FlushCompress::Finish
   } else {
     FlushCompress::None
   };
   let before = compress.total_in();
-  let mut out: Vec<u8> = Vec::with_capacity(data.len().saturating_add(1));
   loop {
     let consumed = compress.total_in().saturating_sub(before);
     let consumed = usize::try_from(consumed).map_err(|_| FragmentRefused::Deflate)?;
     let rest = data.get(consumed..).unwrap_or_default();
+    if out.len() == out.capacity() {
+      let grow = out.capacity().max(data.len().saturating_add(1)).max(1);
+      out.reserve(grow);
+    }
     let status = compress
-      .compress_vec(rest, &mut out, flush)
+      .compress_vec(rest, out, flush)
       .map_err(|_| FragmentRefused::Deflate)?;
     let taken = compress.total_in().saturating_sub(before);
     if status == Status::StreamEnd || (!last && taken == to_u64(data.len())) {
-      return Ok(out);
+      return Ok(());
     }
-    out.reserve(out.capacity().max(1));
+    let grow = out.capacity().max(1);
+    out.reserve(grow);
   }
 }
 

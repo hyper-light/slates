@@ -565,8 +565,8 @@ pub struct Reader<'index, L: Locate + ?Sized = NoIndex> {
   index: &'index L,
   /// The checksum of every byte read before the trailer.
   checksum: Hasher,
-  /// The inflater, reset for each entry.
-  inflater: Decompress,
+  /// The inflater, borrowed from the thread's reusable pool and reset for each entry.
+  inflater: crate::store::deflaters::Inflater,
   /// The bytes of the pack read so far.
   at: u64,
   /// What comes next.
@@ -631,8 +631,8 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     Self {
       format,
       index,
-      checksum: Hasher::raw(format),
-      inflater: Decompress::new(true),
+      checksum: Hasher::pack_checksum(format),
+      inflater: crate::store::deflaters::inflater(),
       at: 0,
       stage: Stage::PackHeader,
       partial: Vec::new(),
@@ -874,7 +874,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     let mut content = Vec::new();
     reserve(&mut content, size)?;
     content.resize(size, 0);
-    self.inflater.reset(true);
+    self
+      .inflater
+      .state()
+      .ok_or(Refusal::Inflate { at: began })?
+      .reset(true);
     self.stage = Stage::Data(Data {
       header,
       began,
@@ -896,7 +900,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     let Stage::Data(data) = &mut self.stage else {
       return Ok(None);
     };
-    let inflated = inflate(&mut self.inflater, data, rest)?;
+    let inflater = self
+      .inflater
+      .state()
+      .ok_or(Refusal::Inflate { at: data.began })?;
+    let inflated = inflate(inflater, data, rest)?;
     let took = usize::try_from(inflated.took).unwrap_or(usize::MAX);
     let piece = rest.get(..took).unwrap_or_default();
     self.checksum.update(piece);
@@ -1127,7 +1135,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     if self.partial.len() < self.format.raw_len() {
       return Ok(take);
     }
-    let checksum = core::mem::replace(&mut self.checksum, Hasher::raw(self.format))
+    let checksum = core::mem::replace(&mut self.checksum, Hasher::pack_checksum(self.format))
       .finish()
       .map_err(|attack| Refusal::Pack(pack::Refusal::Collision(attack)))?;
     if checksum.as_bytes() != self.partial.as_slice() {

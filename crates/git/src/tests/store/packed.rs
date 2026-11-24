@@ -1232,3 +1232,67 @@ fn a864_a_window_never_brought_back_is_stopped_at_once_then_refused_never_waited
     "then refused, not waited for: {ended:?}"
   );
 }
+
+/// Wave 6C regression (bug fix = failing test first): committing a push whose pack populated
+/// `Push::keep_read` + `true_up_recent` must discharge its recent-reads charge on `ContentStore`
+/// before discarding `Scratch`; releasing a forked `Repository` whose reads populated `recent` must
+/// likewise discharge its recent-reads charge and leave `ContentStore::used() == 0`.
+#[test]
+fn committing_a_push_and_releasing_a_fork_discharge_recent_charges() {
+  let pack = crate::pack_fixtures::packs()[0].bytes.to_vec();
+  let whole = read_whole(&pack, &Held(BTreeMap::new()));
+  let mut store = ContentStore::new(1 << 26, 4096).unwrap();
+  let mut repository = Repository::new(ObjectFormat::Sha1);
+  let naming = GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = Push::new(ObjectFormat::Sha1);
+  push.extend_pack(&pack);
+  for object in &whole.objects {
+    push
+      .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
+      .unwrap();
+    push.keep_read(object.offset, object.kind, object.content.clone());
+  }
+  push.true_up_recent(&mut store);
+  assert!(push.kept_lately() > 0, "push kept recent objects");
+  repository.seal(&store, &mut push).unwrap();
+  repository.stage(&mut store, &mut push).unwrap();
+  let commit = whole
+    .objects
+    .iter()
+    .find(|object| object.kind == Kind::Commit)
+    .unwrap()
+    .id;
+  let moved = repository.admit(&store, &push, 1, Some(commit)).unwrap();
+  repository.commit(&mut store, &mut push, &[moved]).unwrap();
+  push.abandon(&mut store).unwrap();
+
+  // Fork the repository, read an object through the fork so its delta-base scratch populates,
+  // charge it to `store`, and release the fork; the fork's recent budget must be non-zero AND its
+  // release must restore `store.used()` exactly.
+  let before_fork = store.used();
+  let fork = repository.fork(&mut store).unwrap();
+  let obj_row = fork.object(&store, &commit).unwrap();
+  let (row, content) = fork.indexed(&store, &commit).unwrap();
+  assert!(fork.row_bytes(&store, &row, content).is_some());
+  assert_eq!(obj_row.position, row.position);
+  assert!(
+    fork.recent_bytes() > 0,
+    "a forked repository must inherit the delta-base scratch budget"
+  );
+  fork.true_up_recent(&mut store);
+  fork.release(&mut store).unwrap();
+  assert_eq!(
+    store.used(),
+    before_fork,
+    "releasing a fork must discharge all recent charges"
+  );
+
+  repository.release(&mut store).unwrap();
+  assert_eq!(
+    store.used(),
+    0,
+    "committing a push and releasing the repository must leave zero leaked charge"
+  );
+}

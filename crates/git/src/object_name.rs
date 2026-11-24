@@ -279,7 +279,7 @@ const FORMATS: [(ObjectFormat, &str, usize); 2] = [
 ];
 
 /// Derived: the longest object name any format makes, SHA-256's.
-const MAX_RAW_LEN: usize = 32;
+pub(crate) const MAX_RAW_LEN: usize = 32;
 
 /// Format: the bits one hexadecimal digit of an object name carries.
 const HEX_DIGIT_BITS: u32 = 4;
@@ -480,28 +480,67 @@ pub struct Hasher {
 
 /// The running hash of a [`Hasher`].
 enum State {
-  /// SHA-1 with collision detection, boxed: its detection keeps the expanded message of the block it checks.
+  /// SHA-1 with collision detection, boxed so long-lived `Hasher` holders (`Upload`, `unpack::Reader`,
+  /// `Sealing`, which use [`Hasher::pack_checksum`]) stay 80 bytes instead of 824 bytes per connection;
+  /// one-shot [`name_of`] keeps `sha1_checked::Sha1` on the stack with zero heap allocation.
   Sha1(Box<sha1_checked::Sha1>),
-  /// SHA-256.
-  Sha256(aws_lc_rs::digest::Context),
+  /// Vetted hardware-accelerated hash (`aws-lc-rs`) for SHA-256 object names and pack/index transport checksums.
+  Fast {
+    format: ObjectFormat,
+    context: aws_lc_rs::digest::Context,
+  },
+}
+
+/// Builds a collision-detecting SHA-1 state configured as git configures it (`git_SHA1DCInit`).
+fn new_sha1_checked() -> sha1_checked::Sha1 {
+  sha1_checked::Sha1::builder()
+    .detect_collision(true)
+    .safe_hash(false)
+    .build()
+}
+
+/// Finalizes a collision-detecting SHA-1 state into an [`ObjectId`] or [`CollisionAttack`].
+fn finish_sha1_checked(hash: sha1_checked::Sha1) -> Result<ObjectId, CollisionAttack> {
+  let result = hash.try_finalize();
+  let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
+  let name = name.unwrap_or(ObjectId {
+    format: ObjectFormat::Sha1,
+    bytes: [0; MAX_RAW_LEN],
+  });
+  if result.has_collision() {
+    return Err(CollisionAttack { sha1: name });
+  }
+  Ok(name)
 }
 
 impl Hasher {
   /// A hasher of raw bytes in `format`, with no header: what git's `test-tool sha1` hashes.
   pub fn raw(format: ObjectFormat) -> Hasher {
     let state = match format {
-      // git's own configuration of the detection: on, with the safe hash off (`git_SHA1DCInit`).
-      ObjectFormat::Sha1 => State::Sha1(Box::new(
-        sha1_checked::Sha1::builder()
-          .detect_collision(true)
-          .safe_hash(false)
-          .build(),
-      )),
-      ObjectFormat::Sha256 => {
-        State::Sha256(aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256))
-      }
+      ObjectFormat::Sha1 => State::Sha1(Box::new(new_sha1_checked())),
+      ObjectFormat::Sha256 => State::Fast {
+        format: ObjectFormat::Sha256,
+        context: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
+      },
     };
     Hasher { state }
+  }
+
+  /// A hasher for packfile and pack-index transport integrity checksums in `format`, matching git's
+  /// `unsafe_hash_algo` (`csum-file.c`, `index-pack.c`, `pack-write.c`): vetted hardware-accelerated
+  /// SHA-1 (`aws-lc-rs`) or SHA-256 without collision detection. Every object identity inside the
+  /// pack still runs collision-detecting [`Hasher::object`] / [`name_of`].
+  pub fn pack_checksum(format: ObjectFormat) -> Hasher {
+    let algorithm = match format {
+      ObjectFormat::Sha1 => &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
+      ObjectFormat::Sha256 => &aws_lc_rs::digest::SHA256,
+    };
+    Hasher {
+      state: State::Fast {
+        format,
+        context: aws_lc_rs::digest::Context::new(algorithm),
+      },
+    }
   }
 
   /// A hasher of an object with `header` in `format`: the header hashed first, as git's `hash_object_file` hashes it,
@@ -516,30 +555,19 @@ impl Hasher {
   pub fn update(&mut self, bytes: &[u8]) {
     match &mut self.state {
       State::Sha1(hash) => sha1_checked::Digest::update(hash.as_mut(), bytes),
-      State::Sha256(context) => context.update(bytes),
+      State::Fast { context, .. } => context.update(bytes),
     }
   }
 
   /// The name of what was hashed, or the attack SHA-1's detection found in it.
   pub fn finish(self) -> Result<ObjectId, CollisionAttack> {
     match self.state {
-      State::Sha1(hash) => {
-        let result = (*hash).try_finalize();
-        let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
-        let name = name.unwrap_or(ObjectId {
-          format: ObjectFormat::Sha1,
-          bytes: [0; MAX_RAW_LEN],
-        });
-        if result.has_collision() {
-          return Err(CollisionAttack { sha1: name });
-        }
-        Ok(name)
-      }
-      State::Sha256(context) => {
+      State::Sha1(hash) => finish_sha1_checked(*hash),
+      State::Fast { format, context } => {
         let digest = context.finish();
         Ok(
-          ObjectId::from_bytes(ObjectFormat::Sha256, digest.as_ref()).unwrap_or(ObjectId {
-            format: ObjectFormat::Sha256,
+          ObjectId::from_bytes(format, digest.as_ref()).unwrap_or(ObjectId {
+            format,
             bytes: [0; MAX_RAW_LEN],
           }),
         )
@@ -561,21 +589,38 @@ pub fn empty_tree(format: ObjectFormat) -> Option<ObjectId> {
   name_of(format, Kind::Tree, &[]).ok()
 }
 
+/// Stack-allocated [`Out`] adapter over `sha1_checked::Sha1` for zero-alloc [`name_of`].
+struct Sha1Stack(sha1_checked::Sha1);
+
+impl Out for Sha1Stack {
+  fn put(&mut self, bytes: &[u8]) {
+    sha1_checked::Digest::update(&mut self.0, bytes);
+  }
+}
+
 /// The name of an object of `kind` whose whole content is `content`, in `format`.
 pub fn name_of(
   format: ObjectFormat,
   kind: Kind,
   content: &[u8],
 ) -> Result<ObjectId, CollisionAttack> {
-  let mut hasher = Hasher::object(
-    format,
-    Header {
-      kind,
-      size: to_u64(content.len()),
-    },
-  );
-  hasher.update(content);
-  hasher.finish()
+  let header = Header {
+    kind,
+    size: to_u64(content.len()),
+  };
+  match format {
+    ObjectFormat::Sha1 => {
+      let mut hasher = Sha1Stack(new_sha1_checked());
+      write_header(header, &mut hasher);
+      sha1_checked::Digest::update(&mut hasher.0, content);
+      finish_sha1_checked(hasher.0)
+    }
+    ObjectFormat::Sha256 => {
+      let mut hasher = Hasher::object(format, header);
+      hasher.update(content);
+      hasher.finish()
+    }
+  }
 }
 
 #[cfg(test)]

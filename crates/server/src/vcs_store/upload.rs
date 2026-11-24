@@ -527,15 +527,21 @@ fn lend_uncounted<R>(
     })
     .collect();
   let mut packs = ShardPacks::of(state);
-  let lent = super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
-    let (content, store) = stores.git_ref(id)?;
-    let served = Served {
-      repository: &store.repository,
-      store: content,
-      refs: &refs,
-      head: &head,
+  let lent = super::within_budget(state, 0, |stores| {
+    let answer = {
+      let (content, store) = stores.git_ref(id)?;
+      let served = Served {
+        repository: &store.repository,
+        store: content,
+        refs: &refs,
+        head: &head,
+      };
+      step(&served, &mut packs)
     };
-    Some(step(&served, &mut packs))
+    if let Some((content, store)) = stores.git(id) {
+      store.repository.true_up_recent(content);
+    }
+    Some(answer)
   });
   packs.count_on(state);
   lent
@@ -656,19 +662,30 @@ fn lend_held_in<R>(
     .collect();
   let mut packs = ShardPacks::of(state);
   let lent = super::observed(state, hold.id, |state| {
-    super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
-      let fork = stores
-        .git_forks
-        .get(&hold.id)?
-        .iter()
-        .find(|fork| fork.stamp == hold.stamp)?;
-      let served = Served {
-        repository: &fork.repository,
-        store: stores.content.as_ref()?,
-        refs: &refs,
-        head: &hold.head,
+    super::within_budget(state, 0, |stores| {
+      let answer = {
+        let fork = stores
+          .git_forks
+          .get(&hold.id)?
+          .iter()
+          .find(|fork| fork.stamp == hold.stamp)?;
+        let served = Served {
+          repository: &fork.repository,
+          store: stores.content.as_ref()?,
+          refs: &refs,
+          head: &hold.head,
+        };
+        step(&served, &mut packs)
       };
-      Some(step(&served, &mut packs))
+      if let Some(content) = stores.content.as_mut()
+        && let Some(fork) = stores
+          .git_forks
+          .get(&hold.id)
+          .and_then(|forks| forks.iter().find(|fork| fork.stamp == hold.stamp))
+      {
+        fork.repository.true_up_recent(content);
+      }
+      Some(answer)
     })
   });
   packs.count_on(state);

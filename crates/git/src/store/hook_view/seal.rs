@@ -198,7 +198,7 @@ impl Sealing {
     Sealing {
       pack: unit.name,
       stage: Stage::Pack { at: 0 },
-      hasher: Hasher::raw(unit.name.format()),
+      hasher: Hasher::pack_checksum(unit.name.format()),
       adlers: Vec::new(),
       crcs: Vec::new(),
       crc: crc32fast::Hasher::new(),

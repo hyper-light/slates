@@ -20,12 +20,10 @@
 //! - [`Writer`] writes a pack as git does: the header at version 2, the caller's objects, then the trailer, computed
 //!   as the bytes stream out (§4.17.2 "A fetch", item 3).
 //!
-//! **Checksums** are taken through [`Hasher`] (A-600), the hash the crate names objects with, so a SHA-1 checksum runs
-//! git's collision detection too. A checksum whose input carries a known attack's disturbance is refused by kind
-//! ([`Refusal::Collision`]). git 2.50.1 hashes its files' checksums with `unsafe_hash_algo` (`csum-file.c`), which
-//! `hash.h` makes the collision-detecting SHA-1 unless a build names a separate fast one, so a default build of git
-//! dies on such a checksum too. No published collision begins with a pack's first bytes, so no golden vector reaches
-//! that refusal (GAPS, the §4.17 entry).
+//! **Checksums** are taken through [`Hasher::pack_checksum`], matching git's `unsafe_hash_algo` (`csum-file.c`,
+//! `index-pack.c`, `pack-write.c`): vetted hardware-accelerated SHA-1 (`aws-lc-rs`) or SHA-256 for transport integrity
+//! trailers. Every object inside the pack is still named through collision-detecting [`crate::object_name::name_of`]
+//! (`sha1-checked`), so no forged object identity can enter a repository.
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted. Each refusal is a typed variant naming where it stopped. Nothing
 //! here allocates beyond the hash's own state.
@@ -160,7 +158,7 @@ fn word(bytes: &[u8], at: usize) -> Option<u32> {
 
 /// The checksum `format` takes of `bytes`: what a pack's trailer and an index's last two hashes hold.
 pub(crate) fn checksum_of(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId, CollisionAttack> {
-  let mut hasher = Hasher::raw(format);
+  let mut hasher = Hasher::pack_checksum(format);
   hasher.update(bytes);
   hasher.finish()
 }
@@ -226,7 +224,7 @@ impl<'o, O: Out> Checksummed<'o, O> {
   pub(crate) fn new(format: ObjectFormat, out: &'o mut O) -> Self {
     Self {
       out,
-      hasher: Hasher::raw(format),
+      hasher: Hasher::pack_checksum(format),
     }
   }
 

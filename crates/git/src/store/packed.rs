@@ -265,14 +265,23 @@ struct Lent {
 impl Recent {
   /// The object kept for the entry at `place`; none when none is, or its chunk has gone.
   fn get(&self, place: InPack) -> Option<(Kind, &[u8])> {
+    let (kind, chunk, at, len) = self.get_slot(place)?;
+    Some((kind, self.slice(chunk, at, len)?))
+  }
+
+  /// Resolves the live chunk slot for `place` without borrowing `self`, allowing callers to borrow
+  /// directly on hit or mutate `Scratch` on miss without re-probing the map.
+  fn get_slot(&self, place: InPack) -> Option<(Kind, usize, usize, usize)> {
     let (kind, lent) = self.objects.get(&(place.pack, place.offset))?;
     let index = usize::try_from(lent.chunk.checked_sub(self.first)?).ok()?;
-    let bytes = self
-      .chunks
-      .get(index)?
-      .bytes
-      .get(lent.at..lent.at.checked_add(lent.len)?)?;
-    Some((*kind, bytes))
+    let end = lent.at.checked_add(lent.len)?;
+    let _ = self.chunks.get(index)?.bytes.get(lent.at..end)?;
+    Some((*kind, index, lent.at, lent.len))
+  }
+
+  /// Borrows the slice previously validated by [`Recent::get_slot`].
+  fn slice(&self, index: usize, at: usize, len: usize) -> Option<&[u8]> {
+    self.chunks.get(index)?.bytes.get(at..at.checked_add(len)?)
   }
 
   /// Keeps `bytes`, the object of type `kind` whose entry begins at `place`: taken whole as a chunk of its own when it is
@@ -533,6 +542,38 @@ pub fn read(
   (scratch, room): (&mut Scratch, u64),
   out: &mut Vec<u8>,
 ) -> Result<Kind, PackedRefused> {
+  let kind = read_into_scratch(store, (place, format), bases, (scratch, room))?;
+  core::mem::swap(out, &mut scratch.built);
+  Ok(kind)
+}
+
+/// Reads the object whose entry begins at `place` and lends its bytes directly from `scratch`
+/// (borrowing straight from [`Recent`] on a direct hit, or from `scratch.built` without surrendering
+/// its capacity on a miss).
+pub fn read_in_place<'a>(
+  store: &dyn PackSource,
+  (place, format): (InPack, ObjectFormat),
+  bases: &dyn Bases,
+  (scratch, room): (&'a mut Scratch, u64),
+) -> Result<(Kind, &'a [u8]), PackedRefused> {
+  if let Some((kind, chunk, at, len)) = scratch.recent.get_slot(place) {
+    let bytes = scratch
+      .recent
+      .slice(chunk, at, len)
+      .ok_or(PackedRefused::Unread { at: place.offset })?;
+    return Ok((kind, bytes));
+  }
+  let kind = read_into_scratch(store, (place, format), bases, (scratch, room))?;
+  Ok((kind, scratch.built.as_slice()))
+}
+
+/// Core packed reader that leaves the resolved object bytes in `scratch.built`.
+fn read_into_scratch(
+  store: &dyn PackSource,
+  (place, format): (InPack, ObjectFormat),
+  bases: &dyn Bases,
+  (scratch, room): (&mut Scratch, u64),
+) -> Result<Kind, PackedRefused> {
   scratch.chain.clear();
   let mut at = place;
   let (kind, base) = loop {
@@ -600,7 +641,6 @@ pub fn read(
     core::mem::swap(built, next);
     recent.keep_copy(link.entry, kind, built);
   }
-  core::mem::swap(out, built);
   Ok(kind)
 }
 

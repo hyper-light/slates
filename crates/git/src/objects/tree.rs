@@ -226,10 +226,17 @@ impl<'a> Tree<'a> {
     format: ObjectFormat,
     admission: &mut Admission,
   ) -> Result<Self, ObjectRefused> {
+    let item_bytes = crate::to_u64(core::mem::size_of::<Entry<'a>>()).max(1);
+    let max_entries =
+      usize::try_from(admission.left().checked_div(item_bytes).unwrap_or(0)).unwrap_or(usize::MAX);
+    let mut kept = Vec::new();
     let mut count = 0_usize;
     for entry in entries(bytes, format) {
-      entry?;
+      let entry = entry?;
       count = count.saturating_add(1);
+      if count <= max_entries {
+        kept.push(entry);
+      }
     }
     admission
       .charge_items::<Entry<'a>>(count)
@@ -237,10 +244,6 @@ impl<'a> Tree<'a> {
         at: 0,
         refusal: Refusal::PastAdmission(past),
       })?;
-    let mut kept = Vec::with_capacity(count);
-    for entry in entries(bytes, format) {
-      kept.push(entry?);
-    }
     Ok(Self { entries: kept })
   }
 
@@ -362,7 +365,7 @@ pub fn entry_after(
 }
 
 /// Every entry of `bytes` in order, ending at the first refusal.
-fn entries(
+pub fn entries(
   bytes: &[u8],
   format: ObjectFormat,
 ) -> impl Iterator<Item = Result<Entry<'_>, ObjectRefused>> {

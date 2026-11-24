@@ -743,6 +743,40 @@ impl Repository {
     }
   }
 
+  /// Runs `use_bytes` over the bytes of the object at `stored`, `len` long: lent directly from
+  /// the content store for whole single-window objects, or directly from [`packed::Scratch`] /
+  /// [`packed::Recent`] for packed objects without allocating a `Vec` per read.
+  fn with_stored_bytes<R>(
+    &self,
+    store: &ContentStore,
+    stored: &StoredAt,
+    len: u64,
+    use_bytes: impl FnOnce(&[u8]) -> R,
+  ) -> Option<R> {
+    match stored {
+      StoredAt::Whole(content) => {
+        let bytes = stored_bytes(store, content, len)?;
+        Some(use_bytes(&bytes))
+      }
+      StoredAt::InPack(place) => {
+        let bases = IndexBases {
+          repository: self,
+          store,
+        };
+        let mut reading = self.reading.borrow_mut();
+        let read = packed::read_in_place(
+          store,
+          (*place, self.format),
+          &bases,
+          (&mut *reading, self.largest.max(len)),
+        );
+        self.note_waited(&read);
+        let (_, bytes) = read.ok()?;
+        (u64::try_from(bytes.len()).ok() == Some(len)).then(|| use_bytes(bytes))
+      }
+    }
+  }
+
   /// The bytes of the object at `stored`, `len` long: lent where the store holds it whole as one window, else
   /// assembled; read where it lies in its pack otherwise (`packed::read`, its chain from the objects read lately, a
   /// REF_DELTA's base followed through the index), the reader's buffer handed over.
@@ -896,6 +930,33 @@ impl Repository {
     })
   }
 
+  /// Runs `use_bytes` over the bytes of the object at `place` without allocating a `Vec` for
+  /// indexed pack reads.
+  fn with_bytes_of<R>(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+    place: &Place<'_>,
+    use_bytes: impl FnOnce(&[u8]) -> Result<R, StoreRefused>,
+  ) -> Result<R, StoreRefused> {
+    let unreadable = StoreRefused::Unreadable { id: *id };
+    match place {
+      Place::Indexed { row, content } => self
+        .with_stored_bytes(store, &self.stored_of(row, *content), row.len, use_bytes)
+        .ok_or(unreadable)?,
+      Place::Pushed { push, .. } => {
+        let outside = IndexBases {
+          repository: self,
+          store,
+        };
+        match push.bytes(store, &outside, id) {
+          Some(Ok(bytes)) => use_bytes(&bytes),
+          _ => Err(unreadable),
+        }
+      }
+    }
+  }
+
   /// The bytes of the object at `place`: lent where the store holds it as one window, read where it lies in a push's
   /// pack otherwise (`Push::bytes`).
   fn bytes_of<'s>(
@@ -1022,19 +1083,48 @@ impl Repository {
     place: &Place,
     path: &'p [u8],
   ) -> Result<Option<(ObjectId, &'p [u8])>, StoreRefused> {
-    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
-    let tree =
-      Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
-    tree
-      .find(path)
-      .map(|(entry, below)| {
-        entry
-          .object_id(self.format)
-          .map(|object| (object, below))
-          .ok_or(malformed)
-      })
-      .transpose()
+    self.with_bytes_of(store, id, place, |bytes| {
+      let mut admission = Admission::new(store.room());
+      let mut decided = false;
+      let mut found: Option<(ObjectId, &'p [u8])> = None;
+      for entry in crate::objects::tree::entries(bytes, self.format) {
+        let entry = entry.map_err(|_| malformed)?;
+        admission
+          .charge_items::<crate::objects::tree::Entry<'_>>(1)
+          .map_err(|_| malformed)?;
+        if decided {
+          continue;
+        }
+        let Some(start) = path.get(..entry.name.len()) else {
+          continue;
+        };
+        match start.cmp(entry.name) {
+          std::cmp::Ordering::Greater => continue,
+          std::cmp::Ordering::Less => {
+            decided = true;
+            continue;
+          }
+          std::cmp::Ordering::Equal => {}
+        }
+        let after = path.get(entry.name.len()..).unwrap_or_default();
+        if after.is_empty() {
+          let object = entry.object_id(self.format).ok_or(malformed)?;
+          found = Some((object, after));
+          decided = true;
+          continue;
+        }
+        let Some(below) = after.strip_prefix(b"/") else {
+          continue;
+        };
+        if entry.is_dir() {
+          let object = entry.object_id(self.format).ok_or(malformed)?;
+          found = Some((object, below));
+        }
+        decided = true;
+      }
+      Ok(found)
+    })
   }
 
   /// A tree's entries' objects with their names, in the tree's order, a submodule's commit left out (A-640 part 4: what
@@ -1045,21 +1135,22 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<(ObjectId, Vec<u8>)>, StoreRefused> {
-    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
-    let tree =
-      Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
-    tree
-      .entries()
-      .iter()
-      .filter(|entry| entry.kind() != Kind::Commit)
-      .map(|entry| {
-        entry
-          .object_id(self.format)
-          .map(|object| (object, entry.name.to_vec()))
-          .ok_or(malformed)
-      })
-      .collect()
+    self.with_bytes_of(store, id, place, |bytes| {
+      let mut admission = Admission::new(store.room());
+      let mut refs = Vec::new();
+      for entry in crate::objects::tree::entries(bytes, self.format) {
+        let entry = entry.map_err(|_| malformed)?;
+        admission
+          .charge_items::<crate::objects::tree::Entry<'_>>(1)
+          .map_err(|_| malformed)?;
+        if entry.kind() != Kind::Commit {
+          let object = entry.object_id(self.format).ok_or(malformed)?;
+          refs.push((object, entry.name.to_vec()));
+        }
+      }
+      Ok(refs)
+    })
   }
 
   /// A tree's entries' objects, a submodule's commit left out.
@@ -1069,16 +1160,22 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<ObjectId>, StoreRefused> {
-    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
-    let tree =
-      Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
-    tree
-      .entries()
-      .iter()
-      .filter(|entry| entry.kind() != Kind::Commit)
-      .map(|entry| entry.object_id(self.format).ok_or(malformed))
-      .collect()
+    self.with_bytes_of(store, id, place, |bytes| {
+      let mut admission = Admission::new(store.room());
+      let mut refs = Vec::new();
+      for entry in crate::objects::tree::entries(bytes, self.format) {
+        let entry = entry.map_err(|_| malformed)?;
+        admission
+          .charge_items::<crate::objects::tree::Entry<'_>>(1)
+          .map_err(|_| malformed)?;
+        if entry.kind() != Kind::Commit {
+          let object = entry.object_id(self.format).ok_or(malformed)?;
+          refs.push(object);
+        }
+      }
+      Ok(refs)
+    })
   }
 
   /// The object a tag names.
@@ -1088,10 +1185,11 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<ObjectId, StoreRefused> {
-    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
-    let tag = Tag::parse(&bytes, &mut Admission::new(store.room())).map_err(|_| malformed)?;
-    tag.object(self.format).ok_or(malformed)
+    self.with_bytes_of(store, id, place, |bytes| {
+      let tag = Tag::parse(bytes, &mut Admission::new(store.room())).map_err(|_| malformed)?;
+      tag.object(self.format).ok_or(malformed)
+    })
   }
 
   /// Seals `push`: each of its commits' generation numbers, one more than its parents' greatest, its parents read from
@@ -1544,6 +1642,12 @@ impl Repository {
     Ok(versions)
   }
 
+  /// Derived: the repository's delta-base scratch budget (largest stored pack length, R3).
+  fn largest_pack_budget(&self) -> usize {
+    let largest = self.packs.values().copied().max().unwrap_or(0);
+    usize::try_from(largest).unwrap_or(usize::MAX)
+  }
+
   /// Records the pack a committed push brought (adjusting the recent delta-base budget) and notes
   /// whether any committed objects were stored outside a pack.
   fn record_push_packs(&mut self, push: &Push, positions: usize) {
@@ -1553,12 +1657,8 @@ impl Repository {
     if let Some((pack, len)) = push.stored_pack() {
       self.packs.insert(pack, len);
       self.largest = self.largest.max(push.largest());
-      let largest = self.packs.values().copied().max().unwrap_or(0);
-      self
-        .reading
-        .get_mut()
-        .recent()
-        .set_budget(usize::try_from(largest).unwrap_or(usize::MAX));
+      let budget = self.largest_pack_budget();
+      self.reading.get_mut().recent().set_budget(budget);
     } else {
       self.unpacked_objects = self.unpacked_objects.saturating_add(to_u64(positions));
     }
@@ -2097,6 +2197,8 @@ impl Repository {
       let _ = store.discharge(charge);
       return Err(refused);
     }
+    let mut reading = Scratch::default();
+    reading.recent().set_budget(self.largest_pack_budget());
     Ok(Repository {
       format: self.format,
       index,
@@ -2110,7 +2212,7 @@ impl Repository {
       landings: self.landings.clone(),
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
-      reading: RefCell::new(Scratch::default()),
+      reading: RefCell::new(reading),
       waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
@@ -2144,6 +2246,7 @@ impl Repository {
   /// Gives back everything the repository holds: its rows' holds, their tables, its versions' values and their charge.
   /// It goes on past a refusal and answers the first.
   pub fn release(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
+    let _ = self.let_go_recent(store);
     let mut first = self.index.release(store).map_err(StoreRefused::from);
     for kept in self.chains.values().flat_map(Chain::kept) {
       first = first.and(

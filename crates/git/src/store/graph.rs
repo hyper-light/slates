@@ -115,10 +115,17 @@ impl<'r> StoreGraph<'r> {
 
   /// The id and row of the object at `position`.
   fn row(&self, position: u64) -> Option<(ObjectId, ObjectRow)> {
-    let found = self
-      .repository
-      .id_at(self.store, position)
-      .and_then(|id| self.repository.object(self.store, &id).map(|row| (id, row)));
+    self.indexed_at(position).map(|(id, row, _)| (id, row))
+  }
+
+  /// The id, row, and root content of the object at `position` in a single index lookup pair.
+  fn indexed_at(&self, position: u64) -> Option<(ObjectId, ObjectRow, slates_vcs::ContentId)> {
+    let found = self.repository.id_at(self.store, position).and_then(|id| {
+      self
+        .repository
+        .indexed(self.store, &id)
+        .map(|(row, content)| (id, row, content))
+    });
     if found.is_none() {
       self.failed(GraphFault::NoRow { position });
     }
@@ -127,11 +134,7 @@ impl<'r> StoreGraph<'r> {
 
   /// The objects the object at `position` names, read from its bytes: a tree's entries or a tag's object.
   fn named(&self, position: u64) -> Vec<u64> {
-    let Some((id, _)) = self.row(position) else {
-      return Vec::new();
-    };
-    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
-      self.failed(GraphFault::NoRow { position });
+    let Some((id, row, content)) = self.indexed_at(position) else {
       return Vec::new();
     };
     let kind = row.kind;
@@ -156,11 +159,7 @@ impl<'r> StoreGraph<'r> {
   /// The entries of the tree at `position`, each with its name, read from its bytes: none when it is no tree or the
   /// store cannot read it (kept as a fault).
   fn named_entries_of(&self, position: u64) -> Vec<(u64, Vec<u8>)> {
-    let Some((id, _)) = self.row(position) else {
-      return Vec::new();
-    };
-    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
-      self.failed(GraphFault::NoRow { position });
+    let Some((id, row, content)) = self.indexed_at(position) else {
       return Vec::new();
     };
     if row.kind != Kind::Tree {
@@ -238,11 +237,7 @@ impl<'r> StoreGraph<'r> {
     position: u64,
     path: &'p [u8],
   ) -> Option<(ObjectId, &'p [u8])> {
-    let (id, _) = self.row(position)?;
-    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
-      self.failed(GraphFault::NoRow { position });
-      return None;
-    };
+    let (id, row, content) = self.indexed_at(position)?;
     if row.kind != Kind::Tree {
       return None;
     }

@@ -27,9 +27,11 @@
 //! generation number (one more than its parents' greatest, one for a root: version 1, "topological levels") and its
 //! parents in its own order, each by position. **A position row** names nothing and carries the object's id.
 
+use std::cmp::Ordering;
 use std::mem::size_of;
+use std::ops::Deref;
 
-use crate::object_name::{Kind, ObjectFormat, ObjectId};
+use crate::object_name::{Kind, MAX_RAW_LEN, ObjectFormat, ObjectId};
 
 use super::naming::kind_of;
 
@@ -101,20 +103,84 @@ pub struct CommitRow {
   pub parents: Vec<u64>,
 }
 
+/// Derived: the longest row key any object format produces (prefix byte + SHA-256 object id).
+const MAX_KEY_BYTES: usize = 1 + MAX_RAW_LEN;
+
+/// Stack-allocated index row key for object and position lookups, avoiding a heap `Vec<u8>`
+/// allocation on every `Repository::indexed` and `Repository::id_at` call.
+#[derive(Clone, Copy, Debug)]
+pub struct RowKey {
+  bytes: [u8; MAX_KEY_BYTES],
+  len: usize,
+}
+
+impl RowKey {
+  /// The live key bytes.
+  pub fn as_slice(&self) -> &[u8] {
+    self.bytes.get(..self.len).unwrap_or_default()
+  }
+}
+
+impl Deref for RowKey {
+  type Target = [u8];
+
+  fn deref(&self) -> &[u8] {
+    self.as_slice()
+  }
+}
+
+impl AsRef<[u8]> for RowKey {
+  fn as_ref(&self) -> &[u8] {
+    self.as_slice()
+  }
+}
+
+impl PartialEq for RowKey {
+  fn eq(&self, other: &Self) -> bool {
+    self.as_slice() == other.as_slice()
+  }
+}
+
+impl Eq for RowKey {}
+
+impl PartialOrd for RowKey {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for RowKey {
+  fn cmp(&self, other: &Self) -> Ordering {
+    self.as_slice().cmp(other.as_slice())
+  }
+}
+
 /// The key of `id`'s object row.
-pub fn object_key(id: &ObjectId) -> Vec<u8> {
-  let mut key = Vec::with_capacity(id.as_bytes().len().saturating_add(1));
-  key.push(OBJECT_KEY);
-  key.extend_from_slice(id.as_bytes());
-  key
+pub fn object_key(id: &ObjectId) -> RowKey {
+  let raw = id.as_bytes();
+  let mut bytes = [0u8; MAX_KEY_BYTES];
+  if let Some(first) = bytes.first_mut() {
+    *first = OBJECT_KEY;
+  }
+  let len = raw.len().min(MAX_RAW_LEN);
+  let end = len.saturating_add(1);
+  if let (Some(dst), Some(src)) = (bytes.get_mut(1..end), raw.get(..len)) {
+    dst.copy_from_slice(src);
+  }
+  RowKey { bytes, len: end }
 }
 
 /// The key of `position`'s row.
-pub fn position_key(position: u64) -> Vec<u8> {
-  let mut key = Vec::with_capacity(WORD_BYTES.saturating_add(1));
-  key.push(POSITION_KEY);
-  key.extend_from_slice(&position.to_be_bytes());
-  key
+pub fn position_key(position: u64) -> RowKey {
+  let mut bytes = [0u8; MAX_KEY_BYTES];
+  if let Some(first) = bytes.first_mut() {
+    *first = POSITION_KEY;
+  }
+  let end = WORD_BYTES.saturating_add(1);
+  if let Some(dst) = bytes.get_mut(1..end) {
+    dst.copy_from_slice(&position.to_be_bytes());
+  }
+  RowKey { bytes, len: end }
 }
 
 /// An object row's payload.
