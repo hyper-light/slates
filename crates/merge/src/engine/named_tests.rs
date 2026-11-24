@@ -140,6 +140,86 @@ fn read_in_steps(work: &mut Increment, plane: &Plane, slice: u64) -> u64 {
   steps
 }
 
+/// A work creating each of `files`, every file's bytes its object's named run, in order.
+fn named_creates(files: &[(String, Identity)]) -> Increment {
+  let journal: Vec<VolumeOp> = files
+    .iter()
+    .flat_map(|(path, object)| {
+      [
+        VolumeOp::Create { path: path.clone() },
+        VolumeOp::Extend {
+          path: path.clone(),
+          at: 0,
+          len: object.len,
+        },
+      ]
+    })
+    .collect();
+  let (doc, _) = compose_volume_planned(&Base::of_files(Vec::new()), &journal).unwrap();
+  let mut work = Increment {
+    id: [8; 32],
+    base: 0,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  let mut next = 0u64;
+  for (_, object) in files {
+    let src = work.push_named(NamedRun {
+      identity: *object,
+      offset: 0,
+      len: object.len,
+    });
+    assert_eq!(src, Some(next), "each run follows the one before");
+    next += object.len;
+  }
+  work
+}
+
+/// Shape: the files of the many-runs read test, each [`MANY_RUN_BYTES`]: enough that a run a call shows.
+const MANY_RUNS: usize = 64;
+
+/// Shape: each of the many-runs read test's files' bytes.
+const MANY_RUN_BYTES: usize = 100;
+
+/// Goal 93 (main 09:09 of 2026-11-24: a wide revision's staging step, `read_named`, was quadratic in its runs). Do: name
+/// [`MANY_RUNS`] texts a work creates and read them with a slice of their whole length, then again, fresh, a slice of
+/// one and a half runs. Expect: the first read whole in one call; the second in as many calls as its bytes take
+/// slices, no call reading past its slice; each file then committed with its own bytes. Before, a call read one run at
+/// most, so the whole slice took a call a run (and each call searched every run twice).
+#[test]
+fn a_works_runs_are_read_a_slice_a_call_across_runs() {
+  let mut plane = Plane::default();
+  let files: Vec<(String, Identity)> = (0..MANY_RUNS)
+    .map(|file| {
+      let bytes = vec![u8::try_from(file % 251).unwrap(); MANY_RUN_BYTES];
+      (format!("f{file:03}"), plane.put(bytes))
+    })
+    .collect();
+  let total = (MANY_RUNS * MANY_RUN_BYTES) as u64;
+  let mut work = named_creates(&files);
+  assert_eq!(
+    work.read_step(&plane, total),
+    Ok(true),
+    "read whole in one call"
+  );
+  let slice = (MANY_RUN_BYTES + MANY_RUN_BYTES / 2) as u64;
+  let mut again = named_creates(&files);
+  let before = plane.largest.get();
+  assert_eq!(
+    read_in_steps(&mut again, &plane, slice),
+    total.div_ceil(slice)
+  );
+  assert!(plane.largest.get() <= before.max(MANY_RUN_BYTES));
+  let mut green = Green::new();
+  assert_eq!(green.submit(&again), Outcome::Accepted { version: 1 });
+  for (file, (path, _)) in files.iter().enumerate() {
+    let bytes = vec![u8::try_from(file % 251).unwrap(); MANY_RUN_BYTES];
+    assert_eq!(read_through(&green, path, &plane), Some(bytes), "{path}");
+  }
+}
+
 /// A-760's hostile input. Do: decode a named work's encoding with its run count raised past the bytes left, and with a
 /// run reaching past its object's length. Expect: each refused `Truncated`, nothing allocated for the wild count.
 #[test]
