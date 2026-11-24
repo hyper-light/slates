@@ -233,6 +233,10 @@ const TAKEOVER_RECOVERED_PAST_TOLERANCE: &str = "fleet.takeover.recovered_past_t
 /// The status count under which a successor records an object it adopted and placed under itself.
 /// Format: a refusal name in the daemon's status report.
 const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
+/// Counter: an object a takeover round found already adopted here by its persisted adoption when it began, after this
+/// node restarted warm, and settled instead of taking it over again ([`adopted_in_its_round`], A-890).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_SETTLED: &str = "fleet.takeover.settled";
 
 /// Counter: a repository's state log's register adopted by this successor (A-636 part 2b): owned and placed here, never
 /// taken for a volume's head; the repository's state rebuilt from its logs is part 2c's.
@@ -294,7 +298,8 @@ pub struct HostTakeover {
   learned: BTreeMap<ObjectId, BTreeMap<HostId, Accepted>>,
   /// The objects adopted and placed under this node.
   adopted: BTreeSet<ObjectId>,
-  /// The highest fence a holder reported above the epoch; the next round runs above it.
+  /// The highest fence a holder reported above the epoch, or the round's own epoch once a round at its settled epoch has
+  /// learned what it must adopt (A-890, [`adoptable`]); the next round runs above it.
   fenced: Option<HostEpoch>,
   /// Per learned object, the members that answered for it by name holding nothing of it (A-251 (b)): their promise of
   /// that object alone. A member's complete pages promise nothing of an object they did not list.
@@ -324,6 +329,13 @@ pub struct HostTakeover {
   began_ns: u64,
   /// Whether that recovery has been timed: a share stays done while its retirement completes, and is timed once.
   timed: bool,
+  /// The highest epoch of the adoptions this round settled when it began, found by their persisted record after this
+  /// node restarted warm ([`adopted_in_its_round`], A-890); `None` for a round that settled none. At or below it the
+  /// round pages, which raises no fence above it, and adopts nothing, since a run before the restart may have proposed
+  /// there. Above it the round asks by name only, for the objects it learned below it (A-251 (b)'s question), since a
+  /// page promises every copy falling here and would fence the settled ones above the epoch their successor writes
+  /// under. The names it asks are its own `learned` keys, so this adds no state beyond the objects learned.
+  settles_at: Option<HostEpoch>,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -384,6 +396,7 @@ impl HostTakeover {
       judged_incarnation: incarnation,
       began_ns,
       timed: false,
+      settles_at: None,
     }
   }
 
@@ -434,6 +447,17 @@ impl HostTakeover {
   /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
   fn settled(&self, object: &ObjectId) -> bool {
     self.adopted.contains(object) || self.given_up.contains(object)
+  }
+
+  /// Whether this round runs at or below the epoch of the adoptions it settled when it began, where it adopts nothing
+  /// (A-890, [`HostTakeover::settles_at`]).
+  fn adopts_nothing(&self) -> bool {
+    self.settles_at.is_some_and(|at| self.epoch <= at)
+  }
+
+  /// Whether this round runs above that epoch, where it asks by name only (A-890).
+  fn by_name_only(&self) -> bool {
+    self.settles_at.is_some_and(|at| self.epoch > at)
   }
 
   /// Records `host`'s answer to a page as its progress `page`, counting it in [`HostTakeover::page_advances`] when it
@@ -1167,6 +1191,7 @@ async fn drive_host_takeover(
     dispatches.extend(ask_pages(departed, requests, budget).await);
   }
   let ready = state::with_state(|s| ready_objects(s, departed, local)).unwrap_or_default();
+  let ready = state::with_state(|s| adoptable(s, departed, local, ready)).unwrap_or_default();
   for (object, adopted) in ready {
     dispatches.extend(adopt(departed, object, adopted, local, budget).await);
   }
@@ -1222,27 +1247,51 @@ pub(crate) fn begin_round(
     state.count(TAKEOVER_ROUND_BEHIND, 1);
     return None;
   }
-  let Some(first_epoch) = initial_epoch(state, &regional, departed, local) else {
+  // A round begun after this node restarted warm settles what its earlier run adopted, by the record each adoption
+  // persisted with its copy, instead of taking it over again (A-890).
+  let fresh = !state.host_takeovers.contains_key(&departed);
+  let (settled, settles_at) = if fresh {
+    adopted_in_its_round(state, &regional, departed, local)
+  } else {
+    (BTreeSet::new(), None)
+  };
+  let Some(first_epoch) = initial_epoch(state, &regional, departed, local, (&settled, settles_at))
+  else {
     state.count(TAKEOVER_EPOCH_EXHAUSTED, 1);
     return None;
   };
+  if !settled.is_empty() {
+    state.count(
+      TAKEOVER_SETTLED,
+      u64::try_from(settled.len()).unwrap_or(u64::MAX),
+    );
+  }
   let held = state.fleet.membership().state(departed);
   let incarnation = held.map_or(0, |held| held.incarnation);
   let take = state.host_takeovers.entry(departed).or_insert_with(|| {
-    HostTakeover::new(
+    let mut take = HostTakeover::new(
       regional.version,
       first_epoch,
       incarnation,
       slates_rt::futures::now_ns(),
-    )
+    );
+    take.adopted = settled;
+    take.settles_at = settles_at;
+    take
   });
+  // What a round above its settled epoch asks by name after a restart: the objects it had learned (A-890).
+  let learned_names: Vec<ObjectId> = take.learned.keys().copied().collect();
   let mut restarted = false;
   if take.generation != regional.version {
     let epoch = take.epoch.max(first_epoch);
     take.restart(regional.version, epoch, incarnation);
     restarted = true;
   }
-  if let Some(fence) = take.fenced {
+  // A round at or below its settled epoch goes above only once its pages are complete, so every object it must adopt
+  // is learned before it asks by name alone (A-890).
+  if let Some(fence) = take.fenced
+    && (!take.adopts_nothing() || pages_complete(take, &regional, departed, local))
+  {
     let Some(above) = fence.0.checked_add(1) else {
       state.count(TAKEOVER_EPOCH_EXHAUSTED, 1);
       return None;
@@ -1255,6 +1304,9 @@ pub(crate) fn begin_round(
   if judged_afresh {
     let epoch = take.epoch;
     take.restart(regional.version, epoch, incarnation);
+  }
+  if (restarted || judged_afresh) && take.by_name_only() {
+    asks_by_name_only(take, &regional, (departed, local), &learned_names);
   }
   let (epoch, generation) = (take.epoch, take.generation);
   if restarted {
@@ -1355,12 +1407,16 @@ fn initial_epoch(
   regional: &RegionalConfiguration,
   departed: HostId,
   local: HostId,
+  (settled, settles_at): (&BTreeSet<ObjectId>, Option<HostEpoch>),
 ) -> Option<HostEpoch> {
   let bumped = regional
     .epochs
     .get(&departed)
     .copied()
     .unwrap_or(slates_db::register::FIRST_EPOCH);
+  // A round that settles adoptions runs at their epoch, never above it, so the holders it pages keep the fence its
+  // successor writes under (A-890).
+  let floor = settles_at.map_or(bumped, |at| bumped.max(at));
   let adopted = state
     .host_takeovers
     .get(&departed)
@@ -1370,12 +1426,120 @@ fn initial_epoch(
     .iter()
     .filter(|(object, acceptor)| {
       copy_falls_to(regional, acceptor, **object, departed, local)
+        && !settled.contains(*object)
         && !adopted.is_some_and(|adopted| adopted.contains(*object))
     })
     .flat_map(|(_, acceptor)| acceptor.persisted().1)
-    .try_fold(bumped, |highest, (_, _, epoch, _)| {
+    .try_fold(floor, |highest, (_, _, epoch, _)| {
       Some(highest.max(HostEpoch(epoch.0.checked_add(1)?)))
     })
+}
+
+/// The objects this node adopted in `departed`'s retirement as its successor, by the record each adoption persisted
+/// with its copy ([`Acceptor::adopted`], A-890), and the highest epoch any of them holds a record at: what a round run
+/// again after this node restarted warm settles when it begins, instead of taking it over again above the epoch its
+/// successor writes under (main 01a20182's ruling of 2026-11-23). Only the retirement the configuration keeps counts, so
+/// an adoption at an earlier retirement of a host admitted again says nothing of this one (A-883's rule for a move), and
+/// only a copy still under this node's authority.
+fn adopted_in_its_round(
+  state: &ShardState,
+  regional: &RegionalConfiguration,
+  departed: HostId,
+  local: HostId,
+) -> (BTreeSet<ObjectId>, Option<HostEpoch>) {
+  let Some(retired_at) = regional.retirement_version(departed) else {
+    return (BTreeSet::new(), None);
+  };
+  let this_retirement = MovedFrom {
+    owner: departed,
+    retired_at,
+  };
+  let mut settled = BTreeSet::new();
+  let mut highest: Option<HostEpoch> = None;
+  for (object, acceptor) in &state.holder_records {
+    if acceptor.owner() != local || acceptor.adopted() != Some(this_retirement) {
+      continue;
+    }
+    settled.insert(*object);
+    let held = acceptor
+      .persisted()
+      .1
+      .into_iter()
+      .map(|(_, _, epoch, _)| epoch)
+      .max();
+    highest = highest.max(held);
+  }
+  (settled, highest)
+}
+
+/// Whether every member `departed`'s round asks has answered its pages whole.
+fn pages_complete(
+  take: &HostTakeover,
+  regional: &RegionalConfiguration,
+  departed: HostId,
+  local: HostId,
+) -> bool {
+  regional
+    .recovery_hosts(departed)
+    .into_iter()
+    .filter(|host| *host != local && regional.members.contains(host))
+    .all(|host| take.pages.get(&host).is_some_and(|page| page.complete))
+}
+
+/// Readies a round above its settled epoch to ask by name only (A-890): every member's page counts as complete, so
+/// none is asked for one, and each of `learned`, the objects the round learned before it started over, is learned again
+/// to be asked by name. A complete page promises nothing of an object it did not list (`CountingRule::NamedAnswer`).
+fn asks_by_name_only(
+  take: &mut HostTakeover,
+  regional: &RegionalConfiguration,
+  (departed, local): (HostId, HostId),
+  learned: &[ObjectId],
+) {
+  for host in regional
+    .recovery_hosts(departed)
+    .into_iter()
+    .filter(|host| *host != local && regional.members.contains(host))
+  {
+    take.pages.insert(
+      host,
+      Page {
+        after: None,
+        complete: true,
+      },
+    );
+  }
+  for object in learned {
+    if !take.settled(object) {
+      take.learned.entry(*object).or_default();
+    }
+  }
+}
+
+/// The ready objects `departed`'s round may adopt this period (A-890): all of them, unless the round runs at or below the
+/// epoch of the adoptions it settled, where it adopts none, since a run before this node's restart may have proposed
+/// there. Such a round goes above once its pages are complete and it learned an object to adopt: its fence is marked at
+/// its own epoch, so the next period starts it over above it, asking by name only.
+pub(crate) fn adoptable(
+  state: &mut ShardState,
+  departed: HostId,
+  local: HostId,
+  ready: Vec<(ObjectId, Accepted)>,
+) -> Vec<(ObjectId, Accepted)> {
+  let regional = state.council.configuration().clone();
+  let Some(take) = state.host_takeovers.get_mut(&departed) else {
+    return ready;
+  };
+  if !take.adopts_nothing() {
+    return ready;
+  }
+  if !take.learned.is_empty() && pages_complete(take, &regional, departed, local) {
+    take.fenced = Some(
+      take
+        .fenced
+        .map_or(take.epoch, |fence| fence.max(take.epoch)),
+    );
+  }
+  Vec::new()
 }
 
 /// The retirements the council's configuration keeps, each host's with the version that retired it

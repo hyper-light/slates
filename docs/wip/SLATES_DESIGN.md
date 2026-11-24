@@ -29997,12 +29997,14 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
     - where they disagreed (a holder whose copy came after the move refuses it by name), the object was never promised
       and was given up, and the retirement was never confirmed, so the fleet never settled (the chaos nemesis, seeds
       14946995733817154046 and 8173581894251929445).
-  - **An adoption records its move (A-885, 2026-11-23).** A takeover's adoption makes the copy the successor's with
-    `Acceptor::adopt`, recording `MovedFrom { departed, retirement }` whatever the copy served before. A round lives
-    in its successor's memory, so a successor restarted warm before it confirmed its share runs the round again; its
-    adopted copy then falls there by that move, and the rerun counts the adoption as the successor's own promise
-    (re-adopting the object at the rerun's epoch) instead of refusing it by name and giving the object up. A round never
-    promises again what it adopted.
+  - **An adoption records its move (A-885, 2026-11-23), and itself (A-890).** A takeover's adoption makes the copy the
+    successor's with `Acceptor::adopt`, recording `MovedFrom { departed, retirement }` whatever the copy served before,
+    and since A-890 the same record as `Acceptor::adopted`, persisted with the copy. A round lives in its successor's
+    memory, so a successor restarted warm before it confirmed its share runs the round again. That rerun settles the
+    copies whose adoption record names its retirement, at the adoption's epoch, and above that epoch it asks by name
+    only, so no page fences a settled copy above the epoch its successor writes under. Until A-890 the rerun counted the
+    adoption as the successor's own promise and re-adopted the object one epoch up, which fenced the successor's own log
+    (the asker's own objects never fall here, and an adopted one is the asker's own).
   - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
@@ -62425,17 +62427,19 @@ Applied in the same change to: A-789's record (its room wait), GAPS (item 3b's e
     owner's object moved to its successor at that retirement. The record is persisted with the acceptor.
   - A rerun therefore lists the adopted copy as the successor's own promise (`promise_local_copies`) and answers it by
     name. The volume is ready with the other survivor's promise and adopted again at the rerun's epoch. Nothing is
-    given up.
+    given up. **Superseded by A-890:** the rerun settles the adoption at its own epoch instead.
   - A round never promises again what it adopted (`promise_local_copies` leaves its `adopted` set out), so a round
     started over above its epoch never fences an adoption its successor writes under.
   - A moved volume's adoption (A-291) records no move. A later retirement of the same host never counts this one
     (A-883).
-- **Why the rerun's second adoption is harmless (main's ruling of 2026-11-23).**
-  - The rerun adopts the object again at its own epoch, one above the first run's, and fences its holders there.
-  - That is not A-883's spurious self-takeover coming back. There, a live owner's own object was taken over again by
-    another host's later round, with its requests in flight.
-  - Here, the warm restart has already ended every request in flight from the first run. So the extra fence costs
-    nothing a client can see beyond the restart itself, and the successor's next writes go out under the new epoch.
+- **The rerun's second adoption was not harmless (corrected by A-890, 2026-11-23; main's ruling of that day, withdrawn
+  the same evening).** The ruling held that the warm restart had ended every request in flight, so a fence one epoch up
+  cost nothing a client could see. But the successor's live log resumes at the first run's epoch after a warm restart
+  (A-344), and a holder fenced one epoch up refused it as stale. The successor marked the volume superseded by its own
+  new epoch, and every verb on it was refused `Overloaded`: 4 of 6 runs of a diagnostic build on adacachy2 (kiln r649),
+  `fleet.live.hold_refused.stale_epoch` 1 on a holder, `fleet.owner_location.owned_unmaterialized` 4,165 to 4,774 on the
+  successor, every read refused for a whole 60 s window while both coordinators ran about 585 periods a minute. See
+  A-890.
 - **Rejected (main's ruling):** clearing a copy's move once its successor has written it (A-484's ownership rule).
   That widens what a move means for every copy, and still misses a restart that comes before any write.
 - **Tests** (adacachy2):
@@ -62544,3 +62548,75 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
 - **Applied in the same change to:** `crates/server/src/live_ship.rs` (`period_volume`, `published_for_image`, the two
   counters, the test and its helpers); §4.10 "An install image beside the log (2026-11-07)"; GAPS (the live-shipped
   fsstress over FUSE); docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md.
+
+### A-890 — A takeover's adoption is persisted with its copy, so a round run again after a warm restart settles it instead of taking the object over again (2026-11-23, w-chaos for main 01a20182, its rulings of 2026-11-23 22:12, 22:17 and 22:30; corrects A-885; A-251, A-344, A-883)
+
+- **Why.** A-885's rerun re-adopted the successor's own object one epoch up. Its holders' pages promised every copy
+  falling to the successor at that epoch, the adopted one included, so its fence rose above the epoch the successor's
+  live log resumes at after a warm restart (A-344). A holder refused that log as stale, the successor marked the volume
+  superseded by its own new epoch (`live_ship::learn_superseded`), its owner shard forwarded every verb to the control
+  shard, and there the routing named the successor the owner with nothing pending, so every verb was refused
+  `Overloaded` (`verbs::owned_unmaterialized`) with no end. A-885's own words forbid it: "a takeover round re-run after
+  a crash must reach the same end as the run it replaces", and "a round started over above its epoch never fences an
+  adoption its successor writes under". Evidence: a diagnostic build on adacachy2 (kiln r649, load 38 to 57), 4 of 6
+  runs of the A-885 leg and the A-344 write test. A holder counted `fleet.live.hold_refused.stale_epoch` 1, the
+  successor `fleet.owner_location.owned_unmaterialized` 4,165 to 4,774 and `fleet.live.taken_over` 1 since its
+  restart, and every read was refused for a whole 60 s window while both coordinators ran about 585 periods a minute.
+  The 2 passing runs took nothing over again. CI's windows-latest run at f9a5539b5 (job 138224257079) read the same
+  seven files false.
+- **The rule.**
+  - `Acceptor::adopt` records the retirement it adopts in (`Acceptor::adopted`, a `MovedFrom`), persisted with the
+    copy. An install records the same move on a copy before any adoption, and a record's epoch does not name its
+    writer: `RegionalConfiguration::take_over` sets a retired host's epoch to its own plus one, every host starting at
+    `FIRST_EPOCH`, so a chain of retirements (D to S1 to S2) gives S1's records epochs S2's rerun could read as its own.
+    Only the adoption record says the copy was adopted here.
+  - A round begun after its successor restarted warm settles the copies under its own authority whose adoption record
+    names the retirement the configuration keeps (`takeover::adopted_in_its_round`), counted `fleet.takeover.settled`.
+    It begins at the highest epoch they hold a record at, never above it (`initial_epoch`'s floor), so its pages raise no
+    fence above it (`Fence::accept` takes an equal epoch).
+  - At or below that epoch the round adopts nothing (`takeover::adoptable`), since a run before the restart may have
+    proposed there. Once its pages are complete and it learned an object to adopt, it goes above by its fence mark, and
+    above that epoch it asks by name only (A-251 (b)'s question), for the objects it learned below it: every member's
+    page counts as complete there, and a complete page promises nothing of an object it did not list
+    (`CountingRule::NamedAnswer`). No settled copy is ever fenced above its epoch, and a holder that restarted too
+    answers by name like any other. The names it asks are the round's own learned objects, so this state is bounded by
+    them (`HostTakeover::settles_at`).
+- **Rejected.**
+  - Carrying the settled copies to the round's new epoch (main's ruling of 22:17, withdrawn at 22:30). It is safe, since
+    a successor ships only from publications it committed locally, but the write epoch is fixed when a live shipper is
+    made (`live_ship::planned`), and no path remakes a running shipper at a new epoch. That path's absence is also why
+    A-885's second adoption left the fenced shipper running.
+  - Holders leaving out a copy last written by the asker (`Acceptor::written_by`). That is known only in memory (A-484),
+    so a holder that restarted too would list it again.
+- **Format.** `PersistedAcceptor`'s last field is the adoption record. The image is version 35 and the delta 13. No
+  reader of the old layouts is kept: an older image or delta is refused by its version, and a register without the
+  record is refused as truncated (§2.7). Golden vector: `an_adopted_acceptors_persisted_encoding_is_its_golden_vector`,
+  derived by hand from the format.
+- **The fleet tests retry `Overloaded`** (`Client::call_admitted` in `crates/server/tests/fleet.rs`, for
+  `write_attachment` and `continuity_read`), as `verbs::await_materialization`'s contract expects of a client. The
+  retries are charged in the slowest fleet coordinator in the process, never shorter than the client's own daemon's
+  liveness window, with `FROZEN_CAP` the only wall bound.
+- **Tests** (adacachy2):
+  - `a_successor_restarted_warm_settles_what_it_adopted_at_its_adoptions_epoch` (`crates/server/src/daemon.rs`): adopt
+    at epoch 2, restart warm through the held image, the restored acceptor compared whole, begin the round again.
+  - `a_successor_restarted_warm_after_adopting_part_asks_above_by_name_only_for_the_rest` (same file): adopt one of two
+    objects, restart warm, page at 2, adopt nothing there, ask at 3 by name for the other alone, the settled copy's fence
+    still 2.
+  - The register nemesis's three scenes (`crates/db/src/register_nemesis.rs`), owners restarting warm beside every
+    fault, at `f = 1` and `f = 2`, 48 seeds each, every invariant checked: an owner that promoted restarted warm twice,
+    settling at its epoch each time; a successor restarted warm before it promoted, running phase one again; a settled
+    owner met by a later phase one. None broke. The mutation, a warm restart that settles an owner that never promoted,
+    broke 41 and 42 of 48 seeds, each first at Continuity.
+  - The register's persisted-state, hostile-input and golden-vector tests; the image's and delta's version refusals.
+  - `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted` and
+    `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over` (`crates/server/tests/fleet.rs`): every file
+    read back, nothing refused as owned but unmade (`owned_unmaterialized` 0), the adoption settled (the first).
+- **Applied in the same change to:**
+  - `crates/db/src/register.rs`: `Acceptor::adopted`, `Acceptor::adopt`, `PersistedAcceptor`, the tests.
+  - `crates/db/src/register_nemesis.rs`: the warm restart, the three scenes and the mutation.
+  - `crates/vfs/src/recover.rs` (image 35) and `checkpoint_log.rs` (delta 13).
+  - `crates/server/src/takeover.rs`: `HostTakeover::settles_at`, `adopted_in_its_round`, `begin_round`,
+    `initial_epoch`, `pages_complete`, `asks_by_name_only`, `adoptable`, `drive_host_takeover`.
+  - `crates/server/src/daemon.rs` and `crates/server/tests/fleet.rs`: the tests and the retry.
+  - A-885's entry, A-251 (i)'s text, GAPS.
+  - docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md.
