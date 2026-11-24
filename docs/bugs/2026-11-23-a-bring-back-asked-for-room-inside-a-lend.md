@@ -56,3 +56,31 @@ false path and the shard budget's terms:
   grown from its pool 7 times a run.
 - Under a 4 GiB memory bound (a `systemd-run --user --scope`), 20 interleaved runs each: as on main 19 of 20 (one
   refused at file 57), outside the lend 20 of 20. Plain, outside the lend: 100 of 100.
+
+## Sibling sweep (`hg_push.rs`, `homes.rs`: every `.ok()?`, `let _ =`, `.is_ok()` and `.unwrap_or(false)` that drops a refusal)
+Fixed with consequences (main 01a20182's list, the second commit):
+- `hg_push::room_after_wait` dropped its sleep's refusal (`let _ = sleep(ns).await`), so a refused sleep turned the wait
+  again at once and spun the shard through the wait's patience. It ends typed now (`WaitEnded::SleepRefused`, counted
+  `vcs.hg.push_intake_room_wait_sleep_refused`; the step answered as past patience). Red with the old line restored: the
+  watchdog ended the daemon's process in 3 to 5 s, 2 runs of 2.
+- `homes::restore_region_holds` took a region hold in the store first and gave it back where the region's set was
+  borrowed, the release's refusal dropped, which would leave the store's count and the set apart. The hold is taken only
+  once the set can name it, so there is no release to drop. Not driven red: a release of a hold just taken is never
+  refused.
+- `homes::settle_later` dropped the settle task's detach refusal (`let _ = detach(task)`), which would leave the task
+  joinable, holding its slot once it ended. It is spawned detached (`spawn_detached`), a refusal counted
+  (`vcs_store.homes.settle_task_refused`) and its settles left for the next settle. Not driven red: it needs the
+  shard's task slab full at the moment a settle is owed.
+- The test-only step-room hook's `let _ = room.charge(held)` could not fail: an admission of `held + left` with `held`
+  charged leaves `left`, so it is made as `Admission::new(left)`.
+
+Kinds dropped, the failure itself handled, left for their owners:
+- `hg_push.rs`: `disk.land(..).await.is_ok()` (the owner's kind, the push refused `UNLANDED`); `recorded_segments`'
+  `record_writer(..).ok()?` and `record_turn(..)?.ok()?`; `brought_back`'s `bring_back_file(..).ok()` (the push refused
+  `WORK_TEXT_UNREAD`).
+- `homes.rs`: `publish_shard(state).is_ok()` (a home's publication), `content_durable(..).is_ok()`, and
+  `let_go_region_at_home(..).is_ok()` in the healer (a refused let-go leaves no trace); `landed_bytes`' store refusal,
+  `PackUnread` with no owner kind; the `RefCell` `try_borrow` sites (`landed`, `landed_changed`, `settle_owed`), where
+  a nested borrow reads as absent.
+- `hg_view::answer_one`: `texts_by_tool`, `places` and `text`, each `.ok()?`, so `answer_store_wants` answers a bare
+  false and a bring-back can name only `StoreUnanswered`.

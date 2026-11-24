@@ -2669,8 +2669,8 @@ async fn taking_begun(
     if left > 0 {
       let held = admitted.saturating_sub(room.left());
       *admitted = held.saturating_add(left);
-      *room = Admission::new(*admitted);
-      let _ = room.charge(held);
+      // What it holds is charged already: an admission of `held + left` with `held` charged leaves `left`.
+      *room = Admission::new(left);
     }
   }
   let sized = crate::state::with_state(|state| {
@@ -2949,7 +2949,7 @@ async fn begun_after_waits(
         *room = Admission::new(grown);
       }
       Err(WaitEnded::PastCeiling) => return Some(Err(past_ceiling())),
-      Err(WaitEnded::Patience) => {
+      Err(WaitEnded::Patience | WaitEnded::SleepRefused(_)) => {
         return Some(Err(PushOutcome::refused(&intake_refused(&refused))));
       }
     }
@@ -2973,7 +2973,9 @@ async fn retaken(
   let grown = match room_after_wait(repository, *admitted, Some(needed)).await? {
     Ok(grown) => grown,
     Err(WaitEnded::PastCeiling) => return Some(Err(past_ceiling())),
-    Err(WaitEnded::Patience) => return Some(Err(intake_outcome(&refused))),
+    Err(WaitEnded::Patience | WaitEnded::SleepRefused(_)) => {
+      return Some(Err(intake_outcome(&refused)));
+    }
   };
   let mut regrown = Admission::new(grown);
   if regrown.charge(held).is_err() {
@@ -3012,13 +3014,22 @@ thread_local! {
 /// 2026-11-22 03:03). Format: a counter name in the status report.
 pub(crate) const INTAKE_ROOM_WAITS: &str = "vcs.hg.push_intake_room_waits";
 
+/// Counter: a push's wait for room ended by its sleep's refusal ([`WaitEnded::SleepRefused`]): zero in every correct
+/// use. Format: a counter name in the status report.
+pub(crate) const INTAKE_ROOM_WAIT_SLEEP_REFUSED: &str =
+  "vcs.hg.push_intake_room_wait_sleep_refused";
+
 /// How a push's wait for room ended without room (`vcs_share::wait`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WaitEnded {
   /// No room came within the wait's patience: the push's step is answered its own refusal.
   Patience,
   /// Its need is past the most the repository could ever be lent: the push is answered [`PAST_CEILING`].
   PastCeiling,
+  /// The runtime refused the wait's sleep (polled off a shard, or by a waker that is no task's): ended at once, since a
+  /// turn taken again at once would spin the shard through the wait's patience; the push's step is answered its own
+  /// refusal, as past patience, and the end counted ([`INTAKE_ROOM_WAIT_SLEEP_REFUSED`]).
+  SleepRefused(slates_rt::RtError),
 }
 
 /// The push's refusal past the most its repository could ever be lent ([`PAST_CEILING`]).
@@ -3051,7 +3062,10 @@ async fn room_after_wait(
     match waited {
       crate::vcs_share::wait::Waited::Again(room) => return Some(Ok(room)),
       crate::vcs_share::wait::Waited::Wait(ns) => {
-        let _ = slates_rt::futures::sleep(ns).await;
+        if let Err(refused) = slates_rt::futures::sleep(ns).await {
+          crate::state::with_state(|state| state.count(INTAKE_ROOM_WAIT_SLEEP_REFUSED, 1));
+          return Some(Err(WaitEnded::SleepRefused(refused)));
+        }
       }
       crate::vcs_share::wait::Waited::GiveUp => {
         // Named in the daemon's log with its numbers, so a run that meets it says what the push needed against the
