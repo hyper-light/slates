@@ -48,7 +48,6 @@ use slates_hg::import::record;
 use slates_hg::push::intake::{KeptText, PushSegment};
 use slates_store::log::{Header, SectionKind, Tool};
 use slates_store::owner::{Part, StoreHandle};
-use slates_vcs::ContentStore;
 
 use crate::repository::svn_commit::landing::{self, Turn};
 use crate::state::ShardState;
@@ -495,23 +494,16 @@ async fn parked(repository: RepositoryId) -> Option<Result<Turn, Vec<u8>>> {
 pub(crate) type SegmentChangeset = (StoreHandle, Header, Vec<Part>);
 
 /// `segment` of a push to `repository` as a changeset at the repository's next sequence, its owner shard's to allocate
-/// (module docs): its `Record`
-/// written by `record` over the intake's fork, its `Payload` its slice of `payload`, its `Texts` its texts. None where
-/// the node holds no store; refused where the record could not be written or the slice is not the payload's.
+/// (module docs): its `Record` `written` (by `hg_push`'s record turns over the intake's fork, a turn's steps at a
+/// time), its `Payload` its slice of `payload`, its `Texts` its texts. None where the node holds no store; refused where
+/// the slice is not the payload's.
 pub(crate) fn segment_changeset(
   state: &mut ShardState,
   repository: RepositoryId,
   (segment, payload): (&PushSegment, &[u8]),
-  record: impl FnOnce(&ContentStore) -> Result<Vec<u8>, record::WriteRefused>,
+  written: Vec<u8>,
 ) -> Option<Result<SegmentChangeset, record::WriteRefused>> {
   let disk = state.vcs_disk.clone()?;
-  // The fork's rows read the repository's windows: the shard's chunk store is lent to it.
-  let written =
-    crate::vcs_store::lent_state(state, |state| state.vcs_stores.content().map(record))?;
-  let written = match written {
-    Ok(written) => written,
-    Err(refused) => return Some(Err(refused)),
-  };
   let start = usize::try_from(segment.slice.start).unwrap_or(usize::MAX);
   let end = usize::try_from(segment.slice.end).unwrap_or(usize::MAX);
   let Some(slice) = payload.get(start..end) else {

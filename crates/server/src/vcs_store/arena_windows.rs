@@ -101,11 +101,19 @@ impl Placed {
   }
 }
 
-/// One chunk the windows lie in (module docs, "Slabs"): a slab of several windows' slots, or a window's own chunk.
+/// One chunk the windows lie in (module docs, "Slabs"): a slab of several windows' slots, or a window's own chunk. It
+/// keeps its windows' placement once (goal 93): its block's length, its chunk's bytes used and its birth epoch, read when
+/// it was sealed, since an image is made outside a lend; its region and offset are its key.
 #[derive(Clone, Copy, Debug)]
 struct Slab {
   /// The chunk.
   chunk: Handle<Chunk>,
+  /// The block's length.
+  block: u64,
+  /// The chunk's bytes used.
+  used: u32,
+  /// The chunk's birth epoch.
+  born: u64,
   /// Its windows kept.
   live: u32,
   /// Their bytes: what the block asks of the arena.
@@ -125,12 +133,58 @@ pub(crate) struct SlabCensus {
   pub(crate) freed_kept_bytes: u64,
 }
 
-/// One window kept: its identity once the content store names it, its length, and its chunk (none for an empty window).
+/// One window kept, what the window alone names (goal 93; its slab keeps the placement its windows share): its identity
+/// once the content store names it, its length, and its slot, the slab's key (region and offset) and the window's offset
+/// in it, where it has one (none for an empty window). Laid out flat, 56 bytes: the windows' map keeps one a window.
 #[derive(Clone, Copy, Debug)]
 struct Kept {
-  identity: Option<ContentId>,
-  len: usize,
-  placed: Option<Placed>,
+  /// Its identity, once `named`.
+  identity: ContentId,
+  /// Its slab's offset, where `placed`.
+  offset: u64,
+  /// Its length.
+  len: u32,
+  /// Its slot's offset in its slab, where `placed`.
+  at: u32,
+  /// Its slab's region, where `placed`.
+  region: u16,
+  /// Whether the content store has named it.
+  named: bool,
+  /// Whether it lies in a slab (an empty window does not).
+  placed: bool,
+}
+
+impl Kept {
+  /// A window of `len` bytes placed at `placed`, not yet named; refused `Storage` past a chunk's length.
+  fn of(len: usize, placed: Option<Placed>) -> Result<Kept, ContentRefused> {
+    let len = u32::try_from(len).map_err(|_| ContentRefused::Storage)?;
+    let (region, offset, at) = placed.map_or((0, 0, 0), |placed| {
+      (
+        placed.region,
+        placed.offset,
+        placed.slot().map_or(0, |(_, at)| at),
+      )
+    });
+    Ok(Kept {
+      identity: ContentId([0; 32]),
+      offset,
+      len,
+      at,
+      region,
+      named: false,
+      placed: placed.is_some(),
+    })
+  }
+
+  /// Its slab's key, where it lies in one.
+  fn key(&self) -> Option<(u16, u64)> {
+    self.placed.then_some((self.region, self.offset))
+  }
+
+  /// Its length.
+  fn bytes(&self) -> usize {
+    usize::try_from(self.len).unwrap_or(usize::MAX)
+  }
 }
 
 /// The windows kept as chunks of the shard's lent chunk store (module docs).
@@ -188,13 +242,14 @@ pub(crate) enum PieceRefused {
   Unclaimable,
 }
 
-/// A window piece's bytes (module docs, "Owed": the table the shard image carries).
-fn piece_of(identity: &ContentId, kept: &Kept) -> Vec<u8> {
+/// A window piece's bytes (module docs, "Owed": the table the shard image carries): a named window and its placement.
+fn piece_of(kept: &Kept, placed: Option<Placed>) -> Vec<u8> {
   let mut out = Vec::with_capacity(PIECE_BYTES);
   out.push(PIECE_VERSION);
-  out.extend_from_slice(&identity.0);
-  out.extend_from_slice(&u64::try_from(kept.len).unwrap_or(u64::MAX).to_le_bytes());
-  let placed = kept.placed.unwrap_or(Placed {
+  out.extend_from_slice(&kept.identity.0);
+  out.extend_from_slice(&u64::from(kept.len).to_le_bytes());
+  let has = placed.is_some();
+  let placed = placed.unwrap_or(Placed {
     extent: Extent {
       off: 0,
       len: 0,
@@ -206,7 +261,7 @@ fn piece_of(identity: &ContentId, kept: &Kept) -> Vec<u8> {
     used: 0,
     born: 0,
   });
-  out.push(u8::from(kept.placed.is_some()));
+  out.push(u8::from(has));
   out.extend_from_slice(&placed.region.to_le_bytes());
   out.extend_from_slice(&placed.offset.to_le_bytes());
   out.extend_from_slice(&placed.block.to_le_bytes());
@@ -368,6 +423,9 @@ impl ChunkWindows {
       key,
       Slab {
         chunk,
+        block: placed.block,
+        used: placed.used,
+        born: placed.born,
         live: 1,
         asked: bytes.len(),
         freed: (0, 0),
@@ -447,6 +505,27 @@ impl ChunkWindows {
       used: chunk.len,
       born: chunk.born.0,
     }))
+  }
+
+  /// A kept window's placement, from its slot and the slab it lies in: none for an empty window.
+  fn placed_of(&self, kept: &Kept) -> Option<Placed> {
+    let key = kept.key()?;
+    let slab = self.slabs.get(&key)?;
+    Some(Placed {
+      extent: Extent {
+        off: 0,
+        len: u64::from(kept.len),
+        src: ExtentSrc::Chunk {
+          chunk: slab.chunk,
+          at: kept.at,
+        },
+      },
+      region: key.0,
+      offset: key.1,
+      block: slab.block,
+      used: slab.used,
+      born: slab.born,
+    })
   }
 
   /// Asks the arena for the slab's live windows' bytes now when the store is lent, at the next lend otherwise.
@@ -537,7 +616,8 @@ impl ChunkWindows {
     self
       .held
       .range(StoredWindow(lo)..=StoredWindow(hi))
-      .filter_map(|(window, kept)| Some((window.0, piece_of(kept.identity.as_ref()?, kept))))
+      .filter(|(_, kept)| kept.named)
+      .map(|(window, kept)| (window.0, piece_of(kept, self.placed_of(kept))))
       .collect()
   }
 
@@ -673,6 +753,9 @@ impl ChunkWindows {
       key,
       Slab {
         chunk,
+        block: first.block,
+        used: first.used,
+        born: first.born,
         live,
         asked,
         freed: (0, 0),
@@ -693,14 +776,10 @@ impl ChunkWindows {
     if self.held.contains_key(&window) {
       return Err(PieceRefused::Malformed);
     }
-    self.held.insert(
-      window,
-      Kept {
-        identity: Some(identity),
-        len,
-        placed,
-      },
-    );
+    let mut kept = Kept::of(len, placed).map_err(|_| PieceRefused::Malformed)?;
+    kept.identity = identity;
+    kept.named = true;
+    self.held.insert(window, kept);
     self.restored.push((identity, window, len));
     self.next = self.next.max(handle.saturating_add(1));
     Ok(())
@@ -721,21 +800,14 @@ impl WindowStorage for ChunkWindows {
       .next
       .checked_add(1)
       .ok_or(ContentRefused::CountExhausted)?;
-    self.held.insert(
-      window,
-      Kept {
-        identity: None,
-        len: bytes.len(),
-        placed,
-      },
-    );
+    self.held.insert(window, Kept::of(bytes.len(), placed)?);
     self.changed.insert(window);
     Ok(window)
   }
 
   fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
     let kept = self.held.get(&window)?;
-    let Some(placed) = kept.placed else {
+    let Some(placed) = self.placed_of(kept) else {
       return Some(Cow::Borrowed(&[]));
     };
     if !self.lent {
@@ -761,7 +833,7 @@ impl WindowStorage for ChunkWindows {
     kept_in: &dyn Any,
   ) -> Option<()> {
     let kept = self.held.get(&window)?;
-    let Some(placed) = kept.placed else {
+    let Some(placed) = self.placed_of(kept) else {
       return into.is_empty().then_some(());
     };
     let end = offset.checked_add(into.len())?;
@@ -784,7 +856,7 @@ impl WindowStorage for ChunkWindows {
     }
     // Not lent this step: the shard's chunk store holds the chunks, read in its place (A-760: a replay's read).
     let kept = self.held.get(&window)?;
-    let Some(placed) = kept.placed else {
+    let Some(placed) = self.placed_of(kept) else {
       return Some(Cow::Borrowed(&[]));
     };
     let chunks = kept_in.downcast_ref::<ChunkStore>()?;
@@ -800,22 +872,18 @@ impl WindowStorage for ChunkWindows {
       return;
     };
     self.changed.insert(window);
-    let Some(placed) = kept.placed else {
+    let Some(key) = kept.key() else {
       return;
     };
-    let key = placed.key();
+    // Every placed window lies in a slab the storage keeps (its placement is the slab's).
     let Some(slab) = self.slabs.get_mut(&key) else {
-      // Every window's chunk is a slab's; one that is not is freed alone, as before the slabs.
-      if let Some((chunk, _)) = placed.slot() {
-        self.free_or_owe(chunk);
-      }
       return;
     };
     slab.live = slab.live.saturating_sub(1);
-    slab.asked = slab.asked.saturating_sub(kept.len);
+    slab.asked = slab.asked.saturating_sub(kept.bytes());
     if slab.live > 0 {
       // The slot stays unused while the slab is held (module docs, "Slabs").
-      let len = u64::try_from(kept.len).unwrap_or(u64::MAX);
+      let len = u64::from(kept.len);
       slab.freed = (
         slab.freed.0.saturating_add(1),
         slab.freed.1.saturating_add(len),
@@ -871,7 +939,8 @@ impl WindowStorage for ChunkWindows {
 
   fn named(&mut self, window: StoredWindow, identity: &ContentId) {
     if let Some(kept) = self.held.get_mut(&window) {
-      kept.identity = Some(*identity);
+      kept.identity = *identity;
+      kept.named = true;
     }
   }
 

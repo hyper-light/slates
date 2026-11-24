@@ -2144,7 +2144,7 @@ pub(crate) fn store_blocking(
       state,
       repository,
       (&segment, &forked.changegroup.1),
-      |_| Ok(record),
+      record,
     );
     let Some(Ok((disk, header, parts))) = changeset else {
       return Err(unlanded());
@@ -2587,11 +2587,25 @@ async fn segment_landed(
   // A-740: a shard stuck landing a segment names it.
   let _doing = slates_rt::futures::doing("hg_push::segment");
   let (intake, (_, payload)) = (taking.intake.as_ref()?, taking.changegroup.as_ref()?);
-  let room = taking.room;
+  let unlanded = || Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
+  let Ok(mut writer) = intake.record_writer(segment, taking.room) else {
+    return unlanded();
+  };
+  let mut costs = vcs_store::TurnCosts::ZERO;
+  // The record a turn's steps at a time, a yield between turns (the slice rule: a whole segment's record in one step
+  // ran 316 ms on the big Studio, r499).
+  loop {
+    match crate::state::with_state(|state| record_turn(state, intake, &mut writer, &mut costs))?? {
+      Ok(true) => slates_rt::futures::yield_now().await,
+      Ok(false) => break,
+      Err(_) => return unlanded(),
+    }
+  }
+  let Some(written) = writer.finish() else {
+    return unlanded();
+  };
   let changeset = crate::state::with_state(|state| {
-    super::hg_run::segment_changeset(state, repository, (segment, payload), |content| {
-      intake.segment_record(segment, room, content)
-    })
+    super::hg_run::segment_changeset(state, repository, (segment, payload), written)
   })?;
   let Some(Ok((disk, header, parts))) = changeset else {
     return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
@@ -2601,12 +2615,60 @@ async fn segment_landed(
   crate::state::with_state(|state| landed_segment(state, (run, segment), sequence, ok))
 }
 
+/// Counter: the turns a push's segment records were written in, a turn's steps under the shard's paced turn each
+/// ([`record_turn`]): at least one a segment landed, so a record written in one call is seen. Format: a counter name
+/// in the status report.
+pub(crate) const SEGMENT_RECORD_TURNS: &str = "vcs.hg.segment_record_turns";
+
+/// One turn of `writer`, a segment's record, over `intake`'s fork: its steps while the shard's paced turn has room
+/// (`vcs_store::paced_turn`, A-783, as an intake slice takes its units), the content store lent for the turn alone;
+/// whether more steps follow, or the writer's refusal. None where the content store went away. Each turn counted
+/// ([`SEGMENT_RECORD_TURNS`]).
+fn record_turn(
+  state: &mut ShardState,
+  intake: &slates_hg::push::intake::Intake,
+  writer: &mut slates_hg::import::record::Writer,
+  costs: &mut vcs_store::TurnCosts,
+) -> Option<Result<bool, slates_hg::import::record::WriteRefused>> {
+  let quantum = vcs_store::hg_import::quantum_of(state);
+  let mut paced = vcs_store::paced_turn(quantum, slates_rt::futures::now_ns());
+  let stepped = vcs_store::lent_state(state, |state| {
+    let content = state.vcs_stores.content()?;
+    Some(loop {
+      if !paced.more(vcs_store::ANSWER_STEP, costs) {
+        break Ok(true);
+      }
+      match intake.record_step(writer, content) {
+        Ok(true) => {}
+        other => break other,
+      }
+    })
+  });
+  paced.close(slates_rt::futures::now_ns(), costs);
+  state.count(SEGMENT_RECORD_TURNS, 1);
+  stepped
+}
+
 /// `take_sliced`'s settle: the intake finished into its fork, its delta bases counted. None where the store went away.
 fn settled(taking: Taking) -> Option<Forked> {
-  let forked = taking.finish()?;
-  let _ = crate::state::with_state(|state| count_bases(state, &forked.intaken));
+  let mut forked = taking.finish()?;
+  let lookups = forked.fork.rows().counters();
+  let _ = crate::state::with_state(|state| {
+    count_bases(state, &forked.intaken);
+    state.count(INDEX_LOOKUPS, lookups.lookups);
+    state.count(INDEX_RUNS_VISITED, lookups.runs_visited);
+  });
   Some(forked)
 }
+
+/// Counter: the lookups a push's fork made of its rows over the push, its intake's checks and keeps alike (goal 93:
+/// arena-19 put the index seal's reland at 24-35% of push-all under a loaded lane, none on a quiet Studio, r517).
+/// Format: a counter name in the status report.
+pub(crate) const INDEX_LOOKUPS: &str = "vcs.hg.push_index_lookups";
+
+/// Counter: the runs those lookups visited, a miss every run ([`INDEX_LOOKUPS`]): runs a lookup is the one over the
+/// other. Format: a counter name in the status report.
+pub(crate) const INDEX_RUNS_VISITED: &str = "vcs.hg.push_index_runs_visited";
 
 /// Counter: a push admitted its known need up front at its begin, past the room it was first given (main 01a20182's
 /// ruling (a) of 2026-11-22 04:23). Format: a counter name in the status report.
@@ -2960,16 +3022,12 @@ fn taken_whole(
 fn recorded_segments(state: &mut ShardState, taking: &mut Taking) -> Option<Vec<RecordedSegment>> {
   let mut recorded = Vec::new();
   while let Some(segment) = taking.take_segment() {
-    let room = taking.room;
     let intake = taking.intake.as_ref()?;
-    let record = vcs_store::lent_state(state, |state| {
-      state
-        .vcs_stores
-        .content()
-        .map(|content| intake.segment_record(&segment, room, content))
-    })?
-    .ok()?;
-    recorded.push((segment, record));
+    let mut writer = intake.record_writer(&segment, taking.room).ok()?;
+    let mut costs = vcs_store::TurnCosts::ZERO;
+    // The daemon's record turns, taken one after another: the test's caller holds the shard and cannot yield.
+    while record_turn(state, intake, &mut writer, &mut costs)?.ok()? {}
+    recorded.push((segment, writer.finish()?));
   }
   Some(recorded)
 }

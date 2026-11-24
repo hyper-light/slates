@@ -41,7 +41,7 @@ pub mod session_log;
 pub use client::{
   Advanced, ArchiveExported, ArchiveImported, Attachment, Client, Connecting, CreateSpec,
   Deadlines, Digest, DriftedPage, EntriesPage, ImageBuilt, Imported, LAST_SEQUENCE, Landing,
-  MergeCheck, MergeRecord, MergeStatement, MoveState, Page, Rebased, RepositoryPolicy,
+  MergeCheck, MergeRecord, MergeStatement, MoveState, Page, Rebased, Renewal, RepositoryPolicy,
   RepositorySpec, Rewitnessed, SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd,
   Submitted, VhostUserDevice,
 };

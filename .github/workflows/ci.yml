@@ -979,14 +979,15 @@ jobs:
       # commit back, one outlives a killed daemon, a create the moment the daemon serves is admitted (its extents held
       # before it answers a claim), and one at once after a destroy waits for the released extents' remakes
       # (`slates_server`'s `room_wait`). No lane ran the file until 2026-11-23. Gated by `SLATES_TEST_CLI=1`. Its
-      # commit give-back test is skipped, a tracked red (GAPS, A-878): its 256 MiB write through a CLI attachment made by
-      # another `slates attach` process is refused `AttachmentExpired` on both runners (diag run 45260798132).
+      # commit give-back test writes 256 MiB through a CLI attachment another `slates attach` process made, which
+      # `slates write` holds while it reads and stages its input (A-879; refused `AttachmentExpired` on both runners
+      # before, diag run 45260798132).
       - name: The content pool's extents through the CLI (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
-        run: cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture --skip a_freed_content_extent_gives_its_commit_back_on_windows
+        run: cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture
       # A-209: Win32 semantics through the drive that winfstest found broken (a move not asked to replace, a directory
       # holding a file, SetFileTime's times, an open that truncates), then WinFsp's own two suites over the drive through
       # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
@@ -1359,7 +1360,7 @@ jobs:
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
-        run: cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture --skip a_freed_content_extent_gives_its_commit_back_on_windows
+        run: cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture
       # The WinFsp mount on arm64 (the DAX matrix's bare-metal Windows arm64 mount-route cell, docs/wip/virtiofs.md §8):
       # WinFsp's package carries its arm64 driver and library (`winfsp-a64.sys`, `winfsp-a64.dll`, which the bridge
       # loads by name on this target), and the same tests as the x86_64 lanes run: a cached read follows another path's
@@ -1595,18 +1596,30 @@ jobs:
       # lane sets no environment variable and explores exactly what a laptop run explores. The models
       # print the interleavings they explored (`--nocapture`), so the log carries the numbers
       # `docs/wip/concurrency.md` records.
+      # Each step's timeout is about three times its slowest measured pass, so a stall fails the lane in bounded time:
+      # the runtime step below sat 3 h 49 min in main run 45251228315 (2026-11-23, Miri retagging the cell table's
+      # 4 MiB at every claim), and since this workflow's concurrency group never cancels a run in progress, every
+      # main run behind it waited and was replaced unrun. loom's slowest pass in the eleven main runs read was 1 min
+      # 59 s (78ba9b117).
       - name: loom (every bounded interleaving of the rings, the handle core, the parking and doorbell protocols)
+        timeout-minutes: 6
         run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc -p slates-bridge-winfsp --lib --release loom -- --nocapture
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      # Its slowest pass read: 17 min 18 s (4b12a582e, 2026-11-19); 13 min 19 s in 45294047051.
       - name: "Miri (memory and wire: leak check on)"
+        timeout-minutes: 52
         run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
       # The runtime leaks its shard contexts, rings and registry entries on purpose (they live
       # for the process; the leak is what makes every reference to them a plain `&'static`), so
       # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
       # marked ignored under Miri, which cannot model kqueue or eventfd.
+      # Its last full pass took 3 min 9 s (29ef4521d, 2026-11-17); in 45294047051 it ran 3 min 17 s to its first
+      # failure, a test Miri cannot run, with the retirement and channel tests added since. 15 minutes is about four
+      # and a half times the longer, since that failure left the step's later tests unrun.
       - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
+        timeout-minutes: 15
         run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness --test alone
 
   windows-nightly:

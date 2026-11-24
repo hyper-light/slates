@@ -624,8 +624,9 @@ fn no_table_passes_the_window_and_the_tail_seals_once_its_rows_no_longer_fit_one
 
 /// Goal 93 perf (main's ruling of 2026-11-21: the index's merge sliced under the step budget). Do: give an index six runs
 /// of forty rows in all, under a window of 256 bytes; merge them a step at a time, counting the steps and reading every
-/// row between steps. Expect: one table cut a step (seven, then the step that admits the run), every row read back
-/// unchanged at each step (nothing changes until the last), one run left, every table within the window.
+/// row between steps. Expect: one table cut a step (seven, then the step that swaps the run in), every row read back
+/// unchanged at each step, the runs unchanged until the swap, then their tables given back a step each; one run left,
+/// every table within the window.
 #[test]
 fn a_merge_made_a_table_a_step_reads_the_same_rows_throughout_and_ends_as_one_run() {
   let mut store = store();
@@ -640,8 +641,14 @@ fn a_merge_made_a_table_a_step_reads_the_same_rows_throughout_and_ends_as_one_ru
   let before = read(&index, &store);
   let runs = index.run_tables().len();
   assert!(runs > 2, "runs to merge: {runs}");
-  let (rows, steps) = merged_a_table_a_step(&mut index, &mut store, &before, runs);
-  assert_eq!((rows, steps), (40, 8));
+  let tables_before: usize = index.run_tables().iter().map(Vec::len).sum();
+  let (rows, cut, steps) = merged_a_table_a_step(&mut index, &mut store, &before, runs);
+  assert_eq!((rows, cut), (40, 7));
+  assert_eq!(
+    steps,
+    cut + 1 + tables_before,
+    "the cuts, the swap, a table given back a step"
+  );
   assert_eq!(index.run_tables().len(), 1);
   assert_eq!(read(&index, &store), before);
   assert_tables_within_the_window(&index, &store);
@@ -675,7 +682,7 @@ fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows() {
       seals += 1;
       fewest = fewest.min(sealed.max(1));
       while let Some(runs) = index.tiered_due() {
-        let mut merge = index.merge_begin(&store, runs).unwrap();
+        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
         while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
       }
       let sealed_rows = index.rows().saturating_sub(index.tail_len() as u64);
@@ -696,29 +703,27 @@ fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows() {
   index.release(&mut store).unwrap();
 }
 
-/// `index`'s runs merged a step at a time: one table cut a step, every row read back as `before` and `runs` runs left
-/// until the last step. The rows merged and the steps taken.
+/// `index`'s runs merged a step at a time: one table cut a step, every row read back as `before` throughout, `runs`
+/// runs left until the step that swaps the merged run in and one after it, while the merged runs' tables are given back
+/// a step each. The rows merged, the tables cut and the steps taken.
 fn merged_a_table_a_step(
   index: &mut Index,
   store: &mut ContentStore,
   before: &[(Vec<u8>, Vec<u8>)],
   runs: usize,
-) -> (u64, usize) {
-  let mut merge = index.merge_begin(store, usize::MAX).unwrap();
+) -> (u64, usize, usize) {
+  let mut merge = index.merge_begin(store, usize::MAX).unwrap().unwrap();
   let mut steps = 0usize;
   loop {
     steps = steps.saturating_add(1);
-    match index.merge_step(store, &mut merge).unwrap() {
-      MergeStep::More => {
-        assert_eq!(merge.tables_cut(), steps, "one table a step");
-        assert_eq!(
-          read(index, store),
-          before,
-          "nothing changes until the last step"
-        );
-        assert_eq!(index.run_tables().len(), runs);
+    let stepped = index.merge_step(store, &mut merge).unwrap();
+    assert_eq!(read(index, store), before, "every row read back throughout");
+    match stepped {
+      MergeStep::More if merge.tables_cut() == steps => {
+        assert_eq!(index.run_tables().len(), runs, "unchanged until the swap");
       }
-      MergeStep::Done(rows) => return (rows, steps),
+      MergeStep::More => assert_eq!(index.run_tables().len(), 1, "swapped in"),
+      MergeStep::Done(rows) => return (rows, merge.tables_cut(), steps),
       MergeStep::GivenUp => panic!("nothing shares these runs"),
     }
   }
@@ -733,7 +738,7 @@ fn a_merge_whose_runs_a_fork_comes_to_share_is_given_up() {
   let mut index = Index::new();
   add_runs(&mut index, &mut store, &[b"a0", b"a1"]);
   let before = read(&index, &store);
-  let mut merge = index.merge_begin(&store, usize::MAX).unwrap();
+  let mut merge = index.merge_begin(&mut store, usize::MAX).unwrap().unwrap();
   assert_eq!(
     index.merge_step(&mut store, &mut merge),
     Ok(MergeStep::More)
@@ -748,6 +753,131 @@ fn a_merge_whose_runs_a_fork_comes_to_share_is_given_up() {
     (2, before)
   );
   fork.release(&mut store).unwrap();
+  index.release(&mut store).unwrap();
+  assert_empty(&store);
+}
+
+/// An index of forty plain rows sealed as they come under the tests' window, then sealed whole: six runs, seven tables
+/// once merged. The keys come seven apart (modulo forty), so each run's keys are scattered and every merged table is
+/// new to the store (in key order, the merge would cut the very tables the seals wrote, each stored already).
+fn forty_rows_in_runs(store: &mut ContentStore) -> Index {
+  let mut index = Index::new();
+  for at in 0..40u16 {
+    insert_plain(&mut index, store, u8::try_from(at * 7 % 40).unwrap());
+    if index.seal_due(store) {
+      index.seal(store).unwrap();
+    }
+  }
+  index.seal_all(store).unwrap();
+  index
+}
+
+/// Goal 93 (main's ruling of 2026-11-23 18:41: a merge step that puts every cut table and gives back every merged run
+/// at once breaks the bounded slice, as the segment record did; r499's longest merge step took 89.7 ms on a quiet
+/// Studio). Do: merge an index of six runs and forty rows a step at a time, reading the store's counters around each
+/// step. Expect: no step puts more than one table (stored new or found held) nor frees more than one (the merged runs'
+/// tables given back a step each too, since a freed table gives back its rows' holds); every row read back at each step;
+/// the merge ends as one run of forty rows. Red before: the last step put all seven tables and freed the six runs'.
+#[test]
+fn no_merge_step_puts_more_than_one_table() {
+  let mut store = store();
+  let mut index = forty_rows_in_runs(&mut store);
+  let before = read(&index, &store);
+  let mut merge = index.merge_begin(&mut store, usize::MAX).unwrap().unwrap();
+  let mut steps = 0_usize;
+  loop {
+    let was = store.counters();
+    let stepped = index.merge_step(&mut store, &mut merge).unwrap();
+    steps += 1;
+    let now = store.counters();
+    let put = (now.stored + now.deduplicated) - (was.stored + was.deduplicated);
+    assert!(put <= 1, "step {steps} put {put} tables");
+    let freed = now.freed - was.freed;
+    assert!(freed <= 1, "step {steps} freed {freed} tables");
+    assert_eq!(read(&index, &store), before, "step {steps}");
+    match stepped {
+      MergeStep::More => {}
+      MergeStep::Done(rows) => {
+        assert_eq!(rows, 40);
+        break;
+      }
+      MergeStep::GivenUp => panic!("nothing shares these runs"),
+    }
+  }
+  assert_eq!(index.run_tables().len(), 1);
+  assert_tables_within_the_window(&index, &store);
+  index.release(&mut store).unwrap();
+  assert_empty(&store);
+}
+
+/// Goal 93 (main's ruling of 2026-11-23 18:41: a given-up merge gives back the tables it put). Do: begin merging an
+/// index of six runs, step it three times (three tables put), then fork the index and step again; separately, begin
+/// another such merge, step it twice, and release the index with the merge part-way; and over a store whose budget
+/// leaves room for one merged table beside the runs, step a merge until it is refused. Expect: the fork's merge given
+/// up, the store holding the contents it held before the merge began and every row read back; the released index
+/// leaving the store empty; the refused merge refused over budget, the store's contents and bytes as before it began,
+/// every row read back, and empty once released.
+#[test]
+fn a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put() {
+  let mut store = store();
+  let mut index = forty_rows_in_runs(&mut store);
+  let before = read(&index, &store);
+  let held = store.len();
+  let mut merge = index.merge_begin(&mut store, usize::MAX).unwrap().unwrap();
+  for _ in 0..3 {
+    assert_eq!(
+      index.merge_step(&mut store, &mut merge),
+      Ok(MergeStep::More)
+    );
+  }
+  let fork = index.fork(&mut store).unwrap();
+  assert_eq!(
+    index.merge_step(&mut store, &mut merge),
+    Ok(MergeStep::GivenUp)
+  );
+  assert_eq!((store.len(), read(&index, &store)), (held, before.clone()));
+  fork.release(&mut store).unwrap();
+  index.release(&mut store).unwrap();
+  assert_empty(&store);
+
+  let mut index = forty_rows_in_runs(&mut store);
+  let mut merge = index.merge_begin(&mut store, usize::MAX).unwrap().unwrap();
+  for _ in 0..2 {
+    assert_eq!(
+      index.merge_step(&mut store, &mut merge),
+      Ok(MergeStep::More)
+    );
+  }
+  index.release(&mut store).unwrap();
+  assert_empty(&store);
+
+  let runs_use = {
+    let mut store = ContentStore::new(1 << 20, WINDOW).unwrap();
+    let index = forty_rows_in_runs(&mut store);
+    let used = store.used();
+    index.release(&mut store).unwrap();
+    used
+  };
+  let one_table = u64::try_from(WINDOW + 1 + FENCE_SLOT_BYTES).unwrap();
+  let mut store = ContentStore::new(runs_use + one_table, WINDOW).unwrap();
+  let mut index = forty_rows_in_runs(&mut store);
+  let (held, used) = (store.len(), store.used());
+  let mut merge = index.merge_begin(&mut store, usize::MAX).unwrap().unwrap();
+  let refused = loop {
+    match index.merge_step(&mut store, &mut merge) {
+      Ok(MergeStep::More) => {}
+      other => break other,
+    }
+  };
+  assert!(
+    matches!(
+      refused,
+      Err(IndexRefused::Content(ContentRefused::OverBudget { .. }))
+    ),
+    "{refused:?}"
+  );
+  assert_eq!((store.len(), store.used()), (held, used));
+  assert_eq!(read(&index, &store), before);
   index.release(&mut store).unwrap();
   assert_empty(&store);
 }
@@ -1550,4 +1680,41 @@ fn a_tail_sealed_a_table_a_step_is_the_tail_sealed_at_once() {
   whole.release(&mut whole_store).unwrap();
   assert_empty(&stepped_store);
   assert_empty(&whole_store);
+}
+
+/// Goal 93 (arena-19: the index seal's reland cost 24-35% of push-all outside the intake; the lane reads runs a lookup
+/// from these counters). Do: give an index three runs (a0, a1, a2, newest last), each insert's duplicate check a lookup
+/// (over none, one and two runs: a push's misses); look up a key in the newest run, one in the oldest and one no run
+/// holds; then fork it and look one key up in the fork. Expect the inserts' 3 lookups visiting 3 runs, then 3 more
+/// visiting 1, 3 and 3 (a miss visits every run, the tail empty after each seal); the fences counted (one a run); and
+/// the fork's own counts from none: 1 lookup, its runs as it walked them.
+#[test]
+fn an_indexs_lookups_count_the_runs_they_visit_for_its_life() {
+  let mut store = store();
+  let mut index = Index::new();
+  add_runs(&mut index, &mut store, &[b"a0", b"a1", b"a2"]);
+  assert_eq!(index.fences(), 3, "one table a run");
+  let inserted = index.counters();
+  assert_eq!(
+    (inserted.lookups, inserted.runs_visited),
+    (3, 3),
+    "each insert's duplicate check"
+  );
+  assert!(index.get(&store, b"a2").is_some());
+  assert!(index.get(&store, b"a0").is_some());
+  assert!(index.get(&store, b"nowhere").is_none());
+  let counted = index.counters();
+  assert_eq!(
+    (
+      counted.lookups - inserted.lookups,
+      counted.runs_visited - inserted.runs_visited
+    ),
+    (3, 1 + 3 + 3)
+  );
+  let fork = index.fork(&mut store).unwrap();
+  assert!(fork.get(&store, b"a1").is_some());
+  let forked = fork.counters();
+  assert_eq!((forked.lookups, forked.runs_visited), (1, 2));
+  fork.release(&mut store).unwrap();
+  index.release(&mut store).unwrap();
 }

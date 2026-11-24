@@ -14,7 +14,11 @@
 //!   recover. A period is timed only when its probe was answered (`MemberPlane::period_probed`): one whose probe went
 //!   unanswered ends at the probe's timer, which doubles at each expiry (RFC 6298 §5.5), so it measures the timer, not
 //!   the period (Karn's rule), and a member no peer answers keeps the term it measured while they did. Folded, those
-//!   periods grew a cut-off owner's `D` from 2.4 s to 95.6 s in 19 s (2026-11-23). Each pair is Chen, Toueg and
+//!   periods grew a cut-off owner's `D` from 2.4 s to 95.6 s in 19 s (2026-11-23). While a pair is still judged by its
+//!   own retransmission timer (a member's first seconds, before its pool has a verdict), its unanswered probes run the
+//!   timer's span and the relay stage, and `D` is at least the bound the detector states for the deadlines it judges by
+//!   (A-882, [`detection`]): a forming fleet's survivors took 7.2 s to condemn a cut-off leader where the count said
+//!   about 0.7 s. Each pair is Chen, Toueg and
 //!   Aguilera's NFD-E (IEEE Transactions on Computers 51(5), 2002) over the probe
 //!   stream, with Lifeguard's local health (Dadgar, Phillips & Currey, DSN 2018): a member condemns only once another
 //!   member has answered it since, and its own wake lateness floors every margin, so both stretch the periods `D` counts.
@@ -116,9 +120,25 @@ pub struct Term {
 /// period resolves the condemnation (hyper-swim's `Detector::detection_bound` counts the same). hyper-swim's bound counts
 /// each period at the longest the member ever ran, a ratchet that one slow period sets for good: on a quiet three-node
 /// loopback fleet it read 7.0 and 14.0 s before any loss where other runs read 0.9 s (2026-11-18, the Mac Studio). The
-/// running tail forgets a slow period as later ones run at their pace, so the term keeps learning. `None` with no member
-/// besides this one (nothing to detect), or before a period was timed.
-pub fn detection(members_besides: u64, periods: &RunningDuration) -> Option<Term> {
+/// running tail forgets a slow period as later ones run at their pace, so the term keeps learning. Those two readings
+/// were seven periods at a timer's 1 s and 2 s, the case the next paragraph counts, without the ratchet.
+///
+/// The count stands for a detection an estimator judges, where a crashed peer's unanswered probe runs about a period.
+/// While a pair the detector probes is still judged by the pair's own retransmission timer (RFC 6298: before the member's
+/// pool has a verdict, or once a late answer has taken the pair out of the pool's), that peer's unanswered probes run the
+/// timer's span and then the relay stage, a second and more each before any estimator has measured the host's stalls.
+/// So the term is then at least `timer_bound_ns`, the detection bound the detector states for the deadlines it judges by
+/// now (A-882; [`crate::member_plane::MemberPlane::detection`] reads it): a young member's peer was condemned 6.0 s after
+/// its last answer where the count said 20 ms (`crates/cluster/tests/member_plane.rs`), and a leader cut off 0.9 s into a
+/// fleet's life was condemned 7.2 s after its last answer where it said about 0.7 s (adacachy2, 2026-11-23). Before a
+/// period was timed, the stated bound alone is the term, its samples zero as a prior's are: a forming member whose
+/// first probes went unanswered has timed no period, and its peers took 7.2 s to condemn. `None` with no member
+/// besides this one (nothing to detect), or with neither a period timed nor a bound stated.
+pub fn detection(
+  members_besides: u64,
+  periods: &RunningDuration,
+  timer_bound_ns: Option<u64>,
+) -> Option<Term> {
   if members_besides == 0 {
     return None;
   }
@@ -127,8 +147,12 @@ pub fn detection(members_besides: u64, periods: &RunningDuration) -> Option<Term
     .saturating_sub(1)
     .saturating_mul(2)
     .saturating_add(1);
-  periods.tail_ns().map(|tail| Term {
-    ns: count.saturating_mul(tail),
+  let counted = periods.tail_ns().map(|tail| count.saturating_mul(tail));
+  if counted.is_none() && timer_bound_ns.is_none() {
+    return None;
+  }
+  Some(Term {
+    ns: counted.unwrap_or(0).max(timer_bound_ns.unwrap_or(0)),
     samples: periods.samples(),
   })
 }
@@ -516,23 +540,69 @@ mod tests {
   #[test]
   fn detection_counts_swims_periods_at_the_measured_period() {
     let mut periods = RunningDuration::new();
-    assert_eq!(detection(2, &periods), None, "no period timed yet");
+    assert_eq!(detection(2, &periods, None), None, "no period timed yet");
     for _ in 0..32 {
       periods.on_sample(128_000_000);
     }
     let tail = periods.tail_ns().expect("periods timed");
     assert_eq!(
-      detection(2, &periods),
+      detection(2, &periods, None),
       Some(Term {
         ns: 7 * tail,
         samples: 32,
       })
     );
-    assert_eq!(detection(0, &periods), None, "no member to detect");
+    assert_eq!(detection(0, &periods, None), None, "no member to detect");
     assert_eq!(
-      detection(4, &periods).map(|term| term.ns),
+      detection(4, &periods, None).map(|term| term.ns),
       Some(15 * tail),
       "four members besides: fifteen periods"
+    );
+  }
+
+  /// A-882. Do: count detection for two members besides this one with no period timed and then over periods timed at
+  /// 2 ms, with a pair still judged by its own retransmission timer whose detector states a 21 s bound, then with one
+  /// stating less than the count, then with none. Expect the stated bound alone before a period was timed, its samples
+  /// zero; then the stated bound while it is the larger and the count otherwise, the periods counted either way; and
+  /// nothing with neither.
+  #[test]
+  fn detection_is_at_least_the_bound_a_timer_judged_pair_is_stated_at() {
+    let mut periods = RunningDuration::new();
+    let stated = 21_000_000_000;
+    assert_eq!(
+      detection(2, &periods, Some(stated)),
+      Some(Term {
+        ns: stated,
+        samples: 0,
+      }),
+      "no period timed yet: the stated bound, as a prior"
+    );
+    assert_eq!(
+      detection(2, &periods, None),
+      None,
+      "neither a period timed nor a bound stated"
+    );
+    for _ in 0..32 {
+      periods.on_sample(2_000_000);
+    }
+    let counted = 7 * periods.tail_ns().expect("periods timed");
+    assert_eq!(
+      detection(2, &periods, Some(stated)),
+      Some(Term {
+        ns: stated,
+        samples: 32,
+      }),
+      "a timer's stated bound past the count is the term"
+    );
+    assert_eq!(
+      detection(2, &periods, Some(counted / 2)).map(|term| term.ns),
+      Some(counted),
+      "a stated bound under the count leaves the count"
+    );
+    assert_eq!(
+      detection(2, &periods, None).map(|term| term.ns),
+      Some(counted),
+      "no pair on its timer: the count alone"
     );
   }
 
@@ -546,7 +616,7 @@ mod tests {
       periods.on_sample(128_000_000);
     }
     periods.on_sample(2_000_000_000);
-    let stalled = detection(2, &periods).expect("periods timed").ns;
+    let stalled = detection(2, &periods, None).expect("periods timed").ns;
     assert!(
       stalled > 7 * 1_000_000_000,
       "the stall shows at once: {stalled}"
@@ -554,7 +624,7 @@ mod tests {
     for _ in 0..32 {
       periods.on_sample(128_000_000);
     }
-    let recovered = detection(2, &periods).expect("periods timed").ns;
+    let recovered = detection(2, &periods, None).expect("periods timed").ns;
     assert!(
       recovered < 2 * 7 * 128_000_000,
       "the stall is forgotten as periods run at their pace: {recovered}"
