@@ -317,6 +317,10 @@ fn note_reconnected(state: &mut ShardState, anchor: HostId, member: HostId, proc
   }
   let previous = state.plane.announced_from.insert(member, process);
   let restarted = previous.is_some_and(|previous| previous != process);
+  if restarted {
+    // The attempts its old process left are resolved (A-727 (d1a-3)).
+    crate::vcs_store::homes::resolve_owed();
+  }
   if restarted && anchor > state.origin_anchor {
     state.record_sessions.remove(&member);
     crate::fleet::sessions_changed(state, member);
@@ -712,6 +716,13 @@ fn fold_on_control(state: &mut ShardState) -> Vec<(HostId, MemberState)> {
   tell_detector_of_deaths(state);
   let changed = changed_members(state);
   let admitted = admit_beliefs(state, &changed);
+  if admitted
+    .iter()
+    .any(|(_, belief)| belief.liveness == slates_cluster::membership::Liveness::Dead)
+  {
+    // A member died: the attempts its process left are resolved (A-727 (d1a-3)).
+    crate::vcs_store::homes::resolve_owed();
+  }
   for (member, _) in changed.iter().filter(|belief| !admitted.contains(belief)) {
     state.plane.folded.remove(member);
   }

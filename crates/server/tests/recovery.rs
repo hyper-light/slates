@@ -3208,6 +3208,50 @@ fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_th
   drop(anchor);
 }
 
+/// The anchor's failed-start bound (A-311; main 01a20182's red of 2026-11-24 05:29: r865's svn round restarted its daemon
+/// 1,189 times in 44 minutes, each logged "recovered: it has served as long as its start took (102 ms)" while shard 0's
+/// start had never ended, so the bound never counted one failed start). A daemon serves once every shard's start has
+/// ended, recovery included: its serving word (`slates_anchor::layout::SUP_SERVING`) says so, and the anchor counts an
+/// exit before it as a failed start. Do: start a daemon whose second shard spends two liveness windows on the CPU in its
+/// start; read its serving word while that start runs, then wait for it. Expect: unmarked while the shard starts, then
+/// marked, no sooner than the held start took. Failing first: unmarked until the daemon's role marked it, as soon as
+/// `Daemon::start` returned and before any shard's start had ended (an in-process daemon here, which no role marks: never).
+#[test]
+fn a_daemon_serves_only_once_every_shards_start_has_ended() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-serving-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Busy,
+      for_ns: HELD_START_NS,
+    });
+  let anchor = held_anchor("serving", &profile, &config);
+  let began = std::time::Instant::now();
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let serving = || daemon.segment().supervision().unwrap().serving_since();
+  let while_starting = serving();
+  // Its serving word, waited for: past the held start by the same again, which a start that never ends exceeds.
+  let deadline = Duration::from_nanos(HELD_START_NS.saturating_mul(4));
+  let mut marked_after = None;
+  while began.elapsed() < deadline {
+    if serving().is_some() {
+      marked_after = Some(began.elapsed());
+      break;
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  daemon.stop();
+  drop(anchor);
+  assert_eq!(while_starting, None, "unmarked while a shard starts");
+  let marked_after = marked_after.expect("marked serving once every shard's start ended");
+  assert!(
+    marked_after >= Duration::from_nanos(HELD_START_NS),
+    "marked after {marked_after:?}, before the held start's {HELD_START_NS} ns"
+  );
+}
+
 /// Boot (GAPS 2026-10-05): do start a daemon whose second shard sleeps through two liveness windows in its start, using
 /// no CPU, as a stuck shard does; expect the daemon to stop beating within the client's start wait (so the anchor, which
 /// restarts a daemon whose heartbeat lapses, restarts it) instead of beating on while it can never serve.

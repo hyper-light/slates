@@ -1879,9 +1879,9 @@ pub(crate) struct SealedPush {
   /// The sequence of the changeset the node's store landed the names and the pack as, before the record names it
   /// (A-767 C5); 0 for none.
   landed: u64,
-  /// Who its holds in the region are for until its record commits (A-727 (d1a)): this attempt, made at its homing's
-  /// first ask ([`SealedPush::home_owner`]); none before.
-  owner: Option<slates_cluster::homes::HomeOwner>,
+  /// Its holds in the region and the attempt they are for until its record commits (A-727 (d1a)): made at its homing's
+  /// first ask ([`SealedPush::home_owner`]), let go if the push is dropped in flight (`homes::AttemptHolds`).
+  attempt: homes::AttemptHolds,
 }
 
 /// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
@@ -1964,6 +1964,7 @@ impl SealedPush {
   /// they are still its names and its pack is homed too.
   pub(crate) fn homed_as(&mut self, named: (slates_vcs::ContentId, u64)) {
     self.named = Some(named);
+    self.attempt.homed(named.0);
   }
 
   /// The push's pack to home in the region for a version 4 record (A-722's record v4): its bytes, and the identity and
@@ -1978,6 +1979,7 @@ impl SealedPush {
   /// it is still the push's stored pack and the names homed are still its names.
   pub(crate) fn pack_homed_as(&mut self, packed: (slates_vcs::ContentId, u64)) {
     self.packed = Some(packed);
+    self.attempt.homed(packed.0);
   }
 
   /// Keeps `sequence`, the changeset the node's store landed the homed names and pack as (A-767 C5): the version 5 record
@@ -1990,24 +1992,17 @@ impl SealedPush {
   /// the attempt's holds of it in the region, let go at every home that kept it (A-727 (d1a)).
   pub(crate) fn release_unhomed(&self, state: &mut ShardState, identity: &slates_vcs::ContentId) {
     release_names(state, identity);
-    if let Some(owner) = self.owner {
-      homes::settle_later(homes::Settle::Release {
-        identity: *identity,
-        owner,
-      });
-    }
+    self.attempt.release_one(*identity);
   }
 
   /// The attempt its holds in the region are for, once its homing began ([`SealedPush::home_owner`]).
   pub(crate) fn owner_now(&self) -> Option<slates_cluster::homes::HomeOwner> {
-    self.owner
+    self.attempt.owner_now()
   }
 
   /// Who the push's holds in the region are for while it is in flight (A-727 (d1a)): this attempt, made once.
   pub(crate) fn home_owner(&mut self, state: &ShardState) -> slates_cluster::homes::HomeOwner {
-    *self
-      .owner
-      .get_or_insert_with(|| homes::attempt_owner(state, self.repository.bytes))
+    self.attempt.owner(state, self.repository.bytes)
   }
 
   /// Gives back the holds the homed names and pack took for a record that will never name them (a push refused after
@@ -2018,24 +2013,14 @@ impl SealedPush {
       .flatten()
     {
       release_names(state, &identity);
-      if let Some(owner) = self.owner {
-        homes::settle_later(homes::Settle::Release { identity, owner });
-      }
     }
+    self.attempt.released();
   }
 
   /// The push's record committed (A-727 (d1a)): its holds in the region moved from the attempt to the repository's
   /// records, at every home.
-  fn homed_committed(&self) {
-    let Some(from) = self.owner else {
-      return;
-    };
-    let to = slates_cluster::homes::HomeOwner::Record {
-      repository: self.repository.bytes,
-    };
-    for (identity, _) in [self.named, self.packed].into_iter().flatten() {
-      homes::settle_later(homes::Settle::Move { identity, from, to });
-    }
+  fn homed_committed(&mut self) {
+    self.attempt.committed(self.repository.bytes);
   }
 
   /// The repository it is a push to.
@@ -2453,7 +2438,7 @@ impl SealingPush {
         named: None,
         packed: None,
         landed: 0,
-        owner: None,
+        attempt: homes::AttemptHolds::default(),
       }))),
       Err(refused) => {
         self.abandon(state);
@@ -5334,28 +5319,9 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
         Opened::Units => {}
       }
     }
-    let outcome = match sectioned.as_mut() {
-      Some(changeset) => sectioned_unit(id, changeset, &mut replay).await,
-      None => record_unit(id, index, &mut replay).await,
-    };
-    match outcome {
-      Unit::More => {}
-      Unit::Replayed => {
-        sectioned = None;
-        let next = crate::state::with_state(|state| replayed(state, id, Ok(()))).unwrap_or(false);
-        if !next {
-          break;
-        }
-        index = index.saturating_add(1);
-      }
-      Unit::Refused(refused) => {
-        crate::state::with_state(|state| {
-          let _ = replayed(state, id, Err(refused));
-        })
-        .unwrap_or_default();
-        break;
-      }
-      Unit::Gone => break,
+    let outcome = next_unit(id, index, &mut sectioned, &mut replay).await;
+    if !unit_taken(id, outcome, (&mut sectioned, &mut index)) {
+      break;
     }
     slates_rt::futures::yield_now().await;
   }
@@ -5366,6 +5332,48 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
     release_aside(state, aside);
   })
   .unwrap_or_default();
+}
+
+/// [`replay_sliced`]'s next unit: of the changeset under way read from the changeset log, else of the register's record
+/// at `index`.
+async fn next_unit(
+  id: RepositoryId,
+  index: usize,
+  sectioned: &mut Option<Sectioned>,
+  replay: &mut Option<slates_hg::import::record::Replay>,
+) -> Unit {
+  match sectioned.as_mut() {
+    Some(changeset) => sectioned_unit(id, changeset, replay).await,
+    None => record_unit(id, index, replay).await,
+  }
+}
+
+/// What a unit's `outcome` leaves [`replay_sliced`] to do: whether the rebuild goes on, a record replayed moving it to
+/// the next (`index`), a refusal or a state gone ending it, either counted.
+fn unit_taken(
+  id: RepositoryId,
+  outcome: Unit,
+  (sectioned, index): (&mut Option<Sectioned>, &mut usize),
+) -> bool {
+  match outcome {
+    Unit::More => true,
+    Unit::Replayed => {
+      *sectioned = None;
+      let next = crate::state::with_state(|state| replayed(state, id, Ok(()))).unwrap_or(false);
+      if next {
+        *index = index.saturating_add(1);
+      }
+      next
+    }
+    Unit::Refused(refused) => {
+      crate::state::with_state(|state| {
+        let _ = replayed(state, id, Err(refused));
+      })
+      .unwrap_or_default();
+      false
+    }
+    Unit::Gone => false,
+  }
 }
 
 /// A changeset of the changeset log a rebuild is replaying (A-767 C4, C1).

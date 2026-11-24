@@ -3823,3 +3823,101 @@ fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object(
     "every hold a's records' alone: {owners:?}"
   );
 }
+
+/// A-727 (d1a-3) (main 01a20182's ruling (u) of 2026-11-23: a hold an attempt a crash left is resolved from the homes'
+/// side once its process ended, by its repository's current holder, from its records; never on a timer). Do: on a
+/// store-backed shard (one node, `f = 0`: the home and the holder are this node), push stock git's `create` whole, its
+/// holds settled to its records; then hold one of its objects again, and an object no record names, for an attempt of
+/// the repository in an earlier process of this member; hold another object for a live attempt of this process, and one
+/// for an earlier process's attempt of a repository no shard here holds; run a resolution pass. Expect: the named
+/// object's hold moved to the repository's records (nothing of the attempt left), the unnamed one let go, the live
+/// attempt's hold untouched (never asked), the unheld repository's hold kept and counted; each counted by its outcome.
+/// Failing first: every crash-left hold stayed for the home's life.
+#[test]
+fn t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records() {
+  use crate::vcs_store::homes;
+  use slates_cluster::homes::HomeOwner;
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "resolved");
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let task = slates_rt::futures::spawn(async move {
+      let pushed = homed_drive(repository, &request).await.is_ok() && settled(2).await;
+      let outcome = crate::state::with_state(|state| {
+        let (node, process) = (state.fleet.host(), state.member_process_nonce ^ 1);
+        let earlier = move |repository: [u8; 16], attempt| HomeOwner::Attempt {
+          repository,
+          node,
+          process,
+          attempt,
+        };
+        let named = homes::region_held_here().first().copied()?;
+        homes::join_owner(&named, earlier(repository.bytes, 1));
+        let (unnamed, _) = homes::keep_for_region(
+          state,
+          b"an object no record of the repository names",
+          &[earlier(repository.bytes, 2)],
+        )
+        .ok()?;
+        let live = homes::attempt_owner(state, repository.bytes);
+        let (lived, _) =
+          homes::keep_for_region(state, b"an object a live attempt holds", &[live]).ok()?;
+        let (orphan, _) = homes::keep_for_region(
+          state,
+          b"an object of a repository nobody here holds",
+          &[earlier([0xEE; 16], 3)],
+        )
+        .ok()?;
+        Some((
+          (named, unnamed),
+          (lived, live),
+          orphan,
+          (state.shard, state.shards.clone()),
+        ))
+      })
+      .flatten();
+      let Some(((named, unnamed), (lived, live), orphan, (origin, shards))) = outcome else {
+        let _ = sent.send(Err("not held".to_owned()));
+        return;
+      };
+      homes::resolve_owed();
+      homes::resolve_ended(origin, &shards, crate::fleet::live_budget()).await;
+      let seen = crate::state::with_state(|state| {
+        let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          homes::region_owners(&named),
+          homes::region_holds_here(&unnamed),
+          homes::region_owners(&lived),
+          homes::region_holds_here(&orphan),
+          [
+            counted(homes::RESOLVED_RECORD),
+            counted(homes::RESOLVED_LET_GO),
+            counted(homes::RESOLVE_KEPT),
+          ],
+        )
+      });
+      let _ = sent.send(Ok((pushed, repository, live, seen)));
+    })
+    .expect("the task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (pushed, repository, live, seen) = got.recv().expect("the pass ended").expect("held");
+  let (named, unnamed, lived, orphan, counts) = seen.expect("the shard's state");
+  assert!(pushed, "the push answered, its holds settled");
+  assert_eq!(
+    named,
+    vec![HomeOwner::Record {
+      repository: repository.bytes
+    }],
+    "the named object's hold the records' alone"
+  );
+  assert_eq!(unnamed, 0, "the unnamed object let go");
+  assert_eq!(lived, vec![live], "the live attempt's hold untouched");
+  assert_eq!(orphan, 1, "the unheld repository's hold kept");
+  assert_eq!(counts, [1, 1, 1], "each counted by its outcome");
+}

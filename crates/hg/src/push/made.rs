@@ -74,6 +74,14 @@ pub enum Unmade {
   NothingChanged,
   /// More than the admission had left.
   PastAdmission(PastAdmission),
+  /// The parent changeset, or its manifest, is one the index holds whose text was let go once landed (goal 93, C1 (1)):
+  /// its owner reads it from the node's changeset store, brings it back and makes the changeset again.
+  NotAtHand {
+    /// Its log: the changelog or the manifest log.
+    log: crate::index::Log<'static>,
+    /// Its node.
+    node: Node,
+  },
 }
 
 impl From<PastAdmission> for Unmade {
@@ -190,6 +198,16 @@ fn arrived(node: Node, p1: Node, text: Vec<u8>) -> Arrived {
   }
 }
 
+/// Why a parent's text was not read: [`Unmade::NotAtHand`] where the index `holds` its row (its text let go once landed),
+/// else [`Unmade::ParentUnknown`].
+fn not_at_hand(holds: bool, log: crate::index::Log<'static>, node: Node) -> Unmade {
+  if holds {
+    Unmade::NotAtHand { log, node }
+  } else {
+    Unmade::ParentUnknown
+  }
+}
+
 /// The parent's manifest node and entries; the null manifest's, none, for the null parent.
 fn parent_entries(
   held: &(impl Held + ?Sized),
@@ -199,14 +217,26 @@ fn parent_entries(
   if parent == NULL_NODE {
     return Ok((NULL_NODE, Entries::new()));
   }
-  let text = held.changeset_text(&parent).ok_or(Unmade::ParentUnknown)?;
+  let text = held.changeset_text(&parent).ok_or_else(|| {
+    not_at_hand(
+      held.holds_changeset(&parent),
+      crate::index::Log::Changelog,
+      parent,
+    )
+  })?;
   let manifest = changeset::decode(&text)
     .and_then(|read| read.manifest_node())
     .map_err(|_| Unmade::ParentUnknown)?;
   if manifest == NULL_NODE {
     return Ok((NULL_NODE, Entries::new()));
   }
-  let listed = held.manifest_text(&manifest).ok_or(Unmade::ParentUnknown)?;
+  let listed = held.manifest_text(&manifest).ok_or_else(|| {
+    not_at_hand(
+      held.holds_manifest(&manifest),
+      crate::index::Log::Manifest,
+      manifest,
+    )
+  })?;
   admission.charge(to_u64(listed.len()))?;
   let entries = manifest::decode(&listed)
     .map_err(|_| Unmade::ParentUnknown)?

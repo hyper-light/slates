@@ -166,27 +166,37 @@ impl Increment {
   /// file whose length after depends on its base is read, as the apply may make it.
   pub fn replay_reads(&self, applied: &[crate::chain_entry::Applied]) -> Vec<bool> {
     let changed = changed_files(applied);
-    let wholes = self.named_wholes(&changed);
-    let overlaps = |op: &Op, (from, to): (u64, u64)| {
-      op.src != u64::MAX && op.src < to && op.src.saturating_add(op.len) > from
-    };
-    self
-      .run_spans()
-      .enumerate()
-      .map(|(at, span)| {
-        let named_whole = wholes.iter().any(|(_, run)| *run == at);
-        let read_elsewhere = changed.iter().enumerate().any(|(change, (_, ops, _))| {
-          !wholes.contains(&(change, at))
-            && ops
-              .iter()
-              .any(|op| adds_content(op.kind) && overlaps(op, span))
-        });
-        let payload = self.doc.ops.iter().any(|op| {
-          matches!(op.kind, OpKind::SetXattr | OpKind::Mknod | OpKind::Symlink)
-            && overlaps(op, span)
-        });
-        !named_whole || read_elsewhere || payload
-      })
+    let spans: Vec<(u64, u64)> = self.run_spans().collect();
+    // Each change makes at most one run whole; each run is marked read by any byte another change or a payload takes
+    // of it, every operation placed by halving the runs' ascending spans: linear in the entry (A-887's watchdog red).
+    let mut whole_of: Vec<Option<usize>> = vec![None; changed.len()];
+    let mut named_whole = vec![false; spans.len()];
+    for (change, run) in self.named_wholes(&changed) {
+      if let Some(slot) = whole_of.get_mut(change) {
+        *slot = Some(run);
+      }
+      if let Some(named) = named_whole.get_mut(run) {
+        *named = true;
+      }
+    }
+    let mut read = vec![false; spans.len()];
+    for ((_, ops, _), whole) in changed.iter().zip(&whole_of) {
+      for op in ops.iter().filter(|op| adds_content(op.kind)) {
+        mark_runs_read(&spans, op, *whole, &mut read);
+      }
+    }
+    for op in self
+      .doc
+      .ops
+      .iter()
+      .filter(|op| matches!(op.kind, OpKind::SetXattr | OpKind::Mknod | OpKind::Symlink))
+    {
+      mark_runs_read(&spans, op, None, &mut read);
+    }
+    named_whole
+      .iter()
+      .zip(read)
+      .map(|(named, read)| !named || read)
       .collect()
   }
 
@@ -227,10 +237,14 @@ impl Increment {
       let Some(op) = whole_adding_op(ops, *created) else {
         continue;
       };
-      let found = spans.iter().zip(&self.named.runs).position(|(span, run)| {
-        op.src == span.0 && op.len == run.len && run.offset == 0 && run.len == run.identity.len
+      // The run beginning where the operation reads, found by halving the ascending spans.
+      let Ok(run) = spans.binary_search_by_key(&op.src, |span| span.0) else {
+        continue;
+      };
+      let whole = self.named.runs.get(run).is_some_and(|named| {
+        op.len == named.len && named.offset == 0 && named.len == named.identity.len
       });
-      if let Some(run) = found {
+      if whole {
         wholes.push((change, run));
       }
     }
@@ -1893,6 +1907,26 @@ fn whole_adding_op(ops: &[Op], created: bool) -> Option<&Op> {
 /// before (A-887: a recovery brings back a named base only for a change that reads it).
 pub fn splice_reads_base(ops: &[Op]) -> bool {
   whole_adding_op(ops, false).is_none()
+}
+
+/// Marks read every run of `spans` (ascending, each from its first byte to past its last) that `op` takes a byte of, but
+/// `except`, the run its change makes whole ([`Increment::replay_reads`]): the first found by halving, the rest in turn.
+fn mark_runs_read(spans: &[(u64, u64)], op: &Op, except: Option<usize>, read: &mut [bool]) {
+  if op.src == u64::MAX {
+    return;
+  }
+  let end = op.src.saturating_add(op.len);
+  let first = spans.partition_point(|span| span.1 <= op.src);
+  for (at, span) in spans.iter().enumerate().skip(first) {
+    if span.0 >= end {
+      break;
+    }
+    if Some(at) != except
+      && let Some(marked) = read.get_mut(at)
+    {
+      *marked = true;
+    }
+  }
 }
 
 /// Whether an operation of `kind` adds bytes to a file from the post-state.

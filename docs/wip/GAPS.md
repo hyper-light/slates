@@ -167,10 +167,24 @@
 > **OPEN (A-727 (d1a), w-shared; main 01a20182's rulings of 2026-11-23): region holds name their owners; what is owed.**
 > BUILT: an attempt's holds move to its records at its commit and are let go at its refusal (`homes::settle_later`), so
 > a refused push holds nothing and another repository's hold of the same object stays; the image and the home wire carry
-> owners, version 2, refusing the old forms typed. OWED (d1a-3): an attempt a crash left between homing and its end
-> (or whose settle a home did not answer, counted `vcs_store.homes.settle_unanswered`) keeps its holds until it is
-> resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's current owner;
-> bounded meanwhile by the attempts a crash or a lost answer left, each one's homed objects. OWED (fleet memory, one item
+> owners, version 2, refusing the old forms typed. BUILT (d1a-3): an attempt a crash left between homing and its end
+> is resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's holder, a pass
+> owed by an event (a death, a new process, a start, a new configuration, and a repository's rebuild on its successor,
+> told to every member by `HomeMessage::Rebuilt`, home wire version 0x83, until each answers); red first, the unreachable
+> holder's fleet test, its rebuild held until a pass kept every hold, then resolved by the rebuild's event alone. An
+> ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
+> resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
+> for it (`git_fleet`) until the creation does.
+> **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
+> disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
+> agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
+> the failing runs of the healer flake), `Daemon::repository_takeover`'s fifth flag (the repository in
+> `partition().repositories()`, observed on each of `Daemon::shards` and OR'd) read false on both survivors at the end,
+> while a period watch on the rebuilder (`call_within` to `state.shards[partition]`, the shard `fleet`'s
+> `rebuild_adopted_repositories` rebuilt it on, the same accessor) read it held for 3,980 to 3,985 consecutive periods,
+> its counters rebuilt 1, unrebuilt 0. The flag was dropped from the view; the disagreement may be a real inconsistency
+> between the observed shard and the routed one, not a bad flag: start from comparing `Daemon::shards` with
+> `state.shards` and the shard `verbs::owner_of` routes a repository id to. OWED (fleet memory, one item
 > for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
 > in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
 > should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
@@ -1236,8 +1250,11 @@
 >   brings back through its fork what was let go before its entry commits; a replay reads no run its apply names whole,
 >   and recovery rebuilds a green whose replay reads a named base after the stores whose index resolves it. Reds green:
 >   the naming, a mount's read, an in-place edit, a second work naming the same bytes, two restarts. Owed: main's rerun
->   of the 57k lifetimes sampler (the greens' bytes the gate); a takeover's re-adoption of a Mercurial green brings back
->   no named base (`green_adopt::readopt_with` runs svn's live pre-pass alone); git as its own piece.
+>   of the 57k lifetimes sampler (the greens' bytes the gate; VERIFIED r851, 2026-11-24: live under the mapped floor
+>   at the push's end 114,954,401 B against r583's ~170 MB, the greens' heap copies gone); git as its own piece. A
+>   takeover's re-adoption brings back the named bases a Mercurial green's replay reads, by the plan a recovery runs
+>   (`hg_named::bring_back_named_live`, 2026-11-24; red `a_readopted_green_brings_back_the_named_base_its_chain_splices_first`:
+>   not re-adopted, the edit's replay fencing `ContentMissing`).
 > - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
 >   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
 >   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no
@@ -1374,8 +1391,18 @@
 >   `Store::log_text_len`, `Store::manifest_entry`, `Walk::log_texts_asked`), and a lookup's `.hgtags` reading asks the
 >   heads' manifests first (`Repository::manifest_not_at_hand`); held by
 >   `a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store` (a clone and a pull) and
->   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. Next: P3 (the push's work), P4 (the intake and
->   the record), P5.
+>   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. P3 BUILT (5de28ccb2): a push's work lays its
+>   trees out again once a changeset or manifest `NotAtHand` is brought back (`LAYOUT_TEXTS`,
+>   `vcs.hg.push_work_log_texts_read`). P4 BUILT (63e25a1ca): the intake asks its delta base and previous manifest
+>   through `Stepped::Store`. The reach BUILT: a stale re-base (a313f83d9) and a replay (b82590ddf; changeset texts
+>   batched by the record's room, `vcs_store.hg_replay_texts_asked`) ask likewise; a push's segment record reads no
+>   text (a guard). P4b BUILT: a made changeset brings its parent's texts back before it is made, in one place
+>   (`hg_made::parent_texts_at_hand`, `vcs.hg.made_parent_texts_read`; the deferred path makes in its landing task).
+>   Found and closed with it: a Mercurial green's second deferred submit was unmade `NotHead` and its version committed
+>   with nothing behind it, the held verdict's preview (a branch whose head is its version 1, `Lineage::preview`) read at
+>   the green's own versions; every made-changeset test submitted once, which hid it
+>   (`a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset`). Next: the commit-alone reds with w-svn's
+>   `commit_held` guard (A-891), then P5.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
@@ -4421,8 +4448,19 @@
 > `push::check_entry`), so the step is not refused after it applied anything; held by
 > `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` and
 > `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version` (each red before: accepted at version 1, no revision).
-> Owed to their owners (main's sweep): git's and Mercurial's made commits still commit a version alone when their
-> commit is unmade or their tool refuses, through `made_commit::commit`. (c) a Mercurial
+> Git's half BUILT (w-git, 2026-11-23 and 24): a git made commit goes only through `made_commit::commit_guarded`
+> (`commits::guard_made`: the record written, the register's entry judged, the store committed, before anything
+> applies), `refuse` (its commit not made: refused typed and recorded, nothing applied), `give_up` and `abandon` (its
+> changeset not landed: retryable); held by `t_a888_git_a_made_commit_not_made_refuses_its_submit_with_nothing_applied`
+> and `t_a888_git_a_made_commits_refused_entry_refuses_its_submit_with_nothing_applied` (red first at 22a88984b), and a
+> bare git submit is refused `RecordedSubmitRequired` since A-896. Mercurial's half BUILT (w-hg, 2026-11-24): a
+> Mercurial made changeset goes only through `made_commit::commit_guarded` (`hg_made::guard_made`: the record's node,
+> its fork not made stale, the register's entry judged, before anything applies; `apply_made` appends it) and `refuse`
+> (its changeset not made or its landing refused: refused typed, `hg_made::Unmade::refusal`), `abandon` where the store
+> refused it; a bare Mercurial submit is refused `RecordedSubmitRequired` and the bare path is gone; held by the four
+> `hg_made` reds `a_deferred_submit_whose_*_commits_no_version_alone` and
+> `a_bare_submit_to_a_mercurial_green_is_refused_recorded_submit_required`. `made_commit::commit`, with no caller left,
+> is removed (agreed with w-git). (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

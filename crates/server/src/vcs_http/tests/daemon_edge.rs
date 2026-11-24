@@ -3521,21 +3521,32 @@ pub(crate) fn whole_fetch_of(wants: &[ObjectId]) -> Vec<u8> {
 }
 
 /// The room the answer to `fetch` of repository `name` takes, answered whole on its shard in an unbounded room: what its
-/// walk's tables, its request and its pack's buffers are charged.
-fn room_needed(daemon: &Daemon, name: &str, fetch: &[u8]) -> u64 {
+/// walk's tables, its request and its pack's buffers are charged; and the shard steps it took. It runs as a task of the
+/// repository's shard, one step its request's serve and then one step each write of its answer, yielding between them,
+/// as the edge's own answer runs: answered whole in one step, it held the shard past the watchdog's window under
+/// ThreadSanitizer's slowdown (main's TSan lane, run 45385055058: 23,056 ms of CPU against a 22,998 ms window, the lib
+/// run killed).
+fn room_needed(daemon: &Daemon, name: &str, fetch: &[u8]) -> (u64, u64) {
   let (name, fetch) = (name.to_owned(), fetch.to_vec());
-  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let id = state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(&name)
-      .expect("the repository")
-      .id;
+  let measured = move || async move {
+    let lent = |step: &mut dyn FnMut(&mut crate::state::ShardState)| {
+      crate::state::with_state(|state| step(state)).expect("the shard's state")
+    };
+    let mut id = None;
+    lent(&mut |state| {
+      id = state
+        .db
+        .partition()
+        .repositories()
+        .repository_named(&name)
+        .map(|record| record.id);
+    });
+    let id = id.expect("the repository");
     let unbounded = u64::MAX >> 1;
     let mut admission = slates_git::Admission::new(unbounded);
-    let mut answer =
-      crate::vcs_store::upload::lend_on(state, (id, Some(&owner())), |served, packs| {
+    let mut answer = None;
+    lent(&mut |state| {
+      answer = crate::vcs_store::upload::lend_on(state, (id, Some(&owner())), |served, packs| {
         slates_git::upload::serve(
           served,
           slates_git::http::Version::V2,
@@ -3543,23 +3554,38 @@ fn room_needed(daemon: &Daemon, name: &str, fetch: &[u8]) -> u64 {
           packs,
           &mut admission,
         )
-      })
-      .expect("lent");
+      });
+    });
+    let mut answer = answer.expect("lent");
+    let mut steps = 1u64;
     let mut out = Vec::new();
-    while crate::vcs_store::upload::lend_on(state, (id, None), |served, packs| {
-      answer.write(
-        served,
-        packs,
-        &mut admission,
-        &mut out,
-        slates_git::pktline::MAX_LEN,
-      )
-    })
-    .expect("lent")
-      == slates_git::upload::Written::More
-    {}
-    unbounded.saturating_sub(admission.left())
-  })
+    loop {
+      slates_rt::futures::yield_now().await;
+      steps = steps.saturating_add(1);
+      let mut written = None;
+      lent(&mut |state| {
+        written = crate::vcs_store::upload::lend_on(state, (id, None), |served, packs| {
+          answer.write(
+            served,
+            packs,
+            &mut admission,
+            &mut out,
+            slates_git::pktline::MAX_LEN,
+          )
+        });
+      });
+      if written.expect("lent") != slates_git::upload::Written::More {
+        break;
+      }
+    }
+    (unbounded.saturating_sub(admission.left()), steps)
+  };
+  crate::test_store::run_at(
+    daemon,
+    REPOSITORY,
+    measured,
+    std::time::Duration::from_nanos(patience_ns()),
+  )
 }
 
 /// The first bytes of `answer`, as text, for a failure's message.
@@ -3591,10 +3617,14 @@ fn a_clone_of_git_gits_many_refs_is_answered_whole_over_the_daemons_edge() {
   let created = pushed(edge, &name, &request);
   let edge_room = crate::vcs_http::daemon_edge::bounds_of(daemon.config()).room;
   let fetch = whole_fetch_of(&wants);
-  let needed = room_needed(&daemon, &name, &fetch);
+  let (needed, steps) = room_needed(&daemon, &name, &fetch);
   let fetched = uploaded(edge, &name, &fetch);
   daemon.stop();
   assert_eq!(created.0, 200, "{}", opening(&created.1));
+  assert!(
+    steps > 2,
+    "the measurement took its answer's writes a shard step each: {steps} steps"
+  );
   assert!(
     needed > edge_room,
     "the shape's answer needs {needed}, within one region's {edge_room}"

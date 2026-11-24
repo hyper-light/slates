@@ -3408,55 +3408,14 @@ fn working_copies_compared(
 /// HTTP): one difference at line 1,608,541, the same deletions of `trunk/templates/` in another order. A record's body
 /// is skipped by its `Content-length`, so no text it carries is read as a record.
 fn sibling_deletes_in_order(dump: &str) -> String {
-  let bytes = dump.as_bytes();
-  // Each record: its bytes, and the path it deletes where it is a deletion alone.
-  let mut records: Vec<(&[u8], Option<&str>)> = Vec::new();
-  let mut at = 0;
-  while at < bytes.len() {
-    let start = at;
-    let mut path = None;
-    let mut deletes = false;
-    let mut other_header = false;
-    let mut content = 0usize;
-    // Its headers, to the blank line that ends them.
-    while at < bytes.len() {
-      let end = bytes[at..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(bytes.len(), |line| at + line + 1);
-      let line = std::str::from_utf8(&bytes[at..end])
-        .unwrap_or("")
-        .trim_end_matches('\n');
-      at = end;
-      if line.is_empty() {
-        break;
-      }
-      if let Some(named) = line.strip_prefix("Node-path: ") {
-        path = Some(named);
-      } else if line == "Node-action: delete" {
-        deletes = true;
-      } else if let Some(length) = line.strip_prefix("Content-length: ") {
-        content = length.parse().unwrap_or(0);
-        other_header = true;
-      } else {
-        other_header = true;
-      }
-    }
-    // Its body, then the blank lines after it.
-    at = (at + content).min(bytes.len());
-    while bytes.get(at) == Some(&b'\n') {
-      at += 1;
-    }
-    let deletion = (deletes && !other_header).then_some(path).flatten();
-    records.push((&bytes[start..at], deletion));
-  }
+  let records = dump_records(dump);
   let parent = |path: &str| {
     path
       .rsplit_once('/')
       .map_or("", |(parent, _)| parent)
       .to_owned()
   };
-  let mut out = Vec::with_capacity(bytes.len());
+  let mut out = Vec::with_capacity(dump.len());
   let mut index = 0;
   while index < records.len() {
     let Some(first) = records[index].1 else {
@@ -3480,6 +3439,63 @@ fn sibling_deletes_in_order(dump: &str) -> String {
     index = end;
   }
   String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One record of an `svnrdump` stream as [`sibling_deletes_in_order`] reads it: its bytes, and the path it deletes where
+/// it is a deletion alone.
+type DumpRecord<'a> = (&'a [u8], Option<&'a str>);
+
+/// The records of `dump` in order ([`sibling_deletes_in_order`]): each one's headers to the blank line that ends them,
+/// then its body by its `Content-length`, then the blank lines after it.
+fn dump_records(dump: &str) -> Vec<DumpRecord<'_>> {
+  let bytes = dump.as_bytes();
+  let mut records = Vec::new();
+  let mut at = 0;
+  while at < bytes.len() {
+    let start = at;
+    let (headers_end, deletion, content) = record_headers(dump, at);
+    at = (headers_end + content).min(bytes.len());
+    while bytes.get(at) == Some(&b'\n') {
+      at += 1;
+    }
+    records.push((&bytes[start..at], deletion));
+  }
+  records
+}
+
+/// The headers of `dump`'s record starting at `at`, to the blank line that ends them ([`dump_records`]): where they end,
+/// the path the record deletes where it is a deletion alone, and its `Content-length`.
+fn record_headers(dump: &str, mut at: usize) -> (usize, Option<&str>, usize) {
+  let bytes = dump.as_bytes();
+  let (mut path, mut deletes, mut other_header, mut content) = (None, false, false, 0usize);
+  while at < bytes.len() {
+    let end = bytes[at..]
+      .iter()
+      .position(|byte| *byte == b'\n')
+      .map_or(bytes.len(), |line| at + line + 1);
+    let line = std::str::from_utf8(&bytes[at..end])
+      .unwrap_or("")
+      .trim_end_matches('\n');
+    at = end;
+    if line.is_empty() {
+      break;
+    }
+    if let Some(named) = line.strip_prefix("Node-path: ") {
+      path = Some(named);
+    } else if line == "Node-action: delete" {
+      deletes = true;
+    } else if let Some(length) = line.strip_prefix("Content-length: ") {
+      content = length.parse().unwrap_or(0);
+      other_header = true;
+    } else {
+      other_header = true;
+    }
+  }
+  (
+    at,
+    (deletes && !other_header).then_some(path).flatten(),
+    content,
+  )
 }
 
 /// Stock's dump order of a directory's deletions is its hash's ([`sibling_deletes_in_order`]). Do: put two dumps that

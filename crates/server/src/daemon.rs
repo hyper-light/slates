@@ -1620,6 +1620,156 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-727 (d1a-3)): every hold this node's shards keep for the region, each object's identity with its
+  /// owners. A one-shot observation of each shard; the typed refusal when one could not answer.
+  pub fn region_holds(
+    &self,
+  ) -> Result<Vec<([u8; 32], Vec<slates_cluster::homes::HomeOwner>)>, ObserveError> {
+    let mut holds = Vec::new();
+    for shard in self.shards.clone() {
+      holds.extend(self.observe(Some(shard), |_| {
+        crate::vcs_store::homes::region_holds_owned()
+      })?);
+    }
+    Ok(holds)
+  }
+
+  /// Test support, a fleet test's kill point (A-727 (d1a-3)): every shard's settles of its attempts' holds wait unsent
+  /// while `held` (`vcs_store::homes::hold_settles`), so a stop then leaves them unsent, as a crash after an attempt's
+  /// end and before its homes heard does.
+  pub fn hold_home_settles(&self, held: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.clone() {
+      self.observe(Some(shard), move |_| {
+        crate::vcs_store::homes::hold_settles(held);
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support (A-727 (d1a-3)): this node's resolutions of crash-left holds answer unresolved while `held`, as when
+  /// the repository's holder is unreachable (`vcs_store::homes::hold_resolutions`).
+  pub fn hold_home_resolutions(&self, held: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |_| {
+      crate::vcs_store::homes::hold_resolutions(held);
+    })
+  }
+
+  /// Test support (A-727 (d1a-3)): owes this node a resolution pass, as the healer's pass at a new configuration does
+  /// (`vcs_store::homes::resolve_owed`); the region's period turn runs it.
+  pub fn owe_home_resolution(&self) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), |_| {
+      crate::vcs_store::homes::resolve_owed();
+    })
+  }
+
+  /// Test support (A-727 (d1a)): the most nanoseconds one homing on this node spent on its other homes, across its
+  /// shards (`vcs_store.homes.longest_homing_region_ns`).
+  pub fn longest_homing_ns(&self) -> Result<u64, ObserveError> {
+    let mut longest = 0u64;
+    for shard in self.shards.clone() {
+      let here = self.observe(Some(shard), |s| {
+        s.refusals
+          .get(crate::vcs_store::homes::HOMING_LONGEST_REGION_NS)
+          .copied()
+          .unwrap_or(0)
+      })?;
+      longest = longest.max(here);
+    }
+    Ok(longest)
+  }
+
+  /// Test support (A-727 (d1a)): the deadline a homing waits its homes within (`fleet::live_budget`), nanoseconds.
+  pub fn homing_budget_ns(&self) -> u64 {
+    crate::fleet::live_budget().max_deadline_ns()
+  }
+
+  /// Test support (A-727 (d1a-3)'s trace of a repository's takeover, A-636 part 2c): across this node's shards, whether
+  /// one holds the register of `repository`'s record, holds it adopted and pending, still learns a register of its
+  /// family, and still waits to materialize a green of it; and its takeover counters (adopted, rebuilt, not rebuilt).
+  pub fn repository_takeover(
+    &self,
+    repository: [u8; 16],
+  ) -> Result<([bool; 4], [u64; 3]), ObserveError> {
+    let object = slates_db::register::ObjectId(repository);
+    let mut view = [false; 4];
+    let mut counts = [0u64; 3];
+    for shard in self.shards.clone() {
+      let (seen, counted) = self.observe(Some(shard), move |s| {
+        let counted = |name: &str| s.refusals.get(name).copied().unwrap_or(0);
+        (
+          crate::takeover::repository_takeover_view(s, object),
+          [
+            counted(crate::takeover::TAKEOVER_REPOSITORY_ADOPTED),
+            counted(crate::takeover::TAKEOVER_REPOSITORY_REBUILT),
+            counted(crate::takeover::TAKEOVER_REPOSITORY_UNREBUILT),
+          ],
+        )
+      })?;
+      for (into, at) in view.iter_mut().zip(seen) {
+        *into |= at;
+      }
+      for (into, at) in counts.iter_mut().zip(counted) {
+        *into = into.saturating_add(at);
+      }
+    }
+    Ok((view, counts))
+  }
+
+  /// Test support (A-727 (d1a-3)): owes this node a heal walk of every region hold, as a new configuration does
+  /// (`vcs_store::homes::owe_heal_walk`); the region's period turn runs it.
+  pub fn owe_heal_walk(&self) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), |_| {
+      crate::vcs_store::homes::owe_heal_walk();
+    })
+  }
+
+  /// Test support (A-727 (d1a-3)): whether this node's heal walk of its current configuration has run through.
+  pub fn heal_walk_done(&self) -> Result<bool, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::vcs_store::homes::heal_walk_done(s.fleet.configuration().version)
+    })
+  }
+
+  /// Test support (A-727 (d1a-3)): this node's healer counts: objects offered, and offered or held back without an
+  /// ended attempt among their owners.
+  pub fn heal_counts(&self) -> Result<[u64; 2], ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let counted = |name: &str| s.refusals.get(name).copied().unwrap_or(0);
+      [
+        counted(crate::vcs_store::homes::HEAL_OFFERED),
+        counted(crate::vcs_store::homes::HEAL_ENDED_WITHHELD),
+      ]
+    })
+  }
+
+  /// Test support (A-727 (d1a-3)): holds every rebuild of a repository this node took over while `held`
+  /// (`fleet::hold_repository_rebuilds`), so a test orders a resolution pass before a rebuild.
+  pub fn hold_repository_rebuilds(&self, held: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |_| {
+      crate::fleet::hold_repository_rebuilds(held);
+    })
+  }
+
+  /// Test support (A-727 (d1a-3)): this node's resolutions so far: holds moved to their records, let go, and kept.
+  pub fn home_resolutions(&self) -> Result<[u64; 3], ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let counted = |name: &str| s.refusals.get(name).copied().unwrap_or(0);
+      [
+        counted(crate::vcs_store::homes::RESOLVED_RECORD),
+        counted(crate::vcs_store::homes::RESOLVED_LET_GO),
+        counted(crate::vcs_store::homes::RESOLVE_KEPT),
+      ]
+    })
+  }
+
+  /// Test support (A-727 (d1a)): this node answers every home message as a node of another home-wire version does
+  /// while `on` (`vcs_store::homes::answer_as_another_version`).
+  pub fn answer_homes_as_another_version(&self, on: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |_| {
+      crate::vcs_store::homes::answer_as_another_version(on);
+    })
+  }
+
   /// Test support: the version at which the council's configuration fixed `member`'s settled neighbourhood
   /// and the version its current neighbourhood was fixed at (§4.8 "Neighbourhood changes"): equal once the
   /// member has reported its change placed and the council settled it; `None` for a non-member. A one-shot
@@ -6680,6 +6830,19 @@ async fn boot_before_claims(listener: &mut Listener, control: u16, shards: &[Sha
   true
 }
 
+/// Marks in the anchor's segment that this daemon serves (`slates_anchor::layout::SUP_SERVING`), now in the heartbeat's
+/// host domain, over a mapping of its own; nothing where the segment cannot be mapped or holds no supervision block.
+fn mark_serving(handoff: &Handoff, len: usize, identity: &Identity) {
+  let Ok(segment) = AnchorSegment::attach(handoff, len, identity) else {
+    return;
+  };
+  if let Ok(supervision) = segment.supervision() {
+    supervision.mark_serving(slates_vfs::clock::Clock::monotonic_ns(
+      &mut slates_vfs::clock::HostClock::new(),
+    ));
+  }
+}
+
 /// The control shard's loop: the rendezvous, the heartbeat, and a client handed to its shard
 /// as a spawned task (sharing by move). Every client region is named under `region_names`
 /// ([`region_name_key`]).
@@ -6733,6 +6896,13 @@ async fn control_loop(
   // daemon served at once, so a create the moment it served was refused.
   #[cfg(windows)]
   crate::content_extents::hold_before_serving(&config).await;
+  // The start is done, every shard's recovery included: this loop runs on the control shard, which runs nothing until
+  // its own start ends, and the boot above asked every other shard, each answering only once its start ended. An exit
+  // from here on is a daemon that recovered, which the anchor's restart bound does not count; one before is a failed
+  // start (`slates_anchor::layout::SUP_SERVING`, A-311). Until 2026-11-24 the daemon's role marked it as soon as
+  // `Daemon::start` returned, before any shard's start ended: a start that spun past its window on every restart was
+  // never counted (r865, 1,189 restarts in 44 minutes).
+  mark_serving(&handoff, len, &identity);
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the

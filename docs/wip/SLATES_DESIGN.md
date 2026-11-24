@@ -56056,6 +56056,39 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
     `git_push::tests::t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region` (red first: the
     names' hold stayed for the home's life), `t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object`,
     and slates-cluster `homes::tests::a_home_message_of_another_version_or_without_an_owner_is_refused_typed`.
+  - **(d1a-3) A crash-left attempt's holds are resolved from the homes' side** (main 01a20182's rulings of 2026-11-23,
+    (u), and of 2026-11-24 01:36). A home's holds for an attempt whose process ended (`homes::process_ended`: this
+    member's earlier process, a member dead, or one announcing another process nonce) are asked of the repository's
+    holder (`homes::resolve_one`: this node first, then its routing, then the committed configuration's lineage, then a
+    location round), which walks the repository's records a slice a turn (`homes::resolve_step`): named, the hold moves
+    to the records; not named, it is let go; unanswered, it stays, counted `vcs_store.homes.resolve_kept`. A pass is owed
+    by an event, never a timer: a member's death, a member's new process, this node's start, the healer's pass at a new
+    configuration, **and a repository's rebuild on its successor** (`homes::rebuilt`, at `takeover`'s rebuild, A-636
+    part 2c-2): the answer a resolution asks for exists only once the repository stands there, so a pass the death or the
+    configuration owed, run before the rebuild, keeps every hold, and before this nothing asked again (flaky by
+    construction: three of four runs of the unreachable test red, the green one where a pass fell after the rebuild).
+    The rebuilder owes itself a pass and owes each other member of the configuration word of the rebuild
+    (`HomeMessage::Rebuilt`, home wire version 0x83), told from its period until the member answers that it owes itself a
+    pass (`HomeOutcome::Owed`; owing twice is harmless), an unanswered one asked again next period and counted
+    (`vcs_store.homes.rebuilt_unanswered`), one whose member left the configuration dropped: bounded by the members a
+    rebuild, one word each per takeover, at membership-change time (D-14). A member of version 0x82 is refused at once,
+    typed, by (d1a)'s version rule. **An ended attempt is never spread, only resolved, so the resolution's answer is
+    the only way a hold changes owner** (main 01a20182's ruling of 2026-11-24 04:40): the healer offers an object for
+    every owner its hold has except an ended attempt (`homes::heal_one`, judged by `process_ended` on the control
+    shard; counted `vcs_store.homes.heal_ended_withheld`), and one whose every owner is an ended attempt waits where it
+    is until its resolution moves it to the records or lets it go. Before, a home not yet resolved offered the attempt
+    to one that had moved it to the records, which joined it back after its last owed pass, and the hold stayed an
+    attempt's (the group runs' flake, 1 in 4: the logs showed each hold moved to the records, then the attempt back
+    beside them). Tests: `git_push::tests::t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records`
+    (N = 1), and the fleet's `t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_next_pass`
+    (every survivor's rebuild held until a pass ran and kept every hold, then let go with nothing more owed: resolved by
+    the rebuild's event alone; red without it), `..._an_owner_killed_after_its_entry_before_its_homes_heard_...`,
+    `..._an_owner_killed_after_homing_before_its_entry_...` (the other nodes refuse the owner's register records once its
+    repository is made, so its push is refused after homing), `..._a_healer_never_spreads_an_ended_attempt_to_a_home_that_resolved_it`
+    (one survivor resolved and its resolutions then held, the other walks its holds still the attempt's: the first's stay
+    its records' alone; red without the filter) and `..._a_push_homing_to_a_node_of_another_home_wire_version_...`
+    (judged by the homing's own time with its other homes against its deadline,
+    `vcs_store.homes.longest_homing_region_ns`, never a push's wall time).
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
 - **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
@@ -58087,7 +58120,10 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   base and from any), its object whole, and read by no other change nor by a payload of the document (an attribute's,
   a node's, a link's value). The replay reads those (`read_step_among`), the apply waits on those alone
   (`unread_among`), and a recovery's pre-pass brings back no other (`svn_texts::named_lacking`). The post-state places
-  each run by its declared length (`named::Post`), so a run never read moves no later run's address. Red:
+  each run by its declared length (`named::Post`), so a run never read moves no later run's address. The choice is n log
+  n in the entry's operations (a whole operation's run found by halving the runs' ascending spans, each run's other
+  readers marked in one pass): first written cubic, it ran past a shard's liveness window on a push of a history's
+  tree (docs/bugs/2026-11-24-a-replays-choice-of-named-runs-was-cubic-in-a-pushs-files.md). Red:
   `repository::hg_push::tests::a_restart_replays_a_push_naming_its_files_without_reading_their_texts` (the green fenced
   `ContentMissing { version: 1 }`, the push's runs read from a content store that had let them go).
 
@@ -62650,7 +62686,9 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   needs an index and the branches made from them (`verbs::rebuilt_after_stores`, counted
   `merge.recovery.greens_after_stores`), in the same recovery. Their works wait as a work over a green awaiting
   adoption does (`work_home.unbuilt`), replayed through the green once it is in, before any client is admitted. The
-  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). Rejected: recovering
+  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). A takeover's
+  re-adoption runs the same plan on its live shard before it replays (`hg_named::bring_back_named_live` beside
+  `svn_texts::bring_back_named_live` in `green_adopt::readopt_with`; one planner, `hg_named::to_bring`). Rejected: recovering
   one repository's store before its greens (a store's replay reads greens: an import's bookmarks, a cycle), and a
   second resolver over the node's store without the index.
 - **Counters.** `repository.push.files_named` (named rather than made); `vcs.hg.pushed_texts_brought_back` (a named
@@ -63011,6 +63049,24 @@ its serve tests, `crates/server/src/virtiofs.rs`, `crates/server/src/vcs_store/n
 
 Applied in the same change to: GAPS (GAP-A9-14's row), `crates/server/src/{virtiofs,mounted_work}.rs`,
 `crates/server/tests/virtiofs.rs`.
+
+### A-900 — A lineage member is lent in place: no engine moved by value, none made or dropped for a lend (2026-11-24, w-svn for main 01a20182, its order of 2026-11-23 and approval of 2026-11-24 04:42; goal 93's speed list; amends A-575's `Lent`)
+
+- **What was there.** A lend of a lineage's member (`Lent`, A-575) took the member's engine out of its seat by value
+  into the lineage's slot for the one member out, with the arenas swapped into it, and its drop put it back by value
+  after taking an empty engine into the slot (`mem::take`). Every lend, a read-only one too (`Greens::is_owing`,
+  `repository::branch_version`), moved a `Green` twice and made and dropped an empty one: w-git's push profile counted
+  about 10,000 memmove samples in 30 s there.
+- **The rule.** A lend is made in place: `Lent::new` swaps the lineage's arenas into the seated engine and marks it out,
+  the guard reads and writes it where it sits, and its drop swaps the arenas back. No engine is moved by value, and
+  none is made or dropped for a lend. `Lineage::take` and `put_back`, which move an engine out by value, stay for a
+  replay that holds one across slices. `Lineage::lend_counts` counts engines taken by value, lends made in place and
+  engines dropped making a lend, the non-vacuity counters of the rule.
+- **Evidence.** `a_lend_moves_no_engine_and_drops_none` (`crates/merge/src/engine/branch/tests.rs`): one lend counted
+  `(taken, dropped, borrowed) = (1, 1, 0)` before, `(0, 0, 1)` after (macOS, debug, 2026-11-24); the merge crate's
+  tests and the server's lend-heavy filters pass (counts in the commit). Owed: main's push profile again.
+
+Applied in the same change to: `crates/merge/src/engine/branch.rs` and its tests.
 
 ### A-897 — 84a's every-run bar on Windows bare metal is held back by stalls of the path's own threads, which no scheduling change on slates' side removes; the bench names whose time each slow sample is (2026-11-24, w-84a-win for main 01a20182, its rulings of 2026-11-24 04:55 and 05:35; goal 84a; A-871, A-799, A-326, A-559)
 

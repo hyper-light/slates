@@ -512,7 +512,8 @@ async fn readopt_one(control: u16, owner: u16, id: DbVolumeId, through: u64) -> 
 /// First, as a task of the owner shard, the named texts the green's own checkpoint and chain name that the content
 /// store does not hold whole are brought back from the node's changeset store, as a recovery's pre-pass brings them
 /// (`svn_texts::bring_back_named_live`; A-869), so the replay reads every name through the plane; their holds are given
-/// back once the green is installed or fenced. End to end this stays unreachable for a Subversion green until A-727
+/// back once the green is installed or fenced. A Mercurial green's named bases its replay reads come back the same way,
+/// by the plan a recovery runs (`hg_named::bring_back_named_live`, A-887), and are let go again after. End to end this stays unreachable for a Subversion green until A-727
 /// (d): the engine handed is the holder's replica, which reads no named content, so an svn takeover fails today at
 /// the replica's build, whose recomputed versions' named runs it does not read.
 pub(crate) async fn readopt_with(
@@ -523,6 +524,12 @@ pub(crate) async fn readopt_with(
 ) -> Option<bool> {
   let brought = crate::xshard::task_to_its_end(control, owner, move || {
     crate::vcs_store::svn_texts::bring_back_named_live(id)
+  })
+  .await
+  .unwrap_or_default();
+  // A Mercurial green's named bases its replay reads, by the plan a recovery runs (A-887).
+  let brought_hg = crate::xshard::task_to_its_end(control, owner, move || {
+    crate::vcs_store::hg_named::bring_back_named_live(id)
   })
   .await
   .unwrap_or_default();
@@ -543,6 +550,16 @@ pub(crate) async fn readopt_with(
       control,
       owner,
       move |s| crate::vcs_store::name_holds::give_back_brought(s, &brought),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+  }
+  // A landed text's bytes are the node's store's: let go again once the green is installed or fenced.
+  if !brought_hg.is_empty() {
+    let _ = crate::xshard::call_in_shard_time(
+      control,
+      owner,
+      move |s| crate::vcs_store::name_holds::let_go_landed_texts(s, &brought_hg),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;

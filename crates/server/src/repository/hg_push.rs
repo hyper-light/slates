@@ -1878,16 +1878,16 @@ async fn built_works(
           let Ok(node) = Node::try_from(object.key.as_bytes()) else {
             continue;
           };
-          let revision = (object.identity, object.path.into_bytes(), node);
-          if !named.contains(&revision) {
-            named.push(revision);
-          }
+          named.push((object.identity, object.path.into_bytes(), node));
         }
         built.insert(*key, increment);
       }
       Err(outcome) => return Some(Err(outcome)),
     }
   }
+  // Each once, in n log n: a push of a history's tree names thousands of files, a scan for each was quadratic.
+  named.sort_unstable();
+  named.dedup();
   Some(Ok((plan, (built, named))))
 }
 
@@ -2226,14 +2226,14 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
 /// Which index a bring-back finds a revision's names in (A-887): the repository's own ([`Committed`]), or a push's fork
 /// before its entry commits (`&Forked`). A type, not an `Option<&Forked>`, so the bring-back a read parks on, which
 /// never has a fork, holds nothing across its waits that cannot move between threads (a fork's index keeps cells).
-trait IndexOver: Copy {
+pub(crate) trait IndexOver: Copy {
   /// The fork, if any.
   fn forked(&self) -> Option<&Forked>;
 }
 
 /// The repository's own index ([`IndexOver`]).
 #[derive(Clone, Copy, Debug)]
-struct Committed;
+pub(crate) struct Committed;
 
 impl IndexOver for Committed {
   fn forked(&self) -> Option<&Forked> {
@@ -2319,7 +2319,7 @@ fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
 /// let go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of
 /// the revision it is against too, the delta made again from the two and put back only as the very delta its row names
 /// ([`slates_hg::push::held::bring_back_log`]). Ok where its object is held whole after; its refusal not yet counted.
-async fn bring_back_log_on<L: ShardLender, O: IndexOver>(
+pub(crate) async fn bring_back_log_on<L: ShardLender, O: IndexOver>(
   lender: &mut L,
   repository: RepositoryId,
   over: O,
