@@ -1,6 +1,6 @@
 use std::io::{Read, Write as _};
 use std::net::TcpStream as ClientStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -70,8 +70,8 @@ const HOLDER: Principal = Principal::Certificate { hash: [7; 32] };
 const USER: &[u8] = b"git";
 /// Shape: the client's channel number.
 const CLIENT_CHANNEL: u32 = 7;
-/// Shape: the client's window: room for everything these tests' commands write.
-const CLIENT_WINDOW: u32 = 1 << 20;
+/// Shape: the client's window: room for everything these tests' commands write, twice [`STREAMED`], the most of them.
+const CLIENT_WINDOW: u32 = 16 << 20;
 /// Shape: the client's packet, OpenSSH's session default (32 KiB).
 const CLIENT_PACKET: u32 = 1 << 15;
 /// Shape: what the tests' command writes first, before it waits for its client.
@@ -265,6 +265,8 @@ struct Seen {
   backoffs: [u64; 5],
   /// The key time a new session would take.
   key_time_ns: u64,
+  /// The writes still counted waiting on their clients ([`super::WRITES_WAITING`]).
+  writes_waiting: u64,
 }
 
 /// What `state` holds now.
@@ -275,6 +277,7 @@ fn seen(state: &EdgeState) -> Seen {
     learned: PHASES.map(|phase| state.learned(phase)),
     backoffs: PHASES.map(|phase| state.backoffs(phase)),
     key_time_ns: state.key_time_ns(),
+    writes_waiting: state.writes_waiting(),
   }
 }
 
@@ -355,6 +358,8 @@ where
     .context()
     .keep(edge)
     .expect("the edge's state kept on its shard");
+  // Named this shard's edge, as the daemon's `keep_here` names it, so the shard's readings find it.
+  super::HERE.with(|here| here.set(Some(state)));
   runtime
     .spawn(async move {
       let _ = serve(listener, state, make).await;
@@ -370,6 +375,7 @@ where
   let seen = state
     .with_in(runtime.context(), seen)
     .expect("the edge's state");
+  super::HERE.with(|here| here.set(None));
   (result, seen)
 }
 
@@ -947,14 +953,39 @@ impl Command for SaysWhere {
 }
 
 /// Shape: what [`Streams`] writes, within the test client's channel window ([`CLIENT_WINDOW`], never adjusted) and past
-/// what a loopback socket's buffers take at once, so a client that reads late leaves the edge's writes waiting.
-const STREAMED: usize = (1 << 20) - (64 << 10);
+/// what a loopback socket pair buffers while its reader reads nothing, so a client that reads late leaves the edge's
+/// writes waiting: 8 MiB, as the HTTP edge's `LARGE` reply. 960 KiB was not: with the client gated on a write waiting,
+/// none waited in 20 runs of 20 (2026-11-23, adacachy2).
+const STREAMED: usize = 8 << 20;
 
 thread_local! {
   /// Each write [`Streams`] heard of, as the connection reported it (`Command::paced`), on this thread: an edge runs on
   /// the test's own thread ([`served_keyed`] runs its runtime there), so each test reads only its own command's writes.
   static PACED: std::cell::RefCell<Vec<crate::vcs_store::upload::Sent>> =
     const { std::cell::RefCell::new(Vec::new()) };
+  /// How many times a [`Streams`] heard a write wait (`Command::write_waits`), on this thread.
+  static HEARD_WAITING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The most writes waiting on their clients the edge counted when a [`Streams`] heard one wait (`Command::write_waits`):
+/// set on the shard's thread, read by the client's, which reads nothing until it moves.
+static WAITING_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the edge counts a write waiting on its client within `for_ns` ([`WAITING_SEEN`]), looked at every
+/// [`TICK_NS`].
+fn a_write_waits_within(for_ns: u64) -> bool {
+  let until = Instant::now() + Duration::from_nanos(for_ns);
+  while WAITING_SEEN.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+    std::thread::park_timeout(Duration::from_nanos(TICK_NS));
+  }
+  WAITING_SEEN.load(Ordering::SeqCst) > 0
+}
+
+/// What [`Streams`] writes: [`STREAMED`] bytes, each its offset modulo 251.
+fn streamed() -> Vec<u8> {
+  (0..STREAMED)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect()
 }
 
 /// A command that writes [`STREAMED`] bytes and exits 0, keeping every write of the connection it hears of in [`PACED`].
@@ -976,9 +1007,7 @@ impl Command for Streams {
   async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     if !self.wrote {
       self.wrote = true;
-      self.out = (0..STREAMED)
-        .map(|at| u8::try_from(at % 251).unwrap())
-        .collect();
+      self.out = streamed();
     }
     Ok(Stepped {
       consumed: 0,
@@ -996,6 +1025,11 @@ impl Command for Streams {
 
   fn paced(&mut self, sent: crate::vcs_store::upload::Sent) {
     PACED.with_borrow_mut(|paced| paced.push(sent));
+  }
+
+  fn write_waits(&mut self) {
+    HEARD_WAITING.with(|heard| heard.set(heard.get().saturating_add(1)));
+    WAITING_SEEN.fetch_max(super::writes_waiting_here(), Ordering::SeqCst);
   }
 }
 
@@ -1030,14 +1064,19 @@ impl SshSite for StreamsSite {
 
 /// A-859 part A on SSH (GAPS: "the SSH edge's writes heard (SSH fetches price cold)"; main 01a20182's ruling of
 /// 2026-11-22 06:32: a link's price learned from the time the edge's writes waited for the peer, from the first that
-/// found the socket full). Do: run a command writing [`STREAMED`] bytes for a client that reads a tenth of a liveness
-/// window late, then reads it all. Expect: the client reads every byte; the command hears the connection's writes while
-/// it runs (`Command::paced`), their bytes at least what it wrote; some found the socket full and waited; and what a
-/// fetch's pacing learns from them, the bytes from that first wait on, past 256 KiB. Red before: nothing heard.
+/// found the socket full), the client's late read gated on the edge's own word (main 01a20182's ruling (a) of 2026-11-23
+/// 20:08). Do: run a command writing [`STREAMED`] bytes for a client that reads nothing until the edge counts a write
+/// waiting on it ([`super::WRITES_WAITING`], told to the command, `Command::write_waits`), then reads it all. Expect: a write
+/// counted waiting before the client read a byte; the client reads every byte, each the command's; the command hears
+/// the connection's writes while it runs (`Command::paced`), their bytes at least what it wrote; some found the socket
+/// full and waited; what a fetch's pacing learns from them, the bytes from that first wait on, past 256 KiB; and no write
+/// counted waiting once the session ends. Red before: the client read a tenth of a liveness window late, which a loaded
+/// box (adacachy2, load 35 to 70) and the TSan lane outlasted before the socket filled.
 #[test]
 fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits() {
   PACED.with_borrow_mut(Vec::clear);
-  let (transcript, _) = served_by(
+  WAITING_SEEN.store(0, Ordering::SeqCst);
+  let (session, seen) = served_by(
     ONE_SEAT,
     || StreamsSite,
     |address| {
@@ -1045,12 +1084,12 @@ fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_
       (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
       (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
       exec(&mut peer, b"git-upload-pack '/r.git'").then_some(())?;
-      // The client reads late on purpose, so the edge's writes meet a full socket.
-      pause(MOMENT_NS);
-      Some(transcript(&mut peer))
+      // Nothing is read until the edge says a write waits on this client, however slowly the edge runs.
+      let gated = a_write_waits_within(PATIENCE_NS);
+      Some((gated, transcript(&mut peer)))
     },
   );
-  let transcript = transcript.expect("the session");
+  let (gated, transcript) = session.expect("the session");
   let paced = PACED.with_borrow(Vec::clone);
   let written: u64 = paced.iter().map(|sent| sent.bytes).sum();
   let mut pacing = crate::vcs_store::upload::Pacing::default();
@@ -1059,7 +1098,15 @@ fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_
     .filter_map(|sent| pacing.sent(*sent))
     .map(|(_, bytes)| bytes)
     .sum();
-  assert_eq!(transcript.out.len(), STREAMED, "the output read whole");
+  assert!(
+    gated,
+    "a write counted waiting before the client read a byte"
+  );
+  assert!(
+    transcript.out == streamed(),
+    "every byte read, each the command's: {} of {STREAMED}",
+    transcript.out.len()
+  );
   assert!(
     written >= STREAMED as u64,
     "{written} bytes heard written of {STREAMED}"
@@ -1070,12 +1117,17 @@ fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_
     paced.len()
   );
   assert!(learned > 256 << 10, "learned {learned} bytes");
+  assert_eq!(
+    seen.writes_waiting, 0,
+    "no write counted waiting once the session ended"
+  );
 }
 
 /// A-859 part A on SSH, through the daemon's own command (w-svn's agreement of 2026-11-23): the daemon's SSH services wrap
 /// git's commands in the Subversion tunnel's `svn::EitherCommand`. Do: wrap a [`Streams`] as another service's command
-/// and tell the wrapper of a write (`Command::paced`). Expect: the command inside hears that write. Red before: the
-/// wrapper kept the trait's no-op default and the write was lost, so the daemon's git fetches over SSH priced cold.
+/// and tell the wrapper of a write (`Command::paced`), then of a write's wait (`Command::write_waits`, main 01a20182's
+/// ruling (a) of 2026-11-23 20:08). Expect: the command inside hears both. Red before: the wrapper kept the trait's no-op
+/// default and the write was lost, so the daemon's git fetches over SSH priced cold.
 #[test]
 fn a859_a_write_heard_by_the_svn_sites_command_reaches_the_git_command_it_wraps() {
   let sent = crate::vcs_store::upload::Sent {
@@ -1089,6 +1141,13 @@ fn a859_a_write_heard_by_the_svn_sites_command_reaches_the_git_command_it_wraps(
   assert!(
     PACED.with_borrow(|paced| paced.contains(&sent)),
     "the write reached the command the wrapper carries"
+  );
+  let heard = HEARD_WAITING.with(std::cell::Cell::get);
+  wrapped.write_waits();
+  assert_eq!(
+    HEARD_WAITING.with(std::cell::Cell::get),
+    heard + 1,
+    "a write's wait reached the command the wrapper carries"
   );
 }
 

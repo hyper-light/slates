@@ -26777,9 +26777,15 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   - Both A-859 tests (`vcs_http`'s and `vcs_ssh`'s, a client that reads late): none of the edge's 63 and 30 writes
     found the socket full, the client's tenth of a liveness window over before the slowed edge had filled it.
     `vcs_ssh`'s had also failed on plain Linux at a load of 35 to 70 on adacachy2, where no slowdown is declared, so a
-    scaled lateness would leave it. **Open, next:** the edges tell the exchange or command when a write first waits,
-    and status counts the writes waiting on a client now; the client reads once one waits (main 01a20182's ruling of
-    2026-11-23 20:08).
+    scaled lateness would leave it. **Fixed (2026-11-23, w-tsan; main 01a20182's ruling (a) of 20:08):** each edge
+    counts a write live from its first pend until it ends or is dropped (`vcs_http.writes_waiting`,
+    `vcs_ssh.writes_waiting` in the status report, readings, not counts) and tells the exchange or the command at that
+    pend (`Exchange::write_waits`, `Command::write_waits`, which the SSH wrappers pass on); each test's client reads
+    nothing until a write waits, then checks every byte. The SSH test's 960 KiB never filled a loopback socket pair whose
+    reader reads nothing (with the gate, no write waited in 20 runs of 20), so it writes 8 MiB, as the HTTP test's reply.
+    On adacachy2 at a load of 45 to 70: the old SSH test 0 of 20 green and the new 20 of 20; the old HTTP test 20 of 20
+    there (it failed under TSan) and the new 20 of 20; with the gate removed the HTTP client, reading at once, saw no
+    write wait in 20 runs of 20, while the SSH client, slower than its edge, still saw one in 20 of 20.
   - `memory_gauges`'s `the_control_shards_memory_status_names_glibcs_bytes_where_glibc_runs`: no `malloc_*` row, since
     the runtime's allocator replaces glibc's and glibc's figures read zero. **Fixed:** the test tells that build by
     `cfg(slates_tsan)` and expects no row there.

@@ -228,6 +228,11 @@ pub(crate) trait Command {
   /// time to the client taking its last byte, and whether it found the socket full and waited. A git fetch's answer
   /// learns its link's price from it (`crate::vcs_store::upload::Pacing`); every other command hears nothing.
   fn paced(&mut self, _sent: crate::vcs_store::upload::Sent) {}
+  /// A write of the connection to its client's socket while this command runs found the socket full and now waits for
+  /// the client (A-859; main 01a20182's ruling (a) of 2026-11-23 20:08): told at the write's first pend, once the edge
+  /// counts it live (`vcs_ssh::WRITES_WAITING`), before its [`Command::paced`]. A command that carries another passes
+  /// it on, as it passes `paced`; every other command hears nothing.
+  fn write_waits(&mut self) {}
 }
 
 /// How a site answers an `exec`.
@@ -544,6 +549,14 @@ impl<L: StoreLender, H: HgStores, S: ShardLender> Command for ToolCommand<L, H, 
       ToolCommand::Upload(command) => command.paced(sent),
       ToolCommand::Receive(command) => command.paced(sent),
       ToolCommand::Mercurial(command) => command.paced(sent),
+    }
+  }
+
+  fn write_waits(&mut self) {
+    match self {
+      ToolCommand::Upload(command) => command.write_waits(),
+      ToolCommand::Receive(command) => command.write_waits(),
+      ToolCommand::Mercurial(command) => command.write_waits(),
     }
   }
 }
