@@ -783,13 +783,18 @@ enum Turn {
   Idle,
 }
 
+thread_local! {
+  /// Shard-local read scratch shared by every SSH connection on this shard thread: connections only touch it
+  /// synchronously inside `read_now` (never across an `.await`), eliminating one permanent `READ_BYTES` heap buffer
+  /// per idle connection.
+  static SSH_READ_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// One connection: its socket, its session, its site, its waits, the principal its key proved, its command, and when
 /// it was accepted.
 struct Link<S: SshSite> {
   /// The socket.
   stream: TcpStream,
-  /// One read's buffer.
-  buffer: Vec<u8>,
   /// The client's bytes read and not yet taken by the session.
   unread: Vec<u8>,
   /// The session.
@@ -996,20 +1001,58 @@ impl<S: SshSite> Link<S> {
     }
   }
 
-  /// Reads the client's bytes into the session, within the phase's wait and the session's own timer; the client's close
-  /// ends the loop.
+  /// Reads whatever bytes are currently queued on the stream into `self.unread` via [`SSH_READ_SCRATCH`].
+  fn read_now_into_unread(&mut self) -> Result<Option<usize>, RtError> {
+    SSH_READ_SCRATCH.with(|cell| {
+      let mut buf = cell.borrow_mut();
+      if buf.len() < READ_BYTES {
+        buf.resize(READ_BYTES, 0);
+      }
+      match self.stream.read_now(buf.as_mut_slice()) {
+        Ok(Some(count)) => {
+          if count > 0 {
+            self
+              .unread
+              .extend_from_slice(buf.get(..count).unwrap_or_default());
+          }
+          Ok(Some(count))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+      }
+    })
+  }
+
+  /// Reads the client's bytes into the session via [`SSH_READ_SCRATCH`], within the phase's wait and the session's
+  /// own timer, holding zero per-connection read buffer while waiting; the client's close ends the loop.
   async fn read(&mut self) -> Result<(), Why> {
     let (deadline_ns, overdue) = self.armed()?;
-    let marker = self.marker(overdue);
+    let mut marker = self.marker(overdue);
     let timer_ns = self.session.next_timer_ns();
-    let outcome = awaited(
-      self.stream.read(&mut self.buffer),
-      deadline_ns,
-      timer_ns,
-      marker,
-    )
-    .await;
-    match self.settle(outcome)? {
+    let mut marked = false;
+    let waited = loop {
+      match self.read_now_into_unread() {
+        Ok(Some(count)) => break Waited::Done(Ok(count)),
+        Err(error) => break Waited::Done(Err(error)),
+        Ok(None) => {
+          let (ready, was_overdue) = awaited(
+            self.stream.wait_readable(),
+            deadline_ns,
+            timer_ns,
+            &mut marker,
+          )
+          .await;
+          marked |= was_overdue;
+          match ready {
+            Waited::Done(Ok(())) => {}
+            Waited::Done(Err(error)) => break Waited::Done(Err(error)),
+            Waited::Timer => break Waited::Timer,
+            Waited::Failed => break Waited::Failed,
+          }
+        }
+      }
+    };
+    match self.settle((waited, marked))? {
       Some(Ok(0)) => {
         // The client left: a closing connection's wait ends as it should; any other wait's true length is unknown.
         if self.phase == Phase::Closing {
@@ -1020,10 +1063,7 @@ impl<S: SshSite> Link<S> {
         }
         Err(Why::Closed)
       }
-      Some(Ok(count)) => {
-        self
-          .unread
-          .extend_from_slice(self.buffer.get(..count).unwrap_or_default());
+      Some(Ok(_)) => {
         self.feed();
         Ok(())
       }
@@ -1051,6 +1091,9 @@ impl<S: SshSite> Link<S> {
     let worked_ns = now_ns().saturating_sub(started_ns);
     self.tracker.worked(worked_ns);
     self.unread.drain(..taken.min(self.unread.len()));
+    if self.unread.is_empty() {
+      self.unread = Vec::new();
+    }
     if self.phase == Phase::Handshake && self.session.transport().is_established() {
       self.enter(Phase::Authentication);
     }
@@ -1329,7 +1372,6 @@ where
   };
   let mut link = Link {
     stream,
-    buffer: vec![0; READ_BYTES],
     unread: Vec::new(),
     session,
     site,
@@ -1496,7 +1538,6 @@ where
   };
   let mut link = Link {
     stream,
-    buffer: vec![0; READ_BYTES],
     unread,
     session,
     site: make(),

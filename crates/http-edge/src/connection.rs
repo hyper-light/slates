@@ -541,10 +541,15 @@ impl Connection {
     &self.output
   }
 
-  /// The bytes [`Connection::output`] lent were written out: they are cleared and the buffer kept, its capacity what one
-  /// turn's output held at most (a reply's run framed, within the request's room), freed with the connection.
+  /// The bytes [`Connection::output`] lent were written out: they are cleared and the buffer kept while a reply
+  /// streams (A-830: no allocation per chunk), and released once the connection returns to `State::Head` so idle
+  /// keep-alive connections hold zero output buffer capacity.
   pub fn written(&mut self) {
-    self.output.clear();
+    if matches!(self.state, State::Head) {
+      self.output = Vec::new();
+    } else {
+      self.output.clear();
+    }
   }
 
   /// Bytes the socket delivered: deciphered first on a TLS connection, ignored once the connection is draining.
@@ -744,11 +749,16 @@ impl Connection {
     }
   }
 
-  /// Readies the connection for the client's next request, whose bytes may already be here.
+  /// Readies the connection for the client's next request, whose bytes may already be here; drops idle body/input
+  /// capacity when empty so parked keep-alive connections hold zero scratch buffers.
   fn next_request(&mut self) {
     self.state = State::Head;
     self.reader = HeadReader::new();
     self.admission = Admission::new(self.room);
+    self.inflated = Vec::new();
+    if self.input.is_empty() {
+      self.input = Vec::new();
+    }
   }
 
   /// The service took the run of body [`Next::Body`] handed it.

@@ -948,21 +948,61 @@ pub(crate) async fn awaited<F: Future>(
   .await
 }
 
-/// A connection's socket and its read buffer.
+thread_local! {
+  /// Shard-local read scratch buffer shared across all HTTP connections on this shard thread (thread-per-core, zero
+  /// locks): a parked connection awaits [`TcpStream::wait_readable`] with zero per-connection read buffer, then
+  /// synchronously drains into this scratch via [`TcpStream::read_now`].
+  static HTTP_READ_SCRATCH: core::cell::RefCell<Vec<u8>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// A connection's socket (holds no per-connection read buffer; reads borrow [`HTTP_READ_SCRATCH`] synchronously).
 struct Socket {
   /// The stream.
   stream: TcpStream,
-  /// What one read takes.
-  buffer: Vec<u8>,
 }
 
 impl Socket {
-  /// Reads, `overdue` called if `deadline_ns` passes first: the count read (zero at the client's close), and whether the
-  /// wait was overdue.
-  async fn read(&mut self, deadline_ns: u64, overdue: impl FnMut()) -> (Waited<usize>, bool) {
+  /// Reads into [`HTTP_READ_SCRATCH`] without retaining a per-connection buffer across waits, `overdue` called if
+  /// `deadline_ns` passes first, and passes any non-empty read slice synchronously to `on_bytes`.
+  async fn read_with(
+    &mut self,
+    deadline_ns: u64,
+    mut overdue: impl FnMut(),
+    on_bytes: impl FnOnce(&[u8]),
+  ) -> (Waited<usize>, bool) {
     let started_ns = now_ns();
-    let read = self.stream.read(&mut self.buffer);
-    waited(awaited(read, deadline_ns, overdue).await, started_ns)
+    let mut marked = false;
+    let mut on_bytes = Some(on_bytes);
+    loop {
+      let immediate = HTTP_READ_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < READ_BYTES {
+          buf.resize(READ_BYTES, 0);
+        }
+        match self.stream.read_now(buf.as_mut_slice()) {
+          Ok(Some(n)) => {
+            let waited_ns = now_ns().saturating_sub(started_ns);
+            if n > 0
+              && let Some(take) = on_bytes.take()
+            {
+              take(buf.get(..n).unwrap_or_default());
+            }
+            Ok(Some((n, waited_ns)))
+          }
+          Ok(None) => Ok(None),
+          Err(error) => Err(error),
+        }
+      });
+      match immediate {
+        Ok(Some((value, waited_ns))) => return (Waited::Done { value, waited_ns }, marked),
+        Err(_) => return (Waited::Failed, marked),
+        Ok(None) => match awaited(self.stream.wait_readable(), deadline_ns, &mut overdue).await {
+          Ok((Ok(()), was_overdue)) => marked |= was_overdue,
+          Ok((Err(_), was_overdue)) => return (Waited::Failed, marked | was_overdue),
+          Err(_) => return (Waited::Failed, false),
+        },
+      }
+    }
   }
 
   /// Writes `bytes` whole, `overdue` called if `deadline_ns` passes first: whether the write found the socket full and
@@ -982,11 +1022,6 @@ impl Socket {
       polled.map(|written| written.map(|()| pended))
     });
     waited(awaited(write, deadline_ns, overdue).await, started_ns)
-  }
-
-  /// The bytes the last read brought, `count` of them.
-  fn read_bytes(&self, count: usize) -> &[u8] {
-    self.buffer.get(..count).unwrap_or_default()
   }
 }
 
@@ -1130,7 +1165,15 @@ impl<S: Site> Parts<S> {
       return Flow::End(Why::Failed);
     };
     let marker = self.marker(overdue);
-    let count = match self.socket.read(deadline_ns, marker).await {
+    let mut receiving_ns = 0_u64;
+    let waited = self
+      .socket
+      .read_with(deadline_ns, marker, |bytes| {
+        receiving_ns = now_ns();
+        connection.receive(bytes);
+      })
+      .await;
+    match waited {
       (Waited::Done { value: 0, .. }, overdue) => {
         if overdue {
           let slot = self.slot;
@@ -1141,13 +1184,12 @@ impl<S: Site> Parts<S> {
         connection.peer_closed();
         return Flow::Go;
       }
-      waited => match self.settle(phase, waited) {
-        Ok(count) => count,
-        Err(why) => return Flow::End(why),
-      },
-    };
-    let receiving_ns = now_ns();
-    connection.receive(self.socket.read_bytes(count));
+      waited => {
+        if let Err(why) = self.settle(phase, waited) {
+          return Flow::End(why);
+        }
+      }
+    }
     let now = now_ns();
     if phase == Phase::Handshake {
       // The edge's own work on the handshake (its key exchange, its signature, its records), which the client's share
@@ -1285,10 +1327,12 @@ impl<S: Site> Parts<S> {
         if !self.reply.is_empty() {
           connection.reply(&self.reply);
         }
+        self.reply = Vec::new();
         self.service = None;
         connection.reply_end();
       }
       Err(Failed(status)) => {
+        self.reply = Vec::new();
         self.service = None;
         connection.fail(status);
       }
@@ -1316,7 +1360,7 @@ impl<S: Site> Parts<S> {
         return Why::Failed;
       };
       let marker = self.marker(overdue);
-      let waited = self.socket.read(deadline_ns, marker).await;
+      let waited = self.socket.read_with(deadline_ns, marker, |_| {}).await;
       match self.settle(Phase::Drain, waited) {
         Ok(0) => {
           let now = now_ns();
@@ -1381,10 +1425,7 @@ async fn drive<S, M>(
   M: Fn() -> S + Clone + Send + 'static,
 {
   let mut parts = Parts {
-    socket: Socket {
-      stream,
-      buffer: vec![0; READ_BYTES],
-    },
+    socket: Socket { stream },
     state: seat.state,
     slot: seat.slot,
     tracker,

@@ -875,10 +875,12 @@ async fn step(
   if !out.is_empty() && !written_timed(stream, out).await {
     return Stepped::End;
   }
-  // Written: what follows (a revision property change's hooks, a commit's hook or landing, a lock verb) writes its own
-  // answer after it, never this again (a revision property change once wrote its trivial authentication request twice,
-  // which stock svn read as the change's success).
-  out.clear();
+  // Release `out` capacity before parking on an idle client read so 10k idle connections keep zero reply scratch.
+  if matches!(next, Next::Read) {
+    *out = Vec::new();
+  } else {
+    out.clear();
+  }
   follow(stream, conversation, next, out, seat).await
 }
 
@@ -989,11 +991,15 @@ async fn read_step(stream: &TcpStream, conversation: &mut Conversation, seat: &S
   if read { Stepped::Go } else { Stepped::End }
 }
 
-/// Drops the first `bytes` of the conversation's input, which an answer took (all of it, if it holds fewer).
+/// Drops the first `bytes` of the conversation's input, which an answer took (all of it, if it holds fewer),
+/// releasing the buffer when empty so idle connections hold zero input capacity.
 fn consume(conversation: &mut Conversation, bytes: usize) {
   conversation
     .input
     .drain(..bytes.min(conversation.input.len()));
+  if conversation.input.is_empty() {
+    conversation.input = Vec::new();
+  }
 }
 
 /// After a URL resolved to `found`: its repository opened here, the move to the shard it lives on, or the end when the
@@ -2274,6 +2280,13 @@ impl Drop for Arriving {
   }
 }
 
+thread_local! {
+  /// Shard-local read scratch buffer shared across all ra_svn connections on this shard thread (thread-per-core, zero
+  /// locks): a parked connection awaits [`TcpStream::wait_readable`] with zero idle input allocation, then appends
+  /// only the bytes actually read.
+  static SVN_READ_SCRATCH: core::cell::RefCell<Vec<u8>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
 /// Reads more of the client's bytes onto `input`: at most one read's bytes and what the item's bound leaves, marking the
 /// connection overdue once the wait passes `deadline_ns` and waiting on. Whether the client sent any: none at its end,
 /// at its socket's failure, or with the item's bound reached.
@@ -2291,21 +2304,38 @@ async fn read_more(
   if room == 0 {
     return false;
   }
-  let start = input.len();
-  input.resize(start.saturating_add(room), 0);
-  let Some(buffer) = input.get_mut(start..) else {
-    return false;
-  };
-  let read = awaited(stream.read(buffer), deadline_ns, || {
-    seat.overdue(deadline_ns)
-  })
-  .await;
-  let taken = match read {
-    Ok((Ok(taken), _)) => taken,
-    Ok((Err(_), _)) | Err(_) => 0,
-  };
-  input.truncate(start.saturating_add(taken));
-  taken > 0
+  loop {
+    let immediate = SVN_READ_SCRATCH.with(|cell| {
+      let mut buf = cell.borrow_mut();
+      if buf.len() < READ_BYTES {
+        buf.resize(READ_BYTES, 0);
+      }
+      let target = buf.get_mut(..room).unwrap_or_default();
+      match stream.read_now(target) {
+        Ok(Some(taken)) => {
+          if taken > 0 {
+            input.extend_from_slice(buf.get(..taken).unwrap_or_default());
+          }
+          Ok(Some(taken))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+      }
+    });
+    match immediate {
+      Ok(Some(taken)) => return taken > 0,
+      Err(_) => return false,
+      Ok(None) => {
+        let ready = awaited(stream.wait_readable(), deadline_ns, || {
+          seat.overdue(deadline_ns)
+        })
+        .await;
+        if !matches!(ready, Ok((Ok(()), _))) {
+          return false;
+        }
+      }
+    }
+  }
 }
 
 #[cfg(test)]

@@ -423,7 +423,7 @@ enum Proof {
 /// repositories and stores it decides and answers with (the module doc).
 pub(crate) struct HgSite<A, R, S> {
   /// The realm a `401`'s challenges name.
-  realm: String,
+  realm: std::borrow::Cow<'static, str>,
   /// The room a request's route and exchange are each charged to: the edge's request room.
   room: u64,
   /// What proves credentials.
@@ -437,14 +437,14 @@ pub(crate) struct HgSite<A, R, S> {
 impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
   /// A site naming `realm` in its challenges, charging each request to `room`.
   pub(crate) fn new(
-    realm: String,
+    realm: impl Into<std::borrow::Cow<'static, str>>,
     room: u64,
     authenticator: A,
     repositories: R,
     stores: S,
   ) -> Self {
     Self {
-      realm,
+      realm: realm.into(),
       room,
       authenticator,
       repositories,

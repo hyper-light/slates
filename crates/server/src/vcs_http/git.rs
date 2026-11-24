@@ -586,7 +586,7 @@ impl Asked {
 /// repositories, services and Git LFS service it decides with (the module doc).
 pub(crate) struct GitSite<A, R, S, L = NoLfs> {
   /// The realm a `401`'s challenges name.
-  realm: String,
+  realm: std::borrow::Cow<'static, str>,
   /// The room a request's decoded path is charged to: the edge's request room.
   room: u64,
   /// What proves credentials.
@@ -603,14 +603,14 @@ impl<A, R, S> GitSite<A, R, S, NoLfs> {
   /// A site naming `realm` in its challenges, charging each route's path to `room`; it serves no Git LFS endpoint until
   /// it is given a service ([`GitSite::with_lfs`]).
   pub(crate) fn new(
-    realm: String,
+    realm: impl Into<std::borrow::Cow<'static, str>>,
     room: u64,
     authenticator: A,
     repositories: R,
     services: S,
   ) -> Self {
     Self {
-      realm,
+      realm: realm.into(),
       room,
       authenticator,
       repositories,
