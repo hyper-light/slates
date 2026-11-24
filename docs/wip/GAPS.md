@@ -1120,6 +1120,10 @@
 >   windows): a window keeps what it alone names (its identity, length, slot and slab's key, 56 bytes), and its slab
 >   keeps the placement its windows share. Held by `tests/window_records_heap.rs` through a count of the test thread's
 >   live heap: red 250 bytes a window on main's record, now 150, against a derived 192.
+> - A chunk store's table of chunk records grows a page of records at a time BUILT (w-perf, 2026-11-23, main's (1)):
+>   its segment was `min(max_chunks, page)` records, so a shard's first chunk made 2.2 MB of records at a 16 KiB page.
+>   Held by `slates-vfs`'s `tests/chunk_records_heap.rs` (red 2,228,320 bytes, now 8,800). Owed: main's AC-0.4
+>   provisioning A/B on a quiet Studio.
 > - The memory status test's content hold row depends on where the work was computed. OPEN (w-perf, 2026-11-23,
 >   main's (2)). `memory_gauges::a_memory_status_names_its_holders_and_a_plain_one_none` asserts
 >   `mem.gauge.held.content_manifests`, which exists only when the submit's increment was held at compose, on a holder
