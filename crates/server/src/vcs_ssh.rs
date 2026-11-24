@@ -251,6 +251,9 @@ pub(crate) struct EdgeState {
   /// How long the authenticated connections lived.
   /// The counts.
   counts: Cell<Counts>,
+  /// The writes waiting on their clients now, each from its first pend until it ends or is dropped ([`WriteWaiting`]):
+  /// at most one a seat.
+  writes_waiting: Cell<u64>,
   /// A key time a test gives its sessions in place of the RFC's hour, so its rekeys come within the test.
   #[cfg(test)]
   key_time_for_test: Cell<Option<u64>>,
@@ -278,6 +281,7 @@ impl EdgeState {
       arriving: Cell::new(0),
       waits: RefCell::new(PhaseWaits::default()),
       counts: Cell::new(Counts::default()),
+      writes_waiting: Cell::new(0),
       #[cfg(test)]
       key_time_for_test: Cell::new(None),
     }
@@ -286,6 +290,11 @@ impl EdgeState {
   /// What the edge has counted.
   pub(crate) fn counts(&self) -> Counts {
     self.counts.get()
+  }
+
+  /// The writes waiting on their clients now ([`WRITES_WAITING`]).
+  pub(crate) fn writes_waiting(&self) -> u64 {
+    self.writes_waiting.get()
   }
 
   /// The connections being served: the seats taken.
@@ -553,6 +562,44 @@ pub(crate) fn keep_here(state: EdgeState) -> Result<Kept<EdgeState>, RtError> {
 /// This shard's edge state, if one was kept here.
 pub(crate) fn here() -> Option<Kept<EdgeState>> {
   HERE.with(Cell::get)
+}
+
+/// Format: the status row of the writes this shard's SSH edge has waiting on their clients now (A-859; main 01a20182's
+/// ruling (a) of 2026-11-23 20:08): a reading at the report, not a count, each write from its first pend to its end
+/// ([`WriteWaiting`]).
+pub(crate) const WRITES_WAITING: &str = "vcs_ssh.writes_waiting";
+
+/// [`WRITES_WAITING`]'s reading on this shard: none where no edge is kept here.
+pub(crate) fn writes_waiting_here() -> u64 {
+  here()
+    .and_then(|edge| edge.with(EdgeState::writes_waiting))
+    .unwrap_or(0)
+}
+
+/// A write of the edge waiting on its client, counted live in the edge's state ([`WRITES_WAITING`]) from its first pend
+/// until it ends or is dropped, the session's timer coming due or its connection reaped included.
+struct WriteWaiting(Kept<EdgeState>);
+
+impl WriteWaiting {
+  /// Counts a write of `state`'s edge waiting.
+  fn begin(state: Kept<EdgeState>) -> WriteWaiting {
+    state.with(|state| {
+      state
+        .writes_waiting
+        .set(state.writes_waiting.get().saturating_add(1));
+    });
+    WriteWaiting(state)
+  }
+}
+
+impl Drop for WriteWaiting {
+  fn drop(&mut self) {
+    self.0.with(|state| {
+      state
+        .writes_waiting
+        .set(state.writes_waiting.get().saturating_sub(1));
+    });
+  }
 }
 
 /// Waits, holding an accepted connection, until a seat is free for it (the module doc): at once below the bound; with
@@ -937,9 +984,22 @@ impl<S: SshSite> Link<S> {
     let pended = core::cell::Cell::new(false);
     let outcome = {
       let mut write = std::pin::pin!(self.stream.write_some(&bytes));
+      // A-859: the write's first pend counted live, then heard by the command, where an operator and a test can see a
+      // write waiting on its client; the count held until the write ends or is dropped.
+      let (state, running) = (self.state, &mut self.running);
+      let mut waiting = None;
       let watched = std::future::poll_fn(|cx| {
         let polled = write.as_mut().poll(cx);
         pended.set(pended.get() || polled.is_pending());
+        if polled.is_pending() && waiting.is_none() {
+          waiting = Some(WriteWaiting::begin(state));
+          if let Some(command) = running
+            .as_mut()
+            .and_then(|running| running.command.as_mut())
+          {
+            command.write_waits();
+          }
+        }
         polled
       });
       awaited(watched, deadline_ns, timer_ns, marker).await

@@ -45,14 +45,24 @@ The first run never needed the record, since it kept the object in its `adopted`
   records `MovedFrom { departed, retirement version }` whatever the copy served before (`adopted_acceptor`).
   - The copy then falls in that retirement's round for its adopter (`copy_falls_to`), and the record is persisted, so
     a rerun after a warm restart lists the adoption as the successor's own promise and answers it by name.
-  - The rerun reaches the end of the first run: the object adopted by the successor, at the rerun's epoch.
+  - The rerun was to reach the end of the first run, the object adopted by the successor, but at the rerun's epoch.
+    A-890 corrects that: the end of the first run is the adoption at its own epoch (below).
   - A moved volume's adoption (A-291) records none. A later retirement of the same host never counts it (A-883).
-- **Why the second adoption is harmless (main's ruling of 2026-11-23).** The rerun re-adopts the object one epoch
-  above the first run's and fences its holders there. That is not A-883's spurious self-takeover returning. The warm
-  restart has already ended every request in flight from the first run, so the extra fence costs nothing a client can
-  see beyond the restart itself.
-- **A round never promises again what it adopted.** `promise_local_copies` leaves out the objects in `adopted`. A round
-  started over above its epoch therefore never fences the adoption this node writes under.
+- **The second adoption was not harmless (corrected by A-890, 2026-11-23).** Main's ruling had the rerun re-adopt the
+  object one epoch above the first run's, a fence the warm restart would make invisible. It was not invisible. The
+  successor's live log resumes at the first run's epoch after its restart (A-344), and a holder the rerun had fenced one
+  epoch up refused it as stale. The successor then marked the volume superseded by its own new epoch, and its owner
+  shard forwarded every verb to the control shard. There its routing named it the owner, so each verb was refused
+  `Overloaded` while no materialization was pending. Evidence: a diagnostic build on adacachy2 (kiln r649, load 38 to
+  57), 4 of 6 runs. A holder counted `fleet.live.hold_refused.stale_epoch` 1, the successor counted
+  `fleet.owner_location.owned_unmaterialized` 4,165 to 4,774 and `fleet.live.taken_over` 1 since its restart, and
+  every read was refused for its whole 60 s window while both coordinators ran about 585 periods a minute. The 2 runs
+  that passed took nothing over again. A-890 has the rerun settle its adoption, by the record the adoption now persists
+  with its copy (`Acceptor::adopted`), at the adoption's epoch.
+- **A round never promises again what it adopted.** `promise_local_copies` leaves out the objects in `adopted`. That
+  kept the round's own promises off its adoption, but a holder's page promises every copy falling to the asker, so a
+  round started over above its epoch still fenced the adoption through its holders. Since A-890 a round above its
+  settled epoch asks by name only.
 
 ## Tests (adacachy2)
 
@@ -70,10 +80,9 @@ The first run never needed the record, since it kept the object in its `adopted`
   - With the move not recorded it is no deterministic red. It fails only where the successor held no copy of the
     volume's registers before adopting them, and that depends on the volume's placement. The unit test above is the
     deterministic red.
-  - Under load 55 to 73 on adacachy2, runs of either kind met `Overloaded { shard: 1 }`:
-    - at the scene's setup, its attach (`write_attachment`), before any takeover;
-    - or at the single-try reads after the write (`continuity_read`; a diagnostic build printed each refusal).
-    Both helpers try once, and `Overloaded` is a retryable refusal: that is the harness's, reported apart.
+  - Under load 55 to 73 on adacachy2, runs of either kind met `Overloaded { shard: 1 }` after the successor's restart,
+    at the write's attach or the reads after it. This was reported as the harness's, since both helpers tried once.
+    It was the state above: no refusal ever cleared (A-890).
 - A diagnostic build of this change logged the rerun's re-adoption: the volume's registers adopted at epoch 2 by the
   first run and at epoch 3 by the rerun.
 

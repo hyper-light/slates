@@ -1478,12 +1478,13 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) {
       ),
       "the import did not end: {ended:?}"
     );
-    // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
-    assert_eq!(
-      crate::vcs_store::hg_import::land_imported(state, id),
-      Ok(())
-    );
   });
+  // A done import waits to land (A-687); landed from this thread, which waits, so the shard is never held through a
+  // segment's commit; landed, its index is the store's and the store is lent again.
+  assert_eq!(
+    crate::vcs_store::hg_import::land_imported_on(daemon, REPOSITORY, id),
+    Ok(())
+  );
 }
 
 /// The status and body of `GET /<name>?cmd=<command>` by the owner's bearer token, as stock hg asks a command.
@@ -4973,15 +4974,29 @@ fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
   assert!(held.iter().all(|here| !here), "every file's window let go");
 }
 
-/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:
-/// start a two-shard daemon over loopback TLS; on the repository's shard, keep for the region an object one byte longer
-/// than a window, its first window ranking on the other shard (so no hold here names it); push one changeset whose file
-/// is exactly that first window; once landed, look at the window, then read the object from its home
-/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
-/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
-/// window was let go unnoted and the home read none.
-#[test]
-fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+/// A region object one byte longer than a window kept on the repository's shard, and a landed changeset whose file is
+/// exactly its first window ([`a_region_object_sharing_a_landed_files_window`]): the daemon, its shards, the object and
+/// its identity, the push's answer, and whether the shared window was held once landed.
+struct SharedWindow {
+  /// The daemon.
+  daemon: crate::test_store::StoredDaemon,
+  /// Its shards.
+  shards: Vec<u16>,
+  /// The region's object.
+  object: Vec<u8>,
+  /// Its identity.
+  object_id: slates_vcs::ContentId,
+  /// The push's answer.
+  pushed: (u16, String, Vec<u8>),
+  /// Whether the repository's content store held the shared window once the push landed.
+  window_held: Option<bool>,
+}
+
+/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push: start a two-shard daemon over
+/// loopback TLS; on the repository's shard, keep for the region an object one byte longer than a window, its first
+/// window ranking on the other shard (so no hold here names it); push one changeset whose file is exactly that first
+/// window. What it left.
+fn a_region_object_sharing_a_landed_files_window() -> SharedWindow {
   let (identity, certificate) = identity();
   let (daemon, _instance) = daemon_named(Some(identity));
   let port = daemon.vcs_http_port().expect("the edge started");
@@ -5048,31 +5063,63 @@ fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
       })
     })
   });
-  let reading = shards.clone();
-  let read = crate::test_store::run_at(
-    &daemon,
+  SharedWindow {
+    daemon,
+    shards,
+    object,
+    object_id,
+    pushed,
+    window_held,
+  }
+}
+
+/// Reads `object_id` from its home among `shards` on the listener's shard (`homes::read`), answered or refused.
+fn home_read(
+  daemon: &Daemon,
+  shards: &[u16],
+  object_id: slates_vcs::ContentId,
+) -> Result<Vec<u8>, crate::vcs_store::homes::HomeReadRefused> {
+  let reading = shards.to_vec();
+  crate::test_store::run_at(
+    daemon,
     LISTENER,
     move || async move {
       let origin = reading.first().copied().unwrap();
       crate::vcs_store::homes::read(origin, &reading, object_id, u64::MAX).await
     },
     Duration::from_secs(60),
-  );
+  )
+}
+
+/// codex-review's region-object pin through a real push, and goal 93 item 2b(b). Do: as
+/// [`a_region_object_sharing_a_landed_files_window`]; once landed, look at the window, then read the object from its home
+/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
+/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
+/// window was let go unnoted and the home read none.
+#[test]
+fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+  let shared = a_region_object_sharing_a_landed_files_window();
+  let read = home_read(&shared.daemon, &shared.shards, shared.object_id);
   let brought = counted_on(
-    &daemon,
+    &shared.daemon,
     REPOSITORY,
     crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
   );
-  daemon.stop();
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  shared.daemon.stop();
   assert_eq!(
-    window_held,
+    shared.pushed.0,
+    200,
+    "{}",
+    String::from_utf8_lossy(&shared.pushed.2)
+  );
+  assert_eq!(
+    shared.window_held,
     Some(false),
     "the shared window let go once landed"
   );
   assert_eq!(
-    read.map(|bytes| bytes == object),
-    Some(true),
+    read.map(|bytes| bytes == shared.object),
+    Ok(true),
     "the home reads its object whole"
   );
   assert_eq!(
@@ -5081,11 +5128,96 @@ fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
   );
 }
 
+/// Each kind of `hg_push::bring_back`'s refusal as the repository's shard counted it, in `BringBackRefused`'s order:
+/// not held, store unanswered, no text, content refused, not whole.
+fn bring_back_refusals(daemon: &Daemon) -> [u64; 5] {
+  use crate::repository::hg_push::{
+    BRING_BACK_CONTENT_REFUSED, BRING_BACK_NO_TEXT, BRING_BACK_NOT_HELD, BRING_BACK_NOT_WHOLE,
+    BRING_BACK_STORE_UNANSWERED,
+  };
+  [
+    BRING_BACK_NOT_HELD,
+    BRING_BACK_STORE_UNANSWERED,
+    BRING_BACK_NO_TEXT,
+    BRING_BACK_CONTENT_REFUSED,
+    BRING_BACK_NOT_WHOLE,
+  ]
+  .map(|kind| counted_on(daemon, REPOSITORY, kind))
+}
+
+/// The typed refusal a home's read passes on (main 01a20182's ruling of 2026-11-23 21:25; §2 item 9). Do: as
+/// [`a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`], then hold back the repository's
+/// shard's whole room, every byte it holds or could claim (§4.2: a host under memory pressure), read the object from its
+/// home, release the hold and read it again. Expect: the first read refused `NotBroughtBack` with the revision's
+/// bring-back refused by the content store's room (`OverBudget`, a window's need), counted once under that kind and
+/// under no other; the second read the whole object, brought back once, nothing more counted refused. Red before: the
+/// read answered a bare none and no counter named the kind.
+#[test]
+fn a_homes_read_whose_bring_back_is_refused_room_fails_with_that_refusal_counted_once() {
+  use crate::repository::hg_push::BringBackRefused;
+  use crate::vcs_store::homes::{HomeReadRefused, LandedRefused};
+  let shared = a_region_object_sharing_a_landed_files_window();
+  crate::daemon::observe_at(&shared.daemon, REPOSITORY, |state| {
+    state.pressure_pinned = true;
+    let claimable = u64::try_from(state.store.content.arena().claimable()).unwrap();
+    let all = state.store.budget.capacity().saturating_add(claimable);
+    state.store.budget.set_hold(all);
+  });
+  let refused = home_read(&shared.daemon, &shared.shards, shared.object_id);
+  let counted_refused = bring_back_refusals(&shared.daemon);
+  crate::daemon::observe_at(&shared.daemon, REPOSITORY, |state| {
+    state.store.budget.set_hold(0);
+  });
+  let read = home_read(&shared.daemon, &shared.shards, shared.object_id);
+  let counted_after = bring_back_refusals(&shared.daemon);
+  let brought = counted_on(
+    &shared.daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
+  );
+  shared.daemon.stop();
+  let window = u64::try_from(shared.object.len() - 1).unwrap();
+  assert!(
+    matches!(
+      refused,
+      Err(HomeReadRefused::NotBroughtBack(LandedRefused::Revision(
+        BringBackRefused::Content(slates_vcs::ContentRefused::OverBudget { need, .. })
+      ))) if need == window
+    ),
+    "the home's read refused with the bring-back's room refusal: {:?}",
+    refused.map(|bytes| bytes.len())
+  );
+  assert_eq!(
+    counted_refused,
+    [0, 0, 0, 1, 0],
+    "counted once, under the content store's kind alone"
+  );
+  assert_eq!(
+    read.map(|bytes| bytes == shared.object),
+    Ok(true),
+    "the hold released, the home reads its object whole"
+  );
+  assert_eq!(
+    counted_after, counted_refused,
+    "the read after the release refused nothing"
+  );
+  assert_eq!(brought, 1, "brought back once, after the release");
+}
+
 /// w-shared's seam 1 of goal 93 item 2b(b) (main's ruling of 2026-11-22 18:43): a home reads a landed file revision by
-/// its (path, node). Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; on the
-/// repository's shard, bring each file revision back by its path and node (`hg_push::bring_back`), then look at its
-/// window again. Expect the push `200`; some window let go; every bring-back true; every window held whole after, each let
-/// go read from the changeset store and counted once. Red before: none could be brought back by its (path, node).
+/// its (path, node). Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; publish
+/// the repository's shard, which gives the arena's idle extents back to the pool as the sweep's publication may at any
+/// moment ([`published_down_to_demand`]); on that shard, bring each file revision back by its path and node
+/// (`hg_push::bring_back`), then look at its window again. Expect the push `200`; some window let go; every bring-back
+/// answered `Ok`; every window held whole after, each let go read from the changeset store and counted once; and every
+/// bring-back's room made outside a lend, where the pool is reachable: each let go brought back once
+/// (`vcs.hg.landed_texts_brought_back`, the non-vacuity count) and no room asked inside a lend
+/// (`vcs_store.room_out_of_reach` 0), whatever slack this machine's publication left. Red before: none could be brought
+/// back by its (path, node); then, with the publication (w-tsan, 2026-11-23), 10 runs of 10 refused
+/// `OverBudget { need: 8192, room: 5869 }` from the 49th file, the room asked inside `lent_state`, where the pool is out
+/// of reach (plainly 2 runs of 100 at a load of 47, at the 49th and the 81st). A first form asserted the arena grew past
+/// the publication, which held only where the slack was short: on w-hg's MacBook the publication left 16 MiB, room for
+/// all 120, and it failed 3 runs of 3 with every bring-back answered.
 #[test]
 fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node() {
   let (identity, certificate) = identity();
@@ -5107,6 +5239,7 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
   })
   .expect("the repository's record");
   let before = windows_held(&daemon, texts);
+  let published = published_down_to_demand(&daemon);
   let files: Vec<(Vec<u8>, slates_hg::Node)> = made
     .iter()
     .map(|made| (made.file.0.clone(), made.file.1))
@@ -5129,14 +5262,23 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
     REPOSITORY,
     crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
   );
+  let grown = crate::daemon::observe_at(&daemon, REPOSITORY, |state| state.store.budget.capacity());
+  let out_of_reach = counted_on(&daemon, REPOSITORY, crate::vcs_store::ROOM_OUT_OF_REACH);
   daemon.stop();
   let gone = before.iter().filter(|here| !**here).count();
-  println!("{gone} of {TEXTS_CHANGESETS} files' windows let go before; {counted} brought back");
+  println!(
+    "{gone} of {TEXTS_CHANGESETS} files' windows let go before; {counted} brought back; the shard's capacity \
+     {published} after the publication, {grown} after"
+  );
   assert!(gone > 0, "some window let go");
   for (at, (brought, here)) in brought.iter().zip(&after).enumerate() {
-    assert!(brought, "file {at} brought back");
+    assert_eq!(*brought, Ok(()), "file {at} brought back");
     assert!(here, "file {at}'s window held whole after");
   }
+  assert_eq!(
+    out_of_reach, 0,
+    "no room asked inside a lend: each bring-back's room made where the pool is reachable"
+  );
   assert_eq!(
     counted,
     u64::try_from(gone).unwrap(),
@@ -5148,9 +5290,11 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
 /// store, brought back through the node's changeset store; a manifest delta made again from its two texts). Do: start a
 /// two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; on the repository's shard, let go every
 /// object the repository's changelog and manifest rows name; bring each revision back by its log's path and its node
-/// (`hg_push::bring_back`); read every text again. Expect the push `200`; objects let go (the non-vacuity count); every
-/// bring-back true; every changeset's and manifest's text read back the same; each let go counted once
-/// (`vcs.hg.landed_log_texts_brought_back`). Red before: a bring-back by those paths looked for a file revision.
+/// (`hg_push::bring_back`) after a publication gave the arena's idle extents back ([`published_down_to_demand`]); read
+/// every text again. Expect the push `200`; objects let go (the non-vacuity count); every bring-back answered `Ok`;
+/// every changeset's and manifest's text read back the same; each let go counted once
+/// (`vcs.hg.landed_log_texts_brought_back`); no room asked inside a lend. Red before: a bring-back by those paths looked
+/// for a file revision.
 #[test]
 fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_and_node() {
   let (identity, certificate) = identity();
@@ -5173,6 +5317,7 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   .expect("the repository's record");
   let before = log_texts(&daemon, repository);
   let let_go = let_go_logs(&daemon, repository);
+  published_down_to_demand(&daemon);
   let asks: Vec<(Vec<u8>, slates_hg::Node)> = before
     .0
     .iter()
@@ -5202,13 +5347,15 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
     REPOSITORY,
     crate::repository::hg_push::LANDED_LOG_TEXTS_BROUGHT_BACK,
   );
+  let out_of_reach = counted_on(&daemon, REPOSITORY, crate::vcs_store::ROOM_OUT_OF_REACH);
   daemon.stop();
   println!(
     "{let_go} of {} changelog and manifest objects let go; {counted} brought back",
     brought.len()
   );
   assert!(let_go > 0, "objects let go");
-  assert!(brought.iter().all(|brought| *brought), "{brought:?}");
+  assert!(brought.iter().all(Result::is_ok), "{brought:?}");
+  assert_eq!(out_of_reach, 0, "no room asked inside a lend");
   assert_eq!(after, before, "every text read back the same");
   assert_eq!(
     counted,
@@ -5278,6 +5425,17 @@ fn log_texts(
     })
   })
   .expect("the repository's rows")
+}
+
+/// Publishes the repository's shard and answers its capacity after. A committed publication gives the arena's wholly free
+/// extents back to the pool (`Store::release_idle`), as the sweep's may at any moment, so what follows grows from the
+/// pool for its room, never only from the slack a push left behind (w-tsan, 2026-11-23: a bring-back that met the slack
+/// alone was refused at the 49th of 120 files).
+fn published_down_to_demand(daemon: &Daemon) -> u64 {
+  crate::daemon::observe_at(daemon, REPOSITORY, |state| {
+    crate::verbs::publish_shard(state).expect("the repository's shard published");
+    state.store.budget.capacity()
+  })
 }
 
 /// Whether the repository's shard's content store reads each of `texts`' windows (none for one let go).

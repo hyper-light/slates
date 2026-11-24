@@ -64,7 +64,7 @@ kind_of() {
     *"slates --instance"*" daemon"*) echo slates-daemon ;;
     *"git daemon"* | *"git-daemon"*) echo git-daemon ;;
     *httpd*"stock-http-"* | *git-http-backend*) echo httpd-git ;;
-    *"hg serve"*) echo hg-serve ;;
+    *hg*" serve "*) echo hg-serve ;; # hg_scale.sh runs `hg -R ROOT serve ...`
     *svnserve*) echo svnserve ;;
     *) echo - ;;
   esac

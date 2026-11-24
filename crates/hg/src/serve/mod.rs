@@ -101,6 +101,14 @@ pub trait Repository {
   /// Its text is read from the node's changeset store (`lookup::TagsRead`).
   fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal>;
 
+  /// The node of revision `rev`'s manifest and its text's length, where the store holds its row but not its text at
+  /// hand (goal 93, C1 (1): the manifests' texts let go once landed): a reading of the heads' `.hgtags` asks it of the
+  /// node's changeset store first (`lookup::TagsRead`), in place of [`Repository::tags_file`]. None where its text is at
+  /// hand or it names none, and by default.
+  fn manifest_not_at_hand(&self, _rev: Rev) -> Option<(Node, u64)> {
+    None
+  }
+
   /// The repository's obsolescence markers, in any order: a fetch sends them, and a push's are judged against them.
   fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>>;
 }

@@ -28,13 +28,13 @@
 //! store is the truth, with no second path): until then it committed its version in its own step and a task landed
 //! the revision after it, so a crash between left a version with no revision.
 //!
-//! **Not made, refused** (A-890; main's ruling of 2026-11-23 20:51, guard-then-apply), counted [`UNMADE`], nothing of
+//! **Not made, refused** (A-891; main's ruling of 2026-11-23 20:51, guard-then-apply), counted [`UNMADE`], nothing of
 //! the version applied and the refusal recorded as the request's completion (`made_commit::refuse`): a special file or
 //! a symbolic link with properties of its own (no Subversion node the step makes yet) and a path beneath a copy the
 //! submit does not declare `Unsupported`; a version not the one after the youngest revision, a property list the
 //! records do not hold, a text whose digests cannot be made and the store's check `StoreRefused`, in their words. The
 //! register entry's commit is judged before the verdict applies (`MadeEntry::guard`), so the step that commits the
-//! version and its entry is not refused after it applied anything. Until A-890 such a version was committed alone, the
+//! version and its entry is not refused after it applied anything. Until A-891 such a version was committed alone, the
 //! green past its records, and every later revision refused as not the next.
 //!
 //! **Symbolic links** become files as Subversion keeps them: the text `link ` and the target, the property list
