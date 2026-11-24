@@ -147,7 +147,8 @@ start_slates() {
     sleep 0.1
   done
   "$SLATES" --instance "$instance" bootstrap root > /dev/null
-  "$SLATES" --instance "$instance" repository create project --tool hg > /dev/null
+  "$SLATES" --instance "$instance" repository create project --tool hg > /dev/null \
+    || { echo "slates run $1: repository create refused" | tee -a "$RESULTS"; return 1; }
   IMPORT=("$SLATES" --instance "$instance" repository import project "$SOURCE")
   # shellcheck disable=SC2086 # the surface's NAME=VALUE pairs are words
   token=$(env $exports "$SLATES" --instance "$instance" credential token | sed -n 's/^token: //p')
@@ -240,12 +241,26 @@ for run in $(seq 1 "$RUNS"); do
 done
 
 echo "== results (seconds; every run shown)"
+FAILED_ROWS=""
 for step in push push-chunked import clone incremental-push incremental-pull stream; do
+  grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
   printf '%-18s %-6s' "$step" "$server"
   grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
-    $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  best %s", (best == "" ? "-" : best) }'
+    $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  %s", (best == "" ? "FAILED" : "best " best) }'
   echo
+  if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
+# A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
+# could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round
+# exited 0). A server that timed no step at all (its setup refused) fails it too, though it left no row to mark.
+for server in $SERVERS; do
+  grep -qE "^$server [^ ]+ [0-9]+ [0-9.]+ " "$RESULTS" || FAILED_ROWS="$FAILED_ROWS $server:every-step"
+done
+if [ -n "$FAILED_ROWS" ]; then
+  echo "FAILED: every run failed for$FAILED_ROWS"
+  exit 1
+fi
+

@@ -1627,3 +1627,144 @@ fn an_imports_run_reference_reads_back_whole_or_not_at_all() {
     Err(Refused::Version { version: 9 })
   ));
 }
+
+/// Goal 93, C1 (1) P1 (main's ruling of 2026-11-23 20:53: the changelog's and the manifests' texts off the content store,
+/// read back through the node's changeset store; a let-go manifest delta made again from its two texts and checked
+/// against its row's identity). Do: import each fixture repository; read every changeset's and every manifest's text;
+/// let go every object those rows name; bring each one not held whole back from its text alone, a manifest kept as a
+/// delta from its text and the text of the revision it is against ([`crate::push::held::log_text_held`]); then let a
+/// delta go again and bring it back against a wrong text. Expect: objects let go (the non-vacuity count) and each read
+/// as not whole until brought back; every text read back the same after; a delta against the wrong text refused
+/// `NotHeld`, nothing brought back.
+#[test]
+fn a_changelog_or_manifest_revision_let_go_is_brought_back_from_its_text_a_delta_made_again() {
+  let (mut deltas_brought, mut refused) = (0u64, 0u64);
+  for name in REPOSITORIES {
+    let (deltas, wrong_refused) = let_go_and_brought_back(name);
+    deltas_brought += deltas;
+    refused += u64::from(wrong_refused);
+  }
+  assert!(
+    deltas_brought > 0,
+    "manifest deltas made again and brought back"
+  );
+  assert!(refused > 0, "a delta against the wrong text refused");
+}
+
+/// A log's revisions as the let-go test reads them: each one's node, the object its row names, and its text.
+type LogObjects = Vec<(crate::Node, ContentId, Vec<u8>)>;
+
+/// The changelog's and the manifest log's revisions `index` holds, each with the object its row names and its text.
+fn log_objects(
+  index: &crate::index::HgIndex,
+  store: &ContentStore,
+  changesets: u32,
+) -> (LogObjects, LogObjects) {
+  let changelog = (0..changesets)
+    .map(|rev| {
+      let row = index.changeset(store, rev).unwrap();
+      (
+        row.node,
+        row.text,
+        store.object_bytes(&row.text, row.len).unwrap(),
+      )
+    })
+    .collect();
+  let manifests = (0..index.len(store, Log::Manifest))
+    .map(|rev| {
+      let row = index.revision(store, Log::Manifest, rev).unwrap();
+      (
+        row.node,
+        row.bytes,
+        index.revision_text(store, Log::Manifest, rev).unwrap(),
+      )
+    })
+    .collect();
+  (changelog, manifests)
+}
+
+/// The let-go test over fixture `name` (its doc): every changelog and manifest object let go, each not held whole
+/// brought back from its text, every text read back the same, and a delta's bring-back against the wrong text tried.
+/// The manifest deltas made again, and whether the wrong one was refused.
+fn let_go_and_brought_back(name: &str) -> (u64, bool) {
+  let mut repository = repository(name);
+  let mut store = store();
+  let imported = import(&mut repository, &mut store, room()).unwrap();
+  let index = &imported.index;
+  let (changesets, manifests) = log_objects(index, &store, imported.changesets);
+  let text_of: BTreeMap<crate::Node, Vec<u8>> = manifests
+    .iter()
+    .map(|(node, _, text)| (*node, text.clone()))
+    .collect();
+  let let_go: u64 = changesets
+    .iter()
+    .chain(&manifests)
+    .map(|(_, identity, _)| store.let_go_object(identity))
+    .sum();
+  assert!(let_go > 0, "{name}: objects let go");
+  // A changeset's text: no manifest delta is made against one.
+  let wrong = changesets[0].2.clone();
+  let changesets_back = brought_back(index, &mut store, (Log::Changelog, &changesets), &text_of);
+  let (manifests_back, deltas) =
+    brought_back(index, &mut store, (Log::Manifest, &manifests), &text_of);
+  assert!(
+    changesets_back.0 + manifests_back > 0,
+    "{name}: revisions brought back"
+  );
+  assert_eq!(
+    log_objects(index, &store, imported.changesets),
+    (changesets, manifests.clone()),
+    "{name}"
+  );
+  let delta = manifests.iter().find(|(node, _, _)| {
+    crate::push::held::log_text_held((index, &store), Log::Manifest, node)
+      .unwrap()
+      .against
+      .is_some()
+  });
+  let refused = delta.is_some_and(|(node, identity, text)| {
+    wrong_delta_refused(index, &mut store, (node, identity), (text, &wrong))
+  });
+  (deltas, refused)
+}
+
+/// Brings back each of `objects`, revisions of `log`, not held whole, from its text (a manifest delta against
+/// `text_of` its base's): how many, and how many of them were deltas made again.
+fn brought_back(
+  index: &crate::index::HgIndex,
+  store: &mut ContentStore,
+  (log, objects): (Log<'_>, &LogObjects),
+  text_of: &BTreeMap<crate::Node, Vec<u8>>,
+) -> (u64, u64) {
+  let (mut brought, mut deltas) = (0u64, 0u64);
+  for (node, _, text) in objects {
+    let held = crate::push::held::log_text_held((index, store), log, node).unwrap();
+    if held.whole {
+      continue;
+    }
+    let against = held.against.map(|against| text_of[&against].as_slice());
+    crate::push::held::bring_back_log((index, store), log, node, (text, against)).unwrap();
+    brought += 1;
+    deltas += u64::from(against.is_some());
+  }
+  (brought, deltas)
+}
+
+/// Lets the manifest delta `identity` of `node` go again and brings it back against `wrong`, a text not its base's:
+/// whether it was refused `NotHeld` and left not whole (false where nothing could be let go).
+fn wrong_delta_refused(
+  index: &crate::index::HgIndex,
+  store: &mut ContentStore,
+  (node, identity): (&crate::Node, &ContentId),
+  (text, wrong): (&[u8], &[u8]),
+) -> bool {
+  if store.let_go_object(identity) == 0 {
+    return false;
+  }
+  let answered =
+    crate::push::held::bring_back_log((index, store), Log::Manifest, node, (text, Some(wrong)));
+  answered == Err(slates_vcs::ContentRefused::NotHeld)
+    && !crate::push::held::log_text_held((index, store), Log::Manifest, node)
+      .unwrap()
+      .whole
+}

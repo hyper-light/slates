@@ -173,10 +173,11 @@ fn main() -> ExitCode {
   let own_bytes = fork.rows().own_bytes();
   let windows = own_bytes / u64::try_from(window).unwrap().max(1);
   println!(
-    "intake_steps: the fork's rows {rows}, seals {seals} ({} rows a seal on average); most own runs {}, tiered merges \
-     {}, the longest merge {longest_merge} steps",
+    "intake_steps: the fork's rows {rows}, seals {seals} ({} rows a seal on average); most own runs {} (no merge due; \
+     {} with one due or under way), tiered merges {}, the longest merge {longest_merge} steps",
     rows / seals.max(1),
     intaken.most_own_runs,
+    intaken.most_own_runs_in_flight,
     intaken.tiered_merges
   );
   println!(
