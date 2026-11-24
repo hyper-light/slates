@@ -2805,8 +2805,16 @@
 > identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
 > released, `EROFS` to every change; the server's seam over `ContentStore`. A-645 (a) BUILT (2026-11-20): a hook's
 > REPOS-PATH is its repository's view, presented on the owner shard and mounted read-only under the store's standing
-> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. Owed: the
-> by-use run with stock svn 1.15 (run-requests.md); a revision property change's own signal, since each hook refreshes
+> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. **By use
+> with stock svn 1.15 (main 01a20182, big Studio, 2026-11-23):** `a_repository_policys_hook_lets_stock_svn_change_a_revision_property`,
+> `a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory` and
+> `a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it` pass (r202, 2e375de89).
+> `a_hooks_first_view_of_a_long_history_is_waited_for_while_it_is_laid_out` passes 3 of 3 alone (r351, 23850ce74), red
+> 3 of 3 at 2e375de89 (r269, the import refused `BudgetExceeded { available: 0 }`). **A-877 (c1da780ec) closed it:**
+> main's bisect of the 79 commits between (r378, 7 steps, the test alone on the big Studio) names c1da780ec the first
+> fixed commit ("repository windows shorter than a granule share one-granule slabs"). Before it, each of the first
+> revision's 4,872 tiny texts held a granule of its own, and the owner shard's admittable room ran out within seconds. The svn matrix's revprop rows pass with the store (r202, 66 of 66 over svn:// and
+> HTTP). Owed: a revision property change's own signal, since each hook refreshes
 > every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
 > repository. Owed before: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
@@ -4566,6 +4574,15 @@
 >   (r21).
 > - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
 >   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **The use test over HTTP, every verb (main's r202, 2026-11-23, big Studio, main 2e375de89):** the svn matrix over
+> svn:// and with `ROUTE=http` both passed 66 of 66 (blame, diff and merge over HTTP among them, and the revision
+> property rows with the store: A-681's HTTP rows and A-645 (a)'s revprop rows by use). The use test met two of the
+> harness's own faults, now fixed:
+> - `info`'s entries compared in stock svn's hash order, which APR seeds afresh each run;
+> - a working copy's symbolic link read through as a file (`IsADirectory` over git-2000).
+>
+> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Owed:** main's rerun of the
+> use test over HTTP with reads.dump and git-2000.dump.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
