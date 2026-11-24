@@ -18,6 +18,8 @@ use slates_vfs::host::tree::{TreeEntry, TreeSource};
 /// Green `green` as it was at `version`, as a base tree.
 pub(crate) struct GreenTree<'a> {
   green: &'a Green,
+  /// The green's id, where its reader reads the plane: a read that meets a let-go window notes where it read (A-887).
+  id: Option<slates_db::catalog::VolumeId>,
   version: u64,
   /// The shard's content plane, where a file the green holds by its object's name alone is read (A-760 (b) 4d); none
   /// for a reader without one, which refuses such a file.
@@ -29,6 +31,7 @@ impl<'a> GreenTree<'a> {
   pub(crate) fn at(green: &'a Green, version: u64) -> GreenTree<'a> {
     GreenTree {
       green,
+      id: None,
       version,
       plane: None,
     }
@@ -37,11 +40,12 @@ impl<'a> GreenTree<'a> {
   /// [`GreenTree::at`], a named file read through `plane`, the shard's content plane.
   pub(crate) fn reading(
     green: &'a Green,
-    version: u64,
+    (id, version): (slates_db::catalog::VolumeId, u64),
     plane: Option<crate::vcs_store::named_objects::PlaneObjects<'a>>,
   ) -> GreenTree<'a> {
     GreenTree {
       green,
+      id: Some(id),
       version,
       plane,
     }
@@ -51,7 +55,7 @@ impl<'a> GreenTree<'a> {
   /// past its end reads none; one the plane cannot give now (its windows let go, or no plane) is the try-again answer.
   fn read_named(
     &self,
-    identity: slates_merge::named::Identity,
+    (path, identity): (&str, slates_merge::named::Identity),
     offset: u64,
     into: &mut [u8],
   ) -> Result<usize, HostError> {
@@ -70,6 +74,7 @@ impl<'a> GreenTree<'a> {
         objects,
         identity,
         (offset, u64::try_from(take).unwrap_or(u64::MAX)),
+        self.id.map(|green| (green, path, self.version)),
       );
       return Err(named_unread());
     }
@@ -196,7 +201,7 @@ impl TreeSource for GreenTree<'_> {
         slates_merge::engine::Content::Bytes(bytes) => bytes,
         // Held by its object's name alone (A-760 (b) 4d): read through the plane.
         slates_merge::engine::Content::Named(identity) => {
-          return self.read_named(identity, offset, into);
+          return self.read_named((path, identity), offset, into);
         }
       };
       let start = usize::try_from(offset)
@@ -217,7 +222,7 @@ impl TreeSource for GreenTree<'_> {
     let page = match page {
       slates_merge::engine::ContentAt::Bytes(page) => page,
       slates_merge::engine::ContentAt::Named(identity) => {
-        return self.read_named(identity, offset, into);
+        return self.read_named((path, identity), offset, into);
       }
     };
     let take = page.len().min(into.len());

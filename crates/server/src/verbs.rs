@@ -9707,6 +9707,7 @@ fn edit(
     let lent = greens.get(&w.green);
     let base = crate::work_files::Base {
       green: lent.as_deref(),
+      green_id: Some(w.green),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
       entries: Some(&w.entries),
@@ -9945,6 +9946,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     let lent = greens.get(&w.green);
     let base = crate::work_files::Base {
       green: lent.as_deref(),
+      green_id: Some(w.green),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
       entries: Some(&w.entries),
@@ -10164,6 +10166,7 @@ fn build_increment(
   let base = engine.base_for(base_version, &sealed.journal);
   let files_base = crate::work_files::Base {
     green: Some(&*engine),
+    green_id: Some(green_id),
     fetched: None,
     version: base_version,
     entries: None,
@@ -10254,6 +10257,7 @@ pub(crate) fn composed_whole(
   let base = engine.base_for(base_version, &w.journal);
   let files_base = crate::work_files::Base {
     green: Some(&*engine),
+    green_id: Some(green),
     fetched: None,
     version: base_version,
     entries: None,
@@ -11059,7 +11063,14 @@ fn verdict_of(
     return Some(first);
   }
   let wanted = state.greens.get_mut(&green_id)?.unlent_reads(inc);
-  if name_holds::lend_from_plane(state, green_id, &wanted).is_err() {
+  let head = state.greens.get(&green_id)?.head();
+  if name_holds::lend_from_plane(
+    state,
+    &name_holds::ReadIn::verdict(green_id, head, inc),
+    &wanted,
+  )
+  .is_err()
+  {
     return Some(first);
   }
   state.count(name_holds::NAME_LENT_VERDICTS, 1);
@@ -12388,6 +12399,7 @@ pub(crate) fn compose_on_replica(
   let base = replica.base_for(sealed.base_version, &sealed.journal);
   let files_base = crate::work_files::Base {
     green: Some(replica),
+    green_id: None,
     fetched: None,
     version: sealed.base_version,
     entries: None,
@@ -12588,6 +12600,7 @@ fn apply_replacement(
   let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
     green: Some(engine),
+    green_id: None,
     fetched: None,
     version: head,
     entries: None,
@@ -19812,7 +19825,7 @@ pub(crate) async fn rebuild_recovered(
   // Plain volumes first, origins before their clones (A-64: a clone is rebuilt over its recovered origin's snapshot);
   // then greens, whose held origin is walked from a plain volume's snapshot (A-217); then works, each replayed over its
   // rebuilt green (§4.16, A-207). Every record is then reconciled the same way.
-  let max_prefix = rebuild_records(
+  let (max_prefix, after_stores) = rebuild_records(
     state,
     records,
     &images,
@@ -19854,6 +19867,21 @@ pub(crate) async fn rebuild_recovered(
   // Each repository's tool store made again, every entry's objects replayed through its admission and commit in log
   // order, a record a unit (A-662).
   crate::vcs_store::recover(state, slices).await;
+  // The greens whose replay reads a named base a repository's store resolves, rebuilt now the stores are (A-887): the
+  // same rebuild, in the order recovery took them.
+  let mut prefix = max_prefix;
+  for record in &after_stores {
+    rebuild_reconciled(
+      state,
+      record,
+      (&std::collections::BTreeMap::new(), None),
+      (slices, &mut rebuilt),
+      &mut prefix,
+    )
+    .await;
+  }
+  state.merge.after_stores.clear();
+  state.next_prefix = state.next_prefix.max(prefix);
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
   slices.unit_done().await;
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
@@ -19932,7 +19960,7 @@ fn restore_held_image(
 }
 
 /// Every recorded volume rebuilt in the order recovery takes them, a unit each, and reconciled; the prefix a new volume
-/// must start from.
+/// must start from, and the greens left for after the repositories' stores, in that order ([`rebuilt_after_stores`]).
 async fn rebuild_records(
   state: &mut ShardState,
   mut records: Vec<VolumeRecord>,
@@ -19940,7 +19968,7 @@ async fn rebuild_records(
   claims: Option<&slates_vfs::recover::Claims>,
   slices: &mut crate::recovery_slices::RecoverySlices,
   rebuilt: &mut Rebuilt,
-) -> u16 {
+) -> (u16, Vec<VolumeRecord>) {
   let mut max_prefix = state.next_prefix;
   // Each record's key is computed once: computed at every comparison, with a lineage walk that listed the whole catalog
   // each time, the sort alone took 132-141 ms of a 1,001-volume recovery's CPU (2026-11-07, step 1 of the slicing plan).
@@ -19958,35 +19986,98 @@ async fn rebuild_records(
     )
   });
   slices.unit_done().await;
+  let mut after_stores = Vec::new();
   for record in &records {
-    if rebuild_record(
+    if rebuilt_after_stores(state, record) {
+      after_stores.push(record.clone());
+      slices.unit_done().await;
+      continue;
+    }
+    rebuild_reconciled(
       state,
       record,
-      images,
-      claims,
-      slices,
-      rebuilt,
+      (images, claims),
+      (slices, rebuilt),
       &mut max_prefix,
     )
-    .await
-    {
-      let (snapshots, attachments) = reconcile_lost(state, record);
-      rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
-      rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
-      // The NFSv4 opens and delegations the partition journaled hold their files again before the settle reclaims the
-      // files no one holds (A-260): the image carries none of these holds.
-      crate::nfs_state::hold_recovered(state, record.id);
-      rebuilt.orphans_reclaimed = rebuilt
-        .orphans_reclaimed
-        .saturating_add(settle_references(state, record));
-    } else {
-      rebuilt.attachments_dropped = rebuilt
-        .attachments_dropped
-        .saturating_add(keep_unrecovered_mounts(state, record));
-    }
-    slices.unit_done().await;
+    .await;
   }
-  max_prefix
+  (max_prefix, after_stores)
+}
+
+/// Counted: the content store refused to be made when recovery ordered a Mercurial green ([`rebuilt_after_stores`]).
+/// Format: a counter name in the status report.
+const CONTENT_UNMADE_AT_ORDER: &str = "merge.recovery.content_unmade_at_order";
+
+/// Counted: a green recovery rebuilt after the repositories' stores ([`rebuilt_after_stores`]). Format: a counter name
+/// in the status report.
+const GREENS_AFTER_STORES: &str = "merge.recovery.greens_after_stores";
+
+/// Whether recovery rebuilds green `record` after the repositories' stores (A-887; main 01a20182's ruling of 2026-11-24
+/// 03:00, a recovery order by dependency, decided from the replay's plan): a Mercurial green whose replay reads a named
+/// base the content store does not hold whole, which only its repository's index resolves
+/// (`vcs_store::hg_named::named_bases`), or a branch made from one such. Noted so its works wait as a work over a green
+/// awaiting adoption does ([`rebuild_work`]), and counted.
+fn rebuilt_after_stores(state: &mut ShardState, record: &VolumeRecord) -> bool {
+  if !matches!(record.policy.role, Role::Green { .. }) {
+    return false;
+  }
+  let from_one = state
+    .db
+    .partition()
+    .repositories()
+    .member(record.id)
+    .is_some_and(|member| match member.origin {
+      slates_db::catalog::MemberOrigin::Branch { from, .. } => {
+        state.merge.after_stores.contains(&from)
+      }
+      slates_db::catalog::MemberOrigin::Root => false,
+    });
+  // The content store made first, as a first repository makes it (`svn_texts::to_bring`): what it holds whole from the
+  // image is what the plan need not bring.
+  let mercurial = crate::vcs_store::hg_made::mercurial_repository_of(state, record.id).is_some();
+  if mercurial {
+    let window = state.store.content.chunk_bytes();
+    // Refused, the plan finds nothing held and the green waits for the stores: the order is only ever later.
+    if state.vcs_stores.content_made(window).is_err() {
+      state.count(CONTENT_UNMADE_AT_ORDER, 1);
+    }
+  }
+  if !from_one && !(mercurial && crate::vcs_store::hg_named::needs_store(state, record.id)) {
+    return false;
+  }
+  state.merge.after_stores.insert(record.id);
+  state.count(GREENS_AFTER_STORES, 1);
+  true
+}
+
+/// One record rebuilt by its role and reconciled, a unit of the recovery's slices ([`rebuild_records`]).
+async fn rebuild_reconciled(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  (images, claims): (
+    &std::collections::BTreeMap<[u8; 16], VolumeImage>,
+    Option<&slates_vfs::recover::Claims>,
+  ),
+  (slices, rebuilt): (&mut crate::recovery_slices::RecoverySlices, &mut Rebuilt),
+  max_prefix: &mut u16,
+) {
+  if rebuild_record(state, record, images, claims, slices, rebuilt, max_prefix).await {
+    let (snapshots, attachments) = reconcile_lost(state, record);
+    rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
+    rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
+    // The NFSv4 opens and delegations the partition journaled hold their files again before the settle reclaims the
+    // files no one holds (A-260): the image carries none of these holds.
+    crate::nfs_state::hold_recovered(state, record.id);
+    rebuilt.orphans_reclaimed = rebuilt
+      .orphans_reclaimed
+      .saturating_add(settle_references(state, record));
+  } else {
+    rebuilt.attachments_dropped = rebuilt
+      .attachments_dropped
+      .saturating_add(keep_unrecovered_mounts(state, record));
+  }
+  slices.unit_done().await;
 }
 
 /// The FUSE mounts of a volume recovery could not rebuild (§4.8 `NotRecovered`; A-102; A-509): one whose device the
@@ -20110,11 +20201,15 @@ async fn rebuild_record(
       // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
       // once it is replayed.
       let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
+      // A Mercurial green's named bases its replay reads, by the revisions its checkpoint's and chain's changesets name
+      // (A-887), let go again once it is replayed: a landed text's bytes are the node's store's.
+      let brought_hg = crate::vcs_store::hg_named::bring_back_named(state, record.id, slices).await;
       let versions = match member {
         Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
         None => rebuild_green_sliced(state, record, slices).await,
       };
       crate::vcs_store::name_holds::give_back_brought(state, &brought);
+      crate::vcs_store::name_holds::let_go_landed_texts(state, &brought_hg);
       for version in versions {
         crate::merge_service::enqueue_recovered_record(state, record.id, version);
         slices.unit_done().await;
@@ -21036,12 +21131,15 @@ fn replay_chain_entry(
     }
   };
   // An entry naming its content (A-760) reads it from the content plane first, a copy slice a step, so no step reads
-  // a large text whole: the step ends with the entry kept for the next.
-  if entry.increment.unread().is_some() {
+  // a large text whole: the step ends with the entry kept for the next. A run its apply names whole is never read: the
+  // apply keeps no byte of its file (A-887, `Increment::replay_reads`).
+  let reads = entry.increment.replay_reads(&entry.applied);
+  if entry.increment.unread_among(&reads).is_some() {
     let objects = replay_objects(state);
+    let slice = state.config.copy_slice_bytes().max(1);
     let read = entry
       .increment
-      .read_step(&objects, state.config.copy_slice_bytes().max(1))
+      .read_step_among(&objects, slice, &reads)
       .map_err(|_| GreenFence::ContentMissing { version })?;
     if !read {
       *reading = Some(entry);
@@ -21408,6 +21506,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
   if holder
     || owner_of(to_wire_volume(green)) != state.partition
     || state.merge.awaiting_adoption.contains_key(&green)
+    || state.merge.after_stores.contains(&green)
   {
     let created_at = match record.policy.role {
       Role::Work { base_version, .. } => base_version,

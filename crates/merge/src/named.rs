@@ -68,35 +68,60 @@ impl PartialEq for Read {
 impl Eq for Read {}
 
 /// A work's post-state as the engine reads it (A-760): its inline bytes, then each named run's bytes as read, one
-/// address space an op's `src` indexes. A span inside one piece is lent, one across pieces copied.
+/// address space an op's `src` indexes. A span inside one piece is lent, one across pieces copied. Each run takes its
+/// declared length in that space, read or not (A-887, main 01a20182's ruling of 2026-11-24 02:17: a replay leaves
+/// unread a run its apply names whole, which no op reads, so no later run's address may move with it); a run never read
+/// spans no bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct Post<'a> {
   /// The inline bytes.
   pub(crate) inline: &'a [u8],
   /// Each run's bytes as read.
   pub(crate) runs: &'a [Vec<u8>],
+  /// Each run as named, its declared length its place in the address space: none for a post-state of inline bytes
+  /// alone, whose runs then take the lengths read.
+  pub(crate) declared: &'a [NamedRun],
 }
 
 impl<'a> Post<'a> {
-  /// The post-state of `inline` bytes and `runs`.
-  pub(crate) fn of(inline: &'a [u8], runs: &'a [Vec<u8>]) -> Post<'a> {
-    Post { inline, runs }
+  /// The post-state of `inline` bytes and `runs` as read, each the run `declared` names at its place.
+  pub(crate) fn of(inline: &'a [u8], runs: &'a [Vec<u8>], declared: &'a [NamedRun]) -> Post<'a> {
+    Post {
+      inline,
+      runs,
+      declared,
+    }
   }
 
-  /// Its length: the inline bytes and every run's as read.
+  /// How many runs it holds.
+  fn run_count(&self) -> usize {
+    self.runs.len().max(self.declared.len())
+  }
+
+  /// The `at`th run's place in the address space: its declared length, else the bytes read.
+  fn run_len(&self, at: usize) -> u64 {
+    match self.declared.get(at) {
+      Some(run) => run.len,
+      None => self
+        .runs
+        .get(at)
+        .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+    }
+  }
+
+  /// Its length: the inline bytes and every run's.
   pub(crate) fn len(&self) -> u64 {
-    let runs = self
-      .runs
-      .iter()
-      .fold(0usize, |total, run| total.saturating_add(run.len()));
-    u64::try_from(self.inline.len().saturating_add(runs)).unwrap_or(u64::MAX)
+    (0..self.run_count()).fold(
+      u64::try_from(self.inline.len()).unwrap_or(u64::MAX),
+      |total, at| total.saturating_add(self.run_len(at)),
+    )
   }
 
   /// The run whose bytes are exactly the `len` bytes at `src`, by its place: what a whole text's file is made of.
   pub(crate) fn whole_run(&self, src: u64, len: u64) -> Option<usize> {
     let mut start = u64::try_from(self.inline.len()).ok()?;
-    for (at, run) in self.runs.iter().enumerate() {
-      let run_len = u64::try_from(run.len()).ok()?;
+    for at in 0..self.run_count() {
+      let run_len = self.run_len(at);
       if src == start && len == run_len {
         return Some(at);
       }
@@ -105,17 +130,26 @@ impl<'a> Post<'a> {
     None
   }
 
-  /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was).
+  /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was); a run's bytes not read span none.
   pub(crate) fn span(&self, src: u64, len: u64) -> std::borrow::Cow<'a, [u8]> {
     let end = src.saturating_add(len).min(self.len());
     let mut pieces: Vec<&'a [u8]> = Vec::new();
+    let inline = (
+      self.inline,
+      u64::try_from(self.inline.len()).unwrap_or(u64::MAX),
+    );
+    let runs = (0..self.run_count()).map(|at| {
+      let bytes: &'a [u8] = self.runs.get(at).map_or(&[], Vec::as_slice);
+      (bytes, self.run_len(at))
+    });
     let mut start = 0u64;
-    for piece in core::iter::once(self.inline).chain(self.runs.iter().map(Vec::as_slice)) {
-      let piece_end = start.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+    for (piece, piece_len) in core::iter::once(inline).chain(runs) {
+      let piece_end = start.saturating_add(piece_len);
       if src < piece_end && end > start {
         let from = usize::try_from(src.saturating_sub(start)).unwrap_or(usize::MAX);
         let to = usize::try_from(end.min(piece_end).saturating_sub(start)).unwrap_or(usize::MAX);
-        pieces.push(piece.get(from..to).unwrap_or_default());
+        let to = to.min(piece.len());
+        pieces.push(piece.get(from.min(to)..to).unwrap_or_default());
       }
       if piece_end >= end {
         break;

@@ -47,6 +47,8 @@ pub(crate) enum ReadThroughRefused {
     /// The offset in the pack the read asked from.
     at: u64,
   },
+  /// A Mercurial green's named file was not brought back by the revision its changeset names (A-887).
+  Mercurial(super::hg_named::HgNamedRefused),
 }
 
 /// How long a bring-back waits for each read of the node's store before it is refused `Unanswered` (module docs,

@@ -2046,10 +2046,10 @@ fn step_beginning_lent(
   // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
   let lent_green =
     crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
-  let tree = lent_green.as_ref().map(|(green, version)| {
+  let tree = lent_green.as_ref().map(|(green, at)| {
     crate::green_tree::GreenTree::reading(
       green,
-      *version,
+      *at,
       crate::vcs_store::named_objects::plane(&state.vcs_stores, &()),
     )
   });
@@ -2193,10 +2193,10 @@ fn step_granted_lent(state: &mut ShardState, granted: &mut GrantedRun) -> Steppe
   // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
   let lent_green =
     crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
-  let tree = lent_green.as_ref().map(|(green, version)| {
+  let tree = lent_green.as_ref().map(|(green, at)| {
     crate::green_tree::GreenTree::reading(
       green,
-      *version,
+      *at,
       crate::vcs_store::named_objects::plane(&state.vcs_stores, &()),
     )
   });

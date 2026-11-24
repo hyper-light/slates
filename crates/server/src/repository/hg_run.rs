@@ -320,7 +320,9 @@ pub(crate) fn contents_bytes(state: &mut ShardState, contents: &[FileContents]) 
 /// its revision on this shard (`homes::note_landed`, `Landed::Hg`), so no home pins it and a home's read brings it back
 /// by its path and node (`hg_push::bring_back`; goal 93 item 2b(b)); a window noted already (a landed pack's, another
 /// revision's of the same bytes) keeps its note, which brings back the same bytes. The bytes freed and the windows kept
-/// pinned: a push's ([`let_go_landed`]) and an import's (`hg_import::segment_landed`) one path.
+/// pinned: a push's ([`let_go_landed`]) and an import's (`hg_import::segment_landed`) one path. A synchronous test
+/// history, which can bring nothing back, keeps them, as it keeps a Subversion landing's texts and a git push's pack
+/// (`vcs_store::KEEP_LANDED`): a green holds a pushed file by its object's name alone (A-887).
 pub(crate) fn let_go_windows(
   state: &mut ShardState,
   noting: Option<RepositoryId>,
@@ -338,6 +340,10 @@ fn let_go_windows_until(
   contents: &[FileContents],
   deadline_ns: u64,
 ) -> (u64, u64, usize) {
+  #[cfg(test)]
+  if crate::vcs_store::KEEP_LANDED.with(core::cell::Cell::get) {
+    return (0, 0, contents.len());
+  }
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
   crate::vcs_store::lent_state(state, |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
