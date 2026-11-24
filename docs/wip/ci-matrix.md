@@ -96,6 +96,30 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
   `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` failed (`fleet.rs:4990`), and passed in both diag
   runs; an intermittent failure, not a hang.
 
+## The Windows fleet step measured again (2026-11-24)
+
+Main CI run 45385055058 (f0624c32b) cut both Windows fleet steps at their 31-minute limit, every test they reached
+passing: x86_64 had run 218 of the suite's 244 tests, in 1,510.3 s. The suite had more than doubled since the limit
+above was derived. Diagnostics run 45399658803 (branch `diag-measurer-main-winfleet-1`) ran the step whole at 21b8b5311
+on both runners, under a limit only a hang reaches, and the same formulas take its numbers.
+
+| measured | x86_64 | arm64 | source |
+|---|---|---|---|
+| tests run | 237 | 237 | 45399658803 |
+| passed | 236 | 236 | the same |
+| killed at the 240 s deadline | 1 | 1 | `a_captured_clone_moved_to_another_node_is_found_there_by_its_name`, on every Windows run (main CI 45385055058 too) |
+| slowest passing test | 62.9 s | 144.5 s | arm64's `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`, 12.5 s on x86_64 |
+| mean test | 5.73 s | 7.39 s | the same |
+| passing tests' whole, a process each | 1,356.9 s | 1,748.9 s | the step's wall (1,597 s, 1,989 s) less the killed test's 240.1 s |
+| the runner's and the test binary's build | 267 s | 374 s | the same |
+
+- **Deadline:** 2 × max(the slowest passing test, 144.5 s; the suite's own longest wait, 120 s) = 289 s.
+- **Step limit:** ⌈(1.5 × 1,748.9 s + 289 s for one killed test + 374 s to build) / 60⌉ = 55 minutes. The job's ceiling
+  stays GitHub's default 360 minutes, so the suite is still one step on each runner.
+- **Seen while measuring:** `a_captured_clone_moved_to_another_node_is_found_there_by_its_name` waits out its deadline at
+  `fleet.rs:7072` for the share's carry on both Windows runners while its two sibling captured-clone moves pass (w-shared
+  has it). arm64 runs `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` 11.6 times as long as x86_64 does.
+
 ## The gaps, and the cheapest lane for each
 
 1. **Five CLI suites run nowhere** (every test skips for `SLATES_TEST_CLI`, which only the CLI steps set):
