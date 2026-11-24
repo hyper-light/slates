@@ -10962,6 +10962,10 @@ fn submit(
         crate::made_commit::Taken::Unrecorded(tool) => {
           return refused(Refusal::RecordedSubmitRequired { tool });
         }
+        // Its repository awaits its rebuild here: retryable, unrecorded (A-636 part 2c-2).
+        crate::made_commit::Taken::Unbuilt => {
+          return refused(Refusal::Overloaded { shard: state.shard });
+        }
         crate::made_commit::Taken::Held | crate::made_commit::Taken::Unhooked => {}
       }
       let Some(sealed) = take_sealed(state, work_id) else {
@@ -13006,6 +13010,10 @@ fn submit_computed(
     }
     crate::made_commit::Taken::Unrecorded(tool) => {
       return refused(Refusal::RecordedSubmitRequired { tool });
+    }
+    // Its repository awaits its rebuild here: retryable, unrecorded (A-636 part 2c-2).
+    crate::made_commit::Taken::Unbuilt => {
+      return refused(Refusal::Overloaded { shard: state.shard });
     }
     crate::made_commit::Taken::Held | crate::made_commit::Taken::Unhooked => {}
   }
