@@ -489,16 +489,26 @@
 > READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
 > test now fails in 305 s naming the stall instead of hanging.
 
-> **A-878 (OPEN, 2026-11-23, w-win2; main 01a20182's ruling): a long write through a separately attached client is
-> refused `AttachmentExpired`.** `a_freed_content_extent_gives_its_commit_back_on_windows`
-> (`crates/cli/tests/content_extents_windows.rs`), run by a lane for the first time, attaches a volume for writing with
-> `slates attach`, a process that then exits, and writes 256 MiB through that attachment with `slates write`, another.
-> The write is refused `AttachmentExpired { attachment: 281474976710657 }` on windows-latest and windows-11-arm (diag
-> run 45260798132), where the restart test's 16 MiB write through the same flow passes. Read so far, not measured: the
-> attachment's term runs out mid-write, with nothing renewing it once the process that attached has gone. The test is
-> skipped by name in CI's two extents steps, and is this entry's red. Next: whether it is Windows-only (a write that
-> outlasts the term through a separate attach process, on macOS), and if not, the term renewed while the attachment is
-> in use.
+> **A-879 (FIXED 2026-11-23, w-win2; main 01a20182's rulings; opened as A-878, renumbered when that id went to w-chaos's
+> design amendment): a long write through a separately attached client was refused `AttachmentExpired`.**
+> `slates write` read all of stdin and staged it before its first verb named the attachment, and nothing renewed a CLI
+> attachment another `slates attach` process had made meanwhile. So an input slower than the term to arrive, or a large
+> one slower than the term to stage, met a lapsed attachment. Seen on both Windows runners for the 256 MiB write of
+> `a_freed_content_extent_gives_its_commit_back_on_windows` (`AttachmentExpired { attachment: 281474976710657 }`, diag
+> run 45260798132), and on macOS for a 16 MiB input that arrived after an 8 s pause (the same input with no pause was
+> written in 1 s). It is every platform's bug. The Windows test also let its attachment lapse before its write began: it
+> made its 256 MiB input after attaching, seconds in a debug build against a term of about a second (the named
+> refusal, diag run 45289962818: "could not be held ... AttachmentExpired"); it now holds the attachment from its making
+> with `slates attach --hold` until the write says its own hold is taken, as the restart test does. Now `slates write`
+> holds the attachment (`slates_client::Hold`) from before it reads stdin until its write is answered. `Renew` answers
+> an attachment with no term with `NoTerm`, where it
+> was refused `BadRequest`, so the hold's first renewal says whether there is a term to hold (contract 61). Red then
+> green: the late-input CLI test with the hold off on ubuntu, the Windows commit give-back
+> test with the write's hold ended at once on both runners (`AttachmentExpired` at the staged write's apply), and both
+> green with it (diag runs 45285066499, 45292483681) (`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`). **Owed, the
+> next piece (main's ruling):** the CLI still holds the write's whole input, up to the largest shard's metadata ledger,
+> while the daemon's staging buffer holds a second copy. The fix is a stage opened without a length, reserved put by put
+> within the ledger and bound to the attachment, with a peak-RSS red.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -528,7 +538,7 @@
 > reversed and green with it on both runners (diag run 45260798132: the first create refused `{ available: 5722144768 }`
 > on windows-latest and the create during the remakes `{ available: 5713756160 }`, both admitted with the fix; the Node
 > SDK suites 8 of 8 on both; `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`). The
-> extents file runs on both Windows lanes now, its commit give-back test skipped there as A-878's red. **Owed
+> extents file runs on both Windows lanes now, its commit give-back test among them since A-879's fix. **Owed
 > (item 3b, main's ruling):** a create sent at once after a destroy meets the teardown, which holds the volume's
 > reservation past the destroy's answer, and is refused `BudgetExceeded` on every platform (diag run 45251289894:
 > `{ available: 1430536192 }`, the room less the destroyed volume's). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
