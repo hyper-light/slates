@@ -1144,6 +1144,13 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
+>   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
+>   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
+>   same test on the same merge passed at once after, and in the next round. An observation waits
+>   `LIVENESS_BUDGET_NS` for its shard (`Daemon::pending_patient`), and a busy runner is the norm, so a submit and its
+>   checkpoint's first step inside one observation can outlast it. Main's ruling: a real load sensitivity, to fix in its
+>   turn.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's

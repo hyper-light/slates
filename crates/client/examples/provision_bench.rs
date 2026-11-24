@@ -186,7 +186,15 @@ struct Sample {
   parked: bool,
 }
 
-/// One client's samples: `count` creates (each followed by a destroy that is not timed).
+/// Creates the daemon refused, typed, over the whole bench: each is reported and counted, and the bench fails at its end,
+/// never at the refusal (main 01a20182's r509, 2026-11-23: the 64-client sweep's first `BudgetExceeded` aborted the bench
+/// in a client thread, so its rows never reported).
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Shape: the refusals printed whole; the rest are counted.
+const REFUSALS_PRINTED: u64 = 8;
+
+/// One client's samples: `count` creates (each followed by a destroy that is not timed); a create the daemon refuses
+/// is reported and counted ([`REFUSED`]), and takes no sample.
 fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> Vec<Sample> {
   let mut client = connect(instance);
   // The spinning form spins for the floor (the reply lands without a wake when the daemon
@@ -212,7 +220,16 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
     };
     let (parks_before, _) = client.park_ratio();
     let (started, sent_ns) = (Instant::now(), monotonic_ns());
-    let id = client.create(&spec).unwrap();
+    let id = match client.create(&spec) {
+      Ok(id) => id,
+      Err(ClientError::Refused(refusal)) => {
+        if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < REFUSALS_PRINTED {
+          println!("  provision.{tag} create {n} refused: {refusal:?}");
+        }
+        continue;
+      }
+      Err(e) => panic!("{e}"),
+    };
     let total = ns(started.elapsed());
     let taken_ns = monotonic_ns();
     let exchange = Exchange {
@@ -369,6 +386,11 @@ fn form(
       cpu_now_ns().saturating_sub(cpu_before),
       started.elapsed(),
     ));
+    if all.is_empty() {
+      // Every create of the run refused: its rows read the most a latency can, so the gate fails where it is read.
+      println!("  provision.{key} run {run}: every create refused");
+      all.push(u64::MAX);
+    }
     per_run.push(percentiles(all));
   }
   let mut rows = Vec::new();
@@ -644,7 +666,11 @@ fn main() {
     );
   }
   daemon.stop();
-  if failed {
+  let refused = REFUSED.load(std::sync::atomic::Ordering::Relaxed);
+  if refused > 0 {
+    println!("provision: {refused} creates refused (the first {REFUSALS_PRINTED} printed above)");
+  }
+  if failed || refused > 0 {
     std::process::exit(1);
   }
 }
