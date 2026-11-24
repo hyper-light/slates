@@ -307,93 +307,137 @@ pub(crate) fn needs_store(state: &ShardState, green: VolumeId) -> bool {
 /// turn, whose splices that read a base read the file named then (`slates_merge::engine::splice_reads_base`), and
 /// whose changes leave files named whole (`Increment::named_whole_files`) or not, and move the head attribute.
 fn named_bases(state: &ShardState, green: VolumeId) -> Vec<(Node, Vec<(Identity, String)>)> {
-  use slates_merge::chain_entry::Applied;
-  let mut named: std::collections::BTreeMap<String, Identity> = std::collections::BTreeMap::new();
-  let mut changeset: Option<Node> = None;
-  let partition = state.db.partition();
-  if let Some((_, checkpointed)) = partition.green_checkpoint(green)
-    && let Some(bytes) = crate::merge_service::checkpoint_bytes(state, green, &checkpointed)
-    && let Ok(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
-  {
-    named.extend(
+  let mut planning = Planning::at_checkpoint(state, green);
+  for bytes in state.db.partition().green_chain(green).iter() {
+    if let Some(entry) = chain_entry(state, green, bytes) {
+      planning.reads(state, &entry.applied);
+      planning.leaves(&entry);
+    }
+  }
+  planning.plan
+}
+
+/// Recovery's plan for a green as its chain is walked ([`named_bases`]): the files named as of the entry reached, the
+/// changeset its root's head attribute names then, and the bases planned so far, by changeset.
+struct Planning {
+  /// Each file held by an object's name, by path.
+  named: std::collections::BTreeMap<String, Identity>,
+  /// The changeset named, if any.
+  changeset: Option<Node>,
+  /// The bases to bring back, by the changeset that resolves them.
+  plan: Vec<(Node, Vec<(Identity, String)>)>,
+}
+
+impl Planning {
+  /// The plan at green `green`'s checkpoint: its named files and its root's head attribute; nothing at all without one.
+  fn at_checkpoint(state: &ShardState, green: VolumeId) -> Planning {
+    let mut planning = Planning {
+      named: std::collections::BTreeMap::new(),
+      changeset: None,
+      plan: Vec::new(),
+    };
+    let Some((_, checkpointed)) = state.db.partition().green_checkpoint(green) else {
+      return planning;
+    };
+    let Some(checkpoint) = crate::merge_service::checkpoint_bytes(state, green, &checkpointed)
+      .and_then(|bytes| slates_merge::checkpoint::Checkpoint::decode(&bytes).ok())
+    else {
+      return planning;
+    };
+    planning.named.extend(
       checkpoint
         .named
         .iter()
         .map(|file| (file.key.clone(), file.identity)),
     );
-    changeset = checkpoint
+    planning.changeset = checkpoint
       .xattrs
       .iter()
       .find(|xattr| xattr.key.0 == ROOT && xattr.key.1 == HEAD_ATTRIBUTE)
       .and_then(|xattr| xattr.value.as_deref())
       .and_then(|bytes| Node::try_from(bytes).ok());
+    planning
   }
-  let mut plan: Vec<(Node, Vec<(Identity, String)>)> = Vec::new();
-  let mut want = |changeset: Option<Node>, identity: Identity, path: &str| {
-    let held = state
-      .vcs_stores
-      .content()
-      .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(identity.hash)));
-    let Some(changeset) = changeset.filter(|_| !held) else {
-      return;
-    };
-    let entry = (identity, path.to_owned());
-    match plan.iter_mut().find(|(at, _)| *at == changeset) {
-      Some((_, set)) if set.contains(&entry) => {}
-      Some((_, set)) => set.push(entry),
-      None => plan.push((changeset, vec![entry])),
-    }
-  };
-  for bytes in partition.green_chain(green).iter() {
-    if slates_merge::push::DeferredPush::is_record(bytes) {
-      continue;
-    }
-    let Ok((inputs, carried)) = slates_merge::chain_entry::placement(bytes) else {
-      continue;
-    };
-    let increment = match carried {
-      Some(carried) => std::borrow::Cow::Borrowed(carried),
-      None => match crate::merge_service::increment_of(state, green, &inputs) {
-        Some(increment) => increment,
-        None => continue,
-      },
-    };
-    let Ok(entry) = slates_merge::chain_entry::decode(bytes, &increment) else {
-      continue;
-    };
-    // The bases it reads, as the files were named before it.
-    for change in &entry.applied {
+
+  /// The bases an entry's `applied` changes read, as the files were named before it: each a splice that reads its base
+  /// (`slates_merge::engine::splice_reads_base`) or a copy's source.
+  fn reads(&mut self, state: &ShardState, applied: &[slates_merge::chain_entry::Applied]) {
+    use slates_merge::chain_entry::Applied;
+    for change in applied {
       let read = match change {
         Applied::Spliced(path, ops) if slates_merge::engine::splice_reads_base(ops) => Some(path),
         Applied::Copied { from, .. } => Some(from),
         _ => None,
       };
       if let Some(path) = read
-        && let Some(identity) = named.get(path)
+        && let Some(identity) = self.named.get(path).copied()
       {
-        want(changeset, *identity, path);
+        self.want(state, identity, path);
       }
     }
-    // What it leaves named, and the changeset it names.
+  }
+
+  /// What `entry` leaves named, and the changeset it names.
+  fn leaves(&mut self, entry: &slates_merge::chain_entry::ChainEntry) {
+    use slates_merge::chain_entry::Applied;
     for change in &entry.applied {
       match change {
         Applied::Spliced(path, _) | Applied::Created(path, _) | Applied::RemoveContent(path) => {
-          named.remove(path);
+          self.named.remove(path);
         }
         Applied::Copied { dst, .. } => {
-          named.remove(dst);
+          self.named.remove(dst);
         }
         Applied::CopyTree { dst, .. } => {
           let under = format!("{dst}/");
-          named.retain(|path, _| path != dst && !path.starts_with(&under));
+          self
+            .named
+            .retain(|path, _| path != dst && !path.starts_with(&under));
         }
         Applied::SetXattr(path, name, value) if path == ROOT && name == HEAD_ATTRIBUTE => {
-          changeset = Node::try_from(value.as_slice()).ok();
+          self.changeset = Node::try_from(value.as_slice()).ok();
         }
         _ => {}
       }
     }
-    named.extend(entry.increment.named_whole_files(&entry.applied));
+    self
+      .named
+      .extend(entry.increment.named_whole_files(&entry.applied));
   }
-  plan
+
+  /// `identity`, the file at `path`, planned under the changeset named now, where the content store does not hold it
+  /// whole; each once.
+  fn want(&mut self, state: &ShardState, identity: Identity, path: &str) {
+    let held = state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(identity.hash)));
+    let Some(changeset) = self.changeset.filter(|_| !held) else {
+      return;
+    };
+    let entry = (identity, path.to_owned());
+    match self.plan.iter_mut().find(|(at, _)| *at == changeset) {
+      Some((_, set)) if set.contains(&entry) => {}
+      Some((_, set)) => set.push(entry),
+      None => self.plan.push((changeset, vec![entry])),
+    }
+  }
+}
+
+/// Green `green`'s chain entry `bytes` decoded, its increment carried or read from the content store; none for a deferred
+/// push's record or an entry that does not decode, which the replay fences as it meets it.
+fn chain_entry(
+  state: &ShardState,
+  green: VolumeId,
+  bytes: &[u8],
+) -> Option<slates_merge::chain_entry::ChainEntry> {
+  if slates_merge::push::DeferredPush::is_record(bytes) {
+    return None;
+  }
+  let (inputs, carried) = slates_merge::chain_entry::placement(bytes).ok()?;
+  let increment = match carried {
+    Some(carried) => std::borrow::Cow::Borrowed(carried),
+    None => crate::merge_service::increment_of(state, green, &inputs)?,
+  };
+  slates_merge::chain_entry::decode(bytes, &increment).ok()
 }
