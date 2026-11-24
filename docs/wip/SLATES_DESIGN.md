@@ -63011,3 +63011,35 @@ its serve tests, `crates/server/src/virtiofs.rs`, `crates/server/src/vcs_store/n
 
 Applied in the same change to: GAPS (GAP-A9-14's row), `crates/server/src/{virtiofs,mounted_work}.rs`,
 `crates/server/tests/virtiofs.rs`.
+
+### A-897 — 84a's every-run bar on Windows bare metal is held back by stalls of the path's own threads, which no scheduling change on slates' side removes; the bench names whose time each slow sample is (2026-11-24, w-84a-win for main 01a20182, its rulings of 2026-11-24 04:55 and 05:35; goal 84a; A-871, A-799, A-326, A-559)
+
+- **Why.** A-871 held jupiter's p99 and p999 under 1 ms as each invocation's median of three runs, but single runs
+  still crossed it. The bar is every run (a run of 1,000 samples may hold one sample over 1 ms). Two directions were to
+  be built: (a) a shard's idle window priced on its measured wake tail, rent or buy, and (b) a client spinning for its
+  reply within a window derived from the service time.
+- **Measured instead of built** (BENCHMARKS "84a on Windows bare metal: whose time a slow sample is"; 143 invocations
+  at Normal outside kiln's job, six rounds, every arm against main in the same round). Main failed 1 of 96 loaded runs
+  and 15 of 114 quiet runs, a quiet rate of 3-7e-4 samples over 1 ms a sample. Split on one clock with the slots'
+  stamps (A-559), 177 of 239 slow samples were the client's own thread (its send path stalled 1-29 ms, or its take), and
+  29 were the seat's pickup. No arm moved the rate:
+  - (a) as a 2 ms window tied main, at 4-5 more shard cores.
+  - (b) helped quiet and hurt loaded (with (a): 5 of 24 loaded runs failed against 0). A client spinning for its
+    replies uses up its quantum, and is then round-robined behind the load in its own normal-level code.
+  - Neither did the client's shard holding for its loop, A-326's holds off, the client's thread at ABOVE_NORMAL,
+    HIGHEST or TIME_CRITICAL, or fixed to one of four CPUs.
+  The client stalls 3-12 ms even at TIME_CRITICAL, DPC and interrupt time ran 1.6-2.7% on every CPU, and the hypervisor
+  is present: hypervisor- or DPC-class preemption, inferred, not measured. The operating system's own floor
+  (`pingpong.ps1`: a blocked thread woken 1-12 ms late at 2e-4 to 1e-3 a wake) sits around slates' rate.
+- **The change.** No scheduling change: §4.3's idle window and §4.7's reply wait stand as A-223, A-326 and A-799 left
+  them. `crates/client/examples/edit_merge_bench.rs` carries each judgment's context. A `floor` line before each sweep
+  times the operating system's own wake of a parked thread under the sweep's load. A `cpu` line per form gives the
+  CPU of the shards and of the client thread. The `goal` line lists every run's p99 and p999 beside w-perf's verdict.
+  A `slow` line per sample over the bound splits its edit and its submit into the client's send, the seat's pickup,
+  the service and the client's take, which add up to the call.
+- **Found on the way.** The bench's per-sample telemetry drain touches every shard, and A-326's holds keep each one
+  spinning: about 7 of its ~10 shard cores, for no measured latency (holds off: 2.7-3.3 cores, failed runs unchanged).
+  That observations hold no shard is its own amendment (main's ruling).
+
+Applied in the same change to: `crates/client/examples/edit_merge_bench.rs` (and its unit test of the split),
+`crates/client/Cargo.toml` (`slates-rt` for the client thread's clock), BENCHMARKS, GAPS (84a).
