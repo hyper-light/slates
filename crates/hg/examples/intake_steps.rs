@@ -18,7 +18,9 @@
   clippy::cast_precision_loss
 )]
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::process::ExitCode;
 use std::time::Instant;
 
 use slates_hg::Admission;
@@ -58,10 +60,11 @@ impl Kind {
   }
 }
 
-fn main() {
+fn main() -> ExitCode {
   let args: Vec<String> = std::env::args().collect();
   let [_, bundle, window, room, segment] = args.as_slice() else {
-    panic!("usage: intake_steps <bundle> <window bytes> <room bytes> <segment bytes>");
+    eprintln!("usage: intake_steps <bundle> <window bytes> <room bytes> <segment bytes>");
+    return ExitCode::FAILURE;
   };
   let (window, room, segment): (usize, u64, u64) = (
     window.parse().unwrap(),
@@ -100,7 +103,7 @@ fn main() {
     kinds.entry(unit).or_default().note(took);
     slowest.push((took, at, unit));
     if slowest.len() > SLOWEST * 4 {
-      slowest.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+      slowest.sort_unstable_by_key(|step| Reverse(step.0));
       slowest.truncate(SLOWEST);
     }
     merge_run = if unit == "merge" { merge_run + 1 } else { 0 };
@@ -123,7 +126,10 @@ fn main() {
     match stepped {
       Stepped::More => {}
       Stepped::Done => break,
-      other => panic!("a whole changegroup in memory stepped {other:?}"),
+      other => {
+        eprintln!("intake_steps: a whole changegroup in memory stepped {other:?}");
+        return ExitCode::FAILURE;
+      }
     }
   }
   println!(
@@ -144,7 +150,7 @@ fn main() {
     line(name, kind);
   }
   line("segment records", &records);
-  slowest.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+  slowest.sort_unstable_by_key(|step| Reverse(step.0));
   for (us, step, unit) in slowest.iter().take(SLOWEST) {
     println!(
       "intake_steps:   step {step} ({unit}): {:.1} ms",
@@ -152,7 +158,8 @@ fn main() {
     );
   }
   let Ok((mut fork, intaken)) = intake.finish() else {
-    panic!("the intake finished");
+    eprintln!("intake_steps: the intake did not finish");
+    return ExitCode::FAILURE;
   };
   let (rows, seals) = (fork.rows().rows(), fork.rows().counters().seals);
   println!(
@@ -162,6 +169,7 @@ fn main() {
     intaken.most_own_runs,
     intaken.tiered_merges
   );
+  ExitCode::SUCCESS
 }
 
 /// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
