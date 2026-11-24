@@ -1064,20 +1064,6 @@
 >   `push_heap`'s `a_cached_file_base_is_read_where_it_lies` (one 160 KiB file on two interleaved lines, each delta on
 >   the revision two back): red 176,689 B a revision (1.08 copies), now 12,887 B (0.08). Owed: the 57k push's reading
 >   after the three cuts (`hg_push_lifetimes`, w-perf's).
->   The index tail sealed as a push appends, its runs size-tiered BUILT (2026-11-23, w-hg; main's ruling, the reland of
->   w-perf's 0cd8ef36a, reverted in 2662ca69f): a push held its tail's rows to its end (56 MB of Mercurial's push: each
->   row two buffers), since only an import sealed; sealed at every append alone (0cd8ef36a), each seal a run its fork
->   never merged, so each new row's lookup walked them all and a segment step grew with the push (arena-14: shard 0 past
->   1 s in `hg_push::segment`, the daemon killed). Now every append seals when due through one insert
->   (`HgIndex::insert`, import's own seal gone), and the fork's runs are merged by a size-tiered rule as it goes
->   (`slates_vcs::Index::tiered_due`: the newest merged while their rows together are at least half the next older's;
->   Derived: at most ⌊log₃(own rows ÷ the fewest a seal writes)⌋ + 1 own runs), a table a step between revisions
->   (`Taker::merge_step`, `Intaken::tiered_merges`, `most_own_runs`). Held by
->   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows` (slates-vcs, 2,000 rows: red 2 runs past the
->   bound after 2 seals) and push_heap's
->   `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows` (1,500 edits under a 4 KiB window, 186 seals: red
->   186 own runs against a bound of 9, the push 210 s in debug; now at most 4, 102 merges, 43 s). Owed: the 56 MB tail's
->   reading at full scale (arena-17).
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
