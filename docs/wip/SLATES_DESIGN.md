@@ -61758,7 +61758,8 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   shard CPU; measured on a loaded Mac, debug: the catch-up's 1.11 s in all, 0.32 s of it the begin's drain and count;
   after, 0.24 to 0.26 s, the drain 6 to 9 ms; red `a_turn_and_a_drain_copy_no_directory_however_many_pages_it_holds`,
   20,000 directory pages copied by one mark and one turn over 10,000, now none). The catch-up's step no longer drains
-  twice. The catch-up spends a copy slice's bytes a wake, turns until then (`content_holder::image_catch_up_slice`;
+  twice. CI run 45354317783 at 427ad2389, the starvation test ten times on each: release and debug, ubuntu-latest and
+  macos-latest, 10/10 every one (macOS debug 6/10 at 2cdd88fa3, run 45336582846). The catch-up spends a copy slice's bytes a wake, turns until then (`content_holder::image_catch_up_slice`;
   main's ruling (a) of 2026-11-23 19:16): a turn spends the page size, which a test sets far below the slice, so the
   slice is what a yield's work is judged by, a step's share of the shard's own owed work whatever the page size. The
   pause stays (main's ruling (a)): with F2 it is reached only while publications are refused, where it bounds
