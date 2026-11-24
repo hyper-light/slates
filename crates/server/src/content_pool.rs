@@ -565,7 +565,8 @@ impl ContentPool {
       .sum()
   }
 
-  /// Counts of the pool's free room answered without a scan (A-906's non-vacuity count).
+  /// Counts of the pool's free room answered without a scan (A-906's non-vacuity count; its test reads it).
+  #[cfg(test)]
   pub(crate) fn scans_skipped(&self) -> u64 {
     self.scans_skipped.get()
   }
