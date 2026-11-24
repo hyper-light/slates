@@ -1,0 +1,13 @@
+--- a/crates/bridge-fuse/src/channel.rs
++++ b/crates/bridge-fuse/src/channel.rs
+@@ -1318,7 +1318,9 @@
+     if Some(ino) != root {
+       invalidate(ino, messages);
+     }
+-    more()
++    // DIAG RED (never merged): the walk ignores the budget, so the first slice takes the whole set.
++    let _ = more;
++    std::ops::ControlFlow::Continue(())
+   });
+   let next = match (whole, last) {
+     (false, Some(after)) => Takeover::SentThrough { after },
