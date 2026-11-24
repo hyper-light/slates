@@ -96,3 +96,6 @@ red, and CI skipped it.
   failed stdin read are still `BadRequest` strings. That piece removes both together with the buffer.
 - A staging buffer expires one failover delay after its last put, as an attachment's term does, and no hold renews it.
   The length-less stage is bound to its attachment, so the same hold keeps both alive.
+- This change's CLI flow on the Mac found that a burst of uses, now every held write, drove a CLI attachment's term
+  below the silence its holder had just shown. A-384's floor fixes it in the same landing
+  (`docs/bugs/2026-11-23-a-burst-of-uses-shortened-a-cli-attachments-term.md`).

@@ -35185,6 +35185,28 @@ process was killed (11.9-12.3 s); the CLI's parse tests take `--hold` (29 of 29;
 from the global switch table). Red-checked: a `Hold` whose renewer renews nothing fails the library test's held write,
 and a `--hold` that returns after attaching fails the CLI flow (its holder gone before the write).
 
+**A-384's floor (the third change, 2026-11-23, w-win2 for main 01a20182, its ruling of the same day; found by A-879).**
+A term was `min(F, the tail of the gaps + W)`, and RFC 6298's tail follows its latest samples. So a burst of uses a few
+milliseconds apart, a holder's or any verbs', drove the tail to the burst's gaps and the term toward `W`, whatever
+silence the holder had shown before it. A holder that had just been silent for seconds lapsed sooner than it was ever
+silent. A-879 made every `slates write` such a burst (its hold's first renewal, then its verbs), and A-879's CLI flow
+(an attach, a 2.5 s pause, a held write, a 2.5 s pause, a detach) met `AttachmentExpired` at the detach on the Mac,
+where the failover delay was about 3 s. **The rule:** a term is never below the longest silence its holder has shown
+since its pace began (`AttachmentPace::longest_gap_ns`), plus `W`, and still at most `F`:
+`min(F, max(tail, longest gap) + W)`. Over the attachment's life: a gap longer than `F` ends the attachment, and a
+restart begins its pace again (`renew_termed_at_start`), so the worst a long silence costs is `F`, which A-230 and
+A-363 accept for an abandoned attachment. A holder renewing at its cadence shows no silence longer than that cadence, so
+its term still settles near four thirds of `W`, and it still lapses at its own pace. No verb, field or mode is added.
+**Evidence.** Diag run 45309657568 (2026-11-23, ubuntu-latest and macos-latest, debug builds; the test daemon's `W`
+1 s, its failover delay held at 4 s): `a_burst_of_uses_does_not_shorten_a_term_below_its_holders_earlier_silence`
+failed with the floor reverted on both runners: after a 2.5 s silence the burst's terms fell to 1.357 s (macOS
+1.358 s), below the silence. With the floor they ran from 3.501 s (macOS 3.508 s) to the 4 s ceiling, and the write
+after a shorter 2 s silence was accepted. The held test's renewals named 1.001 s, rose to 1.907 s (macOS 1.908 s) while
+the estimator's deviation warmed, and fell to 1.439 s by the 24th renewal on both, toward four thirds of `W`
+(1.333 s). Its late write, two last terms (2.88 s) after the renewals stopped, was refused `AttachmentExpired`, before
+the ceiling. `attachment_term` 6 of 6 on both (40.9 s, 41.6 s), the library's holds 2 of 2, and the CLI's four
+attachment flows, `a_cli_attachment_outlives_the_process_that_made_it` among them, 4 of 4 on both (20.5 s, 27.5 s).
+
 ### A-382 — A host admitted again lets go its own register copies, and a volume it lost ships no record: the superseded adopter's copy catches up (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Promotion and takeover"; the chaos nemesis's convergence, seeds 6876545201569229162 and 7236833171758868842; A-334's holder side)
 Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the entry of 2026-11-18), the bug record
 `docs/bugs/2026-11-18-a-readmitted-adopters-own-register-copies-refused-its-successor-for-good.md`, and the code below.
@@ -62032,10 +62054,16 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   run 45285066499), and the Windows commit give-back test with the write's hold ended at once on both runners, refused
   `AttachmentExpired` at the staged write's apply, then the extents file 4 of 4 with it (diag run 45292483681). The
   term tests 5 of 5 and the holds 2 of 2 on macOS, ubuntu and both Windows runners.
+- **Found by it: A-384's floor.** A held write is a burst of uses (the hold's first renewal, then the write's verbs a
+  few milliseconds apart), and the gaps' tail follows its latest samples, so the burst drove the term toward `W` below
+  the silence its holder had just shown, and the CLI's attach, pause, write, pause, detach flow met `AttachmentExpired`
+  at the detach on the Mac. A term is now never below the longest silence its holder has shown, plus `W`, and still
+  at most `F`; its rule and its evidence (diag run 45309657568) are in A-384's record, "A-384's floor".
 
-Applied in the same change to: §4.7's A-384 record (the verb's answer for an attachment with no term), GAPS (A-879,
-and A-789's note on the extents file), `docs/cli.md`, `docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`,
-`crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/server/src/verbs.rs`,
-`crates/client/src/{client,hold,lib}.rs`, `crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`,
-`crates/server/tests/attachment_term.rs`, `crates/client/tests/client.rs`, `crates/cli/tests/cli.rs`,
-`.github/workflows/ci.yml`.
+Applied in the same change to: §4.7's A-384 record (the verb's answer for an attachment with no term, and its floor),
+GAPS (A-879, A-384's floor, and A-789's note on the extents file), `docs/cli.md`,
+`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`,
+`docs/bugs/2026-11-23-a-burst-of-uses-shortened-a-cli-attachments-term.md`, `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.txt`, `crates/server/src/{state,verbs}.rs`, `crates/client/src/{client,hold,lib}.rs`,
+`crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`, `crates/server/tests/attachment_term.rs`,
+`crates/client/tests/client.rs`, `crates/cli/tests/{cli,content_extents_windows}.rs`, `.github/workflows/ci.yml`.

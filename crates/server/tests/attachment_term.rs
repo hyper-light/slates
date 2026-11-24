@@ -164,6 +164,65 @@ fn a_cli_attachment_is_renewed_by_its_own_principals_use_alone() {
   );
 }
 
+/// Shape: the floor test's silence before its burst, in liveness windows `W`: five halves, far past the four thirds of a
+/// window a burst's millisecond gaps drive the term toward, and under the ceiling with a window beside it.
+const SILENCE_HALF_WINDOWS: u32 = 5;
+/// Shape: the renewals of the floor test's burst, each at once after the last.
+const BURST: usize = 32;
+/// Shape: the floor test's silence after its burst, in liveness windows: two, shorter than the silence before it and
+/// longer than the four thirds of a window the burst drives the term toward.
+const AFTER_BURST_WINDOWS: u32 = 2;
+
+/// A-384's floor (main 01a20182's ruling of 2026-11-23). Do: on a daemon whose failover delay is held at
+/// [`HELD_CEILING`], attach a volume for write in the CLI's form, leave it unused for [`SILENCE_HALF_WINDOWS`] half
+/// liveness windows, renew it [`BURST`] times at once, leave it unused for [`AFTER_BURST_WINDOWS`] windows, shorter than
+/// the silence before, and write under it. Expect every term the burst's renewals named at least the silence before
+/// it, and the write accepted: a burst of uses teaches no pace its holder has not already shown it keeps. Before, the
+/// burst's millisecond gaps drove the estimator's tail, and with it the term, toward a liveness window, and the write
+/// was refused `AttachmentExpired`.
+#[test]
+fn a_burst_of_uses_does_not_shorten_a_term_below_its_holders_earlier_silence() {
+  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let silence = window.saturating_mul(SILENCE_HALF_WINDOWS) / 2;
+  let after_burst = window.saturating_mul(AFTER_BURST_WINDOWS);
+  let profile = common::machine_profile();
+  let (daemon, instance) = term_daemon(&profile, "term-floor", HELD_CEILING);
+  let mut holder = connect(&instance);
+  let volume = holder.create(&scratch("floor")).unwrap();
+  let attachment = holder
+    .attach_with(volume, None, Intent::Write, AttachRequest::Termed)
+    .unwrap()
+    .attachment;
+  #[allow(clippy::disallowed_methods)] // the holder's silence before its burst
+  std::thread::sleep(silence);
+  let mut terms = Vec::new();
+  for _ in 0..BURST {
+    match holder.renew(attachment) {
+      Ok(Renewal::Renewed { term_ns, .. }) => terms.push(term_ns),
+      other => panic!("a renewal of the burst: {other:?}"),
+    }
+  }
+  #[allow(clippy::disallowed_methods)] // a silence shorter than the one before the burst
+  std::thread::sleep(after_burst);
+  let written = holder.fs_write((volume, attachment), "after.txt", b"after", 0o644);
+  drop(holder);
+  daemon.stop();
+  eprintln!(
+    "after a {silence:?} silence the burst's terms ran {} ns to {} ns",
+    terms.iter().min().copied().unwrap_or(0),
+    terms.iter().max().copied().unwrap_or(0)
+  );
+  let silence_ns = u64::try_from(silence.as_nanos()).unwrap();
+  assert!(
+    terms.iter().all(|term| *term >= silence_ns),
+    "every term the burst named at least the silence before it: {terms:?}"
+  );
+  assert!(
+    written.is_ok(),
+    "the write after a shorter silence than the holder's earlier one: {written:?}"
+  );
+}
+
 /// A-879. Do: on a daemon whose failover delay is held at [`TERM`], attach one volume for write in the SDK's form (its
 /// life is its client's, not a term) and another in the CLI's form; `Renew` each; wait out two terms; write under each.
 /// Expect the SDK attachment's renewal answered `NoTerm` and the CLI attachment's `Renewed` with a term no longer than

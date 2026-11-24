@@ -9614,7 +9614,9 @@
 > (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
 > behind it. **Since A-375 the failover-shaped waits read it** (a forward's bound, the location round's cap, a held
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
-> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
+> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart;
+> **since A-384's floor, 2026-11-23, never below the longest silence its holder has shown, plus `W`**, so a burst of
+> verbs, every held `slates write` since A-879, no longer lapses it sooner than its holder was ever silent),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
 > end with their client); since A-405 a laptop's failover delay counts its anchor's supervision as its detection, and
 > **since A-574 that detection is measured**: the widest window the watchdog judges the daemon's shards by and then the
