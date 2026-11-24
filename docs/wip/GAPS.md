@@ -1178,6 +1178,11 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - A pushed file held twice, as the green's bytes and the content store's object. OPEN, being built (A-887, w-perf,
+>   2026-11-23; main's order on r583: 55,981,957 bytes live under `Green::make_mapped` at the 57k push's end, a third
+>   of system_live). Red: `a_pushed_file_the_content_store_holds_whole_is_held_by_its_name` (both fixture files held as
+>   bytes). Owed: the builder's named runs (Mercurial first, files with copy metadata inline and counted), the
+>   recovery's bring-back for Mercurial greens, main's rerun of the lifetimes sampler; git as its own piece.
 > - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
 >   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
 >   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no

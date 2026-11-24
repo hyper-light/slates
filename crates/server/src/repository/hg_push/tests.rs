@@ -488,10 +488,7 @@ fn head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
 
 /// A green's file at its head.
 fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
-  state
-    .greens
-    .get(&green)
-    .and_then(|engine| engine.content_bytes(path).map(<[u8]>::to_vec))
+  crate::vcs_store::named_objects::read_file(state, green, path)
 }
 
 /// Rebuilds the fixtures' repository in `hg` as one push to its empty first line: `base` and `second`, the changesets
@@ -546,6 +543,84 @@ fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert_eq!(head(state, hg.root), Some(made[1].node));
   assert_eq!(file(state, hg.root, "b").as_deref(), Some(&b"b\n"[..]));
   assert!(hg.holds(state, &made[0].node) && hg.holds(state, &made[1].node));
+}
+
+/// A-887 (main 01a20182's order of 2026-11-23 on the greens' 56 MB: the 57k push's `Green::make_mapped` bytes, live at
+/// its end). Do: rebuild the fixtures' repository as one push to its empty first line, then look at every file of its
+/// root green's head. Expect: each file whose bytes the repository's content store holds whole (by their identity) held
+/// by that name (`Content::Named`), none of them as bytes, and some such files (non-vacuity). Failing first: every one
+/// held as bytes, the green's second copy of what the store holds.
+#[test]
+fn a_pushed_file_the_content_store_holds_whole_is_held_by_its_name() {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let mut hg = Hg::new(state, "named");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let content = state.vcs_stores.content().unwrap();
+    let engine = state.greens.get(&hg.root).unwrap();
+    let (mut named, mut as_bytes) = (0usize, Vec::new());
+    for (path, held) in engine.files() {
+      match held {
+        slates_merge::engine::Content::Named(_) => named += 1,
+        slates_merge::engine::Content::Bytes(bytes) => {
+          if content.contains(&content.object_id(bytes)) {
+            as_bytes.push(path);
+          }
+        }
+      }
+    }
+    assert!(
+      named + as_bytes.len() > 0,
+      "the push's files are in the content store (non-vacuity)"
+    );
+    assert!(
+      as_bytes.is_empty(),
+      "held as bytes though the content store holds them whole: {as_bytes:?} ({named} named)"
+    );
+  });
+}
+
+/// A-887 (main 01a20182's ruling (a), its red for a mount's read). Do: on a store-backed daemon, rebuild the fixtures'
+/// repository as one push to its empty first line; check its root green holds file `b` by its object's name, that
+/// object let go from the content store, as a push's texts are once kept; then read `b` through its name on the shard,
+/// as a mount's read does (`named_objects::read_file_brought`). Expect: `b`'s bytes, `b\n`, its windows brought back by
+/// identity through homes' records. Failing first: none, the read-through finding no object of that identity on the
+/// node's store (a Mercurial file revision's bytes lie there as a delta, by its text's name).
+#[test]
+fn a_named_pushed_file_let_go_is_read_back_through_its_name() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (green, named_away) = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "named-read");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let content = state.vcs_stores.content().unwrap();
+    let held = state
+      .greens
+      .get(&hg.root)
+      .unwrap()
+      .content("b")
+      .map(|held| match held {
+        slates_merge::engine::Content::Named(identity) => {
+          content.is_away(&slates_vcs::ContentId(identity.hash))
+        }
+        slates_merge::engine::Content::Bytes(_) => false,
+      });
+    (hg.root, held)
+  });
+  let served = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { crate::vcs_store::named_objects::read_file_brought(green, "b").await },
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert_eq!(
+    named_away,
+    Some(true),
+    "`b` held by its name, its object let go"
+  );
+  assert_eq!(
+    served.as_deref(),
+    Some(&b"b\n"[..]),
+    "read back through its name"
+  );
 }
 
 /// A-657, AC-HG.3 (T-HG.3; golden, by meaning and byte for byte). Do: rebuild the fixtures' repository from its texts

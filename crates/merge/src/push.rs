@@ -196,6 +196,12 @@ pub trait PushObjects {
   fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable>;
   /// The bytes of the blob `id`.
   fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable>;
+  /// The identity of the object whose bytes are the blob `id`'s whole, where the store holds it as an object of its own
+  /// (A-887): a file the work writes whole from it is named for it, not carried, so the green holds no second copy.
+  /// None by default: the blob is carried in the work's post-state.
+  fn blob_named(&self, _id: ObjectKey) -> Option<crate::named::Identity> {
+    None
+  }
 }
 
 /// A tree's entries read an entry a unit ([`PushObjects::listing`]; A-752 part 2b): listed whole, or the tree's bytes
@@ -282,6 +288,8 @@ pub struct Reads {
   pub blobs: u64,
   /// The subtrees it never read, the base and the push naming the same tree at their path.
   pub skipped: u64,
+  /// The files it named for an object the store holds whole rather than carried (A-887, [`PushObjects::blob_named`]).
+  pub named: u64,
 }
 
 /// A push refused, typed, before any work is made of it.
@@ -777,10 +785,10 @@ impl Building {
         };
         match laid {
           None => Stage::Post(posting),
-          Some((doc, post_state, reads)) => Stage::Identity(Box::new(Hashing::new(
+          Some((doc, post_state, reads, named)) => Stage::Identity(Box::new(Hashing::new(
             (&self.push.name, self.push.base_version),
             doc,
-            post_state,
+            (post_state, named),
             reads,
           ))),
         }
@@ -1437,7 +1445,7 @@ impl Posting {
     objects: &O,
     head: Option<&[u8]>,
     slices: Slices,
-  ) -> Result<Option<(OpsDoc, Vec<u8>, Reads)>, PushRefused> {
+  ) -> Result<Option<Laid>, PushRefused> {
     let Some(size) = self.size else {
       match self.doc.ops.get(self.at) {
         Some(op) => {
@@ -1474,9 +1482,10 @@ impl Posting {
       return Ok(None);
     }
     let Some(op) = self.doc.ops.get(self.at).copied() else {
+      let named = whole_named_runs(&self.doc, &self.plan, &self.walk, objects);
       let doc = core::mem::take(&mut self.doc);
       let post = core::mem::take(&mut self.post);
-      return Ok(Some((doc, post, self.walk.reads)));
+      return Ok(Some((doc, post, self.walk.reads, named)));
     };
     self.at = self.at.saturating_add(1);
     if op.src == u64::MAX {
@@ -1558,6 +1567,8 @@ struct Hashing {
   doc: OpsDoc,
   /// The post-state.
   post_state: Vec<u8>,
+  /// Each operation that writes a file whole from an object the store holds, and that object (A-887), named once hashed.
+  named: Vec<(usize, crate::named::Identity)>,
   /// What the walk read.
   reads: Reads,
   /// The next piece of the document.
@@ -1573,7 +1584,7 @@ impl Hashing {
   fn new(
     (name, base): (&[u8; 32], u64),
     doc: OpsDoc,
-    post_state: Vec<u8>,
+    (post_state, named): (Vec<u8>, Vec<(usize, crate::named::Identity)>),
     reads: Reads,
   ) -> Hashing {
     let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_CONTEXT);
@@ -1583,6 +1594,7 @@ impl Hashing {
       hasher,
       doc,
       post_state,
+      named,
       reads,
       piece: 0,
       hashed: 0,
@@ -1612,20 +1624,133 @@ impl Hashing {
     self.hashed == self.post_state.len()
   }
 
-  /// The work, hashed.
+  /// The work, hashed, then its whole named files' runs taken out of its post-state into named runs (A-887), its
+  /// identity the one its carried form hashes to.
   fn built(self, base: u64) -> Built {
-    Built {
-      increment: Increment {
-        id: *self.hasher.finalize().as_bytes(),
-        base,
-        doc: self.doc,
-        post_state: self.post_state,
-        evidence: Vec::new(),
-        named: Default::default(),
-      },
-      reads: self.reads,
+    let mut increment = Increment {
+      id: *self.hasher.finalize().as_bytes(),
+      base,
+      doc: self.doc,
+      post_state: self.post_state,
+      evidence: Vec::new(),
+      named: Default::default(),
+    };
+    let mut reads = self.reads;
+    reads.named = name_runs(&mut increment, self.named);
+    Built { increment, reads }
+  }
+}
+
+/// What a [`Posting`] lays: the document, the post-state, what the walk read, and each operation that writes a file
+/// whole from an object the store holds, with that object ([`whole_named_runs`]).
+type Laid = (OpsDoc, Vec<u8>, Reads, Vec<(usize, crate::named::Identity)>);
+
+/// Each operation of `doc` that writes a file's blob whole, from its first byte, the only operation adding bytes to its
+/// path, where `objects` holds the blob as an object of its own (A-887, [`PushObjects::blob_named`]): its index and the
+/// object's identity. A loose reading is safe: the commit names a file only where its bytes are exactly one named run
+/// whole (`Green::commit_held`'s `sole_runs`), and makes every other from the same bytes.
+fn whole_named_runs<O: PushObjects + ?Sized>(
+  doc: &OpsDoc,
+  plan: &PostStatePlan,
+  walk: &Walk,
+  objects: &O,
+) -> Vec<(usize, crate::named::Identity)> {
+  let mut adding: BTreeMap<u64, usize> = BTreeMap::new();
+  for op in &doc.ops {
+    if op.src != u64::MAX && adds_bytes(op.kind) {
+      let count = adding.entry(op.path).or_default();
+      *count = count.saturating_add(1);
     }
   }
+  doc
+    .ops
+    .iter()
+    .enumerate()
+    .filter_map(|(at, op)| {
+      let writes = matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
+      if !writes || op.src == u64::MAX || op.at != 0 || adding.get(&op.path) != Some(&1) {
+        return None;
+      }
+      if plan.get(&op.src).copied() != Some(0) {
+        return None;
+      }
+      let path = doc.paths.path(op.path)?;
+      let (id, len) = walk.contents.get(path).copied()?;
+      if len == 0 || op.len != len {
+        return None;
+      }
+      let identity = objects.blob_named(id)?;
+      (identity.len == len).then_some((at, identity))
+    })
+    .collect()
+}
+
+/// Takes each of `named`'s runs (an operation's index and the object its bytes are whole) out of `increment`'s inline
+/// post-state into a named run of that object (A-760), its read buffer the bytes taken, and points the operation at it;
+/// every later inline run moves down by the bytes taken before it. The files named.
+fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Identity)>) -> u64 {
+  let ranges: Vec<(usize, crate::named::Identity, u64, u64)> = {
+    named.sort_by_key(|(at, _)| increment.doc.ops.get(*at).map_or(u64::MAX, |op| op.src));
+    named
+      .into_iter()
+      .filter_map(|(at, identity)| {
+        let op = increment.doc.ops.get(at)?;
+        let end = op.src.checked_add(op.len)?;
+        (end <= to_u64(increment.post_state.len())).then_some((at, identity, op.src, end))
+      })
+      .collect()
+  };
+  // Runs that overlap one before them are left carried: each named run is a range of its own.
+  let mut kept: Vec<(usize, crate::named::Identity, u64, u64)> = Vec::new();
+  for range in ranges {
+    if kept.last().is_none_or(|last| last.3 <= range.2) {
+      kept.push(range);
+    }
+  }
+  if kept.is_empty() {
+    return 0;
+  }
+  let removed_before = |src: u64| -> u64 {
+    kept
+      .iter()
+      .filter(|(_, _, _, end)| *end <= src)
+      .map(|(_, _, start, end)| end.saturating_sub(*start))
+      .fold(0u64, u64::saturating_add)
+  };
+  let old = core::mem::take(&mut increment.post_state);
+  let mut inline = Vec::with_capacity(old.len());
+  let mut buffers = Vec::with_capacity(kept.len());
+  let mut at = 0usize;
+  for (_, _, start, end) in &kept {
+    let (start, end) = (
+      usize::try_from(*start).unwrap_or(usize::MAX),
+      usize::try_from(*end).unwrap_or(usize::MAX),
+    );
+    inline.extend_from_slice(old.get(at..start).unwrap_or_default());
+    buffers.push(old.get(start..end).unwrap_or_default().to_vec());
+    at = end;
+  }
+  inline.extend_from_slice(old.get(at..).unwrap_or_default());
+  drop(old);
+  let named_places: BTreeSet<usize> = kept.iter().map(|(place, ..)| *place).collect();
+  for (place, op) in increment.doc.ops.iter_mut().enumerate() {
+    if op.src != u64::MAX && adds_bytes(op.kind) && !named_places.contains(&place) {
+      op.src = op.src.saturating_sub(removed_before(op.src));
+    }
+  }
+  increment.post_state = inline;
+  for (place, identity, start, end) in &kept {
+    let run = crate::named::NamedRun {
+      identity: *identity,
+      offset: 0,
+      len: end.saturating_sub(*start),
+    };
+    if let (Some(src), Some(op)) = (increment.push_named(run), increment.doc.ops.get_mut(*place)) {
+      op.src = src;
+    }
+  }
+  increment.named.read.0 = buffers;
+  to_u64(kept.len())
 }
 
 /// Whether an operation of `kind` adds bytes the post-state holds.

@@ -91,6 +91,11 @@ pub trait Held {
     let text = self.file_text(path, node)?;
     FileNames::of(&text)
   }
+  /// Whether each file revision's bytes are an object of their own in the node's content store, named by their identity
+  /// ([`FileNames::bytes`]), so a push's work may name a file for them rather than carry them (A-887). Every holder
+  /// states it (no default): one with no content store behind it (a test's texts in memory) has nothing a name could be
+  /// read back from.
+  fn stores_bytes(&self) -> bool;
   /// The length of the revision `node` of `path`'s file log's bytes (its text past its metadata block), if the log
   /// holds it. By default told from its text; a store keeping its rows tells it unread, so a revision whose text is not
   /// at hand (let go to the node's changeset store, A-767 C1) still has its length.

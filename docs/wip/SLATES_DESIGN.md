@@ -62504,3 +62504,28 @@ Applied in the same change to: §4.8 (an operation over several registers); §4.
 Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/ipc/src/protocol.rs`,
 `crates/ipc/tests/wire_order.{rs,txt}`, `crates/api/src/{error,lib}.rs`,
 `crates/server/src/{made_commit,verbs}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named above.
+
+### A-887 — A push's files are held by the names of the objects the content store holds whole, not as a second copy (2026-11-23, w-perf; main 01a20182's order on r583's greens' 56 MB, goal 93; A-760, A-767 C1, A-869)
+
+- **Why.** r583 (the 57k push of Mercurial's history, 80fbd5249) left 55,981,957 bytes under `Green::make_mapped` live
+  at the push's end, a third of the daemon's system allocator's live bytes. Each pushed file's bytes were made whole in
+  the green's heap (`commit_held` makes every file no named run makes whole), while the repository's content store
+  held the same bytes as an object. The push's work carried them inline: merge's push builder lays each written blob
+  into the post-state (`Walk::write`, `Posting`), so the commit read no named run and named no file.
+- **The rule.** A push's builder asks its objects for a blob's stored identity (`PushObjects::blob_named`, none by
+  default); a file the work writes whole from such a blob is taken out of the inline post-state into a named run of
+  that identity (A-760), its read buffer the bytes the builder already holds. The commit then names the file
+  (`named_files`) and keeps no bytes (`Green::set_file`'s `insert_named`). The work's identity is hashed before the
+  runs are named, so it is the one it was. Mercurial first: a file revision's stored text is its object, so a file
+  whose text carries no copy metadata is named; one that carries it (the `\x01\n` block) is not its object whole and
+  stays inline, counted. Git once its blobs are content-plane objects by that identity.
+- **Recovery and reads.** A recovery brings back what a green's checkpoint and chain name and the content store does
+  not hold whole before the green replays (`svn_texts::bring_back_named`, and its live twin for a takeover), now for a
+  Mercurial repository's greens as for a Subversion one's: a Mercurial text let go (A-767 C1) is its landed changeset's
+  Payload, found by its identity. A read of a named file brings back its let-go windows (`named_objects::bring_back_range`,
+  tool-neutral already).
+- **Not changed here.** A work that edits a named file in place, its text let go, is refused at its judge until the text
+  is brought back, as for a Subversion green's named files; a push replaces its files whole and reads no base.
+- **Counters.** `repository.push.files_named` (named rather than made), `repository.push.files_inline_metadata`.
+- **Proven** (to be filled as it lands): `repository::hg_push::tests::a_pushed_file_the_content_store_holds_whole_is_held_by_its_name`
+  (red: both of the fixtures' files held as bytes, none named).

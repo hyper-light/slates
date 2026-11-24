@@ -41,6 +41,11 @@ struct Kept {
 }
 
 impl Held for Kept {
+  /// Texts in memory: no content store holds their bytes, so a push names no file for them.
+  fn stores_bytes(&self) -> bool {
+    false
+  }
+
   fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
     self
       .changesets
@@ -710,6 +715,11 @@ struct LetGo<'k> {
 }
 
 impl Held for LetGo<'_> {
+  /// Texts in memory: no content store holds their bytes, so a push names no file for them.
+  fn stores_bytes(&self) -> bool {
+    false
+  }
+
   fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
     self.kept.changeset_text(node)
   }

@@ -680,7 +680,8 @@ fn work((named, head): (&Named, &Node), works: &mut Works<'_>) -> Result<Increme
       if left > 1 {
         uses.insert(key, left.saturating_sub(1));
         if let Some(work) = built.get(&key) {
-          return Ok(work.clone());
+          // With its named runs' bytes (A-887): the judge reads them, and the content store has let them go.
+          return Ok(work.clone_read());
         }
       } else {
         uses.remove(&key);
@@ -1828,7 +1829,10 @@ async fn built_works(
         }
         None => slates_rt::futures::yield_now().await,
         Some(Ok(work)) => {
-          let _ = crate::state::with_state(|state| state.count(WORKS_BUILT, 1));
+          let _ = crate::state::with_state(|state| {
+            state.count(WORKS_BUILT, 1);
+            state.count(crate::repository::push::FILES_NAMED, work.reads.named);
+          });
           built.insert(*key, work.increment);
           break;
         }

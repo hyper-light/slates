@@ -1259,6 +1259,11 @@ enum Verdict {
   Before(u64),
 }
 
+/// Counter: the files a push's works named for the objects the content store holds whole rather than carried (A-887,
+/// `slates_merge::push::Reads::named`): the files whose bytes the green keeps by name, not as a second copy.
+/// Format: a counter name in the status report.
+pub(crate) const FILES_NAMED: &str = "repository.push.files_named";
+
 /// Counter: the bytes of named runs (A-760) a work still held once an accepted verdict was taken: a verdict that cloned
 /// them rather than took them (`Green::judge` against `Green::judge_named`), a copy of every named text a push brings.
 /// Format: a counter name in the status report.
@@ -1309,6 +1314,16 @@ fn judge(
       verdicts.push(None);
       continue;
     };
+    // A work naming its files' objects (A-887) reads them from the content store first: a clone of it, as each step's
+    // is, carries no run's bytes (`slates_merge::named::Read`).
+    if crate::repository::svn_commit::read_named(state, work).is_err() {
+      refused.push(ChangeRefused {
+        index,
+        why: ChangeRefusal::Refused(Refusal::ContentUnavailable),
+      });
+      verdicts.push(None);
+      continue;
+    }
     let judgment = judged_lent(state, green, work);
     // An accepted verdict takes the runs' buffers: any the work still holds were cloned. A refused one takes none, and
     // they go with the work.

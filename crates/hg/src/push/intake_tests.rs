@@ -31,6 +31,11 @@ fn store() -> ContentStore {
 struct Nothing;
 
 impl Held for Nothing {
+  /// Texts in memory: no content store holds their bytes, so a push names no file for them.
+  fn stores_bytes(&self) -> bool {
+    false
+  }
+
   fn changeset_text(&self, _node: &Node) -> Option<Cow<'_, [u8]>> {
     None
   }

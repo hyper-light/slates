@@ -664,7 +664,8 @@ fn a_first_push_creates_every_path_and_sets_the_head() {
     Reads {
       trees: 3,
       blobs: 5,
-      skipped: 0
+      skipped: 0,
+      named: 0
     }
   );
   holds_exactly(&green, &files, &head(1));
@@ -698,7 +699,8 @@ fn a_push_reads_only_the_subtrees_whose_ids_changed() {
     Reads {
       trees: 4,
       blobs: 1,
-      skipped: 2
+      skipped: 2,
+      named: 0
     }
   );
   assert_eq!(
@@ -1296,7 +1298,8 @@ fn a_push_of_more_paths_than_a_u16_table_held_lands_as_one_work() {
     Reads {
       trees: 1,
       blobs: 0,
-      skipped: 0
+      skipped: 0,
+      named: 0
     }
   );
   assert_eq!(
