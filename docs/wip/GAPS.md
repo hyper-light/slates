@@ -4042,7 +4042,10 @@
 >   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
 >   - delete, revert and status failed after them, on the edit left behind.
 >   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
->     4d), and nothing brought it back. The fix is w-svn's, in progress; run 5 follows it.
+>     4d), and nothing brought it back.
+>   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
+>     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
+>     its chunk again, on all three edges, counted.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
@@ -13742,6 +13745,22 @@ its slack, since for a page grain the congruent address is the reservation's bas
 population by its **median**, which a handful of merges cannot move and a grain changed from the page to the
 huge page would move all sixty-four of. **A sum cannot tell a merge from a regression; an order statistic
 can.**
+
+### 8a-tsan-sweep. One sweep held the TSan lane for hours, and one Subversion test fails under it (2026-11-24, open)
+
+Main's TSan step (62 minutes, three times diag 45315777446's 20 min 38 s) timed out on main run 45461883678 at
+62.6 minutes. Diag 45411303175 (7d6874639, ubuntu-latest, its step held to 300 minutes) took 234 minutes. Its log's
+timestamps put 3 h 26 min of that in one test, `content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`
+(14:34 to 18:00), where the rest of the server's library took 16 min 15 s. The sweep runs on one shard, so it has no
+second thread for ThreadSanitizer to watch, while every byte it holds to is read through the shared object's atomics
+(A-171), each intercepted. The lane now leaves it out (`SERVER_SKIPPED` in `xtask/src/tsan.rs`, with that reason;
+it runs in every other lane), and the step's limit is three times the measured pass without it: 31 min 41 s,
+95 minutes.
+
+Open (w-svn): the same diag's one failure in 1,306 library tests,
+`daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (daemon.rs:9662,
+`seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
+fixed or explained.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
