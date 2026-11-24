@@ -73,9 +73,20 @@ const SHARDS: &str = "2";
 /// anchor restarts a daemon whose first heartbeat lapsed, and a verb sent in that window is not answered.
 const STABLE_STREAK: u32 = 10;
 
-/// Shape: how long a daemon gets to answer verbs steadily once it serves, and one stock git command to end: a guard
-/// against a server that never answers, far above what any command of these sessions takes, never a measure of one.
+/// Shape: how long a daemon's resident set gets to settle ([`settled_resident`]) and `ssh-keyscan` to reach the SSH
+/// edge: a guard against a server that never answers, never a measure of one. A stock git command has no such bound: it
+/// is judged by its progress ([`exit_progressing`]).
 const PATIENCE: Duration = Duration::from_secs(120);
+
+/// Format: the daemon's counters, besides [`CLONE_PATHS`], that move while it works for a git command
+/// ([`exit_progressing`]): the turns of the encoding and of the derivation of versions admitted with no walk (both run
+/// before a fetch's first byte), the versions encoded, and the pushes landed.
+const WORK_COUNTERS: [&str; 4] = [
+  "vcs_store.git_encode.turns",
+  "vcs_store.git_derive.turns",
+  "vcs_store.git_encode.encoded",
+  "git_push.landed",
+];
 
 /// Shape: the pause between polls of a settling daemon and of a running git.
 const POLL: Duration = Duration::from_millis(20);
@@ -204,6 +215,9 @@ struct Git {
   home: String,
   /// The `-c` words every command takes before its subcommand.
   config: Vec<String>,
+  /// The instance of the daemon the session's commands talk to, if any: its processes and counters are judged with
+  /// git's ([`exit_progressing`]).
+  daemon: Option<String>,
 }
 
 impl Git {
@@ -217,7 +231,14 @@ impl Git {
       session: session.to_owned(),
       home,
       config,
+      daemon: None,
     }
+  }
+
+  /// The same client, its commands talking to the daemon of `instance` ([`Git::daemon`]).
+  fn serving(mut self, instance: &str) -> Git {
+    self.daemon = Some(instance.to_owned());
+    self
   }
 
   /// The path of the session's copy `name`.
@@ -225,7 +246,8 @@ impl Git {
     format!("{}/{}-{name}", self.scratch, self.session)
   }
 
-  /// Runs git with `args` in `dir`, killed past [`PATIENCE`]: its exit code and both outputs.
+  /// Runs git with `args` in `dir`, killed once neither it nor its daemon makes progress ([`exit_progressing`]): its
+  /// exit code and both outputs.
   fn run(&self, dir: &str, args: &[&str]) -> (i32, String, String) {
     let (program, leading) = self.program.split_first().expect("a command");
     let mut child = Command::new(program)
@@ -250,7 +272,11 @@ impl Git {
       .unwrap();
     let out = read_on_a_thread(child.stdout.take().unwrap());
     let err = read_on_a_thread(child.stderr.take().unwrap());
-    let code = exit_within(&mut child, &format!("git {args:?} in {dir}"));
+    let code = exit_progressing(
+      &mut child,
+      &format!("git {args:?} in {dir}"),
+      self.daemon.as_deref(),
+    );
     (code, out.join().unwrap(), err.join().unwrap())
   }
 
@@ -292,21 +318,55 @@ fn read_on_a_thread(mut from: impl Read + Send + 'static) -> std::thread::JoinHa
   })
 }
 
-/// Waits for `child` to end within [`PATIENCE`], killing it and failing the test past that: its exit code, -1 where a
-/// signal ended it.
-fn exit_within(child: &mut Child, what: &str) -> i32 {
-  let started = Instant::now();
+/// Waits for `child` to end, judged by progress (main 01a20182's ruling of 2026-11-23, after r229: a bound by time or
+/// by a speed ratio fails a correct but slow run, as the whole-repository session's 120 s did while git/git's clone
+/// resolved its deltas): the wait goes on while the process tree under `child` or the processes of the daemon of
+/// `daemon` gain CPU, or that daemon's [`CLONE_PATHS`] and [`WORK_COUNTERS`] move. Once none of them has for
+/// [`process_wait::STALL`], the child is killed and the test fails, naming `what`: a hang fails within that window, a
+/// slow step never. The counters are read only when the CPU shows no progress, and the next window is judged from after
+/// the read, so the status verb's own work is never taken for progress. Its exit code, -1 where a signal ended it.
+fn exit_progressing(child: &mut Child, what: &str, daemon: Option<&str>) -> i32 {
+  let pid = child.id();
+  let roots = || {
+    let mut roots = vec![pid];
+    roots.extend(
+      daemon
+        .map(process_wait::instance_processes)
+        .unwrap_or_default(),
+    );
+    roots
+  };
+  let counted = || daemon.and_then(work_counted);
+  let mut judged = process_wait::Judged::progressing(roots());
+  let mut counters = counted();
   loop {
     if let Some(status) = child.try_wait().unwrap() {
       return status.code().unwrap_or(-1);
     }
-    if started.elapsed() > PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{what} ran past {PATIENCE:?} and was killed");
+    let verdict = judged.judge();
+    if !matches!(verdict, process_wait::Verdict::Waiting { .. }) {
+      let now = counted();
+      if now.is_some() && now != counters {
+        counters = now;
+        judged = process_wait::Judged::progressing(roots());
+      } else if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+          "{what} made no progress for {:?} and was killed: {verdict:?}, its daemon {daemon:?}'s work counters {now:?}",
+          process_wait::STALL
+        );
+      }
     }
     pause();
   }
+}
+
+/// The sums of the daemon of `instance`'s [`CLONE_PATHS`] and [`WORK_COUNTERS`], read once; none where its status
+/// could not be read.
+fn work_counted(instance: &str) -> Option<Vec<u64>> {
+  let names: Vec<&str> = CLONE_PATHS.iter().chain(&WORK_COUNTERS).copied().collect();
+  counters_of(instance, &names)
 }
 
 fn pause() {
@@ -679,7 +739,7 @@ fn stock_git_without_credentials_is_refused_in_its_own_words() {
   let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
   let port = http_edge_port(&started.lines);
   let scratch = Scratch::new("git-refused");
-  let git = Git::new(&program, &scratch, "refused", Vec::new());
+  let git = Git::new(&program, &scratch, "refused", Vec::new()).serving(&instance);
   let site = format!("http://127.0.0.1:{port}");
   let (code, out, err) = git.run(
     &scratch.path,
@@ -713,7 +773,8 @@ fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_toke
   };
   let scratch = Scratch::new("git-http-bearer");
   let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
-  let git = Git::new(&program, &scratch, "bearer", vec!["-c".to_owned(), header]);
+  let git =
+    Git::new(&program, &scratch, "bearer", vec!["-c".to_owned(), header]).serving(&leg.instance);
   round_trip(&git, &format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port));
 }
 
@@ -739,7 +800,8 @@ fn stock_git_pushes_and_clones_tags_of_a_blob_a_tree_and_a_tag() {
   };
   let scratch = Scratch::new("git-http-tags");
   let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
-  let git = Git::new(&program, &scratch, "tags", vec!["-c".to_owned(), header]);
+  let git =
+    Git::new(&program, &scratch, "tags", vec!["-c".to_owned(), header]).serving(&leg.instance);
   let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
   let source = git.copy("source");
   git.ok(&git.scratch, &["init", "-q", "-b", BRANCH, &source]);
@@ -831,7 +893,8 @@ fn a_status_during_a_push_reports_the_daemons_memory_by_kind_while_the_anchor_ke
   let before = status(&leg.instance);
   let scratch = Scratch::new("git-http-memory");
   let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
-  let git = Git::new(&program, &scratch, "memory", vec!["-c".to_owned(), header]);
+  let git =
+    Git::new(&program, &scratch, "memory", vec!["-c".to_owned(), header]).serving(&leg.instance);
   let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
   let pushing = std::sync::atomic::AtomicBool::new(true);
   let reports = std::thread::scope(|scope| {
@@ -1001,7 +1064,7 @@ fn made_history(git: &Git, dir: &str, commits: usize) -> u64 {
   }
   drop(stream);
   let err = read_on_a_thread(importer.stderr.take().unwrap());
-  let code = exit_within(&mut importer, "git fast-import");
+  let code = exit_progressing(&mut importer, "git fast-import", None);
   assert_eq!(code, 0, "git fast-import: {}", err.join().unwrap());
   git.ok(dir, &["repack", "-a", "-d", "-q"]);
   let packs = format!("{dir}/.git/objects/pack");
@@ -1050,7 +1113,7 @@ fn pack_bytes(git: &Git, dir: &str, cut: &str) -> u64 {
   drop(asked);
   let mut pack = packer.stdout.take().unwrap();
   let counted = std::thread::spawn(move || std::io::copy(&mut pack, &mut std::io::sink()).unwrap());
-  let code = exit_within(&mut packer, "git pack-objects");
+  let code = exit_progressing(&mut packer, "git pack-objects", None);
   assert_eq!(code, 0, "git pack-objects --revs of {cut} in {dir}");
   counted.join().unwrap()
 }
@@ -1169,7 +1232,8 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
     &scratch,
     "resident",
     vec!["-c".to_owned(), header],
-  );
+  )
+  .serving(&leg.instance);
   let site = format!("http://127.0.0.1:{}", leg.port);
   let pid = daemon_pid(&leg.instance);
   let real = std::env::var(HISTORY_SOURCE_VARIABLE)
@@ -1275,7 +1339,7 @@ fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_basic() {
     return;
   };
   let scratch = Scratch::new("git-http-basic");
-  let git = Git::new(&program, &scratch, "basic", Vec::new());
+  let git = Git::new(&program, &scratch, "basic", Vec::new()).serving(&leg.instance);
   let url = format!(
     "http://{USER}:{}@127.0.0.1:{}/{REPOSITORY}",
     leg.token, leg.port
@@ -1392,7 +1456,7 @@ fn stock_git_clones_pushes_and_fetches_over_the_ssh_edge() {
      -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts} \
      -o GlobalKnownHostsFile=/dev/null"
   );
-  let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]);
+  let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]).serving(&instance);
   round_trip(&git, &format!("ssh://{USER}@127.0.0.1:{port}/{REPOSITORY}"));
 }
 
@@ -1414,7 +1478,7 @@ fn stock_git_sees_the_branches_the_cli_makes_retires_and_binds() {
   };
   let instance = format!("git-http-branches-{}", std::process::id());
   let scratch = Scratch::new("git-branches");
-  let git = Git::new(&program, &scratch, "branches", Vec::new());
+  let git = Git::new(&program, &scratch, "branches", Vec::new()).serving(&leg.instance);
   let url = format!(
     "http://{USER}:{}@127.0.0.1:{}/{REPOSITORY}",
     leg.token, leg.port
@@ -1527,7 +1591,8 @@ fn racing(session: &str) -> Option<Racing> {
   let leg = http_leg(session)?;
   let scratch = Scratch::new(&format!("git-race-{session}"));
   let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
-  let git = Git::new(&program, &scratch, session, vec!["-c".to_owned(), header]);
+  let git =
+    Git::new(&program, &scratch, session, vec!["-c".to_owned(), header]).serving(&leg.instance);
   let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
   Some(Racing {
     _leg: leg,
@@ -2240,7 +2305,7 @@ fn pack_file_bytes(dir: &str) -> u64 {
 }
 
 /// What a whole-repository mirror clone over one edge took (main 01a20182's order of 2026-11-22 04:53), said on stderr
-/// when dropped, so a clone killed past [`PATIENCE`] says it too, before its daemon goes: the time, the pack bytes slates
+/// when dropped, so a clone killed for making no progress ([`exit_progressing`]) says it too, before its daemon goes: the time, the pack bytes slates
 /// sent beside stock's, and each of [`CLONE_PATHS`]'s counts the clone added.
 struct CloneReport<'a> {
   /// The step (main 01a20182's r28: each heavy step of the session says what it did, a killed one too).
@@ -2446,9 +2511,9 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
 /// repository; over HTTP, also read the edge's `git-upload-pack` advertisement right after the push and compare its ref
 /// lines byte for byte with stock git's own `http-backend` serving the source. Expect every step as stated, every
 /// listing, ref and archive equal, and the advertisements' ref lines identical; each edge's mirror clone says its time,
-/// its pack bytes beside stock git's own clone's and the paths its objects took ([`CloneReport`], said a clone killed past
-/// [`PATIENCE`] too). Skips loudly without stock git, the
-/// dataset, OpenSSH (the SSH edge) or curl (the advertisement), as the round trips do.
+/// its pack bytes beside stock git's own clone's and the paths its objects took ([`CloneReport`], said by a clone
+/// killed for no progress, [`exit_progressing`], too). Skips loudly without stock git, the dataset, OpenSSH (the SSH
+/// edge) or curl (the advertisement), as the round trips do.
 #[test]
 #[ignore = "an interop round over a whole repository (CLAUDE.md §8: main runs it): SLATES_TEST_GIT_DATASET=<repo> cargo test --release -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge"]
 fn stock_git_carries_a_whole_repository_over_each_edge() {
@@ -2479,7 +2544,8 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
       return;
     };
     let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
-    let git = Git::new(&program, &scratch, "http", vec!["-c".to_owned(), header]);
+    let git =
+      Git::new(&program, &scratch, "http", vec!["-c".to_owned(), header]).serving(&leg.instance);
     let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
     git.ok(
       &source,
@@ -2532,7 +2598,7 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
       "core.sshCommand=ssh -F /dev/null -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
        -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts} -o GlobalKnownHostsFile=/dev/null"
     );
-    let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]);
+    let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]).serving(&instance);
     whole_session(
       &git,
       &source,
@@ -2725,7 +2791,7 @@ fn stock_git_carries_windows_paths_byte_identically() {
     "-c".to_owned(),
     format!("http.extraHeader=Authorization: Bearer {}", leg.token),
   ]);
-  let git = Git::new(&program, &scratch, "http", config);
+  let git = Git::new(&program, &scratch, "http", config).serving(&leg.instance);
   let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
   git.ok(
     &source,
