@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 11 (main 01a20182, 2026-11-24 13:25 PST): run 10 passed the server library and found push_on_top's assertions
+# (A-907's test); main's commit moves both pushes' setup to commit_in.
 # Run 10 (main 01a20182, 2026-11-24 13:19 PST): run 9 found serve_peer_records at 11 (A-907's arm); main's commit moves its
 # dispatch to dispatched_request.
 # Run 9 (main 01a20182, 2026-11-24 13:10 PST): main itself after main's lint commits landed (c890f5b6b); run 8 was
