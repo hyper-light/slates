@@ -356,8 +356,8 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
-  let (alive, live_note) = leg.session.alive_and_shipped();
-  notes.extend(live_note);
+  let after = leg.session.after_run();
+  notes.extend(after.notes);
   notes.extend(leg.session.size_note.clone());
   let command = leg.recorded(&command)?;
   drop(leg);
@@ -378,12 +378,13 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     expected_failure_list: None,
     notes,
-    ok: verdict.ok && alive,
+    ok: verdict.ok && after.ok,
   })
 }
 
 /// fsstress inside a container over the OCI bind: LTP's pinned sources staged with the Linux shim and compiled
-/// inside, run with the lane's bounds; the daemon must still answer afterwards.
+/// inside, run with the lane's bounds; the daemon must still answer afterwards. Its whole output is kept in the
+/// scratch, as the host lane keeps it.
 pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let sources = run.scratch.shared("tools")?.join("ltp-linux");
   fetch::stage_fsstress(&sources, HostOs::Linux)?;
@@ -400,9 +401,13 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   );
   let (success, output, command) =
     run_in_container(&mounting_user()?, &leg.binding, &sources, &script)?;
+  super::write_file(
+    &run.scratch.path().join("fsstress-output.txt"),
+    output.as_bytes(),
+  )?;
   let verdict = judge_fsstress(success, &output);
-  let (alive, live_note) = leg.session.alive_and_shipped();
-  let ok = verdict.ok && alive;
+  let after = leg.session.after_run();
+  let ok = verdict.ok && after.ok;
   let mut notes = leg.notes(format!(
     "fsstress: {} ({}), sha256 {}, compiled inside the container `cc {}` over the harness's Linux shim config.h",
     fetch::FSSTRESS_C.upstream,
@@ -410,19 +415,10 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     fetch::FSSTRESS_C.sha256,
     fetch::FSSTRESS_CFLAGS.join(" ")
   ));
-  notes.push(format!(
-    "the daemon answered `volume list` after the run: {alive}"
-  ));
   if !verdict.ok {
     notes.push(format!("fsstress output tail: {}", verdict.detail));
   }
-  if !alive {
-    notes.push(format!(
-      "the daemon stopped answering during the run; anchor log tail:\n{}",
-      leg.session.anchor_log_tail()
-    ));
-  }
-  notes.extend(live_note);
+  notes.extend(after.notes);
   notes.extend(leg.session.size_note.clone());
   let command = leg.recorded(&command)?;
   drop(leg);
@@ -740,7 +736,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .iter()
     .map(|(path, text)| slates_conformance::tap::parse_file(path, text, &runner))
     .collect();
-  let (alive, live_note) = leg.session.alive_and_shipped();
+  let after = leg.session.after_run();
   let mut notes = leg.notes(format!(
     "pjdfstest: {} at {}, compiled inside the container with config.h answered by its own compiler from the \
      harness's {} probes",
@@ -748,13 +744,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     fetch::PJDFSTEST_COMMIT,
     slates_conformance::pjdfstest::probes().len()
   ));
-  if !alive {
-    notes.push(format!(
-      "the daemon stopped answering during the run; anchor log tail:\n{}",
-      leg.session.anchor_log_tail()
-    ));
-  }
-  notes.extend(live_note);
+  notes.extend(after.notes);
   notes.extend(leg.session.size_note.clone());
   let command = leg.recorded(&command)?;
   let files = outputs.len();
@@ -766,7 +756,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       runner,
       files,
       timed_out,
-      alive,
+      after_ok: after.ok,
       command,
       notes,
     },

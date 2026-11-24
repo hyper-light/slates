@@ -10487,9 +10487,18 @@
 > `docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`.
 > - Not a defect: the candidates' `durable=none` in the record. Every held copy reports no durable position, and the
 >   harness reads only the candidates' heads.
-> - **Open (the harness's):** a live run's record says "the daemon answered `volume list` after the run: false" and "the
->   daemon stopped answering during the run" whenever the log did not catch up, because `Session::alive_and_shipped`
->   returns the two answers as one flag. The daemon answered `status` throughout.
+> - **Closed (the harness's, 2026-11-24, w-ci):** a live run's record said "the daemon answered `volume list` after the
+>   run: false" and "the daemon stopped answering during the run" whenever the log did not catch up, because
+>   `Session::alive_and_shipped` returned the two answers as one flag; the daemon answered `status` throughout. Every
+>   suite's record now takes both from `Session::after_run`, which notes each on its own; the live note keeps each
+>   node's whole `live` status line (holders, fence, recorded holders), and the container lane keeps fsstress's output in
+>   its scratch, as the host lane does. Test: `a_record_says_whether_the_daemon_stopped_or_the_fleet_did_not_ship`.
+> - **Open (w-ci, 2026-11-24): the lane still fails after the fix, with one candidate left behind.** Run 45318320246 at
+>   1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s fleet wait the
+>   owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at 2149. The same
+>   shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083). The
+>   live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job steps),
+>   so it is no regression of that window; the cause is being looked for.
 > - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
 >   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
 

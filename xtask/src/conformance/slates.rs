@@ -1012,6 +1012,46 @@ pub(crate) struct Session {
 /// the abort or the refusal that ended it sits at the tail.
 const ANCHOR_LOG_TAIL_LINES: usize = 40;
 
+/// What a session showed after its suite: the verdict on the daemon and, for a live-shipped session, on the fleet, and
+/// the notes that say each.
+pub(crate) struct AfterRun {
+  /// The daemon answered and, for a live-shipped session, the run shipped.
+  pub(crate) ok: bool,
+  /// The daemon's answer, with the anchor's log tail when it gave none; then the live note.
+  pub(crate) notes: Vec<String>,
+}
+
+/// The [`AfterRun`] of a daemon that `answered` `volume list` and, for a live-shipped session, of the fleet's
+/// `shipped` judgement and its note; `anchor_log_tail` is read for a daemon that stopped answering. Each is its own
+/// note: until 2026-11-24 the two were one flag, so a fleet that did not catch up was recorded as a daemon that stopped
+/// answering (CI run 45318320246, GAPS "The live-shipped fsstress over FUSE fell behind its candidates").
+fn after_run(
+  answered: bool,
+  shipped: Option<(bool, String)>,
+  anchor_log_tail: impl FnOnce() -> String,
+) -> AfterRun {
+  let mut notes = vec![format!(
+    "the daemon answered `volume list` after the run: {answered}"
+  )];
+  if !answered {
+    notes.push(format!(
+      "the daemon stopped answering during the run; anchor log tail:\n{}",
+      anchor_log_tail()
+    ));
+  }
+  let shipped = match shipped {
+    Some((shipped, note)) => {
+      notes.push(note);
+      shipped
+    }
+    None => true,
+  };
+  AfterRun {
+    ok: answered && shipped,
+    notes,
+  }
+}
+
 impl Session {
   /// Builds the binary, starts the anchor (under `tracer` when given), provisions a volume named
   /// after the suite and mounts it.
@@ -1131,14 +1171,12 @@ impl Session {
     })
   }
 
-  /// Whether the daemon still answers and, for a live-shipped session, the run shipped ([`Session::live_shipped`]);
-  /// and the live note the record carries, for a live-shipped session.
-  pub(crate) fn alive_and_shipped(&self) -> (bool, Option<String>) {
-    let alive = self.daemon_alive();
-    match self.live_shipped() {
-      Some((shipped, note)) => (alive && shipped, Some(note)),
-      None => (alive, None),
-    }
+  /// What the session showed after its suite ([`AfterRun`]): whether the daemon still answers and, for a live-shipped
+  /// session, whether the run shipped ([`Session::live_shipped`]).
+  pub(crate) fn after_run(&self) -> AfterRun {
+    after_run(self.daemon_alive(), self.live_shipped(), || {
+      self.anchor_log_tail()
+    })
   }
 
   /// The live fleet's candidates, for a test that stops them.
@@ -1193,7 +1231,51 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-  use super::{admitted_size, available_of_refusal};
+  use super::{admitted_size, after_run, available_of_refusal};
+
+  /// CI run 45318320246 at 1a734fc38 (`oci-linux` fsstress, live-shipped): the owner answered `status` with its log
+  /// durable at its head while a candidate held 2149 of 2195, and the record said "the daemon answered `volume list`
+  /// after the run: false" and "the daemon stopped answering during the run". Do: judge a run whose daemon answered and
+  /// whose fleet did not ship, one whose daemon stopped answering and whose fleet shipped, and one where both held.
+  /// Expect: the first two fail and each says which: the first that the daemon answered, with the fleet's note and no
+  /// anchor log; the second that the daemon stopped answering, with the anchor's log tail. The third passes.
+  #[test]
+  fn a_record_says_whether_the_daemon_stopped_or_the_fleet_did_not_ship() {
+    let has = |notes: &[String], text: &str| notes.iter().any(|note| note.contains(text));
+    let tail = || "the anchor's last line".to_owned();
+
+    let not_shipped = after_run(true, Some((false, "NOT caught up".to_owned())), tail);
+    assert!(!not_shipped.ok, "a run that did not ship fails");
+    assert!(
+      has(
+        &not_shipped.notes,
+        "the daemon answered `volume list` after the run: true"
+      ) && has(&not_shipped.notes, "NOT caught up"),
+      "{:?}",
+      not_shipped.notes
+    );
+    assert!(
+      !has(&not_shipped.notes, "stopped answering")
+        && !has(&not_shipped.notes, "the anchor's last line"),
+      "a daemon that answered is not recorded as stopped: {:?}",
+      not_shipped.notes
+    );
+
+    let stopped = after_run(false, Some((true, "durable at its head".to_owned())), tail);
+    assert!(!stopped.ok, "a run whose daemon stopped answering fails");
+    assert!(
+      has(
+        &stopped.notes,
+        "the daemon answered `volume list` after the run: false"
+      ) && has(&stopped.notes, "stopped answering during the run")
+        && has(&stopped.notes, "the anchor's last line"),
+      "{:?}",
+      stopped.notes
+    );
+
+    let held = after_run(true, Some((true, "durable at its head".to_owned())), tail);
+    assert!(held.ok, "{:?}", held.notes);
+  }
 
   /// CI run 36565560556 (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`):
   /// stopping an anchor leaves no daemon of its instance running, so no process of one suite outlives it into

@@ -239,7 +239,7 @@ pub(crate) fn run_winfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     write_file(&kept.join(output_name(path)), tap.as_bytes())?;
     parsed.push(parse_file(path, tap, &Runner::Root));
   }
-  let (alive, live_note) = session.alive_and_shipped();
+  let after = session.after_run();
   let mut notes = vec![
     built.note,
     format!(
@@ -253,23 +253,17 @@ pub(crate) fn run_winfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       work.display()
     ),
   ];
-  if !alive {
-    notes.push(format!(
-      "the daemon stopped answering; anchor log tail: {}",
-      session.anchor_log_tail()
-    ));
-  }
-  notes.extend(live_note);
+  notes.extend(after.notes);
   notes.extend(session.size_note.clone());
   drop(session);
-  judged(run, &parsed, alive, notes)
+  judged(run, &parsed, after.ok, notes)
 }
 
 /// The parsed scripts judged against the reviewed list and made a record.
 fn judged(
   run: &Run<'_>,
   parsed: &[slates_conformance::tap::TapFile],
-  alive: bool,
+  after_ok: bool,
   mut notes: Vec<String>,
 ) -> Result<SuiteResult, Failure> {
   let tally = super::suites::tally(parsed);
@@ -281,7 +275,7 @@ fn judged(
   for id in &judgement.listed_now_passing {
     println!("winfstest: listed but now passing {id}");
   }
-  let ok = judgement.acceptable() && tally.incomplete.is_empty() && alive;
+  let ok = judgement.acceptable() && tally.incomplete.is_empty() && after_ok;
   notes.insert(1, judgement.describe());
   if tally.failed > 0 {
     notes.push(super::suites::shape_note(&tally.cases));
