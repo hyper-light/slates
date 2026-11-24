@@ -594,3 +594,10 @@ Waiting: main's route; arena-7 and arena-8.
 - r536 (main, 19:10): the reland costs +20% under load (84 s against 70 s). The cost is Index::get walking sealed runs, each run resolved through ContentStore::get and the shared object's atomics.
 - Next: cut resolves per lookup. Red: a test counting resolves per lookup. Proposed fix: a per-run key filter. Asked main to choose between it and (B).
 - Still to do: (B) the bound in bytes; then the pending steps (72% of intake time).
+
+## 2026-11-23: a key filter per run landed (fa30061d2, merge 34d055a3c)
+- Each run keeps a Bloom filter of its keys (vcs/src/filter.rs), sized by a derived rule: k = ceil(log2 2R) probes, with R = 2(floor(log3 budget)+1). A fork's copies of shared runs carry no filter.
+- Red: 2,000 misses over 5 runs fetched 9,502 tables before, 95 after; 9,903 runs passed over by the filters.
+- New counters: vcs.hg.push_index_resolves and push_index_filter_rejections.
+- Asked main for the r536 loaded matrix at 34d055a3c.
+- Next: (B), the tiered bound in bytes. Possible follow-up: give a push's fork the parent's filters.
