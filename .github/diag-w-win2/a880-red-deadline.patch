@@ -1,0 +1,12 @@
+--- a/crates/server/src/staging.rs
++++ b/crates/server/src/staging.rs
+@@ -140,7 +140,8 @@
+         principal: principal.clone(),
+         bytes: Vec::new(),
+         len: None,
+-        life: Life::WithAttachment(attachment),
++        // DIAG RED (never merged): an open buffer with a lease's deadline, as a sized one has.
++        life: Life::Until(0),
+         credit,
+       },
+     );

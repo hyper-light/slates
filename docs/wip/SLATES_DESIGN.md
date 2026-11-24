@@ -62090,11 +62090,11 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   with that refusal's code (main's ruling: a failed hold reads itself). A hold taken says so on stderr before any input
   is read, the signal a caller that held the attachment itself waits for before it lets go (the Windows extents tests
   hand their attachment from `slates attach --hold` to the write so).
-- **Not changed, owed (the next piece, main's ruling).** The CLI still holds the input whole, up to the largest
-  shard's metadata ledger, while the daemon's staging buffer holds a second copy for the time of the write. A stage
-  opened without a length, reserved put by put within the ledger and bound to the attachment, will take the input as
-  it arrives. Today a staging buffer expires one failover delay after its last put, which no hold renews, so the
-  length-less stage is bound to the attachment the hold keeps.
+- **Not changed, owed (the next piece, main's ruling; A-880 built it the same day).** The CLI still holds the input
+  whole, up to the largest shard's metadata ledger, while the daemon's staging buffer holds a second copy for the time
+  of the write. A stage opened without a length, reserved put by put within the ledger and bound to the attachment, will
+  take the input as it arrives. Today a staging buffer expires one failover delay after its last put, which no hold
+  renews, so the length-less stage is bound to the attachment the hold keeps.
 - **Evidence.** Red then green on every platform: the late-input CLI test with the write's hold off on ubuntu (diag
   run 45285066499), and the Windows commit give-back test with the write's hold ended at once on both runners, refused
   `AttachmentExpired` at the staged write's apply, then the extents file 4 of 4 with it (diag run 45292483681). The
@@ -62283,3 +62283,39 @@ GAPS (A-879, A-384's floor, and A-789's note on the extents file), `docs/cli.md`
 Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A-491's entry),
 `crates/rt/src/shard.rs`, `crates/rt/tests/idle_work.rs`, `crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
 `docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.
+
+### A-880 — A file write streams its input into a staging buffer of no stated length that lives with its attachment (2026-11-23, w-win2 for main 01a20182, its ruling of 2026-11-23 on A-879's input buffer; §4.12; A-879, A-522)
+
+- **What was there.** `slates write` read all of stdin, up to the largest metadata ledger any shard reported, before it
+  sent a byte, and `Client::fs_write` then cloned the input into a request and framed it whole only to learn whether it
+  fitted one, before it staged it in pages into a buffer whose length it stated first (`StageBegin`). A 128 MiB write
+  held its command at 549 MB resident on macOS (a 4-byte write at 11.7 MB, 2026-11-23). A staging buffer reserves its
+  whole length when it begins, and expires one failover delay after its last put (A-522), so a writer that learns its
+  input's length only at its end (a pipe) could neither stage before reading everything nor survive a producer slower
+  than a lease between pages.
+- **The rule** (main's ruling): a writer holds a page of its input, never the input. The daemon stages what arrives,
+  reserving each put's bytes as it comes, within the shard's metadata ledger, and refuses past it typed
+  (`BudgetExceeded`).
+- **The verb.** `RequestBody::StageOpen { volume, attachment }` (appended, published as tag 103) opens a buffer of no
+  stated length for an `FsWriteStaged` under the caller's write attachment, checked as a write through it is
+  (`fs_verbs::writer_attachment`, shared with `with_writer`). Its record is reserved at the open, and each `StagePut`
+  reserves its own bytes from the metadata budget and the allocator, both or neither, refused `BudgetExceeded` with the
+  buffer as it was. It is taken whole at whatever its puts put. It has no deadline: it lives as long as its attachment
+  and is released when the attachment ends, however it ends (a detach, a term's lapse, its client's reap, its volume's
+  destroy: `staging::after_borrow`, which closes every state borrow; a borrow that ended no attachment costs it one
+  comparison of the partition's count of ended attachments, `Partition::attachments_ended`, and one that did walks the
+  open buffers alone), or when applied. StageOpen serves a plain volume, as the file verbs do. Its writer holds the
+  attachment while it reads (A-879), so a producer slower than a lease between pages never loses it, and a writer that
+  dies leaves it for at most the attachment's term. Counted as `staging.opened`, and a release with its attachment as
+  `staging.released_with_attachment`.
+- **The client.** `Client::fs_write_from` reads its input a page at a time, a page being what one `StagePut` of the
+  client's region carries past its framing (`put_page_bytes`, shared with `stage`). An input that ends within a page
+  goes as `fs_write` sends it; a longer one goes into an open buffer as it is read, so the client holds two pages at
+  most. A failed read is `OsRefused`, with nothing written. `slates write` writes stdin through it, with no bound of
+  its own and no `BadRequest`.
+- **Evidence.** A880_RED_AND_GREEN
+
+Applied in the same change to: A-879's record and its bug record (the piece it owed), GAPS (A-879's entry),
+`docs/cli.md`, `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`,
+`crates/server/src/{staging,verbs,fs_verbs,state}.rs`, `crates/db/src/partition.rs`, `crates/client/src/client.rs`,
+`crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`, `crates/client/tests/client.rs`, `crates/cli/tests/cli.rs`.

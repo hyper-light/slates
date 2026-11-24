@@ -1,0 +1,11 @@
+--- a/crates/db/src/partition.rs
++++ b/crates/db/src/partition.rs
+@@ -1154,7 +1154,7 @@
+       .ok_or(DbError::NotFound)?;
+     let record = self.attachments.remove(handle)?;
+     self.unindex_term(&record);
+-    self.attachments_ended = self.attachments_ended.wrapping_add(1);
++    // DIAG RED (never merged): the count of ended attachments never moves.
+     Ok(())
+   }
+ 
