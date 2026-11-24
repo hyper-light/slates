@@ -3241,7 +3241,7 @@ fn start_mesh_unbootstrapped(
     shards,
     regions,
     mirrors,
-    |_| {},
+    &|_, _| {},
   )
 }
 
@@ -3266,7 +3266,7 @@ fn start_mesh_tuned(
     shards,
     &none,
     &std::collections::BTreeMap::new(),
-    tune,
+    &|_, config| tune(config),
   );
   bootstrap_mesh(&daemons, hosts, &none);
   settle_initial_consensus(&daemons, hosts, &none, Quorum { f: 1 });
@@ -3294,7 +3294,7 @@ fn start_mesh_bound_and_advertised(
     slates_db::register::RegionId,
     slates_db::register::RegionId,
   >,
-  tune: fn(&mut DaemonConfig),
+  tune: &dyn Fn(usize, &mut DaemonConfig),
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
@@ -3332,7 +3332,7 @@ fn start_mesh_bound_and_advertised(
           durability: None,
           region_mirrors: mirrors.clone(),
         });
-      tune(&mut config);
+      tune(i, &mut config);
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
@@ -17582,7 +17582,7 @@ fn mesh_with_mapped_candidates() -> (PortLease, [PortMapping; 2], Vec<Daemon>) {
     1,
     &regions,
     &std::collections::BTreeMap::new(),
-    |_| {},
+    &|_, _| {},
   );
   bootstrap_mesh(&daemons, &seeds, &regions);
   settle_initial_consensus(&daemons, &seeds, &regions, Quorum { f: 1 });
@@ -36110,5 +36110,558 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
     head,
     Some(ReplyBody::Versions { head: 1 }),
     "the green holds the one version"
+  );
+}
+
+// ---- A-727 (d1a-3): a region's homes resolve what a crash left (main 01a20182's rulings of 2026-11-23) ----
+
+/// Shape: the store each git fleet node lands its repositories' changesets on (A-767), as `common::hg`'s.
+const GIT_STORE_SIZING: slates_store::store::Sizing = slates_store::store::Sizing {
+  memory: 8 << 20,
+  disk: 1 << 30,
+  extent_bytes: 128 << 10,
+  fanout: 8,
+};
+/// Shape: the store's waiting requests, as `common::hg`'s.
+const GIT_STORE_WAITING: usize = 64;
+
+/// One fleet node's changeset store and the build-output directory it lives in.
+struct NodeStore {
+  owner: slates_store::owner::StoreOwner,
+  _dir: common::target::TargetDir,
+}
+
+/// A store in a directory of its own (`common::hg::serve`'s recipe), its file growing to at most `disk` bytes.
+fn node_store(disk: u64) -> NodeStore {
+  use slates_land::store_root::{StoreGrant, StoreRoot};
+  let dir = common::target::target_dir();
+  let store_dir = format!("{}/store", dir.path);
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(&store_dir).unwrap();
+  let store_dir = std::fs::canonicalize(&store_dir).unwrap();
+  let grant = StoreGrant {
+    repository: 0,
+    target: StoreRoot::identify(&store_dir).unwrap(),
+    issued_ns: 0,
+  };
+  let owner = slates_store::owner::StoreOwner::start(
+    StoreRoot::open(&store_dir, &grant).unwrap(),
+    slates_store::store::Sizing {
+      disk,
+      ..GIT_STORE_SIZING
+    },
+    GIT_STORE_WAITING,
+  )
+  .unwrap();
+  NodeStore { owner, _dir: dir }
+}
+
+/// A three-node `f = 1` fleet whose every node has a changeset store and a git edge (A-727 (d1a-3)'s harness, and
+/// (d3)'s): a git repository `project` made on node `a` (the owner), a token enrolled for this uid, its kill points the
+/// daemons' own test hooks (`Daemon::hold_home_settles`: a stop then leaves an attempt's homes unsettled).
+struct GitFleet {
+  daemons: Vec<Daemon>,
+  hosts: Vec<HostId>,
+  /// The repository's id, as its creation answered.
+  repository: [u8; 16],
+  token: String,
+  _stores: Vec<NodeStore>,
+  _lease: PortLease,
+}
+
+/// [`GitFleet`] named `name`.
+fn git_fleet(name: &str) -> GitFleet {
+  use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, Principal, VcsTool};
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> = names
+    .iter()
+    .map(|node| fleet_node(&format!("{name}-{node}")))
+    .collect();
+  let seeds: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (lease, serve) = mesh_serve_ports(n);
+  let stores: Vec<NodeStore> = (0..n).map(|_| node_store(GIT_STORE_SIZING.disk)).collect();
+  let handles: Vec<_> = stores.iter().map(|store| store.owner.handle()).collect();
+  let tune = move |i: usize, config: &mut DaemonConfig| {
+    config.vcs_http = Some(slates_server::config::VcsHttpConfig {
+      address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+      identity: None,
+    });
+    config.vcs_disk = handles.get(i).cloned();
+  };
+  let none = std::collections::BTreeMap::new();
+  let daemons = start_mesh_bound_and_advertised(
+    nodes,
+    n,
+    &seeds,
+    &certs,
+    (serve.as_slice(), serve.as_slice()),
+    1,
+    1,
+    &none,
+    &std::collections::BTreeMap::new(),
+    &tune,
+  );
+  bootstrap_mesh(&daemons, &seeds, &none);
+  settle_initial_consensus(&daemons, &seeds, &none, Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = common::client::connect(daemons[0].instance());
+  let repository = client
+    .create_repository(&slates_client::RepositorySpec {
+      name: "project".to_owned(),
+      tool: VcsTool::Git,
+      format: ObjectFormat::Sha1,
+      default_branch: "main".to_owned(),
+      green: None,
+    })
+    .unwrap()
+    .bytes;
+  let token = format!("{name}-token-{}", std::process::id());
+  let principal = Principal::Uid {
+    host: client.daemon_status().unwrap().anchor,
+    uid: rustix::process::getuid().as_raw(),
+  };
+  let material = CredentialMaterial::HttpToken {
+    id: slates_server::credentials::token_id(token.as_bytes()),
+    cram_md5_contexts: slates_server::credentials::cram_md5_contexts(token.as_bytes()),
+  };
+  let secret = daemons[0].segment().issuer_secret().unwrap();
+  let proof = slates_server::credentials::enroll_proof(&secret, &principal, &material, None);
+  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
+  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
+  let began = Instant::now();
+  loop {
+    match client.enroll_credential(principal.clone(), material.clone(), None, proof) {
+      Ok(_) => break,
+      Err(slates_client::ClientError::Refused(
+        slates_ipc::protocol::Refusal::CredentialUnreplicated { .. },
+      )) if began.elapsed() < PLACEMENT_DEADLINE => std::thread::yield_now(),
+      Err(error) => panic!("the credential enrolled: {error:?}"),
+    }
+  }
+  // The repository's record at every other node before a test kills its owner (A-636 part 2c-1: its successor takes it
+  // over from it). Its creation answers before the record ships (A-894, owed: the creation is to wait for its f + 1),
+  // and a test that killed the owner sooner left no node to take the repository over, so nothing answered a resolution:
+  // the A-727 (d1a-3) tests red one run in three or four by that alone.
+  let others: Vec<&Daemon> = daemons[1..].iter().collect();
+  let shipped = poll_until(&others, PLACEMENT_DEADLINE, || {
+    Ok(others.iter().all(|daemon| {
+      daemon
+        .repository_takeover(repository)
+        .is_ok_and(|([holds, ..], _)| holds)
+    }))
+  });
+  assert!(shipped, "every other node holds the repository's record");
+  GitFleet {
+    daemons,
+    hosts,
+    repository,
+    token,
+    _stores: stores,
+    _lease: lease,
+  }
+}
+
+/// Stock git in `dir`, never prompting, its messages C's.
+fn git_in(dir: &str, args: &[&str]) -> std::process::Output {
+  std::process::Command::new("git")
+    .current_dir(dir)
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("LC_ALL", "C")
+    .env_remove("GIT_ASKPASS")
+    .args(args)
+    .output()
+    .unwrap()
+}
+
+impl GitFleet {
+  /// Commits `bytes` as `file` in a fresh clone-less repository and pushes `main` to node `node`'s edge: git's stderr
+  /// where it failed.
+  fn push(&self, node: usize, (file, bytes): (&str, &[u8])) -> Result<(), String> {
+    let dir = common::target::target_dir();
+    let work = dir.path.clone();
+    for args in [
+      vec!["init", "-q", "-b", "main"],
+      vec!["config", "user.email", "fleet@example.invalid"],
+      vec!["config", "user.name", "fleet"],
+    ] {
+      assert!(git_in(&work, &args).status.success());
+    }
+    dir.seed(file, bytes);
+    assert!(git_in(&work, &["add", file]).status.success());
+    assert!(
+      git_in(&work, &["commit", "-q", "-m", file])
+        .status
+        .success()
+    );
+    let port = self.daemons[node]
+      .vcs_http_port()
+      .expect("the edge listens");
+    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
+    let url = format!("http://127.0.0.1:{port}/project");
+    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, "main"]);
+    if pushed.status.success() {
+      Ok(())
+    } else {
+      Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    }
+  }
+
+  fn stop(self) {
+    for daemon in self.daemons {
+      daemon.stop();
+    }
+  }
+}
+
+/// A-727 (d1a), no mixed-version homing in a fleet (main 01a20182's ruling of 2026-11-23: refused at once and typed,
+/// never left to the homing's deadline). Do: in a three-node `f = 1` git fleet, make every node but the owner answer home
+/// messages as a node of another home-wire version does; push a commit to the owner's edge; then let them speak this
+/// version again and push another. Expect: the first push refused (no record names objects its homes did not keep), its
+/// homing's time with its other homes far under the homing deadline (`Daemon::longest_homing_ns`: refused at once,
+/// never waiting it out); the second landed. (Judged by the push's wall time against a landed push's first, the bound
+/// failed under load by git's own start, 13.3 s against 10.4 s and the 2 s deadline.)
+#[test]
+fn t_a727_d1a_a_push_homing_to_a_node_of_another_home_wire_version_is_refused_at_once() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("homes-version");
+  for daemon in &fleet.daemons[1..] {
+    daemon.answer_homes_as_another_version(true).unwrap();
+  }
+  let homing = fleet.daemons[0].homing_budget_ns();
+  let refused = fleet.push(0, ("a.txt", b"refused while the region is mixed\n"));
+  let longest = fleet.daemons[0].longest_homing_ns().unwrap_or(u64::MAX);
+  for daemon in &fleet.daemons[1..] {
+    daemon.answer_homes_as_another_version(false).unwrap();
+  }
+  let landed = fleet.push(0, ("b.txt", b"landed once the region matches\n"));
+  fleet.stop();
+  assert!(refused.is_err(), "a push homing to another version refused");
+  assert!(
+    longest < homing,
+    "refused at once: the homing spent {longest} ns with its other homes, against its {homing} ns deadline"
+  );
+  assert_eq!(landed, Ok(()), "the region matched, the push lands");
+}
+
+/// What a resolution test's failure says (A-727 (d1a-3)): each held object's owners now at its home, each node's
+/// resolutions ([to the records, let go, kept]), and its view of the repository's takeover ([holds the record, pending,
+/// learning, materializing], [adopted, rebuilt, unrebuilt]).
+fn resolution_state(fleet: &GitFleet, held: &[(usize, [u8; 32], [u8; 16])]) -> String {
+  let owners: Vec<_> = held
+    .iter()
+    .map(|(at, identity, _)| owners_of(&fleet.daemons[*at - 1], *identity))
+    .collect();
+  let resolutions: Vec<_> = fleet.daemons.iter().map(Daemon::home_resolutions).collect();
+  let takeover: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| daemon.repository_takeover(fleet.repository))
+    .collect();
+  format!(
+    "owners now {owners:?}; resolutions {resolutions:?}; takeover {takeover:?}; the fleet's hosts in order (the owner \
+     first) {:?}",
+    fleet.hosts
+  )
+}
+
+/// The objects `daemon` holds for the region for an attempt of member `node`, each with that attempt's repository.
+fn attempt_holds_of(daemon: &Daemon, node: HostId) -> Vec<([u8; 32], [u8; 16])> {
+  daemon
+    .region_holds()
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|(identity, owners)| {
+      owners.iter().find_map(|owner| match owner {
+        slates_cluster::homes::HomeOwner::Attempt {
+          repository,
+          node: of,
+          ..
+        } if *of == node => Some((identity, *repository)),
+        _ => None,
+      })
+    })
+    .collect()
+}
+
+/// The owners `daemon` holds `identity` for, none where it holds it not.
+fn owners_of(daemon: &Daemon, identity: [u8; 32]) -> Option<Vec<slates_cluster::homes::HomeOwner>> {
+  daemon
+    .region_holds()
+    .ok()?
+    .into_iter()
+    .find(|(held, _)| *held == identity)
+    .map(|(_, owners)| owners)
+}
+
+/// The holds survivors keep for the owner's attempt after its push, each with the survivor's index.
+fn survivors_attempt_holds(fleet: &GitFleet) -> Vec<(usize, [u8; 32], [u8; 16])> {
+  let owner = fleet.hosts[0];
+  fleet.daemons[1..]
+    .iter()
+    .enumerate()
+    .flat_map(|(at, daemon)| {
+      attempt_holds_of(daemon, owner)
+        .into_iter()
+        .map(move |(identity, repository)| (at + 1, identity, repository))
+    })
+    .collect()
+}
+
+/// A-727 (d1a-3), the kill point after the entry (main 01a20182's ruling (u) of 2026-11-23). Do: in a three-node `f = 1`
+/// git fleet, hold the owner's settles (so its homes never hear its move); push a commit to the owner's edge; then stop
+/// the owner. Expect: the push landed, its objects held by the other homes for the owner's attempt; once the owner is
+/// gone, each of those holds resolved by the repository's holder to its records alone (a record names it), never let go
+/// (NoLoss). Failing first: the holds stayed the dead attempt's for the homes' life.
+#[test]
+fn t_a727_d1a3_an_owner_killed_after_its_entry_before_its_homes_heard_leaves_its_objects_held_for_its_records()
+ {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("homes-after-entry");
+  fleet.daemons[0].hold_home_settles(true).unwrap();
+  let pushed = fleet.push(0, ("a.txt", b"landed before its owner died\n"));
+  let held = survivors_attempt_holds(&fleet);
+  fleet.daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let resolved = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(held.iter().all(|(at, identity, repository)| {
+      owners_of(&fleet.daemons[*at - 1], *identity)
+        == Some(vec![slates_cluster::homes::HomeOwner::Record {
+          repository: *repository,
+        }])
+    }))
+  });
+  let state = resolution_state(&fleet, &held);
+  fleet.stop();
+  assert_eq!(pushed, Ok(()), "the push landed");
+  assert!(
+    !held.is_empty(),
+    "the other homes held its objects for its attempt"
+  );
+  assert!(
+    resolved,
+    "each hold resolved to the records: {held:?}; {state}"
+  );
+}
+
+/// A-727 (d1a-3), an ended attempt is never spread, only resolved (main 01a20182's ruling of 2026-11-24 04:40). Do: as
+/// the kill point after the entry, every survivor's resolutions held; once both survivors' heal walks of the owner's
+/// retirement have run through (the survivor whose homes hold the objects offers them to the other, whatever the
+/// placement), let that first survivor resolve its holds to the records and hold its resolutions again; then have the
+/// other walk its holds (`Daemon::owe_heal_walk`, as a new configuration does); then let both resolve. Expect: the first
+/// survivor's holds stay its records' alone through the other's walk, then every hold any survivor keeps resolves to the
+/// records. Failing first: the first walk spread the dead owner's attempt to the other survivor, whose walk offered it
+/// back for every owner its hold had, so the first survivor's home joined the ended attempt after its last owed pass
+/// (the group runs' flake, 1 in 4).
+#[test]
+fn t_a727_d1a3_a_healer_never_spreads_an_ended_attempt_to_a_home_that_resolved_it() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("homes-healer");
+  fleet.daemons[0].hold_home_settles(true).unwrap();
+  for daemon in &fleet.daemons[1..] {
+    daemon.hold_home_resolutions(true).unwrap();
+  }
+  let pushed = fleet.push(
+    0,
+    ("a.txt", b"landed, its attempt resolved at one home first\n"),
+  );
+  let held = survivors_attempt_holds(&fleet);
+  fleet.daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let records = |repository: [u8; 16]| {
+    Some(vec![slates_cluster::homes::HomeOwner::Record {
+      repository,
+    }])
+  };
+  // The first survivor: one whose homes hold the attempt's objects; the other offers back what it was offered.
+  let first = held.first().map_or(1, |(at, _, _)| *at);
+  let (x, y) = (first - 1, 2 - first);
+  let mine: Vec<&(usize, [u8; 32], [u8; 16])> =
+    held.iter().filter(|(at, _, _)| *at == first).collect();
+  let walked_retirement = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      fleet
+        .daemons
+        .iter()
+        .all(|daemon| daemon.heal_walk_done().unwrap_or(false)),
+    )
+  });
+  fleet.daemons[x].hold_home_resolutions(false).unwrap();
+  fleet.daemons[x].owe_home_resolution().unwrap();
+  let resolved_first = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(mine.iter().all(|(_, identity, repository)| {
+      owners_of(&fleet.daemons[x], *identity) == records(*repository)
+    }))
+  });
+  fleet.daemons[x].hold_home_resolutions(true).unwrap();
+  fleet.daemons[y].owe_heal_walk().unwrap();
+  let walked = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(fleet.daemons[y].heal_walk_done().unwrap_or(false))
+  });
+  let stayed = mine.iter().all(|(_, identity, repository)| {
+    owners_of(&fleet.daemons[x], *identity) == records(*repository)
+  });
+  let after_walk = resolution_state(&fleet, &held);
+  for daemon in &fleet.daemons {
+    daemon.hold_home_resolutions(false).unwrap();
+    daemon.owe_home_resolution().unwrap();
+  }
+  let resolved = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(held.iter().all(|(_, identity, repository)| {
+      fleet.daemons.iter().all(|daemon| {
+        let owners = owners_of(daemon, *identity);
+        owners.is_none() || owners == records(*repository)
+      })
+    }))
+  });
+  let state = resolution_state(&fleet, &held);
+  fleet.stop();
+  assert_eq!(pushed, Ok(()), "the push landed");
+  assert!(
+    !mine.is_empty(),
+    "a survivor's homes held its objects for its attempt"
+  );
+  assert!(
+    walked_retirement,
+    "both survivors walked their holds at the owner's retirement"
+  );
+  assert!(
+    resolved_first,
+    "the first survivor's holds resolved to the records; {state}"
+  );
+  assert!(walked, "the other survivor walked its holds again");
+  assert!(
+    stayed,
+    "the first survivor's holds stayed its records' alone through the other's walk; {after_walk}"
+  );
+  assert!(
+    resolved,
+    "every hold any survivor keeps resolved to the records; {state}"
+  );
+}
+
+/// A-727 (d1a-3), the kill point after homing, before the entry. Do: in a three-node git fleet, its repository made,
+/// every other node holding its record ([`git_fleet`]: so its successor can take it over and answer for it), have them
+/// refuse every register record of the owner's (`Daemon::inject_record_refusal`:
+/// the push's entry never reaches a quorum, so the push is refused after its names are homed) and hold the owner's
+/// settles (its homes never hear its release, as a crash's would not); push a commit to the owner's edge; then stop the
+/// owner. Expect: the push refused, its objects held by the other homes for the owner's attempt; once the owner is gone,
+/// each let go, no record naming it. (A changeset store too small for the push was the kill point first: its 4 MiB
+/// landed in 1 MiB, never refused. Injected at once after the creation, the refusal took the repository's record too,
+/// which ships later, so no successor could take it over and nothing answered a resolution.)
+#[test]
+fn t_a727_d1a3_an_owner_killed_after_homing_before_its_entry_has_its_homes_let_the_objects_go() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("homes-before-entry");
+  fleet.daemons[0].hold_home_settles(true).unwrap();
+  let owner = fleet.hosts[0];
+  for daemon in &fleet.daemons[1..] {
+    daemon.inject_record_refusal(&[owner]).unwrap();
+  }
+  let refused = fleet.push(0, ("a.txt", b"homed, its entry never committed\n"));
+  let held = survivors_attempt_holds(&fleet);
+  fleet.daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let released = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      held
+        .iter()
+        .all(|(at, identity, _)| owners_of(&fleet.daemons[*at - 1], *identity).is_none()),
+    )
+  });
+  let state = resolution_state(&fleet, &held);
+  fleet.stop();
+  assert!(
+    refused.is_err(),
+    "the push refused, its entry never committed"
+  );
+  assert!(
+    !held.is_empty(),
+    "the other homes held its objects for its attempt"
+  );
+  assert!(released, "each hold let go: {held:?}; {state}");
+}
+
+/// A-727 (d1a-3), a holder unreachable at first, and the rebuild that makes its answer exist (main 01a20182's ruling of
+/// 2026-11-24 01:36). Do: as the kill point after the entry, with every survivor's resolutions answering unresolved (as
+/// when the repository's holder cannot be reached) and every survivor's rebuild of the repository it takes over held;
+/// once a resolution was kept, let the resolutions answer and owe a pass, and wait for that pass to be kept again on
+/// every home (nothing answers it: the repository is not rebuilt yet); then let the rebuild go, owing nothing more.
+/// Expect: the holds kept while unresolved, kept by the pass before the rebuild, then resolved to the records by the
+/// rebuild's event alone (`homes::rebuilt`: a pass owed on the rebuilder, and on each other member by its word,
+/// `HomeMessage::Rebuilt`). Failing first: no pass was owed after a rebuild, so holds whose passes all ran before it
+/// stayed an attempt's (flaky by construction: 3 of 4 runs red before, the one green where a pass fell after it).
+#[test]
+fn t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_next_pass() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("homes-unreachable");
+  fleet.daemons[0].hold_home_settles(true).unwrap();
+  for daemon in &fleet.daemons[1..] {
+    daemon.hold_home_resolutions(true).unwrap();
+    daemon.hold_repository_rebuilds(true).unwrap();
+  }
+  let pushed = fleet.push(0, ("a.txt", b"landed, its holder unreachable at first\n"));
+  let held = survivors_attempt_holds(&fleet);
+  fleet.daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let kept_count = |daemon: &Daemon| daemon.home_resolutions().map_or(0, |[_, _, kept]| kept);
+  let kept = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(fleet.daemons.iter().any(|daemon| kept_count(daemon) > 0))
+  });
+  let still_held = held
+    .iter()
+    .all(|(at, identity, _)| owners_of(&fleet.daemons[*at - 1], *identity).is_some());
+  let homes: std::collections::BTreeSet<usize> = held.iter().map(|(at, _, _)| *at).collect();
+  let kept_then: Vec<u64> = fleet.daemons.iter().map(kept_count).collect();
+  for daemon in &fleet.daemons {
+    daemon.hold_home_resolutions(false).unwrap();
+    daemon.owe_home_resolution().unwrap();
+  }
+  let passed_before = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      homes
+        .iter()
+        .all(|at| kept_count(&fleet.daemons[*at - 1]) > kept_then[*at - 1]),
+    )
+  });
+  let unresolved_before = held.iter().all(|(at, identity, _)| {
+    owners_of(&fleet.daemons[*at - 1], *identity).is_some_and(|owners| {
+      owners
+        .iter()
+        .all(|owner| matches!(owner, slates_cluster::homes::HomeOwner::Attempt { .. }))
+    })
+  });
+  for daemon in &fleet.daemons {
+    daemon.hold_repository_rebuilds(false).unwrap();
+  }
+  let resolved = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(held.iter().all(|(at, identity, repository)| {
+      owners_of(&fleet.daemons[*at - 1], *identity)
+        == Some(vec![slates_cluster::homes::HomeOwner::Record {
+          repository: *repository,
+        }])
+    }))
+  });
+  let state = resolution_state(&fleet, &held);
+  fleet.stop();
+  assert_eq!(pushed, Ok(()), "the push landed");
+  assert!(
+    !held.is_empty(),
+    "the other homes held its objects for its attempt"
+  );
+  assert!(kept && still_held, "kept while its holder was unreachable");
+  assert!(
+    passed_before && unresolved_before,
+    "a pass before the rebuild kept every hold an attempt's (passed {passed_before}, unresolved {unresolved_before})"
+  );
+  assert!(
+    resolved,
+    "resolved to the records by the rebuild's event alone: {held:?}; {state}"
   );
 }

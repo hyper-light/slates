@@ -1697,6 +1697,9 @@ async fn read_part(
 /// answer nothing, as the session's other streams do.
 pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
+  if OTHER_VERSION.with(std::cell::Cell::get) {
+    return Vec::new();
+  }
   let message = match HomeMessage::decode(request) {
     Ok(message) => message,
     // Another version's message (a peer of another build): refused at once and typed, so its sender's homing fails at
@@ -1781,14 +1784,38 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
       identity,
       moved_answer(origin, &shards, (identity, (from, to)), budget_ns).await,
     ),
-    // Resolved by the repository's current owner from its records (A-727 (d1a-3)): until that lands this node answers
-    // none, and the asking home keeps the attempt's hold, the safe side.
-    HomeMessage::Resolve { identity, .. } => {
-      (identity, HomeOutcome::Refused(HomeRefusal::Unanswered))
+    // Answered by the shard holding the attempt's repository, from its records (A-727 (d1a-3)).
+    HomeMessage::Resolve { identity, attempt } => (
+      identity,
+      resolve_answer(origin, &shards, (identity, attempt), budget_ns).await,
+    ),
+    // A repository rebuilt on its successor (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 01:36): the answer a
+    // resolution asks for exists now, so a pass is owed here, on this control shard; owing it twice is harmless.
+    HomeMessage::Rebuilt { .. } => {
+      resolve_owed();
+      let _ = crate::state::with_state(|state| state.count(REBUILT_HEARD, 1));
+      ([0; 32], HomeOutcome::Owed)
     }
     HomeMessage::Answer { .. } => return Vec::new(),
   };
   HomeMessage::Answer { identity, outcome }.encode()
+}
+
+/// [`serve_remote`]'s answer to a resolution of `attempt`'s hold of `identity` (A-727 (d1a-3)): whether a record of its
+/// repository names it, from the shard holding the repository here ([`answer_resolve`]); `NotHeld` where none does,
+/// `Unanswered` where the attempt is still in flight or the shard did not answer.
+async fn resolve_answer(
+  origin: u16,
+  shards: &[u16],
+  (identity, attempt): ([u8; 32], HomeOwner),
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::{HomeOutcome, HomeRefusal};
+  match answer_resolve(origin, shards, (ContentId(identity), attempt), budget_ns).await {
+    Resolution::Named(named) => HomeOutcome::Named { named },
+    Resolution::NotHeld => HomeOutcome::Refused(HomeRefusal::NotHeld),
+    Resolution::Unresolved => HomeOutcome::Refused(HomeRefusal::Unanswered),
+  }
 }
 
 /// [`serve_remote`]'s answer to a let-go of `identity` for `owner` (every owner where none), from its home among
@@ -1893,6 +1920,70 @@ std::thread_local! {
     const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
   /// Whether the task settling [`SETTLES`] runs.
   static SETTLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// The attempts of this process in flight on this shard, by number ([`attempt_owner`], [`attempt_ended`]): a resolution
+  /// of one of them is answered unresolved, never released under a live attempt (A-727 (d1a-3)). Bounded by the attempts
+  /// in flight, one a repository's landing turn.
+  static LIVE_ATTEMPTS: std::cell::RefCell<std::collections::BTreeSet<u64>> =
+    const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+  /// Whether this node owes a pass resolving the attempts whose process ended ([`resolve_ended`]): set by a member's
+  /// death, a member's new process, and this node's own start (A-727 (d1a-3)); cleared as a pass begins.
+  static RESOLVE_OWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+  /// Test support (a fleet test's kill point, A-727 (d1a-3)): whether this shard's settles wait unsent, so a stop leaves
+  /// them unsent, as a crash between an attempt's end and its homes' messages does ([`hold_settles`]).
+  static SETTLES_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Test support (A-727 (d1a)): whether this node answers every home message as a node of another home-wire version
+  /// does, nothing it can read ([`answer_as_another_version`]).
+  static OTHER_VERSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Test support (A-727 (d1a-3)): whether this node answers every resolution unresolved, as a repository's holder this
+  /// node cannot reach does ([`hold_resolutions`]).
+  static RESOLUTIONS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test support (A-727 (d1a-3)): this node's resolutions all answer unresolved while `held`, as when the repository's
+/// holder is unreachable (a takeover under way): the holds stay, counted kept, for the next pass.
+pub(crate) fn hold_resolutions(held: bool) {
+  RESOLUTIONS_HELD.with(|resolutions| resolutions.set(held));
+}
+
+/// Test support, a fleet test's kill point (A-727 (d1a-3)): this shard's settles wait unsent while `held`, so the
+/// daemon's stop leaves an attempt's moves and let-gos unsent, as a crash after its end and before its homes heard does.
+/// Released, what waited is settled.
+pub(crate) fn hold_settles(held: bool) {
+  SETTLES_HELD.with(|settles| settles.set(held));
+  if !held
+    && SETTLES.with(|settles| {
+      settles
+        .try_borrow()
+        .is_ok_and(|settles| !settles.is_empty())
+    })
+  {
+    let owed = SETTLES.with(|settles| settles.try_borrow_mut().ok()?.pop_front());
+    if let Some(settle) = owed {
+      settle_later(settle);
+    }
+  }
+}
+
+/// Test support (A-727 (d1a)): this node answers every home message empty while `on`, as a node of the previous
+/// home-wire version answers one of this version's (its decode refuses it, and every record-session request is
+/// answered): the version mismatch a mixed region meets.
+pub(crate) fn answer_as_another_version(on: bool) {
+  OTHER_VERSION.with(|other| other.set(on));
+}
+
+/// Test support (A-727 (d1a-3)): every hold this shard keeps for the region, with its owners.
+pub(crate) fn region_holds_owned() -> Vec<([u8; 32], Vec<HomeOwner>)> {
+  REGION_HELD.with(|held| {
+    held
+      .try_borrow()
+      .map(|held| {
+        held
+          .iter()
+          .map(|(identity, owners)| (identity.0, owners.iter().copied().collect()))
+          .collect()
+      })
+      .unwrap_or_default()
+  })
 }
 
 /// Format: the bits an attempt's number keeps for its shard's count, below the shard's own number (a shard numbers its
@@ -1911,11 +2002,104 @@ pub(crate) fn attempt_owner(state: &ShardState, repository: [u8; 16]) -> HomeOwn
   let shard = u64::from(state.shard)
     .checked_shl(ATTEMPT_SHARD_SHIFT)
     .unwrap_or(0);
+  let attempt = shard | (count & ((1u64 << ATTEMPT_SHARD_SHIFT) - 1));
+  LIVE_ATTEMPTS.with(|live| {
+    if let Ok(mut live) = live.try_borrow_mut() {
+      live.insert(attempt);
+    }
+  });
   HomeOwner::Attempt {
     repository,
     node: state.fleet.host(),
     process: state.member_process_nonce,
-    attempt: shard | (count & ((1u64 << ATTEMPT_SHARD_SHIFT) - 1)),
+    attempt,
+  }
+}
+
+/// The attempt `owner` ended on this shard (A-727 (d1a-3)): committed or refused, what it owes settled
+/// ([`settle_later`]); a resolution of it is answered from the records from now on.
+pub(crate) fn attempt_ended(owner: &HomeOwner) {
+  if let HomeOwner::Attempt { attempt, .. } = owner {
+    LIVE_ATTEMPTS.with(|live| {
+      if let Ok(mut live) = live.try_borrow_mut() {
+        live.remove(attempt);
+      }
+    });
+  }
+}
+
+/// Marks a resolution pass owed ([`resolve_ended`]): a member died or announced a new process (A-727 (d1a-3)).
+pub(crate) fn resolve_owed() {
+  RESOLVE_OWED.with(|owed| owed.set(true));
+}
+
+/// An attempt's holds in the region (A-727 (d1a), (d1a-3)): the owner they are for, made at the attempt's first homing,
+/// and the objects homed for it. Ended once, by its record's commit ([`AttemptHolds::committed`]: each moved to the
+/// records) or its refusal ([`AttemptHolds::released`]: each let go); dropped before either (its push's task gone), it
+/// is released as a refusal would be, so no hold outlives its attempt unowed. Bounded by the objects one attempt homes
+/// (a push's names and pack).
+#[derive(Debug, Default)]
+pub(crate) struct AttemptHolds {
+  /// The attempt, once its homing began.
+  owner: Option<HomeOwner>,
+  /// The objects homed for it.
+  homed: Vec<ContentId>,
+}
+
+impl AttemptHolds {
+  /// The attempt's owner, made at the first ask ([`attempt_owner`]).
+  pub(crate) fn owner(&mut self, state: &ShardState, repository: [u8; 16]) -> HomeOwner {
+    *self
+      .owner
+      .get_or_insert_with(|| attempt_owner(state, repository))
+  }
+
+  /// The attempt's owner, once made.
+  pub(crate) fn owner_now(&self) -> Option<HomeOwner> {
+    self.owner
+  }
+
+  /// `identity` homed for the attempt.
+  pub(crate) fn homed(&mut self, identity: ContentId) {
+    if !self.homed.contains(&identity) {
+      self.homed.push(identity);
+    }
+  }
+
+  /// The attempt's hold of `identity` let go at every home that kept it: its homing fell short.
+  pub(crate) fn release_one(&self, identity: ContentId) {
+    if let Some(owner) = self.owner {
+      settle_later(Settle::Release { identity, owner });
+    }
+  }
+
+  /// The attempt's record committed: each of its holds moved to repository `repository`'s records, the attempt ended.
+  pub(crate) fn committed(&mut self, repository: [u8; 16]) {
+    let Some(from) = self.owner.take() else {
+      return;
+    };
+    let to = HomeOwner::Record { repository };
+    for identity in core::mem::take(&mut self.homed) {
+      settle_later(Settle::Move { identity, from, to });
+    }
+    attempt_ended(&from);
+  }
+
+  /// The attempt refused: each of its holds let go, the attempt ended.
+  pub(crate) fn released(&mut self) {
+    let Some(owner) = self.owner.take() else {
+      return;
+    };
+    for identity in core::mem::take(&mut self.homed) {
+      settle_later(Settle::Release { identity, owner });
+    }
+    attempt_ended(&owner);
+  }
+}
+
+impl Drop for AttemptHolds {
+  fn drop(&mut self) {
+    self.released();
   }
 }
 
@@ -1971,6 +2155,9 @@ pub(crate) fn settle_later(settle: Settle) {
 /// the shard's state is gone.
 async fn settle_owed() {
   loop {
+    if SETTLES_HELD.with(std::cell::Cell::get) {
+      break;
+    }
     let next = SETTLES.with(|settles| settles.try_borrow_mut().ok()?.pop_front());
     let Some(settle) = next else {
       break;
@@ -2068,12 +2255,420 @@ async fn settle_in_region(
   answered && settled == count
 }
 
+/// Test support (A-727 (d1a-3)): `owner` joined to the region hold of `identity` this shard keeps, as a keep for it would.
+#[cfg(test)]
+pub(crate) fn join_owner(identity: &ContentId, owner: HomeOwner) {
+  join_owners(identity, &[owner]);
+}
+
 /// Test support: the owner a test's region hold is kept for where no attempt or record of its own is about (A-727 (d1a)):
 /// a repository's records, the repository all zeros.
 #[cfg(test)]
 pub(crate) const TEST_OWNER: HomeOwner = HomeOwner::Record {
   repository: [0; 16],
 };
+
+/// What a resolution of an attempt's hold found (A-727 (d1a-3), main 01a20182's rulings of 2026-11-23, (u)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resolution {
+  /// The shard holding the attempt's repository answered: whether a record of it names the object.
+  Named(bool),
+  /// No shard of this node holds the repository (its placement moved: the asker routes again at its next pass).
+  NotHeld,
+  /// Not answerable now: the attempt is still in flight here, or the shard did not answer in time.
+  Unresolved,
+}
+
+/// Answers a resolution of `attempt`'s hold of `identity` on this node (A-727 (d1a-3)): on the shard the attempt's
+/// repository's id routes to (its partition, `slates_db::catalog::RepositoryId::partition`), from the repository's
+/// records, a slice of them a turn ([`records_name`]). Asked from shard `origin` of `shards`.
+async fn answer_resolve(
+  origin: u16,
+  shards: &[u16],
+  (identity, attempt): (ContentId, HomeOwner),
+  budget_ns: u64,
+) -> Resolution {
+  let repository = slates_db::catalog::RepositoryId {
+    bytes: attempt.repository(),
+  };
+  let Some(shard) = shards.get(usize::from(repository.partition())).copied() else {
+    return Resolution::NotHeld;
+  };
+  let mut from = 0usize;
+  loop {
+    let step = crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| resolve_step(state, (repository, identity, attempt), from),
+      budget_ns,
+    )
+    .await;
+    match step {
+      Some(Walked::Done(resolution)) => return resolution,
+      Some(Walked::More(next)) => from = next,
+      None => return Resolution::Unresolved,
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// How far a slice of a resolution's walk of a repository's records came ([`resolve_step`]).
+enum Walked {
+  /// The answer.
+  Done(Resolution),
+  /// The walk goes on from this entry.
+  More(usize),
+}
+
+/// One slice of a resolution on the shard holding `repository` (A-727 (d1a-3)): unresolved while the attempt is still
+/// in flight here (this member, this process, one of this shard's live attempts); else whether a record of the
+/// repository names `identity`, walked from entry `from` until the shard's step quantum is spent.
+fn resolve_step(
+  state: &mut ShardState,
+  (repository, identity, attempt): (slates_db::catalog::RepositoryId, ContentId, HomeOwner),
+  from: usize,
+) -> Walked {
+  if let HomeOwner::Attempt {
+    node,
+    process,
+    attempt: number,
+    ..
+  } = attempt
+    && node == state.fleet.host()
+    && process == state.member_process_nonce
+    && LIVE_ATTEMPTS.with(|live| {
+      live
+        .try_borrow()
+        .map_or(true, |live| live.contains(&number))
+    })
+  {
+    return Walked::Done(Resolution::Unresolved);
+  }
+  let partition = state.db.partition();
+  let repositories = partition.repositories();
+  let Some(record) = repositories.repository(repository) else {
+    return Walked::Done(Resolution::NotHeld);
+  };
+  match record.tool {
+    slates_db::catalog::VcsTool::Git => {
+      let Some(format) = super::git_format(record.format) else {
+        return Walked::Done(Resolution::Named(false));
+      };
+      let quantum_ns = state.config.step_quantum_ns();
+      let began = slates_rt::futures::now_ns();
+      for (at, bytes) in repositories.objects(repository).enumerate().skip(from) {
+        if let Ok(record) = super::record::Record::decode(bytes, format)
+          && [record.named, record.packed]
+            .into_iter()
+            .flatten()
+            .any(|(named, _)| named == identity)
+        {
+          return Walked::Done(Resolution::Named(true));
+        }
+        if slates_rt::futures::now_ns().saturating_sub(began) >= quantum_ns {
+          return Walked::More(at.saturating_add(1));
+        }
+      }
+      Walked::Done(Resolution::Named(false))
+    }
+    // Only git homes in the region so far (A-727 (d1b) brings Subversion's texts): no other tool's record names a hold.
+    _ => Walked::Done(Resolution::Named(false)),
+  }
+}
+
+std::thread_local! {
+  /// The members owed word of a repository rebuilt here (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 01:36): each
+  /// (repository, member) until the member answers that it owes itself a pass ([`announce_rebuilt`]). Bound: the
+  /// configuration's members a rebuild, each entry dropped once answered or once its member leaves the configuration.
+  static REBUILT_OWED: std::cell::RefCell<std::collections::BTreeSet<([u8; 16], slates_db::HostId)>> =
+    const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// A repository taken over was rebuilt here (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 01:36), called on the
+/// control shard: the answer a resolution of its attempts' holds asks for exists from now on, so a resolution pass is
+/// owed here, and each other member of the configuration is owed word of it ([`announce_rebuilt`]), since the homes
+/// holding its attempts' objects are on any of them. Before, nothing owed a pass after the rebuild: a pass the death or
+/// the configuration owed ran before it and kept every hold, and the holds stayed an attempt's.
+pub(crate) fn rebuilt(
+  repository: [u8; 16],
+  (local, members): (slates_db::HostId, &[slates_db::HostId]),
+) {
+  resolve_owed();
+  REBUILT_OWED.with(|owed| {
+    if let Ok(mut owed) = owed.try_borrow_mut() {
+      owed.extend(
+        members
+          .iter()
+          .filter(|member| **member != local)
+          .map(|member| (repository, *member)),
+      );
+    }
+  });
+}
+
+/// Tells each member owed word of a rebuild here ([`rebuilt`]) that the repository was rebuilt, from the control shard's
+/// period (`fleet`), never on a timer: an entry its member answers is dropped (counted [`REBUILT_TOLD`]); one it does not is
+/// kept for the next period and counted ([`REBUILT_UNANSWERED`]), so a lost message is asked again, never dropped; one
+/// whose member is no member of the configuration any more is dropped.
+pub(crate) async fn announce_rebuilt(
+  origin: u16,
+  shards: &[u16],
+  budget: slates_cluster::CommitBudget,
+) {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let owed: Vec<([u8; 16], slates_db::HostId)> = REBUILT_OWED.with(|owed| {
+    owed
+      .try_borrow()
+      .map(|owed| owed.iter().copied().collect())
+      .unwrap_or_default()
+  });
+  if owed.is_empty() {
+    return;
+  }
+  let members =
+    crate::state::with_state(|state| state.fleet.members().to_vec()).unwrap_or_default();
+  for (repository, member) in owed {
+    let answered = if members.contains(&member) {
+      let request = HomeMessage::Rebuilt { repository }.encode();
+      let replies = crate::xshard::task_in_shard_time(
+        origin,
+        shards.first().copied().unwrap_or(origin),
+        move || async move { exchange(&[member], &request, budget).await },
+        budget.max_deadline_ns(),
+      )
+      .await
+      .unwrap_or_default();
+      let told = replies.iter().any(|(_, reply)| {
+        matches!(
+          HomeMessage::decode(reply),
+          Ok(HomeMessage::Answer {
+            outcome: HomeOutcome::Owed,
+            ..
+          })
+        )
+      });
+      let _ = crate::state::with_state(|state| {
+        state.count(
+          if told {
+            REBUILT_TOLD
+          } else {
+            REBUILT_UNANSWERED
+          },
+          1,
+        );
+      });
+      told
+    } else {
+      true
+    };
+    if answered {
+      REBUILT_OWED.with(|owed| {
+        if let Ok(mut owed) = owed.try_borrow_mut() {
+          owed.remove(&(repository, member));
+        }
+      });
+    }
+  }
+}
+
+/// Counter: a member told that a repository was rebuilt here, its answer heard (A-727 (d1a-3)). Format: a counter name.
+pub(crate) const REBUILT_TOLD: &str = "vcs_store.homes.rebuilt_told";
+/// Counter: a member owed word of a rebuild here that did not answer: asked again next period. Format: a counter name.
+pub(crate) const REBUILT_UNANSWERED: &str = "vcs_store.homes.rebuilt_unanswered";
+/// Counter: a rebuild elsewhere heard here, a resolution pass owed by it. Format: a counter name.
+pub(crate) const REBUILT_HEARD: &str = "vcs_store.homes.rebuilt_heard";
+
+/// Counter: an attempt's hold a resolution moved to its repository's records (A-727 (d1a-3)). Format: a counter name.
+pub(crate) const RESOLVED_RECORD: &str = "vcs_store.homes.resolved_record";
+/// Counter: an attempt's hold a resolution let go, no record naming its object. Format: a counter name.
+pub(crate) const RESOLVED_LET_GO: &str = "vcs_store.homes.resolved_let_go";
+/// Counter: an attempt's hold a resolution left held, unanswered (its repository's holder unknown or unreachable, or the
+/// attempt still in flight): asked again at the next pass. Format: a counter name.
+pub(crate) const RESOLVE_KEPT: &str = "vcs_store.homes.resolve_kept";
+
+/// The control shard's resolution of the attempts whose process ended (A-727 (d1a-3), main's ruling (u)): where one is
+/// owed ([`resolve_owed`]: a member's death or new process, this node's start) or the healer begins a pass at a new
+/// configuration ([`heal_region`] marks one owed), every hold this node's home shards keep for an attempt whose member is dead or runs another
+/// process now is resolved by its repository's current holder ([`resolve_one`]), never on a timer. Driven from the
+/// region's period turn (`fleet`), within `budget`.
+pub(crate) async fn resolve_ended(
+  origin: u16,
+  shards: &[u16],
+  budget: slates_cluster::CommitBudget,
+) {
+  if !RESOLVE_OWED.with(|owed| owed.replace(false)) {
+    return;
+  }
+  let budget_ns = budget.max_deadline_ns();
+  for shard in shards.iter().copied() {
+    let attempts =
+      crate::xshard::call_in_shard_time(origin, shard, |_| attempt_holds_here(), budget_ns)
+        .await
+        .unwrap_or_default();
+    for (identity, attempt) in attempts {
+      let ended = crate::state::with_state(|state| process_ended(state, &attempt)).unwrap_or(false);
+      if ended {
+        resolve_one((origin, shards, shard), (identity, attempt), budget).await;
+      }
+    }
+  }
+}
+
+/// Every hold this shard keeps for an attempt, with that attempt.
+fn attempt_holds_here() -> Vec<(ContentId, HomeOwner)> {
+  REGION_HELD.with(|held| {
+    held
+      .try_borrow()
+      .map(|held| {
+        held
+          .iter()
+          .flat_map(|(identity, owners)| {
+            owners
+              .iter()
+              .filter(|owner| matches!(owner, HomeOwner::Attempt { .. }))
+              .map(move |owner| (*identity, *owner))
+          })
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
+/// Whether the process an attempt ran in has ended, as this control shard knows (A-727 (d1a-3)): this member's own
+/// earlier process; another member dead, or announcing another process (`member_task`'s announcements). A member this
+/// node has heard nothing of is not judged ended.
+fn process_ended(state: &ShardState, attempt: &HomeOwner) -> bool {
+  let HomeOwner::Attempt { node, process, .. } = attempt else {
+    return false;
+  };
+  if *node == state.fleet.host() {
+    return *process != state.member_process_nonce;
+  }
+  let dead = state
+    .fleet
+    .membership()
+    .dead()
+    .iter()
+    .any(|(member, _)| member == node);
+  dead
+    || state
+      .plane
+      .announced_from
+      .get(node)
+      .is_some_and(|current| current != process)
+}
+
+/// Resolves `attempt`'s hold of `identity` on home shard `home` (A-727 (d1a-3)): asks the node holding the attempt's
+/// repository now (this node's routing for it, else a location round, as a forwarded verb finds an owner) whether a
+/// record names the object; named, the hold moves to the repository's records; not named, it is let go; unanswered, it
+/// stays, counted, for the next pass.
+async fn resolve_one(
+  (origin, shards, home): (u16, &[u16], u16),
+  (identity, attempt): (ContentId, HomeOwner),
+  budget: slates_cluster::CommitBudget,
+) {
+  let budget_ns = budget.max_deadline_ns();
+  let repository = attempt.repository();
+  // This node first: a node knows what its own shards hold (at `N = 1` the holder is always this node). Elsewhere, the
+  // node holding it now: this node's routing for the repository, else a location round, as a forwarded verb finds one.
+  if RESOLUTIONS_HELD.with(std::cell::Cell::get) {
+    let _ = crate::state::with_state(|state| state.count(RESOLVE_KEPT, 1));
+    return;
+  }
+  let mut resolution = answer_resolve(origin, shards, (identity, attempt), budget_ns).await;
+  if resolution == Resolution::NotHeld {
+    resolution = resolve_elsewhere((origin, shards), (identity, attempt), budget).await;
+  }
+  let records = HomeOwner::Record { repository };
+  let applied = match resolution {
+    Resolution::Named(true) => crate::xshard::call_in_shard_time(
+      origin,
+      home,
+      move |_| move_region_owner(&identity, (attempt, records)).is_ok(),
+      budget_ns,
+    )
+    .await
+    .map(|moved| (moved, RESOLVED_RECORD)),
+    Resolution::Named(false) => crate::xshard::call_in_shard_time(
+      origin,
+      home,
+      move |state| let_go_for_region(state, &identity, Some(attempt)).is_ok(),
+      budget_ns,
+    )
+    .await
+    .map(|released| (released, RESOLVED_LET_GO)),
+    Resolution::NotHeld | Resolution::Unresolved => None,
+  };
+  let counter = match applied {
+    Some((true, counter)) => counter,
+    _ => RESOLVE_KEPT,
+  };
+  let _ = crate::state::with_state(|state| state.count(counter, 1));
+}
+
+/// [`resolve_one`] asked of the node that holds the attempt's repository now, where this node does not: this node's
+/// routing for the repository's register, else the committed configuration's lineage for it (its member, or the
+/// successor its retirement names), else a location round.
+async fn resolve_elsewhere(
+  (origin, shards): (u16, &[u16]),
+  (identity, attempt): (ContentId, HomeOwner),
+  budget: slates_cluster::CommitBudget,
+) -> Resolution {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let object = slates_db::register::ObjectId(attempt.repository());
+  let HomeOwner::Attempt { node, .. } = attempt else {
+    return Resolution::Unresolved;
+  };
+  // Where the repository's register belongs now, from the committed configuration alone (every node names the same
+  // one, `RegionalConfiguration::lineage`): the attempt's member while it is one (a process that only restarted), else the
+  // successor its retirement names.
+  let Some((local, routed, configured, query)) = crate::state::with_state(|state| {
+    let regional = state.council.configuration();
+    let configured = match regional.lineage(node, object) {
+      slates_db::register::Lineage::Successor { successor, .. } => Some(successor),
+      _ if state.fleet.members().contains(&node) => Some(node),
+      _ => None,
+    };
+    (
+      state.fleet.host(),
+      state.fleet.object_owner(object),
+      configured,
+      crate::owner_location::Query::new(state, object, 0),
+    )
+  }) else {
+    return Resolution::Unresolved;
+  };
+  let holder = match routed.or(configured) {
+    Some(holder) => Some(holder),
+    None => crate::owner_location::locate(query).await.ok(),
+  };
+  let Some(holder) = holder.filter(|holder| *holder != local) else {
+    return Resolution::Unresolved;
+  };
+  let request = HomeMessage::Resolve {
+    identity: identity.0,
+    attempt,
+  }
+  .encode();
+  let replies = crate::xshard::task_in_shard_time(
+    origin,
+    shards.first().copied().unwrap_or(origin),
+    move || async move { exchange(&[holder], &request, budget).await },
+    budget.max_deadline_ns(),
+  )
+  .await
+  .unwrap_or_default();
+  replies
+    .iter()
+    .find_map(|(_, reply)| match HomeMessage::decode(reply) {
+      Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Named { named },
+      }) if answered == identity.0 => Some(Resolution::Named(named)),
+      _ => None,
+    })
+    .unwrap_or(Resolution::Unresolved)
+}
 
 /// Counter: a push's names asked to be homed that no edge took by the next turn: the record written as version 2
 /// (A-724 piece 8c). Format: a counter name.
@@ -2176,6 +2771,7 @@ pub(crate) async fn home_in_region(
   crate::state::with_state(|state| {
     state.count(HOMING_LOCAL_NS, local_ns);
     state.count(HOMING_REGION_NS, region_ns);
+    state.count_max(HOMING_LONGEST_REGION_NS, region_ns);
   });
   let homed = kept >= homes.len() && !homes.is_empty();
   crate::state::with_state(|state| {
@@ -2449,9 +3045,33 @@ pub(crate) const HOMING_LOCAL_NS: &str = "vcs_store.homes.homing_local_ns";
 /// Counter: nanoseconds homings spent on their other homes (the exchange, their keep and publication), summed. Format: a
 /// counter name.
 pub(crate) const HOMING_REGION_NS: &str = "vcs_store.homes.homing_region_ns";
+/// Counter: the most nanoseconds one homing spent on its other homes: a homing that waited out its deadline shows it
+/// (A-727 (d1a): one refused by another home-wire version is refused at once, far under it). Format: a counter name.
+pub(crate) const HOMING_LONGEST_REGION_NS: &str = "vcs_store.homes.longest_homing_region_ns";
 
 /// Counter: identities the healer offered to their region homes. Format: a counter name.
 pub(crate) const HEAL_OFFERED: &str = "vcs_store.homes.heal_offered";
+/// Counter: an object the healer offered without an ended attempt among its owners, or held back while every owner was
+/// one (A-727 (d1a-3)): an ended attempt is resolved, never spread. Format: a counter name.
+pub(crate) const HEAL_ENDED_WITHHELD: &str = "vcs_store.homes.heal_ended_withheld";
+
+/// Test support (A-727 (d1a-3)): whether this control shard's heal walk of the configuration `version` has run through.
+pub(crate) fn heal_walk_done(version: u64) -> bool {
+  HEALING.with(|healing| {
+    healing
+      .try_borrow()
+      .is_ok_and(|healing| healing.0 == Some(version) && healing.1.is_empty())
+  })
+}
+
+/// Test support (A-727 (d1a-3)): owes this control shard a heal walk of every hold, as a new configuration does.
+pub(crate) fn owe_heal_walk() {
+  HEALING.with(|healing| {
+    if let Ok(mut healing) = healing.try_borrow_mut() {
+      *healing = (None, std::collections::VecDeque::new());
+    }
+  });
+}
 /// Counter: identities this node let go once every region home held them. Format: a counter name.
 pub(crate) const HEAL_RELEASED: &str = "vcs_store.homes.heal_released";
 
@@ -2484,6 +3104,9 @@ pub(crate) async fn heal_region(origin: u16, shards: &[u16], budget: slates_clus
       .map_or(true, |healing| healing.0 == Some(version))
   });
   if !begun {
+    // A new configuration: the holds an attempt a crash left are resolved again too (A-727 (d1a-3)), so one whose
+    // repository's holder was unreachable before is asked of the holder this configuration names.
+    resolve_owed();
     let mut identities = std::collections::VecDeque::new();
     for shard in shards {
       let held = crate::xshard::call_in_shard_time(
@@ -2570,6 +3193,23 @@ async fn heal_one(
       .unwrap_or_default(),
       None => Vec::new(),
     };
+    // An ended attempt is never spread, only resolved (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 04:40): a
+    // home not yet resolved offering it to one that had moved it to the records joined it back after the last owed pass
+    // (the group runs' flake, 1 in 4), so the resolution's answer is the only way a hold changes owner. Judged here, on
+    // the control shard; a live attempt (a push in flight) is offered as before. An object whose every owner is an
+    // ended attempt waits here until its resolution moves it to the records or lets it go.
+    let offered: Vec<HomeOwner> = crate::state::with_state(|state| {
+      owners
+        .iter()
+        .copied()
+        .filter(|owner| !process_ended(state, owner))
+        .collect()
+    })
+    .unwrap_or_default();
+    if offered.len() < owners.len() {
+      crate::state::with_state(|state| state.count(HEAL_ENDED_WITHHELD, 1));
+    }
+    let owners = offered;
     if owners.is_empty() {
       return;
     }

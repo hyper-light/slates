@@ -5059,11 +5059,25 @@ async fn materialize_adopted_objects(
   rebuild_adopted_repositories(origin).await;
 }
 
+std::thread_local! {
+  /// Test support (A-727 (d1a-3)): while set on the control shard, no adopted repository is rebuilt, so a test orders a
+  /// resolution pass before a rebuild ([`hold_repository_rebuilds`]).
+  static REBUILDS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test support (A-727 (d1a-3)): holds every rebuild of an adopted repository on this control shard while `held`.
+pub(crate) fn hold_repository_rebuilds(held: bool) {
+  REBUILDS_HELD.with(|rebuilds| rebuilds.set(held));
+}
+
 /// Rebuilds each repository this node took over once its logs and greens are in (A-636 part 2c-2,
 /// [`crate::takeover::repositories_ready`]), on the shard its id routes to ([`crate::takeover::rebuild_repository`]):
 /// one that stands there, or that the database refused (logged and counted there), is pending no more; one whose
 /// partition has no shard here, or whose shard does not answer within the period, is attempted again next period.
 async fn rebuild_adopted_repositories(origin: u16) {
+  if REBUILDS_HELD.with(std::cell::Cell::get) {
+    return;
+  }
   let ready: Vec<(crate::takeover::ReadyRepository, Option<u16>)> = state::with_state(|s| {
     crate::takeover::repositories_ready(s)
       .into_iter()
@@ -5088,6 +5102,14 @@ async fn rebuild_adopted_repositories(origin: u16) {
     .await;
     if answered.is_some() {
       state::with_state(|s| s.pending_repositories.remove(&object));
+    }
+    // Rebuilt: the answer its attempts' holds wait for exists now, so the region owes them a resolution pass (A-727
+    // (d1a-3), main 01a20182's ruling of 2026-11-24 01:36).
+    if answered == Some(true) {
+      state::with_state(|s| {
+        let members = s.fleet.members().to_vec();
+        crate::vcs_store::homes::rebuilt(object.0, (s.fleet.host(), &members));
+      });
     }
   }
 }
@@ -10991,6 +11013,11 @@ async fn follow_configuration(
   // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
   // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
   crate::vcs_store::homes::heal_region(origin, shards, budget).await;
+  // The holds an attempt a crash left, once its process ended (A-727 (d1a-3)): resolved by the repository's holder,
+  // where a death, a new process, this node's start or a new configuration owes it.
+  crate::vcs_store::homes::resolve_ended(origin, shards, budget).await;
+  // A repository rebuilt here is told to the other members until each answers (A-727 (d1a-3)): the pass it owes them.
+  crate::vcs_store::homes::announce_rebuilt(origin, shards, budget).await;
   // Credentials as fleet state (A-764): at a new configuration, every credential this node holds offered to every other
   // member, so one that joined or came back with nothing holds what the region holds (`credentials::heal_region`).
   crate::credentials::heal_region(origin, shards, budget).await;

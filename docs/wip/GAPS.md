@@ -167,10 +167,14 @@
 > **OPEN (A-727 (d1a), w-shared; main 01a20182's rulings of 2026-11-23): region holds name their owners; what is owed.**
 > BUILT: an attempt's holds move to its records at its commit and are let go at its refusal (`homes::settle_later`), so
 > a refused push holds nothing and another repository's hold of the same object stays; the image and the home wire carry
-> owners, version 2, refusing the old forms typed. OWED (d1a-3): an attempt a crash left between homing and its end
-> (or whose settle a home did not answer, counted `vcs_store.homes.settle_unanswered`) keeps its holds until it is
-> resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's current owner;
-> bounded meanwhile by the attempts a crash or a lost answer left, each one's homed objects. OWED (fleet memory, one item
+> owners, version 2, refusing the old forms typed. BUILT (d1a-3): an attempt a crash left between homing and its end
+> is resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's holder, a pass
+> owed by an event (a death, a new process, a start, a new configuration, and a repository's rebuild on its successor,
+> told to every member by `HomeMessage::Rebuilt`, home wire version 0x83, until each answers); red first, the unreachable
+> holder's fleet test, its rebuild held until a pass kept every hold, then resolved by the rebuild's event alone. An
+> ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
+> resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
+> for it (`git_fleet`) until the creation does. OWED (fleet memory, one item
 > for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
 > in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
 > should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.

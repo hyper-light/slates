@@ -39,8 +39,10 @@ use slates_db::register::HostId;
 pub const HOME_STREAM: u64 = 30;
 
 /// Format: the version byte every message begins with (A-727 (d1a): owners on the wire). Version 1 had none, its first
-/// byte a kind of 1 to 6, so neither version reads the other's messages as its own.
-pub const VERSION: u8 = 0x82;
+/// byte a kind of 1 to 6, so neither version reads the other's messages as its own. 0x83 (A-727 (d1a-3), main
+/// 01a20182's ruling of 2026-11-24 01:36) adds a repository's rebuild ([`HomeMessage::Rebuilt`]) and its answer
+/// ([`HomeOutcome::Owed`]); a member of 0x82 is refused at once, typed, by the version rule.
+pub const VERSION: u8 = 0x83;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;
 /// Format: the kind byte of a read.
@@ -57,6 +59,8 @@ const KIND_READ_PART: u8 = 6;
 const KIND_MOVED: u8 = 7;
 /// Format: the kind byte of an attempt's resolution asked of its repository's owner (A-727 (d1a)).
 const KIND_RESOLVE: u8 = 8;
+/// Format: the kind byte of a repository's rebuild told to a member (A-727 (d1a-3), version 0x83).
+const KIND_REBUILT: u8 = 9;
 /// Format: an owner's tag byte: an attempt in flight.
 const OWNER_ATTEMPT: u8 = 1;
 /// Format: an owner's tag byte: the records naming it.
@@ -86,6 +90,8 @@ const OUTCOME_PART: u8 = 6;
 const OUTCOME_MOVED: u8 = 7;
 /// Format: the outcome byte of a resolution: whether a record names the identity, a byte 0 or 1 (A-727 (d1a)).
 const OUTCOME_NAMED: u8 = 8;
+/// Format: the outcome byte of a rebuild's answer: a resolution pass owed (version 0x83).
+const OUTCOME_OWED: u8 = 9;
 
 /// The most bytes one part carries ([`HomeMessage::PutPart`], [`HomeOutcome::Part`]): the chunk cap a message's byte
 /// string is held to. Derived: `slates_archive::format::MAX_CHUNK_BYTES`.
@@ -233,6 +239,8 @@ pub enum HomeOutcome {
     /// Whether one does.
     named: bool,
   },
+  /// A rebuild's answer: the member owes itself a resolution pass (A-727 (d1a-3)); owing it twice is harmless.
+  Owed,
 }
 
 /// A home exchange's message (module docs).
@@ -297,6 +305,13 @@ pub enum HomeMessage {
     identity: [u8; 32],
     /// The attempt it is held for.
     attempt: HomeOwner,
+  },
+  /// The repository `repository` was rebuilt on the sender, its successor after a takeover (A-727 (d1a-3)): the answer
+  /// a resolution of its attempts' holds asks for exists from now on, so the member owes itself a resolution pass. On
+  /// the wire its identity field is all zeros, no object being meant, and the repository's bytes follow.
+  Rebuilt {
+    /// The repository's id.
+    repository: [u8; 16],
   },
   /// A member's answer about the window named `identity`.
   Answer {
@@ -402,6 +417,11 @@ impl HomeMessage {
         out.extend_from_slice(identity);
         attempt.encode_into(&mut out);
       }
+      HomeMessage::Rebuilt { repository } => {
+        out.push(KIND_REBUILT);
+        out.extend_from_slice(&[0; 32]);
+        out.extend_from_slice(repository);
+      }
       HomeMessage::Answer { identity, outcome } => {
         out.push(KIND_ANSWER);
         out.extend_from_slice(identity);
@@ -433,6 +453,7 @@ impl HomeMessage {
             out.push(OUTCOME_NAMED);
             out.push(u8::from(*named));
           }
+          HomeOutcome::Owed => out.push(OUTCOME_OWED),
         }
       }
     }
@@ -483,6 +504,11 @@ impl HomeMessage {
         identity,
         attempt: reader.owner()?,
       },
+      // No object is meant: an identity other than all zeros is no message of this kind.
+      KIND_REBUILT if identity == [0; 32] => HomeMessage::Rebuilt {
+        repository: <[u8; REPOSITORY_BYTES]>::try_from(reader.take(REPOSITORY_BYTES)?)
+          .map_err(|_| HomeWireError::Truncated)?,
+      },
       KIND_ANSWER => {
         let outcome = match reader.byte()? {
           OUTCOME_KEPT => HomeOutcome::Kept {
@@ -502,6 +528,7 @@ impl HomeMessage {
             bytes: reader.blob()?,
           },
           OUTCOME_MOVED => HomeOutcome::Moved,
+          OUTCOME_OWED => HomeOutcome::Owed,
           OUTCOME_NAMED => HomeOutcome::Named {
             named: match reader.byte()? {
               0 => false,
@@ -686,6 +713,15 @@ mod tests {
       (identity, owner())
         .prop_map(|(identity, attempt)| HomeMessage::Resolve { identity, attempt })
         .boxed(),
+      any::<[u8; 16]>()
+        .prop_map(|repository| HomeMessage::Rebuilt { repository })
+        .boxed(),
+      identity
+        .prop_map(|identity| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Owed,
+        })
+        .boxed(),
       (identity, any::<bool>())
         .prop_map(|(identity, named)| HomeMessage::Answer {
           identity,
@@ -796,18 +832,30 @@ mod tests {
   }
 
   /// A-724 piece 6, hostile lengths. Do: a put whose length prefix passes the bytes, one past the chunk cap, an unknown
-  /// kind, an unknown refusal and trailing bytes. Expect: each refused by its kind.
+  /// kind, a rebuild naming an object (A-727 (d1a-3): its identity field is all zeros), an unknown refusal and trailing
+  /// bytes. Expect: each refused by its kind.
   #[test]
   fn hostile_home_messages_are_refused_by_kind() {
     let mut long = vec![VERSION, 1u8];
     long.extend_from_slice(&[0; 32]);
     long.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(HomeMessage::decode(&long), Err(HomeWireError::BadLength));
-    let mut unknown = vec![VERSION, 9u8];
+    let mut unknown = vec![VERSION, super::KIND_REBUILT + 1];
     unknown.extend_from_slice(&[0; 32]);
     assert_eq!(
       HomeMessage::decode(&unknown),
-      Err(HomeWireError::Unknown { byte: 9 })
+      Err(HomeWireError::Unknown {
+        byte: super::KIND_REBUILT + 1
+      })
+    );
+    let mut naming = vec![VERSION, super::KIND_REBUILT];
+    naming.extend_from_slice(&[7; 32]);
+    naming.extend_from_slice(&[1; 16]);
+    assert_eq!(
+      HomeMessage::decode(&naming),
+      Err(HomeWireError::Unknown {
+        byte: super::KIND_REBUILT
+      })
     );
     let mut refusal = vec![VERSION, 4u8];
     refusal.extend_from_slice(&[0; 32]);
