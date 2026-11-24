@@ -22,6 +22,18 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 13:15 on 11-24:
+- LANDED main's lint fixes, c890f5b6b: seven commits taking every site lint diags 1-7 found (lint diag 8 green on
+  Linux and Windows; macOS clippy and the focused tests green on the Studio, r971). Lint diag 9 at main = 45488444050
+  checks what landed since.
+- Gate 12 (45482482443) at a551b0a88 = A-907: 40 of 40. The takeover regression (gate 10) is closed and gate 9's
+  NotAHome is gone: the push-0 chain (A-902, A-894, A-903, A-907) holds.
+- In flight: w-shared A-908 (a branch's green replicated on holders through the owner's Lineage; piece 1 replicas as
+  Greens), w-svn the Linux "Corrupt" fix (an edit's delta base brought back: Due::Text), w-hg P5's two hg reds (a pull
+  sending 3 revisions whole; a tag pull over HTTP hanging), w-perf the successor's brought-back texts let go.
+- The 57k hg push and restart passed with P5 (227 s); r977 reruns it at c890f5b6b.
+- Still Ada's: w-git's kiln approval (blocked since ~11:47), adacachy2's runner (84a Linux re-check), A-904's naming.
+
 Updates at 12:22 on 11-24:
 - Landed since 11:38: A-906 (w-git, 4664f8d26: the content pool's free room counted once a generation), w-svn's
   RunTable and step slicing (1efdd7b45: the 9,000-file import's longest step 1,208 -> 473 ms), w-perf's (a) (31bf5e5c7:
