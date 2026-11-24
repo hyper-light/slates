@@ -1551,3 +1551,40 @@ fn a_tail_sealed_a_table_a_step_is_the_tail_sealed_at_once() {
   assert_empty(&stepped_store);
   assert_empty(&whole_store);
 }
+
+/// Goal 93 (arena-19: the index seal's reland cost 24-35% of push-all outside the intake; the lane reads runs a lookup
+/// from these counters). Do: give an index three runs (a0, a1, a2, newest last), each insert's duplicate check a lookup
+/// (over none, one and two runs: a push's misses); look up a key in the newest run, one in the oldest and one no run
+/// holds; then fork it and look one key up in the fork. Expect the inserts' 3 lookups visiting 3 runs, then 3 more
+/// visiting 1, 3 and 3 (a miss visits every run, the tail empty after each seal); the fences counted (one a run); and
+/// the fork's own counts from none: 1 lookup, its runs as it walked them.
+#[test]
+fn an_indexs_lookups_count_the_runs_they_visit_for_its_life() {
+  let mut store = store();
+  let mut index = Index::new();
+  add_runs(&mut index, &mut store, &[b"a0", b"a1", b"a2"]);
+  assert_eq!(index.fences(), 3, "one table a run");
+  let inserted = index.counters();
+  assert_eq!(
+    (inserted.lookups, inserted.runs_visited),
+    (3, 3),
+    "each insert's duplicate check"
+  );
+  assert!(index.get(&store, b"a2").is_some());
+  assert!(index.get(&store, b"a0").is_some());
+  assert!(index.get(&store, b"nowhere").is_none());
+  let counted = index.counters();
+  assert_eq!(
+    (
+      counted.lookups - inserted.lookups,
+      counted.runs_visited - inserted.runs_visited
+    ),
+    (3, 1 + 3 + 3)
+  );
+  let fork = index.fork(&mut store).unwrap();
+  assert!(fork.get(&store, b"a1").is_some());
+  let forked = fork.counters();
+  assert_eq!((forked.lookups, forked.runs_visited), (1, 2));
+  fork.release(&mut store).unwrap();
+  index.release(&mut store).unwrap();
+}

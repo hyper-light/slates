@@ -133,6 +133,11 @@ pub struct IndexCounters {
   pub compactions: u64,
   /// The runs those merges read.
   pub runs_merged: u64,
+  /// Lookups made ([`Index::get`]), for the index's life; a fork counts its own from none.
+  pub lookups: u64,
+  /// The runs those lookups visited, a miss every run (goal 93: a push's fork seals as it appends, so its lookups walk
+  /// runs where they met one tail; arena-19 put the reland at 24-35% of push-all outside the intake).
+  pub runs_visited: u64,
 }
 
 /// One table of a run: its identity, its first key (the fence a lookup searches) and its rows.
@@ -206,6 +211,7 @@ impl Run {
 struct Visit {
   visits: u64,
   compactable: u64,
+  runs: u64,
 }
 
 impl Visit {
@@ -282,6 +288,10 @@ pub struct Index {
   tail_bytes: usize,
   /// Visits since the caller last reported its lookups' time.
   visits: Cell<u64>,
+  /// Lookups made, for the index's life ([`IndexCounters::lookups`]).
+  lookups: Cell<u64>,
+  /// The runs those lookups visited ([`IndexCounters::runs_visited`]).
+  runs_visited: Cell<u64>,
   /// `depths[p]`: the lookups since then that visited `p` runs only this index holds.
   depths: RefCell<Vec<u64>>,
   /// Rows inserted since the caller last reported its inserts' time.
@@ -555,6 +565,10 @@ impl Index {
     self
       .visits
       .set(self.visits.get().saturating_add(visit.visits));
+    self.lookups.set(self.lookups.get().saturating_add(1));
+    self
+      .runs_visited
+      .set(self.runs_visited.get().saturating_add(visit.runs));
     if let Ok(mut depths) = self.depths.try_borrow_mut() {
       let at = usize::try_from(visit.compactable).unwrap_or(usize::MAX);
       if depths.len() <= at {
@@ -583,6 +597,7 @@ impl Index {
     }
     self.runs.iter().rev().find_map(|run| {
       visit.visit(!run.shared);
+      visit.runs = visit.runs.saturating_add(1);
       let fence = run.fence_for(key)?;
       view(store, &fence.table)?.get(key)
     })
@@ -1299,7 +1314,18 @@ impl Index {
 
   /// What the index has done.
   pub fn counters(&self) -> IndexCounters {
-    self.counters
+    IndexCounters {
+      lookups: self.lookups.get(),
+      runs_visited: self.runs_visited.get(),
+      ..self.counters
+    }
+  }
+
+  /// The fences of every run: what a fork copies ([`Index::fork`]).
+  pub fn fences(&self) -> u64 {
+    self.runs.iter().fold(0_u64, |fences, run| {
+      fences.saturating_add(u64::try_from(run.fences.len()).unwrap_or(u64::MAX))
+    })
   }
 
   /// The caller's lookups since its last report took `elapsed_ns`: the merge rule's rent.
