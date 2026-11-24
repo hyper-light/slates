@@ -1,0 +1,83 @@
+name: diag w-tsan
+# w-tsan for main 01a20182 (2026-11-23), diag 2: CI's TSan job copied unchanged from .github/workflows/ci.yml, and a
+# focused job that runs only the server library's tests diag 1 (run 45289949180) failed or hung, instrumented the same
+# way, with --nocapture so each message prints as it fails (diag 1's library never ended, so none printed). Run only
+# from `diag-measurer-w-tsan-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-w-tsan-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tsan-nightly:
+    name: TSan (mem, rt, ipc, client; every push to main and nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        env:
+          # ThreadSanitizer's 10-20x slowdown inflates the restart-detection publish window far past a native run, so
+          # the slow-restart client test needs a larger scale than the plain Test lane (same reason; the invariant
+          # publish << reply << recovery << reconnect holds at any scale). crates/client/tests/client.rs.
+          #
+          # Since 2026-10-20 this also scales START_WAIT, how long a client retries the rendezvous while a daemon
+          # starts. That budget was a flat five seconds and read this knob not at all, so the lane declared itself
+          # 25x slow and one of the two budgets that needed to hear it did not: run 39527867650 failed
+          # a_client_maps_files_across_shards_and_always_gets_the_bytes with "the daemon did not answer the claim
+          # within the claim wait" while that daemon was still starting (a shard took 15 753 us against 2 106 us
+          # unloaded).
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+        run: cargo xtask tsan
+
+  tsan-focused:
+    name: TSan, the server library's reds with their messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: The library's reds under ThreadSanitizer, messages printed
+        env:
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+          RUSTFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc --cfg=slates_tsan"
+          RUSTDOCFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc --cfg=slates_tsan"
+          TSAN_OPTIONS: "halt_on_error=0"
+        run: |
+          host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+          cargo +nightly test -Zbuild-std --target "$host" -p slates-server --lib -- --nocapture --exact \
+            content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes \
+            content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes \
+            git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects \
+            hook_driver::tests::a_hook_whose_child_holds_its_output_is_judged_by_its_exit_and_its_child_ended \
+            memory_gauges::tests::the_control_shards_memory_status_names_glibcs_bytes_where_glibc_runs \
+            memory_gauges::tests::a_memory_status_names_its_holders_and_a_plain_one_none \
+            repository::store_tests::a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history \
+            repository::store_tests::a_region_held_window_is_restored_beside_the_named_texts_brought_back \
+            vcs_http::daemon_edge::tests::a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node \
+            vcs_http::daemon_edge::tests::a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once \
+            vcs_http::daemon_edge::tests::a_clone_of_git_gits_many_refs_is_answered_whole_over_the_daemons_edge \
+            vcs_http::daemon_edge::tests::a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping \
+            vcs_http::daemon_edge::tests::a_pushs_texts_high_water_is_a_segments_whatever_its_history \
+            vcs_http::tests::a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each_write \
+            vcs_http::daemon_edge::tests::a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge \
+            vcs_http::daemon_edge::tests::an_advertisement_over_a_let_go_pack_is_the_one_over_it_held \
+            vcs_ssh::tests::a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits \
+            2>&1 | tee focused.log
+          grep -c 'WARNING: ThreadSanitizer' focused.log || true
