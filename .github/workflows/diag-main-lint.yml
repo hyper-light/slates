@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 2 (main 01a20182, 2026-11-24 11:20 PST): the wall again at c45aff536 with main's e7f18e4d1, which takes the three
+# sites run 1 (45463272613) named under it: content.rs's empty-window test, homes.rs's serve_remote, hg_push's re-adopt test.
 # main 01a20182 (2026-11-24 10:47 PST): the lint wall at current main (d9cabf2cc) after the nine sites main CI 45450619947 named
 # at d48863ddb were fixed by their authors (42589bb44 w-svn, d6f54329a w-perf, d9cabf2cc w-shared): the workspace's clippy on
 # Linux, and on Windows the CI's own clippy steps (the Windows-buildable crates and every slates-cli target), so the wall is
