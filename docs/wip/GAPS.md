@@ -824,17 +824,29 @@
 > observations, an import's segments through `hg_import::land_imported_on`. Moved, each red under the 1.5 s `fdatasync`
 > and green after: `daemon_edge`'s creations and its import (076a4adb5 and the next change), the ssh serve test's
 > creation, `vcs_store::read_through`'s six tests, `vcs_store::upload`'s three landing tests and `hg_import`'s rebuild
-> test. Still held, by helper and caller count, each moved in its own change: `repository/hg_push/tests.rs` `new` (48),
-> `git_push/tests.rs` `git_repository` (37), `repository.rs` `ask` (31) and `create` (18), `vcs_store/paths/tests.rs`
-> `ask` (15), `vcs_store/tests.rs` `repository` (14), `appended` (10) and `push_unsettled` (1), `hg_import/tests.rs`
-> `created` (13) and its five direct `land_imported` histories, `repository/push/tests.rs` `repository` (12),
-> `hg_view/tests.rs` `created` (10) and `imported` (4), `lfs/tests.rs` `repository` (5), `identities/tests.rs` `ask`
-> (5) and `created` (2), `repository/import/tests.rs` `created` (5), `hg_made/tests.rs` `mercurial` (4),
-> `vcs_share/tests.rs` `hg_repository` (3), `vcs_ssh/tests/hg.rs` (3), `commits/tests.rs` `recorded_submit` (2),
-> `fleet.rs` `repository_and_branch` (2); the direct histories in `index_upkeep.rs` (2), `upload/tests.rs` (1) and
-> `repository.rs` (2); and the test helpers in product files (`hg_push.rs` `store_blocking`, `commits.rs`
-> `home_and_land_blocking` and `made_after_now`, `git_push/tests.rs` `carried_blocking`, `daemon.rs` `b1_crash` and two
-> histories). Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
+> test, and `lfs`'s five tests (`test_store::audit_on_stored_shard_made`: the repository made first, then the history).
+> - **Held by design (main's ruling of 2026-11-24 23:15; not moved).** Three families check a model deterministically by
+>   holding their shard on purpose (A-767 item 7), so a store commit slower than the shard's liveness window ends their
+>   binary with exit 4. Measured: 1 run in 100 at load 47 on adacachy2 (w-tsan), none in CI's recent runs.
+>   - `repository/hg_push/tests.rs`' push tests (`Hg`: 18 creations in 16 tests): each push lands its segments through
+>     `hg_push::land_stored` and `store_blocking` between prepare and land ("a test holds the shard's state through its
+>     push", `settled_whole`).
+>   - `git_push/tests.rs`' synchronous driver (`pushed` and `carry_blocking`, 30 calls): "a synchronous driver holds the
+>     shard", each changeset landed with `land_answered_blocking`.
+>   - `repository.rs`' creation-reply tests (`ask`, 32 calls; `create`, 17): they read the creation's own reply, which on
+>     a store-holding daemon goes by its reply route.
+>   The fix if CI ever shows the exit 4: the push tests re-targeted at the async drivers (`hg_run`; `carry_awaited` in
+>   a `run_on_first` history), the creation-reply tests at a client that captures the routed reply.
+> - **Still to move** (each in its own change, red under the 1.5 s `fdatasync` and green after; stopped and named here
+>   where a synchronous driver appears): `git_repository`'s other callers (101 calls in 12 files with the driver's),
+>   `vcs_store/paths/tests.rs` `ask`, `vcs_store/tests.rs` `repository`, `appended` and `push_unsettled`,
+>   `hg_import/tests.rs` `created` and its five direct `land_imported` histories, `repository/push/tests.rs`
+>   `repository`, `hg_view/tests.rs` `created` and `imported`, `identities/tests.rs` `ask` and `created`,
+>   `repository/import/tests.rs` `created`, `hg_made/tests.rs` `mercurial`, `vcs_share/tests.rs` `hg_repository`,
+>   `vcs_ssh/tests/hg.rs`, `commits/tests.rs` `recorded_submit`, `fleet.rs` `repository_and_branch`; the direct histories
+>   in `index_upkeep.rs`, `upload/tests.rs` and `repository.rs`; and the test helpers in product files (`commits.rs`
+>   `home_and_land_blocking` and `made_after_now`, `daemon.rs` `b1_crash` and two histories).
+>   Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
 > `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
@@ -4736,7 +4748,9 @@
 > Past twice that a run is stuck, not slow. It ended with 18 differences, server reds sent to w-svn by main: `info`
 > answered 500 on `/project/!svn/rvr/N/trunk/t` at all 17 samples, and svnrdump's dump differs in one deletion's order.
 > Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
-> w-svn. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
+> w-svn. Since then (main's ruling) blame leaves out a file added without a source, whose blame names its one revision
+> on every line, so revision 1's import is blamed no more; a later sample that changes such a file blames its whole
+> history. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -7785,6 +7799,11 @@
 >   charged the client's own shard, which counts no periods on a two-shard node, and 3 of its 6 runs failed anyway, two
 >   at `FROZEN_CAP` (304 s) and one at its 900 s timeout. **Open (daemon):** the takeover a restarted successor runs on
 >   its own live volume leaves the owner shard without the volume while the routing names the node its owner.
+>   **FIXED 2026-11-23 (w-chaos; A-890, main's rulings of 22:12 to 22:30).** The cause was the rerun fencing its own
+>   adoption one epoch up through its holders' pages: a holder refused the successor's resumed log as stale, and the
+>   successor marked itself superseded. The adoption is now persisted with its copy (`Acceptor::adopted`, image 35, delta
+>   13), and the rerun settles it at its own epoch; above that epoch it asks by name only. The fleet tests retry
+>   `Overloaded`, charged in the slowest fleet coordinator. Reds: the two daemon tests in A-890.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).

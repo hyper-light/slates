@@ -3009,10 +3009,12 @@ fn info_entries_in_order(text: &str) -> String {
   head + &entries.concat() + &tail
 }
 
-/// The files a blame at revision `at` reads (main 01a20182's ruling of 2026-11-23): those revision `at` added or
-/// modified, as `leg`'s `svn log -v -r AT` names them, that `copy` (a working copy of the repository's root at `at`)
-/// holds; where `at` changed no file the copy holds, those of the nearest earlier revision that did. The paths beneath
-/// the copy, and the revision they were taken from. Read from one leg (the control), so both legs blame the same files.
+/// The files a blame at revision `at` reads (main 01a20182's rulings of 2026-11-23): those revision `at` changed with a
+/// history to blame ([`files_changed_in`]: modified, replaced, or added as a copy), as `leg`'s `svn log -v -r AT` names
+/// them, that `copy` (a working copy of the repository's root at `at`) holds; where `at` changed none, those of the
+/// nearest earlier revision that did; none at all where no revision up to `at` did (revision 1, an import of added files),
+/// so that sample blames nothing. The paths beneath the copy, and the revision they were taken from (0 for none). Read
+/// from one leg (the control), so both legs blame the same files.
 fn blamed_files(leg: &UseLeg, scratch: &str, at: u64, copy: &str) -> (Vec<String>, u64) {
   for revision in (1..=at).rev() {
     let rev = revision.to_string();
@@ -3029,13 +3031,17 @@ fn blamed_files(leg: &UseLeg, scratch: &str, at: u64, copy: &str) -> (Vec<String
 }
 
 /// The files `log`, an `svn log -v --xml` answer made plain (each `<path ...>` tag one line, [`UseLeg::plain`]), names
-/// as added, modified or replaced, by their repository paths without the leading `/`; a deletion and a directory are left
-/// out.
+/// as changed with a history to blame: modified, replaced, or added as a copy (`copyfrom-path`), by their repository
+/// paths without the leading `/`. A deletion and a directory are left out, and so is a file added without a source
+/// (main 01a20182's ruling of 2026-11-23): its history is the one revision, so its blame names that revision on every
+/// line and shows nothing, and the sample that later changes it blames its whole history. Over git-2000 that was
+/// revision 1's 4,523 added files, 308 of stock's 393 s of blame.
 fn files_changed_in(log: &str) -> Vec<String> {
   log
     .lines()
     .filter(|line| line.contains("<path ") && line.contains("kind=\"file\""))
     .filter(|line| !line.contains("action=\"D\""))
+    .filter(|line| !line.contains("action=\"A\"") || line.contains("copyfrom-path="))
     .filter_map(|line| {
       let start = line.find('>')?.checked_add(1)?;
       let end = line.find("</path>")?;
@@ -3365,11 +3371,19 @@ fn working_copies_compared(
       }
       held_by.push(if verb == "blame" {
         let (files, from) = blamed_files(legs[0], scratch, *at, &copy);
-        eprintln!(
-          "svn use: blame r{at} on {}: {} files, those r{from} changed",
-          leg.name,
-          files.len()
-        );
+        if files.is_empty() {
+          eprintln!(
+            "svn use: blame r{at} on {}: none, no revision up to r{at} changed a file with a history (only files \
+             added without a source, whose blame names their one revision)",
+            leg.name
+          );
+        } else {
+          eprintln!(
+            "svn use: blame r{at} on {}: {} files, those r{from} changed with a history",
+            leg.name,
+            files.len()
+          );
+        }
         files
           .iter()
           .map(|file| leg.answer(&copy, &["blame", "-v", "-r", &rev, file]))
@@ -3810,22 +3824,24 @@ fn an_infos_entry_order_is_no_part_of_an_answer() {
   );
 }
 
-/// The blame rule's reading of a revision's changes ([`files_changed_in`], main 01a20182's ruling of 2026-11-23). Do: read
-/// a plain `svn log -v --xml` answer naming a modified file, an added file, a deleted file, a replaced file and a changed
-/// directory. Expect the three files still there after the revision, by their paths without the leading `/`, in the
-/// log's order.
+/// The blame rule's reading of a revision's changes ([`files_changed_in`], main 01a20182's rulings of 2026-11-23). Do:
+/// read a plain `svn log -v --xml` answer naming a modified file, a file added without a source, a file added as a copy,
+/// a deleted file, a replaced file and a changed directory. Expect the modified, copied and replaced files, by their
+/// paths without the leading `/`, in the log's order: the plain add has no history to blame, and the deletion and the
+/// directory are no files to blame.
 #[test]
 fn a_revisions_changed_files_are_read_from_its_log() {
   let log = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<logentry revision=\"7\">\n<author>t</author>\n<paths>\n\
 <path action=\"M\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/a.c</path>\n\
 <path action=\"A\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/dir/new.h</path>\n\
+<path action=\"A\" copyfrom-path=\"/trunk/a.c\" copyfrom-rev=\"6\" kind=\"file\" prop-mods=\"false\" text-mods=\"false\">/trunk/b.c</path>\n\
 <path action=\"D\" kind=\"file\" prop-mods=\"false\" text-mods=\"false\">/trunk/gone.c</path>\n\
 <path action=\"R\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/again.c</path>\n\
 <path action=\"M\" kind=\"dir\" prop-mods=\"true\" text-mods=\"false\">/trunk/dir</path>\n\
 </paths>\n<msg>m</msg>\n</logentry>\n</log>\n";
   assert_eq!(
     files_changed_in(log),
-    ["trunk/a.c", "trunk/dir/new.h", "trunk/again.c"]
+    ["trunk/a.c", "trunk/b.c", "trunk/again.c"]
   );
 }
 
