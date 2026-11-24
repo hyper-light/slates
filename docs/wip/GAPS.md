@@ -4672,6 +4672,14 @@
 > `GreenReplay::step`). Owed: git-2000 re-measured on the merged tree (main's run), which closes P7's finding (2) or
 > not. Still one step a batch: `append_versions`' loop before the record (each version's increment held, its entry
 > encoded; w-rewrite-ops'), and `follow`, the fold and the texts' release after the last slice.
+> **A depth-1 PROPFIND streams its children; a server error names its cause, BUILT (A-893, 2026-11-24, w-svn; main's
+> interop red of 2026-11-23, run 45330574435).** `svn info -R` over HTTP of git-2000 answered `500` at
+> `!svn/rvr/N/trunk/t` at all 17 sampled revisions: a collection's depth-1 multistatus was written into one body bounded
+> by the request's room, and `trunk/t`'s children overflowed it (`OutputRoom`), answered as a bare `500` that named
+> nothing. Now the children's responses stream a slice at a time (`site::PropfindWalk`, a `Report` answered `207`),
+> depth 0 whole; a site refusal answered `500` names its cause in Subversion's error form, and the edge logs it
+> (counted `vcs.svn.http_server_refusals`). Held by `a_depth_one_propfind_past_its_room_is_streamed_whole` (red: `500`
+> with an empty body). Owed: main's git-2000 info round.
 > **An import batch is bounded by its green's retention room, BUILT (A-892, 2026-11-24, w-svn; main's red of 2026-11-23
 > on the Studio's 23 shards).** git-2000.dump's import was refused `BudgetExceeded { available: 373475417 }` in every
 > run: one batch's versions reserved 422,803,669 bytes of the green's retention against its cap of 373,475,417

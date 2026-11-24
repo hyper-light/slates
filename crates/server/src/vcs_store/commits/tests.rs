@@ -14,8 +14,8 @@ use slates_git::objects::tree::{Mode, Tree};
 use slates_git::unpack::{self, NoIndex};
 use slates_git::upload::Asked;
 use slates_ipc::protocol::{ReplyBody, RequestBody, WorkOp};
-use slates_wire::Wire;
 use slates_vfs::clock::{Clock, HostClock};
+use slates_wire::Wire;
 
 use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_ENTRY_REFUSED, TEST_MAP_BUDGET, TEST_UNMADE};
 use super::{MADE, UNMADE};

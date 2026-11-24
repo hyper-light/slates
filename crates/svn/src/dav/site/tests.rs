@@ -324,13 +324,9 @@ fn a_depth_one_propfind_lists_the_children_the_principal_may_read() {
   let fixture = Fixture::new();
   let alice = rules_of(Some(b"alice"));
   let listed = |rules: &PrincipalRules| {
-    let answer = whole(fixture.ask(
-      Some(rules),
-      "PROPFIND",
-      ("/!svn/rvr/6/trunk", Some("1")),
-      PROPFIND_KIND,
-    ));
-    (answer.status, hrefs(&text_of(&answer)))
+    let at = ("/!svn/rvr/6/trunk", "1", PROPFIND_KIND);
+    let (status, body) = propfound(&fixture, rules, at, ROOM);
+    (status, hrefs(&body))
   };
   let prefix = "/repo/!svn/rvr/6/trunk/";
   let children = ["", "a.txt", "big.txt", "dir/", "renamed.txt", "script.sh"];
@@ -344,6 +340,55 @@ fn a_depth_one_propfind_lists_the_children_the_principal_may_read() {
     (listed(&rules_of(None)), listed(&alice)),
     ((207, anonymous), (207, alices))
   );
+}
+
+/// A PROPFIND of `body`'s properties, answered as the edge sends it: a whole answer's status and body, or a streamed
+/// multistatus's status and its slices of `room` joined.
+fn propfound(
+  fixture: &Fixture,
+  rules: &PrincipalRules,
+  (path, depth, body): (&str, &str, &[u8]),
+  room: usize,
+) -> (u16, String) {
+  let request = Request {
+    method: "PROPFIND",
+    path,
+    depth: Some(depth),
+    label: None,
+    body,
+  };
+  match answer(&fixture.served(Some(rules)), &request, &BOUNDS, room) {
+    Answer::Whole(whole) => (whole.status, text_of(&whole)),
+    Answer::Report(mut report) => {
+      let status = report.status();
+      let mut out = Vec::new();
+      loop {
+        match report.resume(&fixture.served(Some(rules)), &mut out, untimed(room)) {
+          ReportProgress::More => {}
+          ReportProgress::Done => break,
+          other => panic!("the multistatus ended: {other:?}"),
+        }
+      }
+      (status, String::from_utf8(out).expect("UTF-8"))
+    }
+    Answer::Text { .. } => panic!("a text where a multistatus was due"),
+  }
+}
+
+/// Goal 93 (main's interop red of 2026-11-23: `svn info -R` over HTTP of git-2000's `trunk/t` answered `500` at every
+/// revision; `mod_dav` streams a multistatus however many children a directory holds). Do: PROPFIND a directory at depth
+/// 1 with `svn info`'s properties, once within a room for the whole answer and once within a room smaller than it.
+/// Expect: `207` both times and the same multistatus. Before, the small room answered `500` (`OutputRoom`).
+#[test]
+fn a_depth_one_propfind_past_its_room_is_streamed_whole() {
+  let fixture = Fixture::new();
+  let rules = rules_of(None);
+  let at = ("/!svn/rvr/6/trunk", "1", PROPFIND_INFO);
+  let (status, whole) = propfound(&fixture, &rules, at, ROOM);
+  assert_eq!(status, 207);
+  // A room past the opening and the directory's own response, short of the whole answer.
+  let small = whole.len() / 2;
+  assert_eq!(propfound(&fixture, &rules, at, small), (207, whole));
 }
 
 /// The text a [`Answer::Text`] streams, read from the green a piece at a time as the edge reads it, and its headers.
