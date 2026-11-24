@@ -1,0 +1,134 @@
+name: diag measurer
+# w-interop (2026-11-22): the HTTP edge's spin under stock hg on a loaded Linux host (vcs_http.rs:850, `drive`; the hg
+# matrix's clone-rev and stream-clone rows red on adacachy at load 35-41, 2 kills). kiln reaches no Linux box, so this
+# reproduces it on ubuntu-latest, its CPUs oversubscribed twice over by busy loops, with DIAG timing of hg's `begin` and
+# of each streamed turn (crates/server/src/vcs_http/hg.rs) in the anchor log. Run only from `diag-measurer-*` branches,
+# never main; every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  hg-matrix-loaded:
+    name: hg matrix, loaded (${{ matrix.runner }}, run ${{ matrix.run }}, malloc ${{ matrix.malloc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, run: 1, malloc: default }
+          - { runner: ubuntu-latest, run: 1, malloc: tunables }
+          - { runner: ubuntu-24.04-arm, run: 1, malloc: default }
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # A virtualenv at a fixed path, not `pip --user`: the matrix runs with HOME set to its scratch, where a user
+      # install's libraries are not (the first run's every row: "abort: couldn't find mercurial libraries").
+      - name: Stock Mercurial 7.2
+        run: |
+          python3 -m venv "$RUNNER_TEMP/hgvenv"
+          "$RUNNER_TEMP/hgvenv/bin/pip" install --disable-pip-version-check --no-input "mercurial==7.2"
+          echo "$RUNNER_TEMP/hgvenv/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: Mercurial's own history (a tag at a time, so a cut transfer is retried small)
+        run: |
+          hg version -q | head -1
+          URL=https://www.mercurial-scm.org/repo/hg; S=$RUNNER_TEMP/hg-src
+          for i in 1 2 3; do hg clone -q -U -r 1.0 $URL $S && break; rm -rf $S; sleep 10; done
+          for t in 2.0 3.0 4.0 5.0 6.0 6.5 7.0 tip; do
+            for i in 1 2 3 4; do if [ $t = tip ]; then hg -R $S pull -q $URL && break; else hg -R $S pull -q -r $t $URL && break; fi; sleep 10; done
+            echo "$t: $(hg -R $S log -r tip -T '{rev}')"
+          done
+      - name: The hg matrix with the CPUs oversubscribed twice over
+        run: |
+          # main 01a20182 (arena-21): main 34d055a3c with w-hg's merge-step slicing (8933770f2) and key filter per run (fa30061d2),
+          # the seal reland in, with arena-19's status snapshots; compare arena-20 (97caa43f1, slicing alone), arena-18
+          # (012543d77, push-all 1,175 / 783 / 700 s) and arena-19 (a3c351645, the reland out). Every vcs.hg.* counter printed.
+          # main 01a20182 (arena-8): is the RSS floor glibc's retention? One leg runs the daemon with a single arena.
+          if [ "${{ matrix.malloc }}" = arena1 ]; then export MALLOC_ARENA_MAX=1; fi
+          # arena-12: glibc's thresholds fixed, so a large block is its own mapping and is returned on free.
+          if [ "${{ matrix.malloc }}" = tunables ]; then export GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072; fi
+          echo "GLIBC_TUNABLES=${GLIBC_TUNABLES:-unset}"
+          echo "MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-unset}"
+          echo "nproc $(nproc); load before $(cat /proc/loadavg)"
+          for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
+          sleep 20; echo "load with burners $(cat /proc/loadavg)"
+          set +e
+          HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
+          rc=${PIPESTATUS[0]}
+          echo "load after $(cat /proc/loadavg)"
+          A=$RUNNER_TEMP/matrix-hg/anchor.log
+          echo "spins $(grep -cE 'is spinning' $A); kills $(grep -cE 'killing it' $A); restarts $(grep -cE 'daemon exited' $A)"
+          grep -E 'is spinning|killing it' $A | cut -c1-300 || true
+          echo "== held-ahead increments the content store refused (NoCapacity, StaleStage or Unstaged)"
+          grep "a push's increment held ahead was refused by the content store" $A | cut -c1-300 | sort | uniq -c | head -20 || true
+          echo "== w-hg's give-up line"; grep "a push's intake waited for room and gave up" $A | cut -c1-400 | sort | uniq -c | head -20 || true
+          echo "== the typed refusal"; grep -h "needs more room than its repository could ever be lent on its shard" $A $RUNNER_TEMP/matrix-hg/logs/*.log | cut -c1-400 | sort | uniq -c | head -20 || true
+          echo "== push-all's log"; tail -c 3000 $RUNNER_TEMP/matrix-hg/logs/push-all.log || true
+          echo "== the push's outcome"; grep -E "^(PASS|FAIL) push-all" $RUNNER_TEMP/matrix-hg.out | head -1 | cut -c1-400 || true
+          echo "== past-ceiling log line (typed, at the wait)"; grep "a push's intake needs more than its repository could ever be lent" $A | cut -c1-400 | sort | uniq -c | head -20 || true
+          echo "== the counters (vcs.hg.push_segments_landed, vcs.hg.push_runs_abandoned, vcs.hg.push_need_admitted, the room waits)"; python3 -c 'import json,sys
+          kinds = ["vcs.hg.push_segments_landed", "vcs.hg.push_runs_abandoned", "vcs.hg.push_need_admitted",
+                   "vcs.hg.push_intake_room_waits", "vcs_share.room_waits_given_up", "vcs_share.room_waits_past_ceiling"]
+          def walk(o):
+              if isinstance(o, dict):
+                  if o.get("kind") in kinds: yield o
+                  for v in o.values(): yield from walk(v)
+              elif isinstance(o, list):
+                  for v in o: yield from walk(v)
+          hits = list(walk(json.load(open(sys.argv[1]))))
+          for kind in kinds:
+              print(kind, sum(h.get("count", 0) for h in hits if h.get("kind") == kind))' $RUNNER_TEMP/matrix-hg/status.json || true
+          echo "== DIAG what holds memory right after push-all (content_range.*, mem.gauge.*, vcs.hg.push_*)"; python3 -c 'import json,sys
+          def walk(o):
+              if isinstance(o, dict):
+                  k = o.get("kind")
+                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.") or k.startswith("vcs.hg.")): yield o
+                  for v in o.values(): yield from walk(v)
+              elif isinstance(o, list):
+                  for v in o: yield from walk(v)
+          totals = {}
+          for h in walk(json.load(open(sys.argv[1]))):
+              totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
+          for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
+          echo "== DIAG what holds memory after idle (content_range.*, mem.gauge.*, vcs.hg.push_*, content.purge*)"; python3 -c 'import json,sys
+          def walk(o):
+              if isinstance(o, dict):
+                  k = o.get("kind")
+                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.") or k.startswith("vcs.hg.") or k.startswith("content.purge")): yield o
+                  for v in o.values(): yield from walk(v)
+              elif isinstance(o, list):
+                  for v in o: yield from walk(v)
+          totals = {}
+          for h in walk(json.load(open(sys.argv[1]))):
+              totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
+          for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-idle.json || true
+          echo "== peak RSS (compare arena-12 047f639ca: push-all peak 2150 x86 default, 1926 x86 tunables, 2206 arm64 MiB; RSS after push-all 1,865 MB x86)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
+          echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); print a[2] "\t" $0}}' | sort -k1,1nr | head -20 | cut -f2- || true
+          echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hg-matrix-loaded-logs-${{ matrix.runner }}-${{ matrix.run }}-${{ matrix.malloc }}
+          path: |
+            ${{ runner.temp }}/matrix-hg.out
+            ${{ runner.temp }}/matrix-hg/anchor.log
+            ${{ runner.temp }}/matrix-hg/logs
+            ${{ runner.temp }}/matrix-hg/status.json
+            ${{ runner.temp }}/matrix-hg/status-after-push.json
+          if-no-files-found: warn

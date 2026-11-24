@@ -102,7 +102,47 @@ PUSH=(--new-branch -f)
 [ -n "${PUSH_REV:-}" ] && PUSH+=(-r "$PUSH_REV")
 echo "hg $(h --version | head -1); source $SOURCE $(h -R "$SOURCE" log -r 'all()' -T x | wc -c | tr -d ' ') changesets; http $HTTP ssh $SSH"
 
+# DIAG (diag branch only): PUSH_CHUNK pushes the history a PUSH_CHUNK of revisions at a time (`-r REV -f`, ancestors
+# with it) then the rest, as hg_scale.sh does, for a server whose one push of it is refused; the repository is the same.
+# A chunk refused in words that ask for it ("push again") is pushed again, up to six times, a second more each time.
+if [ -n "${PUSH_CHUNK:-}" ]; then
+  PUSH_ERR=$WORK/push-chunk.err
+  export PUSH_CHUNK SOURCE URL PUSH_ERR
+  export HG_WORDS="${HG[*]}"
+  row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); tries=0; for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do for try in 1 2 3 4 5 6; do $HG_WORDS -R "$SOURCE" push -q --new-branch -f -r "$rev" "$URL" 2>"$PUSH_ERR"; c=$?; [ $c -le 1 ] && break; grep -q "push again" "$PUSH_ERR" || break; tries=$((tries+1)); sleep $try; done; [ $c -le 1 ] || { cat "$PUSH_ERR"; echo "chunk at $rev exit $c after $try tries"; exit $c; }; done; echo "chunks pushed; retried on push again: $tries"'
+else
 row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
+# DIAG (diag branch only; w-hg's ask, main 01a20182 2026-11-22 11:16): what holds the daemon's memory right after
+# push-all, before any later row can spin and restart it.
+s status --json --memory >"$WORK/status-after-push.json" 2>"$WORK/status-after-push.err" ||
+  echo "DIAG status after push failed: $(head -3 "$WORK/status-after-push.err")"
+# DIAG (diag branch only; main 01a20182 arena-12): the daemon's resident memory by mapping right after push-all, its
+# smaps_rollup and the mappings holding the most, summed by name ([anon] for a nameless one), to name what no gauge counts.
+DPID=$(ps -axo pid=,command= 2>/dev/null | grep -F -- "--instance $INSTANCE daemon" | grep -v grep | awk '{print $1}' | head -1)
+if [ -n "$DPID" ] && [ -r "/proc/$DPID/smaps" ]; then
+  echo "DIAG smaps_rollup after push-all (pid $DPID): $(tr -s ' ' < "/proc/$DPID/smaps_rollup" | tr '\n' ';' | cut -c1-900)"
+  awk '/^[0-9a-f]+-[0-9a-f]+ / {name = (NF >= 6 ? $6 : "[anon]")} /^Rss:/ {rss[name] += $2} END {for (n in rss) print rss[n], n}' \
+    "/proc/$DPID/smaps" | sort -rn | head -15 | while read -r kib name; do echo "DIAG resident after push-all: $kib KiB $name"; done
+fi
+# DIAG (diag branch only; main 01a20182 arena-13): the same readings after the daemon sat idle past several sweep
+# passes (a pass runs a sweep's interval, the liveness budget of about 1 s, after what owes it), so a freed content page
+# not yet purged is told apart from one kept short or deferred (w-shared's three mechanisms, the content arena gauges).
+sleep 10
+s status --json --memory >"$WORK/status-after-idle.json" 2>"$WORK/status-after-idle.err" ||
+  echo "DIAG status after idle failed: $(head -3 "$WORK/status-after-idle.err")"
+if [ -n "$DPID" ] && [ -r "/proc/$DPID/smaps" ]; then
+  echo "DIAG smaps_rollup after idle (pid $DPID): $(tr -s ' ' < "/proc/$DPID/smaps_rollup" | tr '\n' ';' | cut -c1-900)"
+  awk '/^[0-9a-f]+-[0-9a-f]+ / {name = (NF >= 6 ? $6 : "[anon]")} /^Rss:/ {rss[name] += $2} END {for (n in rss) print rss[n], n}' \
+    "/proc/$DPID/smaps" | sort -rn | head -15 | while read -r kib name; do echo "DIAG resident after idle: $kib KiB $name"; done
+fi
+# DIAG (diag branch only): stop here when asked, so the read after push-all doesn't wait on rows that still spin.
+if [ "${DIAG_STOP_AFTER_PUSH:-0}" = 1 ]; then
+  printf '%s\n' "---- stopped after push-all (DIAG_STOP_AFTER_PUSH)" "${ROWS[@]}"
+  echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
+  s status --json --memory >"$WORK/status.json" 2>/dev/null || true
+  exit 0
+fi
+fi
 row identify "${HG[@]}" identify "$URL"
 row clone "${HG[@]}" clone -q "$URL" a
 row verify "${HG[@]}" -R a verify -q
@@ -135,6 +175,8 @@ row ssh-pull "${HG[@]}" -R a pull -q "$SSHURL"
 row ssh-push bash -c "${HG[*]} clone -q a f && cd f && echo ssh >ssh.txt && ${HG[*]} commit -qAm ssh \
   && ${HG[*]} push -r . $SSHURL"
 
+# DIAG (diag branch only): the daemon's status, its shards' counters with it, while the anchor still runs.
+s status --json --memory >"$WORK/status.json" 2>"$WORK/status.err" || echo "DIAG status failed: $(head -3 "$WORK/status.err")"
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
 echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
 printf '%s\n' "${ROWS[@]}"
