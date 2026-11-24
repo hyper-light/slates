@@ -1,5 +1,12 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 14:50 PST 11-24: LANDED main 9272195a6: A-907's test fix (28cf8622a: waits for its sender to hold a region window,
+  PUSHES_FOR_A_HOME 8; the flake was a home of neither window 1 run in 9) and A-908 part 1 (fdc59391e: holder replicas
+  kept as crate::greens::Greens, each alone; lend/lend_mut at holder sites so the owner's P2 gate keeps its meaning).
+  Gate 12 recorded in GAPS. NEXT: A-908 part 2 (version 0's record names membership, format 5; holder founds and
+  branches lineages, OUT_OF_ORDER while a source is behind; whole-lineage adoption; branch rebuilds; format-4 records
+  refused on restart leave replicas rebuilt, with a test). Red kept in scratch branch-red.diff.
+
 ## 13:10 PST 11-24: LANDED A-907, main a551b0a88 (113c937b6): every broadcast's stragglers end on their links (one
   settle for homes' exchange, the healer and credentials; Stragglers' Drop and ReplyTx::send hand sessions to an
   installed orphan hook), HOME_STREAM served on its own task. Gate 10's cause (A-902's slow home outlasting the healer's
