@@ -1087,6 +1087,33 @@ impl Intake {
     }
   }
 
+  /// Whether a merge of the fork's runs is under way ([`Taker::merge_step`]): the next step cuts one of its tables. What
+  /// a caller timing its steps reads to tell a merge's cost from a revision's.
+  pub fn merging(&self) -> bool {
+    self.taker.merging.is_some()
+  }
+
+  /// The kind of unit the next step takes, as [`Intake::step`] chooses it: `pending` (a revision longer than a window,
+  /// a window more), `merge` (a table of the fork's merge), else the stage's (`changelog`, `manifest`, `file`,
+  /// `manifests-present`, `files-present`, `done`). What a caller timing its steps reads to tell which unit a long one
+  /// took.
+  pub fn unit(&self) -> &'static str {
+    if self.taker.pending.is_some() {
+      return "pending";
+    }
+    if self.taker.merging.is_some() {
+      return "merge";
+    }
+    match self.taker.stage {
+      Stage::Changelog(_) => "changelog",
+      Stage::Manifests(_) => "manifest",
+      Stage::Files { .. } => "file",
+      Stage::ManifestsPresent(_) => "manifests-present",
+      Stage::FilesPresent => "files-present",
+      Stage::Done => "done",
+    }
+  }
+
   /// The fork and what was brought, once every unit is taken; the intake itself (boxed: it is large) while there is
   /// more.
   pub fn finish(self) -> Result<(HgIndex, Intaken), Box<Self>> {
