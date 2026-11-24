@@ -2,7 +2,8 @@
 //! push held thousands of steps past 100 ms, before and after the index seal's reland; main's ruling of 2026-11-23
 //! 16:29: attribute them by kind). A bundle's changegroup is taken into an empty index through the intake as the daemon
 //! takes it, cut into segments of `segment bytes`, each segment's record written and timed apart from the step that
-//! cut it, its room the push's admission. Each step is timed under the kind of unit it takes (`Intake::unit`). Printed:
+//! cut it, its room the push's admission. Each step is timed under the kind of unit it takes (`Intake::unit`), a long
+//! revision's last window apart (`pending-last`: it reads, checks and keeps the whole revision). Printed:
 //! the wall time; for each kind its steps, its time, its steps past 100 ms and past 1 s and its longest; the segment
 //! records' alike; the slowest steps with their kinds; and the fork's rows, seals, most own runs, tiered merges and
 //! longest merge in steps, and its own bytes in windows, for the size-tiered rule's bound in bytes.
@@ -100,6 +101,13 @@ fn main() -> ExitCode {
     let start = Instant::now();
     let stepped = intake.step(&payload, &mut store, &mut admission).unwrap();
     let took = start.elapsed().as_micros();
+    // A long revision's last window finishes it (its read, its keep, a manifest's parse and its delta), so its step is
+    // timed apart from the windows' hashing and puts (goal 93: pending steps were 72% of r499's intake).
+    let unit = if unit == "pending" && intake.unit() != "pending" {
+      "pending-last"
+    } else {
+      unit
+    };
     kinds.entry(unit).or_default().note(took);
     slowest.push((took, at, unit));
     if slowest.len() > SLOWEST * 4 {
