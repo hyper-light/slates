@@ -175,10 +175,8 @@ fn branch(state: &mut ShardState, repository: &str, (name, from): (&str, &str)) 
 
 /// A green's file at its head.
 fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
-  state
-    .greens
-    .get(&green)
-    .and_then(|engine| engine.content_bytes(path).map(<[u8]>::to_vec))
+  // Held by name, read through the content plane (A-760 (b) 4d).
+  crate::vcs_store::named_objects::read_file(state, green, path)
 }
 
 /// A green's head as its root's attribute holds it (§4.17.1 item 3).

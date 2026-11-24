@@ -70,6 +70,12 @@ pub enum ReanchorRefused {
   },
   /// The range is not whole lines of the path's text at the comment's version, or the path held no file then.
   NotLines,
+  /// A text the comment's lines are read through is held by its content-plane object alone (A-760 (b) 4d), which a
+  /// comment's move does not read: its reader brings the object's bytes to it.
+  Named {
+    /// The object.
+    identity: crate::named::Identity,
+  },
 }
 
 impl Green {
@@ -104,10 +110,13 @@ impl Green {
     let Some(history) = history else {
       // A path with no history has held the head's bytes since version 0 (the one history rule, A-534), or since its
       // copy (A-586): nothing changed it, so the lines stand where they stood.
-      let lines = self
-        .content
-        .get(path)
-        .is_some_and(|text| whole_lines(text, range));
+      let lines = match self.content.get(path) {
+        Some(crate::engine::Content::Bytes(text)) => whole_lines(text, range),
+        Some(crate::engine::Content::Named(identity)) => {
+          return Err(ReanchorRefused::Named { identity });
+        }
+        None => false,
+      };
       return if lines {
         Ok(Reanchored::Moved(range))
       } else {
@@ -117,6 +126,14 @@ impl Green {
     let after = history.partition_point(|(version, _)| *version <= from);
     // The value in effect at `from` is the last entry at or before it; with none, the path held no file then (a path
     // that held one before its first change records that value first, at version 0).
+    // Every value it reads through holds its bytes, or the move is refused naming the one held by name alone.
+    if let Some(identity) = history
+      .iter()
+      .filter_map(|(_, value)| value.as_ref())
+      .find_map(|value| self.value_name(value))
+    {
+      return Err(ReanchorRefused::Named { identity });
+    }
     let stood = after
       .checked_sub(1)
       .and_then(|index| history.get(index))
@@ -171,7 +188,7 @@ impl Green {
           (&self.chunks, self.content.blocks()),
           at,
           at.saturating_add(1),
-        )
+        )?
         .first()
         .copied()
     };

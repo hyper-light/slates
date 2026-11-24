@@ -819,6 +819,7 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
         fetched: None,
         version: sealed.base_version,
         entries: Some(&w.entries),
+        plane: None,
       }
       .entry_len(path);
       // Unknown length, or one equal to what the replacement replaces: the refinement may read it.
@@ -884,6 +885,7 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
     entries: state.works.get(&sealed.work).map(|w| &w.entries),
+    plane: None,
   };
   let kept = crate::refining::kept(
     state,
@@ -947,6 +949,7 @@ fn sealed_with_edit(
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
     entries: state.works.get(&sealed.work).map(|w| &w.entries),
+    plane: None,
   };
   let old_len = sealed.files.len(base, key).ok()?;
   let inserted = u64::try_from(bytes.len()).ok()?;

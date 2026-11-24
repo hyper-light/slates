@@ -203,10 +203,10 @@ fn assert_a_held_verdict_is_refused_once_its_green_moved(green: &mut Green) {
   let moved = seen(green);
   assert_eq!(
     green.commit_judged(stale).map(|(version, _)| version),
-    Err(HeadMoved {
+    Err(super::CommitRefused::Moved(HeadMoved {
       judged_at: 2,
       head: 3
-    })
+    }))
   );
   assert_eq!(seen(green), moved, "a refused commit applied something");
   assert_eq!(accepted(green.judge(&late)).at(), 3);
