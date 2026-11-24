@@ -262,11 +262,16 @@ impl<L: ShardLender> Exchange for Receive<L> {
       return Ok(());
     }
     let Self { lender, push, .. } = self;
-    lender
-      .lend(|state| push.input(state, run))
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
-      .map(|_| ())
-      .map_err(failed)
+    // Refused while its body is read, a side-band push's reply has begun (its head, a keepalive), so the client sees the
+    // connection end: the cause is logged here, as nothing else names it.
+    let Some(taken) = lender.lend(|state| push.input(state, run)) else {
+      slates_machine::log_line!("slates-server: a push's body was refused: its shard was not lent");
+      return Err(Failed(Status::SERVICE_UNAVAILABLE));
+    };
+    taken.map(|_| ()).map_err(|failure| {
+      slates_machine::log_line!("slates-server: a push's body was refused: {failure:?}");
+      failed(failure)
+    })
   }
 
   async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {

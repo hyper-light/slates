@@ -1225,6 +1225,9 @@ impl<S: Site> Parts<S> {
         }
       }
       Err(Failed(status)) => {
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP request's body was refused {status:?}"
+        );
         self.service = None;
         connection.fail(status);
       }
@@ -1241,6 +1244,9 @@ impl<S: Site> Parts<S> {
       None => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     };
     if let Err(Failed(status)) = ended {
+      slates_machine::log_line!(
+        "slates-server: a version-control HTTP request's end was refused {status:?}"
+      );
       self.service = None;
       connection.fail(status);
     }
@@ -1289,6 +1295,10 @@ impl<S: Site> Parts<S> {
         connection.reply_end();
       }
       Err(Failed(status)) => {
+        // Its head is out, so the client sees its connection end, not this status: logged (goal 93).
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP reply under way was failed {status:?}"
+        );
         self.service = None;
         connection.fail(status);
       }
@@ -1333,9 +1343,20 @@ impl<S: Site> Parts<S> {
   /// The module doc's loop: takes `connection`'s steps until it ends or moves to another shard.
   async fn serve(&mut self, connection: &mut Connection) -> Exit {
     loop {
+      let phase = connection.phase();
       match self.step(connection).await {
         Flow::Go => {}
-        Flow::End(why) => return Exit::Ended(why),
+        Flow::End(why) => {
+          // A connection that ends on a failure, not a close, ends a client's request it may be part way through
+          // answering: logged with the phase it failed in, as nothing the client sees names it (goal 93, the
+          // `v3_takeover` gate's push-0 disconnect).
+          if matches!(why, Why::Failed) {
+            slates_machine::log_line!(
+              "slates-server: a version-control HTTP connection failed in {phase:?}"
+            );
+          }
+          return Exit::Ended(why);
+        }
         Flow::Move(shard) => return Exit::Moved(shard),
       }
     }
