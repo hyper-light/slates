@@ -616,3 +616,13 @@ Waiting: main's route; arena-7 and arena-8.
 - Tiered fix landed as c81dce7db (merge 14b44fb7f): merge through the deepest violation; most_own_runs sampled at the invariant point, plus _in_flight. r618 had 8 own runs against a bound of 6.
 - Before P2, merge w-tsan's lend fix (within_budget outside lent_state). bring_back_log is the fourth site.
 - After C1: the interop speed round, stream (8.7x slower than stock) then push (6x slower). Then the pending steps.
+
+## 2026-11-23 22:08: queued correctness item (main, from w-svn's sweep; svn's A-888 piece 2)
+- In hg_made.rs a version can be committed with nothing behind it on the store (the green ends up ahead of the store). Sites:
+  - made Err or Ok(None) commits the version alone;
+  - Unmade other than Unlanded commits it alone;
+  - commit_made Err commits the version through made_commit::commit_held;
+  - hg_made::make on the bare path records in the same transaction, counted when unmade.
+- Use w-svn's guard-then-apply for commit_held when it lands. Red first per site where the path can be driven.
+- Order: after C1 P2, before the stream and push speed items.
+- Waiting: w-tsan's lend fix (merge it before P2); r670, the 57k rerun at 14b44fb7f.
