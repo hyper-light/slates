@@ -1766,7 +1766,11 @@ async fn bring_back_named(
     let (pin, _) = vcs_store::named_objects::pin_range(*identity, (0, identity.len))
       .map_err(|_| BringBackRefused::NotHeld)?;
     pins.push(pin);
-    bring_back_file_on(&mut ThisShard, repository, forked, (path.clone(), *node)).await?;
+    let revision = (path.clone(), *node);
+    match forked {
+      Some(forked) => bring_back_file_on(&mut ThisShard, repository, forked, revision).await?,
+      None => bring_back_file_on(&mut ThisShard, repository, Committed, revision).await?,
+    }
     let whole = crate::state::with_state(|state| vcs_store::hg_named::held_whole(state, *identity));
     if !whole.unwrap_or(false) {
       return Err(BringBackRefused::NotWhole);
@@ -1902,14 +1906,11 @@ async fn layout_text_read(
     slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
     _ => slates_hg::push::intake::MANIFEST_PATH,
   };
-  let read = bring_back_log_on(
-    &mut ThisShard,
-    repository,
-    forked,
-    (log, path.to_vec()),
-    node,
-  )
-  .await
+  let asked = (log, path.to_vec());
+  let read = match forked {
+    Some(forked) => bring_back_log_on(&mut ThisShard, repository, forked, asked, node).await,
+    None => bring_back_log_on(&mut ThisShard, repository, Committed, asked, node).await,
+  }
   .is_ok();
   if read {
     let _ = crate::state::with_state(|state| state.count(WORK_LOG_TEXTS_READ, 1));
@@ -2175,8 +2176,8 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
   (path, node): (Vec<u8>, Node),
 ) -> Result<(), BringBackRefused> {
   let brought = match whole_log(&path) {
-    Some(log) => bring_back_log_on(lender, repository, None, (log, path), node).await,
-    None => bring_back_file_on(lender, repository, None, (path, node)).await,
+    Some(log) => bring_back_log_on(lender, repository, Committed, (log, path), node).await,
+    None => bring_back_file_on(lender, repository, Committed, (path, node)).await,
   };
   if let Err(refused) = brought {
     lender.lend(|state| state.count(refused.counter(), 1));
@@ -2184,17 +2185,41 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
   brought
 }
 
+/// Which index a bring-back finds a revision's names in (A-887): the repository's own ([`Committed`]), or a push's fork
+/// before its entry commits (`&Forked`). A type, not an `Option<&Forked>`, so the bring-back a read parks on, which
+/// never has a fork, holds nothing across its waits that cannot move between threads (a fork's index keeps cells).
+trait IndexOver: Copy {
+  /// The fork, if any.
+  fn forked(&self) -> Option<&Forked>;
+}
+
+/// The repository's own index ([`IndexOver`]).
+#[derive(Clone, Copy, Debug)]
+struct Committed;
+
+impl IndexOver for Committed {
+  fn forked(&self) -> Option<&Forked> {
+    None
+  }
+}
+
+impl IndexOver for &Forked {
+  fn forked(&self) -> Option<&Forked> {
+    Some(self)
+  }
+}
+
 /// [`bring_back_on`] for a file's revision, its refusal not yet counted: by the revision the repository's index holds,
 /// or, for a push not yet landed, its fork's (A-887: a push's texts leave once their segment is durable, before its
 /// entry).
-async fn bring_back_file_on<L: ShardLender>(
+async fn bring_back_file_on<L: ShardLender, O: IndexOver>(
   lender: &mut L,
   repository: RepositoryId,
-  forked: Option<&Forked>,
+  over: O,
   (path, node): (Vec<u8>, Node),
 ) -> Result<(), BringBackRefused> {
   let (len, whole) = lender
-    .lend(|state| held_whole(state, (repository, forked), (&path, &node)))
+    .lend(|state| held_whole(state, (repository, over.forked()), (&path, &node)))
     .flatten()
     .ok_or(BringBackRefused::NotHeld)?;
   if whole {
@@ -2202,7 +2227,7 @@ async fn bring_back_file_on<L: ShardLender>(
   }
   let (path, node, text) = asked_text_on(lender, repository, (path, node), len).await?;
   lender
-    .lend(|state| file_put_back(state, (repository, forked), (&path, &node), &text))
+    .lend(|state| file_put_back(state, (repository, over.forked()), (&path, &node), &text))
     .unwrap_or(Err(BringBackRefused::NotHeld))
 }
 
@@ -2256,15 +2281,15 @@ fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
 /// let go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of
 /// the revision it is against too, the delta made again from the two and put back only as the very delta its row names
 /// ([`slates_hg::push::held::bring_back_log`]). Ok where its object is held whole after; its refusal not yet counted.
-async fn bring_back_log_on<L: ShardLender>(
+async fn bring_back_log_on<L: ShardLender, O: IndexOver>(
   lender: &mut L,
   repository: RepositoryId,
-  forked: Option<&Forked>,
+  over: O,
   (log, path): (slates_hg::index::Log<'static>, Vec<u8>),
   node: Node,
 ) -> Result<(), BringBackRefused> {
   let held = lender
-    .lend(|state| log_held(state, (repository, forked), log, &node))
+    .lend(|state| log_held(state, (repository, over.forked()), log, &node))
     .flatten()
     .ok_or(BringBackRefused::NotHeld)?;
   if held.whole {
@@ -2274,7 +2299,7 @@ async fn bring_back_log_on<L: ShardLender>(
   let against = match held.against {
     Some(against) => {
       let len = lender
-        .lend(|state| log_held(state, (repository, forked), log, &against))
+        .lend(|state| log_held(state, (repository, over.forked()), log, &against))
         .flatten()
         .ok_or(BringBackRefused::NotHeld)?
         .len;
@@ -2287,7 +2312,7 @@ async fn bring_back_log_on<L: ShardLender>(
     .lend(|state| {
       log_put_back(
         state,
-        (repository, forked, log, &node),
+        (repository, over.forked(), log, &node),
         (&text, against.as_deref()),
       )
     })

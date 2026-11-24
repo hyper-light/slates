@@ -181,11 +181,15 @@ pub(crate) async fn answer_store_wants(
 
 /// [`answer_store_wants`] over the shard's state as `lender` lends it a step at a time: this thread's (`ThisShard`), or
 /// one a caller holds already (`vcs_store::HeldShard`, a recovery's).
-pub(crate) async fn answer_store_wants_on<L: crate::vcs_http::git::ShardLender>(
+pub(crate) async fn answer_store_wants_on<L, W>(
   lender: &mut L,
-  wants: &mut dyn slates_hg::render::StoreWants,
+  wants: &mut W,
   id: RepositoryId,
-) -> bool {
+) -> bool
+where
+  L: crate::vcs_http::git::ShardLender,
+  W: slates_hg::render::StoreWants + ?Sized,
+{
   use slates_hg::render::Want;
   let repository = u128::from_be_bytes(id.bytes);
   while let Some(want) = wants.wants().cloned() {
@@ -246,11 +250,11 @@ pub(crate) async fn answer_wants_over(
 
 /// Answers one `want` of `repository` from `disk` into `wants`: the whole texts it gave (zero for any other want), or
 /// none where the store refused or was gone.
-async fn answer_one(
+async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
   want: slates_hg::render::Want,
-  wants: &mut dyn slates_hg::render::StoreWants,
+  wants: &mut W,
 ) -> Option<u64> {
   use slates_hg::render::{StoredPlace, StoredRevision, Want};
   match want {
