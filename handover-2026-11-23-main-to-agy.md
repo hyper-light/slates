@@ -22,6 +22,14 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 03:32 on 11-24:
+- Main CI: the Ubuntu disk fix works (run 45373311018: 88G free before, 113G after, of 145G), but clippy had broken again
+  from the day's landings (agents don't run it). Main landed f0624c32b (vcs, hg, server fixes); four errors are with their
+  authors: refining.rs:1082 Prepared_'s variant size and refining/tests.rs:136 (w-git), hg_push.rs:1740 built_works
+  (w-hg), svn_import.rs:711 stage_owed (w-svn). Keep the wall after every burst of landings: clippy --workspace
+  --all-targets -D warnings, with CARGO_TARGET_DIR ~/.cache/main-01a20182-lint-target (kept warm for that).
+- HeldShard carries #[expect(dead_code)] until A-887 constructs it; w-perf removes it in that landing.
+
 Updates at 03:02 on 11-24:
 - NEW SUBAGENT w-84a-win (in main's session; worktree ~/slates-work/w-84a-win): 84a's Windows every-run tail. A shard
   idle window derived from the measured park-cost tail (one formula on every platform, under IDLE_SPIN_CEILING), a
