@@ -3710,6 +3710,16 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: every shard runs no teardown slice while `held` (A-884), so a destroyed volume's teardown stays
+  /// where it is and a create waiting for its room meets its bound. `Ok` once set everywhere, else the first shard's
+  /// typed refusal.
+  pub fn inject_teardown_hold(&self, held: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.teardowns_held = held)?;
+    }
+    Ok(())
+  }
+
   /// The memory-pressure hold now on each shard's byte budget (§4.2), in shard order — the capacity
   /// each withholds from new admission. Zero when the host is not under pressure (or has no sampler).
   /// An observation a shard could not answer is its typed refusal.
@@ -5233,6 +5243,7 @@ async fn init_shard(
     stop_watch: None,
     stop_watch_install,
     nfs_purges_refused: false,
+    teardowns_held: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
     delegation_lapse_at: None,

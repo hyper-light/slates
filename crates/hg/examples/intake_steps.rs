@@ -5,7 +5,7 @@
 //! cut it, its room the push's admission. Each step is timed under the kind of unit it takes (`Intake::unit`). Printed:
 //! the wall time; for each kind its steps, its time, its steps past 100 ms and past 1 s and its longest; the segment
 //! records' alike; the slowest steps with their kinds; and the fork's rows, seals, most own runs, tiered merges and
-//! longest merge in steps, for the size-tiered rule's bound.
+//! longest merge in steps, and its own bytes in windows, for the size-tiered rule's bound in bytes.
 //!
 //! Command: `cargo run --release -p slates-hg --example intake_steps -- <bundle (hg bundle --all -t none-v2)> <window
 //! bytes> <room bytes> <segment bytes>`.
@@ -155,12 +155,19 @@ fn main() {
     panic!("the intake finished");
   };
   let (rows, seals) = (fork.rows().rows(), fork.rows().counters().seals);
+  let own_bytes = fork.rows().own_bytes();
+  let windows = own_bytes / u64::try_from(window).unwrap().max(1);
   println!(
     "intake_steps: the fork's rows {rows}, seals {seals} ({} rows a seal on average); most own runs {}, tiered merges \
      {}, the longest merge {longest_merge} steps",
     rows / seals.max(1),
     intaken.most_own_runs,
     intaken.tiered_merges
+  );
+  println!(
+    "intake_steps: the fork's own bytes {own_bytes} ({windows} windows of {window}); the bytes bound at the end \
+     floor(log3 windows) + 1 = {}",
+    windows.max(1).ilog(3) + 1
   );
 }
 
