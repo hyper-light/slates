@@ -16,20 +16,6 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  miri:
-    name: rt Miri (ubuntu-latest)
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - name: CI's Miri set on slates-rt, the OS-runtime sync tests skipped
-        run: |
-          MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib -- --skip sync::tests::
-          MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --test differential --test ownership --test timers --test readiness --test alone
-
   spin-kick:
     name: spin_kick with and without the change (macos-latest)
     runs-on: macos-latest
