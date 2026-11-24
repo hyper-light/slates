@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 14 (main 01a20182, 2026-11-24 15:26 PST): main CI 45507135789 (77c0fe495) found the let-go test's assert_let_go_sliced
+# at 16; main's commit splits it.
 # Run 13 (main 01a20182, 2026-11-24 15:00 PST): run 12 found the svn SSH step at 12; main's commit settles its bookkeeping
 # in settle_before_step.
 # Run 12 (main 01a20182, 2026-11-24 14:52 PST): main itself at 9272195a6 (A-908 part 1, A-907's test fix, the svn log and
