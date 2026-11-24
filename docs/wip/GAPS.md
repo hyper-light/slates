@@ -1212,6 +1212,15 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - A pushed file held twice, as the green's bytes and the content store's object. FIXED for Mercurial (A-887, w-perf,
+>   2026-11-24; main's order on r583: 55,981,957 bytes live under `Green::make_mapped` at the 57k push's end, a third
+>   of system_live). A push names each file whose bytes the content store holds whole; a read that meets its let-go
+>   windows parks and brings them back by the revision the green's changeset names (`vcs_store::hg_named`); a push
+>   brings back through its fork what was let go before its entry commits; a replay reads no run its apply names whole,
+>   and recovery rebuilds a green whose replay reads a named base after the stores whose index resolves it. Reds green:
+>   the naming, a mount's read, an in-place edit, a second work naming the same bytes, two restarts. Owed: main's rerun
+>   of the 57k lifetimes sampler (the greens' bytes the gate); a takeover's re-adoption of a Mercurial green brings back
+>   no named base (`green_adopt::readopt_with` runs svn's live pre-pass alone); git as its own piece.
 > - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
 >   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
 >   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no

@@ -374,8 +374,12 @@ pub(crate) fn named_lacking(
     let Ok(entry) = slates_merge::chain_entry::decode(bytes, &increment) else {
       continue;
     };
-    for run in &entry.increment.named.runs {
-      want(run.identity);
+    // A run the replay's apply names whole is never read for it (A-887, `Increment::replay_reads`): nothing to bring.
+    let reads = entry.increment.replay_reads(&entry.applied);
+    for (at, run) in entry.increment.named.runs.iter().enumerate() {
+      if reads.get(at).copied().unwrap_or(true) {
+        want(run.identity);
+      }
     }
   }
   wanted
