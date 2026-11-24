@@ -54,7 +54,7 @@ the code: its holds raced the control shard's start the same way).
   watchdog that ends its anchor past its bound so a blocked step fails rather than holds the run; the wait for the
   daemon's serving line is bounded too.
 - `.github/workflows/ci.yml`: the extents file runs on both Windows lanes (its commit give-back test skipped as
-  A-878's red, below).
+  A-879's red, below; run again since A-879's fix).
 
 ## Evidence
 - Red, with the fix reversed (diag run 45260798132, both runners): the first create refused
@@ -71,7 +71,9 @@ the code: its holds raced the control shard's start the same way).
   the extents tests hung on both runners until cancelled (diag run 45251289894). The holds run at the control loop's
   head since.
 - The file's commit give-back test, run here for the first time, fails apart from this: its 256 MiB write through a
-  CLI attachment is refused `AttachmentExpired`. Skipped in CI by name, a tracked red (GAPS, A-878).
+  CLI attachment is refused `AttachmentExpired`. Skipped in CI by name as a tracked red (GAPS, A-879, opened as A-878
+  and renumbered), and run again since A-879's fix
+  (`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`).
 
 ## Siblings
 - A dynamic volume's growth by a write and the other admissions (a clone, a copy-up) still meet a released extent's

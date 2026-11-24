@@ -1360,18 +1360,38 @@ struct Stream<'a> {
 }
 
 impl Stream<'_> {
-  /// Connects and attaches for writing, retrying within the fleet wait (a node just succeeded or taking over).
-  fn attach(&self) -> Option<(Client, u64)> {
+  /// Connects and attaches for writing, retrying within the fleet wait (a node just succeeded or taking over); past it,
+  /// the last refusal of the connect or the attach, so a stream that never attached says why. A verdict with no write
+  /// and no refusal was vacuous: the nemesis runs of 2026-11-23 (#5, #9 and #11 of 14 on adacachy2) each failed with no
+  /// write sent, the stream's attach to the volume's owner refused for its whole stretched wait (95 to 178 s), and
+  /// nothing said why.
+  fn attach(&self) -> Result<(Client, u64), String> {
     let mut deadline = FleetWait::begin();
+    let mut last = String::from("no connect tried within the fleet wait");
     while deadline.open() {
-      if let Ok(mut client) = Client::connect(self.instance, deadlines())
-        && let Ok(attached) = client.attach(self.volume, None, Intent::Write)
-      {
-        return Some((client, attached.attachment));
+      match Client::connect(self.instance, deadlines()) {
+        Ok(mut client) => match client.attach(self.volume, None, Intent::Write) {
+          Ok(attached) => return Ok((client, attached.attachment)),
+          Err(error) => last = format!("the attach refused: {error}"),
+        },
+        Err(error) => last = format!("the connect refused: {error}"),
       }
       pause();
     }
-    None
+    Err(last)
+  }
+
+  /// The outcome of `file`'s write when the stream could not attach to send it: never sent, refused with `why`, the
+  /// attach's last refusal, timed from `began`, when the stream set out to attach.
+  fn unattached(&self, file: usize, began: Instant, why: &str) -> Outcome {
+    Outcome {
+      file,
+      sent: self.began.elapsed(),
+      took: began.elapsed(),
+      refused: Some(format!(
+        "never sent: no attach for writing within the fleet wait ({why})"
+      )),
+    }
   }
 
   /// Writes `/chaos-N` for each N in `files` until `stop` is set, each once its previous one is answered. A refused
@@ -1389,9 +1409,15 @@ impl Stream<'_> {
     newest: Option<&NewestAcknowledged>,
   ) -> Vec<Outcome> {
     let mut outcomes = Vec::new();
-    let Some((mut client, mut attachment)) = self.attach() else {
-      return outcomes;
+    let attaching = Instant::now();
+    let (mut client, mut attachment) = match self.attach() {
+      Ok(attached) => attached,
+      Err(why) => {
+        outcomes.push(self.unattached(files.start, attaching, &why));
+        return outcomes;
+      }
     };
+    let end = files.end;
     for file in files {
       if stop.load(Ordering::Acquire) {
         break;
@@ -1419,10 +1445,18 @@ impl Stream<'_> {
         refused,
       });
       if failed {
-        let Some((again, again_attachment)) = self.attach() else {
-          return outcomes;
-        };
-        (client, attachment) = (again, again_attachment);
+        let attaching = Instant::now();
+        match self.attach() {
+          Ok((again, again_attachment)) => (client, attachment) = (again, again_attachment),
+          Err(why) => {
+            // The next file is never sent; past the last one there is none to say so of.
+            let next = file.saturating_add(1);
+            if next < end {
+              outcomes.push(self.unattached(next, attaching, &why));
+            }
+            return outcomes;
+          }
+        }
       }
     }
     let _ = client.detach(attachment);

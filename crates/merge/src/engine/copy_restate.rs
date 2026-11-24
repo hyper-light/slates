@@ -92,10 +92,7 @@ impl Green {
           to: path.clone(),
         });
         // The edits the work made after the rename follow it, over the bytes it moved (A-547).
-        let moved_len = self
-          .content
-          .get(&from)
-          .map_or(0, |moved| moved.len() as u64);
+        let moved_len = self.content.get(&from).map_or(0, |moved| moved.len());
         journal.extend(content_volume_ops(&path, &edits, moved_len));
         moved_from.insert(from);
       }

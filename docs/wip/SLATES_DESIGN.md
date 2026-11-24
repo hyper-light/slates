@@ -2047,7 +2047,8 @@ landing constants are in §4.15.
 
 > **Status (2026-11-18, A-363): the failover delay is a live output, not a setting.** Each node estimates
 > `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` SWIM's count of its
-> detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
+> detector's periods at their measured running tail, and **since A-882** at least the bound its detector states while a
+> pair is still judged by its own retransmission timer (a member's first seconds), `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
 > (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
 > round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; **since
@@ -23794,6 +23795,8 @@ Status: built 2026-11-06.
   (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
   still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
   own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
+  Since A-881 (2026-11-23) the rest waits for the shard's next idle point, not the next pass: the stop is the same, and a
+  shard under sustained load, which has no idle point, still pays nothing more.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -29958,16 +29961,28 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
   - **The field, as bounded.** `Acceptor::moved_from` is set only by an install that moves the authority away from a
     retired owner (`Acceptor::move_authority`, from a takeover's page or answer and from the authority reconcile). It
     holds one owner, overwritten by the next such move, never a list.
+  - **A move names its retirement (amended by A-883, 2026-11-23).** The record is the retired owner and the version of
+    the retirement whose install made the move (`slates_db::register::MovedFrom`,
+    `RegionalConfiguration::retirement_version`), and `copy_falls_to` counts it only while the configuration keeps that
+    same retirement of that owner. A host whose retirement completed may be admitted again under its id and retire
+    again, and a move made at its first retirement says nothing of its next, as A-309's completion record says nothing
+    of the member an id names after its admission. Counted by the host alone, a copy moved at the first retirement fell
+    in every later round of that host, and "the asker's own objects never fall here" broke two ways:
+    - where every holder's copy carried the stale move, the successor took its own live object over again at a higher
+      epoch, fencing its own log;
+    - where they disagreed (a holder whose copy came after the move refuses it by name), the object was never promised
+      and was given up, and the retirement was never confirmed, so the fleet never settled (the chaos nemesis, seeds
+      14946995733817154046 and 8173581894251929445).
   - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
     byte. The layout without the field is refused as truncated, never read as "moved from none".
   - **The image.** The held image's register is its object and this encoding (`HeldRegister`), so a warm restart keeps
-    an earlier move. The layout changed, so the image version is 25 and the delta version 8: a delta carries the held
-    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7); A-275 (image 26, delta 9) and
-    raft-7's A-270 (image 27, delta 10) take the numbers after, in landing order. An image or delta of another version
-    is refused by its version. A missing field is never read as none: that would be the compatibility shim §2.7
-    forbids.
+    an earlier move, and since A-883 the retirement that made it (image version 34, delta version 12). The layout
+    changed, so the image version is 25 and the delta version 8: a delta carries the held image whole. Both follow
+    conformance-14 (A-262, image 23 and 24, delta 6 and 7); A-275 (image 26, delta 9) and raft-7's A-270 (image 27,
+    delta 10) take the numbers after, in landing order. An image or delta of another version is refused by its
+    version. A missing field is never read as none: that would be the compatibility shim §2.7 forbids.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.
@@ -32325,7 +32340,9 @@ model below; each red before its fix):
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
   never a loss. An id admitted again loses its old record (`admit`): it says nothing of the member it names now, and
-  kept it would let a later, uncompleted takeover of the id read as completed.
+  kept it would let a later, uncompleted takeover of the id read as completed. The same holds of a holder's record of
+  a move (A-883): a move names the retirement that made it, never the host alone, so a copy moved at one retirement of
+  an id is listed in no later round of that id.
 - **A move on an unresolved line is allowed** (`RegionalConfiguration::moves`). Records are bounded, so the line of
   every volume whose creator's takeover completed long ago reads unresolved once its record goes; refusing it, as
   A-272 did, would leave such a volume unmovable for good. The configuration names no owner there and holds no claim
@@ -34210,6 +34227,13 @@ Lifeguard has it condemn no one. Applied in the same change to: `crates/cluster/
 40 s of it on main, unchanged with the fix), GAPS, and
 `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
 
+**Amended 2026-11-23 again (A-882): while a pair is still judged by its own retransmission timer, the detection term
+is at least the bound the detector states.** "Not the detector's own bound" above holds for the ratchet, and A-882 keeps
+it so. But the 7.0 and 14.0 s that bound read before any loss were not a ratchet's artifact. They are SWIM's seven
+periods at a timer's 1 s and 2 s spans, and a peer judged by its timer takes that long to condemn: 6.0 s on the
+simulated network where the count said 20 ms, and 7.2 s for a cut-off leader on adacachy2 where it said about 0.7 s.
+See A-882 for the rule, the bound chosen (`least_detection_bound`, not the ratchet) and every reader checked.
+
 ### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
 Applied in the same change to:
 - §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
@@ -35137,7 +35161,7 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **The verb.** `RequestBody::Renew { attachment }` answered `ReplyBody::Renewed { term_ns, renew_every_ns }` (both appended and published:
   `RequestBody` 77, `ReplyBody` 68, after A-267's `Drifted` and `Conflicts`), served on the attachment's owner shard: a renewal asked for is made durable, a whole
   term from now; refused as any use is (`AttachmentExpired` past its term), and `BadRequest` for an attachment with no
-  term. `Client::renew`.
+  term (since A-879 answered `NoTerm`, a state rather than a refusal). `Client::renew`.
 - **Lifeguard's rule** (Dadgar et al. 2018: a member does not condemn others for its own unavailability): at a shard's
   start, before its serve loop answers anything, every CLI attachment of its partition gets a fresh term, `F` from then,
   and its pace starts again (`verbs::renew_termed_at_start`), so a restart longer than a term never ends an attachment
@@ -35184,6 +35208,28 @@ flow, twice, held one through 4 s with no verb, wrote under it from another proc
 process was killed (11.9-12.3 s); the CLI's parse tests take `--hold` (29 of 29; its first run refused the flag, missing
 from the global switch table). Red-checked: a `Hold` whose renewer renews nothing fails the library test's held write,
 and a `--hold` that returns after attaching fails the CLI flow (its holder gone before the write).
+
+**A-384's floor (the third change, 2026-11-23, w-win2 for main 01a20182, its ruling of the same day; found by A-879).**
+A term was `min(F, the tail of the gaps + W)`, and RFC 6298's tail follows its latest samples. So a burst of uses a few
+milliseconds apart, a holder's or any verbs', drove the tail to the burst's gaps and the term toward `W`, whatever
+silence the holder had shown before it. A holder that had just been silent for seconds lapsed sooner than it was ever
+silent. A-879 made every `slates write` such a burst (its hold's first renewal, then its verbs), and A-879's CLI flow
+(an attach, a 2.5 s pause, a held write, a 2.5 s pause, a detach) met `AttachmentExpired` at the detach on the Mac,
+where the failover delay was about 3 s. **The rule:** a term is never below the longest silence its holder has shown
+since its pace began (`AttachmentPace::longest_gap_ns`), plus `W`, and still at most `F`:
+`min(F, max(tail, longest gap) + W)`. Over the attachment's life: a gap longer than `F` ends the attachment, and a
+restart begins its pace again (`renew_termed_at_start`), so the worst a long silence costs is `F`, which A-230 and
+A-363 accept for an abandoned attachment. A holder renewing at its cadence shows no silence longer than that cadence, so
+its term still settles near four thirds of `W`, and it still lapses at its own pace. No verb, field or mode is added.
+**Evidence.** Diag run 45309657568 (2026-11-23, ubuntu-latest and macos-latest, debug builds; the test daemon's `W`
+1 s, its failover delay held at 4 s): `a_burst_of_uses_does_not_shorten_a_term_below_its_holders_earlier_silence`
+failed with the floor reverted on both runners: after a 2.5 s silence the burst's terms fell to 1.357 s (macOS
+1.358 s), below the silence. With the floor they ran from 3.501 s (macOS 3.508 s) to the 4 s ceiling, and the write
+after a shorter 2 s silence was accepted. The held test's renewals named 1.001 s, rose to 1.907 s (macOS 1.908 s) while
+the estimator's deviation warmed, and fell to 1.439 s by the 24th renewal on both, toward four thirds of `W`
+(1.333 s). Its late write, two last terms (2.88 s) after the renewals stopped, was refused `AttachmentExpired`, before
+the ceiling. `attachment_term` 6 of 6 on both (40.9 s, 41.6 s), the library's holds 2 of 2, and the CLI's four
+attachment flows, `a_cli_attachment_outlives_the_process_that_made_it` among them, 4 of 4 on both (20.5 s, 27.5 s).
 
 ### A-382 — A host admitted again lets go its own register copies, and a volume it lost ships no record: the superseded adopter's copy catches up (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Promotion and takeover"; the chaos nemesis's convergence, seeds 6876545201569229162 and 7236833171758868842; A-334's holder side)
 Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the entry of 2026-11-18), the bug record
@@ -40016,6 +40062,22 @@ steps `return_dead_recovery` and `purge_write_log`, each timed by a clock it is 
   three steps' six. Green on the Mac Studio (kiln r154, debug, 0.76 s: 16 KiB pages, a 3,889 ns quantum); red with the
   steps timed by the wall clock again, which learned 21,239 bytes and then 82,598 from the steps' real wall time where
   the CPU said 16,384, 32,768 and 98,304. The recovery test's give-back case is filed for main.
+- **On Windows, a step timed by its cycles (w-win2 for main 01a20182, 2026-11-23).** The fold above waited for a step
+  whose clock showed CPU, and on Windows that took thousands of one-page steps of a few microseconds each, since
+  `GetThreadTimes` charges a thread a scheduler tick at a time. A pass cut short by any other task never reached one,
+  so the slice stayed a page, and an idle shard's give-back of its emptied write log, opened over the whole area a
+  predecessor may have written, never ended: both idle-sweep tests failed on both Windows runners (diag run 45238179939
+  on windows-latest: 332 one-page steps in the first pass, then one a pass). A step on Windows is now timed by the
+  thread's cycles at the rate the runtime measures once a process, before any shard runs
+  (`slates_machine::own_cpu::own_cpu_ns`, the clock the long-poll attribution reads, A-871), and by the thread clock
+  elsewhere, a pair of `#[cfg]` functions (`daemon::shard_thread_cpu_ns`). Measured and rejected: the cycles scaled by
+  the thread's own charged time, which taught nothing on a shard not yet charged a tick (diag run 45260798132: both
+  tests failed on windows-latest, each shard started with 0 µs of its CPU). With it the slice is learned within eight
+  steps (about 11 MB a 13 µs quantum on windows-latest, diag run 45275623386); what still kept windows-latest red was
+  the wait after an interrupted give-back, A-881. Held by the two idle-sweep tests, red with the fix reversed on both
+  runners before A-881 (diag run 45269168513), and since A-881 by `the_give_back_clock_reads_a_step_of_microseconds`,
+  which times steps of microseconds on that clock. Applied in the same change to: `crates/server/src/daemon.rs`, GAPS (A-491),
+  `docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.
 
 ### A-529 — A takeover's share is done only once the successor serves each volume it adopted from its own placement (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover", §4.10 "the healer"; the content release signal's first half; A-335, A-276, A-345)
 Applied in the same change to: GAPS (A-335's release entry), `crates/server/src/takeover.rs` (`share_done`,
@@ -61903,6 +61965,11 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   and version 2's reader first refused it, so every window of a granule or more was lost at a restart. Windows' 4 KiB
   granule showed it, and a 16 KiB granule hid it (`docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-
   chunk-the-seal-trimmed.md`). Only a window's slot is held to its chunk's bytes, and only a shared slab asks again.
+- **A window's record** (2026-11-23, main's (3) of goal 93) keeps what the window alone names: its identity, its
+  length, its slot's offset and its slab's key, 56 bytes. The slab keeps the placement its windows share: the chunk,
+  the block's length, the bytes used and the birth epoch. A window's placement is made from the two when it is read or
+  imaged (`ChunkWindows::placed_of`). Measured with a count of a test thread's live heap (`tests/window_records_heap.rs`):
+  250 bytes a window on the record that repeated the placement, 150 on this one.
 - **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
 - **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
   - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
@@ -61995,3 +62062,224 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - GAPS.
   - docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md and
     docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md.
+
+### A-879 — A CLI write holds its attachment while it reads and stages its input, and a renewal answers an attachment with no term `NoTerm` (2026-11-23, w-win2 for main 01a20182, its rulings of 2026-11-23; opened in GAPS as A-878 and renumbered; A-230, A-384)
+
+- **What was there.** `slates write` read all of stdin, staged it in pages when it was larger than one request
+  (`StageBegin`, `StagePut`, neither of which names the attachment), and then sent the first verb that names the
+  attachment. A CLI attachment made by another `slates attach` process is renewed only by verbs that name it (A-230) or
+  by a holder (A-384), so an input slower than the term to arrive, or a large one slower than the term to stage, met a
+  lapsed attachment: `AttachmentExpired` on both Windows runners for a 256 MiB write (diag run 45260798132) and on macOS
+  for a 16 MiB input that arrived after an 8 s pause. `Renew`, the only verb that reports a term, refused an attachment
+  with no term as a `BadRequest`, so no caller could ask whether an attachment needs holding without reading an error
+  as a fact.
+- **The rule** (main's ruling): a process that names an attachment another made, and may take longer than a term
+  before its verb reaches the daemon, holds the attachment for that time. Whether there is a term to hold is decided by
+  the daemon's own answer about that attachment, never by a refusal.
+- **The verb.** `Renew` answers an attachment with no term (a mount's, which lives by its own activity; an SDK
+  client's, which lives with its client) with `ReplyBody::NoTerm` (appended, tag 85, published), and renews nothing.
+  `Client::renew` returns a `Renewal`: `Renewed { term_ns, renew_every_ns }` or `NoTerm`. `Hold::new` returns `None`
+  for `NoTerm`, its renewer already ended. A renewal answered `NoTerm` after one answered a term is a protocol break,
+  since an attachment's kind never changes: the renewals end on it, typed (`UnexpectedReply`). `Hold::end` stops and
+  joins the renewer and returns the refusal that ended its renewals, which a drop discards. Contract 61.
+- **The write** (`crates/cli/src/verbs.rs`, `emit_write`): `slates write` holds the attachment it names
+  (`slates_client::Hold`, its own client and thread, renewed at the cadence the daemon names) from before it reads
+  stdin until its write is answered, then ends the hold. A refusal that ended the hold's renewals is logged and never
+  dropped, and the write's own outcome is the command's. The hold's first renewal fails fast for an attachment already
+  lapsed or not the caller's, before any input is read: the command then names the hold's refusal on stderr and exits
+  with that refusal's code (main's ruling: a failed hold reads itself). A hold taken says so on stderr before any input
+  is read, the signal a caller that held the attachment itself waits for before it lets go (the Windows extents tests
+  hand their attachment from `slates attach --hold` to the write so).
+- **Not changed, owed (the next piece, main's ruling).** The CLI still holds the input whole, up to the largest
+  shard's metadata ledger, while the daemon's staging buffer holds a second copy for the time of the write. A stage
+  opened without a length, reserved put by put within the ledger and bound to the attachment, will take the input as
+  it arrives. Today a staging buffer expires one failover delay after its last put, which no hold renews, so the
+  length-less stage is bound to the attachment the hold keeps.
+- **Evidence.** Red then green on every platform: the late-input CLI test with the write's hold off on ubuntu (diag
+  run 45285066499), and the Windows commit give-back test with the write's hold ended at once on both runners, refused
+  `AttachmentExpired` at the staged write's apply, then the extents file 4 of 4 with it (diag run 45292483681). The
+  term tests 5 of 5 and the holds 2 of 2 on macOS, ubuntu and both Windows runners.
+- **Found by it: A-384's floor.** A held write is a burst of uses (the hold's first renewal, then the write's verbs a
+  few milliseconds apart), and the gaps' tail follows its latest samples, so the burst drove the term toward `W` below
+  the silence its holder had just shown, and the CLI's attach, pause, write, pause, detach flow met `AttachmentExpired`
+  at the detach on the Mac. A term is now never below the longest silence its holder has shown, plus `W`, and still
+  at most `F`; its rule and its evidence (diag run 45309657568) are in A-384's record, "A-384's floor".
+
+Applied in the same change to: §4.7's A-384 record (the verb's answer for an attachment with no term, and its floor),
+GAPS (A-879, A-384's floor, and A-789's note on the extents file), `docs/cli.md`,
+`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`,
+`docs/bugs/2026-11-23-a-burst-of-uses-shortened-a-cli-attachments-term.md`, `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.txt`, `crates/server/src/{state,verbs}.rs`, `crates/client/src/{client,hold,lib}.rs`,
+`crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`, `crates/server/tests/attachment_term.rs`,
+`crates/client/tests/client.rs`, `crates/cli/tests/{cli,content_extents_windows}.rs`, `.github/workflows/ci.yml`.
+
+### A-882 — The failover delay's detection term is at least the bound the detector states while a pair it probes is still judged by its own retransmission timer (2026-11-23, w-fleet for main 01a20182; found with A-351's readmission flake; amends A-363; §4.8 "Derived constants", D-16, A-375, A-574)
+
+- **Why.** A-363's detection term `D` counts SWIM's `2(2m − 1) + 1` periods at the running tail of the detector's
+  answered periods. That count describes a detection an estimator judges, where a crashed peer's unanswered probe runs
+  about a period. Until a member's pool has a verdict, hyper-swim judges each pair by the pair's own RFC 6298 timer,
+  floored at a second (§2.4) and doubling at each expiry. A crashed peer's unanswered probes then run the timer's span
+  and the relay stage, seconds each, and `D` never saw them: it times answered periods only (A-363's amendment of
+  2026-11-23), and before any was answered it was absent and the estimate took the anchor's supervision, 1.0 s (A-574).
+  On adacachy2 a forming fleet's survivors read a failover delay of 2.2 to 5.1 s while they took 7.2 s to condemn a
+  cut-off leader (A-351's readmission test). On the simulated network a young member's `D` was 19 to 21 ms while its
+  detector stated 21.0 s and the killed peer took 6.0 s. Every wait that reads the delay read the smaller figure in a
+  member's first seconds. The 7.0 and 14.0 s for which A-363 set the detector's own bound aside are SWIM's seven periods
+  at a timer's 1 s and 2 s: this case, not a ratchet's artifact.
+- **The rule.**
+  - While any pair the detector probes is judged by its own timer (hyper-swim's `Judge::Timer`), `D` is the larger of
+    the period count and `Detector::least_detection_bound`. That bound counts each of SWIM's periods at what an
+    unanswered probe's deadlines allow now (the span of the verdict judging the pair, then the relay stage) and adds the
+    member's latest wake lateness. Once an estimator judges every pair, `D` is the count alone.
+  - Before a period was timed, the stated bound alone is `D`, its samples zero, as a prior's are.
+  - It is read at each refresh on the clock the plane is stepped by (`MemberPlane::detection(now_ns)`). Karn's rule
+    applies as for the period's length. Once a period ended unanswered, the bound is the one stated as the latest
+    answered period ended. A member never answered keeps the first bound its detector stated, as its first period ended.
+    So no timer's doubling is taken for a detection.
+  - Before the detector's first period has ended it states no bound, and `D` stays absent, so the estimate takes the
+    anchor's supervision as before (A-574).
+- **Not the ratchet, measured.** `Detector::detection_bound` counts every period at the longest any ever ran as well. On
+  the simulated network, after one detection under the timer, it read 28.0 s once both survivors were judged by an
+  estimator again, where `least_detection_bound` read 75 to 80 ms. Any later fall back to a timer (a late answer takes a
+  pair out of the pool's) would have read that old detection's periods. Before any long period the two agree (21.0 s).
+- **What the bound does not cover.** It is stated for the deadlines in force when it is read. A detection that needs
+  further expiries, or relays not yet heard from, outgrows it: two of 40 readmission runs took 15.3 s to condemn. `D`
+  follows such a detection as the member's answered periods restate the bound.
+- **The membership horizon.** `lease::horizon_ns` (0.9 s) was documented as the longest a peer can go unanswered
+  before the detector declares it dead. It is the window the lease's two sides reason with, judged from answers, and
+  the detection budget the plane asks of its detector. The detector keeps that budget only while an estimator judges
+  every pair. Its doc says so now, and names the bound the detector does keep.
+- **Readers of the delay, checked against the corrected figure.**
+  - Every product reader waits at most the delay or holds for it. That covers takeover and materialization attempts
+    (A-304), a forward's bound (A-352), the location round's cap, a held reply's total (A-354), a work verb's held
+    commit (A-434), a move's overdue bound and the telemetry horizon (A-525), the learned helper and answer bounds, a
+    parked submit, and a direct map's claim. The terms are the write lease, a landing's target lease, a staging buffer
+    (A-414) and a CLI attachment (A-384). In a member's first seconds each now waits or holds longer, while detection
+    itself takes that long.
+  - None decides by taking the delay back off a stored time. The two that subtract it are a landing's
+    `lease_seen_ns`, which only feeds the `longest_lease_gap_ns` gauge, and a test's setup.
+  - In the tests, `departure_learned_periods` counted the detection as one membership horizon, nine periods, and its
+    three callers stop the bootstrap voter as the fleet forms. It now counts the survivors' detection term
+    (`Daemon::failover_detection_ns`). The tests that read the delay once to size a wait or a hold read a larger
+    figure in the young window, which loosens an upper bound or lengthens a hold. The three dead-session and forward
+    tests, the held-verb SLO test (11.0 to 20.5 s a run), A-363's estimator test, A-351's readmission test and the
+    cut-off owner's flow all pass with it (below).
+  - Before the detector's first period has ended it states no bound and the estimate still takes the anchor's
+    supervision: both survivors read 1.00 s at the cut in 7 of 30 readmission runs, their first probes unanswered. That
+    window closes only with a statement hyper-swim does not make before a period (GAPS).
+- **Tests.**
+  - `a_young_members_detection_term_covers_a_detection_its_timer_judges` (`crates/cluster/tests/member_plane.rs`). On
+    main each term was 19.3 to 20.9 ms against a stated 21.0 s, and the peer was condemned 6.0 s after its last answer.
+    With the change each term was 21.0 s, the condemnation came within it, and each term fell back to 14.6 to 14.7 ms
+    once no pair was on its timer.
+  - `a_member_never_answered_keeps_the_first_bound_its_detector_stated` (the same file). On main there was no term at
+    all. With the change it was 14.0 s with zero samples, and it held at 14.0 s after 40 s cut off while the detector
+    stated 112.0 s.
+  - `detection_is_at_least_the_bound_a_timer_judged_pair_is_stated_at` (`crates/cluster/src/failover.rs`).
+  - Red-checked on a copy. Without the timer's bound both plane tests fail. Without the first statement the
+    never-answered test fails. Without the prior before a period the unit test fails.
+  - Live on adacachy2, two and four CPUs: A-351's readmission test 20 of 20 and 10 of 10. The three departure tests
+    4 of 4 and 2 of 2 each. The held-verb SLO test, A-363's estimator test, the three dead-session and forward tests,
+    and `live_chaos`'s cut-off owner flow (5 of 5, 3 of 3) all pass. The server's failover unit tests pass 11 of 11.
+- **Applied in the same change to:**
+  - `crates/cluster`: `failover.rs` (`detection`'s bound and prior, its unit test) and `member_plane.rs`
+    (`detection(now_ns)`, `timer_bound`, and the fields `answered_lately`, `ever_answered` and `answered_timer_bound`),
+    with `tests/member_plane.rs` (the two tests above, and item 1's test reading the term at its clock).
+  - `crates/server`: `fleet.rs` (`refresh_failover` reads the term on the plane's clock), `daemon.rs`
+    (`failover_detection_ns`), `lease.rs` (`horizon_ns`'s doc), and `tests/fleet.rs` (`departure_learned_periods`,
+    `detection_periods`, the readmission test's record of each survivor's term at the cut).
+  - §4.4's status, A-363's entry, GAPS, and
+    `docs/bugs/2026-11-23-the-failover-delay-left-out-a-detection-the-detectors-timer-judged.md`.
+
+### A-883 — A move names its retirement, not its host (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the chaos nemesis's settle failure; amends A-251 (i); A-309, A-409)
+
+- **Why.** A takeover's install moves a retired owner's copies to the owner's successor, and the holder records the
+  owner a copy came from (`Acceptor::moved_from`, A-251), so the successor's round still lists the copy once routing
+  names the successor as a live owner. The record named the host alone. A host whose retirement completed may be
+  admitted again under the same id and retire again. A copy moved at its first retirement then fell in every later
+  round of that host, and the asker's own objects, which never fall in another host's round, did:
+  - where every holder's copy carried the stale move, the successor took its own live volume over again at a higher
+    epoch, fencing its own log (diagnostic run 11 of 14 on adacachy2, seed 14946995733817154046: epoch 3 seq 8 adopted
+    again as epoch 4 seq 8);
+  - where they disagreed, a holder whose copy came after the move refused the object by name, the object was given up
+    at the failover SLO, the share was never confirmed and the fleet never settled (CI, seeds 14946995733817154046 and
+    8173581894251929445: 371 copies listed by the moved-from owner, 233 by-name refusals, 246 unpromised, 3 given up).
+- **The rule.** A move records the retired owner and the version of the retirement whose install made it
+  (`slates_db::register::MovedFrom`, `RegionalConfiguration::retirement_version`, as `DepartedOwner::since_version`
+  names the lease gate's retirement). `copy_falls_to` counts the move only while the configuration keeps that same
+  retirement of that owner. A-309's completion record is dropped at an admission for the same reason: a record of an
+  earlier takeover of an id says nothing of the member it names now.
+- **Rejected.** Clearing the move at the install that admits the host again: a lagging holder can install from the
+  first retirement straight to the second without seeing the admission, and keeps the stale move.
+- **Format.** `PersistedAcceptor`'s last field is the record, the owner and the retirement's version. The image is
+  version 34 and the delta 12. No reader of the old layouts is kept: an older image or delta is refused by its version,
+  and a register whose record is the owner alone is refused as truncated (§2.7).
+- **Tests** (adacachy2):
+  - `a_copy_moved_at_a_hosts_earlier_retirement_falls_in_none_of_its_later_rounds` (`crates/db/src/takeover.rs`,
+    through the real configuration, on the copy and its twin rebuilt from its encoding): red with the version ignored,
+    green with it.
+  - `a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time`
+    (`crates/server/tests/fleet.rs`, three daemons): red with the version ignored, green with it.
+  - The register nemesis (`crates/db/src/register_nemesis.rs`): each takeover's install is a move from a retired
+    owner, the owner hosts taking turns as a re-admitted id does, and every holder back from a restart, through the
+    encoding, must name the move it named before; its restarts across a move are counted.
+  - The daemon's three moved-copy tests, the register's persisted-state and hostile-input tests, and the lineage
+    model's copy of the rule, each held to the record and its retirement.
+- **Applied in the same change to:**
+  - `crates/db/src/register.rs`: `MovedFrom`, `Acceptor::move_authority`, `Acceptor::moved_from`, `PersistedAcceptor`,
+    `RegionalConfiguration::retirement_version`, the persisted-state tests.
+  - `crates/db/src/takeover.rs`: `copy_falls_to`, `promise_object`, `answer_by_name`, the ledger's answer, the tests.
+  - `crates/db/src/register_nemesis.rs` and `crates/db/tests/lineage_model.rs`.
+  - `crates/server/src/fleet.rs` (`reconcile_held_copy`, `install_on_copy`, the install walk), `takeover.rs` (the page's
+    and the round's promises, `retirement_versions`) and `daemon.rs` (the moved-copy tests).
+  - `crates/server/tests/fleet.rs`.
+  - `crates/vfs/src/recover.rs` (image 34) and `checkpoint_log.rs` (delta 12).
+  - A-251 (i)'s field and image text, A-309's admission rule.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-move-named-its-host-not-its-retirement.md.
+
+### A-881 — An interrupted idle give-back resumes at the shard's next idle point, not a sweep's interval on (2026-11-23, w-win2 for main 01a20182, its ruling (c) of 2026-11-23 on item 2; A-226, A-715, A-491)
+
+- **What was there.** A pass's give-back (the free content, the dead recovery memory, the emptied write log) stops at
+  the first step across whose yield another task ran (A-226), and the rest waited for the next pass, which the sweep
+  armed a whole interval after the interrupted one ended (`idle_sweep::finish`). Anything that ran once an interval cut
+  that next pass short again at its first step. On CI's windows-latest the idle-sweep tests' look, once an interval,
+  landed on the same 15.6 ms scheduler tick as each pass: 60 passes of one step each (about 130 µs, about 8 MB), and 680
+  MB of a 1.43 GB walk still left at the 60-interval bound, where one uninterrupted pass walks it in 2.6 to 5.9 ms (diag
+  run 45275623386). windows-11-arm showed the same one-step passes and drifted out of the lock after a few. A client
+  polling once a second does the same in the field.
+- **The rule** (main's ruling (c)): a give-back is idle-time work, so after an interruption it waits for the shard's
+  next idle point, not a period. A-226's stop is unchanged: a give-back still ends at the first step across whose yield
+  another task ran, never interleaved with ready work. The interval paces only a fresh pass after one that owed it.
+  Under sustained load there is no idle point, so the give-back waits and costs nothing. Under a poller it resumes
+  right after each poll.
+- **The mechanism.** `purge_if_idle` says how it ended (`GiveBack::{Settled, Busy, Interrupted}`) and the pass says
+  how it ended (`PassEnd::{Settled, Owed, GiveBackLeft}`). A pass whose give-back was interrupted stays under way, so
+  nothing arms another meanwhile. It sets `give_back_waits_idle` and waits. The shard's idle work
+  (`ShardContext::set_idle_work`, its one slot, called when the shard finds nothing ready and its idle spin has run
+  out, before it parks) is `idle_sweep::idle_work`, registered at the shard's start. It wakes the sweep there to resume
+  the give-back (`resume_give_back`, counted as `content.give_back.resumed_at_idle`), and otherwise advances an armed
+  content-range sweep (A-744's `idle_slice`, which until now registered itself in the slot when armed). The pass ends
+  when its give-back settles or finds the shard busy. `sweep.passes_started` counts passes.
+- **A lost wake closed in the runtime (the same change).** The idle work borrows the shard's state, and a borrow's
+  hooks may wake a task; the shard's loop parked as soon as the idle work answered that it did nothing, with that task
+  ready on its own queue, to wait out the park's deadline or a kick (none, on a shard with no timer armed). Every park
+  now counts one begun with a task ready (`slates_rt` `Counters::parked_with_ready`), and the loop runs such a task
+  instead (`shard.rs`, `run`). Red without the change: `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_
+  out_a_park` (`crates/rt/tests/idle_work.rs`: the task did not run within 2 s). Every deadlines and idle-sweep test of
+  the daemon asserts the count stays 0 (main's ruling: the hazard answers for itself, not a rate).
+- **Why not the alternatives.** Pacing the test's looks off the interval would have hidden the field's starvation.
+  Ending a pass only when other work ran across two yields in a row would have changed A-226's rule and doubled the
+  sweep's intrusion under sustained load to buy back a timing coincidence.
+- **Evidence.** Diag run 45286588671: the drift-free test (`a_pass_cut_short_at_each_start_settles_in_that_pass_at_
+  the_shards_idle_points`, a poller the keeper wakes beside each pass) red with the resume off on windows-latest,
+  windows-11-arm and ubuntu; the idle sweep's tests 5 of 5 rounds on all three, about 10.5 s a round where
+  windows-latest's took 35 to 124 s and failed 2 of 5; macOS 4 of 4. The server's unit suite on both Windows runners
+  kept every test but A-877's two store tests. The lost wake (diag run 45309498515): red without the loop's change on
+  ubuntu and on macOS; green with it, every rt test binary on ubuntu and macOS, loom 6 of 6, and rt clippy for the two
+  Linux and two Windows targets; CI's Miri set on slates-rt clean (diag run 45310233924). `spin_kick`'s one failure on
+  macos-latest in that run is older than the change: 10 of 10 rounds with it, 9 of 10 without (diag run 45311228860).
+
+Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A-491's entry),
+`crates/rt/src/shard.rs`, `crates/rt/tests/idle_work.rs`, `crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
+`docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.

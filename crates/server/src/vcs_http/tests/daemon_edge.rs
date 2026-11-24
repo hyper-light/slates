@@ -3900,6 +3900,11 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   release_long_push(&daemon);
   let long = long.join().expect("the long push answered");
   let rebased = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED);
+  let lookups = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::INDEX_LOOKUPS,
+  );
   let after = hg_command(edge, &name, "heads");
   daemon.stop();
   println!(
@@ -3923,6 +3928,10 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   assert_eq!(
     rebased, 1,
     "the long push's fork re-based over the small push's entry"
+  );
+  assert!(
+    lookups > 0,
+    "a settled push counts its fork's index lookups (goal 93, arena-20's counters)"
   );
   let after = String::from_utf8_lossy(&after.1).into_owned();
   for tip in [crate::verbs::hex_of(&long_tip), small_tip] {
@@ -4077,6 +4086,245 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
     "at most a turn's windows held: {observed:?} of {}",
     windows.len()
   );
+}
+
+/// A pushed history whose one file is chained as offset deltas ([`chained_create`]): the request creating `main` at its
+/// last commit, and each commit's id, tree and blob, oldest first.
+pub(crate) struct Chained {
+  /// The push's request.
+  pub(crate) request: Vec<u8>,
+  /// Each commit, oldest first: its id, its tree's bytes and its blob's bytes.
+  pub(crate) commits: Vec<(ObjectId, Vec<u8>, Vec<u8>)>,
+  /// The commits' contents, oldest first.
+  pub(crate) commit_bytes: Vec<Vec<u8>>,
+}
+
+/// Stock git's request creating `main` at the last of `depth + 1` commits, each a child of the one before, whose one
+/// file is `bytes` long ([`large_create`]'s bytes), each commit's file the one before with one byte changed. The pack
+/// holds the first blob whole and each later blob as an offset delta against the one before it, as `git pack-objects`
+/// stores a file's revisions, so the last blob's chain is `depth` deltas over the first, every base earlier in the pack.
+pub(crate) fn chained_create(bytes: usize, depth: usize) -> Chained {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::Kind;
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let first: Vec<u8> = (0..bytes)
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0]
+    })
+    .collect();
+  let mut blobs = vec![first];
+  for revision in 1..=depth {
+    let mut next = blobs[revision - 1].clone();
+    let at = (revision * bytes / (depth + 1)).min(bytes - 1);
+    next[at] = next[at].wrapping_add(1);
+    blobs.push(next);
+  }
+  let mut commits = Vec::new();
+  let mut commit_bytes = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  for blob in &blobs {
+    let mut tree = b"100644 large\0".to_vec();
+    tree.extend_from_slice(git_name(Kind::Blob, blob).as_bytes());
+    let tree_id = git_name(Kind::Tree, &tree);
+    let parent_line = parent
+      .map(|id| format!("parent {id}\n"))
+      .unwrap_or_default();
+    let commit = format!(
+      "tree {tree_id}\n{parent_line}author A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\nchained\n"
+    )
+    .into_bytes();
+    let commit_id = git_name(Kind::Commit, &commit);
+    parent = Some(commit_id);
+    commits.push((commit_id, tree, blob.clone()));
+    commit_bytes.push(commit);
+  }
+  // The blobs first, the first whole and each later one an offset delta against the one before; then the trees and
+  // the commits, whole.
+  let count = u32::try_from(blobs.len() * 3).expect("a count");
+  let mut pack = Vec::new();
+  let mut writer = slates_git::pack::Writer::new(GitFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut put = |representation: Representation, data: &[u8], size: usize, at: &mut u64| {
+    let header = Header {
+      representation,
+      size: u64::try_from(size).expect("a size"),
+    };
+    let zlib = stored_zlib(data);
+    let began = *at;
+    entry::write(header, began, &mut writer).expect("the entry's header");
+    slates_git::out::Out::put(&mut writer, &zlib);
+    *at = began
+      + entry::written_len(header, began).expect("the header's length")
+      + u64::try_from(zlib.len()).expect("a length");
+    began
+  };
+  let mut base = put(
+    Representation::Whole(Kind::Blob),
+    &blobs[0],
+    blobs[0].len(),
+    &mut at,
+  );
+  for revision in 1..blobs.len() {
+    let delta =
+      slates_git::store::delta_of(&blobs[revision - 1], &blobs[revision]).expect("a delta");
+    base = put(
+      Representation::OfsDelta { base },
+      &delta,
+      delta.len(),
+      &mut at,
+    );
+  }
+  for ((_, tree, _), commit) in commits.iter().zip(&commit_bytes) {
+    put(Representation::Whole(Kind::Tree), tree, tree.len(), &mut at);
+    put(
+      Representation::Whole(Kind::Commit),
+      commit,
+      commit.len(),
+      &mut at,
+    );
+  }
+  drop(put);
+  writer.finish().expect("the trailer");
+  let tip = commits.last().expect("a commit").0;
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {tip} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  Chained {
+    request,
+    commits,
+    commit_bytes,
+  }
+}
+
+/// Shape: the chain [`a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`] pushes first: one delta.
+const CHAIN_SHALLOW: usize = 1;
+
+/// Shape: the deeper chain it pushes after: deep enough that the tip's read needs many bases' windows at once, each
+/// brought back in its own turn.
+const CHAIN_DEEP: usize = 8;
+
+/// Shape: the bytes of each revision of the chained file: several windows, so each base's read spans windows.
+const CHAIN_FILE: usize = 1 << 20;
+
+/// Format: a turn's look-ahead and the window it stopped at, as `vcs_store::upload::read_ahead` brings them back (its
+/// `LOOK_AHEAD_WINDOWS`, two, and one).
+const LOOK_AHEAD_AND_STOP: usize = 3;
+
+/// What a shallow clone of a chained file let go answered, at `depth` ([`chained_create`]): the push's and the shallow
+/// clone's statuses, whether the clone held the tip's objects as pushed, the windows let go, the most windows the clone
+/// held at once (`git_resident.peak_windows`) and the stopped windows held for their object
+/// (`git_resident.pinned_held`), and the store's window.
+fn shallow_of_a_chain_let_go(depth: usize) -> ((u16, u16), bool, usize, (u64, u64), usize) {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let chained = chained_create(CHAIN_FILE, depth);
+  let created = pushed(edge, &name, &chained.request);
+  let (tip, tree, blob) = chained.commits.last().expect("a tip").clone();
+  let (_, commands_end) = packets_from(&chained.request, 0);
+  let pack = chained
+    .request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
+  // Each window marked landed and let go as [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`]
+  // lets its pack's go.
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| crate::vcs_store::let_go_read(state, id))
+      .filter(|outcome| matches!(outcome, Ok(_) | Err(slates_vcs::LetGoRefused::Away)))
+      .count()
+  });
+  // The fetch answers without waiting for the encoding, as git/git's did with its history unencoded: its stream sends
+  // the tip's objects through its loose stage, reading the pushed pack.
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::vcs_store::git_encode::NO_FETCH_WAIT.with(|off| off.set(true));
+  });
+  let peak_before = counted_on(&daemon, REPOSITORY, "vcs_store.git_resident.peak_windows");
+  let shallow = uploaded(edge, &name, &shallow_fetch_of(tip));
+  let peak =
+    counted_on(&daemon, REPOSITORY, "vcs_store.git_resident.peak_windows").max(peak_before);
+  let pinned = counted_on(&daemon, REPOSITORY, "vcs_store.git_resident.pinned_held");
+  daemon.stop();
+  let mut expected = std::collections::BTreeMap::new();
+  let tip_bytes = chained.commit_bytes.last().expect("a tip").clone();
+  expected.insert(git_name(Kind::Commit, &tip_bytes).to_string(), tip_bytes);
+  expected.insert(git_name(Kind::Tree, &tree).to_string(), tree);
+  expected.insert(git_name(Kind::Blob, &blob).to_string(), blob);
+  let whole_tip = shallow.0 == 200
+    && std::panic::catch_unwind(|| objects_of(&fetched_pack_after(&shallow.1)))
+      .is_ok_and(|objects| objects == expected);
+  (
+    (created.0, shallow.0),
+    whole_tip,
+    let_go,
+    (peak, pinned),
+    window,
+  )
+}
+
+/// Goal 93, r130's shallow refusal (main 01a20182's order of 2026-11-23 16:25: a stock `git clone --depth 1` with the
+/// landed pack let go answered `Pack(Store(Unreadable))` for a 785,414-byte blob of git/git). Do: at chains of
+/// [`CHAIN_SHALLOW`] and [`CHAIN_DEEP`] deltas, each in a daemon of its own, push a create of `main` whose one file
+/// ([`CHAIN_FILE`] bytes) is stored as offset deltas over its first revision ([`chained_create`]); let every window of
+/// the pushed pack go; then clone it one commit deep, the fetch answering without waiting for the encoding
+/// (`git_encode::NO_FETCH_WAIT`), as git/git's did with its history unencoded. Expect: each shallow clone `200` holding the tip's
+/// commit, tree and blob as pushed. A one-commit-deep pack sends the tip's blob whole (its base is not sent), so the read
+/// resolves its chain from the let-go pack, each base earlier in it than the cursor. Red before the change: the window a
+/// base's read stopped at was brought back and let go again behind the cursor in the same turn
+/// (`vcs_store::upload::let_go_behind`), the read met it again, and the answer was refused `Unreadable`.
+#[test]
+fn a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth() {
+  for depth in [CHAIN_SHALLOW, CHAIN_DEEP] {
+    let ((created, shallow), whole_tip, let_go, (peak, pinned), window) =
+      shallow_of_a_chain_let_go(depth);
+    assert_eq!(created, 200, "depth {depth}: the push");
+    assert!(let_go >= 1, "depth {depth}: some window let go");
+    assert!(
+      shallow == 200 && whole_tip,
+      "depth {depth}: the shallow clone {shallow}, whole {whole_tip}, peak {peak} windows of {window} bytes"
+    );
+    // The bound the pin keeps to: the windows the tip's chain lies in (each of its entries, the first blob whole and a
+    // delta a revision, spans at most its bytes' windows and one more), beside a turn's look-ahead and its stop.
+    assert!(
+      pinned >= 1,
+      "depth {depth}: a stopped window held for its object"
+    );
+    let chain_windows = (depth + 1) * (CHAIN_FILE.div_ceil(window) + 1);
+    assert!(
+      peak <= u64::try_from(chain_windows + LOOK_AHEAD_AND_STOP).expect("a bound"),
+      "depth {depth}: held {peak} windows at once, past the chain's {chain_windows} and a turn's"
+    );
+  }
 }
 
 /// The two clones of [`a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole`]: the one commit

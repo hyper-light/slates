@@ -209,10 +209,16 @@ fn a_named_texts_file_is_its_name_alone() {
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
+  holds_its_name_alone(&mut green, (object, &plane), &bytes);
+}
+
+/// `green`'s file `big` is `object`'s name alone (A-760 (b) 4d): no byte held, one hold of the object taken, its bytes
+/// (`bytes`) the plane's; the hold given back before the green goes.
+fn holds_its_name_alone(green: &mut Green, (object, plane): (Identity, &Plane), bytes: &[u8]) {
   assert_eq!(green.content("big"), Some(super::Content::Named(object)));
   assert_eq!(green.named_bytes_held(), 0, "the file holds bytes");
   assert_eq!(green.take_name_holds(), vec![super::NameHold::Take(object)]);
-  assert_eq!(read_through(&green, "big", &plane), Some(bytes));
+  assert_eq!(read_through(green, "big", plane).as_deref(), Some(bytes));
   assert_eq!(
     green.give_back_name_holds(),
     vec![super::NameHold::Give(object)]

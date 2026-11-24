@@ -942,7 +942,8 @@ async fn change_turn(attachment: u64) -> bool {
       let _ = state::with_state_counted(|s| ended(s, attachment));
       return false;
     }
-    Some(Turned::Idle | Turned::Served) => {
+    // A change turn reads no request, so it parks none (A-760 (b) 4d: only a request's dispatch parks).
+    Some(Turned::Idle | Turned::Served | Turned::Parked) => {
       // A round its slice cut that sent nothing has no return to wake the task, and the wait answers at once while
       // it is owed (A-562): the shard's other tasks run between its slices.
       if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
@@ -1227,10 +1228,10 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   });
   // A parked request is served again once: its entry goes whatever this turn did.
   let reserved = match kind {
-    TurnKind::Parked => mount.parked.take().map(|parked| {
-      s.fuse_parked.release(parked.entry);
-      parked
-    }),
+    TurnKind::Parked => mount
+      .parked
+      .take()
+      .inspect(|parked| s.fuse_parked.release(parked.entry)),
     TurnKind::Request | TurnKind::Change => None,
   };
   let Some(dispatched) = lent_turn else {
@@ -2117,6 +2118,7 @@ mod tests {
       let turns: Vec<&'static str> = (0..2)
         .map(|_| match turn(s, ATTACHMENT, TurnKind::Request) {
           Turned::Idle => "idle",
+          Turned::Parked => "parked",
           Turned::Served => "served",
           Turned::Fenced => "fenced",
           Turned::Ended => "ended",
