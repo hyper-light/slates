@@ -460,6 +460,22 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     )
     .map_err(|e| failure_of(e, &request.instance));
   }
+  if let Verb::Write {
+    volume,
+    attachment,
+    path,
+    mode,
+  } = &request.verb
+  {
+    return emit_write(
+      &mut client,
+      &request.instance,
+      (*volume, *attachment),
+      (path, *mode),
+      request.json,
+    )
+    .map_err(|e| failure_of(e, &request.instance));
+  }
   let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
 }
@@ -483,7 +499,11 @@ fn hold(
     AttachRequest::Termed,
     json,
   )?;
-  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?;
+  let Some(held) = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)? else {
+    // The attachment this command made in the CLI's form has a term (A-230): a daemon answering that it has none broke
+    // the protocol.
+    return Err(ClientError::UnexpectedReply { verb: "renew" });
+  };
   slates_machine::log_line!(
     "slates attach --hold: holding attachment {attachment} (its term {} ms); it lapses once this process ends",
     held.term_ns() / NANOS_PER_MILLISECOND
@@ -1612,16 +1632,58 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
   }
 }
 
-/// `write`: stdin's bytes as the file's whole new content. stdin is read up to the largest metadata ledger any shard
-/// reports, past which no shard can stage it (`crate::staging` in the daemon reserves a staged write there), so the
-/// command holds at most that much and refuses more, naming it.
+/// `write`: stdin's bytes as the file's whole new content, under a write attachment that another `slates` process may
+/// have made. A CLI attachment lapses one term after its last use (A-230), and stdin may take longer than that to
+/// arrive and to stage, so the attachment is held from before stdin is read until the write is answered
+/// ([`slates_client::Hold`], renewed at the cadence the daemon names); one with no term (a mount's, an SDK client's)
+/// needs no hold, as the hold's first renewal answers (A-879). Until 2026-11-23 nothing renewed it while stdin was read
+/// and staged, and a write whose input outlasted the term was refused `AttachmentExpired`. A hold that cannot be made
+/// (the attachment gone, lapsed, or not the caller's; its client refused) ends the command before it reads any input,
+/// naming the hold's refusal on stderr, and exits with that refusal's code. A hold taken says so on stderr before any
+/// input is read (the line a caller that held the attachment itself waits for before it lets go, A-879). A refusal that
+/// ended the hold's renewals later is logged, never dropped; the write's own outcome is the command's.
 fn emit_write(
+  client: &mut Client,
+  instance: &str,
+  (volume, attachment): (slates_client::VolumeId, u64),
+  (path, mode): (&str, u32),
+  json: bool,
+) -> Result<(), ClientError> {
+  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment).inspect_err(|refused| {
+    slates_machine::log_line!(
+      "slates write: attachment {attachment} could not be held for the write, so none of its input was read: {refused}"
+    );
+  })?;
+  if let Some(held) = &held {
+    slates_machine::log_line!(
+      "slates write: holding attachment {attachment} (its term {} ms) until the write is answered",
+      held.term_ns() / NANOS_PER_MILLISECOND
+    );
+  }
+  let written = write_stdin(client, (volume, attachment), path, mode);
+  if let Some(lost) = held.and_then(slates_client::Hold::end) {
+    slates_machine::log_line!(
+      "slates write: the hold of attachment {attachment} ended before the write was answered: {lost}"
+    );
+  }
+  let size = written?;
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "path": path, "size": size }));
+  } else {
+    slates_machine::out_line!("wrote {size} bytes to {path}");
+  }
+  Ok(())
+}
+
+/// Writes stdin's bytes as `path`'s whole new content: the file's size. stdin is read up to the largest metadata ledger
+/// any shard reports, past which no shard can stage it (`crate::staging` in the daemon reserves a staged write there),
+/// so the command holds at most that much and refuses more, naming it.
+fn write_stdin(
   client: &mut Client,
   (volume, attachment): (slates_client::VolumeId, u64),
   path: &str,
   mode: u32,
-  json: bool,
-) -> Result<(), ClientError> {
+) -> Result<u64, ClientError> {
   use std::io::Read;
   let bound = client
     .daemon_status()?
@@ -1645,13 +1707,7 @@ fn emit_write(
       reason: format!("stdin holds more than any shard can stage ({bound} bytes)"),
     }));
   }
-  let size = client.fs_write((volume, attachment), path, &bytes, mode)?;
-  if json {
-    slates_machine::out_line!("{}", serde_json::json!({ "path": path, "size": size }));
-  } else {
-    slates_machine::out_line!("wrote {size} bytes to {path}");
-  }
-  Ok(())
+  client.fs_write((volume, attachment), path, &bytes, mode)
 }
 
 /// Acknowledges an outcome-only verb: a JSON `{ "ok": true }` under `--json`, else the text `message`.
@@ -1693,7 +1749,11 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
     // `ClientError`), and `attach --hold` needs the instance for its own client, so [`run`] handles them before this
     // dispatch; they never reach here.
-    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } | Verb::Hold { .. } => {}
+    Verb::Mount { .. }
+    | Verb::Unmount { .. }
+    | Verb::Export { .. }
+    | Verb::Hold { .. }
+    | Verb::Write { .. } => {}
     Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;
@@ -1711,12 +1771,6 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::ResolveMerge { .. }
     | Verb::Advance { .. }
     | Verb::Read { .. } => serve_merge(client, verb, json)?,
-    Verb::Write {
-      volume,
-      attachment,
-      path,
-      mode,
-    } => emit_write(client, (*volume, *attachment), path, *mode, json)?,
     Verb::Placed {
       volume,
       snapshot,

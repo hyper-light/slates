@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use slates_client::{AttachRequest, ClientError, Intent, Refusal};
+use slates_client::{AttachRequest, ClientError, Intent, Refusal, Renewal};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -164,6 +164,117 @@ fn a_cli_attachment_is_renewed_by_its_own_principals_use_alone() {
   );
 }
 
+/// Shape: the floor test's silence before its burst, in liveness windows `W`: five halves, far past the four thirds of a
+/// window a burst's millisecond gaps drive the term toward, and under the ceiling with a window beside it.
+const SILENCE_HALF_WINDOWS: u32 = 5;
+/// Shape: the renewals of the floor test's burst, each at once after the last.
+const BURST: usize = 32;
+/// Shape: the floor test's silence after its burst, in liveness windows: two, shorter than the silence before it and
+/// longer than the four thirds of a window the burst drives the term toward.
+const AFTER_BURST_WINDOWS: u32 = 2;
+
+/// A-384's floor (main 01a20182's ruling of 2026-11-23). Do: on a daemon whose failover delay is held at
+/// [`HELD_CEILING`], attach a volume for write in the CLI's form, leave it unused for [`SILENCE_HALF_WINDOWS`] half
+/// liveness windows, renew it [`BURST`] times at once, leave it unused for [`AFTER_BURST_WINDOWS`] windows, shorter than
+/// the silence before, and write under it. Expect every term the burst's renewals named at least the silence before
+/// it, and the write accepted: a burst of uses teaches no pace its holder has not already shown it keeps. Before, the
+/// burst's millisecond gaps drove the estimator's tail, and with it the term, toward a liveness window, and the write
+/// was refused `AttachmentExpired`.
+#[test]
+fn a_burst_of_uses_does_not_shorten_a_term_below_its_holders_earlier_silence() {
+  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let silence = window.saturating_mul(SILENCE_HALF_WINDOWS) / 2;
+  let after_burst = window.saturating_mul(AFTER_BURST_WINDOWS);
+  let profile = common::machine_profile();
+  let (daemon, instance) = term_daemon(&profile, "term-floor", HELD_CEILING);
+  let mut holder = connect(&instance);
+  let volume = holder.create(&scratch("floor")).unwrap();
+  let attachment = holder
+    .attach_with(volume, None, Intent::Write, AttachRequest::Termed)
+    .unwrap()
+    .attachment;
+  #[allow(clippy::disallowed_methods)] // the holder's silence before its burst
+  std::thread::sleep(silence);
+  let mut terms = Vec::new();
+  for _ in 0..BURST {
+    match holder.renew(attachment) {
+      Ok(Renewal::Renewed { term_ns, .. }) => terms.push(term_ns),
+      other => panic!("a renewal of the burst: {other:?}"),
+    }
+  }
+  #[allow(clippy::disallowed_methods)] // a silence shorter than the one before the burst
+  std::thread::sleep(after_burst);
+  let written = holder.fs_write((volume, attachment), "after.txt", b"after", 0o644);
+  drop(holder);
+  daemon.stop();
+  eprintln!(
+    "after a {silence:?} silence the burst's terms ran {} ns to {} ns",
+    terms.iter().min().copied().unwrap_or(0),
+    terms.iter().max().copied().unwrap_or(0)
+  );
+  let silence_ns = u64::try_from(silence.as_nanos()).unwrap();
+  assert!(
+    terms.iter().all(|term| *term >= silence_ns),
+    "every term the burst named at least the silence before it: {terms:?}"
+  );
+  assert!(
+    written.is_ok(),
+    "the write after a shorter silence than the holder's earlier one: {written:?}"
+  );
+}
+
+/// A-879. Do: on a daemon whose failover delay is held at [`TERM`], attach one volume for write in the SDK's form (its
+/// life is its client's, not a term) and another in the CLI's form; `Renew` each; wait out two terms; write under each.
+/// Expect the SDK attachment's renewal answered `NoTerm` and the CLI attachment's `Renewed` with a term no longer than
+/// the ceiling; and, two terms on, the SDK attachment's write accepted (it never had a term to lapse) and the CLI one's
+/// refused `AttachmentExpired` (its renewal was a renewal, not a hold). Until 2026-11-23 the first renewal was refused
+/// `BadRequest`, an uncategorized refusal for a valid state, which no caller could tell from a malformed request.
+#[test]
+fn a_renewal_answers_no_term_for_an_attachment_with_none_and_renews_a_termed_one() {
+  let profile = common::machine_profile();
+  let (daemon, instance) = term_daemon(&profile, "term-none", TERM);
+  let mut client = connect(&instance);
+  let sdk_volume = client.create(&scratch("no-term")).unwrap();
+  let sdk = client
+    .attach_with(sdk_volume, None, Intent::Write, AttachRequest::Root)
+    .unwrap()
+    .attachment;
+  let cli_volume = client.create(&scratch("termed-renewal")).unwrap();
+  let cli = client
+    .attach_with(cli_volume, None, Intent::Write, AttachRequest::Termed)
+    .unwrap()
+    .attachment;
+  let sdk_renewal = client.renew(sdk);
+  let cli_renewal = client.renew(cli);
+  #[allow(clippy::disallowed_methods)] // two terms with no use of either attachment
+  std::thread::sleep(TERM.saturating_mul(2));
+  let sdk_write = client.fs_write((sdk_volume, sdk), "sdk.txt", b"sdk", 0o644);
+  let cli_write = client.fs_write((cli_volume, cli), "cli.txt", b"cli", 0o644);
+  drop(client);
+  daemon.stop();
+  assert_eq!(
+    sdk_renewal,
+    Ok(Renewal::NoTerm),
+    "an attachment with no term: nothing to renew"
+  );
+  let ceiling_ns = u64::try_from(TERM.as_nanos()).unwrap();
+  assert!(
+    matches!(cli_renewal, Ok(Renewal::Renewed { term_ns, .. }) if term_ns <= ceiling_ns),
+    "a CLI attachment renewed, its term within the ceiling: {cli_renewal:?}"
+  );
+  assert!(
+    sdk_write.is_ok(),
+    "the SDK attachment had no term to lapse: {sdk_write:?}"
+  );
+  assert!(
+    matches!(
+      cli_write,
+      Err(ClientError::Refused(Refusal::AttachmentExpired { attachment: named })) if named == cli
+    ),
+    "the CLI attachment lapsed two terms after its renewal: {cli_write:?}"
+  );
+}
+
 /// A one-shard daemon of its own segment, bootstrapped, whose failover delay is held at `ceiling` (A-384: injected, since
 /// nothing sets the estimate), and its instance.
 fn term_daemon(
@@ -216,13 +327,16 @@ fn a_held_attachment_lives_while_its_holder_renews_and_lapses_at_its_own_pace() 
   let mut refused = None;
   while began.elapsed() < HELD_CEILING.saturating_mul(2) {
     match holder.renew(attachment) {
-      Ok((term_ns, renew_every_ns)) => {
+      Ok(Renewal::Renewed {
+        term_ns,
+        renew_every_ns,
+      }) => {
         terms.push(term_ns);
         #[allow(clippy::disallowed_methods)] // the holder's pace: the cadence the reply named
         std::thread::sleep(Duration::from_nanos(renew_every_ns));
       }
-      Err(error) => {
-        refused = Some(error);
+      other => {
+        refused = Some(other);
         break;
       }
     }
@@ -292,7 +406,7 @@ fn a_restart_gives_a_cli_attachment_a_fresh_term() {
   drop(user);
   second.stop();
   assert!(
-    renewed.is_ok(),
+    matches!(renewed, Ok(Renewal::Renewed { .. })),
     "the restart gave the attachment a fresh term: {renewed:?}"
   );
   assert!(

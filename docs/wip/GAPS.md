@@ -504,16 +504,26 @@
 > READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
 > test now fails in 305 s naming the stall instead of hanging.
 
-> **A-878 (OPEN, 2026-11-23, w-win2; main 01a20182's ruling): a long write through a separately attached client is
-> refused `AttachmentExpired`.** `a_freed_content_extent_gives_its_commit_back_on_windows`
-> (`crates/cli/tests/content_extents_windows.rs`), run by a lane for the first time, attaches a volume for writing with
-> `slates attach`, a process that then exits, and writes 256 MiB through that attachment with `slates write`, another.
-> The write is refused `AttachmentExpired { attachment: 281474976710657 }` on windows-latest and windows-11-arm (diag
-> run 45260798132), where the restart test's 16 MiB write through the same flow passes. Read so far, not measured: the
-> attachment's term runs out mid-write, with nothing renewing it once the process that attached has gone. The test is
-> skipped by name in CI's two extents steps, and is this entry's red. Next: whether it is Windows-only (a write that
-> outlasts the term through a separate attach process, on macOS), and if not, the term renewed while the attachment is
-> in use.
+> **A-879 (FIXED 2026-11-23, w-win2; main 01a20182's rulings; opened as A-878, renumbered when that id went to w-chaos's
+> design amendment): a long write through a separately attached client was refused `AttachmentExpired`.**
+> `slates write` read all of stdin and staged it before its first verb named the attachment, and nothing renewed a CLI
+> attachment another `slates attach` process had made meanwhile. So an input slower than the term to arrive, or a large
+> one slower than the term to stage, met a lapsed attachment. Seen on both Windows runners for the 256 MiB write of
+> `a_freed_content_extent_gives_its_commit_back_on_windows` (`AttachmentExpired { attachment: 281474976710657 }`, diag
+> run 45260798132), and on macOS for a 16 MiB input that arrived after an 8 s pause (the same input with no pause was
+> written in 1 s). It is every platform's bug. The Windows test also let its attachment lapse before its write began: it
+> made its 256 MiB input after attaching, seconds in a debug build against a term of about a second (the named
+> refusal, diag run 45289962818: "could not be held ... AttachmentExpired"); it now holds the attachment from its making
+> with `slates attach --hold` until the write says its own hold is taken, as the restart test does. Now `slates write`
+> holds the attachment (`slates_client::Hold`) from before it reads stdin until its write is answered. `Renew` answers
+> an attachment with no term with `NoTerm`, where it
+> was refused `BadRequest`, so the hold's first renewal says whether there is a term to hold (contract 61). Red then
+> green: the late-input CLI test with the hold off on ubuntu, the Windows commit give-back
+> test with the write's hold ended at once on both runners (`AttachmentExpired` at the staged write's apply), and both
+> green with it (diag runs 45285066499, 45292483681) (`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`). **Owed, the
+> next piece (main's ruling):** the CLI still holds the write's whole input, up to the largest shard's metadata ledger,
+> while the daemon's staging buffer holds a second copy. The fix is a stage opened without a length, reserved put by put
+> within the ledger and bound to the attachment, with a peak-RSS red.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -543,7 +553,7 @@
 > reversed and green with it on both runners (diag run 45260798132: the first create refused `{ available: 5722144768 }`
 > on windows-latest and the create during the remakes `{ available: 5713756160 }`, both admitted with the fix; the Node
 > SDK suites 8 of 8 on both; `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`). The
-> extents file runs on both Windows lanes now, its commit give-back test skipped there as A-878's red. **Owed
+> extents file runs on both Windows lanes now, its commit give-back test among them since A-879's fix. **Owed
 > (item 3b, main's ruling):** a create sent at once after a destroy meets the teardown, which holds the volume's
 > reservation past the destroy's answer, and is refused `BudgetExceeded` on every platform (diag run 45251289894:
 > `{ available: 1430536192 }`, the room less the destroyed volume's). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
@@ -2805,8 +2815,16 @@
 > identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
 > released, `EROFS` to every change; the server's seam over `ContentStore`. A-645 (a) BUILT (2026-11-20): a hook's
 > REPOS-PATH is its repository's view, presented on the owner shard and mounted read-only under the store's standing
-> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. Owed: the
-> by-use run with stock svn 1.15 (run-requests.md); a revision property change's own signal, since each hook refreshes
+> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. **By use
+> with stock svn 1.15 (main 01a20182, big Studio, 2026-11-23):** `a_repository_policys_hook_lets_stock_svn_change_a_revision_property`,
+> `a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory` and
+> `a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it` pass (r202, 2e375de89).
+> `a_hooks_first_view_of_a_long_history_is_waited_for_while_it_is_laid_out` passes 3 of 3 alone (r351, 23850ce74), red
+> 3 of 3 at 2e375de89 (r269, the import refused `BudgetExceeded { available: 0 }`). **A-877 (c1da780ec) closed it:**
+> main's bisect of the 79 commits between (r378, 7 steps, the test alone on the big Studio) names c1da780ec the first
+> fixed commit ("repository windows shorter than a granule share one-granule slabs"). Before it, each of the first
+> revision's 4,872 tiny texts held a granule of its own, and the owner shard's admittable room ran out within seconds. The svn matrix's revprop rows pass with the store (r202, 66 of 66 over svn:// and
+> HTTP). Owed: a revision property change's own signal, since each hook refreshes
 > every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
 > repository. Owed before: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
@@ -4566,6 +4584,15 @@
 >   (r21).
 > - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
 >   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **The use test over HTTP, every verb (main's r202, 2026-11-23, big Studio, main 2e375de89):** the svn matrix over
+> svn:// and with `ROUTE=http` both passed 66 of 66 (blame, diff and merge over HTTP among them, and the revision
+> property rows with the store: A-681's HTTP rows and A-645 (a)'s revprop rows by use). The use test met two of the
+> harness's own faults, now fixed:
+> - `info`'s entries compared in stock svn's hash order, which APR seeds afresh each run;
+> - a working copy's symbolic link read through as a file (`IsADirectory` over git-2000).
+>
+> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Owed:** main's rerun of the
+> use test over HTTP with reads.dump and git-2000.dump.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -5015,6 +5042,22 @@
 >   copy of the head takes the owner its catalog copy names. Test:
 >   `a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names` (red: the successor refused). Record:
 >   `docs/bugs/2026-11-23-a-readmitted-creator-refused-its-successors-log-as-not-the-acting-owner.md`.
+> - **FIXED 2026-11-23 (w-chaos; A-883, a move names its retirement): a copy moved at a host's first retirement fell in
+>   every later round of that host.** The holder's record of a move named the host alone, and a re-admitted host keeps
+>   its id, so when it retired again its earlier successor's round listed that successor's own volume by the stale
+>   move. Where every holder agreed, the successor took its own volume over again at a higher epoch (diagnostic run 11
+>   on adacachy2: epoch 3 seq 8 adopted again as epoch 4). Where they disagreed, the volume was given up and the
+>   retirement never confirmed, so the fleet never settled (CI, seeds 14946995733817154046 and 8173581894251929445:
+>   233 by-name refusals, 3 given up). Now the record carries the retirement's version (`MovedFrom`), counted only
+>   while that retirement is kept; image 34, delta 12. Tests:
+>   `a_copy_moved_at_a_hosts_earlier_retirement_falls_in_none_of_its_later_rounds` (db) and
+>   `a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time` (fleet), both red with the
+>   version ignored; the register nemesis now restarts holders across moves. Record:
+>   `docs/bugs/2026-11-23-a-move-named-its-host-not-its-retirement.md`.
+> - **Open (found by reading with A-883, reported to main): a round is keyed by the retired host's id**
+>   (`ShardState::host_takeovers`). A lagging node that still owes a confirmation of a host's first retirement and
+>   installs its second directly restarts the old round, keeping its `adopted` set and its `began_ns`, so the failover
+>   estimate is timed from the first round's start.
 
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
@@ -5617,13 +5660,26 @@
 >     of 7.2 to 15.3 s, and the give-up then came 53 to 89 periods after the death was held, against a budget of about
 >     144 to 177. Record:
 >     `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`.
->   - **Open (found with it, measured 2026-11-23):** the failover delay's detection term (A-363) leaves out a detection
->     the timer judges. While a member's pool has no verdict, its timer-judged pairs take about 7 s to condemn in a
->     three-node fleet, where its delay said 2.2 to 5.1 s, so every wait that reads the delay reads the smaller figure
->     for those seconds. A fix would count a crashed peer's two unanswered probes at the run the detector bounds them by
->     now (hyper-swim's `longest_unanswered`), which falls back once the pool has a verdict. That is an amendment of A-363
->     and of each consumer. In the same regime `lease::horizon_ns`'s doc ("the longest a peer can go unanswered before
->     this node's detector declares it dead", 0.9 s) is untrue, though the lease's safety rests on answers, not on it.
+>   - **FIXED 2026-11-23 (A-882, w-fleet; found with it):** the failover delay's detection term (A-363) left out a
+>     detection the timer judges. While a member's pool has no verdict, its timer-judged pairs take seconds to condemn:
+>     7.2 s on adacachy2, where the delay said 2.2 to 5.1 s, and 6.0 s on the simulated network, where the term said
+>     20 ms. Every wait that reads the delay read the smaller figure for those seconds. Now, while any pair is judged by
+>     its own timer, the term is at least the detector's `least_detection_bound`, its own stated bound for the deadlines
+>     it judges by. It is taken at answered periods, as the period tail is, and a member never answered keeps the first
+>     bound stated. Not the ratcheting `detection_bound`, which read 28.0 s after one detection where the other read
+>     75 to 80 ms. Every reader of the delay was checked against the corrected figure. `departure_learned_periods` now
+>     counts the survivors' detection term instead of a nine-period horizon, and `lease::horizon_ns`'s doc now says
+>     what the detector keeps. Record:
+>     `docs/bugs/2026-11-23-the-failover-delay-left-out-a-detection-the-detectors-timer-judged.md`.
+>     - **Open (found with it, measured):** before the detector's first period has ended it states no bound, so the
+>       delay takes the anchor's supervision (1.0 s). That covered both survivors at the cut in 7 of 30 logged
+>       readmission runs, whose first probes had gone unanswered. Closing it needs hyper-swim to state a bound before a
+>       period, a change to the vendored detector.
+>     - **Open (found with it, measured):** a bound read at a crash is outgrown by a detection that needs further
+>       expiries. Two of 40 readmission runs took 15.3 s to condemn. The term follows such a detection as the member's
+>       answered periods restate the bound, and the bound stated at each condemnation held in every run measured.
+>     - **Open (found with it):** `FailoverReport` does not say whether the timer's bound set the detection term. Adding
+>       it is an appended field and a contract bump.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
@@ -7560,9 +7616,25 @@
 > - `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over` (fleet): its write was held past the failover
 >   SLO on each of its three sends, the last `DurabilityPending { held_ns: 3,246,047,745 }`. The SLO is a product
 >   deadline (A-354). The test's bet is `CONTINUITY_WRITES`, three sends, one for each outcome it allows.
+>   **Read since (w-chaos, 2026-11-23, a diagnostic build with A-883): not a deadline, a give-up.** In 2 of 8 runs at
+>   load 50, the successor, restarted warm before it confirmed its share, ran the creator's round again. It learned the
+>   volume from the third node's copy, which still falls in that round by its move. It refused its own copy by name: its
+>   adoption made that copy its own, owner itself and no move. So the volume was never promised and was given up ("the
+>   takeover of the creator's objects gave up 2 of them"), and every write was held until the SLO. A-883's version check
+>   refused no copy in those runs. CI's ae43b42ea run, before A-883, logged the same give-up on Windows x64.
+>   **Open, reported to main:** a copy the successor has since written (its adoption placed) should no longer fall by its
+>   move, or a restarted round should count its own adoption.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
+
+> **Open (w-chaos, 2026-11-23): the chaos stream could not attach to the volume's owner for its whole stretched wait.**
+> In 3 of 14 nemesis runs on adacachy2 (seed 14946995733817154046, #5, #9 and #11, the test given 0.22 to 0.42 of a
+> CPU), the last write was never sent: `Stream::attach` retried its connect and attach to the owner for 95 to 178 s
+> and failed, and the verdict said only "never answered" (#5) or "no write acknowledged ... []" (#9, #11), naming no
+> refusal. The stream now records a write it never sent with the attach's last refusal (`Stream::unattached`), so the
+> next such run names it. Why the owner refused the attach is not yet read. In #5 the owner c shipped V at epoch 4,
+> fully durable, while b still showed its own epoch-3 log of V, a superseded owner that never learned it.
 
 > **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
 > a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,
@@ -9653,7 +9725,9 @@
 > (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
 > behind it. **Since A-375 the failover-shaped waits read it** (a forward's bound, the location round's cap, a held
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
-> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
+> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart;
+> **since A-384's floor, 2026-11-23, never below the longest silence its holder has shown, plus `W`**, so a burst of
+> verbs, every held `slates write` since A-879, no longer lapses it sooner than its holder was ever silent),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
 > end with their client); since A-405 a laptop's failover delay counts its anchor's supervision as its detection, and
 > **since A-574 that detection is measured**: the widest window the watchdog judges the daemon's shards by and then the

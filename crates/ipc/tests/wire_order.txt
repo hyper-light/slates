@@ -399,6 +399,7 @@ ReplyBody 81 WorkAdmitted
 ReplyBody 82 WorkFloorMoved
 ReplyBody 83 SessionLog
 ReplyBody 84 MergeChecked
+ReplyBody 85 NoTerm
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot

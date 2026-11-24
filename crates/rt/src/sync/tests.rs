@@ -63,7 +63,10 @@ fn two_threads_pass_every_value_in_order() {
 /// Do: a task awaits 500 values a plain thread sends into a channel of four. Expect: the task is woken for each and
 /// takes all 500 in order, then `Closed` once the thread's sender is gone.
 #[test]
-#[cfg_attr(miri, ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model")]
+#[cfg_attr(
+  miri,
+  ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model"
+)]
 fn a_task_receives_what_a_thread_sends() {
   let runtime = runtime();
   let (sender, mut receiver) = channel::<u32>(4).unwrap();
@@ -99,7 +102,10 @@ fn a_task_receives_what_a_thread_sends() {
 /// Do: a task sends 300 values into a channel of one that a plain thread drains slowly. Expect: the task waits for
 /// room in a place, is granted it by each take, and every value arrives in order.
 #[test]
-#[cfg_attr(miri, ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model")]
+#[cfg_attr(
+  miri,
+  ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model"
+)]
 fn a_task_waits_for_room_a_thread_makes() {
   let runtime = runtime();
   let (sender, mut receiver) = channel::<u32>(1).unwrap();
@@ -155,7 +161,10 @@ fn full_and_closed_hand_the_value_back() {
 /// Do: a task waits to send into a full channel, then the receiver goes. Expect: the waiting task is woken and told
 /// `Closed`, its value handed back.
 #[test]
-#[cfg_attr(miri, ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model")]
+#[cfg_attr(
+  miri,
+  ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model"
+)]
 fn a_waiting_sender_learns_the_receiver_went() {
   let runtime = runtime();
   let (sender, receiver) = channel::<u32>(1).unwrap();
@@ -192,7 +201,10 @@ fn a_channel_gives_its_cells_back() {
 /// Do: refuse a zero capacity, and a blocking call on a shard. Expect: `BadConfig`, and `NotOnShardThread` with the
 /// value handed back (a shard never blocks).
 #[test]
-#[cfg_attr(miri, ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model")]
+#[cfg_attr(
+  miri,
+  ignore = "it runs a shard on the OS driver, whose epoll timerfd and kqueue Miri cannot model"
+)]
 fn a_bad_channel_and_a_blocking_call_on_a_shard_are_refused() {
   assert!(matches!(channel::<u8>(0), Err(RtError::BadConfig { .. })));
   assert!(matches!(

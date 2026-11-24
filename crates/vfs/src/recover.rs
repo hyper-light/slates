@@ -104,9 +104,13 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// 33 (A-578, 2026-11-19) the image and every delta carry the volume's live inode counter beside its reserved ceiling,
 /// so a successor names to every mount it took over the numbers the dead daemon may have issued after its last
 /// publication; a reader of an earlier version has no such counter, so it refuses this one.
+/// 34 (A-883, 2026-11-23) each held register's moved-from owner carries the version of the retirement that moved it
+/// (`slates_db::register::MovedFrom`), so a warm restart keeps which retirement a move belongs to: a host admitted again
+/// under its id retires again, and a move made at its first retirement says nothing of its next. No reader of 33's
+/// layout is kept: it is refused by its version (CLAUDE.md §2.7).
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 33;
+pub const IMAGE_VERSION: u16 = 34;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
