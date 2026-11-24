@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 10 (main 01a20182, 2026-11-24 13:19 PST): run 9 found serve_peer_records at 11 (A-907's arm); main's commit moves its
+# dispatch to dispatched_request.
 # Run 9 (main 01a20182, 2026-11-24 13:10 PST): main itself after main's lint commits landed (c890f5b6b); run 8 was
 # clean at 8658733f8 with them, and main has since taken A-907, the hg replay ask and w-svn's slicing.
 # Run 8 (main 01a20182, 2026-11-24 12:31 PST): run 7 reached the server's library (Staging::land 13/15, A-906's server
