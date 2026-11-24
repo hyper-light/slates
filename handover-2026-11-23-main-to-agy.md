@@ -22,6 +22,19 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 01:13 on 11-24:
+- 84a's Windows tail is DIAGNOSED (r801 on jupiter, main 891de2741 plus three DIAG commits on the scratch worktree
+  ~/slates-work/main-84a-windiag, not for main). Every slow sample is a parked thread's wake arriving late: the shard's
+  pickup 1-10 ms late, or the client's take of a published reply 3-9 ms late, loaded and quiet alike. jupiter keeps 16 of
+  32 logical processors parked. Sent to w-perf for after A-887: a ping-pong noise floor first, then one path that
+  doesn't rest on a parked thread's wake within 1 ms, needing no privilege. Confirm with round8.sh / round7.sh on jupiter.
+- Gate 4 RUNNING: GitHub run 45363070862, v3_takeover at d801b78d2 (w-git's connection-end logging plus client git
+  traces). Send w-git the disconnecting run's server end line and client trace.
+- w-shared's (d1a-3) reds: the dead owner's successor never adopts the git repository's record. Ruled: takeover is mostly
+  built (A-636 2c-1, 2c-2); trace which of three it is (record never shipped, adopted but pending, rebuild waiting on a
+  missing log part) before building. No replica-answer second path. w-shared is uds 57324 since its restart.
+- F2 rerun 45354317783: 3 of 4 jobs green so far, macOS release running. Land F2 only on all four.
+
 Updates at 00:51 on 11-24:
 - 84a at current main 55650fef1. macOS (r791, Studio): every run under 1 ms (24 loaded runs: p99 at most 216 us, p999 at
   most 542 us). Windows (r792, jupiter): every run's p99 under 1 ms, but p999 crossed 1 ms in 3 of 24 loaded accept runs
