@@ -4966,6 +4966,22 @@
 >   copy of the head takes the owner its catalog copy names. Test:
 >   `a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names` (red: the successor refused). Record:
 >   `docs/bugs/2026-11-23-a-readmitted-creator-refused-its-successors-log-as-not-the-acting-owner.md`.
+> - **FIXED 2026-11-23 (w-chaos; A-883, a move names its retirement): a copy moved at a host's first retirement fell in
+>   every later round of that host.** The holder's record of a move named the host alone, and a re-admitted host keeps
+>   its id, so when it retired again its earlier successor's round listed that successor's own volume by the stale
+>   move. Where every holder agreed, the successor took its own volume over again at a higher epoch (diagnostic run 11
+>   on adacachy2: epoch 3 seq 8 adopted again as epoch 4). Where they disagreed, the volume was given up and the
+>   retirement never confirmed, so the fleet never settled (CI, seeds 14946995733817154046 and 8173581894251929445:
+>   233 by-name refusals, 3 given up). Now the record carries the retirement's version (`MovedFrom`), counted only
+>   while that retirement is kept; image 34, delta 12. Tests:
+>   `a_copy_moved_at_a_hosts_earlier_retirement_falls_in_none_of_its_later_rounds` (db) and
+>   `a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time` (fleet), both red with the
+>   version ignored; the register nemesis now restarts holders across moves. Record:
+>   `docs/bugs/2026-11-23-a-move-named-its-host-not-its-retirement.md`.
+> - **Open (found by reading with A-883, reported to main): a round is keyed by the retired host's id**
+>   (`ShardState::host_takeovers`). A lagging node that still owes a confirmation of a host's first retirement and
+>   installs its second directly restarts the old round, keeping its `adopted` set and its `began_ns`, so the failover
+>   estimate is timed from the first round's start.
 
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
@@ -7511,9 +7527,25 @@
 > - `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over` (fleet): its write was held past the failover
 >   SLO on each of its three sends, the last `DurabilityPending { held_ns: 3,246,047,745 }`. The SLO is a product
 >   deadline (A-354). The test's bet is `CONTINUITY_WRITES`, three sends, one for each outcome it allows.
+>   **Read since (w-chaos, 2026-11-23, a diagnostic build with A-883): not a deadline, a give-up.** In 2 of 8 runs at
+>   load 50, the successor, restarted warm before it confirmed its share, ran the creator's round again. It learned the
+>   volume from the third node's copy, which still falls in that round by its move. It refused its own copy by name: its
+>   adoption made that copy its own, owner itself and no move. So the volume was never promised and was given up ("the
+>   takeover of the creator's objects gave up 2 of them"), and every write was held until the SLO. A-883's version check
+>   refused no copy in those runs. CI's ae43b42ea run, before A-883, logged the same give-up on Windows x64.
+>   **Open, reported to main:** a copy the successor has since written (its adoption placed) should no longer fall by its
+>   move, or a restarted round should count its own adoption.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
+
+> **Open (w-chaos, 2026-11-23): the chaos stream could not attach to the volume's owner for its whole stretched wait.**
+> In 3 of 14 nemesis runs on adacachy2 (seed 14946995733817154046, #5, #9 and #11, the test given 0.22 to 0.42 of a
+> CPU), the last write was never sent: `Stream::attach` retried its connect and attach to the owner for 95 to 178 s
+> and failed, and the verdict said only "never answered" (#5) or "no write acknowledged ... []" (#9, #11), naming no
+> refusal. The stream now records a write it never sent with the attach's last refusal (`Stream::unattached`), so the
+> next such run names it. Why the owner refused the attach is not yet read. In #5 the owner c shipped V at epoch 4,
+> fully durable, while b still showed its own epoch-3 log of V, a superseded owner that never learned it.
 
 > **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
 > a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,

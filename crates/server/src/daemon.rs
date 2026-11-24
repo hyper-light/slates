@@ -10970,6 +10970,7 @@ mod tests {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
       crate::fleet::reconcile_held_authority(state);
+      let retired_at = state.council.configuration().retirement_version(departed);
       let moved_from = state.holder_records.get(&object).and_then(|acceptor| {
         (acceptor.owner() == successor)
           .then(|| acceptor.moved_from())
@@ -10994,12 +10995,16 @@ mod tests {
         .get("fleet.takeover.listed_by_moved_from")
         .copied()
         .unwrap_or(0);
-      (moved_from.map(|from| from == departed), page, counted)
+      (
+        moved_from.map(|from| (from.owner, Some(from.retired_at)) == (departed, retired_at)),
+        page,
+        counted,
+      )
     });
     assert_eq!(
       moved_from,
       Some(true),
-      "the install moved the copy from the retired owner"
+      "the install moved the copy from the retired owner, naming its retirement (A-883)"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(
@@ -11020,15 +11025,23 @@ mod tests {
   /// (the move); build the delta's held pieces (`held_changes`) and fold them over the checkpoint's as recovery does;
   /// drop the acceptors, routing and lineage and restore them from the folded pieces; answer the successor's page.
   /// Expect: no move at the checkpoint, the register's piece carried by the delta, the restored acceptor naming the
-  /// retired owner it moved from, and the page listing the copy. A move whose mark the tracked map missed would leave
+  /// retired owner it moved from and the retirement that moved it (A-883), and the page listing the copy. A move whose mark the tracked map missed would leave
   /// the checkpoint's piece in place, and the restored copy would name no move and go unlisted.
   #[test]
   fn a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([47; 16]);
-    let (before_move, in_delta, restored_from, departed, page) = audit_on_shard(move |state| {
+    let (before_move, in_delta, restored_from, moved, page) = audit_on_shard(move |state| {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let moved = slates_db::register::MovedFrom {
+        owner: departed,
+        retired_at: state
+          .council
+          .configuration()
+          .retirement_version(departed)
+          .unwrap(),
+      };
       let before_move = state
         .holder_records
         .get(&object)
@@ -11084,7 +11097,7 @@ mod tests {
         named: Vec::new(),
       };
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
-      (before_move, in_delta, restored_from, departed, page)
+      (before_move, in_delta, restored_from, moved, page)
     });
     assert_eq!(
       before_move, None,
@@ -11093,8 +11106,8 @@ mod tests {
     assert!(in_delta > 0, "the delta carried the moved register's piece");
     assert_eq!(
       restored_from,
-      Some(departed),
-      "the checkpoint and its delta kept the owner the copy moved from"
+      Some(moved),
+      "the checkpoint and its delta kept the owner the copy moved from and its retirement"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(
@@ -11112,14 +11125,23 @@ mod tests {
   /// from, so after the restore, which routes the copy to the successor as a live owner, the successor's page still
   /// lists it. Do: retire the owner of a record this node holds; run the authority reconcile; write the held image, drop
   /// the acceptors, routing and lineage, and restore them from the image; answer the successor's page. Expect: the
-  /// restored acceptor names the retired owner it moved from, and the page lists the copy.
+  /// restored acceptor names the retired owner it moved from and the retirement that moved it (A-883), and the page
+  /// lists the copy.
   #[test]
   fn a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([43; 16]);
-    let (restored_from, departed, page) = audit_on_shard(move |state| {
+    let (restored_from, moved, page) = audit_on_shard(move |state| {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let moved = slates_db::register::MovedFrom {
+        owner: departed,
+        retired_at: state
+          .council
+          .configuration()
+          .retirement_version(departed)
+          .unwrap(),
+      };
       crate::fleet::reconcile_held_authority(state);
       let image = crate::content_holder::held_image(state);
       state.holder_records.clear();
@@ -11147,12 +11169,12 @@ mod tests {
         named: Vec::new(),
       };
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
-      (restored_from, departed, page)
+      (restored_from, moved, page)
     });
     assert_eq!(
       restored_from,
-      Some(departed),
-      "the image kept the owner the copy moved from"
+      Some(moved),
+      "the image kept the owner the copy moved from and its retirement"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(

@@ -142,8 +142,9 @@ struct HeldCopy {
   adoptions: u64,
   /// The owner the holder routes it to (its acceptor's authority).
   owner: HostId,
-  /// The retired owner an install moved its authority from (A-251's `moved_from`).
-  moved_from: Option<HostId>,
+  /// The retired owner an install moved its authority from, with the version of the retirement that moved it (A-251's
+  /// `moved_from`, A-883's `MovedFrom`).
+  moved_from: Option<(HostId, u64)>,
   /// The retired host whose takeover this copy is in, as the lease gate records it (`departed_owners`).
   departed: Option<HostId>,
   /// Whether the write that made this copy placed its record (`f + 1` of each cohort it went to): a record never placed
@@ -397,12 +398,14 @@ impl World {
     }
   }
 
-  /// Whether a copy falls to `successor` in `departed`'s round: its owner's line or its moved-from owner's ends there.
+  /// Whether a copy falls to `successor` in `departed`'s round: its owner's line ends there, or its moved-from owner's
+  /// does while the retirement that moved it is the one the configuration keeps of that owner (A-883).
   fn falls(&self, object: ObjectId, copy: &HeldCopy, departed: HostId, successor: HostId) -> bool {
     falls_to(&self.regional, copy.owner, object, departed, successor)
-      || copy
-        .moved_from
-        .is_some_and(|from| falls_to(&self.regional, from, object, departed, successor))
+      || copy.moved_from.is_some_and(|(from, retired_at)| {
+        self.regional.retirement_version(from) == Some(retired_at)
+          && falls_to(&self.regional, from, object, departed, successor)
+      })
   }
 
   /// `successor` runs its share of `departed`'s takeover to its end: every object some member's copy of which falls
@@ -589,8 +592,8 @@ impl World {
           successor,
         } => {
           // `reconcile_held_authority` records the owner an install moved the authority from only when that owner's
-          // retirement is kept.
-          let retired_owner = self.regional.retired.contains_key(&owner);
+          // retirement is kept, with that retirement's version (A-883).
+          let retired_at = self.regional.retirement_version(owner);
           let entry = self
             .objects
             .get_mut(&object)
@@ -598,8 +601,10 @@ impl World {
             .copies
             .get_mut(&holder)
             .unwrap();
-          if entry.owner != successor && retired_owner {
-            entry.moved_from = Some(entry.owner);
+          if entry.owner != successor
+            && let Some(retired_at) = retired_at
+          {
+            entry.moved_from = Some((entry.owner, retired_at));
           }
           entry.owner = successor;
           entry.departed = Some(departed);

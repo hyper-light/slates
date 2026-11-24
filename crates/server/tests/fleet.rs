@@ -16033,6 +16033,204 @@ fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retir
   );
 }
 
+/// A move names its retirement, across processes (A-883; the chaos nemesis's settle failure of 2026-11-23, seeds
+/// 14946995733817154046 and 8173581894251929445; §4.8 "Promotion and takeover", A-251): a host admitted again under its id
+/// keeps it, so when it retires a second time no copy moved at its first retirement falls to that retirement's successor
+/// again. Before A-883 the successor listed its own live volume in the second round, by the owner the copies had been
+/// moved from, and took it over again at a higher fence; where its holders disagreed it gave the volume up instead, and
+/// the retirement was never confirmed. Do: three nodes at `f = 1`; on a, a live-shipped volume written six files and
+/// shared with the fleet; cut a off on the probe plane until the survivor the volume ranks first has taken it over, heal,
+/// and wait for one configuration of all three; note who ships the volume at the highest fence and at which; then make
+/// a deaf to the others until the survivors retire it ([`deaf_until_its_takeover_resolves`]), heal, wait for one
+/// configuration again, and write through the successor. Expect the same node shipping the volume at the same fence
+/// before the write and after it, the write answered and never refused `StaleEpoch` (a's second retirement fenced
+/// nothing of the successor's volume), no node counting a live takeover or a given-up object while a was deaf (a owned
+/// nothing then), and the fleet on one configuration naming all three after each fault. With the retirement ignored,
+/// the second round's promises fenced the volume's holders above the successor's own epoch, and its writes were refused
+/// `StaleEpoch { current: 3 }` until it took its own volume over again.
+#[test]
+fn a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time() {
+  let _serial = serialize_fleet_tests();
+  let seen = retired_twice();
+  eprintln!(
+    "retired twice: the first takeover {} by node {}, a re-admitted {}; shipping at the highest fence (node, fence, \
+     durable) {:?}; a deaf {} retired {} healed {}, live takeovers and given-up objects per node {:?} -> {:?}; settled \
+     {}; then {:?}; a write through the successor {:?}, then {:?}\nafter the first takeover:\n{}\nat a's second \
+     retirement:\n{}\nat the end:\n{}",
+    seen.taken,
+    seen.adopter,
+    seen.readmitted,
+    seen.before,
+    seen.spell.deafened,
+    seen.spell.retired,
+    seen.spell.healed,
+    seen.spell.outcomes.0,
+    seen.spell.outcomes.1,
+    seen.settled,
+    seen.after,
+    seen.through_owner,
+    seen.after_the_write,
+    seen.after_first.join("\n"),
+    seen.spell.at_retirement.join("\n"),
+    seen.at_end.join("\n")
+  );
+  judge_retired_twice_scene(&seen);
+  judge_retired_twice_volume(&seen);
+}
+
+/// What [`retired_twice`] saw.
+struct RetiredTwice {
+  written: Vec<ReplyBody>,
+  adopter: usize,
+  taken: bool,
+  readmitted: bool,
+  before: Option<(usize, u64, Option<u64>)>,
+  after_first: Vec<String>,
+  spell: DeafSpell,
+  settled: bool,
+  after: Option<(usize, u64, Option<u64>)>,
+  through_owner: Vec<ReplyBody>,
+  after_the_write: Option<(usize, u64, Option<u64>)>,
+  at_end: Vec<String>,
+}
+
+/// [`a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time`]'s scene: three nodes at
+/// `f = 1`; on a, a live-shipped volume written six files and shared with the fleet; a cut off on the probe plane until
+/// the survivor the volume ranks first has taken it over, healed, and one configuration of all three waited for; the
+/// node shipping the volume at the highest fence noted; a made deaf until the survivors retire it a second time
+/// ([`deaf_until_its_takeover_resolves`]), healed, one configuration waited for again; a write through the successor.
+fn retired_twice() -> RetiredTwice {
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "retired-twice");
+  drop(client);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let adopter = if successor == hosts[1] { 1 } else { 2 };
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
+  let readmitted = taken
+    && poll_for_live_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let before = shipping_at_the_highest_fence(&daemons, id);
+  let after_first: Vec<String> = daemons.iter().map(configuration_view).collect();
+  let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, 0);
+  let settled = spell.healed
+    && poll_for_live_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let after = shipping_at_the_highest_fence(&daemons, id);
+  let through_owner = written_through(&daemons, adopter, id, "/after-the-second-retirement");
+  let after_the_write = shipping_at_the_highest_fence(&daemons, id);
+  let at_end: Vec<String> = daemons
+    .iter()
+    .map(|daemon| {
+      format!(
+        "{}; live {:?}",
+        configuration_view(daemon),
+        live_lines(daemon, id)
+      )
+    })
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  RetiredTwice {
+    written,
+    adopter,
+    taken,
+    readmitted,
+    before,
+    after_first,
+    spell,
+    settled,
+    after,
+    through_owner,
+    after_the_write,
+    at_end,
+  }
+}
+
+/// Judges [`retired_twice`]'s scene: every step of it happened, and the fleet settled on one configuration after each
+/// fault.
+fn judge_retired_twice_scene(seen: &RetiredTwice) {
+  assert!(
+    seen
+      .written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {:?}",
+    seen.written
+  );
+  assert!(
+    seen.taken && seen.readmitted,
+    "the adopter took the volume over and a was re-admitted: {}",
+    seen.after_first.join("; ")
+  );
+  assert!(
+    seen.spell.deafened && seen.spell.retired && seen.spell.healed,
+    "a was made deaf, retired a second time and healed: {}",
+    seen.spell.at_retirement.join("; ")
+  );
+  assert!(
+    seen.settled,
+    "every node holds one configuration naming a, b and c, all voting and meshed, once a hears again: {}",
+    seen.at_end.join("; ")
+  );
+}
+
+/// Judges what [`retired_twice`]'s second retirement did to the successor's volume: nothing. No node took a volume over
+/// or gave an object up while a was deaf, the successor ships the volume at the fence it had before (and after its
+/// write), and its write is answered, never refused `StaleEpoch`.
+fn judge_retired_twice_volume(seen: &RetiredTwice) {
+  let owner_and_fence =
+    |shipping: Option<(usize, u64, Option<u64>)>| shipping.map(|(owner, fence, _)| (owner, fence));
+  assert!(
+    seen
+      .before
+      .is_some_and(|(owner, _, _)| owner == seen.adopter),
+    "node {} ships the volume at the highest fence after the first takeover: {:?}",
+    seen.adopter,
+    seen.before
+  );
+  assert_eq!(
+    seen.spell.outcomes.1, seen.spell.outcomes.0,
+    "no node took a volume over or gave an object up at a's second retirement: a owned nothing then"
+  );
+  for shipping in [seen.after, seen.after_the_write] {
+    assert_eq!(
+      owner_and_fence(shipping),
+      owner_and_fence(seen.before),
+      "the successor ships its volume at the same fence: a's second retirement took nothing of it over"
+    );
+  }
+  let stale = seen.through_owner.iter().any(|reply| {
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::StaleEpoch { .. }
+      }
+    )
+  });
+  assert!(
+    !stale
+      && seen
+        .through_owner
+        .last()
+        .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "a write through the successor was answered, never refused StaleEpoch: a's second retirement fenced nothing of \
+     its volume: {:?}",
+    seen.through_owner
+  );
+}
+
 /// Shape: the volumes [`retakeable_volume`] makes at most to find one whose second takeover falls where its test needs
 /// it. Each falls to the creator or to the third node with even odds (`RegionalConfiguration::successor` ranks the
 /// survivors by rendezvous), so a run finds none with odds of one in 2^32.
