@@ -1,24 +1,38 @@
 name: diag main fuse takeover
-# main 01a20182 (2026-11-23): is bridge-fuse's takeover_round red on main itself? w-svn's 4d diag (run 45315337284) read
-# 0 of 2 there: a zero budget's slices came out [1, 1, ...] where the test asserts [2, 1, ...]. Main's ubuntu lane has
-# stopped at clippy since 16e3cd261, so no main run has reached the test. One job at the pushed tree, the whole test file
-# with its output; a diagnostics branch, never merged.
+# main 01a20182 (2026-11-23): bridge-fuse's takeover_round is red on main (run 45324224922 at 80fbd5249: a zero budget's
+# slices [1, 1, ...] where the test asserts [2, 1, ...], the root alone in the first slice). ff16bed94 (11-18) sliced
+# every serving-thread round under one turn budget and wrote the test's [2, 1, ...]; bridge-fuse's code changed after it
+# only in 3c3efe4f0, 731331eef and 6f29c8de5 (the S3 base removed). Run 2 runs the test at each, oldest first, to find
+# where the first slice lost its first inode. A diagnostics branch, never merged.
 on:
   push:
     branches: ["diag-measurer-main-fuse-*"]
 
 jobs:
   takeover-round:
+    name: takeover_round at ${{ matrix.at }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        at:
+          - ff16bed94b12f21d0c926d4426c29f30cb182327
+          - 3c3efe4f0bfebca8b89511d78ff247f2f1e4bfd6
+          - 731331eef7b479f27df47c22d17821000509c274
+          - 72576cb1fffc79f5649075d31909cb9dc5091349
+          - 6f29c8de5487c6582d7ff1cfce17312a4fa0d1be
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.at }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
-      - name: takeover_round at the pushed tree
-        run: cargo test --locked -p slates-bridge-fuse --test takeover_round -- --nocapture
+      - name: takeover_round at ${{ matrix.at }}
+        run: |
+          git log --oneline -1 | cut -c1-120
+          cargo test --locked -p slates-bridge-fuse --test takeover_round -- --nocapture 2>&1 | grep -E "^test |test result|left:|right:|panicked" | cut -c1-200
