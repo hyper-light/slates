@@ -648,3 +648,19 @@
   derive_for_read (waited whole, unbounded), encode_for_fetch (one liveness window) and the wanted set (header count);
   all of it on the owner shard. Proposal P1-P3 to spread across shards (P1 needs a rule on the encoding's learned
   rules). NEXT: git_interop's per-step PATIENCE from the work (needs main's ratio over stock, asked), then B1.
+
+- 2026-11-23 evening: LANDED hot path 68132daeb (r405: push answer 77.0 -> 59.9 s least-of-2, push to listable only -8%
+  because the listing waited); PATIENCE by progress 0f40bfea3 (merge 719a296e1); shallow over let-go 050ef43c2 (merge
+  bbe4a27e0; r524 26/26 verbs with the lift on). drop(put) lint is main's lint keeper's, not mine.
+- ON BRANCH agents/w-git-push-barrier (NOT landed): 07b384f4c barrier waits for moved greens' merge placement;
+  bb4bb182b ls-refs waits for no derive/encode (red 4 -> 0 turns). Main's v3 gate (GitHub 45312465577): before 0/5
+  (loss), after 0/5 (push 1 disconnect). Cause from per-node counters: merge.replica.owes ~1,173/holder: push 0's create
+  is a deferred push (P2), holders' replicas owe it and refuse to judge push 1's version 2 (GAPS A-812(b) OPEN,
+  A-813's limit). Uncommitted in w-git-p2: diag (W-GIT-DIAG eprintlns in state.rs count, state_log.rs, receive.rs;
+  20 s deadline) + log_uncommitted + PendingGreen::versions. REMOVE the W-GIT-DIAG lines before committing.
+- NEXT (main 20:00 ruling): holder makes its owing replica lazily through the takeover's door from objects on the node
+  (changeset store + region homes), sliced, counted (build begun, slices, versions waited); barrier progress-aware
+  (refused only after a window of no progress, window from the record plane's live estimates; A-884's rule), expiry
+  answers report-status `ng <ref> unable to commit`; reds: v3_takeover release+debug and a fleet double-push at f=1;
+  record git/git build time at f=1. Read w-shared notes ~/.local/state/main-fanout/progress/w-shared.md 355-383 first.
+  Then: (iii) plan/footprint O(G), B1/B2, pack shape vs stock, LANDED_LET_GO decision.
