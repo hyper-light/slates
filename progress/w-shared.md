@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 11:55 PST 11-24: LANDED the lint-only commit d9cabf2cc (my five sites at d48863ddb: RegionHold, caught_up while-let,
+  serve_remote / exchange / heal_one split by meaning) and the must_use sweep cd4e2bf04 (poll_until,
+  poll_for_periods, poll_for_live_periods #[must_use]; 14 sites: nine asserted, five helpers commented as settles;
+  8 of 8 tests green in 116 s, no finding). Edge-to-owner routing: owed per D-14 (w-git's reading), w-git's after
+  the clone work, awaiting main's ruling on (a) forward vs (b) redirect. Nothing active; waiting for main's next piece.
+
 ## 11:20 PST 11-24: LANDED A-903, main 29f45e606: a successor writes its adopted state logs' parts at the adopted
   epoch (was its host epoch; 19 StaleEpoch refusals a run, no push to a taken-over repository committed). Red/green in
   A-894's takeover test (push to the successor). OPEN for main and w-git: a repository is reachable only at its
