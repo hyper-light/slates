@@ -525,7 +525,11 @@ slates-land = 35
 # 2026-11-04 (+4, A-213): the anchor's end keeps a read posted so its loop wakes on the channel: the read posted, its
 # result taken without waiting, its cancellation and join at the channel's drop, and the supervisor's wait on the read's
 # event and the daemon's process handle together. The completion event's two sites are shared with the timed reads.
-slates-anchor = 14
+# 2026-11-23 (+1, w-chaos; docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md): the
+#   supervisor's Linux spawn clears close-on-exec on the segment's and the content object's descriptors in the child
+#   alone (`supervise.rs` `hand_on_in_child`, `CommandExt::pre_exec`, unsafe by signature): one `fcntl(F_SETFD)` per
+#   number between the fork and the exec. Before, each start made an inheritable duplicate of both that nothing closed.
+slates-anchor = 15
 slates-db = 0
 # 2026-11-02, A-198: one DuplicateHandle out of a child, two process-exit polling calls, and one message-mode pipe
 # setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
@@ -538,6 +542,11 @@ slates-db = 0
 # SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
 # (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
 # after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
+# 2026-11-23 (+1 -1, w-chaos; docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md): the
+#   daemon's start marks every descriptor it inherited close-on-exec by number (`confined_spawn.rs`
+#   `close_inherited_on_exec`, `fcntl(F_SETFD)`, which no safe wrapper offers for a number no owner holds), and the Linux
+#   claim's hand-off no longer adopts a duplicate of the region's descriptor (`rendezvous.rs`, `from_raw_fd`): it sends
+#   the region's own, borrowed.
 slates-ipc = 179
 # 2026-11-23 (+10, A-875, w-interop, compiled only for Windows): the Node SDK's completion pipe (`completion_pipe.rs`),
 #   since Node adopts no Windows socket by descriptor: the pipe made (`CreateNamedPipeW`, its handle adopted), its

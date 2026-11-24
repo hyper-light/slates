@@ -15,11 +15,11 @@
 //! identities). A version ([`Version`]) is a tree of runs in order: each node holds one run, its subtrees, its height and
 //! the bytes beneath it, so a byte offset is found by descending on the left subtrees' lengths (the order-statistic
 //! tree, as VS Code's piece tree keeps a left subtree's length in each node). The tree is an AVL tree kept balanced by
-//! *join* (Blelloch, Ferizovic and Sun, "Just Join for Parallel Ordered Sets", SPAA 2016, tier A): [`join`] of two trees
-//! and a run between them rebalances along one spine in O(the heights' difference), and split and concatenation are
-//! made of joins, O(log n) each. A change is [`PieceTrees::rebuild`]: the next version as parts in order, each a range
-//! kept from the version before ([`Part::Kept`], a slice: two splits) or a run the change added ([`Part::Added`]),
-//! concatenated: exactly the shape the engine's `segments` gives an op list.
+//! *join* (Blelloch, Ferizovic and Sun, "Just Join for Parallel Ordered Sets", SPAA 2016, tier A):
+//! [`join`](PieceTrees::join) of two trees and a run between them rebalances along one spine in O(the heights'
+//! difference), and split and concatenation are made of joins, O(log n) each. A change is [`PieceTrees::rebuild`]: the
+//! next version as parts in order, each a range kept from the version before ([`Part::Kept`], a slice: two splits) or a
+//! run the change added ([`Part::Added`]), concatenated: exactly the shape the engine's `segments` gives an op list.
 //!
 //! **Persistence by path copying** (Driscoll, Sarnak, Sleator and Tarjan, "Making Data Structures Persistent", JCSS 38,
 //! 1989, tier A). Nodes live in one arena ([`PieceTrees`]) and count their holders: the versions whose root they are and

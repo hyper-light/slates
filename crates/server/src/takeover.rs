@@ -9,7 +9,7 @@
 //!   holds from the configuration's lineage ([`RegionalConfiguration::lineage`]): the retirement ranks each
 //!   object's successor among the members it left (its survivors), and a successor that itself retired before
 //!   confirming carries the object into its own takeover. A copy whose line ends in a takeover the configuration
-//!   keeps a completion record of is stale and reclaimed ([`resolve_held_objects`]); a line that ends anywhere else
+//!   keeps a completion record of is stale and reclaimed ([`resolve_held_object`]); a line that ends anywhere else
 //!   (no record kept) is unresolved, and its copy is kept (A-272, A-309).
 //! - **Phase one, one round per retired host.** Every survivor that owes a confirmation of the retired host's
 //!   takeover asks every other member of its recovery neighbourhoods for the records it holds of that host's
@@ -538,11 +538,11 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   }
 }
 
-/// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
-/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests. The copy
-/// is judged by its route ([`resolve_by_route`]), then follows its object's move, if the configuration moved it (A-291,
-/// [`crate::moves::follow_moved_object`]), whatever the route judged: a copy routed to its live old owner follows the
-/// move too (A-485).
+/// One held copy, `object`'s, resolved to its owner under `regional`: the walk of an install takes the copies a slice a
+/// turn through this (`fleet::install_on_copy`, A-398), and `resolve_held_objects`, which resolves every copy at once,
+/// is that walk's oracle in the daemon's unit tests. The copy is judged by its route ([`resolve_by_route`]), then
+/// follows its object's move, if the configuration moved it (A-291, [`crate::moves::follow_moved_object`]), whatever
+/// the route judged: a copy routed to its live old owner follows the move too (A-485).
 pub(crate) fn resolve_held_object(
   state: &mut ShardState,
   local: HostId,

@@ -6,13 +6,13 @@
 //! adapter (an `href`, headers, an expiry) or an error with one of LFS's codes; the bytes then move by plain `PUT` and
 //! `GET`, and an upload may be confirmed by a verify callback. Locks are per path: created, listed with a cursor,
 //! listed for a push's verification as ours and theirs, and released, by force when another user holds them
-//! ([`locks`]). A version's tree holds pointer files in place of the large files ([`pointer`]). [`route`] names the
-//! endpoint a path under `<repo>.git/info/lfs` asks for. The HTTP server (§4.17.2 piece 8) carries these; the objects
-//! themselves are content in the volume store (§4.17.2 "Large files").
+//! ([`locks`]). A version's tree holds pointer files in place of the large files ([`pointer`](mod@pointer)).
+//! [`route`] names the endpoint a path under `<repo>.git/info/lfs` asks for. The HTTP server (§4.17.2 piece 8) carries
+//! these; the objects themselves are content in the volume store (§4.17.2 "Large files").
 //!
 //! **Sources** (read 2026-11-19): git-lfs v3.8.1 (tag object 36e29152, commit a662a6dbf, released 2026-10-22):
-//! `docs/api/batch.md`, `basic-transfers.md`, `locking.md`, `server-discovery.md`, `docs/spec.md` [B]; the JSON schemas
-//! `tq/schemas/` and `locking/schemas/` [B]; and what the stock client runs [C]: its request structs (`tq/api.go`,
+//! `docs/api/batch.md`, `basic-transfers.md`, `locking.md`, `server-discovery.md`, `docs/spec.md` \[B\]; the JSON schemas
+//! `tq/schemas/` and `locking/schemas/` \[B\]; and what the stock client runs \[C\]: its request structs (`tq/api.go`,
 //! `tq/transfer.go`, `locking/api.go`), its pointer reader (`lfs/pointer.go`) and its test server
 //! (`t/cmd/lfstest-gitserver.go`). Where the documents and the client differ, the client is followed, and the module
 //! says so.

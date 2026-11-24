@@ -138,6 +138,9 @@ pub struct ClientEnd {
   wake: WakeEstimate,
   /// Parks whose wake fed the estimate (a non-vacuity count).
   wake_samples: u64,
+  /// Parks whose wake was held to be learned once its stamp can be judged ([`wait_may_teach`] let it): the estimate folds
+  /// only these, so a park the client's own count says never blocked must never be one.
+  wakes_held: u64,
   /// Parks a reply ended, by the reply stamp slot each named, whose stamp could not be judged when the client read it
   /// (a waker's confirmation not yet landed): settled at a later park's arming, and given up when the slot is armed
   /// again (`region::REPLY_STAMP_SLOTS`).
@@ -200,6 +203,7 @@ impl ClientEnd {
     ClientEnd {
       wake,
       wake_samples: 0,
+      wakes_held: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
       liveness_looks: 0,
       room_parks: 0,
@@ -339,10 +343,12 @@ impl ClientEnd {
         let eventfd = self.completion.as_ref().ok_or(IpcError::Unsupported {
           feature: "async completion fd (the rendezvous passed no completion descriptor)",
         })?;
-        let eventfd_dup = rustix::io::dup(eventfd).map_err(|error| IpcError::OsRefused {
-          call: "dup",
-          code: Some(error.raw_os_error()),
-        })?;
+        // Close-on-exec, as every descriptor here: a plain `dup` made one without it, which any child inherited.
+        let eventfd_dup =
+          rustix::io::fcntl_dupfd_cloexec(eventfd, 0).map_err(|error| IpcError::OsRefused {
+            call: "fcntl(F_DUPFD_CLOEXEC)",
+            code: Some(error.raw_os_error()),
+          })?;
         self.bridge = Some(crate::completion::CompletionBridge::start_from_eventfd(
           eventfd_dup,
         )?);
@@ -367,9 +373,9 @@ impl ClientEnd {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     match &self.completion {
       Some(fd) => Ok(
-        rustix::io::dup(fd)
+        rustix::io::fcntl_dupfd_cloexec(fd, 0)
           .map_err(|error| IpcError::OsRefused {
-            call: "dup",
+            call: "fcntl(F_DUPFD_CLOEXEC)",
             code: Some(error.raw_os_error()),
           })?
           .into_raw_fd(),
@@ -579,6 +585,11 @@ impl ClientEnd {
   /// Parks whose measured wake fed the estimate.
   pub fn wake_samples(&self) -> u64 {
     self.wake_samples
+  }
+
+  /// Parks whose wake was held to be learned (see the field): every park that may teach, before its stamp is judged.
+  pub fn wakes_held(&self) -> u64 {
+    self.wakes_held
   }
 
   /// Parks so far and replies so far (the measured spin-to-park ratio).
@@ -909,6 +920,7 @@ impl ClientEnd {
       && let Some(unsettled) = self.unsettled.get_mut(slot)
     {
       *unsettled = Some(woke);
+      self.wakes_held = self.wakes_held.saturating_add(1);
     }
     self.settle_wakes()?;
     self.try_take()
@@ -1204,19 +1216,23 @@ struct Unsettled {
 }
 
 /// Whether a park's wake goes on to be judged by its stamp ([`ClientEnd::settle_wakes`]), from the client's
-/// own switch count across its wait (`slates_machine::switches`). Where the daemon's wake confirms a sleeper
-/// found (`waker_confirms`), that confirmation judges and every park goes on. Elsewhere (Windows' Event, and a Linux
-/// park that waits on its daemon's departure, A-456) the client judges itself: only a wait across which its count
-/// rose slept. A wait that found the reply's signal already set returned without switching, and timing it taught an
-/// on-CPU handoff (0.1–0.8 µs) for a sleeper's wake (6–9 µs on CI's Windows runners, A-223); a count the OS refused
-/// proves nothing, so the client learns nothing and keeps its seed.
+/// own switch count across its wait (`slates_machine::switches`). Wherever the OS gives the count before and after,
+/// it judges: only a wait across which it rose slept. A wait that found the reply's signal already set returned
+/// without switching, and timing it taught an on-CPU handoff (0.1–0.8 µs) for a sleeper's wake (6–9 µs on CI's Windows
+/// runners, A-223). That holds where the daemon's wake confirms a sleeper found (`waker_confirms`) as well, whose
+/// confirmation is still awaited at the settle: Linux's `futex_wake` counts a waiter that queued itself and was set
+/// running again before it blocked, so 4 of 5,341 parks that never switched out were confirmed and taught 560 to
+/// 9,286 ns (adacachy2, 2026-11-23). Where the OS gives no count (macOS), the confirmation alone lets a wait go on; a
+/// wait with neither teaches nothing, so the client keeps its seed.
 fn wait_may_teach(
   waker_confirms: bool,
   switches_before: Option<u64>,
   switches_after: Option<u64>,
 ) -> bool {
-  waker_confirms
-    || matches!((switches_before, switches_after), (Some(before), Some(after)) if after > before)
+  match (switches_before, switches_after) {
+    (Some(before), Some(after)) => after > before,
+    _ => waker_confirms,
+  }
 }
 
 /// The client's parked flag for a park that names `slot`.
@@ -1512,29 +1528,32 @@ fn elapsed_ns(since: Instant) -> u64 {
 mod judged {
   use super::wait_may_teach;
 
-  /// §4.7, §4.3 (A-223, sibling (d)): do judge waits by the client's own switch count, as on Windows, and by
-  /// the daemon's confirmation, as on Linux and macOS. Expect: under its own count only a wait across which
-  /// the count rose goes on to teach, while one it never moved across, or one whose count the OS refused (its
-  /// profiling declined), teaches nothing, so the estimate keeps its seed; under the daemon's confirmation
-  /// every wait goes on, its stamp judged when the confirmation lands.
+  /// §4.7, §4.3 (A-223, sibling (d)): do judge waits by the client's own switch count, as on Windows and Linux, and
+  /// by the daemon's confirmation alone where the OS counts no switches for the thread (macOS). Expect: wherever the
+  /// count is read before and after, only a wait across which it rose goes on to teach, the daemon's confirmation or
+  /// not; a wait it never moved across teaches nothing, so a confirmed wake whose waiter was set running again before it
+  /// blocked is not learned (a Linux `futex_wake` counts such a waiter: 4 of 5,341 parks that never switched out taught
+  /// a wake on adacachy2, 2026-11-23); where a count is missing, the daemon's confirmation alone lets a wait go on, and
+  /// without one it teaches nothing, so the estimate keeps its seed.
   #[test]
   fn only_a_wait_that_switched_out_teaches_where_the_client_judges_itself() {
     let waits = [
-      (Some(7), Some(8), true),
-      (Some(7), Some(7), false),
-      (None, None, false),
-      (Some(7), None, false),
-      (None, Some(8), false),
+      (Some(7), Some(8), true, true),
+      (Some(7), Some(7), false, false),
+      (None, None, false, true),
+      (Some(7), None, false, true),
+      (None, Some(8), false, true),
     ];
-    for (before, after, slept) in waits {
+    for (before, after, alone, confirmed) in waits {
       assert_eq!(
         wait_may_teach(false, before, after),
-        slept,
+        alone,
         "the client's own count, {before:?} → {after:?}"
       );
-      assert!(
+      assert_eq!(
         wait_may_teach(true, before, after),
-        "the daemon's confirmation, {before:?} → {after:?}"
+        confirmed,
+        "the daemon's confirmation with the client's count, {before:?} → {after:?}"
       );
     }
   }

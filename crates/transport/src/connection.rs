@@ -1,15 +1,15 @@
 //! The sans-io session-plane connection driver (§4.10a §8): the state machine that composes the
 //! stream layer ([`crate::stream`]), the reliability core ([`crate::conn`]) and the flow-control
 //! credit law ([`crate::flow`]) into *reliable, ordered, exactly-once* delivery of **many multiplexed
-//! streams** over a lossy, reordering datagram path. It owns no socket and no clock: [`poll_transmit`]
-//! yields the next packet's frames and its packet number, [`handle_incoming`] takes a received
-//! packet's number and frames, and the caller (the [`crate::endpoint::Endpoint`]) does the I/O —
+//! streams** over a lossy, reordering datagram path. It owns no socket and no clock: [`poll_transmit_into`]
+//! writes the next packet's frames into the caller's buffer and yields its packet number, [`handle_incoming`] takes a
+//! received packet's number and frames, and the caller (the [`crate::endpoint::Endpoint`]) does the I/O —
 //! protecting, sending, receiving and unprotecting. Keeping the protocol logic sans-io is what lets
 //! the oracle below drive loss and reorder *directly and deterministically*, with no OS network and no
 //! injected-fault plumbing (the pattern quinn-proto and rustls follow, and the shape `session.rs`,
 //! `stream.rs`, `conn.rs` and `flow.rs` are already written in).
 //!
-//! [`poll_transmit`]: Connection::poll_transmit
+//! [`poll_transmit_into`]: Connection::poll_transmit_into
 //! [`handle_incoming`]: Connection::handle_incoming
 //!
 //! Multiplexing: several streams share one connection (one handshake, one packet-number space, one

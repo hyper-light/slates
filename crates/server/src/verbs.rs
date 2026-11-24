@@ -1385,7 +1385,8 @@ const FORWARD_NOT_OWNER_HERE: &str = "fleet.forward.refused.not_owner_here";
 /// record of the volume (§4.8 "Lookup", the rule by authority): only the volume's owner may answer that it does not
 /// exist, so a node without the record answers only where it is that owner by the rule a local client's verb is routed
 /// by ([`owned_by_another_host`]): its creator, which no routing here sends elsewhere and which did not lose it to a
-/// successor. Dispatched there, a volume it never made or destroyed is `NotFound`. Anywhere else the verb is refused,
+/// successor; or, for a work no member owns after its owner's takeover, the owner of the green its catalog record names
+/// (A-255). Dispatched there, a volume it never made or destroyed is `NotFound`. Anywhere else the verb is refused,
 /// retryable and recorded nowhere, so the origin locates the owner again on the resend:
 /// - This node owns the volume by its own routing (a takeover's successor) but has not made it yet: `Overloaded`, the
 ///   answer a local client's verb gets here ([`owned_unmaterialized`]), counted [`FORWARD_BEFORE_MADE`]. Dispatched, the
@@ -1416,6 +1417,16 @@ fn refusal_of_unheld_forward(state: &mut ShardState, volume: VolumeId) -> Option
   if routed.is_none() && object.creator() == host && !lost_to_a_successor(state, id) {
     return None;
   }
+  // A work no member owns after its owner's takeover is answered for by its green's owner (A-255), which holds its
+  // submits' completions and refuses anything else typed without running it: where this node's copy of the work's
+  // catalog record names a green this node owns, the verb is dispatched, and a work gone with its owner is `NotFound`
+  // there. Until 2026-11-23 it was refused `NotOwnerHere` here from 6b2952f4d on, and a fresh submit of such a work
+  // was never answered (`a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version`).
+  let green_here = crate::owner_location::held_work_of(state, object)
+    .is_some_and(|green| state.fleet.object_owner(ObjectId(green)) == Some(host));
+  if routed.is_none() && green_here {
+    return None;
+  }
   state.count(FORWARD_NOT_OWNER_HERE, 1);
   Some(refused(Refusal::NotOwnerHere {
     owner: routed.map(|owner| owner.0),
@@ -1433,8 +1444,20 @@ async fn forwarded_write(
   (ack_up_to, ack_owed): (Option<u32>, Vec<u32>),
 ) -> ReplyBody {
   let forwarded = call_owner(control, shard, move |s| {
-    // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-    if let Some(refusal) = made_on.and_then(|volume| refusal_of_unheld_forward(s, volume)) {
+    // A request this partition knows (completed, acknowledged or awaiting its commit) is answered by what it recorded,
+    // whoever holds its volume now (§4.9): a work's resend after its owner's takeover meets the completion its green's
+    // successor holds (A-255). Only a request new here meets the guard: not made here yet, refused before any completion
+    // is recorded, so the resend under its id runs it once made. Until 2026-11-23 the guard came first, so from
+    // 6b2952f4d such a resend was refused `NotOwnerHere` for good (four takeover-resend fleet tests).
+    let new_here = matches!(
+      s.db
+        .partition()
+        .completion(origin_host, id.client, id.sequence),
+      Seen::New
+    );
+    if new_here
+      && let Some(refusal) = made_on.and_then(|volume| refusal_of_unheld_forward(s, volume))
+    {
       return (Some(refusal), None);
     }
     if let Some(up_to) = ack_up_to {
@@ -1452,7 +1475,8 @@ async fn forwarded_write(
 }
 
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
-/// are told, or, when the verb deferred its acceptance to a fleet commit, the completion that commit records.
+/// are told, or, when the verb deferred its reply (to a fleet commit, a work's gate, or its live volume's durability), the
+/// outcome [`await_deferred_completion`] answers.
 async fn answer_forwarded_write(
   forwarded: (Option<ReplyBody>, Option<crate::told::Owed>),
   (control, shard): (u16, u16),
@@ -1474,11 +1498,29 @@ async fn answer_forwarded_write(
       }
       reply
     }
-    // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
-    // completion record the commit writes, within the same liveness budget.
-    (None, _) => await_deferred_completion(control, shard, origin_host, id).await,
+    // The verb deferred its reply: this exchange waits where it is held, within the same liveness budget.
+    (None, _) => {
+      injected_forward_answer_delay().await;
+      await_deferred_completion(control, shard, origin_host, id).await
+    }
   }
 }
+
+/// Waits out a test's injected delay (`Daemon::inject_forward_answer_delay`) before a forwarded verb's exchange asks
+/// where its deferred reply stands; nothing in production. A sleep the runtime could not time is counted and the
+/// exchange asks at once.
+async fn injected_forward_answer_delay() {
+  let Some(delay_ns) = crate::state::with_state(|s| s.injected_forward_answer_delay_ns).flatten()
+  else {
+    return;
+  };
+  if slates_rt::futures::sleep(delay_ns).await.is_err() {
+    crate::state::with_state_counted(|s| s.count(FORWARD_ANSWER_DELAY_UNTIMED, 1));
+  }
+}
+
+/// Counter: a test's injected forward-answer delay the runtime could not time; the exchange asked at once.
+const FORWARD_ANSWER_DELAY_UNTIMED: &str = "fleet.forward.answer_delay_untimed";
 
 /// The region a forward of `volume` should be redirected to, when this node has learned a different owner or home.
 fn forward_redirect(volume: VolumeId) -> Option<u64> {
@@ -1565,47 +1607,84 @@ fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
   }
 }
 
-/// A cross-node forwarded verb whose acceptance was deferred to a fleet commit (AUD-11): answered when the commit
-/// records its reply. The exchange registers an awaited call on this (control) shard and attaches it to the deferred
-/// acceptance on the owner shard (`merge_service::await_forwarded`), whose resolve completes it with the reply it records
-/// (`merge_service::resolve_accepted`); a completion recorded already is the answer at once. Within the liveness budget
-/// in the owner's own time; past it, or when the acceptance no longer waits (a restart between), the request is refused
-/// **retryable** (`Overloaded` names the owner shard): the origin's retry meets the completion record once the version
-/// commits, never a success the quorum has not committed. Until 2026-11-20 the exchange slept a heartbeat between looks
-/// at the completion window, so a commit of about 30 ms was answered at about 100 (A-697's release bench: a holder's 4
-/// MiB submit's forward 130 ms against 33 ms of work at the owner).
+/// A cross-node forwarded verb that ran on its owner and deferred its reply, answered where the reply is held: its
+/// completion if recorded already; a deferred acceptance's commit (AUD-11), answered by `merge_service::resolve_accepted`;
+/// a work's gate (A-794); or the durability of its live volume's log or its tombstone's placement (A-200), answered by
+/// `live_ship::answer`. The exchange registers an awaited call on this (control) shard and attaches it on the owner
+/// shard ([`attach_deferred_forward`]). It waits within the liveness budget, in the owner's own time.
+///
+/// Past that budget, or where nothing holds the reply and no completion is recorded (a restart between), or where the
+/// owner's shard cannot be asked, the verb ran but its outcome is not known here: the answer is the in-doubt refusal
+/// [`deferred_in_doubt`], recorded nowhere, so the origin's resend under the id meets the outcome once decided.
+///
+/// History:
+/// - Until 2026-11-20 the exchange slept a heartbeat between looks at the completion window, so a commit of about 30 ms
+///   was answered at about 100 (A-697's release bench).
+/// - From then until 2026-11-23 it waited only for a deferred acceptance, so a write held for its live volume's
+///   durability was answered `Overloaded` at once, every time. That says the verb was not applied, so a client resending
+///   under a fresh id applied it again: a superseded owner's clients met it on every write (the fleet's A-338 and A-349
+///   tests).
 async fn await_deferred_completion(
   control: u16,
   shard: u16,
   origin_host: u64,
   id: RequestId,
 ) -> ReplyBody {
+  let began = slates_rt::futures::now_ns();
+  let in_doubt = || deferred_in_doubt(slates_rt::futures::now_ns().saturating_sub(began));
   let (call, waiter) = crate::xshard::awaited::<ReplyBody>(shard);
   let attached = call_owner(control, shard, move |s| {
-    match crate::merge_service::await_forwarded(s, (origin_host, id), (control, waiter)) {
-      // A verb parked at its work's gate (A-794) answers this exchange when its queue resumes it.
-      crate::merge_service::ForwardedAcceptance::Gone
-        if crate::work_home::attach_forwarded(s, (origin_host, id), (control, waiter)) =>
-      {
-        crate::merge_service::ForwardedAcceptance::Waiting
-      }
-      other => other,
-    }
+    attach_deferred_forward(s, (origin_host, id), (control, waiter))
   })
   .await;
   match attached {
     Ok(crate::merge_service::ForwardedAcceptance::Completed(bytes)) => {
+      crate::state::with_state_counted(|s| s.count(FORWARD_DEFERRED_COMPLETED, 1));
       ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest))
     }
-    Ok(crate::merge_service::ForwardedAcceptance::Gone) => refused(Refusal::Overloaded { shard }),
     Ok(crate::merge_service::ForwardedAcceptance::Waiting) => {
       crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
         .await
-        .unwrap_or_else(|| refused(Refusal::Overloaded { shard }))
+        .unwrap_or_else(in_doubt)
     }
-    Err(refusal) => *refusal,
+    Ok(crate::merge_service::ForwardedAcceptance::Gone) | Err(_) => in_doubt(),
   }
 }
+
+/// Attaches the exchange `waiter` (the control shard and its awaited call) of a forwarded request `(origin, id)` that ran
+/// on this owner shard and deferred its reply, wherever that reply is held: the completion if recorded, which is the
+/// answer at once, else a deferred acceptance (`merge_service::await_forwarded`), a verb parked at its work's gate
+/// (`work_home::attach_forwarded`, A-794), or a reply held for its live volume's durability or its tombstone's placement
+/// (`live_ship::await_forwarded`, A-200). `Gone` where none holds it.
+pub(crate) fn attach_deferred_forward(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> crate::merge_service::ForwardedAcceptance {
+  use crate::merge_service::ForwardedAcceptance;
+  match crate::merge_service::await_forwarded(state, (origin, id), waiter) {
+    ForwardedAcceptance::Gone
+      if crate::work_home::attach_forwarded(state, (origin, id), waiter)
+        || crate::live_ship::await_forwarded(state, (origin, id), waiter) =>
+    {
+      ForwardedAcceptance::Waiting
+    }
+    other => other,
+  }
+}
+
+/// The answer to a forwarded request that ran on its owner and deferred its reply, where its outcome is not known: the
+/// in-doubt refusal `DurabilityPending`, recorded nowhere (A-354, as a held write told at the failover SLO is answered),
+/// `held_ns` its exchange's wait. Its client resends under the same id, which joins the request's wait or meets its
+/// recorded outcome, and never runs it again. Never `Overloaded`: that says the verb was not applied, and a client that
+/// resends under a fresh id after it applies a committed write twice.
+pub(crate) fn deferred_in_doubt(held_ns: u64) -> ReplyBody {
+  refused(Refusal::DurabilityPending { held_ns })
+}
+
+/// Counter: a forwarded request's deferred reply found recorded when its exchange asked where it stands
+/// ([`await_deferred_completion`]): the outcome answered, never refused.
+const FORWARD_DEFERRED_COMPLETED: &str = "fleet.forward.deferred_completed";
 
 /// Prunes a forwarded client's completions on this (owner) node up to the acknowledgement watermark the
 /// origin relayed, except the ids it still owes, the same way a local client's are pruned by its acknowledgements — so
@@ -7093,9 +7172,10 @@ fn attest_on_channel(
 /// docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md). Nor is a volume another host owns as far
 /// as this node can tell ([`crate::remote_attach::elsewhere`]), or one this node lost to a successor: only the owner may
 /// say a volume does not exist (§4.8 "Lookup", the rule by authority), so a verb that is not forwarded (a landing's
-/// `Present` or `Land`) meets `NotOwnerHere`, naming the owner this node's routing names. Until 2026-11-23 it met
+/// `Present` or `Land`, a write policy's read or setting, `landing::policy_record`) meets `NotOwnerHere`, naming the
+/// owner this node's routing names: one rule, here, for every verb that finds no slot. Until 2026-11-23 they met
 /// `NotFound`.
-fn absent(state: &ShardState, volume: VolumeId) -> Refusal {
+pub(crate) fn absent(state: &ShardState, volume: VolumeId) -> Refusal {
   let object = ObjectId(volume.bytes);
   if state.holder_records.contains_key(&object) {
     let shard = state
@@ -8010,7 +8090,7 @@ pub(crate) fn reconcile_candidate_claims(
 }
 
 /// The bytes this shard's candidate claim on `id` holds for its content ([`CandidateClaim`]), none without one: what a
-/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_taken_over`]).
+/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_admitted`]).
 pub(crate) fn claimed_bytes(state: &ShardState, id: DbVolumeId) -> u64 {
   state
     .candidate_claims
@@ -17286,8 +17366,8 @@ pub(crate) fn discard_making(state: &mut ShardState, id: DbVolumeId) {
 /// Finishes making taken-over volume `id` once its tree is laid ([`populate_making`]): a dynamic volume's hold for the
 /// inodes it was restored with (A-342), its record created under the adopted catalog and published, and the tree sealed
 /// as the taken-over head: the snapshot at the adopted sequence, carrying the manifest identity the head names and the
-/// placement the head recorded (`region`), so the successor answers for it as the dead owner did
-/// ([`materialize_taken_over`]'s doc). A volume not being made here is `NotFound`.
+/// placement the head recorded (`region`), so the successor answers for it as the dead owner did (the doc of
+/// `materialize_taken_over`, the tests' making in one call). A volume not being made here is `NotFound`.
 pub(crate) fn finish_making(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -20262,8 +20342,9 @@ fn replay_green(
   replay_green_keeping(state, id, Vec::new())
 }
 
-/// [`replay_green`], its named texts read from the content plane, then from `kept` (sorted by identity, each an
-/// object's whole bytes: [`remake_green`]'s).
+/// Green `id` replayed from its durable chain into a fresh engine, as a recovery replays it (the tests' `replay_green`
+/// keeps nothing), its named texts read from the content plane, then from `kept` (sorted by identity, each an object's
+/// whole bytes: [`remake_green`]'s).
 fn replay_green_keeping(
   state: &ShardState,
   id: DbVolumeId,

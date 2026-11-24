@@ -5452,6 +5452,12 @@ drops.
 > (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
 > 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
 > against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
+> **Linux too (2026-11-23).** The daemon's confirmation was not enough there: `futex_wake` counts a waiter that queued
+> itself and was set running again before it blocked, so the same test on adacachy2 found 5,341 of 16,384 racing parks
+> that never switched out, and 4 of them taught 560 to 9,286 ns. A Linux park now teaches only if the client's own
+> voluntary switch count rose across it and the daemon confirmed. The client already read the count around every
+> wait, so no call is added. macOS, which gives no per-thread count, keeps the confirmation alone. Record:
+> `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -58679,7 +58685,10 @@ GAPS.
 
 Status: built 2026-11-20, macOS; Windows written the same day (main's ruling of 18:40), its build and tests owed to
 w-lint on jupiter (run-requests). Linux keeps one memfd with holes punched (g226: the anchor's punch frees the pages
-with a peer still mapping them; BENCHMARKS "Content give-back per platform").
+with a peer still mapping them; BENCHMARKS "Content give-back per platform"). A release punches its extent's hole
+through the extent's own mapping before the unmap since 2026-11-23 (`ContentPool::punch`, `MADV_REMOVE`). Before, it
+only unmapped, a memfd's pages outlive every mapping, and a 64 MiB burst's destroyed volume left the object at 69 MiB
+on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`.
 - Windows: each extent is a reserved, unnamed section of its own (`slates_mem::make_extent_section`), since only
   closing a section returns its commit (g226: decommitting a view is refused, error 87). The anchor holds a duplicate
   of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of
@@ -61626,6 +61635,16 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   encoder's (w-git's catch: a let-go task that ended while packs were queued stranded them). Ported: piece 1's delta test runs the
   encoder's turns before each publication; `homes::tests::a_committed_publication_publishes_the_tickets_of_windows_kept_before_it`
   shows a publication of an older cut leaving the ticket unpublished.
+- **A refused catch-up publication is never dropped (2026-11-23; main 01a20182's ruling, banned item 9).** The
+  catch-up's publication (`content_holder::image_catch_up`) dropped `publish_shard`'s error, so a refused one left the
+  publication owed with no task to make it, and a homing waiting on its ticket (`homes::published_within`, bounded by
+  the home shard's own CPU time) waited on an idle shard without end: the HTTP push stall's strongest candidate. Now a
+  refused catch-up publication is counted (`vcs_store.image.catch_up_publish_refused`) and stays owed; an owed
+  publication no catch-up makes (refused, or its task unspawned, `catch_up_refused`) arms the shard's sweep
+  (`idle_sweep::after_borrow`), whose pass begins it again first (`content_holder::image_retry_owed`, counted
+  `catch_up_retried`) and does not settle the shard while it is owed. Test
+  `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first, the
+  retry cut out: the wait unanswered after six sweep intervals; green: answered, the refusal and the retry counted).
 - **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
   bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
   pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
@@ -61880,6 +61899,10 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   groups the pieces by block and claims each block once, refusing as `Malformed` a group whose pieces disagree on the
   chunk or whose slots overlap. Version 1 is refused typed (`PieceRefused::OldVersion(1)`) and counted unrestored. Its
   window is put again by the record replay that holds its bytes.
+  **Corrected 2026-11-23.** A chunk of its own whose block the seal trimmed (A-118) names a head shorter than its bytes,
+  and version 2's reader first refused it, so every window of a granule or more was lost at a restart. Windows' 4 KiB
+  granule showed it, and a 16 KiB granule hid it (`docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-
+  chunk-the-seal-trimmed.md`). Only a window's slot is held to its chunk's bytes, and only a shared slab asks again.
 - **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
 - **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
   - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
@@ -61891,6 +61914,87 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   below arena-16's. When the shard's cipher comes to repository windows (A-99), a slab can no longer be filled in
   place: its chunk carries no seal today (`ChunkStore::seal` with no key), and its later slots are written into the
   sealed chunk's unused bytes. So that work seals a slab when it closes, or each slot alone (w-shared's review).
+
+### A-878 — A Linux daemon's children inherit nothing of the daemon's; a hand-off names the object's own descriptor (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the descriptor sweep; A-858, §2.6, §4.7, §4.13)
+
+- **Why.** A-858 holds that every child the daemon spawns is handed only its three streams. That held on macOS, whose
+  spawn closes what it does not name. On Linux the spawn hands a child every descriptor not marked close-on-exec, and
+  the daemon held many:
+  - the anchor's segment and content object, inherited at the daemon's start, and duplicates of both, one per shard and
+    one for the control loop: a Linux hand-off was a duplicate made inheritable, which nothing owned;
+  - the anchor's listeners and its hold table, inherited at the start;
+  - a plain `dup` of each client's completion eventfd.
+  A start-commit hook listed 17 such descriptors. The segment holds the issuer secret, the authority under which the
+  issuer's verbs prove a human's grant. The content object holds every volume's bytes.
+  The same duplicates grew the anchor by two descriptors per daemon start (8 of each object after 7 starts), and a
+  claim refused for want of a descriptor leaked its region's duplicate.
+- **The rule.**
+  - A descriptor is close-on-exec everywhere except in the one exec that needs it.
+  - A hand-off names the object's own descriptor. An open duplicates it and owns the duplicate. A spawn that hands it to
+    a child clears close-on-exec in that child alone: the anchor's `hand_on_in_child`, between the fork and the exec.
+  - The daemon's first step at its start makes every descriptor it inherited close-on-exec
+    (`confined_spawn::close_inherited_on_exec`); a daemon that cannot does not start.
+  - Its own copies are made with `fcntl_dupfd_cloexec`, never a plain `dup`.
+  - The anchor records a start before the spawn and its pid after. Recorded after, the record could wipe a quick
+    daemon's first beat and serving mark, and show it the last start's restart count.
+- **Tests** (adacachy2; red on main, green with the change):
+  - `a_hook_holds_no_descriptor_of_its_daemon` (`crates/cli/tests/svn_interop.rs`, a real anchor, daemon and hook):
+    17 descriptors past the streams, then none.
+  - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once` (`crates/anchor/tests/anchor.rs`): `[8, 8]`
+    and children holding 2, 4, … 12; then `[1, 1]` and 2 each.
+  - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region` (`crates/ipc/tests/rendezvous.rs`, the descriptor
+    limit capped as the claim is prepared): `remaining=1`, then 0.
+  - The anchor's test file: 5 of 6 runs on main, 2 of 6 with the forked spawn alone, 6 of 6 with the record's order.
+- **Applied in the same change to:**
+  - `crates/mem/src/shared.rs`: `handoff`, `Handoff`'s doc.
+  - `crates/anchor`: `segment.rs` (`handed_descriptors`, `record_pid`, `record_start`'s doc) and `supervise.rs`
+    (`hand_on_in_child`, the start's order).
+  - `crates/api/src/role/daemon.rs`: the start's first step.
+  - `crates/ipc`: `confined_spawn.rs` (`close_inherited_on_exec`, the module doc), `rendezvous.rs` (the claim's
+    borrowed send, the kick, `completion_dup`), `completion.rs` and `endpoint.rs` (the client's copies).
+  - The three tests above.
+  - `unsafe-budget.toml`: anchor +1, ipc ±0.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+
+### AUD-11 amended again — A forwarded verb that ran and deferred its reply is answered where the reply is held, or in doubt; never `Overloaded` (2026-11-23, w-chaos for main 01a20182, its rulings of 2026-11-23 on the forward's answer; A-200, A-255, A-354, A-794, §4.8 "Lookup", §4.9)
+
+- **Why.** AUD-11's first amendment (2026-11-20) attached a forward's exchange only to a deferred acceptance. A write or
+  destroy the live log held for durability or its tombstone's placement (A-200, AUD-29-43) met `Gone` and was answered
+  `Overloaded` at once, every time, though it ran and became durable. A superseded owner's clients met that on every
+  write (the fleet's A-338 and A-349 tests). `Overloaded` says a verb was not applied, so a client resending under a
+  fresh id applies a committed write twice.
+- **The rule.** A forwarded verb that ran on its owner and deferred its reply is answered as follows:
+  - the reply recorded already;
+  - else by whatever holds the reply: a deferred acceptance's commit, a work's gate (A-794), or the live hold
+    (`live_ship::await_forwarded`, answered at the hold's every ending: its own reply, `DurabilityPending` at the
+    failover SLO, or the fence's, the yield's or the destroy's refusal);
+  - else, and past the exchange's liveness budget, and where the owner's shard cannot be asked, the in-doubt
+    `DurabilityPending`, recorded nowhere, so a resend under the id meets the outcome. `Overloaded` is answered only
+    where a request provably was never admitted.
+- **The guard's order.** The unheld-forward guard (6b2952f4d, 0a4dcc51b) applies only to a request new on the
+  partition: one the partition knows is answered by what it recorded, whoever holds its volume now. For a work no
+  member owns, the owner of the green its catalog record names answers for it (A-255). Both were missed when the guard
+  landed. A takeover's resend met `NotOwnerHere` for good in four fleet tests.
+- **Tests** (adacachy2; red on main, green with the change):
+  - the two superseded-owner tests;
+  - `a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability` (11,007 `Overloaded` before);
+  - `a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome` (`Daemon::inject_forward_answer_delay`,
+    its count `fleet.forward.deferred_completed`);
+  - the four takeover-resend tests.
+  Two forwarded-submit tests now expect `DurabilityPending` (or their origin's `OwnerUnreachable`) where they expected
+  `Overloaded`.
+- **Applied in the same change to:**
+  - `crates/server/src/verbs.rs`: `await_deferred_completion`, `attach_deferred_forward`, `deferred_in_doubt`, the
+    guard's order and A-255's authority in `forwarded_write` and `refusal_of_unheld_forward`, the test delay.
+  - `crates/server/src/live_ship.rs`: `Awaiting::forwarded`, `await_forwarded`, the answers in `answer` and
+    `tell_given_up`.
+  - `crates/server/src/work_home.rs`: `answer_forwarded`.
+  - `crates/server/src/state.rs` and `daemon.rs`: the test delay.
+  - `crates/server/tests/fleet.rs`.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md and
+    docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md.
 
 ### A-879 — A CLI write holds its attachment while it reads and stages its input, and a renewal answers an attachment with no term `NoTerm` (2026-11-23, w-win2 for main 01a20182, its rulings of 2026-11-23; opened in GAPS as A-878 and renumbered; A-230, A-384)
 

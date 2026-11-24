@@ -20,7 +20,7 @@
 /// Format: the one name outside `refs/` the protocol carries [gitprotocol-common: `refname = "HEAD"`].
 const HEAD: &[u8] = b"HEAD";
 
-/// Format: what every other whole name begins with [gitprotocol-common: `refname /= "refs/" <see discussion below>`].
+/// Format: what every other whole name begins with \[gitprotocol-common: `refname /= "refs/" <see discussion below>`\].
 const REFS: &[u8] = b"refs/";
 
 /// Format: the byte between a name's components (`refname_disposition` 1, with the NUL that ends a C string).

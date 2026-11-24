@@ -1,5 +1,5 @@
-//! The locks API (A-610; git-lfs v3.8.1 `docs/api/locking.md` and `locking/schemas/` [B]; the client's
-//! `locking/api.go` [C]).
+//! The locks API (A-610; git-lfs v3.8.1 `docs/api/locking.md` and `locking/schemas/` \[B\]; the client's
+//! `locking/api.go` \[C\]).
 //!
 //! **Requests.** Creating a lock ([`read_create`], `POST /locks`) names its `path` and optionally a `ref`. Listing them
 //! (`GET /locks`) sends `path`, `id`, `cursor`, `limit` and `refspec` as a query ([`read_list_query`]), which the

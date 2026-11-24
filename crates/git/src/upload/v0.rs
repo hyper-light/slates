@@ -4,8 +4,8 @@
 //!
 //! **Sources** (read 2026-11-19, git v2.50.1): `upload-pack.c` (`send_ref`, `format_symref_info`, `upload_pack`,
 //! `receive_needs`, `get_common_commits`, `got_oid`, `do_got_oid`, `ok_to_give_up`, `create_pack_file`,
-//! `send_client_data`), `sideband.c` (`send_sideband`) and `pkt-line.h` (`DEFAULT_PACKET_MAX`) [C];
-//! `gitprotocol-pack` and `gitprotocol-capabilities` [B].
+//! `send_client_data`), `sideband.c` (`send_sideband`) and `pkt-line.h` (`DEFAULT_PACKET_MAX`) \[C\];
+//! `gitprotocol-pack` and `gitprotocol-capabilities` \[B\].
 //!
 //! **The advertisement.** `version 1` first under v1. `HEAD` first where its branch has a commit, then each ref in name
 //! order, an annotated tag's peeled line after it; a repository with no ref sends `capabilities^{}` in their place. The
@@ -804,7 +804,7 @@ fn at_flush(
 }
 
 /// A v0 or v1 request answered in turns (A-745 item 3; §4.17.1 "A fetch's answer" rule 3): what the request bounds is
-/// read and checked now, as [`answer`] reads it; then the answer's steps ([`Answer::write_within`]) make its
+/// read and checked now, as [`answer`](fn@answer) reads it; then the answer's steps ([`Answer::write_within`]) make its
 /// acknowledgments a have a unit, each `ready` the server asks stepped a parent a unit ([`negotiation::Ready`]), and its
 /// negotiation (`done` taken, as a stateless v0 request's is) its cut and its choice a unit at a time; the head (the
 /// shallow-update, then the acknowledgments) is written once both are known, and the pack begun from the choice.
@@ -932,7 +932,7 @@ enum Then {
 
 /// What an opening's head made of the answer.
 pub(super) enum Opened<K> {
-  /// The whole answer, no pack due: the head alone, no negotiation's counters, as [`answer`] answers it.
+  /// The whole answer, no pack due: the head alone, no negotiation's counters, as [`answer`](fn@answer) answers it.
   NoPack(Answer<K>),
   /// The whole answer: `pack-objects` died as it began.
   Whole(Answer<K>),

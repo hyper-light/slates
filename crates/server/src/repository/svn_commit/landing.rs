@@ -4,8 +4,8 @@
 //!
 //! **The order.** Every record a Subversion repository takes (a revision, a lock verb's entries, a revision's
 //! properties, the UUID, a deltified text) is checked, then landed whole on the store as one changeset, durable, then
-//! committed in the register by an entry naming its sequence ([`reference`]), with the green's version where it moves
-//! one; the client is answered after both. The register never holds the record's bytes.
+//! committed in the register by an entry naming its sequence ([`reference`](fn@reference)), with the green's version
+//! where it moves one; the client is answered after both. The register never holds the record's bytes.
 //!
 //! **The sequence** is the repository's changeset count: its creation is 0, and each record the register names is the
 //! next. It is read from the register when the changeset is landed ([`next_sequence`]), never kept beside it, so a

@@ -433,7 +433,7 @@ pub struct TextCache {
   pub edits: u64,
   /// Places read from the log or the staging.
   pub places: u64,
-  /// The changesets those places lie in, each counted at each read ([`TextCache::changesets_read`]).
+  /// The changesets those places lie in, each recorded as a chain's place is read from it ([`Store::make_chain`]).
   pub changesets: std::collections::BTreeSet<u64>,
 }
 

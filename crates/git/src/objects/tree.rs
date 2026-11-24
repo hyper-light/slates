@@ -44,7 +44,7 @@ const ENTRY_LEAST: usize = 3;
 const LAST_OCTAL_DIGIT: u8 = b'7';
 /// Format: the bits one octal digit carries (`parse_mode`: `mode << 3`).
 const OCTAL_DIGIT_BITS: u32 = 3;
-/// Format: the byte between a path's components (`find_tree_entry`: "name[entrylen] != '/'").
+/// Format: the byte between a path's components (`find_tree_entry`: "name\[entrylen\] != '/'").
 const PATH_SEPARATOR: &[u8] = b"/";
 
 /// A mode git writes: one of the five `fsck_tree` takes as standard. Each is written as git writes it (`%o`: no

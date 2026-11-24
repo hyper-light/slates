@@ -76,7 +76,8 @@ macOS and Windows were not affected. A macOS region arrives as a Mach fileport, 
 Each construction of `Handoff::Descriptor`, each `into_raw_fd` or `as_raw_fd` handed to a callee that duplicates, and
 each route that carries descriptors or handles across processes:
 
-- Leaking, not fixed here (reported):
+- Leaking, found here, fixed since (A-878, docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md,
+  which also found what every child of a Linux daemon inherited):
   - `crates/anchor/src/segment.rs` `handoff_env`. It calls `SharedObject::handoff` for the segment and the content
     object. That makes a duplicate without close-on-exec and returns only its number, and the caller formats the
     number into a child's environment and never closes it.

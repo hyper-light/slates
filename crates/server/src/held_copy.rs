@@ -11,14 +11,15 @@
 //!   given, and released when the copy is let go ([`release`]). A refused hold is counted and the map works on, ending
 //!   with its daemon as before A-197.
 //! - **The successor takes each back while recovery rebuilds the shard** ([`adopt_or_release`], in one ascending slot
-//!   order with the Shards streams' held DAX objects, `crate::shards::adopt_inherited`, A-365): its writer attachment
-//!   is kept ([`keeps`]), as a FUSE mount whose device the anchor held is (A-61); the copy is adopted at the exact slot
-//!   and generation its backing had, so the map id its client holds names it again; and its map is held under its client
-//!   once more. It is kept dormant through the write log's replay (A-63) and woken after it ([`wake_adopted`], A-389):
-//!   the copy already holds every write the dead daemon made to its file, in order with its client's stores, and a
-//!   replay written into it wrote a logged write over a store its client had made after that write, in the client's own
-//!   map, so the client's next sync found nothing to write and the store was lost. From the wake on, every change
-//!   reaches it; the replayed bytes it differs from are its client's later stores, which its next sync writes back.
+//!   order with the Shards streams' held DAX objects,
+//!   [`adopt_inherited`](crate::shards::dax_hold::adopt_inherited), A-365): its writer attachment is kept ([`keeps`]),
+//!   as a FUSE mount whose device the anchor held is (A-61); the copy is adopted at the exact slot and generation its
+//!   backing had, so the map id its client holds names it again; and its map is held under its client once more. It is
+//!   kept dormant through the write log's replay (A-63) and woken after it ([`wake_adopted`], A-389): the copy already
+//!   holds every write the dead daemon made to its file, in order with its client's stores, and a replay written into it
+//!   wrote a logged write over a store its client had made after that write, in the client's own map, so the client's
+//!   next sync found nothing to write and the store was lost. From the wake on, every change reaches it; the replayed
+//!   bytes it differs from are its client's later stores, which its next sync writes back.
 //! - **Its holder claims it** by naming it in a sync or a release ([`claimed`]): a client reconnects under its own id
 //!   (`slates_client::Client::reconnect`), and `slates pmem` syncs as soon as it sees its daemon go. A map no holder
 //!   claims within the failover delay the shard holds, counted from the shard's start (`crate::direct_map::claim_overdue`:
@@ -155,7 +156,7 @@ pub(crate) fn taken_back_ns(state: &mut ShardState) -> u64 {
 /// replay: adopted at the slot and generation its backing had, whole and dormant until [`wake_adopted`], its map held
 /// under its client with its writer, its claim owed from `taken_back` ([`taken_back_ns`]); or let go, counted. The
 /// caller runs every held copy of either kind in ascending slot order, as the backings' registry takes them
-/// (`crate::shards::adopt_inherited`). Whether it was taken back.
+/// ([`adopt_inherited`](crate::shards::dax_hold::adopt_inherited)). Whether it was taken back.
 pub(crate) fn adopt_or_release(
   state: &mut ShardState,
   copy: InheritedCopy,
@@ -172,7 +173,7 @@ pub(crate) fn adopt_or_release(
   taken
 }
 
-/// Takes back one copy ([`adopt_inherited`]): whether it was.
+/// Takes back one copy ([`adopt_inherited`](crate::shards::dax_hold::adopt_inherited)): whether it was.
 fn adopt_one(state: &mut ShardState, copy: InheritedCopy, taken_back: u64) -> bool {
   let InheritedCopy {
     copy,

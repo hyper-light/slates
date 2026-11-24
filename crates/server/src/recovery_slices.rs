@@ -17,10 +17,12 @@
 //!
 //! A start's own setup between the catalog's replay and the rebuild is named pieces, each a unit
 //! ([`RecoverySlices::piece_done`]): the pool's segment and content regions, the store, the council and fleet, the
-//! content object, the shard's state, the kept mounts, retention and the node's sealing recipient. The report keeps the
-//! most pieces of at least a slice's floor that one slice held (1, every such piece a slice of its own) and the
-//! heaviest piece by name, so a piece no slicing divides (a map of a 100 GB object) shows by name rather than hiding in
-//! a slice. Until 2026-11-22 they ran as one unit, 12 to 21 ms of CPU in one slice on CI's macOS runner (84a).
+//! content object, the shard's state, the kept mounts, retention and the node's sealing recipient. A piece of at least a
+//! slice's floor ends its slice whatever the yields have cost, so each is a slice of its own. The report keeps the
+//! most such pieces that one slice held (1) and the heaviest piece by name, so a piece no slicing divides (a map of a
+//! 100 GB object) shows by name rather than hiding in a slice. Until 2026-11-22 they ran as one unit, 12 to 21 ms of
+//! CPU in one slice on CI's macOS runner (84a). Until 2026-11-23 a piece ended its slice only as a unit does, once its
+//! yields were paid for, and on Linux all eight ran in one slice again.
 //!
 //! Before 2026-11-07 the whole start was one poll. Measured on this Mac (`crates/server/tests/recovery_slicing.rs`, the
 //! recovery test): 1,024 merge units recovered in 5.52 s of CPU in one poll, and the beat went 9.3 s without
@@ -163,18 +165,27 @@ impl RecoverySlices {
 
   /// A named piece of a start done, `name` saying what it was: timed from the last piece's end (or the last slice's
   /// start), counted against the slice it ran in when it took at least a slice's floor, and the heaviest kept by name.
-  /// Then the piece is a unit ([`Self::unit_done`]), so a slice the piece spent ends with it.
+  /// Then the piece is a unit. A piece of at least the floor ends its slice whatever the yields have cost so far, so each
+  /// is a slice of its own (84a); a lighter one ends it as any unit does ([`Self::unit_done`]). Until 2026-11-23 every
+  /// piece ended its slice as a unit does, only once the slice's yields were paid for: where a yield cost more than a
+  /// twentieth of the pieces after it, they ran as one slice (eight of a start's eight on adacachy2, plain Linux; seven
+  /// under CI's TSan). The pieces are the start's own fixed eight, so this adds at most eight yields a start.
   pub(crate) async fn piece_done(&mut self, name: &'static str) {
-    self.note_piece(name);
-    self.unit_done().await;
+    let heavy = self.note_piece(name);
+    self.units = self.units.saturating_add(1);
+    let now = slates_rt::futures::now_ns();
+    if heavy || self.spent(now) {
+      self.yield_slice(now).await;
+    }
   }
 
-  /// Counts the piece `name` just done (see [`Self::piece_done`]).
-  fn note_piece(&mut self, name: &'static str) {
+  /// Counts the piece `name` just done (see [`Self::piece_done`]): whether it took at least a slice's floor.
+  fn note_piece(&mut self, name: &'static str) -> bool {
     let now = slates_rt::futures::now_ns();
     let took = now.saturating_sub(self.piece_began_ns.max(self.began_ns));
     self.piece_began_ns = now;
-    if took >= self.budget_ns {
+    let heavy = took >= self.budget_ns;
+    if heavy {
       self.heavy_pieces_in_slice = self.heavy_pieces_in_slice.saturating_add(1);
       self.heavy_pieces_in_one_slice = self
         .heavy_pieces_in_one_slice
@@ -186,6 +197,7 @@ impl RecoverySlices {
     {
       self.heaviest_piece = Some((name, took));
     }
+    heavy
   }
 
   /// The least a slice is given: what a unit that runs several steps of its own holds itself to (A-732 part 5).
@@ -198,14 +210,24 @@ impl RecoverySlices {
   pub(crate) async fn unit_done(&mut self) {
     self.units = self.units.saturating_add(1);
     let now = slates_rt::futures::now_ns();
-    if !slice_is_spent(
+    if self.spent(now) {
+      self.yield_slice(now).await;
+    }
+  }
+
+  /// Whether the slice is spent at `now` ([`slice_is_spent`]).
+  fn spent(&self, now: u64) -> bool {
+    slice_is_spent(
       now.saturating_sub(self.began_ns),
       self.budget_ns,
       self.yielding_ns,
       now.saturating_sub(self.recovery_began_ns),
-    ) {
-      return;
-    }
+    )
+  }
+
+  /// Ends the slice at `now` and yields, so the shard completes a step before the next unit begins; the yield's time is
+  /// counted as the recovery's yielding.
+  async fn yield_slice(&mut self, now: u64) {
     self.end_slice(now);
     slates_rt::futures::yield_now().await;
     let resumed = slates_rt::futures::now_ns();
@@ -262,7 +284,7 @@ fn thread_cpu_ns() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-  use super::{RecoverySlices, SLICE_CEILING_NS, slice_is_spent};
+  use super::{RecoverySlices, SLICE_CEILING_NS, SliceReport, slice_is_spent};
 
   /// What slicing may add to a recovery's time, in percent: the recovery-slicing plan's limit on its CPU cost.
   const ALLOWED_RISE_PERCENT: u64 = 10;
@@ -331,6 +353,53 @@ mod tests {
     assert!(
       yielding_ns.saturating_mul(100) <= elapsed_ns.saturating_mul(ALLOWED_RISE_PERCENT),
       "{slices} slices of a cheapest yield of {least_yield_ns} ns are {yielding_ns} ns of a recovery of {elapsed_ns} ns"
+    );
+  }
+
+  /// Shape: the floor of the slicing in the test below: a microsecond, the least a step quantum's half comes to on a
+  /// debug daemon, so a yield costs more than a twentieth of a piece twice as long.
+  const PIECE_FLOOR_NS: u64 = 1_000;
+  /// Shape: the pieces it names done: as many as a shard's start names (the eight `piece_done`s of `daemon.rs`).
+  const PIECES: u32 = 8;
+
+  /// 84a (boot): a heavy piece is a slice of its own whatever the yields have cost. Do: on an audit shard, begin a
+  /// slicing whose floor is [`PIECE_FLOOR_NS`] and name done [`PIECES`] pieces that each spin twice that floor. Expect
+  /// every piece counted heavy (the heaviest named, the non-vacuity check) and no slice to have held more than one of
+  /// them. Red before: a piece ended its slice only once the slice's yields were paid for (yielding at most 5% of the
+  /// time), so after the first yield every piece ran in one slice, as the start's eight did on adacachy2 (plain Linux,
+  /// 2026-11-23: "a slice held 8 heavy pieces of the start").
+  #[test]
+  // The test thread waits off the shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_heavy_piece_ends_its_slice_whatever_the_yields_have_cost() {
+    let daemon = crate::daemon::audit_daemon();
+    let (report, report_seen) = std::sync::mpsc::sync_channel::<SliceReport>(1);
+    crate::daemon::observe_first(&daemon, move |_state| {
+      let start = slates_rt::futures::spawn(async move {
+        let mut slices = RecoverySlices::begin(PIECE_FLOOR_NS);
+        for _ in 0..PIECES {
+          let began = slates_rt::futures::now_ns();
+          while slates_rt::futures::now_ns().saturating_sub(began) < 2 * PIECE_FLOOR_NS {
+            std::hint::spin_loop();
+          }
+          slices.piece_done("a piece").await;
+        }
+        let _ = report.try_send(slices.finish());
+      })
+      .unwrap();
+      slates_rt::futures::detach(start).unwrap();
+    });
+    let sliced = report_seen.recv_timeout(REPORT_WAIT).unwrap();
+    daemon.stop();
+    assert!(
+      sliced
+        .heaviest_piece
+        .is_some_and(|(_, took)| took >= PIECE_FLOOR_NS),
+      "the pieces were counted heavy: {sliced:?}"
+    );
+    assert_eq!(
+      sliced.heavy_pieces_in_one_slice, 1,
+      "each heavy piece a slice of its own: {sliced:?}"
     );
   }
 }
