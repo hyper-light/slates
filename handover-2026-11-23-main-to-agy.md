@@ -20,7 +20,21 @@ for tonight).
 ## Fleet agents (kiln agents on this Mac; message them by uds socket ~/.kiln-run/cc-socks/<pid>.sock)
 
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
-Pids at 22:40: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 98664, w-interop 9734.
+Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
+
+Updates at 23:35 (newest first; they supersede the table where they differ):
+- w-git: the push-0 disconnect did not reproduce locally (4 debug runs passed). Its logging commit (why the edge ends a response
+  early) is landing. OWED by the coordinator: gate 3 at that commit on ubuntu, v3_takeover 3x release then 4x debug back to back,
+  every daemon and anchor log kept as an artifact (worktree ~/slates-work/main-v3diag, workflow diag-main-v3.yml). Also asked
+  to explain r678: A-886 made whole-repository clones slower (mirror 72.0/73.1 s -> 98.2/102.8 s).
+- w-hg: r670 GREEN (most own runs 5 against the bound 6; intake 71.25 s, was 105.64 s). On C1(1) P2.
+- w-perf: r691 sent (below). Next after A-887: read each shard thread's QoS class (bench main thread runs at QoS utility under
+  kiln's launchd job), then A/B shards declaring user-initiated and user-interactive against main; the lower class wins unless
+  the numbers separate. A-887 part 1: a work's first read of its named runs comes back Unstored; probing.
+- w-svn: interop round 2's svn leg measured nothing: every slates import refused BudgetExceeded { available: 373475417 }.
+  Round 3 runs on its import fix's hash.
+- w-interop: round 2 record complete; writing BENCHMARKS rows for git and hg; svn waits for round 3.
+- w-ci: DONE (below). w-chaos's A-890 Windows check: GREEN, 5/5 on windows-latest and 5/5 on windows-11-arm.
 
 | Agent | Landed tonight | Now | Next, in order |
 |---|---|---|---|
@@ -40,11 +54,23 @@ Their worktrees keep their work. If main's session closes before they report, re
 | w-chaos | ~/slates-work/w-chaos | DONE 23:20: A-890 landed (c5de37b3b + 46e1d3efb, merge 8462ef25a): a restarted successor settles what it adopted; A-885 leg and A-344 write 5/5 under load; nemesis scenes clean, the Continuity mutation caught 41-42/48. Windows check: diag-measurer-main-a890-1 (run 45347202509). Left open: the Continuity test's through_the_successor reads and other read_at_head callers still try once. |
 | w-tsan | ~/slates-work/w-tsan-land, w-tsan-probe | commit 1 landed 21323f227 (lend fix, six sites). Commit 2: swallowed refusals with consequences (hg_push.rs:2878 timer spin, homes.rs:896 release, homes.rs:1569 detach). Then a859 (edge records a pending write as observable state). |
 | w-wall | ~/slates-work/w-wall | lint round 5: two new sites, receive.rs:366 (11/10, from A-886) and identities/tests.rs:221 (std::thread::sleep). |
-| w-ci | ~/slates-work/w-ci | landed conformance record split 87ef753f3, create_on 076a4adb5, A-889 live image publish cfeab3e9b (FUSE lanes 2/12 fail -> 0/30), dialer b43e1a20d, lender test 37b0b3c37. Now: red 4, ~300 tests whose helpers land on the store from a shard thread (watchdog exit 4 on a slow fdatasync): movable set first, then helper by helper by exposure. |
+| w-ci | ~/slates-work/w-ci (clean at 31e0c2596) | DONE 23:26, context full. Landed 9: conformance record split 87ef753f3, create_on 076a4adb5, A-889 live image publish cfeab3e9b (FUSE lanes 2/12 fail -> 0/30), dialer b43e1a20d, lender test 37b0b3c37, b7524c5bc (13 tests, hg_import::land_imported_on), 9c5d0de5b (lfs, audit_on_stored_shard_made; merge 31e0c2596). Left (GAPS lists it): the rest of red 4, mechanical, on the same patterns; the red is the LD_PRELOAD shim adacachy2:~/.cache/w-ci-red4/delay_fdatasync.so (1.5 s before fdatasync); check vcs_share, paths, hg_view and vcs_ssh/tests/hg.rs first. By ruling left as they are: hg_push's 16 push tests, git_push's synchronous driver (30 calls), repository.rs creation replies (exposure 1 in 100 at load 47, none in CI). |
 
 ## Runs in flight
 
-The big Studio (`adas-mac-studio.local-2`), a chain, each waiting on the one before:
+At 23:35 the Studio chain below has ENDED; every result went to its owner:
+- r655 interop round 2: svn import refused BudgetExceeded x5 (w-svn); hg stream stock 0.417 s vs slates 3.829 s best, with
+  one 57.0 s outlier (w-interop to explain); slates-daemon peak RSS 2,934 MiB.
+- r670 hg intake: GREEN, as above.
+- r678 push A/B: A-886 slows clones (w-git to explain): mirror 72.0/73.1 -> 98.2/102.8 s, work 88.4/88.5 -> 93.7/100.6 s,
+  partial 69.5/69.3 -> 71.6/103.4 s; the session test passed 4 of 4.
+- r691 provision at 5108ce3a6: 0 refusals. 23 shards spinning_1 p99 92.1/102.3/96.6 us (FAIL); spinning_1_own_shard p99
+  68.5-71.5 us, its tail parked (10-16 of 21, client part 50-65 us). 2 shards p99 42.0-46.2 us (ok), own shard 30.5-33.5 us.
+Main CI at 23:35: 45338067629 at a018ee86b still running its two Windows jobs (80+ min); 45347644597 at 31e0c2596 waits
+behind it and starts when it ends (the concurrency group keeps one waiting, replacing it on each push). The first run past
+w-wall's last round is the lint-clean one whose Linux and macOS test steps w-ci's red 3 triage needs.
+
+The chain as it was planned:
 1. r655 interop speed round 2 at a51b627f5: git leg done (below), hg then svn running. Record:
    `~/.cache/main-rounds/interop-speed/work/interop-speed.txt` on the Studio.
 2. r670 hg intake_steps at 14b44fb7f: red if most own runs > floor(log3 windows)+1 = 6, or in flight > 7.
