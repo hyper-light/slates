@@ -1,0 +1,58 @@
+name: diag-main-lint
+# main 01a20182 (2026-11-24 10:47 PST): the lint wall at current main (d9cabf2cc) after the nine sites main CI 45450619947 named
+# at d48863ddb were fixed by their authors (42589bb44 w-svn, d6f54329a w-perf, d9cabf2cc w-shared): the workspace's clippy on
+# Linux, and on Windows the CI's own clippy steps (the Windows-buildable crates and every slates-cli target), so the wall is
+# known clean or its new sites named without waiting for a main CI run that newer pushes cancel. Run only from
+# diag-measurer-main-lint-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-lint-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    name: workspace clippy (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy, the whole workspace, every target
+        run: |
+          set +e
+          cargo clippy --locked --workspace --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
+          rc=$?
+          echo "::notice title=linux clippy::exit $rc: $(grep -aE '^(error|warning)(\[[A-Za-z0-9_:]+\])?: |^ *--> ' "$RUNNER_TEMP/clippy.log" | grep -av 'could not compile' | paste - - | head -20 | tr '\n' ';' | cut -c1-3000)"
+          grep -aE '^(error|warning)(\[[A-Za-z0-9_:]+\])?: |^ *--> ' "$RUNNER_TEMP/clippy.log" | grep -av 'could not compile' | head -40
+          exit $rc
+  windows:
+    name: Windows clippy steps (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: Clippy the Windows-buildable crates and every slates-cli target
+        run: |
+          set +e
+          cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings > "$RUNNER_TEMP/c1.log" 2>&1; rc1=$?
+          cargo clippy -p slates-cli --all-targets -- -D warnings > "$RUNNER_TEMP/c2.log" 2>&1; rc2=$?
+          for f in c1 c2; do echo "== $f"; grep -aE '^(error|warning)(\[[A-Za-z0-9_:]+\])?: |^ *--> ' "$RUNNER_TEMP/$f.log" | grep -av 'could not compile' | head -30; done
+          echo "::notice title=windows clippy::crates exit $rc1, cli exit $rc2: $(cat "$RUNNER_TEMP/c1.log" "$RUNNER_TEMP/c2.log" | grep -aE '^(error|warning)(\[[A-Za-z0-9_:]+\])?: |^ *--> ' | grep -av 'could not compile' | paste - - | head -20 | tr '\n' ';' | cut -c1-3000)"
+          [ $rc1 -eq 0 ] && [ $rc2 -eq 0 ]
