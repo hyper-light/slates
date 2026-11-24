@@ -279,18 +279,20 @@ pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
 fn report_first_budget_refusal(
   state: &crate::state::ShardState,
   dimension: &str,
-  requested: u64,
+  requested: Option<u64>,
   available: u64,
 ) {
   static REFUSE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
   static COVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-  let (gate, kind) = if available == 0 {
-    (&REFUSE_ALL, "refuse-all")
-  } else if requested <= available {
-    (&COVERED, "refused what its available covers")
-  } else {
-    return;
+  // A refusal that names no request (the record step's catch-all, which sees only the reply) is logged where nothing
+  // was available; whether one covered its request is known only where it was asked (main's question of 2026-11-24:
+  // "requested=0" read as a counting bug).
+  let (gate, kind) = match requested {
+    _ if available == 0 => (&REFUSE_ALL, "refuse-all"),
+    Some(requested) if requested <= available => (&COVERED, "refused what its available covers"),
+    _ => return,
   };
+  let requested = requested.map_or_else(|| "unknown".to_owned(), |requested| requested.to_string());
   if gate.swap(true, std::sync::atomic::Ordering::Relaxed) {
     return;
   }
@@ -3878,7 +3880,7 @@ fn record_completion_routed(
     // restore), logs the store's breakdown once — the create path alone did before, and a takeover's
     // `BudgetExceeded { available: 0 }` on CI (run 36828863866, 2026-10-01) carried no breakdown.
     if let Refusal::BudgetExceeded { available } = refusal {
-      report_first_budget_refusal(state, "any verb", 0, *available);
+      report_first_budget_refusal(state, "any verb", None, *available);
     }
   }
   reply
@@ -7700,7 +7702,7 @@ pub(crate) fn admit_over(
         // (A-789) and the teardowns of the volumes this shard destroys (A-884), so only a refusal that waits for
         // nothing is the shard's first to report.
         if !crate::room_wait::note_refusal(state, crate::room_wait::Room::Bytes, limit, available) {
-          report_first_budget_refusal(state, "bytes", limit, available);
+          report_first_budget_refusal(state, "bytes", Some(limit), available);
         }
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
@@ -7736,7 +7738,7 @@ pub(crate) fn admit_over(
       // A teardown in flight gives its volume's inode allowance back as it ends (A-884): waited for, as bytes are.
       if !crate::room_wait::note_refusal(state, crate::room_wait::Room::Versions, wanted, available)
       {
-        report_first_budget_refusal(state, "versions", wanted, available);
+        report_first_budget_refusal(state, "versions", Some(wanted), available);
       }
       return Err(Box::new(give_back(
         state,
@@ -11204,7 +11206,7 @@ pub(crate) fn secure_retention(
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
   crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
   crate::merge_service::secure_green_retention(state, green_id, secured).inspect_err(|available| {
-    report_first_budget_refusal(state, "retention", secured, *available);
+    report_first_budget_refusal(state, "retention", Some(secured), *available);
     report_first_retention_cap_refusal(state, green_id, (secured, *available));
   })
 }
@@ -11378,7 +11380,7 @@ fn increment_held(
 /// 356-429 ms (main's A/B, 2026-11-21). The bound is where the step's copy of the increment (about 2.6 ms a mebibyte at
 /// A-825's 256 MiB rate) is still of the order of one publication; it is a judgment, not a measured crossover, and a
 /// sweep across it is owed. A chain whose cap is small carries less ([`CARRIED_CHAIN_SHARE`]).
-pub(crate) const CARRIED_INCREMENT_MAX: usize = 1 << 20;
+pub const CARRIED_INCREMENT_MAX: usize = 1 << 20;
 
 /// Shape: the share of the partition's green-chain cap one carried increment may take, at most (A-854): a carrying chain
 /// holds at least this many versions before its cap, so carrying never makes a small chain fold or refuse an entry a
@@ -11730,6 +11732,12 @@ impl AcceptedParts {
 /// Commits `parts` in the running transaction, under the running request (`state.current_request`): the wait staged
 /// first (A-252), the chain entry appended, the merge record enqueued, the retention trued up, and a git repository's
 /// commit recorded (A-664 part 3). Refused where the wait or the entry is.
+/// Gives back what an accept refused before its step holds (`made_commit::refuse`): its increment, which the content
+/// store held for its chain entry, released as a refused verdict's is.
+pub(crate) fn release_refused_parts(state: &mut ShardState, parts: AcceptedParts) {
+  crate::merge_service::release_refused_increment(state, parts.green, parts.held_increment);
+}
+
 pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> Result<(), Refusal> {
   let AcceptedParts {
     green: green_id,

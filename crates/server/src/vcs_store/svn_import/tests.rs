@@ -697,6 +697,205 @@ fn many_revisions(revisions: usize) -> Vec<u8> {
   dump.into_bytes()
 }
 
+/// A format-2 dump of `revisions` revisions after revision 0: revision 1 adds file `f` of `size` bytes, and each later
+/// one rewrites it whole with `size` other bytes, so every version supersedes the whole file before it: a batch whose
+/// versions' retention grows by the file's size a revision, while its bytes in flight stay one file's.
+fn rewrites(revisions: usize, size: usize) -> Vec<u8> {
+  let props = |entries: &[(&str, &str)]| {
+    let mut section = String::new();
+    for (name, value) in entries {
+      section.push_str(&format!(
+        "K {}\n{name}\nV {}\n{value}\n",
+        name.len(),
+        value.len()
+      ));
+    }
+    section.push_str("PROPS-END\n");
+    section
+  };
+  let mut dump =
+    String::from("SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000893\n\n");
+  let zero = props(&[("svn:date", "2026-11-24T00:00:00.000000Z")]);
+  dump.push_str(&format!(
+    "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+    zero.len()
+  ));
+  for number in 1..=revisions {
+    let date = format!("2026-11-24T00:00:00.{number:06}Z");
+    let log = format!("r{number}");
+    let section = props(&[
+      ("svn:author", "alice"),
+      ("svn:date", &date),
+      ("svn:log", &log),
+    ]);
+    let line = format!("{number:07}\n");
+    let text: String = line.repeat(size / line.len());
+    dump.push_str(&format!(
+      "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+      section.len()
+    ));
+    let (action, empty) = if number == 1 {
+      ("add", "PROPS-END\n")
+    } else {
+      ("change", "")
+    };
+    let props_header = if number == 1 {
+      format!("Prop-content-length: {}\n", empty.len())
+    } else {
+      String::new()
+    };
+    dump.push_str(&format!(
+      "Node-path: f\nNode-kind: file\nNode-action: {action}\n{props_header}Text-content-length: {}\n\
+       Content-length: {}\n\n{empty}{text}\n\n",
+      text.len(),
+      empty.len() + text.len()
+    ));
+  }
+  dump.into_bytes()
+}
+
+/// Shape: the green's retention cap the cap test runs under (`DaemonConfig::caps.green_chain_bytes`, the derived merge
+/// byte bound a green's history and chain are held to): a few rewrites' worth, far below the whole import's.
+const SMALL_GREEN_CAP: usize = 256 << 10;
+
+/// Shape: the rewritten file's bytes in the cap test, and how many rewrites: together past [`SMALL_GREEN_CAP`] many
+/// times over, each alone far within it.
+const REWRITE_BYTES: usize = 8 << 10;
+/// Shape: see [`REWRITE_BYTES`].
+const REWRITES: usize = 200;
+
+/// Goal 93, main's red of 2026-11-23 (interop round 2 on the Studio's 23 shards: the import of git-2000.dump refused
+/// `BudgetExceeded { available: 373475417 }`, the daemon's log "retention refused at the green's cap ... secured=
+/// 422803669 ... cap=373475417"): one batch's versions reserved more of the green's retention than its cap, and the
+/// batch was bounded by the shard's memory alone. Do: under a green cap of [`SMALL_GREEN_CAP`], import [`rewrites`]'s
+/// [`REWRITES`] rewrites of one [`REWRITE_BYTES`]-byte file. Expect: the import whole, revision [`REWRITES`] the
+/// records' youngest, landed in more than one batch, each within the cap (`repository.svn_import.flushed_retention`
+/// moved). Before, refused `Budget` at the first batch's landing.
+#[test]
+fn t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_time() {
+  let (loaded, flushed) = crate::repository::svn_commit::tests::stored_configured(
+    || async move {
+      let (svn, _green) = subversion("capped").await;
+      let (loaded, _turns) = imported(svn, rewrites(REWRITES, REWRITE_BYTES)).await;
+      let flushed = on(|state| {
+        count(
+          state,
+          crate::repository::svn_commit::staging::FLUSHED_RETENTION,
+        )
+      });
+      (loaded.map(|loaded| loaded.youngest), flushed)
+    },
+    |config| config.caps.green_chain_bytes = SMALL_GREEN_CAP,
+  );
+  assert_eq!(loaded, Ok(u64::try_from(REWRITES).unwrap_or(u64::MAX)));
+  assert!(flushed > 0, "landed in batches within the green's cap");
+}
+
+/// A format-2 dump whose revision 1 adds `files` files `f0`.. of about `size` bytes and whose revision 2 rewrites every
+/// one of them whole: one revision of `files` paths.
+fn one_wide_rewrite(files: usize, size: usize) -> Vec<u8> {
+  let props = |entries: &[(&str, &str)]| {
+    let mut section = String::new();
+    for (name, value) in entries {
+      section.push_str(&format!(
+        "K {}\n{name}\nV {}\n{value}\n",
+        name.len(),
+        value.len()
+      ));
+    }
+    section.push_str("PROPS-END\n");
+    section
+  };
+  let mut dump =
+    String::from("SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000894\n\n");
+  let zero = props(&[("svn:date", "2026-11-24T00:00:00.000000Z")]);
+  dump.push_str(&format!(
+    "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+    zero.len()
+  ));
+  for number in 1..=2usize {
+    let date = format!("2026-11-24T00:00:00.{number:06}Z");
+    let log = format!("r{number}");
+    let section = props(&[
+      ("svn:author", "alice"),
+      ("svn:date", &date),
+      ("svn:log", &log),
+    ]);
+    dump.push_str(&format!(
+      "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+      section.len()
+    ));
+    for file in 0..files {
+      let line = format!("{number}:{file:05}\n");
+      let text: String = line.repeat(size / line.len());
+      let (action, empty) = if number == 1 {
+        ("add", "PROPS-END\n")
+      } else {
+        ("change", "")
+      };
+      let props_header = if number == 1 {
+        format!("Prop-content-length: {}\n", empty.len())
+      } else {
+        String::new()
+      };
+      dump.push_str(&format!(
+        "Node-path: f{file}\nNode-kind: file\nNode-action: {action}\n{props_header}Text-content-length: {}\n\
+         Content-length: {}\n\n{empty}{text}\n\n",
+        text.len(),
+        empty.len() + text.len()
+      ));
+    }
+  }
+  dump.into_bytes()
+}
+
+/// Shape: the green's retention cap the lone-revision test runs under: below what one revision adding [`WIDE_FILES`]
+/// paths reserves of the change index alone.
+const TINY_GREEN_CAP: usize = 16 << 10;
+
+/// Shape: the files the lone revision adds, each a few bytes: their paths' change-index entries alone reserve past
+/// [`TINY_GREEN_CAP`] (each path's entry is charged twice its bytes, `Green::changes_reservation`; 400 paths reserved
+/// just under it).
+const WIDE_FILES: usize = 1000;
+
+/// Goal 93 (main's ruling of 2026-11-24 00:49: a lone revision past the cap is refused typed, naming the revision and
+/// both numbers). Do: under a green cap of [`TINY_GREEN_CAP`], import [`one_wide_rewrite`] of [`WIDE_FILES`] small
+/// files: revision 1 adds them all. Expect: refused at revision 1, what it would reserve past the room it names, no
+/// revision landed; on the wire `ImportRefused` with `RetentionPastRoom { revision: 1, reserved, room, landed: 0 }`.
+#[test]
+fn t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_and_both_numbers() {
+  let failed = crate::repository::svn_commit::tests::stored_configured(
+    || async move {
+      let (svn, _green) = subversion("wide").await;
+      let (loaded, _turns) = imported(svn, one_wide_rewrite(WIDE_FILES, 16)).await;
+      loaded.err()
+    },
+    |config| config.caps.green_chain_bytes = TINY_GREEN_CAP,
+  );
+  let Some(LoadFailed::Uncommitted {
+    refusal: Uncommitted::PastRetention { reserved, room },
+    revision,
+    landed,
+  }) = failed.clone()
+  else {
+    panic!("refused past the green's retention room: {failed:?}");
+  };
+  assert_eq!((revision, landed), (1, 0));
+  assert!(reserved > room, "{reserved} past {room}");
+  let wire = svn_refusal_of(DUMP, ROOM, failed.expect("refused"));
+  assert_eq!(
+    wire,
+    Refusal::ImportRefused {
+      fault: ImportFault::RetentionPastRoom {
+        revision: 1,
+        reserved,
+        room,
+        landed: 0,
+      }
+    }
+  );
+}
+
 /// Shape: the revisions of the batch whose apply the sliced commit test holds to the shard's quantum: past what one
 /// quantum applies on any build (a version's apply is tens of microseconds in debug, the quantum a few).
 const MANY_REVISIONS: usize = 400;

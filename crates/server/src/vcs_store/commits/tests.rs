@@ -13,10 +13,11 @@ use slates_git::object_name::{Kind, ObjectFormat, ObjectId};
 use slates_git::objects::tree::{Mode, Tree};
 use slates_git::unpack::{self, NoIndex};
 use slates_git::upload::Asked;
-use slates_ipc::protocol::WorkOp;
+use slates_ipc::protocol::{ReplyBody, RequestBody, WorkOp};
 use slates_vfs::clock::{Clock, HostClock};
+use slates_wire::Wire;
 
-use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_MAP_BUDGET};
+use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_ENTRY_REFUSED, TEST_MAP_BUDGET, TEST_UNMADE};
 use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
@@ -375,32 +376,70 @@ fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
   assert_eq!(topic.files, expected);
 }
 
-/// A-664 part 3 (its commit; module docs, "Not made, and counted"). Do: submit a version whose message holds a NUL,
-/// which git's strict fsck refuses in a commit (`nulInCommit`); then submit a second version with a plain message, and
-/// clone. Expect: the first version accepted, its commit not made and counted, the repository's store holding no version
-/// of the green and its register only the commit the submit owed (A-664's live whole builds, part 2: staged before its
-/// map was built, settled by the next made commit); the second's commit made as the repository's first, with no parent,
-/// its tree holding both versions' files.
+/// A-664 part 3's message rule, refused before its verdict (main 01a20182's ruling of 2026-11-23 22:08: a version is never
+/// committed alone, its commit not made; w-svn's A-888). Do: submit a version whose message holds a NUL, which git's
+/// strict fsck refuses in a commit (`nulInCommit`); then submit a second version with a plain message, and clone. Expect:
+/// the first refused `BadRequest` before its verdict, the green's durable head still 0, no version of the green in the
+/// store and nothing counted unmade; the second's commit made as the repository's first, its tree holding its own file
+/// alone. Red before: the first was accepted, its version committed with no commit (the green past its store), counted
+/// unmade.
 #[test]
-fn t_a664_p3_a_commit_git_refuses_is_not_made_and_its_successor_holds_both() {
-  let (unmade, clone, made) =
+fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() {
+  let (refused, clone, made) =
     crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
       let (repository, green) = git_repository(state, "refused");
-      version_saying(state, (green, 1), vec![create("/f", b"one")], "one\0two");
+      let made = crate::vcs_store::paths::tests::ask(
+        state,
+        RequestBody::CreateWork {
+          green,
+          name: "work-1".to_owned(),
+        },
+      );
+      let ReplyBody::WorkCreated { id: work, .. } = made else {
+        panic!("no work: {made:?}")
+      };
+      let edited = crate::vcs_store::paths::tests::ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: "/f".to_owned(),
+          at: 0,
+          delete_len: 0,
+          bytes: b"one".to_vec(),
+        },
+      );
+      assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+      let submitted =
+        crate::vcs_store::paths::tests::ask(state, crate::identities::authored(work, "one\0two"));
+      // As `version_saying` drives them: the whole build a first submit owes, then the commit's queued job.
+      crate::vcs_store::paths::whole_build::settle(state);
+      crate::vcs_store::commits::made_after_now(state);
       let key = green_key(to_db_volume(green));
       let held = state
         .vcs_stores
         .git_ref(repository)
         .map(|(_, git)| git.versions(key).len());
-      let unmade = (counts(state), held, records(state, repository).len());
+      let head = state.db.partition().green_head(to_db_volume(green));
+      let refused = (
+        matches!(
+          submitted,
+          ReplyBody::Refused {
+            refusal: slates_ipc::protocol::Refusal::BadRequest { .. },
+            ..
+          }
+        ),
+        head,
+        held,
+        counts(state),
+      );
       version(state, green, 2, vec![create("/g", b"two")]);
-      (unmade, cloned(state, repository, "main"), counts(state))
+      (refused, cloned(state, repository, "main"), counts(state))
     });
-  assert_eq!(unmade, ((0, 1), Some(0), 1));
+  assert_eq!(refused, (true, 0, Some(0), (0, 0)));
   assert_eq!(parents_of(&clone.text), Vec::<ObjectId>::new());
-  let expected = listing(&[("f", Mode::File, b"one"), ("g", Mode::File, b"two")]);
+  let expected = listing(&[("g", Mode::File, b"two")]);
   assert_eq!(clone.files, expected);
-  assert_eq!(made, (1, 1));
+  assert_eq!(made, (1, 0));
 }
 
 /// A work's `mv` of `from` to `to`.
@@ -1049,6 +1088,117 @@ fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_befor
     ),
     "the retry landed once, recorded version 6, and answered"
   );
+}
+
+/// A submit of a work making `/README` to a git repository's root green, as a client's recorded request, with `fault`
+/// set for it (a refusal of its made commit, [`TEST_UNMADE`] or [`TEST_ENTRY_REFUSED`]): once it is answered, the
+/// green's durable head, the store's versions of it, the register's records more than before, whether the request was
+/// completed, and whether its recorded answer is a refusal.
+fn refused_made(
+  name: &'static str,
+  fault: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
+) -> (u64, usize, usize, bool, bool) {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let id = slates_wire::request::RequestId {
+        client: 7,
+        sequence: 1,
+      };
+      let (repository, root, work, held) = crate::state::with_state(|state| {
+        let (repository, green) = git_repository(state, name);
+        let ask = crate::vcs_store::paths::tests::ask;
+        let made = ask(
+          state,
+          RequestBody::CreateWork {
+            green,
+            name: format!("work-{name}"),
+          },
+        );
+        let ReplyBody::WorkCreated { id: work, .. } = made else {
+          panic!("no work: {made:?}");
+        };
+        ask(
+          state,
+          RequestBody::Edit {
+            work,
+            path: "/README".to_owned(),
+            at: 0,
+            delete_len: 0,
+            bytes: b"made\n".to_vec(),
+          },
+        );
+        (
+          repository,
+          to_db_volume(green),
+          work,
+          records(state, repository).len(),
+        )
+      })
+      .expect("the shard's state");
+      fault.with(|set| set.set(true));
+      crate::state::with_state(|state| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, id),
+          &owner(),
+          crate::identities::authored(work, "made"),
+        );
+      })
+      .expect("the shard's state");
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      while !crate::state::with_state(|state| completed(state, 7, id)).unwrap_or(false)
+        && slates_rt::futures::now_ns() < deadline
+      {
+        slates_rt::futures::yield_now().await;
+      }
+      crate::state::with_state(|state| {
+        let versions = state
+          .vcs_stores
+          .git_ref(repository)
+          .map_or(0, |(_, git)| git.versions(green_key(root)).len());
+        let refused = matches!(
+          state.db.partition().completion(7, id.client, id.sequence),
+          slates_wire::request::Seen::Completed(answer)
+            if matches!(ReplyBody::from_bytes(&answer), Ok(ReplyBody::Refused { .. }))
+        );
+        (
+          state.db.partition().green_head(root),
+          versions,
+          records(state, repository).len().saturating_sub(held),
+          completed(state, 7, id),
+          refused,
+        )
+      })
+      .expect("the shard's state")
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  seen
+}
+
+/// A-888's git half (main 01a20182's ruling of 2026-11-23 22:08: a version is never committed alone). Do: submit a work
+/// to a git repository's root green as a client's recorded request, its made commit's sealing refused once (as a map's
+/// or the store's refusal before the step leaves it, [`TEST_UNMADE`]). Expect: the request completed with a refusal
+/// recorded, the green's durable head 0, no store version of it, no record more. Red before: the version committed
+/// alone, its commit not made (durable head 1, answered accepted).
+#[test]
+fn t_a888_git_a_made_commit_not_made_refuses_its_submit_with_nothing_applied() {
+  let seen = refused_made("unmade", &TEST_UNMADE);
+  assert_eq!(seen, (0, 0, 0, true, true));
+}
+
+/// A-888's git half, its register guard (w-svn's A-891 `made_commit::commit_guarded`). Do: as above, the made commit's
+/// register entry refused once at its guard, after its changeset landed ([`TEST_ENTRY_REFUSED`]). Expect: the request
+/// completed with a refusal recorded, the green's durable head 0, no store version, no record more. Red before: the entry
+/// was judged after the version's parts committed, so the version committed alone and the accept was answered.
+#[test]
+fn t_a888_git_a_made_commits_refused_entry_refuses_its_submit_with_nothing_applied() {
+  let seen = refused_made("entry-refused", &TEST_ENTRY_REFUSED);
+  assert_eq!(seen, (0, 0, 0, true, true));
 }
 
 /// Shape: the files each version of [`t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview`] makes or

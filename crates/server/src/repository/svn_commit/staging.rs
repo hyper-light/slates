@@ -20,8 +20,11 @@
 //!
 //! **Bounded by the import's admission** (main's ruling of 08:17). The batch's increments' post-state bytes are charged
 //! to the shard as the import's holding (`vcs_store::svn_import`), beside the texts the content store charges as it
-//! takes them. A revision that the shard could not admit flushes the batch first. So under concurrency the batch shrinks
-//! by itself, and a flush's cost amortizes over what memory allows. A changeset holds at most [`MAX_RECORDS`] records.
+//! takes them. A revision that the shard could not admit flushes the batch first. So under concurrency the batch
+//! shrinks by itself, and a flush's cost amortizes over what memory allows. A changeset holds at most [`MAX_RECORDS`]
+//! records. And a batch holds no more of its green's retention than the green may: a revision whose reservation would
+//! take it past its room (`ImportBatch::room`) is handed to the next batch whole ([`Deferred`], [`Flush::Retention`]),
+//! and one past the room alone is refused (A-892; main's red of 2026-11-23, the Studio's git-2000 import).
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_svn::commit::revision::Revision;
@@ -40,6 +43,9 @@ pub(crate) const MAX_RECORDS: usize = (u16::MAX as usize) - 2;
 pub(crate) const FLUSHED_ADMISSION: &str = "repository.svn_import.flushed_admission";
 /// Counter: a batch landed at [`MAX_RECORDS`]. Format: a counter name.
 pub(crate) const FLUSHED_SECTIONS: &str = "repository.svn_import.flushed_sections";
+/// Counter: a batch landed because the next revision's reservation would take it past the green's retention room
+/// (`ImportBatch::room`). Format: a counter name.
+pub(crate) const FLUSHED_RETENTION: &str = "repository.svn_import.flushed_retention";
 /// Counter: a batch landed at the import's end, or before a record that moves no version. Format: a counter name.
 pub(crate) const FLUSHED_END: &str = "repository.svn_import.flushed_end";
 
@@ -96,6 +102,8 @@ pub(crate) enum Flush {
   Admission,
   /// The changeset holds [`MAX_RECORDS`].
   Sections,
+  /// The next revision's reservation would take the batch past the green's retention room.
+  Retention,
   /// The import's end, or a record that moves no version next.
   End,
 }
@@ -106,8 +114,35 @@ impl Flush {
     match self {
       Flush::Admission => FLUSHED_ADMISSION,
       Flush::Sections => FLUSHED_SECTIONS,
+      Flush::Retention => FLUSHED_RETENTION,
       Flush::End => FLUSHED_END,
     }
+  }
+}
+
+/// What [`Staging::stage_in`] did with a revision.
+enum StagedIn {
+  /// Staged: checked, its version judged into the scratch member, the records applied.
+  Staged,
+  /// Not staged: its reservation would take the batch past the green's retention room (`ImportBatch::room`).
+  PastRoom,
+}
+
+/// A revision whose texts are put, not yet staged ([`Staging::stage_deferred`]): what a batch with no room for it hands
+/// the next, its texts' holds with it.
+pub(crate) struct Deferred {
+  /// The revision, its texts named stored.
+  revision: Revision,
+  /// The texts it put into the content store, one hold each.
+  put: Vec<ContentIdentity>,
+  /// What its changeset carries of them.
+  carried: Vec<landing::LandedText>,
+}
+
+impl Deferred {
+  /// Gives its texts' holds back: the import refused before it was staged.
+  pub(crate) fn give_back(self, state: &mut ShardState) {
+    super::release_texts(state, None, &self.put);
   }
 }
 
@@ -190,6 +225,11 @@ impl Staging {
     })
   }
 
+  /// The green's retention the batch may reserve (`ImportBatch::room`); none where its batch is gone.
+  pub(crate) fn room(&self) -> u64 {
+    self.batch.as_ref().map_or(0, ImportBatch::room)
+  }
+
   /// The batch's holding beyond what the content store charges: its increments' post-state bytes.
   pub(crate) fn held(&self) -> u64 {
     self.held
@@ -233,25 +273,51 @@ impl Staging {
     &mut self,
     revision: Revision,
     imported: Vec<ContentIdentity>,
-  ) -> Option<Result<(), Uncommitted>> {
+  ) -> Option<Result<Option<Deferred>, Uncommitted>> {
     let repository = self.repository;
     let mut revision = revision;
     let (storing, carried) = match super::stage_texts(repository, &mut revision, imported).await? {
       Ok(staged) => staged,
       Err(refused) => return Some(Err(refused)),
     };
-    self.put.extend(storing.put.iter().copied());
-    self.carried.extend(carried);
+    let deferred = Deferred {
+      revision,
+      put: storing.put,
+      carried,
+    };
+    self.stage_deferred(deferred).await
+  }
+
+  /// Stages `deferred`, a revision whose texts are put already ([`Staging::stage`], or a batch before this one that
+  /// had no room for it): the deferred revision again where its reservation would take the batch past the green's
+  /// retention room ([`Flush::Retention`]), nothing of it staged, for the caller to land this batch and stage it in the
+  /// next. Refused, its texts are the batch's, given back with it.
+  pub(crate) async fn stage_deferred(
+    &mut self,
+    deferred: Deferred,
+  ) -> Option<Result<Option<Deferred>, Uncommitted>> {
+    let repository = self.repository;
+    let Deferred {
+      revision,
+      put,
+      carried,
+    } = deferred;
     // A stored text a row names that the content store let go, and the texts its copies set back, are brought back
     // whole for the increment, and given back once it is built.
     let brought_texts = match super::bring_stored(repository, &revision.record.changes).await? {
       Ok(brought) => brought,
-      Err(refused) => return Some(Err(refused)),
+      Err(refused) => {
+        self.put.extend(put);
+        self.carried.extend(carried);
+        return Some(Err(refused));
+      }
     };
     let plans = match restore::plan(repository, &revision.record.changes).await? {
       Ok(plans) => plans,
       Err(refused) => {
         let _ = crate::state::with_state(|state| super::release_texts(state, None, &brought_texts));
+        self.put.extend(put);
+        self.carried.extend(carried);
         return Some(Err(refused));
       }
     };
@@ -261,15 +327,36 @@ impl Staging {
       Ok(restoring) => restoring,
       Err(refused) => {
         let _ = crate::state::with_state(|state| super::release_texts(state, None, &brought_texts));
+        self.put.extend(put);
+        self.carried.extend(carried);
         return Some(Err(refused));
       }
     };
-    crate::state::with_state(|state| {
+    // Kept for the next batch, where this one has no room for it.
+    let kept = revision.clone();
+    let staged = crate::state::with_state(|state| {
       let staged = self.stage_in(state, repository, (revision, plans));
       super::release_texts(state, None, &brought_texts);
       super::release_texts(state, None, &restoring);
       staged
-    })
+    })?;
+    match staged {
+      Ok(StagedIn::Staged) => {
+        self.put.extend(put);
+        self.carried.extend(carried);
+        Some(Ok(None))
+      }
+      Ok(StagedIn::PastRoom) => Some(Ok(Some(Deferred {
+        revision: kept,
+        put,
+        carried,
+      }))),
+      Err(refused) => {
+        self.put.extend(put);
+        self.carried.extend(carried);
+        Some(Err(refused))
+      }
+    }
   }
 
   /// [`Staging::stage`]'s step: the check, the increment built against the scratch member and staged, the records
@@ -279,7 +366,7 @@ impl Staging {
     state: &mut ShardState,
     repository: RepositoryId,
     (revision, plans): (Revision, restore::CopyPlans),
-  ) -> Result<(), Uncommitted> {
+  ) -> Result<StagedIn, Uncommitted> {
     // The records' room lent for the whole step, check to apply, as a landing's commit lends it.
     let lent = brought(&revision);
     if !crate::vcs_store::lend_svn(state, repository, lent) {
@@ -296,7 +383,7 @@ impl Staging {
     state: &mut ShardState,
     repository: RepositoryId,
     (revision, plans): (Revision, restore::CopyPlans),
-  ) -> Result<(), Uncommitted> {
+  ) -> Result<StagedIn, Uncommitted> {
     let (checked, record) = checked(state, repository, revision, None)?;
     let batch = self.batch.as_mut().ok_or(Uncommitted::NotHeld)?;
     let head = batch.head();
@@ -331,14 +418,34 @@ impl Staging {
     let growth = grown(&checked);
     crate::vcs_store::reserve_svn(state, repository, growth)
       .map_err(|available| Uncommitted::Budget { available })?;
-    if let Err(refused) = batch.stage(state, built) {
-      slates_machine::log_line!(
-        "slates-server: partition {}: an imported revision's version was not staged: {refused:?}",
-        state.partition
-      );
-      crate::vcs_store::unreserve_svn(state, repository, growth);
-      state.count(super::DIVERGED, 1);
-      return Err(Uncommitted::Diverged);
+    match batch.stage(state, built) {
+      Ok(_) => {}
+      // Past the green's retention room: nothing of it staged or applied to the records, for the next batch; past it
+      // alone, refused naming its reservation and the room.
+      Err(crate::import_batch::StageRefused::PastRoom {
+        reserved,
+        work,
+        room,
+        ..
+      }) => {
+        crate::vcs_store::unreserve_svn(state, repository, growth);
+        if reserved == 0 {
+          return Err(Uncommitted::PastRetention {
+            reserved: work,
+            room,
+          });
+        }
+        return Ok(StagedIn::PastRoom);
+      }
+      Err(refused) => {
+        slates_machine::log_line!(
+          "slates-server: partition {}: an imported revision's version was not staged: {refused:?}",
+          state.partition
+        );
+        crate::vcs_store::unreserve_svn(state, repository, growth);
+        state.count(super::DIVERGED, 1);
+        return Err(Uncommitted::Diverged);
+      }
     }
     let changes = checked.changes().to_vec();
     let before = state
@@ -373,7 +480,7 @@ impl Staging {
     }
     self.records.push(record);
     self.held = self.held.saturating_add(post);
-    Ok(())
+    Ok(StagedIn::Staged)
   }
 
   /// Lands the batch (module docs) for `cause`, counted: one changeset, then one register entry by `principal`, its

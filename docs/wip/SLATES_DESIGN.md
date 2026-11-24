@@ -61702,7 +61702,8 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   A publication first takes the changes since into dirty pages (`content_holder::image_drain`, the encoder their one
   reader) and runs one turn (`image_turn`: dirty pages re-encoded from the source maps until the copy slice is spent,
   at least one page). Where nothing is dirty after it, the publication carries the re-encoded pages, and they and the
-  committed ones are the shard's entries at that moment exactly (`content_holder::image_cut`). Otherwise it carries the
+  committed ones are the shard's entries at that moment exactly (`content_holder::image_cut`; since F2, below, the
+  moment its cut began, carried once the cut's pages are encoded whatever is dirty after). Otherwise it carries the
   committed cut again, so an image is always one moment's cut, never a mix of two. It is then counted skipped
   (`vcs_store.image.publications_skipped`), every block the arena would free at its commit is kept
   (`capture_deferred`, A-64: the cut may name it; kept whole, a selective keep only if the counters show deferred
@@ -61744,10 +61745,76 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   `catch_up_retried`) and does not settle the shard while it is owed. Test
   `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first, the
   retry cut out: the wait unanswered after six sweep intervals; green: answered, the refusal and the retry counted).
-- **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
-  bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
-  pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
-  a publication, so a put stream that outpaces it is a measurement owed, not seen.
+- **F2, a cut of one moment encoded over turns (BUILT 2026-11-23; main 01a20182's rulings of 2026-11-23: F2 over F1,
+  copy-on-write by entry, the E + I bound, the shapes, the pause kept).** Red first: a ticket's wait on a shard that
+  homes 256 fresh objects a turn was refused `Unanswered` (r8): a publication carried the encoder's pages only where no
+  page was dirty, so a shard that kept dirtying pages never carried one, and every homing waited out its budget (the
+  git mirror stall's hypothesis). Encoding a cut's pages in one step instead (F1) is user-scaled work in a step, a bug
+  signal; reading each page as it stands when encoded mixes two moments (a window let go after the cut placed in the
+  windows page and away in the aways page, its block not deferred, since no committed image names it yet). So a turn
+  begins a cut where none is in flight (`content_holder::image_begin`, after the changes are taken): the pages dirty
+  then are the cut's, each frozen in its store (`slates_vcs::preimage`: the content store's lists, names and windows let
+  go, `ChunkWindows`' pieces, homes' region holds and landed records). A store about to change an entry in a frozen page
+  keeps its value at the cut first, once (its old value, or an absent marker of its key alone); a turn encodes the cut's
+  pages read through those pre-images, at least one a turn, and thaws each as it is encoded; the publication carries the
+  cut once every page of it is encoded, whatever is dirtied after (`Encoder::complete`), so a cut of P pages is carried
+  within P turns. A change after the cut marks its page for the next cut, which the carrying publication's commit
+  begins and owes, so a ticket kept after a cut is never left with nothing to publish it. Homes' tickets move to the
+  cut's moment: its generation begun as it begins (`homes::cut_begun`) and published as it is carried. `ChunkWindows`
+  holds every chunk it would free while a cut is in flight and frees them at the carry, A-64's deferral taking over
+  from there, since the cut may name a block no committed image yet does. A ticket's wait that finds its image
+  unpublished and nothing owed is answered not durable at once and counted (`vcs_store.homes.ticket_stranded`), a bug
+  signal; its only wakes are publications and its first poll publishes, so it is checked at every poll. A page a gap
+  left (a family's first: its directory empty, so one page covers every coordinate) can hold the family's every entry,
+  which one turn encoded whole (327,620 bytes at a 4,096-byte page, found by F2; unseen before, since the step test's
+  check compared the journal with the encoder's committed cut, which it always equals while a cut is in flight). So a
+  turn reads a page only until twice the page size (`Encoder::read_cap`); a read stopped there is planned over the
+  page as a whole page's would be, the planned pages that end before its last coordinate encoded and the rest put back
+  in the cut, still frozen (`Encoder::split_at_stop`; thawing is interval subtraction, so a split page's other part
+  stays frozen). Pages stay aligned halves rather than ending at the read's stop: a page piece's key names its depth
+  and start, the image's format, from which a recovered directory is rebuilt, and piece 1's bound on a family's pages
+  rests on halving by bytes. A read counts every entry it visits against the cap, the ones inserted since the cut that
+  it passes over too, else a frozen page's tail (where every handle put after the cut lands) is walked whole each
+  read; where it kept too little to complete a planned page, the page is halved instead, shrinking toward the stop.
+  What a split visits and does not keep is at most the cap and an entry, a turn splitting once at most, read again
+  later. Bounds, each on a `Derived:` line and asserted by the oracle: the
+  pre-images at most E + I (E the entries in the cut's pages at the cut; I at most a turn's inserts into them times the
+  turns the cut lasts, its pages and the pages its splits put back), the chunks held at most a turn's frees times those
+  turns. A turn, a drain and a split read and change a family's directory in place: `Directories::of` copied it whole
+  at every mark (each family, every drain) and every page encoded, a family's size of work a turn, which made a third
+  of the catch-up's time (CI's macOS debug runs of the starvation test red 4 of 10, the cut of 65,536 windows and as
+  many region holds needing about 1,754 turns against the about 1,700 a 3-core debug runner fit in the wait's 1 s of
+  shard CPU; measured on a loaded Mac, debug: the catch-up's 1.11 s in all, 0.32 s of it the begin's drain and count;
+  after, 0.24 to 0.26 s, the drain 6 to 9 ms; red `a_turn_and_a_drain_copy_no_directory_however_many_pages_it_holds`,
+  20,000 directory pages copied by one mark and one turn over 10,000, now none). The catch-up's step no longer drains
+  twice. CI run 45354317783 at 427ad2389, the starvation test ten times on each: release and debug, ubuntu-latest and
+  macos-latest, 10/10 every one (macOS debug 6/10 at 2cdd88fa3, run 45336582846). The catch-up spends a copy slice's bytes a wake, turns until then (`content_holder::image_catch_up_slice`;
+  main's ruling (a) of 2026-11-23 19:16): a turn spends the page size, which a test sets far below the slice, so the
+  slice is what a yield's work is judged by, a step's share of the shard's own owed work whatever the page size. The
+  pause stays (main's ruling (a)): with F2 it is reached only while publications are refused, where it bounds
+  the let-gos, and so the deferred frees, that pile up meanwhile. Counters: `vcs_store.image.{cuts,
+  cut_preimages_old, cut_preimages_absent, longest_cut_step_bytes, cut_left, pages_split, split_discarded_bytes,
+  longest_split_discard_bytes}` (`cut_left` a bug signal).
+- **Evidence (F2).** `vcs_store::durable::tests::a_tickets_wait_is_answered_while_the_shard_keeps_dirtying_its_image`
+  (red `Err(Unanswered)` at 256 objects a turn, r8; its dirtier then shaped as a landing in the field, main's ruling (c)
+  of 2026-11-23 20:26: a round keeps objects until half the shard's step quantum is spent, the 65,536-object backlog
+  before the wait asserted reached and the dirtier asserted keeping objects in every round of the wait; green: durable,
+  publications skipped meanwhile; red again with a publication carrying only where nothing is dirty, the rule before
+  F2). Measured on a loaded Mac (debug): the field-shaped dirtier leaves the encoder CPU enough that the test stays
+  green with the catch-up's byte slice removed and with the capped read's hole put back, so each has its own red:
+  `image_pages::tests::a_catch_up_wake_spends_a_copy_slice_not_one_turn` (red: one turn, 5,055 of 41,509 bytes) and
+  `slates_vcs::preimage::tests::a_capped_read_of_a_frozen_range_stops_within_its_cap_however_much_was_inserted_since`
+  (red: no stop, every inserted key walked).
+  `image_pages::tests::a_window_let_go_while_its_cut_is_encoded_leaves_the_carried_image_one_moment` (the committed
+  image equal to the shard's at the cut, the window let go after it placed and not let go, its chunk held then freed,
+  an old value kept; red with the stores' hooks turned off). The oracle
+  (`generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound`) now holds every
+  carried image to the shard's entries at its cut's moment, the E + I and held-frees bounds, and no stranded ticket or
+  pre-image left; it no longer asks that a history pause.
+  `a_publication_encodes_at_most_a_slice_in_its_step_and_its_cuts_catch_up` now checks the committed image against the
+  shard's entries now, asserts pages split (the capped read ran on every family's first page) and holds each
+  publication's discarded read within the read's cap and an entry. The pause under refusals:
+  `a_cut_owed_past_its_bound_while_its_publications_are_refused_pauses_let_gos_until_one_commits`.
 
 ### A-871 — On Windows the OS places every shard, and a client waits for its reply one level above normal (2026-11-23, main 01a20182; goal 84a; A-361, A-834, A-831, A-41, A-208)
 
@@ -62620,3 +62687,105 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   - `crates/server/src/daemon.rs` and `crates/server/tests/fleet.rs`: the tests and the retry.
   - A-885's entry, A-251 (i)'s text, GAPS.
   - docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md.
+
+### A-891 — A Subversion made commit is guard-then-apply: a version no revision can be made of is refused typed and recorded, and the register entry is judged before the verdict applies (2026-11-23, w-svn for main 01a20182, its rulings of 2026-11-23 20:51 and 22:08; goal 93's correctness; A-805, A-888, `crates/db/src/partition.rs`'s check before apply)
+
+- **What was there.** A Subversion green's held verdict (A-805) was committed by a task holding the landing turn. Where
+  no revision could be made of the version (a special file, a symbolic link with properties of its own, a copy the
+  submit did not declare, a property list the records do not hold, the records past it) or the store's check refused
+  the revision, the task committed the version alone, counted `vcs.svn.revision_unmade`: the green stood past its
+  records, so every later made revision was not the one after the youngest and every client commit was refused (the
+  green no longer at the youngest). One special file broke a repository for good. And the one step ran the register
+  entry's commit (`commit_made`: the records' stamp, their being held, the store's admission, the records' growth, the
+  register's append) after the version's parts: refused there, the step committed the version and answered the accept
+  with no entry naming its revision.
+- **The rule** (main's ruling, `Partition::check` before `apply`): everything that can refuse is judged before
+  anything applies. A version no revision can be made of, or one the check refuses, is refused typed with its refusal
+  recorded as the request's completion and nothing applied (`made_commit::refuse`): `Unsupported` for a special file,
+  a link with its own properties or an undeclared copy; `StoreRefused`, in its words, for the rest. A store's refusal
+  of the changeset stays retryable (`abandon`, `Overloaded`): its I/O can clear. Then `made_commit::commit_guarded`
+  runs the tool's guard before the verdict applies (`MadeEntry::guard`: the records' stamp and their being held, the
+  reference within the store's admission, the register's entry judged as its append judges it,
+  `push::check_entry`, and the records' growth reserved last); refused, the submit is refused typed and recorded. Past
+  the guard, the verdict, the version's parts and the entry's append (`GuardedMade::commit`) apply and are not refused;
+  where the verdict or the version's parts are refused all the same (a green made again meanwhile, the step's own
+  record), the guard's reservation is given back. The one failure left after the guard is the step's own database
+  commit: a transaction, nothing durable, its in-memory effects made again from the chain as every verb's are. An
+  append refused after its guard passed is counted `vcs.svn.made_entry_refused`, zero in every correct use.
+- **Shared, changed for Subversion alone.** `made_commit::commit` (git's and Mercurial's) is `commit_guarded` with a
+  guard that never refuses, as before; their own unmade and refused-tool paths are their owners' (main's sweep).
+- **Evidence.** Red first on main a018ee86b (macOS, debug):
+  `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` was answered `Submitted { version: Some(1) }`
+  for a work holding a FIFO; `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version`, with the entry's commit
+  refused for the budget, was answered `Submitted { version: Some(1) }`. Green after: refused
+  `Unsupported` and `BudgetExceeded { available: 0 }`, recorded, the green's head 0, the records at revision 0 and the
+  register holding the creation alone; the next submit lands revision 1. `svn_commit::tests`' made-commit tests 20 of
+  20, with `t_a664_svn_an_edit_beneath_an_earlier_copy_is_a_revision` (main's question: an edit beneath an earlier
+  copy is made, so `Unmade::Copy` is no stock client's operation).
+
+Applied in the same change to: GAPS (C2's made commits), `crates/server/src/{made_commit,verbs}.rs`,
+`crates/server/src/repository/{svn_commit,push}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named
+above.
+
+### A-892 — An import batch is bounded by its green's retention room as well as the shard's memory (2026-11-24, w-svn for main 01a20182, its rulings of 2026-11-24 00:09 and 00:49; goal 93, the Studio's interop round 2; amends A-822's batch rule; A-814, A-835)
+
+- **What was there.** A Subversion import lands its revisions a batch at a time (A-822), the batch flushed when the next
+  revision's memory would not be admitted (`Staging::due_before`) or its changeset is full. Its landing secures every
+  staged version's history and change-index reservation at once against the green's retention cap
+  (`push::append_versions`, `verbs::secure_retention`; the cap is `caps.green_chain_bytes`, the derived merge byte bound
+  a green's history and chain are held to). Nothing bounded the batch by that cap. On the Studio's 23 shards (main
+  a51b627f5, round 2) git-2000.dump's first batch secured 422,803,669 bytes against a cap of 373,475,417 with nothing
+  charged, and the import was refused `BudgetExceeded { available: 373475417 }` in all five runs; a 4-CPU runner's
+  larger shards imported it.
+- **The rule.** A batch takes its room when it begins: the green's cap less what it holds once its history is folded as
+  far as its readers let it (`ImportBatch::begin` settles first, as the landing's securing does). `ImportBatch::stage`
+  measures a work's reservation in the scratch member before its verdict, as the verdict would (`reservation_of`), and a
+  work that would take the batch past its room is refused `StageRefused::PastRoom` with nothing judged; the import's
+  staging hands the revision, its texts put and their holds kept, to the next batch (`staging::Deferred`), the
+  revision's records not yet applied, and lands this one (`Flush::Retention`, counted
+  `repository.svn_import.flushed_retention`). A revision past the room alone, in a batch of none, is refused
+  `Uncommitted::PastRetention`, on the wire `ImportFault::RetentionPastRoom { revision, reserved, room, landed }`
+  (appended, tag 11; the API's contract 64): nothing of it staged, the repository at `landed`.
+- **A budget log names what it knows.** The record step logs every `BudgetExceeded` reply once, where its request is
+  unknown; it logged `requested=0` and so classed the refusal as one its available covered (main's question of
+  2026-11-24). `report_first_budget_refusal` takes the request as an `Option`: unknown is logged `unknown`, and only a
+  refusal with nothing available is logged there.
+- **Evidence.** Red first on main 891de2741 (macOS, debug): under a green cap of 256 KiB,
+  `t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_time` (200 rewrites of an 8 KiB file) was
+  refused `Uncommitted { refusal: Append(Entry(BudgetExceeded { available: 262144 })), revision: 0, landed: 0 }`. Green
+  after: the import whole at revision 200, landed in batches (`flushed_retention` moved);
+  `t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_and_both_numbers` (under a 16 KiB cap, one
+  revision adding 1,000 paths) refused at revision 1, reserved past the room, none landed, the wire fault as named; the
+  fault's golden vector in `crates/ipc/tests/wire_order.rs`. Owed: the Studio's round 3 (main's).
+
+Applied in the same change to: GAPS (C2 stage C), `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.{rs,txt}`,
+`crates/api/src/lib.rs`, `crates/server/src/{import_batch,verbs}.rs`,
+`crates/server/src/repository/{import,svn_commit}.rs`, `crates/server/src/repository/svn_commit/staging.rs`,
+`crates/server/src/vcs_store/svn_import.rs`, and the tests named above.
+
+### A-893 — A depth-1 PROPFIND of a collection streams its children's responses, and a server error names its cause (2026-11-24, w-svn for main 01a20182, its order of 2026-11-23 22:52 and ruling of 2026-11-24 01:57; goal 93's svn use test over HTTP; A-681, A-749)
+
+- **What was there.** The HTTP edge's PROPFIND (`slates_svn::dav::site::propfind`) wrote a collection's multistatus,
+  its own response and then every child's, into one body bounded by the request's room, and a body past it was refused
+  `OutputRoom`, answered as a bare `500`. Main's svn use test over HTTP with git-2000.dump on ubuntu (run
+  45330574435, stock svn 1.15.0) failed `svn info -R` at all 17 sampled revisions: "E175002: Unexpected server error
+  500 'Internal Server Error' on '/project/!svn/rvr/N/trunk/t'", git's test directory past the room; stock answered
+  the entries. The daemon's log named nothing.
+- **The rule.** `mod_dav` streams a multistatus however many children a directory holds. A depth-1 PROPFIND of a
+  collection is now answered as a streamed walk (`Walk::Propfind`, `PropfindWalk`), its status `207`
+  (`Report::status`; a REPORT's stays `200`): the opening and the collection's own response are written when the
+  request is read, then its children's, the repository lent again for each slice, until a slice's bytes reach its
+  room or its steps are spent, at least one; then the multistatus is closed. One child's response past the request's
+  room alone, or the index's refusal of a child, ends the answer after it began (`ReportProgress::Broken`), as
+  `mod_dav` ends a multistatus it cannot finish. Depth 0, and every other PROPFIND, is answered whole as before.
+- **A server error says why.** A site refusal answered `500` (a body past its room, a drive out of order, an aborted
+  drive, a value an answer cannot carry) names its cause in Subversion's error form (`site::refused_body`,
+  `cause_of`); a request's own fault stays a bare `4xx`, as `mod_dav` answers it. The edge logs each `5xx` it answers
+  with the method, the path and that cause (`server_refusal_logged`, counted `vcs.svn.http_server_refusals`).
+- **Evidence.** Red first (macOS, debug, on main a51883940): `a_depth_one_propfind_past_its_room_is_streamed_whole`
+  (`svn info`'s PROPFIND of a directory at depth 1, within a room half its multistatus) answered `(500, "")`; green
+  after: `207` and the same multistatus as within a room for all of it. `slates-svn --lib` and the server's svn and
+  HTTP tests pass (the counts in the commit). Owed: main's git-2000 info round over HTTP.
+
+Applied in the same change to: GAPS (the svn HTTP edge), `crates/svn/src/dav/site.rs` and its tests,
+`crates/server/src/vcs_http/svn.rs`.

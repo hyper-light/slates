@@ -7280,20 +7280,30 @@ impl HeldMount {
 /// Lane (A) by reference, condition 1 (main's ruling of 2026-11-21 00:52 PST; chain entry format 6): a version's
 /// increment is held in its owner shard's content store, in the anchor-held segment beside the partition's log, and the
 /// version's chain entry names it there by its inputs identity. Do: on an anchored daemon, keep a second work at the
-/// green's version 0 (so its chain cannot fold), land a 64 KiB file as version 1, then `kill -9` the daemon and let the
-/// anchor restart it. Expect: the submit held the increment in the content store
-/// (`merge.inputs.held_by_owner`), the restarted daemon's recovery replayed version 1 with its increment read from that
-/// store (`merge.chain.inputs_resolved`), and the head reads the file's bytes. Failing first: the entry carried the
-/// increment's bytes, and neither count existed.
+/// green's version 0 (so its chain cannot fold), land a file past the largest increment a chain entry carries
+/// (`slates_server::verbs::CARRIED_INCREMENT_MAX`, format 7, A-854: a smaller one rides its entry instead) as version 1,
+/// edited in [`BYREF_EDIT_BYTES`] pieces, a command line's room each; then `kill -9` the daemon and let the anchor
+/// restart it. Expect: the submit held the increment in the content store (`merge.inputs.held_by_owner`), the restarted
+/// daemon's recovery replayed version 1 with its increment read from that store (`merge.chain.inputs_resolved`), and the
+/// head reads the file's bytes. Failing first: the entry carried the increment's bytes, and neither count existed; then
+/// (A-854, CI's macOS runner, run 45347644597) a 64 KiB file the test landed was under the carry bound the machine
+/// derives (the least of 1 MiB and a 64th of the partition's chain cap), so the entry carried it.
 #[cfg(unix)]
 #[test]
 fn an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill() {
   let instance = format!("cli-byref-{}", std::process::id());
   let _anchor = start_anchor(&instance);
   let (green, work) = byref_green_and_work(&instance);
-  let body = "by-reference-".repeat(64 * 1024 / 13);
-  let (code, _, err) = run(&instance, &["edit", &work, "/f.txt", "0", "0", &body]);
-  assert_eq!(code, 0, "{err}");
+  let mut body = String::new();
+  let mut piece = 0usize;
+  while body.len() <= slates_server::verbs::CARRIED_INCREMENT_MAX {
+    let text = format!("by-reference-{piece:08}-").repeat(BYREF_EDIT_BYTES / 22);
+    let at = body.len().to_string();
+    let (code, _, err) = run(&instance, &["edit", &work, "/f.txt", &at, "0", &text]);
+    assert_eq!(code, 0, "{err}");
+    body.push_str(&text);
+    piece += 1;
+  }
   let (code, out, err) = run(&instance, &["submit", &work, "--json"]);
   assert_eq!(code, 0, "{err}");
   assert!(out.contains("\"accepted\":true"), "accepted: {out}");
@@ -7318,6 +7328,11 @@ fn an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill() {
     read.len()
   );
 }
+
+/// Shape: the bytes one `edit` of the by-reference test lands: well inside a command line's room (macOS's `ARG_MAX`, 1
+/// MiB for every argument and the environment), so the file past the carry bound is landed in pieces.
+#[cfg(unix)]
+const BYREF_EDIT_BYTES: usize = 64 * 1024;
 
 /// A green, a work kept at its version 0 so its chain cannot fold, and the work to land on it: the green and that work.
 #[cfg(unix)]

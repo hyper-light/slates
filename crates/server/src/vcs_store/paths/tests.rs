@@ -271,7 +271,7 @@ fn take(model: &mut Model, path: &str) -> (FileClass, Vec<u8>) {
 }
 
 /// A named pipe as a work declares one.
-fn fifo() -> IpcNode {
+pub(crate) fn fifo() -> IpcNode {
   IpcNode {
     kind: IpcNodeKind::Fifo,
     mode: PLAIN,

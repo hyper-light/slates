@@ -34,17 +34,20 @@
 //! store committed next, the entry appended last; a store whose entry the log then refuses is made again from the log
 //! (`super::rebuild`), with the version's commit not made.
 //!
-//! **Not made, and counted** ([`UNMADE`]): a version whose trees are not kept (its step of the map was refused), an
-//! identity git would not write as it is, a commit git's strict fsck refuses (a NUL in the message), a store's refusal
-//! (the budget), the register's refusal. The version stands, since its own record is in the transaction already; the
-//! green's ref stays at the commit before; nothing new is held.
+//! **Not made, and counted** ([`UNMADE`]): a version whose trees are not kept (its step of the map was refused), a
+//! store's refusal (the budget), the register's refusal. A deferred submit's version is then not committed: nothing of
+//! its accept is applied or durable, and it is answered so its retry runs (main 01a20182's ruling of 2026-11-23 22:08,
+//! w-svn's A-888: a version is never committed alone, its green ahead of the store). What git refuses in any commit, a
+//! message holding a NUL (`nulInCommit`), is refused before the verdict (`identities::refused_for_its_commit`), and
+//! an identity git would not write is refused where it is set.
 //!
 //! **Counters.** [`MADE`] (the path's non-vacuity count), [`UNMADE`].
 //!
 //! **Owed** (GAPS, A-664): the holders' commits (A-636's fleet half: the merge record carrying the message, the identity
 //! and the time, so every holder makes the same commit; a register entry's objects reach no holder today); a submit
-//! refused before its verdict when git cannot hold its post-state or its message; Mercurial's changesets and
-//! Subversion's revisions by the same rule.
+//! refused before its verdict when git cannot hold its post-state (its message is, since 2026-11-23); the store's and the
+//! register's refusals of a made commit judged before its step's apply (`made_commit::commit_held`'s guard, w-svn's
+//! A-888 piece 2); Mercurial's changesets and Subversion's revisions by the same rule.
 
 use std::collections::BTreeSet;
 
@@ -696,13 +699,100 @@ pub(crate) fn make_deferred(
 enum Before {
   /// Its changeset landed: the sealed push, its record version 5 once written.
   Landed(Box<SealedPush>),
-  /// Its commit not made (counted [`UNMADE`]): the version stands alone, as a version no commit was made of does
-  /// (module docs).
-  Unmade,
+  /// Its commit not made (counted [`UNMADE`]), and why: the submit is refused typed with nothing applied.
+  Unmade(Unmade),
   /// Its changeset refused by the node's store or the region: nothing of the accept may be durable.
   Unlanded,
   /// The shard's state is gone (the daemon stopping).
   Gone,
+}
+
+/// What a made commit's guard took ([`guard_made`]): the register's entry judged, and the instant it was judged at,
+/// appended unrefused by [`append_made`].
+struct GuardedMade {
+  entry: Op,
+  now: u64,
+}
+
+/// A landed made commit's guard (`made_commit::commit_guarded`): its record written into an entry of the register, the
+/// entry judged by the register's guard, then the store committed, all before anything of the accept applies. Refused
+/// typed where any of them refuses; the store left as it was, since it commits last.
+fn guard_made(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  sealed: &mut SealedPush,
+) -> Result<GuardedMade, Unmade> {
+  #[cfg(test)]
+  if TEST_ENTRY_REFUSED.with(|refused| refused.replace(false)) {
+    return Err(Unmade::Entry(Refusal::StoreRefused {
+      reason: "a test's refusal of the register's entry".to_owned(),
+    }));
+  }
+  let objects = sealed
+    .record(super::Lent::new(&mut state.store, &mut state.vcs_stores).stores)
+    .map_err(Unmade::Store)?;
+  let entry = Op::RepositoryAdvanced {
+    entry: RepositoryEntry {
+      repository,
+      objects,
+      ..RepositoryEntry::default()
+    },
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .partition()
+    .check(&entry, now)
+    .map_err(|error| Unmade::Entry(refusal_of_db(&error)))?;
+  super::commit(state, sealed).map_err(Unmade::Store)?;
+  Ok(GuardedMade { entry, now })
+}
+
+/// A guarded made commit's apply ([`guard_made`]): the judged entry appended in the step's transaction. Its guard
+/// judged it, so the append is not refused; were it, the store, ahead of the log, is made again from the log, logged and
+/// counted, as every refused apply's effects are.
+fn append_made(state: &mut ShardState, repository: RepositoryId, guarded: GuardedMade) {
+  if let Err(error) = state
+    .db
+    .mutate(&mut state.segment, &guarded.entry, guarded.now)
+  {
+    slates_machine::log_line!(
+      "slates-server: partition {}: a made commit's judged entry was refused at its append: {error:?}",
+      state.partition
+    );
+    super::rebuild(state, repository);
+    state.count(UNMADE, 1);
+  }
+}
+
+impl Unmade {
+  /// The typed refusal a submit is answered whose commit could not be made (main's ruling of 2026-11-23 20:51, as
+  /// w-svn's `svn_made::Unmade::refusal`): the register's own refusal as it is; git's message or identity rule
+  /// `BadRequest` in its words; anything of the store's `StoreRefused` in its words.
+  fn refusal(&self) -> Refusal {
+    match self {
+      Unmade::Entry(refusal) => refusal.clone(),
+      Unmade::Authorship => Refusal::MessageRequired,
+      Unmade::Identity(refused) => Refusal::BadRequest {
+        reason: format!("git would not write the identity: {refused:?}"),
+      },
+      Unmade::Commit(refused) => Refusal::BadRequest {
+        reason: format!("git would not write the commit: {refused:?}"),
+      },
+      other => Refusal::StoreRefused {
+        reason: format!("the commit could not be made: {other:?}"),
+      },
+    }
+  }
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's refusal of a made commit's sealing, once ([`sealed_made`]): what a store's or a map's refusal before the
+  /// commit's step leaves, now that no submit git refuses outright reaches it.
+  pub(crate) static TEST_UNMADE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// A test's refusal of a made commit's register entry at its guard, once ([`guard_made`]).
+  pub(crate) static TEST_ENTRY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`make_deferred`]'s task: the commit made and landed before its step, then the step (`made_commit::commit`), the
@@ -723,29 +813,41 @@ async fn made_landing(
     match before {
       Before::Landed(mut sealed) => {
         let repository = sealed.repository();
-        match crate::made_commit::commit(state, pending, |state| {
-          record_and_commit(state, repository, &mut sealed)
-        }) {
-          Some(Ok(())) => {
-            state.count(MADE, 1);
-            state.count(MADE_LANDED, 1);
-          }
-          Some(Err(_)) => {
-            sealed.release_homed(state);
-            state.count(UNMADE, 1);
-          }
-          // The green moved meanwhile: nothing of the accept committed.
-          None => {
-            sealed.release_homed(state);
-            super::paths::forget_preview_head(state, green, version);
-          }
+        // Guard then apply (main's ruling of 2026-11-23 20:51, w-svn's A-891 `made_commit::commit_guarded`): the record
+        // written, the register's entry judged and the store committed before anything of the accept applies; refused,
+        // the submit is refused typed and recorded, nothing applied. The entry is then appended in the step's
+        // transaction, which its judgment holds unrefused.
+        let made = crate::made_commit::commit_guarded(
+          state,
+          pending,
+          |state| {
+            guard_made(state, repository, &mut sealed).map_err(|why| {
+              state.count(UNMADE, 1);
+              why.refusal()
+            })
+          },
+          (
+            |state: &mut ShardState, guarded: GuardedMade| append_made(state, repository, guarded),
+            // The green made again meanwhile: the store, committed by the guard, made again from the log.
+            |state: &mut ShardState, _: GuardedMade| super::rebuild(state, repository),
+          ),
+        );
+        if made.is_some() {
+          state.count(MADE, 1);
+          state.count(MADE_LANDED, 1);
+        } else {
+          sealed.release_homed(state);
+          super::paths::forget_preview_head(state, green, version);
         }
         // Committed, the push holds nothing and this gives back nothing; refused, it gives back what it held.
         sealed.abandon(state);
       }
-      Before::Unmade => {
+      // Its commit not made: refused typed and recorded, nothing of the accept applied or durable (main 01a20182's ruling
+      // of 2026-11-23 22:08: a version is never committed alone; w-svn's A-891 `made_commit::refuse`).
+      Before::Unmade(why) => {
         state.count(UNMADE, 1);
-        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+        super::paths::forget_preview_head(state, green, version);
+        crate::made_commit::refuse(state, pending, why.refusal());
       }
       Before::Unlanded | Before::Gone => {
         super::paths::forget_preview_head(state, green, version);
@@ -768,18 +870,18 @@ async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
       None => return Before::Gone,
       Some(Ok(true)) => break,
       Some(Ok(false)) => slates_rt::futures::yield_now().await,
-      Some(Err(_)) => {
+      Some(Err(why)) => {
         // A build begun and not finished gives back what its puts held.
         if let Some(change) = building.take() {
           let _ = crate::state::with_state(|state| change.abandon(state));
         }
-        return Before::Unmade;
+        return Before::Unmade(why);
       }
     }
   }
   let mut sealed = match crate::state::with_state(|state| sealed_made(state, pending)) {
     None => return Before::Gone,
-    Some(Err(_)) => return Before::Unmade,
+    Some(Err(why)) => return Before::Unmade(why),
     Some(Ok(sealed)) => sealed,
   };
   if home_and_land(&mut sealed).await.is_some() {
@@ -915,6 +1017,10 @@ fn sealed_made(
   let repository =
     super::paths::git_repository_of(state, green).ok_or(Unmade::Store(GitRefused::NoStore))?;
   let authored = authored_now(state, pending.authorship())?;
+  #[cfg(test)]
+  if TEST_UNMADE.with(|unmade| unmade.replace(false)) {
+    return Err(Unmade::Store(GitRefused::NoStore));
+  }
   sealed_of(state, (repository, green, version), &authored)
 }
 
