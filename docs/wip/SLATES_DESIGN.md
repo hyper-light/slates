@@ -29971,6 +29971,12 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
     - where they disagreed (a holder whose copy came after the move refuses it by name), the object was never promised
       and was given up, and the retirement was never confirmed, so the fleet never settled (the chaos nemesis, seeds
       14946995733817154046 and 8173581894251929445).
+  - **An adoption records its move (A-885, 2026-11-23).** A takeover's adoption makes the copy the successor's with
+    `Acceptor::adopt`, recording `MovedFrom { departed, retirement }` whatever the copy served before. A round lives
+    in its successor's memory, so a successor restarted warm before it confirmed its share runs the round again; its
+    adopted copy then falls there by that move, and the rerun counts the adoption as the successor's own promise
+    (re-adopting the object at the rerun's epoch) instead of refusing it by name and giving the object up. A round never
+    promises again what it adopted.
   - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
@@ -62147,3 +62153,42 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - A-251 (i)'s field and image text, A-309's admission rule.
   - GAPS.
   - docs/bugs/2026-11-23-a-move-named-its-host-not-its-retirement.md.
+
+### A-885 — An adoption records its move, so a takeover round run again after a warm restart counts its own adoption (2026-11-23, w-chaos for main 01a20182, its ruling (1) (b) of 2026-11-23; amends A-251 (i); A-883, A-344)
+
+- **Why.** A takeover round lives in its successor's memory (`ShardState::host_takeovers`), so a successor restarted
+  warm before it confirmed its share runs the departed owner's round again from nothing. That rerun learned the
+  adopted volume from the third node's copy, which still falls in the round by its move, then asked itself by name
+  and refused: its own copy, made at the adoption, recorded no move, and A-251 keeps the asker's own objects out of
+  another host's round. The cohort's quorum needs both survivors, so the volume was never promised, was given up at
+  the failover SLO, and every write was held there. This was GAPS' load flake
+  `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`: 2 of 8 runs at load 50 in a diagnostic build,
+  and CI's ae43b42ea run on Windows x64.
+- **The rule (main's ruling (b): a restarted round counts its own adoption).** "A takeover round re-run after a crash
+  must reach the same end as the run it replaces."
+  - A takeover's adoption records the move it is (`takeover::adopted_acceptor`, `Acceptor::adopt`): the departed
+    owner's object moved to its successor at that retirement. The record is persisted with the acceptor.
+  - A rerun therefore lists the adopted copy as the successor's own promise (`promise_local_copies`) and answers it by
+    name. The volume is ready with the other survivor's promise and adopted again at the rerun's epoch. Nothing is
+    given up.
+  - A round never promises again what it adopted (`promise_local_copies` leaves its `adopted` set out), so a round
+    started over above its epoch never fences an adoption its successor writes under.
+  - A moved volume's adoption (A-291) records no move. A later retirement of the same host never counts this one
+    (A-883).
+- **Rejected (main's ruling):** clearing a copy's move once its successor has written it (A-484's ownership rule).
+  That widens what a move means for every copy, and still misses a restart that comes before any write.
+- **Tests** (adacachy2):
+  - `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (`crates/server/src/daemon.rs`):
+    adopt as the round does, restart warm from the held image, and ask the rerun's question by name. Red with the move
+    not recorded (refused 1, nothing answered); green (the adopted record answered, nothing refused).
+  - `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted` (`crates/server/tests/fleet.rs`):
+    the successor withholds its confirmation until its restart. Green 2 of 2 runs whose setup completed: the write
+    answered, every file read, the registers re-adopted at the rerun's epoch, nothing given up.
+- **Applied in the same change to:**
+  - `crates/db/src/register.rs`: `Acceptor::adopt`.
+  - `crates/server/src/takeover.rs`: `adopted_acceptor`, `commit_adopted`, `commit_adopted_at`, `adopt_at`,
+    `promise_local_copies`.
+  - `crates/server/src/daemon.rs` and `crates/server/tests/fleet.rs`: the tests, `restarted_successor_owing`.
+  - A-251 (i)'s text.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md.
