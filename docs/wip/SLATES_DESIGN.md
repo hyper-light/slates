@@ -56056,6 +56056,39 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
     `git_push::tests::t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region` (red first: the
     names' hold stayed for the home's life), `t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object`,
     and slates-cluster `homes::tests::a_home_message_of_another_version_or_without_an_owner_is_refused_typed`.
+  - **(d1a-3) A crash-left attempt's holds are resolved from the homes' side** (main 01a20182's rulings of 2026-11-23,
+    (u), and of 2026-11-24 01:36). A home's holds for an attempt whose process ended (`homes::process_ended`: this
+    member's earlier process, a member dead, or one announcing another process nonce) are asked of the repository's
+    holder (`homes::resolve_one`: this node first, then its routing, then the committed configuration's lineage, then a
+    location round), which walks the repository's records a slice a turn (`homes::resolve_step`): named, the hold moves
+    to the records; not named, it is let go; unanswered, it stays, counted `vcs_store.homes.resolve_kept`. A pass is owed
+    by an event, never a timer: a member's death, a member's new process, this node's start, the healer's pass at a new
+    configuration, **and a repository's rebuild on its successor** (`homes::rebuilt`, at `takeover`'s rebuild, A-636
+    part 2c-2): the answer a resolution asks for exists only once the repository stands there, so a pass the death or the
+    configuration owed, run before the rebuild, keeps every hold, and before this nothing asked again (flaky by
+    construction: three of four runs of the unreachable test red, the green one where a pass fell after the rebuild).
+    The rebuilder owes itself a pass and owes each other member of the configuration word of the rebuild
+    (`HomeMessage::Rebuilt`, home wire version 0x83), told from its period until the member answers that it owes itself a
+    pass (`HomeOutcome::Owed`; owing twice is harmless), an unanswered one asked again next period and counted
+    (`vcs_store.homes.rebuilt_unanswered`), one whose member left the configuration dropped: bounded by the members a
+    rebuild, one word each per takeover, at membership-change time (D-14). A member of version 0x82 is refused at once,
+    typed, by (d1a)'s version rule. **An ended attempt is never spread, only resolved, so the resolution's answer is
+    the only way a hold changes owner** (main 01a20182's ruling of 2026-11-24 04:40): the healer offers an object for
+    every owner its hold has except an ended attempt (`homes::heal_one`, judged by `process_ended` on the control
+    shard; counted `vcs_store.homes.heal_ended_withheld`), and one whose every owner is an ended attempt waits where it
+    is until its resolution moves it to the records or lets it go. Before, a home not yet resolved offered the attempt
+    to one that had moved it to the records, which joined it back after its last owed pass, and the hold stayed an
+    attempt's (the group runs' flake, 1 in 4: the logs showed each hold moved to the records, then the attempt back
+    beside them). Tests: `git_push::tests::t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records`
+    (N = 1), and the fleet's `t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_next_pass`
+    (every survivor's rebuild held until a pass ran and kept every hold, then let go with nothing more owed: resolved by
+    the rebuild's event alone; red without it), `..._an_owner_killed_after_its_entry_before_its_homes_heard_...`,
+    `..._an_owner_killed_after_homing_before_its_entry_...` (the other nodes refuse the owner's register records once its
+    repository is made, so its push is refused after homing), `..._a_healer_never_spreads_an_ended_attempt_to_a_home_that_resolved_it`
+    (one survivor resolved and its resolutions then held, the other walks its holds still the attempt's: the first's stay
+    its records' alone; red without the filter) and `..._a_push_homing_to_a_node_of_another_home_wire_version_...`
+    (judged by the homing's own time with its other homes against its deadline,
+    `vcs_store.homes.longest_homing_region_ns`, never a push's wall time).
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
 - **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the

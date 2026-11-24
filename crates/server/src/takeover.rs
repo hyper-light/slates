@@ -2776,6 +2776,27 @@ pub(crate) type ReadyRepository = (
   Vec<slates_db::catalog::StateLogRecord>,
 );
 
+/// Test support (A-727 (d1a-3)'s trace of a repository's takeover): on this shard, whether it holds the register of
+/// repository `object`'s record, whether it holds it adopted and pending, whether a takeover round still learns a
+/// register of its family, and whether a green of its family waits to be materialized.
+pub(crate) fn repository_takeover_view(state: &ShardState, object: ObjectId) -> [bool; 4] {
+  let family = object.line_key();
+  [
+    state.holder_records.get(&object).is_some(),
+    state.pending_repositories.contains_key(&object),
+    state.host_takeovers.values().any(|take| {
+      take
+        .learned
+        .keys()
+        .any(|learned| learned.line_key() == family)
+    }),
+    state
+      .pending_green_materializations
+      .keys()
+      .any(|green| green.line_key() == family),
+  ]
+}
+
 /// The repositories this node adopted whose rebuild can run (A-636 part 2c-2): each whose record was adopted
 /// ([`adopt_own`]) and no register of whose family any takeover round still learns, its state logs' and its greens'
 /// alike, and none of whose greens still waits to be materialized, so every log it keeps is adopted and every green's
