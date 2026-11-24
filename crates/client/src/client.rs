@@ -4302,34 +4302,46 @@ impl Client {
       ReplyBody::Staged { token } => token,
       _ => return Err(ClientError::UnexpectedReply { verb: "stage" }),
     };
-    // Each put's page is what a request holds past the put's own framing at its largest offset and length.
+    let mut offset = 0u64;
+    for piece in bytes.chunks(self.put_page_bytes(work)) {
+      self.put_page((work, token), offset, piece)?;
+      offset = offset.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+    }
+    Ok(token)
+  }
+
+  /// Derived: the bytes one `StagePut` of `work` carries, what a request of this client's region holds past the put's
+  /// own framing at its largest offset (`chunk_capacity` less the framed length of an empty put): every field of a put
+  /// is fixed width but its bytes, whose length prefix is a fixed four bytes, so the empty put's framing is every put's.
+  /// At least one byte.
+  fn put_page_bytes(&self, work: VolumeId) -> usize {
     let empty = RequestBody::StagePut {
       work,
-      token,
+      token: u64::MAX,
       offset: u64::MAX,
       bytes: Vec::new(),
     };
-    // Every field of a put is fixed width but its bytes (and their length prefix is a fixed four bytes), so the
-    // empty put's framed length is exactly the framing of every put.
-    let framing = slates_ipc::protocol::framed_len(&empty);
-    let page = slates_ipc::protocol::chunk_capacity(self.end.region())
-      .saturating_sub(framing)
-      .max(1);
-    let mut offset = 0usize;
-    for piece in bytes.chunks(page) {
-      let at = u64::try_from(offset).unwrap_or(u64::MAX);
-      match resolved(self.call(&RequestBody::StagePut {
-        work,
-        token,
-        offset: at,
-        bytes: piece.to_vec(),
-      })?)? {
-        ReplyBody::StagePutDone { .. } => {}
-        _ => return Err(ClientError::UnexpectedReply { verb: "stage" }),
-      }
-      offset = offset.saturating_add(piece.len());
+    slates_ipc::protocol::chunk_capacity(self.end.region())
+      .saturating_sub(slates_ipc::protocol::framed_len(&empty))
+      .max(1)
+  }
+
+  /// Puts `piece` at `offset` of staging buffer `token` of `work`: what the buffer holds after it.
+  fn put_page(
+    &mut self,
+    (work, token): (VolumeId, u64),
+    offset: u64,
+    piece: &[u8],
+  ) -> Result<u64, ClientError> {
+    match resolved(self.call(&RequestBody::StagePut {
+      work,
+      token,
+      offset,
+      bytes: piece.to_vec(),
+    })?)? {
+      ReplyBody::StagePutDone { filled } => Ok(filled),
+      _ => Err(ClientError::UnexpectedReply { verb: "stage" }),
     }
-    Ok(token)
   }
 
   /// Declares an edit on a work volume (§4.16): a splice at `path` — remove `delete_len` bytes at
@@ -4399,6 +4411,49 @@ impl Client {
         mode,
       })?
     };
+    fs_done(reply, "fs write")
+  }
+
+  /// Replaces `path`'s content with everything `input` yields to its end (§4.12 `slates.fs.write`, A-880), under the
+  /// caller's write attachment, as one verb, so the file never holds part of it: the file's size. An input that ends
+  /// within a page goes as [`Client::fs_write`] sends it. A longer one is staged in a buffer of no stated length
+  /// (`StageOpen`, living as long as the attachment) a page at a time as it is read, so this holds two pages of it at
+  /// most, however long the input or however slowly it comes; the daemon refuses a buffer past its metadata budget
+  /// `BudgetExceeded`. The attachment must outlive the reading: a caller whose input may come slower than a CLI
+  /// attachment's term holds it ([`crate::Hold`], A-879). A failed read of `input` is `OsRefused`, nothing written.
+  pub fn fs_write_from(
+    &mut self,
+    (volume, attachment): (VolumeId, u64),
+    path: &str,
+    input: &mut impl std::io::Read,
+    mode: u32,
+  ) -> Result<u64, ClientError> {
+    let page = self.put_page_bytes(volume);
+    let mut first = Vec::new();
+    read_page(input, page, &mut first)?;
+    let mut next = Vec::new();
+    if first.len() == page {
+      read_page(input, page, &mut next)?;
+    }
+    if next.is_empty() {
+      return self.fs_write((volume, attachment), path, &first, mode);
+    }
+    let token = match resolved(self.call(&RequestBody::StageOpen { volume, attachment })?)? {
+      ReplyBody::Staged { token } => token,
+      _ => return Err(ClientError::UnexpectedReply { verb: "stage" }),
+    };
+    let mut offset = self.put_page((volume, token), 0, &first)?;
+    while !next.is_empty() {
+      offset = self.put_page((volume, token), offset, &next)?;
+      read_page(input, page, &mut next)?;
+    }
+    let reply = self.call(&RequestBody::FsWriteStaged {
+      volume,
+      attachment,
+      path: path.to_owned(),
+      token,
+      mode,
+    })?;
     fs_done(reply, "fs write")
   }
 
@@ -5904,6 +5959,29 @@ impl Client {
       _ => Err(ClientError::UnexpectedReply { verb: "pin" }),
     }
   }
+}
+
+/// Reads the next page of `input` into `into`, which it clears first: up to `page` bytes, fewer only at the input's end
+/// (none once it has ended). A failed read is `OsRefused` (A-880).
+fn read_page(
+  input: &mut impl std::io::Read,
+  page: usize,
+  into: &mut Vec<u8>,
+) -> Result<(), ClientError> {
+  use std::io::Read;
+  into.clear();
+  let limit = u64::try_from(page).unwrap_or(u64::MAX);
+  input
+    .by_ref()
+    .take(limit)
+    .read_to_end(into)
+    .map(|_| ())
+    .map_err(|error| {
+      ClientError::Ipc(IpcError::OsRefused {
+        call: "read a file write's input",
+        code: error.raw_os_error(),
+      })
+    })
 }
 
 /// A file verb's reply: the changed object's size, or the unexpected reply named by `verb`.

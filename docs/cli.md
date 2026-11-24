@@ -19,7 +19,10 @@ stuck daemon by, then the lapse its anchor waits before replacing it, both measu
 a few seconds in a fleet; `slates status` shows the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
 `slates write` holds the attachment it names from before it reads its stdin until its write is answered, so an input
 slower than the term to arrive, or a large one slower to stage, never lets the attachment lapse mid-write (design
-A-879); an attachment with no term, a mount's, needs no hold.
+A-879); an attachment with no term, a mount's, needs no hold. It streams stdin to the daemon a page at a time as it
+reads it, a page being what one request of its connection carries, so it holds two pages of any input however long
+(design A-880); the file is replaced whole when the input ends, and an input larger than the volume's owner can stage
+is refused `BudgetExceeded`.
 It ends at the term's lapse, releasing the volume's write lease unless the same user still holds another write
 attachment of it: a write lease stays its holder's while any of its write attachments lives (design A-414). A verb
 that names an ended attachment is refused
