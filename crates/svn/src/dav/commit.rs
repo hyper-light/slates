@@ -36,7 +36,7 @@ use super::xml::{Element, parse};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::commit::drive::{Drive, Due, Edited, Green, Setup, TextSink, Work};
 use crate::commit::edit::{CopiedFrom, EditCommand};
-use crate::index::{Index, NodeKind, PropertyPairs, Revision};
+use crate::index::{ContentIdentity, Index, NodeKind, PropertyPairs, Revision};
 use crate::lock::LockTable;
 
 /// `SVN_ERR_FS_NO_SUCH_TRANSACTION`: a request on a transaction that has ended.
@@ -144,6 +144,16 @@ enum EditStep {
   Done(Edited),
   /// A hook is due.
   Hook(Due),
+}
+
+/// What a PUT's run made of its delta ([`DavCommit::put_chunk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chunked {
+  /// Taken.
+  Taken,
+  /// Waiting for its base, which the green holds no bytes of now (`Due::Text`): the caller brings it back and answers
+  /// with [`DavCommit::resume_chunk`], which takes the run again; nothing of the run is taken meanwhile.
+  Wants(ContentIdentity),
 }
 
 /// The revision properties a POST's skel names (`create_txn.c`: `( create-txn-with-props ( NAME VALUE ... ) )` or
@@ -679,7 +689,10 @@ impl DavCommit {
       version_name: put.version_name,
     };
     self.begin_put(world, hooks, path, &start)?;
-    self.put_chunk(world, hooks, put.body)?;
+    // A whole body in one call: a base it waits for is answered by `hooks`, as every hook here is.
+    if let Chunked::Wants(identity) = self.put_chunk(world, hooks, put.body)? {
+      self.resume_chunk(world, hooks, hooks(&Due::Text { identity }))?;
+    }
     Ok(self.end_put(world, hooks))
   }
 
@@ -743,15 +756,47 @@ impl DavCommit {
     world: &World<'_, G>,
     hooks: Hooks<'_>,
     chunk: &[u8],
-  ) -> Result<(), HttpAnswer> {
+  ) -> Result<Chunked, HttpAnswer> {
     let Some(file) = self.putting.as_ref().map(|putting| putting.file.clone()) else {
       return Err(unserved("A PUT's body with no PUT begun"));
     };
-    self.step(
-      world,
-      hooks,
-      &EditCommand::TextdeltaChunk { file: &file, chunk },
-    )
+    let step = self.edit_until_hook(world, &EditCommand::TextdeltaChunk { file: &file, chunk })?;
+    self.chunk_step(world, hooks, step)
+  }
+
+  /// The run [`DavCommit::put_chunk`] left waiting for its base, taken again once the caller's `answer` came: `Ok` once
+  /// the base is brought back, or the errors the PUT is refused with, naming it.
+  ///
+  /// # Errors
+  /// The answer to the PUT where the drive refused the run, which ends the transaction.
+  pub fn resume_chunk<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Result<Chunked, HttpAnswer> {
+    let step = self.resume_until_hook(world, answer)?;
+    self.chunk_step(world, hooks, step)
+  }
+
+  /// What a run's step made: taken, its base wanted, or refused; every hook it meets but a base answered by `hooks`.
+  fn chunk_step<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+    mut step: EditStep,
+  ) -> Result<Chunked, HttpAnswer> {
+    loop {
+      match step {
+        EditStep::Done(Edited::Taken) => return Ok(Chunked::Taken),
+        EditStep::Done(_) => {
+          self.over = true;
+          return Err(no_such_transaction(self.drive.pending().transaction));
+        }
+        EditStep::Hook(Due::Text { identity }) => return Ok(Chunked::Wants(identity)),
+        EditStep::Hook(due) => step = self.resume_until_hook(world, hooks(&due))?,
+      }
+    }
   }
 
   /// Ends the PUT begun last: its delta ended and its file closed with the result checksum; `201` for a file it added,

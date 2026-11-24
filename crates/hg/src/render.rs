@@ -386,6 +386,12 @@ pub trait StoreWants {
   fn reads_bases(&self) -> bool {
     false
   }
+  /// Whether the asker's next want reads a changeset's or a manifest's text whole, its window let go once landed (goal
+  /// 93, C1 (1) P5; a fetch's `crate::serve::getbundle` `LogTexts`): a text it reads to send or diff, never a revision it
+  /// sends whole, so the daemon counts it apart. Read before the want is answered.
+  fn reads_logs(&self) -> bool {
+    false
+  }
 }
 
 impl StoreWants for Streaming {

@@ -12,7 +12,8 @@
 //! 2. **The suites.** Every library and integration test of [`CRATES`], instrumented, with `--no-fail-fast`.
 //!    A report makes the test binary exit non-zero (ThreadSanitizer's `exitcode`, 66 by default), so any
 //!    race fails the task. Only the tests in [`SKIPPED`] are left out, each with its measured reason.
-//! 3. **The server.** Its library and in-process daemon suites ([`SERVER_TARGETS`]), the same way.
+//! 3. **The server.** Its library and in-process daemon suites ([`SERVER_TARGETS`]), the same way, but for the tests in
+//!    [`SERVER_SKIPPED`].
 //!
 //! ThreadSanitizer needs the nightly toolchain (`-Zsanitizer=thread`) and the standard library rebuilt with
 //! the same instrumentation (`-Zbuild-std`, so a race through std's own code is seen and std's
@@ -108,6 +109,16 @@ const SKIPPED: [(&str, &str); 8] = [
      thread states and shares no memory to race on; it runs in every other Linux lane",
   ),
 ];
+
+/// Shape: the server's tests the lane leaves out, each with why. A test here has no second thread for ThreadSanitizer to
+/// watch, and its instrumented run passes the step's limit; it still runs in every other lane.
+const SERVER_SKIPPED: [(&str, &str); 1] = [(
+  "content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes",
+  "it sweeps one shard's content ranges alone, so it has no second thread to race, while every byte it holds to is \
+   read through the shared object's atomics (A-171), each of which the instrumentation intercepts: diag 45411303175 \
+   (2026-11-24, ubuntu-latest) ran it from 14:34 to 18:00, 3 h 26 min, where the rest of the server's library took \
+   16 min; main run 45294047051 had seen it pass 90 minutes before",
+)];
 
 /// Format: the canary test target and the test it holds (`crates/mem/tests/race_canary.rs`).
 const CANARY: (&str, &str) = (
@@ -235,11 +246,16 @@ fn suites(root: &Path, target: &str) -> Result<(), Failure> {
   }
 }
 
-/// Step 3: the server's [`SERVER_TARGETS`], instrumented; any report fails.
+/// Step 3: the server's [`SERVER_TARGETS`] but [`SERVER_SKIPPED`], instrumented; any report fails.
 fn server(root: &Path, target: &str) -> Result<(), Failure> {
   let mut command = instrumented(root, target);
   command.args(["--no-fail-fast", "-p", "slates-server"]);
   command.args(SERVER_TARGETS);
+  command.arg("--");
+  for (test, reason) in SERVER_SKIPPED {
+    eprintln!("tsan: skipping {test}: {reason}");
+    command.args(["--skip", test]);
+  }
   eprintln!(
     "tsan: the server's {} under ThreadSanitizer",
     SERVER_TARGETS.join(" ")

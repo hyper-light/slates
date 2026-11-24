@@ -791,6 +791,70 @@ fn new_file_commit() -> Vec<u8> {
   commit
 }
 
+/// A commit appending "more\n" to `new.txt` at revision 1, as stock `svn` edits a file: `open-file` at its base revision,
+/// then a text delta against its base (svndiff0: the base's 11 bytes copied, then 5 new), no checksum.
+#[cfg(unix)]
+fn file_edit_commit() -> Vec<u8> {
+  // One window: source offset 0, source length 11, target length 16, 3 bytes of instructions, 5 of new data; the
+  // instructions copy 11 bytes from the source at 0, then take 5 new.
+  let window: &[u8] = b"SVN\x00\x00\x0b\x10\x03\x05\x0b\x00\x85more\n";
+  let mut commit =
+    b"( commit ( 4:edit ( ) false ( ( 7:svn:log 4:edit ) ) ) ) ( open-root ( ( 1 ) 2:d0 ) ) \
+( open-file ( 7:new.txt 2:d0 2:c1 ( 1 ) ) ) ( apply-textdelta ( 2:c1 ( ) ) ) "
+      .to_vec();
+  commit.extend_from_slice(format!("( textdelta-chunk ( 2:c1 {}:", window.len()).as_bytes());
+  commit.extend_from_slice(window);
+  commit.extend_from_slice(
+    b" ) ) ( textdelta-end ( 2:c1 ) ) ( close-file ( 2:c1 ( ) ) ) ( close-dir ( 2:d0 ) ) ( close-edit ( ) ) ",
+  );
+  commit
+}
+
+/// The Linux svn matrix's red (main's run 3, 45445378898: commit-edit, propset, switch and merge refused E160004
+/// "Corrupt"). Do: commit [`new_file_commit`] over svn://, whose text the content store lets go once its changeset is
+/// durable (A-760 (b) 4d, main's ruling (B)), then [`file_edit_commit`], a delta against that text, and ask
+/// `get-latest-rev`. Expect: the edit committed as revision 2, its base brought back once (counted). Before, the drive
+/// read the delta's base from the green, whose let-go text answered no bytes, and refused the commit `Corrupt`.
+#[cfg(unix)]
+#[test]
+fn an_edit_whose_base_text_was_let_go_is_committed_over_svn() {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-edit-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  signed
+    .stream
+    .set_read_timeout(Some(Duration::from_nanos(HOOK_PATIENCE_NS)))
+    .expect("the client's wait");
+  let added = asked(&mut signed.stream, &new_file_commit(), 5);
+  assert!(added.ends_with(" ) ( ) ) "), "{added}");
+  let edited = asked(&mut signed.stream, &file_edit_commit(), 5);
+  assert!(!edited.contains("failure"), "{edited}");
+  let latest = asked(&mut signed.stream, b"( get-latest-rev ( ) ) ", 2);
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 2 ) ) ");
+  // Non-vacuity: the edit's base was let go and brought back, not found resident.
+  let brought: u64 = [LISTENER, OTHER]
+    .into_iter()
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(crate::vcs_store::svn_view::BASES_BROUGHT)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .sum();
+  assert_eq!(brought, 1, "the edit's base brought back");
+}
+
 /// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, commits
 /// [`new_file_commit`], then asks `verb` (a lock verb's item): what it answered through its `done` and one item more.
 #[cfg(unix)]

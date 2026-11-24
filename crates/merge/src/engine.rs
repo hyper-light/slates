@@ -733,6 +733,10 @@ impl core::fmt::Debug for Judged {
 }
 
 /// A verdict held (A-635): what [`Green::judge`] reached, nothing of it applied.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "an accepted verdict is the common outcome: boxing it would allocate per judgment, to shrink the rare refusals"
+)]
 #[derive(Debug)]
 pub enum Judgment {
   /// Accepted, and held until [`Green::commit_judged`].

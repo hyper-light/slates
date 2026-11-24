@@ -153,6 +153,12 @@ pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
 /// 2026-11-21 08:45; `slates_hg::serve::getbundle::Pull`). Format: a counter name in the status report.
 pub(crate) const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
 
+/// Counter: the changelog's and the manifests' texts a fetch read whole from the node's changeset store, their windows
+/// let go once landed (goal 93, C1 (1) P5; `slates_hg::serve::getbundle`'s `LogTexts`): a text a fetch reads to send a
+/// changeset or diff a manifest, never a revision it sends whole, so counted apart from [`PULL_WHOLE_TEXTS`]. Format: a
+/// counter name in the status report.
+pub(crate) const PULL_LOG_TEXTS: &str = "vcs_store.hg_pull_log_texts";
+
 /// Counter: the asks a `lookup` or a `batch` made of the node's changeset store for the heads' `.hgtags` (A-767 C1,
 /// main's ruling (A) of 2026-11-21; `slates_hg::serve::lookup::TagsRead`), each a want of rows or of texts. Format: a
 /// counter name in the status report.
@@ -208,6 +214,8 @@ where
       );
       continue;
     };
+    // Read before the answer, which ends the want it names.
+    let logs = wants.reads_logs();
     let Some(whole) = answer_one(&disk, repository, want, wants).await else {
       return false;
     };
@@ -220,6 +228,8 @@ where
         state.count(LOOKUP_STORE_ASKS, 1);
       } else if bases {
         state.count(INTAKE_BASE_ASKS, 1);
+      } else if logs {
+        state.count(PULL_LOG_TEXTS, whole);
       } else {
         state.count(PULL_WHOLE_TEXTS, whole);
       }

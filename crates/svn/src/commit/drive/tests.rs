@@ -1471,6 +1471,8 @@ fn refused_by_hook(replay: &Replay, refused: &str) -> (Option<Vec<(u64, String)>
       let hook = match due {
         Due::StartCommit { .. } => "start-commit",
         Due::PreCommit { .. } => "pre-commit",
+        // Every base is held here: no delta waits for one.
+        Due::Text { .. } => "text",
       };
       let answer = if hook == refused {
         Err(hook_errors(hook))

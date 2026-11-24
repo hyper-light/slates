@@ -198,6 +198,9 @@ impl Uncommitted {
   /// its own words; the others, which no FSFS commit meets, in slates' words under Subversion's nearest error.
   pub(crate) fn answered(&self) -> slates_svn::serve::Uncommitted {
     use slates_svn::serve::Uncommitted as Answered;
+    // Named in the daemon's log, since a client sees one word of it (main's finding of 2026-11-24: the Linux matrix's
+    // bare "Corrupt" left no line).
+    slates_machine::log_line!("slates-server: a Subversion commit answered refused: {self:?}");
     let (code, message) = match self {
       Uncommitted::Step(refusal) => return Answered::Step(refusal.clone()),
       Uncommitted::NotHeld => (
@@ -756,8 +759,14 @@ fn commit_prepared(
   landed
 }
 
-/// The refusal of records that do not hold together.
+/// The refusal of records that do not hold together, its site named in the daemon's log: the client's answer is the
+/// one word.
+#[track_caller]
 fn corrupt() -> Uncommitted {
+  slates_machine::log_line!(
+    "slates-server: a Subversion commit refused Corrupt at {}",
+    std::panic::Location::caller()
+  );
   Uncommitted::Step(StepRefusal::Corrupt)
 }
 
