@@ -1,0 +1,11 @@
+--- a/crates/rt/src/shard.rs
++++ b/crates/rt/src/shard.rs
+@@ -1432,7 +1432,7 @@
+       // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time"). A slice that woke a task,
+       // whatever it answered, left that task to run, not to wait out a park: the daemon's idle work borrows its state,
+       // whose hooks may wake a task, and until 2026-11-23 the shard parked with it ready (A-881, `parked_with_ready`).
+-      if self.idle_slice() || !self.local.is_empty() {
++      if self.idle_slice() {
+         // The driver is harvested between idle slices, as the idle spin harvests it each turn: a step queues only what
+         // is already woken, and only a park, the spin or a busy stretch's quantum ask the driver, so without this a
+         // socket's readiness waited for the idle work to run out (the daemon's memory sweep on idle time held live

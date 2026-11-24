@@ -1,6 +1,9 @@
 name: diag-w-win2
 
-# w-win2 for main 01a20182 (2026-11-23), item 2, run 16: CI's Miri set on slates-rt for the shard loop's change
+# w-win2 for main 01a20182 (2026-11-23), item 2, runs 16 and 17. Run 17 adds a macOS job: run 14's macos-latest failed
+# spin_kick's a_kick_the_spins_harvest_takes_still_gets_its_ring_served (spin_kick.rs:146, the poller never asked past
+# the injection point), so it runs ten rounds with the shard loop's change and ten without. Run 16: CI's Miri set on
+# slates-rt for the shard loop's change
 # (2697686f5). Run 14's Miri stopped at sync::tests::a_bad_channel_and_a_blocking_call_on_a_shard_are_refused, an OS
 # runtime test Miri cannot model (timerfd_create), which w-tsan is marking ignored under Miri; this run skips the
 # sync::tests module so the rest of the set runs.
@@ -26,3 +29,21 @@ jobs:
         run: |
           MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib -- --skip sync::tests::
           MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --test differential --test ownership --test timers --test readiness --test alone
+
+  spin-kick:
+    name: spin_kick with and without the change (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: "spin_kick ten rounds with the change, then ten without"
+        run: |
+          set +e
+          cargo test -p slates-rt --test spin_kick --no-run 2>&1 | tail -1
+          for round in 1 2 3 4 5 6 7 8 9 10; do echo "with, round $round: $(cargo test -p slates-rt --test spin_kick 2>&1 | grep -a 'test result\|panicked' | tr '\n' ' ')"; done
+          git apply .github/diag-w-win2/rt-red.patch
+          for round in 1 2 3 4 5 6 7 8 9 10; do echo "without, round $round: $(cargo test -p slates-rt --test spin_kick 2>&1 | grep -a 'test result\|panicked' | tr '\n' ' ')"; done
+          git apply -R .github/diag-w-win2/rt-red.patch
