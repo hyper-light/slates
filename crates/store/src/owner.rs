@@ -22,8 +22,13 @@
 //! request it serves (the drop sends one to wake it), and the log's end never moved, so the next record is written over
 //! the abandoned bytes and recovery never sees them (a record verifies only with its trailer).
 //!
-//! **Ending.** When every handle is gone the owner checkpoints the engine at the log's end (so a restart replays
-//! nothing) and its thread returns; [`StoreOwner::stop`] joins it. A checkpoint that fails is logged.
+//! **Ending.** The daemon stops the owner ([`StoreOwner::stop`]): the owner ends at the stop, lets its open landing go,
+//! checkpoints the engine at the log's end (so a restart replays nothing) and its thread returns, and the stop joins it.
+//! A checkpoint that fails is logged. Every request queued or sent after the stop is refused `Gone`: the queue closes
+//! with the owner, and the requests in it drop with their answers. Before (main 01a20182's ruling of 2026-11-23), the
+//! stop let only the daemon's own handle go and joined an owner that ended once every handle was gone, so a handle a
+//! task still held made it a blind join: the fleet's harness waited in it 75 minutes. An owner whose every handle goes
+//! without a stop ends the same way.
 //!
 //! **A store that cannot open (goal 93; jupiter's red of 2026-11-21).** The owner never ends with no word: it logs the
 //! store's path and the open's reason once, and answers every request with [`StoreError::Unopened`] naming it until the
@@ -84,6 +89,8 @@ enum Request {
     landing: u64,
     answer: Sender<Result<Located, StoreError>>,
   },
+  /// The daemon stops the owner ([`StoreOwner::stop`]): it ends now, whatever handles are still held.
+  Stop,
   /// A sliced landing was let go: wakes the owner to look at its liveness channel.
   Dropped,
   Land {
@@ -155,7 +162,8 @@ pub enum OwnerError {
   Gone,
   /// The store refused.
   Store(StoreError),
-  /// The handle was used where a task's wait is not (a plain thread uses the store directly, or a test drives a shard).
+  /// The handle was used where a task's wait is not (a plain thread uses the store directly, or a test drives a shard),
+  /// or the owner's stop, a plain thread's wait, was asked on a shard, which never blocks.
   NotOnShard,
 }
 
@@ -212,6 +220,7 @@ impl fmt::Debug for Request {
         .debug_struct("Commit")
         .field("landing", landing)
         .finish_non_exhaustive(),
+      Request::Stop => f.write_str("Stop"),
       Request::Dropped => f.write_str("Dropped"),
       Request::Land { header, parts, .. } => f
         .debug_struct("Land")
@@ -303,9 +312,23 @@ impl StoreOwner {
     self.handle.clone()
   }
 
-  /// Lets the daemon's own handle go and joins the owner once every other handle is gone: its checkpoint written, its
-  /// store closed. The owner's own failure (its open or its checkpoint) is the answer.
+  /// Stops the owner and joins it, on a plain thread (the daemon's, once its shards have stopped): its open landing let
+  /// go, its checkpoint written, its store closed. The owner ends at the stop whatever handles are still held, so the
+  /// join waits for the request it is serving and the checkpoint, never for a handle to go; every request queued or
+  /// sent after it is refused [`OwnerError::Gone`] (its queue closes with it). The owner's own failure (its open or its
+  /// checkpoint) is the answer.
+  ///
+  /// # Errors
+  /// `NotOnShard` when asked on a shard (it would block one); `Gone` when the owner's thread did not end cleanly; the
+  /// store's refusal of its open or its checkpoint.
   pub fn stop(self) -> Result<(), OwnerError> {
+    match self.handle.requests.blocking_send(Request::Stop) {
+      // Sent, or the owner is gone already: either way the join ends.
+      Ok(()) | Err(SyncError::Closed(_)) => {}
+      Err(SyncError::NotOnShardThread(_) | SyncError::Full(_)) => {
+        return Err(OwnerError::NotOnShard);
+      }
+    }
     drop(self.handle);
     match self.thread.join() {
       Ok(result) => result.map_err(OwnerError::Store),
@@ -330,6 +353,7 @@ fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
       Request::Commit { answer, .. } | Request::Land { answer, .. } => {
         drop(answer.try_send(unopened(reason)))
       }
+      Request::Stop => return,
       Request::Dropped => {}
       Request::Piece { answer, .. } | Request::Text { answer, .. } => {
         drop(answer.try_send(unopened(reason)))
@@ -437,6 +461,8 @@ fn serve(
         });
         let _ = answer.try_send(committed);
       }
+      // The daemon's stop: the loop ends here, and the open landing is let go and the checkpoint written below.
+      Request::Stop => break,
       Request::Dropped => {}
       Request::Land {
         header,

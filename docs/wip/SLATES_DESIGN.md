@@ -58404,7 +58404,10 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > property changes their own changesets).
 >
 > **Status (2026-11-20, C4 groundwork: the store's owner).** `owner.rs`: one thread a node runs holding its `Store`
-> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first), reached from shards by a
+> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first; since 2026-11-23 the stop is a
+> request the owner ends at whatever handles are still held, later requests refused `Gone`, after a fleet test's stop
+> joined 75 minutes on a held handle: `docs/bugs/2026-11-23-the-store-owners-stop-joined-blind-on-a-held-handle.md`),
+> reached from shards by a
 > cloneable `StoreHandle` over a bounded `slates_rt::sync` channel: `land` (sections' `Vec`s moved in, answered once
 > durable), `piece`, `changesets`, each answer on a one-value channel the task awaits; a full queue is refused `Busy`.
 > The commit's `F_FULLFSYNC` and the engine's device waits never run on a shard. Test: `--test owner` 1/1 (a shard's
