@@ -20,7 +20,30 @@ for tonight).
 ## Fleet agents (kiln agents on this Mac; message them by uds socket ~/.kiln-run/cc-socks/<pid>.sock)
 
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
-Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
+Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
+
+Updates at 04:59 on 11-24:
+- Gate 6 (45395461722, 77397a5f4) passed 7 of 7 with no Unlanded line, so push 0's cause is still unnamed (gate 5 met it
+  once in 7). Gate 7 runs 10 release and 10 debug at 3d65116a6 (run 45398593779, branch diag-measurer-main-v3-gate7),
+  each log grepped for the typed Unlanded line; its cause goes to w-git.
+- virtio-fs on Linux: A-899 holds (run 45395756328 at 7416cae15, 2 of 2; the guest's read of a let-go Subversion text is
+  brought back and answered).
+- Landed: w-svn A-900 3d65116a6 (a lineage member is lent in place; no engine moved or dropped per lend); w-hg P4b
+  866bfc1dd (with the second deferred submit's NotHead fix and replay_sliced's split).
+- 84a Windows tail, CORRECTED: w-84a-win's larger sample shows no measurable gain from a 2 ms idle window (arm W), and the
+  client spin arms (C, WC) hurt loaded runs. The slow samples are mostly the client thread descheduled while raised
+  spinning shards hold cores (A-326's holds keep 9.5-10 cores spinning; Windows parks 16 of 32 logical processors). The
+  03:00 note below (a 2 ms window halved the slow samples) was a small sample and is superseded. Next arms: NH (holds
+  off) and NHC (NH plus a client spin). If NH cuts the quiet failures without hurting loaded, the product change is a CPU
+  budget on raised idle spinning, bounded by the processors actually free, not a longer window. Design note first.
+- Rulings: w-svn's speed order is HTTPv2 writes (24x) first, then svnsync's per-piece round trip, then A-891's apply
+  bring-back and svn:// update as the Studio ranks them. A-891's owed line (made commits committing a version alone) is
+  split: w-git takes git's half, w-hg takes Mercurial's half, and any change to made_commit::commit itself is agreed
+  between them in writing. w-git retracted its "lend 6 hang" finding (false).
+- Studio: r865 (svn use round, git-2000, at 77397a5f4) runs since 04:39. r866 (git leg at 9f3c3ad80) waits behind it.
+  w-interop is adding a SAMPLE=1 pass to git_scale.sh (one push and one clone sampled 10 s in, status before and after
+  each, every clone step's counters, first byte against total). Relaunch the git leg at that commit if r866 hasn't
+  started. The push sample checks A-900 against r244's ~10k memmove samples in 30 s.
 
 Updates at 04:39 on 11-24:
 - A-887 VERIFIED on the 57k push (r851): live at the push's end 115 MB, was ~170 MB; the greens' 56 MB is gone. RED: w-perf's
@@ -64,7 +87,7 @@ Updates at 03:02 on 11-24:
   runs still cross on Windows (OS wake tail) and on Linux under heavy external load. The hook's text is Ada's to replace.
 
 Updates at 03:00 on 11-24:
-- 84a Windows tail, second measurement (r820, jupiter): a 2 ms idle window before parking (DIAG override, scratch
+- (SUPERSEDED at 04:59, see above) 84a Windows tail, second measurement (r820, jupiter): a 2 ms idle window before parking (DIAG override, scratch
   a06a2a062) against the default 50 us cut slow samples 21 -> 11 and rounds with a single run over 1 ms 5/7 -> 1/7; the
   client's late takes didn't fall (56 -> 78). Evidence for w-perf's derived window (after A-887): a shard window from the
   measured park cost, plus a client spin window; measure CPU inside the bench.
