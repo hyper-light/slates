@@ -36341,18 +36341,32 @@ fn git_in(dir: &str, args: &[&str]) -> std::process::Output {
     .unwrap()
 }
 
-/// A fresh repository in `dir` with `bytes` committed as `file` on `main`. A git step that fails here fails the test,
-/// so a push's refusal is never a setup that went wrong.
+/// A fresh repository in `dir` with `bytes` committed as `file` on `main` ([`commit_in`]).
 fn committed_in(dir: &common::target::TargetDir, (file, bytes): (&str, &[u8])) {
-  let work = dir.path.clone();
+  assert!(
+    git_in(&dir.path, &["init", "-q", "-b", "main"])
+      .status
+      .success()
+  );
+  commit_in(dir, "", (file, bytes));
+}
+
+/// `bytes` committed as `file` in the work tree at `dir`'s `sub` folder (`dir` itself where `sub` is empty), as the
+/// fleet's pushes make their commits. A git step that fails here fails the test, so a push's refusal is never a setup
+/// that went wrong.
+fn commit_in(dir: &common::target::TargetDir, sub: &str, (file, bytes): (&str, &[u8])) {
+  let (work, seeded) = if sub.is_empty() {
+    (dir.path.clone(), file.to_owned())
+  } else {
+    (format!("{}/{sub}", dir.path), format!("{sub}/{file}"))
+  };
   for args in [
-    vec!["init", "-q", "-b", "main"],
     vec!["config", "user.email", "fleet@example.invalid"],
     vec!["config", "user.name", "fleet"],
   ] {
     assert!(git_in(&work, &args).status.success());
   }
-  dir.seed(file, bytes);
+  dir.seed(&seeded, bytes);
   assert!(git_in(&work, &["add", file]).status.success());
   assert!(
     git_in(&work, &["commit", "-q", "-m", file])
@@ -36394,20 +36408,8 @@ impl GitFleet {
     if !cloned.status.success() {
       return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
     }
+    commit_in(&dir, "copy", (file, bytes));
     let work = format!("{}/copy", dir.path);
-    for args in [
-      vec!["config", "user.email", "fleet@example.invalid"],
-      vec!["config", "user.name", "fleet"],
-    ] {
-      assert!(git_in(&work, &args).status.success());
-    }
-    dir.seed(&format!("copy/{file}"), bytes);
-    assert!(git_in(&work, &["add", file]).status.success());
-    assert!(
-      git_in(&work, &["commit", "-q", "-m", file])
-        .status
-        .success()
-    );
     let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, "main"]);
     if pushed.status.success() {
       Ok(())
