@@ -1,5 +1,13 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~15:00 PST
+- (b) LANDED 60b4de519 (A-636 part 2c-2, hg): a record replay asks the changeset store for texts/rows whose identities
+  the content store never knew (batched by room, node::compute checked); counter vcs_store.hg_replay_unknown_asked.
+  Reds proven with the fix out. w-hg reviewed. Owed (GAPS): what a successor puts back is never let go.
+- svn: nothing owed; the Unlanded was my helper's sync settle. Helper split landed e423d42db.
+- Pre-existing red handed to w-hg (theirs, P5): t_a687_an_import_and_a_recovery_serve_the_same_repository.
+- Free for the next piece.
+
 ## 2026-11-24 ~13:00 PST
 - Main's (a) LANDED 31bf5e5c7: a submit over a green whose repository a takeover adopted but has not rebuilt is
   refused Overloaded in made_commit::take_turn (Taken::Unbuilt), counted merge.made.unbuilt, logged once. hg/git/svn
