@@ -7085,10 +7085,9 @@ fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
     };
     // A clone's head is its origin's until its first snapshot, and only a head of its own carries the capture (A-503).
     let snapshotted = client_a.call(&RequestBody::Snapshot { volume: clone });
-    assert!(
-      matches!(snapshotted, ReplyBody::Snapshotted { .. }),
-      "a snapshot of the clone: {snapshotted:?}"
-    );
+    let ReplyBody::Snapshotted { .. } = snapshotted else {
+      panic!("a snapshot of the clone: {snapshotted:?}");
+    };
     share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
     let carried = poll_until(&fleet, SERVE_DEADLINE, || {
       Ok(move_counter(&members.daemons[0], CARRY_RECORDED)? >= 1)
@@ -36342,26 +36341,33 @@ fn git_in(dir: &str, args: &[&str]) -> std::process::Output {
     .unwrap()
 }
 
+/// A fresh repository in `dir` with `bytes` committed as `file` on `main`. A git step that fails here fails the test,
+/// so a push's refusal is never a setup that went wrong.
+fn committed_in(dir: &common::target::TargetDir, (file, bytes): (&str, &[u8])) {
+  let work = dir.path.clone();
+  for args in [
+    vec!["init", "-q", "-b", "main"],
+    vec!["config", "user.email", "fleet@example.invalid"],
+    vec!["config", "user.name", "fleet"],
+  ] {
+    assert!(git_in(&work, &args).status.success());
+  }
+  dir.seed(file, bytes);
+  assert!(git_in(&work, &["add", file]).status.success());
+  assert!(
+    git_in(&work, &["commit", "-q", "-m", file])
+      .status
+      .success()
+  );
+}
+
 impl GitFleet {
-  /// Commits `bytes` as `file` in a fresh clone-less repository and pushes `main` to node `node`'s edge: git's stderr
-  /// where it failed.
+  /// Commits `bytes` as `file` in a fresh clone-less repository ([`committed_in`]) and pushes `main` to node `node`'s
+  /// edge: git's stderr where the push failed.
   fn push(&self, node: usize, (file, bytes): (&str, &[u8])) -> Result<(), String> {
     let dir = common::target::target_dir();
     let work = dir.path.clone();
-    for args in [
-      vec!["init", "-q", "-b", "main"],
-      vec!["config", "user.email", "fleet@example.invalid"],
-      vec!["config", "user.name", "fleet"],
-    ] {
-      assert!(git_in(&work, &args).status.success());
-    }
-    dir.seed(file, bytes);
-    assert!(git_in(&work, &["add", file]).status.success());
-    assert!(
-      git_in(&work, &["commit", "-q", "-m", file])
-        .status
-        .success()
-    );
+    committed_in(&dir, (file, bytes));
     let port = self.daemons[node]
       .vcs_http_port()
       .expect("the edge listens");

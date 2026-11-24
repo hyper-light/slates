@@ -117,14 +117,27 @@ fn segment_words(geometry: &Geometry) -> Words {
           STUCK_LABEL_WORDS.saturating_add(4),
           Width::U64,
         )),
-      // The content pool's owner words (A-98), each claimed by compare-and-swap, then a want word a partition (A-853).
-      RegionKind::Pool => words.with(WordRun::strided(
-        at,
-        size_of::<u64>(),
-        usize::from(geometry.partitions)
-          .saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION.saturating_add(1)),
-        Width::U64,
-      )),
+      // The content pool's owner words (A-98), each claimed by compare-and-swap, then a want word a partition (A-853), then
+      // the pool's generation word on a line of its own (A-906).
+      RegionKind::Pool => words
+        .with(WordRun::strided(
+          at,
+          size_of::<u64>(),
+          usize::try_from(crate::layout::pool_owner_and_want_words(
+            geometry.partitions,
+          ))
+          .unwrap_or(usize::MAX),
+          Width::U64,
+        ))
+        .with(WordRun::strided(
+          at.saturating_add(
+            usize::try_from(crate::layout::pool_generation_offset(geometry.partitions))
+              .unwrap_or(usize::MAX),
+          ),
+          size_of::<u64>(),
+          1,
+          Width::U64,
+        )),
       RegionKind::Log(_) => words.with(WordRun::strided(
         at.saturating_add(RING_HEAD),
         size_of::<u64>(),
@@ -1178,24 +1191,53 @@ impl AnchorSegment {
   /// the content does (A-98).
   pub fn pool_claim(&self, extent: usize, partition: u16) -> Result<bool, AnchorError> {
     let owner = u64::from(partition).saturating_add(1);
-    Ok(
-      self
-        .pool_word(extent)?
-        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok(),
-    )
+    let claimed = self
+      .pool_word(extent)?
+      .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok();
+    if claimed {
+      self.pool_moved()?;
+    }
+    Ok(claimed)
   }
 
   /// Releases pool extent `extent` if `partition` holds it: whether this call freed it. A release by any other
   /// partition changes nothing.
   pub fn pool_release(&self, extent: usize, partition: u16) -> Result<bool, AnchorError> {
     let owner = u64::from(partition).saturating_add(1);
-    Ok(
-      self
-        .pool_word(extent)?
-        .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok(),
-    )
+    let released = self
+      .pool_word(extent)?
+      .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok();
+    if released {
+      self.pool_moved()?;
+    }
+    Ok(released)
+  }
+
+  /// The pool's generation word (A-906), on its own line past every want word.
+  fn generation_word(&self) -> Result<&AtomicU64, AnchorError> {
+    let at = usize::try_from(crate::layout::pool_generation_offset(
+      self.geometry.partitions,
+    ))
+    .map_err(|_| AnchorError::Geometry {
+      reason: "a pool generation offset overflows",
+    })?;
+    self.word_at(self.spec(RegionKind::Pool)?, at)
+  }
+
+  /// Notes that the pool's room moved: an extent claimed or released by any partition, or (Windows) a free extent made
+  /// claimable again (A-906). A reader that counted the pool's free room at a generation knows its count still holds
+  /// while the generation reads the same.
+  pub fn pool_moved(&self) -> Result<(), AnchorError> {
+    self.generation_word()?.fetch_add(1, Ordering::AcqRel);
+    Ok(())
+  }
+
+  /// The pool's generation (A-906): moved at every claim and release, so a count of the pool's free room taken at one
+  /// generation holds while it reads the same.
+  pub fn pool_generation(&self) -> Result<u64, AnchorError> {
+    Ok(self.generation_word()?.load(Ordering::Acquire))
   }
 
   /// Partition `partition`'s want word (A-853), after every owner word, refused past the partitions.

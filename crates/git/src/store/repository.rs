@@ -292,10 +292,11 @@ pub(super) struct Kept {
   /// budget, read for every kept part each time a repository's holding is weighed (main 01a20182's r100: git/git's work
   /// clone spent 85% of its shard counting them again, a set's runs walked whole each turn of its encoding ahead).
   pub(super) runs: usize,
-  /// What the store answers for its content's length (`ContentStore::len_of`), read once as it is kept, since a kept
-  /// part's content never changes: what weighing a repository's kept fragments reads ([`Repository::kept_fragments`]),
-  /// which read it from the store's map for every kept part on every weighing (gate r935, main 01a20182: 2,270 of a
-  /// clone's 24,971 samples in `len_of`, under each version encoded and each grant weighed).
+  /// The bytes the store holds under its content, its whole tree of windows and lists (`ContentStore::tree_bytes`), read
+  /// once as it is kept, since a kept part's content never changes: what weighing a repository's kept fragments reads
+  /// ([`Repository::kept_fragments`]). It read `len_of` from the store's map for every kept part on every weighing (gate
+  /// r935: 2,270 of a clone's 24,971 samples), and that was the root node's length alone, so a fragment kept as a tree
+  /// was weighed at a few dozen bytes (main 01a20182's ruling of 2026-11-24 10:56).
   pub(super) held: u64,
 }
 
@@ -2288,7 +2289,7 @@ fn keep_both(
   match (keep(objects), keep(blobs)) {
     (Ok(mut objects), Ok(mut blobs)) => {
       for kept in [&mut objects, &mut blobs] {
-        kept.held = store.len_of(&kept.content).unwrap_or(0);
+        kept.held = store.tree_bytes(&kept.content);
       }
       Ok(Fragments { objects, blobs })
     }

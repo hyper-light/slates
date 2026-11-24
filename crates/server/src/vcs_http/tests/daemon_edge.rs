@@ -5846,13 +5846,7 @@ fn log_rows(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) -> Ve
 }
 
 /// How many of `rows` ([`log_rows`]) have a text that hashes, with their parents, to their node.
-fn log_texts_hashing_to_their_nodes(
-  rows: &[(
-    slates_hg::Node,
-    (slates_hg::Node, slates_hg::Node),
-    Option<Vec<u8>>,
-  )],
-) -> usize {
+fn log_texts_hashing_to_their_nodes(rows: &[LogRow]) -> usize {
   rows
     .iter()
     .filter(|(node, (p1, p2), text)| {
