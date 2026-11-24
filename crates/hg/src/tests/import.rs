@@ -1169,6 +1169,7 @@ fn a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store()
       replay.answer_texts(texts);
     }
   }
+  let brought_back = replay.take_brought_back();
   let replayed = replay.finish(&mut index, &mut store).unwrap();
   assert_eq!(whole_texts(&index, &store), saved, "every revision's text");
   assert_eq!(
@@ -1182,6 +1183,11 @@ fn a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store()
   );
   assert!(replayed.unknown_asked > 0, "asked for unknown identities");
   assert_eq!(replayed.texts_asked, 0, "none let go");
+  assert_eq!(
+    u64::try_from(brought_back.len()).unwrap(),
+    replayed.unknown_asked,
+    "every revision brought back named for its let-go"
+  );
   let changesets = usize::try_from(index.len(&store, Log::Changelog)).unwrap();
   assert_eq!(
     asks

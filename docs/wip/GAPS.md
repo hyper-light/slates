@@ -4560,8 +4560,14 @@
 > record's room, each held to its node (`node::compute`) before it is kept, counted `vcs_store.hg_replay_unknown_asked`
 > (`slates_hg` `a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store`; the hg twin with its store
 > gone). Subversion owed nothing: its rebuild's task reads its records back (the earlier `Unlanded` was a test's
-> one-step settle). Owed (w-hg's review): what a successor's replay puts back stays held, marked landed by nothing, so
-> nothing lets it go, as P5 lets a landed push's go; to be let go once the rebuild ends, as `hg_run`'s let-go does. (c) a Mercurial
+> one-step settle). What a replay keeps from texts the changeset store gave (a successor's never known here, a
+> restart's let go once landed, a manifest kept again over them) is let go again once the replay ends: every replay,
+> one rule (main's rulings of 13:12 and 13:22), through P5's landed let-go (`hg_run::let_go_committed`), counted
+> `vcs_store.hg_brought_back_let_go`, equal to the texts asked
+> (`a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands`, `a_restarts_replay_lets_go_the_texts_it_brought_back`;
+> w-perf, w-hg's review note (c)). Not owed by the other tools (main's ruling of 13:22): a git rebuild keeps the pack it reads whole
+> (`put_changeset`), as a live commit keeps its landed pack while `LANDED_LET_GO` is held (whether a landed pack goes
+> at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
