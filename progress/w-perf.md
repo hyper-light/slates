@@ -540,3 +540,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Next (main's order): (1) the chunk record slab's segment, min(max_chunks, page) -> a page of records as TagStore
     does, red by heap count, AC-0.4 provisioning A/B via kiln; (2) the gauge test's placement dependence (GAPS OPEN);
     (3) system_live by owner.
+- 2026-11-23 ~20:00 PST:
+  - LANDED 16e3cd261: chunk record and tag tables grow a page of slots at a time (Slab::slots_a_page); a first chunk's
+    heap 2,228,320 -> 8,800 B. Main's r509 A/B: neutral (provision p50/p99, vfs_bench create/write rows).
+  - LANDED 8918cc8d0: the memory status test waits for its checkpoint (taken in turns when it outgrows the step's
+    measured quantum; the cause was checkpoint timing, not placement). Red pins in-turns via hold_pause_at.
+  - LANDED 9ec97f9b1: provision_bench reports refusals and fails at its end; the daemon logs the first refusal its own
+    available covers, with the pool's side (new ChunkArena::room_lost). Run request at 80fbd5249 sent (r509's
+    BudgetExceeded { available: 33945026560 }; hypothesis: make_room's all-or-nothing claims lose races).
+  - AC-2.1 at 23 shards: never met on the M3 Ultra Studio (2026-11-18 rows 200-324 us); r509's 88-95 us is the best.
+  - system_live by owner sent from the 57k sampler (pre-cuts): greens 57.5 MB, hg index tables 56.8, content entries
+    25.8, window records 22.1, image pages 20.2. Asked main who runs the fresh 57k sampler at 80fbd5249.
