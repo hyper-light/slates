@@ -39,3 +39,16 @@ wrong event.
 Every writer of `SUP_SERVING`: the role (removed) and the control loop (now). Every reader: the anchor's supervisor
 (`supervise.rs`, the start's end and the recovered verdict) and `slates status`. The anchor's own failed-start count is
 unchanged and held by its tests, which mark serving themselves.
+
+## The end-to-end test (main's order of 06:05)
+
+The bug lived between the daemon's word and the anchor's count, and each side's own tests passed. So the test that
+holds the two together runs across processes on `common::supervised`:
+`recovery::a_shard_start_that_never_ends_is_a_failed_start_and_its_loop_backs_off`. A supervised daemon's second
+shard's start spins in one poll past its window on every start (`BootFaultKind::Spinning`), and the test plays an
+anchor that kills a daemon whose beat lapsed (`supervised::watch_restarts`). Expect: the first exit a failed start
+restarted at once, the second a `CrashLoop`, its restart no sooner than its backoff, no exit read as recovered. Green
+here: a failed start at 19.3 s, a crash loop at 30.5 s backing off 11.1 s, the restart at 41.7 s (debug, the MacBook,
+44 s in all). Red with the bug put back (the serving word marked as `Daemon::start` returned): three exits, each
+`Restarted { failed_in_a_row: 0 }`, restarted at once, never a crash loop, as r865's 1,189 were.
+

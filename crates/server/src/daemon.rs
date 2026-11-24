@@ -4819,6 +4819,13 @@ async fn hold_start(fault: crate::config::BootFault, slice_ns: u64) {
       }
       let _report = slices.finish();
     }
+    // One poll, never a step: the boot tests' model of a recovery step past its window.
+    crate::config::BootFaultKind::Spinning => {
+      let started = std::time::Instant::now();
+      while started.elapsed() < duration {
+        std::hint::spin_loop();
+      }
+    }
   }
 }
 

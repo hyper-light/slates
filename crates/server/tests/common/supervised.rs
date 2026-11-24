@@ -40,6 +40,98 @@ const STEP_PAUSE: Duration = Duration::from_nanos(slates_server::daemon::HEARTBE
 /// Runs this test binary's ignored test `role` as a supervised daemon's process of `shards` shards, the test playing its
 /// anchor, and asserts the role passed. `name` names the instance and the segment.
 pub(crate) fn run(role: &str, name: &str, shards: u16) {
+  let (mut supervisor, args_role) = supervisor_for(role, name, shards);
+  let clock = Instant::now();
+  let now_ns = || u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  supervisor.start(now_ns()).unwrap();
+  let exit = loop {
+    match supervisor.step(now_ns()).unwrap() {
+      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code, .. } => break exit_code,
+      _ if clock.elapsed() > ROLE_WAIT => {
+        let _ = supervisor.kill();
+        panic!("the supervised role {args_role} was still running after {ROLE_WAIT:?}");
+      }
+      _ => {
+        // The harness paces its supervision; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(STEP_PAUSE);
+      }
+    }
+  };
+  // The role restarted at its exit is stopped at once, before it runs the body again.
+  supervisor.stop().unwrap();
+  assert_eq!(
+    exit,
+    Some(0),
+    "the supervised role {role} passed (its output is above)"
+  );
+}
+
+/// What a supervision that kills a lapsed beat saw ([`watch_restarts`]), on its own clock: each step that ended a daemon,
+/// with when, and when each daemon started.
+pub(crate) struct Watched {
+  /// Each end: when, and the step that reported it ([`Step::Restarted`] or [`Step::CrashLoop`]).
+  pub(crate) ends: Vec<(u64, Step)>,
+  /// When each daemon started, the first included.
+  pub(crate) starts: Vec<u64>,
+}
+
+/// Runs this test binary's ignored test `role` as a supervised daemon's process of `shards` shards, the test playing its
+/// anchor as `slates anchor` does: a daemon whose beat has not moved for a liveness window is killed (A-232; the anchor's
+/// own bound adds its lateness), and the supervisor restarts it by its policy (A-311). Watched until `done` says so of
+/// what it saw, or for `watch`; then stopped. What it saw.
+pub(crate) fn watch_restarts(
+  role: &str,
+  (name, shards): (&str, u16),
+  watch: Duration,
+  done: impl Fn(&Watched) -> bool,
+) -> Watched {
+  let (mut supervisor, _) = supervisor_for(role, name, shards);
+  let lapse = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let clock = Instant::now();
+  let now_ns = || u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  let mut watched = Watched {
+    ends: Vec::new(),
+    starts: Vec::new(),
+  };
+  supervisor.start(now_ns()).unwrap();
+  watched.starts.push(now_ns());
+  let mut pid = supervisor.child_pid();
+  let mut beat = (0u64, Instant::now());
+  while clock.elapsed() < watch && !done(&watched) {
+    // Each time the clock the step was given: a restart its step made is no sooner than that step's now.
+    let now = now_ns();
+    let step = supervisor.step(now).unwrap();
+    if matches!(step, Step::Restarted { .. } | Step::CrashLoop { .. }) {
+      watched.ends.push((now, step));
+    }
+    let now_pid = supervisor.child_pid();
+    if now_pid.is_some() && now_pid != pid {
+      watched.starts.push(now);
+      beat = (0, Instant::now());
+    }
+    pid = now_pid;
+    if supervisor.running() {
+      let heartbeat = supervisor.segment().supervision().unwrap().heartbeat_ns();
+      if heartbeat != beat.0 {
+        beat = (heartbeat, Instant::now());
+      } else if beat.1.elapsed() > lapse {
+        supervisor.kill().unwrap();
+        beat = (heartbeat, Instant::now());
+      }
+    }
+    // The harness paces its supervision; shipped code parks on its driver (D-9).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(STEP_PAUSE);
+  }
+  let _ = supervisor.kill();
+  supervisor.stop().unwrap();
+  watched
+}
+
+/// A supervisor of this test binary's ignored test `role` as a daemon's process of `shards` shards, over a segment named
+/// after `name` holding the profile it derives from; and the role.
+fn supervisor_for(role: &str, name: &str, shards: u16) -> (Supervisor, String) {
   let profile = super::machine_profile();
   let instance = format!("sup-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(shards));
@@ -68,30 +160,7 @@ pub(crate) fn run(role: &str, name: &str, shards: u16) {
   supervisor.hold_environment(ROLE_ENV, role.to_owned());
   supervisor.hold_environment(INSTANCE_ENV, instance);
   supervisor.hold_environment(SHARDS_ENV, shards.to_string());
-  let clock = Instant::now();
-  let now_ns = || u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
-  supervisor.start(now_ns()).unwrap();
-  let exit = loop {
-    match supervisor.step(now_ns()).unwrap() {
-      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code, .. } => break exit_code,
-      _ if clock.elapsed() > ROLE_WAIT => {
-        let _ = supervisor.kill();
-        panic!("the supervised role {role} was still running after {ROLE_WAIT:?}");
-      }
-      _ => {
-        // The harness paces its supervision; shipped code parks on its driver (D-9).
-        #[allow(clippy::disallowed_methods)]
-        std::thread::sleep(STEP_PAUSE);
-      }
-    }
-  };
-  // The role restarted at its exit is stopped at once, before it runs the body again.
-  supervisor.stop().unwrap();
-  assert_eq!(
-    exit,
-    Some(0),
-    "the supervised role {role} passed (its output is above)"
-  );
+  (supervisor, role.to_owned())
 }
 
 /// The daemon a supervised role runs beside, when this process is that role's child: attached from the environment its
