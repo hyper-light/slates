@@ -919,6 +919,7 @@ fn departure_settled_periods(daemons: &[&Daemon]) -> u64 {
 /// the earlier "least absolute count" rule let happen under unequal starts (`tests/observe.rs` proves the
 /// rule with numbers).
 #[track_caller]
+#[must_use = "a wait's result says whether its condition held: assert it, or show the wait is a deliberate settle"]
 fn poll_until(
   daemons: &[&Daemon],
   within: Duration,
@@ -932,6 +933,7 @@ fn poll_until(
 /// budget is sized for an operation to converge however slowly, so a watch that never holds spent all of it: 4,000
 /// periods, about 400 s on CI for a watch of four liveness budgets (`a_works_head_is_never_placed...`, 2026-11-08).
 #[track_caller]
+#[must_use = "a wait's result says whether its condition held: assert it, or show the wait is a deliberate settle"]
 fn poll_for_periods(
   daemons: &[&Daemon],
   within: Duration,
@@ -947,6 +949,7 @@ fn poll_for_periods(
 /// failed once in a loaded run of the fleet tests with the successor not yet giving up, and a successor whose estimate
 /// rose tenfold during the wait failed it every time (w-forming, 2026-11-20).
 #[track_caller]
+#[must_use = "a wait's result says whether its condition held: assert it, or show the wait is a deliberate settle"]
 fn poll_for_live_periods(
   daemons: &[&Daemon],
   within: Duration,
@@ -3536,10 +3539,14 @@ fn three_daemons_form_a_full_mesh() {
 
   // Poll until every node's full direct mesh has formed (all six probe sessions established). Robust to CPU
   // load: `poll_until` charges the fleet's own forward progress, not wall-clock (see its docs).
-  poll_until(
+  let meshed = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     formation_deadline(),
     || all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed())),
+  );
+  assert!(
+    meshed,
+    "every node's full direct mesh formed within the deadline"
   );
   // A refusal names a node that could not be observed at all, and the stage it reached — shown as such in
   // the failure, never counted as meshed.
@@ -5235,7 +5242,8 @@ fn moved_to_b_and_written_there(
 /// A write attachment of `volume` through `client` once its owner serves it, or none within the serve deadline.
 fn attach_when_served(fleet: &[&Daemon], client: &mut Client, volume: VolumeId) -> Option<u64> {
   let mut attached = None;
-  poll_until(fleet, SERVE_DEADLINE, || {
+  // A settle: the attachment itself is the outcome, `None` past the deadline, judged by each caller.
+  let _ = poll_until(fleet, SERVE_DEADLINE, || {
     if let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
       volume,
       snapshot: None,
@@ -6997,7 +7005,7 @@ fn a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its
     let failover = members.daemons[0].failover_ns();
     let to = members.hosts[1].0;
     let mut answers: Vec<String> = Vec::new();
-    poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
+    let settled = poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
       let reply = client_a.call(&RequestBody::Move { volume: clone, to });
       let settled = !matches!(reply, ReplyBody::Moving { .. });
       let named = format!("{reply:?}");
@@ -7006,6 +7014,10 @@ fn a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its
       }
       Ok(settled)
     });
+    assert!(
+      settled,
+      "the first ask's move was answered other than Moving within the deadline: {answers:?}"
+    );
     let refused = move_counter(&members.daemons[0], MOVE_REFUSED);
     (answers, refused, failover, describe(&fleet))
   };
@@ -7086,10 +7098,14 @@ fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
     let mut client_b = Client::connect(&members.instances[1]);
     let (served, _) = read_back(&fleet, &mut client_b, clone, &[("/kept", KEPT_AS_CAPTURED)]);
     let mut resolved = None;
-    poll_until(&fleet, SERVE_DEADLINE, || {
+    let found = poll_until(&fleet, SERVE_DEADLINE, || {
       resolved = Some(members.daemons[1].mount_capability(&name));
       Ok(matches!(resolved, Some(Ok(Some(_)))))
     });
+    assert!(
+      found,
+      "b resolved the moved clone's name within the deadline: {resolved:?}"
+    );
     (carried, served, resolved, answers, describe(&fleet))
   };
   for daemon in members.daemons {
@@ -8611,9 +8627,13 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     .collect();
   // The lane forwarding before the session goes deaf: a read of every reader served on the healthy session.
   let readers_served = || DEAD_SESSION_SERVED.load(std::sync::atomic::Ordering::Acquire);
-  poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+  let forwarded = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
     Ok(readers_served() >= u64::try_from(DEAD_SESSION_READERS).unwrap())
   });
+  assert!(
+    forwarded,
+    "every reader was served on the healthy session before it went deaf"
+  );
   let forwarding = readers_served();
   // Installed once the control shard answers.
   let marked = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
@@ -8621,7 +8641,7 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   });
   // Until the lane has answered on the replacement.
   let mut recovered = None;
-  poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+  let replaced = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
     recovered = daemons[1]
       .observation(
         Some(daemons[1].shards()[0]),
@@ -8631,6 +8651,10 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
       .wait()?;
     Ok(recovered.is_some())
   });
+  assert!(
+    replaced,
+    "the lane answered on the replacement session: {recovered:?}"
+  );
   drop(everyone);
   DEAD_SESSION_READING.store(false, std::sync::atomic::Ordering::Release);
   let reads: Vec<[u64; 3]> = readers
@@ -10086,7 +10110,7 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   // One forwarded write. `call` assigns a fresh request id; a transient forward failure is retried on the
   // **same** id (`call_retry`), so a is never asked for a second snapshot while the first is in flight.
   let mut first = client_b.call(&RequestBody::Snapshot { volume: id });
-  poll_until(
+  let answered = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     COUNCIL_RETIRE_DEADLINE,
     || {
@@ -10096,6 +10120,10 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
       first = client_b.call_retry(&RequestBody::Snapshot { volume: id });
       Ok(matches!(first, ReplyBody::Snapshotted { .. }))
     },
+  );
+  assert!(
+    answered,
+    "the forwarded snapshot was answered within the deadline: {first:?}"
   );
   // A further retry of the same id must return the recorded reply.
   let forwards_before = daemons[1].fleet_refusals().unwrap();
@@ -15517,7 +15545,8 @@ fn written_through(
   let mut client = Client::connect(daemons[through].instance());
   let mut replies = Vec::new();
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+  // A settle: every reply is the outcome, the last the one that ended the wait, judged by each caller.
+  let _ = poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
     let reply = match client.call(&RequestBody::Attach {
       volume,
       snapshot: None,
@@ -21773,7 +21802,8 @@ fn place_first_and_promise(
   }
   // The owner records the snapshot's identity once its placement completes, after the holder kept it.
   let mut first_manifest = None;
-  poll_until(&observed, PLACEMENT_DEADLINE, || {
+  // A settle: the manifest read is the outcome, refused just below when none was identified.
+  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
     first_manifest = daemons[0].fleet_head_manifest(ObjectId(first.bytes))?;
     Ok(first_manifest.is_some())
   });
@@ -29974,12 +30004,16 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
     })
   };
   // The daemon's own verdict ends the wait: the green placed at version 3, or given up at its bound.
-  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+  let decided = poll_until(&survivors, PLACEMENT_DEADLINE, || {
     Ok(
       daemons[successor_index].merge_record_placed(green, 3)?
         || given_up(&daemons[successor_index])?,
     )
   });
+  assert!(
+    decided,
+    "the successor decided the green: placed at 3 or given up"
+  );
   let placed = daemons[successor_index].merge_record_placed(green, 3);
   let counted = daemons[successor_index].refusals_on_every_shard();
   let successor_chain = daemons[successor_index].merge_chain_identities(green);
@@ -30163,7 +30197,8 @@ fn a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_i
 /// Waits, within the placement deadline in the survivors' own periods, for `daemon`'s verdict on the taken-over
 /// `green`: placed at `version`, or given up at its bound. The verdict is read again by the caller.
 fn await_placed_or_given_up(survivors: &[&Daemon], daemon: &Daemon, green: VolumeId, version: u64) {
-  poll_until(survivors, PLACEMENT_DEADLINE, || {
+  // A settle: the verdict is read again by the caller, which judges it.
+  let _ = poll_until(survivors, PLACEMENT_DEADLINE, || {
     Ok(daemon.merge_record_placed(green, version)? || takeover_given_up(daemon)?)
   });
 }
@@ -30432,7 +30467,8 @@ fn head_once_its_lease_confirms(
 ) -> ReplyBody {
   let observed: Vec<&Daemon> = fleet.iter().collect();
   let mut last = None;
-  poll_until(&observed, PLACEMENT_DEADLINE, || {
+  // A settle: the last reply is the outcome, judged by each caller.
+  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
     let reply = reader.call(&RequestBody::Versions { green });
     let confirmed = !matches!(
       reply,
@@ -30614,13 +30650,17 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
   let again = resend_while_refused_retryable(&mut client, &submit);
   let survivors: Vec<&Daemon> = daemons.iter().collect();
   let mut head = None;
-  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+  let served = poll_until(&survivors, PLACEMENT_DEADLINE, || {
     head = daemons
       .iter()
       .map(|daemon| Client::connect(daemon.instance()).call(&RequestBody::Versions { green }))
       .find(|reply| matches!(reply, ReplyBody::Versions { .. }));
     Ok(head.is_some())
   });
+  assert!(
+    served,
+    "a survivor served the green's versions after both takeovers: {head:?}"
+  );
   drop(survivors);
   for daemon in daemons {
     daemon.stop();
@@ -36073,13 +36113,14 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
     .collect();
   let survivors: Vec<&Daemon> = daemons.iter().collect();
   let mut head = None;
-  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+  let served = poll_until(&survivors, PLACEMENT_DEADLINE, || {
     head = readers
       .iter_mut()
       .map(|reader| reader.call(&RequestBody::Versions { green }))
       .find(|reply| matches!(reply, ReplyBody::Versions { .. }));
     Ok(head.is_some())
   });
+  assert!(served, "a survivor served the green's versions: {head:?}");
   drop(survivors);
   drop(readers);
   for daemon in daemons {

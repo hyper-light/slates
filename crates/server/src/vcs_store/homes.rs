@@ -1824,7 +1824,6 @@ pub(crate) async fn serve_remote(
   request: &[u8],
   budget_ns: u64,
 ) -> Vec<u8> {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome};
   let message = match decoded(request) {
     Ok(message) => message,
     Err(answer) => return answer,
@@ -1842,7 +1841,23 @@ pub(crate) async fn serve_remote(
   }) else {
     return Vec::new();
   };
-  let (identity, outcome) = match message {
+  outcome_of(message, (origin, &shards), (local, &members, f), budget_ns)
+    .await
+    .map_or_else(Vec::new, |(identity, outcome)| {
+      slates_cluster::homes::HomeMessage::Answer { identity, outcome }.encode()
+    })
+}
+
+/// [`serve_remote`]'s outcome for a decoded `message` and the identity it answers for, served on shard `origin` with what
+/// this node knows of the region; `None` for an answer, which nothing answers.
+async fn outcome_of(
+  message: slates_cluster::homes::HomeMessage,
+  (origin, shards): (u16, &[u16]),
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  budget_ns: u64,
+) -> Option<([u8; 32], slates_cluster::homes::HomeOutcome)> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let answered = match message {
     HomeMessage::Put {
       identity,
       owners,
@@ -1852,8 +1867,8 @@ pub(crate) async fn serve_remote(
       identity,
       keep_put(
         origin,
-        &shards,
-        (local, &members, f),
+        shards,
+        (local, members, f),
         (identity, owners, bytes),
         budget_ns,
       )
@@ -1869,8 +1884,8 @@ pub(crate) async fn serve_remote(
     } => (
       identity,
       part_answer(
-        (origin, &shards),
-        (local, &members, f),
+        (origin, shards),
+        (local, members, f),
         (identity, owners, (total, offset)),
         (bytes, budget_ns),
       )
@@ -1878,27 +1893,24 @@ pub(crate) async fn serve_remote(
     ),
     HomeMessage::ReadPart { identity, offset } => (
       identity,
-      read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
+      read_part(origin, shards, ContentId(identity), offset, budget_ns).await,
     ),
-    HomeMessage::Read { identity } => {
-      let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
-        Ok(bytes) => HomeOutcome::Bytes(bytes),
-        Err(refused) => HomeOutcome::Refused(refused.wire()),
-      };
-      (identity, outcome)
-    }
+    HomeMessage::Read { identity } => (
+      identity,
+      read_answer(origin, shards, identity, budget_ns).await,
+    ),
     HomeMessage::LetGo { identity, owner } => (
       identity,
-      let_go_answer(origin, &shards, (identity, owner), budget_ns).await,
+      let_go_answer(origin, shards, (identity, owner), budget_ns).await,
     ),
     HomeMessage::Moved { identity, from, to } => (
       identity,
-      moved_answer(origin, &shards, (identity, (from, to)), budget_ns).await,
+      moved_answer(origin, shards, (identity, (from, to)), budget_ns).await,
     ),
     // Answered by the shard holding the attempt's repository, from its records (A-727 (d1a-3)).
     HomeMessage::Resolve { identity, attempt } => (
       identity,
-      resolve_answer(origin, &shards, (identity, attempt), budget_ns).await,
+      resolve_answer(origin, shards, (identity, attempt), budget_ns).await,
     ),
     // A repository rebuilt on its successor (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 01:36): the answer a
     // resolution asks for exists now, so a pass is owed here, on this control shard; owing it twice is harmless.
@@ -1907,9 +1919,23 @@ pub(crate) async fn serve_remote(
       let _ = crate::state::with_state(|state| state.count(REBUILT_HEARD, 1));
       ([0; 32], HomeOutcome::Owed)
     }
-    HomeMessage::Answer { .. } => return Vec::new(),
+    HomeMessage::Answer { .. } => return None,
   };
-  HomeMessage::Answer { identity, outcome }.encode()
+  Some(answered)
+}
+
+/// [`serve_remote`]'s answer to a read: the bytes this node's home holds, or the refusal typed for the wire.
+async fn read_answer(
+  origin: u16,
+  shards: &[u16],
+  identity: [u8; 32],
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::HomeOutcome;
+  match read(origin, shards, ContentId(identity), budget_ns).await {
+    Ok(bytes) => HomeOutcome::Bytes(bytes),
+    Err(refused) => HomeOutcome::Refused(refused.wire()),
+  }
 }
 
 /// A home message read from `request` ([`serve_remote`]), or what to answer at once instead: nothing for bytes no message

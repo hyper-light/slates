@@ -352,6 +352,13 @@ fn let_go_windows_until(
       };
       let (mut freed, mut pinned, mut taken) = (0_u64, 0_u64, 0_usize);
       for revision in contents {
+        // The changelog's and the manifests' texts go only once their changeset is named (a push's entry committed, an
+        // import landed): until then the push's work and intake read them (goal 93, C1 (1) P5, main's ruling of
+        // 2026-11-23 20:53).
+        if noting.is_none() && is_log_path(&revision.path) {
+          taken = taken.saturating_add(1);
+          continue;
+        }
         for identity in revision.identities() {
           if let Some(repository) = noting {
             note_windows(content, repository, revision, identity);
@@ -368,6 +375,12 @@ fn let_go_windows_until(
       (freed, pinned, taken)
     })
   })
+}
+
+/// Whether `path` names the changelog's or the manifest log's texts (`slates_hg::push::intake::CHANGELOG_PATH`,
+/// `MANIFEST_PATH`), not a file's.
+fn is_log_path(path: &[u8]) -> bool {
+  path == slates_hg::push::intake::CHANGELOG_PATH || path == slates_hg::push::intake::MANIFEST_PATH
 }
 
 /// Counter: the turns a committed run's or a landed import's file revisions were noted and let go over

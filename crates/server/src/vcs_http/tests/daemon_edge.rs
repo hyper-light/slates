@@ -2151,8 +2151,16 @@ fn hg_getbundle(
   name: &str,
   head: &str,
 ) -> (u16, String, Vec<u8>) {
+  hg_getbundle_over(edge, name, (&"0".repeat(40), head))
+}
+
+/// [`hg_getbundle`] over `common` (a pull's: the client holds it), for `heads` (`+` between several).
+fn hg_getbundle_over(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  (common, head): (&str, &str),
+) -> (u16, String, Vec<u8>) {
   let (port, certificate) = edge;
-  let common = "0".repeat(40);
   let arguments = format!(
     "bundlecaps=HG20%2Cbundle2%3DHG20%250Achangegroup%253D02%252C03&cg=1&common={common}&heads={head}"
   );
@@ -4990,9 +4998,9 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
 /// as a whole-history push's committed file revisions were noted and let go in one step, and the daemon was killed).
 /// Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line with the let-go's turn
 /// budget at a nanosecond (`hg_run::TEST_LET_GO_TURN_NS`); read the let-go's counters. Expect the push `200`; its file
-/// revisions let go over a turn each, one at a time ([`TEXTS_CHANGESETS`] turns: a turn ends at the first revision past
-/// its budget, a revision being the let-go's unit), the longest counted; every file's window let go. Red before: one
-/// turn took them all (1 turn, 642,500 ns in debug).
+/// revisions let go over a turn each, one at a time ([`TEXTS_CHANGESETS`] times [`LET_GO_UNITS_A_CHANGESET`] turns: a
+/// turn ends at the first revision past its budget, a revision being the let-go's unit), the longest counted; every
+/// file's window let go. Red before: one turn took them all (1 turn, 642,500 ns in debug).
 #[test]
 fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
   let (identity, certificate) = identity();
@@ -5018,12 +5026,16 @@ fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
   assert_hg_answered(&pushed);
   assert_eq!(
     turns,
-    u64::try_from(TEXTS_CHANGESETS).unwrap(),
-    "a file revision a turn"
+    u64::try_from(TEXTS_CHANGESETS * LET_GO_UNITS_A_CHANGESET).unwrap(),
+    "a revision a turn"
   );
   assert!(longest > 0, "the longest turn counted");
   assert!(held.iter().all(|here| !here), "every file's window let go");
 }
+
+/// Shape: the revisions a changeset of [`a_long_push_of_own_texts`] lets go, each its own unit of the let-go: its file's,
+/// its changeset's text and its manifest's (goal 93, C1 (1) P5: the logs' texts let go with the files').
+const LET_GO_UNITS_A_CHANGESET: usize = 3;
 
 /// A region object one byte longer than a window kept on the repository's shard, and a landed changeset whose file is
 /// exactly its first window ([`a_region_object_sharing_a_landed_files_window`]): the daemon, its shards, the object and
@@ -5343,9 +5355,9 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
 /// object the repository's changelog and manifest rows name; bring each revision back by its log's path and its node
 /// (`hg_push::bring_back`) after a publication gave the arena's idle extents back ([`published_down_to_demand`]); read
 /// every text again. Expect the push `200`; objects let go (the non-vacuity count); every bring-back answered `Ok`;
-/// every changeset's and manifest's text read back the same; each let go counted once
-/// (`vcs.hg.landed_log_texts_brought_back`); no room asked inside a lend. Red before: a bring-back by those paths looked
-/// for a file revision.
+/// every changeset's and manifest's text read back hashing to its node (the landing let them go before any was read
+/// here, since P5); each let go counted once (`vcs.hg.landed_log_texts_brought_back`); no room asked inside a lend. Red
+/// before: a bring-back by those paths looked for a file revision.
 #[test]
 fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_and_node() {
   let (identity, certificate) = identity();
@@ -5393,6 +5405,7 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
     Duration::from_secs(60),
   );
   let after = log_texts(&daemon, repository);
+  let daemon_rows = log_rows(&daemon, repository);
   let counted = counted_on(
     &daemon,
     REPOSITORY,
@@ -5407,7 +5420,17 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   assert!(let_go > 0, "objects let go");
   assert!(brought.iter().all(Result::is_ok), "{brought:?}");
   assert_eq!(out_of_reach, 0, "no room asked inside a lend");
-  assert_eq!(after, before, "every text read back the same");
+  let read = |texts: &LogTexts| texts.iter().filter(|(_, text)| text.is_some()).count();
+  assert_eq!(
+    (read(&after.0), read(&after.1)),
+    (before.0.len(), before.1.len()),
+    "every text read back"
+  );
+  assert_eq!(
+    log_texts_hashing_to_their_nodes(&daemon_rows),
+    before.0.len() + before.1.len(),
+    "every text read back hashes to its node"
+  );
   assert_eq!(
     counted,
     u64::try_from(let_go).unwrap(),
@@ -5487,7 +5510,252 @@ fn a_push_whose_works_base_was_let_go_reads_it_from_the_changeset_store() {
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
 }
 
-/// Lets go every object `repository`'s changelog and manifest rows name on its shard: how many let any window go.
+/// Goal 93, C1 (1) P5 (main's order of 2026-11-24: the changelog's and the manifests' texts leave the content store once
+/// landed, an import's as a push's). Do: start a two-shard daemon over loopback TLS; import the `states` repository into
+/// one Mercurial repository and land it; into another, empty, push a line of [`LET_GO_LINE`] changesets but its last,
+/// then its last alone; look at every changelog and manifest row's object in the repositories' shard's content store;
+/// clone each whole (`getbundle`), and pull the second's last changeset over its line before it. Expect every such
+/// object let go (no window of it held), before the clones and after; each clone's and the pull's changegroup verified
+/// by the push's own verifier, every text hashing to its node (the pull's over what the line's clone brought); the
+/// second push's intake asked its texts of the node's changeset store, the parent manifest's read-back counted apart.
+/// Red before: the import and the push kept every changelog and manifest object whole.
+#[test]
+fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let edge = (port, &certificate);
+  let names = hg_names_on_the_repositorys_partition(2);
+  let (imported, pushed) = (names[0].clone(), names[1].clone());
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_hg_from_states(&daemon, &imported);
+  create_empty_hg(&daemon, &pushed);
+  let paths: &'static [String] = Box::leak(
+    (0..LET_GO_LINE)
+      .map(|at| format!("line-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = (0..LET_GO_LINE)
+    .map(|at| {
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        paths[at].as_bytes(),
+        at.checked_sub(1),
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let first: Vec<usize> = (0..LET_GO_LINE - 1).collect();
+  let line = hg_unbundle(edge, &pushed, &history_bundle(&made, &first));
+  let last = hg_unbundle(edge, &pushed, &history_bundle(&made, &[LET_GO_LINE - 1]));
+  let ids = [imported.clone(), pushed.clone()].map(|name| repository_named(&daemon, name));
+  let held_before = ids.map(|id| log_windows_held(&daemon, id));
+  let heads = hg_command(edge, &imported, "heads");
+  let imported_heads = String::from_utf8_lossy(&heads.1)
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join("+");
+  let null = "0".repeat(40);
+  let (before, tip) = (
+    crate::verbs::hex_of(&made[LET_GO_LINE - 2].node),
+    crate::verbs::hex_of(&made[LET_GO_LINE - 1].node),
+  );
+  let imported_clone = hg_getbundle_over(edge, &imported, (&null, &imported_heads));
+  let line_clone = hg_getbundle_over(edge, &pushed, (&null, &before));
+  let whole_clone = hg_getbundle_over(edge, &pushed, (&null, &tip));
+  let pull = hg_getbundle_over(edge, &pushed, (&before, &tip));
+  let held_after = ids.map(|id| log_windows_held(&daemon, id));
+  let asked = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LOG_TEXTS_ASKED,
+  );
+  let previous = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::PREVIOUS_MANIFESTS_ASKED,
+  );
+  daemon.stop();
+  println!(
+    "log objects held before {held_before:?}, after {held_after:?}; the pushes asked {asked} texts, {previous} of them \
+     the parent manifest"
+  );
+  assert_hg_answered(&line);
+  assert_hg_answered(&last);
+  for (rows, held, bytes) in held_before.iter().chain(&held_after) {
+    assert!(
+      *rows > 0,
+      "the repository keeps changelog and manifest rows"
+    );
+    assert_eq!(
+      (*held, *bytes),
+      (0, 0),
+      "no changelog or manifest text held"
+    );
+  }
+  let nothing = NothingHeld;
+  let imported_verified = verified_clone(&imported_clone, &nothing);
+  assert!(
+    !imported_verified.changesets.is_empty(),
+    "the import's clone brings changesets"
+  );
+  let whole = verified_clone(&whole_clone, &nothing);
+  assert_eq!(
+    whole.changesets.len(),
+    LET_GO_LINE,
+    "the line's clone brings every changeset"
+  );
+  let line_verified = verified_clone(&line_clone, &nothing);
+  let pulled = verified_clone(&pull, &ClonedHeld(&line_verified));
+  assert_eq!(
+    pulled
+      .changesets
+      .iter()
+      .map(|arrived| arrived.node)
+      .collect::<Vec<_>>(),
+    vec![made[LET_GO_LINE - 1].node],
+    "the pull brings the last changeset"
+  );
+  assert!(
+    asked > 0,
+    "the last push's intake asked its texts of the store"
+  );
+}
+
+/// A repository holding nothing: what a clone's changegroup is verified against.
+struct NothingHeld;
+
+impl slates_hg::push::verify::Held for NothingHeld {
+  fn changeset_text(&self, _node: &slates_hg::Node) -> Option<std::borrow::Cow<'_, [u8]>> {
+    None
+  }
+
+  fn manifest_text(&self, _node: &slates_hg::Node) -> Option<std::borrow::Cow<'_, [u8]>> {
+    None
+  }
+
+  fn file_text(&self, _path: &[u8], _node: &slates_hg::Node) -> Option<std::borrow::Cow<'_, [u8]>> {
+    None
+  }
+
+  fn stores_bytes(&self) -> bool {
+    false
+  }
+}
+
+/// What a verified clone brought, as a pull over it is verified against.
+struct ClonedHeld<'v>(&'v slates_hg::push::verify::Verified);
+
+impl slates_hg::push::verify::Held for ClonedHeld<'_> {
+  fn changeset_text(&self, node: &slates_hg::Node) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .0
+      .changeset(node)
+      .map(|arrived| std::borrow::Cow::Borrowed(arrived.text.as_slice()))
+  }
+
+  fn manifest_text(&self, node: &slates_hg::Node) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .0
+      .manifest(node)
+      .map(|arrived| std::borrow::Cow::Borrowed(arrived.text.as_slice()))
+  }
+
+  fn file_text(&self, path: &[u8], node: &slates_hg::Node) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .0
+      .file(path, node)
+      .map(|arrived| std::borrow::Cow::Borrowed(arrived.text.as_slice()))
+  }
+
+  fn stores_bytes(&self) -> bool {
+    false
+  }
+}
+
+/// The changegroup of `answer` (a `getbundle` answered `200`, uncompressed) verified against `held` by the push's own
+/// verifier: every text rebuilt and hashed to its node.
+fn verified_clone(
+  answer: &(u16, String, Vec<u8>),
+  held: &dyn slates_hg::push::verify::Held,
+) -> slates_hg::push::verify::Verified {
+  assert_eq!(answer.0, 200, "{}", String::from_utf8_lossy(&answer.2));
+  let stream = answer
+    .2
+    .strip_prefix(b"\x04none")
+    .expect("an uncompressed answer");
+  let mut room = slates_hg::Admission::new(u64::MAX);
+  let bundle = Bundle2::decode(stream, &mut room).expect("a bundle2");
+  let (index, part) = bundle
+    .top_level()
+    .find(|(_, part)| part.is(b"changegroup"))
+    .expect("a changegroup part");
+  let version =
+    slates_hg::changegroup::Version::from_part_param(part.param(b"version")).expect("a version");
+  let part = slates_hg::push::ChangegroupPart {
+    version,
+    changesets: None,
+    target_phase: None,
+    tree_manifests: false,
+    payload: bundle.payload_bytes(index, &mut room).expect("its payload"),
+  };
+  slates_hg::push::verify::verify(&part, held, &mut room).expect("every text hashes to its node")
+}
+
+/// The id of the repository named `name` on [`REPOSITORY`]'s partition.
+fn repository_named(daemon: &Daemon, name: String) -> slates_db::catalog::RepositoryId {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&name)
+      .map(|record| record.id)
+  })
+  .expect("the repository's record")
+}
+
+/// `repository`'s changelog and manifest rows on its shard: how many, how many of their objects with any bytes have any
+/// window held in its content store, and those objects' bytes. The empty window (a manifest kept as an empty delta) is
+/// never let go and holds no bytes (`LetGoRefused::Empty`), so it is not counted.
+fn log_windows_held(
+  daemon: &Daemon,
+  repository: slates_db::catalog::RepositoryId,
+) -> (usize, usize, u64) {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      let index = &store.index;
+      let changesets = (0..index.len(content, slates_hg::index::Log::Changelog))
+        .map(|rev| index.changeset(content, rev).map(|row| (row.text, row.len)));
+      let manifests = (0..index.len(content, slates_hg::index::Log::Manifest)).map(|rev| {
+        index
+          .revision(content, slates_hg::index::Log::Manifest, rev)
+          .map(|row| (row.bytes, row.len))
+      });
+      let objects = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
+      let held: Vec<u64> = objects
+        .iter()
+        .filter(|(object, _)| content.len_of(object).is_some_and(|len| len > 0))
+        .filter(|(object, _)| {
+          content
+            .object_layout(object)
+            .iter()
+            .any(|(window, _)| !content.is_away(window))
+        })
+        .map(|(_, len)| *len)
+        .collect();
+      Some((objects.len(), held.len(), held.iter().sum()))
+    })
+  })
+  .expect("the repository's rows")
+}
+
+/// Lets go every object `repository`'s changelog and manifest rows name on its shard: how many of those with any bytes
+/// are let go after, by the landing (goal 93, C1 (1) P5: once its push committed) or here.
 fn let_go_logs(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) -> usize {
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
     crate::vcs_store::lent_state(state, |state| {
@@ -5502,16 +5770,97 @@ fn let_go_logs(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) ->
             .map(|row| row.bytes)
         });
         let identities = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
+        for identity in &identities {
+          content.let_go_object(identity);
+        }
         Some(
           identities
             .iter()
-            .filter(|identity| content.let_go_object(identity) > 0)
+            .filter(|identity| content.len_of(identity).is_some_and(|len| len > 0))
+            .filter(|identity| {
+              let layout = content.object_layout(identity);
+              !layout.is_empty() && layout.iter().all(|(window, _)| content.is_away(window))
+            })
             .count(),
         )
       })
     })
   })
   .expect("the repository's rows")
+}
+
+/// Each changelog and manifest revision of `repository` as its shard holds it: its node, its parents' nodes, and its
+/// text read from the content store (none where not held).
+fn log_rows(
+  daemon: &Daemon,
+  repository: slates_db::catalog::RepositoryId,
+) -> Vec<(
+  slates_hg::Node,
+  (slates_hg::Node, slates_hg::Node),
+  Option<Vec<u8>>,
+)> {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let (content, store) = stores.mercurial(repository)?;
+        let index = &store.index;
+        let mut rows = Vec::new();
+        for log in [
+          slates_hg::index::Log::Changelog,
+          slates_hg::index::Log::Manifest,
+        ] {
+          let parent = |rev: u32| match log {
+            _ if rev == slates_hg::index::NONE => Some(slates_hg::NULL_NODE),
+            slates_hg::index::Log::Changelog => index.changeset(content, rev).map(|row| row.node),
+            _ => index.revision(content, log, rev).map(|row| row.node),
+          };
+          for rev in 0..index.len(content, log) {
+            let (node, p1, p2, text) = match log {
+              slates_hg::index::Log::Changelog => {
+                let row = index.changeset(content, rev)?;
+                (
+                  row.node,
+                  row.p1,
+                  row.p2,
+                  content.object_bytes(&row.text, row.len),
+                )
+              }
+              _ => {
+                let row = index.revision(content, log, rev)?;
+                (
+                  row.node,
+                  row.p1,
+                  row.p2,
+                  index.revision_text(content, log, rev),
+                )
+              }
+            };
+            rows.push((node, (parent(p1)?, parent(p2)?), text));
+          }
+        }
+        Some(rows)
+      })
+    })
+  })
+  .expect("the repository's rows")
+}
+
+/// How many of `rows` ([`log_rows`]) have a text that hashes, with their parents, to their node.
+fn log_texts_hashing_to_their_nodes(
+  rows: &[(
+    slates_hg::Node,
+    (slates_hg::Node, slates_hg::Node),
+    Option<Vec<u8>>,
+  )],
+) -> usize {
+  rows
+    .iter()
+    .filter(|(node, (p1, p2), text)| {
+      text
+        .as_deref()
+        .is_some_and(|text| slates_hg::node::compute(p1, p2, text).ok() == Some(*node))
+    })
+    .count()
 }
 
 /// A log's revisions as [`log_texts`] reads them: each one's node and its text, none where it is not held.
