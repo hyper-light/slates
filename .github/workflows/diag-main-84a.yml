@@ -1,5 +1,10 @@
 name: diag-main-84a
-# main 01a20182 (2026-11-24 09:12 PST): goal 84a's loaded and quiet tails of a full edit and merge at current main
+# Run 2 (main 01a20182, 2026-11-24 09:38 PST): the Linux legs only, with the account granted RLIMIT_RTPRIO (as an
+# administrator grants it; slates asks for no privilege and takes SCHED_RR where the account grants it, goal 84a's Linux
+# condition: "an account with none stays in the fair class and its 1 ms tick", which run 1 measured on these runners:
+# pickup and take about 1 ms each). `sudo prlimit` raises the step shell's limit; the bench, run as the runner's own
+# user, inherits it. The daemon's log line "runs round-robin" or "time-share" is printed so the grant is visible.
+# Run 1 (main 01a20182, 2026-11-24 09:12 PST): goal 84a's loaded and quiet tails of a full edit and merge at current main
 # (afa579483), on the runners its Windows evidence came from (w-k90-win's run 44948887874, 2026-11-21) and on Linux's two:
 # ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm. edit_merge_bench (release), --spinners-per-core 2,
 # 10 files, both forms; three loaded invocations, then two quiet. Each form's `goal` line carries its verdict (p99 and p999
@@ -18,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     defaults:
@@ -51,6 +56,8 @@ jobs:
       - name: Three loaded invocations, then two quiet
         run: |
           set +e
+          sudo prlimit --pid $$ --rtprio=99:99
+          echo "RLIMIT_RTPRIO of this shell: $(ulimit -r) (soft) $(ulimit -Hr) (hard), user $(id -un)"
           L="$RUNNER_TEMP/84a"; mkdir -p "$L"
           B=target/release/examples/edit_merge_bench; [ -f "$B.exe" ] && B="$B.exe"
           echo "cores: $(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
@@ -60,6 +67,7 @@ jobs:
             echo "::notice title=${{ matrix.os }} loaded $n (exit $rc)::$(grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
             grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -c1-400
           done
+          grep -ahE 'runs round-robin|runs time-share|NoPriorityGranted' "$L"/loaded-*.log | sort | uniq -c | head -4
           for n in 1 2; do
             timeout 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null > "$L/quiet-$n.log" 2>&1
             rc=$?
