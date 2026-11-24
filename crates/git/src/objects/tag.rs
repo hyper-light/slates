@@ -165,7 +165,7 @@ fn check(bytes: &[u8], format: ObjectFormat, report: &mut Report) -> Result<(), 
   if !refname::tag_name_is_valid(name) && report.report(FsckId::BadTagName) {
     return Ok(());
   }
-  let rest = match rest.strip_prefix(b"tagger ") {
+  let mut rest = match rest.strip_prefix(b"tagger ") {
     None => {
       // Early tags have no tagger: an info, reported as a warning, and the walk goes on.
       if report.report(FsckId::MissingTaggerEntry) {
@@ -182,6 +182,19 @@ fn check(bytes: &[u8], format: ObjectFormat, report: &mut Report) -> Result<(), 
       after.get(advance..).unwrap_or_default()
     }
   };
+  // git v2.56.1 `fsck_tag_standalone`: `gpgsig` and `gpgsig-sha256` headers (with their space-prefixed continuation
+  // lines) are valid tag headers after `tagger`, not `extraHeaderEntry`.
+  while let Some(after) = rest
+    .strip_prefix(b"gpgsig ")
+    .or_else(|| rest.strip_prefix(b"gpgsig-sha256 "))
+  {
+    let (_, mut next) = line(after).ok_or(FsckId::BadGpgsig)?;
+    while next.starts_with(b" ") {
+      let (_, continued) = line(next).ok_or(FsckId::BadHeaderContinuation)?;
+      next = continued;
+    }
+    rest = next;
+  }
   if !rest.is_empty() && !rest.starts_with(b"\n") {
     report.report(FsckId::ExtraHeaderEntry);
   }

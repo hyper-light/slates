@@ -5,8 +5,10 @@
 //! (607 MiB) ran both whole in the step that took the pack's last bytes, and its shard ran past the
 //! watchdog's window. [`super::check`] runs the same passes whole, in one turn with no end.
 
+use std::borrow::Cow;
+
 use super::connect::{Connected, Stopped, Walk, unbounded};
-use super::fsck;
+use super::fsck::{self, SpecialBlob};
 use super::{
   Checked, HiddenRefs, PackRefusal, PackRefused, Pushed, Refusal, Repository, Request,
   UNPACKER_ERROR, charged_vec, early_refusal, refused,
@@ -23,6 +25,13 @@ enum Stage {
   /// The objects checked as git checks a push, up to this one.
   Fsck {
     /// The next object.
+    at: usize,
+  },
+  /// Special dotfile blobs (`.gitmodules`, `.gitattributes`) referenced by trees, checked one a unit.
+  SpecialBlobs {
+    /// Each object's name and position, sorted by name.
+    by_id: Vec<(ObjectId, usize)>,
+    /// The next entry in `special`.
     at: usize,
   },
   /// The connectivity walk under way, over the objects indexed by name.
@@ -50,6 +59,8 @@ pub struct Checking {
   request: Request,
   /// The pack's objects' places, or why it was refused; `None` when no pack was due.
   unpacked: Option<Result<Kept, PackRefused>>,
+  /// Special dotfile entries collected while checking trees, validated in `Stage::SpecialBlobs`.
+  special: Vec<SpecialBlob>,
   /// Where the checks stand.
   stage: Stage,
 }
@@ -71,6 +82,7 @@ impl Checking {
     Checking {
       request,
       unpacked,
+      special: Vec::new(),
       stage,
     }
   }
@@ -78,7 +90,18 @@ impl Checking {
   /// The checks of `request` and its pack, `unpacked`, whose every object was checked as git checks
   /// a push as it was kept (the session's, A-719 part 3): the connectivity walk alone to make.
   pub fn fscked(request: Request, unpacked: Option<Result<Kept, PackRefused>>) -> Checking {
+    Checking::fscked_with_special(request, unpacked, Vec::new())
+  }
+
+  /// Like [`Checking::fscked`], carrying any `.gitmodules` and `.gitattributes` entries collected
+  /// from trees as they were kept so they are checked once the whole pack is unpacked.
+  pub(crate) fn fscked_with_special(
+    request: Request,
+    unpacked: Option<Result<Kept, PackRefused>>,
+    special: Vec<SpecialBlob>,
+  ) -> Checking {
     let mut checking = Checking::new(request, unpacked);
+    checking.special = special;
     if let (Stage::Fsck { at }, Some(Ok(kept))) = (&mut checking.stage, &checking.unpacked) {
       *at = kept.objects.len();
     }
@@ -115,8 +138,8 @@ impl Checking {
     Ok(self.is_done())
   }
 
-  /// One unit of the checks: one object checked as git checks a push, the objects indexed, or a
-  /// turn of the walk for what is `left` of the quantum.
+  /// One unit of the checks: one object checked as git checks a push, one special dotfile blob
+  /// checked, the objects indexed, or a turn of the walk for what is `left` of the quantum.
   fn unit<R: Repository + ?Sized, C: Contents>(
     &mut self,
     (repository, contents): (&R, &C),
@@ -126,6 +149,7 @@ impl Checking {
     let Checking {
       request,
       unpacked,
+      special,
       stage,
     } = self;
     let objects = match unpacked {
@@ -135,22 +159,47 @@ impl Checking {
     let contents: &dyn Contents = contents;
     match stage {
       Stage::Fsck { at } => match objects.get(*at) {
-        Some(object) => match fsck_one(object, *at, (contents, request.format)) {
+        Some(object) => match fsck_one(object, *at, (contents, request.format), special) {
           Some(finding) => {
-            let counted = u32::try_from(objects.len()).ok();
-            *unpacked = Some(Err(PackRefused {
-              objects: counted,
-              why: PackRefusal::Fsck {
-                id: object.id,
-                finding,
-              },
-            }));
-            *stage = Stage::Refused;
+            let (count, id) = (objects.len(), object.id);
+            refuse_pack(unpacked, stage, count, id, finding);
           }
           None => *at = at.saturating_add(1),
         },
         None => {
           let pushed = Pushed::new(objects, Some(contents), admission)?;
+          if special.is_empty() {
+            let walk = Walk::new(request, &pushed, admission)?;
+            *stage = Stage::Walk {
+              by_id: pushed.by_id,
+              walk,
+            };
+          } else {
+            special.sort_unstable();
+            special.dedup();
+            *stage = Stage::SpecialBlobs {
+              by_id: pushed.by_id,
+              at: 0,
+            };
+          }
+        }
+      },
+      Stage::SpecialBlobs { by_id, at } => match special.get(*at).copied() {
+        Some(entry) => {
+          let finding = check_special_entry(entry, objects, by_id, contents, repository);
+          if let Some(finding) = finding {
+            let count = objects.len();
+            refuse_pack(unpacked, stage, count, entry.id, finding);
+          } else {
+            *at = at.saturating_add(1);
+          }
+        }
+        None => {
+          let pushed = Pushed {
+            objects,
+            by_id: core::mem::take(by_id),
+            contents: Some(contents),
+          };
           let walk = Walk::new(request, &pushed, admission)?;
           *stage = Stage::Walk {
             by_id: pushed.by_id,
@@ -212,7 +261,7 @@ impl Checking {
         );
         by_id
       }
-      Stage::Refused | Stage::Fsck { .. } | Stage::Walk { .. } => {
+      Stage::Refused | Stage::Fsck { .. } | Stage::SpecialBlobs { .. } | Stage::Walk { .. } => {
         early.extend((0..count).map(|_| Some(refused(UNPACKER_ERROR, None))));
         Vec::new()
       }
@@ -226,19 +275,59 @@ impl Checking {
   }
 }
 
+/// Marks the pack refused for an fsck finding on `id`.
+fn refuse_pack(
+  unpacked: &mut Option<Result<Kept, PackRefused>>,
+  stage: &mut Stage,
+  count: usize,
+  id: ObjectId,
+  finding: crate::objects::FsckId,
+) {
+  let counted = u32::try_from(count).ok();
+  *unpacked = Some(Err(PackRefused {
+    objects: counted,
+    why: PackRefusal::Fsck { id, finding },
+  }));
+  *stage = Stage::Refused;
+}
+
+/// Checks one `.gitmodules` or `.gitattributes` entry against the pushed pack first, then `repository`.
+fn check_special_entry<R: Repository + ?Sized>(
+  entry: SpecialBlob,
+  objects: &[crate::unpack::Placed],
+  by_id: &[(ObjectId, usize)],
+  contents: &dyn Contents,
+  repository: &R,
+) -> Option<crate::objects::FsckId> {
+  let lookup = |id: &ObjectId| {
+    if let Ok(pos) = by_id.binary_search_by(|(known, _)| known.cmp(id))
+      && let Some(&(_, at)) = by_id.get(pos)
+      && let Some(placed) = objects.get(at)
+      && let Some(bytes) = contents.content(at, id)
+    {
+      return Some((placed.kind, bytes));
+    }
+    repository
+      .object(id)
+      .map(|(kind, bytes)| (kind, Cow::Borrowed(bytes)))
+  };
+  fsck::check_special(entry, lookup, |id| repository.holds(id))
+}
+
 /// What a push's check finds against the object `placed` at position `at`, its bytes read from
-/// `contents`: a blob passes unread (its checks are A-590's to give, `fsck`'s module docs); one whose
+/// `contents`: a blob passes unread until referenced as a special dotfile by a tree; one whose
 /// bytes are not lent is refused as git refuses an object it cannot read.
 fn fsck_one(
   placed: &crate::unpack::Placed,
   at: usize,
   (contents, format): (&dyn Contents, crate::object_name::ObjectFormat),
+  special: &mut Vec<SpecialBlob>,
 ) -> Option<crate::objects::FsckId> {
   if placed.kind == Kind::Blob {
     return None;
   }
   match contents.content(at, &placed.id) {
-    Some(content) => fsck::refusal_of(placed.kind, &content, format),
+    Some(content) => fsck::check_object(placed.kind, &content, format, special),
     None => Some(crate::objects::FsckId::BadObjectSha1),
   }
 }

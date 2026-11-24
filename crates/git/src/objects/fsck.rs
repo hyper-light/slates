@@ -62,6 +62,12 @@ pub enum FsckId {
   BadDateOverflow,
   /// `BAD_EMAIL` (error), printed `badEmail`.
   BadEmail,
+  /// `BAD_GPGSIG` (error), printed `badGpgsig`.
+  BadGpgsig,
+  /// `BAD_HEAD_TARGET` (error), printed `badHeadTarget`.
+  BadHeadTarget,
+  /// `BAD_HEADER_CONTINUATION` (error), printed `badHeaderContinuation`.
+  BadHeaderContinuation,
   /// `BAD_NAME` (error), printed `badName`.
   BadName,
   /// `BAD_OBJECT_SHA1` (error), printed `badObjectSha1`.
@@ -78,6 +84,8 @@ pub enum FsckId {
   BadRefFiletype,
   /// `BAD_REF_NAME` (error), printed `badRefName`.
   BadRefName,
+  /// `BAD_REF_OID` (error), printed `badRefOid`.
+  BadRefOid,
   /// `BAD_REFERENT_NAME` (error), printed `badReferentName`.
   BadReferentName,
   /// `BAD_TIMEZONE` (error), printed `badTimezone`.
@@ -168,6 +176,8 @@ pub enum FsckId {
   NulInCommit,
   /// `LARGE_PATHNAME` (warn), printed `largePathname`.
   LargePathname,
+  /// `BAD_REFTABLE_TABLE_NAME` (warn), printed `badReftableTableName`.
+  BadReftableTableName,
   /// `BAD_FILEMODE` (info), printed `badFilemode`.
   BadFilemode,
   /// `EMPTY_PACKED_REFS_FILE` (info), printed `emptyPackedRefsFile`.
@@ -197,13 +207,16 @@ pub enum FsckId {
 }
 
 impl FsckId {
-  /// Format: every id, in fsck.h's order (`FOREACH_FSCK_MSG_ID`, 71 in git 2.50.1).
-  pub const ALL: [FsckId; 71] = [
+  /// Format: every id, in fsck.h's order (`FOREACH_FSCK_MSG_ID`, 76 in git 2.56.1).
+  pub const ALL: [FsckId; 76] = [
     FsckId::NulInHeader,
     FsckId::UnterminatedHeader,
     FsckId::BadDate,
     FsckId::BadDateOverflow,
     FsckId::BadEmail,
+    FsckId::BadGpgsig,
+    FsckId::BadHeadTarget,
+    FsckId::BadHeaderContinuation,
     FsckId::BadName,
     FsckId::BadObjectSha1,
     FsckId::BadPackedRefEntry,
@@ -212,6 +225,7 @@ impl FsckId {
     FsckId::BadRefContent,
     FsckId::BadRefFiletype,
     FsckId::BadRefName,
+    FsckId::BadRefOid,
     FsckId::BadReferentName,
     FsckId::BadTimezone,
     FsckId::BadTree,
@@ -257,6 +271,7 @@ impl FsckId {
     FsckId::ZeroPaddedFilemode,
     FsckId::NulInCommit,
     FsckId::LargePathname,
+    FsckId::BadReftableTableName,
     FsckId::BadFilemode,
     FsckId::EmptyPackedRefsFile,
     FsckId::GitmodulesParse,
@@ -280,6 +295,9 @@ impl FsckId {
       FsckId::BadDate => Severity::Error,
       FsckId::BadDateOverflow => Severity::Error,
       FsckId::BadEmail => Severity::Error,
+      FsckId::BadGpgsig => Severity::Error,
+      FsckId::BadHeadTarget => Severity::Error,
+      FsckId::BadHeaderContinuation => Severity::Error,
       FsckId::BadName => Severity::Error,
       FsckId::BadObjectSha1 => Severity::Error,
       FsckId::BadPackedRefEntry => Severity::Error,
@@ -288,6 +306,7 @@ impl FsckId {
       FsckId::BadRefContent => Severity::Error,
       FsckId::BadRefFiletype => Severity::Error,
       FsckId::BadRefName => Severity::Error,
+      FsckId::BadRefOid => Severity::Error,
       FsckId::BadReferentName => Severity::Error,
       FsckId::BadTimezone => Severity::Error,
       FsckId::BadTree => Severity::Error,
@@ -333,6 +352,7 @@ impl FsckId {
       FsckId::ZeroPaddedFilemode => Severity::Warn,
       FsckId::NulInCommit => Severity::Warn,
       FsckId::LargePathname => Severity::Warn,
+      FsckId::BadReftableTableName => Severity::Warn,
       FsckId::BadFilemode => Severity::Info,
       FsckId::EmptyPackedRefsFile => Severity::Info,
       FsckId::GitmodulesParse => Severity::Info,
@@ -358,6 +378,9 @@ impl FsckId {
       FsckId::BadDate => "badDate",
       FsckId::BadDateOverflow => "badDateOverflow",
       FsckId::BadEmail => "badEmail",
+      FsckId::BadGpgsig => "badGpgsig",
+      FsckId::BadHeadTarget => "badHeadTarget",
+      FsckId::BadHeaderContinuation => "badHeaderContinuation",
       FsckId::BadName => "badName",
       FsckId::BadObjectSha1 => "badObjectSha1",
       FsckId::BadPackedRefEntry => "badPackedRefEntry",
@@ -366,6 +389,7 @@ impl FsckId {
       FsckId::BadRefContent => "badRefContent",
       FsckId::BadRefFiletype => "badRefFiletype",
       FsckId::BadRefName => "badRefName",
+      FsckId::BadRefOid => "badRefOid",
       FsckId::BadReferentName => "badReferentName",
       FsckId::BadTimezone => "badTimezone",
       FsckId::BadTree => "badTree",
@@ -411,6 +435,7 @@ impl FsckId {
       FsckId::ZeroPaddedFilemode => "zeroPaddedFilemode",
       FsckId::NulInCommit => "nulInCommit",
       FsckId::LargePathname => "largePathname",
+      FsckId::BadReftableTableName => "badReftableTableName",
       FsckId::BadFilemode => "badFilemode",
       FsckId::EmptyPackedRefsFile => "emptyPackedRefsFile",
       FsckId::GitmodulesParse => "gitmodulesParse",

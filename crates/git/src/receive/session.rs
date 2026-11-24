@@ -76,6 +76,9 @@ pub struct Session<'s, H> {
   /// The first object of the pack git's checks refuse, found as each object was kept (A-719 part 3:
   /// its bytes in hand, so the checks after the pack read none of them again for this).
   refused: Option<(ObjectId, crate::objects::FsckId)>,
+  /// Any `.gitmodules` and `.gitattributes` entries referenced by pushed trees, checked once the pack
+  /// is unpacked.
+  special: Vec<super::fsck::SpecialBlob>,
   /// How many of the client's bytes were the pack's, each charged to the admission as it arrived: what the caller keeps
   /// of them is its own (a server's push holds the pack as its objects' one copy, A-723 and main's ruling B part 2), so
   /// the session keeps none ([`Session::pack_len`]).
@@ -91,6 +94,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       state: State::Request(RequestReader::new(advertised)),
       held: Held::default(),
       refused: None,
+      special: Vec::new(),
       pack_len: 0,
     }
   }
@@ -173,6 +177,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       site: &mut *site,
       format: self.advertised.format,
       refused: &mut self.refused,
+      special: &mut self.special,
     };
     let read = reader.read_into(rest, admission, &mut fscking).map(|_| ());
     if read.is_ok() && !reader.is_whole() {
@@ -354,6 +359,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       site,
       format: self.advertised.format,
       refused: &mut self.refused,
+      special: &mut self.special,
     };
     let unpacked = finished_pack(reader, read, &mut fscking, admission);
     let unpacked = match (unpacked, self.refused) {
@@ -363,7 +369,12 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       }),
       (unpacked, _) => unpacked,
     };
-    self.state = State::Checking(Checking::fscked(request, Some(unpacked)));
+    let special = core::mem::take(&mut self.special);
+    self.state = State::Checking(Checking::fscked_with_special(
+      request,
+      Some(unpacked),
+      special,
+    ));
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read: what lets the edge
@@ -411,6 +422,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       site: &mut *site,
       format: self.advertised.format,
       refused: &mut self.refused,
+      special: &mut self.special,
     };
     let turned = reader.resolve_turn(admission, &mut super::Thin(&mut fscking), quantum);
     let read = match turned {
@@ -485,7 +497,8 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
 }
 
 /// The caller's site as the session reads a pack into it, every object checked as git checks a push
-/// as it is kept (A-719 part 3; `super::fsck`), the first refused noted.
+/// as it is kept (A-719 part 3; `super::fsck`), the first refused noted and any special dotfiles
+/// referenced by trees recorded to check once the pack is unpacked.
 struct Fscking<'f, S: ?Sized> {
   /// The caller's site.
   site: &'f mut S,
@@ -493,6 +506,8 @@ struct Fscking<'f, S: ?Sized> {
   format: crate::object_name::ObjectFormat,
   /// The first object refused, if any.
   refused: &'f mut Option<(ObjectId, crate::objects::FsckId)>,
+  /// Any `.gitmodules` and `.gitattributes` entries referenced by pushed trees.
+  special: &'f mut Vec<super::fsck::SpecialBlob>,
 }
 
 impl<S: Repository + ?Sized> Repository for Fscking<'_, S> {
@@ -524,7 +539,8 @@ impl<S: Keep + ?Sized> Keep for Fscking<'_, S> {
     admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {
     if self.refused.is_none()
-      && let Some(finding) = super::fsck::refusal_of(object.kind, &object.content, self.format)
+      && let Some(finding) =
+        super::fsck::check_object(object.kind, &object.content, self.format, self.special)
     {
       *self.refused = Some((object.id, finding));
     }

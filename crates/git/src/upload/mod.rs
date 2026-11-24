@@ -486,7 +486,7 @@ fn command_answer<P: PackSource>(
     Arguments::LsRefs(arguments) => refs::ls_refs(graph, served, &arguments, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
-    Arguments::ObjectInfo(arguments) => object_info_answer(served, &arguments, admission)
+    Arguments::ObjectInfo(arguments) => object_info_answer(graph, served, &arguments, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
     Arguments::BundleUri => Err(Refused::plain(Refusal::Command(Command::BundleUri))),
@@ -495,15 +495,39 @@ fn command_answer<P: PackSource>(
   answered
 }
 
-/// The `object-info` answer to `arguments`, each size from the store's rows (A-624's `Stored`).
+/// Object sizes visible through `graph`: objects not reachable from any visible ref answer as absent
+/// so hidden refs cannot be probed via `object-info`.
+struct VisibleSizes<'g, 'r> {
+  /// The repository graph restricted to visible refs.
+  graph: &'g StoreGraph<'r>,
+  /// The underlying store sizes.
+  stored: object_info::Stored<'r>,
+}
+
+impl object_info::ObjectSizes for VisibleSizes<'_, '_> {
+  fn size(&self, id: &ObjectId) -> Option<u64> {
+    let node = crate::negotiation::Graph::node(self.graph, id)?;
+    if !self.graph.is_visible_want(node) {
+      return None;
+    }
+    self.stored.size(id)
+  }
+}
+
+/// The `object-info` answer to `arguments`, each size from the store's rows (A-624's `Stored`),
+/// restricted to objects reachable from visible refs.
 fn object_info_answer(
+  graph: &StoreGraph<'_>,
   served: &Served<'_>,
   arguments: &[Line<object_info::Argument>],
   admission: &mut Admission,
 ) -> Result<Vec<u8>, Refusal> {
-  let sizes = object_info::Stored {
-    repository: served.repository,
-    content: served.store,
+  let sizes = VisibleSizes {
+    graph,
+    stored: object_info::Stored {
+      repository: served.repository,
+      content: served.store,
+    },
   };
   let format = served.repository.format();
   charged(admission, |out| {

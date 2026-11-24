@@ -271,6 +271,91 @@ impl<'r> StoreGraph<'r> {
     self.chain(green)?.versions.get(index)?.head
   }
 
+  /// Whether `node` is reachable from at least one visible ref in `self.refs` (git's
+  /// `uploadpack.allowReachableSHA1InWant` combined with `transfer.hideRefs`, §4.17.2 "Access"):
+  /// O(1) when `node` is a visible ref tip, O(tree depth) with zero allocations via each visible
+  /// ref's persistent [`super::reach::Sets`] tree, and falling back to an iterative graph walk only
+  /// for visible refs whose reach sets are still deferred.
+  pub(crate) fn is_visible_want(&self, node: u64) -> bool {
+    if self.refs.is_empty() {
+      return false;
+    }
+    let mut deferred_heads = Vec::new();
+    for named in self.refs {
+      let Some(chain) = self.chain(named.green) else {
+        continue;
+      };
+      let Some(head) = chain.head() else {
+        continue;
+      };
+      if head == node {
+        return true;
+      }
+      let Some(newest) = chain.newest() else {
+        continue;
+      };
+      match self
+        .repository
+        .reached_contains(self.store, named.green, newest, node)
+      {
+        Ok(Some(true)) => return true,
+        Ok(Some(false)) => {}
+        Ok(None) => deferred_heads.push(head),
+        Err(refused) => {
+          self.failed(GraphFault::Store(refused));
+          return false;
+        }
+      }
+    }
+    if deferred_heads.is_empty() {
+      return false;
+    }
+    self.heads_reach(&deferred_heads, node)
+  }
+
+  /// Whether any head in `heads` reaches `target` (used only for visible refs whose reach sets have
+  /// not yet been derived). For a commit target, prunes by generation number; for any other object
+  /// (tag, tree, blob), walks commits, tags and trees iteratively.
+  fn heads_reach(&self, heads: &[u64], target: u64) -> bool {
+    if self.kind(target) == Kind::Commit {
+      return heads.iter().any(|&head| {
+        let mut current = head;
+        while self.kind(current) == Kind::Tag {
+          if current == target {
+            return true;
+          }
+          let Some(next) = self.target(current) else {
+            return false;
+          };
+          current = next;
+        }
+        self.reaches(current, target)
+      });
+    }
+    let mut seen = BTreeSet::new();
+    let mut stack = heads.to_vec();
+    while let Some(current) = stack.pop() {
+      if current == target {
+        return true;
+      }
+      if !seen.insert(current) {
+        continue;
+      }
+      match self.kind(current) {
+        Kind::Commit => {
+          if let Some(row) = self.commit(current) {
+            stack.push(row.tree);
+          }
+          stack.extend(self.parents(current));
+        }
+        Kind::Tree => stack.extend(self.entries(current)),
+        Kind::Tag => stack.extend(self.target(current)),
+        Kind::Blob => {}
+      }
+    }
+    false
+  }
+
   /// Whether the commit at `later` is the commit at `earlier` or reaches it, searched back through parents no lower
   /// than `earlier`'s generation; never when either is no commit.
   fn reaches(&self, later: u64, earlier: u64) -> bool {

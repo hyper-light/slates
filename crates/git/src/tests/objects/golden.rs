@@ -262,8 +262,9 @@ fn each_fixture_is_what_its_name_says_under_gits_default_check() {
 }
 
 /// A-590 (fsck.h). Do: name every message id and read each name back; take each id's level under both strictnesses.
-/// Expect: 71 ids, each with one name that reads back to it alone; a fatal or an error reported as an error under
-/// either, a warning as a warning or, under the strict check, an error, an info as a warning, and an ignored id never.
+/// Expect: 76 ids (git 2.56.1), each with one name that reads back to it alone; a fatal or an error reported as an
+/// error under either, a warning as a warning or, under the strict check, an error, an info as a warning, and an
+/// ignored id never.
 #[test]
 fn every_fsck_id_has_one_name_and_its_level_follows_the_strictness() {
   let mut names: Vec<&str> = FsckId::ALL.iter().map(|id| id.name()).collect();

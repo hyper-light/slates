@@ -136,3 +136,28 @@ fn a_bad_tag_name_and_a_missing_tagger_are_warnings_under_either_strictness() {
     assert_eq!(tag.tagger(), None);
   }
 }
+
+/// Git 2.56.1 `fsck_tag_standalone`: `gpgsig` and `gpgsig-sha256` headers (with space-prefixed continuation lines)
+/// are accepted after `tagger` without raising `extraHeaderEntry`.
+#[test]
+fn a_tag_with_gpgsig_headers_passes_without_extra_header_finding() {
+  for header in ["gpgsig", "gpgsig-sha256"] {
+    let text = format!(
+      "object 0000000000000000000000000000000000000001\n\
+       type commit\n\
+       tag v2\n\
+       tagger A U Thor <author@example.com> 1112911993 +0000\n\
+       {header} -----BEGIN PGP SIGNATURE-----\n \
+       line1\n \
+       -----END PGP SIGNATURE-----\n\n\
+       signed tag\n"
+    );
+    let report = tag::fsck(
+      text.as_bytes(),
+      crate::object_name::ObjectFormat::Sha1,
+      Strictness::Strict,
+    );
+    assert_eq!(report.findings(), [], "{header}");
+    assert_eq!(report.refusal(), None, "{header}");
+  }
+}

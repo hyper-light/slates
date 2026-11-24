@@ -1872,6 +1872,26 @@ impl Repository {
     })
   }
 
+  /// Whether `green`'s version `version`'s reached set holds `position`, descending its persistent
+  /// tree without materializing the set; `Ok(None)` while the version's sets are still deferred.
+  pub(super) fn reached_contains(
+    &self,
+    store: &ContentStore,
+    green: u64,
+    version: usize,
+    position: u64,
+  ) -> Result<Option<bool>, StoreRefused> {
+    let Some(value) = self.value_of(green, version)? else {
+      return Ok(None);
+    };
+    Sets::reached_contains(store, &value, position)
+      .map(Some)
+      .ok_or(StoreRefused::SetsUnreadable {
+        green,
+        version: to_u64(version),
+      })
+  }
+
   /// `green`'s version `version`'s value: its record's, else the memo's; none while it is not derived.
   pub(super) fn value_of(
     &self,

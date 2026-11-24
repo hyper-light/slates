@@ -241,6 +241,27 @@ impl Sets {
     names.next().is_none().then_some(Sets { reached, brought })
   }
 
+  /// Whether the reached set stored under value `root` contains `position`, read by descending the
+  /// set's bitmap-indexed tree with zero allocations; `None` when `root` is not a valid value.
+  pub fn reached_contains(store: &ContentStore, root: &ContentId, position: u64) -> Option<bool> {
+    let node = store.derived(root)?;
+    let (&VALUE, rest) = node.payload().split_first()? else {
+      return None;
+    };
+    let (&present, rest) = rest.split_first()?;
+    let (block, rest) = rest.split_first_chunk::<WORD_BYTES>()?;
+    let fanout = <[u8; WORD_BYTES]>::try_from(rest).ok()?;
+    let shape = Shape::recorded(u64::from_le_bytes(*block), u64::from_le_bytes(fanout))?;
+    if present & !(REACHED | BROUGHT) != 0 {
+      return None;
+    }
+    if present & REACHED == 0 {
+      return Some(false);
+    }
+    let reached_root = node.names().next()?;
+    tree_contains(store, reached_root, shape, position)
+  }
+
   /// Puts the sets as the type's value of `shape` (module docs): each set's tree, then the node naming their roots,
   /// held once by the caller. Refused, nothing is kept.
   pub(super) fn put(
@@ -495,6 +516,107 @@ fn set_bit(bitmap: &mut [u8], slot: u64) -> Option<()> {
 fn bit(bitmap: &[u8], slot: u64) -> Option<bool> {
   let (byte, mask) = slot_place(slot)?;
   Some(bitmap.get(byte)? & mask != 0)
+}
+
+/// Whether the tree rooted at `root` of `shape` contains `position`, descending iteratively with
+/// zero heap allocations; `None` for a malformed node.
+fn tree_contains(
+  store: &ContentStore,
+  mut id: ContentId,
+  shape: Shape,
+  position: u64,
+) -> Option<bool> {
+  let mut start = 0_u64;
+  let mut expected: Option<u32> = None;
+  loop {
+    let node = store.derived(&id)?;
+    match node.payload().split_first()? {
+      (&LEAF, runs) => {
+        if expected.is_some_and(|level| level != 0) || node.names().next().is_some() {
+          return None;
+        }
+        let rel = position.checked_sub(start)?;
+        return if rel >= shape.block {
+          Some(false)
+        } else {
+          leaf_contains(runs, rel)
+        };
+      }
+      (&INNER, rest) => match inner_child(rest, node.names(), shape, expected, position, start)? {
+        Some((next_id, next_start, below)) => {
+          id = next_id;
+          start = next_start;
+          expected = Some(below);
+        }
+        None => return Some(false),
+      },
+      _ => return None,
+    }
+  }
+}
+
+/// Descends one inner node toward `position`, returning `Ok(Some((child, child_start, below)))` when
+/// the child slot is marked, `Ok(None)` when `position` falls outside the marked slots, or `None`
+/// when the node is malformed.
+fn inner_child(
+  rest: &[u8],
+  mut names: impl Iterator<Item = ContentId>,
+  shape: Shape,
+  expected: Option<u32>,
+  position: u64,
+  start: u64,
+) -> Option<Option<(ContentId, u64, u32)>> {
+  let (&level_byte, bitmap) = rest.split_first()?;
+  let level = u32::from(level_byte);
+  if expected.is_some_and(|want| want != level) || bitmap.len() != shape.bitmap_len()? {
+    return None;
+  }
+  let below = level.checked_sub(1)?;
+  let span = shape.span(below)?;
+  let slot = position.checked_sub(start)?.checked_div(span)?;
+  if slot >= shape.fanout || !bit(bitmap, slot)? {
+    return Some(None);
+  }
+  let child_index = rank_below(bitmap, slot)?;
+  let child = names.nth(child_index)?;
+  let next_start = start.checked_add(slot.checked_mul(span)?)?;
+  Some(Some((child, next_start, below)))
+}
+
+/// Number of marked slots strictly below `slot` in `bitmap`.
+fn rank_below(bitmap: &[u8], slot: u64) -> Option<usize> {
+  let (byte, mask) = slot_place(slot)?;
+  let before = bitmap.get(..byte)?.iter().fold(0_usize, |acc, b| {
+    acc.saturating_add(b.count_ones() as usize)
+  });
+  let lower_mask = mask.saturating_sub(1);
+  let in_byte = (*bitmap.get(byte)? & lower_mask).count_ones() as usize;
+  Some(before.saturating_add(in_byte))
+}
+
+/// Whether the sorted, disjoint relative runs in `bytes` contain `rel`, found by binary search.
+fn leaf_contains(bytes: &[u8], rel: u64) -> Option<bool> {
+  let (pairs, left) = bytes.as_chunks::<RUN_BYTES>();
+  if pairs.is_empty() || !left.is_empty() {
+    return None;
+  }
+  let mut lo = 0_usize;
+  let mut hi = pairs.len();
+  while lo < hi {
+    let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+    let pair = pairs.get(mid)?;
+    let (s, e) = pair.split_first_chunk::<WORD_BYTES>()?;
+    let run_start = u64::from_le_bytes(*s);
+    let run_end = u64::from_le_bytes(<[u8; WORD_BYTES]>::try_from(e).ok()?);
+    if rel < run_start {
+      hi = mid;
+    } else if rel >= run_end {
+      lo = mid.saturating_add(1);
+    } else {
+      return Some(true);
+    }
+  }
+  Some(false)
 }
 
 /// The set the tree `root` of `shape` holds (module docs); `None` for nodes in any other form, and for a root of

@@ -23,7 +23,7 @@
 use super::answer::{Answer, Framing, Said};
 use super::sparse;
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
-use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, ShallowInfo};
+use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Graph as _, Outcome, ShallowInfo};
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::store::StoreGraph;
 use crate::v2::fetch::{Argument, Event, Response, Section, WantedRef};
@@ -155,6 +155,17 @@ pub(super) fn answer<P: PackSource>(
       return Err(refused(refusal));
     }
   };
+  if let Some(&id) = asked.wants.iter().find(|id| {
+    !graph
+      .node(id)
+      .is_some_and(|node| graph.is_visible_want(node))
+  }) {
+    drop(asked);
+    admission.release(lists);
+    return Err(refused(Refusal::Negotiation(
+      negotiation::Refusal::NotOurs { id },
+    )));
+  }
   let sparse = sparse::read(graph, served, asked.filter.as_ref(), admission).map_err(refused)?;
   let request = negotiation::Request {
     wants: &asked.wants,

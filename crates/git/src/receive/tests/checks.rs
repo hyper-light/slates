@@ -232,3 +232,157 @@ fn an_atomic_push_naming_a_hidden_ref_moves_no_ref() {
   assert_eq!(outcomes, expected);
   assert!(judged.is_empty());
 }
+
+/// Git 2.56.1 `.gitmodules` and `.gitattributes` blob fsck: hostile `.gitmodules` (bad name, `-` path, `-` or `%0a`
+/// url, `!` update, non-blob, missing blob) and hostile `.gitattributes` (line >= 2048 bytes, non-blob, missing blob)
+/// are refused on push before any ref moves, while valid `.gitmodules` and `.gitattributes` blobs pass.
+#[test]
+fn special_dotfile_blobs_are_checked_on_push_as_git_checks_them() {
+  let bad_cases: [(&str, &[u8], FsckId); 7] = [
+    (
+      ".gitmodules",
+      b"[submodule \"../escape\"]\n\tpath = sub\n\turl = https://example.com/r.git\n",
+      FsckId::GitmodulesName,
+    ),
+    (
+      ".gitmodules",
+      b"[submodule \"a\\\\..\\\\b\"]\n\tpath = sub\n\turl = https://example.com/r.git\n",
+      FsckId::GitmodulesName,
+    ),
+    (
+      ".gitmodules",
+      b"[submodule \"ok\"]\n\tpath = -dash\n\turl = https://example.com/r.git\n",
+      FsckId::GitmodulesPath,
+    ),
+    (
+      ".gitmodules",
+      b"[submodule \"ok\"]\n\tpath = sub\n\turl = -u./payload\n",
+      FsckId::GitmodulesUrl,
+    ),
+    (
+      ".gitmodules",
+      b"[submodule \"ok\"]\n\tpath = sub\n\turl = https://example.com/a%0ab\n",
+      FsckId::GitmodulesUrl,
+    ),
+    (
+      ".gitmodules",
+      b"[submodule \"ok\"]\n\tpath = sub\n\turl = https://example.com/r.git\n\tupdate = !evil\n",
+      FsckId::GitmodulesUpdate,
+    ),
+    (
+      ".gitattributes",
+      &[b'a'; 2048],
+      FsckId::GitattributesLineLength,
+    ),
+  ];
+  for (name, blob_bytes, expected) in bad_cases {
+    let blob_id = id_of(Kind::Blob, blob_bytes);
+    let tree_bytes = tree_entry("100644", name, blob_id);
+    // Test with tree BEFORE blob in pack order so deferred special-blob checking is exercised.
+    let objects: [(Kind, &[u8]); 2] = [(Kind::Tree, &tree_bytes), (Kind::Blob, blob_bytes)];
+    assert_refused_by_fsck(&objects, blob_id, expected);
+  }
+  // Non-blob at `.gitmodules` and `.gitattributes` (directory mode 40000).
+  let empty_tree = id_of(Kind::Tree, b"");
+  for (name, expected) in [
+    (".gitmodules", FsckId::GitmodulesBlob),
+    (".gitattributes", FsckId::GitattributesBlob),
+  ] {
+    let tree_bytes = tree_entry("40000", name, empty_tree);
+    let objects: [(Kind, &[u8]); 2] = [(Kind::Tree, b""), (Kind::Tree, &tree_bytes)];
+    assert_refused_by_fsck(&objects, empty_tree, expected);
+  }
+  // Missing `.gitmodules` blob.
+  let missing_id = id_of(Kind::Blob, b"never sent");
+  let tree_bytes = tree_entry("100644", ".gitmodules", missing_id);
+  let objects: [(Kind, &[u8]); 1] = [(Kind::Tree, &tree_bytes)];
+  assert_refused_by_fsck(&objects, missing_id, FsckId::GitmodulesMissing);
+  // Valid `.gitmodules` and 2047-byte `.gitattributes` line pass.
+  let ok_modules = b"[submodule \"ok\"]\n\tpath = sub\n\turl = https://example.com/r.git\n";
+  let mut ok_attrs = vec![b'a'; 2047];
+  ok_attrs.push(b'\n');
+  let mod_id = id_of(Kind::Blob, ok_modules);
+  let attr_id = id_of(Kind::Blob, &ok_attrs);
+  let tree_bytes = [
+    tree_entry("100644", ".gitattributes", attr_id),
+    tree_entry("100644", ".gitmodules", mod_id),
+  ]
+  .concat();
+  let tree_id = id_of(Kind::Tree, &tree_bytes);
+  let commit = commit_text(tree_id, &[]);
+  let commit_id = id_of(Kind::Commit, &commit);
+  let pack = pack_of(&[
+    (Kind::Blob, ok_modules),
+    (Kind::Blob, &ok_attrs),
+    (Kind::Tree, &tree_bytes),
+    (Kind::Commit, &commit),
+  ]);
+  let bytes = request(
+    &[],
+    &[(zero(), commit_id, b"refs/heads/ok")],
+    b" report-status",
+    &[],
+    &pack,
+  );
+  let mut judge = Applies::default();
+  let received = receive(
+    &bytes,
+    &ADVERTISED,
+    &Repo::default(),
+    &NoneHidden,
+    &mut judge,
+    &mut unbounded(),
+  )
+  .unwrap();
+  assert!(received.unpacked.as_ref().is_some_and(Result::is_ok));
+  assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
+  // Also verify the streaming `Session` path refuses a hostile `.gitmodules` blob even when the tree arrives before it.
+  let bad_modules = b"[submodule \"ok\"]\n\tpath = sub\n\turl = -u./evil\n";
+  let bad_id = id_of(Kind::Blob, bad_modules);
+  let bad_tree = tree_entry("100644", ".gitmodules", bad_id);
+  let bad_tree_id = id_of(Kind::Tree, &bad_tree);
+  let bad_pack = pack_of(&[(Kind::Tree, &bad_tree), (Kind::Blob, bad_modules)]);
+  let bad_req = request(
+    &[],
+    &[(zero(), bad_tree_id, b"refs/heads/evil")],
+    b" report-status",
+    &[],
+    &bad_pack,
+  );
+  let mut session = crate::receive::Session::new(&ADVERTISED, NoneHidden);
+  let mut admission = unbounded();
+  assert!(
+    session
+      .input(&bad_req, &Repo::default(), &mut admission)
+      .unwrap()
+  );
+  struct Still;
+  impl crate::store::learn::Clock for Still {
+    fn now_ns(&mut self) -> u64 {
+      0
+    }
+  }
+  let mut clock = Still;
+  while !session
+    .check_turn(
+      &Repo::default(),
+      &mut admission,
+      crate::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns: u64::MAX,
+      },
+    )
+    .unwrap()
+  {}
+  let checked = session.checked().unwrap();
+  assert_eq!(
+    checked.unpacked,
+    Some(Err(PackRefused {
+      objects: Some(2),
+      why: PackRefusal::Fsck {
+        id: bad_id,
+        finding: FsckId::GitmodulesUrl,
+      },
+    }))
+  );
+}

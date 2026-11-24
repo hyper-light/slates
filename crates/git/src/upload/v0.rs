@@ -508,7 +508,11 @@ pub(super) fn answer<P: PackSource>(
     return Ok(Answer::whole(Vec::new()));
   }
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
-  if let Some(id) = asked.wants.iter().find(|id| graph.node(id).is_none()) {
+  if let Some(id) = asked.wants.iter().find(|id| {
+    !graph
+      .node(id)
+      .is_some_and(|node| graph.is_visible_want(node))
+  }) {
     return Err(Refusal::Negotiation(negotiation::Refusal::NotOurs {
       id: *id,
     }));
@@ -821,7 +825,11 @@ pub(super) fn answer_in_turns<P: PackSource>(
     return Ok(Answer::whole(Vec::new()));
   }
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
-  if let Some(id) = asked.wants.iter().find(|id| graph.node(id).is_none()) {
+  if let Some(id) = asked.wants.iter().find(|id| {
+    !graph
+      .node(id)
+      .is_some_and(|node| graph.is_visible_want(node))
+  }) {
     return Err(Refusal::Negotiation(negotiation::Refusal::NotOurs {
       id: *id,
     }));

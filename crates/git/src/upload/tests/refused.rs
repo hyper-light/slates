@@ -482,3 +482,80 @@ fn every_cut_and_flip_of_a_request_is_refused_or_answered_whole() {
     "refused {refused}, answered {answered}"
   );
 }
+
+/// §4.17.2 "Access" (hidden-ref reachability in upload-pack v2, v0, and object-info): hide `refs/heads/main` (whose
+/// tip is `THIRD`) while keeping `refs/heads/side` (`FIRST`) and `refs/tags/v1` (`SECOND`) visible. Expect: `THIRD`
+/// is refused `NotOurs` in both v2 and v0 fetch and omitted from `object-info`, while `SECOND` (reachable from the
+/// visible tag `refs/tags/v1`) is still served.
+#[test]
+fn objects_only_reachable_from_hidden_refs_are_refused_in_v2_v0_and_object_info() {
+  let fixture = served::served();
+  let visible = [REFS[1], REFS[2]];
+  // Protocol v2 fetch wanting `THIRD` (only reachable from hidden `main`) -> NotOurs.
+  let v2_hidden = command("fetch", &[&naming("want", THIRD), b"done"]);
+  let (_, answer) = answer_of(
+    &fixture,
+    &visible,
+    b"refs/heads/side",
+    Version::V2,
+    Asked::Request(&v2_hidden),
+  );
+  assert_eq!(
+    answer.refusal(),
+    Some(&Refusal::Negotiation(negotiation::Refusal::NotOurs {
+      id: id(THIRD),
+    }))
+  );
+  // Protocol v2 fetch wanting `SECOND` (reachable from visible `refs/tags/v1`) -> served!
+  let v2_visible = command("fetch", &[&naming("want", crate::served::SECOND), b"done"]);
+  let (_, answer) = answer_of(
+    &fixture,
+    &visible,
+    b"refs/heads/side",
+    Version::V2,
+    Asked::Request(&v2_visible),
+  );
+  assert_eq!(answer.refusal(), None);
+  // Protocol v0 fetch wanting `THIRD` -> NotOurs.
+  let v0_hidden = [
+    pkt(format!("want {THIRD} side-band-64k\n").as_bytes()),
+    b"0000".to_vec(),
+    pkt(b"done\n"),
+  ]
+  .concat();
+  let (_, answer) = answer_of(
+    &fixture,
+    &visible,
+    b"refs/heads/side",
+    Version::V0,
+    Asked::Request(&v0_hidden),
+  );
+  assert_eq!(
+    answer.refusal(),
+    Some(&Refusal::Negotiation(negotiation::Refusal::NotOurs {
+      id: id(THIRD),
+    }))
+  );
+  // Protocol v2 `object-info` asking for `THIRD` and `FIRST`: `FIRST` gets its size, `THIRD` answers unknown (`<oid> `).
+  let info = command(
+    "object-info",
+    &[b"size", &naming("oid", THIRD), &naming("oid", FIRST)],
+  );
+  let (bytes, answer) = answer_of(
+    &fixture,
+    &visible,
+    b"refs/heads/side",
+    Version::V2,
+    Asked::Request(&info),
+  );
+  assert_eq!(answer.refusal(), None);
+  let text = String::from_utf8_lossy(&bytes);
+  assert!(
+    text.contains(&format!("{FIRST} 152")),
+    "visible object reports its size: {text}"
+  );
+  assert!(
+    text.contains(&format!("002d{THIRD} ")),
+    "hidden object answers unknown (no size): {text}"
+  );
+}
