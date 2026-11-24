@@ -771,3 +771,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   awaits bring_back (server: bring_back_reads, Send) and re-serves first; second miss answered (away_again).
 - Owed (main): Linux guest over a work on an svn green, crates/server/tests/virtiofs.rs.
 - NEXT (main's order 02:25): 4 lend items (borrow read-only lends; no Green::default per lend); 5 speed.
+## 2026-11-24 ~05:00: A-899 virtio-fs serves a work, 7416cae15
+- virtiofs attach ensure_slot; pass lends GreenTree via mounted_work::source/lend (one lend); A-898 park now reached.
+- Integration case a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered (in-process seam, unix).
+- Scratch moved out of /tmp to ~/.cache/w-svn (CLAUDE.md forbids /tmp).
+- NEXT: item 4 lend items (in-place lend: no by-value move, no Green::default per lend; counters red first); 5 speed.
