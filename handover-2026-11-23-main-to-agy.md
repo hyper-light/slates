@@ -22,6 +22,19 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 02:18 on 11-24:
+- 84a Linux, a second current-main round (A arm of the client-RR A/B at a51883940, adacachy2, CPUWeight 10000, the box
+  at load 58 rising to 214): every reported p99 <= 415 us and p999 <= 961 us. The client-RR arm (D'') was dead even
+  (3 of 48 single runs over 1 ms in each arm), so it stays not taken. Scratch worktrees main-84a-linuxA,
+  main-84a-linuxdpp and main-84a-windiag are throwaway; delete them by exact path when done.
+- Rulings since 01:50: w-shared's before-entry test waits for the record's register before injecting; next, a
+  repository creation answered before its record reaches f+1 (a NoLoss red, through A-886's barrier). w-perf's A-887:
+  the replay reads only runs a splice consumes; one resolver resolve_at for reads and recovery; w-perf lands the
+  state-passing split of hg_push's bring-back first, told to w-hg. w-git's RefineJob reshape lands first as its own
+  commit, then the recorded-submit move; the NoTrees deferred-path gap is in scope.
+- Runs queued on the big Studio: r811 interop round 3 (running), then r817 the svn use round over HTTP (git-2000, after
+  w-svn's A-893 info fix), then owed: git/git's whole-repository round at >= 0417fd1f6 for w-git's encoding numbers.
+
 Updates at 02:01 on 11-24:
 - 84a CONFIRMED AT CURRENT MAIN 55650fef1 on all three bare-metal platforms, by the bench's reported p99/p999 (each
   invocation's three runs' median; p999 read from the numbers, since the verdict line judges p99 only): macOS p99 <= 158
