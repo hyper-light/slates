@@ -22,6 +22,19 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 00:03 on 11-24:
+- Main CI's Ubuntu tests: the first lint-clean run (45347644597, at 31e0c2596) ran the runner out of disk in
+  `cargo test --workspace` (job 138289296963, "No space left on device"). No Ubuntu test build had run on main since at
+  least 11-19, since every run stopped at Format or Clippy. Main landed 2033268c5: the gates job frees the image's unused
+  SDKs on Linux and prints the free space before, after, and after the tests. Verify in the next main run, and watch
+  45347644597's macOS gates job (still running) for the same failure.
+- The lint wall is clean at b0d738c6f (w-wall, done). The fleet lands without clippy, so the wall needs a keeper after
+  each burst of landings. CI's full Windows clippy wasn't checked locally (cargo-xwin is installed here, unrun).
+- w-tsan landed A-859's gate (27131596a, merge 3ca9de314) and is fixing daemon_edge.rs:5274's assertion.
+- w-perf: A-887 ruled option (a), one landing. Every reader of a named text (mount read, recovery, a work's judge)
+  brings it back by identity through homes, async, held until the judge's end, bounded, with a typed refusal for a text
+  gone everywhere. Held::stores_bytes is required with no default; an in-memory store for hg's unit tests is owed in GAPS.
+
 Updates at 23:49 (stamped from date; the commit 4e8f007 said 23:52 by mistake):
 - Gate 3 is RUNNING: GitHub run 45350914168 (branch diag-measurer-main-v3-gate3, commit 509d46e3c), v3_takeover at
   b98233544 (w-git's edge-failure logging ba4e4e35e): 3 release then 4 debug back to back; artifact v3-gate3 holds each
