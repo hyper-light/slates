@@ -27,8 +27,8 @@
 //!    route.
 //! 4. **A failed landing.** A store that refused the changeset leaves nothing applied or durable, so no reader saw
 //!    anything of it: the secured retention is credited back and the request is answered `Overloaded`, unrecorded, so
-//!    its retry runs ([`abandon`]). A revision the check refused (a version not made, counted `UNMADE`) commits the
-//!    version alone, as before.
+//!    its retry runs ([`abandon`]). A commit the check refused (counted `UNMADE`) is given up the same way: the version
+//!    is never committed alone (main 01a20182's ruling of 2026-11-23 22:08, A-888).
 //!
 //! **A crash.** Before the step's commit nothing of the version is durable and the register names no new sequence, so
 //! recovery comes back to the state before the submit (recovery applies only what the register names); the changeset

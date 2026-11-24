@@ -11378,7 +11378,7 @@ fn increment_held(
 /// 356-429 ms (main's A/B, 2026-11-21). The bound is where the step's copy of the increment (about 2.6 ms a mebibyte at
 /// A-825's 256 MiB rate) is still of the order of one publication; it is a judgment, not a measured crossover, and a
 /// sweep across it is owed. A chain whose cap is small carries less ([`CARRIED_CHAIN_SHARE`]).
-pub(crate) const CARRIED_INCREMENT_MAX: usize = 1 << 20;
+pub const CARRIED_INCREMENT_MAX: usize = 1 << 20;
 
 /// Shape: the share of the partition's green-chain cap one carried increment may take, at most (A-854): a carrying chain
 /// holds at least this many versions before its cap, so carrying never makes a small chain fold or refuse an entry a
