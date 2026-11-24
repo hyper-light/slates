@@ -22,6 +22,18 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 03:00 on 11-24:
+- 84a Windows tail, second measurement (r820, jupiter): a 2 ms idle window before parking (DIAG override, scratch
+  a06a2a062) against the default 50 us cut slow samples 21 -> 11 and rounds with a single run over 1 ms 5/7 -> 1/7; the
+  client's late takes didn't fall (56 -> 78). Evidence for w-perf's derived window (after A-887): a shard window from the
+  measured park cost, plus a client spin window; measure CPU inside the bench.
+- Landed this hour: w-hg P3 5de28ccb2, P4 63e25a1ca, the status-only sweep 16186398b (19 tests judge bodies now); w-svn's
+  dump-order normalization c94252e87, the held-verdict red 4c73eb315; w-git's RefineJob reshape 770b7d200; w-perf's
+  bring-back split 8cd23c967. Rulings: w-hg's stale re-base and record writer ask for texts not at hand through the
+  intake's channel (no whole manifest per push); w-perf's recovery deferred by dependency (greens needing a store's index
+  rebuilt after the stores, works waiting as over a green awaiting adoption).
+- Session addresses after restarts: w-perf uds 92158, w-hg 38517, w-shared 57324.
+
 Updates at 02:20 on 11-24:
 - Gate 4 NAMED the push-0 failure (run 45363070862, 6 of 7): the server answered the push 200 OK, chunked, and ended the
   body cleanly with zero bytes 3.5 ms later; no report-status. It was never a disconnect. w-git now hunts the path that
