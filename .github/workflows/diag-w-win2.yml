@@ -64,11 +64,16 @@ jobs:
             grep -a '^error\|^warning: [a-z]' -A6 "$RUNNER_TEMP/clippy-$t.log" | head -12
           done
   miri:
-    name: rt Miri (ubuntu-latest)
+    name: rt loom and Miri (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: CI's loom models of slates-rt
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-rt --lib --release loom -- --nocapture 2>&1 | grep -a 'test result\|panicked\|^test '
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
