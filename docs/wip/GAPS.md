@@ -814,6 +814,12 @@
 > test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
 > recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
 > `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
+> **A synchronous history's landing held its shard past the watchdog's window (2026-11-24, w-ci; OPEN until every site
+> moves).** `create_blocking`, `land_blocking` and `land_segments_blocking` wait in a `join` on the shard's own thread
+> while the store commits. An `fdatasync` longer than the 1000 ms window then ends the test binary with the watchdog's
+> exit 4 (w-tsan: 1 of 100 `daemon_edge` runs at load 47; reproduced 3 of 3 on adacachy2 with the store's `fdatasync`
+> delayed 1.5 s). `daemon_edge`'s creations moved to `create_on`, which waits on the test's thread; about 45 sites in
+> other files follow. Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
 > `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
@@ -1180,7 +1186,10 @@
 >   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
 >   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
 >   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
->   makes each extent's object afresh at a claim after a release), should refusals remain.
+>   makes each extent's object afresh at a claim after a release), should refusals remain. r633 named it: no OS
+>   refusal, but an extent object a run before had left under the bench's fixed segment name, at another length. FIXED
+>   at the cause the same day: a created content object clears its extents' names and its creator removes them as it
+>   drops (`docs/bugs/2026-11-23-a-content-extents-object-outlived-its-daemon-and-met-the-next-run.md`).
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
@@ -1425,6 +1434,14 @@
 > windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
 > answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
 > r130's verbs with the lift on.
+> A ref listing waits for nothing a fetch reads BUILT (2026-11-23, w-git; main 01a20182's r405: stock `git ls-remote`
+> right after git/git's whole push took 29 to 54 s in every run, where stock lists its 4,451 refs in under a second).
+> Every upload-pack request but the advertisement derived the repository's unwalked versions whole and waited up to a
+> liveness window on its encoding (A-718's `encode`), a v2 `ls-refs` too; the SSH edge did it at each session's start.
+> Now only a request that may fetch waits (`vcs_http::git::upload::fetches`: every request before v2, and a v2 request
+> naming `fetch` or no command this crate reads; `slates_git::v2::request::command_of`), and SSH before its session's
+> first fetch (`a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding`: 4 turns during the listing before, 0
+> after, the fetch after it still readying the store). Owed: main's rerun of r405's push answer to refs listable.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -1683,7 +1700,14 @@
 > - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,
 >   and a holder's replica owes the same push at the base's identity, so a takeover adopts a green that owes it
 >   (`a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`).
->   OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
+>   BUILT, A-813's limit (A-886, w-git, 2026-11-23): a holder makes a replica that owes when a later version's record
+>   needs it, from a replica store of the repository its names-log parts make (held equal to the owner's store by an
+>   oracle), through the same door; a record waiting on it answers `ReplicaBuilding`, and a push's barrier waits for
+>   every green it moved (`v3_takeover` passes at f = 1, debug, macOS arm64, locally: both holders began and made a
+>   replica, 14.2 and 17.3 ms from begun to made, 877 and 1,468 turns, most waiting out the replica store's sliced
+>   replay; 3 versions waited; the takeover made its store again rather than adopting, its parts cut by `whole_parts`).
+>   Owed: main's release and debug gate; the build's time for git/git's history at f = 1.
+>   Was OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
 >   replica cannot judge it, so the record is refused (`merge.replica.owes`, counted) and waits for placement until a
 >   holder's replica is made. Before A-813 the owed version itself never placed. The fix: a holder makes its replica
 >   through the same door over its tool's objects, which needs the repository's store on holders (w-git, w-store).
@@ -1894,6 +1918,17 @@
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
+> Lost again at ae43b42ea (w-chaos, 2026-11-23, `v3_takeover` 7 of 7): the barrier waited for the names log alone, while
+> a push also moves its greens, whose versions stood at version 1 at both survivors while pushes 1 and 2 were answered, so
+> the successor's rebuild (`whole_parts`, a green's span judged by its head) kept push 0 only. Fixed (w-git, main
+> 01a20182's ruling): the barrier (`state_log::names_committed`, all three answer paths) also waits until every green the
+> repository's operations moved is placed at f + 1 through the version they took it to (`StateLogs::note_greens` as the
+> records are taken, `greens_placed` against `merge.placed`; `a_push_is_held_until_every_green_it_moved_is_placed_…`).
+> Its first gate (GitHub 45312465577) found the barrier right and what it waited for never placing: a holder's replica
+> owing its push could not judge the next version (A-813's limit), now built (A-886, below under A-812 (b)). The barrier
+> gives up only after a window with no progress, from the record plane's live pace, and answers `ng <ref> unable to
+> commit` (`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`). Owed: main's gate again, release and
+> debug.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -7692,8 +7727,18 @@
 >   `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (refused 1, then answered). Fleet
 >   leg: `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted`, the successor withholding its
 >   confirmation until its restart. Record: `docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md`.
->   **Still open (harness):** under load 55 to 73 on adacachy2 the scene's setup attach (`write_attachment`) and its
->   single-try reads (`continuity_read`) meet `Overloaded { shard: 1 }`, a retryable refusal neither retries.
+>   **Not the harness (w-chaos, 2026-11-23): the refusal never clears.** A diagnostic build named each site that
+>   refused and printed every node's counters at the scene's end (adacachy2, load 38 to 57, kiln r649). In 4 of 6 runs,
+>   3 of 3 of the A-885 leg and 1 of 3 of this test, every read was refused `Overloaded { shard: 1 }` for the whole of
+>   its 60 s window, 593 to 597 times, and in one run the write's attach was too. Both live coordinators ran 579 to 591
+>   periods a minute meanwhile. The successor's routing names it the volume's owner, but its owner shard holds no
+>   volume and no materialization is pending. So `await_materialization` ends at once and `resolve_and_forward` refuses
+>   again (`fleet.owner_location.owned_unmaterialized` 4,165 to 4,774 a run). Every run restored the volume from the
+>   image and resumed it. Only the failed runs then took it over again after the restart (`fleet.live.taken_over` 1,
+>   `fleet.live.rebuilds_begun` 1). A retry cannot turn these runs green, so round 1's retry was not landed. It also
+>   charged the client's own shard, which counts no periods on a two-shard node, and 3 of its 6 runs failed anyway, two
+>   at `FROZEN_CAP` (304 s) and one at its 900 s timeout. **Open (daemon):** the takeover a restarted successor runs on
+>   its own live volume leaves the owner shard without the volume while the routing names the node its owner.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).

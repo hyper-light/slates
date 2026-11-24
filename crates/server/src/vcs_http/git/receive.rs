@@ -40,7 +40,7 @@
 
 use slates_git::http::{Service, Version};
 use slates_git::pktline::{self, MAX_LEN, Packet};
-use slates_git::receive::Refusal;
+use slates_git::receive::{Received, Refusal};
 use slates_git::sideband::{self, Band};
 use slates_http::reply::Status;
 
@@ -110,31 +110,51 @@ async fn carried_within(
   }
 }
 
-/// The report held until the push's records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): given once they
-/// are (true), refused when they are not within the commit's budget, or, once `silent_until` passes, left for the
-/// next turn (false) so git's keepalive is written meanwhile (R2).
+/// A push's report held until its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report, what the
+/// push received (its `ng` report is made from it, should the barrier give up), and the barrier's wait.
+struct HeldReport {
+  report: Vec<u8>,
+  received: Box<Received>,
+  waited: crate::state_log::Waited,
+}
+
+/// The report held until the push's records are held at f + 1: given once they are (true); once a whole window passes
+/// with nothing it waits for moving (`crate::state_log::Waited`), each command it applied reported `ng <ref> unable to
+/// commit` in its stead (`git_push::uncommitted_report`), never a cut connection; or, once `silent_until` passes, left
+/// for the next turn (false) so git's keepalive is written meanwhile (R2).
 async fn held_report_given<L: ShardLender>(
   lender: &mut L,
   repository: slates_db::catalog::RepositoryId,
-  (held_report, given): (&mut Option<(Vec<u8>, u64)>, &mut Vec<u8>),
+  (held_report, given): (&mut Option<HeldReport>, &mut Vec<u8>),
   silent_until: Option<u64>,
 ) -> Result<bool, Cut> {
   let unavailable = || Cut::Unserved;
-  let began = held_report.as_ref().map_or(0, |(_, began)| *began);
   let budget = crate::fleet::live_budget();
   loop {
     if lender
       .lend(|state| crate::state_log::names_committed(state, repository))
       .ok_or_else(unavailable)?
     {
-      if let Some((report, _)) = held_report.take() {
-        given.extend_from_slice(&report);
+      if let Some(held) = held_report.take() {
+        given.extend_from_slice(&held.report);
       }
       return Ok(true);
     }
-    if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
-      let _ = lender.lend(|state| state.count(crate::state_log::PUSH_UNCOMMITTED, 1));
-      return Err(unavailable());
+    let reading = lender
+      .lend(|state| crate::state_log::barrier_reading(state, repository))
+      .ok_or_else(unavailable)?;
+    let expired = held_report
+      .as_mut()
+      .is_none_or(|held| held.waited.expired(reading));
+    if expired {
+      let _ = lender.lend(|state| {
+        state.count(crate::state_log::PUSH_UNCOMMITTED, 1);
+        crate::state_log::log_uncommitted(state, repository);
+      });
+      if let Some(held) = held_report.take() {
+        given.extend_from_slice(&crate::git_push::uncommitted_report(&held.received));
+      }
+      return Ok(true);
     }
     if silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
       return Ok(false);
@@ -219,7 +239,7 @@ pub(crate) struct Receive<L> {
   carrying: Option<slates_rt::sync::ChannelReceiver<crate::git_push::Carried>>,
   /// The push's report, written and held back until its records are held at `f + 1` (A-724 piece 8c's commit rule), and
   /// when that wait began: given then, git's keepalive written meanwhile (R2).
-  held_report: Option<(Vec<u8>, u64)>,
+  held_report: Option<HeldReport>,
 }
 
 impl<L: ShardLender> Exchange for Receive<L> {
@@ -384,16 +404,24 @@ impl<L: ShardLender> Receive<L> {
         .ok_or_else(unavailable)?
         .map_err(Cut::Failed)?;
       match step {
-        Answering::Answered(_) => {
+        Answering::Answered(received) => {
           // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
-          // out after, or the push is refused, never lost with its owner.
+          // out after, or each command it applied is reported `ng`, never lost with its owner nor cut off.
           drop(turn);
           if silent_until.is_some() {
-            *held_report = Some((given.split_off(before), slates_rt::futures::now_ns()));
+            let mark = lender
+              .lend(|state| crate::state_log::push_progress(state, repository))
+              .ok_or_else(unavailable)?;
+            *held_report = Some(HeldReport {
+              report: given.split_off(before),
+              received,
+              waited: crate::state_log::Waited::new(mark),
+            });
             continue;
           }
           if !crate::state_log::names_committed_within(repository).await {
-            return Err(unavailable());
+            given.truncate(before);
+            given.extend_from_slice(&crate::git_push::uncommitted_report(&received));
           }
           return Ok(true);
         }

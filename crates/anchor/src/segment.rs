@@ -159,6 +159,44 @@ pub struct AnchorSegment {
   /// across daemon restarts), `None` on a process that only attached the metadata object — that
   /// process opens the content object from the handoff env ([`AnchorSegment::open_content`]).
   content: Option<SparseObject>,
+  /// Whether this segment created its content object ([`AnchorSegment::with_content`]), not adopted it
+  /// ([`AnchorSegment::adopt_content`]): the creator's extents go with it when it drops (macOS, where each extent is an
+  /// object of its own).
+  content_created: bool,
+}
+
+impl Drop for AnchorSegment {
+  /// The extents of a content object this segment created go with it, as the object's own name does (its creator's
+  /// `SparseObject` removes that): on macOS each is a shared-memory object of its own that outlives every holder while
+  /// its name exists, with every page a shard wrote. Until 2026-11-23 a daemon that created its segment in-process
+  /// (`SegmentSource::Create`: a bench, a test, an embedding) left them in the kernel, and the next run under the same
+  /// names met them (main 01a20182's r633). An anchored daemon releases its anchor's when the anchor is gone
+  /// (`slates_api`'s `release_the_anchors_objects`).
+  fn drop(&mut self) {
+    if self.content_created
+      && let Some(content) = &self.content
+      && let Ok(handoff) = content.handoff()
+    {
+      release_extent_names(&handoff, self.geometry.partitions);
+    }
+  }
+}
+
+/// Removes every name the content object `content` gives an extent (`slates_mem::extent_handoff`: macOS, where each is
+/// an object of its own; nothing elsewhere), every id the layout can name, `partitions × POOL_EXTENTS_PER_PARTITION`: a
+/// bounded count of calls on a segment's creation and its end, never a request's path; a name never made is no refusal,
+/// and any other is logged.
+fn release_extent_names(content: &Handoff, partitions: u16) {
+  let ids = usize::from(partitions).saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION);
+  for id in (0..ids).filter_map(|id| u16::try_from(id).ok()) {
+    if let Some(extent) = slates_mem::extent_handoff(content, id)
+      && let Err(refusal) = slates_mem::unlink_handoff(&extent)
+    {
+      slates_machine::log_line!(
+        "slates anchor: content extent {id}'s name was not released: {refusal}"
+      );
+    }
+  }
 }
 
 impl std::fmt::Debug for AnchorSegment {
@@ -400,6 +438,7 @@ impl AnchorSegment {
       object,
       geometry,
       content: None,
+      content_created: false,
     };
     segment.init_rings();
     Ok(segment)
@@ -418,11 +457,12 @@ impl AnchorSegment {
     content_bytes: usize,
   ) -> Result<AnchorSegment, AnchorError> {
     // The content object has one accessor at a time (the running daemon): no concurrent words.
-    self.content = Some(SparseObject::create(
-      content_name,
-      content_bytes.max(1),
-      Words::new(),
-    )?);
+    let content = SparseObject::create(content_name, content_bytes.max(1), Words::new())?;
+    // A fresh content object has no extents: an object of an extent's name is a dead run's that never released it, which
+    // a claim would meet at another length (refused) or adopt with the dead run's bytes (main 01a20182's r633).
+    release_extent_names(&content.handoff()?, self.geometry.partitions);
+    self.content = Some(content);
+    self.content_created = true;
     Ok(self)
   }
 
@@ -523,6 +563,7 @@ impl AnchorSegment {
       object,
       geometry,
       content: None,
+      content_created: false,
     })
   }
 
@@ -630,6 +671,7 @@ impl AnchorSegment {
   /// segment carries it into [`AnchorSegment::handoff_env`] for the daemon's shard children (§4.8).
   pub fn adopt_content(&mut self, object: SparseObject) {
     self.content = Some(object);
+    self.content_created = false;
   }
 
   /// A borrow of the segment's own descriptor, for the anchor's issuer route to hand a process that proved the issuer's
