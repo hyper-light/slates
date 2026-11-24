@@ -1,0 +1,35 @@
+--- a/crates/cli/src/verbs.rs
++++ b/crates/cli/src/verbs.rs
+@@ -1673,12 +1673,26 @@
+   path: &str,
+   mode: u32,
+ ) -> Result<u64, ClientError> {
+-  client.fs_write_from(
+-    (volume, attachment),
+-    path,
+-    &mut std::io::stdin().lock(),
+-    mode,
+-  )
++  // DIAG RED (never merged): stdin read whole first, as before A-880.
++  use std::io::Read;
++  let bound = client
++    .daemon_status()?
++    .shards
++    .iter()
++    .map(|shard| shard.metadata_bytes)
++    .max()
++    .unwrap_or(0);
++  let mut bytes = Vec::new();
++  let read = std::io::stdin()
++    .lock()
++    .take(bound.saturating_add(1))
++    .read_to_end(&mut bytes);
++  if let Err(e) = read {
++    return Err(ClientError::Refused(slates_client::Refusal::BadRequest {
++      reason: format!("reading stdin: {e}"),
++    }));
++  }
++  client.fs_write((volume, attachment), path, &bytes, mode)
+ }
+ 
+ /// Acknowledges an outcome-only verb: a JSON `{ "ok": true }` under `--json`, else the text `message`.

@@ -1,0 +1,150 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), A-880, run 18: a file write streams its input into a staging buffer of no
+# stated length that lives with its attachment. On ubuntu and macOS: three reds, each with one mutation applied and
+# reverted (the CLI reading stdin whole, as before A-880, against the large write's peak resident size; an open
+# buffer given a lease's deadline, against the slow producer under a hold; the partition's count of ended attachments
+# held still, against the detach that must release the buffer), then the green: the wire's published order and the
+# contract's history, the staging unit tests, the library's streamed writes and holds, the CLI's attachment and write
+# flows with the large write's peak printed, and clippy of the touched crates. On both Windows runners: the extents
+# file (its 256 MiB write now streamed), the library's streamed writes, and clippy of the touched crates.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  unix:
+    name: A-880 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+      - name: "Red 1: the CLI reads stdin whole, as before A-880 (the large write's peak)"
+        timeout-minutes: 50
+        run: |
+          git apply .github/diag-w-win2/a880-red-buffered.patch
+          set +e
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact a_large_write_keeps_a_page_of_its_input_resident_not_the_input > "$RUNNER_TEMP/red1.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a880-red-buffered.patch
+          grep -a 'test result\|panicked\|peaked at\|resident at its peak' "$RUNNER_TEMP/red1.log" | cut -c1-240 | head -12
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the large write passed reading stdin whole"; exit 1; fi
+      - name: "Red 2: an open buffer with a lease's deadline (the slow producer under a hold)"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          git apply .github/diag-w-win2/a880-red-deadline.patch
+          set +e
+          cargo test -p slates-client --test client -- --test-threads=1 --nocapture a_streamed_write_slower_than_a_lease > "$RUNNER_TEMP/red2.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a880-red-deadline.patch
+          grep -a 'test result\|panicked\|NotFound' "$RUNNER_TEMP/red2.log" | cut -c1-240 | head -12
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the slow producer passed with a deadline"; exit 1; fi
+      - name: "Red 3: the count of ended attachments held still (the detach must release the buffer)"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          git apply .github/diag-w-win2/a880-red-count.patch
+          set +e
+          cargo test -p slates-client --test client -- --test-threads=1 --nocapture an_open_staging_buffer_goes_with_its_attachment > "$RUNNER_TEMP/red3.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a880-red-count.patch
+          grep -a 'test result\|panicked' "$RUNNER_TEMP/red3.log" | cut -c1-240 | head -12
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the detach test passed with the count held still"; exit 1; fi
+      - name: "Green: the wire's order and the contract's history"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          cargo test -p slates-ipc --test wire_order 2>&1 | grep -a '^test \|test result\|panicked'
+          cargo test -p slates-api contract_history 2>&1 | grep -a '^test \|test result\|panicked'
+      - name: "Green: the staging unit tests and the db partition's"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          cargo test -p slates-server --lib staging:: 2>&1 | grep -a '^test \|test result\|panicked'
+          cargo test -p slates-db --lib partition 2>&1 | grep -a 'test result\|panicked'
+      - name: "Green: the library's streamed writes and holds"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          cargo test -p slates-client --test client -- --test-threads=1 a_write_from_a_reader an_open_staging_buffer a_streamed_write a_hold 2>&1 | grep -a '^test \|test result\|panicked'
+      - name: "Green: the CLI's attachment and write flows, the large write's peak printed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact a_large_write_keeps_a_page_of_its_input_resident_not_the_input a_write_whose_input_outlasts_its_attachments_term_holds_it a_cli_attachment_outlives_the_process_that_made_it attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor > "$RUNNER_TEMP/cli.log" 2>&1
+          code=$?
+          grep -a '^test \|test result\|panicked\|peaked at\|AttachmentExpired' "$RUNNER_TEMP/cli.log" | cut -c1-220 | head -20
+          exit $code
+      # Judged by A-880's own files: main's wall has daemon_edge.rs's drop_non_drop (w-git's 050ef43c2) to clear.
+      - name: "Clippy of the touched crates, every target, every error printed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          cargo fmt --all -- --check
+          set +e
+          cargo clippy --keep-going -p slates-db -p slates-server -p slates-client -p slates-ipc -p slates-api -p slates-cli --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
+          echo "clippy exit $?"
+          grep -a -A8 '^error' "$RUNNER_TEMP/clippy.log" | head -120
+
+  windows:
+    name: A-880 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: "The library's streamed writes and holds"
+        timeout-minutes: 50
+        run: |
+          cargo test -p slates-client --test client -- --test-threads=1 a_write_from_a_reader an_open_staging_buffer a_streamed_write a_hold 2>&1 | grep -a '^test \|test result\|panicked'
+      - name: "The content pool's extents through the CLI, its 256 MiB write streamed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          set +e
+          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture > "$RUNNER_TEMP/extents.log" 2>&1
+          code=$?
+          grep -a '^test \|test result\|panicked\|holding attachment\|refused\|MiB' "$RUNNER_TEMP/extents.log" | cut -c1-220 | head -30
+          exit $code
+      - name: "Clippy of the touched crates, every error printed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          cargo clippy --keep-going -p slates-db -p slates-server -p slates-client -p slates-ipc -p slates-api -p slates-cli --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
+          echo "clippy exit $?"
+          grep -a -A8 '^error' "$RUNNER_TEMP/clippy.log" | head -120
