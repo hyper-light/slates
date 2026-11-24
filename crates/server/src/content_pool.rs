@@ -449,7 +449,8 @@ impl ContentPool {
     let mapped = self.map(id);
     match mapped {
       Ok(region) => Some((id, region)),
-      Err(_) => {
+      Err(refusal) => {
+        report_first_refused_map(id, &refusal);
         self.refused = self.refused.saturating_add(1);
         let _released = self.segment.pool_release(usize::from(id), self.partition);
         None
@@ -474,6 +475,29 @@ impl ContentPool {
     }
     None
   }
+}
+
+/// Logs the first extent map the OS refused in this process, once (main 01a20182's order of 2026-11-23 on r578): the
+/// refusal, and its OS error by name and number where it carries one. A claim tries the next candidate past a refused
+/// map, which ends a refusal the pool could serve; a cause every extent meets (descriptors, the shared-memory name
+/// space, the VM's limits) would only move to the next, and this line names which the host met.
+fn report_first_refused_map(id: u16, refusal: &ServerError) {
+  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    return;
+  }
+  let os = match refusal {
+    ServerError::Memory(slates_mem::MemError::OsRefused {
+      code: Some(code), ..
+    }) => format!(
+      ", errno {code}: {}",
+      std::io::Error::from_raw_os_error(*code)
+    ),
+    _ => String::new(),
+  };
+  slates_machine::log_line!(
+    "slates-server: content pool extent {id} refused its map (first occurrence): {refusal}{os}"
+  );
 }
 
 /// Whether extent `id` may be claimed now: on Windows, where each extent is a section of its own (A-789), only once it
