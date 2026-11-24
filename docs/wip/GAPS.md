@@ -1163,6 +1163,15 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
+>   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
+>   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no
+>   debt and no hold). The pool's claim returned at the first extent it claimed and could not hand out, so the arena's
+>   growth came up short and gave back what it took, refusing the admission whole. Now a refused map is counted, the
+>   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
+>   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
+>   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
+>   makes each extent's object afresh at a claim after a release), should refusals remain.
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
