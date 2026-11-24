@@ -174,6 +174,12 @@
 > for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
 > in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
 > should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
+> **The store owner's stop joined blind on a held handle (2026-11-23, w-shared; main 01a20182's ruling): CLOSED.** A
+> fleet test's harness waited 75 minutes in `StoreOwner::stop`, which joined an owner that ended only once every
+> handle was gone. The stop is now a request the owner ends at, whatever handles are still held: its open landing let
+> go, its checkpoint written, every later request refused `Gone`. Red first (the stop unanswered within 60 s), now
+> answered at once (`crates/store/tests/owner.rs`). The sweep found no other blind join in shipped code
+> (`docs/bugs/2026-11-23-the-store-owners-stop-joined-blind-on-a-held-handle.md`).
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
