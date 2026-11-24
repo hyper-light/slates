@@ -761,3 +761,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - NEXT: dump-order normalization in crates/cli/tests/svn_interop.rs (uncommitted in worktree, unit test
   a_dumps_order_of_a_directorys_deletions_is_no_part_of_an_answer); then speed list (writes 24x, svnsync piece_fetched,
   svn:// update), lend borrow items, made-commit held verdict item 2, virtio-fs park.
+## 2026-11-24 ~03:30: held-verdict answer 4c73eb315 (never differs; costs a run), A-895 chain room cda02d89d
+- A-895: batch takes its chains' room; judge_named → encoded_len → commit_judgment; PastChainRoom deferred whole
+  (Flush::Chain); lone entry past room = typed TableAtCapacity; Loaded::batches logged at import end.
+- NEXT (main's order 02:25): 3 virtio-fs park; 4 lend items (borrow read-only lends, no Green::default per lend);
+  5 speed (HTTPv2 writes 24x, svnsync per-piece room round trip, svn:// update; apply bring-back before the made step).
