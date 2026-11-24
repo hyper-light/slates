@@ -722,3 +722,9 @@
 - WAITING: gate 6 at 77397a5f4 (names the Unlanded cause; HomedShort/repo-at-f+1 -> w-shared's A-894). Main to run
   interop git leg dumping `status --json` git_encode/git_derive counters per step (runs 2-5 fetch 9x, shallow 3x).
 - NEXT: clone speed item.
+- Clone item prep (04:55): main has w-interop widening git_scale.sh (my counter list before/after each clone, clone-again,
+  partial, fetch, shallow; time to first byte; a separate `sample <pid> 30` pass). Counters already exported:
+  vcs_store/upload.rs STREAM_COUNTED (git_upload.*), git_deflate.*, git_encode.*, git_resident.*. Reading key: loose_deltas
+  >> reused_* = searching; parts_by_entry >> parts_copied = cover entry-by-entry; stops w/o stopped_brought = let-go stall;
+  git_encode.turns during fetch = fetch pays encode. Stream: crates/git/src/store/upload.rs (cover 1165, holders 1193,
+  reused 1494, search_unit 1849). Await main's rows + sample, then name the step and land red-first.
