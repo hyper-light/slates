@@ -295,6 +295,13 @@ impl<C: Command, T: Command> Command for EitherCommand<C, T> {
       Self::Tunnel(command) => command.paced(sent),
     }
   }
+
+  fn write_waits(&mut self) {
+    match self {
+      Self::Other(command) => command.write_waits(),
+      Self::Tunnel(command) => command.write_waits(),
+    }
+  }
 }
 
 impl<S, R, V> Services for SvnServices<S, R, V>

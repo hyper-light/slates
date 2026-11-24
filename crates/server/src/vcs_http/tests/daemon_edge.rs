@@ -5209,11 +5209,15 @@ fn a_homes_read_whose_bring_back_is_refused_room_fails_with_that_refusal_counted
 /// the repository's shard, which gives the arena's idle extents back to the pool as the sweep's publication may at any
 /// moment ([`published_down_to_demand`]); on that shard, bring each file revision back by its path and node
 /// (`hg_push::bring_back`), then look at its window again. Expect the push `200`; some window let go; every bring-back
-/// answered `Ok`; every window held whole after, each let go read from the changeset store and counted once; the
-/// arena grown from its pool for them, and no room asked inside a lend (`vcs_store.room_out_of_reach` 0). Red before:
-/// none could be brought back by its (path, node); then, with the publication (w-tsan, 2026-11-23), 10 runs of 10
-/// refused `OverBudget { need: 8192, room: 5869 }` from the 49th file, the room asked inside `lent_state`, where the
-/// pool is out of reach (plainly 2 runs of 100 at a load of 47, at the 49th and the 81st).
+/// answered `Ok`; every window held whole after, each let go read from the changeset store and counted once; and every
+/// bring-back's room made outside a lend, where the pool is reachable: each let go brought back once
+/// (`vcs.hg.landed_texts_brought_back`, the non-vacuity count) and no room asked inside a lend
+/// (`vcs_store.room_out_of_reach` 0), whatever slack this machine's publication left. Red before: none could be brought
+/// back by its (path, node); then, with the publication (w-tsan, 2026-11-23), 10 runs of 10 refused
+/// `OverBudget { need: 8192, room: 5869 }` from the 49th file, the room asked inside `lent_state`, where the pool is out
+/// of reach (plainly 2 runs of 100 at a load of 47, at the 49th and the 81st). A first form asserted the arena grew past
+/// the publication, which held only where the slack was short: on w-hg's MacBook the publication left 16 MiB, room for
+/// all 120, and it failed 3 runs of 3 with every bring-back answered.
 #[test]
 fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node() {
   let (identity, certificate) = identity();
@@ -5271,11 +5275,10 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
     assert_eq!(*brought, Ok(()), "file {at} brought back");
     assert!(here, "file {at}'s window held whole after");
   }
-  assert!(
-    grown > published,
-    "the bring-backs grew the arena from its pool past the publication's give-back"
+  assert_eq!(
+    out_of_reach, 0,
+    "no room asked inside a lend: each bring-back's room made where the pool is reachable"
   );
-  assert_eq!(out_of_reach, 0, "no room asked inside a lend");
   assert_eq!(
     counted,
     u64::try_from(gone).unwrap(),

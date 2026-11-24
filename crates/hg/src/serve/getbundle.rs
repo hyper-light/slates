@@ -128,6 +128,21 @@ pub trait Store: Repository {
   /// Whether the manifest log holds `node` (A-745: a changeset sent is held to name a manifest the log holds).
   fn holds_manifest(&self, node: &Node) -> bool;
 
+  /// The length of the text of `log`'s revision `node` where the log holds its row, its text at hand or not (goal 93,
+  /// C1 (1): the changelog's and the manifests' texts let go once landed): what a fetch asks the changeset store for
+  /// ([`LogTexts`]) where [`Store::changeset_text`] or [`Store::manifest`] finds no text. None where the log holds no
+  /// such row, and by default.
+  fn log_text_len(&self, _log: WholeLog, _node: &Node) -> Option<u64> {
+    None
+  }
+
+  /// The manifest revision of `node` as its log's row holds it, with no text read ([`FileEntry`]: its position, its
+  /// parents, its link and its flags): what a manifest whose text the changeset store gave back is sent with. None where
+  /// the log lacks it, and by default.
+  fn manifest_entry(&self, _node: &Node) -> Option<FileEntry> {
+    None
+  }
+
   /// Whether the view serves every changeset its changelog holds (A-745): then every link names a served changeset,
   /// and a fetch that leaves none neither sent nor held is walked by its links.
   fn serves_every_changeset(&self) -> bool;
@@ -171,6 +186,118 @@ pub enum Given {
   Texts(Vec<Vec<u8>>),
   /// The full texts asked hold more than the want's `most` bytes: none read past it.
   TextsPast,
+}
+
+/// The changelog or the manifest log, whose texts a fetch reads whole ([`Store::log_text_len`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeLog {
+  /// The changelog.
+  Changelog,
+  /// The manifest log.
+  Manifest,
+}
+
+impl WholeLog {
+  /// The path the changeset store keeps this log's texts under ([`crate::push::intake::CHANGELOG_PATH`],
+  /// [`crate::push::intake::MANIFEST_PATH`]).
+  fn path(self) -> &'static [u8] {
+    match self {
+      WholeLog::Changelog => crate::push::intake::CHANGELOG_PATH,
+      WholeLog::Manifest => crate::push::intake::MANIFEST_PATH,
+    }
+  }
+
+  /// The refusal of a fetch whose store holds no row of this log's revision.
+  fn missing(self) -> Refusal {
+    match self {
+      WholeLog::Changelog => no_changeset_text(),
+      WholeLog::Manifest => no_manifest(),
+    }
+  }
+}
+
+/// The changelog's and the manifests' texts a fetch's steps found not at hand (goal 93, C1 (1): those logs' texts off
+/// the content store once landed, main's ruling of 2026-11-23 20:53), read from the changeset store as a file revision
+/// is: the unit asks the text's row under its log's path, then the text, and is taken again once given, the text it was
+/// given read in place of the store's. What it holds is the texts given since the last unit taken whole, two at most (a
+/// pull's changeset and its manifest), each charged to the step that reads it; a revision the store keeps no row of is
+/// refused at the step after.
+#[derive(Debug, Default)]
+struct LogTexts {
+  /// What the next step asks of the store.
+  want: Option<crate::render::Want>,
+  /// The revision asked and its text's length.
+  asked: Option<(Node, u64)>,
+  /// The texts given since the last unit taken whole, each with its node.
+  given: Vec<(Node, Vec<u8>)>,
+  /// A revision the store keeps no row or text of: refused at the next step.
+  unkept: bool,
+  /// The texts asked, for the walk's life: the non-vacuity counter.
+  asked_count: u64,
+}
+
+impl LogTexts {
+  /// The text given for `node`, if any.
+  fn given(&self, node: &Node) -> Option<&[u8]> {
+    self
+      .given
+      .iter()
+      .find(|(given, _)| given == node)
+      .map(|(_, text)| text.as_slice())
+  }
+
+  /// Asks the changeset store for the text of `log`'s revision `node`: its row under the log's path first. Refused
+  /// where the store gave nothing for the last one asked, or the log holds no row of this one.
+  fn ask(&mut self, store: &impl Store, log: WholeLog, node: Node) -> Result<(), Refusal> {
+    if core::mem::take(&mut self.unkept) {
+      return Err(Refusal::Store {
+        what: "a changelog or manifest text the changeset store keeps no row of",
+      });
+    }
+    let len = store
+      .log_text_len(log, &node)
+      .ok_or_else(|| log.missing())?;
+    self.asked = Some((node, len));
+    self.want = Some(crate::render::Want::Rows {
+      logs: vec![(log.path().to_vec(), vec![node])],
+    });
+    self.asked_count = self.asked_count.saturating_add(1);
+    Ok(())
+  }
+
+  /// The changeset store's answer: a row asks its text, within the length its log's row names; a text is kept for the
+  /// unit taken again; anything else marks the revision unkept.
+  fn give(&mut self, given: Given) {
+    self.want = None;
+    match given {
+      Given::Rows(rows) => {
+        let row = rows
+          .into_iter()
+          .next()
+          .and_then(|log| log.into_iter().next())
+          .flatten();
+        match (row, self.asked) {
+          (Some(row), Some((_, len))) => {
+            self.want = Some(crate::render::Want::Texts {
+              texts: vec![row.text],
+              most: len,
+            });
+          }
+          _ => self.unkept = true,
+        }
+      }
+      Given::Texts(texts) => match (texts.into_iter().next(), self.asked.take()) {
+        (Some(text), Some((node, _))) => self.given.push((node, text)),
+        _ => self.unkept = true,
+      },
+      Given::Chunks(_) | Given::TextsPast => self.unkept = true,
+    }
+  }
+
+  /// The unit is taken whole: the texts given for it go.
+  fn done(&mut self) {
+    self.given.clear();
+  }
 }
 
 /// A manifest revision as the store keeps it, a delta ([`Store::manifest_delta`]): its base's position in the log, its
@@ -743,6 +870,8 @@ pub struct Walk {
   files: Files,
   /// A pull's file section, once its changelog and manifests are written ([`Pull`]).
   pull: Option<Pull>,
+  /// The changelog's and the manifests' texts read from the changeset store ([`LogTexts`]).
+  logs: LogTexts,
 }
 
 /// The revisions whose rows are asked: each log's path, and its revisions' positions and nodes, in the walk's order.
@@ -851,6 +980,7 @@ impl Walk {
       named: None,
       files: Files::default(),
       pull: None,
+      logs: LogTexts::default(),
     };
     if !linked {
       walk.named = Some(Named {
@@ -873,13 +1003,34 @@ impl Walk {
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
-    if let Some(mut named) = self.named.take() {
-      if named.step(store, (&self.missing, self.version), room, out)? {
-        self.pull = Some(named.pull());
-      } else {
-        self.named = Some(named);
-      }
+    // A text a unit asked (`LogTexts`): given here where the store answers at once, else asked between steps.
+    if !self.logs_answered_now(store) {
       return Ok(true);
+    }
+    if let Some(mut named) = self.named.take() {
+      loop {
+        let written = named.step(
+          store,
+          (&self.missing, self.version),
+          &mut self.logs,
+          room,
+          out,
+        )?;
+        if self.logs.want.is_some() {
+          if self.logs_answered_now(store) {
+            continue;
+          }
+          self.named = Some(named);
+          return Ok(true);
+        }
+        self.logs.done();
+        if written {
+          self.pull = Some(named.pull());
+        } else {
+          self.named = Some(named);
+        }
+        return Ok(true);
+      }
     }
     if let Some(pull) = &mut self.pull {
       if pull.ended {
@@ -921,6 +1072,13 @@ impl Walk {
           open,
         } => self.file(store, (path, position), open, room, out)?,
       };
+      if self.logs.want.is_some() {
+        if self.logs_answered_now(store) {
+          continue;
+        }
+        return Ok(true);
+      }
+      self.logs.done();
       if self.files.want.is_none() {
         return Ok(self.at.is_some());
       }
@@ -930,15 +1088,39 @@ impl Walk {
   /// What the next step asks of the changeset store, if anything ([`Files`], [`Pull`]): given back by [`Walk::give`]
   /// before it.
   pub fn wants(&self) -> Option<&crate::render::Want> {
+    if let Some(want) = &self.logs.want {
+      return Some(want);
+    }
     match &self.pull {
       Some(pull) => pull.want.as_ref(),
       None => self.files.want.as_ref(),
     }
   }
 
+  /// Whether every text a unit asked (`LogTexts`) is answered now, by a store that answers at once (a whole answer's,
+  /// [`Store::stored_now`]); false where it answers only between steps (the daemon's), its edge asking before the next.
+  fn logs_answered_now(&mut self, store: &impl Store) -> bool {
+    while let Some(want) = self.logs.want.clone() {
+      let Some(given) = store.stored_now(&want) else {
+        return false;
+      };
+      self.logs.give(given);
+    }
+    true
+  }
+
+  /// The changelog's and the manifests' texts this walk asked of the changeset store, their windows let go ([`LogTexts`]).
+  pub fn log_texts_asked(&self) -> u64 {
+    self.logs.asked_count
+  }
+
   /// The changeset store's answer to [`Walk::wants`]: rows ask the chunks of as many of their revisions as the room the
   /// asking step was given holds, at once.
   pub fn give(&mut self, given: Given) {
+    if self.logs.want.is_some() {
+      self.logs.give(given);
+      return;
+    }
     if let Some(pull) = &mut self.pull {
       pull.give(given);
       return;
@@ -998,9 +1180,10 @@ impl Walk {
       .saturating_add(self.pull.as_ref().map_or(0, |pull| pull.stored))
   }
 
-  /// The missing changeset at or after `from`, or the changelog group's end.
+  /// The missing changeset at or after `from`, or the changelog group's end; where its text is not at hand, asked of
+  /// the changeset store ([`LogTexts`]) and the same place taken again once given.
   fn changeset(
-    &self,
+    &mut self,
     store: &impl Store,
     from: Rev,
     room: &mut Admission,
@@ -1015,9 +1198,19 @@ impl Walk {
     let parent =
       |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
     let parents = [parent(first)?, parent(second)?];
-    let text = store
-      .changeset_text(rev, room)?
-      .ok_or_else(no_changeset_text)?;
+    let text = match store.changeset_text(rev, room)? {
+      Some(text) => text,
+      None => match self.logs.given(&node) {
+        Some(text) => {
+          room.charge(to_u64(text.len()))?;
+          Cow::Borrowed(text)
+        }
+        None => {
+          self.logs.ask(store, WholeLog::Changelog, node)?;
+          return Ok(Some(At::Changelog(from)));
+        }
+      },
+    };
     let (manifest, _) = read_changeset(&text)?;
     if manifest != NULL_NODE && !store.holds_manifest(&manifest) {
       return Err(no_manifest());
@@ -1027,9 +1220,10 @@ impl Walk {
   }
 
   /// The manifest at `position` where a missing changeset links it, or the manifest group's end: sent as the delta the
-  /// store keeps where its base is `sent`, the manifest this answer sent last ([`Store::manifest_delta`]), else whole.
+  /// store keeps where its base is `sent`, the manifest this answer sent last ([`Store::manifest_delta`]), else whole,
+  /// its text asked of the changeset store where it is not at hand ([`LogTexts`]) and the same place taken again.
   fn manifest(
-    &self,
+    &mut self,
     store: &impl Store,
     (position, sent): (u64, Option<(u64, Node)>),
     room: &mut Admission,
@@ -1065,13 +1259,23 @@ impl Walk {
         room,
         out,
       )?;
-    } else {
-      let logged = store
-        .manifest(&linked.node, room)?
-        .ok_or_else(no_manifest)?;
+    } else if let Some(logged) = store.manifest(&linked.node, room)? {
       self.put(
         (linked.node, logged.parents, link, logged.flags),
         &logged.text,
+        room,
+        out,
+      )?;
+    } else {
+      let Some(text) = self.logs.given(&linked.node) else {
+        self.logs.ask(store, WholeLog::Manifest, linked.node)?;
+        return Ok(Some(At::Manifests(position, sent)));
+      };
+      let entry = store.manifest_entry(&linked.node).ok_or_else(no_manifest)?;
+      room.charge(to_u64(text.len()))?;
+      self.put(
+        (linked.node, entry.parents, link, entry.flags),
+        text,
         room,
         out,
       )?;
@@ -1711,6 +1915,7 @@ impl Named {
     &mut self,
     store: &impl Store,
     (missing, version): (&pull::Ranges, Version),
+    logs: &mut LogTexts,
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
@@ -1724,8 +1929,9 @@ impl Named {
           self.stage = NamedStage::Manifests(0);
           return Ok(false);
         };
-        self.changeset(store, (rev, version), room, out)?;
-        self.stage = NamedStage::Changelog(rev.saturating_add(1));
+        if self.changeset(store, (rev, version), logs, room, out)? {
+          self.stage = NamedStage::Changelog(rev.saturating_add(1));
+        }
         Ok(false)
       }
       NamedStage::Manifests(at) => {
@@ -1736,49 +1942,98 @@ impl Named {
           }
           return Ok(true);
         };
-        let logged = store.manifest(&node, room)?.ok_or_else(no_manifest)?;
-        put_whole(
-          (node, logged.parents, link, logged.flags),
-          version,
-          &logged.text,
-          room,
-          out,
-        )?;
+        if let Some(logged) = store.manifest(&node, room)? {
+          put_whole(
+            (node, logged.parents, link, logged.flags),
+            version,
+            &logged.text,
+            room,
+            out,
+          )?;
+        } else {
+          let Some(text) = logs.given(&node) else {
+            logs.ask(store, WholeLog::Manifest, node)?;
+            return Ok(false);
+          };
+          let entry = store.manifest_entry(&node).ok_or_else(no_manifest)?;
+          room.charge(to_u64(text.len()))?;
+          put_whole(
+            (node, entry.parents, link, entry.flags),
+            version,
+            text,
+            room,
+            out,
+          )?;
+        }
         self.stage = NamedStage::Manifests(at.saturating_add(1));
         Ok(false)
       }
     }
   }
 
-  /// Missing changeset `rev` written whole, linked to itself, and what its manifest names at the paths it lists planned.
+  /// Missing changeset `rev` written whole, linked to itself, and what its manifest names at the paths it lists planned:
+  /// whether it was taken. Its text and its manifest's are both in hand before anything is written: one not at hand is
+  /// asked of the changeset store ([`LogTexts`]) and the unit taken again once given (false), so a unit taken again
+  /// writes nothing twice.
   fn changeset(
     &mut self,
     store: &impl Store,
     (rev, version): (Rev, Version),
+    logs: &mut LogTexts,
     room: &mut Admission,
     out: &mut Vec<u8>,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     let node = node_of(store, rev)?;
     let parent =
       |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
     let [first, second] = parents_of(store, rev)?;
     let parents = [parent(first)?, parent(second)?];
-    let text = store
-      .changeset_text(rev, room)?
-      .ok_or_else(no_changeset_text)?;
-    put_whole((node, parents, node, 0), version, &text, room, out)?;
-    let (manifest, touched) = read_changeset(&text)?;
-    let logged = store.manifest(&manifest, room)?.ok_or_else(no_manifest)?;
-    manifest::decode(&logged.text).map_err(|_| no_manifest())?;
+    let lent = store.changeset_text(rev, room)?;
+    if lent.is_none() && logs.given(&node).is_none() {
+      logs.ask(store, WholeLog::Changelog, node)?;
+      return Ok(false);
+    }
+    let manifest = {
+      let text = lent
+        .as_deref()
+        .or_else(|| logs.given(&node))
+        .ok_or_else(no_changeset_text)?;
+      read_changeset(text)?.0
+    };
+    let logged = store.manifest(&manifest, room)?;
+    if logged.is_none() && logs.given(&manifest).is_none() {
+      logs.ask(store, WholeLog::Manifest, manifest)?;
+      return Ok(false);
+    }
+    let text = match lent.as_deref() {
+      Some(text) => text,
+      None => {
+        let text = logs.given(&node).ok_or_else(no_changeset_text)?;
+        room.charge(to_u64(text.len()))?;
+        text
+      }
+    };
+    let (position, manifest_text) = match &logged {
+      Some(logged) => (logged.position, logged.text.as_ref()),
+      None => {
+        let text = logs.given(&manifest).ok_or_else(no_manifest)?;
+        let entry = store.manifest_entry(&manifest).ok_or_else(no_manifest)?;
+        room.charge(to_u64(text.len()))?;
+        (entry.position, text)
+      }
+    };
+    put_whole((node, parents, node, 0), version, text, room, out)?;
+    let (_, touched) = read_changeset(text)?;
+    manifest::decode(manifest_text).map_err(|_| no_manifest())?;
     if self.seen_manifests.insert(manifest) {
       room.charge_items::<(u64, Node, Node)>(1)?;
-      self.manifests.push((logged.position, manifest, node));
+      self.manifests.push((position, manifest, node));
     }
     for path in touched
       .split(|byte| *byte == NEWLINE)
       .filter(|path| !path.is_empty())
     {
-      let Some(found) = manifest::find(&logged.text, path) else {
+      let Some(found) = manifest::find(manifest_text, path) else {
         continue;
       };
       if !self.seen_files.insert((path.to_vec(), found.node)) {
@@ -1803,7 +2058,7 @@ impl Named {
         ));
       }
     }
-    Ok(())
+    Ok(true)
   }
 
   /// The file section over what was planned, each group in its log's order.
