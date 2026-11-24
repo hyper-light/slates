@@ -195,8 +195,21 @@ const REFUSALS_PRINTED: u64 = 8;
 
 /// One client's samples: `count` creates (each followed by a destroy that is not timed); a create the daemon refuses
 /// is reported and counted ([`REFUSED`]), and takes no sample.
-fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> Vec<Sample> {
+fn sample(
+  instance: &str,
+  tag: &str,
+  (count, pause): (usize, Option<Duration>),
+  own_shard: Option<usize>,
+) -> Vec<Sample> {
   let mut client = connect(instance);
+  // Where the client's own shard is asked for (of `own_shard` shards), each name is one its shard owns: the client's
+  // shard is its id's residue over the shards (the daemon's accept), a name's owner its hash's (`owner_of_name`).
+  let seat = own_shard.map(|shards| {
+    (
+      usize::try_from(client.client_id()).unwrap_or(0) % shards.max(1),
+      shards,
+    )
+  });
   // The spinning form spins for the floor (the reply lands without a wake when the daemon
   // meets it); the parked form keeps the daemon's published window and parks.
   client.spin_for(if pause.is_none() {
@@ -209,8 +222,15 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
     if let Some(pause) = pause {
       std::thread::park_timeout(pause);
     }
+    let name = match seat {
+      None => format!("{tag}-{n}"),
+      Some((seat, shards)) => (0u64..)
+        .map(|k| format!("{tag}-{n}-{k}"))
+        .find(|name| usize::from(slates_server::verbs::owner_of_name(name, shards)) == seat)
+        .unwrap(),
+    };
     let spec = CreateSpec {
-      name: format!("{tag}-{n}"),
+      name,
       size: SizeClass::Bounded {
         limit: VOLUME_BYTES,
       },
@@ -357,9 +377,8 @@ fn print_parks(
 fn form(
   instance: &str,
   key: &str,
-  clients: usize,
-  count: usize,
-  pause: Option<Duration>,
+  (clients, count, pause): (usize, usize, Option<Duration>),
+  own_shard: Option<usize>,
 ) -> (Vec<(&'static str, Vec<u64>)>, Vec<u64>) {
   let mut per_run: Vec<Vec<(&'static str, u64)>> = Vec::new();
   let mut cpu = Vec::new();
@@ -369,7 +388,7 @@ fn form(
       .map(|c| {
         let instance = instance.to_owned();
         let tag = format!("{key}-{run}-{c}");
-        std::thread::spawn(move || sample(&instance, &tag, count, pause))
+        std::thread::spawn(move || sample(&instance, &tag, (count, pause), own_shard))
       })
       .collect();
     let mut all = Vec::new();
@@ -494,7 +513,7 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   );
   let key = format!("loaded{load_per_cpu}_spinning_1");
   let before = daemon.shard_pulses();
-  let (spinning, cpu) = form(instance, &key, 1, SPINNING_SAMPLES, None);
+  let (spinning, cpu) = form(instance, &key, (1, SPINNING_SAMPLES, None), None);
   print_cpu(&key, shards, &cpu);
   print_parks(
     &key,
@@ -505,7 +524,12 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   print_rows_gated(&key, &spinning, true);
   let key = format!("loaded{load_per_cpu}_parked_1");
   let before = daemon.shard_pulses();
-  let (parked, cpu) = form(instance, &key, 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  let (parked, cpu) = form(
+    instance,
+    &key,
+    (1, PARKED_SAMPLES, Some(PARKED_PAUSE)),
+    None,
+  );
   print_cpu(&key, shards, &cpu);
   print_parks(&key, &before, &daemon.shard_pulses(), RUNS * PARKED_SAMPLES);
   print_rows_gated(&key, &parked, true);
@@ -585,7 +609,7 @@ fn main() {
   for clients in CLIENT_COUNTS {
     let key = format!("spinning_{clients}");
     let before = daemon.shard_pulses();
-    let (rows, cpu) = form(&instance, &key, *clients, SPINNING_SAMPLES, None);
+    let (rows, cpu) = form(&instance, &key, (*clients, SPINNING_SAMPLES, None), None);
     print_cpu(&key, shards, &cpu);
     print_parks(
       &key,
@@ -620,6 +644,22 @@ fn main() {
       );
     }
   }
+  // The single spinning client again, each name one its own shard owns: no create crosses to another shard, so its
+  // rows beside `spinning_1`'s split the cross-shard hop and its wakes from the rest (informational, never gated;
+  // GAPS' open AC-2.1 entry at many shards on macOS, main 01a20182's order of 2026-11-23).
+  let key = "spinning_1_own_shard";
+  let (rows, cpu) = form(
+    &instance,
+    key,
+    (1, SPINNING_SAMPLES, None),
+    Some(usize::from(shards)),
+  );
+  print_cpu(key, shards, &cpu);
+  print_rows_gated(key, &rows, false);
+  println!(
+    "ac-2.1: 1 client spinning on its own shard's names, p99 {} ns (informational: no cross-shard hop)",
+    p99_median(&rows)
+  );
   // The channel and the completion record alone: a status of one volume, one client, so the
   // create's own cost is the difference (informational).
   let rows = status_form(&instance);
@@ -637,7 +677,12 @@ fn main() {
   // The parked form is reported separately (AC-2.1), not gated: its latency is a wake, which
   // the scheduler's park granularity dominates.
   let before = daemon.shard_pulses();
-  let (rows, cpu) = form(&instance, "parked_1", 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  let (rows, cpu) = form(
+    &instance,
+    "parked_1",
+    (1, PARKED_SAMPLES, Some(PARKED_PAUSE)),
+    None,
+  );
   print_cpu(
     &format!("paced_1_{}us", PARKED_PAUSE.as_micros()),
     shards,
