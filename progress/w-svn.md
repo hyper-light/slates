@@ -787,3 +787,4 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Diff r251 red was the harness: canonical_tags on non-XML answers (a0c46b705, `a_diffs_text_is_compared_as_written_whatever_its_blocks_order`). Main's next HTTP round confirms nothing else differs past line 362.
 - read_named O(R^2) fixed (a0c46b705, `a_works_runs_are_read_a_slice_a_call_across_runs`).
 - Next: locate the judge's superlinear part (batch.stage 290 ms @3k files vs 1,865 ms @6k, debug) by a counter, then fix; then item 5.1 (HTTPv2 writes).
+- 10:30 judge quadratic landed 7861187a4: Post::run_places index, alone by counts, holds_place binary searches; import red at 6,000 files 1,511 ms -> 592 ms (debug). Left: per-revision slicing (linear one step), Post::span/len walks. Next: item 5.1 HTTPv2 writes unless main reorders.
