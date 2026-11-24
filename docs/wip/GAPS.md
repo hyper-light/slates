@@ -4466,11 +4466,13 @@
 > green re-adopted at boot was refused `NotHead`, its held verdict's preview `Stale`, since a re-adoption installed
 > every green standing alone and a preview is made through the lineage; a re-adopted lineage root now founds its lineage
 > again as a recovery's does (`verbs::install_readopted`), held by the second edit of
-> `a_readopted_green_brings_back_the_named_base_its_chain_splices_first` (red: `NotHead`). Owed: a re-adopted branch
-> member is still installed alone, its engine the replica's over arenas of its own (counted
-> `merge.readoption.outside_lineage`), so a made commit over it is refused; and a boot fences a branch member whose
-> root awaits re-adoption (`SourceUnavailable`, the branch rebuilt before its source stands). Both need a re-adopted
-> branch rebuilt over its re-adopted source. (c) a Mercurial
+> `a_readopted_green_brings_back_the_named_base_its_chain_splices_first` (red: `NotHead`). A re-adopted branch
+> member whose source stands in its lineage is rebuilt over that source, branched again at its version and its own
+> chain replayed, as a recovery rebuilds one (`verbs::begin_readoption`, `install_readopted`; w-perf, 2026-11-24, main's
+> item (1) of 08:52; red `a_readopted_branch_member_is_rebuilt_over_its_source_and_takes_a_made_commit`: installed
+> alone, `merge.readoption.outside_lineage` 1). Owed: a boot fences a branch member whose root awaits re-adoption
+> (`SourceUnavailable`, the branch rebuilt before its source stands): it needs rebuilding over its source once that is
+> re-adopted. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

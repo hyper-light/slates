@@ -830,6 +830,81 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
   assert_eq!(after.as_deref(), Some(&b"bxx\n"[..]), "edited again");
 }
 
+/// A green re-adopted at its boot's ledger, as a test leaves one (a restart's takeover, A-333): its engine gone and its
+/// lineage slot released, awaiting its re-adoption through version 0.
+fn awaiting_readoption(state: &mut ShardState, green: DbVolumeId) {
+  if let Some((lineage, Ok(mut release))) = state.greens.retire(&green) {
+    while state
+      .greens
+      .release_step(lineage, &mut release)
+      .is_ok_and(|more| more)
+    {}
+  }
+  state.greens.remove(&green);
+  state.merge.awaiting_adoption.insert(
+    green,
+    crate::green_adopt::AwaitingAdoption {
+      through: 0,
+      identity: None,
+      replay: None,
+    },
+  );
+}
+
+/// A re-adoption's branch member (main 01a20182's order of 2026-11-24 08:52, item (1), from w-hg's sweep for 259b0db84):
+/// a branch re-adopted while its source stands in the lineage is rebuilt over that source, as a recovery rebuilds one
+/// (`verbs::rebuild_member_sliced`), not installed alone over the replica's arenas. Do: on a store-backed daemon,
+/// rebuild the fixtures' repository as one push (its root green, and bookmark `main`'s green branched from it); leave
+/// `main` awaiting its re-adoption, its root in the lineage; re-adopt `main` over a fresh engine
+/// (`green_adopt::readopt_with`); read `b` on it and edit `b` over a work on it. Expect: re-adopted, none installed
+/// outside its lineage (`merge.readoption.outside_lineage` 0); `b` `b\n`; the edit landed (its changeset made over the
+/// lineage's preview). Failing first: installed alone, counted outside its lineage, the edit refused.
+#[test]
+fn a_readopted_branch_member_is_rebuilt_over_its_source_and_takes_a_made_commit() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let branch = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "branch-readopt");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let branch = hg
+      .bound(state, &bookmark_name(b"main"))
+      .expect("`main`'s green");
+    assert_ne!(branch, hg.root, "a branch of its own");
+    awaiting_readoption(state, branch);
+    branch
+  });
+  let (readopted, outside, read, edited) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      let readopted =
+        crate::green_adopt::readopt_with(shard, shard, branch, slates_merge::engine::Green::new())
+          .await;
+      let outside = crate::repository::svn_commit::tests::on(|state| {
+        state
+          .refusals
+          .get(crate::verbs::READOPTED_OUTSIDE_LINEAGE)
+          .copied()
+          .unwrap_or(0)
+      });
+      if readopted != Some(true) {
+        return (readopted, outside, None, None);
+      }
+      let read = crate::vcs_store::named_objects::read_file_brought(branch, "b").await;
+      let (edited, _, _) = edited_named_as(branch, ("edit-branch", 1)).await;
+      (readopted, outside, read, Some(edited))
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(readopted, Some(true), "re-adopted");
+  assert_eq!(outside, 0, "none installed outside its lineage");
+  assert_eq!(read.as_deref(), Some(&b"b\n"[..]), "`b` on the branch");
+  assert!(
+    matches!(&edited, Some(reply) if !matches!(reply, ReplyBody::Refused { .. })),
+    "{edited:?}"
+  );
+}
+
 /// A daemon over `instance`'s segment and `store`, the anchor's, with a Mercurial repository rebuilt from the fixtures by
 /// one push to its empty first line: the daemon and the repository's root green.
 fn named_restart_daemon(
