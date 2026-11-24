@@ -3710,6 +3710,16 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: every shard runs no teardown slice while `held` (A-884), so a destroyed volume's teardown stays
+  /// where it is and a create waiting for its room meets its bound. `Ok` once set everywhere, else the first shard's
+  /// typed refusal.
+  pub fn inject_teardown_hold(&self, held: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.teardowns_held = held)?;
+    }
+    Ok(())
+  }
+
   /// The memory-pressure hold now on each shard's byte budget (§4.2), in shard order — the capacity
   /// each withholds from new admission. Zero when the host is not under pressure (or has no sampler).
   /// An observation a shard could not answer is its typed refusal.
@@ -3825,6 +3835,17 @@ impl Daemon {
   /// make is its typed refusal.
   pub fn failover_ns(&self) -> Result<u64, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.failover_ns)
+  }
+
+  /// The detection term of this node's failover estimate now, nanoseconds (A-363's `D`, A-882): SWIM's count of its
+  /// detector's periods at their measured tail, at least the bound its detector states while a pair is still judged by
+  /// its own retransmission timer; the anchor's supervision where no peer's detector judges the node; `None` before
+  /// either. A one-shot control-shard question; an observation the daemon could not make is its typed refusal. Exposed so
+  /// a fleet test sizes a wait on a member's detection by the detection its survivors state, not by a fixed window.
+  pub fn failover_detection_ns(&self) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      s.failover.estimate().detection.map(|term| term.ns)
+    })
   }
 
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
@@ -5003,6 +5024,13 @@ async fn init_shard(
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
     nfs_v4_files: None,
+    nfs_parked: Default::default(),
+    #[cfg(target_os = "linux")]
+    fuse_parked: Default::default(),
+    #[cfg(windows)]
+    winfsp_parked: Default::default(),
+    verb_parked: Default::default(),
+    verb_resuming: Default::default(),
     recall_queues: std::collections::BTreeMap::new(),
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
@@ -5216,12 +5244,14 @@ async fn init_shard(
     stop_watch: None,
     stop_watch_install,
     nfs_purges_refused: false,
+    teardowns_held: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
     delegation_lapse_at: None,
     idle_sweep_at: None,
     idle_sweeper: None,
     idle_sweep_running: false,
+    give_back_waits_idle: false,
     idle_sweep_seen: (0, 0),
     placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
@@ -5343,6 +5373,12 @@ async fn init_shard(
   // The idle sweep (A-715): one pass a sweep's interval after what owes it, none while nothing does.
   let sweeper = futures::spawn(crate::idle_sweep::sweeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(sweeper);
+  // The shard's idle work, its one slot: an interrupted give-back resumes there, at the shard's next idle point, and an
+  // armed content-range sweep advances (`idle_sweep::idle_work`). A shard that cannot register it is a typed
+  // initialization failure, as one whose sweep the arena refuses is.
+  registry::with_current(|context| context.set_idle_work(Box::new(crate::idle_sweep::idle_work)))
+    .unwrap_or(Err(slates_rt::RtError::NotOnShardThread))
+    .map_err(ServerError::Runtime)?;
   // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
   let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reaper);
@@ -5436,9 +5472,11 @@ async fn rebuild_and_report(
 /// tick before): every volume ages its writes, then the open extents of files idle a whole pass are sealed in
 /// cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in the shard's step quantum; AES-256-GCM seals
 /// at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's 9–10 here), yielding between slices so the shard
-/// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
-/// volume owes another pass; otherwise the sweep arms its next.
-pub(crate) async fn seal_idle_content() -> bool {
+/// keeps serving, until none is left. How the pass ended ([`PassEnd`]): settled, when it reached an idle purge that
+/// finished, no volume owes another pass and no image publication is owed; its give-back left for the shard's next idle
+/// point, when other work ran across one of its steps ([`purge_if_idle`]); otherwise owing the next pass a sweep's
+/// interval on.
+pub(crate) async fn seal_idle_content() -> PassEnd {
   // An image publication owed is begun again where no catch-up makes it, first of all (A-870 piece 2: a refused catch-up
   // publication is never dropped), and the shard is not settled while it is owed.
   let image_owed = state::with_state(crate::content_holder::image_retry_owed).unwrap_or(false);
@@ -5448,7 +5486,7 @@ pub(crate) async fn seal_idle_content() -> bool {
     }
   });
   if aged.is_none() {
-    return true;
+    return PassEnd::Settled;
   }
   // Idle base directories give their descriptors back first (A-838): a pass that kept any is not settled.
   let directories_idle = crate::idle_sweep::close_idle_directories().await;
@@ -5502,16 +5540,53 @@ pub(crate) async fn seal_idle_content() -> bool {
         1,
       );
     });
-    return false;
+    return PassEnd::Owed;
   }
-  let purged = purge_if_idle().await;
-  let owes = state::with_state(|s| {
-    s.volumes
-      .iter_mut_all()
-      .any(|(_, slot)| slot.volume.sweep_owes())
-  })
-  .unwrap_or(false);
-  purged && !owes && !image_owed && directories_idle
+  pass_end(purge_if_idle().await, image_owed || !directories_idle)
+}
+
+/// How a sweep pass ended (A-715; `crate::idle_sweep`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassEnd {
+  /// Nothing owes another pass: none is armed after it, and an idle shard is never woken for the sweep.
+  Settled,
+  /// Something owes the next pass a sweep's interval on: a file written but not yet aged, a seal or a deferred free that
+  /// published, a busy arena, an idle base directory kept, an image publication owed.
+  Owed,
+  /// The pass's give-back left the rest because other work ran across one of its steps (A-226): the rest is idle-time
+  /// work, resumed at the shard's next idle point ([`resume_give_back`]), and the pass is under way until it ends.
+  GiveBackLeft {
+    /// Whether the pass owes the next one for something besides its give-back: a base directory it kept (A-838), or an
+    /// image publication owed (A-870 piece 2).
+    owed_besides: bool,
+  },
+}
+
+/// The end of a pass whose give-back ended as `give_back`, owing the next pass besides it or not.
+fn pass_end(give_back: GiveBack, owed_besides: bool) -> PassEnd {
+  match give_back {
+    GiveBack::Interrupted => PassEnd::GiveBackLeft { owed_besides },
+    GiveBack::Busy => PassEnd::Owed,
+    GiveBack::Settled => {
+      let owes = state::with_state(|s| {
+        s.volumes
+          .iter_mut_all()
+          .any(|(_, slot)| slot.volume.sweep_owes())
+      })
+      .unwrap_or(false);
+      if owes || owed_besides {
+        PassEnd::Owed
+      } else {
+        PassEnd::Settled
+      }
+    }
+  }
+}
+
+/// The rest of a pass's give-back, resumed at the shard's idle point after other work interrupted it
+/// ([`PassEnd::GiveBackLeft`]): the purge again, from where it stopped, and how the pass ends now.
+pub(crate) async fn resume_give_back(owed_besides: bool) -> PassEnd {
+  pass_end(purge_if_idle().await, owed_besides)
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
@@ -5543,11 +5618,25 @@ fn give_back_slice(s: &ShardState) -> usize {
   s.give_back_rate.slice_bytes.max(page)
 }
 
-/// The shard thread's own CPU clock now, nanoseconds (`slates_rt::registry::calling_thread_cpu`, the clock the
-/// watchdog reads): what a give-back step is timed by, since a loaded host stretches the wall time a step takes and
-/// not the CPU it spends. `None` where the platform reads none.
+/// The shard thread's own CPU time now, nanoseconds, to the nanosecond: what a give-back step is timed by, since a
+/// loaded host stretches the wall time a step takes and not the CPU it spends (A-491). Linux and macOS: the thread's
+/// CPU clock (`slates_rt::registry::calling_thread_cpu`, the clock the watchdog reads). `None` where the platform reads
+/// none.
+#[cfg(not(windows))]
 fn shard_thread_cpu_ns() -> Option<u64> {
   registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// [`shard_thread_cpu_ns`] on Windows: the thread's cycles at the rate measured once a process, before any shard runs
+/// (`slates_machine::own_cpu`, the clock the long-poll attribution reads, A-871). The thread time Windows keeps
+/// (`GetThreadTimes`) is charged a scheduler tick at a time, about 15.6 ms, so a give-back step of a few microseconds
+/// read no CPU unless a tick fell inside it, and taught nothing ([`GiveBackRate::fold`]): until 2026-11-23 the slice
+/// stayed a page, and an idle shard's give-back of its emptied write log, opened over the whole area a predecessor may
+/// have written, never ended while its passes were cut short (CI's windows-latest, diag run 45238179939: 332 one-page
+/// steps in the first pass, then one a pass).
+#[cfg(windows)]
+fn shard_thread_cpu_ns() -> Option<u64> {
+  slates_machine::own_cpu::own_cpu_ns()
 }
 
 /// The CPU a step spent between the readings `started` and `ended`, `None` unless both were read.
@@ -5584,9 +5673,9 @@ pub(crate) struct GiveBackRate {
 impl GiveBackRate {
   /// Folds one step that walked `walked` bytes and spent `spent` nanoseconds of its shard thread's CPU (`None` where
   /// the thread's clock reads nothing), learning the slice, the bytes one `quantum_ns` of that CPU walks, once the
-  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step (Windows charges thread
-  /// time a scheduler tick at a time) shows most steps' CPU as none and one step's as a whole tick, so the steps are
-  /// folded until one shows any: their bytes over the CPU shown.
+  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step shows most steps' CPU as
+  /// none and one step's as a whole tick, so the steps are folded until one shows any: their bytes over the CPU shown.
+  /// Every platform's clock is finer than a step now ([`shard_thread_cpu_ns`]; Windows' since 2026-11-23).
   pub(crate) fn fold(&mut self, walked: usize, spent: Option<u64>, quantum_ns: u64) {
     let Some(spent) = spent.filter(|_| walked > 0) else {
       return;
@@ -5624,7 +5713,7 @@ async fn probe_give_back(neighbour: bool) {
     let _ = futures::detach(task);
   }
   let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
-  let _settled = purge_if_idle().await;
+  let _ended = purge_if_idle().await;
   let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
   GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
 }
@@ -5734,7 +5823,10 @@ fn return_dead_recovery_timed(
 /// the last write burst's worth of free pages resident and faulted them back in at idle, so one large push left its whole
 /// burst resident behind it (w-hg's release run after hg's history push: 4,931.4 MiB, and 3.5 GB more faulted at idle).
 /// Measured against none: BENCHMARKS, "The idle prefault reserve, measured against none".
-async fn purge_if_idle() -> bool {
+///
+/// How it ended ([`GiveBack`]). A step across whose yield another task ran ends it (A-226), the rest left for the
+/// shard's next idle point (`crate::idle_sweep::idle_work`), never interleaved with the shard's work.
+async fn purge_if_idle() -> GiveBack {
   loop {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
@@ -5770,12 +5862,16 @@ async fn purge_if_idle() -> bool {
     .flatten();
     if step != Some(true) {
       // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
-      return step == Some(false);
+      return if step == Some(false) {
+        GiveBack::Settled
+      } else {
+        GiveBack::Busy
+      };
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
-    // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
-    // as a granted landing does, and a step of a whole quantum between each of its short ones made it 4 to 5 times
-    // slower under load (A-226). The poll this replaced stays gone: a step is no longer than it was.
+    // shard's next idle point. The arena's idle test cannot see such work when it allocates nothing, as a granted
+    // landing does, and a step of a whole quantum between each of its short ones made it 4 to 5 times slower under load
+    // (A-226). The poll this replaced stays gone: a step is no longer than it was.
     let polls_before = futures::polls_so_far();
     futures::yield_now().await;
     let others_ran = polls_before
@@ -5783,13 +5879,24 @@ async fn purge_if_idle() -> bool {
       .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
     if others_ran {
       let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
-      return false;
+      return GiveBack::Interrupted;
     }
   }
 }
 
-/// Counter: give-backs that left the rest for the next sweep pass because another task ran on the shard (A-226), the
-/// non-vacuity count of the check in [`purge_if_idle`].
+/// How an idle give-back ended ([`purge_if_idle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GiveBack {
+  /// A step found the shard idle and left nothing to give back.
+  Settled,
+  /// A step found the arena allocated since the step before: a busy shard, which owes the next pass.
+  Busy,
+  /// Another task ran across a step's yield (A-226): the rest waits for the shard's next idle point.
+  Interrupted,
+}
+
+/// Counter: give-backs that left the rest for the shard's next idle point because another task ran on the shard (A-226),
+/// the non-vacuity count of the check in [`purge_if_idle`].
 pub const GIVE_BACK_LEFT: &str = "content.give_back.left_for_next_tick";
 
 /// Counter: sweep passes that sealed content, and so published and left the purge for a later pass (A-105).
@@ -7325,7 +7432,8 @@ pub fn log_descriptor_raise(who: &str, raise: slates_machine::facts::DescriptorR
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_daemon_of_configured,
-  audit_on_shard, audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
+  audit_daemon_within, audit_on_shard, audit_on_shard_configured, hold_busy, observe_at,
+  observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -7524,6 +7632,22 @@ mod tests {
     );
     let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     configure(&mut config);
+    audit_daemon_with(&profile, config, instance)
+  }
+
+  /// [`audit_daemon`] on a host whose memory is bounded at `memory` bytes (its limit, as a container's is): every size
+  /// the daemon derives from the host's memory (its shard's slice, its tables, its segment's log and snapshot slots)
+  /// derived from that bound, for a test whose work walks what those sizes span; the test stops it.
+  pub(crate) fn audit_daemon_within(memory: u64) -> super::Daemon {
+    let mut profile = test_profile();
+    profile.facts.memory.limit = Some(memory);
+    static NEXT_WITHIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-within-{}-{}",
+      std::process::id(),
+      NEXT_WITHIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     audit_daemon_with(&profile, config, instance)
   }
 
@@ -9262,6 +9386,7 @@ mod tests {
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
     let identity = text.identity;
+    let size = text.size;
     let read = || {
       second
         .observe(shard, move |state| {
@@ -9273,10 +9398,11 @@ mod tests {
           let recovered = state.vcs_stores.unrecovered(repository).is_none()
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
+          // RAM keeps no byte of it (A-760 (b) 4d, main's (B)): the recovered green's name keeps its entry, no window.
           let kept = state
             .vcs_stores
             .content()
-            .is_some_and(|content| content.contains(&slates_vcs::ContentId(identity)));
+            .is_some_and(|content| crate::vcs_store::name_holds::resident(content, identity, size));
           (recovered, refused, kept)
         })
         .ok()
@@ -10411,6 +10537,35 @@ mod tests {
     (state.give_back_rate.slice_bytes, more)
   }
 
+  /// Shape: the steps of a give-back's size the clock test times, each a spin of [`STEP_SPIN_NS`] on the thread.
+  const TIMED_STEPS: usize = 8;
+  /// Shape: one timed step's spin: tens of microseconds, a give-back step's order (about 13 µs on CI's windows-latest,
+  /// diag run 45275623386), far under Windows' 15.6 ms charge of a thread's time.
+  const STEP_SPIN_NS: u64 = 50_000;
+
+  /// A-491 on Windows (2026-11-23). Do: time [`TIMED_STEPS`] spins of [`STEP_SPIN_NS`] each on the clock a give-back step
+  /// is timed by (`shard_thread_cpu_ns`). Expect every one read, as CPU no less than a hundredth of its spin and no more
+  /// than its wall time and a millisecond: a step of microseconds teaches the rate it folds. Red on Windows with the
+  /// thread's charged time as that clock, which reads such a step as no CPU unless a 15.6 ms tick falls inside it.
+  #[test]
+  fn the_give_back_clock_reads_a_step_of_microseconds() {
+    for step in 0..TIMED_STEPS {
+      let before = super::shard_thread_cpu_ns().expect("the thread's clock reads");
+      let began = std::time::Instant::now();
+      while u64::try_from(began.elapsed().as_nanos()).unwrap() < STEP_SPIN_NS {
+        std::hint::spin_loop();
+      }
+      let wall = u64::try_from(began.elapsed().as_nanos()).unwrap();
+      let spent = super::shard_thread_cpu_ns()
+        .expect("the thread's clock reads")
+        .saturating_sub(before);
+      assert!(
+        spent >= STEP_SPIN_NS / 100 && spent <= wall + 1_000_000,
+        "step {step}: a {wall} ns spin read {spent} ns of the thread's CPU"
+      );
+    }
+  }
+
   /// A-491 (A-226's slice; CLAUDE.md "Bounded work everywhere": a step is held to its shard's quantum of its own CPU).
   /// Do: on a shard whose recovery memory is all dead (an image committed, the journal's record of what it gave back
   /// forgotten, as after a restart), take give-back steps timed by a controlled CPU clock: one spending a quantum, one
@@ -10972,6 +11127,7 @@ mod tests {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
       crate::fleet::reconcile_held_authority(state);
+      let retired_at = state.council.configuration().retirement_version(departed);
       let moved_from = state.holder_records.get(&object).and_then(|acceptor| {
         (acceptor.owner() == successor)
           .then(|| acceptor.moved_from())
@@ -10996,12 +11152,16 @@ mod tests {
         .get("fleet.takeover.listed_by_moved_from")
         .copied()
         .unwrap_or(0);
-      (moved_from.map(|from| from == departed), page, counted)
+      (
+        moved_from.map(|from| (from.owner, Some(from.retired_at)) == (departed, retired_at)),
+        page,
+        counted,
+      )
     });
     assert_eq!(
       moved_from,
       Some(true),
-      "the install moved the copy from the retired owner"
+      "the install moved the copy from the retired owner, naming its retirement (A-883)"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(
@@ -11022,15 +11182,23 @@ mod tests {
   /// (the move); build the delta's held pieces (`held_changes`) and fold them over the checkpoint's as recovery does;
   /// drop the acceptors, routing and lineage and restore them from the folded pieces; answer the successor's page.
   /// Expect: no move at the checkpoint, the register's piece carried by the delta, the restored acceptor naming the
-  /// retired owner it moved from, and the page listing the copy. A move whose mark the tracked map missed would leave
+  /// retired owner it moved from and the retirement that moved it (A-883), and the page listing the copy. A move whose mark the tracked map missed would leave
   /// the checkpoint's piece in place, and the restored copy would name no move and go unlisted.
   #[test]
   fn a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([47; 16]);
-    let (before_move, in_delta, restored_from, departed, page) = audit_on_shard(move |state| {
+    let (before_move, in_delta, restored_from, moved, page) = audit_on_shard(move |state| {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let moved = slates_db::register::MovedFrom {
+        owner: departed,
+        retired_at: state
+          .council
+          .configuration()
+          .retirement_version(departed)
+          .unwrap(),
+      };
       let before_move = state
         .holder_records
         .get(&object)
@@ -11086,7 +11254,7 @@ mod tests {
         named: Vec::new(),
       };
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
-      (before_move, in_delta, restored_from, departed, page)
+      (before_move, in_delta, restored_from, moved, page)
     });
     assert_eq!(
       before_move, None,
@@ -11095,8 +11263,8 @@ mod tests {
     assert!(in_delta > 0, "the delta carried the moved register's piece");
     assert_eq!(
       restored_from,
-      Some(departed),
-      "the checkpoint and its delta kept the owner the copy moved from"
+      Some(moved),
+      "the checkpoint and its delta kept the owner the copy moved from and its retirement"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(
@@ -11110,18 +11278,107 @@ mod tests {
     );
   }
 
+  /// A takeover round run again after its successor restarted warm (main 01a20182's ruling of 2026-11-23; the cause of
+  /// GAPS' load flake `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`, read in a diagnostic build):
+  /// a successor that adopted an object and restarted before it confirmed its share runs the departed owner's round
+  /// again, and its adoption is its own promise of the object there. Do: make this node the successor of a held object of
+  /// a retired member; adopt it here as the round does (`takeover::adopted_acceptor`, its record accepted here as the
+  /// commit accepts it first); write the held image, drop the acceptors and routing, and restore them (the warm
+  /// restart); then answer the rerun's question by name of this node itself (`answer_own_copies_by_name`). Expect the
+  /// adopted record answered and nothing refused. Before, the adopted copy recorded no move, so the rerun refused it by
+  /// name as this node's own, waited for that promise, and gave the object up.
+  #[test]
+  fn a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again() {
+    use slates_db::register::{HostEpoch, HostPrepare, MovedFrom, ObjectId};
+    let (refused, answered, adopted_at) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      // An object of the retired member whose successor among the two survivors is this node.
+      let (object, departed) = (1..=u8::MAX)
+        .find_map(|byte| {
+          let object = ObjectId([byte; 16]);
+          state.holder_records.clear();
+          let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+          (successor == local).then_some((object, departed))
+        })
+        .unwrap();
+      let adopted = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.highest_accepted(object))
+        .unwrap();
+      let from = state
+        .council
+        .configuration()
+        .retirement_version(departed)
+        .map(|retired_at| MovedFrom {
+          owner: departed,
+          retired_at,
+        });
+      let (mut acceptor, _, _, record, _) =
+        crate::takeover::adopted_acceptor(state, object, adopted, (HostEpoch(2), from), local);
+      acceptor.accept(&record).unwrap();
+      state.holder_records.insert(object, acceptor);
+      let image = crate::content_holder::held_image(state);
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let regional = state.council.configuration().clone();
+      let prepare = HostPrepare {
+        departed,
+        owner: local,
+        epoch: HostEpoch(3),
+        generation: regional.version,
+        after: None,
+        named: vec![object],
+      };
+      let answer = slates_db::takeover::answer_by_name(
+        local,
+        &prepare,
+        &regional,
+        &mut state.holder_records,
+        usize::MAX,
+      );
+      let answered: Vec<(ObjectId, u64)> = answer
+        .promise
+        .entries
+        .iter()
+        .map(|(object, highest)| (*object, highest.sequence))
+        .collect();
+      (answer.refused, answered, (object, record.sequence))
+    });
+    assert_eq!(
+      (refused, answered),
+      (0, vec![adopted_at]),
+      "the rerun's question by name is answered with this node's adoption, never refused as its own"
+    );
+  }
+
   /// A-251 (b), the moved case across a warm restart: the held image keeps the retired owner a copy's authority moved
   /// from, so after the restore, which routes the copy to the successor as a live owner, the successor's page still
   /// lists it. Do: retire the owner of a record this node holds; run the authority reconcile; write the held image, drop
   /// the acceptors, routing and lineage, and restore them from the image; answer the successor's page. Expect: the
-  /// restored acceptor names the retired owner it moved from, and the page lists the copy.
+  /// restored acceptor names the retired owner it moved from and the retirement that moved it (A-883), and the page
+  /// lists the copy.
   #[test]
   fn a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([43; 16]);
-    let (restored_from, departed, page) = audit_on_shard(move |state| {
+    let (restored_from, moved, page) = audit_on_shard(move |state| {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let moved = slates_db::register::MovedFrom {
+        owner: departed,
+        retired_at: state
+          .council
+          .configuration()
+          .retirement_version(departed)
+          .unwrap(),
+      };
       crate::fleet::reconcile_held_authority(state);
       let image = crate::content_holder::held_image(state);
       state.holder_records.clear();
@@ -11149,12 +11406,12 @@ mod tests {
         named: Vec::new(),
       };
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
-      (restored_from, departed, page)
+      (restored_from, moved, page)
     });
     assert_eq!(
       restored_from,
-      Some(departed),
-      "the image kept the owner the copy moved from"
+      Some(moved),
+      "the image kept the owner the copy moved from and its retirement"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(

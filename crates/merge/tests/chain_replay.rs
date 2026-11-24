@@ -135,11 +135,7 @@ fn recovered(
   identities: &std::collections::BTreeMap<u64, [u8; 32]>,
 ) -> Green {
   let mut green = match &durable.checkpoint {
-    Some(bytes) => Green::restore(
-      origin_of(origin_rows),
-      &mut Checkpoint::decode(bytes).unwrap(),
-    )
-    .unwrap(),
+    Some(bytes) => Green::restore(origin_of(origin_rows), &Checkpoint::decode(bytes).unwrap()),
     None => Green::with_origin(origin_of(origin_rows)),
   };
   for bytes in &durable.chain {

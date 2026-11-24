@@ -2,10 +2,11 @@
 //! push held thousands of steps past 100 ms, before and after the index seal's reland; main's ruling of 2026-11-23
 //! 16:29: attribute them by kind). A bundle's changegroup is taken into an empty index through the intake as the daemon
 //! takes it, cut into segments of `segment bytes`, each segment's record written and timed apart from the step that
-//! cut it, its room the push's admission. Each step is timed under the kind of unit it takes (`Intake::unit`). Printed:
+//! cut it, its room the push's admission. Each step is timed under the kind of unit it takes (`Intake::unit`), a long
+//! revision's last window apart (`pending-last`: it reads, checks and keeps the whole revision). Printed:
 //! the wall time; for each kind its steps, its time, its steps past 100 ms and past 1 s and its longest; the segment
 //! records' alike; the slowest steps with their kinds; and the fork's rows, seals, most own runs, tiered merges and
-//! longest merge in steps, for the size-tiered rule's bound.
+//! longest merge in steps, and its own bytes in windows, for the size-tiered rule's bound in bytes.
 //!
 //! Command: `cargo run --release -p slates-hg --example intake_steps -- <bundle (hg bundle --all -t none-v2)> <window
 //! bytes> <room bytes> <segment bytes>`.
@@ -18,13 +19,15 @@
   clippy::cast_precision_loss
 )]
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::process::ExitCode;
 use std::time::Instant;
 
 use slates_hg::Admission;
 use slates_hg::bundle2::Bundle2;
 use slates_hg::index::HgIndex;
-use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::push::intake::{Intake, PushSegment, Stepped};
 use slates_hg::push::read;
 use slates_vcs::ContentStore;
 
@@ -58,10 +61,11 @@ impl Kind {
   }
 }
 
-fn main() {
+fn main() -> ExitCode {
   let args: Vec<String> = std::env::args().collect();
   let [_, bundle, window, room, segment] = args.as_slice() else {
-    panic!("usage: intake_steps <bundle> <window bytes> <room bytes> <segment bytes>");
+    eprintln!("usage: intake_steps <bundle> <window bytes> <room bytes> <segment bytes>");
+    return ExitCode::FAILURE;
   };
   let (window, room, segment): (usize, u64, u64) = (
     window.parse().unwrap(),
@@ -97,10 +101,17 @@ fn main() {
     let start = Instant::now();
     let stepped = intake.step(&payload, &mut store, &mut admission).unwrap();
     let took = start.elapsed().as_micros();
+    // A long revision's last window finishes it (its read, its keep, a manifest's parse and its delta), so its step is
+    // timed apart from the windows' hashing and puts (goal 93: pending steps were 72% of r499's intake).
+    let unit = if unit == "pending" && intake.unit() != "pending" {
+      "pending-last"
+    } else {
+      unit
+    };
     kinds.entry(unit).or_default().note(took);
     slowest.push((took, at, unit));
     if slowest.len() > SLOWEST * 4 {
-      slowest.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+      slowest.sort_unstable_by_key(|step| Reverse(step.0));
       slowest.truncate(SLOWEST);
     }
     merge_run = if unit == "merge" { merge_run + 1 } else { 0 };
@@ -110,7 +121,7 @@ fn main() {
     }
     while let Some(taken) = intake.take_segment() {
       let start = Instant::now();
-      let _record = intake.segment_record(&taken, u64::MAX, &store).unwrap();
+      let _record = whole_record(&intake, &taken, u64::MAX, &store);
       records.note(start.elapsed().as_micros());
     }
     at += 1;
@@ -123,7 +134,10 @@ fn main() {
     match stepped {
       Stepped::More => {}
       Stepped::Done => break,
-      other => panic!("a whole changegroup in memory stepped {other:?}"),
+      other => {
+        eprintln!("intake_steps: a whole changegroup in memory stepped {other:?}");
+        return ExitCode::FAILURE;
+      }
     }
   }
   println!(
@@ -144,7 +158,7 @@ fn main() {
     line(name, kind);
   }
   line("segment records", &records);
-  slowest.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+  slowest.sort_unstable_by_key(|step| Reverse(step.0));
   for (us, step, unit) in slowest.iter().take(SLOWEST) {
     println!(
       "intake_steps:   step {step} ({unit}): {:.1} ms",
@@ -152,9 +166,12 @@ fn main() {
     );
   }
   let Ok((mut fork, intaken)) = intake.finish() else {
-    panic!("the intake finished");
+    eprintln!("intake_steps: the intake did not finish");
+    return ExitCode::FAILURE;
   };
   let (rows, seals) = (fork.rows().rows(), fork.rows().counters().seals);
+  let own_bytes = fork.rows().own_bytes();
+  let windows = own_bytes / u64::try_from(window).unwrap().max(1);
   println!(
     "intake_steps: the fork's rows {rows}, seals {seals} ({} rows a seal on average); most own runs {}, tiered merges \
      {}, the longest merge {longest_merge} steps",
@@ -162,4 +179,22 @@ fn main() {
     intaken.most_own_runs,
     intaken.tiered_merges
   );
+  println!(
+    "intake_steps: the fork's own bytes {own_bytes} ({windows} windows of {window}); the bytes bound at the end \
+     floor(log3 windows) + 1 = {}",
+    windows.max(1).ilog(3) + 1
+  );
+  ExitCode::SUCCESS
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }

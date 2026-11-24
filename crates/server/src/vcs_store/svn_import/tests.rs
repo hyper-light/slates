@@ -106,6 +106,11 @@ pub(crate) async fn imported(
     if let Some(Err(failed)) = super::land_owed(id).await {
       return (Err(failed), turns);
     }
+    // A delta base the import owes brought back through the node's store, as `super::run` brings it: since A-760 (b)
+    // 4d a landed batch's texts go from RAM once durable (main's ruling (B)), so a later revision's base is owed.
+    if let Some(Err(failed)) = super::supply_owed_base(id).await {
+      return (Err(failed), turns);
+    }
     match on(|state| turn(state, id)) {
       Some(Ok(Turned::More)) => {}
       Some(Ok(Turned::Done(loaded))) => return (Ok(loaded), turns),

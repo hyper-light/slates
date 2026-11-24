@@ -52,9 +52,16 @@ const EXPIRED_TOKEN: &str = "slates_expired";
 const LONG_AGO_NS: u64 = 1;
 /// Shape: the owner's token as Basic's password for the user `git`: `git:slates_owner` in base64 (RFC 7617 §2).
 const OWNER_BASIC: &str = "Authorization: Basic Z2l0OnNsYXRlc19vd25lcg==";
-/// Shape: how long a client waits for an answer: ten of the daemon's liveness budgets, past a [`LONG_HISTORY`] push's
-/// and fetch's answers in a debug build, as a stock client waits for as long as its server works.
+/// Shape: how long a client waits for an answer in a developer's debug build: ten of the daemon's liveness budgets, past
+/// a [`LONG_HISTORY`] push's and fetch's answers there, as a stock client waits for as long as its server works.
 const PATIENCE_NS: u64 = 10 * crate::daemon::LIVENESS_BUDGET_NS;
+
+/// Derived: how long a client waits for an answer in this lane: [`PATIENCE_NS`] times the lane's declared slowdown
+/// ([`crate::test_lane`]). Unscaled, ThreadSanitizer's lane gave up on four answers at the ten budgets before a byte of
+/// them came (diag run 45315777446, 2026-11-24: "the answer ended inside a line", the read timed out with nothing read).
+fn patience_ns() -> u64 {
+  PATIENCE_NS.saturating_mul(crate::test_lane::slowdown())
+}
 
 /// The repository's owner, the principal of the human's channel that created it.
 fn owner() -> Principal {
@@ -195,7 +202,7 @@ fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
 ) -> StreamOwned<ClientConnection, ClientStream> {
-  tls_client_within(port, certificate, Duration::from_nanos(PATIENCE_NS))
+  tls_client_within(port, certificate, Duration::from_nanos(patience_ns()))
 }
 
 /// [`tls_client`], its reads waiting at most `patience` for an answer.
@@ -473,7 +480,7 @@ fn typed_exchange(
     port,
     certificate,
     request,
-    Duration::from_nanos(PATIENCE_NS),
+    Duration::from_nanos(patience_ns()),
   )
 }
 
@@ -2155,7 +2162,7 @@ fn hg_unbundle(
   name: &str,
   bundle: &[u8],
 ) -> (u16, String, Vec<u8>) {
-  hg_unbundle_within(edge, name, bundle, Duration::from_nanos(PATIENCE_NS))
+  hg_unbundle_within(edge, name, bundle, Duration::from_nanos(patience_ns()))
 }
 
 /// [`hg_unbundle`], its client waiting at most `patience` for each read of the answer.
@@ -2200,12 +2207,12 @@ fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, PartParameters)> {
     .collect()
 }
 
-/// A plain connection to the edge on loopback `port`, its reads waiting [`PATIENCE_NS`].
+/// A plain connection to the edge on loopback `port`, its reads waiting [`patience_ns`].
 fn cleartext_client(port: u16) -> ClientStream {
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
   socket
-    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .set_read_timeout(Some(Duration::from_nanos(patience_ns())))
     .expect("a read timeout");
   socket
 }
@@ -2397,13 +2404,13 @@ fn stock_hg() -> Option<Vec<String>> {
 }
 
 /// Runs stock hg (its command's `words`) with `args`, outside any user's configuration (`HGRCPATH` empty), in its plain
-/// words (`HGPLAIN`), with no terminal to prompt on and each of its socket's waits bounded by [`PATIENCE_NS`]
+/// words (`HGPLAIN`), with no terminal to prompt on and each of its socket's waits bounded by [`patience_ns`]
 /// (`http.timeout`): its exit code and both outputs.
 fn hg_run(words: &[String], args: &[&str]) -> (Option<i32>, String, String) {
   let (program, leading) = words.split_first().expect("a command");
   let timeout = format!(
     "http.timeout={}",
-    Duration::from_nanos(PATIENCE_NS).as_secs_f64()
+    Duration::from_nanos(patience_ns()).as_secs_f64()
   );
   let output = Command::new(program)
     .args(leading)
@@ -3743,7 +3750,7 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   };
   // Seen parked, then held [`TURN_HELD`] more: the push's wait runs from before it was seen to past the release, whatever
   // its intake took on a busy machine before it parked.
-  let deadline = std::time::Instant::now() + Duration::from_nanos(PATIENCE_NS);
+  let deadline = std::time::Instant::now() + Duration::from_nanos(patience_ns());
   while counted(crate::repository::hg_run::TURN_WAITS) == 0 && std::time::Instant::now() < deadline
   {
     #[allow(clippy::disallowed_methods)]
@@ -3846,7 +3853,7 @@ fn a_long_push_parked(
 }
 
 /// Derived: how long a test's client waits for a long push's answer ([`a_long_push_parked`]): a client's patience
-/// ([`PATIENCE_NS`]) and one of the daemon's liveness budgets for each segment the push lands at
+/// ([`patience_ns`]) and one of the daemon's liveness budgets for each segment the push lands at
 /// [`LONG_SEGMENT_BYTES`], each a durable write of the store's that a busy machine draws out, and one more for its
 /// entry's commit (main 01a20182's order of 2026-11-22 16:30: a busy machine is the norm, so a bound from the push's
 /// own size, never a constant).
@@ -3856,7 +3863,7 @@ fn long_push_patience(bundle: &[u8]) -> Duration {
     .div_ceil(LONG_SEGMENT_BYTES)
     .saturating_add(1);
   Duration::from_nanos(
-    PATIENCE_NS.saturating_add(segments.saturating_mul(crate::daemon::LIVENESS_BUDGET_NS)),
+    patience_ns().saturating_add(segments.saturating_mul(crate::daemon::LIVENESS_BUDGET_NS)),
   )
 }
 
@@ -3900,6 +3907,11 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   release_long_push(&daemon);
   let long = long.join().expect("the long push answered");
   let rebased = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED);
+  let lookups = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::INDEX_LOOKUPS,
+  );
   let after = hg_command(edge, &name, "heads");
   daemon.stop();
   println!(
@@ -3919,13 +3931,36 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
     "the long push's tip unknown: {}",
     String::from_utf8_lossy(&unknown.1)
   );
+  assert_the_long_push_re_based_and_landed(
+    &long,
+    rebased,
+    lookups,
+    &after,
+    [crate::verbs::hex_of(&long_tip), small_tip],
+  );
+}
+
+/// The long push of [`a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named`] once let go on: `long`
+/// answered `200`, its fork re-based once over the small push's entry and its index lookups counted (`rebased`,
+/// `lookups`), and the repository's heads after it (`after`) naming both `tips`.
+fn assert_the_long_push_re_based_and_landed(
+  long: &(u16, String, Vec<u8>),
+  rebased: u64,
+  lookups: u64,
+  after: &(u16, Vec<u8>),
+  tips: [String; 2],
+) {
   assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
   assert_eq!(
     rebased, 1,
     "the long push's fork re-based over the small push's entry"
   );
+  assert!(
+    lookups > 0,
+    "a settled push counts its fork's index lookups (goal 93, arena-20's counters)"
+  );
   let after = String::from_utf8_lossy(&after.1).into_owned();
-  for tip in [crate::verbs::hex_of(&long_tip), small_tip] {
+  for tip in tips {
     assert!(after.contains(&tip), "{after}");
   }
 }
@@ -4178,7 +4213,6 @@ pub(crate) fn chained_create(bytes: usize, depth: usize) -> Chained {
       &mut at,
     );
   }
-  drop(put);
   writer.finish().expect("the trailer");
   let tip = commits.last().expect("a commit").0;
   let mut request = Vec::new();

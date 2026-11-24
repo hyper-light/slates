@@ -42,11 +42,10 @@
 //! **Laptop ≡ fleet.** A lineage lives on the shard that owns the repository's greens (§4.17.1 item 2), on a laptop and
 //! in a fleet alike; a holder replays a branch from the same record the owner made it from (owed with shared piece 2).
 
-use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 use super::{
-  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry_of,
+  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry,
   link_entry, mode_entry, relink, special_entry, xattr_entry,
 };
 use crate::dims::{Arenas, GreenRelease};
@@ -57,6 +56,8 @@ use crate::special::SpecialNode;
 #[derive(Debug)]
 enum Revert {
   File(String, Option<Vec<u8>>),
+  /// A file set back to the whole of a content-plane object, held by its name alone (A-760 (b) 4d).
+  Named(String, crate::named::Identity),
   Special(String, Option<SpecialNode>),
   Dir(String, bool),
   Mode(String, Option<u32>),
@@ -316,17 +317,27 @@ impl Green {
     if !self.content_history.contains_key(path) {
       return;
     }
-    let then = self.content_ref_at_bytes(path, version);
+    // The file at `version` and now, each its bytes or the object it is held by alone (A-760 (b) 4d), told apart by their
+    // digests, the identity entry's (A-873).
+    let then = self.content_ref_at(path, version);
     let now = self.content.get(path);
-    if then.as_deref() != now {
+    let digest_then = then.as_ref().map(super::ContentAt::digest);
+    let digest_now = now.as_ref().map(super::Content::digest);
+    if digest_then != digest_now {
       exchange(
         identity,
-        now.map(|bytes| file_entry_of(path, bytes)),
-        then.as_deref().map(|bytes| file_entry_of(path, bytes)),
+        digest_now.map(|digest| file_entry(path, digest)),
+        digest_then.map(|digest| file_entry(path, digest)),
       );
     }
-    if then.as_deref() != now.filter(|_| !cut) {
-      reverts.push(Revert::File(path.to_owned(), then.map(Cow::into_owned)));
+    if digest_then != digest_now.filter(|_| !cut) {
+      reverts.push(match then {
+        Some(super::ContentAt::Named(name)) => Revert::Named(path.to_owned(), name),
+        Some(super::ContentAt::Bytes(bytes)) => {
+          Revert::File(path.to_owned(), Some(bytes.into_owned()))
+        }
+        None => Revert::File(path.to_owned(), None),
+      });
     }
   }
 
@@ -418,6 +429,7 @@ impl Green {
   fn revert(&mut self, revert: Revert) {
     match revert {
       Revert::File(path, Some(bytes)) => self.content.insert(&path, bytes),
+      Revert::Named(path, identity) => self.content.insert_named(&path, identity),
       Revert::File(path, None) => {
         self.content.remove(&path);
       }
@@ -724,6 +736,24 @@ impl Lineage {
       release.history.release_step(&mut self.arenas.blocks)
         || self.arenas.release_step(&mut release.maps),
     )
+  }
+
+  /// The holds the lineage's named blocks took and gave back, tracked from the first call (A-760 (b) 4d,
+  /// [`Green::track_name_holds`]): refused `Busy` while a member is out, since the arenas are then in its engine.
+  pub fn take_name_holds(&mut self) -> Result<Vec<super::NameHold>, LineageRefused> {
+    if self.out.is_some() {
+      return Err(LineageRefused::Busy);
+    }
+    Ok(self.arenas.blocks.track())
+  }
+
+  /// Every hold the lineage's named blocks still take given back ([`Green::give_back_name_holds`]): what its owner
+  /// applies before it lets the lineage go. Refused `Busy` while a member is out.
+  pub fn give_back_name_holds(&mut self) -> Result<Vec<super::NameHold>, LineageRefused> {
+    if self.out.is_some() {
+      return Err(LineageRefused::Busy);
+    }
+    Ok(self.arenas.blocks.give_back())
   }
 
   /// The members seated.

@@ -6,6 +6,8 @@
 //!   `Arc`, `Rc`, `Mutex` or `RwLock` outside the crates allowed to, and no write-capable file
 //!   syscall may appear outside the landing crate. Test code (`tests/`, `benches/`, `examples/`,
 //!   and `#[cfg(test)]` modules) is exempt: tests write only to RAM-backed directories they name.
+//!   And no `mod` declaration, in any code, may carry `///` docs when its module opens with `//!`
+//!   docs, since rustdoc joins the two (see `module_docs.rs`).
 //! - `cargo xtask literals` — the literal check (AC-0.2, R3): a numeric literal in shipped code
 //!   must carry its derivation. Allowed forms: inside a `derived!(...)` call; on or within four
 //!   lines after a doc line marked `Derived:`, `Measured:`, `Format:` or `Shape:`; the values 0, 1
@@ -53,6 +55,7 @@ mod callgrind;
 mod capabilities;
 mod conformance;
 mod kind;
+mod module_docs;
 mod named_tests;
 mod ratchet;
 mod tag;
@@ -200,11 +203,21 @@ struct Package {
   manifest_path: String,
   #[serde(default)]
   dependencies: Vec<Dependency>,
+  /// Its targets (library, binaries, tests, examples, benches, build script), each with its root file.
+  #[serde(default)]
+  targets: Vec<Target>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct Dependency {
   name: String,
+}
+
+/// One target of a package as `cargo metadata` describes it.
+#[derive(Debug, serde::Deserialize)]
+struct Target {
+  /// The target's root file, which declares its modules beside itself.
+  src_path: PathBuf,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -713,6 +726,7 @@ mod structural {
     }
     check_design_table(&root, &mut violations)?;
     crate::named_tests::check(&root, &mut violations)?;
+    crate::module_docs::check(&root, &metadata, &mut violations)?;
     if violations.is_empty() {
       println!(
         "structural: ok ({} shipped crates)",

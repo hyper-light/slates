@@ -19,11 +19,12 @@
 //! fork shares are never merged, and a merge whose runs a fork comes to share is given up (`MergeStep::GivenUp`).
 //!
 //! **Sliced** (bounded work, CLAUDE.md §3). A merge is made a table at a time (`Index::merge_step`), each slice taking
-//! steps until the shard's step budget is spent (at least one), by a task of its own; nothing changes until its last
-//! step, so lookups read the runs it merges meanwhile. Its time across its slices is reported as the merge's
-//! (`Index::compaction_took`), the rule's price. One merge a repository at a time, kept by the repository's key, so the
-//! merges are bounded by the partition's repositories. Each step is lent every byte the shard could admit now, as an
-//! import's turn is: the merged run's tables are written before the merged runs give theirs back.
+//! steps until the shard's step budget is spent (at least one), by a task of its own; each step puts one table or gives
+//! one back (goal 93), and lookups read the runs it merges until the step that swaps its run in. Its time across its
+//! slices is reported as the merge's (`Index::compaction_took`), the rule's price. One merge a repository at a time,
+//! kept by the repository's key, so the merges are bounded by the partition's repositories. Each step is lent the room
+//! one table and its fence take (`Merge::step_room`): the merged run's tables are written before the merged runs give
+//! theirs back.
 //!
 //! **Which indexes.** Every tool's that is a `slates_vcs::Index`: Mercurial's (`HgIndex::rows`) and git's repository
 //! index (`slates_git::store::Repository::rows`), each reported from its lend over the store's own index
@@ -102,10 +103,15 @@ fn begin(state: &mut ShardState, id: RepositoryId, runs: usize) {
   if state.vcs_stores.index_upkeep.0.contains_key(&id) {
     return;
   }
-  let Some(merge) = index_of(&mut state.vcs_stores, id)
-    .and_then(|(content, index)| index.merge_begin(content, runs))
-  else {
-    return;
+  let begun =
+    index_of(&mut state.vcs_stores, id).map(|(content, index)| index.merge_begin(content, runs));
+  let merge = match begun {
+    Some(Ok(Some(merge))) => merge,
+    Some(Err(_)) => {
+      state.count(GIVEN_UP, 1);
+      return;
+    }
+    Some(Ok(None)) | None => return,
   };
   state
     .vcs_stores
@@ -136,10 +142,11 @@ pub(crate) fn slice(state: &mut ShardState, id: RepositoryId, budget_ns: u64) ->
       return false;
     };
     let started = slates_rt::futures::now_ns();
-    // Lent what the step can put (its tables cut so far, which its last step puts whole), never the shard's whole room:
-    // a lend grows the arena from the pool the shards share, and a merge lent all it could admit claimed the whole pool
-    // for its shard, so another shard admitted nothing (main's red of 2026-11-21 16:18, hg concurrency at N=10).
-    let room = job.merge.cut_bytes();
+    // Lent what the step can put (one table and its fence, goal 93: a step puts one table at most), never the shard's
+    // whole room: a lend grows the arena from the pool the shards share, and a merge lent all it could admit claimed the
+    // whole pool for its shard, so another shard admitted nothing (main's red of 2026-11-21 16:18, hg concurrency at
+    // N=10).
+    let room = job.merge.step_room();
     let stepped = within_budget(state, room, |stores| {
       let (content, index) = index_of(stores, id)?;
       Some(index.merge_step(content, &mut job.merge))

@@ -1130,8 +1130,10 @@ pub enum RequestBody {
   /// library's and the SDKs' attachment objects send while they live, so an attachment its holder keeps never lapses
   /// for want of another verb naming it. Does nothing else. Served on the attachment's owner shard and answered
   /// `Renewed` with the term now in force and when to renew again; refused as any use of the attachment is
-  /// (`AttachmentExpired` once its term lapsed), and `BadRequest` for an attachment with no term (a mount's renews
-  /// through its own activity). Appended.
+  /// (`AttachmentExpired` once its term lapsed). An attachment with no term (a mount's, which lives by its own activity;
+  /// an SDK client's, which lives with its client) is answered `NoTerm`, nothing renewed: a state, not a fault, which a
+  /// process naming an attachment another made reads to learn whether to hold it (A-879; `BadRequest` until
+  /// 2026-11-23). Appended.
   Renew {
     /// The attachment.
     attachment: u64,
@@ -1473,6 +1475,19 @@ pub enum RequestBody {
   DestroyRepository {
     /// The repository.
     repository: String,
+  },
+  /// Open a staging buffer of no stated length on a plain volume's owner for an `FsWriteStaged` under the caller's write
+  /// attachment `attachment` of `volume` (A-880): each `StagePut` reserves its own bytes from the owner's metadata budget
+  /// as it extends the buffer, refused `BudgetExceeded` past it, so a writer that learns its input's length only at its
+  /// end (`slates write` reading a pipe) holds one page of the input at a time. The buffer lives as long as the
+  /// attachment, released when the attachment ends or when applied, never at a deadline. Answered `Staged`; refused as
+  /// `StageBegin` is for the volume, and as a write through the attachment is for the attachment. Never recorded.
+  /// Appended.
+  StageOpen {
+    /// The volume.
+    volume: VolumeId,
+    /// The caller's write attachment of the volume, which the buffer lives with.
+    attachment: u64,
   },
 }
 
@@ -2536,6 +2551,7 @@ impl RequestBody {
       | RequestBody::ReadDir { volume, .. }
       | RequestBody::StageBegin { work: volume, .. }
       | RequestBody::StagePut { work: volume, .. }
+      | RequestBody::StageOpen { volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
       | RequestBody::EditSubmit { work: volume, .. }
       | RequestBody::EditSubmitHeld { work: volume, .. }
@@ -2666,8 +2682,8 @@ impl RequestBody {
   /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
   /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
   /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
-  /// strands a charged buffer that expires within a lease. So does a work's floor move (`MoveWorkFloor`), monotone and
-  /// idempotent at the owner.
+  /// strands a charged buffer that expires within a lease, a retried open one whose record's charge goes when its
+  /// attachment ends (A-880). So does a work's floor move (`MoveWorkFloor`), monotone and idempotent at the owner.
   pub fn forwards_as_read(&self) -> bool {
     matches!(
       self,
@@ -2684,6 +2700,7 @@ impl RequestBody {
         | RequestBody::ReadDir { .. }
         | RequestBody::StageBegin { .. }
         | RequestBody::StagePut { .. }
+        | RequestBody::StageOpen { .. }
         // A floor's move is monotone and idempotent (A-697 part b), so a resent forward changes nothing.
         | RequestBody::MoveWorkFloor { .. }
     )
@@ -5981,6 +5998,12 @@ pub enum ReplyBody {
     /// Operations of the declaration past what this reply holds.
     declaration_elided: u32,
   },
+  /// The attachment `Renew` named has no term (A-879): its life is its own activity or its maker's (a mount's, an SDK
+  /// client's, a guest's), not a holder's renewals, so nothing was renewed and nothing need hold it. An answer, not a
+  /// refusal: `slates write` renews the attachment it names before it reads its input and holds the attachment exactly
+  /// when the answer is `Renewed`. Until 2026-11-23 this was a `BadRequest`, an uncategorized refusal standing for a
+  /// valid state. Appended.
+  NoTerm,
 }
 
 /// Where a session log walk stands (A-773): a line's key. A work's line is keyed by the work alone, a waiting landing's

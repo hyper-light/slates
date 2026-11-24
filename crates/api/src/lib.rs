@@ -341,9 +341,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// that node's routing names one, from a forwarded read, write or work creation that met a node whose configuration
 /// differs from its sender's, and from a verb that is not forwarded (a landing's) sent to a node another host's volume
 /// is not on; until then such a node answered `NotFound`, a claim that acknowledged writes did not exist (2026-11-23).
+/// 61: a renewal says when an attachment has no term (A-879): the wire's `Renew` answers an attachment with none (a
+/// mount's, an SDK client's) with the appended `ReplyBody::NoTerm` where it was refused `BadRequest`; the re-exported
+/// [`Client`]'s `renew` returns a `slates_client::Renewal` (`Renewed { term_ns, renew_every_ns }` or `NoTerm`) where it
+/// returned a pair, and `slates_client::Hold::new` returns `None` for an attachment with no term, which nothing need
+/// hold (2026-11-23).
+/// 62: a file write streams its input (A-880): the wire's appended `RequestBody::StageOpen` opens a staging buffer of no
+/// stated length that lives with the caller's write attachment, reserved put by put; the re-exported [`Client`] gains
+/// `fs_write_from`, which writes everything a reader yields as one verb holding two pages of it at most (2026-11-23).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 60;
+pub const CONTRACT: u32 = 62;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

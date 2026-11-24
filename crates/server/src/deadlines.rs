@@ -141,6 +141,11 @@ fn wake_due_tasks(state: &mut ShardState, now: u64) {
     if let Some(sweeper) = state.idle_sweeper {
       slates_rt::registry::wake(sweeper.0);
     }
+    // Test support: the idle sweep tests' poller, woken beside each pass (`idle_sweep::TEST_POLLER`).
+    #[cfg(test)]
+    if let Some(poller) = crate::idle_sweep::TEST_POLLER.with(std::cell::Cell::get) {
+      slates_rt::registry::wake(poller.0);
+    }
   }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
@@ -303,6 +308,14 @@ mod tests {
 
   use crate::state::{ClientSlot, ShardState};
 
+  /// A-881's lost-wake signal: parks `daemon`'s shard began with a task ready on its own queue (`parked_with_ready`),
+  /// which a healthy shard never does: such a task waits out the park.
+  fn parked_with_ready(daemon: &crate::daemon::Daemon) -> u64 {
+    crate::daemon::observe_first(daemon, |_state| {
+      slates_rt::registry::with_current(|context| context.counters().parked_with_ready).unwrap_or(0)
+    })
+  }
+
   /// Shape: how far ahead the tests set a deadline: a tenth of a liveness window, so the reap loop's tick, once a
   /// window, could not be what released it in time.
   const SOON_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 10;
@@ -376,7 +389,12 @@ mod tests {
       super::noted(state, expires);
     });
     let released = look_until(&daemon, begun, |state| state.staging.len() == 0);
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let released = released.expect("the buffer was released within half a liveness window");
     println!("a staging buffer due in {SOON_NS} ns released {released:?} after it began");
   }
@@ -416,7 +434,12 @@ mod tests {
         .volume(volume)
         .is_some_and(|record| record.lease.is_none())
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let released = released.expect("the lease was released within half a liveness window");
     println!("a write lease due in {SOON_NS} ns released {released:?} after it was recorded");
   }
@@ -446,7 +469,12 @@ mod tests {
       super::noted(state, at);
     });
     let taken = look_until(&daemon, begun, |state| state.destroy_retry_at.is_none());
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let taken = taken.expect("the retry was kept within half a liveness window");
     println!("a destroy's retry due in {SOON_NS} ns kept {taken:?} after it was set");
   }
@@ -510,7 +538,12 @@ mod tests {
           record.grant == Some(grant) && record.kind == slates_db::catalog::AuditKind::GrantExpired
         })
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let ended = ended.expect("the grant ended and was audited within half a liveness window");
     println!("a grant with a {SOON_NS} ns term ended {ended:?} after it was issued");
   }
@@ -607,7 +640,12 @@ mod tests {
     let ended = look_until(&daemon, retired, move |state| {
       state.db.partition().attachment(attachment).is_none()
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let ended = ended.expect("the departed peer's attachment ended within half a liveness window");
     println!(
       "a departed peer's attachment ended {ended:?} after the configuration without it was installed"
@@ -641,7 +679,12 @@ mod tests {
       #[allow(clippy::disallowed_methods)]
       std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
     };
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let rearmed = rearmed.expect("re-armed within half a window past a window after the decline");
     println!("a declined placement re-armed {rearmed:?} after the decline");
     assert!(
@@ -703,7 +746,12 @@ mod tests {
     let ended = look_until(&daemon, begun, move |state| {
       state.db.partition().attachment(attachment).is_none()
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     let ended = ended.expect("the attachment ended within half a liveness window");
     println!("a CLI attachment with a {SOON_NS} ns term ended {ended:?} after it was made");
   }
@@ -789,7 +837,12 @@ mod tests {
             !client.status_pages.pending() && client.status_pages.indexed().is_none()
           })
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert_eq!(
       entries_after_the_end, 1,
       "the ended seat's entry left the index with it"
@@ -877,7 +930,12 @@ mod tests {
         .get_mut(asked)
         .is_ok_and(|client| !client.status_pages.pending())
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(
       matches!(
         first,

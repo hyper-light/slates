@@ -15,11 +15,14 @@
 //! - each is held a latency drawn for it, so messages reorder, and some are lost or delivered twice;
 //! - pairs of hosts are cut, one way or both, and healed;
 //! - holders are knocked offline (every message to them lost) and come back from their persisted state
-//!   (`Acceptor::to_persisted`, `from_persisted`);
+//!   (`Acceptor::to_persisted`, `from_persisted`), which must keep the retired owner a takeover moved the authority from
+//!   and the retirement that moved it (A-251, A-883): a holder back from a restart across a move names the same move;
 //! - owners pause and resume, and a resumed one goes on proposing under its old epoch as if nothing happened;
-//! - the master hands out new epochs throughout: a takeover moves the authority to a host under a new generation, and an
-//!   owner's restart gives its host the next epoch under the same authority and generation, its old incarnation perhaps
-//!   still running.
+//! - the master hands out new epochs throughout: a takeover moves the authority to a host under a new generation, the old
+//!   owner retired at that generation (`Acceptor::move_authority`, so each holder records the move and its retirement;
+//!   the three owner hosts take turns, so one host is retired again and again, as a host admitted again under its id
+//!   is), and an owner's restart gives its host the next epoch under the same authority and generation, its old
+//!   incarnation perhaps still running.
 //!
 //! **The history checks**, after every event that can break them:
 //! - **Agreement** (TotalOrder): no position commits two values, under any epochs.
@@ -28,6 +31,9 @@
 //! - **StaleNeverCommits**: a record issued after a higher epoch has its promotion quorum never commits.
 //! - **ReadSafety**: at every committed position, every majority's highest-epoch entry is the committed value
 //!   (`FencedLedger.tla`'s rule, over the holders' state, an offline holder's included).
+//! - **A move survives a restart** (A-883): a holder back from its persisted state, through its encoding, names the move
+//!   it named before it went down, the retired owner and the retirement that moved it, so a takeover's listing reads
+//!   the copy the same way after a warm restart (`slates_db::takeover::copy_falls_to`).
 //!
 //! Three mutations are kept as tests, so the checks are known to bite. Each broke histories (the Mac Studio, 2026-11-18,
 //! the first check each broken seed failed):
@@ -46,8 +52,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use slates_wire::Wire;
+
 use crate::register::{
-  Accepted, Acceptor, Ack, Authority, HostEpoch, HostId, ObjectId, Prepare, Promise, Record,
+  Accepted, Acceptor, Ack, Authority, HostEpoch, HostId, ObjectId, PersistedAcceptor, Prepare,
+  Promise, Record,
 };
 
 /// Format: the one object of every run.
@@ -117,7 +126,9 @@ impl Rng {
 /// What a message carries.
 #[derive(Clone, Debug)]
 enum Body {
-  Install(Authority),
+  /// The newest authority, with the version of the retirement of the owner it moved from (`None` before any takeover):
+  /// the configuration's distribution, which a holder installs as a move ([`Acceptor::move_authority`]).
+  Install(Authority, Option<u64>),
   Prepare(Prepare),
   Promise(Promise),
   Record(Record),
@@ -169,6 +180,8 @@ struct Counts {
   stale_accepted: u64,
   completed_after_a_higher_promotion: u64,
   restarts: u64,
+  /// Holders back from a restart whose authority a takeover had moved: each must name the same move (A-883).
+  restarts_across_a_move: u64,
   cuts: u64,
   duplicates: u64,
   lost: u64,
@@ -184,6 +197,7 @@ impl Counts {
     self.stale_accepted += other.stale_accepted;
     self.completed_after_a_higher_promotion += other.completed_after_a_higher_promotion;
     self.restarts += other.restarts;
+    self.restarts_across_a_move += other.restarts_across_a_move;
     self.cuts += other.cuts;
     self.duplicates += other.duplicates;
     self.lost += other.lost;
@@ -399,6 +413,9 @@ struct World {
   epoch: u64,
   generation: u64,
   authority_owner: HostId,
+  /// The version of the retirement of the owner the newest authority moved from: the generation of the takeover that
+  /// handed it out, `None` before the first.
+  retired_at: Option<u64>,
   in_flight: Vec<Message>,
   cuts: BTreeSet<(HostId, HostId)>,
   values: u64,
@@ -431,6 +448,7 @@ impl World {
       epoch: 0,
       generation: 0,
       authority_owner: HostId(0),
+      retired_at: None,
       in_flight: Vec::new(),
       cuts: BTreeSet::new(),
       values: 0,
@@ -475,12 +493,13 @@ impl World {
   }
 
   /// The master hands the next epoch to a host under a new generation and installs its authority on every holder by
-  /// messages.
+  /// messages, the owner it moves from retired by that generation (the model's configuration version).
   fn takeover(&mut self) {
     self.generation += 1;
     self.history.counts.takeovers += 1;
     let host = OWNERS[self.rng.below(OWNERS.len())];
     self.authority_owner = host;
+    self.retired_at = Some(self.generation);
     self.begin_owner(host);
   }
 
@@ -525,7 +544,7 @@ impl World {
         generation: self.generation,
         owner: self.authority_owner,
       };
-      self.send_to_holders(HostId(0), &Body::Install(authority));
+      self.send_to_holders(HostId(0), &Body::Install(authority, self.retired_at));
     }
   }
 
@@ -584,13 +603,29 @@ impl World {
       self.holders.get_mut(&id).unwrap().online = false;
     } else if !online && self.rng.chance(BACK) {
       self.history.counts.restarts += 1;
+      let moved = self.holders[&id].acceptor.moved_from();
       let mut persisted = self.holders[&id].acceptor.to_persisted();
       if self.mutation == Mutation::RestartWithoutFence {
         persisted.promised = 0;
       }
+      // Through the encoding a recovery image keeps (`HeldRegister`), as a warm restart reads it.
+      let persisted = PersistedAcceptor::from_bytes(&persisted.to_bytes()).unwrap();
       let holder = self.holders.get_mut(&id).unwrap();
       holder.acceptor = Acceptor::from_persisted(id, persisted);
       holder.online = true;
+      let back = holder.acceptor.moved_from();
+      if moved.is_some() {
+        self.history.counts.restarts_across_a_move += 1;
+      }
+      if back != moved {
+        let step = self.step;
+        self.history.violate(
+          step,
+          format!(
+            "a move survives a restart: holder {id:?} back from its persisted state names {back:?}, not {moved:?}"
+          ),
+        );
+      }
     }
   }
 
@@ -674,7 +709,7 @@ impl World {
 
   fn deliver(&mut self, message: Message) {
     match message.body {
-      Body::Install(authority) => self.on_install(message.to, authority),
+      Body::Install(authority, retired_at) => self.on_install(message.to, authority, retired_at),
       Body::Prepare(prepare) => self.on_prepare(message.to, &prepare),
       Body::Record(record) => self.on_record(message.to, &record),
       Body::Promise(promise) => self.on_promise(message.to, &promise),
@@ -691,9 +726,9 @@ impl World {
       .map(|holder| &mut holder.acceptor)
   }
 
-  fn on_install(&mut self, to: HostId, authority: Authority) {
+  fn on_install(&mut self, to: HostId, authority: Authority, retired_at: Option<u64>) {
     if let Some(acceptor) = self.online_holder(to) {
-      let _refused_older = acceptor.install_authority(authority);
+      let _refused_older = acceptor.move_authority(authority, retired_at);
     }
   }
 
@@ -872,10 +907,12 @@ fn say_broken(mutation: Mutation, f: usize, seeds: u64, broken: &[(u64, String)]
 
 /// Goal 81's chaos part, its network half (§4.8; design models 1 and 4). Do: run the nemesis over [`SEEDS`] seeds at
 /// `f = 1` and `f = 2` (three and five holders): latency, loss, duplication, reordering, one-way and two-way cuts,
-/// holders knocked offline and back from their persisted state, owners paused and resumed, new epochs throughout.
-/// Expect: no history breaks Agreement, Continuity, StaleNeverCommits or ReadSafety. So the run is not vacuous:
-/// takeovers, adoptions of a record, commits, stale records issued and accepted somewhere, records completing after a
-/// higher epoch's promotion, restarts, cuts, duplicates and losses are all counted.
+/// holders knocked offline and back from their persisted state through its encoding, owners paused and resumed, new
+/// epochs throughout, each takeover's install a move from a retired owner. Expect: no history breaks Agreement,
+/// Continuity, StaleNeverCommits or ReadSafety, and every holder back from a restart names the move it named before
+/// (A-883). So the run is not vacuous: takeovers, adoptions of a record, commits, stale records issued and accepted
+/// somewhere, records completing after a higher epoch's promotion, restarts, restarts across a move, cuts, duplicates
+/// and losses are all counted.
 #[test]
 fn the_fenced_register_holds_its_invariants_under_the_network_nemesis() {
   for f in [1, 2] {
@@ -894,6 +931,7 @@ fn the_fenced_register_holds_its_invariants_under_the_network_nemesis() {
         counts.completed_after_a_higher_promotion,
       ),
       ("restarts", counts.restarts),
+      ("restarts across a move", counts.restarts_across_a_move),
       ("cuts", counts.cuts),
       ("duplicates", counts.duplicates),
       ("losses", counts.lost),

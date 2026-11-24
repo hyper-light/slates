@@ -130,7 +130,7 @@ pub struct Intaken {
   /// The fork's runs merged by the size-tiered rule as the push sealed them ([`Taker::merge_step`]).
   pub tiered_merges: u64,
   /// The most runs only the fork held after any step: what a lookup of a new row walked past its parent's runs, held
-  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its rows.
+  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its own tables' bytes.
   pub most_own_runs: u64,
 }
 
@@ -570,16 +570,16 @@ pub struct PushSegment {
   pub contents: Vec<FileContents>,
 }
 
-/// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
-/// identity from `fork`, the intake's fork or the fork it finished as, `room` the room the intake began within; what a
-/// replay appends after the rows the segments before it appended, no text rebuilt. Refused where a row cannot be read
-/// or written.
-pub fn segment_record(
-  fork: &HgIndex,
+/// The writer of the `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept
+/// revisions in it read by identity from the intake's fork a step at a time ([`Intake::record_step`]), `room` the room
+/// the intake began within; what a replay appends after the rows the segments before it appended, no text rebuilt.
+/// Written a step at a time because a segment's whole record in one call was one shard step: 316 ms in a release build
+/// on the big Studio over Mercurial's own push (r499, goal 93), past the slice rule. Refused where its logs cannot be
+/// held.
+fn segment_writer(
   segment: &PushSegment,
   room: u64,
-  store: &ContentStore,
-) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+) -> Result<crate::import::record::Writer, crate::import::record::WriteRefused> {
   use crate::import::record::{Source, WriteRefused, Writer};
   let mut ranges = Vec::new();
   ranges
@@ -591,9 +591,7 @@ pub fn segment_record(
       .iter()
       .map(|(log, first, end)| (log_named(log), *first, *end)),
   );
-  let mut writer = Writer::begin_segment(Source::Push, &ranges, room, false)?;
-  while writer.step(fork, store)? {}
-  writer.finish().ok_or(WriteRefused::Allocation)
+  Writer::begin_segment(Source::Push, &ranges, room, false)
 }
 
 /// A revision longer than the content store's window taken over as many steps as it has windows (A-767 C1, the push
@@ -1027,14 +1025,24 @@ impl Intake {
     self.taker.cutting.as_mut()?.ready.pop_front()
   }
 
-  /// The `Record` of `segment`, cut from this intake (main's ruling (b1)): [`segment_record`] over its fork.
-  pub fn segment_record(
+  /// The writer of the `Record` of `segment`, cut from this intake (main's ruling (b1); [`segment_writer`]): stepped by
+  /// [`Intake::record_step`] over its fork, a turn's steps at a time, then finished (`Writer::finish`).
+  pub fn record_writer(
     &self,
     segment: &PushSegment,
     room: u64,
+  ) -> Result<crate::import::record::Writer, crate::import::record::WriteRefused> {
+    segment_writer(segment, room)
+  }
+
+  /// One step of `writer`, a segment's record, over this intake's fork: whether more steps follow. Refused where a row
+  /// cannot be read or written.
+  pub fn record_step(
+    &self,
+    writer: &mut crate::import::record::Writer,
     store: &ContentStore,
-  ) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
-    segment_record(&self.taker.fork, segment, room, store)
+  ) -> Result<bool, crate::import::record::WriteRefused> {
+    writer.step(&self.taker.fork, store)
   }
 
   /// Cuts the segment being cut whatever its length: the push's last, once every unit is taken.
@@ -1340,8 +1348,9 @@ impl Taker {
   /// ([`slates_vcs::Index::tiered_due`]), or its begin, between revisions; none where none is due. Every append seals
   /// the fork's tail when due (`HgIndex::insert`), each seal a run, and a lookup walks every run: unmerged, a push's
   /// runs grew a seal at a time and each new row's lookup with them (arena-14: shard 0 spun past 1 s in a segment step).
-  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step. A push refused
-  /// or given back drops its merge with the fork: nothing changes until the merge's last step.
+  /// Merged so, the fork's own runs stay within the rule's logarithm of its own bytes, a table's work a step (each step puts
+  /// one table or gives one back). A push refused or given back drops its merge with the fork, whose release gives back
+  /// what the merge put.
   fn merge_step(&mut self, store: &mut ContentStore) -> Result<Option<Stepped>, Refused> {
     let as_refused = |refused: IndexRefused| {
       Refused::Unindexed(Unindexed::Index(crate::index::Refused::Index(refused)))
@@ -1366,7 +1375,12 @@ impl Taker {
     let Some(runs) = self.fork.rows().tiered_due() else {
       return Ok(None);
     };
-    Ok(self.fork.rows().merge_begin(store, runs).map(|merge| {
+    let begun = self
+      .fork
+      .rows()
+      .merge_begin(store, runs)
+      .map_err(as_refused)?;
+    Ok(begun.map(|merge| {
       self.merging = Some(merge);
       Stepped::More
     }))

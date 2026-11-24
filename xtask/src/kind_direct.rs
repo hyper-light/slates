@@ -1,7 +1,8 @@
 //! `cargo xtask kind direct` — the DAX matrix's Kubernetes socket-route cells (§4.6, A-135, A-171;
 //! `docs/wip/virtiofs.md` §8): a process in a pod maps a file of a slates volume by the direct map, with no copy, on a
 //! cluster of its own. It needs nothing of the node's kernel beyond what Linux always has, so it runs wherever kind does
-//! (Docker Desktop on an arm64 Mac included), unlike the export leg.
+//! (Docker Desktop on an arm64 Mac included), unlike the export leg. The leg is a child module of `kind.rs`, so it
+//! reuses the lane's machinery.
 //!
 //! The run, each step a command on the record:
 //!

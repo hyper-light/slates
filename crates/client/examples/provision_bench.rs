@@ -186,9 +186,30 @@ struct Sample {
   parked: bool,
 }
 
-/// One client's samples: `count` creates (each followed by a destroy that is not timed).
-fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> Vec<Sample> {
+/// Creates the daemon refused, typed, over the whole bench: each is reported and counted, and the bench fails at its end,
+/// never at the refusal (main 01a20182's r509, 2026-11-23: the 64-client sweep's first `BudgetExceeded` aborted the bench
+/// in a client thread, so its rows never reported).
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Shape: the refusals printed whole; the rest are counted.
+const REFUSALS_PRINTED: u64 = 8;
+
+/// One client's samples: `count` creates (each followed by a destroy that is not timed); a create the daemon refuses
+/// is reported and counted ([`REFUSED`]), and takes no sample.
+fn sample(
+  instance: &str,
+  tag: &str,
+  (count, pause): (usize, Option<Duration>),
+  own_shard: Option<usize>,
+) -> Vec<Sample> {
   let mut client = connect(instance);
+  // Where the client's own shard is asked for (of `own_shard` shards), each name is one its shard owns: the client's
+  // shard is its id's residue over the shards (the daemon's accept), a name's owner its hash's (`owner_of_name`).
+  let seat = own_shard.map(|shards| {
+    (
+      usize::try_from(client.client_id()).unwrap_or(0) % shards.max(1),
+      shards,
+    )
+  });
   // The spinning form spins for the floor (the reply lands without a wake when the daemon
   // meets it); the parked form keeps the daemon's published window and parks.
   client.spin_for(if pause.is_none() {
@@ -201,8 +222,15 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
     if let Some(pause) = pause {
       std::thread::park_timeout(pause);
     }
+    let name = match seat {
+      None => format!("{tag}-{n}"),
+      Some((seat, shards)) => (0u64..)
+        .map(|k| format!("{tag}-{n}-{k}"))
+        .find(|name| usize::from(slates_server::verbs::owner_of_name(name, shards)) == seat)
+        .unwrap(),
+    };
     let spec = CreateSpec {
-      name: format!("{tag}-{n}"),
+      name,
       size: SizeClass::Bounded {
         limit: VOLUME_BYTES,
       },
@@ -212,7 +240,16 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
     };
     let (parks_before, _) = client.park_ratio();
     let (started, sent_ns) = (Instant::now(), monotonic_ns());
-    let id = client.create(&spec).unwrap();
+    let id = match client.create(&spec) {
+      Ok(id) => id,
+      Err(ClientError::Refused(refusal)) => {
+        if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < REFUSALS_PRINTED {
+          println!("  provision.{tag} create {n} refused: {refusal:?}");
+        }
+        continue;
+      }
+      Err(e) => panic!("{e}"),
+    };
     let total = ns(started.elapsed());
     let taken_ns = monotonic_ns();
     let exchange = Exchange {
@@ -340,9 +377,8 @@ fn print_parks(
 fn form(
   instance: &str,
   key: &str,
-  clients: usize,
-  count: usize,
-  pause: Option<Duration>,
+  (clients, count, pause): (usize, usize, Option<Duration>),
+  own_shard: Option<usize>,
 ) -> (Vec<(&'static str, Vec<u64>)>, Vec<u64>) {
   let mut per_run: Vec<Vec<(&'static str, u64)>> = Vec::new();
   let mut cpu = Vec::new();
@@ -352,7 +388,7 @@ fn form(
       .map(|c| {
         let instance = instance.to_owned();
         let tag = format!("{key}-{run}-{c}");
-        std::thread::spawn(move || sample(&instance, &tag, count, pause))
+        std::thread::spawn(move || sample(&instance, &tag, (count, pause), own_shard))
       })
       .collect();
     let mut all = Vec::new();
@@ -369,6 +405,11 @@ fn form(
       cpu_now_ns().saturating_sub(cpu_before),
       started.elapsed(),
     ));
+    if all.is_empty() {
+      // Every create of the run refused: its rows read the most a latency can, so the gate fails where it is read.
+      println!("  provision.{key} run {run}: every create refused");
+      all.push(u64::MAX);
+    }
     per_run.push(percentiles(all));
   }
   let mut rows = Vec::new();
@@ -472,7 +513,7 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   );
   let key = format!("loaded{load_per_cpu}_spinning_1");
   let before = daemon.shard_pulses();
-  let (spinning, cpu) = form(instance, &key, 1, SPINNING_SAMPLES, None);
+  let (spinning, cpu) = form(instance, &key, (1, SPINNING_SAMPLES, None), None);
   print_cpu(&key, shards, &cpu);
   print_parks(
     &key,
@@ -483,7 +524,12 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   print_rows_gated(&key, &spinning, true);
   let key = format!("loaded{load_per_cpu}_parked_1");
   let before = daemon.shard_pulses();
-  let (parked, cpu) = form(instance, &key, 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  let (parked, cpu) = form(
+    instance,
+    &key,
+    (1, PARKED_SAMPLES, Some(PARKED_PAUSE)),
+    None,
+  );
   print_cpu(&key, shards, &cpu);
   print_parks(&key, &before, &daemon.shard_pulses(), RUNS * PARKED_SAMPLES);
   print_rows_gated(&key, &parked, true);
@@ -498,6 +544,58 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
     if ok { "ok" } else { "FAIL" }
   );
   ok
+}
+
+/// T-2.6's spinning sweep over [`CLIENT_COUNTS`] clients, each level's CPU, parks and rows printed: the single client's
+/// p99 held to [`PROVISION_FLOOR_NS`] (AC-2.1), and each level that `cores` past the `shards` can run ratcheted. The
+/// single client's p99, and whether it failed the floor.
+fn spinning_sweep(daemon: &Daemon, instance: &str, shards: u16, cores: usize) -> (u64, bool) {
+  // A client thread spins for its reply while the shards spin serving; a run with more of
+  // those than the machine has cores past the shards measures the scheduler oversubscribing,
+  // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
+  // is measured on the reference machine, whose cores hold the concurrency).
+  let runnable = cores.saturating_sub(usize::from(shards)).max(1);
+  let mut failed = false;
+  let mut quiet_spinning = 0;
+  for clients in CLIENT_COUNTS {
+    let key = format!("spinning_{clients}");
+    let before = daemon.shard_pulses();
+    let (rows, cpu) = form(instance, &key, (*clients, SPINNING_SAMPLES, None), None);
+    print_cpu(&key, shards, &cpu);
+    print_parks(
+      &key,
+      &before,
+      &daemon.shard_pulses(),
+      RUNS * clients * SPINNING_SAMPLES,
+    );
+    // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
+    // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
+    // recorded so the ratchet catches regressions, but only the single-client p99 is held to
+    // the 50 µs floor here (a concurrency level's tail is contention on shared owner shards,
+    // reported and ratcheted, not floored).
+    let ratchet_gated = *clients <= runnable;
+    print_rows_gated(&key, &rows, ratchet_gated);
+    let p99 = p99_median(&rows);
+    let floor_gated = *clients == 1;
+    if floor_gated {
+      quiet_spinning = p99;
+      let ok = p99 <= PROVISION_FLOOR_NS;
+      failed |= !ok;
+      println!(
+        "ac-2.1: {clients} client spinning ({cores} cores, {shards} shards), provisioning p99 {p99} ns vs floor {PROVISION_FLOOR_NS} ns: {}",
+        if ok { "ok" } else { "FAIL" }
+      );
+    } else if ratchet_gated {
+      println!(
+        "ac-2.1: {clients} clients spinning, p99 {p99} ns (T-2.6 histogram; recorded and ratcheted, not floored)"
+      );
+    } else {
+      println!(
+        "ac-2.1: {clients} clients oversubscribes {runnable} runnable core(s); p99 {p99} ns reported, not gated here"
+      );
+    }
+  }
+  (quiet_spinning, failed)
 }
 
 fn main() {
@@ -552,52 +650,24 @@ fn main() {
     cores_permille(cpu_now_ns().saturating_sub(cpu_before), started.elapsed()),
     started.elapsed().as_millis()
   );
-  // A client thread spins for its reply while the shards spin serving; a run with more of
-  // those than the machine has cores past the shards measures the scheduler oversubscribing,
-  // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
-  // is measured on the reference machine, whose cores hold the concurrency).
-  let cores = profile.facts.cpus_at_once();
-  let runnable = cores.saturating_sub(usize::from(shards)).max(1);
-  let mut failed = false;
-  let mut quiet_spinning = 0;
-  for clients in CLIENT_COUNTS {
-    let key = format!("spinning_{clients}");
-    let before = daemon.shard_pulses();
-    let (rows, cpu) = form(&instance, &key, *clients, SPINNING_SAMPLES, None);
-    print_cpu(&key, shards, &cpu);
-    print_parks(
-      &key,
-      &before,
-      &daemon.shard_pulses(),
-      RUNS * clients * SPINNING_SAMPLES,
-    );
-    // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
-    // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
-    // recorded so the ratchet catches regressions, but only the single-client p99 is held to
-    // the 50 µs floor here (a concurrency level's tail is contention on shared owner shards,
-    // reported and ratcheted, not floored).
-    let ratchet_gated = *clients <= runnable;
-    print_rows_gated(&key, &rows, ratchet_gated);
-    let p99 = p99_median(&rows);
-    let floor_gated = *clients == 1;
-    if floor_gated {
-      quiet_spinning = p99;
-      let ok = p99 <= PROVISION_FLOOR_NS;
-      failed |= !ok;
-      println!(
-        "ac-2.1: {clients} client spinning ({cores} cores, {shards} shards), provisioning p99 {p99} ns vs floor {PROVISION_FLOOR_NS} ns: {}",
-        if ok { "ok" } else { "FAIL" }
-      );
-    } else if ratchet_gated {
-      println!(
-        "ac-2.1: {clients} clients spinning, p99 {p99} ns (T-2.6 histogram; recorded and ratcheted, not floored)"
-      );
-    } else {
-      println!(
-        "ac-2.1: {clients} clients oversubscribes {runnable} runnable core(s); p99 {p99} ns reported, not gated here"
-      );
-    }
-  }
+  let (quiet_spinning, mut failed) =
+    spinning_sweep(&daemon, &instance, shards, profile.facts.cpus_at_once());
+  // The single spinning client again, each name one its own shard owns: no create crosses to another shard, so its
+  // rows beside `spinning_1`'s split the cross-shard hop and its wakes from the rest (informational, never gated;
+  // GAPS' open AC-2.1 entry at many shards on macOS, main 01a20182's order of 2026-11-23).
+  let key = "spinning_1_own_shard";
+  let (rows, cpu) = form(
+    &instance,
+    key,
+    (1, SPINNING_SAMPLES, None),
+    Some(usize::from(shards)),
+  );
+  print_cpu(key, shards, &cpu);
+  print_rows_gated(key, &rows, false);
+  println!(
+    "ac-2.1: 1 client spinning on its own shard's names, p99 {} ns (informational: no cross-shard hop)",
+    p99_median(&rows)
+  );
   // The channel and the completion record alone: a status of one volume, one client, so the
   // create's own cost is the difference (informational).
   let rows = status_form(&instance);
@@ -615,7 +685,12 @@ fn main() {
   // The parked form is reported separately (AC-2.1), not gated: its latency is a wake, which
   // the scheduler's park granularity dominates.
   let before = daemon.shard_pulses();
-  let (rows, cpu) = form(&instance, "parked_1", 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  let (rows, cpu) = form(
+    &instance,
+    "parked_1",
+    (1, PARKED_SAMPLES, Some(PARKED_PAUSE)),
+    None,
+  );
   print_cpu(
     &format!("paced_1_{}us", PARKED_PAUSE.as_micros()),
     shards,
@@ -644,7 +719,11 @@ fn main() {
     );
   }
   daemon.stop();
-  if failed {
+  let refused = REFUSED.load(std::sync::atomic::Ordering::Relaxed);
+  if refused > 0 {
+    println!("provision: {refused} creates refused (the first {REFUSALS_PRINTED} printed above)");
+  }
+  if failed || refused > 0 {
     std::process::exit(1);
   }
 }

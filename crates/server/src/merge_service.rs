@@ -873,6 +873,7 @@ pub(crate) fn with_work_base<R>(
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
     entries: Some(&work.entries),
+    plane: crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content),
   })
 }
 
@@ -1747,18 +1748,20 @@ fn read_green_range(
     Ok(version) => version,
     Err(refusal) => return refused(refusal),
   };
+  // A file held by its content-plane object alone is read through the plane (A-760 (b) 4d).
+  let plane = crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content);
   match engine.content_page_at(path, version, range) {
-    Some((page, total)) => match crate::vcs_store::named_objects::bytes_of(path, page) {
-      Ok(bytes) => ReplyBody::ReadPage {
-        bytes: bytes.into_owned(),
-        total,
-        stamp: version,
-      },
-      // A file held by its content-plane object alone (A-760 (b) 4b): never met until piece 4d, which reads it.
-      Err(unread) => refused(Refusal::Unsupported {
-        feature: format!("a read of {unread}"),
-      }),
-    },
+    Some((page, total)) => {
+      match crate::vcs_store::named_objects::page_of(path, page, range, plane.as_ref()) {
+        Ok(bytes) => ReplyBody::ReadPage {
+          bytes: bytes.into_owned(),
+          total,
+          stamp: version,
+        },
+        // Its windows let go, or not here: refused typed, never read as empty.
+        Err(_) => refused(Refusal::ContentUnavailable),
+      }
+    }
     None => refused(Refusal::NotFound),
   }
 }

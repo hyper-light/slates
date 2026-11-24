@@ -71,6 +71,7 @@ pub mod cold;
 pub mod content;
 pub mod cut;
 pub mod derived;
+mod filter;
 pub mod index;
 pub mod mrc;
 pub mod partition;

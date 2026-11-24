@@ -222,6 +222,9 @@ struct Svn {
   /// The environment every command runs with beside `LC_ALL` (a route's own switches: HTTP v1's,
   /// [`HTTP_V1_SWITCH`]); none for most routes.
   env: Vec<(String, String)>,
+  /// The wall time this session's commands have taken ([`Svn::run`], and the tools charged to it by [`Svn::charged`]),
+  /// so the use test can print each verb's time a leg (main's r546: a round cut at its bound had said nothing).
+  spent: std::cell::Cell<Duration>,
 }
 
 impl Svn {
@@ -239,7 +242,19 @@ impl Svn {
       session: session.to_owned(),
       options,
       env: Vec::new(),
+      spent: std::cell::Cell::new(Duration::ZERO),
     }
+  }
+
+  /// Runs `step` (a stock tool's command on this session's behalf: `svnrdump`, `svnsync`, `svnadmin`), its wall time
+  /// added to the session's [`Svn::spent`].
+  fn charged<T>(&self, step: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let answer = step();
+    self
+      .spent
+      .set(self.spent.get().saturating_add(started.elapsed()));
+    answer
   }
 
   /// The path of the session's working copy `name`.
@@ -260,9 +275,13 @@ impl Svn {
       .stderr(Stdio::piped())
       .spawn()
       .unwrap();
+    let started = Instant::now();
     let out = read_on_a_thread(child.stdout.take().unwrap());
     let err = read_on_a_thread(child.stderr.take().unwrap());
-    let code = exit_within(&mut child, &format!("svn {args:?} in {dir}"));
+    let code = exited_within(child, PATIENCE, &format!("svn {args:?} in {dir}"));
+    self
+      .spent
+      .set(self.spent.get().saturating_add(started.elapsed()));
     (code, out.join().unwrap(), err.join().unwrap())
   }
 
@@ -283,27 +302,54 @@ fn read_on_a_thread(mut from: impl Read + Send + 'static) -> std::thread::JoinHa
   })
 }
 
-/// Waits for `child` to end within [`PATIENCE`], killing it and failing the test past that: its exit code, -1 where a
-/// signal ended it.
-fn exit_within(child: &mut Child, what: &str) -> i32 {
-  let started = Instant::now();
-  loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      return status.code().unwrap_or(-1);
+/// Waits for `child` to end within `bound`, killing it and failing the test past that: its exit code, -1 where a signal
+/// ended it. The wait blocks on the child's own exit, on a thread that owns it, and this thread waits on that thread's
+/// word with the bound, so the command costs what it takes: until 2026-11-23 the harness polled every [`POLL`], a timed
+/// sleep a host's timer policy stretches (launchd's, 10 ms to about 76 ms), paid by every one of a round's thousands of
+/// commands (main's r546, killed at 5,400 s; [`a_commands_wait_takes_no_timed_pause`]).
+fn exited_within(child: Child, bound: Duration, what: &str) -> i32 {
+  let pid = child.id();
+  let (told, word) = std::sync::mpsc::channel();
+  let waiter = std::thread::spawn(move || {
+    let mut child = child;
+    let _ = told.send(child.wait());
+  });
+  match word.recv_timeout(bound) {
+    Ok(status) => {
+      let _ = waiter.join();
+      status.unwrap().code().unwrap_or(-1)
     }
-    if started.elapsed() > PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{what} ran past {PATIENCE:?} and was killed");
+    Err(_) => {
+      // Still unreaped (its waiter has not returned), so the pid is still this child's.
+      killed(pid);
+      let _ = waiter.join();
+      panic!("{what} ran past {bound:?} and was killed");
     }
-    pause();
   }
 }
 
+/// Kills process `pid`, a child of this process that its waiter has not reaped.
+fn killed(pid: u32) {
+  #[cfg(unix)]
+  let _ = Command::new("kill")
+    .args(["-KILL", &pid.to_string()])
+    .status();
+  #[cfg(windows)]
+  let _ = Command::new("taskkill")
+    .args(["/F", "/PID", &pid.to_string()])
+    .status();
+}
+
 fn pause() {
+  PAUSES.with(|pauses| pauses.set(pauses.get().saturating_add(1)));
   // The harness paces its polls; shipped code parks on its driver (D-9).
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(POLL);
+}
+
+thread_local! {
+  /// Counter: this thread's [`pause`]s, for [`a_commands_wait_takes_no_timed_pause`]'s non-vacuity.
+  static PAUSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Writes `text` as working copy `copy`'s [`FILE`]: the test writes the file stock `svn` commits, inside the scratch
@@ -2827,18 +2873,7 @@ fn tool_with(
     .unwrap();
   let out = read_on_a_thread(child.stdout.take().unwrap());
   let err = read_on_a_thread(child.stderr.take().unwrap());
-  let started = Instant::now();
-  let code = loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      break status.code().unwrap_or(-1);
-    }
-    if started.elapsed() > USE_PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{program} {args:?} in {dir} ran past {USE_PATIENCE:?}");
-    }
-    pause();
-  };
+  let code = exited_within(child, USE_PATIENCE, &format!("{program} {args:?} in {dir}"));
   (code, out.join().unwrap(), err.join().unwrap())
 }
 
@@ -2942,7 +2977,41 @@ fn canonical_tags(text: &str) -> String {
   out
 }
 
-/// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out.
+/// `text`, an `svn info -R --xml` answer made plain ([`UseLeg::plain`], so each `<entry ...>` tag is one line), with its
+/// entries in text order and everything around them as answered: stock `svn` lists a directory's children in the order
+/// its hash of them iterates (`libsvn_client/info.c` `push_dir_info` walks `svn_ra_get_dir2`'s hash unsorted), and APR
+/// seeds every hash afresh (`apr_hash_make`, from the clock and the table's address), so the order is no part of an
+/// answer. Found by main's round r202 (2026-11-23, reads.dump over HTTP): seven `info` differences, each the same
+/// entries in another order.
+fn info_entries_in_order(text: &str) -> String {
+  let mut head = String::new();
+  let mut entries: Vec<String> = Vec::new();
+  let mut tail = String::new();
+  for line in text.split_inclusive('\n') {
+    if line.starts_with("<entry") {
+      entries.push(String::new());
+    }
+    match entries.last_mut() {
+      Some(entry) if tail.is_empty() => {
+        entry.push_str(line);
+        if line.trim_end() == "</info>" {
+          // The closing tag is no part of the last entry.
+          let kept = entry.len().saturating_sub(line.len());
+          entry.truncate(kept);
+          tail.push_str(line);
+        }
+      }
+      Some(_) => tail.push_str(line),
+      None => head.push_str(line),
+    }
+  }
+  entries.sort();
+  head + &entries.concat() + &tail
+}
+
+/// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out. A symbolic link is held
+/// as `link TARGET`, the text Subversion keeps for a link (`svn:special`), never read through: a link may name a
+/// directory, and r202's git-2000 round read one as a file ([`a_working_copys_symbolic_links_are_held_as_links`]).
 #[allow(clippy::disallowed_methods)] // test code: reads the working copies stock `svn` wrote
 fn tree_of(copy: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
   let mut files = std::collections::BTreeMap::new();
@@ -2954,16 +3023,23 @@ fn tree_of(copy: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
       if entry.file_name() == ".svn" {
         continue;
       }
-      if entry.file_type().unwrap().is_dir() {
+      let kind = entry.file_type().unwrap();
+      if kind.is_dir() {
         stack.push(path);
-      } else {
-        let relative = path
-          .strip_prefix(copy)
-          .unwrap()
-          .to_string_lossy()
-          .into_owned();
-        files.insert(relative, std::fs::read(&path).unwrap());
+        continue;
       }
+      let relative = path
+        .strip_prefix(copy)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      let bytes = if kind.is_symlink() {
+        let target = std::fs::read_link(&path).unwrap();
+        format!("link {}", target.to_string_lossy()).into_bytes()
+      } else {
+        std::fs::read(&path).unwrap()
+      };
+      files.insert(relative, bytes);
     }
   }
   files
@@ -3138,9 +3214,16 @@ fn use_verb_compared(
       let [a, b] = legs.map(|leg| leg.answer(scratch, &args));
       compare(failed, verb, "0:HEAD", &a, &b);
     }
-    "info" => at_each(failed, &|at| {
-      words(&["info", "-R", "--xml", &format!("{{url}}@{at}")])
-    }),
+    "info" => {
+      // A recursive info lists each directory's children in the client's hash order, seeded afresh each run
+      // ([`info_entries_in_order`]).
+      for at in sampled {
+        let target = format!("{{url}}@{at}");
+        let args = ["info", "-R", "--xml", target.as_str()];
+        let [a, b] = legs.map(|leg| info_entries_in_order(&leg.answer(scratch, &args)));
+        compare(failed, verb, &format!("r{at}"), &a, &b);
+      }
+    }
     "checkout" | "update" | "switch" | "blame" => {
       working_copies_compared(verb, legs, scratch, sampled, failed);
     }
@@ -3158,16 +3241,49 @@ fn use_verb_compared(
       words(&["proplist", "--revprop", "-v", "--xml", "-r", at, "{url}"])
     }),
     "dump" => {
-      let [a, b] = legs.map(|leg| rdump_of(leg, scratch));
+      let [a, b] = legs.map(|leg| leg.svn.charged(|| rdump_of(leg, scratch)));
       compare(failed, "svnrdump dump", "0:HEAD", &a, &b);
     }
     "svnsync" => {
-      let [a, b] = legs.map(|leg| mirror_dump_of(leg, (scratch, root)));
+      let [a, b] = legs.map(|leg| leg.svn.charged(|| mirror_dump_of(leg, (scratch, root))));
       compare(failed, "svnsync", "0:HEAD", &a, &b);
     }
     "commit" | "copy" | "merge" | "propset" => {}
     other => failed.push(format!("{other}: no such verb in the comparison")),
   }
+}
+
+/// Runs one verb's comparison, `run`, printing as it starts and as it ends: its wall time, each leg's share of it (the
+/// time its commands took, [`Svn::spent`]) and the differences found so far, so a round cut at its bound shows how far
+/// it got and which server was slow (main's r546, killed at 5,400 s, had printed nothing past its daemon's start).
+fn timed_verb<T>(
+  verb: &str,
+  legs: [&UseLeg; 2],
+  failed: &mut Vec<String>,
+  run: impl FnOnce(&mut Vec<String>) -> T,
+) -> T {
+  eprintln!("svn use: {verb}: started");
+  let before = legs.map(|leg| leg.svn.spent.get());
+  let started = Instant::now();
+  let answer = run(failed);
+  let [a, b] = [0, 1].map(|at| {
+    legs
+      .get(at)
+      .zip(before.get(at))
+      .map_or(Duration::ZERO, |(leg, then)| {
+        leg.svn.spent.get().saturating_sub(*then)
+      })
+  });
+  eprintln!(
+    "svn use: {verb}: {:.1} s ({} {:.1} s, {} {:.1} s); {} differences so far",
+    started.elapsed().as_secs_f64(),
+    legs[0].name,
+    a.as_secs_f64(),
+    legs[1].name,
+    b.as_secs_f64(),
+    failed.len()
+  );
+  answer
 }
 
 /// `verb` (checkout, update, switch or blame) at each of `sampled` as a working copy on both legs, compared.
@@ -3495,7 +3611,9 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
   let mut ran = Vec::new();
   for verb in &verbs {
     ran.push(verb.clone());
-    use_verb_compared(verb, legs, (&scratch.path, &root), &sampled, &mut failed);
+    timed_verb(verb, legs, &mut failed, |failed| {
+      use_verb_compared(verb, legs, (&scratch.path, &root), &sampled, failed);
+    });
   }
   // The writing verbs, as one session of edits on each server, then each written revision's log, the servers' own
   // stamps (author, date) left out.
@@ -3504,8 +3622,11 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     .filter(|verb| verbs.iter().any(|named| named == verb))
     .collect();
   if !writes.is_empty() {
-    let logs = legs.map(|leg| use_writes_logged(leg, &scratch.path, &writes));
-    compare(&mut failed, &writes.join("+"), "HEAD", &logs[0], &logs[1]);
+    let named = writes.join("+");
+    let logs = timed_verb(&named, legs, &mut failed, |_| {
+      legs.map(|leg| use_writes_logged(leg, &scratch.path, &writes))
+    });
+    compare(&mut failed, &named, "HEAD", &logs[0], &logs[1]);
   }
   println!(
     "svn correctness by use: {} revisions, sampled {:?}; verbs {ran:?}; {} differences between {} and {}",
@@ -3516,6 +3637,20 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     slates_leg.name
   );
   assert!(failed.is_empty(), "differences:\n{}", failed.join("\n"));
+}
+
+/// Main 01a20182's order (r546, 2026-11-23: the use test over HTTP with git-2000.dump killed at its 5,400 s bound, the
+/// test thread found sleeping in the harness's poll between short-lived `svn` children, the daemon at 32 s of CPU in 28
+/// minutes). A stock command's wait must not be a timed sleep: on a host whose timer policy stretches a sleep (launchd's
+/// stretches 10 ms to about 76 ms), every command pays it. Do: run `sh -c 'sleep 0.1'`, longer than the poll, through
+/// [`tool`], counting this thread's [`pause`]s. Expect it to end with status 0 and no pause taken.
+#[cfg(unix)]
+#[test]
+fn a_commands_wait_takes_no_timed_pause() {
+  let before = PAUSES.with(std::cell::Cell::get);
+  let (code, _, err) = tool("sh", ".", &["-c", "sleep 0.1"]);
+  let paused = PAUSES.with(std::cell::Cell::get).saturating_sub(before);
+  assert_eq!((code, paused), (0, 0), "{err}");
 }
 
 /// The comparison's own rule ([`canonical_tags`]). Do: put the two attribute orders the first run of
@@ -3584,6 +3719,81 @@ fn a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from() {
     over_tunnel, over_file,
     "the mirror over {} (left) and over {} (right)",
     tunnel.name, local.name
+  );
+}
+
+/// The comparison's rule for a recursive info ([`info_entries_in_order`]). Do: put r202's two answers to `svn info -R
+/// --xml` at revision 1 (the root, then `branches`, `tags` and `trunk` in two orders, each directory's entry whole)
+/// through it, and an answer whose `tags` entry names another revision. Expect the first two one text, what precedes
+/// the entries and the closing tag kept, and the third still different from them.
+#[test]
+fn an_infos_entry_order_is_no_part_of_an_answer() {
+  let entry = |path: &str, revision: u32| {
+    format!(
+      "<entry kind=\"dir\" path=\"{path}\" revision=\"{revision}\">\n<url><repository>/{path}</url>\n</entry>\n"
+    )
+  };
+  let head = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<info>\n";
+  let root = "<entry kind=\"dir\" path=\"<repository>\" revision=\"1\">\n<url><repository></url>\n</entry>\n";
+  let stock = format!(
+    "{head}{root}{}{}{}</info>\n",
+    entry("trunk", 1),
+    entry("branches", 1),
+    entry("tags", 1)
+  );
+  let slates = format!(
+    "{head}{root}{}{}{}</info>\n",
+    entry("tags", 1),
+    entry("trunk", 1),
+    entry("branches", 1)
+  );
+  assert_eq!(
+    info_entries_in_order(&stock),
+    info_entries_in_order(&slates)
+  );
+  assert!(info_entries_in_order(&stock).starts_with(head));
+  assert!(info_entries_in_order(&stock).ends_with("</info>\n"));
+  let changed = format!(
+    "{head}{root}{}{}{}</info>\n",
+    entry("tags", 2),
+    entry("trunk", 1),
+    entry("branches", 1)
+  );
+  assert_ne!(
+    info_entries_in_order(&stock),
+    info_entries_in_order(&changed)
+  );
+}
+
+/// The comparison's reading of a working copy ([`tree_of`]): a symbolic link is held as the link it is, never read
+/// through. Found by main's round r202 (2026-11-23, git-2000 over HTTP): git/git's history holds symbolic links, which
+/// stock `svn` checks out as links (`svn:special`), and one naming a directory was read as a file (`IsADirectory`, the
+/// harness's panic at `tree_of`). Do: in a scratch directory, make a directory, a file in it, a link to the directory
+/// and a link to the file, and read the tree. Expect the file once under its own path and each link as its target,
+/// with nothing read through either.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn a_working_copys_symbolic_links_are_held_as_links() {
+  let scratch = Scratch::new("tree-links");
+  made_directory(&format!("{}/dir", scratch.path));
+  std::fs::write(format!("{}/dir/file", scratch.path), "bytes\n").unwrap();
+  std::os::unix::fs::symlink("dir", format!("{}/to-dir", scratch.path)).unwrap();
+  std::os::unix::fs::symlink("dir/file", format!("{}/to-file", scratch.path)).unwrap();
+  let tree = tree_of(&scratch.path);
+  let paths: Vec<&str> = tree.keys().map(String::as_str).collect();
+  assert_eq!(paths, ["dir/file", "to-dir", "to-file"]);
+  assert_eq!(
+    tree.get("dir/file").map(Vec::as_slice),
+    Some(&b"bytes\n"[..])
+  );
+  assert_eq!(
+    tree.get("to-dir").map(Vec::as_slice),
+    Some(&b"link dir"[..])
+  );
+  assert_eq!(
+    tree.get("to-file").map(Vec::as_slice),
+    Some(&b"link dir/file"[..])
   );
 }
 

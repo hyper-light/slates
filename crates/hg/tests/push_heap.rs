@@ -15,7 +15,7 @@
 use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::{HgIndex, Log};
 use slates_hg::manifest::{self, Entry, Flag};
-use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::push::intake::{Intake, PushSegment, Stepped};
 use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, NULL_NODE, Node, node};
@@ -318,7 +318,7 @@ fn churned(payload: &[u8]) -> u64 {
       intake.cut_rest();
     }
     while let Some(segment) = intake.take_segment() {
-      let _record = intake.segment_record(&segment, u64::MAX, &store).unwrap();
+      let _record = whole_record(&intake, &segment, u64::MAX, &store);
     }
     match stepped {
       Stepped::More => {}
@@ -647,6 +647,9 @@ fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
   };
   let rows = fork.rows().rows();
   // In integers: f64's log₃ of a power of three can fall just short of it (243 gives 4.999999999999999).
+  // The rule weighs bytes (⌊log₃(own bytes ÷ the fewest bytes a seal writes)⌋ + 1), but the fewest bytes a seal
+  // writes is the data's: a small row cut before a row near a window long makes a short table. A seal writes a row at
+  // least, so the bound in rows is the one that holds for any data, looser than the bytes bound.
   let bound = u64::from(rows.checked_ilog(3).unwrap_or(0)) + 1;
   println!(
     "push_heap: {rows} rows, {} seals, {} tiered merges, the most own runs {} (bound {bound})",
@@ -664,4 +667,16 @@ fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
     "the fork held {} runs of its own, past the bound {bound} at {rows} rows",
     intaken.most_own_runs
   );
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }

@@ -354,7 +354,7 @@ proptest::proptest! {
         7 => {
           for twin in &mut twins {
             let checkpoint = twin.green.checkpoint(head).unwrap();
-            twin.green = Green::restore(crate::origin::Origin::default(), &mut checkpoint.clone()).unwrap();
+            twin.green = Green::restore(crate::origin::Origin::default(), &checkpoint);
           }
           floor = head;
         }

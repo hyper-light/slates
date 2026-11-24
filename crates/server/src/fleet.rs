@@ -2041,41 +2041,30 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 #[cfg(test)]
 pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
-  let retired = retired_hosts(state);
+  let regional = state.council.configuration().clone();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
-    reconcile_held_copy(state, object, generation, &retired);
+    reconcile_held_copy(state, object, generation, &regional);
   }
-}
-
-/// The hosts the council's configuration keeps a retirement of.
-#[cfg(test)]
-fn retired_hosts(state: &ShardState) -> std::collections::BTreeSet<HostId> {
-  state
-    .council
-    .configuration()
-    .retired
-    .keys()
-    .copied()
-    .collect()
 }
 
 /// One held copy's authority brought into step, `object`'s, as an install's walk does it a copy a turn
 /// ([`install_on_copy`]; `reconcile_held_authority`, the unit tests' oracle, does it to every copy at once): moved to
-/// the owner this node's routing names, at `generation`. A move away from a retired owner is recorded with the copy
-/// (A-251): once the authority names the successor, only that record says the copy was the retired owner's, which a
-/// takeover round's listing needs.
+/// the owner this node's routing names, at `generation`. A move away from an owner `regional` keeps a retirement of is
+/// recorded with the copy, with that retirement's version (A-251, A-883): once the authority names the successor, only
+/// that record says the copy was the retired owner's, which a takeover round's listing needs, and only its retirement
+/// says which round: a host admitted again under its id retires again, and its later rounds are not this one.
 fn reconcile_held_copy(
   state: &mut ShardState,
   object: ObjectId,
   generation: u64,
-  retired: &std::collections::BTreeSet<HostId>,
+  regional: &slates_db::register::RegionalConfiguration,
 ) {
   if let Some(owner) = state.fleet.object_owner(object)
     && let Some(acceptor) = state.holder_records.get_mut(&object)
   {
-    let from_retired = retired.contains(&acceptor.owner());
-    let _ = acceptor.move_authority(Authority { generation, owner }, from_retired);
+    let retired_at = regional.retirement_version(acceptor.owner());
+    let _ = acceptor.move_authority(Authority { generation, owner }, retired_at);
   }
 }
 
@@ -10398,7 +10387,6 @@ fn install_slice(s: &mut ShardState, local: HostId, version: u64) -> bool {
     .or_else(futures::step_budget_ns)
     .unwrap_or(s.config.runtime.step_budget_ns);
   let regional = s.council.configuration().clone();
-  let retired: std::collections::BTreeSet<HostId> = regional.retired.keys().copied().collect();
   let began = futures::now_ns();
   let mut after = walk.after;
   loop {
@@ -10416,7 +10404,7 @@ fn install_slice(s: &mut ShardState, local: HostId, version: u64) -> bool {
       s.count(INSTALL_WALKED, 1);
       return false;
     };
-    install_on_copy(s, local, (&regional, &retired), version, object);
+    install_on_copy(s, local, &regional, version, object);
     after = Some(object);
     if futures::now_ns().saturating_sub(began) >= quantum {
       break;
@@ -10437,10 +10425,7 @@ fn install_slice(s: &mut ShardState, local: HostId, version: u64) -> bool {
 pub(crate) fn install_on_copy(
   s: &mut ShardState,
   local: HostId,
-  (regional, retired): (
-    &slates_db::register::RegionalConfiguration,
-    &std::collections::BTreeSet<HostId>,
-  ),
+  regional: &slates_db::register::RegionalConfiguration,
   generation: u64,
   object: ObjectId,
 ) {
@@ -10450,7 +10435,7 @@ pub(crate) fn install_on_copy(
     acceptor.raise_fence(*epoch);
   }
   crate::takeover::resolve_held_object(s, local, regional, object);
-  reconcile_held_copy(s, object, generation, retired);
+  reconcile_held_copy(s, object, generation, regional);
 }
 
 /// Fans the control shard's current committed configurations — the council's placement `Configuration` and the
@@ -10781,15 +10766,18 @@ pub(crate) fn fan_failover() {
 
 /// Refreshes this node's failover estimate for the period (§4.8 "Derived constants", A-363): the detection term from the
 /// member plane (SWIM's count of periods from a crashed peer's last answer to its condemnation, each at the detector's
-/// measured period's running tail, `MemberPlane::detection`), and the confirmation from the council's election timing
+/// measured period's running tail, and at least the bound the detector states while a pair is still judged by its own
+/// retransmission timer, A-882; `MemberPlane::detection`, read on the clock the plane is stepped by), and the
+/// confirmation from the council's election timing
 /// this period derived, at the coordinator's measured period. The recovery term moves as takeovers and volumes complete
 /// (`takeover::drive_host_takeover`, `fleet::materialize`). Nothing sets the estimate: it is what this node measured.
 fn refresh_failover(state: &mut ShardState) {
+  let now_ns = slates_machine::clock::monotonic_ns();
   let detection = state
     .plane
     .plane
     .as_ref()
-    .and_then(slates_cluster::member_plane::MemberPlane::detection);
+    .and_then(|plane| plane.detection(now_ns));
   let timing = state.council_timing;
   state.failover.refresh(detection, &timing, HEARTBEAT_NS);
   publish_failover(state);

@@ -156,6 +156,8 @@ pub mod observe;
 mod owner_location;
 mod staging;
 #[cfg(test)]
+pub(crate) mod test_lane;
+#[cfg(test)]
 pub(crate) mod test_store;
 
 /// The repository content store's window storage over a shard's chunk store (A-727 a2, A-877), its placeholder page

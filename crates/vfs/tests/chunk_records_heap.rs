@@ -32,7 +32,7 @@ const FILE: usize = 100;
 /// Derived: the heap a chunk store's first chunk may make. Its table grows a segment at a time, and a segment is the
 /// records a page holds, so the first chunk makes one page of records; the segments' own table and the slab's free list
 /// take a few pointers more. So at most two pages.
-const FIRST_CHUNK_BYTES: i64 = 2 * PAGE as i64;
+const FIRST_CHUNK_BYTES: usize = 2 * PAGE;
 
 thread_local! {
   /// The heap bytes this thread allocated less those it freed.
@@ -103,8 +103,9 @@ fn a_chunk_stores_first_chunk_makes_a_page_of_records_not_a_page_count_of_them()
   let kept = live_bytes() - before;
   println!("the first chunk kept {kept} bytes of heap");
   assert!(sealed.is_some(), "the file is sealed into a chunk");
+  let bound = i64::try_from(FIRST_CHUNK_BYTES).expect("the bound fits the count's width");
   assert!(
-    kept <= FIRST_CHUNK_BYTES,
+    kept <= bound,
     "the first chunk kept {kept} bytes, past {FIRST_CHUNK_BYTES}"
   );
 }

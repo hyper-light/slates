@@ -19,12 +19,61 @@ use slates_vfs::host::tree::{TreeEntry, TreeSource};
 pub(crate) struct GreenTree<'a> {
   green: &'a Green,
   version: u64,
+  /// The shard's content plane, where a file the green holds by its object's name alone is read (A-760 (b) 4d); none
+  /// for a reader without one, which refuses such a file.
+  plane: Option<crate::vcs_store::named_objects::PlaneObjects<'a>>,
 }
 
 impl<'a> GreenTree<'a> {
-  /// `green` at `version`.
+  /// `green` at `version`, reading no content plane.
   pub(crate) fn at(green: &'a Green, version: u64) -> GreenTree<'a> {
-    GreenTree { green, version }
+    GreenTree {
+      green,
+      version,
+      plane: None,
+    }
+  }
+
+  /// [`GreenTree::at`], a named file read through `plane`, the shard's content plane.
+  pub(crate) fn reading(
+    green: &'a Green,
+    version: u64,
+    plane: Option<crate::vcs_store::named_objects::PlaneObjects<'a>>,
+  ) -> GreenTree<'a> {
+    GreenTree {
+      green,
+      version,
+      plane,
+    }
+  }
+
+  /// At most `into`'s length of the object `identity`'s bytes from `offset`, read through the plane: how many. A read
+  /// past its end reads none; one the plane cannot give now (its windows let go, or no plane) is the try-again answer.
+  fn read_named(
+    &self,
+    identity: slates_merge::named::Identity,
+    offset: u64,
+    into: &mut [u8],
+  ) -> Result<usize, HostError> {
+    use slates_merge::named::Objects;
+    let left = identity.len.saturating_sub(offset);
+    let take = usize::try_from(left).unwrap_or(usize::MAX).min(into.len());
+    if take == 0 {
+      return Ok(0);
+    }
+    let objects = self.plane.as_ref().ok_or_else(named_unread)?;
+    let into = into.get_mut(..take).ok_or_else(named_unread)?;
+    if objects.read(&identity, offset, into).is_err() {
+      // Its windows let go (main's ruling (B)): noted for the call's async frame, which brings them back and serves
+      // the read again (`named_objects::away_scope`); the try-again answer stays inside the bridge.
+      crate::vcs_store::named_objects::note_if_away(
+        objects,
+        identity,
+        (offset, u64::try_from(take).unwrap_or(u64::MAX)),
+      );
+      return Err(named_unread());
+    }
+    Ok(take)
   }
 
   /// Whether the version is the head (nothing changed since).
@@ -143,9 +192,13 @@ impl TreeSource for GreenTree<'_> {
     let want = u64::try_from(into.len()).unwrap_or(u64::MAX);
     // Lent from the head at the head; a page of the file at the version otherwise.
     if self.at_head() {
-      let content = self.green.content(path).ok_or(HostError::NotFound)?;
-      let bytes = crate::vcs_store::named_objects::lent_bytes_of(path, content)
-        .map_err(|_| named_unread())?;
+      let bytes = match self.green.content(path).ok_or(HostError::NotFound)? {
+        slates_merge::engine::Content::Bytes(bytes) => bytes,
+        // Held by its object's name alone (A-760 (b) 4d): read through the plane.
+        slates_merge::engine::Content::Named(identity) => {
+          return self.read_named(identity, offset, into);
+        }
+      };
       let start = usize::try_from(offset)
         .unwrap_or(usize::MAX)
         .min(bytes.len());
@@ -161,7 +214,12 @@ impl TreeSource for GreenTree<'_> {
       .green
       .content_page_at(path, self.version, (offset, want))
       .ok_or(HostError::NotFound)?;
-    let page = crate::vcs_store::named_objects::bytes_of(path, page).map_err(|_| named_unread())?;
+    let page = match page {
+      slates_merge::engine::ContentAt::Bytes(page) => page,
+      slates_merge::engine::ContentAt::Named(identity) => {
+        return self.read_named(identity, offset, into);
+      }
+    };
     let take = page.len().min(into.len());
     into
       .get_mut(..take)

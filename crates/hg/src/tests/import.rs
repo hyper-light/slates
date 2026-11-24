@@ -1420,7 +1420,7 @@ fn an_index_built_whole_is_read_from_one_merged_run() {
   assert!(before > 2, "a lookup visits every run first: {before}");
   // The server's upkeep merges an index built whole a table at a time (`vcs_store::index_upkeep`): the same steps here.
   let rows = imported.index.rows();
-  let mut merge = rows.merge_begin(&store, usize::MAX).unwrap();
+  let mut merge = rows.merge_begin(&mut store, usize::MAX).unwrap().unwrap();
   while rows.merge_step(&mut store, &mut merge).unwrap() == slates_vcs::MergeStep::More {}
   let (after, rows_after) = visited(&mut imported, &store);
   assert_eq!(

@@ -385,6 +385,20 @@ pub struct ShardState {
   /// listener or connection made them, created with the first v4 state call under the configuration's
   /// derived bounds.
   pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
+  /// The NFS calls parked on reads of a named text's let-go windows while they come back (A-760 (b) 4d), bounded by
+  /// the connections the listener holds (each serves one call at a time).
+  pub(crate) nfs_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The FUSE requests parked so (A-760 (b) 4d), one a mount, bounded by the attachments a shard admits.
+  #[cfg(target_os = "linux")]
+  pub(crate) fuse_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The WinFsp requests parked so (A-760 (b) 4d), one a mount, bounded by the attachments a shard admits.
+  #[cfg(windows)]
+  pub(crate) winfsp_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The client requests parked so (A-760 (b) 4d), bounded as a shard's parked requests are (its clients' slots).
+  pub(crate) verb_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The parked requests being run again over their brought-back windows: one met a let-go window again is a bug,
+  /// answered as it ran, never parked twice.
+  pub(crate) verb_resuming: std::collections::BTreeSet<(u64, slates_wire::request::RequestId)>,
   /// The delegation recalls waiting for each session's back channel (`crate::delegation`; bounded by the delegations
   /// each client holds).
   pub(crate) recall_queues: std::collections::BTreeMap<
@@ -1262,6 +1276,9 @@ pub struct ShardState {
   /// Test support: this shard refuses every NFSv4 purge sent to it (`Daemon::inject_nfs_purge_refusal`), as an owner
   /// that cannot make the drop durable does, so a test can leave a purge owed across a restart.
   pub(crate) nfs_purges_refused: bool,
+  /// Test support: this shard runs no teardown slice (`Daemon::inject_teardown_hold`), so a test can hold a destroy's
+  /// teardown where it is and see a create that waits for it refused at its bound (A-884).
+  pub(crate) teardowns_held: bool,
   /// When the deadline keeper next hands a purge round to the reaper (A-570, `crate::nfs::note_purges`): at once at a
   /// start whose partition owes purges, a retry window on while the NFSv4 table owes any; `None` while none is owed.
   pub(crate) nfs_purge_at: Option<u64>,
@@ -1278,6 +1295,9 @@ pub struct ShardState {
   /// Whether a sweep pass is asked for or under way (A-715): set by the keeper at `idle_sweep_at`, cleared by the sweep
   /// as its pass ends, so nothing arms another while one runs.
   pub(crate) idle_sweep_running: bool,
+  /// Whether a pass's give-back, which other work interrupted (A-226), waits for the shard's next idle point, where the
+  /// shard's idle work wakes the sweep to resume it ([`crate::idle_sweep::idle_work`]). The pass is under way meanwhile.
+  pub(crate) give_back_waits_idle: bool,
   /// The content arena's allocation count and allocated bytes as the last sweep pass ended (A-715): a borrow that finds
   /// either changed owes a sweep (a write's allocation, a delete's free once published).
   pub(crate) idle_sweep_seen: (u64, usize),
@@ -1659,7 +1679,10 @@ impl std::fmt::Display for StateAccess {
 /// already borrowed (a nested borrow is a bug, counted by the caller), the shard is fenced, or the
 /// retention check that closes every borrow refused (the borrow ran; its result is discarded).
 pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, StateAccess> {
-  STATE.with(|cell| {
+  // Through `try_with`: a shard's state stays installed until its thread ends, so its values drop in the thread's
+  // local storage teardown, and one whose `Drop` borrows the state then (a landing turn giving itself back) finds it
+  // `Absent`, never a panic in a destructor (CLAUDE.md section 2 item 6).
+  let reached = STATE.try_with(|cell| {
     let mut guard = cell.try_borrow_mut().map_err(|_| StateAccess::Borrowed)?;
     let state = guard.as_mut().ok_or(StateAccess::Absent)?;
     if state.consensus_failure.is_some() {
@@ -1672,9 +1695,12 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     crate::base_hints::after_borrow(state);
     // A write, free or allocation the idle sweep owes a pass arms it (A-715).
     crate::idle_sweep::after_borrow(state);
+    // An open staging buffer goes with its attachment, however the borrow ended it (A-880).
+    crate::staging::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
-  })
+  });
+  reached.unwrap_or(Err(StateAccess::Absent))
 }
 
 /// Borrows the state for the shutdown's release of what the process holds in the kernel (a FUSE mount, a Shards
@@ -1682,10 +1708,14 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
 /// record, but its mounts and streams must not outlive it. Nothing may write a record through this borrow; the records
 /// of what it releases end at the next start's recovery. `None` when the thread holds no state or it is borrowed.
 pub(crate) fn with_state_at_shutdown<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
-  STATE.with(|cell| {
-    let mut guard = cell.try_borrow_mut().ok()?;
-    guard.as_mut().map(f)
-  })
+  // Through `try_with`, as [`try_with_state`]: none once the thread's local storage is torn down.
+  STATE
+    .try_with(|cell| {
+      let mut guard = cell.try_borrow_mut().ok()?;
+      guard.as_mut().map(f)
+    })
+    .ok()
+    .flatten()
 }
 
 /// Borrows the state; `None` for any refusal [`try_with_state`] names — the form for a caller that
@@ -1719,7 +1749,8 @@ pub fn with_state_counted<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> 
     Ok(result) => return Some(result),
     Err(refusal) => refusal,
   };
-  LOST_STEPS.with(|cell| {
+  // Through `try_with`: a refusal met in the thread's local storage teardown has no shard left to report it to.
+  let _ = LOST_STEPS.try_with(|cell| {
     let mut lost = cell.get();
     match refusal {
       StateAccess::Borrowed => lost.borrowed = lost.borrowed.saturating_add(1),
@@ -1733,7 +1764,9 @@ pub fn with_state_counted<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> 
 
 /// The borrows this shard thread refused in a way that lost a step, so far.
 pub fn lost_steps() -> LostSteps {
-  LOST_STEPS.with(std::cell::Cell::get)
+  LOST_STEPS
+    .try_with(std::cell::Cell::get)
+    .unwrap_or_default()
 }
 
 /// Whether any client ring on this thread holds a request (the poller's question).
@@ -1821,7 +1854,8 @@ struct Undelivered {
 }
 
 fn bump_undelivered(change: impl FnOnce(&mut Undelivered)) {
-  UNDELIVERED.with(|cell| {
+  // Through `try_with`, as [`try_with_state`]: a reply dropped in the thread's teardown counts nowhere.
+  let _ = UNDELIVERED.try_with(|cell| {
     let mut counts = cell.get();
     change(&mut counts);
     cell.set(counts);
@@ -1837,13 +1871,18 @@ pub(crate) const FORWARD_UNSERVABLE: &str = "fleet.forward.client.unservable";
 
 /// The replies `deliver` could not hand on, the state borrowed, on this thread so far.
 pub(crate) fn undelivered_borrowed() -> u64 {
-  UNDELIVERED.with(std::cell::Cell::get).borrowed
+  UNDELIVERED
+    .try_with(std::cell::Cell::get)
+    .unwrap_or_default()
+    .borrowed
 }
 
 /// The forwarded replies resent because their run met a borrowed state, and those no shard here could take, on this
 /// thread so far.
 pub(crate) fn forward_undelivered() -> (u64, u64) {
-  let counts = UNDELIVERED.with(std::cell::Cell::get);
+  let counts = UNDELIVERED
+    .try_with(std::cell::Cell::get)
+    .unwrap_or_default();
   (counts.forward_resent, counts.forward_unservable)
 }
 
@@ -1977,14 +2016,18 @@ impl PendingTombstone {
   }
 }
 
-/// A CLI attachment's pace (A-384): when it was last used, and the running estimate of the gaps between its uses
-/// (RFC 6298's estimator, as the failover estimate's terms are), so its term is its holder's own.
+/// A CLI attachment's pace (A-384): when it was last used, the running estimate of the gaps between its uses (RFC 6298's
+/// estimator, as the failover estimate's terms are), and the longest of them, so its term is its holder's own and never
+/// shorter than a silence its holder has already shown (`verbs::attachment_term`).
 #[derive(Debug, Default)]
 pub struct AttachmentPace {
   /// The shard's clock at its last use, or at its making.
   pub last_use_ns: u64,
   /// The gaps between its uses.
   pub gaps: slates_cluster::failover::RunningDuration,
+  /// The longest gap between two of its uses since its pace began (its making, or the shard's start): the silence its
+  /// holder has shown it keeps. A burst of uses lowers the running estimate, never this (A-384's floor, 2026-11-23).
+  pub longest_gap_ns: u64,
 }
 
 impl AttachmentPace {
@@ -1993,6 +2036,7 @@ impl AttachmentPace {
     AttachmentPace {
       last_use_ns: now_ns,
       gaps: slates_cluster::failover::RunningDuration::new(),
+      longest_gap_ns: 0,
     }
   }
 
@@ -2000,6 +2044,7 @@ impl AttachmentPace {
   pub fn used(&mut self, now_ns: u64) {
     if let Some(gap) = now_ns.checked_sub(self.last_use_ns) {
       self.gaps.on_sample(gap);
+      self.longest_gap_ns = self.longest_gap_ns.max(gap);
     }
     self.last_use_ns = now_ns;
   }

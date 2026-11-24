@@ -188,6 +188,10 @@ pub struct Counters {
   /// Tasks woken because a shard they asked for room drained its control channel, or left its loop
   /// ([`crate::room`]): the room wake's non-vacuity count.
   pub room_wakes: u64,
+  /// Parks begun with a task ready on the shard's own queue, which then waits out the park, its deadline or a kick,
+  /// however long that is: a lost wake. Idle work that wakes a task (a borrow's hook in the daemon's) and answers that
+  /// it did nothing left one so, until 2026-11-23 (A-881). Zero on a healthy shard.
+  pub parked_with_ready: u64,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
@@ -1425,8 +1429,10 @@ impl ShardContext {
         continue;
       }
       // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
-      // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
-      if self.idle_slice() {
+      // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time"). A slice that woke a task,
+      // whatever it answered, left that task to run, not to wait out a park: the daemon's idle work borrows its state,
+      // whose hooks may wake a task, and until 2026-11-23 the shard parked with it ready (A-881, `parked_with_ready`).
+      if self.idle_slice() || !self.local.is_empty() {
         // The driver is harvested between idle slices, as the idle spin harvests it each turn: a step queues only what
         // is already woken, and only a park, the spin or a busy stretch's quantum ask the driver, so without this a
         // socket's readiness waited for the idle work to run out (the daemon's memory sweep on idle time held live
@@ -1695,6 +1701,11 @@ impl ShardContext {
   /// protocol and its loom model: [`crate::parking`]).
   pub fn park(&self, deadline_ns: Option<u64>) {
     let _entered = registry::enter(self);
+    if !self.local.is_empty() {
+      self.with_inner(|inner| {
+        inner.counters.parked_with_ready = inner.counters.parked_with_ready.saturating_add(1)
+      });
+    }
     // What this wait is for; the next step measures how late it runs against it (`scheduler_overrun_ns`).
     self.waited_for_ns.set(deadline_ns);
     self.update_attribution(Tracker::wait_began);

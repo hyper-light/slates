@@ -378,8 +378,9 @@ fn step_clock_ns() -> u64 {
 /// Spaced by its own length: a sweep is armed no sooner after the last one completed than that one took. So the sweeps
 /// take at most half of a shard's time over any span however often status is asked (a poller asking every few
 /// milliseconds kept every shard sweeping), and what a request reads is at most two sweeps old. A request that finds the
-/// last sweep too recent is counted (`content_range.sweep.spaced`) and reads it. The shard has one idle-work slot and
-/// this is the daemon's only use of it since A-777 removed the arena reserve's refill.
+/// last sweep too recent is counted (`content_range.sweep.spaced`) and reads it. The shard has one idle-work slot,
+/// registered once at its start (`crate::idle_sweep::idle_work`, which also resumes an interrupted give-back there), and
+/// it advances an armed sweep through [`idle_slice`]; until 2026-11-23 arming registered this sweep's slice in it.
 fn arm(state: &mut ShardState) {
   if state.content_sweep.running {
     return;
@@ -393,19 +394,15 @@ fn arm(state: &mut ShardState) {
     state.content_sweep.spaced = state.content_sweep.spaced.saturating_add(1);
     return;
   }
-  let registered =
-    slates_rt::registry::with_current(|context| context.set_idle_work(Box::new(idle_slice)));
-  if matches!(registered, Some(Ok(()))) {
-    state.content_sweep.running = true;
-    state.content_sweep.armed = (now, state.content_sweep.sweeps);
-    state.content_sweep.armed_count = state.content_sweep.armed_count.saturating_add(1);
-  }
+  state.content_sweep.running = true;
+  state.content_sweep.armed = (now, state.content_sweep.sweeps);
+  state.content_sweep.armed_count = state.content_sweep.armed_count.saturating_add(1);
 }
 
 /// One slice of an armed sweep on the shard's idle time ([`arm`]): one [`advance`], bounded by half the step quantum as
 /// the shard's idle work must be. Whether it did anything: `false` once the armed sweep has completed (or none is armed,
 /// or the state is out of reach), so the shard parks, and an idle shard pays one flag read before each park after that.
-fn idle_slice() -> bool {
+pub(crate) fn idle_slice() -> bool {
   crate::state::with_state(|state| {
     if !state.content_sweep.running {
       return false;
@@ -781,8 +778,15 @@ mod tests {
   /// modelled step that truly costs 1.5 µs and 3 ns a page, each read on a clock rounded down to that tick at both ends,
   /// with half a microsecond of budget left a step and a vector page of 16,384 pages the most. Expect the steps to average
   /// at least nine tenths of the pages their fixed cost buys (1.5 µs ÷ 3 ns = 500). Red on the shard's clock, whose 1,000 ns tick gave
-  /// 333; a tick of a few tens of nanoseconds judges a page truly.
+  /// 333; a tick of a few tens of nanoseconds judges a page truly. Not in ThreadSanitizer's lane: its runtime intercepts
+  /// `clock_gettime` (compiler-rt's `sanitizer_common_interceptors.inc`), so a reading there costs hundreds of
+  /// nanoseconds and the measured tick is that cost, not the clock's (400 ns in diag run 45315777446, 2026-11-24, the
+  /// steps averaging 300 pages of the 450 asked). The test runs one thread, so the lane loses no race by it.
   #[test]
+  #[cfg_attr(
+    slates_tsan,
+    ignore = "ThreadSanitizer intercepts clock_gettime, so its readings of the step clock are 400 ns apart at the least (diag run 45315777446); the test judges the clock's own tick and runs one thread"
+  )]
   fn a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes() {
     const MOST: usize = 16_384;
     const STEPS: u64 = 20_000;
@@ -942,9 +946,16 @@ mod tests {
     sweeps
   }
 
+  /// Shape: the host memory bound the bounded sweep's daemon derives its sizes from: a gibibyte, a small container's,
+  /// so its plan is the same few hundred thousand pages on any host. A one-shard daemon sized by its host planned
+  /// 48,334,716 pages on adacachy2 (126 GiB; the sweep took 33.7 s in a debug build) against 393,231 bounded so (24 to
+  /// 71 ms), and under ThreadSanitizer, on CI's 16 GiB runner, the test ran past 90 minutes without ending (diag run
+  /// 45289949180, main run 45294047051, 2026-11-23), holding the lane's job toward GitHub's six-hour limit.
+  const SWEPT_MEMORY: u64 = 1 << 30;
+
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
-    let daemon = crate::daemon::audit_daemon();
+    let daemon = crate::daemon::audit_daemon_within(SWEPT_MEMORY);
     let (bound, arena_len, planned) = crate::daemon::observe_first(&daemon, |state| {
       let page = state.config.page.max(1);
       let targets = targets(state).0;

@@ -654,17 +654,25 @@ pub struct Base<'a> {
   /// where a length is read when neither the green nor this verb's fetch has it, so an edit after a rebase asks no one
   /// for a length the rebase already gave (A-808). `None` where no work's entries apply.
   pub entries: Option<&'a BTreeMap<String, slates_merge::increment::Base>>,
+  /// The shard's content plane, where a base file the green holds by its object's name alone is read (A-760 (b) 4d);
+  /// none for a base read without one, which refuses such a file [`BaseGone`].
+  pub(crate) plane: Option<crate::vcs_store::named_objects::PlaneObjects<'a>>,
 }
 
 impl<'a> Base<'a> {
   /// The base's bytes of `path`: `Ok(None)` when the base has no such file, `Err(BaseGone)` when the green is gone
-  /// and the base cannot be read, or the file is held by its content-plane object alone, which a work's base does not
-  /// read yet (A-760 (b) 4b; never met until piece 4d brings it back).
+  /// and the base cannot be read, or the file is held by its content-plane object alone and the plane cannot give it
+  /// now (A-760 (b) 4d: read through the plane otherwise).
   pub(crate) fn file(self, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
     if let Some(green) = self.green {
       return green
         .content_ref_at(path, self.version)
-        .map(|content| unread_gone(path, content))
+        .map(|content| match content {
+          slates_merge::engine::ContentAt::Bytes(bytes) => Ok(bytes),
+          named => crate::vcs_store::named_objects::whole_of(named, self.plane.as_ref())
+            .map(Cow::Owned)
+            .ok_or(BaseGone),
+        })
         .transpose();
     }
     match self.fetched {
@@ -726,7 +734,8 @@ impl<'a> Base<'a> {
       let (page, _) = green
         .content_page_at(path, self.version, (at, len))
         .ok_or(BaseGone)?;
-      return unread_gone(path, page).map(|page| Cow::Owned(page.into_owned()));
+      return unread_gone(path, page, (at, len), self.plane.as_ref())
+        .map(|page| Cow::Owned(page.into_owned()));
     }
     let fetched = self
       .fetched
@@ -762,18 +771,20 @@ impl<'a> Base<'a> {
   }
 }
 
-/// The base of a work cannot be read: its green is gone, or (A-760 (b) 4b) a file of it is held by its content-plane
-/// object alone, which a work's base does not read yet.
+/// The base of a work cannot be read: its green is gone, or (A-760 (b) 4d) a file of it is held by its content-plane
+/// object alone and the plane cannot give it now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BaseGone;
 
-/// A base file's content as its bytes, refused [`BaseGone`] for one held by its content-plane object alone (A-760 (b)
-/// 4b; never met until piece 4d brings it back).
+/// A base file's page (`Green::content_page_at`'s, at `range`) as its bytes, read through `plane` for one held by its
+/// content-plane object alone (A-760 (b) 4d): refused [`BaseGone`] where the plane cannot give them now.
 fn unread_gone<'a>(
   path: &str,
-  content: slates_merge::engine::ContentAt<'a>,
+  page: slates_merge::engine::ContentAt<'a>,
+  range: (u64, u64),
+  plane: Option<&crate::vcs_store::named_objects::PlaneObjects<'_>>,
 ) -> Result<Cow<'a, [u8]>, BaseGone> {
-  crate::vcs_store::named_objects::bytes_of(path, content).map_err(|_| BaseGone)
+  crate::vcs_store::named_objects::page_of(path, page, range, plane).map_err(|_| BaseGone)
 }
 
 /// The footprint a work's delta holds at one key: the path and what it holds of the file, the path alone for a removal.
@@ -856,13 +867,22 @@ impl WorkFiles {
   /// Every file the work sees, sorted by path: the base's files it did not change and the files it holds. Without
   /// the base (its green gone) only the files the work holds whole are known. The paths are owned, as the green's walk
   /// gives them (its maps are persistent radix trees, A-534).
-  /// Refused [`BaseGone`] at a base file held by its content-plane object alone (A-760 (b) 4b).
+  /// A base file held by its content-plane object alone is read through the plane, refused [`BaseGone`] where the
+  /// plane cannot give it now (A-760 (b) 4d).
   pub fn files<'a>(&'a self, base: Base<'a>) -> Result<Vec<SeenFile<'a>>, BaseGone> {
     let mut files: BTreeMap<String, Cow<'a, [u8]>> = match base.green {
       Some(green) => green
         .files_at(base.version)
         .into_iter()
-        .map(|(path, content)| Ok((path.clone(), unread_gone(&path, content)?)))
+        .map(|(path, content)| {
+          let bytes = match content {
+            slates_merge::engine::ContentAt::Bytes(bytes) => bytes,
+            named => crate::vcs_store::named_objects::whole_of(named, base.plane.as_ref())
+              .map(Cow::Owned)
+              .ok_or(BaseGone)?,
+          };
+          Ok((path.clone(), bytes))
+        })
         .collect::<Result<_, BaseGone>>()?,
       None => BTreeMap::new(),
     };
@@ -898,7 +918,12 @@ impl WorkFiles {
       None => match base.green {
         Some(green) => green
           .content_page_at(path, base.version, (offset, want))
-          .map(|(page, total)| Ok((unread_gone(path, page)?.into_owned(), total)))
+          .map(|(page, total)| {
+            Ok((
+              unread_gone(path, page, (offset, want), base.plane.as_ref())?.into_owned(),
+              total,
+            ))
+          })
           .transpose(),
         None => base.fetched_page(path, (offset, want)).ok_or(BaseGone),
       },
@@ -1268,6 +1293,7 @@ mod tests {
       fetched: None,
       version: 0,
       entries: None,
+      plane: None,
     };
     let mut files = WorkFiles::default();
     let at = u64::try_from(BIG / 2).unwrap();
@@ -1297,6 +1323,7 @@ mod tests {
       fetched: None,
       version: 0,
       entries: None,
+      plane: None,
     };
     let mut files = WorkFiles::default();
     let mut last = Vec::new();
@@ -1327,6 +1354,7 @@ mod tests {
       fetched: None,
       version: 0,
       entries: None,
+      plane: None,
     };
     let mut files = WorkFiles::default();
     files.splice(base, "old", (10, 0), b"INSERT").unwrap();

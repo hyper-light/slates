@@ -1875,9 +1875,10 @@ impl<'a> WireReader<'a> {
 pub struct Acceptor {
   id: HostId,
   authority: Authority,
-  /// The owner an install last moved this acceptor's authority from (A-251): a takeover moves a retired owner's copies
-  /// to its successor, and only this keeps whose object the copy was once the authority names the successor.
-  moved_from: Option<HostId>,
+  /// The owner an install last moved this acceptor's authority from, with the retirement that moved it (A-251, A-883):
+  /// a takeover moves a retired owner's copies to its successor, and only this keeps whose object the copy was once the
+  /// authority names the successor.
+  moved_from: Option<MovedFrom>,
   /// The owner whose record this copy holds, as far as this process knows (A-484, [`Acceptor::written_by`]).
   written_by: Option<HostId>,
   fence: Fence,
@@ -1920,14 +1921,31 @@ impl PositionChanges {
 /// A holder's durable accepted positions, for recovery: `(object, sequence, epoch, value)` per entry.
 pub type AcceptedPositions = Vec<(ObjectId, u64, HostEpoch, Vec<u8>)>;
 
+/// The retired owner an install last moved an acceptor's authority from, and the retirement that made the move (A-251,
+/// A-883): a takeover's install moves a retired owner's copies to its successor, and only this record keeps whose object
+/// the copy was once its authority names the successor. A move names its retirement, not its host: a host the council
+/// retired, whose retirement completed, may be admitted again under the same id and retire again, and a move made at its
+/// first retirement says nothing of its next ([`crate::takeover::copy_falls_to`]). Before A-883 the record was the host
+/// alone, and a copy moved at a host's first retirement fell in every later round of that host: the asker's own live
+/// object was taken over again by the asker (the chaos nemesis, 2026-11-23: an owner's volume re-adopted at a higher
+/// epoch), or, where its holders disagreed, given up, and the retirement was never confirmed.
+#[derive(slates_wire::Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MovedFrom {
+  /// The retired owner the authority moved from.
+  pub owner: HostId,
+  /// The configuration version that retired it ([`Retirement::version`]): the retirement whose install made the move.
+  pub retired_at: u64,
+}
+
 /// One acceptor's durable state as a recovery image keeps it (§4.8 "persistence before reply"; A-251): the owner and
 /// configuration generation it serves under, the epoch its fence has seen, every position it accepted, and the retired
-/// owner an install last moved its authority from. [`Acceptor::to_persisted`] makes it and [`Acceptor::from_persisted`]
-/// rebuilds the same acceptor from it, so a restarted holder lists, refuses and accepts as it did before.
+/// owner an install last moved its authority from with the retirement that moved it (A-883). [`Acceptor::to_persisted`]
+/// makes it and [`Acceptor::from_persisted`] rebuilds the same acceptor from it, so a restarted holder lists, refuses
+/// and accepts as it did before.
 ///
-/// Format: the `Wire` encoding of its fields in this order. The moved-from owner is last, so the layout without it (the
-/// held image's register before A-251) is refused as truncated, never read as "moved from none" (CLAUDE.md §2.7); the
-/// image's version is what refuses an older image whole.
+/// Format: the `Wire` encoding of its fields in this order. The moved-from record is last, so the layout without it (the
+/// held image's register before A-251) is refused as truncated, never read as "moved from none" (CLAUDE.md §2.7), as is
+/// the layout whose record is the host alone (before A-883); the image's version is what refuses an older image whole.
 #[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
 pub struct PersistedAcceptor {
   /// The owner it serves under ([`Authority::owner`]).
@@ -1938,8 +1956,9 @@ pub struct PersistedAcceptor {
   pub promised: u64,
   /// Every position it accepted, in key order.
   pub accepted: Vec<PersistedPosition>,
-  /// The retired owner an install last moved its authority from ([`Acceptor::moved_from`]).
-  pub moved_from: Option<HostId>,
+  /// The retired owner an install last moved its authority from, with the retirement that moved it
+  /// ([`Acceptor::moved_from`]).
+  pub moved_from: Option<MovedFrom>,
 }
 
 /// One accepted position of a [`PersistedAcceptor`]: the object, its ledger position, the epoch it was accepted at and
@@ -2078,9 +2097,10 @@ impl Acceptor {
     self.authority.owner
   }
 
-  /// The retired owner an install last moved this acceptor's authority from ([`Acceptor::move_authority`]), `None` when
-  /// none has (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::to_persisted`]).
-  pub fn moved_from(&self) -> Option<HostId> {
+  /// The retired owner an install last moved this acceptor's authority from, with the retirement that moved it
+  /// ([`Acceptor::move_authority`]), `None` when none has (A-251, A-883). Persisted with the acceptor, so a restart keeps
+  /// both ([`Acceptor::to_persisted`]).
+  pub fn moved_from(&self) -> Option<MovedFrom> {
     self.moved_from
   }
 
@@ -2374,19 +2394,40 @@ impl Acceptor {
   }
 
   /// Installs `authority` as [`install_authority`](Acceptor::install_authority) does, and when it moves the authority
-  /// away from an owner the caller knows is retired (`from_retired`: a takeover moving a retired owner's copy to its
-  /// successor), records that owner as [`moved_from`](Acceptor::moved_from) (A-251). One owner, overwritten by the next
-  /// such move, never a growing list; an install that changes no owner, or moves from a live one, leaves it as it was.
+  /// away from an owner the caller's configuration keeps a retirement of (`retired_at`: that retirement's
+  /// [`Retirement::version`], a takeover moving a retired owner's copy to its successor), records that owner and that
+  /// retirement as [`moved_from`](Acceptor::moved_from) (A-251, A-883). One record, overwritten by the next such move,
+  /// never a growing list; an install that changes no owner, or moves from a live one (`None`), leaves it as it was.
   pub fn move_authority(
     &mut self,
     authority: Authority,
-    from_retired: bool,
+    retired_at: Option<u64>,
   ) -> Result<(), RegisterError> {
     let previous = self.authority.owner;
     self.install_authority(authority)?;
-    if from_retired && previous != authority.owner {
-      self.moved_from = Some(previous);
+    if let Some(retired_at) = retired_at
+      && previous != authority.owner
+    {
+      self.moved_from = Some(MovedFrom {
+        owner: previous,
+        retired_at,
+      });
     }
+    Ok(())
+  }
+
+  /// Installs `authority`, this node's own as a takeover's successor adopting the object, and records the adoption as
+  /// the move it is (§4.8 phase two; main 01a20182's ruling of 2026-11-23 on the warm-restarted successor): the departed
+  /// owner's object moved to its successor at the retirement `from` names, whatever authority this acceptor served
+  /// before (the departed's, its own after an install, or none, a fresh acceptor). So the adopted copy falls in that
+  /// retirement's round for its adopter ([`crate::takeover::copy_falls_to`]), and a round run again after the adopter
+  /// restarted warm counts the adoption as the adopter's own promise of the object, never refusing it by name: the
+  /// rerun reaches the end of the run it replaces. Before, an adopted copy kept whatever move it had, none for a copy
+  /// made at the adoption, and the rerun refused it by name as the adopter's own object, waited for that promise and
+  /// gave the object up. A later retirement of the same host never counts it (A-883).
+  pub fn adopt(&mut self, authority: Authority, from: MovedFrom) -> Result<(), RegisterError> {
+    self.install_authority(authority)?;
+    self.moved_from = Some(from);
     Ok(())
   }
 
@@ -4034,6 +4075,15 @@ impl RegionalConfiguration {
       .completed
       .get(&takeover)
       .is_some_and(|record| record.confirmed.contains(&holder))
+  }
+
+  /// The version of the retirement this configuration keeps of `host` ([`Retirement::version`]), `None` when it keeps
+  /// none: what names a retirement, since a host whose retirement completed may be admitted again under the same id and
+  /// retire again (A-883). An install that moves a retired owner's copy records it with the move
+  /// ([`Acceptor::move_authority`]), and a takeover's listing counts the move only while the same retirement is kept
+  /// ([`crate::takeover::copy_falls_to`]).
+  pub fn retirement_version(&self, host: HostId) -> Option<u64> {
+    self.retired.get(&host).map(|retirement| retirement.version)
   }
 
   /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
@@ -7783,7 +7833,11 @@ mod tests {
     }
   }
 
-  /// An acceptor with two accepted records, moved from a retired owner, for the persisted-state tests (A-251).
+  /// Shape: the configuration version [`moved_acceptor`]'s retired owner was retired at (A-883).
+  const MOVED_AT: u64 = 7;
+
+  /// An acceptor with two accepted records, moved from a retired owner at its retirement of version [`MOVED_AT`], for the
+  /// persisted-state tests (A-251, A-883).
   fn moved_acceptor() -> Acceptor {
     let generation = 9;
     let mut acceptor = Acceptor::new(
@@ -7812,15 +7866,15 @@ mod tests {
           generation,
           owner: HostId(2),
         },
-        true,
+        Some(MOVED_AT),
       )
       .unwrap();
     acceptor
   }
 
-  /// A-251: an acceptor's persisted state round-trips through its encoding whole, its moved-from owner too, and the
-  /// encoding is canonical. Do: encode a moved acceptor's state, decode it, rebuild, and encode again. Expect: the same
-  /// authority, moved-from owner, fence and positions, and the same bytes.
+  /// A-251: an acceptor's persisted state round-trips through its encoding whole, its moved-from owner and the
+  /// retirement that moved it too (A-883), and the encoding is canonical. Do: encode a moved acceptor's state, decode it,
+  /// rebuild, and encode again. Expect: the same authority, moved-from record, fence and positions, and the same bytes.
   #[test]
   fn an_acceptors_persisted_state_round_trips_through_its_encoding() {
     use slates_wire::Wire;
@@ -7829,7 +7883,13 @@ mod tests {
     let rebuilt =
       Acceptor::from_persisted(HostId(5), PersistedAcceptor::from_bytes(&bytes).unwrap());
     assert_eq!(rebuilt.authority(), acceptor.authority());
-    assert_eq!(rebuilt.moved_from(), Some(HostId(1)));
+    assert_eq!(
+      rebuilt.moved_from(),
+      Some(MovedFrom {
+        owner: HostId(1),
+        retired_at: MOVED_AT,
+      })
+    );
     assert_eq!(rebuilt.persisted(), acceptor.persisted());
     assert_eq!(rebuilt.to_persisted().to_bytes(), bytes);
   }
@@ -7869,7 +7929,7 @@ mod tests {
           generation: 9,
           owner: HostId(2),
         },
-        true,
+        Some(MOVED_AT),
       )
       .unwrap();
     let after_the_move = acceptor.written_by();
@@ -7903,8 +7963,9 @@ mod tests {
   }
 
   /// Hostile input on an acceptor's persisted encoding (A-251; CLAUDE.md §4), its bounds: a body cut at every byte and a
-  /// stray byte after it are each a typed refusal, with and without a moved-from owner. The layout before A-251 (no
-  /// moved-from owner) is refused as truncated, never read as "moved from none" (§2.7).
+  /// stray byte after it are each a typed refusal, with and without a moved-from record. The layout before A-251 (no
+  /// moved-from owner) is refused as truncated, never read as "moved from none" (§2.7), and so is the layout before
+  /// A-883 (the owner without the retirement that moved it), never read as a move from an unnamed retirement.
   #[test]
   fn a_cut_or_overlong_persisted_acceptor_is_refused() {
     use slates_wire::{Wire, WireError};
@@ -7929,13 +7990,28 @@ mod tests {
         Err(WireError::TrailingBytes { count: 1 })
       ));
     }
-    // The layout before A-251: the same fields without the moved-from owner's option.
-    let host_bytes = HostId(0).to_bytes().len();
-    let before = &moved[..moved.len() - 1 - host_bytes];
-    assert!(matches!(
-      PersistedAcceptor::from_bytes(before),
-      Err(WireError::Truncated { .. })
-    ));
+    expect_earlier_layouts_refused(&moved);
+  }
+
+  /// The layouts before A-251 (no moved-from record's option) and before A-883 (the moved-from owner without the
+  /// retirement that moved it), cut from `moved`, a moved acceptor's encoding: each refused as truncated, never read as
+  /// "moved from none" or as a move from an unnamed retirement (§2.7).
+  fn expect_earlier_layouts_refused(moved: &[u8]) {
+    use slates_wire::{Wire, WireError};
+    let moved_bytes = MovedFrom {
+      owner: HostId(0),
+      retired_at: 0,
+    }
+    .to_bytes()
+    .len();
+    let before_a251 = &moved[..moved.len() - 1 - moved_bytes];
+    let before_a883 = &moved[..moved.len() - size_of::<u64>()];
+    for earlier in [before_a251, before_a883] {
+      assert!(matches!(
+        PersistedAcceptor::from_bytes(earlier),
+        Err(WireError::Truncated { .. })
+      ));
+    }
   }
 
   /// Hostile input on an acceptor's persisted encoding (A-251; CLAUDE.md §4), its contents: an accepted count and a
@@ -7962,7 +8038,13 @@ mod tests {
       );
     }
     let mut foreign = moved.clone();
-    let tag_at = moved.len() - 1 - host_bytes;
+    let moved_bytes = MovedFrom {
+      owner: HostId(0),
+      retired_at: 0,
+    }
+    .to_bytes()
+    .len();
+    let tag_at = moved.len() - 1 - moved_bytes;
     foreign[tag_at] = slates_wire::codec::OPTION_SOME + 1;
     assert!(matches!(
       PersistedAcceptor::from_bytes(&foreign),

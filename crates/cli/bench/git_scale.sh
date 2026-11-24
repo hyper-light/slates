@@ -10,6 +10,11 @@
 #   sends as a bearer credential (`http.extraHeader`);
 # - stock: `git daemon` serving a fresh bare repository over git:// on loopback, receive-pack enabled and
 #   `uploadpack.allowFilter` set, as a stock server that offers partial clones is configured.
+# - stock-http: Apache httpd (HTTPD, default /usr/sbin/httpd; its modules in HTTPD_MODULES, default
+#   /usr/libexec/apache2) running `git http-backend` as a CGI over a fresh bare repository on loopback, git's smart HTTP
+#   as git-http-backend(1) configures it for Apache 2 ("ScriptAlias /git/ .../git-http-backend/", `GIT_PROJECT_ROOT`,
+#   `GIT_HTTP_EXPORT_ALL`), receive-pack on (`http.receivepack`) and `uploadpack.allowFilter` set: the stock server
+#   slates' own HTTP edge is the counterpart of (§4.17.1's method, "git-http-backend").
 #
 # The steps, each timed on the wall clock and bounded (`alarm`), a failure recorded and the run going on:
 # 1. push: every branch and tag of SOURCE pushed in one push, the repository's first;
@@ -32,7 +37,7 @@
 #   RUNS    the runs of each server (default 3)
 #   BOUND   the seconds any one step may take before it is killed and recorded as such (default 1800)
 # SERVERS in the environment names the servers measured, in the order each run starts them (default "stock slates";
-# "stock" alone takes the stock baseline, and SLATES may then be "-").
+# "stock" alone takes the stock baseline, and SLATES may then be "-"; "stock-http" adds git-http-backend under Apache).
 set -uo pipefail
 
 SLATES=$1
@@ -146,6 +151,49 @@ start_stock() {
   echo "stock run $1: git daemon on 127.0.0.1:$port"
 }
 
+# Starts Apache httpd serving a fresh bare repository through `git http-backend` for run $1 (the header's stock-http):
+# sets URL, AUTH, STOCK. Prefork, since mod_cgi runs its scripts from the serving process; the server runs as this user
+# in the foreground, its configuration, pid and logs in its own directory under WORK.
+start_stock_http() {
+  local root="$WORK/stock-http-$1" port modules backend
+  mkdir -p "$root/logs"
+  g init -q --bare -b "$DEFAULT" "$root/project.git"
+  g -C "$root/project.git" config uploadpack.allowFilter true
+  g -C "$root/project.git" config http.receivepack true
+  port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  modules=${HTTPD_MODULES:-/usr/libexec/apache2}
+  backend="$(git --exec-path)/git-http-backend"
+  cat > "$root/httpd.conf" <<CONF
+ServerRoot "$root"
+ServerName 127.0.0.1
+Listen 127.0.0.1:$port
+PidFile "$root/logs/httpd.pid"
+ErrorLog "$root/logs/error.log"
+LoadModule mpm_prefork_module $modules/mod_mpm_prefork.so
+LoadModule authz_core_module $modules/mod_authz_core.so
+LoadModule unixd_module $modules/mod_unixd.so
+LoadModule alias_module $modules/mod_alias.so
+LoadModule env_module $modules/mod_env.so
+LoadModule cgi_module $modules/mod_cgi.so
+SetEnv GIT_PROJECT_ROOT "$root"
+SetEnv GIT_HTTP_EXPORT_ALL 1
+SetEnv GIT_CONFIG_NOSYSTEM 1
+SetEnv HOME "$WORK/home"
+ScriptAlias /git/ "$backend/"
+<Directory "$(dirname "$backend")">
+  Require all granted
+</Directory>
+CONF
+  # In a session of its own: prefork signals its whole process group as it shuts down, which took this harness with it.
+  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!\n"' "${HTTPD:-/usr/sbin/httpd}" -f "$root/httpd.conf" \
+    -DFOREGROUND > /dev/null 2> "$WORK/stock-http-$1.log" &
+  STOCK=$!
+  URL="http://127.0.0.1:$port/git/project.git"
+  AUTH=()
+  for _ in $(seq 1 100); do g ls-remote "$URL" > /dev/null 2>&1 && break; sleep 0.1; done
+  echo "stock-http run $1: httpd $("${HTTPD:-/usr/sbin/httpd}" -v | sed -n 's/^Server version: //p') with git http-backend on 127.0.0.1:$port"
+}
+
 # Checks clone $1 of server $2 against SOURCE: fsck, then refs and object ids; a clone that is not there is recorded.
 check() {
   local mirror=$1 server=$2
@@ -207,6 +255,12 @@ for run in $(seq 1 "$RUNS"); do
         stop_servers
         rm -rf "$WORK/stock-$run"
         ;;
+      stock-http)
+        start_stock_http "$run"
+        steps stock-http "$run"
+        stop_servers
+        rm -rf "$WORK/stock-http-$run"
+        ;;
       slates)
         if start_slates "$run"; then steps slates "$run"; else echo "slates run $run: the anchor did not start" | tee -a "$RESULTS"; fi
         stop_servers
@@ -219,7 +273,7 @@ done
 echo "== results (seconds; every run shown)"
 for step in push clone clone-again incremental-push incremental-fetch shallow partial; do
   for server in $SERVERS; do
-    printf '%-18s %-6s' "$step" "$server"
+    printf '%-18s %-10s' "$step" "$server"
     grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
       $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  best %s", (best == "" ? "-" : best) }'
     echo

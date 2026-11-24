@@ -1369,7 +1369,7 @@ fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
   let mut records = Vec::new();
   let mut recorded = |taking: &mut Intake, store: &ContentStore| {
     while let Some(segment) = taking.take_segment() {
-      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+      records.push(whole_record(taking, &segment, 1 << 20, store));
     }
   };
   loop {
@@ -1547,7 +1547,7 @@ fn segment_records_over(
   let mut records = Vec::new();
   let mut recorded = |taking: &mut Intake, store: &ContentStore| {
     while let Some(segment) = taking.take_segment() {
-      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+      records.push(whole_record(taking, &segment, 1 << 20, store));
     }
   };
   loop {
@@ -1688,4 +1688,16 @@ fn each_step_names_the_kind_of_unit_it_takes_in_the_intakes_order() {
   );
   let (fork, _) = finished(intake);
   fork.release(&mut store).unwrap();
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }
