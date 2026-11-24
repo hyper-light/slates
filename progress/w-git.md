@@ -737,3 +737,9 @@
   branch/elapsed, publish_refused counter+log, stranded log; test a_stranded_tickets_wait_is_answered_not_durable_at_once_and_counted.
   Gate 8 at ee9571813 (main). Parked: retry-until-failover in git_push's Homing (second step if a home is truly late).
   If stranded fires -> F2 bug to w-shared.
+- 09:30: gate 9 = (ii) NotAHome; w-shared landed A-902 (d48863ddb; OR clause agreed in writing). Clone item:
+  LANDED 2dfda25d4 (Positions word-wise for bit tables: union/intersection/difference/settle/run_pairs/runs; oracle
+  r870_bit_tables_combined...) and 0ebf10cf4 (push: reader-named objects admitted without a second SHA-1,
+  Push::admit_placed_named, Named::ByReader; test r870_an_object_admitted_under_its_readers_name...). Push's remaining
+  hashing is one SHA-1, one BLAKE3 (content identity, needed) and zlib inflate per object, one shard. WAITING: r935 git
+  leg at 2dfda25d4+ (first-byte split vs r870's 102-111 s; new clone sample callers; push sample).
