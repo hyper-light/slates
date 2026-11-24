@@ -22,7 +22,7 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
-Updates at 23:52:
+Updates at 23:49 (stamped from date; the commit 4e8f007 said 23:52 by mistake):
 - Gate 3 is RUNNING: GitHub run 45350914168 (branch diag-measurer-main-v3-gate3, commit 509d46e3c), v3_takeover at
   b98233544 (w-git's edge-failure logging ba4e4e35e): 3 release then 4 debug back to back; artifact v3-gate3 holds each
   run's whole log, anchor and daemon lines included. Send w-git the disconnecting run's edge lines.
