@@ -252,13 +252,8 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   }
   let daemon = Daemon::start_with_fleet(&profile, config, source, transport)
     .map_err(|e| failed("start", e))?;
-  // The start, recovery included, is done: an exit from here on is a daemon that recovered, which the anchor's restart
-  // bound does not count (`slates_anchor::layout::SUP_SERVING`).
-  if let Ok(supervision) = daemon.segment().supervision() {
-    supervision.mark_serving(slates_vfs::clock::Clock::monotonic_ns(
-      &mut slates_vfs::clock::HostClock::new(),
-    ));
-  }
+  // The daemon marks itself serving once every shard's start has ended (`slates_server`'s control loop, A-311), not
+  // here: `Daemon::start` returns while the shards' starts, their recoveries included, still run.
   // Where the edge serves, before the line that says the daemon serves, so whoever reads the one has read the other (a
   // port 0 asked for is the system's pick). An edge asked for that did not start was logged with its reason by the
   // daemon, which serves everything else.
