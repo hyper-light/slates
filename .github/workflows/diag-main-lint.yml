@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 7 (main 01a20182, 2026-11-24 12:24 PST): run 6 found A-906's anchor test (13 of 10) and scans_skipped unused on
+# Windows; main's sixth lint commit takes both. At main 8658733f8.
 # Run 6 (main 01a20182, 2026-11-24 12:19 PST): run 5 stopped at slates-merge (Judgment's variant size after RunTable);
 # main's fifth lint commit says why it stays unboxed. At main 31bf5e5c7.
 # Run 5 (main 01a20182, 2026-11-24 12:14 PST): run 4 stopped at slates-vcs on tree_bytes' chunks_exact; main's fourth lint
