@@ -137,3 +137,67 @@ fn idle_work_runs_a_slice_at_a_time_until_done_and_the_shard_then_parks() {
   );
   rt.shutdown().unwrap();
 }
+
+/// Shape: how long the woken task may wait for the shard to run it: far past a step, far short of a park with no
+/// deadline, which is forever.
+const RUN_WITHIN: Duration = Duration::from_secs(2);
+
+/// Set when the idle work has woken the test's task.
+static WOKE: AtomicU64 = AtomicU64::new(0);
+/// The task the idle work wakes, as its word (a first task's is zero: shard 0, slot 0, generation 0).
+static SLEEPER: AtomicU64 = AtomicU64::new(0);
+/// Set once [`SLEEPER`] holds the task's word.
+static SLEEPER_SET: AtomicU64 = AtomicU64::new(0);
+
+/// Idle work that wakes [`SLEEPER`] once and answers that it did nothing, as the daemon's idle work does when a state
+/// borrow's hook wakes a task.
+fn waking_slice() -> bool {
+  if SLEEPER_SET.load(Ordering::Acquire) == 1 && WOKE.swap(1, Ordering::AcqRel) == 0 {
+    registry::wake(slates_mem::Encoded::from_word(
+      SLEEPER.load(Ordering::Acquire),
+    ));
+  }
+  false
+}
+
+/// A-881 (item 2's lost wake). Do: on an idle shard with no timer armed, register idle work that wakes a parked task
+/// and answers that it did nothing. Expect the task to run at once, within [`RUN_WITHIN`], and no park begun with a task
+/// ready (`parked_with_ready`). Before, the shard parked right after the idle work answered, with the task ready on its
+/// own queue, and with no deadline to end the park the task waited for the next kick.
+#[test]
+fn idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_out_a_park() {
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (ran, runs) = channel::<()>();
+  rt.spawn_on(shard, async move {
+    let Some(task) = slates_rt::futures::current_task() else {
+      return;
+    };
+    SLEEPER.store(task.0.word(), Ordering::Release);
+    SLEEPER_SET.store(1, Ordering::Release);
+    registry::with_current(|ctx| ctx.set_idle_work(Box::new(waking_slice)))
+      .unwrap()
+      .unwrap();
+    slates_rt::futures::idle().await;
+    let _ = ran.send(());
+  })
+  .unwrap();
+  let woke_and_ran = runs.recv_timeout(RUN_WITHIN).is_ok();
+  let (tx, rx) = channel();
+  rt.spawn_on(shard, async move {
+    let _ = tx.send(registry::with_current(|ctx| ctx.counters().parked_with_ready).unwrap_or(0));
+  })
+  .unwrap();
+  let parked_with_ready = rx.recv_timeout(SETTLE).unwrap();
+  rt.shutdown().unwrap();
+  assert_eq!(
+    WOKE.load(Ordering::Acquire),
+    1,
+    "the idle work woke the task"
+  );
+  assert!(
+    woke_and_ran,
+    "the woken task ran within {RUN_WITHIN:?}, not after a park"
+  );
+  assert_eq!(parked_with_ready, 0, "no park began with a task ready");
+}

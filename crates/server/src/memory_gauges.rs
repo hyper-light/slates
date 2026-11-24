@@ -179,105 +179,159 @@ fn held_rows(state: &ShardState) -> Vec<(&'static str, u64)> {
 #[cfg(test)]
 mod tests {
   /// The memory status's gauges (main 01a20182, 2026-11-22 03:46). Do: on one shard, make a green with one file written
-  /// and accepted, then read the shard's report with and without memory. Expect: with memory, the greens' rows (one green,
-  /// its current file bytes), the content hold's (its checkpoint, the version folded) and the content arena's (its
-  /// regions mapped and in RAM past the file's bytes, and its owners' bytes summing to what it allocated, the content
-  /// hold among them); without, no gauge row at all (a plain status does no residency work).
+  /// and accepted; let its checkpoint end, once taken in turns (its hold paused before its first chunk through the
+  /// submit's step, then let go) and once as the step's budget falls; then read the shard's report with and without
+  /// memory. Expect, each time: with memory, the greens' rows (one green, its current file bytes), the content hold's
+  /// (its checkpoint, the version folded) and the content arena's (its regions mapped and in RAM past the file's bytes,
+  /// and its owners' bytes summing to what it allocated, the content hold among them); without, no gauge row at all (a
+  /// plain status does no residency work). The checkpoint is held once it ends, which a checkpoint taken in turns does
+  /// after the submit's step: until 2026-11-23 this read the status in that step and failed whenever the checkpoint
+  /// went into turns (w-perf's probe: `merge.checkpoint.in_turns`, no manifest held; main's (2)).
   #[test]
   fn a_memory_status_names_its_holders_and_a_plain_one_none() {
-    let (with, without) = crate::daemon::audit_on_shard(|state| {
-      let owner = slates_db::catalog::Principal::Uid {
-        host: slates_db::HostId(0),
-        uid: 1234,
-      };
-      let slates_ipc::protocol::ReplyBody::GreenCreated { id: green } = crate::verbs::dispatch(
-        state,
-        1,
-        &owner,
-        slates_ipc::protocol::RequestBody::CreateGreen {
-          name: "gauged".to_owned(),
-          require_evidence: false,
-          base: None,
-        },
-      ) else {
-        panic!("no green")
-      };
-      let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = crate::verbs::dispatch(
-        state,
-        1,
-        &owner,
-        slates_ipc::protocol::RequestBody::CreateWork {
-          green,
-          name: "gauged-work".to_owned(),
-        },
-      ) else {
-        panic!("no work")
-      };
-      let edited = crate::verbs::dispatch(
-        state,
-        1,
-        &owner,
-        slates_ipc::protocol::RequestBody::Edit {
-          work,
-          path: "f".to_owned(),
-          at: 0,
-          delete_len: 0,
-          bytes: vec![b'x'; 4096],
-        },
-      );
-      assert!(matches!(edited, slates_ipc::protocol::ReplyBody::Edited));
-      let submitted = crate::verbs::dispatch(
-        state,
-        1,
-        &owner,
-        slates_ipc::protocol::RequestBody::submit(work, Vec::new()),
+    for paused in [true, false] {
+      let (with, without) = status_once_checkpointed(paused);
+      assert_eq!(with.get("mem.gauge.greens.count"), Some(&1), "{with:?}");
+      assert!(
+        with
+          .get("mem.gauge.greens.content_bytes")
+          .is_some_and(|bytes| *bytes >= 4096),
+        "{with:?}"
       );
       assert!(
-        matches!(
-          submitted,
-          slates_ipc::protocol::ReplyBody::Submitted {
-            version: Some(1),
-            ..
-          }
-        ),
-        "{submitted:?}"
+        with.contains_key("mem.gauge.held.content_manifests"),
+        "{with:?}"
       );
-      let gauges = |state: &mut crate::state::ShardState, memory: bool| {
-        crate::verbs::shard_report(state, memory)
-          .refusals
-          .into_iter()
-          .filter(|row| row.kind.starts_with("mem.gauge."))
-          .map(|row| (row.kind, row.count))
-          .collect::<std::collections::BTreeMap<_, _>>()
-      };
-      (gauges(state, true), gauges(state, false))
+      // The content arena's rows (main 01a20182, 2026-11-23): the file's bytes lie in a region it maps, in RAM.
+      assert!(
+        with
+          .get("mem.gauge.content.arena_mapped_bytes")
+          .is_some_and(|bytes| *bytes >= 4096),
+        "{with:?}"
+      );
+      assert!(
+        with
+          .get("mem.gauge.content.object_resident_bytes")
+          .is_some_and(|bytes| *bytes >= 4096),
+        "{with:?}"
+      );
+      assert_the_arenas_owners_sum_to_its_allocated(&with);
+      assert!(without.is_empty(), "{without:?}");
+    }
+  }
+
+  /// The rows of the shard's report, with memory and without, by kind.
+  fn gauges(
+    state: &mut crate::state::ShardState,
+    memory: bool,
+  ) -> std::collections::BTreeMap<String, u64> {
+    crate::verbs::shard_report(state, memory)
+      .refusals
+      .into_iter()
+      .filter(|row| row.kind.starts_with("mem.gauge."))
+      .map(|row| (row.kind, row.count))
+      .collect()
+  }
+
+  /// Derived: how long a checkpoint taken in turns may take to end, sixty liveness budgets (a minute at the derived
+  /// budget). It does a turn each time its shard cycles through its ready tasks; a loaded runner stretches a cycle
+  /// toward the liveness budget, past which the watchdog would call the shard stuck, and the checkpoint of one page's
+  /// file is a few turns, so sixty such cycles bound it with room.
+  const CHECKPOINT_WAIT: std::time::Duration =
+    std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS.saturating_mul(60));
+
+  /// A one-shard daemon's memory status, with and without memory, once the checkpoint of a green with one file accepted
+  /// has ended: its hold paused before its first chunk through the submit's step when `paused`, so the checkpoint is
+  /// taken in turns.
+  fn status_once_checkpointed(
+    paused: bool,
+  ) -> (
+    std::collections::BTreeMap<String, u64>,
+    std::collections::BTreeMap<String, u64>,
+  ) {
+    let daemon = crate::daemon::audit_daemon();
+    let in_turns = crate::daemon::observe_first(&daemon, move |state| {
+      state.merge.hold_pause_at = paused.then_some(0);
+      accept_one_file(state);
+      !state.merge.checkpointing.is_empty()
     });
-    assert_eq!(with.get("mem.gauge.greens.count"), Some(&1), "{with:?}");
     assert!(
-      with
-        .get("mem.gauge.greens.content_bytes")
-        .is_some_and(|bytes| *bytes >= 4096),
-      "{with:?}"
+      !paused || in_turns,
+      "a paused hold puts the checkpoint in turns"
+    );
+    crate::daemon::observe_first(&daemon, |state| state.merge.hold_pause_at = None);
+    let deadline = std::time::Instant::now() + CHECKPOINT_WAIT;
+    while crate::daemon::observe_first(&daemon, |state| !state.merge.checkpointing.is_empty()) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the checkpoint never ended"
+      );
+      std::thread::yield_now();
+    }
+    let rows =
+      crate::daemon::observe_first(&daemon, |state| (gauges(state, true), gauges(state, false)));
+    daemon.stop();
+    rows
+  }
+
+  /// Makes a green, writes one file of a page in a work and submits it, on `state`'s shard.
+  fn accept_one_file(state: &mut crate::state::ShardState) {
+    let owner = slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    let slates_ipc::protocol::ReplyBody::GreenCreated { id: green } = crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      slates_ipc::protocol::RequestBody::CreateGreen {
+        name: "gauged".to_owned(),
+        require_evidence: false,
+        base: None,
+      },
+    ) else {
+      panic!("no green")
+    };
+    let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      slates_ipc::protocol::RequestBody::CreateWork {
+        green,
+        name: "gauged-work".to_owned(),
+      },
+    ) else {
+      panic!("no work")
+    };
+    let edited = crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      slates_ipc::protocol::RequestBody::Edit {
+        work,
+        path: "f".to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: vec![b'x'; 4096],
+      },
+    );
+    assert!(matches!(edited, slates_ipc::protocol::ReplyBody::Edited));
+    let submitted = crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      slates_ipc::protocol::RequestBody::submit(work, Vec::new()),
     );
     assert!(
-      with.contains_key("mem.gauge.held.content_manifests"),
-      "{with:?}"
+      matches!(
+        submitted,
+        slates_ipc::protocol::ReplyBody::Submitted {
+          version: Some(1),
+          ..
+        }
+      ),
+      "{submitted:?}"
     );
-    // The content arena's rows (main 01a20182, 2026-11-23): the file's bytes lie in a region it maps, in RAM.
-    assert!(
-      with
-        .get("mem.gauge.content.arena_mapped_bytes")
-        .is_some_and(|bytes| *bytes >= 4096),
-      "{with:?}"
-    );
-    assert!(
-      with
-        .get("mem.gauge.content.object_resident_bytes")
-        .is_some_and(|bytes| *bytes >= 4096),
-      "{with:?}"
-    );
-    assert_the_arenas_owners_sum_to_its_allocated(&with);
-    assert!(without.is_empty(), "{without:?}");
   }
 
   /// The content arena's owners in a memory status's gauges, `with`: their bytes and the deferred frees summing to what

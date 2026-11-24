@@ -78,13 +78,48 @@ fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>,
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  child.stdin.take().unwrap().write_all(input).unwrap();
+  // Fed beside the wait, and a feed the command cut short by ending first is part of its outcome, not the test's panic:
+  // a held write that fails ends before it reads (A-879), and its stderr says why.
+  let mut stdin = child.stdin.take().unwrap();
+  let (fed, output) = std::thread::scope(|scope| {
+    let feeder = scope.spawn(move || stdin.write_all(input));
+    let output = child.wait_with_output().unwrap();
+    (feeder.join().unwrap(), output)
+  });
+  let mut err = String::from_utf8_lossy(&output.stderr).into_owned();
+  if let Err(error) = fed {
+    err.push_str(&format!("\n(the input was not all read: {error})"));
+  }
+  (output.status.code().unwrap_or(-1), output.stdout, err)
+}
+
+/// Runs the command, giving it `input` on its stdin only `after` it started: the exit code and both outputs, the stderr
+/// naming a failure to feed the input (a command that ended before its input came).
+fn run_with_late_stdin(
+  instance: &str,
+  args: &[&str],
+  input: &[u8],
+  after: Duration,
+) -> (i32, Vec<u8>, String) {
+  use std::io::Write;
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  #[allow(clippy::disallowed_methods)] // the input's lateness is what the test gives the command
+  std::thread::sleep(after);
+  let fed = child.stdin.take().unwrap().write_all(input);
   let output = child.wait_with_output().unwrap();
-  (
-    output.status.code().unwrap_or(-1),
-    output.stdout,
-    String::from_utf8_lossy(&output.stderr).into_owned(),
-  )
+  let mut err = String::from_utf8_lossy(&output.stderr).into_owned();
+  if let Err(error) = fed {
+    err.push_str(&format!("\n(the input could not be fed: {error})"));
+  }
+  (output.status.code().unwrap_or(-1), output.stdout, err)
 }
 
 fn value_of(text: &str, key: &str) -> String {
@@ -343,7 +378,8 @@ const STAGED_WRITE_BYTES: usize = 1 << 20;
 
 /// A-97 from the CLI: do attach for writing, `write` a small file and a staged 1 MiB one from stdin, read both back
 /// with `read`, and write under an attachment the caller does not hold; expect both files byte for byte and the last
-/// refused (exit 1) with nothing written.
+/// refused (exit 1) with nothing written, its stderr naming the hold it could not make before it read its input
+/// (A-879).
 fn write_and_read(instance: &str, id: &str) {
   let (code, out, _) = run(instance, &["attach", id, "--write"]);
   assert_eq!(code, 0);
@@ -364,15 +400,27 @@ fn write_and_read(instance: &str, id: &str) {
     assert_eq!(code, 0, "read {path}: {err}");
     assert!(read == *bytes, "{path} reads back as written");
   }
+  a_write_under_another_attachment_is_refused(instance, id);
+  let (code, _, err) = run(instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
+}
+
+/// The last step of [`write_and_read`]: a write under an attachment the caller does not hold is refused (exit 1) with
+/// nothing written, its stderr naming the hold it could not make before it read its input (A-879).
+fn a_write_under_another_attachment_is_refused(instance: &str, id: &str) {
   let (code, _, err) = run_with_stdin(instance, &["write", id, "999999", "stray.txt"], b"stray");
   assert_eq!(
     code, 1,
     "a write under another attachment is refused: {err}"
   );
+  // The write holds its attachment before it reads (A-879): one it cannot hold ends it there, and says so.
+  assert!(
+    err
+      .contains("attachment 999999 could not be held for the write, so none of its input was read"),
+    "the refused hold names itself: {err}"
+  );
   let (code, _, _) = run_with_stdin(instance, &["read", id, "stray.txt"], b"");
   assert_ne!(code, 0, "nothing was written");
-  let (code, _, err) = run(instance, &["detach", &attachment]);
-  assert_eq!(code, 0, "detach: {err}");
 }
 
 /// attach for writing, the volume's status, detach.
@@ -1374,16 +1422,34 @@ fn a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it() {
   drop(anchor);
 }
 
-/// Shape: how long `a_cli_attachment_outlives_the_process_that_made_it` waits between its verbs: past the reaper's
-/// silence (one liveness budget) and its next sweep (one more), which ended a CLI attachment before A-230 (GAPS
-/// 2026-10-23 and 2026-10-27, measured 3 of 3 with a 2.5 s pause).
-const PAST_THE_REAPER: Duration = Duration::from_millis(2_500);
+/// The failover delay `instance`'s daemon reports (`slates status`, `fleet_failover: total_ns=`), nanoseconds: the term a
+/// fresh CLI attachment has, rounded up to the daemon's heartbeat period (A-230, `fleet::failover_in_periods`).
+fn failover_delay_ns(instance: &str) -> u64 {
+  let (code, status, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  status
+    .lines()
+    .find_map(|line| line.strip_prefix("fleet_failover: "))
+    .and_then(|fields| {
+      fields
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("total_ns=")?.parse::<u64>().ok())
+    })
+    .expect("the daemon reports its failover delay")
+}
 
-/// A-230 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; wait past the reaper's sweep;
-/// `slates write` a file under the attachment from a later process; wait again; `slates detach` it. Expect: the write
-/// and the detach succeed: a CLI attachment outlives the process that made it, for its term, renewed by each verb that
-/// names it. Before A-230 the reaper ended it with its client, about a second after `attach` exited, and the write was
-/// refused `NotFound`.
+/// Shape: the share of a CLI attachment's term `a_cli_attachment_outlives_the_process_that_made_it` waits between its
+/// verbs: half. That is inside the term on any machine, where a fixed 2.5 s pause bet on a term of about 3 s (a laptop's
+/// failover delay is about two seconds, A-405). Where the term is over two seconds (about three on the Mac Studio),
+/// half of it is also past the reaper's answer to the attaching process's hangup, about a second, which ended a CLI
+/// attachment before A-230.
+const PAUSE_SHARE_OF_TERM: u32 = 2;
+
+/// A-230 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; wait half the attachment's term
+/// ([`PAUSE_SHARE_OF_TERM`]); `slates write` a file under the attachment from a later process; wait again; `slates
+/// detach` it. Expect: the write and the detach succeed: a CLI attachment outlives the process that made it, for its
+/// term, renewed by each verb that names it. Before A-230 the reaper ended it with its client, about a second after
+/// `attach` exited, and the write was refused `NotFound`.
 #[test]
 fn a_cli_attachment_outlives_the_process_that_made_it() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -1395,20 +1461,66 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   let instance = format!("cli-term-{}", std::process::id());
   let anchor = start_anchor(&instance);
   let id = created_volume(&instance, "termed");
+  let pause = Duration::from_nanos(failover_delay_ns(&instance)) / PAUSE_SHARE_OF_TERM;
   let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
   assert_eq!(code, 0, "attach: {err}");
   let attachment = value_of(&out, "attachment");
   #[allow(clippy::disallowed_methods)] // a test waiting out the reaper it checks
-  std::thread::sleep(PAST_THE_REAPER);
+  std::thread::sleep(pause);
   let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "kept.txt"], b"kept");
   assert_eq!(
     code, 0,
     "a write under the attachment after its process exited: {err}"
   );
   #[allow(clippy::disallowed_methods)] // the same wait again, after the renewal
-  std::thread::sleep(PAST_THE_REAPER);
+  std::thread::sleep(pause);
   let (code, _, err) = run(&instance, &["detach", &attachment]);
   assert_eq!(code, 0, "detach: {err}");
+  drop(anchor);
+}
+
+/// Shape: how many failover delays the late-input test's stdin arrives after its command starts: two, past a fresh CLI
+/// attachment's term, which is the failover delay the daemon reports rounded up to its heartbeat period (A-230,
+/// `fleet::failover_in_periods`).
+const LATE_INPUT_DELAYS: u32 = 2;
+
+/// A-879 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; start `slates write` under the
+/// attachment at once and give it its stdin only [`LATE_INPUT_DELAYS`] failover delays later (the delay read from
+/// `slates status`, `fleet_failover: total_ns=`), longer than the attachment's term; then read the file back. Expect: the
+/// write succeeds and the file reads back as written: the command held its attachment from before it read its input
+/// until its write was answered. Before A-879 nothing renewed the attachment while the command waited for its input,
+/// and the write was refused `AttachmentExpired` (macOS, 2026-11-23, an 8 s pause; both Windows runners for the 256 MiB
+/// write of `a_freed_content_extent_gives_its_commit_back_on_windows`, diag run 45260798132).
+#[test]
+fn a_write_whose_input_outlasts_its_attachments_term_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the late-input write: set SLATES_TEST_CLI=1 to run it (a real anchor and daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-late-input-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let id = created_volume(&instance, "late-input");
+  let failover_ns = failover_delay_ns(&instance);
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "attach: {err}");
+  let attachment = value_of(&out, "attachment");
+  let input = b"arrived after the attachment's term\n";
+  let late = Duration::from_nanos(failover_ns).saturating_mul(LATE_INPUT_DELAYS);
+  let (code, _, err) = run_with_late_stdin(
+    &instance,
+    &["write", &id, &attachment, "late.txt"],
+    input,
+    late,
+  );
+  assert_eq!(
+    code, 0,
+    "a write whose input came {late:?} after it started: {err}"
+  );
+  let (code, read, err) = run_with_stdin(&instance, &["read", &id, "late.txt"], b"");
+  assert_eq!(code, 0, "read: {err}");
+  assert!(read == input, "late.txt reads back as written");
   drop(anchor);
 }
 

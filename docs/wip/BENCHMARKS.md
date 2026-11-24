@@ -18909,3 +18909,66 @@ Every run: oracle failures 0, refusals 0, lost 0.
   (debug, the MacBook, 2026-11-23): a store's first chunk kept 2,228,320 bytes of heap at a 16 KiB page, now 8,800.
   The table now grows a page at a time, every 64 chunks at a 16 KiB page, and nothing reserves its segments ahead
   (`Slab::reserve_segments`); main's AC-0.4 provisioning A/B reads whether that moves the seal path.
+
+## Slates against every stock server of each tool, interleaved on one machine (goal 93 perf, §4.17.1's method; harness ready 2026-11-23, NOT YET RUN)
+
+The order-of-magnitude record: each stock client against slates and against its stock servers, one machine, the servers
+interleaved run by run (stock first), best of N with all N shown, the host's load and each server kind's peak memory
+and CPU beside the times. This entry is the shape and the contract; its numbers are main's run on a quiet big Studio.
+
+- **Command** (repository root, release slates, stock svn 1.15 first on the PATH):
+  `PATH=/opt/homebrew/bin:$PATH crates/cli/bench/interop_speed.sh target/release/slates WORK src.git HG hg-src git-2000.dump src.git master 5 3600`.
+  It runs `git_scale.sh` (`SERVERS="stock stock-http slates"`), `hg_scale.sh` and `svn_scale.sh` (`SERVERS="stock
+  slates"`), and samples every 5 s.
+- **Competitors, exact:**
+  - git: `git daemon --reuseaddr --listen=127.0.0.1 --port=P --base-path=ROOT --export-all --enable=receive-pack ROOT`
+    (`uploadpack.allowFilter` on), and `git http-backend` under Apache httpd. The latter is prefork with mod_cgi,
+    `ScriptAlias /git/ $(git --exec-path)/git-http-backend/`, `GIT_PROJECT_ROOT` and `GIT_HTTP_EXPORT_ALL`, with
+    `http.receivepack` and `uploadpack.allowFilter` on.
+  - Mercurial: `hg serve` over HTTP, `web.push_ssl=False`, `web.allow-push=*`.
+  - Subversion: `svnserve -d` over svn://.
+  - `mod_dav_svn`: measured by no harness. The record says whether the host has it; the big Studio has Apache 2.4 with
+    mod_dav but no mod_dav_svn (checked 2026-11-23).
+- **Datasets:** git/git bare (its refs and tags pushed whole); Mercurial's own repository; git-2000.dump
+  (`git_to_svn_dump.py src.git master 2000`).
+- **The record's parts, in this order:** the date and machine; slates' version and commit; every client's and server's
+  version; which competitors the host has; each harness's table; each server kind's peak resident memory and most CPU
+  time seen; the highest 1-minute load sampled.
+
+| git | stock (git daemon) 1..N | best | stock-http (http-backend) 1..N | best | slates 1..N | best |
+|---|---|---|---|---|---|---|
+| push, every branch and tag | | | | | | |
+| clone `--mirror` | | | | | | |
+| clone again | | | | | | |
+| one-commit push | | | | | | |
+| fetch of it | | | | | | |
+| clone `--depth 1` | | | | | | |
+| clone `--filter=blob:none` | | | | | | |
+
+| Mercurial | stock (hg serve) 1..N | best | slates 1..N | best |
+|---|---|---|---|---|
+| push, every changeset | | | | |
+| clone `-U` | | | | |
+| one-changeset push | | | | |
+| pull of it | | | | |
+| clone `--stream` | | | | |
+
+| Subversion | stock (svnserve) 1..N | best | slates 1..N | best |
+|---|---|---|---|---|
+| load / import (once) | | | | |
+| checkout of trunk | | | | |
+| `log -q`, whole history | | | | |
+| one-file commit | | | | |
+| update to it | | | | |
+| update across 1,000 revisions | | | | |
+
+| server kind | peak resident MiB | most CPU s |
+|---|---|---|
+| slates daemon / anchor, git daemon, httpd with git-http-backend, hg serve, svnserve | | |
+
+The verdict per row is slates' best against the best stock server's best, as a ratio; "an order of magnitude" is a ratio
+of 10 or better.
+
+Tried on the MacBook (2026-11-23, Apple M5 Max, load ~70, a 3-commit repository, `SERVERS="stock stock-http"`, one
+run): every step of both stock servers passed, each clone identical to the source in refs and objects. That only proves
+the harness runs; its seconds are no record.
