@@ -933,11 +933,17 @@ where
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
+          slates_machine::log_line!(
+            "slates-server: a version-control HTTP connection's task was not detached"
+          );
           crate::fleet::count_refusal(NOT_DETACHED);
         }
       }
       // The refused task's future, its seat with it, was dropped: the seat is given back.
       Err(_) => {
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP connection's task could not be spawned; the connection closed"
+        );
         crate::fleet::count_refusal(SPAWN_REFUSED);
       }
     }
@@ -1103,6 +1109,8 @@ struct Parts<S: Site> {
   service: Option<Started<S::Exchange>>,
   /// The reply's run being handed on.
   reply: Vec<u8>,
+  /// The bytes the connection has written on this shard: what an abnormal end logs beside its reason ([`count_end`]).
+  written: u64,
 }
 
 impl<S: Site> Parts<S> {
@@ -1164,6 +1172,7 @@ impl<S: Site> Parts<S> {
     };
     let marker = self.marker(overdue);
     let bytes = u64::try_from(connection.output().len()).unwrap_or(u64::MAX);
+    self.written = self.written.saturating_add(bytes);
     // A-859: a write's first pend counted live, then heard by the service's exchange, where an operator and a test can
     // see a write waiting on its client.
     let (state, service) = (self.state, &mut self.service);
@@ -1489,10 +1498,11 @@ async fn drive<S, M>(
     secure: connection.secure(),
     service: None,
     reply: Vec::new(),
+    written: 0,
   };
   match parts.serve(&mut connection).await {
     Exit::Ended(why) => {
-      count_end(parts.state, why, connection.ended());
+      count_end(parts.state, why, (connection.ended(), parts.written));
       drop(seat);
     }
     Exit::Moved(shard) => {
@@ -1549,6 +1559,11 @@ where
   if slates_rt::registry::send_control(shard, slates_rt::control::Control::Spawn(Box::new(arrive)))
     .is_err()
   {
+    // Logged as well as counted (goal 93, the `v3_takeover` gate's push-0 disconnect named nothing): the client sees
+    // only its connection end.
+    slates_machine::log_line!(
+      "slates-server: a version-control HTTP connection's move to shard {shard} was refused; the connection closed"
+    );
     crate::fleet::count_refusal(MOVE_REFUSED);
   }
 }
@@ -1568,6 +1583,9 @@ where
     make,
   } = moving;
   let (Some(state), Ok(stream)) = (here(), TcpStream::from_owned(stream)) else {
+    slates_machine::log_line!(
+      "slates-server: a version-control HTTP connection moved here was lost: no edge state, or its socket not adopted"
+    );
     crate::fleet::count_refusal(ARRIVAL_LOST);
     return;
   };
@@ -1576,10 +1594,16 @@ where
   )) {
     Ok(task) => {
       if detach(task).is_err() {
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP connection's task was not detached"
+        );
         crate::fleet::count_refusal(NOT_DETACHED);
       }
     }
     Err(_) => {
+      slates_machine::log_line!(
+        "slates-server: a version-control HTTP connection's task could not be spawned; the connection closed"
+      );
       crate::fleet::count_refusal(SPAWN_REFUSED);
     }
   }
@@ -1660,9 +1684,17 @@ impl Drop for Arriving {
 /// Counts how a connection ended: by its loop's reason, then by the engine's. Called before the connection's socket
 /// closes, so its client cannot see the end before the count; a refusal was counted as it ended the connection
 /// (`Parts::close_write`), a reap as it was chosen ([`EdgeState::seating`]).
-fn count_end(state: Kept<EdgeState>, why: Why, ended: Option<Ended>) {
+fn count_end(state: Kept<EdgeState>, why: Why, (ended, written): (Option<Ended>, u64)) {
   if why == Why::Failed {
     crate::fleet::count_refusal(SOCKET_FAILED);
+  }
+  // Any end but a client's close between requests or a completed reply is logged with the engine's reason (goal 93:
+  // the `v3_takeover` gate's push-0 disconnect ended where nothing said why).
+  if why == Why::Failed || !matches!(ended, Some(Ended::Peer | Ended::Completed)) {
+    slates_machine::log_line!(
+      "slates-server: a version-control HTTP connection ended {why:?}, the engine's end {ended:?}, {written} bytes \
+       written (a chunked reply has no length to set them against)"
+    );
   }
   let failed = why == Why::Failed || matches!(ended, Some(Ended::Tls | Ended::Aborted));
   if failed {
