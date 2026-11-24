@@ -728,3 +728,7 @@
   >> reused_* = searching; parts_by_entry >> parts_copied = cover entry-by-entry; stops w/o stopped_brought = let-go stall;
   git_encode.turns during fetch = fetch pays encode. Stream: crates/git/src/store/upload.rs (cover 1165, holders 1193,
   reused 1494, search_unit 1849). Await main's rows + sample, then name the step and land red-first.
+- 05:14: LANDED ba61d4890 (GAPS: A-891 git half built, held by t_a888_git x2; w-hg removes made_commit::commit, agreed in
+  writing) and f7c70b076 (TSan: room_needed sliced a write a step, caller asserts >2 steps). Gate 6 7/7 with no Unlanded;
+  gate 7 (10+10 at 3d65116a6) running. WAITING: t_a614a's TSan words (run 45398791868; passes natively 2.7 s), gate 7's
+  cause, clone profile (git_scale.sh widened by w-interop).
