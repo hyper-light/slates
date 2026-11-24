@@ -159,3 +159,23 @@ fn the_recorded_submit_required_refusal_is_its_golden_vector() {
   );
   assert_eq!(Refusal::from_bytes(&bytes).unwrap(), refusal);
 }
+
+/// Goal 93 (golden vector): do encode `ImportFault::RetentionPastRoom` naming revision 2, 3 bytes reserved, a room of 4
+/// and revision 1 landed. Expect its recorded bytes, the fault's tag 11 in four bytes and each number in eight, all
+/// little-endian, and the same fault decoded back.
+#[test]
+fn the_retention_past_room_import_fault_is_its_golden_vector() {
+  let fault = ImportFault::RetentionPastRoom {
+    revision: 2,
+    reserved: 3,
+    room: 4,
+    landed: 1,
+  };
+  let bytes = fault.to_bytes();
+  let recorded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  assert_eq!(
+    recorded, "0b0000000200000000000000030000000000000004000000000000000100000000000000",
+    "the golden vector changed: a protocol change"
+  );
+  assert_eq!(ImportFault::from_bytes(&bytes).unwrap(), fault);
+}

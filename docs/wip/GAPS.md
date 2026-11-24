@@ -4672,6 +4672,20 @@
 > `GreenReplay::step`). Owed: git-2000 re-measured on the merged tree (main's run), which closes P7's finding (2) or
 > not. Still one step a batch: `append_versions`' loop before the record (each version's increment held, its entry
 > encoded; w-rewrite-ops'), and `follow`, the fold and the texts' release after the last slice.
+> **An import batch is bounded by its green's retention room, BUILT (A-892, 2026-11-24, w-svn; main's red of 2026-11-23
+> on the Studio's 23 shards).** git-2000.dump's import was refused `BudgetExceeded { available: 373475417 }` in every
+> run: one batch's versions reserved 422,803,669 bytes of the green's retention against its cap of 373,475,417
+> (`caps.green_chain_bytes`), the batch bounded by the shard's memory alone; a 4-CPU runner, whose shards are fewer and
+> larger, imported it. Now a batch takes its room when it begins (the cap less what the green holds once folded), and a
+> revision whose reservation would take it past is deferred whole to the next batch (`Flush::Retention`, counted
+> `repository.svn_import.flushed_retention`); one past the room alone is refused `ImportFault::RetentionPastRoom`,
+> naming it, both numbers and what landed. Held by
+> `t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_time` (red: refused at the first batch's
+> landing) and `t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_and_both_numbers`. Owed: the
+> Studio's interop round 3 (main's run); and the batch's chain entries, held to the same cap in the `green_chains`
+> table: under a 16 KiB cap a batch of two revisions adding 400 paths was refused `TableAtCapacity { table:
+> "green_chains" }` at its landing, so a batch must also flush before its entries outgrow the chain's room (found
+> 2026-11-24 writing A-892's red; far from the Studio's cap at git-2000's sizes).
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").

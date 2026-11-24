@@ -501,7 +501,8 @@ fn path_named(refusal: &MigrationRefusal) -> String {
 
 /// The wire's refusal for the owner's step's refusal of a record the import made, at `revision`: the step's own refusal
 /// as the import's (Subversion's number), a revision whose green version this build cannot declare yet `Format`, the
-/// append's refusal as it is, and records not held here, a green that does not follow them or texts not made durable
+/// append's refusal as it is, a revision past its green's retention room `RetentionPastRoom` (naming it, both numbers
+/// and what landed), and records not held here, a green that does not follow them or texts not made durable
 /// `ContentUnavailable`.
 fn of_step(room: u64, refusal: Uncommitted, (revision, landed): (u64, u64)) -> Refusal {
   match refusal {
@@ -511,6 +512,14 @@ fn of_step(room: u64, refusal: Uncommitted, (revision, landed): (u64, u64)) -> R
     Uncommitted::Unsupported { .. } => import_refused(ImportFault::Format),
     Uncommitted::Budget { available } => Refusal::BudgetExceeded { available },
     Uncommitted::Append(refused) => of_append(refused),
+    Uncommitted::PastRetention { reserved, room } => {
+      import_refused(ImportFault::RetentionPastRoom {
+        revision,
+        reserved,
+        room,
+        landed,
+      })
+    }
     Uncommitted::NotHeld | Uncommitted::Diverged | Uncommitted::Unstored => {
       Refusal::ContentUnavailable
     }

@@ -135,6 +135,7 @@ ImportFault 7 RemovedPending
 ImportFault 8 Abandoned
 ImportFault 9 Subversion
 ImportFault 10 SubversionLanded
+ImportFault 11 RetentionPastRoom
 Intent 0 Read
 Intent 1 Write
 IpcNodeKind 0 Fifo

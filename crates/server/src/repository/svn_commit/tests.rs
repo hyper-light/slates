@@ -219,7 +219,7 @@ pub(crate) fn stored<T: Send + 'static, F: std::future::Future<Output = T> + 'st
 }
 
 /// [`stored`] on a daemon whose configuration `configure` changed first.
-fn stored_configured<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
+pub(crate) fn stored_configured<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
   history: impl FnOnce() -> F + Clone + Send + 'static,
   configure: impl FnOnce(&mut crate::DaemonConfig),
 ) -> T {

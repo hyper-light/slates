@@ -353,9 +353,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// with no second path): [`Invalid::RecordedSubmitRequired`] (appended), naming the tool, the wire's appended
 /// `Refusal::RecordedSubmitRequired`; until then such a submit committed its version and a task landed its revision
 /// after it (2026-11-23).
+/// 64: an import past its green's retention: the re-exported [`ImportFault`] gains `RetentionPastRoom` (appended),
+/// naming the revision whose history and change index alone would reserve more of its green's retention than the green
+/// may hold, both numbers and the last revision that landed (goal 93, the Studio's interop round 2; 2026-11-24).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 63;
+pub const CONTRACT: u32 = 64;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

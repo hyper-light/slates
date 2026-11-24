@@ -279,18 +279,20 @@ pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
 fn report_first_budget_refusal(
   state: &crate::state::ShardState,
   dimension: &str,
-  requested: u64,
+  requested: Option<u64>,
   available: u64,
 ) {
   static REFUSE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
   static COVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-  let (gate, kind) = if available == 0 {
-    (&REFUSE_ALL, "refuse-all")
-  } else if requested <= available {
-    (&COVERED, "refused what its available covers")
-  } else {
-    return;
+  // A refusal that names no request (the record step's catch-all, which sees only the reply) is logged where nothing
+  // was available; whether one covered its request is known only where it was asked (main's question of 2026-11-24:
+  // "requested=0" read as a counting bug).
+  let (gate, kind) = match requested {
+    _ if available == 0 => (&REFUSE_ALL, "refuse-all"),
+    Some(requested) if requested <= available => (&COVERED, "refused what its available covers"),
+    _ => return,
   };
+  let requested = requested.map_or_else(|| "unknown".to_owned(), |requested| requested.to_string());
   if gate.swap(true, std::sync::atomic::Ordering::Relaxed) {
     return;
   }
@@ -3878,7 +3880,7 @@ fn record_completion_routed(
     // restore), logs the store's breakdown once — the create path alone did before, and a takeover's
     // `BudgetExceeded { available: 0 }` on CI (run 36828863866, 2026-10-01) carried no breakdown.
     if let Refusal::BudgetExceeded { available } = refusal {
-      report_first_budget_refusal(state, "any verb", 0, *available);
+      report_first_budget_refusal(state, "any verb", None, *available);
     }
   }
   reply
@@ -7700,7 +7702,7 @@ pub(crate) fn admit_over(
         // (A-789) and the teardowns of the volumes this shard destroys (A-884), so only a refusal that waits for
         // nothing is the shard's first to report.
         if !crate::room_wait::note_refusal(state, crate::room_wait::Room::Bytes, limit, available) {
-          report_first_budget_refusal(state, "bytes", limit, available);
+          report_first_budget_refusal(state, "bytes", Some(limit), available);
         }
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
@@ -7736,7 +7738,7 @@ pub(crate) fn admit_over(
       // A teardown in flight gives its volume's inode allowance back as it ends (A-884): waited for, as bytes are.
       if !crate::room_wait::note_refusal(state, crate::room_wait::Room::Versions, wanted, available)
       {
-        report_first_budget_refusal(state, "versions", wanted, available);
+        report_first_budget_refusal(state, "versions", Some(wanted), available);
       }
       return Err(Box::new(give_back(
         state,
@@ -11204,7 +11206,7 @@ pub(crate) fn secure_retention(
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
   crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
   crate::merge_service::secure_green_retention(state, green_id, secured).inspect_err(|available| {
-    report_first_budget_refusal(state, "retention", secured, *available);
+    report_first_budget_refusal(state, "retention", Some(secured), *available);
     report_first_retention_cap_refusal(state, green_id, (secured, *available));
   })
 }

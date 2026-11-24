@@ -696,13 +696,51 @@ async fn stage_owed(
       }
     },
   };
-  match batch.stage(revision, texts).await? {
-    Ok(()) => {
+  let deferred = match batch.stage(revision, texts).await? {
+    Ok(None) => {
       *staging = Some(batch);
-      Some(Ok(()))
+      return Some(Ok(()));
     }
+    Ok(Some(deferred)) => deferred,
     Err(refused) => {
       let _ = crate::state::with_state(|state| batch.abandon(state));
+      return Some(Err(refused));
+    }
+  };
+  // The batch has no room in the green's retention for the revision (goal 93, main's red of 2026-11-23): it lands, and
+  // the revision begins the next.
+  if let Err(refused) = batch.land(principal, Flush::Retention).await? {
+    crate::state::with_state(|state| deferred.give_back(state))?;
+    return Some(Err(refused));
+  }
+  let mut next = match Staging::begin(id).await? {
+    Ok(next) => next,
+    Err(refused) => {
+      crate::state::with_state(|state| deferred.give_back(state))?;
+      return Some(Err(refused));
+    }
+  };
+  match next.stage_deferred(deferred).await? {
+    Ok(None) => {
+      *staging = Some(next);
+      Some(Ok(()))
+    }
+    // A batch of none refuses a revision past its room rather than deferring it, so this is not reached; refused as
+    // that revision would be if it is.
+    Ok(Some(deferred)) => {
+      let room = crate::state::with_state(|state| {
+        let room = next.room();
+        deferred.give_back(state);
+        next.abandon(state);
+        room
+      })?;
+      Some(Err(Uncommitted::PastRetention {
+        reserved: room.saturating_add(1),
+        room,
+      }))
+    }
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| next.abandon(state));
       Some(Err(refused))
     }
   }
