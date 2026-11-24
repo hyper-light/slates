@@ -22,6 +22,19 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 01:50 on 11-24:
+- 84a Windows: the cause is jupiter's OS, measured with no slates involved. A kernel-event ping-pong
+  (~/.cache/main-84a-win/pingpong.ps1 on jupiter, Normal through WMI) wakes a blocked thread 1-12 ms late at 2e-4 to
+  1e-3 of wakes, more often after longer sleeps (500 us idle: p999 1.46-1.89 ms, p9999 7.3 ms). So no design that blocks
+  on the latency path meets every-run p999 < 1 ms there. Current main already lets the OS place Windows shards (A-871,
+  Fixing::Waits); the soft-pin arm was moot. Direction sent to w-perf (after A-887): the client spins for its reply within
+  a derived window; the shard's hold derives from the measured park cost (one formula, the platform's wake tail an input);
+  the bench prints the OS floor as its noise floor.
+- F2 LANDED (e3efe8d21). (d1a-3)'s cause confirmed (a takeover's rebuild owed no resolution pass); ruled: the rebuild owes
+  one locally plus a "rebuilt here" home message acknowledged per member (wire version bump).
+- w-git: guarded made commits landed (22a88984b); commits::make goes (bare git submits refused RecordedSubmitRequired);
+  owed records met at replay are refused typed once no production caller is confirmed to have made them.
+
 Updates at 01:13 on 11-24:
 - 84a's Windows tail is DIAGNOSED (r801 on jupiter, main 891de2741 plus three DIAG commits on the scratch worktree
   ~/slates-work/main-84a-windiag, not for main). Every slow sample is a parked thread's wake arriving late: the shard's
