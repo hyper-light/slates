@@ -5097,6 +5097,14 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
             demux_sum(state, |c| c.high_water),
           ),
           (
+            crate::vcs_http::WRITES_WAITING,
+            crate::vcs_http::writes_waiting_here(),
+          ),
+          (
+            crate::vcs_ssh::WRITES_WAITING,
+            crate::vcs_ssh::writes_waiting_here(),
+          ),
+          (
             crate::fleet::DIAL_RECORD_DIALING,
             crate::fleet::record_dials_dialing(state),
           ),
