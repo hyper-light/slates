@@ -3959,7 +3959,7 @@ fn assert_the_long_push_re_based_and_landed(
   after: &(u16, Vec<u8>),
   tips: [String; 2],
 ) {
-  assert_hg_answered(&long);
+  assert_hg_answered(long);
   assert_eq!(
     rebased, 1,
     "the long push's fork re-based over the small push's entry"

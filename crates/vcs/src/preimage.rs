@@ -72,13 +72,20 @@ pub struct PreimageCounts {
   pub bytes: u64,
 }
 
-impl core::ops::AddAssign for PreimageCounts {
-  fn add_assign(&mut self, other: PreimageCounts) {
-    self.old = self.old.saturating_add(other.old);
-    self.absent = self.absent.saturating_add(other.absent);
-    self.bytes = self.bytes.saturating_add(other.bytes);
+impl PreimageCounts {
+  /// These counts and `other`'s together, each saturating at its type's bound.
+  #[must_use]
+  pub fn and(self, other: PreimageCounts) -> PreimageCounts {
+    PreimageCounts {
+      old: self.old.saturating_add(other.old),
+      absent: self.absent.saturating_add(other.absent),
+      bytes: self.bytes.saturating_add(other.bytes),
+    }
   }
 }
+
+/// What one entry costs a turn's read of a page, in bytes: [`Preimages::overlay_within`]'s `size`.
+pub type EntryCost<'a, K, V> = &'a dyn Fn(&K, &V) -> usize;
 
 /// One family's frozen ranges and pre-images (module docs).
 #[derive(Debug)]
@@ -152,7 +159,7 @@ impl<K: Paged, V: Clone> Preimages<K, V> {
     &self,
     (lo, hi): (u64, u64),
     now: impl Iterator<Item = (K, V)>,
-    (cap, size): (usize, &dyn Fn(&K, &V) -> usize),
+    (cap, size): (usize, EntryCost<'_, K, V>),
   ) -> (Vec<(K, V)>, Option<u64>) {
     let mut kept = self.kept.range(K::keys_in(lo, hi)).peekable();
     let mut now = now.peekable();

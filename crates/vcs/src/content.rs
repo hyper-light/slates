@@ -282,6 +282,9 @@ impl WindowStorage for HeapWindows {
   }
 }
 
+/// The lists read at a cut, and where the read stopped short of its range ([`ContentStore::lists_at_cut`]).
+pub type CutLists = (Vec<(ContentId, Box<[u8]>)>, Option<u64>);
+
 /// Where a held content's bytes are: in the store's own memory (its lists, tables and derived nodes), or kept by its
 /// window storage (its windows).
 #[derive(Debug)]
@@ -1285,7 +1288,13 @@ impl ContentStore {
     self.counters.freed = self.counters.freed.saturating_add(1);
     // Only a list's, a derived node's and a table's bytes are read: they name what is given back next.
     let named = matches!(freed.form, Form::List | Form::Derived | Form::Table);
-    let bytes = match freed.kept {
+    let bytes = self.freed_bytes(freed.kept, named);
+    Ok(Some((bytes, freed.form)))
+  }
+
+  /// A freed entry's bytes where the cascade reads them (`named`), its storage window let go either way.
+  fn freed_bytes(&mut self, kept: Kept, named: bool) -> Option<Box<[u8]>> {
+    match kept {
       Kept::Here(bytes) => named.then_some(bytes),
       // Its bytes are the node's store's: nothing kept here to free or to give back.
       Kept::Away { .. } => None,
@@ -1298,8 +1307,7 @@ impl ContentStore {
         self.storage.release(window);
         bytes
       }
-    };
-    Ok(Some((bytes, freed.form)))
+    }
   }
 
   /// The bytes of the content `identity` names: a window's, a list's identities, or a table's. Lists and tables are the
@@ -1747,28 +1755,24 @@ impl ContentStore {
 
   /// The pre-images kept since this was last asked, the counts started again.
   pub fn take_cut_counts(&mut self) -> PreimageCounts {
-    let mut counts = self.cut.lists.take_counts();
-    counts += self.cut.names.take_counts();
-    counts += self.cut.aways.take_counts();
-    counts
+    self
+      .cut
+      .lists
+      .take_counts()
+      .and(self.cut.names.take_counts())
+      .and(self.cut.aways.take_counts())
   }
 
   /// [`ContentStore::lists_in`] as at the cut: the lists now with their pre-images laid over them (F2), read until
   /// their bytes (an identity and the list's) pass `cap`; where the read stopped short of the range, the coordinate it
   /// stopped at (`crate::preimage::Preimages::overlay_within`).
-  pub fn lists_at_cut(
-    &self,
-    (lo, hi): (u64, u64),
-    cap: usize,
-  ) -> (Vec<(ContentId, Box<[u8]>)>, Option<u64>) {
+  pub fn lists_at_cut(&self, (lo, hi): (u64, u64), cap: usize) -> CutLists {
     self.cut.lists.overlay_within(
       (lo, hi),
       self
         .lists_in(lo, hi)
         .map(|(identity, bytes)| (identity, Box::from(bytes))),
-      (cap, &|_, bytes: &Box<[u8]>| {
-        IDENTITY_BYTES.saturating_add(bytes.len())
-      }),
+      (cap, &|_, bytes| IDENTITY_BYTES.saturating_add(bytes.len())),
     )
   }
 

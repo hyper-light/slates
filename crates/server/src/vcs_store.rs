@@ -1821,6 +1821,10 @@ pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut Shard
 /// A lender of a shard's state its caller holds already (`crate::vcs_http::git::ShardLender`): a recovery's, which owns
 /// the state through its replays and has no thread-local state to lend from, so a step that the daemon runs over
 /// `ThisShard` runs over the same state there (an hg revision's bring-back, `hg_push::bring_back_on`).
+#[expect(
+  dead_code,
+  reason = "A-887's recovery pre-pass constructs it (w-perf's next landing), which removes this expectation"
+)]
 pub(crate) struct HeldShard<'s>(pub(crate) &'s mut ShardState);
 
 impl crate::vcs_http::git::ShardLender for HeldShard<'_> {
