@@ -4672,6 +4672,15 @@
 > `GreenReplay::step`). Owed: git-2000 re-measured on the merged tree (main's run), which closes P7's finding (2) or
 > not. Still one step a batch: `append_versions`' loop before the record (each version's increment held, its entry
 > encoded; w-rewrite-ops'), and `follow`, the fold and the texts' release after the last slice.
+> **A held verdict's base let go between its judge and its apply never makes another green; it costs a run (2026-11-24,
+> w-svn; main's question of 2026-11-23).** The made commit's step applies the verdict as its chain entry records it
+> (`Green::apply_recorded`, named bytes lent by identity from the content plane, `name_holds::apply_recorded_lent`); a
+> base window let go meanwhile cannot be lent in the synchronous step, so the step gives the accept up with nothing
+> applied (`made_commit::abandon`, `Overloaded` unrecorded) and the retry judges, lands and applies anew. Held by
+> `a_base_let_go_between_a_held_verdicts_judge_and_apply_never_makes_another_green` (the base let go in the step through
+> `svn_made::LET_GO_BEFORE_APPLY`: given up, then revision 2 once, the file the verdict judged, head 2). Owed, on the
+> speed list: bring the apply's unlent objects back in the task before its step (the turn is held), so a let-go costs a
+> fetch, not a whole run and a changeset landed again at its sequence.
 > **The use test's dump comparison reads a directory's deletions as a set (2026-11-24, w-svn; main's interop red of
 > 2026-11-23, run 45330574435).** `svnrdump dump 0:HEAD` differed at line 1,608,541 only in the order of one revision's
 > deletions in `trunk/templates/`. Stock's own order is no fixed rule: its dump editor queues a directory's deletions in
