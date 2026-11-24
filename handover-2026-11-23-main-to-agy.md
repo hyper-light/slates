@@ -22,11 +22,27 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 06:07 on 11-24:
+- A-897 landed (fb50fbd61): the bench now names whose time each slow sample is (client send, seat pickup, service, client
+  take, on one clock), every run's p99/p999 beside the verdict, the floor and CPU per form; BENCHMARKS and GAPS 84a carry
+  the measured-and-rejected arms and the OS floor. Of 239 slow samples in rounds 3-6: client send 97, client take 80,
+  seat pickup 29, service or spread 33. w-84a-win now builds A-901 (an observation holds no shard; CPU only).
+- Restart loop fixed at its root (w-perf f6b3717e8/39a1dcd4a): a daemon marks itself serving only once every shard's start
+  has ended, so a start that never ends is a failed start and the anchor backs off. The cubic replay (e7596c80b) was the
+  start_shard spin. The hg 57k restart and the svn git-2000 rounds run again at 39a1dcd4a as r901 after the git leg.
+- Gate 8 (38 of 40): push 0's homing right after creation gets a fast non-Kept answer from a remote home. The best fit is
+  the remote's membership view still settling (NotAHome). w-git lands the answer-kind line, gate 9 names it, then w-git
+  and w-shared agree one wait (A-894's creation wait or NotAHome waited out within budget).
+- The Windows fleet hang was a test that never snapshots its clone, and its unasserted poll passed vacuously on the Mac
+  after 407 s. w-shared lands the fix, then a #[must_use] sweep of the poll helpers (34 statement calls). The Windows
+  fleet step's limit is 55 minutes and its deadline 289 s (5618d46db).
+- The kiln server stopped answering at 06:05. Restarting it is Ada's call. jupiter's C: is at 8.8 GB free.
+
 Updates at 05:37 on 11-24:
 - 84a Windows VERDICT (w-84a-win's A-897, accepted): no scheduling change on slates' side holds the every-run bar on
-  jupiter. 6 interleaved rounds, 254 invocations: main fails 1/114 loaded and 14/120 quiet runs (p999 > 1 ms). Every arm
+  jupiter. 6 interleaved rounds, 143 invocations (corrected at 06:07 from 254): main fails 1/114 loaded and 14/120 quiet runs (p999 > 1 ms). Every arm
   lost or tied: a 2 ms shard window, client spins, seat holds, A-326's holds off, the client thread raised up to
-  TIME_CRITICAL (it still stalls 3-12 ms there), and the client pinned to one CPU. About 80% of slow samples are the
+  TIME_CRITICAL (it still stalls 3-12 ms there; at HIGHEST 3 of 24 quiet runs failed, corrected from 1 of 24), and the client pinned to one CPU. About 80% of slow samples are the
   client thread stalled in its own send path, and about 15% are the seat's pickup. Main's quiet stall rate (3-7e-4 a
   sample) sits inside the OS's own measured wake tail (pingpong.ps1: 1-12 ms late at 2e-4 to 1e-3 a wake). WHP is on,
   and the hypervisor/DPC cause is inferred. Landing: the bench's attribution, no product latency change, the
