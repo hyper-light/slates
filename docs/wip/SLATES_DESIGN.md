@@ -61751,7 +61751,14 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   later. Bounds, each on a `Derived:` line and asserted by the oracle: the
   pre-images at most E + I (E the entries in the cut's pages at the cut; I at most a turn's inserts into them times the
   turns the cut lasts, its pages and the pages its splits put back), the chunks held at most a turn's frees times those
-  turns. The catch-up spends a copy slice's bytes a wake, turns until then (`content_holder::image_catch_up_slice`;
+  turns. A turn, a drain and a split read and change a family's directory in place: `Directories::of` copied it whole
+  at every mark (each family, every drain) and every page encoded, a family's size of work a turn, which made a third
+  of the catch-up's time (CI's macOS debug runs of the starvation test red 4 of 10, the cut of 65,536 windows and as
+  many region holds needing about 1,754 turns against the about 1,700 a 3-core debug runner fit in the wait's 1 s of
+  shard CPU; measured on a loaded Mac, debug: the catch-up's 1.11 s in all, 0.32 s of it the begin's drain and count;
+  after, 0.24 to 0.26 s, the drain 6 to 9 ms; red `a_turn_and_a_drain_copy_no_directory_however_many_pages_it_holds`,
+  20,000 directory pages copied by one mark and one turn over 10,000, now none). The catch-up's step no longer drains
+  twice. The catch-up spends a copy slice's bytes a wake, turns until then (`content_holder::image_catch_up_slice`;
   main's ruling (a) of 2026-11-23 19:16): a turn spends the page size, which a test sets far below the slice, so the
   slice is what a yield's work is judged by, a step's share of the shard's own owed work whatever the page size. The
   pause stays (main's ruling (a)): with F2 it is reached only while publications are refused, where it bounds

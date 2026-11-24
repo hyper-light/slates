@@ -253,10 +253,30 @@ pub(crate) fn decode_page(
 }
 
 /// A family's pages ([`Page`]), each by its first coordinate: a cover of the coordinates, every page apart.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Directory {
   /// Each page's depth, by its first coordinate.
   pages: BTreeMap<u64, u8>,
+}
+
+impl Clone for Directory {
+  /// A copy of every page: work a family's size, which the encoder's turns and drains never pay (A-870 F2), counted
+  /// under a test ([`DIRECTORY_PAGES_COPIED`]).
+  fn clone(&self) -> Directory {
+    #[cfg(test)]
+    DIRECTORY_PAGES_COPIED.with(|copied| {
+      copied.set(copied.get().saturating_add(self.pages.len()));
+    });
+    Directory {
+      pages: self.pages.clone(),
+    }
+  }
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Test support (F2): the directory pages this thread's copies of a [`Directory`] copied.
+  static DIRECTORY_PAGES_COPIED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 impl Directory {
@@ -328,13 +348,6 @@ impl Directory {
 pub(crate) struct Directories {
   /// Each family's.
   pub(crate) families: BTreeMap<Family, Directory>,
-}
-
-impl Directories {
-  /// `family`'s directory: one page of every coordinate where none was published.
-  pub(crate) fn of(&self, family: Family) -> Directory {
-    self.families.get(&family).cloned().unwrap_or_default()
-  }
 }
 
 /// What a shard's image encoder holds (A-870 piece 2; main 01a20182's ruling of 2026-11-23: the encoding moves off the
@@ -427,9 +440,13 @@ impl Encoder {
 
   /// Notes the coordinates of `family`'s entries changed since: the pages they lie in are dirty.
   pub(crate) fn mark(&mut self, family: Family, coordinates: impl IntoIterator<Item = u64>) {
-    let directory = self.working.of(family);
+    // Read in place: a copy of the directory would be a family's size of work a drain.
+    let pages = match self.working.families.get(&family) {
+      Some(directory) => directory.plan_dirty(coordinates),
+      None => Directory::default().plan_dirty(coordinates),
+    };
     let paused = self.paused();
-    for page in directory.plan_dirty(coordinates) {
+    for page in pages {
       if self.dirty.insert((family, page)) && paused {
         self.dirtied_paused.insert((family, page));
       }
@@ -543,9 +560,12 @@ impl Encoder {
         .map(|(page, _)| *page)
         .filter(|into| *into != page)
         .collect();
-      let mut directory = self.working.of(family);
-      directory.replace(page, planned.into_iter().map(|(page, _)| page));
-      self.working.families.insert(family, directory);
+      self
+        .working
+        .families
+        .entry(family)
+        .or_default()
+        .replace(page, planned.into_iter().map(|(page, _)| page));
       // A change since the cut marked the page for the next cut; split, its halves are marked in its place.
       if !split.is_empty() && self.dirty.remove(&(family, page)) {
         self.dirty.extend(split.iter().map(|into| (family, *into)));
@@ -613,9 +633,12 @@ impl Encoder {
       }
     }
     let pages: Vec<Page> = planned.iter().map(|(into, _)| *into).collect();
-    let mut directory = self.working.of(family);
-    directory.replace(page, pages.iter().copied());
-    self.working.families.insert(family, directory);
+    self
+      .working
+      .families
+      .entry(family)
+      .or_default()
+      .replace(page, pages.iter().copied());
     // A change since the cut marked the page for the next cut, or first dirtied it in a pause: its pages take its place.
     if self.dirty.remove(&(family, page)) {
       self.dirty.extend(pages.iter().map(|into| (family, *into)));
@@ -1302,6 +1325,90 @@ mod tests {
     assert!(
       kept_old > 0,
       "an old value kept (the cut's windows pages {windows_pages}, pages left after its first turn {left})"
+    );
+  }
+
+  /// Shape: the pages of the directory the copy test's encoder holds: a family's pages after a large push (about 20,000
+  /// at a 4,096-byte page for 65,536 objects' windows).
+  const DIRECTORY_PAGES: u64 = 10_000;
+
+  /// A-870 F2, a turn's and a drain's work against a family's size (CI's macOS debug runs, 2026-11-23: a third of the
+  /// catch-up's time measured in its begin and drain). Do: hold a directory of [`DIRECTORY_PAGES`] pages in an encoder,
+  /// mark one coordinate dirty, begin a cut and run a turn. Expect: no page of the directory copied. Failing first: the
+  /// mark and the turn each copied the family's directory whole (`Directories::of`), a family's size of work a turn.
+  #[test]
+  fn a_turn_and_a_drain_copy_no_directory_however_many_pages_it_holds() {
+    const DEPTH: u8 = 14;
+    let pages: Vec<((Family, Page), Vec<u8>)> = (0..DIRECTORY_PAGES)
+      .map(|at| {
+        let page = Page {
+          depth: DEPTH,
+          start: at << (64 - u32::from(DEPTH)),
+        };
+        ((Family::Windows, page), Vec::new())
+      })
+      .collect();
+    let mut encoder = Encoder::restored(pages);
+    let coordinate = 5u64 << (64 - u32::from(DEPTH));
+    DIRECTORY_PAGES_COPIED.with(|copied| copied.set(0));
+    encoder.mark(Family::Windows, [coordinate]);
+    assert!(encoder.begin(1).is_some(), "a cut of the dirty page begun");
+    let mut encoded = Vec::new();
+    let turned = encoder.turn(
+      (4096, 4096),
+      &|_, _, _| (vec![entry(coordinate, 10)], None),
+      &mut encoded,
+    );
+    assert!(turned.caught_up, "the cut's one page encoded");
+    let copied = DIRECTORY_PAGES_COPIED.with(core::cell::Cell::get);
+    assert_eq!(
+      copied, 0,
+      "the mark and the turn copied {copied} directory pages"
+    );
+  }
+
+  /// Shape: the objects a fresh shard keeps before its first cut in the chase test: a windows gap page of many entries.
+  const CHASE_BACKLOG: usize = 2_000;
+  /// Shape: the objects put between two of the chase test's turns, each a window at the end of the handle space: more
+  /// than one capped read of its small page visits.
+  const CHASE_PUTS_A_TURN: usize = 64;
+
+  /// A-870 F2 against a dirtier at the frozen range's end (main 01a20182, 2026-11-23 22:09: CI's macOS debug runs red
+  /// 4 of 10, about 1,021 pages split each, the cut never carried). Do: on a fresh shard whose pages are small, keep
+  /// [`CHASE_BACKLOG`] objects (the windows family's first page a gap page, every coordinate on), begin a cut; then, a
+  /// turn at a time, put [`CHASE_PUTS_A_TURN`] fresh objects (windows whose handles land at the end of that frozen page)
+  /// and run a turn. Expect: the cut wholly encoded within its bound (twice its bytes over the page size, plus a page a
+  /// depth for its splits), whatever is put meanwhile. A guard, not a red: written for the suspicion that the capped
+  /// read, visiting every handle put after the cut, would chase the frozen page's tail forever; it passed before any
+  /// change (21.9 s, debug), since handles are dense integers and a page of width w holds at most w of them, so a read
+  /// finishes each page in bounded visits. CI's macOS debug reds were the catch-up's throughput instead
+  /// ([`a_turn_and_a_drain_copy_no_directory_however_many_pages_it_holds`]).
+  #[test]
+  fn a_cut_is_encoded_while_every_turn_puts_windows_at_its_frozen_pages_end() {
+    const PAGE: usize = 512;
+    let (done, turns, bound) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let _ = put_objects(state, (0, CHASE_BACKLOG));
+      let bytes: usize = crate::content_holder::paged_entries_placed(state)
+        .iter()
+        .map(|(_, _, key, value)| key.len() + value.len())
+        .sum();
+      let bound = 2 * bytes / PAGE + 64 * 6;
+      let mut turns = 0;
+      let mut done = crate::content_holder::image_turn(state).caught_up;
+      let mut fresh = CHASE_BACKLOG;
+      while !done && turns < bound {
+        let _ = put_objects(state, (fresh, CHASE_PUTS_A_TURN));
+        fresh += CHASE_PUTS_A_TURN;
+        done = crate::content_holder::image_turn(state).caught_up;
+        turns += 1;
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (done, turns, bound)
+    });
+    assert!(
+      done,
+      "the cut wholly encoded within {bound} turns while windows were put at its end: not done after {turns}"
     );
   }
 

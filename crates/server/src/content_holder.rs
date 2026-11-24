@@ -1063,7 +1063,7 @@ pub(crate) fn image_catch_up_slice(state: &mut ShardState) -> bool {
 /// One step of the catch-up ([`image_catch_up`]): a turn, and where the cut is wholly encoded the catch-up's end and its
 /// publication. Whether it ended, and the bytes the turn spent.
 pub(crate) fn image_catch_up_step(state: &mut ShardState) -> (bool, u64) {
-  image_drain(state);
+  // The turn takes the changes since first (`image_begin`): no drain of its own here.
   let turned = image_turn(state);
   if !turned.caught_up {
     // A turn of no bytes popped pages of no entry: the cut's pages are finite, so the slice still ends.
