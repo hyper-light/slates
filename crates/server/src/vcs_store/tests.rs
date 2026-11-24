@@ -2594,6 +2594,14 @@ fn assert_let_go_sliced(seen: &LetGoSeen) {
     trace[0]
   );
   assert_eq!(taken, *windows, "every window let go once");
+  assert_slices_fit_their_quantum(trace);
+  assert_whole_pack_let_go(trace, (*past, (*freed, *pinned, *len), *whole_after));
+}
+
+/// [`assert_let_go_sliced`]'s slices after the listing: each lets a window go; each window after a slice's first was
+/// taken only where the slice's elapsed and its longest window so far still fit its quantum; and every slice but the
+/// last ended only because its next window would not have fit.
+fn assert_slices_fit_their_quantum(trace: &[super::SliceTrace]) {
   let letting: Vec<_> = trace.iter().skip(1).collect();
   for (at, slice) in letting.iter().enumerate() {
     assert!(
@@ -2618,13 +2626,21 @@ fn assert_let_go_sliced(seen: &LetGoSeen) {
       }
     }
   }
+}
+
+/// [`assert_let_go_sliced`]'s end: each slice judged past the quantum counted (`past`), and the whole pack let go, none
+/// of it pinned and none held whole.
+fn assert_whole_pack_let_go(
+  trace: &[super::SliceTrace],
+  (past, (freed, pinned, len), whole_after): (u64, (u64, u64, u64), bool),
+) {
   let judged_past = trace.iter().filter(|slice| slice.past).count();
   assert_eq!(
-    *past,
+    past,
     u64::try_from(judged_past).unwrap(),
     "each slice judged past the quantum counted"
   );
-  assert_eq!((*freed, *pinned), (*len, 0), "the whole pack let go");
+  assert_eq!((freed, pinned), (len, 0), "the whole pack let go");
   assert!(!whole_after, "the pack held whole no more");
 }
 
