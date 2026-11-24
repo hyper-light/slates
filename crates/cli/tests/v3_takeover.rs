@@ -647,7 +647,10 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     &url(&nodes[at]),
     &acknowledged,
   );
-  // The region homing's and the takeover's own counts, for the record (main's order: land the switch with them).
+  // The region homing's and the takeover's own counts, for the record (main's order: land the switch with them); and
+  // the holders' replica builds (A-886): a branch's later pushes placed at f + 1 only through them, so some survivor,
+  // a holder before the owner died, made one (the non-vacuity count of this test's NoLoss).
+  let mut replicas_made = 0usize;
   for at in &survivors {
     let node = &nodes[*at];
     let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
@@ -661,13 +664,23 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
           "push_uncommitted",
           "replayed",
           "repository_rebuilt",
+          "replica_build",
+          "vcs_store.replica",
         ]
         .iter()
         .any(|word| line.contains(word))
       })
       .collect();
+    replicas_made += counted
+      .iter()
+      .filter(|line| line.contains("merge.replica_build.made:"))
+      .count();
     eprintln!("V3TAKEOVER: node {at} counted {counted:?}");
   }
+  assert!(
+    replicas_made > 0,
+    "no survivor made a replica of the pushed branch (A-886's build never ran)"
+  );
   drop(nodes);
   drop(scratch);
 }

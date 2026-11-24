@@ -2639,7 +2639,7 @@ pub(crate) fn repositories_ready(state: &ShardState) -> Vec<ReadyRepository> {
 }
 
 /// Every part of `repository`'s four state logs this node's acceptors hold, by log and then position.
-fn held_parts(
+pub(crate) fn held_parts(
   state: &ShardState,
   repository: slates_db::catalog::RepositoryId,
 ) -> Vec<slates_db::catalog::StateLogRecord> {
@@ -2710,7 +2710,11 @@ pub(crate) fn rebuild_repository(
   // Its store made from the log a step a turn, lent to nothing until it is whole, then each green's map made again in
   // slices (A-732 and its git and Subversion sibling): a large repository's adoption held in one step would spin the
   // successor's shard past the watchdog, the crash loop on another path.
-  crate::vcs_store::rebuild(state, record.id);
+  // A replica store this node made of it as a holder (`vcs_store::replica`) stands where it was made from the records
+  // the partition now holds: the takeover is warm.
+  if !crate::vcs_store::replica::adopt(state, record.id) {
+    crate::vcs_store::rebuild(state, record.id);
+  }
   state.count(TAKEOVER_REPOSITORY_REBUILT, 1);
   true
 }

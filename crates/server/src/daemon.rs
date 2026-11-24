@@ -5152,6 +5152,7 @@ async fn init_shard(
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
     materializations: crate::green_ready::Materializations::default(),
+    replica_builds: crate::replica_build::ReplicaBuilds::default(),
     hg_tags: crate::vcs_store::hg_tags::HgTags::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
@@ -5299,6 +5300,7 @@ async fn init_shard(
     fenced_greens: std::collections::BTreeMap::new(),
     vcs_disk: config.vcs_disk.clone(),
     family_reserved_through: 0,
+    vcs_replica_records: crate::vcs_store::ReplicaRecords::new(),
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),

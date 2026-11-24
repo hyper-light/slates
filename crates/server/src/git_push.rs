@@ -2479,6 +2479,31 @@ struct ShardGreens<'s, 'v> {
   examined: std::cell::Cell<u64>,
 }
 
+/// Format: why each command of a push whose records were not held at `f + 1` within its barrier's window is reported
+/// `ng` (`crate::state_log::names_committed_within`; main 01a20182's ruling of 2026-11-23 18:55): the client is told in
+/// its own report and may push again, never cut off mid-answer.
+pub(crate) const UNCOMMITTED: &[u8] = b"unable to commit";
+
+/// The report of `received`, a push answered whose records were not held at `f + 1` within its barrier's window: each
+/// command it applied reported `ng <ref> unable to commit` ([`UNCOMMITTED`]), each it refused as it was, in the framing
+/// the client asked (side-band or not), as git reports a ref it could not commit.
+pub(crate) fn uncommitted_report(received: &Received) -> Vec<u8> {
+  let mut refused = received.clone();
+  for outcome in &mut refused.outcomes {
+    if matches!(outcome, receive::Outcome::Ok(_)) {
+      *outcome = receive::Outcome::Ng(Declined {
+        reason: UNCOMMITTED.to_vec(),
+        hook: Vec::new(),
+        message: None,
+      });
+    }
+  }
+  let mut report = Vec::new();
+  // A line past a pkt-line's room cannot arise: each line is one of the client's own ref names and these words.
+  let _ = write_report(&refused, &mut report);
+  report
+}
+
 /// Format: the status counter of the greens a push's search for the green holding a commit examined
 /// (`ShardGreens::holding`): each one lent or whose versions were read.
 pub(crate) const HOLDING_EXAMINED: &str = "git_push.holding.examined";
