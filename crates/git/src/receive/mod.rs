@@ -311,6 +311,11 @@ impl<'a> Pushed<'a> {
     self.contents?.content(at, &placed.id)
   }
 
+  /// Where in its pack the last content read met a window let go, if any.
+  pub fn away(&self) -> Option<u64> {
+    self.contents.and_then(Contents::away)
+  }
+
   /// The position in pack order of the object named `id`, if the pack brought it.
   pub fn position(&self, id: &ObjectId) -> Option<usize> {
     self
@@ -350,13 +355,17 @@ impl<R: Repository + ?Sized> Repository for InMemory<'_, R> {
   }
 }
 
-impl<R: ?Sized> Contents for InMemory<'_, R> {
+impl<R: Repository + ?Sized> Contents for InMemory<'_, R> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     self.held.content(at, id)
   }
+
+  fn away(&self) -> Option<u64> {
+    self.repository.away()
+  }
 }
 
-impl<R: ?Sized> Keep for InMemory<'_, R> {
+impl<R: Repository + ?Sized> Keep for InMemory<'_, R> {
   fn keep(
     &mut self,
     at: usize,
@@ -389,6 +398,10 @@ impl<S: Repository + ?Sized> Outside for Thin<'_, S> {
 impl<S: Contents + ?Sized> Contents for Thin<'_, S> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     self.0.content(at, id)
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.0.away()
   }
 }
 

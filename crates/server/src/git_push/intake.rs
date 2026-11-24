@@ -47,7 +47,7 @@ impl Repository for Intake<'_> {
   }
 
   fn away(&self) -> Option<u64> {
-    Repository::away(&self.indexed)
+    Repository::away(&self.indexed).or_else(|| self.quarantined.away())
   }
 }
 
@@ -57,6 +57,10 @@ impl Contents for Intake<'_> {
       return (object.id == *id).then_some(Cow::Borrowed(object.content.as_slice()));
     }
     self.quarantined.content(at, id)
+  }
+
+  fn away(&self) -> Option<u64> {
+    Repository::away(&self.indexed).or_else(|| self.quarantined.away())
   }
 }
 
@@ -90,21 +94,32 @@ pub(crate) struct Quarantined<'s> {
 impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     // The push's object is read where it is: in the store, lent with no copy where it is one window there (A-727 a1), or
-    // where it lies in the push's pack (`Push::bytes`, main's ruling B part 2), a REF_DELTA's base outside the push read
-    // from the index.
+    // where it lies in the push's pack (`Push::pack_bytes`, main's ruling B part 2, covering objects passed over by the
+    // quarantine because the repository already indexed them so in-RAM pack/recent reads never hit let-go seed windows),
+    // a REF_DELTA's base outside the push read from the index.
     if let Some(push) = self.push {
       let outside = IndexBases {
         repository: self.repository,
         store: self.store,
       };
-      if let Some(read) = push.bytes(self.store, &outside, id) {
-        return read.ok();
+      match push.pack_bytes(self.store, &outside, id) {
+        Some(Ok(bytes)) => return Some(bytes),
+        Some(Err(refused)) => {
+          if let Some(waited) = refused.waited() {
+            self.repository.wait_for(waited);
+          }
+          return None;
+        }
+        None => {}
       }
     }
-    // An object the repository indexed already is passed over by the quarantine as it arrives (`admit_object`): a pack
-    // that resends it is read back from the index (A-753; git's receive-pack takes such a pack).
+    // An object the repository indexed already and not carried in this push's pack is read back from the index (A-753).
     let (_, stored, len) = self.repository.stored(self.store, id)?;
     self.repository.read_stored(self.store, &stored, len)
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.repository.peek_waiting().map(|waited| waited.offset)
   }
 }
 

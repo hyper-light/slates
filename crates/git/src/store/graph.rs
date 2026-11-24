@@ -21,7 +21,7 @@
 //! ([`StoreGraph::fault`]); the service refuses an answer made while one was kept, so a broken store never yields a
 //! wrong pack.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::BTreeSet;
 
 use slates_vcs::ContentStore;
@@ -70,6 +70,12 @@ pub struct StoreGraph<'r> {
   refs: &'r [NamedRef<'r>],
   /// The first read that failed, if any.
   fault: Cell<Option<GraphFault>>,
+  /// Sorted positions of every visible ref's current head, built once on first visibility check so multi-ref clones
+  /// validate every wanted tip in O(log R) instead of O(R^2) reach-set scans.
+  visible_tips: OnceCell<Vec<u64>>,
+  /// Index in `refs` that most recently proved a non-tip object reachable, checked first on subsequent non-tip queries
+  /// (e.g., partial-clone lazy blob batches).
+  last_reach_ref: Cell<usize>,
 }
 
 impl<'r> StoreGraph<'r> {
@@ -85,6 +91,8 @@ impl<'r> StoreGraph<'r> {
       null: ObjectId::null(repository.format()),
       refs,
       fault: Cell::new(None),
+      visible_tips: OnceCell::new(),
+      last_reach_ref: Cell::new(0),
     }
   }
 
@@ -271,26 +279,46 @@ impl<'r> StoreGraph<'r> {
     self.chain(green)?.versions.get(index)?.head
   }
 
+  /// Sorted positions of all visible ref heads in `self.refs`, computed once per [`StoreGraph`].
+  fn visible_tips(&self) -> &[u64] {
+    self.visible_tips.get_or_init(|| {
+      let mut tips: Vec<u64> = self
+        .refs
+        .iter()
+        .filter_map(|named| self.chain(named.green).and_then(Chain::head))
+        .collect();
+      tips.sort_unstable();
+      tips.dedup();
+      tips
+    })
+  }
+
   /// Whether `node` is reachable from at least one visible ref in `self.refs` (git's
   /// `uploadpack.allowReachableSHA1InWant` combined with `transfer.hideRefs`, §4.17.2 "Access"):
-  /// O(1) when `node` is a visible ref tip, O(tree depth) with zero allocations via each visible
-  /// ref's persistent [`super::reach::Sets`] tree, and falling back to an iterative graph walk only
-  /// for visible refs whose reach sets are still deferred.
+  /// O(log R) when `node` is any visible ref tip (the common clone/fetch case), O(tree depth) via
+  /// each visible ref's persistent [`super::reach::Sets`] tree starting from the most recent hit,
+  /// and falling back to an iterative graph walk only for visible refs whose reach sets are still
+  /// deferred.
   pub(crate) fn is_visible_want(&self, node: u64) -> bool {
     if self.refs.is_empty() {
       return false;
     }
+    if self.visible_tips().binary_search(&node).is_ok() {
+      return true;
+    }
+    let hint = self.last_reach_ref.get();
     let mut deferred_heads = Vec::new();
-    for named in self.refs {
+    let order = (hint..self.refs.len()).chain(0..hint.min(self.refs.len()));
+    for index in order {
+      let Some(named) = self.refs.get(index) else {
+        continue;
+      };
       let Some(chain) = self.chain(named.green) else {
         continue;
       };
       let Some(head) = chain.head() else {
         continue;
       };
-      if head == node {
-        return true;
-      }
       let Some(newest) = chain.newest() else {
         continue;
       };
@@ -298,7 +326,10 @@ impl<'r> StoreGraph<'r> {
         .repository
         .reached_contains(self.store, named.green, newest, node)
       {
-        Ok(Some(true)) => return true,
+        Ok(Some(true)) => {
+          self.last_reach_ref.set(index);
+          return true;
+        }
         Ok(Some(false)) => {}
         Ok(None) => deferred_heads.push(head),
         Err(refused) => {

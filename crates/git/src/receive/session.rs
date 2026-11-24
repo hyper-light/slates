@@ -524,13 +524,17 @@ impl<S: Repository + ?Sized> Repository for Fscking<'_, S> {
   }
 }
 
-impl<S: Contents + ?Sized> Contents for Fscking<'_, S> {
+impl<S: Contents + Repository + ?Sized> Contents for Fscking<'_, S> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<std::borrow::Cow<'_, [u8]>> {
     self.site.content(at, id)
   }
+
+  fn away(&self) -> Option<u64> {
+    Contents::away(&*self.site).or_else(|| Repository::away(&*self.site))
+  }
 }
 
-impl<S: Keep + ?Sized> Keep for Fscking<'_, S> {
+impl<S: Keep + Repository + ?Sized> Keep for Fscking<'_, S> {
   fn keep(
     &mut self,
     at: usize,

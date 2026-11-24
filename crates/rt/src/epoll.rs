@@ -183,6 +183,12 @@ impl Driver for EpollDriver {
     match outcome {
       Ok(_) => {
         self.harvest(out);
+        // Data-derived harvest batching (R3): grow the event buffer on demand when a wait fills it so bursts of
+        // concurrent ready sockets drain in O(1) syscalls instead of 64-event slices.
+        if self.events.len() == self.events.capacity() {
+          let current = self.events.capacity();
+          self.events.reserve(current);
+        }
         Ok(())
       }
       Err(rustix::io::Errno::INTR) => Ok(()),

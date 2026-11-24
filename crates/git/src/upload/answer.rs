@@ -489,10 +489,11 @@ impl<K> Answer<K> {
       .negotiating
       .step(&graph, admission, spent)
       .map_err(Refusal::Negotiation);
-    // If the negotiation paused cleanly on a let-go pack window, keep `self.choosing` in place so
-    // the caller can bring back that window and resume the exact unit rather than restarting from
-    // commit 0.
-    if let Ok(None) = stepped
+    // If the caller holds refusals and the negotiation paused cleanly on a let-go pack window,
+    // keep `self.choosing` in place so the caller can bring back that window and resume the exact
+    // unit rather than restarting from commit 0.
+    if self.holds
+      && let Ok(None) = stepped
       && let Some(waited) = served.repository.waiting()
     {
       let refusal = graph.fault().map_or(

@@ -899,6 +899,15 @@ mod imp {
     Ok(Socket { fd })
   }
 
+  /// Duplicates a listening socket into a fresh close-on-exec descriptor sharing the same underlying open file
+  /// description (already non-blocking), so every shard of a multi-shard server can accept in parallel off one
+  /// bound or anchor-held listener.
+  pub(crate) fn clone_listener(socket: &Socket) -> Result<Socket, RtError> {
+    let fd = rustix::io::fcntl_dupfd_cloexec(&socket.fd, 0)
+      .map_err(|e| refused("fcntl(F_DUPFD_CLOEXEC)", e))?;
+    Ok(Socket { fd })
+  }
+
   /// A connected stream handed over (from another shard, or across an exec), made ready to serve ([`prepared`]).
   pub(crate) fn adopt_stream(fd: OwnedStream) -> Result<Socket, RtError> {
     prepared(fd)
@@ -1736,20 +1745,10 @@ mod imp {
     unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw) }
   }
 
-  /// A listener's share with process `process` (A-748): Winsock's protocol record of an explicit duplicate of the
-  /// listening socket made for that process alone (`WSADuplicateSocketW`), in [`super::share::encode`]'s bytes. The
-  /// listener stays the caller's; the share names a duplicate that process makes into its own socket with
-  /// [`adopt_share`], never an inherited handle (A-183: no Windows socket is inherited or shared by inheritance).
-  pub(crate) fn share_listener(owned: &OwnedStream, process: u32) -> Result<Vec<u8>, RtError> {
-    use std::os::windows::io::AsRawSocket;
+  /// Encodes a Winsock protocol duplicate of raw socket `raw` for `process` (`WSADuplicateSocketW`).
+  fn duplicate_socket_raw(raw: SOCKET, process: u32) -> Result<Vec<u8>, RtError> {
     use windows_sys::Win32::Networking::WinSock::{WSADuplicateSocketW, WSAPROTOCOL_INFOW};
     ensure_started()?;
-    let Ok(raw) = SOCKET::try_from(owned.as_raw_socket()) else {
-      return Err(RtError::DriverRefused {
-        call: "WSADuplicateSocketW(SOCKET)",
-        code: None,
-      });
-    };
     let mut record = WSAPROTOCOL_INFOW::default();
     // SAFETY: `raw` is the caller's live socket, borrowed for the call; `record` is a plain-data record this frame
     // owns, which the call fills; a refusal is checked before it is read.
@@ -1757,6 +1756,28 @@ mod imp {
       return Err(last("WSADuplicateSocketW"));
     }
     Ok(super::share::encode(&record))
+  }
+
+  /// Duplicates a listening socket for another shard of this same process, so every shard can accept in parallel
+  /// off one bound or anchor-shared listener.
+  pub(crate) fn clone_listener(socket: &Socket) -> Result<Socket, RtError> {
+    let share = duplicate_socket_raw(socket.socket, std::process::id())?;
+    adopt_share(&share)
+  }
+
+  /// A listener's share with process `process` (A-748): Winsock's protocol record of an explicit duplicate of the
+  /// listening socket made for that process alone (`WSADuplicateSocketW`), in [`super::share::encode`]'s bytes. The
+  /// listener stays the caller's; the share names a duplicate that process makes into its own socket with
+  /// [`adopt_share`], never an inherited handle (A-183: no Windows socket is inherited or shared by inheritance).
+  pub(crate) fn share_listener(owned: &OwnedStream, process: u32) -> Result<Vec<u8>, RtError> {
+    use std::os::windows::io::AsRawSocket;
+    let Ok(raw) = SOCKET::try_from(owned.as_raw_socket()) else {
+      return Err(RtError::DriverRefused {
+        call: "WSADuplicateSocketW(SOCKET)",
+        code: None,
+      });
+    };
+    duplicate_socket_raw(raw, process)
   }
 
   /// The listener a share names ([`share_listener`], made for this process): its socket made from the protocol record
@@ -1826,10 +1847,10 @@ mod imp {
 pub(crate) use imp::as_fd;
 pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
 pub(crate) use imp::{
-  accept, adopt_listener, adopt_stream, broken_pipe, bytes_handed, connect, connected, discard,
-  established, into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers,
-  round_trip, set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes, would_block, write,
-  write_vectored,
+  accept, adopt_listener, adopt_stream, broken_pipe, bytes_handed, clone_listener, connect,
+  connected, discard, established, into_owned, invalid, listen, make_sends_whole, peek, read,
+  reserve_buffers, round_trip, set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes,
+  would_block, write, write_vectored,
 };
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,

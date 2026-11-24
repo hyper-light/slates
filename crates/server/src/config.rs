@@ -78,6 +78,9 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// asynchronous one is bounded by its ring's credit, which the ring's slots cap), and the watch
 /// on its hang-up for its whole seat (A-475, `crate::reap::watch`).
 const TASKS_PER_CLIENT: usize = 3;
+/// Shape: tasks one VCS edge connection may occupy at once on a shard: its serving task and its
+/// cross-shard arrival thunk or credential/repository lookup forward.
+const TASKS_PER_VCS_CONNECTION: usize = 2;
 /// Shape: the shard's own perpetual tasks: the server loop, the idle sweep (A-715), the client reaper
 /// (A-475), the deadline keeper (A-522), the pressure sampler (A-570), the hint watcher (A-709),
 /// the control loop and the heartbeat, plus a spare for a shutdown message.
@@ -1289,6 +1292,85 @@ impl DaemonConfig {
     .with_control_shard_noted()
   }
 
+  /// Derived: the VCS edge connections one shard may seat at once (HTTP, SSH and `svn://`): a repository lives on one
+  /// owner shard whichever shard accepted its clients, so every shard's VCS connections may converge there
+  /// (`clients_per_shard × shards`, as [`DaemonConfig::landings_awaiting_per_shard`] is derived), capped by the host
+  /// pages the shard's client share of its reserve holds (`reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / page`,
+  /// since an idle VCS connection holds no client region and occupies under one page of task state), floored by
+  /// `clients_per_shard`, and bounded so its tasks fit in the runtime's wake-word slot field.
+  pub fn vcs_connections_per_shard(&self) -> Derived<usize> {
+    let across_shards = self
+      .clients_per_shard
+      .saturating_mul(usize::from(self.runtime.shards.max(1)));
+    let page = u64::try_from(self.page.max(1)).unwrap_or(u64::MAX);
+    let by_pages = usize::try_from(
+      self
+        .reserve_per_shard
+        .saturating_mul(CLIENT_SHARE_PERMILLE)
+        .checked_div(PERMILLE)
+        .and_then(|share| share.checked_div(page))
+        .unwrap_or(0),
+    )
+    .unwrap_or(usize::MAX);
+    let slot_cap = usize::try_from(slates_mem::Encoded::MAX_TASK_SLOT)
+      .unwrap_or(usize::MAX)
+      .saturating_sub(LOOP_TASKS_PER_SHARD)
+      / TASKS_PER_VCS_CONNECTION;
+    derived!(
+      across_shards
+        .min(by_pages)
+        .max(self.clients_per_shard)
+        .min(slot_cap)
+        .max(1),
+      "min(clients_per_shard × shards, reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / page), floored by \
+       clients_per_shard and capped by wake-word task slots",
+      ["clients_per_shard", "shards", "reserve_per_shard", "page"]
+    )
+  }
+
+  /// Derived: the tasks and timers one shard needs when serving a VCS edge, covering every seated VCS connection
+  /// ([`DaemonConfig::vcs_connections_per_shard`]), its arrival/lookup task, and the shard's own loops. The runtime's
+  /// task arena, timer wheel, and local queue grow lazily, so raising the cap costs no idle RAM.
+  pub fn vcs_tasks_per_shard(&self) -> Derived<usize> {
+    let slot_cap = usize::try_from(slates_mem::Encoded::MAX_TASK_SLOT)
+      .unwrap_or(usize::MAX)
+      .saturating_add(1);
+    derived!(
+      self
+        .vcs_connections_per_shard()
+        .get()
+        .saturating_mul(TASKS_PER_VCS_CONNECTION)
+        .saturating_add(LOOP_TASKS_PER_SHARD)
+        .min(slot_cap),
+      "vcs_connections_per_shard × TASKS_PER_VCS_CONNECTION + LOOP_TASKS_PER_SHARD",
+      ["vcs_connections_per_shard"]
+    )
+  }
+
+  /// Derived: the runtime configuration and control-shard capacity this daemon starts with. When any VCS network edge
+  /// is enabled, every shard's lazy task arena and timer wheel are raised to [`DaemonConfig::vcs_tasks_per_shard`] so
+  /// connections converging on one repository owner shard are seated without exhausting tasks or timers.
+  pub(crate) fn effective_runtime(&self) -> (RuntimeConfig, slates_rt::ShardCapacity) {
+    let mut runtime = self.runtime.clone();
+    let mut control = self.control_shard_capacity().get();
+    if self.vcs_http.is_some() || self.vcs_ssh.is_some() || self.vcs_svn.is_some() {
+      let slot_cap = usize::try_from(slates_mem::Encoded::MAX_TASK_SLOT)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+      let extra = self
+        .vcs_tasks_per_shard()
+        .get()
+        .saturating_sub(runtime.tasks_per_shard);
+      if extra > 0 {
+        runtime.tasks_per_shard = runtime.tasks_per_shard.saturating_add(extra).min(slot_cap);
+        runtime.timers_per_shard = runtime.timers_per_shard.saturating_add(extra).min(slot_cap);
+        control.tasks = control.tasks.saturating_add(extra).min(slot_cap);
+        control.timers = control.timers.saturating_add(extra).min(slot_cap);
+      }
+    }
+    (runtime, control)
+  }
+
   /// Derived: the control shard's task and timer capacities. The control shard runs every forward of every shard's
   /// clients to another node (each a task there for its whole round), and its forward lane admits
   /// [`forward_lane_bound`] of them, so its arena, its control channel (bounded by the same capacity) and its timers
@@ -1360,16 +1442,24 @@ impl DaemonConfig {
     )
   }
 
-  /// This configuration with its control shard's capacity and its shards' kept bound in the boot log, in place of any
-  /// earlier lines for them (both follow `runtime`'s, which [`Self::with_fleet`] raises).
+  /// This configuration with its control shard's capacity, its shards' kept bound, and its converged VCS edge seat
+  /// bound in the boot log, in place of any earlier lines for them (both follow `runtime`'s, which [`Self::with_fleet`]
+  /// raises).
   fn with_control_shard_noted(mut self) -> DaemonConfig {
     let capacity = note("control_shard_capacity", &self.control_shard_capacity());
     let kept = note("kept_bound", &self.kept_bound());
+    let vcs_seats = note(
+      "vcs_connections_per_shard",
+      &self.vcs_connections_per_shard(),
+    );
     self.derivations.retain(|line| {
-      !line.starts_with("control_shard_capacity ") && !line.starts_with("kept_bound ")
+      !line.starts_with("control_shard_capacity ")
+        && !line.starts_with("kept_bound ")
+        && !line.starts_with("vcs_connections_per_shard ")
     });
     self.derivations.push(capacity);
     self.derivations.push(kept);
+    self.derivations.push(vcs_seats);
     self
   }
 }
@@ -2418,6 +2508,41 @@ mod tests {
       above.reserve_per_shard,
       total / shards / MEMORY_CLASSES,
       "a bound above total does not raise the reserve"
+    );
+  }
+
+  /// R3, §4.3: a VCS edge's per-shard seat bound scales across shards for hot-repository convergence
+  /// (`clients_per_shard × shards`), stays bounded by the shard's client share in host pages, never drops below
+  /// `clients_per_shard`, and is logged in the boot derivations.
+  #[test]
+  fn vcs_connections_per_shard_scales_for_convergence_within_memory_and_wake_word_bounds() {
+    let profile = crate::daemon::test_profile();
+    let one = DaemonConfig::derive(&profile, "vcs-seats-1", Some(1));
+    let four = DaemonConfig::derive(&profile, "vcs-seats-4", Some(4));
+    assert_eq!(
+      one.vcs_connections_per_shard().get(),
+      one.clients_per_shard,
+      "a single shard seats its own clients"
+    );
+    assert!(
+      four.vcs_connections_per_shard().get() >= four.clients_per_shard,
+      "multi-shard VCS seats never drop below clients_per_shard"
+    );
+    assert!(
+      four.vcs_connections_per_shard().get() <= four.clients_per_shard.saturating_mul(4),
+      "multi-shard VCS seats never exceed clients_per_shard × shards"
+    );
+    assert!(
+      four.vcs_tasks_per_shard().get()
+        <= usize::try_from(slates_mem::Encoded::MAX_TASK_SLOT).unwrap() + 1,
+      "derived VCS task capacity stays within the wake-word slot limit"
+    );
+    assert!(
+      four
+        .derivations
+        .iter()
+        .any(|line| line.starts_with("vcs_connections_per_shard ")),
+      "the boot log names vcs_connections_per_shard with its inputs"
     );
   }
 }

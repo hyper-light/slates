@@ -556,6 +556,14 @@ pub fn negotiate<S: Graph>(
       if let Some(outcome) = negotiating.step(graph, admission, &mut || false)? {
         return Ok(outcome);
       }
+      // Single-shot negotiation cannot pause to bring back a let-go pack window: exit with the
+      // graph's wait/fault intact so the caller observes `graph.fault()` rather than spinning.
+      if graph.is_waiting() {
+        return Ok(Outcome {
+          answer: Answer::Nothing,
+          counters: negotiating.counters,
+        });
+      }
     },
   }
 }
@@ -646,7 +654,7 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
       if let Some(outcome) = self.unit(graph, admission, spent)? {
         return Ok(Some(outcome));
       }
-      if spent() {
+      if graph.is_waiting() || spent() {
         return Ok(None);
       }
     }
@@ -848,6 +856,9 @@ pub fn ready<S: Graph>(
     if let Some(ready) = asking.step(graph, admission, &mut || false)? {
       return Ok(ready);
     }
+    if graph.is_waiting() {
+      return Ok(false);
+    }
   }
 }
 
@@ -896,7 +907,7 @@ impl<N: Copy + Ord> Ready<N> {
       {
         return Ok(Some(ready));
       }
-      if spent() {
+      if graph.is_waiting() || spent() {
         return Ok(None);
       }
     }

@@ -418,8 +418,8 @@ impl<L: ShardLender> Receive<L> {
           }
         }
         Answering::Turned => {
-          // A-864's push readers: a base or object a turn met in a let-go window is brought back before the next turn.
-          crate::vcs_store::upload::brought_back_waited(push.repository()).await;
+          // A-864's push readers: a base or object a turn met in a let-go window is brought back and pinned before the next turn.
+          push.bring_back_waited().await;
           // The push's names and pack homed in the region, then landed on the node's store, before its record names
           // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top. Taken
           // before the keepalive's return, so an ask made in the step the keepalive came due in is never left untaken

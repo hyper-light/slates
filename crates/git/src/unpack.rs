@@ -165,6 +165,12 @@ pub trait Keep: Contents {
 pub trait Contents {
   /// The content of the object kept at position `at` in pack order, named `id`; `None` when none is kept there.
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
+
+  /// Where in its pack the last read met a window let go, to be brought back before it is asked again
+  /// (A-864's push readers). None by default, for a store that lets nothing go.
+  fn away(&self) -> Option<u64> {
+    None
+  }
 }
 
 /// A keeper that holds every object's bytes itself, each charged for as long as the reader's admission lasts: the pack
@@ -239,13 +245,17 @@ impl<O: Outside + ?Sized> Outside for Beside<'_, O> {
   }
 }
 
-impl<O: ?Sized> Contents for Beside<'_, O> {
+impl<O: Outside + ?Sized> Contents for Beside<'_, O> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     self.held.content(at, id)
   }
+
+  fn away(&self) -> Option<u64> {
+    self.outside.away()
+  }
 }
 
-impl<O: ?Sized> Keep for Beside<'_, O> {
+impl<O: Outside + ?Sized> Keep for Beside<'_, O> {
   fn keep(
     &mut self,
     at: usize,
@@ -589,6 +599,15 @@ impl crate::store::learn::Clock for Unhurried {
 /// row of the table looked at for a base outside the pack. A unit of a turn applies one delta, or lists one entry's
 /// waiting children, so a pack whose deltas all wait for one late base resolves them a turn at a time, never in one poll
 /// (a base with 64 waiting children took one unit before: `tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time`).
+/// Which table a resolving turn last stopped in for a let-go window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoppedIn {
+  /// A pending child delta whose base's content lay in a let-go window.
+  Pending,
+  /// A thin-pack delta whose outside base lay in a let-go window.
+  Outside,
+}
+
 #[derive(Debug, Default)]
 struct Resolving {
   /// The waiting deltas, by their base's key, sorted.
@@ -599,11 +618,11 @@ struct Resolving {
   next: usize,
   /// The next row of `waiting` looked at for a base outside the pack; its length once all are.
   outside: usize,
-  /// The row of `waiting` whose base, outside the pack, lay in a let-go window when the turn last stopped there, and
-  /// where in its pack, until a unit resolves after it (A-864's push readers): met so again at the same place with
-  /// nothing resolved between, it is refused as one not held, so a stop always makes progress or ends (an object across
-  /// several let-go windows stops at each in turn).
-  stopped: Option<(usize, u64)>,
+  /// The unit whose base lay in a let-go window when the turn last stopped there, and where in its
+  /// pack, until a unit resolves after it (A-864's push readers): met so again at the same place
+  /// with nothing resolved between, it is refused as one not held, so a stop always makes progress
+  /// or ends (an object across several let-go windows stops at each in turn).
+  stopped: Option<(StoppedIn, usize, u64)>,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -1040,12 +1059,18 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         found: source.id,
       });
     }
-    let content = keep
-      .content(base, &source.id)
-      .ok_or(Refusal::DeltaBaseMissing {
-        at: *offset,
-        base: source.id,
-      })?;
+    let content = match keep.content(base, &source.id) {
+      Some(content) => content,
+      // Base lies in a let-go window: leave this delta waiting so cooperative resolution brings the
+      // window back on the next turn instead of refusing during streaming pack intake.
+      None if keep.away().is_some() => return Ok(None),
+      None => {
+        return Err(Refusal::DeltaBaseMissing {
+          at: *offset,
+          base: source.id,
+        });
+      }
+    };
     let depth = source.chain.map_or(0, |chain| chain.depth);
     let source = Source {
       kind: source.kind,
@@ -1163,9 +1188,9 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       }
       units = units.saturating_add(1);
       if let Some((parent, child)) = resolving.pending.pop() {
-        if self.resolve_child(parent, child, (admission, &mut *keep))? {
-          resolving.stopped = None;
-          self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+        if self.resolve_pending_unit((parent, child), &mut resolving, (admission, &mut *keep))? {
+          self.resolving = Some(resolving);
+          return Ok(false);
         }
         continue;
       }
@@ -1181,12 +1206,12 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         if self.resolve_outside(key, child, (admission, &mut *keep))? {
           resolving.stopped = None;
           self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
-        } else if let Some(at) = keep.away()
-          && resolving.stopped != Some((row, at))
+        } else if let Some(at) = Outside::away(&*keep).or_else(|| Contents::away(&*keep))
+          && resolving.stopped != Some((StoppedIn::Outside, row, at))
         {
           // Its base lies in a let-go window: the turn stops here, the base to be brought back, the row taken again.
           resolving.outside = row;
-          resolving.stopped = Some((row, at));
+          resolving.stopped = Some((StoppedIn::Outside, row, at));
           self.resolving = Some(resolving);
           return Ok(false);
         }
@@ -1206,6 +1231,41 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       Some(first) => Err(self.unresolved(first)),
       None => Ok(true),
     }
+  }
+
+  /// One pending child delta unit: resolves `child` against `parent`, or pauses the turn (`Ok(true)`)
+  /// when `parent`'s content lies in a let-go window, refusing `DeltaBaseMissing` if the same stop repeats.
+  fn resolve_pending_unit<K: Keep + Outside + ?Sized>(
+    &mut self,
+    (parent, child): (usize, usize),
+    resolving: &mut Resolving,
+    (admission, keep): (&mut Admission, &mut K),
+  ) -> Result<bool, Refusal> {
+    if self.resolve_child(parent, child, (admission, &mut *keep))? {
+      resolving.stopped = None;
+      self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+      return Ok(false);
+    }
+    let Some(at) = Contents::away(&*keep).or_else(|| Outside::away(&*keep)) else {
+      return Ok(false);
+    };
+    if resolving.stopped != Some((StoppedIn::Pending, child, at)) {
+      resolving.pending.push((parent, child));
+      resolving.stopped = Some((StoppedIn::Pending, child, at));
+      return Ok(true);
+    }
+    if let Some(Record {
+      offset,
+      state: State::Resolved(source),
+      ..
+    }) = self.entries.get(parent)
+    {
+      return Err(Refusal::DeltaBaseMissing {
+        at: *offset,
+        base: source.id,
+      });
+    }
+    Ok(false)
   }
 
   /// The waiting deltas, `count` of them, each by its base's key, sorted: an index's offset becomes the entry there.

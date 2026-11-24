@@ -487,7 +487,20 @@ pub struct Upload<A> {
   last_read: Option<(ContentId, u64)>,
   by_entry: Option<ByEntry>,
   pending: Option<Pending>,
+  pending_crc: Option<PendingCrc>,
   counters: UploadCounters,
+}
+
+/// Incremental CRC32 verification state for a multi-window packed entry paused at a let-go window,
+/// so [`Upload::reading_next`] advances across the entry's windows and `let_go_behind` keeps resident
+/// windows bounded to a turn's look-ahead even for arbitrarily large blobs (A-864 piece 3).
+#[derive(Debug)]
+struct PendingCrc {
+  place: InPack,
+  header: Header,
+  data: u64,
+  hasher: crc32fast::Hasher,
+  checked: u64,
 }
 
 impl<A: Answered> Upload<A> {
@@ -528,6 +541,7 @@ impl<A: Answered> Upload<A> {
       last_read: None,
       by_entry: None,
       pending: None,
+      pending_crc: None,
       counters: UploadCounters::default(),
     }
   }
@@ -1303,6 +1317,13 @@ impl<A: Answered> Upload<A> {
     if !self.stopped_any {
       return None;
     }
+    if let Some(crc) = &self.pending_crc {
+      return Some(packed::Waited {
+        pack: crc.place.pack,
+        len: crc.place.len,
+        offset: crc.place.offset.saturating_add(crc.checked),
+      });
+    }
     if let Some(Pending::Copy {
       content, len, from, ..
     }) = &self.pending
@@ -1627,20 +1648,40 @@ impl<A: Answered> Upload<A> {
     (row, place, packed): (&ObjectRow, InPack, rows::PackedRow),
     out: &mut impl Out,
   ) -> Result<Option<Reuse>, StoreRefused> {
-    let room = cx.repository.largest_object().max(row.len);
-    let (header, data) = match packed::entry_header(cx.store, (place, self.format), room) {
-      Ok(found) => found,
-      Err(refused) => {
-        return Ok(
-          self
-            .stopped_by(cx.store, &refused)
-            .then_some(Reuse::Stopped),
-        );
+    let (header, data, mut hasher, mut checked) = match self.pending_crc.take() {
+      Some(pending) if pending.place == place => (
+        pending.header,
+        pending.data,
+        pending.hasher,
+        pending.checked,
+      ),
+      _ => {
+        let room = cx.repository.largest_object().max(row.len);
+        let (header, data) = match packed::entry_header(cx.store, (place, self.format), room) {
+          Ok(found) => found,
+          Err(refused) => {
+            return Ok(
+              self
+                .stopped_by(cx.store, &refused)
+                .then_some(Reuse::Stopped),
+            );
+          }
+        };
+        (header, data, crc32fast::Hasher::new(), 0_u64)
       }
     };
-    let crc = match packed::raw_crc(cx.store, place, packed.len) {
+    let crc = match packed::raw_crc_resume(cx.store, place, packed.len, &mut hasher, &mut checked) {
       Ok(crc) => Some(crc),
-      Err(refused) if self.stopped_by(cx.store, &refused) => return Ok(Some(Reuse::Stopped)),
+      Err(refused) if self.stopped_by(cx.store, &refused) => {
+        self.pending_crc = Some(PendingCrc {
+          place,
+          header,
+          data,
+          hasher,
+          checked,
+        });
+        return Ok(Some(Reuse::Stopped));
+      }
       Err(_) => None,
     };
     if crc != Some(packed.crc) {

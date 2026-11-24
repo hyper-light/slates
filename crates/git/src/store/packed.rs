@@ -780,6 +780,40 @@ pub fn raw_crc(store: &dyn PackSource, place: InPack, len: u64) -> Result<u32, P
   Ok(hasher.finalize())
 }
 
+/// Resumes CRC32 hashing of an entry from `place.offset + *checked` for the remaining `len - *checked` bytes,
+/// updating `hasher` and `checked` across every resident window until either `len` bytes are hashed or a let-go
+/// window is met (`PackedRefused::Away`). Preserving `hasher` and `checked` across stops lets an upload verify a
+/// multi-window entry in O(N) work while letting go windows behind the cursor (A-864 piece 3).
+pub fn raw_crc_resume(
+  store: &dyn PackSource,
+  place: InPack,
+  len: u64,
+  hasher: &mut crc32fast::Hasher,
+  checked: &mut u64,
+) -> Result<u32, PackedRefused> {
+  let mut left = len.saturating_sub(*checked);
+  if left > 0 {
+    let resume = InPack {
+      offset: place.offset.saturating_add(*checked),
+      ..place
+    };
+    each_window_from(store, resume, |piece| {
+      let take = usize::try_from(left).unwrap_or(usize::MAX).min(piece.len());
+      hasher.update(piece.get(..take).unwrap_or_default());
+      let took = u64::try_from(take).unwrap_or(u64::MAX);
+      *checked = checked.saturating_add(took);
+      left = left.saturating_sub(took);
+      left > 0
+    })?;
+    if left > 0 {
+      return Err(PackedRefused::Unread {
+        at: place.offset.saturating_add(*checked),
+      });
+    }
+  }
+  Ok(hasher.clone().finalize())
+}
+
 /// The entry at `place` in a held pack as it lies there ([`RawEntry`], A-859): its header read, and its data inflated
 /// once into `scratch` (its size, held to `room` first) to find where it ends and that it inflates whole to its header's
 /// size. Refused as [`read`] refuses an entry it cannot take.

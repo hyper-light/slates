@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 
-use super::connect::{Connected, Stopped, Walk, unbounded};
+use super::connect::{Connected, Stopped, Walk, WalkStep, unbounded};
 use super::fsck::{self, SpecialBlob};
 use super::{
   Checked, HiddenRefs, PackRefusal, PackRefused, Pushed, Refusal, Repository, Request,
@@ -63,6 +63,9 @@ pub struct Checking {
   special: Vec<SpecialBlob>,
   /// Where the checks stand.
   stage: Stage,
+  /// Where the check last stopped for a let-go window `(stage_tag, at, offset)` so a failed
+  /// bring-back terminates instead of looping.
+  stopped: Option<(u8, usize, u64)>,
 }
 
 impl Checking {
@@ -84,6 +87,7 @@ impl Checking {
       unpacked,
       special: Vec::new(),
       stage,
+      stopped: None,
     }
   }
 
@@ -130,7 +134,9 @@ impl Checking {
         clock: &mut *clock,
         ns: ns.saturating_sub(spent),
       };
-      self.unit((repository, contents), admission, left)?;
+      if self.unit((repository, contents), admission, left)? {
+        break;
+      }
       if clock.now_ns().saturating_sub(begun) >= ns {
         break;
       }
@@ -140,17 +146,19 @@ impl Checking {
 
   /// One unit of the checks: one object checked as git checks a push, one special dotfile blob
   /// checked, the objects indexed, or a turn of the walk for what is `left` of the quantum.
+  /// Returns `Ok(true)` when paused for a let-go window so the driver brings it back before retrying.
   fn unit<R: Repository + ?Sized, C: Contents>(
     &mut self,
     (repository, contents): (&R, &C),
     admission: &mut Admission,
     left: Quantum<'_>,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     let Checking {
       request,
       unpacked,
       special,
       stage,
+      stopped,
     } = self;
     let objects = match unpacked {
       Some(Ok(unpacked)) => unpacked.objects.as_slice(),
@@ -161,12 +169,23 @@ impl Checking {
       Stage::Fsck { at } => match objects.get(*at) {
         Some(object) => match fsck_one(object, *at, (contents, request.format), special) {
           Some(finding) => {
+            if let Some(away) = contents.away()
+              && *stopped != Some((0, *at, away))
+            {
+              *stopped = Some((0, *at, away));
+              return Ok(true);
+            }
+            *stopped = None;
             let (count, id) = (objects.len(), object.id);
             refuse_pack(unpacked, stage, count, id, finding);
           }
-          None => *at = at.saturating_add(1),
+          None => {
+            *stopped = None;
+            *at = at.saturating_add(1);
+          }
         },
         None => {
+          *stopped = None;
           let pushed = Pushed::new(objects, Some(contents), admission)?;
           if special.is_empty() {
             let walk = Walk::new(request, &pushed, admission)?;
@@ -187,6 +206,13 @@ impl Checking {
       Stage::SpecialBlobs { by_id, at } => match special.get(*at).copied() {
         Some(entry) => {
           let finding = check_special_entry(entry, objects, by_id, contents, repository);
+          if let Some(away) = contents.away().or_else(|| repository.away())
+            && *stopped != Some((1, *at, away))
+          {
+            *stopped = Some((1, *at, away));
+            return Ok(true);
+          }
+          *stopped = None;
           if let Some(finding) = finding {
             let count = objects.len();
             refuse_pack(unpacked, stage, count, entry.id, finding);
@@ -195,6 +221,7 @@ impl Checking {
           }
         }
         None => {
+          *stopped = None;
           let pushed = Pushed {
             objects,
             by_id: core::mem::take(by_id),
@@ -214,10 +241,11 @@ impl Checking {
           contents: Some(contents),
         };
         let done = walk.turn((request, &pushed, repository), admission, left);
-        let connected = match done {
-          Ok(true) => Some(walk.connected(request, &pushed, repository)),
-          Ok(false) => None,
-          Err(refusal) => Some(Err(refusal)),
+        let (paused, connected) = match done {
+          Ok(WalkStep::Done) => (false, Some(walk.connected(request, &pushed, repository))),
+          Ok(WalkStep::Away) => (true, None),
+          Ok(WalkStep::More) => (false, None),
+          Err(refusal) => (false, Some(Err(refusal))),
         };
         *by_id = pushed.by_id;
         if let Some(connected) = connected {
@@ -226,10 +254,13 @@ impl Checking {
             connected: connected?,
           };
         }
+        if paused {
+          return Ok(true);
+        }
       }
       Stage::Connected { .. } | Stage::Refused => {}
     }
-    Ok(())
+    Ok(false)
   }
 
   /// The checked push, every check made first in one turn with no end ([`super::check`]'s), each

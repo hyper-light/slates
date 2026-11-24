@@ -74,6 +74,7 @@ mod daemon_edge;
 pub(crate) use daemon_edge::tests as daemon_edge_tests;
 pub(crate) mod git;
 pub(crate) mod hg;
+pub(crate) mod seats;
 pub(crate) mod svn;
 pub(crate) mod waits;
 
@@ -81,7 +82,7 @@ pub(crate) use daemon_edge::{ShardRepositories, bind, bounds_of, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::task::{Poll, Waker};
+use std::task::Poll;
 
 use slates_http::head::Head;
 use slates_http::reply::Status;
@@ -90,12 +91,19 @@ use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
 use slates_rt::futures::{
-  cancel, detach, now_ns, scheduler_overrun_ns, sleep, spawn_child, yield_now,
+  cancel, detach, now_ns, scheduler_overrun_ns, sleep, spawn_child, step_budget_ns, yield_now,
 };
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 
+use seats::{OverdueMark, SeatTable, Seating};
 use waits::{Overdue, PhaseWaits, Tracker};
+
+impl OverdueMark for Overdue {
+  fn since_ns(self) -> u64 {
+    self.since_ns
+  }
+}
 
 /// Format: the bytes one read takes from a connection's socket: one TLS record whole, its header and at most `2^14 + 256`
 /// bytes of ciphertext (RFC 8446 §5.2: "The length MUST NOT exceed 2^14 + 256 bytes"), so a read never splits a record it
@@ -495,42 +503,16 @@ pub(crate) struct Counts {
   pub(crate) arrivals_refused: u64,
 }
 
-/// A taken seat: its connection's task once spawned, whether its wait on its client is past its bound, and whether it is
-/// being reaped.
-#[derive(Clone, Copy, Debug)]
-struct Taken {
-  /// The connection's task, once spawned.
-  task: Option<TaskId>,
-  /// Its wait's mark while it waits past its bound.
-  overdue: Option<Overdue>,
-  /// Whether it has been chosen to be reaped: its seat comes back as its task's cancellation drops it.
-  reaping: bool,
-}
-
-/// How the listener stands for a seat ([`EdgeState::seating`]).
-enum Seating {
-  /// This seat is free.
-  Free(usize),
-  /// None is free and this connection's task, the most overdue, is to be reaped for the one waiting (none when it was
-  /// never spawned, whose seat comes back as its spawn is refused).
-  Reap(Option<TaskId>),
-  /// None is free and none is overdue: wait for a seat to come back or a connection to become overdue.
-  Wait,
-}
-
 /// An edge's state on its shard, shared by its listener and its connections through a [`Kept`] handle: what bounds it,
-/// the identity it presents, its seats, the listener waiting for one, every phase's learned waits, and its counts.
+/// the identity it presents, its seats, the waiters for one, every phase's learned waits, and its counts.
 /// Nothing in it is lent across a wait.
 pub(crate) struct EdgeState {
   /// The edge's bounds.
   bounds: Bounds,
   /// The identity HTTPS presents; none for a cleartext edge on loopback.
   identity: Option<ServingIdentity>,
-  /// Each seat, free or taken: as many as the edge serves at once.
-  seats: RefCell<Vec<Option<Taken>>>,
-  /// Who waits for a seat: the listener, and connections that moved here, at most one of each kind a seat and the
-  /// listener ([`EdgeState::arriving`]).
-  waiting: RefCell<Vec<Waker>>,
+  /// O(1) free-list seat table, O(log K) overdue index, and strict-FIFO wake-one waiters.
+  seats: RefCell<SeatTable<Overdue>>,
   /// The connections that moved here and wait for a seat: at most as many as the shard has seats.
   arriving: Cell<usize>,
   /// Every phase's learned waits.
@@ -545,8 +527,7 @@ impl EdgeState {
     EdgeState {
       bounds,
       identity,
-      seats: RefCell::new(vec![None; bounds.connections]),
-      waiting: RefCell::new(Vec::new()),
+      seats: RefCell::new(SeatTable::new(bounds.connections)),
       arriving: Cell::new(0),
       waits: RefCell::new(PhaseWaits::default()),
       counts: Cell::new(Counts::default()),
@@ -558,12 +539,9 @@ impl EdgeState {
     self.counts.get()
   }
 
-  /// The connections being served: the seats taken.
+  /// The connections being served: the seats taken, in O(1).
   pub(crate) fn serving(&self) -> usize {
-    self
-      .seats
-      .try_borrow()
-      .map_or(0, |seats| seats.iter().flatten().count())
+    self.seats.try_borrow().map_or(0, |seats| seats.serving())
   }
 
   /// How many of `phase`'s waits completed and how many of its connections were reaped; nothing while the waits are lent,
@@ -591,8 +569,8 @@ impl EdgeState {
       .map(|mut waits| f(&mut waits))
   }
 
-  /// Runs `f` over the seats; none while they are lent, which is never across a wait.
-  fn with_seats<R>(&self, f: impl FnOnce(&mut Vec<Option<Taken>>) -> R) -> Option<R> {
+  /// Runs `f` over the seat table; none while it is lent, which is never across a wait.
+  fn with_seats<R>(&self, f: impl FnOnce(&mut SeatTable<Overdue>) -> R) -> Option<R> {
     self
       .seats
       .try_borrow_mut()
@@ -600,24 +578,23 @@ impl EdgeState {
       .map(|mut seats| f(&mut seats))
   }
 
-  /// Wakes whoever waits for a seat: each looks again ([`seat_for`]).
-  fn wake_listener(&self) {
-    let waiting = self
-      .waiting
-      .try_borrow_mut()
-      .map(|mut waiting| std::mem::take(&mut *waiting))
-      .unwrap_or_default();
-    for waker in waiting {
-      waker.wake();
-    }
+  /// Allocates a unique FIFO waiter id for one wait operation.
+  fn allocate_waiter(&self) -> Option<u64> {
+    self.with_seats(SeatTable::allocate_waiter)
   }
 
-  /// Keeps `waker` to be woken when a seat comes back or a connection becomes overdue, once.
-  fn wait_for_seat(&self, waker: &Waker) {
-    if let Ok(mut waiting) = self.waiting.try_borrow_mut()
-      && !waiting.iter().any(|kept| kept.will_wake(waker))
+  /// Claims a free seat immediately in O(1), if one is available.
+  fn claim_free(&self) -> Option<usize> {
+    self.with_seats(SeatTable::claim_free).flatten()
+  }
+
+  /// Removes a cancelled waiter and wakes the next waiter if a seat or overdue target is available.
+  fn cancel_waiter(&self, waiter: u64) {
+    if let Some(waker) = self
+      .with_seats(|seats| seats.cancel_waiter(waiter))
+      .flatten()
     {
-      waiting.push(waker.clone());
+      waker.wake();
     }
   }
 
@@ -636,18 +613,17 @@ impl EdgeState {
     self.arriving.set(self.arriving.get().saturating_sub(1));
   }
 
-  /// How the listener, holding an accepted connection, stands for a seat (the module doc): a free seat; or, with every
-  /// seat taken, the most overdue connection not already being reaped, chosen now (its reap counted, teaching nothing and
-  /// backing its phase off); or a wait, the listener's `waker` kept to be woken when a seat comes back or a connection
-  /// becomes overdue. A first look with every seat taken (`first`) is counted.
-  fn seating(&self, waker: &Waker, first: bool) -> Seating {
-    let Some((seating, reaped)) = self.with_seats(|seats| choose_seat(seats)) else {
+  /// How a waiter stands for a seat (the module doc): a free seat (claimed atomically in O(1)); or, with every seat
+  /// taken, the most overdue connection not already being reaped (O(log K), its reap counted, teaching nothing and
+  /// backing its phase off); or a wait, its `waker` queued in FIFO order. A first look with every seat taken (`first`)
+  /// is counted.
+  fn seating(&self, waiter: u64, waker: &std::task::Waker, first: bool) -> Seating {
+    let Some((seating, reaped)) = self.with_seats(|seats| seats.seating(waiter, waker)) else {
       return Seating::Wait;
     };
     if matches!(seating, Seating::Free(_)) {
       return seating;
     }
-    self.wait_for_seat(waker);
     if first {
       self.count(|counts| counts.full = counts.full.saturating_add(1));
     }
@@ -658,54 +634,29 @@ impl EdgeState {
     seating
   }
 
-  /// Takes seat `slot` for a connection just accepted.
-  fn take_seat(&self, slot: usize) {
-    let _ = self.with_seats(|seats| {
-      if let Some(seat) = seats.get_mut(slot) {
-        *seat = Some(Taken {
-          task: None,
-          overdue: None,
-          reaping: false,
-        });
-      }
-    });
-  }
-
   /// Records the task serving seat `slot`.
   fn set_task(&self, slot: usize, task: TaskId) {
-    let _ = self.with_seats(|seats| {
-      if let Some(Some(taken)) = seats.get_mut(slot) {
-        taken.task = Some(task);
-      }
-    });
+    let _ = self.with_seats(|seats| seats.set_task(slot, task));
   }
 
-  /// Marks seat `slot`'s connection overdue as `overdue` says, or clears its mark (`None`); a mark wakes the listener,
-  /// which may hold a connection waiting for a seat.
+  /// Marks seat `slot`'s connection overdue as `overdue` says, or clears its mark (`None`); a mark wakes one waiter.
   fn mark(&self, slot: usize, overdue: Option<Overdue>) {
-    let marked = self
-      .with_seats(|seats| match seats.get_mut(slot) {
-        Some(Some(taken)) if !taken.reaping => {
-          taken.overdue = overdue;
-          true
-        }
-        _ => false,
-      })
-      .unwrap_or(false);
+    let (marked, wake) = self
+      .with_seats(|seats| seats.mark(slot, overdue))
+      .unwrap_or((false, None));
     if marked && overdue.is_some() {
       self.count(|counts| counts.overdue = counts.overdue.saturating_add(1));
-      self.wake_listener();
+    }
+    if let Some(waker) = wake {
+      waker.wake();
     }
   }
 
-  /// Gives seat `slot` back, waking the listener if it waits for one.
+  /// Gives seat `slot` back in O(1), waking one waiter if any waits for one.
   fn give_back(&self, slot: usize) {
-    let _ = self.with_seats(|seats| {
-      if let Some(seat) = seats.get_mut(slot) {
-        *seat = None;
-      }
-    });
-    self.wake_listener();
+    if let Some(waker) = self.with_seats(|seats| seats.give_back(slot)).flatten() {
+      waker.wake();
+    }
   }
 
   /// The engine for a connection just accepted: over a TLS session of the edge's identity, or cleartext; none when no
@@ -722,31 +673,8 @@ impl EdgeState {
   }
 }
 
-/// A free seat in `seats`; or, with every seat taken, the most overdue connection not already being reaped, marked as
-/// being reaped, with its mark: the earliest deadline passed is the most overdue; or none to reap.
-fn choose_seat(seats: &mut [Option<Taken>]) -> (Seating, Option<Overdue>) {
-  if let Some(free) = seats.iter().position(Option::is_none) {
-    return (Seating::Free(free), None);
-  }
-  let most_overdue = seats
-    .iter_mut()
-    .flatten()
-    .filter(|taken| !taken.reaping)
-    .filter_map(|taken| taken.overdue.map(|overdue| (overdue, taken)))
-    .min_by_key(|(overdue, _)| overdue.since_ns);
-  match most_overdue {
-    Some((overdue, taken)) => {
-      taken.reaping = true;
-      taken.overdue = None;
-      (Seating::Reap(taken.task), Some(overdue))
-    }
-    None => (Seating::Wait, None),
-  }
-}
-
-/// A connection's seat among those its edge serves at once: taken as it is given a seat and given back when this drops,
-/// however the connection ends (its loop's end, its task's cancellation by a reap or with its listener, a refused spawn),
-/// the listener woken if it waits for one.
+/// A connection's seat among those its edge serves at once: claimed atomically when handed out and given back when
+/// this drops, however the connection ends, waking one waiter if any waits for one.
 struct Seat {
   /// The edge.
   state: Kept<EdgeState>,
@@ -755,11 +683,9 @@ struct Seat {
 }
 
 impl Seat {
-  /// Takes seat `slot` on the edge `state` keeps; none off its shard.
-  fn take(state: Kept<EdgeState>, slot: usize) -> Option<Seat> {
-    state
-      .with(|state| state.take_seat(slot))
-      .map(|()| Seat { state, slot })
+  /// Wraps a seat `slot` already claimed from `state`'s table.
+  fn from_claimed(state: Kept<EdgeState>, slot: usize) -> Seat {
+    Seat { state, slot }
   }
 }
 
@@ -771,17 +697,52 @@ impl Drop for Seat {
   }
 }
 
-/// Waits, holding an accepted connection, until a seat is free for it (the module doc): at once below the bound; with
-/// every seat taken, by reaping the most overdue connection, or once a seat comes back or a connection becomes overdue.
-async fn seat_for(state: Kept<EdgeState>) -> Result<usize, EdgeRefused> {
+/// Removes a waiter from the FIFO queue on drop and passes the wake baton if cancelled without claiming a seat.
+struct SeatWaitGuard {
+  state: Kept<EdgeState>,
+  waiter: u64,
+  claimed: bool,
+}
+
+impl Drop for SeatWaitGuard {
+  fn drop(&mut self) {
+    if !self.claimed {
+      let waiter = self.waiter;
+      let _ = self.state.with(|state| state.cancel_waiter(waiter));
+    }
+  }
+}
+
+/// Waits, holding an accepted connection, until a seat is claimed for it (the module doc): at once below the bound;
+/// with every seat taken, by reaping the most overdue connection, or once a seat comes back or a connection becomes
+/// overdue.
+async fn seat_for(state: Kept<EdgeState>) -> Result<Seat, EdgeRefused> {
+  if let Some(slot) = state
+    .with(EdgeState::claim_free)
+    .ok_or(EdgeRefused::StateGone)?
+  {
+    return Ok(Seat::from_claimed(state, slot));
+  }
+  let waiter = state
+    .with(EdgeState::allocate_waiter)
+    .ok_or(EdgeRefused::StateGone)?
+    .ok_or(EdgeRefused::StateGone)?;
+  let mut guard = SeatWaitGuard {
+    state,
+    waiter,
+    claimed: false,
+  };
   let mut first = true;
-  std::future::poll_fn(|cx| {
-    let seating = state.with(|state| state.seating(cx.waker(), first));
+  let slot = std::future::poll_fn(|cx| {
+    let seating = state.with(|state| state.seating(waiter, cx.waker(), first));
     first = false;
     match seating {
-      Some(Seating::Free(slot)) => Poll::Ready(Ok(slot)),
+      Some(Seating::Free(slot)) => {
+        guard.claimed = true;
+        Poll::Ready(Ok(slot))
+      }
       Some(Seating::Reap(task)) => {
-        // Its seat comes back, waking this listener, as the cancellation drops its task.
+        // Its seat comes back, waking a waiter, as the cancellation drops its task.
         if let Some(task) = task
           && cancel(task).is_err()
         {
@@ -794,7 +755,8 @@ async fn seat_for(state: Kept<EdgeState>) -> Result<usize, EdgeRefused> {
       None => Poll::Ready(Err(EdgeRefused::StateGone)),
     }
   })
-  .await
+  .await?;
+  Ok(Seat::from_claimed(state, slot))
 }
 
 thread_local! {
@@ -850,8 +812,19 @@ where
   if !secure && !admits_cleartext(address) {
     return Err(EdgeRefused::CleartextOffLoopback);
   }
+  let mut batch_start_ns = now_ns();
   loop {
-    let stream = listener.accept().await.map_err(EdgeRefused::Listener)?;
+    let stream = match listener.accept_now().map_err(EdgeRefused::Listener)? {
+      Some(stream) => stream,
+      None => {
+        listener
+          .wait_readable()
+          .await
+          .map_err(EdgeRefused::Listener)?;
+        batch_start_ns = now_ns();
+        continue;
+      }
+    };
     let Some(connection) = state
       .with(EdgeState::connection)
       .ok_or(EdgeRefused::StateGone)?
@@ -867,8 +840,8 @@ where
       crate::fleet::count_refusal(NO_ROUND_TRIP);
       continue;
     };
-    let slot = seat_for(state).await?;
-    let seat = Seat::take(state, slot).ok_or(EdgeRefused::StateGone)?;
+    let seat = seat_for(state).await?;
+    let slot = seat.slot;
     let tracker = Tracker::new(round_trip);
     match spawn_child(drive(stream, connection, site.clone(), seat, tracker)) {
       Ok(task) => {
@@ -881,6 +854,10 @@ where
       Err(_) => {
         crate::fleet::count_refusal(SPAWN_REFUSED);
       }
+    }
+    if step_budget_ns().is_some_and(|budget| now_ns().saturating_sub(batch_start_ns) >= budget) {
+      yield_now().await;
+      batch_start_ns = now_ns();
     }
   }
 }
@@ -1051,6 +1028,9 @@ struct Started<E> {
   head_only: bool,
   /// Whether the exchange's reply fields have been asked for and given to the engine.
   fields_given: bool,
+  /// Body runs already handed to the exchange for this request: the first run avoids a pointless yield so
+  /// single-packet POSTs proceed straight to `body_end`, while multi-run uploads yield cooperatively between runs.
+  body_runs: usize,
 }
 
 /// One connection's parts beside its engine: its socket, its edge and seat, its waits, its site and the service its
@@ -1232,6 +1212,7 @@ impl<S: Site> Parts<S> {
           exchange,
           head_only,
           fields_given: false,
+          body_runs: 0,
         });
         connection.decide(Decision::Serve {
           fields,
@@ -1255,12 +1236,16 @@ impl<S: Site> Parts<S> {
     }
   }
 
-  /// Tells the engine whether the service took the body's run, then yields: one run a turn (the module doc).
+  /// Tells the engine whether the service took the body's run, yielding after the first run so multi-chunk uploads
+  /// share the shard while single-packet POSTs avoid an extra queue round-trip before `body_end`.
   async fn body_taken(&mut self, connection: &mut Connection, taken: Result<(), Failed>) -> Flow {
+    let mut should_yield = false;
     match taken {
       Ok(()) => {
         connection.body_taken();
         if let Some(started) = self.service.as_mut() {
+          started.body_runs = started.body_runs.saturating_add(1);
+          should_yield = started.body_runs > 1;
           self.reply.clear();
           started.exchange.interim(&mut self.reply);
           connection.interim(&self.reply);
@@ -1271,7 +1256,9 @@ impl<S: Site> Parts<S> {
         connection.fail(status);
       }
     }
-    yield_now().await;
+    if should_yield {
+      yield_now().await;
+    }
     Flow::Go
   }
 
@@ -1322,7 +1309,11 @@ impl<S: Site> Parts<S> {
     self.reply.clear();
     let gone = ClientGone::watching(&self.socket.stream);
     match started.exchange.reply(&mut self.reply, gone).await {
-      Ok(true) => connection.reply(&self.reply),
+      Ok(true) => {
+        connection.reply(&self.reply);
+        // Streaming reply with more runs to come: yield so large transfers share the shard.
+        yield_now().await;
+      }
       Ok(false) => {
         if !self.reply.is_empty() {
           connection.reply(&self.reply);
@@ -1337,7 +1328,6 @@ impl<S: Site> Parts<S> {
         connection.fail(status);
       }
     }
-    yield_now().await;
     Flow::Go
   }
 
@@ -1540,17 +1530,14 @@ async fn serve_arrival<S, M>(
   S: Site + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
-  let Ok(slot) = seat_arrival(state).await else {
+  let Ok(seat) = seat_arrival(state).await else {
     let _ = state.with(|state| {
       state.count(|counts| counts.arrivals_refused = counts.arrivals_refused.saturating_add(1));
     });
     crate::fleet::count_refusal(ARRIVAL_REFUSED);
     return;
   };
-  let Some(seat) = Seat::take(state, slot) else {
-    crate::fleet::count_refusal(ARRIVAL_LOST);
-    return;
-  };
+  let slot = seat.slot;
   let _ = state.with(|state| {
     if let Some(task) = slates_rt::futures::current_task() {
       state.set_task(slot, task);
@@ -1572,13 +1559,12 @@ enum ArrivalRefused {
 /// A seat for a connection that moved here (the module doc): a free one at once; with every seat taken, as a new
 /// connection is seated by the listener ([`seat_for`]: the most overdue connection's, or the next to come back), while
 /// fewer arrivals wait than the shard has seats; refused past that.
-async fn seat_arrival(state: Kept<EdgeState>) -> Result<usize, ArrivalRefused> {
-  let free = state
-    .with(|state| state.with_seats(|seats| seats.iter().position(Option::is_none)))
+async fn seat_arrival(state: Kept<EdgeState>) -> Result<Seat, ArrivalRefused> {
+  if let Some(slot) = state
+    .with(EdgeState::claim_free)
     .ok_or(ArrivalRefused::Gone)?
-    .flatten();
-  if let Some(slot) = free {
-    return Ok(slot);
+  {
+    return Ok(Seat::from_claimed(state, slot));
   }
   if !state
     .with(EdgeState::admit_arrival)

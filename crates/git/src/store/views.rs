@@ -157,7 +157,10 @@ impl receive::Repository for IndexedObjects<'_> {
   }
 
   fn away(&self) -> Option<u64> {
-    self.away.get()
+    self
+      .away
+      .get()
+      .or_else(|| self.repository.peek_waiting().map(|waited| waited.offset))
   }
 }
 
@@ -251,7 +254,14 @@ impl<'a> PushedObjects<'a> {
         count(&self.counters, |counters| &mut counters.assembled);
         return match read {
           Some(Ok(bytes)) => Ok(bytes),
-          Some(Err(_)) => Err(Unavailable::Malformed),
+          Some(Err(refused)) => {
+            if let Some(waited) = refused.waited() {
+              self.repository.wait_for(waited);
+              Err(Unavailable::NotYet)
+            } else {
+              Err(Unavailable::Malformed)
+            }
+          }
           None => Err(Unavailable::Missing),
         };
       }

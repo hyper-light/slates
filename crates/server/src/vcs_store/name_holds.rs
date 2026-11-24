@@ -248,6 +248,7 @@ pub(crate) fn let_go_landed_texts(state: &mut crate::state::ShardState, texts: &
   });
   if freed > 0 {
     state.count(LANDED_TEXT_LET_GO_BYTES, freed);
+    super::release_excess_extents(state);
   }
   freed
 }

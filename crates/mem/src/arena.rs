@@ -822,6 +822,9 @@ impl ChunkArena {
       })?;
     // The last region moves into the freed place, so its position follows it.
     let removed = self.slots.swap_remove(at);
+    self.resident_free = self
+      .resident_free
+      .saturating_sub(removed.dirty.recorded_bytes());
     if let Some(moved) = self.slots.get(at).map(|slot| slot.id)
       && let Some(place) = self.position.get_mut(usize::from(moved))
     {

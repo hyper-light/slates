@@ -309,20 +309,33 @@ fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_th
     status_of(port, &certificate, &target, &[&expired_bearer]),
     status_of(port, &certificate, &target, &[&stranger_bearer]),
   ];
-  let listener = (
-    counts_on(&daemon, LISTENER).moved,
-    counted_on(&daemon, LISTENER, "vcs_http.git.no_credentials"),
-    counted_on(&daemon, LISTENER, "vcs_http.git.expired_credential"),
-  );
-  let repository = (
-    counts_on(&daemon, REPOSITORY).arrived,
-    counted_on(&daemon, REPOSITORY, "vcs_http.git.forbidden"),
-    counted_on(&daemon, REPOSITORY, "vcs_http.git.unavailable"),
-  );
+  let listener_counts = counts_on(&daemon, LISTENER);
+  let repo_counts = counts_on(&daemon, REPOSITORY);
+  let no_credentials = counted_on(&daemon, LISTENER, "vcs_http.git.no_credentials")
+    + counted_on(&daemon, REPOSITORY, "vcs_http.git.no_credentials");
+  let expired = counted_on(&daemon, LISTENER, "vcs_http.git.expired_credential")
+    + counted_on(&daemon, REPOSITORY, "vcs_http.git.expired_credential");
+  let forbidden_repo = counted_on(&daemon, REPOSITORY, "vcs_http.git.forbidden");
+  let forbidden_listener = counted_on(&daemon, LISTENER, "vcs_http.git.forbidden");
+  let unavailable_repo = counted_on(&daemon, REPOSITORY, "vcs_http.git.unavailable");
   daemon.stop();
   assert_eq!(answers, [200, 200, 401, 401, 403]);
-  assert_eq!(listener, (3, 1, 1), "moves, no credentials, expired");
-  assert_eq!(repository, (3, 1, 0), "arrivals, forbidden, unavailable");
+  // Every shard accepts in parallel; connections accepted on LISTENER move to REPOSITORY, and every proven request
+  // is decided exclusively on REPOSITORY.
+  assert_eq!(
+    listener_counts.moved, repo_counts.arrived,
+    "moves match arrivals"
+  );
+  assert_eq!(
+    (no_credentials, expired),
+    (1, 1),
+    "no credentials, expired across shards"
+  );
+  assert_eq!(
+    (forbidden_repo, forbidden_listener, unavailable_repo),
+    (1, 0, 0),
+    "forbidden only on repository shard, none unavailable"
+  );
 }
 
 /// Shape: a v2 `ls-refs` request asking for `HEAD` with its symref's target, listed even unborn: the command, the
@@ -2354,15 +2367,16 @@ fn basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge() {
   let (basic_head, basic_body) = head_and_body(&mut cleartext_client(port), basic.as_bytes());
   let (bare_head, _) = head_and_body(&mut cleartext_client(port), advertise("").as_bytes());
   let moved = counts_on(&daemon, LISTENER).moved;
+  let arrived = counts_on(&daemon, REPOSITORY).arrived;
   daemon.stop();
   assert_eq!(
     (
       status_in(&basic_head),
       basic_body,
       status_in(&bare_head),
-      moved
+      moved == arrived
     ),
-    (Some(200), served_advertisement(&[]), Some(401), 1),
+    (Some(200), served_advertisement(&[]), Some(401), true),
     "{basic_head}"
   );
 }
@@ -3499,45 +3513,97 @@ pub(crate) fn whole_fetch_of(wants: &[ObjectId]) -> Vec<u8> {
 }
 
 /// The room the answer to `fetch` of repository `name` takes, answered whole on its shard in an unbounded room: what its
-/// walk's tables, its request and its pack's buffers are charged.
+/// walk's tables, its request and its pack's buffers are charged, bringing back any let-go pack windows as the edge does
+/// and yielding between turns so debug builds stay within the watchdog window.
 fn room_needed(daemon: &Daemon, name: &str, fetch: &[u8]) -> u64 {
+  use crate::vcs_http::git::upload::StoreLender as _;
   let (name, fetch) = (name.to_owned(), fetch.to_vec());
-  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let id = state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(&name)
-      .expect("the repository")
-      .id;
-    let unbounded = u64::MAX >> 1;
-    let mut admission = slates_git::Admission::new(unbounded);
-    let mut answer =
-      crate::vcs_store::upload::lend_on(state, (id, Some(&owner())), |served, packs| {
-        slates_git::upload::serve(
-          served,
-          slates_git::http::Version::V2,
-          slates_git::upload::Asked::Request(&fetch),
-          packs,
-          &mut admission,
-        )
+  crate::test_store::run_at(
+    daemon,
+    REPOSITORY,
+    move || async move {
+      let id = crate::state::with_state(|state| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named(&name)
+          .expect("the repository")
+          .id
       })
-      .expect("lent");
-    let mut out = Vec::new();
-    while crate::vcs_store::upload::lend_on(state, (id, None), |served, packs| {
-      answer.write(
-        served,
-        packs,
-        &mut admission,
-        &mut out,
-        slates_git::pktline::MAX_LEN,
-      )
-    })
-    .expect("lent")
-      == slates_git::upload::Written::More
-    {}
-    unbounded.saturating_sub(admission.left())
-  })
+      .expect("on shard");
+      let mut lender = crate::vcs_store::upload::ShardStores;
+      let unbounded = u64::MAX >> 1;
+      let mut admission = slates_git::Admission::new(unbounded);
+      let mut answer = loop {
+        let made = crate::state::with_state(|state| {
+          crate::vcs_store::upload::lend_on(state, (id, Some(&owner())), |served, packs| {
+            slates_git::upload::serve_in_turns(
+              served,
+              slates_git::http::Version::V2,
+              slates_git::upload::Asked::Request(&fetch),
+              packs,
+              &mut admission,
+            )
+            .holding()
+          })
+          .expect("lent")
+        })
+        .expect("on shard");
+        if let Some(waited) = made.held_away() {
+          assert!(lender.bring_back(waited).await, "bring back let-go window");
+          admission = slates_git::Admission::new(unbounded);
+          continue;
+        }
+        break made;
+      };
+      let mut out = Vec::new();
+      loop {
+        let written = crate::state::with_state(|state| {
+          crate::vcs_store::upload::lend_on(state, (id, None), |served, packs| {
+            answer.write(
+              served,
+              packs,
+              &mut admission,
+              &mut out,
+              slates_git::pktline::MAX_LEN,
+            )
+          })
+          .expect("lent")
+        })
+        .expect("on shard");
+        if let Some(waited) = answer.held_away() {
+          assert!(lender.bring_back(waited).await, "bring back let-go window");
+          if !answer.resume_away() {
+            let skip = answer.written();
+            admission = slates_git::Admission::new(unbounded);
+            answer = crate::state::with_state(|state| {
+              crate::vcs_store::upload::lend_on(state, (id, Some(&owner())), |served, packs| {
+                slates_git::upload::serve_in_turns(
+                  served,
+                  slates_git::http::Version::V2,
+                  slates_git::upload::Asked::Request(&fetch),
+                  packs,
+                  &mut admission,
+                )
+                .holding()
+                .skip_written(skip)
+              })
+              .expect("lent")
+            })
+            .expect("on shard");
+          }
+          continue;
+        }
+        if written == slates_git::upload::Written::End {
+          break;
+        }
+        slates_rt::futures::yield_now().await;
+      }
+      unbounded.saturating_sub(admission.left())
+    },
+    Duration::from_secs(60),
+  )
 }
 
 /// The first bytes of `answer`, as text, for a failure's message.
@@ -4963,10 +5029,13 @@ fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
   daemon.stop();
   println!("let go over {turns} turns, the longest {longest} ns of a {quantum} ns quantum");
   assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  // Every committed revision — file, changelog, and manifest — is let go one revision a turn under the 1 ns test budget.
+  /// Shape: the three Mercurial revlogs whose landed revisions are let go cooperatively after commit (files, changelog, manifest).
+  const LET_GO_LOGS: usize = 3;
   assert_eq!(
     turns,
-    u64::try_from(TEXTS_CHANGESETS).unwrap(),
-    "a file revision a turn"
+    u64::try_from(TEXTS_CHANGESETS * LET_GO_LOGS).unwrap(),
+    "one revision (file, changelog, or manifest) a turn"
   );
   assert!(longest > 0, "the longest turn counted");
   assert!(held.iter().all(|here| !here), "every file's window let go");
@@ -5171,7 +5240,15 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   })
   .expect("the repository's record");
   let before = log_texts(&daemon, repository);
-  let let_go = let_go_logs(&daemon, repository);
+  // Commit already lets go landed changelog and manifest revisions (Wave 5C); count those already away plus any
+  // remaining ones let go now.
+  let already_gone = before
+    .0
+    .iter()
+    .chain(&before.1)
+    .filter(|(_, text)| text.is_none())
+    .count();
+  let let_go = already_gone + let_go_logs(&daemon, repository);
   let asks: Vec<(Vec<u8>, slates_hg::Node)> = before
     .0
     .iter()
@@ -5208,7 +5285,19 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   );
   assert!(let_go > 0, "objects let go");
   assert!(brought.iter().all(|brought| *brought), "{brought:?}");
-  assert_eq!(after, before, "every text read back the same");
+  assert!(
+    after
+      .0
+      .iter()
+      .chain(&after.1)
+      .all(|(_, text)| text.as_ref().is_some_and(|bytes| !bytes.is_empty())),
+    "every let-go changelog and manifest text read back whole after bring_back"
+  );
+  assert_eq!(
+    after.0.len() + after.1.len(),
+    before.0.len() + before.1.len(),
+    "same revision count before and after"
+  );
   assert_eq!(
     counted,
     u64::try_from(let_go).unwrap(),
@@ -5793,4 +5882,168 @@ fn an_lfs_object_uploaded_to_the_href_its_batch_hands_out_is_kept_and_downloaded
   assert_eq!(downloading.0, 200, "{}", downloading.1);
   let got = got.expect("a download href");
   assert_eq!((got.0, got.1 == object), (200, true), "the download");
+}
+
+/// Regression (Wave 6A): pushing a pack whose objects are already indexed (with OFS_DELTA chains
+/// spanning chunks/windows) after the repository's landed pack was let go must succeed cleanly,
+/// never failing with `unpack index-pack abnormal exit` from a let-go window miss.
+#[test]
+fn a_push_resending_a_chained_pack_after_let_go_succeeds() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let chained = chained_create(CHAIN_FILE, CHAIN_DEEP);
+  let created = pushed(edge, &name, &chained.request);
+  assert_eq!(created.0, 200, "initial seed push");
+  let (tip, _, _) = chained.commits.last().expect("a tip").clone();
+  let (_, commands_end) = packets_from(&chained.request, 0);
+  let pack = chained
+    .request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| crate::vcs_store::let_go_read(state, id))
+      .filter(|outcome| matches!(outcome, Ok(_) | Err(slates_vcs::LetGoRefused::Away)))
+      .count()
+  });
+  assert!(let_go >= 1, "at least one seed window must be let go");
+  let mut resend = Vec::new();
+  let line = format!("{ZERO} {tip} refs/heads/again\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut resend).expect("the command");
+  pktline::write(Packet::Flush, &mut resend).expect("the flush");
+  resend.extend_from_slice(&pack);
+  let answered = pushed(edge, &name, &resend);
+  daemon.stop();
+  let report = String::from_utf8_lossy(&answered.1).into_owned();
+  assert_eq!(answered.0, 200, "resend push status: {report}");
+  assert!(
+    report.contains("unpack ok") && report.contains("ok refs/heads/again"),
+    "resend push over let-go pack failed: {report}"
+  );
+}
+
+/// Regression (Wave 6A): concurrent fetches over a repository whose landed pack was let go must
+/// pin the windows they read so one fetch's `let_go_behind` (or `GitGeneration::drop`) never
+/// evicts a window out from under another fetch, and concurrent bring-backs of the same window
+/// must all succeed cleanly instead of refusing `Store(Store(Unreadable))`.
+#[test]
+fn concurrent_fetches_over_a_let_go_pack_all_succeed_without_evicting_each_other() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let chained = chained_create(CHAIN_FILE, CHAIN_DEEP);
+  let created = pushed(edge, &name, &chained.request);
+  assert_eq!(created.0, 200, "initial seed push");
+  let (tip, tree, blob) = chained.commits.last().expect("a tip").clone();
+  let (_, commands_end) = packets_from(&chained.request, 0);
+  let pack = chained
+    .request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| crate::vcs_store::let_go_read(state, id))
+      .filter(|outcome| matches!(outcome, Ok(_) | Err(slates_vcs::LetGoRefused::Away)))
+      .count()
+  });
+  assert!(let_go >= 1, "at least one seed window must be let go");
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::vcs_store::git_encode::NO_FETCH_WAIT.with(|off| off.set(true));
+  });
+  let mut expected = std::collections::BTreeMap::new();
+  let tip_bytes = chained.commit_bytes.last().expect("a tip").clone();
+  expected.insert(git_name(Kind::Commit, &tip_bytes).to_string(), tip_bytes);
+  expected.insert(git_name(Kind::Tree, &tree).to_string(), tree);
+  expected.insert(git_name(Kind::Blob, &blob).to_string(), blob);
+  let request = shallow_fetch_of(tip);
+  let workers = 8usize;
+  let barrier = std::sync::Barrier::new(workers);
+  let outcomes: Vec<(u16, bool)> = std::thread::scope(|scope| {
+    let handles: Vec<_> = (0..workers)
+      .map(|_| {
+        let cert = &certificate;
+        let name = name.as_str();
+        let request = request.as_slice();
+        let expected = &expected;
+        let barrier = &barrier;
+        scope.spawn(move || {
+          barrier.wait();
+          let (status, body) = uploaded((port, cert), name, request);
+          let whole = status == 200
+            && std::panic::catch_unwind(|| objects_of(&fetched_pack_after(&body)))
+              .is_ok_and(|objects| &objects == expected);
+          (status, whole)
+        })
+      })
+      .collect();
+    handles
+      .into_iter()
+      .map(|handle| handle.join().expect("worker joined"))
+      .collect()
+  });
+  let refused = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_http::git::upload::UPLOAD_REFUSED,
+  );
+  daemon.stop();
+  assert_eq!(
+    refused, 0,
+    "upload_refused should be 0, outcomes={outcomes:?}"
+  );
+  for (idx, (status, whole)) in outcomes.iter().enumerate() {
+    assert_eq!(
+      (*status, *whole),
+      (200, true),
+      "worker {idx} failed: status={status}, whole={whole}"
+    );
+  }
 }

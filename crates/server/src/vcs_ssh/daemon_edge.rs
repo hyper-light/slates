@@ -146,35 +146,40 @@ pub(crate) fn start(
     Ok(address) => address.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
+  // Distribute independent listener handles (`TcpListener::try_clone`) and host key seeds across every shard so all
+  // shards accept SSH connections in parallel instead of bottlenecking on the control shard.
+  let mut per_shard: Vec<(ShardId, Option<TcpListener>, HostSeed)> =
+    Vec::with_capacity(shards.len());
   for shard in shards.iter().copied().filter(|shard| *shard != control) {
+    per_shard.push((shard, listener.try_clone().ok(), HostSeed(seed.0)));
+  }
+  per_shard.push((control, Some(listener), seed));
+  for (shard, shard_listener, shard_seed) in per_shard {
     runtime.spawn_on(shard, async move {
-      if keep_here(EdgeState::arrivals(bounds)).is_err() {
+      let kept = keep_here(EdgeState::new(bounds, shard_seed.0));
+      // The seed's copy here is wiped as it drops: the edge's state holds its own, wiped with it.
+      drop(shard_seed);
+      let Ok(state) = kept else {
         crate::fleet::count_refusal(NOT_KEPT);
+        return;
+      };
+      if let Some(shard_listener) = shard_listener {
+        let served = futures::spawn(async move {
+          if let Err(refused) = serve(shard_listener, state, move || daemon_site(room)).await {
+            slates_machine::log_line!("slates-server: the SSH edge stopped: {refused}");
+          }
+        });
+        match served {
+          Ok(task) => {
+            let _ = futures::detach(task);
+          }
+          Err(_) => {
+            crate::fleet::count_refusal(NOT_STARTED);
+          }
+        }
       }
     })?;
   }
-  runtime.spawn_on(control, async move {
-    let kept = keep_here(EdgeState::new(bounds, seed.0));
-    // The seed's copy here is wiped as it drops: the edge's state holds its own, wiped with it.
-    drop(seed);
-    let Ok(state) = kept else {
-      crate::fleet::count_refusal(NOT_KEPT);
-      return;
-    };
-    let served = futures::spawn(async move {
-      if let Err(refused) = serve(listener, state, move || daemon_site(room)).await {
-        slates_machine::log_line!("slates-server: the SSH edge stopped: {refused}");
-      }
-    });
-    match served {
-      Ok(task) => {
-        let _ = futures::detach(task);
-      }
-      Err(_) => {
-        crate::fleet::count_refusal(NOT_STARTED);
-      }
-    }
-  })?;
   Ok(Some(VcsSshEdge { port, fingerprint }))
 }
 

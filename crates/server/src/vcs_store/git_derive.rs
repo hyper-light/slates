@@ -190,48 +190,62 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 /// are let go again in quantum-bounded slices once derivation finishes so pack windows do not remain pinned in RAM.
 /// Returns at once where the shard's state is not lent.
 pub(crate) async fn derive_for_read(id: RepositoryId) {
-  let mut brought: Vec<slates_vcs::ContentId> = Vec::new();
+  let mut brought: Vec<super::named_objects::WindowPin> = Vec::new();
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) => slates_rt::futures::yield_now().await,
-      // A window brought back, turned again; one that brought nothing back (back already, or refused) would only meet the
-      // same miss again, so the derivation stops there as a refused one does.
+      // A window brought back (or brought back concurrently by another reader) and pinned so no concurrent
+      // `let_go_behind` can evict it before the next derivation turn reads it.
       Some(Turned::Waiting(waited)) => {
         let window = crate::state::with_state(|state| {
           state
             .vcs_stores
             .content()?
-            .away_window(&waited.pack, waited.len, waited.offset)
+            .window_holding(&waited.pack, waited.len, waited.offset)
             .map(|(window, _, _)| window)
         })
         .flatten();
-        if !matches!(super::read_through::bring_back(waited).await, Ok(brought_bytes) if brought_bytes > 0)
-        {
+        let Some(window) = window else {
+          break;
+        };
+        let pin = super::named_objects::WindowPin::of(window);
+        if super::read_through::bring_back(waited).await.is_err() {
           break;
         }
-        if let Some(window) = window {
-          brought.push(window);
+        let resident = crate::state::with_state(|state| {
+          state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| !content.is_away(&window))
+        })
+        .unwrap_or(false);
+        if !resident {
+          break;
+        }
+        if !brought.iter().any(|held| held.window() == window) {
+          brought.push(pin);
         }
       }
       Some(Turned::Idle) | None => break,
     }
   }
   if super::LANDED_LET_GO && !brought.is_empty() {
-    let_go_brought_windows(&brought).await;
+    let_go_brought_windows(brought).await;
   }
 }
 
-/// Lets go `windows` that [`derive_for_read`] brought back from the node's store, sliced within the shard's step
-/// quantum so the shard is never held across a large batch, and releases any excess arena extents once done.
-async fn let_go_brought_windows(windows: &[slates_vcs::ContentId]) {
-  let mut next = 0_usize;
-  while next < windows.len() {
+/// Lets go `windows` that [`derive_for_read`] brought back from the node's store, unpinning each before releasing so
+/// only other active readers keep it resident, sliced within the shard's step quantum.
+async fn let_go_brought_windows(mut windows: Vec<super::named_objects::WindowPin>) {
+  while !windows.is_empty() {
     let advanced = crate::state::with_state_counted(|state| {
       let quantum = state.config.step_quantum_ns();
       let started = slates_rt::futures::now_ns();
       let mut done = 0_usize;
-      for window in windows.get(next..).unwrap_or_default() {
-        let _ = super::let_go_read(state, window);
+      while let Some(pin) = windows.pop() {
+        let window = pin.window();
+        drop(pin);
+        let _ = super::let_go_read(state, &window);
         done = done.saturating_add(1);
         if slates_rt::futures::now_ns().saturating_sub(started) >= quantum {
           break;
@@ -239,11 +253,10 @@ async fn let_go_brought_windows(windows: &[slates_vcs::ContentId]) {
       }
       done
     });
-    let Some(done) = advanced.filter(|&done| done > 0) else {
+    if advanced.is_none_or(|done| done == 0) {
       break;
-    };
-    next = next.saturating_add(done);
-    if next < windows.len() {
+    }
+    if !windows.is_empty() {
       slates_rt::futures::yield_now().await;
     }
   }

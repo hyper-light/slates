@@ -32,6 +32,9 @@ const EVENTS_PER_WAIT: usize = 64;
 pub struct KqueueDriver {
   kq: KickFd,
   epoch: Instant,
+  /// Pending readiness registrations (`register_readable`/`register_writable`) batched into the next `kevent`
+  /// wait call so N socket armings + 1 harvest take one syscall instead of N + 1.
+  changes: Vec<Event>,
   events: Vec<Event>,
   nops: Vec<u64>,
 }
@@ -85,6 +88,7 @@ impl KqueueDriver {
     KqueueDriver {
       kq,
       epoch: Instant::now(),
+      changes: Vec::with_capacity(EVENTS_PER_WAIT),
       events: Vec::with_capacity(EVENTS_PER_WAIT),
       nops: Vec::new(),
     }
@@ -114,20 +118,27 @@ impl Driver for KqueueDriver {
       timeout = Some(Duration::ZERO);
     }
     self.events.clear();
+    // Ensure the output buffer can hold at least every pending change receipt/error so one `kevent` applies the
+    // entire changelist in one syscall.
+    if self.events.capacity() < self.changes.len() {
+      let grow = self.changes.len().saturating_sub(self.events.capacity());
+      self.events.reserve(grow);
+    }
     let outcome = self
       .kq
       .with(|kq| {
-        // SAFETY: no changes; the output buffer is the vector's spare capacity.
+        // SAFETY: `self.changes` holds valid change records; the output buffer is `self.events`'s spare capacity.
         unsafe {
           kevent(
             kq,
-            &[],
+            &self.changes,
             rustix::buffer::spare_capacity(&mut self.events),
             timeout,
           )
         }
       })
       .ok_or(RtError::DriverLost)?;
+    self.changes.clear();
     if let Err(e) = outcome {
       return match e {
         rustix::io::Errno::INTR => Ok(()),
@@ -135,7 +146,7 @@ impl Driver for KqueueDriver {
         other => Err(refused("kevent", other)),
       };
     }
-    // Kick events carry nothing; other filters (later phases) become completions keyed by udata.
+    // Kick events carry nothing; other filters become completions keyed by udata.
     for ev in &self.events {
       if !matches!(ev.filter(), EventFilter::User { .. }) {
         out.push(Completion {
@@ -143,6 +154,12 @@ impl Driver for KqueueDriver {
           result: 0,
         });
       }
+    }
+    // Data-derived harvest batching (R3): grow the event buffer on demand when a wait fills it so bursts of
+    // concurrent ready sockets drain in O(1) syscalls instead of 64-event slices.
+    if self.events.len() == self.events.capacity() {
+      let current = self.events.capacity();
+      self.events.reserve(current);
     }
     Ok(())
   }
@@ -153,43 +170,24 @@ impl Driver for KqueueDriver {
   }
 
   fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-    // A one-shot read filter whose udata carries the waker word; the `wait` loop above turns the
-    // ready event into a completion keyed by that word (the same path the kick's siblings take).
-    let event = Event::new(
+    // Queue a one-shot read filter whose udata carries the waker word; `wait` flushes the batched changelist in
+    // one `kevent` syscall alongside harvesting ready completions.
+    self.changes.push(Event::new(
       EventFilter::Read(raw),
       EventFlags::ADD | EventFlags::ONESHOT,
       core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
-    );
-    let mut none: Vec<Event> = Vec::new();
-    self
-      .kq
-      .with(|kq| {
-        // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
-        unsafe { kevent(kq, &[event], &mut none, None) }
-      })
-      .ok_or(RtError::DriverLost)?
-      .map_err(|e| refused("kevent(EVFILT_READ)", e))?;
+    ));
     Ok(())
   }
 
   fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-    // A one-shot write filter whose udata carries the waker word; the `wait` loop turns the ready
-    // event into a completion keyed by that word, exactly as the read filter does. The socket becomes
-    // writable when its send buffer has space again (§4.6, TCP send backpressure to a stalled client).
-    let event = Event::new(
+    // Queue a one-shot write filter whose udata carries the waker word (§4.6, TCP send backpressure), flushed
+    // with the next `kevent` wait.
+    self.changes.push(Event::new(
       EventFilter::Write(raw),
       EventFlags::ADD | EventFlags::ONESHOT,
       core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
-    );
-    let mut none: Vec<Event> = Vec::new();
-    self
-      .kq
-      .with(|kq| {
-        // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
-        unsafe { kevent(kq, &[event], &mut none, None) }
-      })
-      .ok_or(RtError::DriverLost)?
-      .map_err(|e| refused("kevent(EVFILT_WRITE)", e))?;
+    ));
     Ok(())
   }
 

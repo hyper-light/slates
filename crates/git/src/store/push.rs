@@ -189,6 +189,10 @@ pub struct Push {
   /// the object it holds (A-864): what tells an entry's raw length (to the next entry, or the pack's trailer) and an
   /// offset delta's base, as git's pack index does.
   entries: BTreeMap<u64, ObjectId>,
+  /// Offsets in `pack` for objects the repository already indexed and the push passed over: allows
+  /// in-pack delta resolution and connectivity checks to read them directly from RAM (`pack`/`recent`)
+  /// rather than hitting a let-go window of an older landed pack on disk.
+  passed_over: BTreeMap<ObjectId, u64>,
   /// The pack put in the content store as one content by the push's staging, a window a unit (A-722's record v4: rows
   /// name their objects by where they lie in it, never a second copy inflated): its identity and length, held by the
   /// push until its rows hold it.
@@ -215,6 +219,7 @@ impl Push {
       pack: Vec::new(),
       placed: BTreeMap::new(),
       entries: BTreeMap::new(),
+      passed_over: BTreeMap::new(),
       stored_pack: None,
       largest: 0,
       reading: RefCell::new(Scratch::default()),
@@ -368,6 +373,22 @@ impl Push {
       }
       HeldAt::Pack(offset) => self.read_placed(store, outside, offset).map(Cow::Owned),
     })
+  }
+
+  /// Like [`Push::bytes`], also serving objects that arrived in this push's pack but were passed
+  /// over because the repository already indexed them ([`Push::entry_at`]), reading directly from
+  /// the push's in-RAM pack and recent cache rather than a let-go repository pack on disk.
+  pub fn pack_bytes<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    outside: &dyn Bases,
+    id: &ObjectId,
+  ) -> Option<Result<Cow<'s, [u8]>, PackedRefused>> {
+    if let Some(read) = self.bytes(store, outside, id) {
+      return Some(read);
+    }
+    let &offset = self.passed_over.get(id)?;
+    Some(self.read_placed(store, outside, offset).map(Cow::Owned))
   }
 
   /// Reads the object whose entry begins at `offset` in the push's pack. Its buffer is the reader's, handed over: an
@@ -597,6 +618,7 @@ impl Push {
   /// the push passes over (A-864): so the entry before it is known to end there, and a delta against it is named.
   pub fn entry_at(&mut self, offset: u64, id: ObjectId) {
     self.entries.insert(offset, id);
+    self.passed_over.entry(id).or_insert(offset);
   }
 
   /// What a row keeps of placed object `id`'s entry in the push's pack (A-864, `rows::PackedRow`): its raw length, to the
@@ -660,6 +682,8 @@ impl Push {
       None => Ok(()),
     };
     self.placed = BTreeMap::new();
+    self.entries = BTreeMap::new();
+    self.passed_over = BTreeMap::new();
     self.pack = Vec::new();
     *self.reading.get_mut() = Scratch::default();
     given

@@ -32,12 +32,13 @@ impl std::fmt::Debug for LocalQueue {
 }
 
 impl LocalQueue {
-  /// A queue for an arena of `capacity` slots.
+  /// A queue for an arena of `capacity` slots (`ready` and `draining` grow on demand up to `capacity` so idle
+  /// shards retain only the 1-byte-per-slot `pending` table).
   pub fn new(capacity: usize) -> Self {
     Self {
       pending: (0..capacity).map(|_| Cell::new(false)).collect(),
-      ready: RefCell::new(VecDeque::with_capacity(capacity)),
-      draining: RefCell::new(Vec::with_capacity(capacity)),
+      ready: RefCell::new(VecDeque::new()),
+      draining: RefCell::new(Vec::new()),
       overflow: Cell::new(0),
       refused: Cell::new(0),
     }

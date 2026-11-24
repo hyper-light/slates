@@ -239,36 +239,55 @@ pub(crate) fn start(
     Ok(address) => address.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
-  for shard in shards.iter().copied().filter(|shard| *shard != control) {
-    runtime.spawn_on(shard, async move {
-      if keep_here(EdgeState::new(bounds, None)).is_err() {
-        crate::fleet::count_refusal(NOT_KEPT);
-      }
-    })?;
-  }
   // Process-lifetime singleton realm string (`Box::leak`, AGENTS.md §3) so every accepted HTTP connection
   // borrows `&'static str` across its three tool sites with zero per-connection heap allocations.
   let realm: &'static str = Box::leak(format!("slates {}", config.instance).into_boxed_str());
   let make = site(realm, bounds.room, config.git_keepalive_ns);
-  runtime.spawn_on(control, async move {
-    let Ok(state) = keep_here(EdgeState::new(bounds, identity)) else {
-      crate::fleet::count_refusal(NOT_KEPT);
-      return;
+  // Distribute independent listener handles (`TcpListener::try_clone`) and shard-local TLS identities across every
+  // shard so all shards accept connections in parallel instead of bottlenecking on the control shard.
+  let mut per_shard: Vec<(
+    ShardId,
+    Option<TcpListener>,
+    Option<slates_http_edge::tls::ServingIdentity>,
+  )> = Vec::with_capacity(shards.len());
+  for shard in shards.iter().copied().filter(|shard| *shard != control) {
+    let shard_identity = match identity.as_ref().map(|id| id.try_clone()).transpose() {
+      Ok(cloned) => cloned,
+      Err(refused) => {
+        return Ok(not_started(&format!(
+          "its identity could not be cloned for shard {}: {refused:?}",
+          shard.0
+        )));
+      }
     };
-    let served = futures::spawn(async move {
-      if let Err(refused) = serve(listener, state, make).await {
-        slates_machine::log_line!("slates-server: the HTTP edge stopped: {refused}");
+    let shard_listener = listener.try_clone().ok();
+    per_shard.push((shard, shard_listener, shard_identity));
+  }
+  per_shard.push((control, Some(listener), identity));
+  for (shard, shard_listener, shard_identity) in per_shard {
+    let make = make.clone();
+    runtime.spawn_on(shard, async move {
+      let Ok(state) = keep_here(EdgeState::new(bounds, shard_identity)) else {
+        crate::fleet::count_refusal(NOT_KEPT);
+        return;
+      };
+      if let Some(shard_listener) = shard_listener {
+        let served = futures::spawn(async move {
+          if let Err(refused) = serve(shard_listener, state, make).await {
+            slates_machine::log_line!("slates-server: the HTTP edge stopped: {refused}");
+          }
+        });
+        match served {
+          Ok(task) => {
+            let _ = futures::detach(task);
+          }
+          Err(_) => {
+            crate::fleet::count_refusal(NOT_STARTED);
+          }
+        }
       }
-    });
-    match served {
-      Ok(task) => {
-        let _ = futures::detach(task);
-      }
-      Err(_) => {
-        crate::fleet::count_refusal(NOT_STARTED);
-      }
-    }
-  })?;
+    })?;
+  }
   Ok(Some(port))
 }
 
@@ -278,11 +297,12 @@ fn not_started(why: &str) -> Option<u16> {
   None
 }
 
-/// The edge's bounds on each shard of `config`: its seats and request room from the shard's budget, its waits floored by
-/// the timer's tick ([`Bounds::of_shard`]); the SSH edge's too (A-684), whose connections are clients of the shard alike.
+/// The edge's bounds on each shard of `config`: its seats derived for cross-shard repository convergence
+/// (`DaemonConfig::vcs_connections_per_shard`), its request room from the shard's budget, and its waits floored by the
+/// timer's tick ([`Bounds::of_shard`]); the SSH edge's too (A-684), whose connections are clients of the shard alike.
 pub(crate) fn bounds_of(config: &DaemonConfig) -> Bounds {
   Bounds::of_shard(
-    config.clients_per_shard,
+    config.vcs_connections_per_shard().get(),
     config.region.total_bytes(),
     config.runtime.timer_tick_ns,
   )

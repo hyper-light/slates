@@ -143,7 +143,7 @@ impl StoreLender for ShardStores {
     waited: slates_git::store::packed::Waited,
     resident: &mut crate::vcs_http::git::upload::Resident,
   ) -> bool {
-    brought_one(waited, resident, None).await
+    brought_one(waited, resident, None).await.is_some()
   }
 
   fn let_go_behind(
@@ -231,7 +231,9 @@ pub(crate) async fn read_ahead(
   // The window a read stopped at is pinned to the object under way (`Brought::pinned`): its read may need it wherever
   // it lies.
   if let Some(stopped) = reads.stopped
-    && brought_one(stopped, resident, reads.next).await
+    && brought_one(stopped, resident, reads.next)
+      .await
+      .is_some_and(|bytes| bytes > 0)
   {
     let _ = crate::state::with_state_counted(|state| state.count(STOPPED_BROUGHT, 1));
   }
@@ -239,7 +241,7 @@ pub(crate) async fn read_ahead(
     note_peak(resident);
     return;
   };
-  let away = crate::state::with_state(|state| {
+  let needed = crate::state::with_state(|state| {
     let content = state.vcs_stores.content()?;
     let window = to_u64(content.window()).max(1);
     let first = next.offset.checked_div(window).unwrap_or(0);
@@ -247,16 +249,22 @@ pub(crate) async fn read_ahead(
       (first..first.saturating_add(LOOK_AHEAD_WINDOWS))
         .map(|index| index.saturating_mul(window).max(next.offset))
         .filter(|offset| *offset < next.len)
-        .filter(|offset| content.away_window(&next.pack, next.len, *offset).is_some())
-        .map(|offset| slates_git::store::packed::Waited { offset, ..next })
+        .filter_map(|offset| {
+          let (id, _, _) = content.window_holding(&next.pack, next.len, offset)?;
+          (!resident.iter().any(|held| held.window == id))
+            .then_some(slates_git::store::packed::Waited { offset, ..next })
+        })
         .collect::<Vec<_>>(),
     )
   })
   .flatten()
   .unwrap_or_default();
   let mut windows = 0_u64;
-  for waited in away {
-    if brought_one(waited, resident, None).await {
+  for waited in needed {
+    if brought_one(waited, resident, None)
+      .await
+      .is_some_and(|bytes| bytes > 0)
+    {
       windows = windows.saturating_add(1);
     }
   }
@@ -276,39 +284,79 @@ pub(crate) const PINNED_HELD: &str = "vcs_store.git_resident.pinned_held";
 /// name.
 pub(crate) const LET_GO_BEHIND: &str = "vcs_store.git_resident.let_go_behind";
 
-/// Brings back `waited`'s let-go window for an answer, kept in its `resident` windows to be let go again behind its
-/// cursor: whether it was brought back.
+/// Brings back and pins `waited`'s window in `resident` so concurrent fetches/pushes cannot evict it while this reader
+/// needs it: returns `Some(bytes_fetched)` when the window is now resident and pinned (`0` if it was already resident
+/// or another concurrent reader brought it back first), or `None` if bring-back failed and the window remains away.
 async fn brought_one(
   waited: slates_git::store::packed::Waited,
   resident: &mut crate::vcs_http::git::upload::Resident,
   pinned: Option<slates_git::store::packed::Waited>,
-) -> bool {
-  let window = crate::state::with_state(|state| {
-    state
-      .vcs_stores
-      .content()?
-      .away_window(&waited.pack, waited.len, waited.offset)
+) -> Option<u64> {
+  let held = crate::state::with_state(|state| {
+    let content = state.vcs_stores.content()?;
+    let (window, start, len) = content.window_holding(&waited.pack, waited.len, waited.offset)?;
+    let away = content.is_away(&window);
+    Some((window, start, len, away))
   })
   .flatten();
-  let Some((window, start, len)) = window else {
-    return false;
-  };
-  match bring_back_within(waited).await {
-    Ok(bytes) if bytes > 0 => {
-      resident.push(crate::vcs_http::git::upload::Brought {
-        pack: waited.pack,
-        end: start.saturating_add(len),
-        window,
-        pinned,
-      });
-      true
+  let (window, start, len, away) = held?;
+  if let Some(existing) = resident.iter_mut().find(|held| held.window == window) {
+    if pinned.is_some() {
+      existing.pinned = pinned;
     }
-    Ok(_) => false,
-    Err(_) => {
-      let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
-      false
+    if !away {
+      return Some(0);
     }
+    return match bring_back_within(waited).await {
+      Ok(bytes) => {
+        let now_resident = crate::state::with_state(|state| {
+          state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| !content.is_away(&window))
+        })
+        .unwrap_or(false);
+        now_resident.then_some(bytes)
+      }
+      Err(_) => {
+        let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+        None
+      }
+    };
   }
+  // Pin before any await so no concurrent `let_go_behind` or idle give-back can evict `window` mid-read-through.
+  let pin = super::named_objects::WindowPin::of(window);
+  let bytes = if away {
+    match bring_back_within(waited).await {
+      Ok(bytes) => {
+        let now_resident = crate::state::with_state(|state| {
+          state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| !content.is_away(&window))
+        })
+        .unwrap_or(false);
+        if !now_resident {
+          return None;
+        }
+        bytes
+      }
+      Err(_) => {
+        let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+        return None;
+      }
+    }
+  } else {
+    0
+  };
+  resident.push(crate::vcs_http::git::upload::Brought {
+    pack: waited.pack,
+    end: start.saturating_add(len),
+    window,
+    pinned,
+    _pin: pin,
+  });
+  Some(bytes)
 }
 
 /// Counts the most windows `resident` holds ([`PEAK_WINDOWS`]).
@@ -319,15 +367,19 @@ fn note_peak(resident: &crate::vcs_http::git::upload::Resident) {
 
 /// Lets go again the windows of `resident` an answer's cursor has passed (A-864 piece 3): those of the pack `next` reads
 /// that end at or before where it reads, and every one of another pack (a pack is read front to back, each in turn);
-/// every one with no `next`. A window a home holds here is kept (`vcs_store::let_go_read`'s `Pinned`); one met again
-/// later is brought back again, its stop and look-ahead as before.
+/// every one with no `next`. Each removed entry's `WindowPin` is dropped first so only other live readers or homes keep
+/// the window pinned (`vcs_store::let_go_read`'s `Pinned`).
 pub(crate) fn let_go_behind(
   state: &mut ShardState,
   resident: &mut crate::vcs_http::git::upload::Resident,
   next: Option<slates_git::store::packed::Waited>,
 ) {
   let mut released = 0_u64;
-  resident.retain(|brought| {
+  let mut at = 0_usize;
+  while at < resident.len() {
+    let Some(brought) = resident.get(at) else {
+      break;
+    };
     // A window a read stopped at stays while the stream still reads the object it stopped for.
     let pinned = next.is_some() && brought.pinned == next;
     let behind =
@@ -335,12 +387,18 @@ pub(crate) fn let_go_behind(
     if pinned {
       state.count(PINNED_HELD, 1);
     }
-    if behind && super::let_go_read(state, &brought.window).is_ok() {
-      state.count(LET_GO_BEHIND, 1);
-      released = released.saturating_add(1);
+    if behind {
+      let removed = resident.swap_remove(at);
+      let window = removed.window;
+      drop(removed);
+      if super::let_go_read(state, &window).is_ok() {
+        state.count(LET_GO_BEHIND, 1);
+        released = released.saturating_add(1);
+      }
+    } else {
+      at = at.saturating_add(1);
     }
-    !behind
-  });
+  }
   if next.is_none() && released > 0 {
     super::release_excess_extents(state);
   }
@@ -369,6 +427,28 @@ pub(crate) async fn bring_back_within(
       Err(super::read_through::ReadThroughRefused::NoStore)
     }
   }
+}
+
+/// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), pinning it in
+/// `resident` so concurrent fetches cannot evict it before the caller's next turn.
+pub(crate) async fn brought_back_waited_into(
+  id: RepositoryId,
+  resident: &mut crate::vcs_http::git::upload::Resident,
+) -> bool {
+  let waited = crate::state::with_state(|state| {
+    state.vcs_stores.stopped_encoding(id).or_else(|| {
+      state
+        .vcs_stores
+        .git(id)
+        .and_then(|(_, store)| store.repository.waiting())
+    })
+  })
+  .flatten();
+  let Some(waited) = waited else {
+    return false;
+  };
+  let _ = brought_one(waited, resident, None).await;
+  true
 }
 
 /// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), where one did;

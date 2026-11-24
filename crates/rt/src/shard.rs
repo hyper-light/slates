@@ -545,8 +545,9 @@ impl ShardContext {
         .tasks_per_shard
         .div_ceil(config.segment_tasks().max(1)),
     );
-    let timers = Wheel::new(
+    let timers = Wheel::growing(
       config.timer_tick_ns,
+      config.timers_per_shard.min(config.segment_tasks()).max(1),
       config.timers_per_shard,
       driver.now_ns(),
     );
@@ -607,7 +608,7 @@ impl ShardContext {
         timers,
         driver,
         control: seed.control,
-        fired: Vec::with_capacity(config.timers_per_shard),
+        fired: Vec::new(),
         completions: Vec::with_capacity(config.ring_entries),
         config,
         counters: Counters::default(),

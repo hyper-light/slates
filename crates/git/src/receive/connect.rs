@@ -69,11 +69,14 @@ pub fn connectivity<R: Repository + ?Sized>(
 ) -> Result<Vec<Connected>, Refusal> {
   let mut walk = Walk::new(request, pushed, admission)?;
   let mut stopped = Stopped;
-  while !walk.turn(
-    (request, pushed, repository),
-    admission,
-    unbounded(&mut stopped),
-  )? {}
+  while !matches!(
+    walk.turn(
+      (request, pushed, repository),
+      admission,
+      unbounded(&mut stopped),
+    )?,
+    WalkStep::Done
+  ) {}
   walk.connected(request, pushed, repository)
 }
 
@@ -127,6 +130,17 @@ enum Frame {
   },
 }
 
+/// A read push's connectivity walk stopped for a let-go window, or progressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalkStep {
+  /// More units remain within the current turn's quantum.
+  More,
+  /// A read met a let-go window: stop this turn now so the driver brings it back before retrying.
+  Away,
+  /// Every tip's connectivity is final.
+  Done,
+}
+
 /// The connectivity check made a turn at a time (A-719; the module docs): every pushed object read once in pack order,
 /// each turn for its quantum and at least one object; then, only when some object is incomplete, the worst state
 /// carried back from each pushed tip. Its tables are charged to the admission before they are made, the stack as it
@@ -147,6 +161,9 @@ pub(crate) struct Walk {
   stack: Vec<Frame>,
   /// Where each object's propagation stands; empty unless the propagation runs.
   marks: Vec<Mark>,
+  /// Where the walk last stopped for a let-go window `(pass, node, offset)` so a failed bring-back
+  /// never spins indefinitely.
+  stopped: Option<(Pass, usize, u64)>,
 }
 
 impl Walk {
@@ -172,26 +189,33 @@ impl Walk {
       at: 0,
       stack: Vec::new(),
       marks: Vec::new(),
+      stopped: None,
     })
   }
 
   /// One turn of the walk over `request`'s `pushed` objects and `repository`, for `quantum` and at
-  /// least one unit of work: whether the walk is done.
+  /// least one unit of work: whether the walk is done, needs another turn, or paused for a let-go window.
   pub(crate) fn turn<R: Repository + ?Sized>(
     &mut self,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
     admission: &mut Admission,
     quantum: Quantum<'_>,
-  ) -> Result<bool, Refusal> {
+  ) -> Result<WalkStep, Refusal> {
     let Quantum { clock, ns } = quantum;
     let begun = clock.now_ns();
     while self.pass != Pass::Done {
-      self.unit((request, pushed, repository), admission)?;
+      if self.unit((request, pushed, repository), admission)? == WalkStep::Away {
+        return Ok(WalkStep::Away);
+      }
       if clock.now_ns().saturating_sub(begun) >= ns {
         break;
       }
     }
-    Ok(self.pass == Pass::Done)
+    Ok(if self.pass == Pass::Done {
+      WalkStep::Done
+    } else {
+      WalkStep::More
+    })
   }
 
   /// One unit of the walk: one object of the first pass, its end, or a frame of the propagation.
@@ -199,14 +223,17 @@ impl Walk {
     &mut self,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
     admission: &mut Admission,
-  ) -> Result<(), Refusal> {
+  ) -> Result<WalkStep, Refusal> {
     match self.pass {
       Pass::States => match pushed.objects().get(self.at) {
         Some(object) => self.judge(object, (request, pushed, repository)),
-        None => self.propagation_begun(admission),
+        None => {
+          self.propagation_begun(admission)?;
+          Ok(WalkStep::More)
+        }
       },
       Pass::Propagate => self.propagation_unit((request, pushed), admission),
-      Pass::Done => Ok(()),
+      Pass::Done => Ok(WalkStep::Done),
     }
   }
 
@@ -215,7 +242,7 @@ impl Walk {
     &mut self,
     object: &Placed,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
-  ) -> Result<(), Refusal> {
+  ) -> Result<WalkStep, Refusal> {
     let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
     let read = edges_of(
@@ -231,13 +258,21 @@ impl Walk {
         }
       },
     )?;
+    if !read
+      && let Some(away) = pushed.away()
+      && self.stopped != Some((Pass::States, self.at, away))
+    {
+      self.stopped = Some((Pass::States, self.at, away));
+      return Ok(WalkStep::Away);
+    }
+    self.stopped = None;
     let state = if read { state } else { Connected::Missing };
     self.incomplete |= state != Connected::Complete;
     if let Some(slot) = self.states.get_mut(self.at) {
       *slot = state;
     }
     self.at = self.at.saturating_add(1);
-    Ok(())
+    Ok(WalkStep::More)
   }
 
   /// The first pass ended: done when no object is incomplete of its own (the module docs), else the propagation begun
@@ -264,7 +299,7 @@ impl Walk {
     &mut self,
     (request, pushed): (&Request, &Pushed<'_>),
     admission: &mut Admission,
-  ) -> Result<(), Refusal> {
+  ) -> Result<WalkStep, Refusal> {
     match self.stack.pop() {
       Some(Frame::Enter { node, parent }) => {
         self.enter(node, parent, (request.format, pushed), admission)
@@ -285,25 +320,28 @@ impl Walk {
           *mark = Mark::Done;
         }
         self.fold(parent, state);
-        Ok(())
+        Ok(WalkStep::More)
       }
       None => {
         let Some(command) = request.commands.get(self.at) else {
           self.stack = Vec::new();
           self.marks = Vec::new();
           self.pass = Pass::Done;
-          return Ok(());
+          return Ok(WalkStep::Done);
         };
         self.at = self.at.saturating_add(1);
         match pushed.position(&command.new) {
-          Some(tip) if !command.is_delete() => self.push(
-            Frame::Enter {
-              node: tip,
-              parent: None,
-            },
-            admission,
-          ),
-          _ => Ok(()),
+          Some(tip) if !command.is_delete() => {
+            self.push(
+              Frame::Enter {
+                node: tip,
+                parent: None,
+              },
+              admission,
+            )?;
+            Ok(WalkStep::More)
+          }
+          _ => Ok(WalkStep::More),
         }
       }
     }
@@ -317,17 +355,17 @@ impl Walk {
     parent: Option<usize>,
     (format, pushed): (ObjectFormat, &Pushed<'_>),
     admission: &mut Admission,
-  ) -> Result<(), Refusal> {
+  ) -> Result<WalkStep, Refusal> {
     match self.marks.get(node) {
       Some(Mark::New) => {}
       Some(Mark::Done) => {
         let state = self.states.get(node).copied().unwrap_or(Connected::Missing);
         self.fold(parent, state);
-        return Ok(());
+        return Ok(WalkStep::More);
       }
       // An object open on the path below cannot be reached again, its names being its children's hashes; nothing
       // to fold.
-      Some(Mark::Open) | None => return Ok(()),
+      Some(Mark::Open) | None => return Ok(WalkStep::More),
     }
     if let Some(mark) = self.marks.get_mut(node) {
       *mark = Mark::Open;
@@ -343,7 +381,7 @@ impl Walk {
       admission,
     )?;
     let Some(object) = pushed.objects().get(node) else {
-      return Ok(());
+      return Ok(WalkStep::More);
     };
     let mut worst = own;
     let mut refused = None;
@@ -353,7 +391,7 @@ impl Walk {
       states,
       ..
     } = self;
-    edges_of((node, object), (format, pushed), &mut |target, _| {
+    let read = edges_of((node, object), (format, pushed), &mut |target, _| {
       let Some(child) = pushed.position(&target) else {
         return;
       };
@@ -374,10 +412,23 @@ impl Walk {
         _ => {}
       }
     })?;
+    if !read
+      && let Some(away) = pushed.away()
+      && self.stopped != Some((Pass::Propagate, node, away))
+    {
+      self.stack.truncate(exit);
+      if let Some(mark) = self.marks.get_mut(node) {
+        *mark = Mark::New;
+      }
+      self.push(Frame::Enter { node, parent }, admission)?;
+      self.stopped = Some((Pass::Propagate, node, away));
+      return Ok(WalkStep::Away);
+    }
+    self.stopped = None;
     if let Some(Frame::Exit { worst: folded, .. }) = self.stack.get_mut(exit) {
       *folded = (*folded).max(worst);
     }
-    refused.map_or(Ok(()), Err)
+    refused.map_or(Ok(WalkStep::More), Err)
   }
 
   /// `state` folded into the exit frame at `parent`, if any.

@@ -133,6 +133,31 @@ impl TcpListener {
     })
   }
 
+  /// Duplicates this listener into an independent owned handle referring to the same listening socket so every
+  /// shard of a multi-shard server can accept connections in parallel without bottlenecking on one shard.
+  pub fn try_clone(&self) -> Result<TcpListener, RtError> {
+    Ok(TcpListener {
+      socket: netsys::clone_listener(&self.socket)?,
+    })
+  }
+
+  /// Accepts one pending connection without waiting: `Ok(None)` when the accept queue is empty (`EAGAIN`).
+  /// Pair with [`TcpListener::wait_readable`] to drain bursts in a cooperative batch.
+  pub fn accept_now(&self) -> Result<Option<TcpStream>, RtError> {
+    loop {
+      match netsys::accept(&self.socket)? {
+        Io::Ready(socket) => return Ok(Some(TcpStream { socket })),
+        Io::WouldBlock => return Ok(None),
+        Io::Interrupted => continue,
+      }
+    }
+  }
+
+  /// Awaits readability (a pending connection in the accept queue) through the shard's driver.
+  pub async fn wait_readable(&self) -> Result<(), RtError> {
+    readable(self.socket.raw_id()).await
+  }
+
   /// Accepts the next connection, awaiting readability through the driver when none is pending. The
   /// accepted socket is made non-blocking and kept from children, like the listener, and `TCP_NODELAY`.
   pub async fn accept(&self) -> Result<TcpStream, RtError> {

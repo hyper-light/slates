@@ -60,11 +60,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::task::{Poll, Waker};
+use std::task::Poll;
 
 use crate::vcs_store::svn_texts::SvnView;
 use slates_db::catalog::{Principal, RepositoryId, VcsTool};
-use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
+use slates_rt::futures::{cancel, detach, now_ns, spawn_child, step_budget_ns, yield_now};
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
@@ -82,6 +82,7 @@ use slates_vfs::clock::Clock;
 use crate::config::DaemonConfig;
 use crate::repository::svn_commit;
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
+use crate::vcs_http::seats::{SeatTable, Seating};
 use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
@@ -295,37 +296,12 @@ impl std::fmt::Display for ListenerRefused {
   }
 }
 
-/// A taken seat: its connection's task once spawned, since when its wait has been past its bound, and whether it is
-/// being reaped.
-#[derive(Clone, Copy, Debug)]
-struct Taken {
-  /// The connection's task, once spawned.
-  task: Option<TaskId>,
-  /// The deadline its wait passed, while it waits past it.
-  overdue_since_ns: Option<u64>,
-  /// Whether it was chosen to be reaped: its seat comes back as its task's cancellation drops it.
-  reaping: bool,
-}
-
-/// How the listener, holding an accepted connection, stands for a seat ([`ListenerState::seating`]).
-enum Seating {
-  /// This seat is free.
-  Free(usize),
-  /// None is free and this connection's task, the most overdue, is to be reaped for the one waiting (none when it was
-  /// never spawned, whose seat comes back as its spawn is refused).
-  Reap(Option<TaskId>),
-  /// None is free and none is overdue: wait for a seat to come back or a connection to become overdue.
-  Wait,
-}
-
-/// A shard's listener state, shared by its connections and, on the listener's shard, the listener, through a [`Kept`]
-/// handle: its seats, who waits for one, and the connections that moved here waiting. Every shard keeps one, so a
-/// connection that moves to a repository's owner is seated there. Nothing in it is lent across a wait.
+/// A shard's listener state, shared by its connections and its listener through a [`Kept`] handle: its seats,
+/// waiters, and arriving connections. Every shard keeps one and accepts in parallel. Nothing in it is lent across a
+/// wait.
 struct ListenerState {
-  /// One entry for each connection served at once, `Some` while taken.
-  seats: RefCell<Vec<Option<Taken>>>,
-  /// Who waits for a seat: the listener holding an accepted connection, and connections that moved here, each once.
-  waiting: RefCell<Vec<Waker>>,
+  /// O(1) free-list seat table, O(log K) overdue index, and strict-FIFO wake-one waiters.
+  seats: RefCell<SeatTable<u64>>,
   /// The connections that moved here and wait for a seat: at most as many as the shard has seats.
   arriving: Cell<usize>,
   /// How many seats there are: the bound on the arrivals waiting.
@@ -336,101 +312,65 @@ impl ListenerState {
   /// A listener serving `connections` at once.
   fn new(connections: usize) -> ListenerState {
     ListenerState {
-      seats: RefCell::new(vec![None; connections]),
-      waiting: RefCell::new(Vec::new()),
+      seats: RefCell::new(SeatTable::new(connections)),
       arriving: Cell::new(0),
       seat_count: connections,
     }
   }
 
-  /// How the listener stands for a seat (the module doc): a free seat; or, with every seat taken, the most overdue
-  /// connection not already being reaped, chosen now; or a wait. With none free, `waker` is kept to be woken when a seat
-  /// comes back or a connection becomes overdue.
-  fn seating(&self, waker: &Waker) -> Seating {
-    let Ok(mut seats) = self.seats.try_borrow_mut() else {
-      return Seating::Wait;
-    };
-    if let Some(free) = seats.iter().position(Option::is_none) {
-      return Seating::Free(free);
-    }
-    self.wait_for_seat(waker);
-    let most_overdue = seats
-      .iter_mut()
-      .flatten()
-      .filter(|taken| !taken.reaping)
-      .filter_map(|taken| taken.overdue_since_ns.map(|since_ns| (since_ns, taken)))
-      .min_by_key(|(since_ns, _)| *since_ns);
-    match most_overdue {
-      Some((_, taken)) => {
-        taken.reaping = true;
-        Seating::Reap(taken.task)
-      }
-      None => Seating::Wait,
-    }
+  /// Runs `f` over the seat table; none while lent, which is never across a wait.
+  fn with_seats<R>(&self, f: impl FnOnce(&mut SeatTable<u64>) -> R) -> Option<R> {
+    self
+      .seats
+      .try_borrow_mut()
+      .ok()
+      .map(|mut seats| f(&mut seats))
   }
 
-  /// Takes seat `slot` for a connection just accepted.
-  fn take_seat(&self, slot: usize) {
-    if let Ok(mut seats) = self.seats.try_borrow_mut()
-      && let Some(seat) = seats.get_mut(slot)
+  /// Allocates a unique FIFO waiter id for one wait operation.
+  fn allocate_waiter(&self) -> Option<u64> {
+    self.with_seats(SeatTable::allocate_waiter)
+  }
+
+  /// Claims a free seat immediately in O(1), if one is available.
+  fn claim_free(&self) -> Option<usize> {
+    self.with_seats(SeatTable::claim_free).flatten()
+  }
+
+  /// How a waiter stands for a seat: a free seat claimed atomically in O(1); or, with every seat taken, the most
+  /// overdue connection not already being reaped (O(log K)); or a FIFO wait.
+  fn seating(&self, waiter: u64, waker: &std::task::Waker) -> Seating {
+    self
+      .with_seats(|seats| seats.seating(waiter, waker).0)
+      .unwrap_or(Seating::Wait)
+  }
+
+  /// Removes a cancelled waiter and passes the wake baton if a seat or overdue target is available.
+  fn cancel_waiter(&self, waiter: u64) {
+    if let Some(waker) = self
+      .with_seats(|seats| seats.cancel_waiter(waiter))
+      .flatten()
     {
-      *seat = Some(Taken {
-        task: None,
-        overdue_since_ns: None,
-        reaping: false,
-      });
+      waker.wake();
     }
   }
 
   /// Records the task serving seat `slot`.
   fn set_task(&self, slot: usize, task: TaskId) {
-    if let Ok(mut seats) = self.seats.try_borrow_mut()
-      && let Some(Some(taken)) = seats.get_mut(slot)
-    {
-      taken.task = Some(task);
-    }
+    let _ = self.with_seats(|seats| seats.set_task(slot, task));
   }
 
-  /// Marks seat `slot`'s connection overdue since `since_ns`, waking the listener, which may hold a connection waiting
-  /// for a seat.
+  /// Marks seat `slot`'s connection overdue since `since_ns`, waking one waiter.
   fn mark(&self, slot: usize, since_ns: u64) {
-    if let Ok(mut seats) = self.seats.try_borrow_mut()
-      && let Some(Some(taken)) = seats.get_mut(slot)
-      && !taken.reaping
-    {
-      taken.overdue_since_ns = Some(since_ns);
-    }
-    self.wake_listener();
-  }
-
-  /// Gives seat `slot` back, waking the listener if it waits for one.
-  fn give_back(&self, slot: usize) {
-    if let Ok(mut seats) = self.seats.try_borrow_mut()
-      && let Some(seat) = seats.get_mut(slot)
-    {
-      *seat = None;
-    }
-    self.wake_listener();
-  }
-
-  /// Wakes whoever waits for a seat: each looks again ([`seat_for`]).
-  fn wake_listener(&self) {
-    let waiting = self
-      .waiting
-      .try_borrow_mut()
-      .map(|mut waiting| std::mem::take(&mut *waiting))
-      .unwrap_or_default();
-    for waker in waiting {
+    if let Some((_, Some(waker))) = self.with_seats(|seats| seats.mark(slot, Some(since_ns))) {
       waker.wake();
     }
   }
 
-  /// Keeps `waker` to be woken when a seat comes back or a connection becomes overdue, once.
-  fn wait_for_seat(&self, waker: &Waker) {
-    if let Ok(mut waiting) = self.waiting.try_borrow_mut()
-      && !waiting.iter().any(|kept| kept.will_wake(waker))
-    {
-      waiting.push(waker.clone());
+  /// Gives seat `slot` back in O(1), waking one waiter if any waits for one.
+  fn give_back(&self, slot: usize) {
+    if let Some(waker) = self.with_seats(|seats| seats.give_back(slot)).flatten() {
+      waker.wake();
     }
   }
 
@@ -448,20 +388,10 @@ impl ListenerState {
   fn arrival_seated(&self) {
     self.arriving.set(self.arriving.get().saturating_sub(1));
   }
-
-  /// A free seat, if one is.
-  fn free_seat(&self) -> Option<usize> {
-    self
-      .seats
-      .try_borrow()
-      .ok()?
-      .iter()
-      .position(Option::is_none)
-  }
 }
 
-/// A connection's seat: taken as it is given one and given back when this drops, however the connection ends (its end,
-/// its task's cancellation by a reap or with its listener, a refused spawn), the listener woken if it waits for one.
+/// A connection's seat: claimed atomically when handed out and given back when this drops, however the connection
+/// ends, waking one waiter if any waits for one.
 struct Seat {
   /// The listener's state.
   state: Kept<ListenerState>,
@@ -470,11 +400,9 @@ struct Seat {
 }
 
 impl Seat {
-  /// Takes seat `slot` of the listener `state` keeps; none off its shard.
-  fn take(state: Kept<ListenerState>, slot: usize) -> Option<Seat> {
-    state
-      .with(|state| state.take_seat(slot))
-      .map(|()| Seat { state, slot })
+  /// Wraps a seat `slot` already claimed from `state`'s table.
+  fn from_claimed(state: Kept<ListenerState>, slot: usize) -> Seat {
+    Seat { state, slot }
   }
 
   /// Marks the connection overdue since `since_ns`, its wait's deadline: it waits on.
@@ -491,6 +419,22 @@ impl Drop for Seat {
     let slot = self.slot;
     // Off its shard (the runtime ending) no listener is left to give the seat back to.
     let _ = self.state.with(|state| state.give_back(slot));
+  }
+}
+
+/// Removes a waiter from the FIFO queue on drop and passes the wake baton if cancelled without claiming a seat.
+struct SeatWaitGuard {
+  state: Kept<ListenerState>,
+  waiter: u64,
+  claimed: bool,
+}
+
+impl Drop for SeatWaitGuard {
+  fn drop(&mut self) {
+    if !self.claimed {
+      let waiter = self.waiter;
+      let _ = self.state.with(|state| state.cancel_waiter(waiter));
+    }
   }
 }
 
@@ -551,42 +495,51 @@ pub(crate) fn start(
     Ok(bound) => bound.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
+  // Distribute independent listener handles (`TcpListener::try_clone`) across every shard so all shards accept
+  // `svn://` connections in parallel instead of bottlenecking on the control shard.
+  let mut per_shard: Vec<(ShardId, Option<TcpListener>)> = Vec::with_capacity(shards.len());
   for shard in shards.iter().copied().filter(|shard| *shard != control) {
+    per_shard.push((shard, listener.try_clone().ok()));
+  }
+  per_shard.push((control, Some(listener)));
+  for (shard, shard_listener) in per_shard {
     runtime.spawn_on(shard, async move {
-      if keep_here(ListenerState::new(bounds.connections)).is_err() {
-        crate::fleet::count_refusal(NOT_KEPT);
+      let Ok(state) = keep_here(ListenerState::new(bounds.connections)) else {
+        crate::fleet::count_refusal(if shard == control {
+          NOT_STARTED
+        } else {
+          NOT_KEPT
+        });
+        return;
+      };
+      if let Some(shard_listener) = shard_listener {
+        let served = futures::spawn(async move {
+          if let Err(refused) = serve(shard_listener, state, bounds, limits).await {
+            slates_machine::log_line!("slates-server: the svn:// listener stopped: {refused}");
+          }
+        });
+        match served {
+          Ok(task) => {
+            if detach(task).is_err() {
+              crate::fleet::count_refusal(NOT_DETACHED);
+            }
+          }
+          Err(_) => {
+            crate::fleet::count_refusal(NOT_STARTED);
+          }
+        }
       }
     })?;
   }
-  runtime.spawn_on(control, async move {
-    let Ok(state) = keep_here(ListenerState::new(bounds.connections)) else {
-      crate::fleet::count_refusal(NOT_STARTED);
-      return;
-    };
-    let served = futures::spawn(async move {
-      if let Err(refused) = serve(listener, state, bounds, limits).await {
-        slates_machine::log_line!("slates-server: the svn:// listener stopped: {refused}");
-      }
-    });
-    match served {
-      Ok(task) => {
-        if detach(task).is_err() {
-          crate::fleet::count_refusal(NOT_DETACHED);
-        }
-      }
-      Err(_) => {
-        crate::fleet::count_refusal(NOT_STARTED);
-      }
-    }
-  })?;
   Ok(Some(port))
 }
 
-/// The listener's bounds on a shard of `config`: the HTTP edge's ([`Bounds::of_shard`]), its seats and room from the
-/// shard's budget, its waits floored by the timer's tick.
+/// The listener's bounds on a shard of `config`: the HTTP edge's ([`Bounds::of_shard`]), its seats derived for
+/// cross-shard repository convergence (`DaemonConfig::vcs_connections_per_shard`), its room from the shard's budget,
+/// and its waits floored by the timer's tick.
 fn bounds_of(config: &DaemonConfig) -> Bounds {
   Bounds::of_shard(
-    config.clients_per_shard,
+    config.vcs_connections_per_shard().get(),
     config.region.total_bytes(),
     config.runtime.timer_tick_ns,
   )
@@ -614,8 +567,19 @@ async fn serve(
   bounds: Bounds,
   limits: Limits,
 ) -> Result<(), ListenerRefused> {
+  let mut batch_start_ns = now_ns();
   loop {
-    let stream = listener.accept().await.map_err(ListenerRefused::Listener)?;
+    let stream = match listener.accept_now().map_err(ListenerRefused::Listener)? {
+      Some(stream) => stream,
+      None => {
+        listener
+          .wait_readable()
+          .await
+          .map_err(ListenerRefused::Listener)?;
+        batch_start_ns = now_ns();
+        continue;
+      }
+    };
     let Ok(round_trip) = stream.round_trip() else {
       crate::fleet::count_refusal(NO_ROUND_TRIP);
       continue;
@@ -624,8 +588,8 @@ async fn serve(
       round_trip.ns,
       bounds.granularity_ns().max(round_trip.resolution_ns),
     );
-    let slot = seat_for(state).await?;
-    let seat = Seat::take(state, slot).ok_or(ListenerRefused::StateGone)?;
+    let seat = seat_for(state).await?;
+    let slot = seat.slot;
     match spawn_child(converse(stream, seat, limits, bound_ns)) {
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
@@ -638,17 +602,40 @@ async fn serve(
         crate::fleet::count_refusal(SPAWN_REFUSED);
       }
     }
+    if step_budget_ns().is_some_and(|budget| now_ns().saturating_sub(batch_start_ns) >= budget) {
+      yield_now().await;
+      batch_start_ns = now_ns();
+    }
   }
 }
 
-/// Waits, holding an accepted connection, until a seat is free for it (the module doc): at once below the bound; with
-/// every seat taken, by reaping the most overdue connection, or once a seat comes back or a connection becomes overdue.
-async fn seat_for(state: Kept<ListenerState>) -> Result<usize, ListenerRefused> {
-  std::future::poll_fn(|context| {
-    match state.with(|state| state.seating(context.waker())) {
-      Some(Seating::Free(slot)) => Poll::Ready(Ok(slot)),
+/// Waits, holding an accepted connection, until a seat is claimed for it (the module doc): at once below the bound;
+/// with every seat taken, by reaping the most overdue connection, or once a seat comes back or a connection becomes
+/// overdue.
+async fn seat_for(state: Kept<ListenerState>) -> Result<Seat, ListenerRefused> {
+  if let Some(slot) = state
+    .with(ListenerState::claim_free)
+    .ok_or(ListenerRefused::StateGone)?
+  {
+    return Ok(Seat::from_claimed(state, slot));
+  }
+  let waiter = state
+    .with(ListenerState::allocate_waiter)
+    .ok_or(ListenerRefused::StateGone)?
+    .ok_or(ListenerRefused::StateGone)?;
+  let mut guard = SeatWaitGuard {
+    state,
+    waiter,
+    claimed: false,
+  };
+  let slot = std::future::poll_fn(|context| {
+    match state.with(|state| state.seating(waiter, context.waker())) {
+      Some(Seating::Free(slot)) => {
+        guard.claimed = true;
+        Poll::Ready(Ok(slot))
+      }
       Some(Seating::Reap(task)) => {
-        // Its seat comes back, waking this listener, as the cancellation drops its task.
+        // Its seat comes back, waking a waiter, as the cancellation drops its task.
         if let Some(task) = task
           && cancel(task).is_err()
         {
@@ -661,7 +648,8 @@ async fn seat_for(state: Kept<ListenerState>) -> Result<usize, ListenerRefused> 
       None => Poll::Ready(Err(ListenerRefused::StateGone)),
     }
   })
-  .await
+  .await?;
+  Ok(Seat::from_claimed(state, slot))
 }
 
 /// What a connection does after one call of its [`Connection`].
@@ -905,6 +893,12 @@ async fn follow(
     Next::Read => return read_step(stream, conversation, seat).await,
     Next::Consume(taken) => {
       consume(conversation, taken);
+      // When no buffered pipelined bytes remain and no streamed fetch is in flight, wait for the next client
+      // command directly instead of running a no-op turn + `yield_now()` behind thousands of ready tasks.
+      if conversation.input.is_empty() && !conversation.connection.fetching() {
+        *out = Vec::new();
+        return read_step(stream, conversation, seat).await;
+      }
       return Stepped::Go;
     }
     Next::Again => return Stepped::Go,
@@ -2215,8 +2209,8 @@ async fn serve_arrival(
   found: Found,
   located: Located,
 ) {
-  let slot = match seat_arrival(state).await {
-    Ok(slot) => slot,
+  let seat = match seat_arrival(state).await {
+    Ok(seat) => seat,
     Err(ArrivalRefused::Full) => {
       crate::fleet::count_refusal(ARRIVAL_REFUSED);
       return;
@@ -2226,10 +2220,7 @@ async fn serve_arrival(
       return;
     }
   };
-  let Some(seat) = Seat::take(state, slot) else {
-    crate::fleet::count_refusal(ARRIVAL_LOST);
-    return;
-  };
+  let slot = seat.slot;
   if let Some(task) = futures::current_task() {
     let _ = state.with(|state| state.set_task(slot, task));
   }
@@ -2252,12 +2243,12 @@ enum ArrivalRefused {
 /// A seat for a connection that moved here (the module doc): a free one at once; with every seat taken, as the listener
 /// seats a new connection ([`seat_for`]: the most overdue connection's, or the next to come back), while fewer arrivals
 /// wait than the shard has seats; refused past that.
-async fn seat_arrival(state: Kept<ListenerState>) -> Result<usize, ArrivalRefused> {
-  let free = state
-    .with(ListenerState::free_seat)
-    .ok_or(ArrivalRefused::Gone)?;
-  if let Some(slot) = free {
-    return Ok(slot);
+async fn seat_arrival(state: Kept<ListenerState>) -> Result<Seat, ArrivalRefused> {
+  if let Some(slot) = state
+    .with(ListenerState::claim_free)
+    .ok_or(ArrivalRefused::Gone)?
+  {
+    return Ok(Seat::from_claimed(state, slot));
   }
   if !state
     .with(ListenerState::admit_arrival)

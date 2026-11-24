@@ -162,9 +162,47 @@ thread_local! {
     const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
-/// Whether a reader keeps `window` until its read's last step ([`ReadPin`]).
+/// Whether a reader keeps `window` until its read's last step ([`ReadPin`], [`WindowPin`]).
 pub(crate) fn read_pinned(window: &ContentId) -> bool {
   READ_PINS.with(|pins| pins.borrow().contains_key(window))
+}
+
+/// One content window pinned against landed let-go on the shard's thread until dropped: zero
+/// heap allocation, used by git upload/push/derive readers so concurrent `let_go_behind` or idle
+/// give-backs never evict a window another active reader is still reading.
+#[derive(Debug)]
+#[must_use = "the window is kept only while the pin lives"]
+pub(crate) struct WindowPin(ContentId);
+
+impl WindowPin {
+  /// Pins `window` on the current shard thread until this guard drops.
+  pub(crate) fn of(window: ContentId) -> WindowPin {
+    READ_PINS.with(|pins| {
+      let mut pins = pins.borrow_mut();
+      let count = pins.entry(window).or_insert(0);
+      *count = count.saturating_add(1);
+    });
+    WindowPin(window)
+  }
+
+  /// The pinned window's identity.
+  pub(crate) fn window(&self) -> ContentId {
+    self.0
+  }
+}
+
+impl Drop for WindowPin {
+  fn drop(&mut self) {
+    let _ = READ_PINS.try_with(|pins| {
+      let mut pins = pins.borrow_mut();
+      if let Some(count) = pins.get_mut(&self.0) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+          pins.remove(&self.0);
+        }
+      }
+    });
+  }
 }
 
 /// The windows of a range of an object a reader brought back ([`bring_back_range`]), kept from a landed let-go until it

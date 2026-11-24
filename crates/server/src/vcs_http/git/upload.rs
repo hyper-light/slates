@@ -166,10 +166,11 @@ pub(crate) fn fetches(version: Version, request: &[u8]) -> bool {
       .is_none_or(|command| command == slates_git::v2::request::Command::Fetch)
 }
 
-/// A window an answer's read-through brought back (A-864 piece 3): its pack, where it ends there, and its identity, let
-/// go again once the answer's cursor has passed it; or, for a window a read stopped at, once the cursor has moved off the
-/// object that read was for (`pinned`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A window an answer's read-through brought back or pinned (A-864 piece 3): its pack, where it ends there, its
+/// identity, and its shard-local read pin (`WindowPin`), let go again once the answer's cursor has passed it (or once
+/// the cursor moves off the object a stopped read was for, `pinned`), and only if no other concurrent reader still pins
+/// the same window.
+#[derive(Debug)]
 pub(crate) struct Brought {
   /// The pack.
   pub(crate) pack: slates_vcs::ContentId,
@@ -182,6 +183,9 @@ pub(crate) struct Brought {
   /// there (goal 93, r130's shallow clone: a base brought back and let go behind the cursor in one turn was met again
   /// and the answer refused `Unreadable`).
   pub(crate) pinned: Option<slates_git::store::packed::Waited>,
+  /// Shard-local read pin keeping `window` resident against concurrent `let_go_behind` and idle give-backs until this
+  /// entry is removed or dropped.
+  pub(crate) _pin: crate::vcs_store::named_objects::WindowPin,
 }
 
 /// The windows an answer brought back and has not let go (A-864 piece 3): a turn's look-ahead, and the windows the
@@ -460,9 +464,10 @@ impl<L: StoreLender> Exchange for Upload<L> {
       return Ok(true);
     }
     if written != Written::More {
-      // The answer is written: its generation is given back, and every window it brought back let go again.
-      *generation = None;
+      // The answer is written: unpin and let go every window it held first, then give back its generation so the last
+      // fetch's idle give-back sees zero pins left on this exchange.
       lender.let_go_behind(resident, None);
+      *generation = None;
       // A refused answer (a pack the store could not finish ends with git's abort words, A-639) is counted and named in
       // the log by its typed refusal, so a client's "possible repository corruption" has its cause on the server.
       if let Some(refusal) = made.refusal() {
@@ -485,10 +490,10 @@ async fn read_ahead_of<L: StoreLender>(
 ) {
   if let Some(pack) = made.pack_source() {
     let reads = L::pack_reads(pack);
-    lender.read_ahead(reads, resident).await;
     if reads.next.is_some() {
       lender.let_go_behind(resident, reads.next);
     }
+    lender.read_ahead(reads, resident).await;
   }
 }
 

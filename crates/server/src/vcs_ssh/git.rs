@@ -372,10 +372,10 @@ impl<L: StoreLender> UploadCommand<L> {
     // A-864 piece 2: the windows the next turn reads brought back first, off the turn.
     if let Some(pack) = self.answer.as_ref().and_then(|made| made.pack_source()) {
       let reads = L::pack_reads(pack);
-      self.lender.read_ahead(reads, &mut self.resident).await;
       if reads.next.is_some() {
         self.lender.let_go_behind(&mut self.resident, reads.next);
       }
+      self.lender.read_ahead(reads, &mut self.resident).await;
     }
     let next = self.write_answer()?;
     // A-864 piece 3: an answer written lets go every window it brought back.

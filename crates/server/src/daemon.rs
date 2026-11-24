@@ -1053,13 +1053,14 @@ impl Daemon {
     // The block the start beats, held across the runtime's start (`supervision` above says who reads the beat).
     let beat_block = segment.supervision()?;
     start_beat.beat(&beat_block);
-    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits. The start
-    // beats after each unit of the runtime's work, its pair rings above all, N(N-1) of them (`slates_rt::runtime`).
-    let runtime = Runtime::start_sized(
-      &config.runtime,
-      &[config.control_shard_capacity().get()],
-      &mut || start_beat.beat(&beat_block),
-    )?;
+    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits and, when
+    // any VCS edge is enabled, every shard's lazy arena and timer wheel sized for converged VCS connections
+    // (`DaemonConfig::effective_runtime`). The start beats after each unit of the runtime's work, its pair rings above
+    // all, N(N-1) of them (`slates_rt::runtime`).
+    let (runtime_config, control_capacity) = config.effective_runtime();
+    let runtime = Runtime::start_sized(&runtime_config, &[control_capacity], &mut || {
+      start_beat.beat(&beat_block)
+    })?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));

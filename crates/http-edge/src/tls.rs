@@ -39,11 +39,17 @@ pub enum TlsRefused {
 }
 
 /// The certificate chain and key the edge presents: the operator's, issued for the names clients reach it by.
+/// Each shard holds its own `ServingIdentity` (via [`ServingIdentity::try_clone`]) with a pre-built shard-local
+/// `rustls::ServerConfig` so accepted HTTPS connections never re-parse the X.509 chain or PKCS#8 private key and
+/// never bounce an `Arc` refcount across CPU cores.
 pub struct ServingIdentity {
   /// The leaf first, then its intermediates.
   chain: Vec<CertificateDer<'static>>,
   /// The leaf's private key.
   key: PrivateKeyDer<'static>,
+  /// Pre-built shard-local TLS configuration.
+  // structural: allow — D-8 exception 2: `rustls::ServerConnection::new` takes `Arc<ServerConfig>` by signature; owners are this shard's `ServingIdentity` and its live connections.
+  config: std::sync::Arc<rustls::ServerConfig>,
 }
 
 impl ServingIdentity {
@@ -52,28 +58,36 @@ impl ServingIdentity {
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
   ) -> Result<ServingIdentity, TlsRefused> {
-    let identity = ServingIdentity { chain, key };
-    // Refused now rather than at the first client: a chain and key rustls cannot use make no configuration.
-    identity.config()?;
-    Ok(identity)
+    let config = Self::build_config(&chain, &key)?;
+    // structural: allow — D-8 exception 2: `ServerConnection::new` takes `Arc` by signature; kept shard-local.
+    let config = std::sync::Arc::new(config);
+    Ok(ServingIdentity { chain, key, config })
+  }
+
+  /// Makes an independent copy with its own shard-local `ServerConfig` so another shard's TLS accepts touch no
+  /// shared atomic refcount across cores.
+  pub fn try_clone(&self) -> Result<ServingIdentity, TlsRefused> {
+    ServingIdentity::new(self.chain.clone(), self.key.clone_key())
   }
 
   /// A server connection for one client, waiting for its `ClientHello`.
   pub fn connection(&self) -> Result<ServerConnection, TlsRefused> {
-    let config = self.config()?;
-    // structural: allow — D-8 exception 2: `ServerConnection::new` takes `Arc` by signature; one owner, this connection.
-    ServerConnection::new(std::sync::Arc::new(config)).map_err(TlsRefused::Setup)
+    // structural: allow — D-8 exception 2: `ServerConnection::new` takes `Arc` by signature; shard-local clone only.
+    ServerConnection::new(std::sync::Arc::clone(&self.config)).map_err(TlsRefused::Setup)
   }
 
-  /// One connection's configuration: TLS 1.3 and 1.2, ALPN `http/1.1`, no client certificate, no resumption.
-  fn config(&self) -> Result<rustls::ServerConfig, TlsRefused> {
+  /// One shard's configuration: TLS 1.3 and 1.2, ALPN `http/1.1`, no client certificate, no resumption.
+  fn build_config(
+    chain: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+  ) -> Result<rustls::ServerConfig, TlsRefused> {
     // structural: allow — D-8 exception 2: `builder_with_provider` takes the provider as `Arc` by signature.
     let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
       .with_safe_default_protocol_versions()
       .map_err(TlsRefused::Setup)?
       .with_no_client_auth()
-      .with_single_cert(self.chain.clone(), self.key.clone_key())
+      .with_single_cert(chain.to_vec(), key.clone_key())
       .map_err(TlsRefused::Setup)?;
     config.alpn_protocols = vec![ALPN_HTTP_1_1.to_vec()];
     config.send_tls13_tickets = 0;

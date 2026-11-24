@@ -255,6 +255,9 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// ([`ReceivePack::refused_report`]), since the request itself moves on through the answer. None under side-band,
   /// whose refusal is band 3's words alone.
   refusal_names: Option<Vec<Vec<u8>>>,
+  /// Let-go pack windows brought back for this push's reads, pinned until the push ends so
+  /// concurrent fetches cannot evict them mid-push.
+  resident: crate::vcs_http::git::upload::Resident,
 }
 
 /// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
@@ -486,6 +489,12 @@ impl<P> ReceivePack<P> {
     self.repository
   }
 
+  /// Brings back and pins the let-go window the push's last turn met, if any, so concurrent
+  /// fetches cannot evict it before the push's next turn.
+  pub(crate) async fn bring_back_waited(&mut self) -> bool {
+    crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident).await
+  }
+
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
   pub(crate) fn side_band(&self) -> bool {
     self.session.side_band()
@@ -554,6 +563,7 @@ impl<P> ReceivePack<P> {
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
       refusal_names: None,
+      resident: crate::vcs_http::git::upload::Resident::new(),
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -1359,11 +1369,14 @@ impl<P> Drop for ReceivePack<P> {
         );
       }
     }
-    // Goal 93 item 2b: the landed packs its entries' commits owed a let-go, let go now that it decides no more refs
-    // (where nothing else of the repository is under way; else what ends last, or its going idle). A drop the state is
-    // not lent to leaves them owed to the repository's going idle.
+    // Goal 93 item 2b: unpin any let-go pack windows this push brought back before letting go
+    // the repository's owed/resident packs.
     let repository = self.repository;
+    let resident = &mut self.resident;
     let _ = crate::state::with_state(|state| {
+      if !resident.is_empty() {
+        crate::vcs_store::upload::let_go_behind(state, resident, None);
+      }
       crate::vcs_store::let_go_owed_as_push_ends(state, repository);
     });
   }
