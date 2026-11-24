@@ -1011,7 +1011,7 @@ pub(crate) const IMAGE_CATCH_UP_PUBLISH_REFUSED: &str = "vcs_store.image.catch_u
 pub(crate) const IMAGE_CATCH_UP_RETRIED: &str = "vcs_store.image.catch_up_retried";
 
 /// A catch-up's publication ([`image_catch_up`]): the shard's, through `verbs::publish_shard`; under a test, refused
-/// first where [`CATCH_UP_REFUSALS`] says so.
+/// first where `CATCH_UP_REFUSALS` says so.
 fn catch_up_publication(state: &mut ShardState) -> Result<(), slates_vfs::VfsError> {
   #[cfg(test)]
   if CATCH_UP_REFUSALS.with(|refusals| {

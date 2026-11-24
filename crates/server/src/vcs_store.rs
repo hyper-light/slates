@@ -417,24 +417,37 @@ impl GitStore {
   }
 
   /// The green's version, and the tree, of the newest of the store's versions of the green keyed `key` whose head is
-  /// `head`: a push's base (§4.17.1 item 1). It reads the green's versions newest first, each one row.
+  /// `head`: a push's base (§4.17.1 item 1). Read from the holders' map (`Repository::holders`), no version walked.
   pub(crate) fn version_of(
     &self,
     content: &ContentStore,
     key: u64,
     head: &ObjectId,
   ) -> Option<(u64, ObjectId)> {
-    let versions = self.versions.get(&key)?;
-    versions.iter().enumerate().rev().find_map(|(at, version)| {
-      (self.repository.head(content, key, at).as_ref() == Some(head))
-        .then(|| {
-          self
-            .repository
-            .tree(content, key, at)
-            .map(|tree| (*version, tree))
-        })
-        .flatten()
-    })
+    let (_, at) = self
+      .repository
+      .holders(content, head)
+      .into_iter()
+      .find(|(green, _)| *green == key)?;
+    self.version_at(content, key, at)
+  }
+
+  /// The greens holding `head` (`Repository::holders`): each one's key and its newest store version whose head is
+  /// `head`, in key order. What a push's search for a create's base reads (goal 93).
+  pub(crate) fn holders(&self, content: &ContentStore, head: &ObjectId) -> Vec<(u64, usize)> {
+    self.repository.holders(content, head)
+  }
+
+  /// The green's version, and the tree, of the store's version `at` of the green keyed `key`.
+  pub(crate) fn version_at(
+    &self,
+    content: &ContentStore,
+    key: u64,
+    at: usize,
+  ) -> Option<(u64, ObjectId)> {
+    let number = *self.versions.get(&key)?.get(at)?;
+    let tree = self.repository.tree(content, key, at)?;
+    Some((number, tree))
   }
 
   /// The green's versions at each of the store's versions of the green keyed `key`.
@@ -1010,19 +1023,12 @@ fn git_format(format: DbFormat) -> Option<ObjectFormat> {
   }
 }
 
-/// The key a green has in its repository's git store (module docs): its volume id's partition and counter.
+/// The key a green has in its repository's git store (module docs): its volume id's partition and counter, the id's
+/// serial (`slates_db::catalog::VolumeId::serial`), so the repository index finds the member a key names
+/// (`Repositories::member_keyed`) without a walk.
 pub(crate) fn green_key(green: DbVolumeId) -> u64 {
-  green
-    .bytes
-    .get(GREEN_KEY_START..)
-    .and_then(|half| <[u8; GREEN_KEY_BYTES]>::try_from(half).ok())
-    .map_or(0, u64::from_be_bytes)
+  green.serial()
 }
-
-/// Format: where a volume id's partition and counter begin (`verbs::fresh_volume_id`: the host's eight bytes first).
-const GREEN_KEY_START: usize = size_of::<u64>();
-/// Format: the bytes of a green's key: the partition's two and the counter's six.
-const GREEN_KEY_BYTES: usize = size_of::<u64>();
 
 /// Makes `record`'s store on its owner shard, beside its record (module docs): empty, so it charges nothing yet but
 /// the objects its entries hold in the partition's register, which a recovery finds there ([`settle_objects`]). A store

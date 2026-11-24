@@ -20,7 +20,7 @@
 //! resolved; it carries its completion key, principal and body, and runs through `verbs::dispatch` under its key
 //! (`crate::lease_wait::run_resumed`). A retry of a parked request joins it ([`join`]). The list is bounded by the
 //! shard's client credit (`crate::lease_wait::bound`); a create past it is refused at once, counted. A remake that ends
-//! on one shard tells every other shard while any admission waits anywhere ([`remade`]).
+//! on one shard tells every other shard while any admission waits anywhere (`remade`, Windows').
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};

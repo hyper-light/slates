@@ -2047,7 +2047,8 @@ landing constants are in §4.15.
 
 > **Status (2026-11-18, A-363): the failover delay is a live output, not a setting.** Each node estimates
 > `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` SWIM's count of its
-> detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
+> detector's periods at their measured running tail, and **since A-882** at least the bound its detector states while a
+> pair is still judged by its own retransmission timer (a member's first seconds), `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
 > (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
 > round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; **since
@@ -34224,6 +34225,13 @@ Lifeguard has it condemn no one. Applied in the same change to: `crates/cluster/
 40 s of it on main, unchanged with the fix), GAPS, and
 `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
 
+**Amended 2026-11-23 again (A-882): while a pair is still judged by its own retransmission timer, the detection term
+is at least the bound the detector states.** "Not the detector's own bound" above holds for the ratchet, and A-882 keeps
+it so. But the 7.0 and 14.0 s that bound read before any loss were not a ratchet's artifact. They are SWIM's seven
+periods at a timer's 1 s and 2 s spans, and a peer judged by its timer takes that long to condemn: 6.0 s on the
+simulated network where the count said 20 ms, and 7.2 s for a cut-off leader on adacachy2 where it said about 0.7 s.
+See A-882 for the rule, the bound chosen (`least_detection_bound`, not the ratchet) and every reader checked.
+
 ### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
 Applied in the same change to:
 - §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
@@ -61917,6 +61925,11 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   and version 2's reader first refused it, so every window of a granule or more was lost at a restart. Windows' 4 KiB
   granule showed it, and a 16 KiB granule hid it (`docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-
   chunk-the-seal-trimmed.md`). Only a window's slot is held to its chunk's bytes, and only a shared slab asks again.
+- **A window's record** (2026-11-23, main's (3) of goal 93) keeps what the window alone names: its identity, its
+  length, its slot's offset and its slab's key, 56 bytes. The slab keeps the placement its windows share: the chunk,
+  the block's length, the bytes used and the birth epoch. A window's placement is made from the two when it is read or
+  imaged (`ChunkWindows::placed_of`). Measured with a count of a test thread's live heap (`tests/window_records_heap.rs`):
+  250 bytes a window on the record that repeated the placement, 150 on this one.
 - **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
 - **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
   - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
@@ -62009,6 +62022,84 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - GAPS.
   - docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md and
     docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md.
+
+### A-882 — The failover delay's detection term is at least the bound the detector states while a pair it probes is still judged by its own retransmission timer (2026-11-23, w-fleet for main 01a20182; found with A-351's readmission flake; amends A-363; §4.8 "Derived constants", D-16, A-375, A-574)
+
+- **Why.** A-363's detection term `D` counts SWIM's `2(2m − 1) + 1` periods at the running tail of the detector's
+  answered periods. That count describes a detection an estimator judges, where a crashed peer's unanswered probe runs
+  about a period. Until a member's pool has a verdict, hyper-swim judges each pair by the pair's own RFC 6298 timer,
+  floored at a second (§2.4) and doubling at each expiry. A crashed peer's unanswered probes then run the timer's span
+  and the relay stage, seconds each, and `D` never saw them: it times answered periods only (A-363's amendment of
+  2026-11-23), and before any was answered it was absent and the estimate took the anchor's supervision, 1.0 s (A-574).
+  On adacachy2 a forming fleet's survivors read a failover delay of 2.2 to 5.1 s while they took 7.2 s to condemn a
+  cut-off leader (A-351's readmission test). On the simulated network a young member's `D` was 19 to 21 ms while its
+  detector stated 21.0 s and the killed peer took 6.0 s. Every wait that reads the delay read the smaller figure in a
+  member's first seconds. The 7.0 and 14.0 s for which A-363 set the detector's own bound aside are SWIM's seven periods
+  at a timer's 1 s and 2 s: this case, not a ratchet's artifact.
+- **The rule.**
+  - While any pair the detector probes is judged by its own timer (hyper-swim's `Judge::Timer`), `D` is the larger of
+    the period count and `Detector::least_detection_bound`. That bound counts each of SWIM's periods at what an
+    unanswered probe's deadlines allow now (the span of the verdict judging the pair, then the relay stage) and adds the
+    member's latest wake lateness. Once an estimator judges every pair, `D` is the count alone.
+  - Before a period was timed, the stated bound alone is `D`, its samples zero, as a prior's are.
+  - It is read at each refresh on the clock the plane is stepped by (`MemberPlane::detection(now_ns)`). Karn's rule
+    applies as for the period's length. Once a period ended unanswered, the bound is the one stated as the latest
+    answered period ended. A member never answered keeps the first bound its detector stated, as its first period ended.
+    So no timer's doubling is taken for a detection.
+  - Before the detector's first period has ended it states no bound, and `D` stays absent, so the estimate takes the
+    anchor's supervision as before (A-574).
+- **Not the ratchet, measured.** `Detector::detection_bound` counts every period at the longest any ever ran as well. On
+  the simulated network, after one detection under the timer, it read 28.0 s once both survivors were judged by an
+  estimator again, where `least_detection_bound` read 75 to 80 ms. Any later fall back to a timer (a late answer takes a
+  pair out of the pool's) would have read that old detection's periods. Before any long period the two agree (21.0 s).
+- **What the bound does not cover.** It is stated for the deadlines in force when it is read. A detection that needs
+  further expiries, or relays not yet heard from, outgrows it: two of 40 readmission runs took 15.3 s to condemn. `D`
+  follows such a detection as the member's answered periods restate the bound.
+- **The membership horizon.** `lease::horizon_ns` (0.9 s) was documented as the longest a peer can go unanswered
+  before the detector declares it dead. It is the window the lease's two sides reason with, judged from answers, and
+  the detection budget the plane asks of its detector. The detector keeps that budget only while an estimator judges
+  every pair. Its doc says so now, and names the bound the detector does keep.
+- **Readers of the delay, checked against the corrected figure.**
+  - Every product reader waits at most the delay or holds for it. That covers takeover and materialization attempts
+    (A-304), a forward's bound (A-352), the location round's cap, a held reply's total (A-354), a work verb's held
+    commit (A-434), a move's overdue bound and the telemetry horizon (A-525), the learned helper and answer bounds, a
+    parked submit, and a direct map's claim. The terms are the write lease, a landing's target lease, a staging buffer
+    (A-414) and a CLI attachment (A-384). In a member's first seconds each now waits or holds longer, while detection
+    itself takes that long.
+  - None decides by taking the delay back off a stored time. The two that subtract it are a landing's
+    `lease_seen_ns`, which only feeds the `longest_lease_gap_ns` gauge, and a test's setup.
+  - In the tests, `departure_learned_periods` counted the detection as one membership horizon, nine periods, and its
+    three callers stop the bootstrap voter as the fleet forms. It now counts the survivors' detection term
+    (`Daemon::failover_detection_ns`). The tests that read the delay once to size a wait or a hold read a larger
+    figure in the young window, which loosens an upper bound or lengthens a hold. The three dead-session and forward
+    tests, the held-verb SLO test (11.0 to 20.5 s a run), A-363's estimator test, A-351's readmission test and the
+    cut-off owner's flow all pass with it (below).
+  - Before the detector's first period has ended it states no bound and the estimate still takes the anchor's
+    supervision: both survivors read 1.00 s at the cut in 7 of 30 readmission runs, their first probes unanswered. That
+    window closes only with a statement hyper-swim does not make before a period (GAPS).
+- **Tests.**
+  - `a_young_members_detection_term_covers_a_detection_its_timer_judges` (`crates/cluster/tests/member_plane.rs`). On
+    main each term was 19.3 to 20.9 ms against a stated 21.0 s, and the peer was condemned 6.0 s after its last answer.
+    With the change each term was 21.0 s, the condemnation came within it, and each term fell back to 14.6 to 14.7 ms
+    once no pair was on its timer.
+  - `a_member_never_answered_keeps_the_first_bound_its_detector_stated` (the same file). On main there was no term at
+    all. With the change it was 14.0 s with zero samples, and it held at 14.0 s after 40 s cut off while the detector
+    stated 112.0 s.
+  - `detection_is_at_least_the_bound_a_timer_judged_pair_is_stated_at` (`crates/cluster/src/failover.rs`).
+  - Red-checked on a copy. Without the timer's bound both plane tests fail. Without the first statement the
+    never-answered test fails. Without the prior before a period the unit test fails.
+  - Live on adacachy2, two and four CPUs: A-351's readmission test 20 of 20 and 10 of 10. The three departure tests
+    4 of 4 and 2 of 2 each. The held-verb SLO test, A-363's estimator test, the three dead-session and forward tests,
+    and `live_chaos`'s cut-off owner flow (5 of 5, 3 of 3) all pass. The server's failover unit tests pass 11 of 11.
+- **Applied in the same change to:**
+  - `crates/cluster`: `failover.rs` (`detection`'s bound and prior, its unit test) and `member_plane.rs`
+    (`detection(now_ns)`, `timer_bound`, and the fields `answered_lately`, `ever_answered` and `answered_timer_bound`),
+    with `tests/member_plane.rs` (the two tests above, and item 1's test reading the term at its clock).
+  - `crates/server`: `fleet.rs` (`refresh_failover` reads the term on the plane's clock), `daemon.rs`
+    (`failover_detection_ns`), `lease.rs` (`horizon_ns`'s doc), and `tests/fleet.rs` (`departure_learned_periods`,
+    `detection_periods`, the readmission test's record of each survivor's term at the cut).
+  - §4.4's status, A-363's entry, GAPS, and
+    `docs/bugs/2026-11-23-the-failover-delay-left-out-a-detection-the-detectors-timer-judged.md`.
 
 ### A-883 — A move names its retirement, not its host (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the chaos nemesis's settle failure; amends A-251 (i); A-309, A-409)
 
