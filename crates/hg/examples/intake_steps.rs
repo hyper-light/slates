@@ -24,7 +24,7 @@ use std::time::Instant;
 use slates_hg::Admission;
 use slates_hg::bundle2::Bundle2;
 use slates_hg::index::HgIndex;
-use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::push::intake::{Intake, PushSegment, Stepped};
 use slates_hg::push::read;
 use slates_vcs::ContentStore;
 
@@ -110,7 +110,7 @@ fn main() {
     }
     while let Some(taken) = intake.take_segment() {
       let start = Instant::now();
-      let _record = intake.segment_record(&taken, u64::MAX, &store).unwrap();
+      let _record = whole_record(&intake, &taken, u64::MAX, &store);
       records.note(start.elapsed().as_micros());
     }
     at += 1;
@@ -162,4 +162,16 @@ fn main() {
     intaken.most_own_runs,
     intaken.tiered_merges
   );
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }
