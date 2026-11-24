@@ -165,6 +165,30 @@ async fn held_report_given<L: ShardLender>(
   }
 }
 
+/// The homing a push's step asked, if it asked one, started as a task of its own off the shard's step: its names and
+/// pack homed in the region, then landed on the node's store (`crate::git_push::carry`), its outcome left in `carrying`
+/// for `Receive::answer_until` to await at its loop's top.
+fn carry_asked_homing<L: ShardLender>(
+  lender: &mut L,
+  push: &mut ReceivePack,
+  carrying: &mut Option<slates_rt::sync::ChannelReceiver<crate::git_push::Carried>>,
+) -> Result<(), Cut> {
+  let unavailable = || Cut::Unserved;
+  if let Some(asked) = push.take_homing() {
+    let (origin, shards) = lender
+      .lend(|state| (state.shard, state.shards.clone()))
+      .ok_or_else(unavailable)?;
+    let (sent_back, outcome) = slates_rt::sync::channel(1).map_err(|_| unavailable())?;
+    slates_rt::futures::spawn_detached(async move {
+      let carried = crate::git_push::carry(origin, &shards, asked).await;
+      let _ = sent_back.try_send(carried);
+    })
+    .map_err(|_| unavailable())?;
+    *carrying = Some(outcome);
+  }
+  Ok(())
+}
+
 impl<L> ReceiveServices<L> {
   /// receive-pack over the state `lender` lends, git's keepalive written after `keepalive_ns` of a silent answer.
   pub(crate) fn new(lender: L, keepalive_ns: u64) -> Self {
@@ -432,18 +456,7 @@ impl<L: ShardLender> Receive<L> {
           // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top. Taken
           // before the keepalive's return, so an ask made in the step the keepalive came due in is never left untaken
           // (which refuses the push, C5 part 2b).
-          if let Some(asked) = push.take_homing() {
-            let (origin, shards) = lender
-              .lend(|state| (state.shard, state.shards.clone()))
-              .ok_or_else(unavailable)?;
-            let (sent_back, outcome) = slates_rt::sync::channel(1).map_err(|_| unavailable())?;
-            slates_rt::futures::spawn_detached(async move {
-              let carried = crate::git_push::carry(origin, &shards, asked).await;
-              let _ = sent_back.try_send(carried);
-            })
-            .map_err(|_| unavailable())?;
-            *carrying = Some(outcome);
-          }
+          carry_asked_homing(lender, push, carrying)?;
           let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
           if due || *sent < given.len() && silent_until.is_some() {
             return Ok(false);

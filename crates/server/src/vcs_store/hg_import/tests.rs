@@ -58,6 +58,19 @@ fn owner() -> Principal {
 }
 
 /// Creates repository `name` of `tool` on the shard: its id.
+/// [`created`] on `daemon`'s first shard as a client's creation is made, this thread waiting for its record
+/// ([`crate::test_store::create_on`]), so the shard is never held through the store's commit
+/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
+pub(crate) fn created_on(daemon: &crate::Daemon, name: &str, tool: VcsTool) -> RepositoryId {
+  crate::test_store::create_on(
+    daemon,
+    0,
+    &owner(),
+    (name, tool, WireFormat::Sha1, "branch:default:0"),
+  )
+  .0
+}
+
 pub(crate) fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
   let reply = crate::test_store::create(
     state,
@@ -574,19 +587,25 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
 #[test]
 fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (id, landed, during) = crate::daemon::observe_first(&daemon, |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  crate::daemon::observe_first(&daemon, move |state| {
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let (_, ended) = to_its_end(state, id);
     assert!(ended.is_ok(), "{ended:?}");
-    assert_eq!(land_imported(state, id), Ok(()));
+  });
+  // Landed from this thread, which waits, so the shard is never held through a segment's commit.
+  assert_eq!(
+    crate::vcs_store::hg_import::land_imported_on(&daemon, 0, id),
+    Ok(())
+  );
+  let (landed, during) = crate::daemon::observe_first(&daemon, move |state| {
     let landed = rows_of(state, id);
     crate::vcs_store::rebuild(state, id);
     let during = (
       state.vcs_stores.rebuilding(id),
       crate::vcs_store::hg_view::held_here(state, id),
     );
-    (id, landed, during)
+    (landed, during)
   });
   let began = Instant::now();
   let rebuilding = loop {
