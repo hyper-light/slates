@@ -1,5 +1,18 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## A-887 LANDED 2026-11-24 ~04:10 PST: main 7e356fa8b (split prep 8cd23c967 first)
+- A push names each file whose bytes the content store holds whole (no green heap copy); a read that meets its let-go
+  windows parks and brings them back by the revision the green's changeset names (vcs_store::hg_named::resolve_at, one
+  resolver); a push brings back through its fork what went before its entry commits (clone_read gone); a replay reads
+  only the runs a splice consumes (A-760 line, svn too); recovery rebuilds a green whose replay needs a store's index
+  after the stores, its works via work_home.unbuilt.
+- Reds green: naming, mount read, in-place edit, second work same bytes, restart (push only), restart (work edit; red
+  without the order: ContentMissing v2). w-svn's reds, A-866 oracle, svn recovery tests green.
+- Left / owed: main's rerun of the 57k lifetimes sampler (greens' 56 MB the gate); a takeover's re-adoption of an hg
+  green brings back no named base (GAPS); git as its own piece.
+- Next (queued, main's): edit_merge_bench's goal verdict judges p999 too (red: a run whose p999 alone crosses 1 ms
+  prints OVER). The 84a Windows latency-path work moved to w-84a-win.
+
 ## CLOSE LIST (main 16:20, Ada's order): C1 goal 93 shared; R2 the hg import's peak -- status 2026-11-20 ~17:30 PST
 - C1 CLOSED whole (inbox/main-from-w-perf-close.md):
   - svn storage A/B vs FSFS: a4b6a9a22 + 756104912 (records' deltas 33.2 MiB raw vs stock FSFS revs 41.0 MiB).
