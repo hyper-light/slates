@@ -7777,6 +7777,11 @@
 >   charged the client's own shard, which counts no periods on a two-shard node, and 3 of its 6 runs failed anyway, two
 >   at `FROZEN_CAP` (304 s) and one at its 900 s timeout. **Open (daemon):** the takeover a restarted successor runs on
 >   its own live volume leaves the owner shard without the volume while the routing names the node its owner.
+>   **FIXED 2026-11-23 (w-chaos; A-890, main's rulings of 22:12 to 22:30).** The cause was the rerun fencing its own
+>   adoption one epoch up through its holders' pages: a holder refused the successor's resumed log as stale, and the
+>   successor marked itself superseded. The adoption is now persisted with its copy (`Acceptor::adopted`, image 35, delta
+>   13), and the rerun settles it at its own epoch; above that epoch it asks by name only. The fleet tests retry
+>   `Overloaded`, charged in the slowest fleet coordinator. Reds: the two daemon tests in A-890.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
