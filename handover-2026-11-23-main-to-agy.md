@@ -22,7 +22,7 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
-Updates at 00:30 on 11-24:
+Updates at 00:28 on 11-24:
 - Goal 84a: the session's stop hook holds the pre-11-22 text and asks for every run under 1 ms on Linux, macOS and Windows
   at main's current tree. Read back from the machines, the 11-22/11-23 bare-metal rounds had every run under 1 ms on
   Linux (worst p999 761 us) and macOS (289 us), but on Windows 1 of 12 accept runs had a 6.1 ms p999 (the goal's met text
