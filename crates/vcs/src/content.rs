@@ -162,6 +162,13 @@ pub enum ContentRefused {
   /// The storage the windows are kept in ([`WindowStorage`], A-727) refused to keep a window: its room, or the arena
   /// under it.
   Storage,
+  /// `need` more bytes asked for in a step whose room its owner could not grow, since it asked inside a lend of the
+  /// chunks the windows live in, where the pool they grow from is out of reach ([`ContentStore::set_budget_out_of_reach`]):
+  /// refused whatever room is left, so the misuse fails at its first put, never only once the slack runs out.
+  OutOfReach {
+    /// The bytes the request needed.
+    need: u64,
+  },
 }
 
 /// A window kept by a [`WindowStorage`]: the handle the storage names it by, opaque to the store.
@@ -439,6 +446,9 @@ pub struct ContentStore {
   /// The identities one list names at most: the window over an identity's bytes, at least two.
   fanout: NonZeroUsize,
   budget: u64,
+  /// Whether the budget is one its owner could not grow for the step ([`ContentStore::set_budget_out_of_reach`]): every
+  /// put that needs a byte is refused [`ContentRefused::OutOfReach`] until the next [`ContentStore::set_budget`].
+  out_of_reach: bool,
   /// The bytes of every content held.
   content_bytes: u64,
   /// The bytes structures beside the store charged to it.
@@ -634,6 +644,7 @@ impl ContentStore {
       window,
       fanout,
       budget,
+      out_of_reach: false,
       content_bytes: 0,
       charged_bytes: 0,
       counters: ContentCounters::default(),
@@ -650,6 +661,16 @@ impl ContentStore {
   /// Sets the budget the caller derived again. Nothing held is dropped; past it, new bytes are refused.
   pub fn set_budget(&mut self, budget: u64) {
     self.budget = budget;
+    self.out_of_reach = false;
+  }
+
+  /// Sets `budget` as one its owner could not grow for the step: room was asked inside a lend of the chunks the windows
+  /// live in, where the pool they grow from is out of reach (the server's `vcs_store::lent_state`). Every put that needs
+  /// a byte is refused [`ContentRefused::OutOfReach`], whatever room is left, until the next
+  /// [`ContentStore::set_budget`]; reads and frees go on.
+  pub fn set_budget_out_of_reach(&mut self, budget: u64) {
+    self.budget = budget;
+    self.out_of_reach = true;
   }
 
   /// The budget.
@@ -667,8 +688,12 @@ impl ContentStore {
     self.budget.saturating_sub(self.used())
   }
 
-  /// Refuses `need` more bytes unless the budget has room for them once `freed` charged bytes are given back.
+  /// Refuses `need` more bytes unless the budget has room for them once `freed` charged bytes are given back, and any
+  /// byte at all while the budget is out of reach ([`ContentStore::set_budget_out_of_reach`]).
   fn admit(&self, need: u64, freed: u64) -> Result<(), ContentRefused> {
+    if self.out_of_reach && need > 0 {
+      return Err(ContentRefused::OutOfReach { need });
+    }
     let room = self
       .budget
       .saturating_sub(self.used().saturating_sub(freed));
@@ -2348,6 +2373,28 @@ mod tests {
     store.release(&eight).unwrap();
     assert_eq!(store.used(), 0);
     assert!(store.put(b"x").is_ok());
+  }
+
+  /// The guard on room asked inside a lend (main 01a20182's ruling of 2026-11-23 21:30). Do: set a budget out of reach
+  /// with room left; put new bytes, charge, put bytes held already, release; set the budget again and put. Expect: the
+  /// put and the charge refused `OutOfReach` with their need, whatever room is left, nothing changed; the put of held
+  /// bytes (it needs none) and the release go on; once the budget is set again the put is taken.
+  #[test]
+  fn a_budget_out_of_reach_refuses_every_byte_by_its_own_kind_until_it_is_set_again() {
+    let mut store = ContentStore::new(64, NARROW).unwrap();
+    let held = store.put(b"held").unwrap();
+    store.set_budget_out_of_reach(64);
+    assert!(store.room() > 3, "room left, so the kind alone refuses");
+    assert_eq!(
+      store.put(b"new"),
+      Err(ContentRefused::OutOfReach { need: 3 })
+    );
+    assert_eq!(store.charge(1), Err(ContentRefused::OutOfReach { need: 1 }));
+    assert_eq!((store.len(), store.used()), (1, 4));
+    assert_eq!(store.put(b"held"), Ok(held));
+    assert_eq!(store.release(&held), Ok(Freed::Held));
+    store.set_budget(64);
+    assert!(store.put(b"new").is_ok());
   }
 
   /// Five windows of `NARROW` bytes, the first and the third equal, and a short sixth: an object two levels of lists

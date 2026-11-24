@@ -190,23 +190,58 @@ fn accepted_version(reply: &ReplyBody) -> Option<u64> {
   }
 }
 
-/// A work over a new `tool` repository's root green named `name`, submitted with identities in both tools and no
-/// message, then an empty one, then one: the two refusals, and the version the last accepted.
+/// Shape: how long a test waits for a held verdict's step to commit its version, far past a debug build's.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Shape: the client the tests' recorded submits name, which no session seats.
+const RECORDING_CLIENT: u32 = 9;
+
+/// `body`, a submit, run as the owner's recorded request `sequence` (`verbs::run_recorded_for_test`): a repository's
+/// green holds its verdict until its commit lands, so an accept answers after this step and a refusal in it. The
+/// refusal it answered in this step, if any. A submit to a Subversion repository's green outside a recorded request is
+/// refused `RecordedSubmitRequired` (main's ruling of 2026-11-23 20:40), so these submits are recorded.
+fn refused_recorded(state: &mut ShardState, body: RequestBody, sequence: u32) -> Option<Refusal> {
+  let id = slates_wire::request::RequestId {
+    client: RECORDING_CLIENT,
+    sequence,
+  };
+  crate::verbs::run_recorded_for_test(state, (1, id), &owner(), body).and_then(refusal)
+}
+
+/// The durable head of `green` on `daemon`'s first shard once it reaches `version`, or where it stood at [`PATIENCE`].
+fn head_reaching(daemon: &crate::Daemon, green: VolumeId, version: u64) -> u64 {
+  let green = crate::verbs::to_db_volume(green);
+  let deadline = std::time::Instant::now() + PATIENCE;
+  loop {
+    let head =
+      crate::daemon::observe_first(daemon, move |state| state.db.partition().green_head(green));
+    if head >= version || std::time::Instant::now() >= deadline {
+      return head;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1));
+  }
+}
+
+/// A work over a new `tool` repository's root green named `name`, submitted as recorded requests from `sequence` on
+/// with identities in both tools and no message, then an empty one, then one: the three refusals, none for the last.
 fn answered_by_message(
   state: &mut ShardState,
   (name, green): (&str, VolumeId),
-) -> (Option<Refusal>, Option<Refusal>, Option<u64>) {
+  sequence: u32,
+) -> [Option<Refusal>; 3] {
   let work = edited_work(state, green, name);
-  let [none, empty, given] = [None, Some(""), Some("the change")]
-    .map(|message| ask(state, submit(work, message, both("Ada"))));
-  (refusal(none), refusal(empty), accepted_version(&given))
+  let mut next = sequence;
+  [None, Some(""), Some("the change")].map(|message| {
+    next += 1;
+    refused_recorded(state, submit(work, message, both("Ada")), next)
+  })
 }
 
 /// A-664 part 1 (§4.17.1 "A push is a work" item 4: "A submit to a green of a repository without a message ... is
 /// refused typed ... before any work is built"). Do: in a git, a Mercurial and a Subversion repository, edit a work over
 /// the root green and submit it with identities in both tools and no message, then with an empty message, then with
-/// one. Expect: `MessageRequired` twice, then accepted at version 1 in each, so neither refusal built or committed
-/// anything of the work.
+/// one, each a recorded request. Expect: `MessageRequired` twice, then accepted, each green's durable head at version
+/// 1, so neither refusal built or committed anything of the work.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_without_a_message_before_any_work_is_built() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
@@ -219,32 +254,40 @@ fn t_a664_a_repositorys_green_refuses_a_submit_without_a_message_before_any_work
     ],
   );
   let answered = crate::daemon::observe_first(&daemon, move |state| {
-    greens.map(|repository| answered_by_message(state, repository))
+    let mut sequence = 0;
+    greens.map(|repository| {
+      sequence += 3;
+      answered_by_message(state, repository, sequence)
+    })
   });
+  let heads = greens.map(|(_, green)| head_reaching(&daemon, green, 1));
   daemon.stop();
   let refused = Some(Refusal::MessageRequired);
-  let each = (refused.clone(), refused, Some(1));
+  let each = [refused.clone(), refused, None];
   assert_eq!(answered, [each.clone(), each.clone(), each]);
+  assert_eq!(heads, [1, 1, 1]);
 }
 
-/// A work over a new `tool` repository's root green named `name`, submitted with a message and `first`'s identities,
-/// then with `then`'s: the first's refusal, and the version the second accepted.
+/// A work over a new `tool` repository's root green named `name`, submitted as recorded requests `sequence` and the one
+/// after with a message and `first`'s identities, then with `then`'s: each one's refusal.
 fn answered_by_identity(
   state: &mut ShardState,
   (name, green): (&str, VolumeId),
   (first, then): (ToolIdentities, ToolIdentities),
-) -> (Option<Refusal>, Option<u64>) {
+  sequence: u32,
+) -> [Option<Refusal>; 2] {
   let work = edited_work(state, green, name);
-  let [first, then] =
-    [first, then].map(|identities| ask(state, submit(work, Some("the change"), identities)));
-  (refusal(first), accepted_version(&then))
+  [
+    refused_recorded(state, submit(work, Some("the change"), first), sequence),
+    refused_recorded(state, submit(work, Some("the change"), then), sequence + 1),
+  ]
 }
 
 /// A-664 part 1 (§4.17.1 item 4: "... or by a principal with no such identity, is refused typed"). Do: in a git and a
 /// Mercurial repository, submit an edited work with a message and an identity in the other tool alone, then with one in
-/// its own; in a Subversion repository, with a message and no identity at all. Expect: `IdentityRequired` naming git,
-/// and Mercurial, each then accepted at version 1; Subversion's accepted at version 1 at once, a revision's author being
-/// the principal's own name.
+/// its own; in a Subversion repository, with a message and no identity at all; each a recorded request. Expect:
+/// `IdentityRequired` naming git, and Mercurial, each then accepted; Subversion's accepted at once, a revision's author
+/// being the principal's own name; each green's durable head at version 1.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
@@ -262,19 +305,21 @@ fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
     let svn = edited_work(state, svn_green.1, "svn");
     let svn = submit(svn, Some("the change"), ToolIdentities::default());
     (
-      answered_by_identity(state, git_green, git),
-      answered_by_identity(state, hg_green, mercurial),
-      accepted_version(&ask(state, svn)),
+      answered_by_identity(state, git_green, git, 1),
+      answered_by_identity(state, hg_green, mercurial, 3),
+      refused_recorded(state, svn, 5),
     )
   });
+  let heads = [git_green, hg_green, svn_green].map(|(_, green)| head_reaching(&daemon, green, 1));
   daemon.stop();
   let required = |tool| Some(Refusal::IdentityRequired { tool });
   let expected = (
-    (required(VcsTool::Git), Some(1)),
-    (required(VcsTool::Mercurial), Some(1)),
-    Some(1),
+    [required(VcsTool::Git), None],
+    [required(VcsTool::Mercurial), None],
+    None,
   );
   assert_eq!(answered, expected);
+  assert_eq!(heads, [1, 1, 1]);
 }
 
 /// A-664 part 1: a plain green makes no tool's commit. Do: submit a work over a plain green with no message and no

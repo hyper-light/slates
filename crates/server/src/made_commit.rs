@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::catalog::{RepositoryId, VolumeId as DbVolumeId};
-use slates_ipc::protocol::{Refusal, ReplyBody};
+use slates_ipc::protocol::{Refusal, ReplyBody, VcsTool};
 use slates_wire::request::RequestId;
 
 use crate::repository::svn_commit::landing::{self, Turn};
@@ -128,6 +128,11 @@ pub(crate) enum Taken {
   Held,
   /// Held by another landing: the submit parks.
   Busy(RepositoryId),
+  /// A Subversion repository's green, with no recorded request running (a bare dispatch, which no answer can wait on):
+  /// its version, its revision on the node's store and the register's entry are one step whose answer waits for the
+  /// store, so the submit is refused `RecordedSubmitRequired`, nothing judged (main's rulings of 2026-11-23: the store
+  /// is the truth, with no second path).
+  Unrecorded(VcsTool),
 }
 
 /// Takes the landing turn of the Subversion, Mercurial or git repository `green` is the green of, for the running submit, before its
@@ -139,12 +144,17 @@ pub(crate) fn take_turn(
   local: Option<DbVolumeId>,
   recorded: bool,
 ) -> Taken {
-  if !recorded {
-    return Taken::Unhooked;
-  }
   let Some((repository, tool)) = made_repository_of(state, green) else {
     return Taken::Unhooked;
   };
+  if !recorded {
+    return match tool {
+      Tool::Subversion => Taken::Unrecorded(VcsTool::Subversion),
+      // GAPS (main's sweep of 2026-11-23): git's and Mercurial's made commits outside a recorded request, their
+      // owners'.
+      Tool::Mercurial | Tool::Git => Taken::Unhooked,
+    };
+  }
   let turn = match state.made_commits.ready.remove(&repository) {
     Some(turn) => Some(turn),
     None => Turn::take_now(state, repository),
@@ -182,6 +192,16 @@ pub(crate) fn holds(state: &ShardState, green: DbVolumeId) -> bool {
     && state.made_commits.held.as_ref().is_some_and(|held| {
       made_repository_of(state, green).map(|(repository, _)| repository) == Some(held.repository)
     })
+}
+
+/// The tool of the repository `green` is the green of, where its made commits take the hook: what a held verdict with
+/// no turn to commit it under is refused naming (`verbs::accepted_answer`).
+pub(crate) fn tool_of(state: &ShardState, green: DbVolumeId) -> Option<VcsTool> {
+  made_repository_of(state, green).map(|(_, tool)| match tool {
+    Tool::Subversion => VcsTool::Subversion,
+    Tool::Mercurial => VcsTool::Mercurial,
+    Tool::Git => VcsTool::Git,
+  })
 }
 
 /// The turn the running recorded submit holds for `green`'s repository, taken for its accept.

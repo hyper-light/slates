@@ -8434,7 +8434,11 @@ mod tests {
     assert!(records.len() > 1, "a record for each window: {records:?}");
     assert_eq!(gone, records.len(), "every recorded window let go");
     assert_eq!(restored, records, "each record taken back as it was");
-    assert!(read == Some(bytes), "the pack read whole after the restart");
+    assert!(
+      read.as_ref() == Ok(&bytes),
+      "the pack read whole after the restart: {:?}",
+      read.err()
+    );
   }
 
   /// Goal 93 item 2b(b), Mercurial's half of the seam (w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43: an hg
@@ -9844,11 +9848,14 @@ mod tests {
   /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
   /// 2026-11-18): the pair's canonical dialer keeps contact with a peer that holds a record session it dialed to it, and
   /// only the canonical dialer does. Do: make this node a non-voting member of seven at `f = 1`, scatter three, all held
-  /// alive, and take a member its role rule drops (no neighbour, no holder, no voter); learn that member under an anchor
-  /// above this node's and then below, each with no session it dialed here and with one. Expect `Dialed`, kept, only
-  /// with the session and this node the lower anchor (the pair's canonical dialer); `OutsideNeighbourhood`, dropped,
-  /// otherwise, so two nodes never keep each other by their sessions alone. Before, the learner in the flake, the pair's
-  /// lower anchor and told stale voters, dropped a voter that kept it, and the pair's plane was never keyed.
+  /// alive, one of them a member its role rule drops (no neighbour, no holder, no voter), made so from the rule itself:
+  /// two members this node's neighbourhood draw ranks above it and two that its own draw ranks above this node; learn
+  /// that member under an anchor above this node's and then below, each with no session it dialed here and with one.
+  /// Expect `Dialed`, kept, only with the session and this node the lower anchor (the pair's canonical dialer);
+  /// `OutsideNeighbourhood`, dropped, otherwise, so two nodes never keep each other by their sessions alone. Before, the
+  /// learner in the flake, the pair's lower anchor and told stale voters, dropped a voter that kept it, and the pair's
+  /// plane was never keyed. Until 2026-11-24 the six were drawn from this node's host id and searched for such a member,
+  /// and in about 1 run of 60 the rule kept all six (1 of 60 on adacachy2; CI's Windows runner, run 45328569758).
   #[test]
   fn the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it() {
     use slates_cluster::config_group::RegionalCouncil;
@@ -9857,8 +9864,29 @@ mod tests {
     use slates_db::register::{HostId, Quorum, RegionId};
     let (dropped, readings) = audit_on_shard(|state| {
       let local = state.fleet.host();
-      let others: Vec<HostId> = (1..=6u64).map(|n| HostId(local.0 ^ (n << 16))).collect();
-      let voter = others[0];
+      let candidate = |n: u64| HostId(local.0 ^ (n << 16));
+      let (voter, outside) = (candidate(1), candidate(2));
+      // Whether `owner`'s neighbourhood draw (`select_neighbourhood`: the owner and its highest-ranked members, scatter
+      // in all) ranks `a` above `b`.
+      let ranks_above = |owner: HostId, a: HostId, b: HostId| {
+        slates_db::register::select_neighbourhood(owner, &[a, b], 2) == [owner, a]
+      };
+      // At scatter three a neighbourhood is its owner and the two members it ranks highest, so two members ranked above
+      // `outside` by this node keep it out of this node's neighbourhood, and two ranked above this node by `outside` keep
+      // this node out of its: more members only push both further down.
+      let above_outside: Vec<HostId> = (3..)
+        .map(candidate)
+        .filter(|member| ranks_above(local, *member, outside))
+        .take(2)
+        .collect();
+      let above_local: Vec<HostId> = (3..)
+        .map(candidate)
+        .filter(|member| !above_outside.contains(member) && ranks_above(outside, *member, local))
+        .take(2)
+        .collect();
+      let mut others = vec![voter, outside];
+      others.extend_from_slice(&above_outside);
+      others.extend_from_slice(&above_local);
       let mut all = vec![local];
       all.extend_from_slice(&others);
       state.council = RegionalCouncil::new(
@@ -9879,13 +9907,10 @@ mod tests {
       for peer in &others {
         slates_cluster::fleet::apply_peer_state(&mut state.fleet, *peer, Some(alive));
       }
-      let Some(peer) = others
-        .iter()
-        .copied()
-        .find(|peer| crate::fleet::direct_contact_reason(state, *peer) == "OutsideNeighbourhood")
-      else {
+      if crate::fleet::direct_contact_reason(state, outside) != "OutsideNeighbourhood" {
         return (None, Vec::new());
-      };
+      }
+      let peer = outside;
       let origin = state.origin_anchor;
       let mut readings = Vec::new();
       for anchor in [

@@ -48,7 +48,11 @@
 //! before remove). Its inputs are the configuration and what the homes answered, never an owner's record (Q3).
 //!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
-//! not answer within the budget; content a home does not hold.
+//! not answer within the budget; content a home does not hold. A read is refused by its own kinds ([`HomeReadRefused`]):
+//! those, bytes that do not hash to their identity, and a window let go once landed that was not brought back, with the
+//! bring-back's kind ([`LandedRefused`]; a revision's from `hg_push::bring_back`), never a bare none (§2 item 9). Each
+//! kind is counted where it is refused or where a reader can only say absent, and a member's read is answered the
+//! nearest kind the wire carries.
 
 use slates_cluster::homes::HomeOwner;
 use slates_db::register::rendezvous_ranked_by_key;
@@ -75,6 +79,118 @@ pub(crate) enum HomeRefused {
   /// The home holds no such content.
   NotHeld,
 }
+
+/// Why a home's read gave no bytes ([`read`]; module docs, "Refused"): answered to the region as the nearest kind its
+/// wire carries ([`HomeReadRefused::wire`]), and counted by its kind where a reader can only say absent
+/// ([`HomeReadRefused::counter`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HomeReadRefused {
+  /// Its home shard did not answer within the read's budget.
+  Unanswered,
+  /// No home among the shards named holds it, and no landed record brings it back.
+  NotHeld,
+  /// Its home's content store could not be made to read it (its budget, or its window).
+  Content(ContentRefused),
+  /// Let go once landed, and not brought back whole ([`bring_back_landed`]).
+  NotBroughtBack(LandedRefused),
+  /// The bytes its home answered do not hash to its identity: never handed on as its.
+  Misnamed,
+}
+
+impl HomeReadRefused {
+  /// The nearest kind the region's wire carries, as a home answers a member's read ([`serve_remote`]).
+  fn wire(self) -> slates_cluster::homes::HomeRefusal {
+    use slates_cluster::homes::HomeRefusal;
+    match self {
+      HomeReadRefused::Unanswered => HomeRefusal::Unanswered,
+      HomeReadRefused::NotHeld => HomeRefusal::NotHeld,
+      HomeReadRefused::Content(_) => HomeRefusal::Room,
+      HomeReadRefused::NotBroughtBack(landed) => landed.wire(),
+      HomeReadRefused::Misnamed => HomeRefusal::Misnamed,
+    }
+  }
+
+  /// This kind's counter, counted where a reader can only say absent (module docs, "Refused").
+  pub(crate) const fn counter(self) -> &'static str {
+    match self {
+      HomeReadRefused::Unanswered => READ_UNANSWERED,
+      HomeReadRefused::NotHeld => READ_NOT_HELD,
+      HomeReadRefused::Content(_) => READ_CONTENT_REFUSED,
+      HomeReadRefused::NotBroughtBack(_) => READ_NOT_BROUGHT_BACK,
+      HomeReadRefused::Misnamed => READ_MISNAMED,
+    }
+  }
+}
+
+/// Counter: a home's read refused, its home shard not answering within the read's budget, where its reader could only
+/// say absent ([`HomeReadRefused::Unanswered`]). Format: a counter name.
+pub(crate) const READ_UNANSWERED: &str = "vcs_store.homes.read_unanswered";
+/// Counter: a home's read refused, no home holding it ([`HomeReadRefused::NotHeld`]), where its reader could only say
+/// absent. Format: a counter name.
+pub(crate) const READ_NOT_HELD: &str = "vcs_store.homes.read_not_held";
+/// Counter: a home's read refused by its content store ([`HomeReadRefused::Content`]), where its reader could only say
+/// absent. Format: a counter name.
+pub(crate) const READ_CONTENT_REFUSED: &str = "vcs_store.homes.read_content_refused";
+/// Counter: a home's read refused, a window let go once landed not brought back ([`HomeReadRefused::NotBroughtBack`]),
+/// where its reader could only say absent; the bring-back's own kind is counted where it was refused. Format: a counter
+/// name.
+pub(crate) const READ_NOT_BROUGHT_BACK: &str = "vcs_store.homes.read_not_brought_back";
+/// Counter: a home's read refused, its bytes not hashing to its identity ([`HomeReadRefused::Misnamed`]), where its
+/// reader could only say absent. Format: a counter name.
+pub(crate) const READ_MISNAMED: &str = "vcs_store.homes.read_misnamed";
+
+/// Why [`bring_back_landed`] did not bring a window or object let go once landed back whole
+/// ([`HomeReadRefused::NotBroughtBack`]): a revision's kind counted by its repository's reader (`hg_push::bring_back`),
+/// the rest here ([`LandedRefused::counter`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LandedRefused {
+  /// A Mercurial revision it lies in, refused by its repository's reader.
+  Revision(crate::repository::hg_push::BringBackRefused),
+  /// A landed pack's window not read whole from the node's store: its owner refused or answered short, or the heap
+  /// refused room for its bytes.
+  PackUnread,
+  /// The content store refused a landed pack's window back: its room, or bytes not the window's own.
+  Content(ContentRefused),
+  /// Not held whole after its windows were brought back.
+  NotWhole,
+}
+
+impl LandedRefused {
+  /// The nearest kind the region's wire carries ([`HomeReadRefused::wire`]).
+  fn wire(self) -> slates_cluster::homes::HomeRefusal {
+    use crate::repository::hg_push::BringBackRefused;
+    use slates_cluster::homes::HomeRefusal;
+    match self {
+      LandedRefused::Revision(BringBackRefused::StoreUnanswered) | LandedRefused::PackUnread => {
+        HomeRefusal::Unanswered
+      }
+      LandedRefused::Revision(BringBackRefused::Content(_)) | LandedRefused::Content(_) => {
+        HomeRefusal::Room
+      }
+      LandedRefused::Revision(_) | LandedRefused::NotWhole => HomeRefusal::NotHeld,
+    }
+  }
+
+  /// This kind's counter, where it is counted here: none for a revision's, which its reader counts.
+  const fn counter(self) -> Option<&'static str> {
+    match self {
+      LandedRefused::Revision(_) => None,
+      LandedRefused::PackUnread => Some(LANDED_UNREAD),
+      LandedRefused::Content(_) => Some(LANDED_CONTENT_REFUSED),
+      LandedRefused::NotWhole => Some(LANDED_NOT_WHOLE),
+    }
+  }
+}
+
+/// Counter: a landed pack's window not read whole from the node's store ([`LandedRefused::PackUnread`]). Format: a
+/// counter name.
+pub(crate) const LANDED_UNREAD: &str = "vcs_store.homes.landed_unread";
+/// Counter: a landed pack's window refused back by the content store ([`LandedRefused::Content`]). Format: a counter
+/// name.
+pub(crate) const LANDED_CONTENT_REFUSED: &str = "vcs_store.homes.landed_content_refused";
+/// Counter: an object let go once landed not held whole after its windows were brought back
+/// ([`LandedRefused::NotWhole`]). Format: a counter name.
+pub(crate) const LANDED_NOT_WHOLE: &str = "vcs_store.homes.landed_not_whole";
 
 /// Where and when a homed window is durable (module docs, "Durable before named"): its home shard, and the generation of
 /// the first of that shard's images that holds it.
@@ -273,12 +389,19 @@ pub(crate) fn keep_here(
   }
 }
 
-/// The bytes of the window `identity` this shard keeps as its home, if it keeps it.
-pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<Vec<u8>> {
+/// The bytes of the window or object `identity` this shard keeps as its home: refused `NotHeld` where it keeps none of
+/// it whole here, and by its content store's kind where the store could not be made.
+pub(crate) fn read_here(
+  state: &mut ShardState,
+  identity: &ContentId,
+) -> Result<Vec<u8>, HomeReadRefused> {
   // The content store made first where a recovery left it unmade (no repository yet), so what the shard image restored
   // (windows, lists, names, region holds) is taken in before the read.
   let window = state.store.content.chunk_bytes();
-  state.vcs_stores.content_made(window).ok()?;
+  state
+    .vcs_stores
+    .content_made(window)
+    .map_err(HomeReadRefused::Content)?;
   let bytes = {
     let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
     lent.stores.content.as_ref().and_then(|content| {
@@ -290,9 +413,10 @@ pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<
       }
       (!bytes.is_empty() && ContentId::of(&bytes) == *identity).then_some(bytes)
     })
-  }?;
+  }
+  .ok_or(HomeReadRefused::NotHeld)?;
   state.count(READ, 1);
-  Some(bytes)
+  Ok(bytes)
 }
 
 /// Lets go one holder of the window `identity` this shard keeps as its home; freed with its last, the charge settled.
@@ -345,48 +469,65 @@ pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Resul
   }
 }
 
-/// The bytes of the window `identity` from its home among `shards`, read from shard `origin` within `budget_ns` of
-/// the home's own time (module docs): none when it is not homed there or the home did not answer.
-pub(crate) async fn read(
+/// [`read`] for a reader that can only say absent: the bytes, or none with the refusal counted by its kind
+/// ([`HomeReadRefused::counter`]), so no kind is dropped unseen (§2 item 9).
+async fn read_else_counted(
   origin: u16,
   shards: &[u16],
   identity: ContentId,
   budget_ns: u64,
 ) -> Option<Vec<u8>> {
-  let target = home_of(shards, &identity)?;
-  let mut bytes = crate::xshard::call_in_shard_time(
-    origin,
-    target,
-    move |state| read_here(state, &identity),
-    budget_ns,
-  )
-  .await
-  .flatten();
-  // A window let go where a landed pack carried it: brought back on its home from the node's store by its record, then
-  // read again (goal 93 item 2b(b)).
-  if bytes.is_none()
-    && crate::xshard::task_in_shard_time(
-      origin,
-      target,
-      move || bring_back_landed(identity),
-      budget_ns,
-    )
-    .await
-    .unwrap_or(false)
-  {
-    bytes = crate::xshard::call_in_shard_time(
+  match read(origin, shards, identity, budget_ns).await {
+    Ok(bytes) => Some(bytes),
+    Err(refused) => {
+      crate::state::with_state(|state| state.count(refused.counter(), 1));
+      None
+    }
+  }
+}
+
+/// The bytes of the window or object `identity` from its home among `shards`, read from shard `origin` within
+/// `budget_ns` of the home's own time (module docs): refused by kind where no home among them holds it, the home did not
+/// answer, or it was let go once landed and not brought back (module docs, "Refused").
+pub(crate) async fn read(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  budget_ns: u64,
+) -> Result<Vec<u8>, HomeReadRefused> {
+  let target = home_of(shards, &identity).ok_or(HomeReadRefused::NotHeld)?;
+  let at_home = || {
+    crate::xshard::call_in_shard_time(
       origin,
       target,
       move |state| read_here(state, &identity),
       budget_ns,
     )
-    .await
-    .flatten();
-  }
-  let bytes = bytes?;
+  };
+  let bytes = match at_home().await {
+    Some(Ok(bytes)) => bytes,
+    // A window let go where a landed pack or revision carried it, or a home that did not answer in time: brought back on
+    // its home from the node's store by its record, then read again (goal 93 item 2b(b)).
+    Some(Err(HomeReadRefused::NotHeld)) | None => {
+      crate::xshard::task_in_shard_time(
+        origin,
+        target,
+        move || bring_back_landed(identity),
+        budget_ns,
+      )
+      .await
+      .ok_or(HomeReadRefused::Unanswered)??;
+      at_home().await.ok_or(HomeReadRefused::Unanswered)??
+    }
+    Some(Err(refused)) => return Err(refused),
+  };
   // A home answers the bytes it keeps under the identity, which its store named by their hash; checked again here, so a
   // window read across shards is never other bytes than its name (§4.17.1 item 5's rule on arrival, kept on reading).
-  (ContentId::of(&bytes) == identity).then_some(bytes)
+  if ContentId::of(&bytes) == identity {
+    Ok(bytes)
+  } else {
+    Err(HomeReadRefused::Misnamed)
+  }
 }
 
 std::thread_local! {
@@ -702,8 +843,9 @@ pub(crate) const LANDED_BROUGHT_BACK: &str = "vcs_store.homes.landed_brought_bac
 /// it lies on the node's store ([`Landed`]): a landed pack's window ([`LandedAt`]) a piece at a time off the shard's
 /// step, then put back by its identity within the step's lent room; a Mercurial file revision's ([`HgLanded`]) by its
 /// repository's reader (`repository::hg_push::bring_back`), once for each revision however many of the object's windows
-/// it holds. True where it is held here whole after (brought back, or never let go).
-pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
+/// it holds. Ok where it is held here whole after (brought back, or never let go); refused `NotHeld` where this shard
+/// holds none of it, otherwise by the bring-back's kind ([`LandedRefused`]), counted where it was refused.
+pub(crate) async fn bring_back_landed(identity: ContentId) -> Result<(), HomeReadRefused> {
   let (disk, (away, revisions)) = crate::state::with_state(|state| {
     // Each physical window once: an object may hold the same window at several offsets (two identical windows are one
     // entry), and the first bring-back puts it back for all of them (codex-review, 2026-11-22).
@@ -735,78 +877,115 @@ pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
       path,
       node,
     } = revision;
-    if !crate::repository::hg_push::bring_back(repository, (path, node)).await {
-      return false;
-    }
+    crate::repository::hg_push::bring_back(repository, (path, node))
+      .await
+      .map_err(|refused| HomeReadRefused::NotBroughtBack(LandedRefused::Revision(refused)))?;
   }
   if let Some(disk) = disk {
-    for (window, at, len) in away {
-      // One another read brought back meanwhile is back: nothing to read.
-      let still_away = crate::state::with_state(|state| {
-        state
-          .vcs_stores
-          .content()
-          .is_some_and(|content| content.is_away(&window))
-      })
-      .unwrap_or(false);
-      if !still_away {
-        continue;
-      }
-      let Some(bytes) = landed_bytes(&disk, at, len).await else {
-        return false;
-      };
-      let back = crate::state::with_state(|state| {
-        // Put back, or back already (another read put it back while this one read the store): either way it is held.
-        let (put, held) = super::within_budget(state, len, |stores| {
-          stores.content_mut().map_or((false, false), |content| {
-            let put = content.bring_back(&window, &bytes).is_ok();
-            (put, put || !content.is_away(&window))
-          })
-        });
-        if put {
-          state.count(LANDED_BROUGHT_BACK, 1);
-        }
-        held
-      })
-      .unwrap_or(false);
-      if !back {
-        return false;
-      }
-    }
+    packs_brought_back(&disk, away)
+      .await
+      .map_err(landed_refused)?;
   }
-  crate::state::with_state(|state| {
+  let (held, whole) = crate::state::with_state(|state| {
     state
       .vcs_stores
       .content()
-      .is_some_and(|content| content.holds_whole(&identity))
+      .map_or((false, false), |content| {
+        (content.contains(&identity), content.holds_whole(&identity))
+      })
   })
-  .unwrap_or(false)
+  .unwrap_or((false, false));
+  match (held, whole) {
+    (_, true) => Ok(()),
+    (true, false) => Err(landed_refused(LandedRefused::NotWhole)),
+    (false, false) => Err(HomeReadRefused::NotHeld),
+  }
 }
 
-/// The `len` bytes of a window where `at` says it lies on the node's store `disk`, read a piece at a time; none where the
-/// store answers short or the room for them is refused.
+/// [`bring_back_landed`]'s windows `away` that landed packs carried, each read from `disk` where its record says it lies
+/// and put back ([`landed_put_back`]); one another read brought back meanwhile is back, so nothing is read for it.
+async fn packs_brought_back(
+  disk: &slates_store::owner::StoreHandle,
+  away: Vec<(ContentId, LandedAt, u64)>,
+) -> Result<(), LandedRefused> {
+  for (window, at, len) in away {
+    let still_away = crate::state::with_state(|state| {
+      state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.is_away(&window))
+    })
+    .unwrap_or(false);
+    if !still_away {
+      continue;
+    }
+    let bytes = landed_bytes(disk, at, len).await?;
+    crate::state::with_state(|state| landed_put_back(state, &window, &bytes, len))
+      .unwrap_or(Err(LandedRefused::NotWhole))?;
+  }
+  Ok(())
+}
+
+/// Puts the landed window `window`'s `bytes` (`len` of them) back within the room they take, counted once put: held
+/// either way where another read put it back while this one read the store; the content store's refusal otherwise.
+fn landed_put_back(
+  state: &mut ShardState,
+  window: &ContentId,
+  bytes: &[u8],
+  len: u64,
+) -> Result<(), LandedRefused> {
+  let put = super::within_budget(state, len, |stores| {
+    let content = stores.content_mut().ok_or(LandedRefused::NotWhole)?;
+    match content.bring_back(window, bytes) {
+      Ok(()) => Ok(true),
+      Err(_) if !content.is_away(window) => Ok(false),
+      Err(refused) => Err(LandedRefused::Content(refused)),
+    }
+  })?;
+  if put {
+    state.count(LANDED_BROUGHT_BACK, 1);
+  }
+  Ok(())
+}
+
+/// `refused` as the home's read answers it ([`HomeReadRefused::NotBroughtBack`]), counted by its kind where this module
+/// counts it ([`LandedRefused::counter`]).
+fn landed_refused(refused: LandedRefused) -> HomeReadRefused {
+  if let Some(counter) = refused.counter() {
+    crate::state::with_state(|state| state.count(counter, 1));
+  }
+  HomeReadRefused::NotBroughtBack(refused)
+}
+
+/// The `len` bytes of a window where `at` says it lies on the node's store `disk`, read a piece at a time: refused
+/// `PackUnread` where the store refuses or answers short, or the heap refuses room for them.
 async fn landed_bytes(
   disk: &slates_store::owner::StoreHandle,
   at: LandedAt,
   len: u64,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, LandedRefused> {
   let mut bytes = Vec::new();
   bytes
     .try_reserve_exact(usize::try_from(len).unwrap_or(usize::MAX))
-    .ok()?;
+    .map_err(|_| LandedRefused::PackUnread)?;
   let end = at.offset.saturating_add(len);
   let mut offset = at.offset;
   while offset < end {
-    let piece = disk.piece(at.pack.0, at.len, offset).await.ok()??;
+    let piece = disk
+      .piece(at.pack.0, at.len, offset)
+      .await
+      .ok()
+      .flatten()
+      .ok_or(LandedRefused::PackUnread)?;
     if piece.is_empty() {
-      return None;
+      return Err(LandedRefused::PackUnread);
     }
     let want = usize::try_from(end.saturating_sub(offset)).unwrap_or(usize::MAX);
     let taken = piece.get(..want.min(piece.len())).unwrap_or_default();
     bytes.extend_from_slice(taken);
     offset = offset.saturating_add(u64::try_from(taken.len()).unwrap_or(u64::MAX));
   }
-  Some(bytes)
+  Ok(bytes)
 }
 
 /// The pack `pack` landed on the node's store (goal 93 item 2b(b)): where this shard holds it for the region, as its
@@ -870,7 +1049,9 @@ pub(crate) fn region_changes_committed() {
 /// one until something holds it, and is freed once every record is replayed, `release_unheld`). How many were held, and
 /// the ones it could not take back (the store lacks the window, refused its hold, or the set was borrowed), never skipped
 /// unseen: a region hold is the pin that keeps a landed window in RAM (goal 93 item 2b, main 01a20182's ruling of
-/// 2026-11-22 07:33), so one lost is counted and logged by the recovery.
+/// 2026-11-22 07:33), so one lost is counted and logged by the recovery. The store's hold is taken only once the set can
+/// name it, so the two always agree: before 2026-11-23 a hold was taken first and given back where the set was
+/// borrowed, its release's refusal dropped (w-tsan's sweep, main 01a20182's commit-2 list).
 pub(crate) fn restore_region_holds(
   content: &mut slates_vcs::ContentStore,
   holds: &[(ContentId, Vec<HomeOwner>)],
@@ -878,22 +1059,20 @@ pub(crate) fn restore_region_holds(
   let mut held = 0u64;
   let mut refused = Vec::new();
   for (identity, owners) in holds {
-    if owners.is_empty() || !content.contains(identity) || content.hold(identity).is_err() {
-      refused.push(*identity);
-      continue;
-    }
     let kept = REGION_HELD.with(|region| {
-      region
-        .try_borrow_mut()
-        .map(|mut region| region.insert(*identity, owners.iter().copied().collect()))
-        .is_ok()
+      let Ok(mut region) = region.try_borrow_mut() else {
+        return false;
+      };
+      if owners.is_empty() || !content.contains(identity) || content.hold(identity).is_err() {
+        return false;
+      }
+      region.insert(*identity, owners.iter().copied().collect());
+      true
     });
     if kept {
       held = held.saturating_add(1);
       region_windows_changed(content, identity, true);
     } else {
-      // Held in the store, but not named as the region's: given back, so the store's count and the set agree.
-      let _ = content.release(identity);
       refused.push(*identity);
     }
   }
@@ -1267,8 +1446,9 @@ async fn read_part(
       .is_ok_and(|reading| reading.as_ref().is_some_and(|(held, _)| *held == identity))
   });
   if !cached || offset == 0 {
-    let Some(bytes) = read(origin, shards, identity, budget_ns).await else {
-      return HomeOutcome::Refused(HomeRefusal::NotHeld);
+    let bytes = match read(origin, shards, identity, budget_ns).await {
+      Ok(bytes) => bytes,
+      Err(refused) => return HomeOutcome::Refused(refused.wire()),
     };
     READING.with(|reading| {
       if let Ok(mut reading) = reading.try_borrow_mut() {
@@ -1376,8 +1556,8 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
     ),
     HomeMessage::Read { identity } => {
       let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
-        Some(bytes) => HomeOutcome::Bytes(bytes),
-        None => HomeOutcome::Refused(HomeRefusal::NotHeld),
+        Ok(bytes) => HomeOutcome::Bytes(bytes),
+        Err(refused) => HomeOutcome::Refused(refused.wire()),
       };
       (identity, outcome)
     }
@@ -1553,6 +1733,9 @@ pub(crate) const SETTLED: &str = "vcs_store.homes.settled";
 /// Counter: one some home did not answer, its hold left to the resolution of the attempt (A-727 (d1a-3)). Format: a
 /// counter name.
 pub(crate) const SETTLE_UNANSWERED: &str = "vcs_store.homes.settle_unanswered";
+/// Counter: the task settling what this shard owes the region not started, or started and not detached
+/// ([`settle_later`]): its settles wait for the next settle to start one. Format: a counter name.
+pub(crate) const SETTLE_TASK_REFUSED: &str = "vcs_store.homes.settle_task_refused";
 
 /// Owes `settle` to the region (A-727 (d1a)), and starts the task that settles what this shard owes where none runs.
 pub(crate) fn settle_later(settle: Settle) {
@@ -1564,12 +1747,11 @@ pub(crate) fn settle_later(settle: Settle) {
   if SETTLING.with(|settling| settling.replace(true)) {
     return;
   }
-  match slates_rt::futures::spawn(settle_owed()) {
-    Ok(task) => {
-      let _ = slates_rt::futures::detach(task);
-    }
-    // No task to spare: what is owed is settled by the next settle that starts one.
-    Err(_) => SETTLING.with(|settling| settling.set(false)),
+  // Detached as it is spawned, since nobody joins it: a joinable task holds its slot once it ends. Refused (no task to
+  // spare, or the detach refused): counted, and what is owed is settled by the next settle that starts one.
+  if slates_rt::futures::spawn_detached(settle_owed()).is_err() {
+    SETTLING.with(|settling| settling.set(false));
+    crate::state::with_state(|state| state.count(SETTLE_TASK_REFUSED, 1));
   }
 }
 
@@ -1819,9 +2001,8 @@ pub(crate) async fn read_in_region(
   budget: slates_cluster::CommitBudget,
 ) -> Option<Vec<u8>> {
   let budget_ns = budget.max_deadline_ns();
-  if let Some(bytes) = read(origin, shards, identity, budget_ns).await
-    && ContentId::of(&bytes) == identity
-  {
+  // A refusal is counted by its kind, since this answer can only say absent; the region's other homes are asked next.
+  if let Some(bytes) = read_else_counted(origin, shards, identity, budget_ns).await {
     return Some(bytes);
   }
   let (local, members, f) = crate::state::with_state(|state| {
@@ -2180,7 +2361,9 @@ async fn heal_one(
     if owners.is_empty() {
       return;
     }
-    let Some(bytes) = read(origin, shards, identity, budget.max_deadline_ns()).await else {
+    // A refusal is counted by its kind, since the healer can only pass it over until its next walk.
+    let Some(bytes) = read_else_counted(origin, shards, identity, budget.max_deadline_ns()).await
+    else {
       return;
     };
     // An object past one message is offered a part at a time (A-724 piece 8c), as `home_in_region` sends it.

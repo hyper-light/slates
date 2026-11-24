@@ -661,7 +661,9 @@ fn main() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-provision-bench".to_owned(),
+      // A name of this process's own: on macOS a content extent's object is named from the segment's and outlives its
+      // daemon until released, so a fixed name met the objects another run had made (main 01a20182's r633).
+      name: format!("slates-seg-provision-bench-{}", std::process::id()),
     },
   )
   .unwrap();

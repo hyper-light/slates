@@ -2035,7 +2035,8 @@ carrying an old configuration version; the reply carries the current one), `NotP
 A-9 adds `RetentionBudgetExceeded`, `GenerationExhausted`, `ResourceGuaranteeLost`,
 `ConsistentBaseUnavailable`, `RecoveryIncomplete`, `AttachmentUnsupported{transport, reason}`,
 `BarrierIncomplete{attachment, generation}`, `ConsumerNotEnrolled`, `ConsumerRevoked`,
-`GrantIssuerUnverified` and `LeaseUnconfirmed`. `QuotaExceeded` maps to ENOSPC at a mount;
+`GrantIssuerUnverified` and `LeaseUnconfirmed`. A-888 adds `RecordedSubmitRequired{tool}` (a submit to a
+Subversion repository's green outside a recorded request). `QuotaExceeded` maps to ENOSPC at a mount;
 subsystem-specific wire/transfer errors retain their closed kind through adapters. An
 uncategorized refusal or a false success is a bug. These required variants are not all
 implemented by the current schema.
@@ -8379,7 +8380,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > - the next publication appends its change as usual, and the volume's whole state, which is that publication's
 >   state, becomes the install at the head just appended (`live_ship::refresh_image`);
 > - on the record period a volume with nothing unpublished makes it the same way, so an idle writer leaves no holder
->   waiting;
+>   waiting. A volume that holds a change no verb recorded (an orphan reclaimed at a FUSE `FORGET`, which has no
+>   barrier) is published by the period first, and the image follows that publication (A-889,
+>   `live_ship::published_for_image`). A `FORGET` does not publish itself: a publication per `FORGET` would cost the
+>   transport's hot path, and an owed image is rare;
 > - the retained tail's bound follows the image, so a laggard is sent entries while they cost less than installing the
 >   volume as it is now;
 > - nothing waits on `owes_image`; only the lagging holder is installed;
@@ -58405,7 +58409,10 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > property changes their own changesets).
 >
 > **Status (2026-11-20, C4 groundwork: the store's owner).** `owner.rs`: one thread a node runs holding its `Store`
-> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first), reached from shards by a
+> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first; since 2026-11-23 the stop is a
+> request the owner ends at whatever handles are still held, later requests refused `Gone`, after a fleet test's stop
+> joined 75 minutes on a held handle: `docs/bugs/2026-11-23-the-store-owners-stop-joined-blind-on-a-held-handle.md`),
+> reached from shards by a
 > cloneable `StoreHandle` over a bounded `slates_rt::sync` channel: `land` (sections' `Vec`s moved in, answered once
 > durable), `piece`, `changesets`, each answer on a one-value channel the task awaits; a full queue is refused `Busy`.
 > The commit's `F_FULLFSYNC` and the engine's device waits never run on a shard. Test: `--test owner` 1/1 (a shard's
@@ -62472,6 +62479,75 @@ Applied in the same change to: §4.8 (an operation over several registers); §4.
 (`ContentMessage::ReplicaBuilding`, its golden vector and refusals); `slates-server` (`state_log`, `vcs_store`,
 `vcs_store::replica`, `replica_build`, `merge_service`, `fleet::serve_merge_shipment`, `takeover::rebuild_repository`,
 `git_push::uncommitted_report`, the HTTP and SSH receive drivers); GAPS (A-812 (b)).
+
+### A-888 — A submit to a Subversion repository's green outside a recorded request is refused `RecordedSubmitRequired`; the path that committed a version and landed its revision after it is gone (2026-11-23, w-svn for main 01a20182, its rulings of 2026-11-23 20:32 and 20:40: the store is the truth, with no second path; goal 93's C2; A-805, A-804, A-664)
+
+- **What was there.** A recorded submit to a Subversion repository's green takes the repository's landing turn, holds
+  its verdict and is answered after one step that commits the version and the register's entry naming its revision's
+  changeset, once that changeset landed on the node's store (A-805). A submit run outside a recorded request (a bare
+  dispatch, which no answer can wait on) took no turn: `verbs::accepted_answer` committed its version in its own step
+  and `vcs_store::svn_made::make` spawned a task that landed its revision after it. A crash between the two left a
+  version no revision on the store held, the green past the records' youngest revision, so every later made commit was
+  not the next and every client commit was refused. No production route reached it (every submit runs under
+  `run_recorded`, a resumed verb or `owner_judge`), but it stood in the code as a second path (§2 item 7), and the
+  "not reached" arm of a held verdict with no turn fell through to it too.
+- **The rule.** A Subversion green's version is made only through its held verdict, in the one step. A submit outside a
+  recorded request is refused before its verdict, `made_commit::take_turn` answering `Taken::Unrecorded`, nothing
+  judged or recorded; a held verdict that finds no turn to commit under is refused the same, its increment released and
+  nothing of it applied. Never `Overloaded`: its retry would fail the same way.
+- **The refusal.** `Refusal::RecordedSubmitRequired { tool }` (appended, wire tag 85; golden vector `5500000002000000`
+  for Subversion, `crates/ipc/tests/wire_order.rs`); the API's `Invalid::RecordedSubmitRequired(VcsTool)`, contract 63.
+  It joins §4.4's taxonomy beside `MessageRequired` and `IdentityRequired`: a submit a repository's commit cannot be
+  made from.
+- **Evidence.** Red on main 240917592 (macOS, debug):
+  `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing` was accepted with the green's
+  durable head 1 and the records at revision 0. Green after: refused `RecordedSubmitRequired` naming Subversion, head 0,
+  revision 0. The tests that submitted to a Subversion green by bare dispatch submit as recorded requests
+  (`paths::tests::submitted_recorded`; `identities::tests`' message and identity tests read each green's durable head
+  once its step committed).
+- **Not changed here** (main's sweep, the owners'): git's and Mercurial's made commits outside a recorded request
+  (`commits::make`, `hg_made::make`) keep theirs.
+
+Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.{rs,txt}`, `crates/api/src/{error,lib}.rs`,
+`crates/server/src/{made_commit,verbs}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named above.
+
+### A-889 — The record period publishes a live volume that owes an install image while a change no verb recorded leaves it unpublished (2026-11-24, w-ci for main 01a20182, its approval of 2026-11-23 21:49; amends §4.10 "An install image beside the log (2026-11-07)"; A-377, A-64)
+
+- **Why.** CI's conformance lane failed the live-shipped fsstress in 37 of 55 main runs from 2026-11-21 06:34 to
+  2026-11-24 03:16, always over FUSE (`native-linux-fuse`, and `oci-linux` over the daemon's FUSE mount). fsstress
+  passed its own verdict every time; the fleet never converged: after the 40 s fleet wait one candidate held, for
+  example, 2149 against the owner's durable head 2195 (run 45318320246). A diagnostic build on adacachy2, pinned to
+  4 CPUs as CI's runner is, showed the owner's record period for the whole wait: the lagging candidate owed an install
+  (`Shipper::pending` answered `Install`), the image owed, no build and no lane, and the volume unpublished for one
+  reason: one inode changed, the reference of attachment 1 on it dropped, and the roots' orphan list emptied. The
+  kernel's `FORGET` of a file unlinked while open had dropped its last lookup after the run's last publication.
+  `Volume::forget_for` reclaims the orphan there, and a `FORGET` has no barrier, so nothing published the change. The
+  period made an owed image only for a volume with nothing unpublished (`published_whole`), so it made none, and the
+  candidate behind the retained tail waited for good.
+- **The rule.** On the record period, a live volume that owes an install image, owes no whole record, has no image
+  sealing and holds a change no verb recorded is published (`live_ship::published_for_image`): the shard's
+  publication, the one every mutating verb runs, sliced as any publication is (a delta captured in turns is appended at
+  its build's end). It is counted `fleet.live.image_published`, or `fleet.live.image_unpublished` when refused, and the
+  next period tries again. The image follows the entry the publication appends (`published`), or the period after that
+  entry's build, once the volume is clean. A volume owing a whole record waits for that record, since its state is past
+  its head; one whose image is sealing waits for that image.
+- **Why a `FORGET` does not publish itself (main's ruling of 2026-11-23 21:49).** A publication per `FORGET` would cost
+  the transport's hot path: the kernel sends `FORGET`s in bulk as it evicts inodes. An owed image is rare: it arises
+  only while a candidate is behind the retained tail. A volume left unpublished by a change no verb recorded is
+  already a state this design holds, as deferred frees are (A-64, `relieve_deferred`); the period's assumption that
+  every unpublished volume has a publication on its way was the fault.
+- **Tests and measurements** (adacachy2):
+  - `a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished` (`crates/server/src/live_ship.rs`):
+    a lookup on a file unlinked while open, one holder behind the retained tail and owed an image, the lookup dropped
+    as `FORGET` drops it, then the period's visit. Red on main: the holder behind sent nothing, the image still owed.
+    Green: an install at 3, past the head 2 before the `FORGET`; the holder ahead sent entry 3; one period publication.
+  - The lane (`cargo xtask conformance run --suite fsstress --live-ship --transport native-linux-fuse`, `taskset -c
+    12-15`): before, 2 of 12 runs failed; after, 0 of 30, the period's publication made in 6 of them (once each, none
+    refused), about the rate the failures had.
+- **Applied in the same change to:** `crates/server/src/live_ship.rs` (`period_volume`, `published_for_image`, the two
+  counters, the test and its helpers); §4.10 "An install image beside the log (2026-11-07)"; GAPS (the live-shipped
+  fsstress over FUSE); docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md.
 
 ### A-890 — A takeover's adoption is persisted with its copy, so a round run again after a warm restart settles it instead of taking the object over again (2026-11-23, w-chaos for main 01a20182, its rulings of 2026-11-23 22:12, 22:17 and 22:30; corrects A-885; A-251, A-344, A-883)
 

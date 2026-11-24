@@ -5911,6 +5911,11 @@ fn owes_whole_within_credit(state: &ShardState, volume: [u8; 16]) -> bool {
 
 /// Counter: one owner-shard turn of the record period's live work ([`period_slice`]).
 const LIVE_PERIOD_SLICES: &str = "fleet.live.period_slices";
+/// Counter: a publication the record period made for a live volume that owed an install image while a change no verb
+/// recorded left it unpublished (A-889, [`published_for_image`]).
+const LIVE_IMAGE_PUBLISHED: &str = "fleet.live.image_published";
+/// Counter: such a publication refused; the next period tries again (A-889).
+const LIVE_IMAGE_UNPUBLISHED: &str = "fleet.live.image_unpublished";
 /// Counter: a record period's live work on one shard ([`period`]), however many turns it took.
 const LIVE_PERIODS: &str = "fleet.live.periods";
 
@@ -6032,9 +6037,36 @@ fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
   // writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
   if owes_whole_within_credit(s, volume) {
     published(s, id, None);
-  } else if owes_image(s, volume) && published_whole(s, id) {
-    // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
-    refresh_image(s, id);
+  } else if owes_image(s, volume) {
+    if published_whole(s, id) {
+      // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
+      refresh_image(s, id);
+    } else {
+      published_for_image(s, volume);
+    }
+  }
+}
+
+/// Publishes the shard for `volume`, which owes an install image while a change no verb recorded leaves it unpublished
+/// with no write to come (A-889): an orphan reclaimed at a FUSE `FORGET`, which has no barrier. The image follows the
+/// entry the publication appends ([`published`]), or, where that entry is captured in turns, the period after its build,
+/// once the volume is clean. A volume owing a whole record waits for that record (its state is past its head), and one
+/// whose image is sealing waits for that image. A `FORGET` does not publish itself: a publication per `FORGET` would
+/// cost the transport's hot path, and an owed image is rare. Until 2026-11-24 the period made an owed image only for a
+/// clean volume, so a candidate behind the retained tail waited for good: CI's live-shipped fsstress over FUSE ended so in
+/// 37 of 55 main runs from 2026-11-21 to 2026-11-24.
+fn published_for_image(s: &mut ShardState, volume: [u8; 16]) {
+  let waits = s
+    .live
+    .shipping
+    .get(&volume)
+    .is_none_or(|live| live.owes_whole || live.image_build.is_some());
+  if waits {
+    return;
+  }
+  match crate::verbs::publish_shard(s) {
+    Ok(_) => s.count(LIVE_IMAGE_PUBLISHED, 1),
+    Err(_) => s.count(LIVE_IMAGE_UNPUBLISHED, 1),
   }
 }
 
@@ -10464,6 +10496,165 @@ mod tests {
       "every publication but the refused one an entry of its own: the first whole state, the rewrites queued, and the \
        page writes (the first of them the whole state owed)"
     );
+  }
+
+  /// Format: the attachment whose lookup holds the orphan in
+  /// [`a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished`], as a FUSE
+  /// mount's lookups are its attachment's.
+  const LOOKING_UP: slates_vfs::ids::RefOwner = slates_vfs::ids::RefOwner::Attachment(1);
+
+  /// Runs `change` on `id`'s volume and its store.
+  fn on_volume<T>(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+    change: impl FnOnce(
+      &mut slates_vfs::volume::Store,
+      &mut slates_vfs::volume::Volume,
+    ) -> Result<T, slates_vfs::VfsError>,
+  ) -> Option<T> {
+    let handle = *state.by_id.get(&id)?;
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).ok()?;
+    change(store, &mut slot.volume).ok()
+  }
+
+  /// Publishes the shard and runs `id`'s build to its end, as its task would.
+  fn published_to_the_end(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+    let _ = crate::verbs::publish_shard(state);
+    run_build(state, id);
+  }
+
+  /// [`acknowledged_at_head`] until the head stands, within [`CAPTURE_TURN_LIMIT`] rounds: `holders` hold the owner's
+  /// newest entry, the build's queue appended (an append it admits moves the head past the one acknowledged).
+  fn held_at_head(state: &mut ShardState, id: slates_db::catalog::VolumeId, holders: &[HostId]) {
+    let head_of = |state: &ShardState| {
+      state
+        .live
+        .shipping
+        .get(&id.bytes)
+        .and_then(|live| live.shipper.head())
+    };
+    let mut rounds = 0u64;
+    loop {
+      rounds += 1;
+      let before = head_of(state);
+      acknowledged_at_head(state, id, holders);
+      if head_of(state) == before || rounds >= CAPTURE_TURN_LIMIT {
+        break;
+      }
+    }
+  }
+
+  /// Ends every lane `id`'s publications opened, whose tasks do not run in a synchronous history: a lane's end sends its
+  /// holder what it lacks then ([`lane_ended`]), which [`pending_sends`] names.
+  fn lanes_ended(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+    if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
+      live.lanes.clear();
+    }
+  }
+
+  /// A-889 (§4.10 "An install image beside the log"). CI's conformance lane: the live-shipped fsstress over FUSE ended
+  /// with a candidate behind in 37 of 55 main runs from 2026-11-21 to 2026-11-24 (run 45318320246: 2149 against the
+  /// owner's durable 2195 after the 40 s fleet wait). A run's last change was the kernel's `FORGET` of a file unlinked
+  /// while open: it reclaims the orphan and has no barrier, so nothing published it, the volume read unclean for good,
+  /// and the record period, which made an owed install image only for a clean volume, made none. Do: on a live volume
+  /// shipping to two holders at `f = 1`, take a lookup on a file as a FUSE mount does and unlink the file (an orphan);
+  /// let both holders take the first whole entry and one of them the rest; cut the retained tail to its newest entry, so
+  /// the other holder is owed an install image; drop the lookup as `FORGET` does; then run the record period's visit.
+  /// Expect: the holder behind sent one install, of a head past the one before the `FORGET`; the holder ahead sent the
+  /// change; the period's publication counted once. Before, the period sent the holder behind nothing and the image
+  /// stayed owed.
+  #[test]
+  fn a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      // Large enough that its kept log never makes a publication whole ([`kept_reaches_size`]): the holder behind is
+      // then installed only from an image.
+      let id = live_volume_here_of(state, "forgotten-orphan", OWED_ONCE_VOLUME_BYTES)?;
+      let local = state.fleet.configuration().owner;
+      let (ahead, behind) = (
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      );
+      owe_first_whole(state, id, &[ahead, behind]);
+      state.live.shipping.get_mut(&id.bytes)?.catalogued = vec![ahead, behind];
+      write_captured(state, id, "kept", b"A-889: a file that stays")?;
+      let orphan = write_captured(state, id, "orphan", b"A-889: a file unlinked while open")?;
+      on_volume(state, id, |store, volume| {
+        volume.reference_for(store, orphan, LOOKING_UP)
+      })?;
+      published_to_the_end(state, id);
+      held_at_head(state, id, &[ahead, behind]);
+      on_volume(state, id, |store, volume| {
+        let root = volume.root_inode(store)?;
+        volume.unlink_no(store, root, "orphan")
+      })?;
+      published_to_the_end(state, id);
+      write_captured(state, id, "kept", b"A-889: the file rewritten")?;
+      published_to_the_end(state, id);
+      held_at_head(state, id, &[ahead]);
+      let live = state.live.shipping.get_mut(&id.bytes)?;
+      let bounds = live.shipper.bounds();
+      live.shipper.set_bounds(Bounds {
+        retain: 0,
+        ..bounds
+      });
+      // The lanes end, and the holder behind is owed an install whose image is owed (the checkpoint is what it holds).
+      lanes_ended(state, id);
+      let _ = pending_sends(state, id.bytes);
+      let owed = owes_image(state, id.bytes);
+      let before = state.live.shipping.get(&id.bytes)?.shipper.head()?.position;
+      on_volume(state, id, |store, volume| {
+        volume.forget_for(store, orphan, LOOKING_UP, 1)
+      })?;
+      let unpublished = !published_whole(state, id);
+      period_volume(state, id.bytes);
+      run_build(state, id);
+      lanes_ended(state, id);
+      let sends = pending_sends(state, id.bytes);
+      let installs: Vec<u64> = sends
+        .iter()
+        .filter(|send| {
+          send.holder == behind && send.stream == slates_cluster::live::LIVE_STATE_STREAM
+        })
+        .filter_map(|send| Install::decode(&send.bytes, usize::MAX).ok())
+        .map(|install| install.head.position)
+        .collect();
+      let changes: Vec<u64> = sends
+        .iter()
+        .filter(|send| {
+          send.holder == ahead && send.stream == slates_cluster::live::LIVE_ENTRY_STREAM
+        })
+        .filter_map(|send| Entry::decode(&send.bytes, usize::MAX).ok())
+        .map(|entry| entry.position)
+        .collect();
+      Some((
+        owed,
+        unpublished,
+        before,
+        installs,
+        changes,
+        live_count(state, LIVE_IMAGE_PUBLISHED),
+      ))
+    });
+    let (owed, unpublished, before, installs, changes, published) =
+      measured.expect("the scene was made");
+    println!(
+      "a forgotten orphan: image owed {owed}, unpublished {unpublished}, head {before} before the FORGET; installs sent \
+       the holder behind {installs:?}; entries sent the holder ahead {changes:?}; {published} period publications"
+    );
+    assert!(
+      owed && unpublished,
+      "the scene is CI's: an install image owed, and the volume unpublished by the FORGET alone"
+    );
+    assert!(
+      installs.len() == 1 && installs.iter().all(|at| *at > before),
+      "the holder behind is sent one install, past the head before the FORGET: {installs:?} against {before}"
+    );
+    assert!(
+      changes.iter().any(|at| *at > before),
+      "the holder ahead is sent the FORGET's change, past the head before it: {changes:?} against {before}"
+    );
+    assert_eq!(published, 1, "the period published once");
   }
 
   /// A-768, A-827: a whole capture in turns reads the head it began on. Do: write two 512 KiB files to a live volume and

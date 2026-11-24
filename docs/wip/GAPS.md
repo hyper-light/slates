@@ -174,6 +174,12 @@
 > for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
 > in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
 > should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
+> **The store owner's stop joined blind on a held handle (2026-11-23, w-shared; main 01a20182's ruling): CLOSED.** A
+> fleet test's harness waited 75 minutes in `StoreOwner::stop`, which joined an owner that ended only once every
+> handle was gone. The stop is now a request the owner ends at, whatever handles are still held: its open landing let
+> go, its checkpoint written, every later request refused `Gone`. Red first (the stop unanswered within 60 s), now
+> answered at once (`crates/store/tests/owner.rs`). The sweep found no other blind join in shipped code
+> (`docs/bugs/2026-11-23-the-store-owners-stop-joined-blind-on-a-held-handle.md`).
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
@@ -936,8 +942,9 @@
 >   it is durable on the changeset store its windows are let go (`hg_run::let_go_landed`, `let_go_object_landed` with
 >   `vcs_store::landed_pin`, as a landed git pack's), and once more when the entry commits, since the push's works
 >   bring back the texts they read between. Entries stay; a read brings a text back from the store, the works' own
->   included (`brought_back`, now within a lent budget and the chunk store's lend: its bring-back was refused
->   `OverBudget { room: 0 }` outside them). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
+>   included (`brought_back`, within a lent budget: its bring-back was refused `OverBudget { room: 0 }` with none; a
+>   `lent_state` wrapper put on it then hid the pool, and since 2026-11-23 room asked inside a lend is refused
+>   `OutOfReach`, docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
 >   `a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land` (120 files of 8 KiB: every window let go
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
@@ -945,7 +952,8 @@
 >   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
 >   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
 >   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
->   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   then put back within its lent room; refused by kind since 2026-11-23, `BringBackRefused`, each counted), counted
+>   `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
 >   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
 >   (`hg_run::Run::settle`) or an import lands, each file revision's windows a home holds (held for the region,
@@ -1180,7 +1188,10 @@
 >   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
 >   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
 >   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
->   makes each extent's object afresh at a claim after a release), should refusals remain.
+>   makes each extent's object afresh at a claim after a release), should refusals remain. r633 named it: no OS
+>   refusal, but an extent object a run before had left under the bench's fixed segment name, at another length. FIXED
+>   at the cause the same day: a created content object clears its extents' names and its creator removes them as it
+>   drops (`docs/bugs/2026-11-23-a-content-extents-object-outlived-its-daemon-and-met-the-next-run.md`).
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
@@ -4313,10 +4324,13 @@
 > preview of the held verdict (`Lineage::preview`, a branch at the head, retired in the submit's step) and the verdict is
 > applied at the commit as its chain entry records it; held by `a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head`
 > and `a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once` (red before: a read in the
-> submit's step saw head 1 and the new bytes). Owed: (b) a submit dispatched outside a recorded request (no answer
-> waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
-> takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
-> after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
+> submit's step saw head 1 and the new bytes). (b) BUILT (A-888, 2026-11-23): a submit dispatched outside a recorded
+> request (no answer waits on it) is refused `RecordedSubmitRequired` before its verdict, and the old path (the version
+> committed in its step, its revision landed after it) is gone; held by
+> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. (c) a Mercurial
+> repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
+> changeset committed in one step after it, then the answer;
+> `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
 > `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`). Since A-767 C1 its
 > changeset lands on the node's store before the step, as a push's does (w-hg, below). A client's hg push still takes no
 > landing turn: one landed between a made changeset's making and its commit leaves the made fork stale, and the version
@@ -4680,8 +4694,24 @@
 > (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). Blame was of every file at every
 > sample, 155,904 commands over git-2000 (4,872 files × 16 samples × 2 legs). By main 01a20182's ruling it is now of
 > the files each sampled revision changed, or those of the nearest earlier change (`blamed_files`,
-> `files_changed_in`), the count printed at each sample. **Owed:** the sizing run (a diag lane on ubuntu-latest,
-> stock svn 1.15 built in the job), then git-2000's rerun on the big Studio, its bound derived from the per-verb lines.
+> `files_changed_in`), the count printed at each sample. **Sized (run 45330574435, diag 1a3f1079b, ubuntu-latest, 4
+> CPUs, load 1.2 to 2.3, stock svn 1.15.0 built in the job, git-2000.dump made in it):** the whole use test over HTTP
+> took 900.37 s, its verbs about 851 s of it, in seconds per leg:
+> - checkout 78.4 (stock 33.5, slates 37.6);
+> - update 126.4 (54.9, 58.6);
+> - switch 81.7 (36.2, 38.1);
+> - blame 393.0 (308.4, 72.8), most of it revision 1, whose 4,523 added files the rule blames, the later samples 1 to
+>   10 files each;
+> - svnsync 137.4 (67.3, 70.0);
+> - svnrdump's dump 9.1 (2.3, 6.6);
+> - the writing session 15.3 (0.6, 14.7);
+> - info, diff, revprops and log about 10 together.
+>
+> **The bound for git-2000's run is 1,800 s:** twice the slowest whole run measured (2 × 900.37 s on a 4-CPU runner).
+> Past twice that a run is stuck, not slow. It ended with 18 differences, server reds sent to w-svn by main: `info`
+> answered 500 on `/project/!svn/rvr/N/trunk/t` at all 17 samples, and svnrdump's dump differs in one deletion's order.
+> Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
+> w-svn. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -10555,12 +10585,20 @@
 >   suite's record now takes both from `Session::after_run`, which notes each on its own; the live note keeps each
 >   node's whole `live` status line (holders, fence, recorded holders), and the container lane keeps fsstress's output in
 >   its scratch, as the host lane does. Test: `a_record_says_whether_the_daemon_stopped_or_the_fleet_did_not_ship`.
-> - **Open (w-ci, 2026-11-24): the lane still fails after the fix, with one candidate left behind.** Run 45318320246 at
->   1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s fleet wait the
->   owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at 2149. The same
->   shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083). The
->   live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job steps),
->   so it is no regression of that window; the cause is being looked for.
+> - **Closed (w-ci, 2026-11-24, A-889): the lane still failed after the fix, with one candidate left behind.** Run
+>   45318320246 at 1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s
+>   fleet wait the owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at
+>   2149. The same shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083).
+>   The live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job
+>   steps), so it was no regression of that window. Only the FUSE lanes failed (`native-linux-fuse`, and `oci-linux`
+>   over the daemon's FUSE mount). The cause, read from a diagnostic build on adacachy2 pinned to 4 CPUs: the kernel's
+>   `FORGET` of a file unlinked while open came after the run's last publication, reclaimed the orphan with no barrier,
+>   and left the owner's volume unpublished for good; the candidate behind the retained tail was owed an install image,
+>   which the record period made only for a volume with nothing unpublished. The period now publishes such a volume and
+>   the image follows (`live_ship::published_for_image`, counted `fleet.live.image_published`). The lane on adacachy2,
+>   pinned to 4 CPUs: 2 of 12 runs failed before; 0 of 30 after, the period's publication made in 6 of them. Test:
+>   `a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished`. Record:
+>   `docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md`.
 > - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
 >   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
 
@@ -26767,8 +26805,16 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   go before; 81 brought back", file 81's bring-back false. Not a patience: the bring-backs run in one task on the
   shard, whose 60 s wait held. `hg_push::bring_back` answers a bare false for each of four refusals (no such revision,
   no text from the store, nothing taken, no room in the content store), each through `.ok()?`, so nothing says which.
-  **Open:** reproduced first, then a typed refusal passed on through `homes::bring_back_landed`, a counter for each
-  kind (main 01a20182's ruling of 2026-11-23 20:08, §2 item 9).
+  **Fixed (2026-11-23, w-tsan; main 01a20182's rulings of 21:25 and 21:30):** the content store's room, asked inside
+  `lent_state`, where the shard's chunk store, and with it the arena's pool, is the content store's for the step. The
+  step had only the arena's slack, which a publication's give-back (`Store::release_idle`) leaves at 407,277 bytes, so
+  the 49th file of 120 was refused `OverBudget { need: 8192, room: 5869 }`. Plainly 2 runs of 100 on adacachy2 at a load
+  of 47; with a publication pinned before the bring-backs 10 of 10 red, and 10 of 10 green with the room made outside
+  the lend. Six steps asked so (`bring_back`, `bring_back_log`, two `brought_back` sites in `hg_push`, two in
+  `hg_import`), all moved out. Room asked inside a lend is now refused by its own kind at its first put
+  (`ContentRefused::OutOfReach`, counted `vcs_store.room_out_of_reach`), and the bring-back's refusal is typed through
+  `homes::bring_back_landed` and `homes::read` (`BringBackRefused`, `LandedRefused`, `HomeReadRefused`), each kind
+  counted. docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md.
 
 ### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
 CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's

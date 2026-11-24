@@ -6,10 +6,10 @@
 //! nothing else made the revision of it: the green passed its records' youngest revision, so every later commit, whose
 //! step lands only while the green is at the youngest revision, was refused, and no client saw the version.
 //!
-//! **What.** As the version commits on the owner ([`make`], from `verbs::judge_submission`, after git's made commit),
-//! the revision after the records' youngest, made of the version's change: each path the change index names between the
-//! two versions (`Green::changed_between`), read before from the records at the youngest revision and after from the
-//! green's head, becomes one changed-path row as FSFS records it: `add` where nothing stood, `delete` where nothing
+//! **What.** As the submit's held verdict is deferred on the owner ([`make_deferred`], from `made_commit::defer`), the
+//! revision after the records' youngest, made of the version's change: each path the change index names between the two
+//! versions (`Green::changed_between`), read before from the records at the youngest revision and after from a preview
+//! of the verdict, becomes one changed-path row as FSFS records it: `add` where nothing stood, `delete` where nothing
 //! stands now, `replace` where the node's kind changed, `modify` where its text or its property list did; a file's text
 //! with its digests (`slates_svn::commit::drive::text_of`), its bytes brought with the revision; a node's property list
 //! the identity its reserved attribute names (`svn_commit::PROPS`), which the records must hold. A directory a row adds
@@ -23,8 +23,10 @@
 //! revision; the verdict is held, never applied before the commit (A-805): the revision is read from a preview of it
 //! ([`make_deferred`]), and a task holding the turn checks it, lands it on the node's changeset store, then applies the
 //! verdict and commits the version and the register's entry naming the sequence in one step and answers. A crash
-//! before that step leaves neither, and the retry lands once. A submit dispatched outside a recorded request ([`make`])
-//! commits its version in its own step and the task lands the revision after it (GAPS).
+//! before that step leaves neither, and the retry lands once. A submit dispatched outside a recorded request is refused
+//! `RecordedSubmitRequired` before its verdict (`made_commit::Taken::Unrecorded`; main's rulings of 2026-11-23: the
+//! store is the truth, with no second path): until then it committed its version in its own step and a task landed
+//! the revision after it, so a crash between left a version with no revision.
 //!
 //! **Not made, and counted** ([`UNMADE`]), the version standing: a version not the one after the youngest revision, a
 //! copy in the change (A-586: the index names a copy at its destination alone), a special file or a symbolic link
@@ -57,7 +59,7 @@ use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
 use crate::made_commit::Pending;
-use crate::repository::svn_commit::landing::{self, Turn};
+use crate::repository::svn_commit::landing::Turn;
 use crate::repository::svn_commit::{PROPS, Uncommitted, land_made};
 use crate::state::ShardState;
 
@@ -121,34 +123,6 @@ impl std::fmt::Debug for Unmade {
   }
 }
 
-/// Makes the revision of `green`'s `version`, where `green` is a Subversion repository's (module docs; C2): the
-/// repository's landing turn taken in the submit's own step where it is free, so no client's commit lands between the
-/// version and its revision, then the revision made, landed on the node's store and committed by a task holding it
-/// ([`made_landing`]); counted.
-pub(crate) fn make(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  authorship: &Authorship,
-  copies: &[MadeCopy],
-) {
-  let Some(repository) = subversion_repository_of(state, green) else {
-    return;
-  };
-  let turn = Turn::take_now(state, repository);
-  let task = made_landing(
-    (repository, green, version),
-    (authorship.clone(), copies.to_vec()),
-    turn,
-  );
-  if slates_rt::futures::spawn(task)
-    .and_then(slates_rt::futures::detach)
-    .is_err()
-  {
-    unmade(state, &Unmade::Unrun);
-  }
-}
-
 /// Counts and logs a version of which no revision was made.
 fn unmade(state: &mut ShardState, why: &Unmade) {
   slates_machine::log_line!(
@@ -156,50 +130,6 @@ fn unmade(state: &mut ShardState, why: &Unmade) {
     state.partition
   );
   state.count(UNMADE, 1);
-}
-
-/// [`make`]'s task: the landing turn (`turn`, or awaited where the submit could not take it), then the revision made of
-/// `green`'s `version` and landed (`svn_commit::land_made`); counted.
-async fn made_landing(
-  (repository, green, version): (RepositoryId, DbVolumeId, u64),
-  (authorship, copies): (Authorship, Vec<MadeCopy>),
-  turn: Option<Turn>,
-) {
-  let turn = match turn {
-    Some(turn) => turn,
-    None => match landing::turn(repository).await {
-      Some(turn) => turn,
-      None => return,
-    },
-  };
-  let Some(made) = crate::state::with_state(|state| {
-    revision_made(state, (repository, green), version, (&authorship, &copies))
-  }) else {
-    return;
-  };
-  let revision = match made {
-    Ok(Some(revision)) => revision,
-    Ok(None) => {
-      let _ = crate::state::with_state(|state| turn.give_back(state));
-      return;
-    }
-    Err(why) => {
-      let _ = crate::state::with_state(|state| {
-        unmade(state, &why);
-        turn.give_back(state);
-      });
-      return;
-    }
-  };
-  let landed = land_made(turn, repository, revision, |state, entry| {
-    entry.commit(state)
-  })
-  .await;
-  let _ = crate::state::with_state(|state| match landed {
-    Some(Ok(_)) => state.count(MADE, 1),
-    Some(Err(refused)) => unmade(state, &Unmade::Step(refused)),
-    None => {}
-  });
 }
 
 /// Makes the revision of the version `pending` holds, of a Subversion repository's green, from its verdict `judged`,
@@ -337,34 +267,6 @@ async fn made_commit_landing(
   });
 }
 
-/// The revision of `green`'s `version`, made after the records' youngest; none where it is made already.
-fn revision_made(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  version: u64,
-  (authorship, copies): (&Authorship, &[MadeCopy]),
-) -> Result<Option<Revision>, Unmade> {
-  let youngest = state
-    .vcs_stores
-    .subversion_records(repository)
-    .map_or(u64::MAX, SvnRecords::youngest);
-  // A revision a client's commit landed moved the green itself: made already.
-  if youngest >= version {
-    return Ok(None);
-  }
-  if youngest.checked_add(1) != Some(version) {
-    return Err(Unmade::NotNext);
-  }
-  let now = AprTime(state.clock.wall_ns().div_euclid(NANOS_PER_MICRO));
-  revision_of(
-    state,
-    (repository, green),
-    (youngest, version),
-    (authorship, now, copies),
-  )
-  .map(Some)
-}
-
 /// The Subversion repository `green` is the green of: a member of a repository whose tool is Subversion's.
 pub(crate) fn subversion_repository_of(
   state: &ShardState,
@@ -376,29 +278,8 @@ pub(crate) fn subversion_repository_of(
   matches!(record.tool, VcsTool::Subversion).then_some(repository)
 }
 
-/// The revision of `green`'s `version`, made after the records' `youngest` (module docs).
-fn revision_of(
-  state: &ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  (youngest, version): (u64, u64),
-  (authorship, now, copies): (&Authorship, AprTime, &[MadeCopy]),
-) -> Result<Revision, Unmade> {
-  let engine = state.greens.get(&green).ok_or(Unmade::NotNext)?;
-  let records = state
-    .vcs_stores
-    .subversion_records(repository)
-    .ok_or(Unmade::NotNext)?;
-  revision_from(
-    (&engine, (youngest, version)),
-    records,
-    (youngest, version),
-    (authorship, now, copies),
-  )
-}
-
 /// The revision made after the records' `youngest` as `version`, read from `engine`, whose versions `(from, to]` hold
-/// the version's change: the green itself (`from` the youngest, `to` the version), or a preview of a verdict held with
-/// its landing (`from` 0, `to` 1; A-805, `Greens::preview`).
+/// the version's change: a preview of a verdict held with its landing (`from` 0, `to` 1; A-805, `Greens::preview`).
 fn revision_from(
   (engine, (from, to)): (&Green, (u64, u64)),
   records: &SvnRecords,
