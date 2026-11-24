@@ -669,6 +669,12 @@ pub struct HgIndex {
   rows: Index,
   /// Every branch's heads in its changelog, kept as it grows.
   branch_heads: BranchHeads,
+  /// Exact revision count of the changelog (maintained on every changelog append; O(1) for `Indexed::new`).
+  changelog_len: u32,
+  /// Exact revision count of the manifest log (maintained on every manifest append).
+  manifest_len: u32,
+  /// Exact count of obsolescence markers (maintained on every marker append; O(1) for `Indexed::new`).
+  markers_len: u64,
   /// The buffers [`HgIndex::revision_text`] rebuilds a chain through ([`TextBuffers`]).
   buffers: core::cell::RefCell<TextBuffers>,
   /// Seals the store refused after an append (its room): the append stood, its rows charged within the budget, and
@@ -701,6 +707,9 @@ impl HgIndex {
     HgIndex {
       rows: Index::new(),
       branch_heads: BranchHeads::default(),
+      changelog_len: 0,
+      manifest_len: 0,
+      markers_len: 0,
       buffers: core::cell::RefCell::new(TextBuffers::default()),
       seals_refused: 0,
     }
@@ -753,6 +762,9 @@ impl HgIndex {
         answered: core::cell::Cell::new(0),
         longest_walk: self.branch_heads.longest_walk,
       },
+      changelog_len: self.changelog_len,
+      manifest_len: self.manifest_len,
+      markers_len: self.markers_len,
       buffers: core::cell::RefCell::new(TextBuffers::default()),
       seals_refused: 0,
     })
@@ -829,14 +841,15 @@ impl HgIndex {
       })
       .collect();
     self.insert(store, &rows)?;
+    if let Some(&last) = numbers.last() {
+      self.markers_len = self.markers_len.max(last.saturating_add(1));
+    }
     Ok(numbers)
   }
 
   /// How many markers the index holds: the first number with no row.
-  pub fn markers_len(&self, store: &ContentStore) -> u64 {
-    first_missing(u64::MAX, |number| {
-      self.rows.get(store, &marker_key(number)).is_some()
-    })
+  pub fn markers_len(&self, _store: &ContentStore) -> u64 {
+    self.markers_len
   }
 
   /// The content of the marker numbered `number`: the marker alone in its format.
@@ -907,10 +920,16 @@ impl HgIndex {
 
   /// How many revisions `log` holds: the first number with no row.
   pub fn len(&self, store: &ContentStore, log: Log<'_>) -> u32 {
-    let held = |rev: u64| {
-      u32::try_from(rev).is_ok_and(|rev| self.rows.get(store, &log.row_key(rev)).is_some())
-    };
-    u32::try_from(first_missing(u64::from(NONE), held)).unwrap_or(NONE)
+    match log {
+      Log::Changelog => self.changelog_len,
+      Log::Manifest => self.manifest_len,
+      Log::File(_) => {
+        let held = |rev: u64| {
+          u32::try_from(rev).is_ok_and(|rev| self.rows.get(store, &log.row_key(rev)).is_some())
+        };
+        u32::try_from(first_missing(u64::from(NONE), held)).unwrap_or(NONE)
+      }
+    }
   }
 
   /// Whether `log` holds no revision.
@@ -989,6 +1008,9 @@ impl HgIndex {
     }
     let (revs, planned) = (planner.revs, planner.planned);
     self.write(store, log, &planned)?;
+    if let Some(last) = planned.last() {
+      self.changelog_len = self.changelog_len.max(last.rev.saturating_add(1));
+    }
     // Each changeset written, oldest first, noted in the branch heads, its parents' rows read back from the index.
     let mut heads = core::mem::take(&mut self.branch_heads);
     let noted = planned.iter().try_for_each(|written| {
@@ -1076,6 +1098,12 @@ impl HgIndex {
     for put in &puts {
       drop(store.release(put));
     }
+    if written.is_ok()
+      && log == Log::Manifest
+      && let Some(last) = planned.last()
+    {
+      self.manifest_len = self.manifest_len.max(last.rev.saturating_add(1));
+    }
     written.map(|()| revs)
   }
 
@@ -1100,7 +1128,13 @@ impl HgIndex {
       row.payload.extend_from_slice(&stored.1.to_le_bytes());
       row.payload.extend_from_slice(&stored.2.to_le_bytes());
     }
-    self.write(store, log, &planned).map(|()| revs)
+    self.write(store, log, &planned)?;
+    if log == Log::Manifest
+      && let Some(last) = planned.last()
+    {
+      self.manifest_len = self.manifest_len.max(last.rev.saturating_add(1));
+    }
+    Ok(revs)
   }
 
   /// A group's rows planned (its numbering, parents and links read, as 7.2's `addgroup` places them), their delta
@@ -1151,10 +1185,21 @@ impl HgIndex {
     if row.base == NONE {
       return object_text(store, &row.bytes, row.len);
     }
+    if row.stored > 0 && store.windows(&row.bytes).next().is_none() {
+      return None;
+    }
     let mut chain = vec![row];
     let mut at = row.base;
     // Each base is before its revision, so the walk takes at most `rev` steps.
     while let Some(link) = self.revision(store, log, at) {
+      let need_bytes = if link.base == NONE {
+        link.len > 0
+      } else {
+        link.stored > 0
+      };
+      if need_bytes && store.windows(&link.bytes).next().is_none() {
+        return None;
+      }
       chain.push(link);
       if link.base == NONE {
         break;
@@ -1178,6 +1223,9 @@ impl HgIndex {
     let mut next = core::mem::take(&mut buffers.next);
     let mut room = crate::Admission::new(u64::MAX);
     let rebuilt = chain.iter().rev().try_for_each(|step| {
+      if step.stored == 0 {
+        return Some(());
+      }
       buffers.delta.clear();
       for window in store.windows(&step.bytes) {
         buffers.delta.extend_from_slice(&window);
@@ -1415,13 +1463,27 @@ fn kept_as<'t>(
         let grown = chain.saturating_add(crate::read::to_u64(delta.len()));
         if grown <= crate::read::to_u64(text.len()) {
           let put = store
-            .put_object(&delta)
+            .put_object_whole(&delta)
             .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
           puts.push(put);
           if let Some(content) = row.contents.first_mut() {
             *content = put;
           }
           fields = (*rev, crate::read::to_u64(delta.len()), grown);
+        }
+      }
+      if fields.0 == NONE
+        && row
+          .contents
+          .first()
+          .is_some_and(|id| !store.holds_whole(id))
+      {
+        let put = store
+          .put_object_whole(&text)
+          .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
+        puts.push(put);
+        if let Some(content) = row.contents.first_mut() {
+          *content = put;
         }
       }
       previous = Some((row.rev, text, fields.2));
@@ -1457,6 +1519,9 @@ fn framed_text(
 /// The object `root` names, `len` bytes, read from its windows into a text of that length (no copy grown from empty);
 /// `None` where the store holds another length.
 fn object_text(store: &ContentStore, root: &ContentId, len: u64) -> Option<Vec<u8>> {
+  if len == 0 {
+    return Some(Vec::new());
+  }
   let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
   for window in store.windows(root) {
     text.extend_from_slice(&window);

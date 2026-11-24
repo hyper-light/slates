@@ -277,6 +277,21 @@ fn start((index, cell): (usize, &'static Cell), handles: u32) -> CellRef {
 }
 
 impl CellRef {
+  /// The cell's index in the process-wide table (below [`MAX_CELLS`]).
+  pub(crate) fn index(self) -> u32 {
+    self.index
+  }
+
+  /// The cell's generation at the claim that issued this handle.
+  pub(crate) fn generation(self) -> u32 {
+    self.generation
+  }
+
+  /// Reconstructs a handle from its packed `(index, generation)` parts.
+  pub(crate) fn from_parts(index: u32, generation: u32) -> Self {
+    Self { index, generation }
+  }
+
   /// The cell, while this handle's generation is its own.
   pub(crate) fn cell(self) -> Option<&'static Cell> {
     let index = usize::try_from(self.index).ok()?;
@@ -294,11 +309,16 @@ impl CellRef {
 
   /// Drops a handle; the last frees the cell.
   pub(crate) fn release(self) {
+    let _ = self.release_last();
+  }
+
+  /// Drops a handle, freeing the cell and returning `true` when this was the last handle.
+  pub(crate) fn release_last(self) -> bool {
     let Some(cell) = self.cell() else {
-      return;
+      return false;
     };
     if cell.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
-      return;
+      return false;
     }
     cell.generation.fetch_add(1, Ordering::AcqRel);
     cell.waiter.store(NO_WAITER, Ordering::Release);
@@ -311,6 +331,7 @@ impl CellRef {
       summary.fetch_or(bit(segment_index & SEGMENT_MASK), Ordering::AcqRel);
     }
     LIVE.fetch_sub(1, Ordering::AcqRel);
+    true
   }
 
   /// Records `word` as the task to wake ([`Cell::register`]).

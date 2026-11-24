@@ -184,41 +184,52 @@ async fn streamed_turn<S: HgStores>(
 ) -> Result<Progress, Refused> {
   // A-740: a shard stuck in a turn names it.
   let _doing = slates_rt::futures::doing("vcs_ssh::hg::streamed_turn");
-  if let Some(wants) = stdio.store_wants()
-    && !stores
-      .answer_wants((generation, repository, room), wants)
-      .await
-  {
-    return Err(unheld());
-  }
   let (turn_room, quantum) = stores.fetch_turn(repository).unwrap_or((room, 0));
-  let mut admission = Admission::new(turn_room);
-  let start = slates_rt::futures::now_ns();
-  let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
-  let mut paced = crate::vcs_store::paced_turn(quantum, start);
-  let before = stdio.stdout().len();
-  let turned = stores
-    .lend_held(generation, &mut admission, |store, _| {
-      loop {
-        if !paced.more(crate::vcs_store::ANSWER_STEP, costs) {
-          break Progress::Streamed { more: true };
+  let started = slates_rt::futures::now_ns();
+  let before_total = stdio.stdout().len();
+  loop {
+    if let Some(wants) = stdio.store_wants()
+      && !stores
+        .answer_wants((generation, repository, room), wants)
+        .await
+    {
+      return Err(unheld());
+    }
+    let mut admission = Admission::new(turn_room);
+    let start = slates_rt::futures::now_ns();
+    let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
+    let mut paced = crate::vcs_store::paced_turn(quantum, start);
+    let before = stdio.stdout().len();
+    let turned = stores
+      .lend_held(generation, &mut admission, |store, _| {
+        loop {
+          if !paced.more(crate::vcs_store::ANSWER_STEP, costs) {
+            break Progress::Streamed { more: true };
+          }
+          match stdio.stream(store, turn_room) {
+            Progress::Streamed { more: true }
+              if stdio.stdout().len() < bound && stdio.store_wants().is_none() => {}
+            other => break other,
+          }
         }
-        match stdio.stream(store, turn_room) {
-          Progress::Streamed { more: true }
-            if stdio.stdout().len() < bound && stdio.store_wants().is_none() => {}
-          other => break other,
-        }
-      }
-    })
-    .ok_or_else(unheld);
-  paced.close(slates_rt::futures::now_ns(), costs);
-  crate::vcs_store::hg_view::turn_taken();
-  // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
-  stores.wrote(
-    generation,
-    u64::try_from(stdio.stdout().len().saturating_sub(before)).unwrap_or(u64::MAX),
-  );
-  turned
+      })
+      .ok_or_else(unheld)?;
+    paced.close(slates_rt::futures::now_ns(), costs);
+    crate::vcs_store::hg_view::turn_taken();
+    // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
+    stores.wrote(
+      generation,
+      u64::try_from(stdio.stdout().len().saturating_sub(before)).unwrap_or(u64::MAX),
+    );
+    let elapsed = slates_rt::futures::now_ns().saturating_sub(started);
+    if !matches!(turned, Progress::Streamed { more: true })
+      || stdio.stdout().len() > before_total
+      || stdio.store_wants().is_none()
+      || (quantum > 0 && elapsed >= quantum)
+    {
+      return Ok(turned);
+    }
+  }
 }
 
 /// The words a session ends with when its store is no longer held here: the site's not-served words (its step 3).

@@ -158,16 +158,23 @@ pub(super) async fn rebase_sliced(
     Err(outcome) => return Some(Err(outcome)),
   };
   loop {
-    let sliced = crate::state::with_state(|state| rebasing.slice(state));
+    let sliced =
+      crate::state::with_state(|state| vcs_store::lent_state(state, |state| rebasing.slice(state)));
     match sliced.flatten()? {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
+      Ok(Stepped::Store) => {
+        let rebase = rebasing.rebase.as_mut()?;
+        if !vcs_store::hg_view::answer_store_wants(rebase, repository).await {
+          return None;
+        }
+      }
       Ok(Stepped::Done) => {
         return crate::state::with_state(|state| rebasing.finish_in(state))
           .flatten()
           .map(Ok);
       }
-      // A re-base reads the fork's rows, never the changegroup's bytes nor the store.
-      Ok(Stepped::Wanted(_) | Stepped::Store) => {
+      // A re-base reads the fork's rows and let-go manifests from the store, never the changegroup.
+      Ok(Stepped::Wanted(_)) => {
         return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
       }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
@@ -191,10 +198,22 @@ pub(super) fn rebase_whole(
     Err(outcome) => return Some(Err(outcome)),
   };
   loop {
-    match rebasing.slice(state)? {
+    let stepped = vcs_store::lent_state(state, |state| rebasing.slice(state))?;
+    match stepped {
       Ok(Stepped::More) => {}
+      Ok(Stepped::Store) => {
+        let disk = state.vcs_disk.clone()?;
+        let rebase = rebasing.rebase.as_mut()?;
+        if !crate::test_store::answer_wants_blocking(
+          &disk,
+          u128::from_be_bytes(repository.bytes),
+          rebase,
+        ) {
+          return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
+        }
+      }
       Ok(Stepped::Done) => return rebasing.finish_in(state).map(Ok),
-      Ok(Stepped::Wanted(_) | Stepped::Store) => {
+      Ok(Stepped::Wanted(_)) => {
         return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
       }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),

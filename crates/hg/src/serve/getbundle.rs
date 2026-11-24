@@ -97,6 +97,12 @@ pub trait Store: Repository {
   /// whole text); none where the log lacks it.
   fn file_entry(&self, path: &[u8], node: &Node) -> Option<FileEntry>;
 
+  /// The manifest revision whose node is `node` as its log's row holds it, with no text read
+  /// (goal 93 C1 (1): manifest texts let go to the changeset store); `None` by default.
+  fn manifest_entry(&self, _node: &Node) -> Option<FileEntry> {
+    None
+  }
+
   /// What a whole answer, which cannot wait between its steps, reads of the changeset store where its walk asks it
   /// ([`crate::render::Want`]), at once; none where the store answers only between steps, as the daemon's does (its
   /// changeset store is its owner's thread's): its edges stream such answers and ask it between turns. None by default.
@@ -910,6 +916,11 @@ pub struct Walk {
   version: Version,
   /// Where the walk stands; none once the changegroup's end is written.
   at: Option<At>,
+  /// Whether changeset texts may still be resident in memory (`false` after the first away miss, avoiding redundant
+  /// `HgIndex::revision_text` walks).
+  changeset_resident: bool,
+  /// Whether manifest texts may still be resident in memory (`false` after the first away miss).
+  manifest_resident: bool,
   /// A fetch the links cannot walk, walked by the changesets that name each revision ([`Named`]), until its file
   /// section ([`Walk::pull`]).
   named: Option<Named>,
@@ -1022,6 +1033,8 @@ impl Walk {
       missing: outgoing.missing.clone(),
       version,
       at: Some(At::Changelog(0)),
+      changeset_resident: true,
+      manifest_resident: true,
       named: None,
       files: Files::default(),
       pull: None,
@@ -1034,6 +1047,10 @@ impl Walk {
         seen_manifests: BTreeSet::new(),
         files: BTreeMap::new(),
         seen_files: BTreeSet::new(),
+        last_sent: None,
+        changeset_resident: true,
+        manifest_resident: true,
+        store: NamedStore::default(),
       });
       walk.at = None;
     }
@@ -1048,12 +1065,24 @@ impl Walk {
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
     if let Some(mut named) = self.named.take() {
-      if named.step(store, (&self.missing, self.version), room, out)? {
-        self.pull = Some(named.pull());
-      } else {
-        self.named = Some(named);
+      loop {
+        while let Some(want) = named.wants().cloned() {
+          let Some(given) = store.stored_now(&want) else {
+            self.named = Some(named);
+            return Ok(true);
+          };
+          named.give(given);
+        }
+        let done = named.step(store, (&self.missing, self.version), room, out)?;
+        if done {
+          self.pull = Some(named.pull());
+          return Ok(true);
+        }
+        if named.wants().is_none() {
+          self.named = Some(named);
+          return Ok(true);
+        }
       }
-      return Ok(true);
     }
     if let Some(pull) = &mut self.pull {
       if pull.ended {
@@ -1101,9 +1130,12 @@ impl Walk {
     }
   }
 
-  /// What the next step asks of the changeset store, if anything ([`Files`], [`Pull`]): given back by [`Walk::give`]
-  /// before it.
+  /// What the next step asks of the changeset store, if anything ([`Named`], [`Files`], [`Pull`]): given back by
+  /// [`Walk::give`] before it.
   pub fn wants(&self) -> Option<&crate::render::Want> {
+    if let Some(named) = &self.named {
+      return named.wants();
+    }
     match &self.pull {
       Some(pull) => pull.want.as_ref(),
       None => self.files.want.as_ref(),
@@ -1113,6 +1145,10 @@ impl Walk {
   /// The changeset store's answer to [`Walk::wants`]: rows ask the chunks of as many of their revisions as the room the
   /// asking step was given holds, at once.
   pub fn give(&mut self, given: Given) {
+    if let Some(named) = &mut self.named {
+      named.give(given);
+      return;
+    }
     if let Some(pull) = &mut self.pull {
       pull.give(given);
       return;
@@ -1172,44 +1208,109 @@ impl Walk {
       .saturating_add(self.pull.as_ref().map_or(0, |pull| pull.stored))
   }
 
-  /// The missing changeset at or after `from`, or the changelog group's end.
+  /// The missing changeset at or after `from`, or the changelog group's end. If the changeset's
+  /// text was let go to the changeset store (goal 93 C1 (1)), reads batched rows and chunks from
+  /// `CHANGELOG_PATH` through [`Files`] and emits stored deltas verbatim.
   fn changeset(
-    &self,
+    &mut self,
     store: &impl Store,
     from: Rev,
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Option<At>, Refusal> {
     let Some(rev) = self.missing.next_from(from) else {
+      self.files.ahead.clear();
+      self.files.chunks_asked = 0;
+      self.files.sent.clear();
       changegroup::put_end(out);
       return Ok(Some(At::Manifests(0, None)));
     };
+    if self.files.unkept {
+      return Err(no_changeset_text());
+    }
     let node = node_of(store, rev)?;
     let [first, second] = parents_of(store, rev)?;
     let parent =
       |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
     let parents = [parent(first)?, parent(second)?];
-    let text = store
-      .changeset_text(rev, room)?
-      .ok_or_else(no_changeset_text)?;
-    let (manifest, _) = read_changeset(&text)?;
-    if manifest != NULL_NODE && !store.holds_manifest(&manifest) {
+    let ready = matches!(
+      self.files.ahead.front(),
+      Some(ahead)
+        if ahead.path == crate::push::intake::CHANGELOG_PATH
+          && ahead.position == u64::from(rev)
+    );
+    if self.changeset_resident && !ready && self.files.ahead.is_empty() {
+      if let Some(text) = store.changeset_text(rev, room)? {
+        let (manifest, _) = read_changeset(&text)?;
+        if manifest != NULL_NODE && !store.holds_manifest(&manifest) {
+          return Err(no_manifest());
+        }
+        self.put((node, parents, node, 0), &text, room, out)?;
+        return Ok(Some(At::Changelog(rev.saturating_add(1))));
+      }
+      self.changeset_resident = false;
+    }
+    if !ready {
+      self.files.ahead.clear();
+      self.files.chunks_asked = 0;
+      self.ask_changelog_rows(store, rev, room.left());
+      return Ok(Some(At::Changelog(rev)));
+    }
+    if self
+      .files
+      .ahead
+      .front()
+      .is_some_and(|ahead| ahead.chunk.is_none())
+    {
+      self.files.ask_chunks(room.left());
+      return Ok(Some(At::Changelog(rev)));
+    }
+    let Some(Ahead {
+      node: stored_node,
+      row,
+      chunk,
+      ..
+    }) = self.files.ahead.pop_front()
+    else {
+      return Ok(Some(At::Changelog(rev)));
+    };
+    let chunk = chunk.unwrap_or_default();
+    if let Some(manifest) = store.manifest_node(rev)
+      && manifest != NULL_NODE
+      && !store.holds_manifest(&manifest)
+    {
       return Err(no_manifest());
     }
-    self.put((node, parents, node, 0), &text, room, out)?;
+    match row.base {
+      None => self.put((stored_node, parents, stored_node, 0), &chunk, room, out)?,
+      Some(base) => {
+        let base = *self.files.sent.get(&base).ok_or_else(no_changeset_text)?;
+        self.put_delta(
+          (stored_node, parents, stored_node, 0),
+          (base, &chunk),
+          room,
+          out,
+        )?;
+      }
+    }
+    self.files.sent.insert(row.text, stored_node);
     Ok(Some(At::Changelog(rev.saturating_add(1))))
   }
 
-  /// The manifest at `position` where a missing changeset links it, or the manifest group's end: sent as the delta the
-  /// store keeps where its base is `sent`, the manifest this answer sent last ([`Store::manifest_delta`]), else whole.
+  /// The manifest at `position` where a missing changeset links it, or the manifest group's end:
+  /// sent as the stored delta from the changeset store when let go (goal 93 C1 (1)), else from the
+  /// resident index (`manifest_delta` / `manifest`).
   fn manifest(
-    &self,
+    &mut self,
     store: &impl Store,
     (position, sent): (u64, Option<(u64, Node)>),
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Option<At>, Refusal> {
     let Some(linked) = store.manifest_linked(position) else {
+      self.files.ahead.clear();
+      self.files.chunks_asked = 0;
+      self.files.sent.clear();
       changegroup::put_end(out);
       if self.version.has_tree_list() {
         changegroup::put_end(out);
@@ -1224,36 +1325,144 @@ impl Walk {
     let Some(link) = linked.link.filter(|link| self.missing.contains(*link)) else {
       return Ok(Some(At::Manifests(following, sent)));
     };
-    let link = node_of(store, link)?;
-    let stored = match sent {
-      Some((sent_position, sent_node)) => store
-        .manifest_delta(position, room)?
-        .filter(|(base, ..)| *base == sent_position)
-        .map(|(_, parents, flags, delta)| (sent_node, parents, flags, delta)),
-      None => None,
-    };
-    if let Some((base, parents, flags, delta)) = stored {
-      self.put_delta(
-        (linked.node, parents, link, flags),
-        (base, &delta),
-        room,
-        out,
-      )?;
-    } else {
-      let logged = store
-        .manifest(&linked.node, room)?
-        .ok_or_else(no_manifest)?;
-      self.put(
-        (linked.node, logged.parents, link, logged.flags),
-        &logged.text,
-        room,
-        out,
-      )?;
+    if self.files.unkept {
+      return Err(no_manifest());
     }
-    Ok(Some(At::Manifests(
-      following,
-      Some((position, linked.node)),
-    )))
+    let link = node_of(store, link)?;
+    let ready = matches!(
+      self.files.ahead.front(),
+      Some(ahead)
+        if ahead.path == crate::push::intake::MANIFEST_PATH && ahead.position == position
+    );
+    if self.manifest_resident && !ready && self.files.ahead.is_empty() {
+      let stored = match sent {
+        Some((sent_position, sent_node)) => store
+          .manifest_delta(position, room)?
+          .filter(|(base, ..)| *base == sent_position)
+          .map(|(_, parents, flags, delta)| (sent_node, parents, flags, delta)),
+        None => None,
+      };
+      if let Some((base, parents, flags, delta)) = stored {
+        self.put_delta(
+          (linked.node, parents, link, flags),
+          (base, &delta),
+          room,
+          out,
+        )?;
+        return Ok(Some(At::Manifests(
+          following,
+          Some((position, linked.node)),
+        )));
+      }
+      if let Some(logged) = store.manifest(&linked.node, room)? {
+        self.put(
+          (linked.node, logged.parents, link, logged.flags),
+          &logged.text,
+          room,
+          out,
+        )?;
+        return Ok(Some(At::Manifests(
+          following,
+          Some((position, linked.node)),
+        )));
+      }
+      self.manifest_resident = false;
+    }
+    if !ready {
+      self.files.ahead.clear();
+      self.files.chunks_asked = 0;
+      self.ask_manifest_rows(store, position, room.left());
+      return Ok(Some(At::Manifests(position, sent)));
+    }
+    if self
+      .files
+      .ahead
+      .front()
+      .is_some_and(|ahead| ahead.chunk.is_none())
+    {
+      self.files.ask_chunks(room.left());
+      return Ok(Some(At::Manifests(position, sent)));
+    }
+    let Some(Ahead {
+      node, row, chunk, ..
+    }) = self.files.ahead.pop_front()
+    else {
+      return Ok(Some(At::Manifests(position, sent)));
+    };
+    let chunk = chunk.unwrap_or_default();
+    let FileEntry { parents, flags, .. } = store.manifest_entry(&node).ok_or_else(no_manifest)?;
+    match row.base {
+      None => self.put((node, parents, link, flags), &chunk, room, out)?,
+      Some(base) => {
+        let base = *self.files.sent.get(&base).ok_or_else(no_manifest)?;
+        self.put_delta((node, parents, link, flags), (base, &chunk), room, out)?;
+      }
+    }
+    self.files.sent.insert(row.text, node);
+    Ok(Some(At::Manifests(following, Some((position, node)))))
+  }
+
+  /// Batches up to `rows_a_step` missing changesets from `from` on into `CHANGELOG_PATH` row asks.
+  fn ask_changelog_rows(&mut self, store: &impl Store, from: Rev, room: u64) {
+    let most = usize::try_from(
+      room
+        .checked_div(to_u64(core::mem::size_of::<Ahead>()).max(1))
+        .unwrap_or(room),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    let rows = store.rows_a_step().max(1);
+    let mut revisions = Vec::new();
+    let mut at = from;
+    while revisions.len() < most && to_u64(revisions.len()) < rows {
+      let Some(rev) = self.missing.next_from(at) else {
+        break;
+      };
+      let Some(node) = store.node(rev) else {
+        break;
+      };
+      revisions.push((u64::from(rev), node));
+      at = rev.saturating_add(1);
+    }
+    let nodes = revisions.iter().map(|(_, node)| *node).collect();
+    let path = crate::push::intake::CHANGELOG_PATH.to_vec();
+    self.files.asked = vec![(path.clone(), revisions)];
+    self.files.room = room;
+    self.files.want = Some(crate::render::Want::Rows {
+      logs: vec![(path, nodes)],
+    });
+  }
+
+  /// Batches up to `rows_a_step` missing manifests from `position` on into `MANIFEST_PATH` row asks.
+  fn ask_manifest_rows(&mut self, store: &impl Store, position: u64, room: u64) {
+    let most = usize::try_from(
+      room
+        .checked_div(to_u64(core::mem::size_of::<Ahead>()).max(1))
+        .unwrap_or(room),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    let rows = store.rows_a_step().max(1);
+    let mut revisions = Vec::new();
+    let mut scanned = 0_u64;
+    let mut at = position;
+    while revisions.len() < most && scanned < rows {
+      let Some(linked) = store.manifest_linked(at) else {
+        break;
+      };
+      scanned = scanned.saturating_add(1);
+      if linked.link.is_some_and(|link| self.missing.contains(link)) {
+        revisions.push((at, linked.node));
+      }
+      at = at.saturating_add(1);
+    }
+    let nodes = revisions.iter().map(|(_, node)| *node).collect();
+    let path = crate::push::intake::MANIFEST_PATH.to_vec();
+    self.files.asked = vec![(path.clone(), revisions)];
+    self.files.room = room;
+    self.files.want = Some(crate::render::Want::Rows {
+      logs: vec![(path, nodes)],
+    });
   }
 
   /// The file revision at or after `from` where a missing changeset links it (its group's name first where it opens
@@ -1867,6 +2076,237 @@ struct Named {
   files: BTreeMap<Vec<u8>, Vec<(u64, PlannedRevision)>>,
   /// The file revisions looked up.
   seen_files: BTreeSet<(Vec<u8>, Node)>,
+  /// The last manifest sent in `NamedStage::Manifests` (position, node) when serving resident
+  /// manifest deltas.
+  last_sent: Option<(u64, Node)>,
+  /// Whether changeset texts may still be resident in memory (`false` after the first away miss).
+  changeset_resident: bool,
+  /// Whether manifest texts may still be resident in memory (`false` after the first away miss, avoiding 500-rev
+  /// dead `HgIndex::revision_text` walks on every changeset).
+  manifest_resident: bool,
+  /// Changeset-store state for reading let-go changelogs and manifests in batches and emitting
+  /// stored manifest deltas verbatim (goal 93 C1 (1)).
+  store: NamedStore,
+}
+
+/// Which changeset-store request [`NamedStore`] currently has in flight.
+#[derive(Debug, Default)]
+enum NamedAsk {
+  #[default]
+  Idle,
+  /// Rows of missing changesets (`CHANGELOG_PATH`).
+  ChangesetRows(Vec<Rev>),
+  /// Full texts of missing changesets (`CHANGELOG_PATH`).
+  ChangesetTexts(Vec<Rev>),
+  /// Rows of manifests needed during `NamedStage::Changelog` (`MANIFEST_PATH`).
+  PlanManifestRows(Vec<Node>),
+  /// Stored chunks of consecutive chainable manifests during `NamedStage::Changelog`.
+  PlanManifestChunks(Vec<Node>),
+  /// One full manifest text during `NamedStage::Changelog` (first manifest or chain jump).
+  PlanManifestText([u8; 32]),
+  /// Rows of manifests being sent during `NamedStage::Manifests` (`MANIFEST_PATH`).
+  SendManifestRows(Vec<(usize, Node)>),
+  /// Stored chunks of manifests being sent during `NamedStage::Manifests`.
+  SendManifestChunks(usize),
+  /// Full texts of manifests being sent during `NamedStage::Manifests`.
+  SendManifestTexts(usize),
+}
+
+/// One manifest revision queued for sending in `NamedStage::Manifests`.
+#[derive(Debug)]
+struct SendManifest {
+  /// Index in `Named::manifests`.
+  at: usize,
+  /// Its node.
+  node: Node,
+  /// Its stored row from `MANIFEST_PATH`.
+  row: crate::render::StoredRevision,
+  /// How it will be sent: `Some(NULL_NODE)` whole via chunk, `Some(base)` delta via chunk,
+  /// `None` whole via `Want::Texts`.
+  send_base: Option<Node>,
+  /// Whether `send_base` has been decided yet.
+  decided: bool,
+  /// The bytes fetched (chunk or whole text), once given.
+  data: Option<Vec<u8>>,
+}
+
+/// Changeset-store batching state for [`Named`].
+#[derive(Debug, Default)]
+struct NamedStore {
+  /// Pending request for the changeset store.
+  want: Option<crate::render::Want>,
+  /// What `want` asked for.
+  ask: NamedAsk,
+  /// Pre-fetched changeset texts, in ascending rev order.
+  changesets: std::collections::VecDeque<(Rev, Vec<u8>)>,
+  /// Pre-fetched manifest `StoredRevision`s for `NamedStage::Changelog`.
+  manifest_rows: BTreeMap<Node, crate::render::StoredRevision>,
+  /// Pre-fetched consecutive chainable manifest chunks for `NamedStage::Changelog`.
+  manifest_chunks: std::collections::VecDeque<(Node, Vec<u8>)>,
+  /// Rolling decoded manifest `(text_identity, full_text)` so consecutive manifest deltas apply in
+  /// O(delta_len) instead of rebuilding from delta chains.
+  last_manifest: Option<([u8; 32], Vec<u8>)>,
+  /// Manifests already sent in `NamedStage::Manifests`, keyed by `row.text` -> sent `Node`.
+  sent_manifests: BTreeMap<[u8; 32], Node>,
+  /// Batch of manifests queued to send in `NamedStage::Manifests`.
+  send_batch: std::collections::VecDeque<SendManifest>,
+  /// Whether the store lacked a requested row or text.
+  unkept: bool,
+  /// Whether a `Want::Texts` exceeded the room bound.
+  texts_past: bool,
+  /// Room hint from the asking step.
+  room: u64,
+}
+
+impl NamedStore {
+  /// Handles `given` from the changeset store.
+  fn give(&mut self, given: Given) {
+    self.want = None;
+    let ask = core::mem::take(&mut self.ask);
+    match (ask, given) {
+      (NamedAsk::ChangesetRows(revs), Given::Rows(rows)) => self.give_changeset_rows(revs, rows),
+      (NamedAsk::ChangesetTexts(revs), Given::Texts(texts)) => {
+        self.give_changeset_texts(revs, texts);
+      }
+      (NamedAsk::PlanManifestRows(nodes), Given::Rows(rows)) => {
+        self.give_plan_manifest_rows(nodes, rows);
+      }
+      (NamedAsk::PlanManifestChunks(nodes), Given::Chunks(chunks)) => {
+        self.give_plan_manifest_chunks(nodes, chunks);
+      }
+      (NamedAsk::PlanManifestText(identity), Given::Texts(mut texts)) => match texts.pop() {
+        Some(text) => self.last_manifest = Some((identity, text)),
+        None => self.unkept = true,
+      },
+      (NamedAsk::SendManifestRows(entries), Given::Rows(rows)) => {
+        self.give_send_manifest_rows(entries, rows);
+      }
+      (NamedAsk::SendManifestChunks(count), Given::Chunks(chunks)) => {
+        self.give_send_manifest_data(count, chunks);
+      }
+      (NamedAsk::SendManifestTexts(count), Given::Texts(texts)) => {
+        self.give_send_manifest_data(count, texts);
+      }
+      (_, Given::TextsPast) => self.texts_past = true,
+      _ => self.unkept = true,
+    }
+  }
+
+  /// Stores fetched changeset rows and requests their full texts.
+  fn give_changeset_rows(
+    &mut self,
+    revs: Vec<Rev>,
+    rows: Vec<Vec<Option<crate::render::StoredRevision>>>,
+  ) {
+    let log = rows.into_iter().next().unwrap_or_default();
+    let Some(texts): Option<Vec<[u8; 32]>> = (log.len() == revs.len())
+      .then(|| log.into_iter().map(|row| row.map(|row| row.text)).collect())
+      .flatten()
+    else {
+      self.unkept = true;
+      return;
+    };
+    self.ask = NamedAsk::ChangesetTexts(revs);
+    self.want = Some(crate::render::Want::Texts {
+      texts,
+      most: self.room,
+    });
+  }
+
+  /// Enqueues fetched changeset texts in revision order.
+  fn give_changeset_texts(&mut self, revs: Vec<Rev>, texts: Vec<Vec<u8>>) {
+    if texts.len() != revs.len() {
+      self.unkept = true;
+      return;
+    }
+    self.changesets.extend(revs.into_iter().zip(texts));
+  }
+
+  /// Records fetched manifest index rows for planning.
+  fn give_plan_manifest_rows(
+    &mut self,
+    nodes: Vec<Node>,
+    rows: Vec<Vec<Option<crate::render::StoredRevision>>>,
+  ) {
+    let log = rows.into_iter().next().unwrap_or_default();
+    if log.len() != nodes.len() {
+      self.unkept = true;
+      return;
+    }
+    for (node, row) in nodes.into_iter().zip(log) {
+      match row {
+        Some(row) => {
+          self.manifest_rows.insert(node, row);
+        }
+        None => {
+          self.unkept = true;
+          return;
+        }
+      }
+    }
+  }
+
+  /// Replaces the manifest planning chunk queue with fetched chunks for rolling delta planning.
+  fn give_plan_manifest_chunks(&mut self, nodes: Vec<Node>, chunks: Vec<Vec<u8>>) {
+    self.manifest_chunks.clear();
+    if chunks.len() != nodes.len() {
+      self.unkept = true;
+      return;
+    }
+    self.manifest_chunks.extend(nodes.into_iter().zip(chunks));
+  }
+
+  /// Enqueues fetched manifest rows for the send stage.
+  fn give_send_manifest_rows(
+    &mut self,
+    entries: Vec<(usize, Node)>,
+    rows: Vec<Vec<Option<crate::render::StoredRevision>>>,
+  ) {
+    let log = rows.into_iter().next().unwrap_or_default();
+    if log.len() != entries.len() {
+      self.unkept = true;
+      return;
+    }
+    for ((at, node), row) in entries.into_iter().zip(log) {
+      let Some(row) = row else {
+        self.unkept = true;
+        return;
+      };
+      self.send_batch.push_back(SendManifest {
+        at,
+        node,
+        row,
+        send_base: None,
+        decided: false,
+        data: None,
+      });
+    }
+  }
+
+  /// Attaches fetched chunks or whole texts to the next `count` pending send-batch items.
+  fn give_send_manifest_data(&mut self, count: usize, payloads: Vec<Vec<u8>>) {
+    if payloads.len() != count {
+      self.unkept = true;
+      return;
+    }
+    for (item, payload) in self
+      .send_batch
+      .iter_mut()
+      .filter(|item| item.data.is_none())
+      .take(count)
+      .zip(payloads)
+    {
+      item.data = Some(payload);
+    }
+  }
+}
+
+/// A resolved manifest position (and optional resident text) for [`Named::changeset`].
+struct PlannedManifest {
+  /// Its position in the manifest log.
+  position: u64,
+  /// Its resident text, when read in memory rather than staged in `NamedStore::last_manifest`.
+  resident: Option<Vec<u8>>,
 }
 
 /// Where a [`Named`] walk stands.
@@ -1879,6 +2319,16 @@ enum NamedStage {
 }
 
 impl Named {
+  /// Pending changeset-store request, if any.
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.store.want.as_ref()
+  }
+
+  /// Feeds the changeset store's reply into [`NamedStore`].
+  fn give(&mut self, given: Given) {
+    self.store.give(given);
+  }
+
   /// The walk's next unit (the type's docs), what it lends and keeps charged to `room`: whether the manifests' group is
   /// written, the file section next ([`Named::pull`]).
   fn step(
@@ -1888,74 +2338,323 @@ impl Named {
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
+    if self.store.texts_past {
+      return Err(Refusal::PastAdmission(crate::PastAdmission {
+        asked: self.store.room.saturating_add(1),
+        left: self.store.room,
+      }));
+    }
     match self.stage {
       NamedStage::Changelog(from) => {
+        if self.store.unkept {
+          return Err(no_changeset_text());
+        }
         let Some(rev) = missing.next_from(from) else {
           changegroup::put_end(out);
           self
             .manifests
             .sort_unstable_by_key(|(position, _, _)| *position);
+          // Drop planning scratch before streaming manifests.
+          self.store.changesets.clear();
+          self.store.manifest_rows.clear();
+          self.store.manifest_chunks.clear();
+          self.store.last_manifest = None;
           self.stage = NamedStage::Manifests(0);
           return Ok(false);
         };
-        self.changeset(store, (rev, version), room, out)?;
-        self.stage = NamedStage::Changelog(rev.saturating_add(1));
+        if self.changeset(store, (missing, rev, version), room, out)? {
+          self.stage = NamedStage::Changelog(rev.saturating_add(1));
+        }
         Ok(false)
       }
       NamedStage::Manifests(at) => {
-        let Some((_, node, link)) = self.manifests.get(at).copied() else {
+        if self.store.unkept {
+          return Err(no_manifest());
+        }
+        let Some((position, node, link)) = self.manifests.get(at).copied() else {
           changegroup::put_end(out);
           if version.has_tree_list() {
             changegroup::put_end(out);
           }
           return Ok(true);
         };
-        let logged = store.manifest(&node, room)?.ok_or_else(no_manifest)?;
-        put_whole(
-          (node, logged.parents, link, logged.flags),
-          version,
-          &logged.text,
-          room,
-          out,
-        )?;
-        self.stage = NamedStage::Manifests(at.saturating_add(1));
+        if self.send_manifest(store, (at, position, node, link), version, room, out)? {
+          self.stage = NamedStage::Manifests(at.saturating_add(1));
+        }
         Ok(false)
       }
     }
   }
 
-  /// Missing changeset `rev` written whole, linked to itself, and what its manifest names at the paths it lists planned.
-  fn changeset(
+  /// Requests a bounded batch of missing changeset rows starting from `rev`.
+  fn ask_changeset_batch(
     &mut self,
     store: &impl Store,
-    (rev, version): (Rev, Version),
-    room: &mut Admission,
-    out: &mut Vec<u8>,
-  ) -> Result<(), Refusal> {
-    let node = node_of(store, rev)?;
-    let parent =
-      |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
-    let [first, second] = parents_of(store, rev)?;
-    let parents = [parent(first)?, parent(second)?];
-    let text = store
-      .changeset_text(rev, room)?
-      .ok_or_else(no_changeset_text)?;
-    put_whole((node, parents, node, 0), version, &text, room, out)?;
-    let (manifest, touched) = read_changeset(&text)?;
-    let logged = store.manifest(&manifest, room)?.ok_or_else(no_manifest)?;
-    manifest::decode(&logged.text).map_err(|_| no_manifest())?;
-    if self.seen_manifests.insert(manifest) {
-      room.charge_items::<(u64, Node, Node)>(1)?;
-      self.manifests.push((logged.position, manifest, node));
+    missing: &pull::Ranges,
+    rev: Rev,
+    room: u64,
+  ) {
+    self.store.changesets.clear();
+    let rows_cap = store.rows_a_step().max(1);
+    let mut revs = Vec::new();
+    let mut nodes = Vec::new();
+    let mut cursor = rev;
+    while to_u64(revs.len()) < rows_cap {
+      let Some(next_rev) = missing.next_from(cursor) else {
+        break;
+      };
+      let Some(next_node) = store.node(next_rev) else {
+        break;
+      };
+      revs.push(next_rev);
+      nodes.push(next_node);
+      cursor = next_rev.saturating_add(1);
     }
-    for path in touched
+    self.store.room = room;
+    self.store.ask = NamedAsk::ChangesetRows(revs);
+    self.store.want = Some(crate::render::Want::Rows {
+      logs: vec![(crate::push::intake::CHANGELOG_PATH.to_vec(), nodes)],
+    });
+  }
+
+  /// Requests a bounded batch of upcoming distinct manifest rows for planning.
+  fn ask_plan_manifest_rows(
+    &mut self,
+    store: &impl Store,
+    missing: &pull::Ranges,
+    (rev, manifest): (Rev, Node),
+    room: u64,
+  ) {
+    let rows_cap = store.rows_a_step().max(1);
+    let mut nodes = vec![manifest];
+    let mut seen = BTreeSet::from([manifest]);
+    let mut cursor = rev.saturating_add(1);
+    while to_u64(nodes.len()) < rows_cap {
+      let Some(next_rev) = missing.next_from(cursor) else {
+        break;
+      };
+      if let Some(next_mf) = store.manifest_node(next_rev)
+        && next_mf != NULL_NODE
+        && !self.store.manifest_rows.contains_key(&next_mf)
+        && seen.insert(next_mf)
+      {
+        nodes.push(next_mf);
+      }
+      cursor = next_rev.saturating_add(1);
+    }
+    self.store.room = room;
+    self.store.ask = NamedAsk::PlanManifestRows(nodes.clone());
+    self.store.want = Some(crate::render::Want::Rows {
+      logs: vec![(crate::push::intake::MANIFEST_PATH.to_vec(), nodes)],
+    });
+  }
+
+  /// Requests consecutive chainable manifest chunks starting from `(rev, manifest, row)`.
+  fn ask_plan_manifest_chunks(
+    &mut self,
+    store: &impl Store,
+    missing: &pull::Ranges,
+    (rev, manifest, row): (Rev, Node, crate::render::StoredRevision),
+    budget: u64,
+  ) {
+    self.store.manifest_chunks.clear();
+    let mut chunk_nodes = vec![manifest];
+    let mut places = vec![row.place];
+    let mut bytes = row.place.len;
+    let mut prev_id = row.text;
+    let mut cursor = rev.saturating_add(1);
+    while let Some(next_rev) = missing.next_from(cursor) {
+      cursor = next_rev.saturating_add(1);
+      let Some(next_mf) = store.manifest_node(next_rev) else {
+        break;
+      };
+      if next_mf == NULL_NODE || next_mf == manifest || chunk_nodes.last() == Some(&next_mf) {
+        continue;
+      }
+      let Some(next_row) = self.store.manifest_rows.get(&next_mf).copied() else {
+        break;
+      };
+      let chains = next_row.base.is_none() || next_row.base == Some(prev_id);
+      if !chains || bytes.saturating_add(next_row.place.len) > budget {
+        break;
+      }
+      bytes = bytes.saturating_add(next_row.place.len);
+      places.push(next_row.place);
+      chunk_nodes.push(next_mf);
+      prev_id = next_row.text;
+    }
+    self.store.room = budget;
+    self.store.ask = NamedAsk::PlanManifestChunks(chunk_nodes);
+    self.store.want = Some(crate::render::Want::Chunks { places });
+  }
+
+  /// Applies one queued `(queued_node, chunk)` onto `self.store.last_manifest` when its stored
+  /// row is known and chains cleanly onto `last_manifest` (or is a whole text). Returns `false` if
+  /// the queued entry cannot chain onto `last_manifest`.
+  fn apply_queued_manifest(
+    &mut self,
+    queued_node: Node,
+    chunk: Vec<u8>,
+    room: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let Some(queued_row) = self.store.manifest_rows.get(&queued_node).copied() else {
+      return Ok(false);
+    };
+    let full = match queued_row.base {
+      None => chunk,
+      Some(base_id) => {
+        let Some((prev_id, prev_text)) = self.store.last_manifest.as_ref() else {
+          return Ok(false);
+        };
+        if *prev_id != base_id {
+          return Ok(false);
+        }
+        delta::apply(prev_text, &chunk, room).map_err(|_| no_manifest())?
+      }
+    };
+    self.store.last_manifest = Some((queued_row.text, full));
+    Ok(true)
+  }
+
+  /// Ensures `self.store.last_manifest` holds `manifest`'s full text for planning, asking the
+  /// changeset store (returning `Ok(false)`) when rows, chunks, or a full text must be fetched.
+  fn load_plan_manifest(
+    &mut self,
+    store: &impl Store,
+    (missing, rev, manifest): (&pull::Ranges, Rev, Node),
+    room: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let Some(row) = self.store.manifest_rows.get(&manifest).copied() else {
+      self.ask_plan_manifest_rows(store, missing, (rev, manifest), room.left());
+      return Ok(false);
+    };
+    if self
+      .store
+      .last_manifest
+      .as_ref()
+      .is_some_and(|(id, _)| *id == row.text)
+    {
+      return Ok(true);
+    }
+    // Advance through any queued chunks up to `manifest` (commits with no touched files skip
+    // `load_plan_manifest`, leaving their intermediate delta in `manifest_chunks` ahead of the
+    // next manifest that chains onto it). If `manifest` is not queued or the chain diverges, drop
+    // the stale queue so we never loop re-fetching behind an unconsumed front entry.
+    if self
+      .store
+      .manifest_chunks
+      .iter()
+      .any(|(queued, _)| *queued == manifest)
+    {
+      while let Some((queued, chunk)) = self.store.manifest_chunks.pop_front() {
+        if !self.apply_queued_manifest(queued, chunk, room)? {
+          self.store.manifest_chunks.clear();
+          break;
+        }
+        if queued == manifest {
+          return Ok(true);
+        }
+      }
+    } else {
+      self.store.manifest_chunks.clear();
+    }
+    let chainable = row.base.is_none()
+      || self
+        .store
+        .last_manifest
+        .as_ref()
+        .is_some_and(|(id, _)| Some(*id) == row.base);
+    if chainable {
+      self.ask_plan_manifest_chunks(store, missing, (rev, manifest, row), room.left());
+    } else {
+      self.store.room = room.left();
+      self.store.ask = NamedAsk::PlanManifestText(row.text);
+      self.store.want = Some(crate::render::Want::Texts {
+        texts: vec![row.text],
+        most: room.left(),
+      });
+    }
+    Ok(false)
+  }
+
+  /// Parses a changeset's manifest node and touched paths.
+  fn parse_changeset_touched(bytes: &[u8]) -> Result<(Node, Vec<Vec<u8>>), Refusal> {
+    let (manifest, touched_raw) = read_changeset(bytes)?;
+    let touched = touched_raw
       .split(|byte| *byte == NEWLINE)
       .filter(|path| !path.is_empty())
-    {
-      let Some(found) = manifest::find(&logged.text, path) else {
+      .map(<[u8]>::to_vec)
+      .collect();
+    Ok((manifest, touched))
+  }
+
+  /// Resolves `manifest`'s log position and ensures its text is available (either returned or in
+  /// `self.store.last_manifest`) when `need_text` is true; returns `Ok(None)` when paused on the
+  /// changeset store.
+  fn resolve_plan_manifest(
+    &mut self,
+    store: &impl Store,
+    (missing, rev, manifest, need_text): (&pull::Ranges, Rev, Node, bool),
+    room: &mut Admission,
+  ) -> Result<Option<PlannedManifest>, Refusal> {
+    if !need_text {
+      if let Some(entry) = store.manifest_entry(&manifest) {
+        return Ok(Some(PlannedManifest {
+          position: entry.position,
+          resident: None,
+        }));
+      }
+      let logged = store.manifest(&manifest, room)?.ok_or_else(no_manifest)?;
+      manifest::decode(&logged.text).map_err(|_| no_manifest())?;
+      return Ok(Some(PlannedManifest {
+        position: logged.position,
+        resident: None,
+      }));
+    }
+    if self.manifest_resident {
+      if let Some(logged) = store.manifest(&manifest, room)? {
+        manifest::decode(&logged.text).map_err(|_| no_manifest())?;
+        return Ok(Some(PlannedManifest {
+          position: logged.position,
+          resident: Some(logged.text.into_owned()),
+        }));
+      }
+      self.manifest_resident = false;
+    }
+    let entry = store.manifest_entry(&manifest).ok_or_else(no_manifest)?;
+    if !self.load_plan_manifest(store, (missing, rev, manifest), room)? {
+      return Ok(None);
+    }
+    Ok(Some(PlannedManifest {
+      position: entry.position,
+      resident: None,
+    }))
+  }
+
+  /// Plans any unseen file revisions named by `touched` in either `resident` or
+  /// `self.store.last_manifest` (zero copy via disjoint field borrows).
+  fn plan_touched_files(
+    &mut self,
+    store: &impl Store,
+    touched: &[Vec<u8>],
+    node: Node,
+    resident: Option<&[u8]>,
+    room: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let manifest_text = resident
+      .or_else(|| {
+        self
+          .store
+          .last_manifest
+          .as_ref()
+          .map(|(_, text)| text.as_slice())
+      })
+      .unwrap_or(&[]);
+    for path in touched {
+      let Some(found) = manifest::find(manifest_text, path) else {
         continue;
       };
-      if !self.seen_files.insert((path.to_vec(), found.node)) {
+      if !self.seen_files.insert((path.clone(), found.node)) {
         continue;
       }
       let entry = store.file_entry(path, &found.node).ok_or(Refusal::Store {
@@ -1967,7 +2666,7 @@ impl Named {
         .rev(&entry.link)
         .is_some_and(|rev| self.held.contains(rev))
       {
-        self.files.entry(path.to_vec()).or_default().push((
+        self.files.entry(path.clone()).or_default().push((
           entry.position,
           PlannedRevision {
             node: found.node,
@@ -1978,6 +2677,232 @@ impl Named {
       }
     }
     Ok(())
+  }
+
+  /// Missing changeset `rev` written whole, linked to itself, and what its manifest names at the
+  /// paths it lists planned. Returns `false` when paused on a changeset-store request.
+  fn changeset(
+    &mut self,
+    store: &impl Store,
+    (missing, rev, version): (&pull::Ranges, Rev, Version),
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    let node = node_of(store, rev)?;
+    let parent =
+      |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
+    let [first, second] = parents_of(store, rev)?;
+    let parents = [parent(first)?, parent(second)?];
+    let from_store = self
+      .store
+      .changesets
+      .front()
+      .is_some_and(|(queued, _)| *queued == rev);
+    let (text_owned, manifest, touched) = if from_store {
+      let bytes = self
+        .store
+        .changesets
+        .front()
+        .map_or(&[][..], |(_, bytes)| bytes.as_slice());
+      let (manifest, touched) = Self::parse_changeset_touched(bytes)?;
+      (None, manifest, touched)
+    } else if self.changeset_resident
+      && let Some(text) = store.changeset_text(rev, room)?
+    {
+      let owned = text.into_owned();
+      let (manifest, touched) = Self::parse_changeset_touched(&owned)?;
+      (Some(owned), manifest, touched)
+    } else {
+      self.changeset_resident = false;
+      self.ask_changeset_batch(store, missing, rev, room.left());
+      return Ok(false);
+    };
+    let Some(PlannedManifest {
+      position: manifest_pos,
+      resident: resident_manifest,
+    }) = self.resolve_plan_manifest(store, (missing, rev, manifest, !touched.is_empty()), room)?
+    else {
+      return Ok(false);
+    };
+    let popped = if from_store {
+      self.store.changesets.pop_front().map(|(_, bytes)| bytes)
+    } else {
+      text_owned
+    };
+    put_whole(
+      (node, parents, node, 0),
+      version,
+      popped.as_deref().unwrap_or(&[]),
+      room,
+      out,
+    )?;
+    if self.seen_manifests.insert(manifest) {
+      room.charge_items::<(u64, Node, Node)>(1)?;
+      self.manifests.push((manifest_pos, manifest, node));
+    }
+    if !touched.is_empty() {
+      self.plan_touched_files(store, &touched, node, resident_manifest.as_deref(), room)?;
+    }
+    Ok(true)
+  }
+
+  /// Requests a bounded batch of manifest rows starting at `at` for the send stage.
+  fn ask_send_manifest_rows(&mut self, store: &impl Store, at: usize, budget: u64) {
+    self.store.send_batch.clear();
+    let most = usize::try_from(
+      budget
+        .checked_div(to_u64(core::mem::size_of::<SendManifest>()).max(1))
+        .unwrap_or(budget),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    let rows_cap = usize::try_from(store.rows_a_step().max(1)).unwrap_or(usize::MAX);
+    let take = most
+      .min(rows_cap)
+      .min(self.manifests.len().saturating_sub(at))
+      .max(1);
+    let mut entries = Vec::with_capacity(take);
+    let mut nodes = Vec::with_capacity(take);
+    for offset in 0..take {
+      let idx = at.saturating_add(offset);
+      if let Some(&(_, mf_node, _)) = self.manifests.get(idx) {
+        entries.push((idx, mf_node));
+        nodes.push(mf_node);
+      }
+    }
+    self.store.room = budget;
+    self.store.ask = NamedAsk::SendManifestRows(entries);
+    self.store.want = Some(crate::render::Want::Rows {
+      logs: vec![(crate::push::intake::MANIFEST_PATH.to_vec(), nodes)],
+    });
+  }
+
+  /// Marks each undecided item in `send_batch` as either a stored delta (against a base already
+  /// sent or earlier in this batch) or a whole-text fetch.
+  fn decide_send_batch(&mut self) {
+    if !self.store.send_batch.iter().any(|item| !item.decided) {
+      return;
+    }
+    let mut planned: BTreeMap<[u8; 32], Node> = BTreeMap::new();
+    for item in &mut self.store.send_batch {
+      if !item.decided {
+        item.send_base = match item.row.base {
+          None => Some(NULL_NODE),
+          Some(base_id) => self
+            .store
+            .sent_manifests
+            .get(&base_id)
+            .or_else(|| planned.get(&base_id))
+            .copied(),
+        };
+        item.decided = true;
+      }
+      planned.insert(item.row.text, item.node);
+    }
+  }
+
+  /// Requests chunks (for stored deltas/wholes) or a full text for the front of `send_batch`.
+  fn ask_send_batch_data(&mut self, budget: u64) {
+    let front_chunk = self
+      .store
+      .send_batch
+      .front()
+      .is_some_and(|item| item.send_base.is_some());
+    self.store.room = budget;
+    if front_chunk {
+      let mut places = Vec::new();
+      let mut bytes = 0_u64;
+      for item in self.store.send_batch.iter().filter(|i| i.data.is_none()) {
+        if item.send_base.is_none()
+          || (!places.is_empty() && bytes.saturating_add(item.row.place.len) > budget)
+        {
+          break;
+        }
+        bytes = bytes.saturating_add(item.row.place.len);
+        places.push(item.row.place);
+      }
+      self.store.ask = NamedAsk::SendManifestChunks(places.len());
+      self.store.want = Some(crate::render::Want::Chunks { places });
+    } else if let Some(item) = self.store.send_batch.iter().find(|i| i.data.is_none()) {
+      self.store.ask = NamedAsk::SendManifestTexts(1);
+      self.store.want = Some(crate::render::Want::Texts {
+        texts: vec![item.row.text],
+        most: budget,
+      });
+    }
+  }
+
+  /// Sends manifest `at` (`position`, `node`, `link`) in `NamedStage::Manifests`: emits stored
+  /// deltas verbatim when the base was already sent in this answer (cutting partial-clone manifest
+  /// bandwidth and CPU by orders of magnitude), falling back to `Want::Texts` only at chain starts.
+  /// Returns `false` when paused on a changeset-store request.
+  fn send_manifest(
+    &mut self,
+    store: &impl Store,
+    (at, position, node, link): (usize, u64, Node, Node),
+    version: Version,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    let ready_front = self
+      .store
+      .send_batch
+      .front()
+      .is_some_and(|item| item.at == at);
+    if self.manifest_resident && !ready_front && self.store.send_batch.is_empty() {
+      if let Some(logged) = store.manifest(&node, room)? {
+        put_whole(
+          (node, logged.parents, link, logged.flags),
+          version,
+          &logged.text,
+          room,
+          out,
+        )?;
+        self.last_sent = Some((position, node));
+        return Ok(true);
+      }
+      self.manifest_resident = false;
+    }
+    if !ready_front {
+      self.ask_send_manifest_rows(store, at, room.left());
+      return Ok(false);
+    }
+    self.decide_send_batch();
+    if self
+      .store
+      .send_batch
+      .front()
+      .is_some_and(|item| item.data.is_none())
+    {
+      self.ask_send_batch_data(room.left());
+      return Ok(false);
+    }
+    let Some(SendManifest {
+      node: sent_node,
+      row,
+      send_base,
+      data: Some(data),
+      ..
+    }) = self.store.send_batch.pop_front()
+    else {
+      return Err(no_manifest());
+    };
+    let FileEntry { parents, flags, .. } =
+      store.manifest_entry(&sent_node).ok_or_else(no_manifest)?;
+    match send_base {
+      Some(base) if base != NULL_NODE => {
+        put_delta_version(
+          (sent_node, parents, link, flags),
+          (base, &data),
+          version,
+          room,
+          out,
+        )?;
+      }
+      _ => put_whole((sent_node, parents, link, flags), version, &data, room, out)?,
+    }
+    self.store.sent_manifests.insert(row.text, sent_node);
+    Ok(true)
   }
 
   /// The file section over what was planned, each group in its log's order.
@@ -1995,6 +2920,30 @@ impl Named {
       .collect();
     Pull::new(files, self.held)
   }
+}
+
+/// A revision written as a stored delta against `base` in `version`, charged to `room`.
+fn put_delta_version(
+  (node, parents, link, flags): (Node, [Node; 2], Node, u16),
+  (base, data): (Node, &[u8]),
+  version: Version,
+  room: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refusal> {
+  room.charge(to_u64(data.len()))?;
+  let revision = Revision {
+    node,
+    p1: parents[0],
+    p2: parents[1],
+    base,
+    link,
+    flags: if version == Version::V02 { 0 } else { flags },
+    info: None,
+    protocol_flags: 0,
+    data,
+    sidedata: None,
+  };
+  changegroup::put_revision(&revision, version, out).map_err(|_| unencodable("a revision"))
 }
 
 /// A revision written whole against the null base in `version`, its delta charged to `room`.

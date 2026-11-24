@@ -93,6 +93,70 @@ impl Held for IndexHeld<'_> {
     };
     row.len.checked_sub(block)
   }
+
+  fn stores_named_files(&self) -> bool {
+    true
+  }
+}
+
+/// A [`Held`] wrapper overlaying a few pre-fetched changeset and manifest texts (e.g. the 1–2
+/// endpoints of `tree::begin_work` or the parent of `hg_made`) on top of an underlying `Held`, so
+/// callers never need to bring back let-go changelog/manifest delta chains into `ContentStore`
+/// (goal 93 C1 (1)).
+pub struct OverlayHeld<'a, H: ?Sized> {
+  /// The underlying store (e.g. `IndexHeld`).
+  inner: &'a H,
+  /// Pre-fetched changeset texts, keyed by changeset node.
+  changesets: std::collections::BTreeMap<Node, Vec<u8>>,
+  /// Pre-fetched manifest texts, keyed by manifest node.
+  manifests: std::collections::BTreeMap<Node, Vec<u8>>,
+}
+
+impl<'a, H: ?Sized> OverlayHeld<'a, H> {
+  /// Wraps `inner` with pre-fetched `changesets` and `manifests`.
+  pub fn new(
+    inner: &'a H,
+    changesets: std::collections::BTreeMap<Node, Vec<u8>>,
+    manifests: std::collections::BTreeMap<Node, Vec<u8>>,
+  ) -> Self {
+    OverlayHeld {
+      inner,
+      changesets,
+      manifests,
+    }
+  }
+}
+
+impl<H: Held + ?Sized> Held for OverlayHeld<'_, H> {
+  fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
+    if let Some(text) = self.changesets.get(node) {
+      return Some(Cow::Borrowed(text.as_slice()));
+    }
+    self.inner.changeset_text(node)
+  }
+
+  fn manifest_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
+    if let Some(text) = self.manifests.get(node) {
+      return Some(Cow::Borrowed(text.as_slice()));
+    }
+    self.inner.manifest_text(node)
+  }
+
+  fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
+    self.inner.file_text(path, node)
+  }
+
+  fn file_names(&self, path: &[u8], node: &Node) -> Option<FileNames> {
+    self.inner.file_names(path, node)
+  }
+
+  fn file_bytes_len(&self, path: &[u8], node: &Node) -> Option<u64> {
+    self.inner.file_bytes_len(path, node)
+  }
+
+  fn stores_named_files(&self) -> bool {
+    self.inner.stores_named_files()
+  }
 }
 
 /// A file revision the repository holds whose text a reader waits for, asked of the node's changeset store (A-767 C1: a

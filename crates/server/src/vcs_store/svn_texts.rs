@@ -319,7 +319,8 @@ pub(crate) async fn bring_back_named_live(
   brought
 }
 
-/// The Subversion repository green `green` is a member of, if it is one's.
+/// The repository whose changeset `T` table holds the named texts of `green`, if it belongs to
+/// a tool that stores named whole-file texts there (Subversion or Mercurial, A-760).
 fn subversion_of(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
@@ -327,7 +328,11 @@ fn subversion_of(
   let repositories = state.db.partition().repositories();
   let member = repositories.member(green)?;
   let record = repositories.repository(member.repository)?;
-  (record.tool == slates_db::catalog::VcsTool::Subversion).then_some(member.repository)
+  matches!(
+    record.tool,
+    slates_db::catalog::VcsTool::Subversion | slates_db::catalog::VcsTool::Mercurial
+  )
+  .then_some(member.repository)
 }
 
 /// The texts green `green`'s checkpoint (A-869) and chain entries name that the content store does not hold whole

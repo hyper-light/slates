@@ -1061,6 +1061,19 @@ impl VcsStores {
     })
   }
 
+  /// Every live Mercurial repository on this shard (excluding any currently rebuilding): whose
+  /// changesets a let-go window of a named Mercurial file text can be read back from (A-760).
+  pub(crate) fn mercurial_repositories(&self) -> Vec<RepositoryId> {
+    self
+      .entries
+      .iter()
+      .filter_map(|(id, entry)| match entry {
+        RepositoryStore::Mercurial(_) if !self.rebuild_turns.contains_key(id) => Some(*id),
+        _ => None,
+      })
+      .collect()
+  }
+
   pub(crate) fn subversion_records(&self, id: RepositoryId) -> Option<&SvnRecords> {
     if self.rebuild_turns.contains_key(&id) {
       return None;

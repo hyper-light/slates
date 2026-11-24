@@ -725,6 +725,51 @@ pub(crate) fn answer_wants_blocking(
   true
 }
 
+/// Reads `[start, start + width)` of `identity` from `repository`'s `T` table on `disk` on a
+/// thread of its own, for synchronous shard tests whose named works need let-go windows brought
+/// back (`named_objects::read_named_work_blocking`).
+pub(crate) fn read_text_blocking(
+  disk: &StoreHandle,
+  repository: u128,
+  identity: [u8; 32],
+  start: u64,
+  width: u64,
+) -> Option<Vec<u8>> {
+  let disk = disk.clone();
+  std::thread::scope(|scope| {
+    scope
+      .spawn(move || {
+        waiting_runtime()
+          .block_on(async move {
+            let end = start.saturating_add(width);
+            let mut bytes = Vec::with_capacity(usize::try_from(width).ok()?);
+            let mut at = start;
+            while at < end {
+              let piece = loop {
+                match disk.text(repository, identity, at).await {
+                  Err(slates_store::owner::OwnerError::Busy) => {
+                    slates_rt::futures::yield_now().await
+                  }
+                  Ok(Some(piece)) if !piece.is_empty() => break piece,
+                  _ => return None,
+                }
+              };
+              let want = usize::try_from(end.saturating_sub(at)).unwrap_or(usize::MAX);
+              let taken = piece.get(..want.min(piece.len())).unwrap_or_default();
+              bytes.extend_from_slice(taken);
+              at = at.saturating_add(u64::try_from(taken.len()).unwrap_or(u64::MAX));
+            }
+            Some(bytes)
+          })
+          .ok()
+          .flatten()
+      })
+      .join()
+      .ok()
+      .flatten()
+  })
+}
+
 /// The principal the Subversion helpers below act as: uid 1234 on host 0, as the store tests' owner.
 pub(crate) fn svn_owner() -> slates_db::catalog::Principal {
   slates_db::catalog::Principal::Uid {

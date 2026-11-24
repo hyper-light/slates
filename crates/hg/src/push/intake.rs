@@ -475,10 +475,13 @@ struct Taker {
 
 /// A push's kept texts cut into segments as they are taken (main 01a20182's ruling (b1) of 2026-11-22 04:44: a push
 /// lands as a run of segment changesets, as an import does): each segment the revisions whose deltas lie in a slice of
-/// at least `bound` bytes of the changegroup, so the push holds one segment's texts at a time, never the whole list.
+/// at least `slice_bound` bytes of the changegroup, or whose resident stored bytes in the content store reach
+/// `resident_bound`, so the push holds one bounded segment at a time, never the whole list.
 struct Cutting {
   /// The least bytes of the changegroup a segment is cut at.
-  bound: u64,
+  slice_bound: u64,
+  /// The least resident stored bytes in the content store a segment is cut at.
+  resident_bound: u64,
   /// The segment being cut: where its slice of the changegroup begins and ends, each log's kept revisions in it, their
   /// texts, and what those texts charged.
   open: Option<Open>,
@@ -487,19 +490,21 @@ struct Cutting {
 }
 
 impl Cutting {
-  /// Notes `kept`, revision `rev` of `log` in the fork, its text charged `charged`; cuts the segment once its slice
-  /// reaches the bound.
+  /// Notes `kept`, revision `rev` of `log` in the fork, its text charged `charged` and holding
+  /// `stored_bytes` in the content store; cuts the segment once either its slice reaches
+  /// `slice_bound` or its resident stored bytes reach `resident_bound`.
   fn kept(
     &mut self,
     (log, rev): (LogOf, u32),
     kept: KeptText,
-    (charged, contents): (u64, Option<FileContents>),
+    (charged, stored_bytes, contents): (u64, u64, Option<FileContents>),
   ) {
     let open = self.open.get_or_insert_with(|| Open {
       slice: kept.place.start..kept.place.end,
       ranges: Vec::new(),
       texts: Vec::new(),
       charged: 0,
+      text_bytes: 0,
       contents: Vec::new(),
     });
     open.contents.extend(contents);
@@ -509,8 +514,14 @@ impl Cutting {
       _ => open.ranges.push((log, rev, rev.saturating_add(1))),
     }
     open.charged = open.charged.saturating_add(charged);
+    open.text_bytes = open.text_bytes.saturating_add(stored_bytes);
     open.texts.push(kept);
-    if open.slice.end.saturating_sub(open.slice.start) >= self.bound {
+    // Cut once either the changegroup slice reaches `slice_bound` or the resident stored bytes
+    // held in the content store reach `resident_bound`: small file deltas over large files
+    // otherwise accumulate hundreds of megabytes of resident full texts in a single segment.
+    if open.slice.end.saturating_sub(open.slice.start) >= self.slice_bound
+      || open.text_bytes >= self.resident_bound
+    {
       self.cut();
     }
   }
@@ -549,6 +560,8 @@ struct Open {
   texts: Vec<KeptText>,
   /// What their texts charged the push's admission.
   charged: u64,
+  /// The sum of unpacked text lengths held in the content store by revisions in this open segment.
+  text_bytes: u64,
   /// Its file revisions as the content store keeps them.
   contents: Vec<FileContents>,
 }
@@ -875,7 +888,7 @@ impl crate::render::StoreWants for Intake {
       None => {
         asked.want = None;
         asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
-          log: LogOf::File(asked.path.clone()),
+          log: log_of_asked_path(&asked.path),
           node: asked.node,
           base: asked.node,
         }));
@@ -897,7 +910,7 @@ impl crate::render::StoreWants for Intake {
     asked.text = texts.into_iter().next();
     if asked.text.is_none() {
       asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
-        log: LogOf::File(asked.path.clone()),
+        log: log_of_asked_path(&asked.path),
         node: asked.node,
         base: asked.node,
       }));
@@ -1013,11 +1026,19 @@ impl Intake {
     })
   }
 
-  /// The intake, its kept texts cut into segments of at least `bound` bytes of the changegroup as they are taken
-  /// ([`Intake::take_segment`]), never held whole (main's ruling (b1)).
-  pub fn cutting(mut self, bound: u64) -> Self {
+  /// The intake, its kept texts cut into segments of at least `bound` bytes of the changegroup (or `bound` resident
+  /// stored bytes) as they are taken ([`Intake::take_segment`]), never held whole (main's ruling (b1)).
+  pub fn cutting(self, bound: u64) -> Self {
+    self.cutting_with_resident(bound, bound)
+  }
+
+  /// The intake, its kept texts cut into segments at `slice_bound` bytes of the changegroup or `resident_bound` bytes
+  /// of resident content-store texts, decoupling on-disk compressed changegroup slice size from in-memory unpacked text
+  /// flush size.
+  pub fn cutting_with_resident(mut self, slice_bound: u64, resident_bound: u64) -> Self {
     self.taker.cutting = Some(Cutting {
-      bound: bound.max(1),
+      slice_bound: slice_bound.max(1),
+      resident_bound: resident_bound.max(1),
       open: None,
       ready: VecDeque::new(),
     });
@@ -1054,6 +1075,15 @@ impl Intake {
     if let Some(cutting) = self.taker.cutting.as_mut() {
       cutting.cut();
     }
+  }
+
+  /// Whether at least one cut segment is ready to be taken and landed ([`Intake::take_segment`]).
+  pub fn has_segment(&self) -> bool {
+    self
+      .taker
+      .cutting
+      .as_ref()
+      .is_some_and(|cutting| !cutting.ready.is_empty())
   }
 
   /// Takes the next unit of the changegroup whose bytes are `payload`, the ones it began with (module docs). Refused,
@@ -1151,7 +1181,10 @@ impl Intake {
 }
 
 impl Taker {
-  /// Takes `next` of `log`, or moves to `after` where its group has no more.
+  /// Takes `next` of `log` (`Log::Changelog` or `Log::Manifest`), or moves to `after` where its
+  /// group has no more. If a delta base or the previous manifest needed to delta-encode the first
+  /// incoming manifest was let go to the changeset store (goal 93 C1 (1)), asks the store between
+  /// steps (`Stepped::Store`).
   fn take_or(
     &mut self,
     next: Option<(Revision<'_>, Range<u64>)>,
@@ -1163,6 +1196,52 @@ impl Taker {
       self.enter(after);
       return Ok(Stepped::More);
     };
+    let kept_before =
+      self.brought.contains(&revision.node) || self.fork.rev(store, log, &revision.node).is_some();
+    // For a non-empty manifest log, `HgIndex::append_revisions_after` needs the previous manifest's
+    // text to delta-encode the first incoming manifest. If it (or its delta base chain) was let go
+    // (`Kept::Away`) and is not in `self.last`, resolve it via the changeset store before taking.
+    if !kept_before
+      && log == Log::Manifest
+      && let Some((prev_rev, prev_node)) = self
+        .fork
+        .len(store, Log::Manifest)
+        .checked_sub(1)
+        .and_then(|prev_rev| {
+          let row = self.fork.revision(store, Log::Manifest, prev_rev)?;
+          let already_last = self.last.as_ref().is_some_and(|(n, _)| *n == row.node);
+          (!already_last
+            && self
+              .fork
+              .revision_text(store, Log::Manifest, prev_rev)
+              .is_none())
+          .then_some((prev_rev, row.node))
+        })
+    {
+      match self.resolve_stored_log_text(Log::Manifest, prev_rev, store, admission)? {
+        Some(text) => {
+          if let Some((_, old)) = self.last.replace((prev_node, text)) {
+            self.spares.give(old);
+          }
+        }
+        None => return Ok(Stepped::Store),
+      }
+    }
+    // If the incoming delta rests on a revision the fork holds whose text (or manifest delta base
+    // chain) was let go, resolve it by fetching the first let-go ancestor from the changeset store
+    // and applying any resident suffix deltas in memory.
+    let given = if !kept_before
+      && revision.base != NULL_NODE
+      && self.base_text(log, &revision, store).is_none()
+      && let Some(base_rev) = self.fork.rev(store, log, &revision.base)
+    {
+      match self.resolve_stored_log_text(log, base_rev, store, admission)? {
+        Some(text) => Some(text),
+        None => return Ok(Stepped::Store),
+      }
+    } else {
+      None
+    };
     let after = match self.stage {
       Stage::Changelog(at) => Stage::Changelog(at.saturating_add(1)),
       Stage::Manifests(at) => Stage::Manifests(at.saturating_add(1)),
@@ -1172,13 +1251,139 @@ impl Taker {
     if self.take(
       log,
       (&revision, place),
-      None,
+      given,
       (store, admission),
       (after, None),
     )? {
       self.stage = after;
     }
     Ok(Stepped::More)
+  }
+
+  /// Reconstructs the full text of `target_rev` in `log` (`Log::Changelog` or `Log::Manifest`)
+  /// when its windows (or a manifest delta ancestor's windows) were let go to the changeset store:
+  /// walks backwards across any resident unlanded manifest deltas until the first let-go ancestor
+  /// (which is guaranteed landed on the changeset store), fetches that ancestor via
+  /// [`Self::ask_stored_text`], and applies the resident delta suffix in memory.
+  fn resolve_stored_log_text(
+    &mut self,
+    log: Log<'_>,
+    target_rev: u32,
+    store: &ContentStore,
+    admission: &mut Admission,
+  ) -> Result<Option<Vec<u8>>, Refused> {
+    if log == Log::Changelog {
+      let Some(row) = self.fork.changeset(store, target_rev) else {
+        return Err(
+          Unverified::UnknownDeltaBase {
+            log: LogOf::Changelog,
+            node: NULL_NODE,
+            base: NULL_NODE,
+          }
+          .into(),
+        );
+      };
+      return self.ask_stored_text(CHANGELOG_PATH, row.node, admission);
+    }
+    let mut cursor = target_rev;
+    let mut deltas: Vec<Vec<u8>> = Vec::new();
+    let base_text = loop {
+      let Some(row) = self.fork.revision(store, Log::Manifest, cursor) else {
+        return Err(
+          Unverified::UnknownDeltaBase {
+            log: LogOf::Manifests,
+            node: NULL_NODE,
+            base: NULL_NODE,
+          }
+          .into(),
+        );
+      };
+      if row.base != NONE && row.stored == 0 {
+        cursor = row.base;
+        continue;
+      }
+      if row.base == NONE && row.len == 0 {
+        break Vec::new();
+      }
+      if !store.holds_whole(&row.bytes) {
+        let Some(text) = self.ask_stored_text(MANIFEST_PATH, row.node, admission)? else {
+          return Ok(None);
+        };
+        break text;
+      }
+      let bytes_len = if row.base == NONE {
+        row.len
+      } else {
+        row.stored
+      };
+      let Some(bytes) = store.object_bytes(&row.bytes, bytes_len) else {
+        return Err(
+          Unverified::UnknownDeltaBase {
+            log: LogOf::Manifests,
+            node: row.node,
+            base: row.node,
+          }
+          .into(),
+        );
+      };
+      if row.base == NONE {
+        break bytes;
+      }
+      deltas.push(bytes);
+      cursor = row.base;
+    };
+    let mut text = base_text;
+    let mut room = *admission;
+    while let Some(delta_bytes) = deltas.pop() {
+      text = delta::apply(&text, &delta_bytes, &mut room).map_err(|fault| Unverified::Delta {
+        log: LogOf::Manifests,
+        node: NULL_NODE,
+        fault,
+      })?;
+    }
+    Ok(Some(text))
+  }
+
+  /// Fetches `(path, node)`'s full text from the changeset store via `self.asked`: returns
+  /// `Ok(Some(text))` once answered, `Ok(None)` when `Stepped::Store` must be returned first.
+  fn ask_stored_text(
+    &mut self,
+    path: &[u8],
+    node: Node,
+    admission: &mut Admission,
+  ) -> Result<Option<Vec<u8>>, Refused> {
+    match self.asked.take() {
+      Some(asked) if asked.node == node && asked.path == path => {
+        if let Some(refused) = asked.refused {
+          return Err(refused);
+        }
+        match asked.text {
+          Some(text) => {
+            self.intaken.base_store_reads = self.intaken.base_store_reads.saturating_add(1);
+            let mut room = *admission;
+            room.charge(to_u64(text.len()))?;
+            Ok(Some(text))
+          }
+          None => {
+            self.asked = Some(asked);
+            Ok(None)
+          }
+        }
+      }
+      _ => {
+        self.asked = Some(StoreAsk {
+          path: path.to_vec(),
+          node,
+          want: Some(crate::render::Want::Rows {
+            logs: vec![(path.to_vec(), vec![node])],
+          }),
+          most: admission.left(),
+          text: None,
+          refused: None,
+        });
+        Ok(None)
+      }
+    }
   }
 
   /// One step of the file groups: a group opened (its path read, audited and kept, charged to `admission`), then its
@@ -1672,21 +1877,58 @@ impl Taker {
     match self.cutting.as_mut() {
       Some(cutting) => {
         let rev = self.fork.len(store, log).saturating_sub(1);
-        let contents = match log {
-          Log::File(_) => self.fork.revision(store, log, rev).map(|row| FileContents {
-            path: path.to_vec(),
-            node: revision.node,
-            bytes: row.bytes,
-            block: row.block,
+        let (contents, stored_bytes) = match log {
+          Log::File(_) => self
+            .fork
+            .revision(store, log, rev)
+            .map_or((None, 0), |row| {
+              (
+                Some(FileContents {
+                  path: path.to_vec(),
+                  node: revision.node,
+                  bytes: row.bytes,
+                  block: row.block,
+                }),
+                row.len,
+              )
+            }),
+          Log::Changelog => self.fork.changeset(store, rev).map_or((None, 0), |row| {
+            (
+              Some(FileContents {
+                path: CHANGELOG_PATH.to_vec(),
+                node: revision.node,
+                bytes: row.text,
+                block: None,
+              }),
+              row.len,
+            )
           }),
-          Log::Changelog | Log::Manifest => None,
+          Log::Manifest => self
+            .fork
+            .revision(store, log, rev)
+            .map_or((None, 0), |row| {
+              let stored = if row.base != NONE {
+                row.stored
+              } else {
+                row.len
+              };
+              (
+                Some(FileContents {
+                  path: MANIFEST_PATH.to_vec(),
+                  node: revision.node,
+                  bytes: row.bytes,
+                  block: None,
+                }),
+                stored,
+              )
+            }),
         };
         let charged = to_u64(size_of::<KeptText>())
           .saturating_add(to_u64(path.len()))
           .saturating_add(contents.as_ref().map_or(0, |contents| {
             to_u64(size_of::<FileContents>()).saturating_add(to_u64(contents.path.len()))
           }));
-        cutting.kept((log_of(log), rev), kept, (charged, contents));
+        cutting.kept((log_of(log), rev), kept, (charged, stored_bytes, contents));
       }
       None => self.intaken.texts.push(kept),
     }
@@ -2024,6 +2266,11 @@ pub struct Rebase {
   logged: bool,
   /// What the push brings over the index as it is now.
   intaken: Intaken,
+  /// A let-go manifest text asked of the changeset store when another push slipped between this
+  /// push's stale fork and the current index (goal 93 C1 (1)).
+  asked: Option<StoreAsk>,
+  /// Cached manifest texts fetched for the current rebase step (at most 2: `prev` and `target`).
+  fetched_manifests: BTreeMap<Node, Vec<u8>>,
 }
 
 impl Rebase {
@@ -2055,6 +2302,8 @@ impl Rebase {
       at: (0, 0),
       logged: false,
       intaken,
+      asked: None,
+      fetched_manifests: BTreeMap::new(),
     })
   }
 
@@ -2069,9 +2318,12 @@ impl Rebase {
     if rev >= self.stale.len(store, log) {
       self.at = (at.saturating_add(1), 0);
       self.logged = false;
+      self.fetched_manifests.clear();
       return Ok(Stepped::More);
     }
-    self.again(log, &named, rev, store)?;
+    if !self.again(log, &named, rev, store)? {
+      return Ok(Stepped::Store);
+    }
     self.at = (at, rev.saturating_add(1));
     Ok(Stepped::More)
   }
@@ -2098,86 +2350,351 @@ impl Rebase {
     stale.and(fork)
   }
 
+  /// Resolves a manifest's text in `index` at `rev` using resident deltas and `fetched_manifests`,
+  /// asking the changeset store via `self.asked` if a let-go ancestor is reached.
+  fn manifest_text_or_ask(
+    &mut self,
+    use_fork: bool,
+    rev: u32,
+    store: &ContentStore,
+  ) -> Result<Option<Vec<u8>>, Unindexed> {
+    let index = if use_fork { &self.fork } else { &self.stale };
+    let mut cursor = rev;
+    let mut deltas = Vec::new();
+    let base_text = loop {
+      let row = index
+        .revision(store, Log::Manifest, cursor)
+        .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+      if let Some(cached) = self.fetched_manifests.get(&row.node) {
+        break cached.clone();
+      }
+      if row.base != NONE && row.stored == 0 {
+        cursor = row.base;
+        continue;
+      }
+      if row.base == NONE && row.len == 0 {
+        break Vec::new();
+      }
+      if !store.holds_whole(&row.bytes) {
+        // Fetch this let-go ancestor from `MANIFEST_PATH`.
+        match self.asked.take() {
+          Some(asked) if asked.node == row.node && asked.path == MANIFEST_PATH => {
+            if asked.refused.is_some() {
+              return Err(Unindexed::Index(crate::index::Refused::Unread { rev }));
+            }
+            match asked.text {
+              Some(text) => {
+                self.fetched_manifests.insert(row.node, text.clone());
+                break text;
+              }
+              None => {
+                self.asked = Some(asked);
+                return Ok(None);
+              }
+            }
+          }
+          _ => {
+            self.asked = Some(StoreAsk {
+              path: MANIFEST_PATH.to_vec(),
+              node: row.node,
+              want: Some(crate::render::Want::Rows {
+                logs: vec![(MANIFEST_PATH.to_vec(), vec![row.node])],
+              }),
+              most: row.len,
+              text: None,
+              refused: None,
+            });
+            return Ok(None);
+          }
+        }
+      }
+      let bytes_len = if row.base == NONE {
+        row.len
+      } else {
+        row.stored
+      };
+      let bytes = store
+        .object_bytes(&row.bytes, bytes_len)
+        .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+      if row.base == NONE {
+        break bytes;
+      }
+      deltas.push(bytes);
+      cursor = row.base;
+    };
+    let mut text = base_text;
+    while let Some(delta_bytes) = deltas.pop() {
+      let mut room = Admission::new(u64::MAX);
+      text = delta::apply(&text, &delta_bytes, &mut room)
+        .map_err(|_| Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+    }
+    Ok(Some(text))
+  }
+
   /// Appends the stale fork's revision `rev` of `log` to the fork, by node; passed over where the fork holds it.
+  /// Returns `Ok(false)` when paused on `self.asked` (`Stepped::Store`).
   fn again(
     &mut self,
     log: Log<'_>,
     named: &LogOf,
     rev: u32,
     store: &mut ContentStore,
-  ) -> Result<(), Unindexed> {
-    let kept = crate::import::record::kept(&self.stale, store, log, rev).ok_or(
-      Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE }),
-    )?;
-    let node = kept.node;
-    if self.fork.rev(store, log, &node).is_some() {
-      self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
-      if log == Log::Changelog {
-        self.intaken.held_changesets.push(node);
-      }
-      return Ok(());
-    }
-    if !self.logged {
-      self
-        .intaken
-        .logs
-        .push((named.clone(), self.fork.len(store, log)));
-      self.logged = true;
-    }
+  ) -> Result<bool, Unindexed> {
+    let missing = || Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE });
     if log == Log::Changelog {
-      let row = self.stale.changeset(store, rev).ok_or(Unindexed::Index(
-        crate::index::Refused::MissingLink { node },
-      ))?;
+      let row = self.stale.changeset(store, rev).ok_or_else(missing)?;
+      let node = row.node;
+      if self.fork.rev(store, log, &node).is_some() {
+        self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
+        self.intaken.held_changesets.push(node);
+        return Ok(true);
+      }
+      let parent = |num: u32| -> Option<Node> {
+        if num == NONE {
+          Some(NULL_NODE)
+        } else {
+          self.stale.changeset(store, num).map(|r| r.node)
+        }
+      };
+      let p1 = parent(row.p1).ok_or_else(missing)?;
+      let p2 = parent(row.p2).ok_or_else(missing)?;
+      let flags = row.flags;
+      let len = row.len;
+      let text = row.text;
+      let manifest = row.manifest;
+      let closed = row.closed;
       let branch = row.branch.to_vec();
+      if !self.logged {
+        self
+          .intaken
+          .logs
+          .push((named.clone(), self.fork.len(store, log)));
+        self.logged = true;
+      }
       let again = crate::index::NewChangeset {
         node,
-        p1: kept.p1,
-        p2: kept.p2,
-        flags: kept.flags,
-        len: kept.len,
-        text: row.text,
-        manifest: row.manifest,
-        closed: row.closed,
+        p1,
+        p2,
+        flags,
+        len,
+        text,
+        manifest,
+        closed,
         branch: &branch,
       };
       self.fork.append_changesets(store, &[again])?;
       self.intaken.changesets.push(node);
-    } else {
-      let row = self
-        .stale
-        .revision(store, log, rev)
-        .ok_or(Unindexed::Index(crate::index::Refused::MissingLink {
-          node,
-        }))?;
-      // A manifest kept as a delta against the stale fork's previous one (A-729) is appended again by its text, which
-      // the fork keeps as its own delta against its previous one.
-      let rebuilt = if row.base == crate::index::NONE {
-        None
+      self.intaken.kept = self.intaken.kept.saturating_add(1);
+      return Ok(true);
+    }
+    let row = self.stale.revision(store, log, rev).ok_or_else(missing)?;
+    let node = row.node;
+    if self.fork.rev(store, log, &node).is_some() {
+      self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
+      return Ok(true);
+    }
+    let parent = |num: u32| -> Option<Node> {
+      if num == NONE {
+        Some(NULL_NODE)
       } else {
-        let text = self
+        self.stale.revision(store, log, num).map(|r| r.node)
+      }
+    };
+    let p1 = parent(row.p1).ok_or_else(missing)?;
+    let p2 = parent(row.p2).ok_or_else(missing)?;
+    let link = self
+      .stale
+      .changeset(store, row.link)
+      .map(|r| r.node)
+      .ok_or_else(missing)?;
+    let flags = row.flags;
+    let len = row.len;
+    let stored_len = row.stored;
+    let chain = row.chain;
+    let row_base = row.base;
+    let row_bytes = row.bytes;
+    let row_block = row.block;
+    let base_node = (row_base != NONE)
+      .then(|| {
+        self
           .stale
-          .revision_text(store, log, rev)
-          .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
-        Some(store.put_object(&text)?)
-      };
+          .revision(store, log, row_base)
+          .map(|base_row| base_row.node)
+      })
+      .flatten();
+    let as_stored = match (log, base_node) {
+      (Log::Manifest, Some(base_node)) => self
+        .fork
+        .len(store, log)
+        .checked_sub(1)
+        .and_then(|last| Some((last, self.fork.revision(store, log, last)?)))
+        .and_then(|(last, last_row)| {
+          let new_chain = last_row.chain.saturating_add(stored_len);
+          (last_row.node == base_node && new_chain <= len).then_some((last, stored_len, new_chain))
+        }),
+      (Log::Manifest, None) if self.fork.len(store, log) == 0 || !store.holds_whole(&row_bytes) => {
+        Some((NONE, stored_len, chain))
+      }
+      _ => None,
+    };
+    if let Some(stored) = as_stored {
+      if !self.logged {
+        self
+          .intaken
+          .logs
+          .push((named.clone(), self.fork.len(store, log)));
+        self.logged = true;
+      }
       let again = crate::index::NewRevision {
         node,
-        p1: kept.p1,
-        p2: kept.p2,
-        link: kept.link.unwrap_or(NULL_NODE),
-        flags: kept.flags,
-        len: kept.len,
-        bytes: rebuilt.unwrap_or(row.bytes),
-        block: row.block,
+        p1,
+        p2,
+        link,
+        flags,
+        len,
+        bytes: row_bytes,
+        block: row_block,
       };
-      let appended = self.fork.append_revisions(store, log, &[again]);
-      if let Some(put) = rebuilt {
-        store.release(&put)?;
+      self.fork.append_stored(store, log, &[(again, stored)])?;
+    } else if log == Log::Manifest {
+      // Another push slipped between the stale fork and the current index: resolve both this
+      // manifest and the current fork's last manifest (asking `vcs_disk` if either was let go),
+      // then re-delta against the fork's last manifest.
+      let Some(target_text) = self.manifest_text_or_ask(false, rev, store)? else {
+        return Ok(false);
+      };
+      let prev = match self.fork.len(store, Log::Manifest).checked_sub(1) {
+        Some(prev_rev) => {
+          let prev_node = self
+            .fork
+            .revision(store, Log::Manifest, prev_rev)
+            .ok_or(Unindexed::Index(crate::index::Refused::Unread {
+              rev: prev_rev,
+            }))?
+            .node;
+          let Some(prev_text) = self.manifest_text_or_ask(true, prev_rev, store)? else {
+            return Ok(false);
+          };
+          Some((prev_node, prev_text))
+        }
+        None => None,
+      };
+      if !self.logged {
+        self
+          .intaken
+          .logs
+          .push((named.clone(), self.fork.len(store, log)));
+        self.logged = true;
       }
+      let put = store.put_object(&target_text)?;
+      let again = crate::index::NewRevision {
+        node,
+        p1,
+        p2,
+        link,
+        flags,
+        len,
+        bytes: put,
+        block: row_block,
+      };
+      let previous = prev.as_ref().map(|(n, t)| (n, t.as_slice()));
+      let given = [(node, target_text.as_slice())];
+      let appended = self
+        .fork
+        .append_revisions_after(store, log, &[again], (previous, &given));
+      store.release(&put)?;
       appended?;
+      self.fetched_manifests.insert(node, target_text);
+    } else {
+      if !self.logged {
+        self
+          .intaken
+          .logs
+          .push((named.clone(), self.fork.len(store, log)));
+        self.logged = true;
+      }
+      let again = crate::index::NewRevision {
+        node,
+        p1,
+        p2,
+        link,
+        flags,
+        len,
+        bytes: row_bytes,
+        block: row_block,
+      };
+      self.fork.append_revisions(store, log, &[again])?;
     }
     self.intaken.kept = self.intaken.kept.saturating_add(1);
-    Ok(())
+    Ok(true)
+  }
+}
+
+impl crate::render::StoreWants for Rebase {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.asked.as_ref().and_then(|asked| asked.want.as_ref())
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    let Some(asked) = self.asked.as_mut() else {
+      return;
+    };
+    match rows
+      .into_iter()
+      .next()
+      .and_then(|log| log.into_iter().next())
+      .flatten()
+    {
+      Some(row) => {
+        asked.want = Some(crate::render::Want::Texts {
+          texts: vec![row.text],
+          most: asked.most,
+        });
+      }
+      None => {
+        asked.want = None;
+        asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
+          log: log_of_asked_path(&asked.path),
+          node: asked.node,
+          base: asked.node,
+        }));
+      }
+    }
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.want = None;
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    let Some(asked) = self.asked.as_mut() else {
+      return;
+    };
+    asked.want = None;
+    asked.text = texts.into_iter().next();
+    if asked.text.is_none() {
+      asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
+        log: log_of_asked_path(&asked.path),
+        node: asked.node,
+        base: asked.node,
+      }));
+    }
+  }
+
+  fn reads_bases(&self) -> bool {
+    true
+  }
+
+  fn texts_past(&mut self) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.want = None;
+      asked.refused = Some(Refused::from(crate::PastAdmission {
+        asked: asked.most.saturating_add(1),
+        left: asked.most,
+      }));
+    }
   }
 }
 
@@ -2187,6 +2704,18 @@ fn log_named(named: &LogOf) -> Log<'_> {
     LogOf::Changelog => Log::Changelog,
     LogOf::Manifests => Log::Manifest,
     LogOf::File(path) => Log::File(path),
+  }
+}
+
+/// The `LogOf` corresponding to a `Texts` section path (`CHANGELOG_PATH`, `MANIFEST_PATH`, or a
+/// file path).
+fn log_of_asked_path(path: &[u8]) -> LogOf {
+  if path == CHANGELOG_PATH {
+    LogOf::Changelog
+  } else if path == MANIFEST_PATH {
+    LogOf::Manifests
+  } else {
+    LogOf::File(path.to_vec())
   }
 }
 

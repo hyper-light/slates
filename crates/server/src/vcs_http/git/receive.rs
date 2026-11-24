@@ -405,25 +405,17 @@ impl<L: ShardLender> Receive<L> {
         .map_err(Cut::Failed)?;
       match step {
         Answering::Answered(received) => {
-          // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
-          // out after, or each command it applied is reported `ng`, never lost with its owner nor cut off.
           drop(turn);
-          if silent_until.is_some() {
-            let mark = lender
-              .lend(|state| crate::state_log::push_progress(state, repository))
-              .ok_or_else(unavailable)?;
-            *held_report = Some(HeldReport {
-              report: given.split_off(before),
-              received,
-              waited: crate::state_log::Waited::new(mark),
-            });
-            continue;
+          if finish_answered(
+            lender,
+            repository,
+            (received, before, silent_until),
+            (held_report, given),
+          )
+          .await?
+          {
+            return Ok(true);
           }
-          if !crate::state_log::names_committed_within(repository).await {
-            given.truncate(before);
-            given.extend_from_slice(&crate::git_push::uncommitted_report(&received));
-          }
-          return Ok(true);
         }
         Answering::Turned => {
           // A-864's push readers: a base or object a turn met in a let-go window is brought back before the next turn.
@@ -433,16 +425,7 @@ impl<L: ShardLender> Receive<L> {
           // before the keepalive's return, so an ask made in the step the keepalive came due in is never left untaken
           // (which refuses the push, C5 part 2b).
           if let Some(asked) = push.take_homing() {
-            let (origin, shards) = lender
-              .lend(|state| (state.shard, state.shards.clone()))
-              .ok_or_else(unavailable)?;
-            let (sent_back, outcome) = slates_rt::sync::channel(1).map_err(|_| unavailable())?;
-            slates_rt::futures::spawn_detached(async move {
-              let carried = crate::git_push::carry(origin, &shards, asked).await;
-              let _ = sent_back.try_send(carried);
-            })
-            .map_err(|_| unavailable())?;
-            *carrying = Some(outcome);
+            *carrying = Some(spawn_homing(lender, asked)?);
           }
           let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
           if due || *sent < given.len() && silent_until.is_some() {
@@ -463,6 +446,51 @@ impl<L: ShardLender> Receive<L> {
       }
     }
   }
+}
+
+/// Holds or commits an answered push report at `f + 1` (§4.8's commit rule; A-724 piece 8c).
+/// Returns `Ok(true)` when the report is finalized in `given`, or `Ok(false)` when stashed in
+/// `held_report` to continue under keepalive pacing.
+async fn finish_answered<L: ShardLender>(
+  lender: &mut L,
+  repository: slates_db::catalog::RepositoryId,
+  (received, before, silent_until): (Box<slates_git::receive::Received>, usize, Option<u64>),
+  (held_report, given): (&mut Option<HeldReport>, &mut Vec<u8>),
+) -> Result<bool, Cut> {
+  if silent_until.is_some() {
+    let mark = lender
+      .lend(|state| crate::state_log::push_progress(state, repository))
+      .ok_or(Cut::Unserved)?;
+    *held_report = Some(HeldReport {
+      report: given.split_off(before),
+      received,
+      waited: crate::state_log::Waited::new(mark),
+    });
+    return Ok(false);
+  }
+  if !crate::state_log::names_committed_within(repository).await {
+    given.truncate(before);
+    given.extend_from_slice(&crate::git_push::uncommitted_report(&received));
+  }
+  Ok(true)
+}
+
+/// Spawns a detached task carrying `asked` off the shard's step and returns its outcome channel.
+fn spawn_homing<L: ShardLender>(
+  lender: &mut L,
+  asked: crate::git_push::Carry,
+) -> Result<slates_rt::sync::ChannelReceiver<crate::git_push::Carried>, Cut> {
+  let unavailable = || Cut::Unserved;
+  let (origin, shards) = lender
+    .lend(|state| (state.shard, state.shards.clone()))
+    .ok_or_else(unavailable)?;
+  let (sent_back, outcome) = slates_rt::sync::channel(1).map_err(|_| unavailable())?;
+  slates_rt::futures::spawn_detached(async move {
+    let carried = crate::git_push::carry(origin, &shards, asked).await;
+    let _ = sent_back.try_send(carried);
+  })
+  .map_err(|_| unavailable())?;
+  Ok(outcome)
 }
 
 /// Why the driver did not start a push, as the site refuses it (the module doc, "Refusals").

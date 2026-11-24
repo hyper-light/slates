@@ -196,6 +196,12 @@ pub trait PushObjects {
   fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable>;
   /// The bytes of the blob `id`.
   fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable>;
+  /// The content-plane identity of the blob `id` where the store already keeps its plain bytes
+  /// under that BLAKE3 identity (A-760): a whole-file write then names the run instead of copying
+  /// the blob's bytes into the increment's post-state and green heap. None by default (inline).
+  fn blob_named(&self, _id: ObjectKey) -> Option<crate::named::Identity> {
+    None
+  }
 }
 
 /// A tree's entries read an entry a unit ([`PushObjects::listing`]; A-752 part 2b): listed whole, or the tree's bytes
@@ -777,11 +783,12 @@ impl Building {
         };
         match laid {
           None => Stage::Post(posting),
-          Some((doc, post_state, reads)) => Stage::Identity(Box::new(Hashing::new(
+          Some(posted) => Stage::Identity(Box::new(Hashing::new(
             (&self.push.name, self.push.base_version),
-            doc,
-            post_state,
-            reads,
+            posted.doc,
+            posted.post_state,
+            posted.named,
+            posted.reads,
           ))),
         }
       }
@@ -1406,14 +1413,35 @@ struct Posting {
   plan: PostStatePlan,
   /// The walk's files, links and reads.
   walk: Walk,
-  /// The post-state so far.
+  /// The post-state so far (inline bytes only when named runs are present).
   post: Vec<u8>,
+  /// Named runs for whole-file blobs the store already holds in the content plane (A-760).
+  named: crate::named::Named,
+  /// Operation indices whose whole-file bytes are named rather than laid inline, in op order.
+  named_ops: Vec<(usize, crate::named::Identity)>,
+  /// Operation indices that stay inline, paired with their original `op.src`, in op order.
+  inline_ops: Vec<(usize, u64)>,
+  /// Cursor into `named_ops` during the laying phase.
+  named_cursor: usize,
   /// Its length once laid; none until the operations have been read for it.
   size: Option<usize>,
   /// The end found so far.
   end: u64,
   /// The next operation.
   at: usize,
+}
+
+/// The finished result of [`Posting::unit`]: the compacted document, inline post-state bytes,
+/// named whole-file runs, and walk read counts.
+struct Posted {
+  /// The composed operations document.
+  doc: OpsDoc,
+  /// Inline post-state bytes (excluding named runs).
+  post_state: Vec<u8>,
+  /// Whole-file runs backed by external named objects.
+  named: crate::named::Named,
+  /// What the walk read.
+  reads: Reads,
 }
 
 impl Posting {
@@ -1424,6 +1452,10 @@ impl Posting {
       plan,
       walk,
       post: Vec::new(),
+      named: crate::named::Named::default(),
+      named_ops: Vec::new(),
+      inline_ops: Vec::new(),
+      named_cursor: 0,
       size: None,
       end: 0,
       at: 0,
@@ -1431,24 +1463,87 @@ impl Posting {
   }
 
   /// One unit: the length found an operation a unit, the post-state zeroed a copy slice a unit, then each operation's run
-  /// laid. The document, the post-state and the reads once laid. Its length was charged as the walk made the runs.
+  /// laid. The document, the post-state, any named runs, and the reads once laid. Its length was charged as the walk made
+  /// the runs.
   fn unit<O: PushObjects + ?Sized>(
     &mut self,
     objects: &O,
     head: Option<&[u8]>,
     slices: Slices,
-  ) -> Result<Option<(OpsDoc, Vec<u8>, Reads)>, PushRefused> {
+  ) -> Result<Option<Posted>, PushRefused> {
     let Some(size) = self.size else {
-      match self.doc.ops.get(self.at) {
+      match self.doc.ops.get(self.at).copied() {
         Some(op) => {
           if op.src != u64::MAX && adds_bytes(op.kind) {
-            self.end = self.end.max(op.src.saturating_add(op.len));
+            let named_id = matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend)
+              .then(|| {
+                if op.len == 0 || self.plan.get(&op.src) != Some(&0) {
+                  return None;
+                }
+                let path = self.doc.paths.path(op.path)?;
+                let (id, said) = self.walk.contents.get(path).copied()?;
+                if op.len != said {
+                  return None;
+                }
+                let identity = objects.blob_named(id)?;
+                (identity.len == said).then_some(identity)
+              })
+              .flatten();
+            match named_id {
+              Some(identity) => self.named_ops.push((self.at, identity)),
+              None => {
+                self.inline_ops.push((self.at, op.src));
+                self.end = self.end.max(op.src.saturating_add(op.len));
+              }
+            }
           }
           self.at = self.at.saturating_add(1);
         }
         None => {
-          let size = usize::try_from(self.end).map_err(|_| PushRefused::PastRoom {
-            asked: self.end,
+          let inline_end = if self.named_ops.is_empty() {
+            self.end
+          } else {
+            // Compact inline runs first, then place named runs right after them so `op.src` stays
+            // one contiguous address space (`crate::named`: inline bytes, then each named run).
+            let mut inline_cursor = 0u64;
+            let mut new_plan = PostStatePlan::new();
+            for &(idx, old_src) in &self.inline_ops {
+              if let Some(op) = self.doc.ops.get_mut(idx) {
+                let new_src = inline_cursor;
+                if let Some(&from) = self.plan.get(&old_src) {
+                  new_plan.insert(new_src, from);
+                }
+                op.src = new_src;
+                inline_cursor = inline_cursor.saturating_add(op.len);
+              }
+            }
+            self.plan = new_plan;
+            self.named.inline_len = inline_cursor;
+            let mut run_cursor = inline_cursor;
+            let mut seen: BTreeMap<crate::named::Identity, u64> = BTreeMap::new();
+            for &(idx, identity) in &self.named_ops {
+              let src = match seen.get(&identity).copied() {
+                Some(src) => src,
+                None => {
+                  let src = run_cursor;
+                  seen.insert(identity, src);
+                  self.named.runs.push(crate::named::NamedRun {
+                    identity,
+                    offset: 0,
+                    len: identity.len,
+                  });
+                  run_cursor = run_cursor.saturating_add(identity.len);
+                  src
+                }
+              };
+              if let Some(op) = self.doc.ops.get_mut(idx) {
+                op.src = src;
+              }
+            }
+            inline_cursor
+          };
+          let size = usize::try_from(inline_end).map_err(|_| PushRefused::PastRoom {
+            asked: inline_end,
             room: self.walk.room,
           })?;
           self.size = Some(size);
@@ -1457,10 +1552,11 @@ impl Posting {
             .post
             .try_reserve_exact(size)
             .map_err(|_| PushRefused::PastRoom {
-              asked: self.end,
+              asked: inline_end,
               room: self.walk.room,
             })?;
           self.at = 0;
+          self.named_cursor = 0;
         }
       }
       return Ok(None);
@@ -1473,12 +1569,27 @@ impl Posting {
       self.post.resize(to, 0);
       return Ok(None);
     }
-    let Some(op) = self.doc.ops.get(self.at).copied() else {
+    let op_index = self.at;
+    let Some(op) = self.doc.ops.get(op_index).copied() else {
       let doc = core::mem::take(&mut self.doc);
-      let post = core::mem::take(&mut self.post);
-      return Ok(Some((doc, post, self.walk.reads)));
+      let post_state = core::mem::take(&mut self.post);
+      let named = core::mem::take(&mut self.named);
+      return Ok(Some(Posted {
+        doc,
+        post_state,
+        named,
+        reads: self.walk.reads,
+      }));
     };
     self.at = self.at.saturating_add(1);
+    if self
+      .named_ops
+      .get(self.named_cursor)
+      .is_some_and(|(idx, _)| *idx == op_index)
+    {
+      self.named_cursor = self.named_cursor.saturating_add(1);
+      return Ok(None);
+    }
     if op.src == u64::MAX {
       return Ok(None);
     }
@@ -1556,14 +1667,18 @@ struct Hashing {
   hasher: blake3::Hasher,
   /// The document.
   doc: OpsDoc,
-  /// The post-state.
+  /// The post-state (inline bytes).
   post_state: Vec<u8>,
+  /// Any named runs carried by identity rather than inline bytes (A-760).
+  named: crate::named::Named,
   /// What the walk read.
   reads: Reads,
   /// The next piece of the document.
   piece: usize,
   /// The post-state's bytes hashed.
   hashed: usize,
+  /// The named runs hashed so far.
+  hashed_runs: usize,
   /// A piece's bytes.
   scratch: Vec<u8>,
 }
@@ -1574,6 +1689,7 @@ impl Hashing {
     (name, base): (&[u8; 32], u64),
     doc: OpsDoc,
     post_state: Vec<u8>,
+    named: crate::named::Named,
     reads: Reads,
   ) -> Hashing {
     let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_CONTEXT);
@@ -1583,9 +1699,11 @@ impl Hashing {
       hasher,
       doc,
       post_state,
+      named,
       reads,
       piece: 0,
       hashed: 0,
+      hashed_runs: 0,
       scratch: Vec::new(),
     }
   }
@@ -1598,18 +1716,44 @@ impl Hashing {
       self.hasher.update(&self.scratch);
       return false;
     }
-    let to = self.post_state.len().min(
-      self.hashed.saturating_add(
-        usize::try_from(slices.hash_bytes)
-          .unwrap_or(usize::MAX)
-          .max(1),
-      ),
-    );
-    if let Some(bytes) = self.post_state.get(self.hashed..to) {
-      self.hasher.update(bytes);
+    if self.hashed < self.post_state.len() || self.named.runs.is_empty() {
+      let to = self.post_state.len().min(
+        self.hashed.saturating_add(
+          usize::try_from(slices.hash_bytes)
+            .unwrap_or(usize::MAX)
+            .max(1),
+        ),
+      );
+      if let Some(bytes) = self.post_state.get(self.hashed..to) {
+        self.hasher.update(bytes);
+      }
+      self.hashed = to;
+      return self.hashed == self.post_state.len() && self.named.runs.is_empty();
     }
-    self.hashed = to;
-    self.hashed == self.post_state.len()
+    if self.hashed_runs == 0 {
+      self
+        .hasher
+        .update(&(self.named.runs.len() as u64).to_le_bytes());
+    }
+    let runs_per_unit = usize::try_from(slices.hash_bytes)
+      .unwrap_or(usize::MAX)
+      .saturating_div(crate::named::RUN_BYTES)
+      .max(1);
+    let to = self
+      .named
+      .runs
+      .len()
+      .min(self.hashed_runs.saturating_add(runs_per_unit));
+    if let Some(runs) = self.named.runs.get(self.hashed_runs..to) {
+      for run in runs {
+        self.hasher.update(&run.identity.hash);
+        self.hasher.update(&run.identity.len.to_le_bytes());
+        self.hasher.update(&run.offset.to_le_bytes());
+        self.hasher.update(&run.len.to_le_bytes());
+      }
+    }
+    self.hashed_runs = to;
+    self.hashed_runs == self.named.runs.len()
   }
 
   /// The work, hashed.
@@ -1621,7 +1765,7 @@ impl Hashing {
         doc: self.doc,
         post_state: self.post_state,
         evidence: Vec::new(),
-        named: Default::default(),
+        named: self.named,
       },
       reads: self.reads,
     }

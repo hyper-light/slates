@@ -551,13 +551,20 @@ fn the_store_makes_a_pushed_mercurial_text_whole() {
   });
 }
 
-/// What a revision's text must be, as its writer kept it: a changeset's or a manifest's text whole; a file revision's
-/// by the identities its row names (its bytes' BLAKE3 and its metadata block's), since a landed file's text leaves the
-/// content store once its writer lands it (goal 93 item 2b(b)) and its row's names are what the writer kept.
+/// What a revision's text must be, as its writer kept it: a changeset's or a manifest's by its node and parents (whose
+/// SHA-1 cryptographically names every byte of its text, since landed changelog and manifest texts leave the content
+/// store once landed, goal 93 C1 (1)); a file revision's by the identities its row names (its bytes' BLAKE3 and its
+/// metadata block's), since a landed file's text leaves the content store once its writer lands it (goal 93 item 2b(b))
+/// and its row's names are what the writer kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kept {
-  /// The text.
-  Text(Vec<u8>),
+  /// A changeset's or manifest's parents and SHA-1 node.
+  Node {
+    /// Its parents' nodes (null for none).
+    parents: [slates_hg::Node; 2],
+    /// Its SHA-1 node identity.
+    node: slates_hg::Node,
+  },
   /// A file revision's names.
   File(slates_hg::push::verify::FileNames),
 }
@@ -566,7 +573,9 @@ impl Kept {
   /// Whether `text`, as the store made it, is the text kept.
   fn is(&self, text: &[u8]) -> bool {
     match self {
-      Kept::Text(kept) => kept.as_slice() == text,
+      Kept::Node { parents, node } => {
+        slates_hg::node::compute(&parents[0], &parents[1], text) == Ok(*node)
+      }
       Kept::File(names) => slates_hg::filerev::split(text).is_ok_and(|split| {
         slates_vcs::ContentId::of(split.bytes) == names.bytes
           && split.metadata.map(slates_vcs::ContentId::of) == names.block
@@ -585,24 +594,25 @@ fn every_revision(
   use slates_hg::push::verify::Held;
   let mut room = Admission::new(ROOM);
   crate::vcs_store::lent_state(state, |state| {
-    super::with_view(state, id, &mut room, |view, held, room| {
+    super::with_view(state, id, &mut room, |view, held, _room| {
       let mut revisions = Vec::new();
       for rev in 0..view.count() {
         let node = view.node(rev).unwrap();
-        let text = view
-          .changeset_text(rev, room)
-          .unwrap()
-          .unwrap()
-          .into_owned();
-        revisions.push((CHANGELOG_PATH.to_vec(), node, Kept::Text(text)));
+        let parents = view
+          .parents(rev)
+          .map(|parent| parent.map_or(slates_hg::NULL_NODE, |parent| view.node(parent).unwrap()));
+        revisions.push((CHANGELOG_PATH.to_vec(), node, Kept::Node { parents, node }));
       }
       let mut position = 0;
       while let Some(linked) = view.manifest_linked(position) {
-        let logged = view.manifest(&linked.node, room).unwrap().unwrap();
+        let entry = view.manifest_entry(&linked.node).unwrap();
         revisions.push((
           MANIFEST_PATH.to_vec(),
           linked.node,
-          Kept::Text(logged.text.into_owned()),
+          Kept::Node {
+            parents: entry.parents,
+            node: linked.node,
+          },
         ));
         position += 1;
       }

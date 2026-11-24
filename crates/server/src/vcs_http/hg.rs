@@ -853,30 +853,44 @@ impl<S: HgStores> Exchange for HgExchange<S> {
         Ok(false)
       }
       Some(Made::Streamed(mut streamed)) => {
-        // What the answer's next step asks of the node's changeset store, answered before its turn (a stream's rows and
-        // chunks, read where the store keeps them).
-        let answered = match self.generation.as_ref() {
-          Some(generation) => {
-            self
-              .stores
-              .answer_wants(
-                (generation, self.repository.id, self.request_room),
-                &mut *streamed,
-              )
-              .await
+        let before_out = out.len();
+        let started = slates_rt::futures::now_ns();
+        let quantum = self
+          .stores
+          .fetch_turn(self.repository.id)
+          .map_or(0, |(_, quantum)| quantum);
+        loop {
+          // What the answer's next step asks of the node's changeset store, answered before its turn (a stream's rows
+          // and chunks, read where the store keeps them).
+          let answered = match self.generation.as_ref() {
+            Some(generation) => {
+              self
+                .stores
+                .answer_wants(
+                  (generation, self.repository.id, self.request_room),
+                  &mut *streamed,
+                )
+                .await
+            }
+            None => false,
+          };
+          if !answered {
+            return Err(Failed(Status::SERVICE_UNAVAILABLE));
           }
-          None => false,
-        };
-        if !answered {
-          return Err(Failed(Status::SERVICE_UNAVAILABLE));
+          let more = self.turn(&mut streamed, out)?;
+          if !more {
+            self.generation = None;
+            return Ok(false);
+          }
+          let elapsed = slates_rt::futures::now_ns().saturating_sub(started);
+          if out.len() > before_out
+            || slates_hg::render::StoreWants::wants(&*streamed).is_none()
+            || (quantum > 0 && elapsed >= quantum)
+          {
+            self.answered = Some(Made::Streamed(streamed));
+            return Ok(true);
+          }
         }
-        let more = self.turn(&mut streamed, out)?;
-        if more {
-          self.answered = Some(Made::Streamed(streamed));
-        } else {
-          self.generation = None;
-        }
-        Ok(more)
       }
       None => Ok(false),
     }

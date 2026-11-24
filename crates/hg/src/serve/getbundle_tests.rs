@@ -71,6 +71,10 @@ pub(crate) struct Served {
   stored_deltas: bool,
   /// Whether its changeset store keeps no row of a file revision while its logs still list each.
   rows_lost: bool,
+  /// Whether changelog and manifest texts are let go to the changeset store (goal 93 C1 (1)), so
+  /// `changeset_text` / `manifest` return `Ok(None)` and `stored_now` serves `CHANGELOG_PATH` and
+  /// `MANIFEST_PATH`.
+  logs_away: bool,
   /// The rows a fetch's step may ask at once ([`Store::rows_a_step`]); none: as many as the room holds.
   rows_a_step: Option<u64>,
   /// The rows each rows' ask named, in order: what the walk asked of its store.
@@ -125,6 +129,13 @@ impl Repository for Served {
   ) -> Result<Option<Node>, crate::serve::Refusal> {
     Ok(None)
   }
+
+  fn manifest_node(&self, rev: Rev) -> Option<Node> {
+    let node = self.history.node(rev)?;
+    let text = self.changesets.get(&node)?;
+    let (manifest, _) = super::read_changeset(text).ok()?;
+    Some(manifest)
+  }
 }
 
 impl Served {
@@ -136,6 +147,71 @@ impl Served {
     let position = kept.position.checked_sub(1)?;
     log.values().find(|other| other.position == position)
   }
+  /// Looks up a single stored row for `(path, node)` in the mock changeset store.
+  fn stored_row(&self, path: &[u8], node: &Node) -> Option<crate::render::StoredRevision> {
+    use crate::render::{StoredPlace, StoredRevision};
+    if path == crate::push::intake::CHANGELOG_PATH {
+      let text = self.changesets.get(node)?;
+      let identity = *blake3::hash(text).as_bytes();
+      return Some(StoredRevision {
+        text: identity,
+        base: None,
+        place: StoredPlace {
+          payload: identity,
+          offset: 0,
+          len: u64::try_from(text.len()).unwrap(),
+        },
+      });
+    }
+    let log = if path == crate::push::intake::MANIFEST_PATH {
+      &self.manifests
+    } else {
+      self.files.get(path)?
+    };
+    let kept = log.get(node).filter(|_| {
+      path == crate::push::intake::MANIFEST_PATH || (!self.files_lost && !self.rows_lost)
+    })?;
+    let identity = *blake3::hash(&kept.text).as_bytes();
+    let before = self.before(log, kept);
+    Some(StoredRevision {
+      text: identity,
+      base: before.map(|before| *blake3::hash(&before.text).as_bytes()),
+      // A delta's place is told from a whole's by its offset: the test store's own convention.
+      place: StoredPlace {
+        payload: identity,
+        offset: u64::from(before.is_some()),
+        len: u64::try_from(kept.text.len() + before.map_or(0, |_| delta::HUNK_HEADER_LEN)).unwrap(),
+      },
+    })
+  }
+
+  /// Resolves one stored chunk for `place` in the mock changeset store.
+  fn stored_chunk(&self, place: &crate::render::StoredPlace) -> Option<Vec<u8>> {
+    let found_file = self
+      .files
+      .values()
+      .flat_map(|log| log.values().map(move |kept| (log, kept)))
+      .find(|(_, kept)| *blake3::hash(&kept.text).as_bytes() == place.payload);
+    let found_manifest = self
+      .manifests
+      .values()
+      .find(|kept| *blake3::hash(&kept.text).as_bytes() == place.payload)
+      .map(|kept| (&self.manifests, kept));
+    if let Some((log, kept)) = found_file.or(found_manifest) {
+      let mut chunk = Vec::new();
+      match self.before(log, kept).filter(|_| place.offset == 1) {
+        Some(before) => delta::encode_lines(&before.text, &kept.text, &mut chunk).ok()?,
+        // A stored whole is its raw text (the store's contract, A-767 C1).
+        None => chunk.extend_from_slice(&kept.text),
+      }
+      return Some(chunk);
+    }
+    self
+      .changesets
+      .values()
+      .find(|text| *blake3::hash(text).as_bytes() == place.payload)
+      .cloned()
+  }
 }
 
 impl Store for Served {
@@ -143,79 +219,47 @@ impl Store for Served {
     self.rows_a_step.unwrap_or(u64::MAX)
   }
 
-  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
-  /// plain BLAKE3 of its text, its place named by that identity, its chunk its raw text (a whole) or its delta; none where its text is
-  /// lost.
+  /// The test's changeset store answered at once (A-767 C1): each revision kept as its whole or delta,
+  /// its identity the plain BLAKE3 of its text, its place named by that identity; none where lost.
   fn stored_now(&self, want: &crate::render::Want) -> Option<super::Given> {
-    use crate::render::{StoredPlace, StoredRevision, Want};
+    use crate::render::Want;
     match want {
       Want::Rows { logs } => {
         self
           .rows_asked
           .borrow_mut()
           .push(logs.iter().map(|(_, nodes)| nodes.len()).sum());
-        let mut rows = Vec::new();
-        for (path, nodes) in logs {
-          let mut log_rows = Vec::new();
-          for node in nodes {
-            let row = self.files.get(path).and_then(|log| {
-              let kept = log
-                .get(node)
-                .filter(|_| !self.files_lost && !self.rows_lost)?;
-              let identity = *blake3::hash(&kept.text).as_bytes();
-              let before = self.before(log, kept);
-              Some(StoredRevision {
-                text: identity,
-                base: before.map(|before| *blake3::hash(&before.text).as_bytes()),
-                // A delta's place is told from a whole's by its offset: the test store's own convention.
-                place: StoredPlace {
-                  payload: identity,
-                  offset: u64::from(before.is_some()),
-                  len: u64::try_from(
-                    kept.text.len() + before.map_or(0, |_| delta::HUNK_HEADER_LEN),
-                  )
-                  .unwrap(),
-                },
-              })
-            });
-            log_rows.push(row);
-          }
-          rows.push(log_rows);
-        }
+        let rows = logs
+          .iter()
+          .map(|(path, nodes)| {
+            nodes
+              .iter()
+              .map(|node| self.stored_row(path, node))
+              .collect()
+          })
+          .collect();
         Some(super::Given::Rows(rows))
       }
       Want::Chunks { places } => {
-        let mut chunks = Vec::new();
-        for place in places {
-          let (log, kept) = self
-            .files
-            .values()
-            .flat_map(|log| log.values().map(move |kept| (log, kept)))
-            .find(|(_, kept)| *blake3::hash(&kept.text).as_bytes() == place.payload)?;
-          let mut chunk = Vec::new();
-          match self.before(log, kept).filter(|_| place.offset == 1) {
-            Some(before) => delta::encode_lines(&before.text, &kept.text, &mut chunk).ok()?,
-            // A stored whole is its raw text (the store's contract, A-767 C1).
-            None => chunk.extend_from_slice(&kept.text),
-          }
-          chunks.push(chunk);
-        }
-        Some(super::Given::Chunks(chunks))
+        let chunks: Option<Vec<Vec<u8>>> = places.iter().map(|p| self.stored_chunk(p)).collect();
+        Some(super::Given::Chunks(chunks?))
       }
       Want::Texts { texts, most } => {
         let mut made = Vec::new();
         let mut total = 0_u64;
         for identity in texts {
-          let kept = self
+          let bytes = self
             .files
             .values()
-            .flat_map(|log| log.values())
-            .find(|kept| blake3::hash(&kept.text).as_bytes() == identity)?;
-          total = total.saturating_add(u64::try_from(kept.text.len()).unwrap());
+            .flat_map(|log| log.values().map(|kept| kept.text.as_slice()))
+            .chain(self.manifests.values().map(|kept| kept.text.as_slice()))
+            .chain(self.changesets.values().map(Vec::as_slice))
+            .find(|text| blake3::hash(text).as_bytes() == identity)?;
+          total = total.saturating_add(u64::try_from(bytes.len()).unwrap());
           if total > *most {
             return Some(super::Given::TextsPast);
           }
-          made.push(kept.text.clone());
+          made.push(bytes.to_vec());
         }
         Some(super::Given::Texts(made))
       }
@@ -227,6 +271,9 @@ impl Store for Served {
     rev: Rev,
     _room: &mut Admission,
   ) -> Result<Option<Cow<'_, [u8]>>, PastAdmission> {
+    if self.logs_away {
+      return Ok(None);
+    }
     let text = self
       .history
       .node(rev)
@@ -238,7 +285,19 @@ impl Store for Served {
     node: &Node,
     _room: &mut Admission,
   ) -> Result<Option<Logged<'_>>, PastAdmission> {
+    if self.logs_away {
+      return Ok(None);
+    }
     Ok(self.manifests.get(node).map(Kept::logged))
+  }
+  fn manifest_entry(&self, node: &Node) -> Option<super::FileEntry> {
+    let kept = self.manifests.get(node)?;
+    Some(super::FileEntry {
+      position: kept.position,
+      parents: kept.parents,
+      link: kept.link,
+      flags: kept.flags,
+    })
   }
   fn file_entry(&self, path: &[u8], node: &Node) -> Option<super::FileEntry> {
     let logged = self
@@ -1663,9 +1722,9 @@ fn listkeys_is_split_as_mercurial_splits_it() {
       .collect()
   };
   assert_eq!(namespaces(None), Vec::<Vec<Vec<u8>>>::new());
-  assert_eq!(namespaces(Some(&b""[..])), [vec![Vec::new()]]);
+  assert_eq!(namespaces(Some(&b""[..])), [vec![Vec::<u8>::new()]]);
   let split = namespaces(Some(&b",phases"[..]));
-  assert_eq!(split, [vec![Vec::new()], vec![b"phases".to_vec()]]);
+  assert_eq!(split, [vec![Vec::<u8>::new()], vec![b"phases".to_vec()]]);
 }
 
 /// AC-HG.9, A-619: do clone from a store that lost a changeset's text, then one that lost a manifest revision, then
@@ -2111,4 +2170,68 @@ fn a_pull_whose_store_keeps_no_row_of_a_file_revision_is_refused_by_kind() {
       what: "a file revision the changeset store keeps no row of"
     }
   );
+}
+
+/// Regression: a `Named` partial clone over let-go changelogs and delta-stored manifests where an
+/// intermediate changeset touches no files (`need_text = false`) must never leave a stale manifest
+/// at the head of `manifest_chunks` and loop forever appending chunks.
+#[test]
+fn a_named_walk_with_an_empty_touched_commit_between_chained_manifests_finishes_cleanly() {
+  let parents = [
+    [None, None],
+    [Some(0), None],
+    [Some(1), None],
+    [Some(2), None],
+    [Some(3), None],
+    [Some(4), None],
+  ];
+  // Rev 0..=5 each produce a distinct chained manifest M0 -> M1 -> M2 -> M3 -> M4 -> M5.
+  // Clear the `files` lines on rev 2 (just like a clean Mercurial merge whose manifest differs
+  // from p1 while listing no touched files in the changelog entry) so rev 2 has `need_text = false`
+  // while M2 is sitting at the front of `manifest_chunks`. Rev 3 then loads M3 via `PlanManifestText`
+  // and rev 4 chains onto M3 (`chainable == true`) while M2 is still stuck at `front`.
+  let edits: Vec<Edit> = vec![
+    (vec![(0, 1)], 0),
+    (vec![(0, 2)], 0),
+    (vec![(0, 3)], 0),
+    (vec![(0, 4)], 0),
+    (vec![(0, 5)], 0),
+    (vec![(0, 6)], 0),
+  ];
+  let (mut served, _) = filled(shaped(&parents), &edits);
+  let rev2_node = served.history.node(2).unwrap();
+  if let Some(cs) = served.changesets.get_mut(&rev2_node) {
+    // Format: `<manifest>\n<user>\n<date>\n<files...>\n\n<desc>` -> drop `<files...>`.
+    let text = String::from_utf8(cs.clone()).unwrap();
+    let mut lines = text.split('\n');
+    let mf = lines.next().unwrap();
+    let user = lines.next().unwrap();
+    let date = lines.next().unwrap();
+    let body = text.split_once("\n\n").map_or("", |(_, b)| b);
+    *cs = format!("{mf}\n{user}\n{date}\n\n{body}").into_bytes();
+  }
+  let outgoing = Outgoing {
+    heads: vec![4],
+    common: Vec::new(),
+    missing: std::iter::once(0..5).collect(),
+  };
+  let expected = super::named_changegroup_whole(&served, &outgoing, Version::V03, &mut room())
+    .expect("resident named changegroup");
+  served.stored_deltas = true;
+  served.logs_away = true;
+  let mut walk = super::Walk::begin(&served, &outgoing, Version::V03, &mut room()).unwrap();
+  let mut out = Vec::new();
+  let mut steps = 0usize;
+  while walk.step(&served, &mut room(), &mut out).unwrap() {
+    steps += 1;
+    assert!(
+      steps < 1_000,
+      "named walk over let-go manifests stuck in an infinite chunk-fetch loop"
+    );
+  }
+  let got = Changegroup::decode(&out, Version::V03, &mut room()).unwrap();
+  let want = Changegroup::decode(&expected, Version::V03, &mut room()).unwrap();
+  assert_eq!(got.changelog.len(), want.changelog.len());
+  assert_eq!(got.manifests.len(), want.manifests.len());
+  assert_eq!(got.files.len(), want.files.len());
 }

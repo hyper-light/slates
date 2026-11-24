@@ -94,8 +94,8 @@ use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
+use crate::vcs_store;
 use crate::vcs_store::hg_view;
-use crate::vcs_store::{self, VcsStores};
 use crate::verbs::hex_of;
 
 // Its history builders serve the edge's push tests too (`crate::vcs_http`'s daemon edge, A-680 part 2b).
@@ -631,15 +631,13 @@ pub(crate) type WorkKey = (DbVolumeId, u64, Option<Node>, Node);
 /// one step spun its shard past the watchdog; main's ruling (1) of 2026-11-21 13:26).
 pub(crate) enum Works<'a> {
   /// Built before the landing a unit a turn ([`built_works`]): taken from here. One the landing's plan names that is
-  /// not here marks `missed`, and the landing gives its fork back to its driver, which builds again.
+  /// not here marks `missed`, and the landing gives its fork back to its driver, which builds again. Each key holds one
+  /// prepared copy per consumer in the plan so named runs stay read without cloning (`Increment::clone` clears `read`).
   Built {
-    /// The works built, by key.
-    built: &'a mut BTreeMap<WorkKey, Increment>,
+    /// The works built, by key (one entry per change in the plan).
+    built: &'a mut BTreeMap<WorkKey, Vec<Increment>>,
     /// Whether one the plan names was missing.
     missed: bool,
-    /// How many of the plan's changes each work still moves: a work moving two changes (a line and the bookmark made
-    /// at it) is lent a copy until its last, which takes it.
-    uses: &'a mut BTreeMap<WorkKey, usize>,
     /// Their increments held in the content store before the landing (`crate::held_ahead`), which its step names.
     ahead: &'a [crate::held_ahead::HeldAhead],
   },
@@ -670,25 +668,17 @@ fn work((named, head): (&Named, &Node), works: &mut Works<'_>) -> Result<Increme
         named: slates_merge::named::Named::default(),
       })
     }
-    Works::Built {
-      built,
-      missed,
-      uses,
-      ..
-    } => {
-      let left = uses.get(&key).copied().unwrap_or(0);
-      if left > 1 {
-        uses.insert(key, left.saturating_sub(1));
-        if let Some(work) = built.get(&key) {
-          return Ok(work.clone());
+    Works::Built { built, missed, .. } => {
+      if let Some(list) = built.get_mut(&key)
+        && let Some(work) = list.pop()
+      {
+        if list.is_empty() {
+          built.remove(&key);
         }
-      } else {
-        uses.remove(&key);
+        return Ok(work);
       }
-      built.remove(&key).ok_or_else(|| {
-        *missed = true;
-        abort(UNBUILT.to_vec())
-      })
+      *missed = true;
+      Err(abort(UNBUILT.to_vec()))
     }
   }
 }
@@ -1304,33 +1294,31 @@ pub(crate) fn land(
 }
 
 /// Puts `fork` in repository `repository`'s index's place and gives back the index it replaces, settling the shard's
-/// charge; a store no longer held gives the fork back instead.
+/// charge; a store no longer held gives the fork back instead. Pending green `NameHold`s are applied first so an
+/// object a just-committed green named outlives the old index's release (A-760 (b) 4d).
 fn replace_index(
   state: &mut ShardState,
   repository: RepositoryId,
   fork: HgIndex,
 ) -> Result<(), IndexRefused> {
   hg_view::walks_noted(state, &fork);
-  vcs_store::within_budget(state, 0, |stores| {
-    let replaced = match stores.mercurial(repository) {
-      Some((content, store)) => core::mem::replace(&mut store.index, fork).release(content),
-      None => return release_in(stores, fork),
+  let to_release = vcs_store::within_budget(state, 0, |stores| {
+    let Some((_, store)) = stores.mercurial(repository) else {
+      return fork;
     };
+    let old = core::mem::replace(&mut store.index, fork);
     stores.index_changed(repository);
-    replaced
-  })
+    old
+  });
+  release_index(state, to_release)
 }
 
-/// Gives back a fork no entry committed, settling the shard's charge.
+/// Gives back a fork no entry committed, settling the shard's charge, applying pending green
+/// `NameHold`s before any hold drops (A-760 (b) 4d).
 fn release_index(state: &mut ShardState, index: HgIndex) -> Result<(), IndexRefused> {
-  vcs_store::within_budget(state, 0, |stores| release_in(stores, index))
-}
-
-/// Gives back `index`'s holds in the content store, where one is made.
-fn release_in(stores: &mut VcsStores, index: HgIndex) -> Result<(), IndexRefused> {
-  stores
-    .content_mut()
-    .map_or(Ok(()), |content| index.release(content))
+  vcs_store::name_holds::freeing(state, |content| {
+    content.map_or(Ok(()), |content| index.release(content))
+  })
 }
 
 /// What a push brings over a transport (module docs, "The driver"): who sends it, its `heads` argument read, and its
@@ -1563,7 +1551,6 @@ async fn landed_after_builds(
             built: &mut built,
             missed: false,
             ahead: &ahead,
-            uses: &mut uses_of(&plan),
           },
           room,
         ),
@@ -1713,7 +1700,7 @@ async fn works_held_ahead(
   Result<
     (
       Vec<WorkKey>,
-      BTreeMap<WorkKey, Increment>,
+      BTreeMap<WorkKey, Vec<Increment>>,
       Vec<crate::held_ahead::HeldAhead>,
     ),
     PushOutcome,
@@ -1727,7 +1714,122 @@ async fn works_held_ahead(
   let Ok(ahead) = held_ahead_waiting(repository, &built).await? else {
     return Some(Err(PushOutcome::refused(&abort(UNHELD.to_vec()))));
   };
-  Some(Ok((plan, built, ahead)))
+  let uses = uses_of(&plan);
+  let mut copies: BTreeMap<WorkKey, Vec<Increment>> = built
+    .into_iter()
+    .map(|(key, work)| {
+      let count = uses.get(&key).copied().unwrap_or(1).max(1);
+      let mut list = Vec::with_capacity(count);
+      for _ in 1..count {
+        list.push(work.clone());
+      }
+      list.push(work);
+      (key, list)
+    })
+    .collect();
+  // Works name whole-file blobs in the content plane (A-760) so `held_ahead` holds only their
+  // identities; read each named run right before the landing step so `Green::judge_named` can
+  // commit them as `Content::Named` and drop the buffers immediately.
+  for list in copies.values_mut() {
+    for work in list {
+      if vcs_store::named_objects::read_named_work_async(repository, work)
+        .await?
+        .is_err()
+      {
+        let _ = crate::state::with_state(|state| crate::held_ahead::give_back(state, &ahead));
+        return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+      }
+    }
+  }
+  Some(Ok((plan, copies, ahead)))
+}
+
+/// Advances one planned work `key` asynchronously to completion, fetching let-go endpoints and
+/// any let-go file revisions between turns.
+async fn build_one_work(
+  repository: RepositoryId,
+  name: [u8; 32],
+  key: WorkKey,
+  forked: Option<&Forked>,
+  room: &Admission,
+) -> Option<Result<Increment, PushOutcome>> {
+  let verified = Verified::default();
+  let (green, base_version, base, head) = key;
+  let moved = Move {
+    name,
+    base_version,
+    base: base.as_ref(),
+    head: &head,
+  };
+  let endpoints = [base, Some(head)];
+  let Ok(overlay_data) = fetch_work_endpoints(repository, forked, &endpoints).await? else {
+    return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+  };
+  let mut layout_room = *room;
+  let begun = crate::state::with_state(|state| {
+    vcs_store::lent_state(state, |state| {
+      let held = held_over(state, repository, forked)?;
+      let overlay = slates_hg::push::held::OverlayHeld::new(
+        &held,
+        overlay_data.changesets,
+        overlay_data.manifests,
+      );
+      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+      Some(tree::begin_work(
+        &moved,
+        (&verified, &overlay),
+        (room.left(), pace),
+        &mut layout_room,
+      ))
+    })
+  })
+  .flatten()?;
+  let mut building = match begun {
+    Ok(building) => building,
+    Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
+  };
+  loop {
+    let advanced = crate::state::with_state(|state| {
+      let quantum = state.config.step_quantum_ns() / 2;
+      building
+        .pace()
+        .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
+      state.count(WORK_TURNS, 1);
+      vcs_store::lent_state(state, |state| {
+        let engine = state.greens.get(&green)?;
+        let held = held_over(state, repository, forked)?;
+        Some(building.advance(&engine, (&verified, &held)))
+      })
+    })
+    .flatten()?;
+    match advanced {
+      // The turn waited for a file revision the repository holds whose text is not at hand (A-767 C1: one an import
+      // let go): read from the node's changeset store between turns and brought back into the content store.
+      None if building.ask_waited(room.left()) => {
+        if !vcs_store::hg_view::answer_store_wants(&mut building, repository).await {
+          return None;
+        }
+        // Its window goes back into the shard's chunk store, lent to the content store for the step.
+        let brought = crate::state::with_state(|state| {
+          vcs_store::lent_state(state, |state| {
+            brought_back(state, repository, forked, &mut building)
+          })
+        })
+        .flatten();
+        if brought.is_none() {
+          return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+        }
+      }
+      None => slates_rt::futures::yield_now().await,
+      Some(Ok(work)) => {
+        let _ = crate::state::with_state(|state| state.count(WORKS_BUILT, 1));
+        return Some(Ok(work.increment));
+      }
+      Some(Err(refused)) => {
+        return Some(Err(PushOutcome::refused(&abort(refused_words(&refused)))));
+      }
+    }
+  }
 }
 
 /// The works `forked`'s push makes, built before its landing a unit a turn (A-767 C1, the push spin; main's ruling (1)
@@ -1763,79 +1865,16 @@ async fn built_works(
   if let Err(outcome) = planned {
     return Some(Err(outcome));
   }
-  let verified = Verified::default();
   let mut built = BTreeMap::new();
   for key in &plan {
     if built.contains_key(key) {
       continue;
     }
-    let (green, base_version, base, head) = *key;
-    let moved = Move {
-      name,
-      base_version,
-      base: base.as_ref(),
-      head: &head,
-    };
-    let mut layout_room = *room;
-    let begun = crate::state::with_state(|state| {
-      vcs_store::lent_state(state, |state| {
-        let held = held_over(state, repository, forked)?;
-        let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-        Some(tree::begin_work(
-          &moved,
-          (&verified, &held),
-          (room.left(), pace),
-          &mut layout_room,
-        ))
-      })
-    })
-    .flatten()?;
-    let mut building = match begun {
-      Ok(building) => building,
-      Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
-    };
-    loop {
-      let advanced = crate::state::with_state(|state| {
-        let quantum = state.config.step_quantum_ns() / 2;
-        building
-          .pace()
-          .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
-        state.count(WORK_TURNS, 1);
-        vcs_store::lent_state(state, |state| {
-          let engine = state.greens.get(&green)?;
-          let held = held_over(state, repository, forked)?;
-          Some(building.advance(&engine, (&verified, &held)))
-        })
-      })
-      .flatten()?;
-      match advanced {
-        // The turn waited for a file revision the repository holds whose text is not at hand (A-767 C1: one an import
-        // let go): read from the node's changeset store between turns and brought back into the content store.
-        None if building.ask_waited(room.left()) => {
-          if !vcs_store::hg_view::answer_store_wants(&mut building, repository).await {
-            return None;
-          }
-          // Its window goes back into the shard's chunk store, lent to the content store for the step.
-          let brought = crate::state::with_state(|state| {
-            vcs_store::lent_state(state, |state| {
-              brought_back(state, repository, forked, &mut building)
-            })
-          })
-          .flatten();
-          if brought.is_none() {
-            return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
-          }
-        }
-        None => slates_rt::futures::yield_now().await,
-        Some(Ok(work)) => {
-          let _ = crate::state::with_state(|state| state.count(WORKS_BUILT, 1));
-          built.insert(*key, work.increment);
-          break;
-        }
-        Some(Err(refused)) => {
-          return Some(Err(PushOutcome::refused(&abort(refused_words(&refused)))));
-        }
+    match build_one_work(repository, name, *key, forked, room).await? {
+      Ok(increment) => {
+        built.insert(*key, increment);
       }
+      Err(outcome) => return Some(Err(outcome)),
     }
   }
   Some(Ok((plan, built)))
@@ -2072,9 +2111,203 @@ async fn bring_back_log(
   .unwrap_or(false)
 }
 
+/// A manifest endpoint whose delta chain hits a let-go revision on `vcs_disk` (goal 93 C1 (1)):
+/// the first away ancestor `(away, away_len)` to fetch from the changeset store, plus any resident
+/// deltas above it (oldest first) to apply in memory to reconstruct `target`.
+pub(crate) struct NeededManifest {
+  /// The target manifest node needed by `tree::begin_work` / `hg_made`.
+  pub(crate) target: Node,
+  /// The first let-go ancestor in the delta chain (equals `target` if `target` itself is away).
+  pub(crate) away: Node,
+  /// Full-text length of `away`.
+  pub(crate) away_len: u64,
+  /// Resident deltas above `away`, oldest first (empty when `away == target`).
+  pub(crate) deltas: Vec<Vec<u8>>,
+}
+
+/// Applies `needed.deltas` on top of `away_text` (oldest first) to reconstruct `needed.target`.
+pub(crate) fn apply_needed_manifest(mut text: Vec<u8>, deltas: &[Vec<u8>]) -> Option<Vec<u8>> {
+  for delta in deltas {
+    let mut room = slates_hg::Admission::new(u64::MAX);
+    text = slates_hg::delta::apply(&text, delta, &mut room).ok()?;
+  }
+  Some(text)
+}
+
+/// Which changesets among `endpoints` and their manifests lack resident full texts in `index`
+/// (goal 93 C1 (1): let go to the changeset store), returning `(missing_changesets, needed_manifests)`.
+pub(crate) fn missing_endpoint_logs(
+  index: &HgIndex,
+  content: &slates_vcs::ContentStore,
+  endpoints: &[Option<Node>],
+) -> (Vec<(Node, u64)>, Vec<NeededManifest>) {
+  let mut missing_cs = Vec::new();
+  let mut missing_mf: Vec<NeededManifest> = Vec::new();
+  for node in endpoints.iter().flatten().copied() {
+    if node == slates_hg::NULL_NODE {
+      continue;
+    }
+    let Some(cs_rev) = index.rev(content, slates_hg::index::Log::Changelog, &node) else {
+      continue;
+    };
+    let Some(cs_row) = index.changeset(content, cs_rev) else {
+      continue;
+    };
+    if !content.holds_whole(&cs_row.text) && !missing_cs.iter().any(|(seen, _)| *seen == node) {
+      missing_cs.push((node, cs_row.len));
+    }
+    if cs_row.manifest != slates_hg::NULL_NODE
+      && !missing_mf.iter().any(|seen| seen.target == cs_row.manifest)
+      && let Some(needed) = needed_manifest_chain(index, content, cs_row.manifest)
+    {
+      missing_mf.push(needed);
+    }
+  }
+  (missing_cs, missing_mf)
+}
+
+/// Walks `target`'s manifest delta chain in `index`: returns `None` when every link is resident in
+/// `content`, or `Some(NeededManifest)` naming the first let-go ancestor plus any resident deltas
+/// sitting above it (handles both already-landed let-go manifests and fresh unlanded resident
+/// deltas sitting on top of a let-go base).
+fn needed_manifest_chain(
+  index: &HgIndex,
+  content: &slates_vcs::ContentStore,
+  target: Node,
+) -> Option<NeededManifest> {
+  let mut rev = index.rev(content, slates_hg::index::Log::Manifest, &target)?;
+  let mut deltas = Vec::new();
+  loop {
+    let row = index.revision(content, slates_hg::index::Log::Manifest, rev)?;
+    if row.base != slates_hg::index::NONE && row.stored == 0 {
+      rev = row.base;
+      continue;
+    }
+    if row.base == slates_hg::index::NONE && row.len == 0 {
+      return None;
+    }
+    if !content.holds_whole(&row.bytes) {
+      deltas.reverse();
+      return Some(NeededManifest {
+        target,
+        away: row.node,
+        away_len: row.len,
+        deltas,
+      });
+    }
+    if row.base == slates_hg::index::NONE {
+      return None;
+    }
+    let delta = content.object_bytes(&row.bytes, row.stored)?;
+    deltas.push(delta);
+    rev = row.base;
+  }
+}
+
+/// Fetched let-go endpoint changeset and manifest texts overlaid onto an `IndexHeld` during
+/// `tree::begin_work` or `hg_made::made_of` without mutating `ContentStore`.
+#[derive(Default)]
+pub(crate) struct EndpointOverlay {
+  /// Reconstructed or fetched changeset texts by node.
+  pub(crate) changesets: BTreeMap<Node, Vec<u8>>,
+  /// Reconstructed or fetched manifest texts by node.
+  pub(crate) manifests: BTreeMap<Node, Vec<u8>>,
+}
+
+/// Fetches any missing endpoint changeset and manifest texts from the node's changeset store
+/// (applying resident manifest deltas on top of the fetched away ancestor).
+pub(crate) async fn fetch_missing_endpoints(
+  repository: RepositoryId,
+  (missing_cs, missing_mf): (Vec<(Node, u64)>, Vec<NeededManifest>),
+) -> Result<EndpointOverlay, ()> {
+  let mut overlay = EndpointOverlay::default();
+  for (node, len) in missing_cs {
+    let text = asked_text(
+      repository,
+      (slates_hg::push::intake::CHANGELOG_PATH.to_vec(), node),
+      len,
+    )
+    .await
+    .ok_or(())?;
+    overlay.changesets.insert(node, text);
+  }
+  for needed in missing_mf {
+    let away_text = asked_text(
+      repository,
+      (slates_hg::push::intake::MANIFEST_PATH.to_vec(), needed.away),
+      needed.away_len,
+    )
+    .await
+    .ok_or(())?;
+    let text = apply_needed_manifest(away_text, &needed.deltas).ok_or(())?;
+    overlay.manifests.insert(needed.target, text);
+  }
+  Ok(overlay)
+}
+
+/// Fetches any let-go endpoint changeset/manifest texts for `tree::begin_work` directly from the
+/// changeset store (at most 2 changesets and 2 manifests, without touching `ContentStore`).
+async fn fetch_work_endpoints(
+  repository: RepositoryId,
+  forked: Option<&Forked>,
+  endpoints: &[Option<Node>],
+) -> Option<Result<EndpointOverlay, ()>> {
+  let missing = crate::state::with_state(|state| {
+    vcs_store::lent_state(state, |state| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      let index = forked.map_or(&store.index, |f| &f.fork);
+      Some(missing_endpoint_logs(index, content, endpoints))
+    })
+  })
+  .flatten()?;
+  Some(fetch_missing_endpoints(repository, missing).await)
+}
+
+/// Synchronous counterpart of [`fetch_work_endpoints`] for shard tests holding `ShardState`.
+#[cfg(test)]
+pub(crate) fn fetch_work_endpoints_blocking(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  index_missing: (Vec<(Node, u64)>, Vec<NeededManifest>),
+) -> Result<EndpointOverlay, ()> {
+  let (missing_cs, missing_mf) = index_missing;
+  let mut overlay = EndpointOverlay::default();
+  if missing_cs.is_empty() && missing_mf.is_empty() {
+    return Ok(overlay);
+  }
+  let disk = state.vcs_disk.clone().ok_or(())?;
+  let from = u128::from_be_bytes(repository.bytes);
+  for (node, len) in missing_cs {
+    let mut ask = slates_hg::push::held::TextAsk::new(
+      slates_hg::push::intake::CHANGELOG_PATH.to_vec(),
+      node,
+      len,
+    );
+    if !crate::test_store::answer_wants_blocking(&disk, from, &mut ask) {
+      return Err(());
+    }
+    let (_, _, text) = ask.taken().ok_or(())?;
+    overlay.changesets.insert(node, text);
+  }
+  for needed in missing_mf {
+    let mut ask = slates_hg::push::held::TextAsk::new(
+      slates_hg::push::intake::MANIFEST_PATH.to_vec(),
+      needed.away,
+      needed.away_len,
+    );
+    if !crate::test_store::answer_wants_blocking(&disk, from, &mut ask) {
+      return Err(());
+    }
+    let (_, _, away_text) = ask.taken().ok_or(())?;
+    let text = apply_needed_manifest(away_text, &needed.deltas).ok_or(())?;
+    overlay.manifests.insert(needed.target, text);
+  }
+  Ok(overlay)
+}
+
 /// The whole text of the revision `node` kept under `path`, at most `most` bytes, read from the node's changeset store
 /// off the shard's step ([`hg_view::answer_store_wants`]); none where the store gave none.
-async fn asked_text(
+pub(crate) async fn asked_text(
   repository: RepositoryId,
   (path, node): (Vec<u8>, Node),
   most: u64,
@@ -2414,6 +2647,7 @@ impl Taking {
           break Ok(Stepped::More);
         }
         match intake.step(payload.as_slice(), content, room) {
+          Ok(Stepped::More) if intake.has_segment() => break Ok(Stepped::More),
           Ok(Stepped::More) => {}
           // A push's changegroup arrived whole: a want names bytes past its end, a truncation.
           Ok(Stepped::Wanted(range)) => break Err(whole_wanted(payload, range)),
@@ -2446,10 +2680,13 @@ impl Taking {
     }
   }
 
-  /// Its kept texts cut into segments of at least `bound` bytes of its changegroup from here on
-  /// ([`hg_run`](super::hg_run)).
-  fn cut_at(&mut self, bound: u64) {
-    self.intake = self.intake.take().map(|intake| intake.cutting(bound));
+  /// Its kept texts cut into segments of at least `slice_bound` bytes of its changegroup or `resident_bound` bytes of
+  /// resident content-store texts from here on ([`hg_run`](super::hg_run)).
+  fn cut_at(&mut self, slice_bound: u64, resident_bound: u64) {
+    self.intake = self
+      .intake
+      .take()
+      .map(|intake| intake.cutting_with_resident(slice_bound, resident_bound));
   }
 
   /// The next segment cut, oldest first.
@@ -2483,10 +2720,8 @@ impl Drop for Taking {
 
 /// Gives `intake`'s fork back, settling the shard's charge; a refused release counted.
 fn abandon(state: &mut ShardState, intake: Intake) {
-  let released = vcs_store::within_budget(state, 0, |stores| {
-    stores
-      .content_mut()
-      .map_or(Ok(()), |content| intake.abandon(content))
+  let released = vcs_store::name_holds::freeing(state, |content| {
+    content.map_or(Ok(()), |content| intake.abandon(content))
   });
   if released.is_err() {
     state.count(vcs_store::RELEASE_REFUSED, 1);
@@ -2593,8 +2828,13 @@ async fn taking_begun(
     Ok(taking) => taking,
     Err(outcome) => return Some(Err(outcome)),
   };
-  let bound = crate::state::with_state(|state| super::hg_run::segment_bytes(state))?;
-  taking.cut_at(bound);
+  let (slice_bound, resident_bound) = crate::state::with_state(|state| {
+    (
+      super::hg_run::segment_bytes(state),
+      super::hg_run::segment_resident_bytes(state),
+    )
+  })?;
+  taking.cut_at(slice_bound, resident_bound);
   #[cfg(test)]
   {
     let left = TEST_STEP_ROOM.with(|left| left.replace(0));
@@ -3100,7 +3340,7 @@ fn taken_whole(
     Err(refused) => return Some(Err(intake_refused(&refused))),
   };
   if let Some(bound) = cut {
-    taking.cut_at(bound);
+    taking.cut_at(bound, super::hg_run::segment_resident_bytes(state));
   }
   let mut segments = Vec::new();
   loop {
@@ -3237,11 +3477,9 @@ pub(crate) fn land_in(
       return Some(outcome);
     }
   };
-  let mut uses = uses_of(&plan);
   let mut works = Works::Built {
     built: &mut built,
     missed: false,
-    uses: &mut uses,
     ahead: &[],
   };
   match landing(
@@ -3276,10 +3514,11 @@ fn works_whole(
   (forked, name): (Option<&Forked>, [u8; 32]),
   plan: &[WorkKey],
   room: &Admission,
-) -> Result<BTreeMap<WorkKey, Increment>, Box<Refused>> {
+) -> Result<BTreeMap<WorkKey, Vec<Increment>>, Box<Refused>> {
   let unread = || abort(WORK_TEXT_UNREAD.to_vec());
   let verified = Verified::default();
-  let mut built = BTreeMap::new();
+  let uses = uses_of(plan);
+  let mut built: BTreeMap<WorkKey, Vec<Increment>> = BTreeMap::new();
   for key in plan {
     if built.contains_key(key) {
       continue;
@@ -3291,13 +3530,27 @@ fn works_whole(
       base: base.as_ref(),
       head: &head,
     };
+    let endpoints = [base, Some(head)];
+    let missing = vcs_store::lent_state(state, |state| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      let index = forked.map_or(&store.index, |f| &f.fork);
+      Some(missing_endpoint_logs(index, content, &endpoints))
+    })
+    .ok_or_else(|| abort(NO_STORE.to_vec()))?;
+    let overlay_data =
+      fetch_work_endpoints_blocking(state, repository, missing).map_err(|()| unread())?;
     let mut layout_room = *room;
     let begun = vcs_store::lent_state(state, |state| {
       let held = held_over(state, repository, forked)?;
+      let overlay = slates_hg::push::held::OverlayHeld::new(
+        &held,
+        overlay_data.changesets,
+        overlay_data.manifests,
+      );
       let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
       Some(tree::begin_work(
         &moved,
-        (&verified, &held),
+        (&verified, &overlay),
         (room.left(), pace),
         &mut layout_room,
       ))
@@ -3330,7 +3583,18 @@ fn works_whole(
         }
         None => {}
         Some(Ok(work)) => {
-          built.insert(*key, work.increment);
+          let count = uses.get(key).copied().unwrap_or(1).max(1);
+          let mut list = Vec::with_capacity(count);
+          for _ in 1..count {
+            list.push(work.increment.clone());
+          }
+          list.push(work.increment);
+          for inc in &mut list {
+            if vcs_store::named_objects::read_named_work_blocking(state, repository, inc).is_err() {
+              return Err(unread());
+            }
+          }
+          built.insert(*key, list);
           break;
         }
         Some(Err(refused)) => return Err(abort(refused_words(&refused))),
@@ -3358,11 +3622,9 @@ fn judged_whole<T>(
     &mut planning_room,
   ));
   let mut built = works_whole(state, repository, (forked, name), &plan, room)?;
-  let mut uses = uses_of(&plan);
   let mut works = Works::Built {
     built: &mut built,
     missed: false,
-    uses: &mut uses,
     ahead: &[],
   };
   Ok(judge(state, &mut works, room))

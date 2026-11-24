@@ -299,6 +299,26 @@ impl<H: Held + ?Sized> PushObjects for Trees<'_, H> {
   fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable> {
     self.bytes(id)
   }
+
+  fn blob_named(&self, id: ObjectKey) -> Option<slates_merge::named::Identity> {
+    if !self.held.stores_named_files() {
+      return None;
+    }
+    let node = Node::try_from(id.as_bytes()).ok()?;
+    let path = self.paths.get(&node)?;
+    if self.verified.file(path, &node).is_some() {
+      return None;
+    }
+    let names = self.held.file_names(path, &node)?;
+    if names.block.is_some() {
+      return None;
+    }
+    let len = self.held.file_bytes_len(path, &node)?;
+    Some(slates_merge::named::Identity {
+      hash: names.bytes.0,
+      len,
+    })
+  }
 }
 
 /// Whether the directory `open` holds the directory `dir`: it is `dir`, or the root, or one of `dir`'s ancestors.

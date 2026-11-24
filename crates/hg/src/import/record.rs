@@ -820,6 +820,12 @@ fn write_identity_revision(
     out.extend_from_slice(&row.flags.to_le_bytes());
     out.extend_from_slice(&row.len.to_le_bytes());
     out.extend_from_slice(&row.text.0);
+    // Changeset index metadata recorded inline so replay appends the row by identity without
+    // reading a let-go changeset text from `ContentStore` (goal 93 C1 (1)).
+    out.extend_from_slice(&row.manifest);
+    out.push(u8::from(row.closed));
+    out.extend_from_slice(&to_u64(row.branch.len()).to_le_bytes());
+    out.extend_from_slice(row.branch);
     return Some(());
   }
   let row = index.revision(store, log, rev)?;
@@ -1992,20 +1998,33 @@ impl Revisions {
       let flags = flags_of(reader)?;
       let len = reader.long()?;
       let text_id = identity_of(reader)?;
+      let manifest = reader.node()?;
+      let closed = match reader.byte()? {
+        0 => false,
+        1 => true,
+        tag => return Err(Refused::Tag { tag }),
+      };
+      let branch = reader.bytes()?;
       // A changeset another push brought meanwhile is held already: passed over.
       if held {
         return Ok(());
       }
-      let text = store.object_bytes(&text_id, len).ok_or_else(unheld)?;
-      let read = Read {
+      if store.len_of(&text_id).is_none() {
+        return Err(unheld());
+      }
+      refuse_flags::<Infallible>(CHANGELOG, rev, flags)?;
+      let planned = PlannedChangeset {
         node,
         p1,
         p2,
-        link: NULL_NODE,
         flags,
-        text: &text,
+        len,
+        text: text_id,
+        manifest,
+        closed,
+        branch: branch.to_vec(),
       };
-      return replay_changeset(&mut self.fork, store, (rev, &read), self.room);
+      return Ok(append_changeset(&mut self.fork, store, rev, &planned)?);
     }
     let link = reader.node()?;
     let flags = flags_of(reader)?;
@@ -2038,7 +2057,7 @@ impl Revisions {
       bytes,
       block,
     };
-    let numbers = match self.stored_on(store, log, base) {
+    let numbers = match self.stored_on(store, log, base, &row) {
       // Its chain rests on its base's as the fork keeps it now: past its text's length, the index would keep it whole
       // (`index::kept_as`'s bound), and so does the replay.
       Keeping::AsStored(_, Some(below)) if below.saturating_add(delta_len) > len => {
@@ -2058,15 +2077,28 @@ impl Revisions {
   }
 
   /// How a row is kept over the fork as it is now: as stored where its record names its base by number
-  /// ([`SEGMENT_VERSION`]), where it is a file revision's whole, or where its stored delta rests on the log's last
-  /// revision by node ([`PUSH_SEGMENT_VERSION`]); else again ([`Revisions::kept_again`]): a manifest kept whole, or as a
-  /// delta on a revision before the log's last, is kept as the index keeps a new manifest (A-729), against the revision
-  /// before it, as a stale fork's re-base keeps it, whether or not another push landed between.
-  fn stored_on(&self, store: &ContentStore, log: Log<'_>, base: Base) -> Keeping {
+  /// ([`SEGMENT_VERSION`]), where it is a file revision's whole, where it is a manifest kept whole
+  /// whose log is empty or whose text was let go (`Kept::Away`), or where its stored delta rests on
+  /// the log's last revision by node ([`PUSH_SEGMENT_VERSION`]); else again ([`Revisions::kept_again`]).
+  fn stored_on(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    base: Base,
+    row: &NewRevision,
+  ) -> Keeping {
     let node = match base {
       Base::Number(number) => return Keeping::AsStored(number, None),
       Base::Node(node) if node == NULL_NODE && log != Log::Manifest => {
         return Keeping::AsStored(NONE, None);
+      }
+      Base::Node(node) if node == NULL_NODE => {
+        // Manifest stored whole: keep as stored when the manifest log is empty or its windows were
+        // let go (`Kept::Away`) so replay never fails trying to delta against an evicted text.
+        if self.fork.len(store, log) == 0 || !store.holds_whole(&row.bytes) {
+          return Keeping::AsStored(NONE, None);
+        }
+        return Keeping::Again;
       }
       Base::Node(node) => node,
     };

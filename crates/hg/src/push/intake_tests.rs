@@ -1701,3 +1701,243 @@ fn whole_record(
   while intake.record_step(&mut writer, store).unwrap() {}
   writer.finish().unwrap()
 }
+
+/// Bundle and raw revision texts built by [`unlanded_manifest_jump_bundle`].
+struct JumpBundle {
+  payload: Vec<u8>,
+  changesets: std::collections::BTreeMap<Node, Vec<u8>>,
+  manifests: std::collections::BTreeMap<Node, Vec<u8>>,
+}
+
+/// One landed revision entry: its content identity and full text.
+type LandedRow = ([u8; 32], Vec<u8>);
+
+/// Simulated landed changeset store for [`a_manifest_delta_on_an_unlanded_segment_base_over_a_let_go_ancestor_resolves`].
+#[derive(Default)]
+struct SimulatedLandedDisk {
+  by_log_node: std::collections::BTreeMap<(Vec<u8>, Node), LandedRow>,
+  by_id: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+  let_go_manifests: usize,
+}
+
+impl SimulatedLandedDisk {
+  /// Records and lets go `seg` while fewer than 2 manifests have landed.
+  fn land_segment(&mut self, seg: &PushSegment, bundle: &mut JumpBundle, store: &mut ContentStore) {
+    if self.let_go_manifests >= 2 {
+      return;
+    }
+    for kept in &seg.texts {
+      let raw = if kept.path == super::MANIFEST_PATH {
+        bundle.manifests.remove(&kept.node)
+      } else {
+        bundle.changesets.get(&kept.node).cloned()
+      };
+      if let Some(raw) = raw {
+        self.by_id.insert(kept.identity, raw.clone());
+        self
+          .by_log_node
+          .insert((kept.path.clone(), kept.node), (kept.identity, raw));
+      }
+    }
+    for c in &seg.contents {
+      if c.path == super::MANIFEST_PATH {
+        self.let_go_manifests += 1;
+      }
+      for id in c.identities() {
+        let _ = store.let_go_object_landed(id, &|_| None);
+      }
+    }
+  }
+
+  /// Answers `intake`'s pending store wants strictly from landed segments.
+  fn answer(&self, intake: &mut Intake) {
+    use crate::render::{StoreWants, StoredPlace, StoredRevision, Want};
+    while let Some(want) = intake.wants().cloned() {
+      match want {
+        Want::Rows { logs } => {
+          let rows = logs
+            .into_iter()
+            .map(|(path, nodes)| {
+              nodes
+                .into_iter()
+                .map(|n| {
+                  self
+                    .by_log_node
+                    .get(&(path.clone(), n))
+                    .map(|(id, raw)| StoredRevision {
+                      text: *id,
+                      base: None,
+                      place: StoredPlace {
+                        payload: *id,
+                        offset: 0,
+                        len: raw.len() as u64,
+                      },
+                    })
+                })
+                .collect()
+            })
+            .collect();
+          intake.give_rows(rows);
+        }
+        Want::Texts { texts, .. } => {
+          let found = texts
+            .into_iter()
+            .filter_map(|id| self.by_id.get(&id).cloned())
+            .collect();
+          intake.give_texts(found);
+        }
+        Want::Chunks { .. } => panic!("unexpected chunks want"),
+      }
+    }
+  }
+}
+
+/// Builds a 5-revision cg03 bundle where m0..m3 are whole manifests (stored as deltas in HgIndex)
+/// and m4 is encoded as a changegroup delta referencing m2 (jumping back over m3).
+fn unlanded_manifest_jump_bundle() -> JumpBundle {
+  use crate::changegroup::{self as cg, Revision, Version};
+  use crate::{NULL_NODE, delta, node};
+  let hex = |n: &Node| {
+    let mut out = Vec::new();
+    crate::pushkey::encode_hex(n, &mut out);
+    out
+  };
+  let whole = |(n, p1, link): (Node, Node, Node), text: &[u8], out: &mut Vec<u8>| {
+    let rev = Revision {
+      node: n,
+      p1,
+      p2: NULL_NODE,
+      base: NULL_NODE,
+      link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: text,
+      sidedata: None,
+    };
+    cg::put_revision_whole(&rev, Version::V03, out).unwrap();
+  };
+  let mut lines_vec: Vec<Vec<u8>> = (0..20)
+    .map(|i| {
+      let body = format!("init-{i}\n").into_bytes();
+      let fnode = node::compute(&NULL_NODE, &NULL_NODE, &body).unwrap();
+      [format!("base{i:02}").as_bytes(), b"\0", &hex(&fnode), b"\n"].concat()
+    })
+    .collect();
+  let mut files_to_send: Vec<(Vec<u8>, Node, Vec<u8>, Node)> = Vec::new();
+  let (mut cs_list, mut mf_list) = (Vec::new(), Vec::new());
+  let (mut prev_cs, mut prev_mf) = (NULL_NODE, NULL_NODE);
+  for step in 0..5usize {
+    let path = format!("step{step}.txt").into_bytes();
+    let body = format!("step-{step}\n").into_bytes();
+    let fnode = node::compute(&NULL_NODE, &NULL_NODE, &body).unwrap();
+    if step == 0 {
+      for i in 0..20 {
+        let bp = format!("base{i:02}").into_bytes();
+        let bb = format!("init-{i}\n").into_bytes();
+        let bn = node::compute(&NULL_NODE, &NULL_NODE, &bb).unwrap();
+        files_to_send.push((bp, bn, bb, NULL_NODE));
+      }
+    }
+    lines_vec.push([&path[..], b"\0", &hex(&fnode), b"\n"].concat());
+    lines_vec.sort();
+    let mf_text = lines_vec.concat();
+    let mf_node = node::compute(&prev_mf, &NULL_NODE, &mf_text).unwrap();
+    let cs_text = [&hex(&mf_node)[..], b"\ntest\n0 0\n", &path, b"\n\nstep"].concat();
+    let cs_node = node::compute(&prev_cs, &NULL_NODE, &cs_text).unwrap();
+    if step == 0 {
+      for item in &mut files_to_send {
+        item.3 = cs_node;
+      }
+    }
+    files_to_send.push((path, fnode, body, cs_node));
+    cs_list.push((cs_node, prev_cs, cs_text));
+    mf_list.push((mf_node, prev_mf, mf_text, cs_node));
+    (prev_cs, prev_mf) = (cs_node, mf_node);
+  }
+  let mut payload = Vec::new();
+  for (n, p1, text) in &cs_list {
+    whole((*n, *p1, *n), text, &mut payload);
+  }
+  cg::put_end(&mut payload);
+  for (idx, (n, p1, text, link)) in mf_list.iter().enumerate() {
+    if idx == 4 {
+      let mut patch = Vec::new();
+      delta::encode_lines(&mf_list[2].2, text, &mut patch).unwrap();
+      let rev = Revision {
+        node: *n,
+        p1: *p1,
+        p2: NULL_NODE,
+        base: mf_list[2].0,
+        link: *link,
+        flags: 0,
+        info: None,
+        protocol_flags: 0,
+        data: &patch,
+        sidedata: None,
+      };
+      cg::put_revision(&rev, Version::V03, &mut payload).unwrap();
+    } else {
+      whole((*n, *p1, *link), text, &mut payload);
+    }
+  }
+  cg::put_end(&mut payload);
+  cg::put_end(&mut payload);
+  files_to_send.sort_by(|a, b| a.0.cmp(&b.0));
+  for (path, n, body, link) in &files_to_send {
+    cg::put_name(path, &mut payload).unwrap();
+    whole((*n, NULL_NODE, *link), body, &mut payload);
+    cg::put_end(&mut payload);
+  }
+  cg::put_end(&mut payload);
+  JumpBundle {
+    payload,
+    changesets: cs_list.into_iter().map(|(n, _, t)| (n, t)).collect(),
+    manifests: mf_list.into_iter().map(|(n, _, t, _)| (n, t)).collect(),
+  }
+}
+
+/// Goal 93 C1 (1) / Wave 5C regression test: a manifest delta in an unlanded segment whose base
+/// was also added in that same unlanded segment (not `self.last`), resting on a delta chain whose
+/// ancestor was landed and let go in an earlier segment. Do: cut Segment 1 after `m1`, simulate
+/// landing Segment 1 into `vcs_disk` and letting go its manifest windows, then continue taking
+/// `m2`, `m3`, and `m4` (where `m4` deltas against unlanded `m2`) while answering `StoreWants`
+/// strictly from landed segments. Expect intake to walk back to the landed let-go ancestor `m1`,
+/// fetch `m1` from `vcs_disk`, apply `m2`'s resident delta, and accept the entire push.
+#[test]
+fn a_manifest_delta_on_an_unlanded_segment_base_over_a_let_go_ancestor_resolves() {
+  let mut bundle = unlanded_manifest_jump_bundle();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, &bundle.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(2_000);
+  let mut disk = SimulatedLandedDisk::default();
+  loop {
+    let stepped = intake
+      .step(&bundle.payload, &mut store, &mut admission)
+      .expect("intake must resolve unlanded delta over let-go ancestor");
+    while let Some(seg) = intake.take_segment() {
+      disk.land_segment(&seg, &mut bundle, &mut store);
+    }
+    match stepped {
+      Stepped::More => {}
+      Stepped::Store => disk.answer(&mut intake),
+      Stepped::Done => break,
+      Stepped::Wanted(_) => panic!("payload is whole"),
+    }
+  }
+  assert!(
+    disk.let_go_manifests > 0,
+    "at least one manifest was let go"
+  );
+  let (fork, intaken) = finished(intake);
+  assert_eq!(intaken.changesets.len(), 5);
+  fork.release(&mut store).unwrap();
+}

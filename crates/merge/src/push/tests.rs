@@ -1959,3 +1959,124 @@ fn a_build_waits_for_each_blob_not_at_hand_and_takes_its_unit_again() {
   assert_eq!(built.unwrap(), whole, "the same work as the one-call build");
   assert_eq!(waits, FILES, "one wait for each file the push changed");
 }
+
+/// A store exposing plain-BLAKE3 whole-file identities through [`PushObjects::blob_named`] (A-760)
+/// and serving those bytes as a [`crate::named::Objects`] plane.
+struct NamedStore<'a> {
+  store: &'a Store,
+}
+
+impl PushObjects for NamedStore<'_> {
+  fn tree(&self, id: ObjectKey) -> Result<Vec<TreeEntry>, Unavailable> {
+    self.store.tree(id)
+  }
+
+  fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable> {
+    self.store.blob_len(id)
+  }
+
+  fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable> {
+    self.store.blob(id)
+  }
+
+  fn blob_named(&self, id: ObjectKey) -> Option<crate::named::Identity> {
+    let bytes = self.store.blob(id).ok()?;
+    Some(crate::named::Identity {
+      hash: *blake3::hash(&bytes).as_bytes(),
+      len: bytes.len() as u64,
+    })
+  }
+}
+
+impl crate::named::Objects for NamedStore<'_> {
+  fn read(
+    &self,
+    identity: &crate::named::Identity,
+    at: u64,
+    into: &mut [u8],
+  ) -> Result<(), crate::named::ObjectMissing> {
+    let missing = crate::named::ObjectMissing {
+      identity: *identity,
+    };
+    let bytes = self
+      .store
+      .objects
+      .values()
+      .find_map(|obj| match obj {
+        Object::Blob(b)
+          if b.len() as u64 == identity.len && *blake3::hash(b).as_bytes() == identity.hash =>
+        {
+          Some(b.as_slice())
+        }
+        _ => None,
+      })
+      .ok_or(missing)?;
+    let from = usize::try_from(at).map_err(|_| missing)?;
+    let slice = bytes
+      .get(from..from.saturating_add(into.len()))
+      .ok_or(missing)?;
+    into.copy_from_slice(slice);
+    Ok(())
+  }
+}
+
+/// A-760: Do: push two distinct files plus a third file sharing the first's bytes and a symlink
+/// over a store returning `blob_named`. Expect: the built increment carries zero file bytes in
+/// `post_state` (only the head xattr stays inline), deduplicates identical blobs to 2 `NamedRun`s,
+/// encodes compactly, and after reading runs and `submit_named`, the green holds every regular file
+/// as `Content::Named` with zero inline file bytes.
+/// Asserts that `path` in `green` stores no inline content bytes and holds `Content::Named` of `len`.
+fn assert_named_file(green: &Green, path: &str, len: u64) {
+  assert!(
+    green.content_bytes(path).is_none(),
+    "{path} holds no inline bytes"
+  );
+  assert!(
+    matches!(green.content(path), Some(crate::engine::Content::Named(id)) if id.len == len),
+    "{path} stored as Content::Named({len})"
+  );
+}
+
+/// A-760 / Wave 5C: do build a push through a `PushObjects` whose `blob_named` returns a named
+/// identity for regular files (like Mercurial/Git file blobs in `ContentStore`) while leaving
+/// symlinks inline. Expect `Posting` to omit regular-file bytes from `post_state`, deduplicate
+/// identical blobs into one `NamedRun`, and `submit_named` to store every regular file as
+/// `Content::Named` with zero inline file bytes.
+#[test]
+fn a_push_over_blob_named_names_whole_files_and_keeps_green_content_bytes_zero() {
+  let mut store = Store::default();
+  let mut green = Green::new();
+  let big_a = vec![b'A'; 16_384];
+  let big_b = vec![b'B'; 8_192];
+  let mut files = Files::new();
+  files.insert("a.bin".to_owned(), file(&big_a));
+  files.insert("a_dup.bin".to_owned(), file(&big_a));
+  files.insert("b.bin".to_owned(), file(&big_b));
+  files.insert("link".to_owned(), Node::Link("a.bin".to_owned()));
+  let tree = put(&mut store, &files);
+  let tip = head(9);
+  let pushed = push(green.head(), None, tree, &tip);
+  let named_store = NamedStore { store: &store };
+  let mut built = build(&pushed, &green, &named_store, u64::MAX).expect("named push builds");
+  assert_eq!(
+    (
+      built.increment.post_state.len(),
+      built.increment.named.runs.len(),
+      built.reads.blobs,
+    ),
+    (tip.len(), 2, 1),
+    "only head xattr stays inline, identical blobs deduplicate, only symlink read"
+  );
+  assert!(built.increment.encode().len() < 2_048);
+  while !built
+    .increment
+    .read_step(&named_store, 4_096)
+    .expect("read named runs")
+  {}
+  let (outcome, _) = green.submit_named(&mut built.increment);
+  assert!(matches!(outcome, Outcome::Accepted { version: 1 }));
+  assert_named_file(&green, "a.bin", big_a.len() as u64);
+  assert_named_file(&green, "a_dup.bin", big_a.len() as u64);
+  assert_named_file(&green, "b.bin", big_b.len() as u64);
+  assert_eq!(green.symlink("link"), Some("a.bin"));
+}

@@ -99,6 +99,12 @@ pub trait Held {
     let split = crate::filerev::split(&text).ok()?;
     Some(crate::read::to_u64(split.bytes.len()))
   }
+  /// Whether this store keeps file revisions without a metadata block in the shared content plane
+  /// under their plain BLAKE3 identity (`file_names().bytes`), so a push's work can name them
+  /// whole (A-760) instead of carrying their bytes inline. False by default for synthetic stores.
+  fn stores_named_files(&self) -> bool {
+    false
+  }
 }
 
 /// A file revision's text named by its parts' identities: its metadata block's, if it has one, and its bytes'. Two texts

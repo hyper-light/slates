@@ -218,41 +218,72 @@ pub(crate) const READ_BROUGHT_BACK_WAIT_NS: &str = "merge.name_read.brought_back
 /// wait. Refused as `read_through::bring_back` refuses.
 pub(crate) async fn bring_back_range(
   identity: Identity,
+  range: (u64, u64),
+) -> Result<ReadPin, super::read_through::ReadThroughRefused> {
+  bring_back_range_in(None, identity, range).await
+}
+
+/// [`bring_back_range`], reading directly from `hint`'s `T` table when the caller already knows
+/// which repository stores `identity` (e.g. a Mercurial push or import), else resolving via
+/// Subversion records, live Mercurial repositories, or `read_through` (Git packs).
+pub(crate) async fn bring_back_range_in(
+  hint: Option<slates_db::catalog::RepositoryId>,
+  identity: Identity,
   (offset, len): (u64, u64),
 ) -> Result<ReadPin, super::read_through::ReadThroughRefused> {
   use super::read_through::ReadThroughRefused;
   let began = slates_rt::futures::now_ns();
   let root = ContentId(identity.hash);
   let windows = crate::state::with_state(|state| {
-    let content = state.vcs_stores.content()?;
-    let end = offset.saturating_add(len.max(1)).min(identity.len.max(1));
-    let mut windows = Vec::new();
-    let mut at = offset;
-    while at < end {
-      let (window, start, width) = content.window_holding(&root, identity.len, at)?;
-      windows.push((window, start));
-      at = start.saturating_add(width.max(1));
-    }
-    Some(windows)
+    super::lent_state(state, |state| {
+      let content = state.vcs_stores.content()?;
+      let end = offset.saturating_add(len.max(1)).min(identity.len.max(1));
+      let mut windows = Vec::new();
+      let mut at = offset;
+      while at < end {
+        let (window, start, width) = content.window_holding(&root, identity.len, at)?;
+        windows.push((window, start));
+        at = start.saturating_add(width.max(1));
+      }
+      Some(windows)
+    })
   })
   .flatten()
   .ok_or(ReadThroughRefused::NoStore)?;
   let pin = ReadPin::of(windows.iter().map(|(window, _)| *window).collect());
-  // A Subversion text is its repository's on the node's store (read by repository and identity); any other object is
-  // its landed changeset's Payload, read by identity alone (`read_through`).
-  let repository =
-    crate::state::with_state(|state| state.vcs_stores.subversion_storing(&identity.hash)).flatten();
+  // A Subversion or Mercurial whole-file text lives in its repository's `T` table on the node's
+  // store (read by repository and identity); any other object is its landed changeset's Payload,
+  // read by identity alone (`read_through`).
+  let mut repository = match hint {
+    Some(repo) => Some(repo),
+    None => crate::state::with_state(|state| state.vcs_stores.subversion_storing(&identity.hash))
+      .flatten(),
+  };
+  let mut hg_candidates: Option<Vec<slates_db::catalog::RepositoryId>> = None;
   for (window, start) in &windows {
-    match repository {
-      Some(repository) => bring_back_text_window(repository, identity, (*window, *start)).await?,
-      None => {
-        let waited = slates_git::store::packed::Waited {
-          pack: root,
-          len: identity.len,
-          offset: *start,
-        };
-        super::read_through::bring_back(waited).await?;
+    if let Some(repo) = repository {
+      bring_back_text_window(repo, identity, (*window, *start)).await?;
+      continue;
+    }
+    let repos = hg_candidates.get_or_insert_with(|| {
+      crate::state::with_state(|state| state.vcs_stores.mercurial_repositories())
+        .unwrap_or_default()
+    });
+    let mut brought = false;
+    for &repo in repos.iter() {
+      if bring_back_text_window_if_present(repo, identity, (*window, *start)).await? {
+        repository = Some(repo);
+        brought = true;
+        break;
       }
+    }
+    if !brought {
+      let waited = slates_git::store::packed::Waited {
+        pack: root,
+        len: identity.len,
+        offset: *start,
+      };
+      super::read_through::bring_back(waited).await?;
     }
   }
   let waited_ns = slates_rt::futures::now_ns().saturating_sub(began);
@@ -384,7 +415,7 @@ pub(crate) async fn bring_back_reads(
   Ok(pins)
 }
 
-/// Brings back the let-go window `window` of Subversion repository `repository`'s text `identity`, from byte `start`,
+/// Brings back the let-go window `window` of repository `repository`'s text `identity`, from byte `start`,
 /// read through the node's store a piece at a time (`StoreHandle::text`, as `svn_texts::bring_whole` reads one), each
 /// read waited for at most `read_through::PATIENCE_NS`; nothing to do for a window back already.
 async fn bring_back_text_window(
@@ -392,6 +423,21 @@ async fn bring_back_text_window(
   identity: Identity,
   (window, start): (ContentId, u64),
 ) -> Result<(), super::read_through::ReadThroughRefused> {
+  if bring_back_text_window_if_present(repository, identity, (window, start)).await? {
+    Ok(())
+  } else {
+    Err(super::read_through::ReadThroughRefused::Missing { at: start })
+  }
+}
+
+/// [`bring_back_text_window`], returning `Ok(false)` instead of `Missing` when `repository`'s `T`
+/// table does not hold `identity` at byte `start`, so a caller with multiple candidate repositories
+/// can probe each before falling back to `read_through`.
+async fn bring_back_text_window_if_present(
+  repository: slates_db::catalog::RepositoryId,
+  identity: Identity,
+  (window, start): (ContentId, u64),
+) -> Result<bool, super::read_through::ReadThroughRefused> {
   use super::read_through::ReadThroughRefused;
   let found = crate::state::with_state(|state| {
     let content = state.vcs_stores.content()?;
@@ -402,7 +448,7 @@ async fn bring_back_text_window(
   })
   .flatten();
   let Some((disk, width)) = found else {
-    return Ok(());
+    return Ok(true);
   };
   let disk = disk.ok_or(ReadThroughRefused::NoDisk)?;
   let from = u128::from_be_bytes(repository.bytes);
@@ -424,6 +470,7 @@ async fn bring_back_text_window(
     .await;
     let piece = match read {
       Ok(Some(Ok(Some(piece)))) if !piece.is_empty() => piece,
+      Ok(Some(Ok(_))) if at == start => return Ok(false),
       Ok(Some(Ok(_))) => return Err(ReadThroughRefused::Missing { at }),
       Ok(Some(Err(refused))) => return Err(ReadThroughRefused::Owner(format!("{refused:?}"))),
       Ok(None) => {
@@ -441,14 +488,215 @@ async fn bring_back_text_window(
     super::within_budget(state, width, |stores| {
       let content = stores.content_mut().ok_or(ReadThroughRefused::NoStore)?;
       if !content.is_away(&window) {
-        return Ok(());
+        return Ok(true);
       }
       content
         .bring_back(&window, &bytes)
+        .map(|()| true)
         .map_err(ReadThroughRefused::Refused)
     })
   })
   .ok_or(ReadThroughRefused::NoStore)?
+}
+
+/// Reads every unread named run of `work` from the shard's content plane one run at a time,
+/// bringing back any let-go windows from `repository`'s `T` table before reading that run and
+/// immediately letting them go again once read, so peak resident content-store memory stays at
+/// most one file while satisfying `Green::judge_named` (A-760). Yields between slices under half
+/// the shard's step quantum. None if the shard state is gone; `Err(())` if any run could not be
+/// brought back or read.
+/// Whether any window covering `run` in `ContentStore` is currently let go to disk.
+fn run_has_away_window(run: &slates_merge::named::NamedRun) -> Option<bool> {
+  crate::state::with_state(|state| {
+    super::lent_state(state, |state| {
+      let content = state.vcs_stores.content()?;
+      let root = ContentId(run.identity.hash);
+      let end = run
+        .offset
+        .saturating_add(run.len.max(1))
+        .min(run.identity.len.max(1));
+      let mut cursor = run.offset;
+      while cursor < end {
+        let (window, start, width) = content.window_holding(&root, run.identity.len, cursor)?;
+        if content.is_away(&window) {
+          return Some(true);
+        }
+        cursor = start.saturating_add(width.max(1));
+      }
+      Some(false)
+    })
+  })
+  .map(|found| found.unwrap_or(false))
+}
+
+/// Reads named run `at` of `work` in cooperative slices under half the shard's step quantum.
+async fn read_one_run_slices(
+  at: usize,
+  len: u64,
+  work: &mut slates_merge::engine::Increment,
+) -> Option<Result<(), ()>> {
+  while (work.read_run(at).map_or(0, <[u8]>::len) as u64) < len {
+    let step = crate::state::with_state(|state| {
+      let slice = state.config.copy_slice_bytes().max(1);
+      let until =
+        slates_rt::futures::now_ns().saturating_add((state.config.step_quantum_ns() / 2).max(1));
+      super::lent_state(state, |state| {
+        let Some(store) = state.vcs_stores.content() else {
+          return Err(());
+        };
+        let objects = PlaneObjects {
+          store,
+          kept_in: &state.store.content,
+        };
+        while (work.read_run(at).map_or(0, <[u8]>::len) as u64) < len {
+          if work.read_step(&objects, slice).is_err() {
+            return Err(());
+          }
+          if slates_rt::futures::now_ns() >= until {
+            break;
+          }
+        }
+        Ok(())
+      })
+    })?;
+    if step.is_err() {
+      return Some(Err(()));
+    }
+    if (work.read_run(at).map_or(0, <[u8]>::len) as u64) < len {
+      slates_rt::futures::yield_now().await;
+    }
+  }
+  Some(Ok(()))
+}
+
+/// Reads every `NamedRun` of `work` asynchronously, bringing back any let-go windows from `vcs_disk`
+/// (preferring `repository`) one file at a time and letting those brought-back windows go
+/// immediately after reading that run so peak resident memory in `ContentStore` stays bounded to at
+/// most one file while satisfying `Green::judge_named` (A-760). Yields between slices under half
+/// the shard's step quantum. None if the shard state is gone; `Err(())` if any run could not be
+/// brought back or read.
+pub(crate) async fn read_named_work_async(
+  repository: slates_db::catalog::RepositoryId,
+  work: &mut slates_merge::engine::Increment,
+) -> Option<Result<(), ()>> {
+  if work.unread().is_none() {
+    return Some(Ok(()));
+  }
+  let runs: Vec<slates_merge::named::NamedRun> = work.named.runs.clone();
+  for (at, run) in runs.iter().enumerate() {
+    if work.read_run(at).map_or(0, <[u8]>::len) as u64 >= run.len {
+      continue;
+    }
+    let was_away = run_has_away_window(run)?;
+    let pin = if was_away {
+      match bring_back_range_in(Some(repository), run.identity, (run.offset, run.len)).await {
+        Ok(pin) => Some(pin),
+        Err(_) => return Some(Err(())),
+      }
+    } else {
+      None
+    };
+    if read_one_run_slices(at, run.len, work).await?.is_err() {
+      return Some(Err(()));
+    }
+    drop(pin);
+    if was_away {
+      let root = ContentId(run.identity.hash);
+      let _ = crate::state::with_state(|state| {
+        super::lent_state(state, |state| {
+          super::within_budget(state, 0, |stores| {
+            if let Some(content) = stores.content_mut() {
+              let _ = content.let_go_object_landed(&root, &super::landed_pin);
+            }
+          })
+        })
+      });
+    }
+  }
+  Some(Ok(()))
+}
+
+/// Synchronous counterpart of [`read_named_work_async`] for tests holding `ShardState` directly:
+/// brings back any let-go windows of `work`'s named runs via `test_store::read_text_blocking`,
+/// reads each run through `PlaneObjects`, and lets the brought-back windows go again.
+#[cfg(test)]
+pub(crate) fn read_named_work_blocking(
+  state: &mut crate::state::ShardState,
+  repository: slates_db::catalog::RepositoryId,
+  work: &mut slates_merge::engine::Increment,
+) -> Result<(), ()> {
+  if work.unread().is_none() {
+    return Ok(());
+  }
+  let runs: Vec<slates_merge::named::NamedRun> = work.named.runs.clone();
+  for (at, run) in runs.iter().enumerate() {
+    if work.read_run(at).map_or(0, <[u8]>::len) as u64 >= run.len {
+      continue;
+    }
+    let root = ContentId(run.identity.hash);
+    let away_windows: Vec<(ContentId, u64, u64)> = super::lent_state(state, |state| {
+      let Some(content) = state.vcs_stores.content() else {
+        return Vec::new();
+      };
+      let end = run
+        .offset
+        .saturating_add(run.len.max(1))
+        .min(run.identity.len.max(1));
+      let mut out = Vec::new();
+      let mut cursor = run.offset;
+      while cursor < end {
+        let Some((window, start, width)) = content.window_holding(&root, run.identity.len, cursor)
+        else {
+          break;
+        };
+        if content.is_away(&window) {
+          out.push((window, start, width));
+        }
+        cursor = start.saturating_add(width.max(1));
+      }
+      out
+    });
+    let was_away = !away_windows.is_empty();
+    if was_away {
+      let disk = state.vcs_disk.clone().ok_or(())?;
+      let from = u128::from_be_bytes(repository.bytes);
+      for (window, start, width) in away_windows {
+        let bytes =
+          crate::test_store::read_text_blocking(&disk, from, run.identity.hash, start, width)
+            .ok_or(())?;
+        super::lent_state(state, |state| {
+          super::within_budget(state, width, |stores| {
+            let content = stores.content_mut().ok_or(())?;
+            if content.is_away(&window) {
+              content.bring_back(&window, &bytes).map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+          })
+        })?;
+      }
+    }
+    super::lent_state(state, |state| {
+      let store = state.vcs_stores.content().ok_or(())?;
+      let objects = PlaneObjects {
+        store,
+        kept_in: &state.store.content,
+      };
+      while (work.read_run(at).map_or(0, <[u8]>::len) as u64) < run.len {
+        work.read_step(&objects, run.len.max(1)).map_err(|_| ())?;
+      }
+      Ok::<(), ()>(())
+    })?;
+    if was_away {
+      super::lent_state(state, |state| {
+        super::within_budget(state, 0, |stores| {
+          if let Some(content) = stores.content_mut() {
+            let _ = content.let_go_object_landed(&root, &super::landed_pin);
+          }
+        })
+      });
+    }
+  }
+  Ok(())
 }
 
 /// Green `green`'s current file `path` whole, its let-go windows brought back first where it is held by name

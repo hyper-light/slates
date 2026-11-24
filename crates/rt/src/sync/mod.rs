@@ -218,14 +218,14 @@ impl<T> Sender<T> {
 
 /// The wait of [`Sender::send`]: a sender task that finds the channel full holds a place among the waiting senders,
 /// its word registered there, and checks once more; each value the receiver takes grants one waiting place its room
-/// and wakes it. A woken sender whose room a racing sender took waits again in its place. One dropped while waiting
-/// frees its place; one dropped after a grant it did not use hands the room on.
+/// and wakes it. A woken sender whose room a racing sender took waits again in a fresh place. One dropped while
+/// waiting frees its place; one dropped after a grant it did not use hands the room on.
 #[derive(Debug)]
 pub struct Send<'a, T> {
   sender: &'a Sender<T>,
   value: Option<T>,
   /// The place held among the waiting senders, while one is.
-  place: Option<usize>,
+  place: Option<CellRef>,
 }
 
 impl<T> Unpin for Send<'_, T> {}
@@ -271,10 +271,20 @@ impl<T> Future for Send<'_, T> {
     let place = match this.place {
       Some(place) => {
         if room.granted(place) {
-          // Granted, and the room went to a racing sender: wait again in the same place.
-          room.wait_again(place);
+          // Granted, and the room went to a racing sender: wait again in a fresh place.
+          match room.wait_again(place) {
+            Some(next) => {
+              this.place = Some(next);
+              next
+            }
+            None => {
+              this.place = None;
+              return Poll::Ready(Err(SyncError::Full(value)));
+            }
+          }
+        } else {
+          place
         }
-        place
       }
       None => match room.hold() {
         Some(place) => {

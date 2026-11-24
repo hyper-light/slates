@@ -779,14 +779,14 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   state.store.budget.credit_retention(reserved);
   // Its segments landed unnamed: the next landing takes the last the register names, plus one (decision 2).
   state.vcs_stores.set_landed(id, named);
-  let whole = match (state.vcs_stores.content_mut(), stage) {
+  let whole = super::name_holds::freeing(state, |content| match (content, stage) {
     (Some(content), Stage::Running { import, .. }) => (*import).abandon(content).is_ok(),
     (Some(content), Stage::Done { imported, .. }) => {
       let Imported { index, .. } = *imported;
       index.release(content).is_ok()
     }
     (None, _) => true,
-  };
+  });
   if !whole {
     state.count(RELEASE_REFUSED, 1);
   }
@@ -796,10 +796,10 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 
 /// Gives back an index a landing did not place, then settles.
 fn give_back(state: &mut ShardState, index: HgIndex) {
-  let whole = match state.vcs_stores.content_mut() {
+  let whole = super::name_holds::freeing(state, |content| match content {
     Some(content) => index.release(content).is_ok(),
     None => true,
-  };
+  });
   if !whole {
     state.count(RELEASE_REFUSED, 1);
   }
@@ -1022,6 +1022,143 @@ struct WantedWorks {
 /// builds none in its one step). Format: a counter name in the status report.
 pub(crate) const WORK_TURNS: &str = "vcs_store.hg_import.work_turns";
 
+/// Begins building one bookmark's work after fetching any let-go endpoint changesets/manifests.
+async fn begin_mark_work(
+  id: RepositoryId,
+  wanted: &WantedWorks,
+  node: &Node,
+  admission: &mut Admission,
+) -> Option<Result<slates_hg::push::tree::WorkBuild, ImportFailed>> {
+  let verified = Verified::default();
+  let moved = Move {
+    name: wanted.name,
+    base_version: wanted.version,
+    base: wanted.head.as_ref(),
+    head: node,
+  };
+  let endpoints = [wanted.head, Some(*node)];
+  let missing = crate::state::with_state(|state| {
+    super::lent_state(state, |state| {
+      let Some(Importing {
+        stage: Stage::Done { imported, .. },
+        ..
+      }) = state.vcs_stores.imports.get(&id)
+      else {
+        return None;
+      };
+      let content = state.vcs_stores.content.as_ref()?;
+      Some(crate::repository::hg_push::missing_endpoint_logs(
+        &imported.index,
+        content,
+        &endpoints,
+      ))
+    })
+  })
+  .flatten()?;
+  let Ok(overlay_data) = crate::repository::hg_push::fetch_missing_endpoints(id, missing).await
+  else {
+    return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
+  };
+  let begun = crate::state::with_state(|state| {
+    let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+    super::lent_state(state, |state| {
+      done_held(state, id, |held| {
+        let overlay = slates_hg::push::held::OverlayHeld::new(
+          held,
+          overlay_data.changesets,
+          overlay_data.manifests,
+        );
+        tree::begin_work(
+          &moved,
+          (&verified, &overlay),
+          (admission.left(), pace),
+          admission,
+        )
+      })
+    })
+  })
+  .flatten()?;
+  Some(begun.map_err(|refused| ImportFailed::Landing(work_refused(&refused, wanted.room))))
+}
+
+/// Charges, reads named runs, and stores a finished bookmark work in the done import.
+async fn finish_mark_work(
+  id: RepositoryId,
+  wanted: &WantedWorks,
+  mark: &[u8],
+  mut built: slates_merge::push::Built,
+  admission: &mut Admission,
+) -> Option<Result<(), ImportFailed>> {
+  if admission
+    .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
+    .is_err()
+  {
+    return Some(Err(ImportFailed::Landing(past_room(wanted.room))));
+  }
+  if super::named_objects::read_named_work_async(id, &mut built.increment)
+    .await?
+    .is_err()
+  {
+    return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
+  }
+  crate::state::with_state(|state| keep_work(state, id, mark.to_vec(), built.increment))?;
+  Some(Ok(()))
+}
+
+/// Builds one bookmark's work asynchronously, fetching let-go endpoints and any let-go file
+/// revisions between turns, then reads its named runs and stores it in the done import.
+async fn build_one_mark_work(
+  id: RepositoryId,
+  wanted: &WantedWorks,
+  (mark, node): (&[u8], &Node),
+  admission: &mut Admission,
+) -> Option<Result<(), ImportFailed>> {
+  let verified = Verified::default();
+  let mut building = match begin_mark_work(id, wanted, node, admission).await? {
+    Ok(building) => building,
+    Err(failed) => return Some(Err(failed)),
+  };
+  loop {
+    let advanced = crate::state::with_state(|state| {
+      let quantum = state.config.step_quantum_ns() / 2;
+      building
+        .pace()
+        .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
+      state.count(WORK_TURNS, 1);
+      // The windows lent for the turn, as the landing's own step lends them (`super::lent_state`).
+      super::lent_state(state, |state| {
+        let engine = state.greens.get(&wanted.root)?;
+        done_held(state, id, |held| {
+          building.advance(&engine, (&verified, held))
+        })
+      })
+    })
+    .flatten()?;
+    match advanced {
+      None if building.ask_waited(admission.left()) => {
+        if !super::hg_view::answer_store_wants(&mut building, id).await {
+          return None;
+        }
+        let brought = crate::state::with_state(|state| {
+          super::lent_state(state, |state| brought_back(state, id, &mut building))
+        })
+        .flatten();
+        if brought.is_none() {
+          return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
+        }
+      }
+      None => slates_rt::futures::yield_now().await,
+      Some(Ok(built)) => return finish_mark_work(id, wanted, mark, built, admission).await,
+      Some(Err(refused)) => {
+        return Some(Err(ImportFailed::Landing(work_refused(
+          &refused,
+          wanted.room,
+        ))));
+      }
+    }
+  }
+}
+
 /// Repository `id`'s done import's bookmark works, each built a unit a turn under half the shard's quantum as a push's are
 /// (`hg_push::built_works`), over the import's own index; a turn waiting for a text not at hand (one a landed segment
 /// let go) reads it from the node's changeset store between turns and brings it back. Kept in the done import for its
@@ -1030,85 +1167,10 @@ async fn built_works(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
   let Some(wanted) = crate::state::with_state(|state| wanted_works(state, id)).flatten() else {
     return Some(Ok(()));
   };
-  let verified = Verified::default();
   let mut admission = Admission::new(wanted.room);
   for (mark, node) in &wanted.marks {
-    let moved = Move {
-      name: wanted.name,
-      base_version: wanted.version,
-      base: wanted.head.as_ref(),
-      head: node,
-    };
-    let begun = crate::state::with_state(|state| {
-      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-      super::lent_state(state, |state| {
-        done_held(state, id, |held| {
-          tree::begin_work(
-            &moved,
-            (&verified, held),
-            (admission.left(), pace),
-            &mut admission,
-          )
-        })
-      })
-    })
-    .flatten()?;
-    let mut building = match begun {
-      Ok(building) => building,
-      Err(refused) => {
-        return Some(Err(ImportFailed::Landing(work_refused(
-          &refused,
-          wanted.room,
-        ))));
-      }
-    };
-    loop {
-      let advanced = crate::state::with_state(|state| {
-        let quantum = state.config.step_quantum_ns() / 2;
-        building
-          .pace()
-          .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
-        state.count(WORK_TURNS, 1);
-        // The windows lent for the turn, as the landing's own step lends them (`super::lent_state`).
-        super::lent_state(state, |state| {
-          let engine = state.greens.get(&wanted.root)?;
-          done_held(state, id, |held| {
-            building.advance(&engine, (&verified, held))
-          })
-        })
-      })
-      .flatten()?;
-      match advanced {
-        None if building.ask_waited(admission.left()) => {
-          if !super::hg_view::answer_store_wants(&mut building, id).await {
-            return None;
-          }
-          let brought = crate::state::with_state(|state| {
-            super::lent_state(state, |state| brought_back(state, id, &mut building))
-          })
-          .flatten();
-          if brought.is_none() {
-            return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
-          }
-        }
-        None => slates_rt::futures::yield_now().await,
-        Some(Ok(built)) => {
-          if admission
-            .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
-            .is_err()
-          {
-            return Some(Err(ImportFailed::Landing(past_room(wanted.room))));
-          }
-          crate::state::with_state(|state| keep_work(state, id, mark.clone(), built.increment))?;
-          break;
-        }
-        Some(Err(refused)) => {
-          return Some(Err(ImportFailed::Landing(work_refused(
-            &refused,
-            wanted.room,
-          ))));
-        }
-      }
+    if let Err(failed) = build_one_mark_work(id, &wanted, (mark, node), &mut admission).await? {
+      return Some(Err(failed));
     }
   }
   Some(Ok(()))
@@ -1193,12 +1255,37 @@ fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), Imp
       base: wanted.head.as_ref(),
       head: node,
     };
+    let endpoints = [wanted.head, Some(*node)];
+    let missing = super::lent_state(state, |state| {
+      let Some(Importing {
+        stage: Stage::Done { imported, .. },
+        ..
+      }) = state.vcs_stores.imports.get(&id)
+      else {
+        return None;
+      };
+      let content = state.vcs_stores.content.as_ref()?;
+      Some(crate::repository::hg_push::missing_endpoint_logs(
+        &imported.index,
+        content,
+        &endpoints,
+      ))
+    })
+    .ok_or_else(unavailable)?;
+    let overlay_data =
+      crate::repository::hg_push::fetch_work_endpoints_blocking(state, id, missing)
+        .map_err(|()| unavailable())?;
     let begun = super::lent_state(state, |state| {
       let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
       done_held(state, id, |held| {
+        let overlay = slates_hg::push::held::OverlayHeld::new(
+          held,
+          overlay_data.changesets,
+          overlay_data.manifests,
+        );
         tree::begin_work(
           &moved,
-          (&verified, held),
+          (&verified, &overlay),
           (admission.left(), pace),
           &mut admission,
         )
@@ -1231,10 +1318,15 @@ fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), Imp
             .ok_or_else(unavailable)?;
         }
         None => {}
-        Some(Ok(built)) => {
+        Some(Ok(mut built)) => {
           admission
             .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
             .map_err(|_| ImportFailed::Landing(past_room(wanted.room)))?;
+          if super::named_objects::read_named_work_blocking(state, id, &mut built.increment)
+            .is_err()
+          {
+            return Err(unavailable());
+          }
           keep_work(state, id, mark.clone(), built.increment);
           break;
         }

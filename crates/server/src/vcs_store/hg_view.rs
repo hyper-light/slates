@@ -178,10 +178,10 @@ pub(crate) async fn answer_store_wants(
 ) -> bool {
   use slates_hg::render::Want;
   let repository = u128::from_be_bytes(id.bytes);
+  let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
   while let Some(want) = wants.wants().cloned() {
     let asked_at = slates_rt::futures::now_ns();
-    let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
-    let Some(disk) = disk else {
+    let Some(disk) = disk.as_ref() else {
       // A daemon holding no store keeps no revision: a rows' want is answered none, any other refused.
       let Want::Rows { logs } = want else {
         return false;
@@ -194,7 +194,7 @@ pub(crate) async fn answer_store_wants(
       );
       continue;
     };
-    let Some(whole) = answer_one(&disk, repository, want, wants).await else {
+    let Some(whole) = answer_one(disk, repository, want, wants).await else {
       return false;
     };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);

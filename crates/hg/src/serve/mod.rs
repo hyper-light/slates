@@ -101,6 +101,14 @@ pub trait Repository {
   /// Its text is read from the node's changeset store (`lookup::TagsRead`).
   fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal>;
 
+  /// The manifest node of changeset `rev`, read from its changelog row without reading the
+  /// changeset's or manifest's text (goal 93 C1 (1): manifests let go to the changeset store).
+  /// `None` by default for stores that do not expose manifest nodes separately (`TagsRead` then
+  /// falls back to [`Repository::tags_file`]).
+  fn manifest_node(&self, _rev: Rev) -> Option<Node> {
+    None
+  }
+
   /// The repository's obsolescence markers, in any order: a fetch sends them, and a push's are judged against them.
   fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>>;
 }

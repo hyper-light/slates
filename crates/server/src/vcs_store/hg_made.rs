@@ -163,14 +163,49 @@ async fn made_landing(
       None => return,
     },
   };
-  let made = crate::state::with_state(|state| {
+  // Bring any let-go parent changeset/manifest directly from the changeset store (at most 2 texts)
+  // so `made_of` can derive the new changeset without reading evicted `ContentStore` windows.
+  let missing_parent = crate::state::with_state(|state| {
+    let before = version.checked_sub(1)?;
+    let parent = made_at(state, green, before)
+      .or_else(|| named_head(state, green))
+      .unwrap_or(slates_hg::NULL_NODE);
     super::lent_state(state, |state| {
-      made_applied(state, green, version, (&authorship, &copies))
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      Some(crate::repository::hg_push::missing_endpoint_logs(
+        &store.index,
+        content,
+        &[Some(parent)],
+      ))
     })
-  });
-  let Some(made) = made else {
+  })
+  .flatten();
+  let overlay = match missing_parent {
+    Some(missing) => crate::repository::hg_push::fetch_missing_endpoints(repository, missing)
+      .await
+      .unwrap_or_default(),
+    None => crate::repository::hg_push::EndpointOverlay::default(),
+  };
+  let Some((mut made, away)) = crate::state::with_state(|state| {
+    super::named_objects::away_scope(|| {
+      super::lent_state(state, |state| {
+        made_applied(state, green, version, (&authorship, &copies), &overlay)
+      })
+    })
+  }) else {
     return;
   };
+  if !away.is_empty() {
+    let _pins = super::named_objects::bring_back_reads(&away).await.ok();
+    let Some(retried) = crate::state::with_state(|state| {
+      super::lent_state(state, |state| {
+        made_applied(state, green, version, (&authorship, &copies), &overlay)
+      })
+    }) else {
+      return;
+    };
+    made = retried;
+  }
   let made = match made {
     Ok(Some(made)) => made,
     other => {
@@ -363,6 +398,7 @@ fn made_applied(
   green: DbVolumeId,
   version: u64,
   (authorship, copies): (&Authorship, &[MadeCopy]),
+  overlay: &crate::repository::hg_push::EndpointOverlay,
 ) -> Result<Option<Made>, Unmade> {
   let Some(inputs) = inputs(state, (green, version), authorship)? else {
     return Ok(None);
@@ -372,7 +408,18 @@ fn made_applied(
     .vcs_stores
     .mercurial_ref(inputs.repository)
     .ok_or(Unmade::NotHead)?;
-  let verified = verified_of(&engine, (&store.index, content), &inputs, copies)?;
+  let plane = super::named_objects::PlaneObjects {
+    store: content,
+    kept_in: &state.store.content,
+  };
+  let verified = verified_of(
+    &engine,
+    (&store.index, content),
+    Some(&plane),
+    overlay,
+    &inputs,
+    copies,
+  )?;
   Ok(verified.map(|verified| Made {
     repository: inputs.repository,
     green,
@@ -393,17 +440,32 @@ fn made_held(
     return Ok(None);
   };
   let ShardState {
-    greens, vcs_stores, ..
+    greens,
+    vcs_stores,
+    store: shard_store,
+    ..
   } = &mut *state;
   let preview = greens
     .preview(&green, judged)
     .map_err(|_| Unmade::NotHead)?;
+  let empty = crate::repository::hg_push::EndpointOverlay::default();
   let verified = greens
     .with_preview(&preview, |engine| {
       let (content, store) = vcs_stores
         .mercurial_ref(inputs.repository)
         .ok_or(Unmade::NotHead)?;
-      verified_of(engine, (&store.index, content), &inputs, copies)
+      let plane = super::named_objects::PlaneObjects {
+        store: content,
+        kept_in: &shard_store.content,
+      };
+      verified_of(
+        engine,
+        (&store.index, content),
+        Some(&plane),
+        &empty,
+        &inputs,
+        copies,
+      )
     })
     .unwrap_or(Err(Unmade::NotHead));
   greens.retire_preview(preview);
@@ -513,18 +575,17 @@ fn commit_made(
   let (repository, green, version) = (made.repository, made.green, made.version);
   let fork = forked.fork;
   super::hg_view::walks_noted(state, &fork);
-  let released = super::within_budget(state, 0, |stores| {
-    let replaced = match stores.mercurial(repository) {
-      Some((content, store)) => {
-        store.made.insert(green_key(green), (version, node));
-        core::mem::replace(&mut store.index, fork).release(content)
-      }
-      None => stores
-        .content_mut()
-        .map_or(Ok(()), |content| fork.release(content)),
+  let to_release = super::within_budget(state, 0, |stores| {
+    let Some((_, store)) = stores.mercurial(repository) else {
+      return fork;
     };
+    store.made.insert(green_key(green), (version, node));
+    let old = core::mem::replace(&mut store.index, fork);
     stores.index_changed(repository);
-    replaced
+    old
+  });
+  let released = super::name_holds::freeing(state, |content| {
+    content.map_or(Ok(()), |content| to_release.release(content))
   });
   if released.is_err() {
     state.count(super::RELEASE_REFUSED, 1);
@@ -534,10 +595,8 @@ fn commit_made(
 
 /// Gives a made changeset's fork back, counted where a hold did not go back.
 fn give_back_fork(state: &mut ShardState, fork: HgIndex) {
-  let released = super::within_budget(state, 0, |stores| {
-    stores
-      .content_mut()
-      .map_or(Ok(()), |content| fork.release(content))
+  let released = super::name_holds::freeing(state, |content| {
+    content.map_or(Ok(()), |content| fork.release(content))
   });
   if released.is_err() {
     state.count(super::RELEASE_REFUSED, 1);
@@ -592,6 +651,8 @@ pub(crate) fn mercurial_repository_of(
 fn verified_of(
   engine: &Green,
   (index, content): (&HgIndex, &slates_vcs::ContentStore),
+  plane: Option<&super::named_objects::PlaneObjects<'_>>,
+  overlay_data: &crate::repository::hg_push::EndpointOverlay,
   inputs: &Inputs,
   copies: &[MadeCopy],
 ) -> Result<Option<Verified>, Unmade> {
@@ -601,11 +662,22 @@ fn verified_of(
   }
   let paths = engine.changed_between(before, version);
   let sources: Vec<Option<String>> = paths.iter().map(|path| copied_from(path, copies)).collect();
+  let owned: Vec<Option<(Vec<u8>, Flag)>> = paths
+    .iter()
+    .map(|path| change_after(engine, path, plane))
+    .collect::<Result<_, _>>()?;
   let changes: Vec<Change<'_>> = paths
     .iter()
     .zip(&sources)
-    .map(|(path, source)| change_of(engine, path, source.as_deref()))
-    .collect::<Result<_, _>>()?;
+    .zip(&owned)
+    .map(|((path, source), after)| Change {
+      path: path.as_bytes(),
+      after: after
+        .as_ref()
+        .map(|(bytes, flag)| (bytes.as_slice(), *flag)),
+      copied_from: source.as_deref().map(str::as_bytes),
+    })
+    .collect();
   let (user, message, seconds) = &inputs.authored;
   let authored = Authored {
     user: user.as_bytes(),
@@ -614,13 +686,13 @@ fn verified_of(
     message: message.as_bytes(),
   };
   let mut room = slates_hg::Admission::new(inputs.room);
-  match made_of(
-    &IndexHeld::new(index, content),
-    inputs.parent,
-    &changes,
-    &authored,
-    &mut room,
-  ) {
+  let base_held = IndexHeld::new(index, content);
+  let overlay = slates_hg::push::held::OverlayHeld::new(
+    &base_held,
+    overlay_data.changesets.clone(),
+    overlay_data.manifests.clone(),
+  );
+  match made_of(&overlay, inputs.parent, &changes, &authored, &mut room) {
     Ok(verified) => Ok(Some(verified)),
     Err(MadeRefused::NothingChanged) => Ok(None),
     Err(refused) => Err(Unmade::Made(refused)),
@@ -647,35 +719,41 @@ fn copied_from(path: &str, copies: &[MadeCopy]) -> Option<String> {
   })
 }
 
-/// The change at `path`; refused [`Unmade::Named`] at a file held by its content-plane object alone (A-760 (b) 4b).
-fn change_of<'g>(
-  engine: &'g Green,
-  path: &'g str,
-  source: Option<&'g str>,
-) -> Result<Change<'g>, Unmade> {
-  let after = match engine.symlink(path) {
-    Some(target) => Some((target.as_bytes(), Flag::Link)),
+/// The new bytes and flag at `path` (reading named files through `plane` where held by name alone,
+/// A-760 (b) 4d); refused [`Unmade::Named`] when a named file's object cannot be read now.
+fn change_after(
+  engine: &Green,
+  path: &str,
+  plane: Option<&super::named_objects::PlaneObjects<'_>>,
+) -> Result<Option<(Vec<u8>, Flag)>, Unmade> {
+  match engine.symlink(path) {
+    Some(target) => Ok(Some((target.as_bytes().to_vec(), Flag::Link))),
     None => match engine.content(path) {
-      None => None,
+      None => Ok(None),
       Some(content) => {
-        let bytes = super::named_objects::lent_bytes_of(path, content).map_err(Unmade::Named)?;
+        let bytes = match content {
+          slates_merge::engine::Content::Bytes(bytes) => bytes.to_vec(),
+          slates_merge::engine::Content::Named(identity) => {
+            super::named_objects::whole_of(content.into(), plane).ok_or_else(|| {
+              Unmade::Named(super::named_objects::NamedUnread {
+                path: path.to_owned(),
+                identity,
+              })
+            })?
+          }
+        };
         let executable = engine.mode(path).is_some_and(|mode| mode & EXECUTABLE != 0);
-        Some((
+        Ok(Some((
           bytes,
           if executable {
             Flag::Executable
           } else {
             Flag::Regular
           },
-        ))
+        )))
       }
     },
-  };
-  Ok(Change {
-    path: path.as_bytes(),
-    after,
-    copied_from: source.map(str::as_bytes),
-  })
+  }
 }
 
 /// The made changeset's branch: its parent's, or for a root its line's, else `default`.

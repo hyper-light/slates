@@ -154,6 +154,27 @@ pub(crate) fn segment_bytes(state: &ShardState) -> u64 {
   u64::try_from(crate::vcs_store::hg_import::segment_bytes(state)).unwrap_or(u64::MAX)
 }
 
+/// Derived: the resident unpacked content-store bytes a push segment may hold before cutting and letting go: one
+/// fanout multiple of [`segment_bytes`] (`chunk_bytes * fanout^2`, two levels of SplinterDB's target fanout — 16 MiB
+/// on 16 KiB pages, 4 MiB on 4 KiB pages). Decoupling this from the compressed on-disk changegroup slice bound keeps
+/// delta-compressed pushes from cutting thousands of tiny disk segments while bounding peak resident texts to one
+/// two-level fanout window instead of the whole repository.
+pub(crate) fn segment_resident_bytes(state: &ShardState) -> u64 {
+  #[cfg(test)]
+  {
+    let set = TEST_SEGMENT_BYTES.with(core::cell::Cell::get);
+    if set > 0 {
+      return set;
+    }
+  }
+  let fanout: slates_machine::Derived<u64> = slates_machine::derived!(
+    8,
+    "SplinterDB's target fanout, sizing one resident push segment as a second-level fanout of one disk segment",
+    ["engine-structure.md §4"]
+  );
+  segment_bytes(state).saturating_mul(fanout.get())
+}
+
 /// A push's run of segment changesets (module docs): its repository, the store it lands on, and the sequences its
 /// segments landed at, as ranges. Settled committed where an entry named it, else forgotten, and a run dropped
 /// unsettled forgets itself.

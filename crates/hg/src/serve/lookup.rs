@@ -56,14 +56,38 @@ enum Resolved {
 /// Format: the path of the file Mercurial keeps its global tags in.
 pub(crate) const TAGS_PATH: &[u8] = b".hgtags";
 
-/// The `.hgtags` of the served view's heads, read from the node's changeset store (module docs): the distinct file
-/// revisions the heads' manifests name, oldest head first (7.2's `_filterfnodes`); then their rows, asked in one want;
-/// then their texts, asked in one, within the room the reading began in; each text's metadata block left out
-/// (7.2's `filectx.data()`).
+/// Which phase of reading `.hgtags` through the changeset store [`TagsRead`] is in:
+/// when the repository exposes head manifest nodes (`Repository::manifest_node`), head manifests
+/// are read from the changeset store first (goal 93 C1 (1): manifest texts let go from RAM), then
+/// the distinct `.hgtags` file revisions those manifests name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagsStage {
+  /// Waiting for rows of the heads' manifests (`MANIFEST_PATH`).
+  ManifestRows,
+  /// Waiting for texts of the heads' manifests (`MANIFEST_PATH`).
+  ManifestTexts,
+  /// Waiting for rows of the heads' `.hgtags` revisions (`TAGS_PATH`).
+  FileRows,
+  /// Waiting for texts of the heads' `.hgtags` revisions (`TAGS_PATH`).
+  FileTexts,
+  /// Finished (succeeded or refused).
+  Done,
+}
+
+/// The `.hgtags` of the served view's heads, read from the node's changeset store (module docs):
+/// when the repository exposes head manifest nodes without reading manifest texts, the distinct
+/// head manifests are read from the changeset store first to extract each head's `.hgtags` node,
+/// then the distinct `.hgtags` file revisions are read in one batch, oldest head first (7.2's
+/// `_filterfnodes`), each text's metadata block left out (7.2's `filectx.data()`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagsRead {
+  /// The distinct non-null head manifest nodes, in head order (empty when `repo.manifest_node`
+  /// returned `None` and `files` was populated directly from `repo.tags_file`).
+  manifests: Vec<Node>,
   /// The `.hgtags` file revisions, in the order read.
   files: Vec<Node>,
+  /// Which stage of the changeset-store exchange is active.
+  stage: TagsStage,
   /// What the next read asks of the store.
   want: Option<Want>,
   /// Each text, in `files`' order, once given.
@@ -79,23 +103,59 @@ impl TagsRead {
   pub fn begin(repo: &impl Repository, admission: &mut Admission) -> Result<TagsRead, Refusal> {
     let heads = head_revs(repo, admission)?;
     admission.charge_items::<Node>(heads.len().saturating_mul(2))?;
-    let mut seen: HashSet<Node> = HashSet::with_capacity(heads.len());
-    let mut files = Vec::with_capacity(heads.len());
-    for head in heads {
-      if let Some(file) = repo.tags_file(head, admission)?
-        && seen.insert(file)
-      {
-        files.push(file);
+    let mut manifests = Vec::new();
+    let mut seen_manifests: HashSet<Node> = HashSet::new();
+    let mut files = Vec::new();
+    let mut seen_files: HashSet<Node> = HashSet::new();
+    let mut deferred_manifests = false;
+    for head in &heads {
+      match repo.tags_file(*head, admission) {
+        Ok(Some(file)) => {
+          if seen_files.insert(file) {
+            files.push(file);
+          }
+        }
+        Ok(None) => {}
+        Err(Refusal::Store { .. }) if repo.manifest_node(*head).is_some() => {
+          // A head manifest was let go to the changeset store (goal 93 C1 (1)): read all distinct
+          // non-null head manifests from the store in order so tag precedence stays exact.
+          deferred_manifests = true;
+          break;
+        }
+        Err(refused) => return Err(refused),
       }
     }
-    let (want, texts) = if files.is_empty() {
-      (None, Some(Vec::new()))
+    if deferred_manifests {
+      files.clear();
+      for head in heads {
+        if let Some(manifest) = repo.manifest_node(head)
+          && manifest != NULL_NODE
+          && seen_manifests.insert(manifest)
+        {
+          manifests.push(manifest);
+        }
+      }
+    }
+    let (stage, want, texts) = if deferred_manifests {
+      if manifests.is_empty() {
+        (TagsStage::Done, None, Some(Vec::new()))
+      } else {
+        let logs = vec![(
+          crate::push::intake::MANIFEST_PATH.to_vec(),
+          manifests.clone(),
+        )];
+        (TagsStage::ManifestRows, Some(Want::Rows { logs }), None)
+      }
+    } else if files.is_empty() {
+      (TagsStage::Done, None, Some(Vec::new()))
     } else {
       let logs = vec![(TAGS_PATH.to_vec(), files.clone())];
-      (Some(Want::Rows { logs }), None)
+      (TagsStage::FileRows, Some(Want::Rows { logs }), None)
     };
     Ok(TagsRead {
+      manifests,
       files,
+      stage,
       want,
       texts,
       most: admission.left(),
@@ -133,15 +193,30 @@ impl TagsRead {
     }
   }
 
-  /// The rows of the `.hgtags` revisions: their texts asked next, within the room; refused where one has none.
+  /// The rows of the requested manifests or `.hgtags` revisions: their texts asked next, within the
+  /// room; refused where one has none.
   pub fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
     self.want = None;
+    let expected = match self.stage {
+      TagsStage::ManifestRows => self.manifests.len(),
+      TagsStage::FileRows => self.files.len(),
+      _ => {
+        return self.fail(Refusal::Store {
+          what: "a .hgtags revision row answered out of turn",
+        });
+      }
+    };
     let log = rows.into_iter().next().unwrap_or_default();
-    let identities: Option<Vec<[u8; 32]>> = (log.len() == self.files.len())
+    let identities: Option<Vec<[u8; 32]>> = (log.len() == expected)
       .then(|| log.into_iter().map(|row| row.map(|row| row.text)).collect())
       .flatten();
     match identities {
       Some(texts) => {
+        self.stage = match self.stage {
+          TagsStage::ManifestRows => TagsStage::ManifestTexts,
+          TagsStage::FileRows => TagsStage::FileTexts,
+          other => other,
+        };
         self.want = Some(Want::Texts {
           texts,
           most: self.most,
@@ -153,22 +228,56 @@ impl TagsRead {
     }
   }
 
-  /// The texts of the `.hgtags` revisions, each with its metadata block left out.
+  /// The texts of the head manifests (extracting `.hgtags` file nodes) or the `.hgtags` revisions
+  /// (each with its metadata block left out).
   pub fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
     self.want = None;
-    if texts.len() != self.files.len() {
-      return self.fail(Refusal::Store {
-        what: "a .hgtags text the changeset store gave short",
-      });
-    }
-    let mut read = Vec::with_capacity(texts.len());
-    for text in texts {
-      match crate::filerev::split(&text) {
-        Ok(split) => read.push(split.bytes.to_vec()),
-        Err(_) => return self.fail(Refusal::Store { what: "tags" }),
+    match self.stage {
+      TagsStage::ManifestTexts => {
+        if texts.len() != self.manifests.len() {
+          return self.fail(Refusal::Store {
+            what: "a manifest text the changeset store gave short",
+          });
+        }
+        let mut seen: HashSet<Node> = HashSet::with_capacity(texts.len());
+        self.files.clear();
+        for text in texts {
+          if let Some(entry) = crate::manifest::find(&text, TAGS_PATH)
+            && seen.insert(entry.node)
+          {
+            self.files.push(entry.node);
+          }
+        }
+        if self.files.is_empty() {
+          self.stage = TagsStage::Done;
+          self.texts = Some(Vec::new());
+        } else {
+          self.stage = TagsStage::FileRows;
+          self.want = Some(Want::Rows {
+            logs: vec![(TAGS_PATH.to_vec(), self.files.clone())],
+          });
+        }
       }
+      TagsStage::FileTexts => {
+        if texts.len() != self.files.len() {
+          return self.fail(Refusal::Store {
+            what: "a .hgtags text the changeset store gave short",
+          });
+        }
+        let mut read = Vec::with_capacity(texts.len());
+        for text in texts {
+          match crate::filerev::split(&text) {
+            Ok(split) => read.push(split.bytes.to_vec()),
+            Err(_) => return self.fail(Refusal::Store { what: "tags" }),
+          }
+        }
+        self.stage = TagsStage::Done;
+        self.texts = Some(read);
+      }
+      _ => self.fail(Refusal::Store {
+        what: "a .hgtags text answered out of turn",
+      }),
     }
-    self.texts = Some(read);
   }
 
   /// The texts hold more than the room the reading began in: the lookup is refused past it.
@@ -181,6 +290,7 @@ impl TagsRead {
 
   /// Ends the read refused.
   fn fail(&mut self, refused: Refusal) {
+    self.stage = TagsStage::Done;
     self.want = None;
     self.refused = Some(refused);
   }
@@ -231,7 +341,11 @@ impl TagsRead {
   /// Whether `self` read the same `.hgtags` revisions `other` begins to: the heads' tags unchanged between them, so a
   /// read made earlier answers a lookup now.
   pub fn same_files(&self, other: &TagsRead) -> bool {
-    self.files == other.files
+    if !self.manifests.is_empty() || !other.manifests.is_empty() {
+      self.manifests == other.manifests
+    } else {
+      self.files == other.files
+    }
   }
 }
 

@@ -230,6 +230,31 @@ impl<'a> Indexed<'a> {
     self
   }
 
+  /// Reads one revision's full text for [`given_from_texts`].
+  #[cfg(test)]
+  fn text_for_log(&self, path: &[u8], node: &Node) -> Option<Option<Vec<u8>>> {
+    let mut room = Admission::new(u64::MAX);
+    if path == crate::push::intake::CHANGELOG_PATH {
+      let text = self
+        .index
+        .rev(self.store, Log::Changelog, node)
+        .and_then(|rev| self.index.changeset(self.store, rev))
+        .and_then(|row| self.store.object_bytes(&row.text, row.len));
+      return Some(text);
+    }
+    let log = if path == crate::push::intake::MANIFEST_PATH {
+      Log::Manifest
+    } else {
+      Log::File(path)
+    };
+    Some(
+      self
+        .logged(log, node, &mut room)
+        .ok()?
+        .map(|logged| logged.text.into_owned()),
+    )
+  }
+
   /// [`Store::stored_now`] from the index's own texts ([`Indexed::answering_from_its_texts`]).
   #[cfg(test)]
   fn given_from_texts(
@@ -244,10 +269,8 @@ impl<'a> Indexed<'a> {
         for (path, nodes) in logs {
           let mut log = Vec::new();
           for node in nodes {
-            let mut room = Admission::new(u64::MAX);
-            let logged = self.logged(Log::File(path), node, &mut room).ok()?;
-            log.push(logged.map(|logged| {
-              let text = logged.text.into_owned();
+            let text = self.text_for_log(path, node)?;
+            log.push(text.map(|text| {
               let identity = *blake3::hash(&text).as_bytes();
               let len = to_u64(text.len());
               texts.borrow_mut().insert(identity, text);
@@ -499,8 +522,17 @@ impl Repository for Indexed<'_> {
     if row.manifest == NULL_NODE {
       return Ok(None);
     }
+    // A repository whose `.hgtags` file log is empty has no `.hgtags` entry in any head manifest,
+    // so no manifest text needs to be read (goal 93 C1 (1): manifest texts let go to disk).
+    if self.index.len(self.store, Log::File(TAGS_PATH)) == 0 {
+      return Ok(None);
+    }
     let manifest = self.text_of(Log::Manifest, &row.manifest, admission)?;
     Ok(crate::manifest::find(&manifest, TAGS_PATH).map(|entry| entry.node))
+  }
+
+  fn manifest_node(&self, rev: Rev) -> Option<Node> {
+    self.row(rev).map(|row| row.manifest)
   }
 }
 
@@ -566,6 +598,22 @@ impl Store for Indexed<'_> {
   /// A file revision as its log's row holds it, no text read (A-767 C1).
   fn file_entry(&self, path: &[u8], node: &Node) -> Option<super::getbundle::FileEntry> {
     let log = Log::File(path);
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self
+      .index
+      .revision(self.store, log, rev)
+      .filter(|row| row.node == *node)?;
+    Some(super::getbundle::FileEntry {
+      position: u64::from(rev),
+      parents: [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
+      link: self.index.changeset(self.store, row.link)?.node,
+      flags: row.flags,
+    })
+  }
+
+  /// A manifest revision as its log's row holds it, no text read (goal 93 C1 (1)).
+  fn manifest_entry(&self, node: &Node) -> Option<super::getbundle::FileEntry> {
+    let log = Log::Manifest;
     let rev = self.index.rev(self.store, log, node)?;
     let row = self
       .index

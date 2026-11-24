@@ -488,10 +488,32 @@ fn head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
 
 /// A green's file at its head.
 fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
-  state
-    .greens
-    .get(&green)
-    .and_then(|engine| engine.content_bytes(path).map(<[u8]>::to_vec))
+  let engine = state.greens.get(&green)?;
+  let content = engine.content(path)?;
+  match content {
+    slates_merge::engine::Content::Bytes(bytes) => Some(bytes.to_vec()),
+    slates_merge::engine::Content::Named(identity) => {
+      if let Some(bytes) = crate::vcs_store::named_objects::read_file(state, green, path) {
+        return Some(bytes);
+      }
+      // The push's landed segment already let the file's window go to `vcs_disk` (A-760): read it
+      // back from the repository's `T` table as `named_objects::read_file_brought` does async.
+      let repository = state
+        .db
+        .partition()
+        .repositories()
+        .member(green)?
+        .repository;
+      let disk = state.vcs_disk.clone()?;
+      crate::test_store::read_text_blocking(
+        &disk,
+        u128::from_be_bytes(repository.bytes),
+        identity.hash,
+        0,
+        identity.len,
+      )
+    }
+  }
 }
 
 /// Rebuilds the fixtures' repository in `hg` as one push to its empty first line: `base` and `second`, the changesets
