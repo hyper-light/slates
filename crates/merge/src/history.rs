@@ -1906,7 +1906,7 @@ mod tests {
       let expected = apply(base_bytes, &ops, &post) == *head_bytes;
       prop_assert_eq!(values[at].applied_equals(
         (&chunks, files.blocks()),
-        (&ops, crate::named::Post::of(&post, &[], &[])),
+        (&ops, crate::named::Post::inline(&post)),
         values.last().unwrap(),
       ), expected);
     }

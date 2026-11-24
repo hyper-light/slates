@@ -353,6 +353,10 @@ impl Staging {
     };
     // Kept for the next batch, where this one has no room for it.
     let kept = revision.clone();
+    // The staging step is a step of its own, never the tail of the texts' last put (goal 93: a revision of 9,000 files
+    // put its texts' last slice and staged in one poll of 952 ms on a debug build). The brought texts are held across
+    // the yield, and the landing turn keeps every other commit out.
+    slates_rt::futures::yield_now().await;
     let staged = crate::state::with_state(|state| {
       let staged = self.stage_in(state, repository, (revision, plans));
       super::release_texts(state, None, &brought_texts);
@@ -561,16 +565,19 @@ impl Staging {
     };
     // The batch is the register's now: its versions applied to the green a slice a turn (`RecordedBatch`), the
     // landing turn and the import's read gate held until the last; a kill between slices recovers from the record.
+    // Each slice a step of its own, the first apart from the commit, the tail apart from the last (goal 93: a revision
+    // of 9,000 files applied its last slice and ran the tail in one poll of 833 ms on a debug build).
     let mut slices = 0usize;
     loop {
       #[cfg(test)]
       kill_at_commit_slice_where_set(slices).await;
+      slates_rt::futures::yield_now().await;
       if crate::state::with_state(|state| recorded.apply_slice(state))?.is_some() {
         break;
       }
       slices = slices.saturating_add(1);
-      slates_rt::futures::yield_now().await;
     }
+    slates_rt::futures::yield_now().await;
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, cause);

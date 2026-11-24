@@ -2022,8 +2022,11 @@ impl ContentStore {
       {
         pending.extend(
           list
-            .chunks_exact(IDENTITY_BYTES)
-            .filter_map(ContentId::from_slice),
+            .as_chunks::<IDENTITY_BYTES>()
+            .0
+            .iter()
+            .copied()
+            .map(ContentId),
         );
       }
     }
