@@ -1,0 +1,44 @@
+name: diag-main-virtiofs
+# main 01a20182 (2026-11-24 04:40 PST): w-svn's run request after A-899 (7416cae15: a virtio-fs device serves a work, so a
+# guest's read of a let-go Subversion text parks, is brought back and answered, A-898). crates/server/tests/virtiofs.rs
+# on Linux, every case that runs here (the in-process seam and the vhost-user ones), twice, each run's full output kept.
+# Run only from diag-measurer-main-virtiofs-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-virtiofs-*"]
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  virtiofs:
+    name: virtiofs tests (ubuntu-latest, at 7416cae15)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7416cae1548864ff9d9f3c1c35f747b0f084d869
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the test
+        run: cargo test --locked -p slates-server --test virtiofs --no-run
+      - name: Run it twice
+        run: |
+          set +e
+          pass=0
+          for n in 1 2; do
+            timeout 1800 cargo test --locked -p slates-server --test virtiofs -- --nocapture > "$RUNNER_TEMP/virtiofs-$n.log" 2>&1
+            rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
+            echo "run $n rc=$rc: $(grep -a '^test result' "$RUNNER_TEMP/virtiofs-$n.log" | tail -1)"
+            grep -aE '^test .* \.\.\. (FAILED|ignored)|panicked at|SKIP|skipping' "$RUNNER_TEMP/virtiofs-$n.log" | head -12 | cut -c1-300
+            grep -aE 'a_guests_read_of_a_let_go_subversion_text' "$RUNNER_TEMP/virtiofs-$n.log" | head -3 | cut -c1-200
+          done
+          echo "== virtiofs: $pass of 2 runs passed"
+          exit 0
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtiofs-logs
+          path: ${{ runner.temp }}/virtiofs-*.log
