@@ -418,6 +418,11 @@ pub(crate) struct Turned {
   pub(crate) discarded: u64,
 }
 
+/// A family's entries over a range of coordinates at the cut, read until their bytes pass a cap, and where the read
+/// stopped short of the range ([`Encoder::turn`]'s `entries`).
+pub(crate) type FamilyReader<'a> =
+  &'a dyn Fn(Family, (u64, u64), usize) -> (Vec<Entry>, Option<u64>);
+
 impl Encoder {
   /// The encoder of a recovered image's `pages` (each family's page and its piece's bytes): its committed cut.
   pub(crate) fn restored(pages: Vec<((Family, Page), Vec<u8>)>) -> Encoder {
@@ -504,7 +509,7 @@ impl Encoder {
   pub(crate) fn turn(
     &mut self,
     (limit, page_bytes): (usize, usize),
-    entries: &dyn Fn(Family, (u64, u64), usize) -> (Vec<Entry>, Option<u64>),
+    entries: FamilyReader<'_>,
     encoded: &mut Vec<(Family, Page)>,
   ) -> Turned {
     let paused = self.paused();

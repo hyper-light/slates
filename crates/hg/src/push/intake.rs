@@ -980,6 +980,7 @@ impl Intake {
     }
   }
 
+  #[cfg(test)]
   pub(crate) fn answer_from_fork(&mut self, store: &ContentStore) {
     let Some(asked) = self.taker.asked.as_mut() else {
       return;
