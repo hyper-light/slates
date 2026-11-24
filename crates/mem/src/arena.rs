@@ -213,6 +213,9 @@ pub struct ChunkArena {
   discard_from: usize,
   /// Bytes released and zeroed in place since the last complete purge: resident RAM no allocation holds.
   resident_free: usize,
+  /// Growths from the pool that found its free room enough and claimed less ([`ChunkArena::make_room`]): another arena
+  /// claimed an extent first, or one could not be added. Each refused its admission whole.
+  room_lost: u64,
   /// Where an unfinished purge resumes: the region id and the byte within it.
   purge_cursor: Option<(u16, usize)>,
   /// Allocations so far, monotone: a caller that sees it unchanged across an interval knows the arena was idle.
@@ -293,6 +296,7 @@ impl ChunkArena {
       source: None,
       discard_from: usize::MAX,
       resident_free: 0,
+      room_lost: 0,
       purge_cursor: None,
       allocations: 0,
       reused: 0,
@@ -526,6 +530,7 @@ impl ChunkArena {
     let added =
       u64::try_from(self.grow(usize::try_from(needed).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
     if added < needed {
+      self.room_lost = self.room_lost.saturating_add(1);
       // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
       // returned first), down to the capacity the arena had before.
       self.shrink(before);
@@ -669,6 +674,11 @@ impl ChunkArena {
     if let Some(source) = self.source.as_mut() {
       source.open_hold(open);
     }
+  }
+
+  /// Growths from the pool that found its free room enough and claimed less, so far ([`ChunkArena::make_room`]).
+  pub fn room_lost(&self) -> u64 {
+    self.room_lost
   }
 
   /// Claims the source could not hand out so far ([`ExtentSource::refused`]); zero without a source.
