@@ -511,7 +511,7 @@ impl Live {
         &mut self.content,
         &self.store,
         (&mut push, &mut writer),
-        (arriving, Some(offset)),
+        (arriving, Some(offset), super::Named::Here),
       )?;
     }
     Ok(Pending {

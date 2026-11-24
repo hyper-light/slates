@@ -175,6 +175,12 @@
 > ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
 > resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
 > for it (`git_fleet`) until the creation does.
+> **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
+> home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
+> 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
+> behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
+> put's budget; red first in-process (`vcs_store::homes::tests::a_home_behind_its_senders_configuration_...`). OWED
+> (main): gate 10 at the landing, 0 of 40 to close.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -4474,11 +4480,17 @@
 > green re-adopted at boot was refused `NotHead`, its held verdict's preview `Stale`, since a re-adoption installed
 > every green standing alone and a preview is made through the lineage; a re-adopted lineage root now founds its lineage
 > again as a recovery's does (`verbs::install_readopted`), held by the second edit of
-> `a_readopted_green_brings_back_the_named_base_its_chain_splices_first` (red: `NotHead`). Owed: a re-adopted branch
-> member is still installed alone, its engine the replica's over arenas of its own (counted
-> `merge.readoption.outside_lineage`), so a made commit over it is refused; and a boot fences a branch member whose
-> root awaits re-adoption (`SourceUnavailable`, the branch rebuilt before its source stands). Both need a re-adopted
-> branch rebuilt over its re-adopted source. (c) a Mercurial
+> `a_readopted_green_brings_back_the_named_base_its_chain_splices_first` (red: `NotHead`). A re-adopted branch
+> member whose source stands in its lineage is rebuilt over that source, branched again at its version and its own
+> chain replayed, as a recovery rebuilds one (`verbs::begin_readoption`, `install_readopted`; w-perf, 2026-11-24, main's
+> item (1) of 08:52; red `a_readopted_branch_member_is_rebuilt_over_its_source_and_takes_a_made_commit`: installed
+> alone, `merge.readoption.outside_lineage` 1). A boot's branch member whose source awaits
+> re-adoption waits for it (`merge_service::MergeShardState::after_source`, counted
+> `merge.recovery.branches_after_source`, its works through `work_home.unbuilt`), is rebuilt over it once it is
+> re-adopted (`verbs::begin_waiting_branches`, stepped by `green_adopt::readopt_with`), and is fenced with it if it is
+> fenced, or at the boot's end if still waiting (w-perf, 2026-11-24, main's item (2) of 08:52; red
+> `a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it`: fenced `SourceUnavailable`). Owed: a green
+> taken over onto a new owner records no membership (`adopt_taken_over_green`), so `hg_made` makes no changeset over it. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

@@ -1900,7 +1900,7 @@ async fn serve_peer_records(
           // for it, apart from the content plane's holds, and answered once its image is published.
           slates_cluster::homes::HOME_STREAM => {
             crate::vcs_store::homes::serve_remote(
-              control,
+              (control, learned_host(peer_anchor, seed)),
               &request,
               crate::daemon::LIVENESS_BUDGET_NS,
             )
