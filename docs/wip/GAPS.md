@@ -808,6 +808,12 @@
 > test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
 > recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
 > `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
+> **A synchronous history's landing held its shard past the watchdog's window (2026-11-24, w-ci; OPEN until every site
+> moves).** `create_blocking`, `land_blocking` and `land_segments_blocking` wait in a `join` on the shard's own thread
+> while the store commits. An `fdatasync` longer than the 1000 ms window then ends the test binary with the watchdog's
+> exit 4 (w-tsan: 1 of 100 `daemon_edge` runs at load 47; reproduced 3 of 3 on adacachy2 with the store's `fdatasync`
+> delayed 1.5 s). `daemon_edge`'s creations moved to `create_on`, which waits on the test's thread; about 45 sites in
+> other files follow. Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
 > `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which

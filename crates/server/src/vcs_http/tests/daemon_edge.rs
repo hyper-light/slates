@@ -150,23 +150,17 @@ fn name_on_the_repositorys_partition() -> String {
     .expect("a name routes there")
 }
 
-/// Creates the git repository `name` on its partition, owned by [`owner`].
+/// Creates the git repository `name` on its partition, owned by [`owner`], as a client's creation is made: answered from
+/// a task of the shard while this thread waits for it to be recorded ([`crate::test_store::create_on`]). Made in a
+/// history holding the shard (`test_store::create`), the shard waited out the store's commit in a thread's `join`, and
+/// a commit slower than the liveness window ended the whole test binary (exit 4, "shard 1 is wedged").
 fn create(daemon: &Daemon, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Git,
-        format: ObjectFormat::Sha1,
-        default_branch: "main".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  crate::test_store::create_on(
+    daemon,
+    REPOSITORY,
+    &owner(),
+    (name, VcsTool::Git, ObjectFormat::Sha1, "main"),
+  );
 }
 
 /// Enrolls `token` for uid `uid` until `expires_ns`, on the partition its hash routes to, as the human surface does.
@@ -1452,22 +1446,18 @@ fn hg_name_on_the_repositorys_partition() -> String {
 /// `states` repository into its store there (A-675), a unit a turn to its end, and lands it (A-687): its phase roots and
 /// markers recorded, so the store serves what 7.2's `served` filter serves of it ([`STATES_SERVED_HEADS`]).
 fn create_hg_from_states(daemon: &Daemon, name: &str) {
-  let name = name.to_owned();
+  let (id, _) = crate::test_store::create_on(
+    daemon,
+    REPOSITORY,
+    &owner(),
+    (
+      name,
+      VcsTool::Mercurial,
+      ObjectFormat::Sha1,
+      "branch:default:0",
+    ),
+  );
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Mercurial,
-        format: ObjectFormat::Sha1,
-        default_branch: "branch:default:0".to_owned(),
-        green: None,
-      },
-    );
-    assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
-    let repositories = state.db.partition().repositories();
-    let id = repositories.repository_named(&name).expect("the record").id;
     let (host, directory) =
       crate::hg_base::tests::laid_out(crate::hg_base::tests::STATES.iter().copied());
     assert_eq!(
@@ -1590,23 +1580,20 @@ const HG_PUSH_FIELDS: &str = "Accept-Encoding: identity\r\nContent-Type: applica
   Vary: X-HgArg-1,X-HgProto-1\r\nX-HgArg-1: heads=666f726365\r\n\
   X-HgProto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull\r\nAccept: application/mercurial-0.1\r\n";
 
-/// Creates the empty Mercurial repository `name` on its partition, owned by [`owner`].
+/// Creates the empty Mercurial repository `name` on its partition, owned by [`owner`], as [`create`] creates a git one:
+/// the shard is never held for the store's commit.
 fn create_empty_hg(daemon: &Daemon, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Mercurial,
-        format: ObjectFormat::Sha1,
-        default_branch: "branch:default:0".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  crate::test_store::create_on(
+    daemon,
+    REPOSITORY,
+    &owner(),
+    (
+      name,
+      VcsTool::Mercurial,
+      ObjectFormat::Sha1,
+      "branch:default:0",
+    ),
+  );
 }
 
 /// A bundle2 holding [`WIRE_HISTORY`] (a changegroup 03, every revision its full text) and `main` at `base`, asking no
