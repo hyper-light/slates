@@ -1,0 +1,54 @@
+name: diag main f2
+# main 01a20182 (2026-11-23): w-shared's F2 (2cdd88fa3 on agents/w-shared-f2, over main ddfb469ee). Its run request: the
+# starvation test, a ticket's wait answered while the shard keeps dirtying its image, ten times in release and ten in
+# debug, on two hosts (CI's runners give it fewer cores than the big Studio, which is booked tonight). Every run's verdict
+# is printed; a red is Err(Unanswered) with its counters in the message. A diagnostics branch, never merged.
+on:
+  push:
+    branches: ["diag-measurer-main-f2-*"]
+
+jobs:
+  starvation:
+    name: starvation ${{ matrix.profile }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        profile: [release, debug]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the server's library tests
+        run: |
+          if [ "${{ matrix.profile }}" = release ]; then P=--release; else P=; fi
+          cargo test $P --locked -p slates-server --lib --no-run
+      - name: The starvation test, ten times
+        run: |
+          if [ "${{ matrix.profile }}" = release ]; then P=--release; else P=; fi
+          T=vcs_store::durable::tests::a_tickets_wait_is_answered_while_the_shard_keeps_dirtying_its_image
+          pass=0
+          for n in 1 2 3 4 5 6 7 8 9 10; do
+            set +e
+            cargo test $P --locked -p slates-server --lib -- --exact "$T" --nocapture > "$RUNNER_TEMP/run-$n.log" 2>&1
+            rc=$?
+            set -e
+            echo "run $n rc=$rc $(grep -a '^test result' "$RUNNER_TEMP/run-$n.log" | tail -1 | cut -c1-80)"
+            if [ $rc -eq 0 ]; then pass=$((pass + 1)); else grep -a -A4 'panicked at' "$RUNNER_TEMP/run-$n.log" | head -6 | cut -c1-400; fi
+          done
+          echo "== ${{ matrix.profile }} on ${{ matrix.os }}: $pass of 10 passed"
+          [ $pass -eq 10 ]
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: f2-starvation-${{ matrix.os }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/run-*.log
+          if-no-files-found: warn
