@@ -22,6 +22,27 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 05:37 on 11-24:
+- 84a Windows VERDICT (w-84a-win's A-897, accepted): no scheduling change on slates' side holds the every-run bar on
+  jupiter. 6 interleaved rounds, 254 invocations: main fails 1/114 loaded and 14/120 quiet runs (p999 > 1 ms). Every arm
+  lost or tied: a 2 ms shard window, client spins, seat holds, A-326's holds off, the client thread raised up to
+  TIME_CRITICAL (it still stalls 3-12 ms there), and the client pinned to one CPU. About 80% of slow samples are the
+  client thread stalled in its own send path, and about 15% are the seat's pickup. Main's quiet stall rate (3-7e-4 a
+  sample) sits inside the OS's own measured wake tail (pingpong.ps1: 1-12 ms late at 2e-4 to 1e-3 a wake). WHP is on,
+  and the hypervisor/DPC cause is inferred. Landing: the bench's attribution, no product latency change, the
+  measured-and-rejected table, then (separately) observations that hold no shard (CPU only). The bar is Ada's to restate,
+  or she gives a hypervisor-free Windows box or turns WHP off on jupiter.
+- svn use round (r865, 77397a5f4) STOPPED in a crash loop: an import poll ran 1,189 ms (import.rs:235), and after the
+  kill every restart's shard 0 spun in start_shard (daemon.rs:1190): 1,189 restarts in 44 minutes, which the anchor
+  never counted as failed starts. Likely a regression in d27106abc..77397a5f4 (r817 and the Linux matrix imported
+  git-2000 cleanly). w-svn owns the import poll (A-895 is in the window). w-perf owns the start's recovery slicing
+  (A-887 is in the window; the same site as r854's hg restart red) and the anchor counting a half-started daemon as
+  served. Evidence: Studio ~/.cache/main-rounds/svn-use-3/excerpt.txt.
+- Gate 8 runs at ee9571813 (45405128575; w-git's homing instrumentation, 20 release + 20 debug runs) to name the
+  branch that answers short. The Linux interop matrices run again at 8466f48b3 (45404800642). The git leg (r870) runs on
+  the big Studio since 05:28.
+- Landed: w-hg's A-891 Mercurial half (946484875; made_commit::commit removed), w-git's ee9571813.
+
 Updates at 05:24 on 11-24:
 - Push-0/1's cause, narrowed: gate 7 (45398593779, 3d65116a6) passed 19 of 20. In the failure, push 1's pack homing came
   back Err(Unanswered) 0.9 ms after the body was sent (13:08:46.350264 sent, 13:08:46.351179 refused on band 3 "not kept
