@@ -593,6 +593,27 @@ fn advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16, Vec<u8
   exchange(port, certificate, request.as_bytes())
 }
 
+/// Goal 93 (main's ruling of 2026-11-24 00:44): an hg reply answered whole, judged by its body as well as its status:
+/// Mercurial answers a refused push or fetch `200` with an abort part in its bundle (`ERROR:ABORT`, its words after
+/// it), so a status alone hid `push refused: Index(Unread { rev: 5 })` (C1 (1)'s red).
+fn assert_hg_answered(reply: &(u16, String, Vec<u8>)) {
+  let body = String::from_utf8_lossy(&reply.2);
+  assert_eq!(reply.0, 200, "{body}");
+  assert!(
+    !body.contains("ERROR:ABORT"),
+    "answered with an abort: {body}"
+  );
+}
+
+/// Goal 93 (main's ruling of 2026-11-24 00:44): a git push accepted, judged by its report as well as its status: a
+/// refused ref is reported `ng` in a `200` answer, so a status alone cannot tell it.
+fn assert_git_pushed(reply: &(u16, Vec<u8>)) {
+  let report = String::from_utf8_lossy(&reply.1);
+  assert_eq!(reply.0, 200, "{report}");
+  assert!(report.contains("unpack ok"), "unpacked: {report}");
+  assert!(!report.contains("ng refs/"), "every ref taken: {report}");
+}
+
 /// `request` pushed to repository `name` by its owner as stock git posts it, with its length: the answer's status and
 /// body.
 fn pushed(edge: (u16, &CertificateDer<'static>), name: &str, request: &[u8]) -> (u16, Vec<u8>) {
@@ -915,7 +936,7 @@ fn a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let (request, commit) = large_create(1 << 20);
   let created = pushed((port, &certificate), &name, &request);
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   let (_, commands_end) = packets_from(&request, 0);
   let pack = request
     .get(commands_end..)
@@ -1239,7 +1260,7 @@ fn a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chos
   let created = pushed(edge, &name, &request);
   let fetched = uploaded(edge, &name, &fetch_of(last));
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   assert_eq!(fetched.0, 200);
   let (lines, _) = packets_from(&fetched.1, 0);
   let opening: Vec<&[u8]> = lines
@@ -1279,7 +1300,7 @@ fn a_long_history_pushed_over_the_daemons_edge_is_fetched_whole_over_it() {
   let created = pushed(edge, &name, &request);
   let fetched = uploaded(edge, &name, &fetch_of(last));
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   assert_eq!(fetched.0, 200);
   let (_, commands_end) = packets_from(&request, 0);
   let pushed_pack = request.get(commands_end..).expect("the push's pack");
@@ -2034,7 +2055,7 @@ fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons
   let tip = crate::verbs::hex_of(&made[0].node);
   let cloned = hg_getbundle(edge, &name, &tip);
   daemon.stop();
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   assert_eq!(
     (cloned.0, cloned.1.as_str()),
     (200, "application/mercurial-0.2"),
@@ -2102,7 +2123,7 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
   );
   let streamed = typed_exchange(port, certificate, request.as_bytes());
   daemon.stop();
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   assert_eq!(
     (streamed.0, streamed.1.as_str()),
     (200, "application/mercurial-0.1"),
@@ -2927,7 +2948,7 @@ fn a_partial_clones_lazy_fetch_of_many_blobs_is_answered_over_the_daemons_edge()
     .collect();
   let fetched = uploaded(edge, &name, &lazy_fetch_of(&blobs));
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   let answer = String::from_utf8_lossy(
     fetched
       .1
@@ -3033,7 +3054,7 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
   let created = pushed(edge, &name, &request);
   let deepened = uploaded(edge, &name, &deepen_of(tip, 100));
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   let answer = String::from_utf8_lossy(
     deepened
       .1
@@ -3123,7 +3144,7 @@ fn a_shallow_clone_deepened_by_one_unshallows_its_tip_over_the_daemons_edge() {
   let moved = pushed(edge, &name, &on_top);
   let deepened = uploaded(edge, &name, &stock_deepen_of(tip, 1));
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   assert_eq!(moved.0, 200, "{}", String::from_utf8_lossy(&moved.1));
   let whole = String::from_utf8_lossy(&deepened.1).into_owned();
   let info = whole
@@ -3764,10 +3785,10 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   let unmoved = hg_command((port, &certificate), &first, "heads");
   daemon.stop();
   println!("(i) a push parked {waited_ns} ns behind a held landing turn");
-  assert_eq!(other.0, 200, "{}", String::from_utf8_lossy(&other.2));
+  assert_hg_answered(&other);
   assert_eq!(other_waits, 0, "another repository's push never waits");
   assert_eq!(waiting, (1, false), "the first's push parked, unanswered");
-  assert_eq!(parked.0, 200, "{}", String::from_utf8_lossy(&parked.2));
+  assert_hg_answered(&parked);
   let tip = crate::verbs::hex_of(&made[0].node);
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
   assert!(
@@ -3905,7 +3926,7 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   println!(
     "staging: a one-changeset push took {small_took:?} during a {FRESH_CHANGESETS}-changeset push"
   );
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   assert_eq!(waits, 0, "the small push never waited for the landing turn");
   assert_eq!(empty, (200, format!("{}\n", "0".repeat(40)).into_bytes()));
   let small_tip = crate::verbs::hex_of(&small[0].node);
@@ -3938,7 +3959,7 @@ fn assert_the_long_push_re_based_and_landed(
   after: &(u16, Vec<u8>),
   tips: [String; 2],
 ) {
-  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_hg_answered(&long);
   assert_eq!(
     rebased, 1,
     "the long push's fork re-based over the small push's entry"
@@ -3986,8 +4007,8 @@ fn a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands() {
   );
   let after = hg_command(edge, &name, "heads");
   daemon.stop();
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_hg_answered(&pushed);
+  assert_hg_answered(&long);
   assert_eq!(
     rebased,
     (2, 1),
@@ -4026,7 +4047,7 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   let edge = (port, &certificate);
   let (request, commit) = large_create(LET_GO_FILE);
   let created = pushed(edge, &name, &request);
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   let (_, commands_end) = packets_from(&request, 0);
   let pack = request
     .get(commands_end..)
@@ -4449,7 +4470,7 @@ fn a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding() {
   let fetched = uploaded(edge, &name, &fetch_of(tip));
   let after_fetch = turns();
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   assert_eq!(listed.0, 200);
   let main = format!("{tip} refs/heads/main");
   assert!(
@@ -4532,7 +4553,7 @@ fn a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole() 
   let shallow = uploaded(edge, &name, &shallow_fetch_of(commit));
   let listed = uploaded(edge, &name, LS_REFS_HEAD);
   daemon.stop();
-  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_git_pushed(&created);
   assert!(
     let_go > 0,
     "the push's commit let its landed pack go: {let_go} bytes"
@@ -4793,7 +4814,7 @@ fn held_and_rows_of(changesets: usize) -> (u64, u64, u64) {
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   create_empty_hg(&daemon, &name);
   let (_, _, pushed) = a_push_of_own_texts(&daemon, (port, &certificate), (&name, changesets));
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   let held = counted_on(
     &daemon,
     REPOSITORY,
@@ -4915,7 +4936,7 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   daemon.stop();
   let gone = windows.iter().filter(|(here, ..)| !here).count();
   println!("let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone");
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   assert_every_files_window_let_go(&windows);
   assert!(gone > 0, "some window let go");
   // At the derived budget (half the shard's step quantum) the commit's let-go is spread over turns too.
@@ -4964,7 +4985,7 @@ fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
   let held = windows_held(&daemon, texts);
   daemon.stop();
   println!("let go over {turns} turns, the longest {longest} ns of a {quantum} ns quantum");
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   assert_eq!(
     turns,
     u64::try_from(TEXTS_CHANGESETS).unwrap(),
@@ -5227,7 +5248,7 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   create_empty_hg(&daemon, &name);
   let (made, texts, pushed) = a_long_push_of_own_texts(&daemon, (port, &certificate), &name);
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   let named = name.clone();
   let repository = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
     state
@@ -5304,7 +5325,7 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   create_empty_hg(&daemon, &name);
   let (_, _, pushed) = a_long_push_of_own_texts(&daemon, (port, &certificate), &name);
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   let named = name.clone();
   let repository = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
     state
@@ -5423,9 +5444,9 @@ fn a_push_whose_works_base_was_let_go_reads_it_from_the_changeset_store() {
   );
   let heads = hg_command(edge, &name, "heads");
   daemon.stop();
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_hg_answered(&pushed);
   assert!(let_go > 0, "objects let go");
-  assert_eq!(last.0, 200, "{}", String::from_utf8_lossy(&last.2));
+  assert_hg_answered(&last);
   assert!(
     !String::from_utf8_lossy(&last.2).contains("ERROR:ABORT"),
     "the last push accepted: {}",
