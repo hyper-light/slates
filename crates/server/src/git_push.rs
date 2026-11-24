@@ -235,6 +235,9 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// The client's bytes this push read, in all: what it brought, learned as its repository's demand once it is answered
   /// (A-724 piece 2, `slates_vcs::Rates`).
   read_bytes: u64,
+  /// Whether its request, read whole, named no command: stock git's probe of a flush alone (`remote-curl.c`'s
+  /// `probe_rpc`), which git's receive-pack answers with nothing. False until a request is read.
+  asked_nothing: bool,
   /// The push counted decoding on its shard until it drops (A-724, `crate::vcs_share::place`): the load the placement
   /// of A-722's intake off the owner shard reads.
   _decoding: crate::vcs_share::place::Decoding,
@@ -550,6 +553,7 @@ impl<P> ReceivePack<P> {
       _live: crate::vcs_share::Live::begin(repository),
       room_bound: room.bound,
       read_bytes: 0,
+      asked_nothing: false,
       _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
@@ -595,10 +599,29 @@ impl<P> ReceivePack<P> {
     self.read_bytes = self.read_bytes.saturating_add(bytes_in);
     charge_step(state, self.repository, began, bytes_in);
     let read = read.map_err(|failed| self.bounded(failed))?;
+    self.note_asked();
     self
       .keep_refusal_names()
       .map_err(|failed| self.bounded(failed))?;
     Ok(read)
+  }
+
+  /// Notes whether the request, once read whole, named no command ([`ReceivePack::asked_nothing`]).
+  fn note_asked(&mut self) {
+    if let Some(request) = self.session.request() {
+      self.asked_nothing = request.commands.is_empty();
+    }
+  }
+
+  /// Whether the push's request, read whole, named no command: a probe, answered with nothing, as git's receive-pack
+  /// answers one. False for a push whose request was never read whole.
+  pub(crate) fn asked_nothing(&self) -> bool {
+    self.asked_nothing
+  }
+
+  /// The client's bytes the push has read, in all.
+  pub(crate) fn read_bytes(&self) -> u64 {
+    self.read_bytes
   }
 
   /// Keeps the commands' names for a refusal's report (`refusal_names`) once the request is read, charged to the push's
@@ -650,6 +673,7 @@ impl<P> ReceivePack<P> {
     });
     charge_step(state, self.repository, began, 0);
     let ended = ended.map_err(|failed| self.bounded(failed))?;
+    self.note_asked();
     self
       .keep_refusal_names()
       .map_err(|failed| self.bounded(failed))?;
