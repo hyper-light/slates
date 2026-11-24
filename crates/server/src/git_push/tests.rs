@@ -1952,7 +1952,7 @@ pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P
 
 /// `carry` carried as [`carry_blocking`] stands in for the edge: content kept for the region on this shard as its home
 /// keeps it, a changeset landed on the node's store from a thread of its own. What a git commit the server makes is
-/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_after_now`).
+/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_landing_now`).
 pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
   match carry {
     super::Carry::Home(bytes, owner) => {

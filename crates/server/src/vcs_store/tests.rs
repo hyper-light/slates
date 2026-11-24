@@ -1122,6 +1122,34 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   assert_a_head_nobody_sent_is_refused_and_leaves_nothing(&mut store, &before);
 }
 
+/// Main 01a20182's ruling of 2026-11-24 01:36 (a git green's version commits with its made commit or not at all, so no
+/// commit is owed). Do: replay, over a store made again from a push's log, an owed commit's record of green key 0's
+/// version 2 as a server before the ruling staged one. Expect: refused `OwedCommit` naming the key and the version,
+/// and the store left as the push's record left it.
+#[test]
+fn t_a664_an_owed_commits_record_is_refused_typed_naming_its_green_and_version() {
+  let mut live = Live::new();
+  let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
+  live
+    .push(&objects, vec![(0, Some(head))], 0)
+    .expect("pushed");
+  let before = live.facts();
+  let owed = super::owed::Owed {
+    key: 0,
+    version: 2,
+    seconds: FIRST_DATE,
+    message: "owed".to_owned(),
+    name: "A U Thor".to_owned(),
+    email: "author@example.com".to_owned(),
+  };
+  let mut store = live.recovered().expect("recovered");
+  assert_eq!(
+    replay_git(&mut store.content, &mut store.store, &owed.encode()),
+    Err(ReplayRefused::OwedCommit { key: 0, version: 2 })
+  );
+  assert_eq!(store.facts(), before);
+}
+
 /// What the tag ref keyed 1 brought at its first version, its sets derived first: the count of objects.
 fn tag_brought(live: &mut Live) -> Result<u64, StoreRefused> {
   live.store.repository.derive(&mut live.content, 1, 0)?;

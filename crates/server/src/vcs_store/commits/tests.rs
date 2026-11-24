@@ -21,9 +21,7 @@ use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_ENTRY_REFUSED, TEST_MAP_BUD
 use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
-use crate::vcs_store::paths::tests::{
-  Op, branch, count, create, git_repository, version, version_saying,
-};
+use crate::vcs_store::paths::tests::{Op, branch, count, create, git_repository, version};
 use crate::vcs_store::record::Record;
 use crate::vcs_store::tests::{
   FIRST_DATE, assert_made_again_whole, commit_of, hex, owner, push_through, push_unsettled,
@@ -409,11 +407,11 @@ fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() 
         },
       );
       assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
-      let submitted =
-        crate::vcs_store::paths::tests::ask(state, crate::identities::authored(work, "one\0two"));
-      // As `version_saying` drives them: the whole build a first submit owes, then the commit's queued job.
-      crate::vcs_store::paths::whole_build::settle(state);
-      crate::vcs_store::commits::made_after_now(state);
+      // A client's recorded submit, as `version_saying` makes a git green's: what it waits on taken here.
+      let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
+        state,
+        crate::identities::authored(work, "one\0two"),
+      );
       let key = green_key(to_db_volume(green));
       let held = state
         .vcs_stores
@@ -423,10 +421,10 @@ fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() 
       let refused = (
         matches!(
           submitted,
-          ReplyBody::Refused {
+          Some(ReplyBody::Refused {
             refusal: slates_ipc::protocol::Refusal::BadRequest { .. },
             ..
-          }
+          })
         ),
         head,
         held,
@@ -629,123 +627,6 @@ fn recorded_submit(state: &mut ShardState, body: slates_ipc::protocol::RequestBo
   let deferred = std::mem::take(&mut state.acceptance_deferred);
   let committed = state.db.commit(&mut state.segment);
   assert!(deferred && committed.is_ok(), "{reply:?}");
-}
-
-/// A work making `/README` submitted to `green`'s first version with `message`, its map and commit left to its build
-/// (A-664's live whole builds, part 2): the version.
-fn first_submit_unsettled(
-  state: &mut ShardState,
-  green: slates_ipc::protocol::VolumeId,
-  message: &str,
-) -> u64 {
-  let ask = crate::vcs_store::paths::tests::ask;
-  let made = ask(
-    state,
-    slates_ipc::protocol::RequestBody::CreateWork {
-      green,
-      name: "work-owed".to_owned(),
-    },
-  );
-  let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
-    return 0;
-  };
-  ask(
-    state,
-    slates_ipc::protocol::RequestBody::Edit {
-      work,
-      path: "/README".to_owned(),
-      at: 0,
-      delete_len: 0,
-      bytes: b"owed\n".to_vec(),
-    },
-  );
-  match ask(state, crate::identities::authored(work, message)) {
-    slates_ipc::protocol::ReplyBody::Submitted {
-      version: Some(version),
-      ..
-    } => version,
-    _ => 0,
-  }
-}
-
-/// The commit `repository`'s register owes, read from its newest record.
-fn staged_owed(
-  state: &ShardState,
-  repository: RepositoryId,
-) -> Option<crate::vcs_store::owed::Owed> {
-  records(state, repository)
-    .last()
-    .and_then(|bytes| crate::vcs_store::owed::Owed::decode(bytes).ok())
-}
-
-/// A-664's live whole builds, part 2 (the owed commit). Do: submit a work making `/README` to a git repository's root
-/// green, its first version, whose map is built whole after it; read the register and the counts; drive the build to
-/// its end; clone `main`. Expect: the submit accepted as version 1 with its commit owed, staged in the register, none
-/// made yet; at the build's end the commit made, listed at `main`, dated at the second the submit staged and carrying
-/// its message, with no parent; nothing owed after it.
-#[test]
-fn t_a664_owed_a_first_submits_commit_is_owed_then_made_at_its_staged_second() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "owed");
-    let version = first_submit_unsettled(state, green, "the owed commit");
-    let owed = staged_owed(state, repository);
-    let before = (version, owed.is_some(), counts(state).0);
-    crate::vcs_store::paths::whole_build::settle(state);
-    let main = cloned(state, repository, "main");
-    let still = state
-      .vcs_stores
-      .git_ref(repository)
-      .map(|(_, git)| git.owed.len());
-    (before, owed, main, counts(state).0, still)
-  });
-  let (before, owed, main, made, still) = seen;
-  assert_eq!(before, (1, true, 0));
-  let owed = owed.expect("the staged commit");
-  assert_eq!(
-    (date_of(&main.text), parents_of(&main.text), made, still),
-    (owed.seconds, Vec::new(), 1, Some(0))
-  );
-  assert!(
-    main.text.ends_with("\n\nthe owed commit\n"),
-    "{}",
-    main.text
-  );
-}
-
-/// A-664's live whole builds, part 2 (main's determinism rule: a replay reads no clock). Do: submit a git repository's
-/// root green's first version, its commit owed; make the store again from the log twice, as two restarts before its
-/// build ends would; drive the build to its end; clone `main`; then make the store again once more, from a log that
-/// holds the made commit, and clone again. Expect: the commit made after the two restarts is the one the staged record
-/// names, byte for byte (its text the staged second, message and identity over its tree), and the store made again
-/// after it lists `main` at the same commit, holds it whole and owes nothing.
-#[test]
-fn t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_record() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "restarted");
-    first_submit_unsettled(state, green, "made after two restarts");
-    let owed = staged_owed(state, repository);
-    crate::vcs_store::rebuild(state, repository);
-    crate::vcs_store::rebuild(state, repository);
-    crate::vcs_store::settle_rebuild(state, repository);
-    crate::vcs_store::paths::whole_build::settle(state);
-    let first = cloned(state, repository, "main");
-    crate::vcs_store::rebuild(state, repository);
-    crate::vcs_store::settle_rebuild(state, repository);
-    let again = cloned(state, repository, "main");
-    let owing = state
-      .vcs_stores
-      .git_ref(repository)
-      .map(|(_, git)| git.owed.len());
-    (owed, first, again, owing)
-  });
-  let (owed, first, again, owing) = seen;
-  let owed = owed.expect("the staged commit");
-  let expected = made_text(tree_named(&first.text), &[], owed.seconds, &owed.message);
-  assert_eq!(first.text, expected);
-  assert_eq!(
-    (again.head, again.text, owing),
-    (first.head, first.text, Some(0))
-  );
 }
 
 /// A-664's live whole builds (main's ruling of 2026-11-20: tens of thousands of concurrent pushes, so a busy green's

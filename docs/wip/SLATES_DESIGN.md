@@ -53517,7 +53517,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
   `paths::remake_green_sliced`), a push's whole build sliced by a task with submits parked until it ends (BUILT
   2026-11-20, `paths::whole_build`), a submit's own whole build too, its commit owed durably in the submit's
-  transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`), a whole map's
+  transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`; WITHDRAWN by
+  A-896 on 2026-11-24: a git green's version is never committed before its commit is made, so nothing is owed), a whole map's
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
@@ -56286,7 +56287,8 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   143 of 143; fmt clean.
 - **Owed.** Part 2: a submit's own whole build (a green's first submit, one past a copy) with its made commit owed
   durably in the submit's transaction (main's ruling: replay reads no clock, the completion settles the owed entry,
-  one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
+  one owed a green; built 2026-11-20 and withdrawn by A-896 on 2026-11-24, the made commit's map now put whole over
+  the held verdict's preview before the one step commits both); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
   restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
   (main's).
 
@@ -57281,6 +57283,12 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
   (`WorkOp 10 Copy`); fmt clean.
 - **Owed.** The SDKs' (Python, Node), MCP's and the CLI's surfaces for a copy; Subversion's copy-from rows over it
   (`vcs_store::svn_made`, next).
+- **Its made commit (A-896, 2026-11-24).** A copy names a tree at its destination alone, so a version whose change
+  names one has no change to step its map over. With the submit a recorded request (A-896), the made commit puts the
+  version's map over the held verdict's preview, and a map before held with a copy in the change is put whole from the
+  preview (`paths::over_preview_step` answers `Whole`, as `advance` builds a committed version's). Before, it answered
+  `HeadFirst`, built the head before's map again, met the copy again and refused the submit `NoTrees`: the bare path's
+  owed commit had hidden it.
 
 ### A-744 — The anchor's memory, range by range: the 581 MiB is the owner partition's durable register, not the content object; and A-742's leftovers (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.14, §4.17.1; A-64, A-420, A-626, A-727, A-742)
 
@@ -62789,3 +62797,78 @@ Applied in the same change to: GAPS (C2 stage C), `crates/ipc/src/protocol.rs`, 
 
 Applied in the same change to: GAPS (the svn HTTP edge), `crates/svn/src/dav/site.rs` and its tests,
 `crates/server/src/vcs_http/svn.rs`.
+
+### A-896 — A git repository's green takes a submit as a client's recorded request alone, and no commit is owed (2026-11-24, w-git for main 01a20182, its rulings of 2026-11-24 01:36, 01:51 and 02:08 ("Option A"); goal 93's correctness; A-664's live whole builds part 2 withdrawn; A-626 part 4; A-888's rule for git)
+
+- **What was there.** A submit to a git repository's green outside a recorded request (a bare dispatch) committed its
+  version in its own step and made the commit after it: queued on the shard's made queue (`commits::make`,
+  `MadeAfter`), or, where the green's map had to be built whole (its first submit, one past a copy), staged as an owed
+  commit in the submit's transaction (`commits::staged`, `vcs_store::owed`) and made at the build's end
+  (`make_owed`), a recovery starting the build again (`resume_owed`). Either way the version was durable before its
+  commit was: a store's refusal, a full queue or a crash before the build's end left a version with no commit, its
+  green ahead of the store, which main's ruling of 2026-11-23 22:08 forbids (a version is never committed alone).
+- **The rule** (main's ruling of 01:36). A git green's submit is a client's recorded request alone: a bare one is
+  refused `RecordedSubmitRequired { tool: Git }` before its verdict (`made_commit::take_turn`'s `Taken::Unrecorded`, as
+  A-888 refuses Subversion's), so every git version is made by the held verdict's made commit
+  (`commits::make_deferred`): the map put over the preview a slice a turn, the commit made, sealed, homed and landed,
+  then one step commits the version and its record together. `commits::make`, the made queue and the owed commit's
+  staging, making and resuming are removed. `commits::after_submit` keeps one check: a git green's version committed
+  outside its made commit's step is counted `vcs_commits.committed_alone` and logged, zero in every correct use.
+  Mercurial's bare submits are untouched (`Taken::Unhooked`).
+- **A log holding an owed record** (main's ruling of 01:51). No server writes one now, and nothing makes its commit:
+  a replay refuses it typed, `ReplayRefused::OwedCommit { key, version }`, naming the green's key and the version,
+  rather than keep a version whose commit nothing will make. `vcs_store::owed` keeps the record's reader for that.
+- **Production paths.** Every client submit runs through `verbs::run_recorded`, and the owner's judgment of a
+  forwarded submit (`owner_judge`) is recorded too; every other `RequestBody::submit` is in a test module. So no
+  slates production path submits bare; kiln's use was not checked from this machine (its source is not here).
+- **The gap it found** (main's ruling of 02:19). Recorded submits whose work copies a tree were refused `NoTrees`:
+  the made commit's map step over the preview answered `HeadFirst` for a change naming a copy even with the map
+  before held, then met the copy again (A-626 part 4's line above). Fixed in the same change.
+- **Tests** (macOS arm64, this Mac, debug, own target, 2026-11-24). Red first under the recorded submit:
+  `vcs_store::paths::tests::t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it` and `..._holding_a_hard_link`
+  were refused `StoreRefused { "the commit could not be made: NoTrees" }`; green after. New:
+  `vcs_store::tests::t_a664_an_owed_commits_record_is_refused_typed_naming_its_green_and_version` (a push's log, then an
+  owed record of key 0's version 2: refused `OwedCommit { key: 0, version: 2 }`, the store as the push left it; before
+  this change the replay kept it owed, by reading, not run red). Moved to recorded submits (`paths::tests::
+  submit_as_taken` and `recorded_git_submit`, which take the refinement through `refining::refined_now` and the made
+  commit through `commits::made_landing_now`): every git `version` of the paths, commits, identities and repository
+  tests, the NUL message test and the copy of nothing. Removed: the two owed tests. `cargo test -p slates-server
+  --lib -- vcs_store:: identities:: made_commit:: repository:: git_push:: refining:: verbs::` 389 of 389 in 7 of 10
+  runs. One ended at the watchdog (exit 4: `t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`'s
+  shard unmoved for 1,001 ms, a push test this change does not reach); two earlier, unlogged, ended one failed with the
+  test unnamed and one with no result line. Reported to main as open.
+
+Applied in the same change to: GAPS, `crates/ipc/src/protocol.rs` and `crates/api/src/error.rs` (the refusal's
+words: git's too, no wire change), `crates/server/src/{made_commit,verbs}.rs`,
+`crates/server/src/vcs_store{.rs,/commits.rs,/owed.rs,/paths.rs,/paths/whole_build.rs,/git_replay.rs}`, and the tests
+named above.
+
+### A-895 — An import batch is bounded by its chains' room: each verdict is held and its entry sized before it applies (2026-11-24, w-svn for main 01a20182, its rulings of 2026-11-24 02:25 and 02:46; goal 93; amends A-892; A-822, A-635)
+
+- **What was there.** A batch's landing appends every staged version's chain entry with the register's parts as one
+  record (`push::append_versions`), judged by the register's guard against the partition's green chains' cap
+  (`caps.green_chain_bytes`); the admission checkpoints the batch's green where the cap refuses, then judges again. A
+  batch was bounded by the shard's memory (A-822) and its green's retention (A-892), never by its entries: under a 16
+  KiB cap two revisions each adding 190 paths, each entry within the room and their reservations within the retention
+  room, together past the chains' room, were refused `TableAtCapacity { table: "green_chains" }` at their batch's
+  landing and the import ended there. (A-892's note named two revisions of 400 paths: one such revision's entry, 18,778
+  bytes, is past the room alone, which the append refuses typed, as it should.)
+- **The rule.** A batch takes its chains' room when it begins: what the chains may still grow by, and its green's own
+  chain, which the landing's checkpoint can fold (`ImportBatch::chain_room`). `ImportBatch::stage` judges a work and
+  holds the verdict (`Green::judge_named`), sizes its chain entry exactly as the batch's record will write it
+  (`chain_entry::encoded_len`, the entry `push::recorded_entry` encodes), and where the batch holds versions already
+  and the entry would take it past its room, refuses `StageRefused::PastChainRoom` with nothing applied: the import
+  hands the revision to the next batch whole, as A-892 hands one past the retention room, and lands this one
+  (`Flush::Chain`, counted `repository.svn_import.flushed_chain`). Otherwise the held verdict commits
+  (`Green::commit_judgment`, public now). A lone revision whose entry alone is past the room keeps the append's typed
+  `TableAtCapacity { table: "green_chains" }`: no new refusal.
+- **An import says why it took its batches.** `Loaded::batches` counts its batches by cause (admission, sections,
+  retention, chain, end), and the import logs them at its end (main's ruling of 2026-11-24 02:46).
+- **Evidence.** `t_c2c_an_import_past_the_chains_room_lands_a_batch_within_it_at_a_time` (16 KiB cap, two revisions of
+  190 new paths each): with the chain check taken out it is refused `Uncommitted { refusal: Append(Entry(TableAtCapacity
+  { table: "green_chains" })), revision: 0, landed: 0 }` (macOS, debug, 2026-11-24); with it, imported whole at revision
+  2, its report "batches landed for ... retention 0, chain 1, end 1". The focused counts are in the commit.
+
+Applied in the same change to: GAPS (C2 stage C, A-892's owed line), `crates/merge/src/{engine,chain_entry}.rs`,
+`crates/server/src/import_batch.rs`, `crates/server/src/repository/svn_commit/staging.rs`,
+`crates/server/src/vcs_store/svn_import.rs` and its tests.

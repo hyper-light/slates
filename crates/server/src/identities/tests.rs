@@ -739,8 +739,13 @@ fn returned_to(
     .get(seat)
     .ok()
     .and_then(|slot| slot.identities.clone());
-  let owners = ask(state, submit(work, Some("the change"), git_only("Ada")));
-  (answer, kept, accepted_version(&owners))
+  // The owner's own submit, a client's recorded request, as a git green takes one (main 01a20182's ruling of 2026-11-24
+  // 01:36).
+  let owners = crate::vcs_store::paths::tests::recorded_git_submit(
+    state,
+    submit(work, Some("the change"), git_only("Ada")),
+  );
+  (answer, kept, owners.as_ref().and_then(accepted_version))
 }
 
 /// A-664 part 1 (module docs: a read is kept with the session that asked, while its seat is still that session's). Do:
