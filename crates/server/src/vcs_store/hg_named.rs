@@ -335,13 +335,14 @@ pub(crate) async fn bring_back_named_live(green: VolumeId) -> Vec<[u8; 32]> {
   brought
 }
 
+/// A recovery's plan for a Mercurial green ([`named_bases`]): by the changeset that resolves them, the named bases to
+/// bring back, each an object and the path it is the file at.
+type Plan = Vec<(Node, Vec<(Identity, String)>)>;
+
 /// What a replay of Mercurial green `green` needs brought back first ([`bring_back_named`], [`bring_back_named_live`]):
 /// its repository, and the named bases its plan reads that the content store does not hold whole ([`named_bases`]), by
 /// the changeset that resolves them. None with nothing to bring, or for a green of no Mercurial repository held here.
-fn to_bring(
-  state: &ShardState,
-  green: VolumeId,
-) -> Option<(RepositoryId, Vec<(Node, Vec<(Identity, String)>)>)> {
+fn to_bring(state: &ShardState, green: VolumeId) -> Option<(RepositoryId, Plan)> {
   let repository = repository_of(state, green)?;
   let plan = named_bases(state, green);
   (!plan.is_empty()).then_some((repository, plan))
@@ -359,7 +360,7 @@ pub(crate) fn needs_store(state: &ShardState, green: VolumeId) -> bool {
 /// changeset that names their revisions: its checkpoint's named files and head attribute, then each chain entry in
 /// turn, whose splices that read a base read the file named then (`slates_merge::engine::splice_reads_base`), and
 /// whose changes leave files named whole (`Increment::named_whole_files`) or not, and move the head attribute.
-fn named_bases(state: &ShardState, green: VolumeId) -> Vec<(Node, Vec<(Identity, String)>)> {
+fn named_bases(state: &ShardState, green: VolumeId) -> Plan {
   let mut planning = Planning::at_checkpoint(state, green);
   for bytes in state.db.partition().green_chain(green).iter() {
     if let Some(entry) = chain_entry(state, green, bytes) {
