@@ -745,3 +745,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   version (counted UNMADE); git commits::make_owed (version committed, commit made after by the queue); hg_made.rs
   made Err/None and Unmade commit version alone, commit_made Err commits version; hg_made::make (bare path, recorded in
   the same transaction); made_commit::commit_held shared by all three tools (tool Err still answers the accept).
+## A-891 LANDED main 891de2741 (2026-11-24 ~01:00): svn made commit guard-then-apply (piece 2)
+- Commit ff000bf3b (subject says A-890; renumbered A-891: w-chaos's unclaimed A-890 was on main first).
+- Unmade/check-refused version refused typed+recorded (made_commit::refuse); register entry guarded before the verdict
+  applies (made_commit::commit_guarded, MadeEntry::guard, push::check_entry, GuardedMade::commit).
+- Reds: a_special_file_refuses_its_submit_and_the_repository_takes_the_next, a_made_entry_its_guard_refuses_leaves_
+  nothing_of_the_version (both Submitted v1 on a018ee86b). t_a664_svn_an_edit_beneath_an_earlier_copy_is_a_revision.
+- Load flakes seen (pass alone): vcs_ssh tunnel hooks test; verbs an_unbuilt_works_shard_asks_its_greens_owner_again.
+- NEXT: import BudgetExceeded on 23 shards (batch reservation > green_chain_bytes cap; scripts /tmp/w-svn-imp/{red,fix}.py),
+  then dump order (patch /tmp/w-svn-p2/dump_order.patch: sibling deletes are APR hash order), then svn info 500 diag.
