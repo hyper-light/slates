@@ -1554,6 +1554,150 @@ fn a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_move
   });
 }
 
+/// Guard-then-apply for a made commit (main's ruling of 2026-11-23 20:51, piece 2; goal 93's correctness): a version no
+/// revision can be made of is refused, never committed alone. Do: submit, as client 7's recorded request 1, a work
+/// making `/trunk/a.txt` and a FIFO `/trunk/p` (a special file, no Subversion node); read its recorded answer, the
+/// green's durable head and the records' youngest revision; then submit a work making `/trunk/b.txt` as request 2.
+/// Expect: the first refused `Unsupported`, recorded, the green's head 0 and the records at revision 0; the second
+/// lands revision 1, the green's head 1. Until then the first committed version 1 alone, with no revision, and the
+/// second was not the revision after the youngest, so none was made: one special file left the green past its records
+/// for good.
+#[test]
+fn a_special_file_refuses_its_submit_and_the_repository_takes_the_next() {
+  stored(|| async move {
+    let (svn, green) = subversion("special").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let pipe = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Mknod {
+      path: "/trunk/p".to_owned(),
+      node: crate::vcs_store::paths::tests::fifo(),
+    });
+    let alpha = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
+    on(|state| {
+      crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, vec![alpha, pipe]);
+    });
+    let first = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let answered = answer_of(7, first).await;
+    let after_first = on(|state| (state.db.partition().green_head(green), kept(state, svn).0));
+    assert!(
+      matches!(
+        answered,
+        slates_ipc::protocol::ReplyBody::Refused {
+          refusal: Refusal::Unsupported { .. }
+        }
+      ),
+      "a special file's submit is refused typed: {answered:?}"
+    );
+    assert_eq!(after_first, (0, 0), "nothing of the refused version stands");
+    let beta = crate::vcs_store::paths::tests::create("/trunk/b.txt", b"beta\n");
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 2, vec![beta]));
+    youngest_reaches(svn, 1).await;
+    assert_eq!(on(|state| state.db.partition().green_head(green)), 1);
+  });
+}
+
+/// Guard-then-apply for a made commit's register entry (main's ruling of 2026-11-23 20:51, piece 2). Do: with the
+/// shard's budget refusing the next made revision's growth, submit a work making `/trunk/a.txt` as client 7's recorded
+/// request 1; read its recorded answer, the green's durable head, the records' youngest revision and the register's
+/// entries; then submit a work making `/trunk/b.txt` as request 2. Expect: the first refused `BudgetExceeded`,
+/// recorded, the green's head 0, the records at revision 0 and the register holding the creation alone; the second
+/// lands revision 1, the green's head 1. Until then the entry's commit ran after the version's parts in the one step,
+/// and its refusal left the version committed and answered with no revision on the store or entry in the register.
+#[test]
+fn a_made_entry_its_guard_refuses_leaves_nothing_of_the_version() {
+  stored(|| async move {
+    let (svn, green) = subversion("guarded").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    super::REFUSE_MADE_ENTRY.with(|refuse| refuse.set(true));
+    let alpha = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
+    on(|state| {
+      crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, vec![alpha])
+    });
+    let first = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let answered = answer_of(7, first).await;
+    let after_first = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        kept(state, svn).0,
+        logged(state, svn).len(),
+      )
+    });
+    assert!(
+      matches!(
+        answered,
+        slates_ipc::protocol::ReplyBody::Refused {
+          refusal: Refusal::BudgetExceeded { available: 0 }
+        }
+      ),
+      "the guard's refusal answers the submit: {answered:?}"
+    );
+    assert_eq!(
+      after_first,
+      (0, 0, 1),
+      "nothing of the refused version stands"
+    );
+    let beta = crate::vcs_store::paths::tests::create("/trunk/b.txt", b"beta\n");
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 2, vec![beta]));
+    youngest_reaches(svn, 1).await;
+    assert_eq!(on(|state| state.db.partition().green_head(green)), 1);
+  });
+}
+
+/// A-664's Subversion objects (main's question of 2026-11-23 22:08: what makes a copy the index names without the
+/// submit's copy). Do: make a Subversion repository; submit a work making `/trunk/a.txt` and `/branches`; submit a work
+/// copying `/trunk` to `/branches/b`; then submit a work editing `/branches/b/a.txt`, each a recorded request. Expect:
+/// revision 3 made, one row modifying `/branches/b/a.txt`, the green's head 3.
+#[test]
+fn t_a664_svn_an_edit_beneath_an_earlier_copy_is_a_revision() {
+  stored(|| async move {
+    let (svn, green) = subversion("beneath").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let first = vec![
+      crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n"),
+      crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Mkdir {
+        path: "/branches".to_owned(),
+      }),
+    ];
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, first));
+    youngest_reaches(svn, 1).await;
+    let copy = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Copy {
+      from: "/trunk".to_owned(),
+      to: "/branches/b".to_owned(),
+      version: None,
+      replace: false,
+    });
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 2, vec![copy]));
+    youngest_reaches(svn, 2).await;
+    let edit = crate::vcs_store::paths::tests::Op::Edit("/branches/b/a.txt", 6, 0, b"beta\n");
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 3, vec![edit]));
+    let third = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 3,
+    };
+    let answered = answer_of(7, third).await;
+    let rows: Vec<(String, Action)> = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .and_then(|records| records.index().changes(3).ok().map(<[ChangedPath]>::to_vec))
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| (row.path, row.action))
+    .collect();
+    assert_eq!(
+      (rows, on(|state| state.db.partition().green_head(green))),
+      (vec![("/branches/b/a.txt".to_owned(), Action::Modify)], 3),
+      "the edit's answer: {answered:?}"
+    );
+  });
+}
+
 /// Main's landing order, its crash case. Do: submit a work to a Subversion repository's green as a client's recorded
 /// request, the made-landing task killed before it commits (as a `kill -9` between the store's land and the register's
 /// commit leaves it); make the green and the records again from what is durable, as a restart does; then run the same

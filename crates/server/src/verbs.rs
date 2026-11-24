@@ -11730,6 +11730,12 @@ impl AcceptedParts {
 /// Commits `parts` in the running transaction, under the running request (`state.current_request`): the wait staged
 /// first (A-252), the chain entry appended, the merge record enqueued, the retention trued up, and a git repository's
 /// commit recorded (A-664 part 3). Refused where the wait or the entry is.
+/// Gives back what an accept refused before its step holds (`made_commit::refuse`): its increment, which the content
+/// store held for its chain entry, released as a refused verdict's is.
+pub(crate) fn release_refused_parts(state: &mut ShardState, parts: AcceptedParts) {
+  crate::merge_service::release_refused_increment(state, parts.green, parts.held_increment);
+}
+
 pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> Result<(), Refusal> {
   let AcceptedParts {
     green: green_id,

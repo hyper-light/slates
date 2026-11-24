@@ -64,6 +64,10 @@ const UNDELIVERED: &str = "vcs.made.undelivered";
 /// Counter: a made commit abandoned before its step (its landing refused, or its green made again meanwhile): nothing
 /// durable, answered `Overloaded` unrecorded. Format: a counter name in the daemon's status report.
 pub(crate) const ABANDONED: &str = "vcs.made.abandoned";
+/// Counter: a made commit refused typed before anything of it applied (no commit can be made of its version, or the
+/// tool's guard refused it), its refusal recorded as its completion. Format: a counter name in the daemon's status
+/// report.
+pub(crate) const REFUSED: &str = "vcs.made.refused";
 
 /// The shard's made commits: the turn the running submit holds, the submits parked for a turn, and the turns a waiting
 /// task took for them.
@@ -428,29 +432,112 @@ impl Pending {
 /// Commits `pending` in one transaction with the tool's register commit `tool` (module docs, 3), then answers it on its
 /// route: the version's parts first, then `tool` (refused, the version stands alone, as a version no commit was made
 /// of does), then the local work's settle and the completion. `tool`'s answer; none where the version's parts were
-/// refused or the green was made again meanwhile (then nothing of the tool's ran).
+/// refused or the green was made again meanwhile (then nothing of the tool's ran). git's and Mercurial's made commits
+/// (GAPS, main's sweep of 2026-11-23: theirs to move to [`commit_guarded`]).
 pub(crate) fn commit<T, E>(
   state: &mut ShardState,
-  mut pending: Pending,
+  pending: Pending,
   tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
 ) -> Option<Result<T, E>> {
+  commit_guarded(
+    state,
+    pending,
+    |_| Ok::<(), Refusal>(()),
+    (|state, ()| tool(state), |_, ()| {}),
+  )
+}
+
+/// Commits `pending` guard-then-apply (main's ruling of 2026-11-23 20:51; `crates/db/src/partition.rs`'s `check` before
+/// `apply`): `guard` judges, before anything of the accept applies, everything the tool's register commit can refuse,
+/// taking what it must hold (reservations) into its answer; refused, the submit is refused typed and recorded, nothing
+/// applied ([`refuse`]). Then the verdict applies, the version's parts commit and `apply` makes the tool's commit from
+/// what the guard took, which cannot be refused; where the verdict or the version's parts are refused after all (a
+/// green made again meanwhile, the step's own record refused), `give_back` returns what the guard took. `apply`'s
+/// answer; none where the guard or the version's parts refused, or the green was made again meanwhile. The one failure
+/// left after the guard is the step's own commit, a transaction whose in-memory effects are made again from the chain,
+/// as every verb's are.
+pub(crate) fn commit_guarded<G, T>(
+  state: &mut ShardState,
+  mut pending: Pending,
+  guard: impl FnOnce(&mut ShardState) -> Result<G, Refusal>,
+  (apply, give_back): (
+    impl FnOnce(&mut ShardState, G) -> T,
+    impl FnOnce(&mut ShardState, G),
+  ),
+) -> Option<T> {
   // The held preview, if any, lives until this step and is retired in it, whatever the step does.
   let mut preview = std::mem::take(&mut pending.preview);
-  let made = commit_held(state, pending, tool);
+  let made = match guard(state) {
+    Ok(guarded) => commit_held(state, pending, guarded, (apply, give_back)),
+    Err(refusal) => {
+      refuse_held(state, pending, refusal);
+      None
+    }
+  };
   preview.retire(state);
   made
 }
 
-/// [`commit`]'s step, its preview held by the caller.
-fn commit_held<T, E>(
+/// Refuses `pending` typed with `refusal` in a step of its own, nothing of its verdict applied (main's ruling of
+/// 2026-11-23 20:51): its increment released, the bytes its verdict secured credited back, and the refusal recorded as
+/// its completion, so a retry under its id is answered the same; then answered on its route. A made commit no commit
+/// can be made of (a special file, a revision the store's check refused) is refused so, never committed alone.
+pub(crate) fn refuse(state: &mut ShardState, mut pending: Pending, refusal: Refusal) {
+  let mut preview = std::mem::take(&mut pending.preview);
+  refuse_held(state, pending, refusal);
+  preview.retire(state);
+}
+
+/// [`refuse`]'s step, its preview held by the caller.
+fn refuse_held(state: &mut ShardState, pending: Pending, refusal: Refusal) {
+  let Pending {
+    origin,
+    id,
+    route,
+    local,
+    parts,
+    ..
+  } = pending;
+  let green = parts.green;
+  crate::verbs::release_refused_parts(state, parts);
+  let _ = crate::merge_service::settle_green_retention(state, green);
+  state.count(REFUSED, 1);
+  state.db.begin();
+  state.current_request = Some((origin, id));
+  state.reply_route = route;
+  let reply = crate::verbs::refused(refusal);
+  let reply = match local {
+    Some(work) => crate::verbs::settle_submit(state, work, green, reply),
+    None => reply,
+  };
+  state.current_request = None;
+  let route = state.reply_route.take();
+  let reply = crate::verbs::recorded_unless_deferred(state, (origin, id), false, reply);
+  let reply = match crate::verbs::commit_settled(state) {
+    Ok(_) => reply,
+    Err(error) => {
+      crate::verbs::reconcile_unpublished_effects(state);
+      crate::verbs::refused(crate::error::refusal_of_db(&error))
+    }
+  };
+  answer(state, route, (origin, id), reply);
+}
+
+/// [`commit_guarded`]'s step after its guard, its preview held by the caller.
+fn commit_held<G, T>(
   state: &mut ShardState,
   mut pending: Pending,
-  tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
-) -> Option<Result<T, E>> {
+  guarded: G,
+  (apply, give_back): (
+    impl FnOnce(&mut ShardState, G) -> T,
+    impl FnOnce(&mut ShardState, G),
+  ),
+) -> Option<T> {
   let (green, version) = pending.version();
   // The verdict was held, not applied (module docs, 2): it applies now, at the head it was judged at, as its chain
   // entry records it (`Green::apply_recorded`, what a recovery replays). A green that moved meanwhile commits nothing.
   if !crate::verbs::apply_accepted(state, &mut pending.parts) {
+    give_back(state, guarded);
     abandon(state, (pending.request(), green));
     return None;
   }
@@ -469,9 +556,12 @@ fn commit_held<T, E>(
   let accepted = crate::verbs::commit_accepted(state, parts);
   state.made_commits.committing = false;
   let (reply, made) = match accepted {
-    Err(refusal) => (crate::verbs::refused(refusal), None),
+    Err(refusal) => {
+      give_back(state, guarded);
+      (crate::verbs::refused(refusal), None)
+    }
     Ok(()) => {
-      let made = tool(state);
+      let made = apply(state, guarded);
       let object = slates_db::register::ObjectId(green.bytes);
       if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
         crate::merge_service::defer_acceptance(state, green, version);

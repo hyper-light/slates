@@ -62620,3 +62620,42 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   - `crates/server/src/daemon.rs` and `crates/server/tests/fleet.rs`: the tests and the retry.
   - A-885's entry, A-251 (i)'s text, GAPS.
   - docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md.
+
+### A-891 — A Subversion made commit is guard-then-apply: a version no revision can be made of is refused typed and recorded, and the register entry is judged before the verdict applies (2026-11-23, w-svn for main 01a20182, its rulings of 2026-11-23 20:51 and 22:08; goal 93's correctness; A-805, A-888, `crates/db/src/partition.rs`'s check before apply)
+
+- **What was there.** A Subversion green's held verdict (A-805) was committed by a task holding the landing turn. Where
+  no revision could be made of the version (a special file, a symbolic link with properties of its own, a copy the
+  submit did not declare, a property list the records do not hold, the records past it) or the store's check refused
+  the revision, the task committed the version alone, counted `vcs.svn.revision_unmade`: the green stood past its
+  records, so every later made revision was not the one after the youngest and every client commit was refused (the
+  green no longer at the youngest). One special file broke a repository for good. And the one step ran the register
+  entry's commit (`commit_made`: the records' stamp, their being held, the store's admission, the records' growth, the
+  register's append) after the version's parts: refused there, the step committed the version and answered the accept
+  with no entry naming its revision.
+- **The rule** (main's ruling, `Partition::check` before `apply`): everything that can refuse is judged before
+  anything applies. A version no revision can be made of, or one the check refuses, is refused typed with its refusal
+  recorded as the request's completion and nothing applied (`made_commit::refuse`): `Unsupported` for a special file,
+  a link with its own properties or an undeclared copy; `StoreRefused`, in its words, for the rest. A store's refusal
+  of the changeset stays retryable (`abandon`, `Overloaded`): its I/O can clear. Then `made_commit::commit_guarded`
+  runs the tool's guard before the verdict applies (`MadeEntry::guard`: the records' stamp and their being held, the
+  reference within the store's admission, the register's entry judged as its append judges it,
+  `push::check_entry`, and the records' growth reserved last); refused, the submit is refused typed and recorded. Past
+  the guard, the verdict, the version's parts and the entry's append (`GuardedMade::commit`) apply and are not refused;
+  where the verdict or the version's parts are refused all the same (a green made again meanwhile, the step's own
+  record), the guard's reservation is given back. The one failure left after the guard is the step's own database
+  commit: a transaction, nothing durable, its in-memory effects made again from the chain as every verb's are. An
+  append refused after its guard passed is counted `vcs.svn.made_entry_refused`, zero in every correct use.
+- **Shared, changed for Subversion alone.** `made_commit::commit` (git's and Mercurial's) is `commit_guarded` with a
+  guard that never refuses, as before; their own unmade and refused-tool paths are their owners' (main's sweep).
+- **Evidence.** Red first on main a018ee86b (macOS, debug):
+  `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` was answered `Submitted { version: Some(1) }`
+  for a work holding a FIFO; `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version`, with the entry's commit
+  refused for the budget, was answered `Submitted { version: Some(1) }`. Green after: refused
+  `Unsupported` and `BudgetExceeded { available: 0 }`, recorded, the green's head 0, the records at revision 0 and the
+  register holding the creation alone; the next submit lands revision 1. `svn_commit::tests`' made-commit tests 20 of
+  20, with `t_a664_svn_an_edit_beneath_an_earlier_copy_is_a_revision` (main's question: an edit beneath an earlier
+  copy is made, so `Unmade::Copy` is no stock client's operation).
+
+Applied in the same change to: GAPS (C2's made commits), `crates/server/src/{made_commit,verbs}.rs`,
+`crates/server/src/repository/{svn_commit,push}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named
+above.
