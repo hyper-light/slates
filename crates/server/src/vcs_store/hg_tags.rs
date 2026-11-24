@@ -49,8 +49,8 @@ pub(crate) struct HgTags {
 }
 
 /// The tags `name` needs over repository `id`'s served view, within `room`: none where it resolves before the tags or
-/// the heads name no `.hgtags` revision ([`Owed::Ready`] then holds an empty read); the read held where it names the
-/// revisions the heads name now; else the read to begin.
+/// the heads name no `.hgtags` revision ([`Owed::Ready`] then holds an empty read); the read held where it was read over
+/// the heads the view has now (`TagsRead::same_heads`); else the read to begin.
 pub(crate) enum Owed {
   /// The tags the name resolves with, if it reaches them.
   Ready(Option<TagsRead>),
@@ -74,7 +74,7 @@ pub(crate) fn owed(
     if begun.wants().is_none() {
       return Ok(Owed::Ready(Some(begun)));
     }
-    Ok(match held.filter(|held| held.same_files(&begun)) {
+    Ok(match held.filter(|held| held.same_heads(&begun)) {
       Some(held) => Owed::Ready(Some(held)),
       None => Owed::Read(begun),
     })

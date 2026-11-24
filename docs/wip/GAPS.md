@@ -1460,6 +1460,12 @@
 >   sent whole (`vcs_store.hg_pull_whole_texts`: 3 for a one-changeset pull, its changeset, its manifest and the parent
 >   manifest), though the pull sent the stored delta; now counted apart (`StoreWants::reads_logs`,
 >   `vcs_store.hg_pull_log_texts`). Held by P5's red above (red: 3 whole, 0 log texts).
+>   Also found there and closed: `branch create --from v1` hung (`stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_
+>   from_the_tag`). The verb parked on its `.hgtags` read ran again and judged the read held by its files, which a read
+>   begun over heads whose manifests are let go does not know yet, so it parked again, for ever. A held read is now judged
+>   by the heads it began over (`TagsRead::same_heads`). Held by
+>   `a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made` (red: refused
+>   `ContentUnavailable`).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
