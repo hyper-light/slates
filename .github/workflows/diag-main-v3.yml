@@ -1,12 +1,10 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 04:57 PST): gate 7 for the push-0 failure, at 3d65116a6 (current main). Gate 6 (run
-# 45395461722, 77397a5f4, Unlanded typed on band 3) passed 7 of 7, so the cause gate 5 met (Unlanded right after
-# creation, 1 of 7) is still unnamed: ten release then ten debug runs, each log grepped for the typed Unlanded line.
-# barrier fixed the f=1 push loss (after 4 of 5, before 0 of 5), but push 0 was disconnected on the second consecutive
-# debug v3_takeover run in both arms. w-git's ba4e4e35e logs why the edge ends a response early, with its cause; it is on
-# main in b98233544. One arm at that commit: three release runs, then four debug runs back to back, one test thread. The
-# anchor's stderr (and the daemons' under it) is copied to the test's stderr, so each run's log holds every daemon and
-# anchor line; all are kept as the artifact. Run only from diag-measurer-main-v3-* branches, never main.
+# main 01a20182 (2026-11-24 05:35 PST): gate 8 for the push-0/1 failure, at ee9571813 (w-git's instrumentation of every
+# branch that can answer a homing short, agreed with w-shared; no behaviour change). Gate 7 (45398593779, 3d65116a6)
+# named the refusal, Unlanded(HomedShort) after a pack homing came back Err(Unanswered) 0.9 ms after the body, in 1 of
+# 20 runs. Twenty release then twenty debug runs (about 87% to meet a 1-in-20 failure), each log grepped for the new
+# lines: "fell short", "publication for generation", "ticket of generation", and the Unlanded line. Run only from
+# diag-measurer-main-v3-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -16,13 +14,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 7 at 3d65116a6)
+    name: v3_takeover (gate 8 at ee9571813)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3d65116a642af5f33136f958d43fbe35d2b04188
+          ref: ee95718132a3879a0ecaf7d3fa1bd1173b10522a
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -32,33 +30,33 @@ jobs:
           git log -1 --format='at %h %s' | cut -c1-120
           cargo test --release --locked -p slates-cli --test v3_takeover --no-run
           cargo test --locked -p slates-cli --test v3_takeover --no-run
-      - name: Run it, ten release then ten debug back to back
+      - name: Run it, twenty release then twenty debug back to back
         env:
           SLATES_TEST_CLI: "1"
         run: |
           set +e
           pass=0
-          for n in 1 2 3 4 5 6 7 8 9 10; do
+          for n in $(seq 1 20); do
             timeout 1200 cargo test --release --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/release-$n.log" 2>&1
             rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
             echo "release $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/release-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/release-$n.log" | head -4 | cut -c1-300
           done
-          for n in 1 2 3 4 5 6 7 8 9 10; do
+          for n in $(seq 1 20); do
             timeout 1800 cargo test --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/debug-$n.log" 2>&1
             rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
             echo "debug $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
-          echo "== gate 7: $pass of 20 passed"
+          echo "== gate 8: $pass of 40 passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
-            grep -a 'Unlanded\|refused after its body' "$f" | head -3 | cut -c1-300
+            grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation' "$f" | head -6 | cut -c1-400
           done
           exit 0
       - name: Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate7
+          name: v3-gate8
           path: ${{ runner.temp }}/*.log
