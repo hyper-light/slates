@@ -1959,6 +1959,9 @@ pub(crate) const LANDED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_texts_brought_
 /// let go); false where the repository holds no such revision here, the store gave no text, or the content store
 /// refused it.
 pub(crate) async fn bring_back(repository: RepositoryId, (path, node): (Vec<u8>, Node)) -> bool {
+  if let Some(log) = whole_log(&path) {
+    return bring_back_log(repository, (log, path), node).await;
+  }
   let Some((len, whole)) =
     crate::state::with_state(|state| held_whole(state, repository, (&path, &node))).flatten()
   else {
@@ -1991,6 +1994,111 @@ pub(crate) async fn bring_back(repository: RepositoryId, (path, node): (Vec<u8>,
     whole
   })
   .unwrap_or(false)
+}
+
+/// Counter: a changelog's or a manifest's revision brought back whole from the node's changeset store by its node, its
+/// windows let go once landed (goal 93, C1 (1): those logs' texts off the content store), apart from file texts
+/// ([`LANDED_TEXTS_BROUGHT_BACK`]). Format: a counter name in the status report.
+pub(crate) const LANDED_LOG_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_log_texts_brought_back";
+
+/// The changelog or the manifest log, by the path its kept texts are named with in the changeset store
+/// ([`slates_hg::push::intake::CHANGELOG_PATH`], [`slates_hg::push::intake::MANIFEST_PATH`]); none for a file's path.
+fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
+  if path == slates_hg::push::intake::CHANGELOG_PATH {
+    Some(slates_hg::index::Log::Changelog)
+  } else if path == slates_hg::push::intake::MANIFEST_PATH {
+    Some(slates_hg::index::Log::Manifest)
+  } else {
+    None
+  }
+}
+
+/// [`bring_back`] for the changelog's or the manifest log's revision `node` (goal 93, C1 (1)): where its object was let
+/// go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of the
+/// revision it is against too, the delta made again from the two and put back only as the very delta its row names
+/// ([`slates_hg::push::held::bring_back_log`]). True where its object is held whole after.
+async fn bring_back_log(
+  repository: RepositoryId,
+  (log, path): (slates_hg::index::Log<'static>, Vec<u8>),
+  node: Node,
+) -> bool {
+  let Some(held) =
+    crate::state::with_state(|state| log_held(state, repository, log, &node)).flatten()
+  else {
+    return false;
+  };
+  if held.whole {
+    return true;
+  }
+  let Some(text) = asked_text(repository, (path.clone(), node), held.len).await else {
+    return false;
+  };
+  let against = match held.against {
+    Some(against) => {
+      let Some(len) = crate::state::with_state(|state| log_held(state, repository, log, &against))
+        .flatten()
+        .map(|held| held.len)
+      else {
+        return false;
+      };
+      let Some(text) = asked_text(repository, (path, against), len).await else {
+        return false;
+      };
+      Some(text)
+    }
+    None => None,
+  };
+  crate::state::with_state(|state| {
+    let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    let whole = vcs_store::lent_state(state, |state| {
+      vcs_store::within_budget(state, lend, |stores| {
+        let (content, store) = stores.mercurial(repository)?;
+        slates_hg::push::held::bring_back_log(
+          (&store.index, content),
+          log,
+          &node,
+          (&text, against.as_deref()),
+        )
+        .ok()?;
+        slates_hg::push::held::log_text_held((&store.index, content), log, &node)
+      })
+    })
+    .is_some_and(|held| held.whole);
+    if whole {
+      state.count(LANDED_LOG_TEXTS_BROUGHT_BACK, 1);
+    }
+    whole
+  })
+  .unwrap_or(false)
+}
+
+/// The whole text of the revision `node` kept under `path`, at most `most` bytes, read from the node's changeset store
+/// off the shard's step ([`hg_view::answer_store_wants`]); none where the store gave none.
+async fn asked_text(
+  repository: RepositoryId,
+  (path, node): (Vec<u8>, Node),
+  most: u64,
+) -> Option<Vec<u8>> {
+  let mut ask = slates_hg::push::held::TextAsk::new(path, node, most);
+  if !hg_view::answer_store_wants(&mut ask, repository).await {
+    return None;
+  }
+  ask.taken().map(|(_, _, text)| text)
+}
+
+/// [`slates_hg::push::held::log_text_held`] in repository `id`, read with the shard's chunks lent.
+fn log_held(
+  state: &mut ShardState,
+  id: RepositoryId,
+  log: slates_hg::index::Log<'static>,
+  node: &Node,
+) -> Option<slates_hg::push::held::LogTextHeld> {
+  vcs_store::lent_state(state, |state| {
+    vcs_store::within_budget(state, 0, |stores| {
+      let (content, store) = stores.mercurial(id)?;
+      slates_hg::push::held::log_text_held((&store.index, content), log, node)
+    })
+  })
 }
 
 /// The length of the text of `path`'s revision `node` repository `id` holds, and whether its windows are held whole
