@@ -873,10 +873,11 @@ fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
     let (svn, green) = subversion("submitted").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
-    let version =
-      on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made]));
-    assert_eq!(version, 1);
+    on(|state| {
+      crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, vec![made]);
+    });
     youngest_reaches(svn, 1).await;
+    assert_eq!(on(|state| state.db.partition().green_head(green)), 1);
     let rows: Vec<(String, Action, NodeKind, bool)> = on(|state| {
       state
         .vcs_stores
@@ -945,7 +946,9 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
       target: "a.txt".to_owned(),
     });
     let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
-    on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made, link]));
+    on(|state| {
+      crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, vec![made, link]);
+    });
     youngest_reaches(svn, 1).await;
     let special = b"K 11\nsvn:special\nV 1\n*\nEND\n";
     let (row, kept_special) = on(|state| {
@@ -993,7 +996,7 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
         path: "/branches".to_owned(),
       }),
     ];
-    on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 1, first));
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, first));
     youngest_reaches(svn, 1).await;
     let copy = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Copy {
       from: "/trunk".to_owned(),
@@ -1001,11 +1004,9 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
       version: None,
       replace: false,
     });
-    assert_eq!(
-      on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 2, vec![copy])),
-      2
-    );
+    on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 2, vec![copy]));
     youngest_reaches(svn, 2).await;
+    assert_eq!(on(|state| state.db.partition().green_head(green)), 2);
     let held = on(|state| {
       let records = state
         .vcs_stores
@@ -1505,6 +1506,50 @@ fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed(
       after,
       (true, 1, 2),
       "answered once the revision landed and both committed"
+    );
+  });
+}
+
+/// The store is the truth, with no second path (main's rulings of 2026-11-23 20:32 and 20:40). Do: submit a work to a
+/// Subversion repository's green outside any recorded request (a bare dispatch, which no answer can wait on); read the
+/// reply, the green's durable head and the records' youngest revision in that step. Expect: refused
+/// `RecordedSubmitRequired` naming Subversion, the green's durable head 0 and the records at revision 0. Until then
+/// such a submit committed the version in its own step and a task landed its revision after it, so a crash between
+/// left a version with no revision on the store.
+#[test]
+fn a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing() {
+  stored(|| async move {
+    let (svn, green) = subversion("bare").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("bare-work", "trunk/a.txt", b"alpha\n")));
+    let (reply, head, youngest) = on(|state| {
+      let reply = crate::verbs::dispatch(
+        state,
+        7,
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      (
+        reply,
+        state.db.partition().green_head(green),
+        kept(state, svn).0,
+      )
+    });
+    assert!(
+      matches!(
+        reply,
+        slates_ipc::protocol::ReplyBody::Refused {
+          refusal: slates_ipc::protocol::Refusal::RecordedSubmitRequired {
+            tool: slates_ipc::protocol::VcsTool::Subversion
+          }
+        }
+      ),
+      "a bare submit to a Subversion green is refused RecordedSubmitRequired: {reply:?}"
+    );
+    assert_eq!(
+      (head, youngest),
+      (0, 0),
+      "nothing of the version stands without its revision"
     );
   });
 }

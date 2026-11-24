@@ -2035,7 +2035,8 @@ carrying an old configuration version; the reply carries the current one), `NotP
 A-9 adds `RetentionBudgetExceeded`, `GenerationExhausted`, `ResourceGuaranteeLost`,
 `ConsistentBaseUnavailable`, `RecoveryIncomplete`, `AttachmentUnsupported{transport, reason}`,
 `BarrierIncomplete{attachment, generation}`, `ConsumerNotEnrolled`, `ConsumerRevoked`,
-`GrantIssuerUnverified` and `LeaseUnconfirmed`. `QuotaExceeded` maps to ENOSPC at a mount;
+`GrantIssuerUnverified` and `LeaseUnconfirmed`. A-888 adds `RecordedSubmitRequired{tool}` (a submit to a
+Subversion repository's green outside a recorded request). `QuotaExceeded` maps to ENOSPC at a mount;
 subsystem-specific wire/transfer errors retain their closed kind through adapters. An
 uncategorized refusal or a false success is a bug. These required variants are not all
 implemented by the current schema.
@@ -58403,7 +58404,10 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > property changes their own changesets).
 >
 > **Status (2026-11-20, C4 groundwork: the store's owner).** `owner.rs`: one thread a node runs holding its `Store`
-> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first), reached from shards by a
+> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first; since 2026-11-23 the stop is a
+> request the owner ends at whatever handles are still held, later requests refused `Gone`, after a fleet test's stop
+> joined 75 minutes on a held handle: `docs/bugs/2026-11-23-the-store-owners-stop-joined-blind-on-a-held-handle.md`),
+> reached from shards by a
 > cloneable `StoreHandle` over a bounded `slates_rt::sync` channel: `land` (sections' `Vec`s moved in, answered once
 > durable), `piece`, `changesets`, each answer on a one-value channel the task awaits; a full queue is refused `Busy`.
 > The commit's `F_FULLFSYNC` and the engine's device waits never run on a shard. Test: `--test owner` 1/1 (a shard's
@@ -62468,3 +62472,35 @@ Applied in the same change to: §4.8 (an operation over several registers); §4.
 (`ContentMessage::ReplicaBuilding`, its golden vector and refusals); `slates-server` (`state_log`, `vcs_store`,
 `vcs_store::replica`, `replica_build`, `merge_service`, `fleet::serve_merge_shipment`, `takeover::rebuild_repository`,
 `git_push::uncommitted_report`, the HTTP and SSH receive drivers); GAPS (A-812 (b)).
+
+### A-888 — A submit to a Subversion repository's green outside a recorded request is refused `RecordedSubmitRequired`; the path that committed a version and landed its revision after it is gone (2026-11-23, w-svn for main 01a20182, its rulings of 2026-11-23 20:32 and 20:40: the store is the truth, with no second path; goal 93's C2; A-805, A-804, A-664)
+
+- **What was there.** A recorded submit to a Subversion repository's green takes the repository's landing turn, holds
+  its verdict and is answered after one step that commits the version and the register's entry naming its revision's
+  changeset, once that changeset landed on the node's store (A-805). A submit run outside a recorded request (a bare
+  dispatch, which no answer can wait on) took no turn: `verbs::accepted_answer` committed its version in its own step
+  and `vcs_store::svn_made::make` spawned a task that landed its revision after it. A crash between the two left a
+  version no revision on the store held, the green past the records' youngest revision, so every later made commit was
+  not the next and every client commit was refused. No production route reached it (every submit runs under
+  `run_recorded`, a resumed verb or `owner_judge`), but it stood in the code as a second path (§2 item 7), and the
+  "not reached" arm of a held verdict with no turn fell through to it too.
+- **The rule.** A Subversion green's version is made only through its held verdict, in the one step. A submit outside a
+  recorded request is refused before its verdict, `made_commit::take_turn` answering `Taken::Unrecorded`, nothing
+  judged or recorded; a held verdict that finds no turn to commit under is refused the same, its increment released and
+  nothing of it applied. Never `Overloaded`: its retry would fail the same way.
+- **The refusal.** `Refusal::RecordedSubmitRequired { tool }` (appended, wire tag 85; golden vector `5500000002000000`
+  for Subversion, `crates/ipc/tests/wire_order.rs`); the API's `Invalid::RecordedSubmitRequired(VcsTool)`, contract 63.
+  It joins §4.4's taxonomy beside `MessageRequired` and `IdentityRequired`: a submit a repository's commit cannot be
+  made from.
+- **Evidence.** Red on main 240917592 (macOS, debug):
+  `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing` was accepted with the green's
+  durable head 1 and the records at revision 0. Green after: refused `RecordedSubmitRequired` naming Subversion, head 0,
+  revision 0. The tests that submitted to a Subversion green by bare dispatch submit as recorded requests
+  (`paths::tests::submitted_recorded`; `identities::tests`' message and identity tests read each green's durable head
+  once its step committed).
+- **Not changed here** (main's sweep, the owners'): git's and Mercurial's made commits outside a recorded request
+  (`commits::make`, `hg_made::make`) keep theirs.
+
+Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.{rs,txt}`, `crates/api/src/{error,lib}.rs`,
+`crates/server/src/{made_commit,verbs}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named above.
