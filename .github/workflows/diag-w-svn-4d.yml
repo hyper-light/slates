@@ -40,7 +40,8 @@ jobs:
       - name: The server's FUSE mount tests, and 4d's reads and parks
         if: ${{ !cancelled() }}
         timeout-minutes: 60
-        run: cargo test -p slates-server --lib -- fuse:: named_objects a_work_over_a_subversion_green a_mount_read_of_a_named_text_let_go a_daemon_stopped_with_a_landing_turn_held
+        run: |
+          cargo test -p slates-server --lib -- fuse:: named_objects a_work_over_a_subversion_green a_mount_read_of_a_named_text_let_go a_daemon_stopped_with_a_landing_turn_held
 
   windows:
     name: WinFsp park (windows)
@@ -81,4 +82,5 @@ jobs:
       - name: The server's WinFsp mount tests, and 4d's reads and parks
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 60
-        run: cargo test -p slates-server --lib -- winfsp:: named_objects a_work_over_a_subversion_green a_mount_read_of_a_named_text_let_go a_daemon_stopped_with_a_landing_turn_held
+        run: |
+          cargo test -p slates-server --lib -- winfsp:: named_objects a_work_over_a_subversion_green a_mount_read_of_a_named_text_let_go a_daemon_stopped_with_a_landing_turn_held
