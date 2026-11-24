@@ -601,3 +601,9 @@ Waiting: main's route; arena-7 and arena-8.
 - New counters: vcs.hg.push_index_resolves and push_index_filter_rejections.
 - Asked main for the r536 loaded matrix at 34d055a3c.
 - Next: (B), the tiered bound in bytes. Possible follow-up: give a push's fork the parent's filters.
+
+## 2026-11-23: (B) landed: the tiered rule weighs bytes (40991f613, merge f9a5539b5)
+- tiered_due now merges by tables' bytes. TIER_RATIO and TIER_BASE are one Derived decision; the key filter's sizing reads TIER_BASE. New Index::own_bytes.
+- Red: 8 own runs against a bytes bound of 5 under the old rule in rows.
+- intake_steps prints own bytes, windows and the bound. Asked main for the 57k run at f9a5539b5.
+- Next: optimize the pending steps (72% of intake, 48,795 steps at 1.56 ms in r499). arena-21's resolves decide the parent's-filters follow-up.
