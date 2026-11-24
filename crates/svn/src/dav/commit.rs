@@ -764,6 +764,12 @@ impl DavCommit {
     self.chunk_step(world, hooks, step)
   }
 
+  /// The last refusal its drive answered, described, once ([`crate::commit::drive::Drive::take_refused`]): what its owner
+  /// logs, since the client is told Subversion's words alone.
+  pub fn take_refused(&mut self) -> Option<String> {
+    self.drive.take_refused()
+  }
+
   /// The run [`DavCommit::put_chunk`] left waiting for its base, taken again once the caller's `answer` came: `Ok` once
   /// the base is brought back, or the errors the PUT is refused with, naming it.
   ///

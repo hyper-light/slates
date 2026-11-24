@@ -152,6 +152,13 @@ impl SvnStores for ServedRecords {
         };
         step(&mut commit, &world)
       })?;
+      // A refusal the drive answered, named in the daemon's log: the client is told Subversion's words alone.
+      if let Some(refused) = commit.take_refused() {
+        slates_machine::log_line!(
+          "slates-server: partition {}: a Subversion HTTP commit's drive refused: {refused}",
+          state.partition
+        );
+      }
       let now_ns = state.clock.monotonic_ns();
       state
         .vcs_stores
