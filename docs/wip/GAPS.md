@@ -392,8 +392,10 @@
 >   interrupt time of 1.6-2.7% on every CPU, and the hypervisor present (WHP). No product latency change lands; the bar
 >   on this machine is Ada's to restate. A measured waste, found on the way: the bench's per-sample telemetry drain
 >   touches every shard, and A-326's holds keep each one spinning, about 7 of the bench's ~10 shard cores, for no
->   measured latency (holds off: 2.7-3.3 cores, failed runs unchanged). Owed: an observation holds no shard (main's
->   ruling, its own amendment).
+>   measured latency (holds off: 2.7-3.3 cores, failed runs unchanged). An observation now holds no shard (A-901,
+>   2026-11-24: the telemetry drain and status pages keep a loop's clock as an acknowledgement does; red first, 390 holds
+>   asked by 200 drains before, none after). Owed: A-901's jupiter A/B (shard CPU, every run's p99/p999) and main's
+>   provision_bench round on the Mac and Windows (R9's p99 unmoved).
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.

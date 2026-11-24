@@ -5624,6 +5624,17 @@ idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is 
 > destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
 > `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
 
+> **Status (2026-11-24, A-901: an observation holds no shard).** A request that is no work of its client's keeps a
+> closed loop's clock as A-326's acknowledgement does: within F of the shard's last client I/O it continues the loop,
+> after a longer pause it ends it. It never lengthens a run or holds a shard. Two kinds: a client's acknowledgement
+> (§4.9), and the daemon's observations of itself, §4.14's telemetry drain and status pages (`verbs::holds_nothing`).
+> Holds are bought for the verbs R9 and 84a hold to a bar, and no bar governs an observation's latency. Judged as the
+> loop's, `edit_merge_bench`'s telemetry drain after every sample held every shard it reached, about 7 of the bench's
+> ~10 shard cores on jupiter, for no measured latency (A-897: with every hold off, 2.7–3.3 cores and the same failed
+> runs). Test: `crates/server/tests/closed_loop.rs`
+> (`an_observation_holds_no_shard_while_a_closed_loop_still_does`: 200 rounds draining three shards asked 390 holds
+> before and none after, and a closed loop run after them still asks its owners for holds).
+
 > **Status (2026-11-18, A-361: Windows' own window, and every idle spin under the watchdog's).** Windows wakes a thread
 > blocked on an event, a semaphore or an address a priority level up, and a thread dequeued from an I/O completion port
 > at its own level, which is how a parked shard waited. Beside two spinners a logical CPU at the shard's level, on CI's
@@ -63099,3 +63110,21 @@ Applied in the same change to: `crates/merge/src/engine/branch.rs` and its tests
 
 Applied in the same change to: `crates/client/examples/edit_merge_bench.rs` (and its unit test of the split),
 `crates/client/Cargo.toml` (`slates-rt` for the client thread's clock), BENCHMARKS, GAPS (84a).
+
+### A-901 — An observation keeps a closed loop's clock and holds no shard (2026-11-24, w-84a-win for main 01a20182, its ruling of 2026-11-24 05:35; A-897's measured waste; amends A-326's acknowledgement rule)
+
+- **Why.** A-326 judges every request a client's ring brings, except its acknowledgement, as its closed loop's, and a
+  forward made for one carries a hold for its owner. `edit_merge_bench` drains every shard's telemetry after every
+  sample, so its drain was a loop over every shard, and A-326 held all of them: about 7 of the bench's ~10 shard cores
+  on jupiter. With every hold off the same rounds measured 2.7-3.3 shard cores and the same failed runs (A-897). The
+  CPU bought no latency, and no bar governs an observation's.
+- **The change.** `verbs::holds_nothing` names the requests that are no work of their client's: an acknowledgement,
+  `Telemetry`, `DaemonStatus` and `DaemonStatusNext`. Each keeps a loop's clock as an acknowledgement did, and none
+  lengthens a run or sets a forward's hold.
+- **Test** (macOS arm64, debug, 2026-11-24). Red first: `an_observation_holds_no_shard_while_a_closed_loop_still_does`
+  (`crates/server/tests/closed_loop.rs`). 200 rounds draining a three-shard daemon's telemetry asked 390 holds (1 kept,
+  389 declined) before the change and none after. A closed loop of creates and destroys run after the drain still asked
+  its owners for holds, so the count can see one. A-326's own test passes unchanged.
+
+Applied in the same change to: §4.7 (a status), `crates/server/src/verbs.rs`, `crates/server/tests/closed_loop.rs`,
+GAPS (84a's owed line).
