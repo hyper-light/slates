@@ -5,6 +5,8 @@ name: diag measurer
 # 45303764098: 24 of 24 on ubuntu-latest and ubuntu-24.04-arm), so it is not run again here. Every dataset is fetched
 # inside the job: git/git by clone (the git matrix's cut at v1.0.0; the svn matrix's git-2000.dump made from it by its
 # recorded recipe, crates/cli/bench/git_to_svn_dump.py). Runs only from `diag-measurer-*` branches, never main.
+# Run 5 (main 01a20182, 2026-11-24 13:50 PST): the svn matrix alone at main 92516ced4, with w-svn's 92516ced4 (an edit's
+# delta base brought back before the drive applies it: Due::Text). Runs 3 and 4 were 26 of 33 on both routes.
 # Run 4 (main 01a20182, 2026-11-24 12:09 PST): the svn matrix alone at current main (4664f8d26). Run 3 (45445378898,
 # c53777733) passed git and 26 of 33 svn rows on both routes: commit-edit, propset, switch and merge refused "E160004:
 # Corrupt" at their commits, and delete, revert and status after them; run 1 had passed 33 of 33.
