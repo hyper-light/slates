@@ -652,3 +652,11 @@ Waiting: main's route; arena-7 and arena-8.
 - The held reds patch is consumed (~/.cache/w-hg-made-reds.patch no longer needed).
 - Next: P5. Let go changelog and manifest windows after commit or landing. Main's red: ContentStore::used, plus clone and pull verifying clean against stock 7.2. Asks per push counted. GAPS off IN FLIGHT.
 - Then: stream (8.8x) and push (5.6x) speed.
+
+## 2026-11-24 ~11:00: re-adoption NotHead, the empty-window durability fix, and P5 landed
+- 259b0db84: a re-adopted lineage root founds its lineage again (`verbs::install_readopted`), so a made changeset over it is previewed. Red: the second edit of `a_readopted_green_brings_back_the_named_base_its_chain_splices_first`. The Branch-member and takeover siblings went to w-perf (main's ruling).
+- 53e09728f: the empty window is never let go (`LetGoRefused::Empty`). Red: Mercurial's first 5,000 revisions pushed and restarted refused `Unheld 00manifest rev 4281`, a manifest kept as an empty delta whose empty window an empty file's let-go had marked away with length 0. Main's r942 (57k, big Studio) is green.
+- c45aff536: P5. Changelog and manifest texts are let go once landed. Readers (layout, made parent, named resolution) read whole texts given in the objects' place. Asks are counted per push, with the parent manifest named apart. GAPS entry moved off IN FLIGHT.
+- Run request (main): stock 7.2 clone, pull and verify over an import and a push (hg_interop).
+- Process slip, owned: one bare `git reset -q`, which only unstaged files a `git apply --3way` had staged. Nothing was lost.
+- Next (main's order): the `hg_push::landing` poll of 3,553 ms at a 4,067-changeset merge-heavy DAG (debug, exit 4). Red first: a counter names the per-history work, then slice it. Then C1 (2), then stream and push speed.
