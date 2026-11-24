@@ -1824,6 +1824,10 @@ pub(crate) async fn serve_remote(
   request: &[u8],
   budget_ns: u64,
 ) -> Vec<u8> {
+  let delay_ns = ANSWER_DELAY_NS.with(std::cell::Cell::get);
+  if delay_ns > 0 {
+    let _ = slates_rt::futures::sleep(delay_ns).await;
+  }
   let message = match decoded(request) {
     Ok(message) => message,
     Err(answer) => return answer,
@@ -2148,6 +2152,15 @@ std::thread_local! {
   /// Test support (A-727 (d1a-3)): whether this node answers every resolution unresolved, as a repository's holder this
   /// node cannot reach does ([`hold_resolutions`]).
   static RESOLUTIONS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Test support (A-907): how long this node waits before it serves each home message from the region
+  /// ([`delay_answers`]): a home slower than its sender's round, as one waiting for its own install is (A-902).
+  static ANSWER_DELAY_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test support (A-907): this node waits `delay_ns` before it serves each home message from the region while `delay_ns`
+/// is not 0, so it answers after its sender's round has stalled, as a home waiting for its own install does (A-902).
+pub(crate) fn delay_answers(delay_ns: u64) {
+  ANSWER_DELAY_NS.with(|delay| delay.set(delay_ns));
 }
 
 /// Test support (A-727 (d1a-3)): this node's resolutions all answer unresolved while `held`, as when the repository's
@@ -3138,31 +3151,39 @@ async fn exchange_round(
     .into_iter()
     .map(|(host, endpoint)| (host, request.to_vec(), endpoint))
     .collect();
-  let (replied, _stragglers) = slates_cluster::broadcast(
+  let (replied, stragglers) = slates_cluster::broadcast(
     outgoing,
     HOME_STREAM,
     slates_transport::connection::Priority::Bulk,
     budget,
   )
   .await;
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
+  let mut take = |host: slates_db::HostId, bytes: Vec<u8>| {
     left.retain(|waiting| *waiting != host);
     let readable = !matches!(
-      HomeMessage::decode(&reply.bytes),
+      HomeMessage::decode(&bytes),
       Ok(HomeMessage::Answer {
         outcome: HomeOutcome::Refused(HomeRefusal::Version),
         ..
       }) | Err(_)
     );
     if readable {
-      answers.push((host, reply.bytes));
+      answers.push((host, bytes));
     } else {
       let _ = crate::state::with_state(|state| state.count(REPLY_OTHER_VERSION, 1));
     }
+  };
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    take(host, reply.bytes);
     returned.push((host, endpoint));
   }
   crate::fleet::return_sessions(returned);
+  // A home slower than the round's stall (one waiting for its own install, A-902) answers late: its answer counts, and
+  // its session goes back on its link (A-907). An unanswered one's link is dialed afresh and the host stays left.
+  for (host, bytes) in crate::fleet::settled_stragglers(stragglers).await {
+    take(host, bytes);
+  }
 }
 
 /// Logs the hosts of an exchange that never answered, how long it ran, and why it stopped (gate 8: a homing short in about
@@ -3576,7 +3597,7 @@ async fn put_whole(
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
-  let (replied, _stragglers) = slates_cluster::broadcast(
+  let (replied, stragglers) = slates_cluster::broadcast(
     outgoing,
     HOME_STREAM,
     slates_transport::connection::Priority::Bulk,
@@ -3584,19 +3605,26 @@ async fn put_whole(
   )
   .await;
   let mut kept = Vec::new();
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
+  let mut take = |host: slates_db::HostId, bytes: &[u8]| {
     if let Ok(HomeMessage::Answer {
       identity: answered,
       outcome: HomeOutcome::Kept { .. },
-    }) = HomeMessage::decode(&reply.bytes)
+    }) = HomeMessage::decode(bytes)
       && answered == identity.0
     {
       kept.push(host);
     }
+  };
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    take(host, &reply.bytes);
     returned.push((host, endpoint));
   }
   crate::fleet::return_sessions(returned);
+  // A late home's answer counts and its session goes back on its link (A-907).
+  for (host, bytes) in crate::fleet::settled_stragglers(stragglers).await {
+    take(host, &bytes);
+  }
   kept
 }
 
