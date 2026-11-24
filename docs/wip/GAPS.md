@@ -1116,6 +1116,16 @@
 >   826 MB from 1,261 MB on x86, vcs_windows 154 MB held for 121 MB asked). Its piece reader lost every window in a
 >   trimmed chunk of its own at a restart; FIXED the same day (w-win2's Windows run 45269168513;
 >   `docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md`).
+>   The windows' records BUILT smaller the same day (main's (3); w-perf's 57k push: 22,107,816 bytes live for 114,200
+>   windows): a window keeps what it alone names (its identity, length, slot and slab's key, 56 bytes), and its slab
+>   keeps the placement its windows share. Held by `tests/window_records_heap.rs` through a count of the test thread's
+>   live heap: red 250 bytes a window on main's record, now 150, against a derived 192.
+> - The memory status test's content hold row depends on where the work was computed. OPEN (w-perf, 2026-11-23,
+>   main's (2)). `memory_gauges::a_memory_status_names_its_holders_and_a_plain_one_none` asserts
+>   `mem.gauge.held.content_manifests`, which exists only when the submit's increment was held at compose, on a holder
+>   (`work_home.rs`, `hold_composed_inputs`). Under a counting allocator installed for the library's tests it failed 4
+>   of 4, and the probe read `merge.inputs.carried_in_entry=1` and no manifest held: the increment rode its chain entry.
+>   Owed: a red pinning each placement, and the test asserting what the product guarantees in both.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's

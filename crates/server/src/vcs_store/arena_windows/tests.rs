@@ -468,7 +468,7 @@ fn carry_slab_blocks(
 ) {
   for (window, _) in put {
     let block_of = |held: &ChunkWindows, store: &ChunkStore| {
-      let (chunk, _) = held.held[window].placed.unwrap().slot().unwrap();
+      let (chunk, _) = held.placed_of(&held.held[window]).unwrap().slot().unwrap();
       store.chunk(chunk).unwrap().block
     };
     let from = chunks
