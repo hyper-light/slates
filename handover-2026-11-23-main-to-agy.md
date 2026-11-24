@@ -22,6 +22,17 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 00:52 on 11-24:
+- 84a at current main 55650fef1. macOS (r791, Studio): every run under 1 ms (24 loaded runs: p99 at most 216 us, p999 at
+  most 542 us). Windows (r792, jupiter): every run's p99 under 1 ms, but p999 crossed 1 ms in 3 of 24 loaded accept runs
+  (2.0-3.7 ms) and 3 of 12 quiet runs (1.0-3.3 ms). A rare ~3.7 ms client-daemon round-trip stall, in edit (L7) or submit
+  (Q1), loaded and quiet alike, the shape of 11-22's "client waits 3 ms" tail at a lower rate. NOT met under every-run.
+  Routed to w-perf after A-887 (B): port the slow-wake DIAG from branch main01a20182/84a-win-diag, name the stall, fix it
+  red first; the coordinator reruns round7.sh on jupiter (launch2.ps1 -Class 32) to confirm. Linux (r793, adacachy2):
+  built (rtprio 99), still waiting for load under 8 (33 at 00:50).
+- w-svn's A-888 piece 2 landed (891de2741, renumbered A-891). w-git is landing the commits.rs sites and then gate 4's
+  logging. w-hg is landing P3, with P4 next.
+
 Updates at 00:28 on 11-24:
 - Goal 84a: the session's stop hook holds the pre-11-22 text and asks for every run under 1 ms on Linux, macOS and Windows
   at main's current tree. Read back from the machines, the 11-22/11-23 bare-metal rounds had every run under 1 ms on
