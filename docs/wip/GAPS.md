@@ -520,10 +520,18 @@
 > was refused `BadRequest`, so the hold's first renewal says whether there is a term to hold (contract 61). Red then
 > green: the late-input CLI test with the hold off on ubuntu, the Windows commit give-back
 > test with the write's hold ended at once on both runners (`AttachmentExpired` at the staged write's apply), and both
-> green with it (diag runs 45285066499, 45292483681) (`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`). **Owed, the
-> next piece (main's ruling):** the CLI still holds the write's whole input, up to the largest shard's metadata ledger,
-> while the daemon's staging buffer holds a second copy. The fix is a stage opened without a length, reserved put by put
-> within the ledger and bound to the attachment, with a peak-RSS red.
+> green with it (diag runs 45285066499, 45292483681)
+> (`docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`). **A-880 (the next piece, main's ruling; fixed
+> 2026-11-23): the write streams its input.** The CLI held the write's whole input, up to the largest shard's metadata
+> ledger, and copied it twice more to frame one request and see whether it fit: a 128 MiB write held its command at 549
+> MB resident on macOS (a 4-byte one at 11.7 MB). Now `Client::fs_write_from` stages it a page at a time into a buffer
+> of no stated length (`StageOpen`), reserved put by put within the shard's metadata ledger and living as long as the
+> held attachment, so the command holds two pages. Red then green (diag run 45321312017; all four runners green): with
+> stdin read whole the 128 MiB write peaked at 548,148 KiB resident on ubuntu and 536,448 KiB on macOS, and streamed at
+> 23,696 KiB and 11,488 KiB; an open buffer given a lease's deadline lost the slow producer's pages (`NotFound`); the
+> count of ended attachments held still left the buffer to the put after a detach. **Sibling, reported:**
+> `Client::fs_write` with a large slice clones it into a request and frames it whole only to ask whether it fits one,
+> two copies of the input before it stages a byte; the SDKs and MCP write through it.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -1144,6 +1152,13 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
+>   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
+>   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
+>   same test on the same merge passed at once after, and in the next round. An observation waits
+>   `LIVENESS_BUDGET_NS` for its shard (`Daemon::pending_patient`), and a busy runner is the norm, so a submit and its
+>   checkpoint's first step inside one observation can outlast it. Main's ruling: a real load sensitivity, to fix in its
+>   turn.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
