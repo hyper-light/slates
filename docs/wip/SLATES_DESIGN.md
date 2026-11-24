@@ -5453,6 +5453,12 @@ drops.
 > (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
 > 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
 > against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
+> **Linux too (2026-11-23).** The daemon's confirmation was not enough there: `futex_wake` counts a waiter that queued
+> itself and was set running again before it blocked, so the same test on adacachy2 found 5,341 of 16,384 racing parks
+> that never switched out, and 4 of them taught 560 to 9,286 ns. A Linux park now teaches only if the client's own
+> voluntary switch count rose across it and the daemon confirmed. The client already read the count around every
+> wait, so no call is added. macOS, which gives no per-thread count, keeps the confirmation alone. Record:
+> `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -61901,6 +61907,10 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   groups the pieces by block and claims each block once, refusing as `Malformed` a group whose pieces disagree on the
   chunk or whose slots overlap. Version 1 is refused typed (`PieceRefused::OldVersion(1)`) and counted unrestored. Its
   window is put again by the record replay that holds its bytes.
+  **Corrected 2026-11-23.** A chunk of its own whose block the seal trimmed (A-118) names a head shorter than its bytes,
+  and version 2's reader first refused it, so every window of a granule or more was lost at a restart. Windows' 4 KiB
+  granule showed it, and a 16 KiB granule hid it (`docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-
+  chunk-the-seal-trimmed.md`). Only a window's slot is held to its chunk's bytes, and only a shared slab asks again.
 - **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
 - **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
   - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
@@ -61954,6 +61964,45 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - `unsafe-budget.toml`: anchor +1, ipc ±0.
   - GAPS.
   - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+
+### AUD-11 amended again — A forwarded verb that ran and deferred its reply is answered where the reply is held, or in doubt; never `Overloaded` (2026-11-23, w-chaos for main 01a20182, its rulings of 2026-11-23 on the forward's answer; A-200, A-255, A-354, A-794, §4.8 "Lookup", §4.9)
+
+- **Why.** AUD-11's first amendment (2026-11-20) attached a forward's exchange only to a deferred acceptance. A write or
+  destroy the live log held for durability or its tombstone's placement (A-200, AUD-29-43) met `Gone` and was answered
+  `Overloaded` at once, every time, though it ran and became durable. A superseded owner's clients met that on every
+  write (the fleet's A-338 and A-349 tests). `Overloaded` says a verb was not applied, so a client resending under a
+  fresh id applies a committed write twice.
+- **The rule.** A forwarded verb that ran on its owner and deferred its reply is answered as follows:
+  - the reply recorded already;
+  - else by whatever holds the reply: a deferred acceptance's commit, a work's gate (A-794), or the live hold
+    (`live_ship::await_forwarded`, answered at the hold's every ending: its own reply, `DurabilityPending` at the
+    failover SLO, or the fence's, the yield's or the destroy's refusal);
+  - else, and past the exchange's liveness budget, and where the owner's shard cannot be asked, the in-doubt
+    `DurabilityPending`, recorded nowhere, so a resend under the id meets the outcome. `Overloaded` is answered only
+    where a request provably was never admitted.
+- **The guard's order.** The unheld-forward guard (6b2952f4d, 0a4dcc51b) applies only to a request new on the
+  partition: one the partition knows is answered by what it recorded, whoever holds its volume now. For a work no
+  member owns, the owner of the green its catalog record names answers for it (A-255). Both were missed when the guard
+  landed. A takeover's resend met `NotOwnerHere` for good in four fleet tests.
+- **Tests** (adacachy2; red on main, green with the change):
+  - the two superseded-owner tests;
+  - `a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability` (11,007 `Overloaded` before);
+  - `a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome` (`Daemon::inject_forward_answer_delay`,
+    its count `fleet.forward.deferred_completed`);
+  - the four takeover-resend tests.
+  Two forwarded-submit tests now expect `DurabilityPending` (or their origin's `OwnerUnreachable`) where they expected
+  `Overloaded`.
+- **Applied in the same change to:**
+  - `crates/server/src/verbs.rs`: `await_deferred_completion`, `attach_deferred_forward`, `deferred_in_doubt`, the
+    guard's order and A-255's authority in `forwarded_write` and `refusal_of_unheld_forward`, the test delay.
+  - `crates/server/src/live_ship.rs`: `Awaiting::forwarded`, `await_forwarded`, the answers in `answer` and
+    `tell_given_up`.
+  - `crates/server/src/work_home.rs`: `answer_forwarded`.
+  - `crates/server/src/state.rs` and `daemon.rs`: the test delay.
+  - `crates/server/tests/fleet.rs`.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md and
+    docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md.
 
 ### A-882 — The failover delay's detection term is at least the bound the detector states while a pair it probes is still judged by its own retransmission timer (2026-11-23, w-fleet for main 01a20182; found with A-351's readmission flake; amends A-363; §4.8 "Derived constants", D-16, A-375, A-574)
 

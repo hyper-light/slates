@@ -1107,7 +1107,10 @@
 >   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
 >   of 100 bytes; now 400). The rounding's fix, A-877, is BUILT: windows shorter than a granule share slabs of one granule,
 >   slots never written twice, a slab freed with its last window through A-64's deferred free (red: 3,276,800 bytes held
->   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). Owed: main's arena-17.
+>   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). arena-17 met its bar (CI 45255642995: RSS
+>   826 MB from 1,261 MB on x86, vcs_windows 154 MB held for 121 MB asked). Its piece reader lost every window in a
+>   trimmed chunk of its own at a restart; FIXED the same day (w-win2's Windows run 45269168513;
+>   `docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md`).
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
@@ -1323,6 +1326,18 @@
 > socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
 > HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
 > before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
+> Push hot path BUILT (2026-11-23, w-git; main 01a20182's order from git/git's push profile): a create's search for the
+> green holding its commit (`git_push::ShardGreens::holding`) lent every member green (`Greens::is_owing`, a take and
+> restore of the lineage) and read each one's versions through its head rows, once a decision: O(decisions x greens).
+> Now the git store keeps, for each commit a version's head names, each green with such a version and its newest one
+> (`Repository::holders`, charged with the chains), and the repository index finds a member by its key and the rank it
+> joined at (`Repositories::member_keyed`), so the search asks only the greens holding the commit, in the same order
+> (`t_goal93_a_pushs_search_…_is_flat_in_the_repositorys_greens`: 60 greens examined with 4 held and 156 with 16
+> before, the same in both after, `git_push.holding.examined`). `keyed`'s walk of the lineage went with it. Owed: a lend
+> that only reads a green's own fields (`is_owing`, `branch_version`) borrowing it rather than taking it out of its
+> lineage, and the empty engine each lend makes and drops (`Lent::new`), with w-svn's lend work; the commit's clone of
+> the whole head map and its footprint's walk of every chain (`Repository::plan`, `footprint`), O(greens) a push;
+> main's git/git push before and after on the Studio.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -7482,7 +7497,21 @@
 > "replicated here" replaces the test hook, so production routing serves a green's works on every node that replicates
 > it; the green's successor takes a holder work's asks after a takeover.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
-> time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
+> time).
+> **Closed (w-chaos, 2026-11-23): that change answered a forwarded write held for its live volume's durability
+> `Overloaded` at once, every time.** The exchange attached only to a deferred acceptance. The write ran and became
+> durable, but no forwarded live write was answered at durability: a superseded owner's clients met `Overloaded` on
+> every write (the fleet's A-338 and A-349 tests, red 2 of 2), and a client resending under a fresh id applied the
+> write twice.
+> - **The fix.** The exchange attaches wherever the reply is held: the completion, the acceptance, a work's gate, or
+>   the live hold (`live_ship::await_forwarded`, writes and destroys), answered wherever the hold ends. Where the verb
+>   ran but its outcome is unknown, it is answered the in-doubt `DurabilityPending`, recorded nowhere, never
+>   `Overloaded` (main's ruling: `Overloaded` only where the request was never admitted).
+> - **Also found and fixed.** A regression of w-chaos's own 6b2952f4d and 0a4dcc51b: the unheld-forward guard ran before
+>   a request's recorded completion and ignored A-255's authority, so four takeover-resend tests met `NotOwnerHere` for
+>   good.
+> - **Notes.** docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md
+>   and docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md. A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
 > interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; 1.3 GB/s median after the sender's and receiver's per-packet copies were removed, BENCHMARKS 2026-11-20; owed: one syscall a datagram, the profile's top, and a datagram's copy out of the shard's receive buffer); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure. Exit 4 is the watchdog's (`watchdog.rs`, `FAILED_EXIT_CODE`): a
@@ -7500,6 +7529,16 @@
 > interval at a time before). A FUSE helper's exit, mount and unmount alike, is awaited by its exit watch since 2026-11-20 (family three: polled
 > a heartbeat tick at a time before; a watch the kernel refuses refuses the mount, typed). Owed from that sweep: the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
+
+> **Open (test, 2026-11-23, w-chaos): two tests failed only under a whole-suite sweep on adacachy2.** That was r322,
+> the forwarded-write fix's sweep. They ran serially among 237 fleet tests and 38 live_fleet flows, while kiln's
+> placement saw 0 to 3 of 32 cores idle. Each passed 2 of 2 alone with the fix, and 1 of 1 on main.
+> - `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over` (fleet): its write was held past the failover
+>   SLO on each of its three sends, the last `DurabilityPending { held_ns: 3,246,047,745 }`. The SLO is a product
+>   deadline (A-354). The test's bet is `CONTINUITY_WRITES`, three sends, one for each outcome it allows.
+> - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
+>   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
+>   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
 
 > **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
 > a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,
@@ -13167,6 +13206,42 @@ finding against the sweep's thirty candidates is the measure of how far a grep w
 **Owed:** five references were deleted rather than repointed, because nothing of that name exists and the
 right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,
 `fold_peer_state`, `ProbeTiming::budget`, all in `crates/server/src/fleet.rs`.
+
+**Red again, cleared 2026-11-23** (w-wall for main, at main b21dd5d5f). Fleet agents land without building docs
+(CLAUDE.md §8), so the gate went red unseen. CI run 45251228315 showed 51 errors in three crates, but cargo stops
+starting crates after the first failure, so that was a subset: `cargo doc --keep-going` with the gate's flags found
+**131 errors in 17 crates** on macOS and 131 on adacachy2's Linux, 132 distinct (the same set but for one each:
+`ProcessMark` is macOS and Windows only, `crates/server/src/held_copy.rs` Linux only). Each was repointed at what it
+means now, never deleted:
+
+| Kind | Count | Examples |
+|---|---|---|
+| A name renamed or removed | 19 | `Store::text_by_tool` (`Store::texts_by_tools`), `changeset_of` (folded into `changeset_landing`), `tell_owners` (`tell_session`), `Landing::chmod` (`Landing::set_meta`), `PendingMount` (`PendingHandshake`), `keylife::key_time_limit_ns` (RFC 4253 §9's hour, `RECOMMENDED_KEY_TIME_NS`) |
+| A `#[cfg(test)]` item named from a production doc | 22 | the takeover oracles `resolve_held_objects` and `reconcile_held_authority` (production walks `install_on_copy` a copy a turn), `Dim::copy_tree` (production holds with `hold_tree` and grafts with `graft_tree`), `Connection::poll_transmit` (`poll_transmit_into`) |
+| A module's own docs resolved in its parent's scope | 27 | `crates/server/src/moves.rs` (13), five `crates/git/src/store` children (10), `crates/vfs/src/host/tree.rs` (4) |
+| Prose read as a link | 21 | evidence tiers `[B]` and `[C]` (14), protocol grammar with `<placeholders>` in brackets (4), C source `name[entrylen]` |
+| Ambiguous between a function and a macro, module or primitive | 19 | `write` (12), `answer` (2), `ready`, `tuple`, `pointer`, `reference`, `slice` |
+| A real item by a path that does not reach it | 17 | `hg_run` from `hg_push.rs` (10), `HomeMessage` imported inside a function only |
+| A placeholder read as an unclosed HTML tag | 4 | git's messages quoting `<name>`, `<digits>`, `<blob-ish>`, `<id>` |
+| An item behind a platform cfg the build cannot see | 3 | `Holder` and `handle_session_bytes` (`cfg(any(windows, test))`), `ProcessMark` |
+
+**The trap behind the 27.** A module with an outer `///` doc on its `mod` line and its own `//!` docs gets one
+merged doc, which rustdoc 1.98.1 resolves in the *parent's* scope, so every inner link to the module's own items
+fails with "no item named ... in scope" beside the very item. Proved on a two-file crate: the inner link fails with
+the outer doc and resolves once the outer doc is a `//` comment. The outer lines became `//` comments, as
+`crates/server/src/lib.rs` already writes its other module notes; each module's own docs already opened with the
+same summary. Eleven more modules still carry both kinds and do not fail today: `crates/ipc/src/lib.rs`'s
+`completion`, `mach_claim` and `peer` (their outer docs say more than their first lines, so turning them into
+comments needs their text moved in), `xtask/src/kind.rs`'s three `kind_*`, and five test-only modules no docs build
+renders.
+
+**The Windows docs lane, run from the Mac** (`cargo xwin doc` over `windows-lint`'s crate list; every one of its 13
+crates builds here, aws-lc-sys and zstd-sys through clang-cl), found 11 more, each a link from docs every platform
+builds to an item Windows does not have: `crates/server/src/shards/resync.rs`'s seven (`establish`, `Resync::end`,
+`give_up` three times, `tell_session`, `send_resync`, all `cfg(unix)`), `Events::acknowledge` twice (macOS and Linux
+alone), `svn_presenter::repos_for_hook` and `Answering::Hook`. Plain code now, the rule for a cfg-gated item. CI's
+Windows lane had stopped at an earlier step (run 45251228315, `svn_interop`'s `UPDATE_SPAN`), so its docs step never
+ran on them.
 
 ### 8a-fdscan. A descriptor probe counted every parallel test's objects as its own (2026-10-20, closed)
 
@@ -26362,16 +26437,48 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   test's fixed 1.25-slice volume left room since A-848's best-fit claims; **fixed**, sized by the refusal's own
   `available`), `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (a released extent kept its pages in
   Linux's memfd; **fixed**, `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`),
-  `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s), and
-  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice); ipc's
+  `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s: a fresh
+  daemon's sweep walks its write log and journal whole, 47.5 million pages in 104 s on adacachy2; **fixed**, the test
+  reads the arena's held runs from the memory report's kinds, which a sweep passed 5.2 ms after the first memory
+  request), and
+  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice; **fixed**, a heavy
+  piece ends its slice whatever the yields have cost,
+  `docs/bugs/2026-11-23-a-starts-heavy-pieces-ran-in-one-slice-where-yields-cost-more.md`); ipc's
   `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
-  wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
+  wake: Linux trusted `futex_wake`'s count, which counts a waiter woken before it blocked; **fixed**, a Linux park
+  teaches only if its thread switched out, the test judged by the client's held wakes,
+  `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`).
 - **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
   left against the claimed capacity, which a publication's give-back trims to the demand (A-853): 6 of 10.5 MiB failed on
   CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
 - **One poll past the budget.** `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
   held the control shard 1,540 ms in one poll here (the daemon's near-miss line); under TSan the watchdog ended the
-  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran.
+  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran. **Fixed:** the test drove the
+  whole push in one observation, where the edges take a step a poll (`vcs_ssh::receive`); it drives it so now
+  (`pushed_a_step_a_poll`).
+- **Measured, open: a push's steps against the quantum.** r16's push driven a step a poll, release, adacachy2 (load
+  12-21, 3 runs): the longest answer step 1.41, 1.20 and 1.11 ms, and the longest carry 3.91, 3.55 and 3.48 ms (an
+  await's wall time, which can span steps), against the shard's live quantum of 2.96, 4.26 and 2.75 µs and its step
+  ceiling of 100 ms. `rt.long_steps` rose 3,403 to 4,747 over each push of about 6,300 to 6,900 steps, and the push
+  took 166 to 186 ms. In debug: 16.7 and 7.5 ms against 8.9 µs. Tied to the push hot path w-git is rebuilding: once
+  w-git's index fix lands, main measures an edit's p99 on a shard during a concurrent git/git push, and the step
+  granularity is decided from that (84a's under-1 ms p99).
+- **A flaky bench assertion.** `crates/ipc/examples/ipc_bench.rs`'s parked row asserts "every trip woke the client"; it
+  aborted 1 run in 12 under load on adacachy2 (2026-11-23, BENCHMARKS' A/B of the switch-count reads). Its spinning row
+  had failed every run since A-799 (85b88770e): **fixed**, it names its spin.
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).
+
+### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
+CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's
+`retirement::tests::a_group_is_adopted_retired_and_its_owner_joined`: w-wall's run went 37 minutes without finishing,
+every progress report inside `sync::cell::claim`'s look-up of the cell table, and a native sample of Miri put its time
+in the borrow tracker. The table was one static array of 262,144 `OnceLock<Box<Segment>>` slots (A-767 C2), and every
+claim and every handle's look-up borrowed all 4 MiB of it, which Stacked Borrows retags slot by slot. On this MacBook the
+cell test `a_cell_is_freed_by_its_last_handle_and_a_stale_handle_finds_it_closed` took 43.0 s of CPU under Stacked
+Borrows and 3.19 s with them off. **Fixed:** two levels, 512 directories of 512 segments' slots, so a look-up borrows
+two arrays of 512. The cell test then took 2.74 s of CPU, and the retirement test passed in 3.98 s; with CI's flags,
+`retirement::` and `sync::cell::` passed 4 of 4 in 158 s of CPU. The plain build pays about 2 ns a claim (12 to 14 ns,
+least against least, 8 interleaved rounds at load 79-103), which main accepted (BENCHMARKS). CI's Miri lane is the check
+of the whole crate.

@@ -3691,7 +3691,10 @@ fn policy_record(
     .partition()
     .volume(crate::verbs::to_db_volume(volume))
     .cloned()
-    .ok_or_else(|| Box::new(crate::verbs::refused(Refusal::NotFound)))?;
+    // A volume this node holds no record of is refused by the rule every slotless verb meets (`verbs::absent`): only its
+    // owner may say it does not exist, so a node that knows it is elsewhere answers `NotOwnerHere` (until 2026-11-23,
+    // `NotFound` here while a landing's verbs answered `NotOwnerHere`).
+    .ok_or_else(|| Box::new(crate::verbs::refused(crate::verbs::absent(state, volume))))?;
   if matches!(
     record.state,
     slates_db::catalog::VolumeState::Destroying | slates_db::catalog::VolumeState::Destroyed

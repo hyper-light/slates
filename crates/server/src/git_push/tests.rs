@@ -881,6 +881,75 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
   assert_eq!(refused, (Vec::new(), 0));
 }
 
+/// Shape: the greens the smaller repository of
+/// [`t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_repositorys_greens`] holds before its push.
+const HELD_FEW: usize = 4;
+
+/// Shape: the greens the larger repository holds: four times [`HELD_FEW`], so work linear in the greens shows as four
+/// times as much.
+const HELD_MANY: usize = 4 * HELD_FEW;
+
+/// Shape: the creates the one push makes, each at a commit no green holds yet.
+const CREATES_UNHELD: usize = 4;
+
+/// The greens a push's search for the green holding a commit examined (`HOLDING_EXAMINED`), in a repository holding
+/// `held` greens at the fixtures' first commit, over one push creating [`CREATES_UNHELD`] branches at its second commit,
+/// which no green holds; and each create's outcome.
+fn examined_over(state: &mut ShardState, name: &str, held: usize) -> (u64, Vec<Vec<u8>>) {
+  let repository = git_repository(state, name);
+  let create = pack_of(scenario!("create").request);
+  for k in 0..held {
+    let branch = if k == 0 {
+      "main".to_owned()
+    } else {
+      format!("held{k}")
+    };
+    let named = format!("refs/heads/{branch}");
+    let created = [("", FIRST, named.as_bytes())];
+    let received = pushed(state, repository, &request(&created, CAPABILITIES, create));
+    assert_eq!(reasons(&received), [b"ok".to_vec()], "{branch}");
+  }
+  let names: Vec<Vec<u8>> = (0..CREATES_UNHELD)
+    .map(|k| format!("refs/heads/unheld{k}").into_bytes())
+    .collect();
+  let commands: Vec<(&str, &str, &[u8])> = names
+    .iter()
+    .map(|name| ("", SECOND, name.as_slice()))
+    .collect();
+  let update = pack_of(scenario!("update").request);
+  let before = state
+    .refusals
+    .get(super::HOLDING_EXAMINED)
+    .copied()
+    .unwrap_or(0);
+  let received = pushed(state, repository, &request(&commands, CAPABILITIES, update));
+  let after = state
+    .refusals
+    .get(super::HOLDING_EXAMINED)
+    .copied()
+    .unwrap_or(0);
+  (after - before, reasons(&received))
+}
+
+/// Goal 93 (main 01a20182's order: git/git's push spent its time in `ShardGreens::holding`, which lent every member
+/// green and read every one's versions for each decision). Do: in one repository holding [`HELD_FEW`] greens at the
+/// first commit and another holding [`HELD_MANY`], push [`CREATES_UNHELD`] creates at the second commit, which no green
+/// holds, so each create asks which green holds its commit and finds none. Expect: every create `ok`, and the greens
+/// the search examined the same in both repositories: what a create's search costs follows the greens holding its
+/// commit, never the repository's greens. Red before the change: the search examined every member green for each create,
+/// four times as many in the larger repository.
+#[test]
+fn t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_repositorys_greens() {
+  let (few, many) = crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let few = examined_over(state, "few", HELD_FEW);
+    let many = examined_over(state, "many", HELD_MANY);
+    (few, many)
+  });
+  let created = vec![b"ok".to_vec(); CREATES_UNHELD];
+  assert_eq!((&few.1, &many.1), (&created, &created));
+  assert_eq!(few.0, many.0, "the search followed the repository's greens");
+}
+
 /// Shape: the files of each tree [`t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`] pushes:
 /// enough that each create's work is a large part of [`SMALL_CHAIN_BUDGET`].
 const ROOMY_FILES: usize = 64;
@@ -2676,6 +2745,82 @@ fn brought_and_searched(
   (brought, git.repository.counters().base_searched)
 }
 
+/// The reasons of `request` pushed to `repository` by its owner as an edge pushes one (`vcs_ssh::receive`'s steps): a
+/// task on the daemon's first shard takes each step of the push on a poll of its own, the shard's state lent for each
+/// and the task yielding between: each piece of the request as an edge hands it in, its end, and each step of its
+/// answer, the names it asks to home carried between them. The test thread waits on the task's channel, never on the
+/// shard. Until 2026-11-23 [`t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`]
+/// drove its whole push inside one observation: 4,151 input pieces and 10,217 answer steps held the shard in one poll for
+/// 1,540 to 1,763 ms on adacachy2 (a plain debug build), and under ThreadSanitizer past the watchdog's window, which ended
+/// the library's test process (exit 4) with about 1,000 of its tests unrun.
+fn pushed_a_step_a_poll(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Vec<Vec<u8>> {
+  let (sent, got) = std::sync::mpsc::channel();
+  let request = request.to_vec();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(stepped_drive(repository, &request).await);
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("the task detached");
+  });
+  got
+    .recv()
+    .expect("the push's task reported")
+    .expect("the push answered")
+}
+
+/// The push of [`pushed_a_step_a_poll`], a step a poll: its reasons, or why it stopped.
+async fn stepped_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+  use crate::state::with_state;
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      true,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state to start")?
+  .map_err(|failed| format!("not started: {failed:?}"))?;
+  for piece in request.chunks(PIECE) {
+    with_state(|state| push.input(state, piece))
+      .ok_or("no state for the request")?
+      .map_err(|failed| format!("not taken: {failed:?}"))?;
+    slates_rt::futures::yield_now().await;
+  }
+  with_state(|state| push.end(state))
+    .ok_or("no state for the end")?
+    .map_err(|failed| format!("not ended: {failed:?}"))?;
+  let mut answer = Vec::new();
+  loop {
+    slates_rt::futures::yield_now().await;
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state for a step")?
+      .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    match step {
+      Answering::Answered(received) => return Ok(reasons(&received)),
+      Answering::Turned => {
+        crate::vcs_store::upload::brought_back_waited(repository).await;
+        carry_awaited(&mut push).await?;
+      }
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => {
+        return Err(format!("no hook runs where no view is shown: {step:?}"));
+      }
+    }
+  }
+}
+
+/// A-850's r16 shape (main's ruling of 2026-11-21 22:40): do push a history of [`R16_HISTORY`] commits and a tag on every
+/// [`TAG_EVERY`]th into an empty repository in one push, driven a step a poll as an edge drives it
+/// ([`pushed_a_step_a_poll`]), then turn its derivation and its encoding to idle, a turn a poll. Expect every command
+/// `ok`, each object brought once, the search back meeting at most the history's commits, and a clone holding every
+/// object pushed, each once.
 #[test]
 fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once()
 {
@@ -2693,12 +2838,11 @@ fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring
     .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
     .collect();
   let pushing = request(&commands, CAPABILITIES, &pack_of_objects(&objects));
-  // The push a poll of its own, and each turn of the derivation and of the encoding below one too: the shard steps
-  // between them, as a daemon's does.
-  let (repository, reasons_pushed) = crate::daemon::observe_first(&daemon, move |state| {
-    let repository = git_repository(state, "r16-shape");
-    (repository, reasons(&pushed(state, repository, &pushing)))
-  });
+  // Each step of the push a poll of its own, and each turn of the derivation and of the encoding below one too: the
+  // shard steps between them, as a daemon's does.
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "r16-shape"));
+  let reasons_pushed = pushed_a_step_a_poll(&daemon, repository, &pushing);
   assert!(
     reasons_pushed.iter().all(|reason| reason == b"ok"),
     "{reasons_pushed:?}"

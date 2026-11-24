@@ -15625,6 +15625,132 @@ fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
   }
 }
 
+/// Format: the owner's count of forwarded requests whose exchange attached to the reply its live log held
+/// (`live_ship::await_forwarded`).
+const FORWARD_ATTACHED_TO_LIVE: &str = "fleet.live.forward_attached";
+/// Format: the owner's count of forwarded requests whose deferred reply was recorded before their exchange asked
+/// (`verbs::await_deferred_completion`).
+const FORWARD_DEFERRED_COMPLETED: &str = "fleet.forward.deferred_completed";
+
+/// Shape: how long the owner's exchange waits before asking where a forwarded write's deferred reply stands, in the
+/// test whose write must be recorded first: half a liveness window, so the forward's origin, which waits one window plus
+/// its path's tail, still hears the answer. A healthy loopback fleet makes a write durable in milliseconds
+/// (2026-11-23, adacachy2: about 13,900 forwarded writes made durable in 30 s by one owner).
+const RECORDED_FIRST_DELAY_NS: u64 = LIVENESS_BUDGET_NS / 2;
+
+/// Writes through node `through` of `daemons` into `id` as [`written_through`] does, and reads owner `owner`'s counts of
+/// the two ways a deferred forwarded reply is answered before and after: the replies, and how much each count moved,
+/// attached to the live log's hold first.
+fn written_through_counted(
+  daemons: &[Daemon],
+  (through, owner): (usize, usize),
+  id: VolumeId,
+  path: &str,
+) -> (Vec<ReplyBody>, [u64; 2]) {
+  let counted = |daemon: &Daemon| {
+    let counters = summed_counters(daemon);
+    [FORWARD_ATTACHED_TO_LIVE, FORWARD_DEFERRED_COMPLETED]
+      .map(|name| counters.get(name).copied().unwrap_or(0))
+  };
+  let before = counted(&daemons[owner]);
+  let replies = written_through(daemons, through, id, path);
+  let after = counted(&daemons[owner]);
+  (
+    replies,
+    [0, 1].map(|at| after[at].saturating_sub(before[at])),
+  )
+}
+
+/// AUD-11, A-200, §4.8 "Lookup" (the regression of 1fc1da1fb, found 2026-11-23 by the two superseded-owner tests above):
+/// a write sent through a node that does not own its live-shipped volume is answered at its durability. Do: three nodes
+/// at `f = 1`; on a, a live-shipped volume written six files and shared with the fleet; then write through a client of
+/// b until a write is answered. Expect the last answer `FsDone`, none `Overloaded`, and the owner's exchange answered
+/// where its reply was held or recorded (a's counts). Before, the owner's exchange waited only for a deferred
+/// acceptance, so the write its live log held was refused `Overloaded` at once, every time, though it became durable,
+/// and a client that resent under a fresh id applied it again.
+#[test]
+fn a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "through-b");
+  drop(client);
+  let (through_b, moved) = written_through_counted(&daemons, (1, 0), id, "/through-b");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    through_b
+      .last()
+      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. }))
+      && !through_b.iter().any(|reply| {
+        matches!(
+          reply,
+          ReplyBody::Refused {
+            refusal: Refusal::Overloaded { .. }
+          }
+        )
+      }),
+    "a write through b was answered at durability, never Overloaded: {through_b:?}"
+  );
+  assert!(
+    moved.iter().sum::<u64>() > 0,
+    "the owner answered the forward where its reply was held or recorded (attached, completed: {moved:?})"
+  );
+}
+
+/// AUD-11, A-200 (main 01a20182's ruling of 2026-11-23 on the forwarded write's answer): a forwarded write whose reply
+/// was recorded before its exchange asked where it stands is answered that outcome, never `Overloaded`. Do: as
+/// [`a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability`], with a's exchange made to ask
+/// [`RECORDED_FIRST_DELAY_NS`] after the write deferred its reply (`Daemon::inject_forward_answer_delay`), long after a
+/// healthy fleet makes it durable. Expect the last answer `FsDone`, none `Overloaded`, and the owner's count of replies
+/// found recorded when their exchange asked moved: the case this test is for happened.
+#[test]
+fn a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "recorded-first");
+  drop(client);
+  daemons[0]
+    .inject_forward_answer_delay(Some(RECORDED_FIRST_DELAY_NS))
+    .unwrap();
+  let (through_b, moved) = written_through_counted(&daemons, (1, 0), id, "/recorded-first");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    through_b
+      .last()
+      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. }))
+      && !through_b.iter().any(|reply| {
+        matches!(
+          reply,
+          ReplyBody::Refused {
+            refusal: Refusal::Overloaded { .. }
+          }
+        )
+      }),
+    "a write through b was answered its recorded outcome, never Overloaded: {through_b:?}"
+  );
+  assert!(
+    moved[1] > 0,
+    "a's exchange found the write's reply recorded when it asked (attached, completed: {moved:?})"
+  );
+}
+
 /// Derived: the coordinator periods a takeover round waits on a learned object's promises before it gives the object
 /// up (`takeover`'s promise-wait bound, A-304): the failover delay's worth of the fleet's periods, the longest any of
 /// `daemons` estimates now (A-363), at least one.
@@ -23494,8 +23620,10 @@ fn a_version_crossing_in_several_shipments_is_archived_once() {
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
 /// commit past the owner's liveness budget, so B's client is answered with a refusal retryable under the same id:
-/// `Overloaded` when A's deferred answer reaches B (this Mac), `OwnerUnreachable` when B's forward gives up on A first
-/// (CI's Linux runners, run 42348339167). Do: the client acknowledges everything it may; the holder's fault is lifted
+/// `DurabilityPending`, the submit's outcome in doubt, when A's deferred answer reaches B, `OwnerUnreachable` when B's
+/// forward gives up on A first (CI's Linux runners, run 42348339167). Until 2026-11-23 A answered `Overloaded`, which
+/// says the submit never ran (main's ruling that day: `Overloaded` only where a request was never admitted). Do: the
+/// client acknowledges everything it may; the holder's fault is lifted
 /// and the version commits; the client sends the submit again under its id (`begin_again`). Expect: the first answer
 /// one of those two; the resend
 /// answered `Submitted { version: Some(1) }` from the completion the commit recorded. Before: the acknowledgement
@@ -23733,8 +23861,8 @@ fn resent_answer(
   }
 }
 
-/// The forwarded resend's assertions: refused `Overloaded` first, then, after the acknowledgement and the commit,
-/// answered with version 1 under its own id.
+/// The forwarded resend's assertions: refused in doubt (`DurabilityPending`) or by its origin (`OwnerUnreachable`) first,
+/// then, after the acknowledgement and the commit, answered with version 1 under its own id.
 fn assert_resent_under_its_id(run: &ForwardedResend) {
   let setup = [
     ("the holder's fault installs and lifts", run.faulted),
@@ -23758,9 +23886,9 @@ fn assert_resent_under_its_id(run: &ForwardedResend) {
   assert!(
     matches!(
       &run.first,
-      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+      Some(Err(refusal)) if refusal.starts_with("DurabilityPending") || refusal.starts_with("OwnerUnreachable")
     ),
-    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {:?}",
+    "the forwarded submit's acceptance outlived a budget, answered in doubt and retryable under its id: {:?}",
     run.first
   );
   assert!(
@@ -23839,9 +23967,9 @@ fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound(
   assert!(
     matches!(
       &first,
-      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+      Some(Err(refusal)) if refusal.starts_with("DurabilityPending") || refusal.starts_with("OwnerUnreachable")
     ),
-    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {first:?}"
+    "the forwarded submit's acceptance outlived a budget, answered in doubt and retryable under its id: {first:?}"
   );
   assert_eq!(
     (edits.served, edits.refused.as_deref()),
@@ -30534,7 +30662,8 @@ fn library_shard_count(client: &mut slates_client::Client, kind: &str) -> u64 {
 const RESEND_RETRY_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS);
 
 /// Sends the client's last request again under its id, as a client does, while the answer is a refusal retryable under
-/// that id (the forward still naming the dead owner: `OwnerUnreachable`; a shard at its bound: `Overloaded`), for
+/// that id (the forward still naming the dead owner: `OwnerUnreachable`; a shard at its bound: `Overloaded`; the owner's
+/// deferred answer in doubt: `DurabilityPending`), for
 /// [`RESEND_RETRY_FOR`], paced by a liveness budget's tenth: the last answer.
 fn resend_while_refused_retryable(
   client: &mut Client,
@@ -30546,7 +30675,9 @@ fn resend_while_refused_retryable(
     let retryable = matches!(
       answer,
       Ok(ReplyBody::Refused {
-        refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. }
+        refusal: Refusal::OwnerUnreachable { .. }
+          | Refusal::Overloaded { .. }
+          | Refusal::DurabilityPending { .. }
       })
     );
     if !retryable || began.elapsed() >= RESEND_RETRY_FOR {

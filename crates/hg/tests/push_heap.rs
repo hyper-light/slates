@@ -641,7 +641,8 @@ fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
     panic!("a whole changegroup taken");
   };
   let rows = fork.rows().rows();
-  let bound = (rows as f64).log(3.0).floor() as u64 + 1;
+  // In integers: f64's log₃ of a power of three can fall just short of it (243 gives 4.999999999999999).
+  let bound = u64::from(rows.checked_ilog(3).unwrap_or(0)) + 1;
   println!(
     "push_heap: {rows} rows, {} seals, {} tiered merges, the most own runs {} (bound {bound})",
     fork.rows().counters().seals,

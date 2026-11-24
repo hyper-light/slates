@@ -3,8 +3,8 @@
 //! it makes is written out a slice at a time ([`Answer::write`]), so a shard serves a clone of any size without holding
 //! it and without holding its state across a wait.
 //!
-//! **Sources** (read 2026-11-19, git v2.50.1). The documents [B]: `gitprotocol-v2.adoc` ("Capability Advertisement",
-//! "Command Request", "ls-refs", "fetch", "object-info"). The code [C]: `serve.c` (`protocol_v2_advertise_capabilities`,
+//! **Sources** (read 2026-11-19, git v2.50.1). The documents \[B\]: `gitprotocol-v2.adoc` ("Capability Advertisement",
+//! "Command Request", "ls-refs", "fetch", "object-info"). The code \[C\]: `serve.c` (`protocol_v2_advertise_capabilities`,
 //! `process_request`, `parse_command`, `receive_client_capability`), `ls-refs.c` (`ls_refs`, `send_ref`,
 //! `send_possibly_unborn_head`), `upload-pack.c` (`upload_pack_advertise`, `upload_pack_v2`, `process_args`,
 //! `parse_want`, `parse_want_ref`, `process_shallow`, `process_deepen_not`, `send_acks`, `process_haves_and_send_acks`,
