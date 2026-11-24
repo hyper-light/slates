@@ -727,3 +727,21 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Set aside: /tmp/w-svn-4d/svn_import_probe.patch (pre-existing uncommitted finding_2 probes in svn_import/tests.rs).
 - NEXT: lend items (borrow on read-only lends; no Green::default per lend), svn piece_fetched 14.7/rev and per-piece
   room round trip; made-commit held verdict re-lend gap.
+## A-888 LANDED main a018ee86b (2026-11-23 ~22:00): goal 93 C2 "store is the truth, no second path" (piece 1)
+- Item 1 answer to main: C2 whole on every production route; the bare-dispatch path (svn_made::make: version committed,
+  revision landed by a task after) was a second path in code. Removed: take_turn answers Taken::Unrecorded for a svn
+  green with no recorded request -> Refusal::RecordedSubmitRequired { tool } (wire tag 85, golden 5500000002000000; API
+  Invalid::RecordedSubmitRequired, contract 63); a held verdict with no turn refuses the same. Commit 6495fa96c.
+- Red: a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing (main: accepted, head 1,
+  youngest 0). Tests moved to recorded submits: paths::tests::submitted_recorded; identities message/identity tests.
+- Pre-existing red on main (not mine to fix in this piece, reported): vcs_http::svn::tests::the_daemons_lender_serves_a_
+  repositorys_committed_records (svn.rs:635 "the text": lender reads a stored text through the records alone).
+- NEXT piece 2 (main 20:51 approved, guard-then-apply): (1) made_commit_landing commits the version alone when no
+  revision can be made (Unmade) or the check refuses -> refuse typed+recorded, nothing applied (Unsupported for special
+  /link-with-props/copy-not-made, StoreRefused for check/NotNext/Unreadable/Digest); (2) made_commit::commit_held runs the
+  register entry's commit after commit_accepted and commits the version even when it errs -> guard all of commit_made
+  before apply. Red written (uncommitted): a_special_file_refuses_its_submit_and_the_repository_takes_the_next.
+- Sweep for main (others' owners): git commits.rs Before::Unmade commits version alone + record_and_commit Err commits
+  version (counted UNMADE); git commits::make_owed (version committed, commit made after by the queue); hg_made.rs
+  made Err/None and Unmade commit version alone, commit_made Err commits version; hg_made::make (bare path, recorded in
+  the same transaction); made_commit::commit_held shared by all three tools (tool Err still answers the accept).
