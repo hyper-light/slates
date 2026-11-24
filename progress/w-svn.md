@@ -714,3 +714,16 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   (A-876's bar <10; fetch_wait 1.86 ms vs ~1 ms expected); per-piece StoreHandle::ask room round trip on shard 0
   (vcs_svn::converse -> follow -> svn_texts::fetch_piece -> Room::drop, 418 samples / 60 s): batch a conversation's
   piece asks, or keep one room per conversation. Profile ~/.cache/main-rounds/svnsync-confirm/sample-svn.txt.
+## A-760 (b) 4c+4d LANDED main 240917592 (2026-11-23 ~20:40)
+- Commits: be143a60a (4c+4d), 2609663a5 (TLS teardown: STATE/LOST_STEPS/UNDELIVERED/TURNS/LIVE/KEPT/DISCARDING
+  try_with, red a_daemon_stopped_with_a_landing_turn_held_ends_without_a_panic), dcd7bab5f (platform gate fixes:
+  FUSE Parked, u64 casts, complexity splits dispatch_parking/next_request/settled_reply, import test harness supplies
+  owed bases), merges 7e92647b0, bc5621949, 240917592.
+- Gates: macOS focused 230 + merge 280 + fmt; diag 45325338128 (Linux FUSE + Windows WinFsp tests green; clippy reds
+  main's vcs tests.rs:821); cross-clippy zig/xwin clean for my crates (main's daemon_edge.rs lints reported).
+- Cross-clippy recipe from this Mac: Linux CC_x86_64_unknown_linux_gnu=~/Library/Caches/cargo-zigbuild/0.23.4/
+  wrappers/1861/zigcc-x86_64-unknown-linux-gnu-8781.sh (+CXX, AR=.../ar) cargo clippy --target x86_64-unknown-linux-gnu;
+  Windows cargo xwin clippy --target x86_64-pc-windows-msvc. Use --no-deps.
+- Set aside: /tmp/w-svn-4d/svn_import_probe.patch (pre-existing uncommitted finding_2 probes in svn_import/tests.rs).
+- NEXT: lend items (borrow on read-only lends; no Green::default per lend), svn piece_fetched 14.7/rev and per-piece
+  room round trip; made-commit held verdict re-lend gap.
