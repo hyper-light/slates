@@ -22,6 +22,23 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 08:58 on 11-24:
+- Main and the fleet were paused by a usage limit from 06:27 to 08:51. The in-process subagent w-84a-win was stopped
+  during it, after A-897 and A-901 had landed; its jupiter A/Bs for A-901 were not run (main's macOS half was: neutral).
+- The restart rounds at 39a1dcd4a (r915): no start_shard spin and no anchor restart anywhere, so w-perf's cubic-replay fix
+  and the failed-start fix hold. Two new reds: (1) the 57k hg repository is not made again after its restart ("a
+  repository's store was not made again from its records: Mercurial(Unheld { revlog: 00manifest, rev: 4222 })", so the edge
+  answers 503): a durability red, w-hg's, ahead of P5. (2) the svn use round on git-2000 completed every step for the first
+  time, with one difference ("diff r251: line 362"): w-svn's, ahead of its speed items. svn timings, stock svnserve / slates
+  over HTTPv2: checkout 61.3/56.0, update 94.7/89.1, blame 85.0/62.4, dump 2.6/8.0, svnsync 298.9/302.1 s.
+- The git leg (r870, 21b8b5311): best of 5, stock / slates: push 10.8/80.9, clone 10.5/122.4, clone-again 10.5/80.7,
+  partial 6.2/73.4 s; a clone's first pack byte at 102-111 s (git_derive's reach sets on one shard); the push hashes SHA-1
+  in admit_object and again in the unpacker's delta apply. Callers written to ~/.cache/main-rounds/git-leg-2/callers.txt.
+- w-hg fixed the re-adopted green's NotHead (259b0db84); w-perf took the two re-adoption gaps it found. Gate 9, the TSan
+  measurement and the Linux svn matrices were unread at 08:58 (GitHub API limit spent until 09:02).
+- Disk on this Mac: 15 GiB free. Holders not slates': ~/.cache/kiln-reaudit-* 124 GiB, astack-review 18 GiB (new),
+  amphora-target 25 GiB, kiln-move-stuck-target 24 GiB.
+
 Updates at 06:07 on 11-24:
 - A-897 landed (fb50fbd61): the bench now names whose time each slow sample is (client send, seat pickup, service, client
   take, on one clock), every run's p99/p999 beside the verdict, the floor and CPU per form; BENCHMARKS and GAPS 84a carry
