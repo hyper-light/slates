@@ -848,3 +848,59 @@ pub(crate) fn landed_work(
     std::time::Duration::from_secs(60),
   )
 }
+
+/// Drops repository `repository`'s record, keeping its greens and their memberships (A-515), and holds the record
+/// pending its rebuild, as a takeover leaves a repository between adopting its greens and rebuilding it
+/// (`ShardState::pending_repositories`, A-636 part 2c-1): its record. Its store goes too where `store_goes`, as a
+/// successor holds none until its rebuild makes it from the log; kept otherwise, for a tool whose rebuilt store cannot
+/// yet hold the objects a resend needs (A-636 part 2c-2, owed: the store's objects rebuilt by content identity; a
+/// Mercurial store's texts).
+pub(crate) fn awaiting_rebuild(
+  state: &mut crate::state::ShardState,
+  repository: slates_db::catalog::RepositoryId,
+  store_goes: bool,
+) -> slates_db::catalog::RepositoryRecord {
+  let record = state
+    .db
+    .partition()
+    .repositories()
+    .repository(repository)
+    .cloned()
+    .expect("the record");
+  let dropped = slates_db::op::Op::RepositoryDestroyed { repository };
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  state
+    .db
+    .mutate(&mut state.segment, &dropped, now)
+    .expect("dropped");
+  if store_goes {
+    crate::vcs_store::free(state, repository);
+  }
+  state.pending_repositories.insert(
+    slates_db::register::ObjectId(repository.bytes),
+    (1, record.clone()),
+  );
+  record
+}
+
+/// Rebuilds `record`'s repository from `parts`, its state logs' parts, as its successor does once its record and logs are
+/// adopted
+/// (`takeover::rebuild_repository`, its store made from the log a step a turn, driven to its end here), and takes it out
+/// of the pending set as the fleet's period does.
+pub(crate) fn rebuilt_after_takeover(
+  state: &mut crate::state::ShardState,
+  (record, parts): (
+    slates_db::catalog::RepositoryRecord,
+    Vec<slates_db::catalog::StateLogRecord>,
+  ),
+) {
+  let id = record.id;
+  state
+    .pending_repositories
+    .remove(&slates_db::register::ObjectId(id.bytes));
+  assert!(
+    crate::takeover::rebuild_repository(state, record, parts),
+    "rebuilt"
+  );
+  crate::vcs_store::settle_rebuild(state, id);
+}
