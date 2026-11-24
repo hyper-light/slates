@@ -21489,7 +21489,7 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
     return ReadoptionStep::Installed;
   };
   let replayed = replay.finish(state);
-  for version in install_green(state, &record, replayed) {
+  for version in install_readopted(state, &record, replayed) {
     crate::merge_service::enqueue_recovered_record(state, id, version);
   }
   // The adopted version was placed at the quorum before the restart (the takeover re-committed it); only the versions
@@ -21505,6 +21505,44 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
     *placed = (*placed).max(adoption.version);
   }
   ReadoptionStep::Installed
+}
+
+/// Counter: a re-adopted green its lineage's records name as a member that is installed standing alone, outside its
+/// lineage (a branch, whose engine the replica built over arenas of its own, or a root whose repository has a lineage
+/// here already): it serves, but a server-made commit over it is refused, since a held verdict is previewed through the
+/// lineage (`Greens::preview`, A-891; GAPS, owed). Format: a counter name in the daemon's status report.
+pub(crate) const READOPTED_OUTSIDE_LINEAGE: &str = "merge.readoption.outside_lineage";
+
+/// Installs a re-adopted green's replay ([`step_readoption`]) the way its lineage's records say it joined, as a
+/// recovery's does (A-575, `install_member_root`): a lineage's root whose repository has no lineage here founds it again
+/// with its engine, nothing copied, so a server-made commit's preview of a held verdict over it (`Greens::preview`,
+/// A-891) is made as before the takeover; any other green is installed standing alone (`install_green`), a member among
+/// them counted ([`READOPTED_OUTSIDE_LINEAGE`]). Red before (main's order of 2026-11-24 05:51): a Mercurial edit over a
+/// re-adopted root refused `NotHead`, its preview `Stale`.
+fn install_readopted(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  replayed: Result<ReplayedGreen, crate::merge_service::GreenFence>,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  let member = state
+    .db
+    .partition()
+    .repositories()
+    .member(record.id)
+    .cloned();
+  match member {
+    Some(member)
+      if matches!(member.origin, slates_db::catalog::MemberOrigin::Root)
+        && !state.greens.has_lineage(member.repository) =>
+    {
+      install_member_root(state, record, &member, replayed)
+    }
+    Some(_) => {
+      state.count(READOPTED_OUTSIDE_LINEAGE, 1);
+      install_green(state, record, replayed)
+    }
+    None => install_green(state, record, replayed),
+  }
 }
 
 /// Fences green `id`, awaiting its re-adoption here, whose boot could not re-adopt it from this node's ledger (A-333):

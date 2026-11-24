@@ -288,6 +288,11 @@ impl Greens {
     }
   }
 
+  /// Whether `repository` has a lineage here.
+  pub fn has_lineage(&self, repository: RepositoryId) -> bool {
+    self.lineages.contains_key(&repository)
+  }
+
   /// Whether `id` is a member of a lineage, and whose.
   pub fn lineage_of(&self, id: &VolumeId) -> Option<RepositoryId> {
     self.members.get(id).map(|(repository, _)| *repository)
