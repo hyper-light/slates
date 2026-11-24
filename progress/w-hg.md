@@ -626,3 +626,14 @@ Waiting: main's route; arena-7 and arena-8.
 - Use w-svn's guard-then-apply for commit_held when it lands. Red first per site where the path can be driven.
 - Order: after C1 P2, before the stream and push speed items.
 - Waiting: w-tsan's lend fix (merge it before P2); r670, the 57k rerun at 14b44fb7f.
+
+## 2026-11-24 ~03:30: C1 (1) P2, P3, P4 and the status sweep landed
+- P2 249865667: a fetch's changeset and manifest units, and lookup's .hgtags, ask the store for a let-go text.
+- P3 5de28ccb2: a push's work lays out again after bringing back a NotAtHand changeset or manifest. bring_back_log_on takes forked, placed after w-perf's split (8cd23c967).
+- P4 63e25a1ca: the intake pre-checks its delta base and previous manifest and asks the store through Stepped::Store. The end-to-end edge red lands with it.
+- Sweep 16186398b: the hg and git push assertions in daemon_edge judge the body. None was passing on status alone.
+- Held, not landed:
+  - ~/.cache/w-hg-made-reds.patch: the four hg_made commit-alone reds. They land with w-svn's commit_held guard.
+- Open, waiting on main: manifest-chain reach. A push's first manifest is a delta against the repository's tip, so a stale re-base or the record writer may rebuild through let-go texts. Before P5.
+- Then: P5 (switch on the let-go, main's red, asks per push counted), then C1 (2), the intake keeping no whole text.
+- Then: stream 9.2x and push 5.8x slower than stock; pending-last 51% of intake time.
