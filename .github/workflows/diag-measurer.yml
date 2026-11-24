@@ -5,6 +5,9 @@ name: diag measurer
 # 45303764098: 24 of 24 on ubuntu-latest and ubuntu-24.04-arm), so it is not run again here. Every dataset is fetched
 # inside the job: git/git by clone (the git matrix's cut at v1.0.0; the svn matrix's git-2000.dump made from it by its
 # recorded recipe, crates/cli/bench/git_to_svn_dump.py). Runs only from `diag-measurer-*` branches, never main.
+# Run 4 (main 01a20182, 2026-11-24 12:09 PST): the svn matrix alone at current main (4664f8d26). Run 3 (45445378898,
+# c53777733) passed git and 26 of 33 svn rows on both routes: commit-edit, propset, switch and merge refused "E160004:
+# Corrupt" at their commits, and delete, revert and status after them; run 1 had passed 33 of 33.
 # Run 3 (main 01a20182, 2026-11-24 09:08 PST): the same matrices at current main, with w-perf's e7596c80b (the cubic replay
 # that crash-looped git-2000's import; run 2's svn legs sat in it for 3.5 h and were cancelled). Run 2 (main 01a20182, 2026-11-24 05:35 PST): the same matrices at 8466f48b3. Run 1 (45316568372, at
 # 54e4a9a4c) passed the svn matrix 33 of 33 with git-2000's import in 7 s; the big Studio's svn use round at 77397a5f4
@@ -26,7 +29,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { matrix: git, route: "" }
           - { matrix: svn, route: svn }
           - { matrix: svn, route: http }
     timeout-minutes: 300
