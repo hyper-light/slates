@@ -265,7 +265,7 @@ fn a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same(
   for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
     let mut store = store();
     let (mut repository, first, second) = two_versions(format, &mut store);
-    let kept = repository.kept_fragments(&store);
+    let kept = repository.kept_fragments();
     assert_eq!(
       kept.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
       vec![(1, 0), (1, 1)]
