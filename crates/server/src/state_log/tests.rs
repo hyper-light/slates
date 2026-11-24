@@ -179,3 +179,71 @@ fn owed_positions(logs: &StateLogs, register: ObjectId) -> Vec<u64> {
     .flat_map(|(_, parts, _)| parts.keys().copied().collect::<Vec<_>>())
     .collect()
 }
+
+/// A part of `repository`'s names log from `from` to `to` whose operation also moved `green` from `green_from` to
+/// `green_to`, as a push's record names the greens it moved beside its names.
+fn push_part(
+  repository: RepositoryId,
+  (from, to): (u64, u64),
+  (green, green_from, green_to): (VolumeId, u64, u64),
+) -> StateLogRecord {
+  let mut record = part(repository, StateLog::Names, (from, to));
+  record.spans.push(LogSpan {
+    log: slates_db::catalog::LogName::Green { green },
+    from: green_from,
+    to: green_to,
+  });
+  record
+}
+
+/// A green, its id's last byte `serial`.
+fn green(serial: u8) -> VolumeId {
+  let mut bytes = [0u8; 16];
+  bytes[15] = serial;
+  VolumeId { bytes }
+}
+
+/// The push barrier's green rule (main 01a20182's ruling of 2026-11-23, w-chaos's `v3_takeover` frame: the names log held
+/// at `f + 1` while the pushes' green versions were not, and a successor rebuilt the repository without two acknowledged
+/// pushes). Do: note three pushes' records, each moving the names log and green `main` one version further (to 1, 2, 3),
+/// one also moving `topic` to 1; judge them while `main` is placed through 1, then 2, then 3, `topic` through 0, then
+/// gone. Expect: not placed while any green is placed short of the newest version a push took it to, placed once every
+/// one is, or is gone; and a repository with nothing noted placed. Red before: the barrier asked the names log alone.
+#[test]
+fn a_push_is_held_until_every_green_it_moved_is_placed_through_its_version() {
+  let pushed = repository(1);
+  let (main, topic) = (green(1), green(2));
+  let mut logs = StateLogs::default();
+  logs.note_greens(&push_part(pushed, (0, 1), (main, 0, 1)));
+  logs.note_greens(&push_part(pushed, (1, 2), (main, 1, 2)));
+  let mut third = push_part(pushed, (2, 3), (main, 2, 3));
+  third.spans.push(LogSpan {
+    log: slates_db::catalog::LogName::Green { green: topic },
+    from: 0,
+    to: 1,
+  });
+  logs.note_greens(&third);
+  let placed = |main_at: u64, topic_at: u64| {
+    move |green: VolumeId| if green == main { main_at } else { topic_at }
+  };
+  assert!(
+    !logs.greens_placed(pushed, placed(1, 0)),
+    "main placed through 1 of 3"
+  );
+  assert!(
+    !logs.greens_placed(pushed, placed(2, 0)),
+    "main placed through 2 of 3"
+  );
+  assert!(
+    !logs.greens_placed(pushed, placed(3, 0)),
+    "topic placed through 0 of 1"
+  );
+  assert!(
+    logs.greens_placed(pushed, placed(3, u64::MAX)),
+    "main placed, topic gone"
+  );
+  assert!(
+    logs.greens_placed(repository(2), placed(0, 0)),
+    "nothing noted"
+  );
+}

@@ -1836,6 +1836,13 @@
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
+> Lost again at ae43b42ea (w-chaos, 2026-11-23, `v3_takeover` 7 of 7): the barrier waited for the names log alone, while
+> a push also moves its greens, whose versions stood at version 1 at both survivors while pushes 1 and 2 were answered, so
+> the successor's rebuild (`whole_parts`, a green's span judged by its head) kept push 0 only. Fixed (w-git, main
+> 01a20182's ruling): the barrier (`state_log::names_committed`, all three answer paths) also waits until every green the
+> repository's operations moved is placed at f + 1 through the version they took it to (`StateLogs::note_greens` as the
+> records are taken, `greens_placed` against `merge.placed`; `a_push_is_held_until_every_green_it_moved_is_placed_…`).
+> Owed: main's `v3_takeover` on adacachy2 before and after, three runs each, release and debug.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >

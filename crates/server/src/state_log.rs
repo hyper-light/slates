@@ -31,8 +31,9 @@
 //! **A push's records ride the names log** (A-724 piece 8c, found by `crates/cli/tests/v3_takeover.rs`): before, they
 //! were kept only in the owner's own partition, so a successor rebuilt a taken-over repository with no refs at all.
 //! Each push's record is now a change of the names log (`LoggedChange::Objects`), shipped here with the operation's
-//! identity and spans, and a push is answered only once its names log is held at `f + 1` ([`names_committed_within`],
-//! the barrier, §4.8's commit rule): the HTTP and SSH edges wait on it before the report goes out.
+//! identity and spans, and a push is answered only once its names log is held at `f + 1` and every green it moved is
+//! placed there through its new version ([`names_committed_within`], the barrier, §4.8's commit rule): the HTTP and SSH
+//! edges wait on it before the report goes out.
 //!
 //! **Owed** (A-636's entry): a candidate
 //! that joins a log's placement past parts every earlier candidate held, which needs the log's state installed before
@@ -57,6 +58,12 @@ pub(crate) struct StateLogs {
   logs: BTreeMap<ObjectId, OwedLog>,
   /// The bytes of every part held: what [`admit`] holds to [`bound`].
   bytes: usize,
+  /// For each repository, each green its operations moved and the newest version one took it to, until that version's
+  /// merge record is placed at `f + 1` (main 01a20182's ruling of 2026-11-23, w-chaos's `v3_takeover` frame): what a
+  /// push's barrier waits for besides its names log ([`names_committed`]). Noted as the records are taken
+  /// ([`take_made`]); a green leaves once placed or gone, so it holds at most the repository's greens.
+  greens_owed:
+    BTreeMap<slates_db::catalog::RepositoryId, BTreeMap<slates_db::catalog::VolumeId, u64>>,
 }
 
 /// One state log's parts and what its candidates acknowledged.
@@ -79,6 +86,39 @@ impl StateLogs {
     if let Some(replaced) = log.parts.insert(record.to, value) {
       self.bytes = self.bytes.saturating_sub(replaced.len());
     }
+  }
+
+  /// Notes the greens `record`'s operation moved, each owed to its newest version the operation took it to.
+  pub(crate) fn note_greens(&mut self, record: &StateLogRecord) {
+    for span in &record.spans {
+      if let slates_db::catalog::LogName::Green { green } = span.log {
+        let owed = self
+          .greens_owed
+          .entry(record.repository)
+          .or_default()
+          .entry(green)
+          .or_insert(span.to);
+        *owed = (*owed).max(span.to);
+      }
+    }
+  }
+
+  /// Whether every green `repository`'s operations moved is placed through the version they took it to: `placed`
+  /// answers a green's version placed at `f + 1`, `u64::MAX` for a green no longer here. Each green placed is let go.
+  pub(crate) fn greens_placed(
+    &mut self,
+    repository: slates_db::catalog::RepositoryId,
+    placed: impl Fn(slates_db::catalog::VolumeId) -> u64,
+  ) -> bool {
+    let Some(owed) = self.greens_owed.get_mut(&repository) else {
+      return true;
+    };
+    owed.retain(|green, version| placed(*green) < *version);
+    if owed.is_empty() {
+      self.greens_owed.remove(&repository);
+      return true;
+    }
+    false
   }
 
   /// Notes `hosts` holding `register`'s log through `sequence`.
@@ -157,6 +197,7 @@ pub(crate) fn take_made(state: &mut ShardState) {
   let config = state.fleet.configuration().clone();
   for record in &records {
     state.state_logs.hold(record);
+    state.state_logs.note_greens(record);
   }
   for record in &records {
     let register = record.log_name().register();
@@ -165,16 +206,39 @@ pub(crate) fn take_made(state: &mut ShardState) {
   }
 }
 
-/// Whether `repository`'s names log is held at `f + 1` through its current position (§4.8's commit rule; A-724 piece
-/// 8c, the takeover test's fix): the records the partition handed on taken first ([`take_made`]), so a part not yet
-/// taken never reads as held; then `f` of the log's remote candidates acknowledged at or past the position (the owner
-/// the `+ 1`), or every remote candidate where there are fewer. A log with no part owed is held: every remote candidate
-/// holds it, or it has none (a laptop's).
+/// Whether every part `repository`'s operations moved is held at `f + 1` (§4.8's commit rule; A-724 piece 8c, the
+/// takeover test's fix): the records the partition handed on taken first ([`take_made`]), so a part not yet taken never
+/// reads as held. Its names log through its current position: `f` of the log's remote candidates acknowledged at or past
+/// it (the owner the `+ 1`), or every remote candidate where there are fewer; a log with no part owed is held, as every
+/// remote candidate holds it or it has none (a laptop's). And every green its operations moved, through the version
+/// they took it to: its merge record placed at `f + 1` (`crate::merge_service::placed_version`; at `f = 0` every
+/// appended version). Until 2026-11-23 the names log alone was waited for, and a successor holding a push's names but
+/// not its greens' versions rebuilt the repository without it: an acknowledged push lost (w-chaos's `v3_takeover`
+/// frame, 7 of 7: the green register at position 1 at both survivors while pushes 1 and 2 were answered).
 pub(crate) fn names_committed(
   state: &mut ShardState,
   repository: slates_db::catalog::RepositoryId,
 ) -> bool {
   take_made(state);
+  let ShardState {
+    state_logs,
+    merge,
+    greens,
+    ..
+  } = state;
+  let greens_placed = state_logs.greens_placed(repository, |green| {
+    if !greens.contains_key(&green) {
+      return u64::MAX;
+    }
+    merge
+      .placed
+      .get(&ObjectId(green.bytes))
+      .copied()
+      .unwrap_or(0)
+  });
+  if !greens_placed {
+    return false;
+  }
   let Some(position) = state
     .db
     .partition()
