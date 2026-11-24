@@ -1,0 +1,76 @@
+name: diag-main-84a
+# main 01a20182 (2026-11-24 09:12 PST): goal 84a's loaded and quiet tails of a full edit and merge at current main
+# (afa579483), on the runners its Windows evidence came from (w-k90-win's run 44948887874, 2026-11-21) and on Linux's two:
+# ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm. edit_merge_bench (release), --spinners-per-core 2,
+# 10 files, both forms; three loaded invocations, then two quiet. Each form's `goal` line carries its verdict (p99 and p999
+# against 1 ms, w-perf's 7ff7c5276) and every run's p99 and p999 (A-897), and each is an annotation here. The big Studio
+# runs macOS bare metal (r931) and adacachy2 was not reachable. Run only from diag-measurer-main-84a-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-84a-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tails:
+    name: 84a tails (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the bench (release)
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.os == 'windows-latest' && '0' || '' }}
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo build --release --locked -p slates-client --example edit_merge_bench
+      - name: Three loaded invocations, then two quiet
+        run: |
+          set +e
+          L="$RUNNER_TEMP/84a"; mkdir -p "$L"
+          B=target/release/examples/edit_merge_bench; [ -f "$B.exe" ] && B="$B.exe"
+          echo "cores: $(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
+          for n in 1 2 3; do
+            timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L/loaded-$n.log" 2>&1
+            rc=$?
+            echo "::notice title=${{ matrix.os }} loaded $n (exit $rc)::$(grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
+            grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -c1-400
+          done
+          for n in 1 2; do
+            timeout 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null > "$L/quiet-$n.log" 2>&1
+            rc=$?
+            echo "::notice title=${{ matrix.os }} quiet $n (exit $rc)::$(grep -a '^goal	merge\.' "$L/quiet-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
+            grep -a '^goal	merge\.' "$L/quiet-$n.log" | cut -c1-400
+          done
+          exit 0
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-84a-${{ matrix.os }}
+          path: ${{ runner.temp }}/84a
+          if-no-files-found: warn
