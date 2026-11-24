@@ -13746,6 +13746,22 @@ population by its **median**, which a handful of merges cannot move and a grain 
 huge page would move all sixty-four of. **A sum cannot tell a merge from a regression; an order statistic
 can.**
 
+### 8a-tsan-sweep. One sweep held the TSan lane for hours, and one Subversion test fails under it (2026-11-24, open)
+
+Main's TSan step (62 minutes, three times diag 45315777446's 20 min 38 s) timed out on main run 45461883678 at
+62.6 minutes. Diag 45411303175 (7d6874639, ubuntu-latest, its step held to 300 minutes) took 234 minutes. Its log's
+timestamps put 3 h 26 min of that in one test, `content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`
+(14:34 to 18:00), where the rest of the server's library took 16 min 15 s. The sweep runs on one shard, so it has no
+second thread for ThreadSanitizer to watch, while every byte it holds to is read through the shared object's atomics
+(A-171), each intercepted. The lane now leaves it out (`SERVER_SKIPPED` in `xtask/src/tsan.rs`, with that reason;
+it runs in every other lane), and the step's limit is three times the measured pass without it: 31 min 41 s,
+95 minutes.
+
+Open (w-svn): the same diag's one failure in 1,306 library tests,
+`daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (daemon.rs:9662,
+`seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
+fixed or explained.
+
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
 The only `RUSTDOCFLAGS` in the tree was in `xtask/src/tsan.rs`, for sanitizer flags. No lane, no xtask and no
