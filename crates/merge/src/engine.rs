@@ -274,21 +274,44 @@ impl Increment {
 
   /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]): whether every
   /// one of them is read. A run `wanted` does not reach is read.
+  ///
+  /// One call reads on from the first run unread into the next, run after run, until its `slice` is spent, so reading
+  /// R runs whole takes calls in proportion to their bytes over the slice, never one a run; and a call walks the runs
+  /// once. Read a run a call, each call searching every run twice, a revision of 6,000 named files read in 713 ms on a
+  /// debug build against 168 ms for 3,000 (quadratic), one step of an import's staging.
   pub fn read_step_among(
     &mut self,
     objects: &impl crate::named::Objects,
     slice: u64,
     wanted: &[bool],
   ) -> Result<bool, crate::named::ObjectMissing> {
-    let Some(at) = self.named.runs.iter().enumerate().position(|(at, run)| {
+    let mut budget = slice.max(1);
+    let mut at = 0usize;
+    while let Some(run) = self.named.runs.get(at).copied() {
       let read = self.named.read.0.get(at).map_or(0, Vec::len);
-      wanted.get(at).copied().unwrap_or(true) && u64::try_from(read).unwrap_or(u64::MAX) < run.len
-    }) else {
-      return Ok(true);
-    };
-    let Some(run) = self.named.runs.get(at).copied() else {
-      return Ok(true);
-    };
+      let read = u64::try_from(read).unwrap_or(u64::MAX);
+      if !wanted.get(at).copied().unwrap_or(true) || read >= run.len {
+        at = at.saturating_add(1);
+        continue;
+      }
+      // A run still owed, and nothing of the slice left for it.
+      if budget == 0 {
+        return Ok(false);
+      }
+      let took = self.read_into_run(objects, (at, run), budget)?;
+      budget = budget.saturating_sub(took);
+    }
+    Ok(true)
+  }
+
+  /// Reads the next at most `budget` bytes of run `at` (`run`) from `objects` into its buffer, reserved once at the
+  /// run's length: the bytes read. A refused read appends nothing.
+  fn read_into_run(
+    &mut self,
+    objects: &impl crate::named::Objects,
+    (at, run): (usize, crate::named::NamedRun),
+    budget: u64,
+  ) -> Result<u64, crate::named::ObjectMissing> {
     let missing = crate::named::ObjectMissing {
       identity: run.identity,
     };
@@ -301,7 +324,7 @@ impl Increment {
       buffer.try_reserve_exact(whole).map_err(|_| missing)?;
     }
     let done = u64::try_from(buffer.len()).map_err(|_| missing)?;
-    let take = run.len.saturating_sub(done).min(slice.max(1));
+    let take = run.len.saturating_sub(done).min(budget);
     let from = buffer.len();
     let to = from
       .checked_add(usize::try_from(take).map_err(|_| missing)?)
@@ -312,7 +335,7 @@ impl Increment {
       buffer.truncate(from);
       return Err(refused);
     }
-    Ok(self.unread_among(wanted).is_none())
+    Ok(take)
   }
 
   /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
