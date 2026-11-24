@@ -38,6 +38,11 @@ const OWN_AND_SHARED: u64 = 2;
 /// Derived: a miss's false resolves over every run it may walk, at most one over this (so under one, main's ruling).
 const FALSE_RESOLVES_PER_MISS_INVERSE: u64 = 2;
 
+/// Derived: how the rows to an index's own run grow, one run to the next older: the size-tiered rule keeps each run
+/// holding more than twice the rows of all the runs newer than it together (`Index::tiered_due`), so the rows to a run
+/// grow more than 1 + 2 = 3 fold a run, and an index of `n` rows has at most ⌊log₃ n⌋ + 1 own runs.
+const TIERED_GROWTH: u64 = 3;
+
 /// A key's hash, taken once a lookup and probed into every run's filter ([`KeyFilter::may_hold`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KeyHash {
@@ -84,7 +89,10 @@ impl KeyFilter {
   /// For the 64 GiB budget of the intake harness: `R` = 46, `k` = 7, 10.1 bits a key. A size past the machine's
   /// words is no filter: it says yes to every key.
   pub(crate) fn sized(rows: u64, budget: u64) -> KeyFilter {
-    let own = budget.checked_ilog(3).unwrap_or(0).saturating_add(1);
+    let own = budget
+      .checked_ilog(TIERED_GROWTH)
+      .unwrap_or(0)
+      .saturating_add(1);
     let walked = u64::from(own).saturating_mul(OWN_AND_SHARED);
     let Some(probes) = walked
       .saturating_mul(FALSE_RESOLVES_PER_MISS_INVERSE)

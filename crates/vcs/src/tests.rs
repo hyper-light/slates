@@ -898,6 +898,25 @@ fn scattered_key(at: u64) -> [u8; 8] {
   (mixed ^ (mixed >> 31)).to_be_bytes()
 }
 
+/// An index of [`FILTERED_ROWS`] scattered keys ([`scattered_key`]), sealed when due and merged as the size-tiered rule
+/// names after each seal, then sealed whole: several runs, as a push's fork leaves them.
+fn scattered_rows_in_runs(store: &mut ContentStore) -> Index {
+  let mut index = Index::new();
+  for at in 0..FILTERED_ROWS {
+    let key = scattered_key(at);
+    index.insert(store, row(&key, &[], b"payload")).unwrap();
+    if index.seal_due(store) {
+      index.seal(store).unwrap();
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(store, runs).unwrap().unwrap();
+        while index.merge_step(store, &mut merge).unwrap() == MergeStep::More {}
+      }
+    }
+  }
+  index.seal_all(store).unwrap();
+  index
+}
+
 /// Shape: the rows the resolves test appends, and the absent keys it looks up.
 const FILTERED_ROWS: u64 = 600;
 /// Shape: see [`FILTERED_ROWS`].
@@ -913,21 +932,7 @@ const ABSENT_LOOKUPS: u64 = 2_000;
 #[test]
 fn a_lookup_of_a_key_no_run_holds_resolves_almost_no_table() {
   let mut store = store();
-  let mut index = Index::new();
-  for at in 0..FILTERED_ROWS {
-    let key = scattered_key(at);
-    index
-      .insert(&mut store, row(&key, &[], b"payload"))
-      .unwrap();
-    if index.seal_due(&store) {
-      index.seal(&mut store).unwrap();
-      while let Some(runs) = index.tiered_due() {
-        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
-        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
-      }
-    }
-  }
-  index.seal_all(&mut store).unwrap();
+  let index = scattered_rows_in_runs(&mut store);
   let runs = index.run_tables().len();
   assert!(runs >= 3, "runs to walk: {runs}");
   let before = index.counters();
