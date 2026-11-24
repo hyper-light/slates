@@ -291,6 +291,8 @@ enum Walk {
   Replay(Box<super::report_replay::ReplayWalk>),
   /// An `update-report`'s ([`super::update`]).
   Update(Box<UpdateWalk>),
+  /// A depth-1 PROPFIND of a collection's: its children's responses (goal 93, main's interop red of 2026-11-23).
+  Propfind(Box<PropfindWalk>),
 }
 
 /// How far a REPORT's answer is.
@@ -311,9 +313,22 @@ pub enum ReportProgress {
 }
 
 impl Report {
-  /// The answer's headers: its content type (`dav_method_report`'s `DAV_XML_CONTENT_TYPE`).
+  /// The answer's headers: its content type (`dav_method_report`'s `DAV_XML_CONTENT_TYPE`), then, for a PROPFIND's,
+  /// the collection's own (its lock's).
   pub fn headers(&self) -> Headers {
-    vec![("Content-Type", String::from(DAV_XML_CONTENT_TYPE))]
+    let mut headers = vec![("Content-Type", String::from(DAV_XML_CONTENT_TYPE))];
+    if let Walk::Propfind(walk) = &self.walk {
+      headers.extend(walk.headers.iter().cloned());
+    }
+    headers
+  }
+
+  /// The status the answer begins with: `207` for a PROPFIND's multistatus, `200` for a REPORT's.
+  pub fn status(&self) -> u16 {
+    match &self.walk {
+      Walk::Propfind(_) => HTTP_MULTI_STATUS,
+      Walk::Log(_) | Walk::FileRevs(_) | Walk::Replay(_) | Walk::Update(_) => HTTP_OK,
+    }
   }
 
   /// Writes the answer's next slice into `out` from `served`, until what it wrote and the steps it took reach the
@@ -328,6 +343,7 @@ impl Report {
     let room = budget.room;
     let log = match &mut self.walk {
       Walk::Log(log) => log,
+      Walk::Propfind(walk) => return walk.resume(served, out, budget),
       Walk::FileRevs(revisions) => return revisions.resume(served, out, budget),
       Walk::Replay(replay) => return replay.resume(served, out, budget),
       Walk::Update(walk) => {
@@ -415,7 +431,7 @@ pub fn answer<R: Repository + ?Sized>(
   };
   match request.method {
     "OPTIONS" => Answer::Whole(options(served, request, bounds, room)),
-    "PROPFIND" => Answer::Whole(propfind(served, &resource, request, bounds, room)),
+    "PROPFIND" => propfind(served, &resource, request, bounds, room),
     "GET" | "HEAD" => get(served, &resource),
     "REPORT" => report(served, &resource, request, bounds, room),
     method => Answer::Whole(unserved_method(method)),
@@ -577,7 +593,34 @@ fn bare(status: u16) -> HttpAnswer {
 
 /// The answer to a body `refused`: its status alone.
 fn refused_body(refused: &DavRefusal) -> HttpAnswer {
-  bare(refused.http_status())
+  let status = refused.http_status();
+  // A refusal of the server's own (`500`) names its cause in Subversion's error form, so a client and the server's log
+  // say why (main's ruling of 2026-11-24: a bare `500` hid `OutputRoom`); a request's own fault stays bare, as
+  // `mod_dav` answers it.
+  if status == HTTP_INTERNAL_SERVER_ERROR {
+    return error_answer(
+      status,
+      true,
+      SVN_ERR_UNSUPPORTED_FEATURE,
+      &cause_of(refused),
+    );
+  }
+  bare(status)
+}
+
+/// The words a `500` names its refusal with.
+fn cause_of(refused: &DavRefusal) -> String {
+  match refused {
+    DavRefusal::OutputRoom { needed, room } => {
+      format!(
+        "The answer would take {needed} bytes, past the {room} this server holds for one answer"
+      )
+    }
+    DavRefusal::DriveOrder { call } => format!("The answer's drive called '{call}' out of order"),
+    DavRefusal::Aborted => String::from("The answer's drive was aborted"),
+    DavRefusal::Unwritable { what, value } => format!("The answer cannot carry {what} '{value}'"),
+    other => format!("{other:?}"),
+  }
 }
 
 /// `501` for a method this part does not serve (the module doc).
@@ -1029,43 +1072,144 @@ fn push_rfc1123_parts(out: &mut String, date: &str) -> Option<()> {
   Some(())
 }
 
-/// The PROPFIND answer (the module doc).
+/// The PROPFIND answer (the module doc): whole for one resource; for a collection at depth 1, its own response and then
+/// its children's a slice at a time ([`PropfindWalk`]), as `mod_dav` streams a multistatus however many children a
+/// directory holds. Until 2026-11-24 the children's responses were written into one body within the request's room,
+/// and a directory past it answered `500` (main's interop round: `svn info -R` of git-2000's `trunk/t` at every
+/// revision).
 fn propfind<R: Repository + ?Sized>(
   served: &Served<'_, R>,
   resource: &Resource,
   request: &Request<'_>,
   bounds: &Bounds,
   room: usize,
-) -> HttpAnswer {
+) -> Answer {
   if let Resource::Vcc | Resource::Baseline(..) = resource {
-    return private_propfind(served, resource, request, bounds, room);
+    return Answer::Whole(private_propfind(served, resource, request, bounds, room));
   }
   let Resource::Node(place) = resource else {
-    return unserved_method("PROPFIND");
+    return Answer::Whole(unserved_method("PROPFIND"));
   };
   let Some(depth) = depth_of(request.depth) else {
-    return bare(HTTP_BAD_REQUEST);
+    return Answer::Whole(bare(HTTP_BAD_REQUEST));
   };
   let asked = match request::propfind(request.body, bounds) {
     Ok(asked) => asked,
-    Err(refused) => return refused_body(&refused),
+    Err(refused) => return Answer::Whole(refused_body(&refused)),
   };
   let node = match node_at(served, place) {
     Ok(Some(node)) => node,
-    Ok(None) => return bare(HTTP_NOT_FOUND),
-    Err(refused) => return refused,
+    Ok(None) => return Answer::Whole(bare(HTTP_NOT_FOUND)),
+    Err(refused) => return Answer::Whole(refused),
   };
   let collection = node.kind() == NodeKind::Directory;
   if depth == Depth::Infinity && collection {
-    return bare(HTTP_FORBIDDEN);
+    return Answer::Whole(bare(HTTP_FORBIDDEN));
   }
   let mut body = Body::new(room);
   if let Err(refused) = body.push(MULTISTATUS_OPEN) {
-    return refused_body(&refused);
+    return Answer::Whole(refused_body(&refused));
   }
-  match described(served, (place, &node), &asked, depth, &mut body) {
-    Ok(headers) => multistatus(body, headers),
-    Err(refused) => refused,
+  let headers = match described(served, (place, &node), &asked, &mut body) {
+    Ok(headers) => headers,
+    Err(refused) => return Answer::Whole(refused),
+  };
+  if depth == Depth::One && collection {
+    return Answer::Report(Report {
+      walk: Walk::Propfind(Box::new(PropfindWalk {
+        children: children(served, place),
+        href: href_of(&place.url, true),
+        place: place.clone(),
+        asked,
+        headers,
+        first: Some(body.into_bytes()),
+        next: 0,
+        closed: false,
+        room,
+      })),
+    });
+  }
+  Answer::Whole(multistatus(body, headers))
+}
+
+/// A collection's depth-1 PROPFIND still to write ([`Walk::Propfind`]): its own response written when it began, then
+/// each child's, the repository lent again for each slice, then the multistatus closed.
+#[derive(Debug)]
+struct PropfindWalk {
+  /// The collection's place.
+  place: Place,
+  /// What was asked.
+  asked: PropfindRequest,
+  /// The collection's href, ending in a slash.
+  href: String,
+  /// The collection's own headers (its lock's), sent with the answer.
+  headers: Headers,
+  /// The opening and the collection's own response, until the first slice takes them.
+  first: Option<Vec<u8>>,
+  /// The children the principal may read, in name order.
+  children: Vec<String>,
+  /// The next child's index.
+  next: usize,
+  /// Whether the multistatus is closed.
+  closed: bool,
+  /// The most one response may take (the request's room): a child's response past it ends the answer.
+  room: usize,
+}
+
+impl PropfindWalk {
+  /// Writes the next slice into `out`: the children's responses until what it wrote reaches the budget's room or its
+  /// steps are spent, at least one, then the multistatus's end. A child's response refused (past the room alone, or
+  /// the index's refusal) after the answer began ends it ([`ReportProgress::Broken`], as `mod_dav` ends a multistatus
+  /// it cannot finish).
+  fn resume<R: Repository + ?Sized>(
+    &mut self,
+    served: &Served<'_, R>,
+    out: &mut Vec<u8>,
+    budget: Budget,
+  ) -> ReportProgress {
+    if let Some(first) = self.first.take() {
+      out.extend_from_slice(&first);
+    }
+    let start = out.len();
+    let mut steps = 0usize;
+    // One response's buffers, made once a slice and cleared between children (MEMORY SIZING).
+    let mut scratch = Described::default();
+    while let Some(name) = self.children.get(self.next) {
+      if steps > 0 && (out.len().saturating_sub(start) >= budget.room || steps >= budget.steps) {
+        return ReportProgress::More;
+      }
+      self.next = self.next.saturating_add(1);
+      steps = steps.saturating_add(1);
+      let child = Place {
+        url: format!("{}/{name}", self.place.url),
+        path: child_path(&self.place.path, name),
+        revision: self.place.revision,
+        public: self.place.public,
+        version: self.place.version,
+      };
+      let Ok(Some(child_node)) = node_at(served, &child) else {
+        continue;
+      };
+      let Ok(child_subject) = subject(served, &child, &child_node) else {
+        return ReportProgress::Broken;
+      };
+      let slash = if child_subject.collection { "/" } else { "" };
+      let child_href = format!("{}{}{slash}", self.href, uri_encode(name));
+      scratch.clear();
+      if one_response(served, &child_subject, &self.asked, &mut scratch).is_err() {
+        return ReportProgress::Broken;
+      }
+      let mut body = Body::new(self.room);
+      if write_response(&scratch, &child_href, &mut body).is_err() {
+        return ReportProgress::Broken;
+      }
+      out.extend_from_slice(&body.into_bytes());
+    }
+    if !self.closed {
+      out.extend_from_slice(b"</D:multistatus>\n");
+      self.closed = true;
+    }
+    ReportProgress::Done
   }
 }
 
@@ -1304,7 +1448,6 @@ fn described<R: Repository + ?Sized>(
   served: &Served<'_, R>,
   (place, node): (&Place, &Node<'_>),
   asked: &PropfindRequest,
-  depth: Depth,
   body: &mut Body,
 ) -> Result<Headers, HttpAnswer> {
   let mut scratch = Described::default();
@@ -1312,26 +1455,6 @@ fn described<R: Repository + ?Sized>(
   let href = href_of(&place.url, target.collection);
   let headers = one_response(served, &target, asked, &mut scratch)?;
   write_response(&scratch, &href, body).map_err(|refused| refused_body(&refused))?;
-  if depth == Depth::One && target.collection {
-    for name in children(served, place) {
-      let child = Place {
-        url: format!("{}/{name}", place.url),
-        path: child_path(&place.path, &name),
-        revision: place.revision,
-        public: place.public,
-        version: place.version,
-      };
-      let Ok(Some(child_node)) = node_at(served, &child) else {
-        continue;
-      };
-      let child_subject = subject(served, &child, &child_node)?;
-      let slash = if child_subject.collection { "/" } else { "" };
-      let child_href = format!("{href}{}{slash}", uri_encode(&name));
-      scratch.clear();
-      one_response(served, &child_subject, asked, &mut scratch)?;
-      write_response(&scratch, &child_href, body).map_err(|refused| refused_body(&refused))?;
-    }
-  }
   Ok(headers)
 }
 

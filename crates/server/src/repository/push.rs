@@ -719,6 +719,23 @@ fn push_holding(
   pushed
 }
 
+/// Judges, without recording anything, the entry of no change that `parts` alone would append to `repository`'s
+/// register (a made commit's: a Subversion revision's reference to its changeset), as [`push`] judges it before it
+/// records (`Partition::check_creating`): the guard a made commit's step runs before anything of its accept applies
+/// (main's ruling of 2026-11-23 20:51, guard-then-apply), so the append after it is not refused.
+pub(crate) fn check_entry(
+  state: &ShardState,
+  repository: RepositoryId,
+  parts: &EntryParts,
+) -> Result<(), AppendRefused> {
+  let entry = entry(repository, (&[], &[]), parts.clone());
+  state
+    .db
+    .partition()
+    .check_creating(&[], &entry)
+    .map_err(|error| AppendRefused::Entry(refusal_of_db(&error)))
+}
+
 /// Plans every change by its rules (module docs, item 1), or names every change refused.
 fn plan(
   state: &mut ShardState,

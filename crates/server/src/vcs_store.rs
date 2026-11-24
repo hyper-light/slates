@@ -1818,6 +1818,17 @@ pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut Shard
   answer
 }
 
+/// A lender of a shard's state its caller holds already (`crate::vcs_http::git::ShardLender`): a recovery's, which owns
+/// the state through its replays and has no thread-local state to lend from, so a step that the daemon runs over
+/// `ThisShard` runs over the same state there (an hg revision's bring-back, `hg_push::bring_back_on`).
+pub(crate) struct HeldShard<'s>(pub(crate) &'s mut ShardState);
+
+impl crate::vcs_http::git::ShardLender for HeldShard<'_> {
+  fn lend<R>(&mut self, step: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+    Some(step(self.0))
+  }
+}
+
 /// Sets the content store's budget back to what is charged after a read lent room ([`lent_to_read`], [`with_room`]).
 fn set_back(stores: &mut VcsStores) {
   let charged = stores.charged;

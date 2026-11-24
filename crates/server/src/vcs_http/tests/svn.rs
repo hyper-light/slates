@@ -614,7 +614,9 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
       })
       .expect("the records lent")
   };
-  let SiteAnswer::Whole(listing) = answer("PROPFIND", "/trunk", Some("1"), PROPFIND_KIND) else {
+  // A collection's depth-1 PROPFIND streams its children (A-893): its multistatus read a slice at a time.
+  let SiteAnswer::Report(mut listed) = answer("PROPFIND", "/trunk", Some("1"), PROPFIND_KIND)
+  else {
     panic!("no listing");
   };
   let SiteAnswer::Text {
@@ -626,6 +628,18 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
   let SiteAnswer::Report(mut report) = answer("REPORT", "/", None, LOG_EVERY) else {
     panic!("no report");
   };
+  let mut listing = Vec::new();
+  while stores
+    .lend(id, &owner, |lent| {
+      listed.resume(
+        &served_of(lent, &root),
+        &mut listing,
+        super::slice_budget(room, None),
+      )
+    })
+    .expect("the records lent")
+    == ReportProgress::More
+  {}
   let fetched = stores
     .lend(id, &owner, |lent| {
       slates_svn::reads::Repository::text(lent.repository, &text.identity, 0)
@@ -645,7 +659,7 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
     .expect("the records lent")
     == ReportProgress::More
   {}
-  (held.0, held.1, listing.body, fetched, log)
+  (held.0, held.1, listing, fetched, log)
 }
 
 /// A-681 (`crate::vcs_store::svn_view`, the daemon's lender; `Index::children`): do make a Subversion repository on a

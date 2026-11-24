@@ -63,6 +63,12 @@ pub(crate) struct ImportBatch {
   preview: Option<Preview>,
   /// The works staged, in order.
   staged: Vec<Staged>,
+  /// The green's retention the batch may reserve: its cap less what it holds once its history is folded as far as its
+  /// readers let it, taken when the batch began (`append_versions` secures every staged version's reservation at once,
+  /// so a batch past it is refused whole at its landing).
+  room: u64,
+  /// What the staged versions reserved of it.
+  reserved: u64,
 }
 
 /// Why a revision's work could not be staged.
@@ -77,6 +83,18 @@ pub(crate) enum StageRefused {
   NotAccepted(Outcome),
   /// The scratch member is gone or busy.
   Unavailable,
+  /// The work's reservation would take the batch past the green's retention room ([`ImportBatch::room`]): with works
+  /// staged, the batch lands first and the work begins the next (goal 93, main's red of 2026-11-23: one batch secured
+  /// 422,803,669 bytes against a cap of 373,475,417); with none (`reserved` 0), the work alone is past the room and is
+  /// refused, typed, naming both.
+  PastRoom {
+    /// What the batch reserved.
+    reserved: u64,
+    /// The work's reservation.
+    work: u64,
+    /// The room.
+    room: u64,
+  },
 }
 
 impl ImportBatch {
@@ -88,6 +106,11 @@ impl ImportBatch {
       .get(&green)
       .map(|engine| engine.head())
       .ok_or(Refusal::NotFound)?;
+    // The green's history folded as far as its readers let it, so what the batch may reserve is what its landing will
+    // find (`verbs::secure_retention` settles first too).
+    let _ = crate::merge_service::settle_green_retention(state, green);
+    let cap = u64::try_from(crate::merge_service::rejected_cache_budget(state)).unwrap_or(u64::MAX);
+    let charged = state.green_retention.get(&green).copied().unwrap_or(0);
     let preview = state
       .greens
       .preview_at_head(&green)
@@ -97,7 +120,14 @@ impl ImportBatch {
       base,
       preview: Some(preview),
       staged: Vec::new(),
+      room: cap.saturating_sub(charged),
+      reserved: 0,
     })
+  }
+
+  /// The green's retention the batch may reserve (its cap less what the green holds after a fold, when it began).
+  pub(crate) fn room(&self) -> u64 {
+    self.room
   }
 
   /// The version the next work is based at, in the green's numbering: its head and every revision staged.
@@ -149,6 +179,20 @@ impl ImportBatch {
       return Err(StageRefused::NotAtHead { head });
     }
     let preview = self.preview.as_ref().ok_or(StageRefused::Unavailable)?;
+    // Within the green's retention room before anything is judged: the batch lands first where the work would take it
+    // past, and a work past the room alone is refused.
+    let reservation = state
+      .greens
+      .with_preview(preview, |engine| reservation_of(engine, &mut work, head))
+      .map_err(|_| StageRefused::Unavailable)?;
+    let work_reserves = u64::try_from(reservation).unwrap_or(u64::MAX);
+    if self.reserved.saturating_add(work_reserves) > self.room {
+      return Err(StageRefused::PastRoom {
+        reserved: self.reserved,
+        work: work_reserves,
+        room: self.room,
+      });
+    }
     let holders = crate::merge_service::record_goes_to_holders(state, self.green);
     // Judged once; judged again once lent from the content plane every named text a copy or a splice read unlent
     // (A-760 (b) 4d), which the scratch member holds by name alone as the green does.
@@ -183,6 +227,9 @@ impl ImportBatch {
     else {
       return Err(StageRefused::NotAccepted(outcome));
     };
+    self.reserved = self
+      .reserved
+      .saturating_add(u64::try_from(reserved).unwrap_or(u64::MAX));
     self.staged.push(Staged {
       increment: work,
       applied,
@@ -260,6 +307,22 @@ impl Drop for ImportBatch {
 /// What a staged work's verdict in the scratch member gives: its outcome, what its entry records, the member's head
 /// identity where holders take its record, and the history and change bytes reserved for it.
 type StagedVerdict = (Outcome, Option<Vec<Applied>>, Option<[u8; 32]>, usize);
+
+/// The history and change bytes `work`, based at the batch's head `head` (in the green's numbering), would reserve in
+/// the scratch member `engine`, read as [`judge_staged`] reads it: moved into the member's numbering and back, `work`
+/// as it was.
+fn reservation_of(engine: &Green, work: &mut Increment, head: u64) -> usize {
+  let offset = head.saturating_sub(engine.head());
+  let base = work.base;
+  work.base = engine.head();
+  in_numbering(work, |version| version.checked_sub(offset));
+  let reserved = engine
+    .history_reservation(work)
+    .saturating_add(engine.changes_reservation(work));
+  in_numbering(work, |version| version.checked_add(offset));
+  work.base = base;
+  reserved
+}
 
 /// `work` judged into the scratch member `engine` at the batch's head `head` (in the green's numbering), moved into the
 /// member's numbering for the verdict and back: refused naming every named text the verdict read that the member holds

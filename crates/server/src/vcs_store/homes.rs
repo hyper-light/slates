@@ -56,6 +56,7 @@
 
 use slates_cluster::homes::HomeOwner;
 use slates_db::register::rendezvous_ranked_by_key;
+use slates_vcs::preimage::Preimages;
 use slates_vcs::{ContentId, ContentRefused};
 
 use crate::state::ShardState;
@@ -254,14 +255,22 @@ pub(crate) fn published_here(generation: u64) -> bool {
   })
 }
 
-/// A publication of this shard's image committed (`crate::content_holder::held_committed`, the end of every checkpoint
-/// and delta `crate::verbs::publish_shard` commits): every window kept before it is in it, since a publication captures
-/// and commits in one turn of the shard's thread, so the image a ticket kept now names begins and is published at once,
-/// and a window kept after waits for the next.
+/// A publication of this shard's image committed with no cut in flight (`crate::content_holder::image_committed`):
+/// nothing was dirty, so every window kept before it is in it, since a publication captures and commits in one turn of
+/// the shard's thread; the image a ticket kept now names begins and is published at once, and a window kept after waits
+/// for the next. One that carried a cut publishes the cut's generation instead ([`cut_begun`]).
 pub(crate) fn publication_committed() {
   let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
   image_begun(generation);
   image_published(generation);
+}
+
+/// An image cut begins (A-870 piece 2, F2): its generation, the image a window kept before now rides, so a window kept
+/// from now on waits for the next. Published once the cut's publication commits ([`image_published`]).
+pub(crate) fn cut_begun() -> u64 {
+  let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
+  image_begun(generation);
+  generation
 }
 
 /// The ticket of a window kept on this shard now.
@@ -300,6 +309,19 @@ impl core::future::Future for PublishedHere {
         return core::task::Poll::Ready(false);
       }
     }
+    // F2: a ticket not yet published waits for a cut's publication, owed while one is in flight and caught up by a task
+    // (`crate::content_holder::image_committed`). Where none is owed nothing will publish it, and the wait would last
+    // until the shard parks and the wait's time runs out: answered not durable at once, typed, and counted, a bug signal.
+    let stranded = crate::state::with_state(|state| {
+      let stranded = !published_here(generation) && !state.image_encoder.owed();
+      if stranded {
+        state.count(HOME_TICKET_STRANDED, 1);
+      }
+      stranded
+    });
+    if stranded == Some(true) {
+      return core::task::Poll::Ready(false);
+    }
     IMAGES.with(|images| match images.try_borrow_mut() {
       Ok(images) if images.published >= generation => core::task::Poll::Ready(true),
       Ok(mut images) => {
@@ -313,6 +335,10 @@ impl core::future::Future for PublishedHere {
     })
   }
 }
+
+/// Counter: a ticket's wait that found its image unpublished and no publication owed (F2): nothing would publish it, so it
+/// was answered not durable at once. A bug signal, asserted none by the image oracle. Format: a counter name.
+pub(crate) const HOME_TICKET_STRANDED: &str = "vcs_store.homes.ticket_stranded";
 
 /// Counter: publications a home's wait for its ticket made itself (A-724 piece 8c), nothing else having published since
 /// the window was kept. Format: a counter name.
@@ -550,6 +576,155 @@ std::thread_local! {
   /// shard image carries ([`region_changes`]), so a home's holds survive its restart (A-724 piece 8c). Bounded by them.
   static REGION_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, bool>> =
     const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+  /// The image cut's pre-images of the region holds (A-870 piece 2, F2; `slates_vcs::preimage`): each hold's owners at
+  /// the cut, kept before it changes in a page the cut has not yet encoded. Bound: E + I (`slates_vcs::preimage`).
+  static CUT_REGION: std::cell::RefCell<Preimages<ContentId, Vec<HomeOwner>>> =
+    std::cell::RefCell::new(Preimages::default());
+  /// The image cut's pre-images of the landed records, as [`CUT_REGION`]'s. Bound: E + I.
+  static CUT_LANDED: std::cell::RefCell<Preimages<ContentId, Landed>> =
+    std::cell::RefCell::new(Preimages::default());
+}
+
+/// Before the region hold of `identity` in `held` changes: its owners at the cut kept where its page is frozen (F2).
+fn region_before(
+  held: &std::collections::BTreeMap<ContentId, std::collections::BTreeSet<HomeOwner>>,
+  identity: &ContentId,
+) {
+  CUT_REGION.with(|cut| {
+    if let Ok(mut cut) = cut.try_borrow_mut() {
+      cut.before(
+        *identity,
+        || {
+          held
+            .get(identity)
+            .map(|owners| owners.iter().copied().collect())
+        },
+        |owners: &Vec<HomeOwner>| {
+          owners
+            .len()
+            .saturating_mul(core::mem::size_of::<HomeOwner>())
+        },
+      );
+    }
+  });
+}
+
+/// A paged family of homes', as a shard image's cut freezes it (A-870 piece 2, F2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutFamily {
+  /// The region holds.
+  RegionHolds,
+  /// The landed records.
+  Landed,
+}
+
+/// Freezes `family`'s coordinates `lo..=hi`, a page of the shard image's cut (F2).
+pub(crate) fn cut_freeze(family: CutFamily, (lo, hi): (u64, u64)) {
+  match family {
+    CutFamily::RegionHolds => CUT_REGION.with(|cut| {
+      if let Ok(mut cut) = cut.try_borrow_mut() {
+        cut.freeze(lo, hi);
+      }
+    }),
+    CutFamily::Landed => CUT_LANDED.with(|cut| {
+      if let Ok(mut cut) = cut.try_borrow_mut() {
+        cut.freeze(lo, hi);
+      }
+    }),
+  }
+}
+
+/// Thaws `family`'s coordinates `lo..=hi`, a page of the cut now encoded: its pre-images dropped.
+pub(crate) fn cut_thaw(family: CutFamily, (lo, hi): (u64, u64)) {
+  match family {
+    CutFamily::RegionHolds => CUT_REGION.with(|cut| {
+      if let Ok(mut cut) = cut.try_borrow_mut() {
+        cut.thaw(lo, hi);
+      }
+    }),
+    CutFamily::Landed => CUT_LANDED.with(|cut| {
+      if let Ok(mut cut) = cut.try_borrow_mut() {
+        cut.thaw(lo, hi);
+      }
+    }),
+  }
+}
+
+/// The cut's publication committed: homes' pre-images dropped. How many pre-images and ranges were left (none where
+/// every page was thawed as it was encoded).
+pub(crate) fn cut_ended() -> usize {
+  let region = CUT_REGION.with(|cut| cut.try_borrow_mut().map_or(0, |mut cut| cut.end()));
+  let landed = CUT_LANDED.with(|cut| cut.try_borrow_mut().map_or(0, |mut cut| cut.end()));
+  region.saturating_add(landed)
+}
+
+/// The pre-images homes kept since this was last asked, the counts started again.
+pub(crate) fn take_cut_counts() -> slates_vcs::preimage::PreimageCounts {
+  let mut counts = CUT_REGION.with(|cut| {
+    cut
+      .try_borrow_mut()
+      .map_or_else(|_| Default::default(), |mut cut| cut.take_counts())
+  });
+  counts += CUT_LANDED.with(|cut| {
+    cut
+      .try_borrow_mut()
+      .map_or_else(|_| Default::default(), |mut cut| cut.take_counts())
+  });
+  counts
+}
+
+/// [`region_held_in`] as at the cut (F2): the holds now with their pre-images laid over them, read until their bytes
+/// (an identity and its owners) pass `cap`; where the read stopped short of the range, the coordinate it stopped at.
+/// None read where a map is borrowed.
+pub(crate) fn region_held_at_cut(
+  (lo, hi): (u64, u64),
+  cap: usize,
+) -> (Vec<(ContentId, Vec<HomeOwner>)>, Option<u64>) {
+  REGION_HELD.with(|held| {
+    CUT_REGION.with(|cut| {
+      let (Ok(held), Ok(cut)) = (held.try_borrow(), cut.try_borrow()) else {
+        return (Vec::new(), None);
+      };
+      let now = held
+        .range(identities_in(lo, hi))
+        .map(|(identity, owners)| (*identity, owners.iter().copied().collect::<Vec<_>>()));
+      cut.overlay_within(
+        (lo, hi),
+        now,
+        (cap, &|_, owners: &Vec<HomeOwner>| {
+          slates_vcs::content::IDENTITY_BYTES.saturating_add(
+            owners
+              .len()
+              .saturating_mul(core::mem::size_of::<HomeOwner>()),
+          )
+        }),
+      )
+    })
+  })
+}
+
+/// [`landed_in`] as at the cut (F2), read until their bytes pass `cap`, as [`region_held_at_cut`].
+pub(crate) fn landed_at_cut(
+  (lo, hi): (u64, u64),
+  cap: usize,
+) -> (Vec<(ContentId, Landed)>, Option<u64>) {
+  LANDED.with(|landed| {
+    CUT_LANDED.with(|cut| {
+      let (Ok(landed), Ok(cut)) = (landed.try_borrow(), cut.try_borrow()) else {
+        return (Vec::new(), None);
+      };
+      let now = landed
+        .range(identities_in(lo, hi))
+        .map(|(identity, landed)| (*identity, landed.clone()));
+      cut.overlay_within(
+        (lo, hi),
+        now,
+        (cap, &|_, landed: &Landed| {
+          slates_vcs::content::IDENTITY_BYTES.saturating_add(landed.image_bytes())
+        }),
+      )
+    })
+  })
 }
 
 /// Where a window a home holds lies on the node's store, once a landed push's pack carried it (goal 93 item 2b(b); main
@@ -606,6 +781,16 @@ pub(crate) enum Landed {
   Pack(LandedAt),
   /// A window of a Mercurial file revision.
   Hg(HgLanded),
+}
+
+impl Landed {
+  /// Its record's bytes in the shard image, the identity's apart.
+  pub(crate) fn image_bytes(&self) -> usize {
+    match self {
+      Landed::Pack(_) => LANDED_AT_BYTES,
+      Landed::Hg(hg) => HG_LANDED_HEAD.saturating_add(hg.path.len()),
+    }
+  }
 }
 
 /// A Mercurial file revision a window let go holds ([`Landed::Hg`]): its repository, its path and its node, by which the
@@ -688,6 +873,15 @@ pub(crate) fn note_landed(identity: ContentId, landed: Landed) {
 fn landed_changed(identity: ContentId, landed: Option<Landed>) {
   let change = LANDED.with(|held| {
     let mut held = held.try_borrow_mut().ok()?;
+    CUT_LANDED.with(|cut| {
+      if let Ok(mut cut) = cut.try_borrow_mut() {
+        cut.before(
+          identity,
+          || held.get(&identity).cloned(),
+          Landed::image_bytes,
+        );
+      }
+    });
     match landed {
       Some(landed) => {
         held.insert(identity, landed.clone());
@@ -771,10 +965,7 @@ pub(crate) fn held() -> HomesHeld {
   let (landed_records, landed_record_bytes) = LANDED.with(|landed| {
     landed.try_borrow().map_or((0, 0), |landed| {
       let bytes = landed.values().fold(0u64, |sum, record| {
-        let record = match record {
-          Landed::Pack(_) => LANDED_AT_BYTES,
-          Landed::Hg(hg) => HG_LANDED_HEAD.saturating_add(hg.path.len()),
-        };
+        let record = record.image_bytes();
         sum.saturating_add(count(
           slates_vcs::content::IDENTITY_BYTES.saturating_add(record),
         ))
@@ -1109,6 +1300,7 @@ pub(crate) fn keep_for_region(
   let kept = keep_here(state, bytes)?;
   let inserted = REGION_HELD.with(|held| {
     held.try_borrow_mut().is_ok_and(|mut held| {
+      region_before(&held, &kept.0);
       held
         .insert(kept.0, owners.iter().copied().collect())
         .is_none()
@@ -1125,6 +1317,13 @@ pub(crate) fn keep_for_region(
 fn join_owners(identity: &ContentId, owners: &[HomeOwner]) {
   let joined = REGION_HELD.with(|held| {
     held.try_borrow_mut().is_ok_and(|mut held| {
+      if owners.iter().any(|owner| {
+        held
+          .get(identity)
+          .is_some_and(|holding| !holding.contains(owner))
+      }) {
+        region_before(&held, identity);
+      }
       held.get_mut(identity).is_some_and(|held| {
         // Every owner is inserted, so no short circuit: `any` would stop at the first new one.
         let mut joined = false;
@@ -1148,6 +1347,12 @@ pub(crate) fn move_region_owner(
 ) -> Result<(), HomeRefused> {
   let moved = REGION_HELD.with(|held| {
     held.try_borrow_mut().is_ok_and(|mut held| {
+      if held
+        .get(identity)
+        .is_some_and(|holding| holding.contains(&from))
+      {
+        region_before(&held, identity);
+      }
       held.get_mut(identity).is_some_and(|held| {
         let had = held.remove(&from);
         if had {
@@ -1223,6 +1428,14 @@ pub(crate) fn let_go_for_region(
     let Ok(mut held) = held.try_borrow_mut() else {
       return (false, false);
     };
+    let releases = match (held.get(identity), owner) {
+      (Some(owners), Some(owner)) => owners.contains(&owner),
+      (Some(_), None) => true,
+      (None, _) => false,
+    };
+    if releases {
+      region_before(&held, identity);
+    }
     let released = match (held.get_mut(identity), owner) {
       (Some(owners), Some(owner)) => owners.remove(&owner),
       (Some(owners), None) => {

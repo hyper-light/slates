@@ -4992,6 +4992,20 @@ pub enum ImportFault {
     /// The repository's youngest revision as the refusal left it: the last that landed.
     landed: u64,
   },
+  /// A Subversion dump's revision whose history and change index alone would reserve more of its green's retention than
+  /// the green may hold (goal 93, main's red of 2026-11-23: the green's cap, `caps.green_chain_bytes`, less what it
+  /// holds once its history is folded): the revision, what it would reserve, the room, and the last revision that
+  /// landed. Nothing of the revision was staged; the repository stands at `landed`. Appended.
+  RetentionPastRoom {
+    /// The revision.
+    revision: u64,
+    /// What its version would reserve of the green's retention, in bytes.
+    reserved: u64,
+    /// What the green may reserve, in bytes.
+    room: u64,
+    /// The repository's youngest revision as the refusal left it: the last that landed.
+    landed: u64,
+  },
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a

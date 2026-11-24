@@ -302,17 +302,28 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
         origin,
         home,
         move |_| {
-          image_begun(1);
-          image_published(2);
+          let generation = super::ticket_here(home).generation;
+          image_begun(generation);
+          image_published(generation);
         },
         budget,
       )
       .await;
-      match HomeMessage::decode(&serve_remote(origin, &put, budget).await) {
+      // Kept again, held once more, under a ticket its home has published (A-870 F2: a cut's generation and the
+      // publication's after it are two, so the ticket's number is not fixed here; that it is published is the rule).
+      let again = HomeMessage::decode(&serve_remote(origin, &put, budget).await);
+      let published = match &again {
         Ok(HomeMessage::Answer {
           outcome: HomeOutcome::Kept { generation },
           ..
-        }) if generation <= 2 => {}
+        }) => home_published(origin, home, *generation, budget).await,
+        _ => false,
+      };
+      match again {
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Kept { .. },
+          ..
+        }) if published => {}
         other => outcome.push(format!("not kept once published: {other:?}")),
       }
       let read = HomeMessage::Read { identity }.encode();
@@ -493,10 +504,11 @@ fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
 }
 
 /// A-724 with A-727 a3, the barrier driven by the daemon's own publications. Do: keep a window on this shard (its
-/// ticket), then commit a publication that carried an older cut of the paged families, then one that carried the
-/// encoder's cut, as `verbs::publish_shard` does (`content_holder::image_committed`, A-870 piece 2), then keep a second.
-/// Expect: the first ticket not published before the publications nor after the older cut's, published after the
-/// encoder's cut; the second's generation past it, so a window kept after a publication waits for the next.
+/// ticket); begin the encoder's cut with a turn, as a publication does, and commit a publication that carried the older
+/// cut again; turn until the cut is encoded and commit one that carried it (`content_holder::image_committed`, A-870
+/// piece 2 with F2); then keep a second. Expect: the first ticket not published before the publications nor after the
+/// older cut's, published after the encoder's cut; the second's generation past it, so a window kept after a
+/// publication waits for the next.
 #[test]
 fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
   use super::{keep_here, published_here};
@@ -508,11 +520,13 @@ fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
     );
     // A-870 piece 2: a publication that carried the committed cut again (a change not yet encoded) carried no window
     // kept since, so its ticket waits; one that carried the encoder's cut publishes it.
+    let _ = crate::content_holder::image_turn(state);
     crate::content_holder::image_committed(state, false);
     assert!(
       !published_here(first.generation),
       "a publication that carried an older cut published the ticket"
     );
+    while !crate::content_holder::image_turn(state).caught_up {}
     crate::content_holder::image_committed(state, true);
     assert!(
       published_here(first.generation),

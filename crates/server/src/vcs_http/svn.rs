@@ -2047,6 +2047,23 @@ fn not_committed(uncommitted: &Uncommitted) -> HttpAnswer {
 
 /// The status a site's answer names, by its code (RFC 9110 §15, RFC 4918 §11.1); a code this site never answers is
 /// `500`.
+/// Logs a request the site refused with a server error (`5xx`): the method, the path and the cause its body names
+/// (`site::refused_body`), so the daemon's log says why (main's ruling of 2026-11-24: a bare `500` over git-2000's
+/// `trunk/t` named nothing). Counted [`SERVER_REFUSALS`]; one line a refused request, which a client's request bounds.
+fn server_refusal_logged(method: &str, path: &str, answer: &HttpAnswer) {
+  let cause = String::from_utf8_lossy(&answer.body);
+  slates_machine::log_line!(
+    "slates-server: svn over HTTP answered {} to {method} {path}: {}",
+    answer.status,
+    cause.trim()
+  );
+  let _ = crate::state::with_state(|state| state.count(SERVER_REFUSALS, 1));
+}
+
+/// Counter: a request over HTTP the Subversion site refused with a server error (`5xx`), logged with its cause.
+/// Format: a counter name in the status report.
+pub(crate) const SERVER_REFUSALS: &str = "vcs.svn.http_server_refusals";
+
 fn status_of(code: u16) -> Status {
   [
     Status::OK,
@@ -2107,11 +2124,16 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     let answered = match answer {
-      SiteAnswer::Whole(whole) => Answered::Whole {
-        status: status_of(whole.status),
-        headers: v1_only_headers(&self.name, &self.method, whole.headers),
-        body: whole.body,
-      },
+      SiteAnswer::Whole(whole) => {
+        if whole.status >= HTTP_INTERNAL_SERVER_ERROR {
+          server_refusal_logged(&self.method, &self.path, &whole);
+        }
+        Answered::Whole {
+          status: status_of(whole.status),
+          headers: v1_only_headers(&self.name, &self.method, whole.headers),
+          body: whole.body,
+        }
+      }
       SiteAnswer::Text { headers, text } => Answered::Text {
         headers,
         text,
@@ -2139,7 +2161,9 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
   fn reply_status(&self) -> Status {
     match &self.answered {
       Some(Answered::Whole { status, .. }) => *status,
-      Some(Answered::Text { .. } | Answered::Report { .. }) => Status::OK,
+      Some(Answered::Text { .. }) => Status::OK,
+      // A REPORT's `200`, a PROPFIND's multistatus `207`.
+      Some(Answered::Report { report, .. }) => status_of(report.status()),
       None => Status::INTERNAL_SERVER_ERROR,
     }
   }

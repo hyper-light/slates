@@ -188,9 +188,14 @@
 > (`capture_deferred` whole) and the publication owed; past its bound elective let-gos pause, woken by the publication
 > that carries the cut; red 1,068,980 bytes encoded in one publication's step at a 4,096-byte page, now at most three
 > pages; held by an oracle of generated let-go, put, publish and crash histories, one continuous (A-870 "Evidence (piece
-> 2)"). OPEN: the lag bound holds only while the encoder outpaces the changes that never pause (puts, bring-backs);
-> a put stream that outpaces a turn a yield is unmeasured until arena-12 reads it: `vcs_store.image.paused_encoded_bytes`
-> against `paused_imposed_bytes` over `paused_turns`, and `longest_lag_turns` (main's addition of 2026-11-23). Counters
+> 2)"). F2 BUILT (main's rulings of 2026-11-23): a cut of one moment encoded over turns, each store keeping an entry's
+> value at the cut before it changes in a page not yet encoded (`slates_vcs::preimage`), so a publication carries a cut
+> of P pages within P turns whatever is dirtied after; red a ticket's wait `Unanswered` while the shard homed 256
+> objects a turn, now durable; the pre-images within E + I and the chunks held for a cut within a turn's frees times
+> its pages, both asserted by the oracle (A-870 "Evidence (F2)"). CI run 45354317783 at 427ad2389, the starvation test
+> ten times each: release ubuntu-latest 10/10, debug ubuntu-latest 10/10, release macos-latest 10/10, debug
+> macos-latest 10/10 (6/10 at 2cdd88fa3, run 45336582846, before the directory was read in place). The pause stays, reached only under refused
+> publications. Counters
 > for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
 > piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
 > the step budget (the volumes' images paged too only if past it).
@@ -4374,7 +4379,16 @@
 > submit's step saw head 1 and the new bytes). (b) BUILT (A-888, 2026-11-23): a submit dispatched outside a recorded
 > request (no answer waits on it) is refused `RecordedSubmitRequired` before its verdict, and the old path (the version
 > committed in its step, its revision landed after it) is gone; held by
-> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. (c) a Mercurial
+> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. Guard-then-apply BUILT
+> (A-891, 2026-11-23, main 20:51): a Subversion version no revision can be made of (a special file, a link with its own
+> properties, an undeclared copy, the records or the store's check refusing) is refused typed and recorded with nothing
+> applied, never committed alone (it had left the green past its records, every later revision not the next), and the
+> register entry is judged before the verdict applies (`made_commit::commit_guarded`, `MadeEntry::guard`,
+> `push::check_entry`), so the step is not refused after it applied anything; held by
+> `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` and
+> `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version` (each red before: accepted at version 1, no revision).
+> Owed to their owners (main's sweep): git's and Mercurial's made commits still commit a version alone when their
+> commit is unmade or their tool refuses, through `made_commit::commit`. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
@@ -4668,6 +4682,36 @@
 > `GreenReplay::step`). Owed: git-2000 re-measured on the merged tree (main's run), which closes P7's finding (2) or
 > not. Still one step a batch: `append_versions`' loop before the record (each version's increment held, its entry
 > encoded; w-rewrite-ops'), and `follow`, the fold and the texts' release after the last slice.
+> **The use test's dump comparison reads a directory's deletions as a set (2026-11-24, w-svn; main's interop red of
+> 2026-11-23, run 45330574435).** `svnrdump dump 0:HEAD` differed at line 1,608,541 only in the order of one revision's
+> deletions in `trunk/templates/`. Stock's own order is no fixed rule: its dump editor queues a directory's deletions in
+> a hash and writes them in the order the hash iterates when it closes the directory (`libsvn_repos/dump_editor.c`
+> `close_directory`; `svnrdump` wraps that editor), and APR seeds every hash from the clock and addresses
+> (`tables/apr_hash.c` `apr_hash_make`), so two stock runs may differ. `svn_interop`'s dump comparison sorts each run of
+> one directory's pure deletions (`sibling_deletes_in_order`, a record's body skipped by its `Content-length`); held by
+> `a_dumps_order_of_a_directorys_deletions_is_no_part_of_an_answer`. Not a server change.
+> **A depth-1 PROPFIND streams its children; a server error names its cause, BUILT (A-893, 2026-11-24, w-svn; main's
+> interop red of 2026-11-23, run 45330574435).** `svn info -R` over HTTP of git-2000 answered `500` at
+> `!svn/rvr/N/trunk/t` at all 17 sampled revisions: a collection's depth-1 multistatus was written into one body bounded
+> by the request's room, and `trunk/t`'s children overflowed it (`OutputRoom`), answered as a bare `500` that named
+> nothing. Now the children's responses stream a slice at a time (`site::PropfindWalk`, a `Report` answered `207`),
+> depth 0 whole; a site refusal answered `500` names its cause in Subversion's error form, and the edge logs it
+> (counted `vcs.svn.http_server_refusals`). Held by `a_depth_one_propfind_past_its_room_is_streamed_whole` (red: `500`
+> with an empty body). Owed: main's git-2000 info round.
+> **An import batch is bounded by its green's retention room, BUILT (A-892, 2026-11-24, w-svn; main's red of 2026-11-23
+> on the Studio's 23 shards).** git-2000.dump's import was refused `BudgetExceeded { available: 373475417 }` in every
+> run: one batch's versions reserved 422,803,669 bytes of the green's retention against its cap of 373,475,417
+> (`caps.green_chain_bytes`), the batch bounded by the shard's memory alone; a 4-CPU runner, whose shards are fewer and
+> larger, imported it. Now a batch takes its room when it begins (the cap less what the green holds once folded), and a
+> revision whose reservation would take it past is deferred whole to the next batch (`Flush::Retention`, counted
+> `repository.svn_import.flushed_retention`); one past the room alone is refused `ImportFault::RetentionPastRoom`,
+> naming it, both numbers and what landed. Held by
+> `t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_time` (red: refused at the first batch's
+> landing) and `t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_and_both_numbers`. Owed: the
+> Studio's interop round 3 (main's run); and the batch's chain entries, held to the same cap in the `green_chains`
+> table: under a 16 KiB cap a batch of two revisions adding 400 paths was refused `TableAtCapacity { table:
+> "green_chains" }` at its landing, so a batch must also flush before its entries outgrow the chain's room (found
+> 2026-11-24 writing A-892's red; far from the Studio's cap at git-2000's sizes).
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
