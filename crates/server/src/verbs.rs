@@ -7172,9 +7172,10 @@ fn attest_on_channel(
 /// docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md). Nor is a volume another host owns as far
 /// as this node can tell ([`crate::remote_attach::elsewhere`]), or one this node lost to a successor: only the owner may
 /// say a volume does not exist (§4.8 "Lookup", the rule by authority), so a verb that is not forwarded (a landing's
-/// `Present` or `Land`) meets `NotOwnerHere`, naming the owner this node's routing names. Until 2026-11-23 it met
+/// `Present` or `Land`, a write policy's read or setting, `landing::policy_record`) meets `NotOwnerHere`, naming the
+/// owner this node's routing names: one rule, here, for every verb that finds no slot. Until 2026-11-23 they met
 /// `NotFound`.
-fn absent(state: &ShardState, volume: VolumeId) -> Refusal {
+pub(crate) fn absent(state: &ShardState, volume: VolumeId) -> Refusal {
   let object = ObjectId(volume.bytes);
   if state.holder_records.contains_key(&object) {
     let shard = state

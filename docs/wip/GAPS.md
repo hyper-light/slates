@@ -7517,6 +7517,16 @@
 > a heartbeat tick at a time before; a watch the kernel refuses refuses the mount, typed). Owed from that sweep: the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 
+> **Open (test, 2026-11-23, w-chaos): two tests failed only under a whole-suite sweep on adacachy2.** That was r322,
+> the forwarded-write fix's sweep. They ran serially among 237 fleet tests and 38 live_fleet flows, while kiln's
+> placement saw 0 to 3 of 32 cores idle. Each passed 2 of 2 alone with the fix, and 1 of 1 on main.
+> - `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over` (fleet): its write was held past the failover
+>   SLO on each of its three sends, the last `DurabilityPending { held_ns: 3,246,047,745 }`. The SLO is a product
+>   deadline (A-354). The test's bet is `CONTINUITY_WRITES`, three sends, one for each outcome it allows.
+> - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
+>   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
+>   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
+
 > **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
 > a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,
 > load about 70) at `waits >= 1` (handshake.rs:252): a helper that sends its descriptor at once can answer before the
