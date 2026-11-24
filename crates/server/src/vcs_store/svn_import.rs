@@ -774,6 +774,7 @@ fn end(state: &mut ShardState, mut importing: Importing) {
   state.store.budget.credit_retention(importing.charged);
   importing.host.close_file(importing.file);
   importing.host.close_dir(importing.directory);
+  crate::vcs_store::release_excess_extents(state);
 }
 
 /// Gives back repository `id`'s import under way, if there is one (the module doc's cancellation): what it charged, its

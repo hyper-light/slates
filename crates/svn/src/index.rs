@@ -532,15 +532,129 @@ struct ShapeEntry {
   shape: Shape,
 }
 
+/// Standard 64-bit FNV-1a offset basis (IETF draft-eastlake-fnv).
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Standard 64-bit FNV-1a prime (IETF draft-eastlake-fnv).
+const FNV1A_PRIME: u64 = 0x0100_0000_01b3;
+
+/// Empty slot sentinel in [`PathTable`].
+const EMPTY_SLOT: u32 = u32::MAX;
+
+/// Computes the 64-bit FNV-1a hash of `bytes`.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+  let mut hash = FNV1A_OFFSET_BASIS;
+  for &byte in bytes {
+    hash ^= u64::from(byte);
+    hash = hash.wrapping_mul(FNV1A_PRIME);
+  }
+  hash
+}
+
+/// Flat open-addressed hash table mapping path strings in `Index::path_bytes` to their path numbers,
+/// replacing `BTreeMap<Box<str>, usize>` to eliminate duplicate string allocations and tree nodes.
+#[derive(Clone, Debug, Default)]
+struct PathTable {
+  /// Power-of-two slot array holding path numbers, or [`EMPTY_SLOT`] when unoccupied.
+  slots: Vec<u32>,
+  /// Number of occupied slots.
+  count: usize,
+}
+
+impl PathTable {
+  /// Looks up `path`'s number using `path_bytes` and `paths`.
+  fn get(&self, path: &str, path_bytes: &str, paths: &[PathEntry]) -> Option<usize> {
+    let mask = self.slots.len().checked_sub(1)?;
+    let mut at = usize::try_from(fnv1a_64(path.as_bytes())).unwrap_or(0) & mask;
+    for _ in 0..self.slots.len() {
+      let slot = *self.slots.get(at)?;
+      if slot == EMPTY_SLOT {
+        return None;
+      }
+      let number = usize::try_from(slot).ok()?;
+      if paths.get(number).and_then(|entry| entry.as_str(path_bytes)) == Some(path) {
+        return Some(number);
+      }
+      at = (at.wrapping_add(1)) & mask;
+    }
+    None
+  }
+
+  /// Inserts `number` (whose string is already stored in `path_bytes`/`paths`) into the table.
+  fn insert(&mut self, number: u32, path_bytes: &str, paths: &[PathEntry]) {
+    if self.count.saturating_add(1).saturating_mul(2) > self.slots.len() {
+      self.grow(path_bytes, paths);
+    }
+    let Some(path) = usize::try_from(number)
+      .ok()
+      .and_then(|idx| paths.get(idx))
+      .and_then(|entry| entry.as_str(path_bytes))
+    else {
+      return;
+    };
+    Self::place(&mut self.slots, number, path);
+    self.count = self.count.saturating_add(1);
+  }
+
+  /// Doubles slot capacity (starting from 16, one cache line of `u32` slots) and rehashes entries.
+  fn grow(&mut self, path_bytes: &str, paths: &[PathEntry]) {
+    /// Derived: 16 `u32` slots = 64 bytes, one cache line.
+    const INITIAL_SLOTS: usize = 16;
+    let next_len = self.slots.len().saturating_mul(2).max(INITIAL_SLOTS);
+    let mut next = vec![EMPTY_SLOT; next_len];
+    for &slot in &self.slots {
+      if slot == EMPTY_SLOT {
+        continue;
+      }
+      if let Some(path) = usize::try_from(slot)
+        .ok()
+        .and_then(|idx| paths.get(idx))
+        .and_then(|entry| entry.as_str(path_bytes))
+      {
+        Self::place(&mut next, slot, path);
+      }
+    }
+    self.slots = next;
+  }
+
+  /// Places `number` (with string `path`) into the first open slot in power-of-two slice `slots`.
+  fn place(slots: &mut [u32], number: u32, path: &str) {
+    let Some(mask) = slots.len().checked_sub(1) else {
+      return;
+    };
+    let mut at = usize::try_from(fnv1a_64(path.as_bytes())).unwrap_or(0) & mask;
+    for _ in 0..slots.len() {
+      if let Some(slot) = slots.get_mut(at)
+        && *slot == EMPTY_SLOT
+      {
+        *slot = number;
+        return;
+      }
+      at = (at.wrapping_add(1)) & mask;
+    }
+  }
+}
+
 /// What the index holds about one path.
 #[derive(Clone, Debug)]
 struct PathEntry {
-  /// The path.
-  path: Box<str>,
+  /// Byte offset in `Index::path_bytes`.
+  start: u32,
+  /// Byte length in `Index::path_bytes`.
+  len: u32,
   /// Its history list, by revision.
   history: Vec<HistoryEntry>,
   /// Its shape list, by revision.
   shapes: Vec<ShapeEntry>,
+}
+
+impl PathEntry {
+  /// Borrows this path's string from `path_bytes`.
+  fn as_str<'a>(&self, path_bytes: &'a str) -> Option<&'a str> {
+    let start = usize::try_from(self.start).ok()?;
+    let end = start.checked_add(usize::try_from(self.len).ok()?)?;
+    path_bytes.get(start..end)
+  }
 }
 
 /// What the index holds about one revision.
@@ -808,10 +922,12 @@ enum Decided {
 /// The Subversion index of one repository (module documentation).
 #[derive(Clone, Debug)]
 pub struct Index {
+  /// Contiguous UTF-8 slab holding every interned path string back-to-back.
+  path_bytes: String,
   /// Every path the index has named, by number.
   paths: Vec<PathEntry>,
-  /// Each named path's number.
-  numbers: BTreeMap<Box<str>, usize>,
+  /// Flat open-addressed index from path string to path number.
+  numbers: PathTable,
   /// Every node-revision, by [`NodeRevisionId`].
   rows: Vec<Row>,
   /// Every revision's rows, by revision.
@@ -820,9 +936,11 @@ pub struct Index {
   youngest: Revision,
   /// The deletions the history lists hold.
   deletions: usize,
-  /// The nodes of every directory row's children map (A-759).
-  maps: Vec<children::MapNode>,
-  /// The bytes those nodes cost (`children::MapNode::bytes`), charged to the room in [`Index::ENTRY_BYTES`] units.
+  /// Flat node descriptors for every directory row's children map (A-759).
+  map_nodes: Vec<children::FlatNode>,
+  /// Contiguous `(path_number, node_revision_or_child_handle)` item slab for all committed map nodes.
+  map_items: Vec<(u32, u32)>,
+  /// The bytes those nodes cost (`children::FlatNode::bytes`), charged to the room in [`Index::ENTRY_BYTES`] units.
   map_bytes: usize,
 }
 
@@ -854,13 +972,19 @@ impl Index {
       revision: 0,
       event: HistoryEvent::Created(FIRST_ROOT),
     };
+    let path_bytes = ROOT.to_owned();
+    let paths = vec![PathEntry {
+      start: 0,
+      len: u32::try_from(ROOT.len()).unwrap_or(1),
+      history: vec![created],
+      shapes: Vec::new(),
+    }];
+    let mut numbers = PathTable::default();
+    numbers.insert(0, &path_bytes, &paths);
     Self {
-      paths: vec![PathEntry {
-        path: ROOT.into(),
-        history: vec![created],
-        shapes: Vec::new(),
-      }],
-      numbers: BTreeMap::from([(Box::<str>::from(ROOT), 0)]),
+      path_bytes,
+      paths,
+      numbers,
       rows: vec![root],
       revisions: vec![RevisionEntry {
         transaction: None,
@@ -868,7 +992,8 @@ impl Index {
       }],
       youngest: 0,
       deletions: 0,
-      maps: Vec::new(),
+      map_nodes: Vec::new(),
+      map_items: Vec::new(),
       map_bytes: 0,
     }
   }
@@ -1174,8 +1299,8 @@ impl Index {
   fn entry(&self, path: &str) -> Option<&PathEntry> {
     self
       .numbers
-      .get(path)
-      .and_then(|&number| self.paths.get(number))
+      .get(path, &self.path_bytes, &self.paths)
+      .and_then(|number| self.paths.get(number))
   }
 
   /// The path numbered `number`.
@@ -1183,7 +1308,7 @@ impl Index {
     self
       .paths
       .get(number)
-      .map(|entry| &*entry.path)
+      .and_then(|entry| entry.as_str(&self.path_bytes))
       .ok_or(IndexRefusal::Corrupt)
   }
 
@@ -1255,13 +1380,33 @@ impl Index {
     latest
   }
 
-  /// Refuses a plan naming a path past those it adds, so that [`Index::commit`] cannot miss one.
+  /// Refuses a plan naming a path past those it adds or overflowing 32-bit slab indices, so that
+  /// [`Index::commit`] cannot miss or truncate anything.
   fn check_plan(&self, plan: &Plan) -> Result<(), IndexRefusal> {
     let named = self
       .paths
       .len()
-      .checked_add(plan.paths.len())
+      .checked_add(plan.path_spans.len())
       .ok_or(IndexRefusal::Corrupt)?;
+    if u32::try_from(named).is_err() || named >= usize::try_from(EMPTY_SLOT).unwrap_or(usize::MAX) {
+      return Err(IndexRefusal::Corrupt);
+    }
+    let total_path_bytes = self
+      .path_bytes
+      .len()
+      .checked_add(plan.path_bytes.len())
+      .ok_or(IndexRefusal::Corrupt)?;
+    if u32::try_from(total_path_bytes).is_err() {
+      return Err(IndexRefusal::Corrupt);
+    }
+    let total_map_items = self
+      .map_items
+      .len()
+      .checked_add(plan.map_items.len())
+      .ok_or(IndexRefusal::Corrupt)?;
+    if u32::try_from(total_map_items).is_err() {
+      return Err(IndexRefusal::Corrupt);
+    }
     if plan.events.iter().all(|(number, _)| *number < named) {
       Ok(())
     } else {
@@ -1277,16 +1422,28 @@ impl Index {
     transaction: String,
     changes: Vec<ChangedPath>,
   ) {
-    for path in plan.paths {
-      self.numbers.insert(path.clone(), self.paths.len());
+    let path_base = u32::try_from(self.path_bytes.len()).unwrap_or(0);
+    self.path_bytes.push_str(&plan.path_bytes);
+    for (rel_start, len) in plan.path_spans {
+      let number = u32::try_from(self.paths.len()).unwrap_or(0);
       self.paths.push(PathEntry {
-        path,
+        start: path_base.saturating_add(rel_start),
+        len,
         history: Vec::new(),
         shapes: Vec::new(),
       });
+      self.numbers.insert(number, &self.path_bytes, &self.paths);
     }
     self.rows.extend(plan.rows);
-    self.maps.extend(plan.maps);
+    let item_base = u32::try_from(self.map_items.len()).unwrap_or(0);
+    self.map_items.extend_from_slice(&plan.map_items);
+    self
+      .map_nodes
+      .extend(plan.map_nodes.into_iter().map(|node| children::FlatNode {
+        start: item_base.saturating_add(node.start),
+        len: node.len,
+        inner: node.inner,
+      }));
     self.map_bytes = self.map_bytes.saturating_add(plan.map_bytes);
     for (number, staged) in plan.events {
       if let Some(entry) = self.paths.get_mut(number) {
@@ -1361,14 +1518,18 @@ impl Planned {
 struct Plan {
   /// The node-revisions it made, numbered after the index's.
   rows: Vec<Row>,
-  /// The paths it names first, numbered after the index's.
-  paths: Vec<Box<str>>,
+  /// New path bytes added by this revision, to be appended to `Index::path_bytes`.
+  path_bytes: String,
+  /// `(relative_start, len)` spans in `path_bytes`, numbered after the index's paths.
+  path_spans: Vec<(u32, u32)>,
   /// What it did at each path, by number.
   events: Vec<(usize, Staged)>,
   /// The deletions it made.
   deletions: usize,
-  /// The children maps' nodes it made, numbered after the index's (A-759).
-  maps: Vec<children::MapNode>,
+  /// Flattened children-map node descriptors (A-759), numbered after the index's.
+  map_nodes: Vec<children::FlatNode>,
+  /// Contiguous `(key, val)` entries for `map_nodes`, with `start` relative to this vec.
+  map_items: Vec<(u32, u32)>,
   /// The bytes they cost.
   map_bytes: usize,
 }
@@ -1581,13 +1742,40 @@ impl<'index> Builder<'index> {
     for (path, done) in staged {
       events.push((self.intern(&path)?, done));
     }
-    let map_bytes = self.maps.iter().map(children::MapNode::bytes).sum();
+    let total_path_len: usize = self.new_paths.iter().map(|path| path.len()).sum();
+    let mut path_bytes = String::with_capacity(total_path_len);
+    let mut path_spans = Vec::with_capacity(self.new_paths.len());
+    for path in &self.new_paths {
+      let start = u32::try_from(path_bytes.len()).map_err(|_| IndexRefusal::Corrupt)?;
+      let len = u32::try_from(path.len()).map_err(|_| IndexRefusal::Corrupt)?;
+      path_bytes.push_str(path);
+      path_spans.push((start, len));
+    }
+    let total_items: usize = self
+      .maps
+      .iter()
+      .map(|node| match node {
+        children::MapNode::Leaf(items) | children::MapNode::Inner(items) => items.len(),
+      })
+      .sum();
+    let mut map_nodes = Vec::with_capacity(self.maps.len());
+    let mut map_items = Vec::with_capacity(total_items);
+    let mut map_bytes = 0usize;
+    for node in self.maps {
+      let flat = node
+        .into_flat(&mut map_items)
+        .ok_or(IndexRefusal::Corrupt)?;
+      map_bytes = map_bytes.saturating_add(flat.bytes());
+      map_nodes.push(flat);
+    }
     Ok(Plan {
       rows: self.rows,
-      paths: self.new_paths,
+      path_bytes,
+      path_spans,
       events,
       deletions: self.deletions,
-      maps: self.maps,
+      map_nodes,
+      map_items,
       map_bytes,
     })
   }
@@ -2101,11 +2289,11 @@ impl<'index> Builder<'index> {
 
   /// The number of `path`, the index's or a new one.
   fn intern(&mut self, path: &str) -> Result<usize, IndexRefusal> {
-    if let Some(&number) = self
+    if let Some(number) = self
       .index
       .numbers
-      .get(path)
-      .or_else(|| self.new_numbers.get(path))
+      .get(path, &self.index.path_bytes, &self.index.paths)
+      .or_else(|| self.new_numbers.get(path).copied())
     {
       return Ok(number);
     }
@@ -2139,21 +2327,27 @@ fn map_units(bytes: usize) -> usize {
 }
 
 impl children::MapRead for Index {
-  fn map_node(&self, handle: u32) -> Option<&children::MapNode> {
-    self.maps.get(usize::try_from(handle).ok()?)
+  fn map_node(&self, handle: u32) -> Option<children::NodeRef<'_>> {
+    self
+      .map_nodes
+      .get(usize::try_from(handle).ok()?)?
+      .as_ref(&self.map_items)
   }
 
   fn key_path(&self, key: usize) -> Option<&str> {
-    self.paths.get(key).map(|entry| &*entry.path)
+    self
+      .paths
+      .get(key)
+      .and_then(|entry| entry.as_str(&self.path_bytes))
   }
 }
 
 impl children::MapRead for Builder<'_> {
-  fn map_node(&self, handle: u32) -> Option<&children::MapNode> {
+  fn map_node(&self, handle: u32) -> Option<children::NodeRef<'_>> {
     let at = usize::try_from(handle).ok()?;
-    match at.checked_sub(self.index.maps.len()) {
-      None => self.index.maps.get(at),
-      Some(made) => self.maps.get(made),
+    match at.checked_sub(self.index.map_nodes.len()) {
+      None => self.index.map_nodes.get(at)?.as_ref(&self.index.map_items),
+      Some(made) => self.maps.get(made).map(children::MapNode::as_ref),
     }
   }
 
@@ -2164,7 +2358,7 @@ impl children::MapRead for Builder<'_> {
 
 impl children::MapWrite for Builder<'_> {
   fn push_map_node(&mut self, node: children::MapNode) -> Option<u32> {
-    let handle = u32::try_from(self.index.maps.len().checked_add(self.maps.len())?).ok()?;
+    let handle = u32::try_from(self.index.map_nodes.len().checked_add(self.maps.len())?).ok()?;
     if handle == children::EMPTY {
       return None;
     }
@@ -2175,14 +2369,14 @@ impl children::MapWrite for Builder<'_> {
   fn staged(&self, handle: u32) -> bool {
     usize::try_from(handle)
       .ok()
-      .and_then(|at| at.checked_sub(self.index.maps.len()))
+      .and_then(|at| at.checked_sub(self.index.map_nodes.len()))
       .is_some_and(|made| made < self.maps.len())
   }
 
   fn map_node_mut(&mut self, handle: u32) -> Option<&mut children::MapNode> {
     let made = usize::try_from(handle)
       .ok()?
-      .checked_sub(self.index.maps.len())?;
+      .checked_sub(self.index.map_nodes.len())?;
     self.maps.get_mut(made)
   }
 }

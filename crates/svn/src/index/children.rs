@@ -1,13 +1,15 @@
 //! A directory node-revision's children (A-759): a persistent ordered map, each entry a child's name (held as the
-//! number of a path the name ends) and its node-revision, kept in an arena of nodes the index owns and named by
+//! number of a path the name ends) and its node-revision, kept in a flat contiguous arena the index owns and named by
 //! handle, so a directory's successor shares every node its change does not touch and a copy shares its source's map
 //! whole (main's ruling: a listing costs O(live children), not O(history beneath the directory)).
 //!
 //! **Shape.** A B-tree of at most [`MOST_ENTRIES`] entries a node, leaves holding (path number, node-revision) pairs
 //! and inner nodes (first path number, child handle) pairs, both in the byte order of the names their path numbers
-//! end with. A change copies the nodes from the root down to its entry and splits a node past [`MOST_ENTRIES`]; a
-//! removal drops a node left empty and lets a root with one child go to it. Nodes are never merged, so heavy deletion
-//! leaves nodes underfull, but every operation still touches one node a level. [`EMPTY`] is the empty map.
+//! end with. Committed nodes live in two flat vectors (`Vec<FlatNode>` + `Vec<(u32, u32)>`) with zero per-node heap
+//! allocations and zero wasted capacity; staged nodes for the single revision being built edit in place and flatten
+//! into the arena on commit. A change copies the nodes from the root down to its entry and splits a node past
+//! [`MOST_ENTRIES`]; a removal drops a node left empty and lets a root with one child go to it. [`EMPTY`] is the
+//! empty map.
 //!
 //! **Copied once a revision.** A node the revision being built made itself (a staged node, `MapWrite::staged`) is
 //! reachable from that revision's own directory rows alone (a copy's source is always a committed revision), so a
@@ -30,16 +32,71 @@ pub(super) const EMPTY: u32 = u32::MAX;
 /// change to a 10,000-entry map (three levels) copies about 768 bytes.
 const MOST_ENTRIES: usize = 32;
 
-/// The bytes one node costs besides its entries: its vector's header and its allocation's bookkeeping.
-/// Derived: a `Vec` is three words (24 bytes on the 64-bit targets slates ships), and the allocator keeps about two
-/// words a block.
-pub(super) const NODE_BYTES: usize = 40;
+/// The bytes one flat node header costs in the committed arena.
+/// Derived: `size_of::<FlatNode>()` (8 bytes: start offset `u32`, length `u16`, inner flag `bool`, 1 byte padding).
+pub(super) const NODE_BYTES: usize = core::mem::size_of::<FlatNode>();
 
 /// The bytes one entry costs: two 32-bit numbers.
 /// Derived: `size_of::<(u32, u32)>()`.
-pub(super) const ENTRY_BYTES: usize = 8;
+pub(super) const ENTRY_BYTES: usize = core::mem::size_of::<(u32, u32)>();
 
-/// One node of a map.
+/// One committed node descriptor in the flat arena (zero per-node heap allocations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FlatNode {
+  /// First entry index in the arena's flat `(u32, u32)` item buffer.
+  pub(super) start: u32,
+  /// Entry count (at most [`MOST_ENTRIES`]).
+  pub(super) len: u16,
+  /// `true` for an inner node, `false` for a leaf node.
+  pub(super) inner: bool,
+}
+
+impl FlatNode {
+  /// The exact bytes this committed node costs in the flat arena: header plus its entries.
+  pub(super) fn bytes(self) -> usize {
+    NODE_BYTES.saturating_add(usize::from(self.len).saturating_mul(ENTRY_BYTES))
+  }
+
+  /// Borrows this node's slice from `items`.
+  pub(super) fn as_ref(self, items: &[(u32, u32)]) -> Option<NodeRef<'_>> {
+    let start = usize::try_from(self.start).ok()?;
+    let end = start.checked_add(usize::from(self.len))?;
+    let slice = items.get(start..end)?;
+    Some(if self.inner {
+      NodeRef::Inner(slice)
+    } else {
+      NodeRef::Leaf(slice)
+    })
+  }
+}
+
+/// A borrowed view of a committed or staged map node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NodeRef<'a> {
+  /// Leaf entries: `(path_number, node_revision_id)` in name order.
+  Leaf(&'a [(u32, u32)]),
+  /// Inner children: `(first_path_number, child_handle)` in name order.
+  Inner(&'a [(u32, u32)]),
+}
+
+impl<'a> NodeRef<'a> {
+  /// Its entries or children.
+  fn items(self) -> &'a [(u32, u32)] {
+    match self {
+      Self::Leaf(items) | Self::Inner(items) => items,
+    }
+  }
+
+  /// Clones the borrowed slice into a mutable staged node for in-revision edits.
+  fn to_staged(self) -> MapNode {
+    match self {
+      Self::Leaf(items) => MapNode::Leaf(items.to_vec()),
+      Self::Inner(items) => MapNode::Inner(items.to_vec()),
+    }
+  }
+}
+
+/// One mutable staged node held during a single revision build; flattened into [`FlatNode`] on finish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MapNode {
   /// Entries: each child's path number and node-revision, in name order.
@@ -49,26 +106,31 @@ pub(super) enum MapNode {
 }
 
 impl MapNode {
-  /// Its entries or children.
-  fn items(&self) -> &[(u32, u32)] {
+  /// Borrows this staged node as a [`NodeRef`].
+  pub(super) fn as_ref(&self) -> NodeRef<'_> {
     match self {
-      Self::Leaf(items) | Self::Inner(items) => items,
+      Self::Leaf(items) => NodeRef::Leaf(items),
+      Self::Inner(items) => NodeRef::Inner(items),
     }
   }
 
-  /// The bytes it costs: [`NODE_BYTES`] and [`ENTRY_BYTES`] an entry it can hold now.
-  pub(super) fn bytes(&self) -> usize {
-    let held = match self {
-      Self::Leaf(items) | Self::Inner(items) => items.capacity(),
+  /// Appends this staged node's exact entries into `items` and returns its compact [`FlatNode`] descriptor.
+  pub(super) fn into_flat(self, items: &mut Vec<(u32, u32)>) -> Option<FlatNode> {
+    let (inner, entries) = match self {
+      Self::Leaf(entries) => (false, entries),
+      Self::Inner(entries) => (true, entries),
     };
-    NODE_BYTES.saturating_add(held.saturating_mul(ENTRY_BYTES))
+    let start = u32::try_from(items.len()).ok()?;
+    let len = u16::try_from(entries.len()).ok()?;
+    items.extend_from_slice(&entries);
+    Some(FlatNode { start, len, inner })
   }
 }
 
 /// Where maps are read: their nodes by handle and the paths their keys name.
 pub(super) trait MapRead {
   /// The node of `handle`.
-  fn map_node(&self, handle: u32) -> Option<&MapNode>;
+  fn map_node(&self, handle: u32) -> Option<NodeRef<'_>>;
   /// The path numbered `key`.
   fn key_path(&self, key: usize) -> Option<&str>;
 
@@ -126,8 +188,8 @@ pub(super) fn remove(store: &mut impl MapWrite, root: u32, name: &str) -> Option
     Removed::Node(handle) => handle,
   };
   // A root left with one child gives way to it.
-  while let Some(MapNode::Inner(children)) = store.map_node(handle) {
-    match children.as_slice() {
+  while let Some(NodeRef::Inner(children)) = store.map_node(handle) {
+    match children {
       [(_, only)] => handle = *only,
       _ => break,
     }
@@ -145,7 +207,7 @@ pub(super) fn entries(store: &impl MapRead, root: u32) -> Option<Vec<(usize, Nod
   let mut stack = vec![root];
   while let Some(handle) = stack.pop() {
     match store.map_node(handle)? {
-      MapNode::Leaf(entries) => {
+      NodeRef::Leaf(entries) => {
         for &(key, value) in entries {
           out.push((
             usize::try_from(key).ok()?,
@@ -153,7 +215,7 @@ pub(super) fn entries(store: &impl MapRead, root: u32) -> Option<Vec<(usize, Nod
           ));
         }
       }
-      MapNode::Inner(children) => stack.extend(children.iter().rev().map(|(_, child)| *child)),
+      NodeRef::Inner(children) => stack.extend(children.iter().rev().map(|(_, child)| *child)),
     }
   }
   Some(out)
@@ -186,8 +248,8 @@ fn collect_after(
   out: &mut Vec<(usize, NodeRevisionId)>,
 ) -> Option<()> {
   match store.map_node(handle)? {
-    MapNode::Leaf(entries) => collect_leaf(store, entries, after, most, out)?,
-    MapNode::Inner(children) => {
+    NodeRef::Leaf(entries) => collect_leaf(store, entries, after, most, out)?,
+    NodeRef::Inner(children) => {
       let start = match after {
         Some(after) => child_for(store, children, after)?,
         None => 0,
@@ -211,14 +273,20 @@ fn collect_leaf(
   most: usize,
   out: &mut Vec<(usize, NodeRevisionId)>,
 ) -> Option<()> {
-  for &(key, value) in entries {
+  let start = match after {
+    Some(after) => {
+      let (place, found) = place_of(store, entries, after)?;
+      if found {
+        place.saturating_add(1)
+      } else {
+        place
+      }
+    }
+    None => 0,
+  };
+  for &(key, value) in entries.get(start..)? {
     if out.len() >= most {
       break;
-    }
-    if let Some(after) = after
-      && store.key_name(key)? <= after
-    {
-      continue;
     }
     out.push((
       usize::try_from(key).ok()?,
@@ -243,17 +311,19 @@ fn first_of(store: &impl MapRead, handle: u32) -> Option<u32> {
   store.map_node(handle)?.items().first().map(|(key, _)| *key)
 }
 
-/// Where `name` goes among `items` (by their keys' names): its place and whether an item there holds it.
+/// Where `name` goes among sorted `items` (by their keys' names): binary search returning `(place, found)`.
 fn place_of(store: &impl MapRead, items: &[(u32, u32)], name: &str) -> Option<(usize, bool)> {
-  let mut place = 0usize;
-  for (key, _) in items {
-    match store.key_name(*key)?.cmp(name) {
-      std::cmp::Ordering::Less => place = place.saturating_add(1),
-      std::cmp::Ordering::Equal => return Some((place, true)),
-      std::cmp::Ordering::Greater => break,
+  let (mut lo, mut hi) = (0usize, items.len());
+  while lo < hi {
+    let mid = lo.saturating_add((hi.saturating_sub(lo)) / 2);
+    let key = items.get(mid)?.0;
+    match store.key_name(key)?.cmp(name) {
+      std::cmp::Ordering::Less => lo = mid.saturating_add(1),
+      std::cmp::Ordering::Equal => return Some((mid, true)),
+      std::cmp::Ordering::Greater => hi = mid,
     }
   }
-  Some((place, false))
+  Some((lo, false))
 }
 
 /// The child of an inner node `name` goes beneath: the last whose first name is at or before it, else the first.
@@ -272,7 +342,7 @@ fn taken(store: &mut impl MapWrite, handle: u32) -> Option<MapNode> {
     let node = store.map_node_mut(handle)?;
     return Some(std::mem::replace(node, MapNode::Leaf(Vec::new())));
   }
-  store.map_node(handle).cloned()
+  store.map_node(handle).map(NodeRef::to_staged)
 }
 
 /// `node`, changed from the node of `handle`, put back: in place where that node is staged, else pushed.
@@ -333,13 +403,13 @@ fn split(
 /// The node of `handle` with the entry named `name` removed beneath it; taken to change only once a change is due.
 fn removed(store: &mut impl MapWrite, handle: u32, name: &str) -> Option<Removed> {
   let below = match store.map_node(handle)? {
-    MapNode::Leaf(entries) => {
+    NodeRef::Leaf(entries) => {
       if !place_of(store, entries, name)?.1 {
         return Some(Removed::Unchanged);
       }
       None
     }
-    MapNode::Inner(children) => {
+    NodeRef::Inner(children) => {
       let at = child_for(store, children, name)?;
       Some((at, children.get(at)?.1))
     }

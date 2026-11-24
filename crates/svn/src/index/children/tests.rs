@@ -17,8 +17,8 @@ struct Store {
 }
 
 impl MapRead for Store {
-  fn map_node(&self, handle: u32) -> Option<&MapNode> {
-    self.nodes.get(handle as usize)
+  fn map_node(&self, handle: u32) -> Option<NodeRef<'_>> {
+    self.nodes.get(handle as usize).map(MapNode::as_ref)
   }
   fn key_path(&self, key: usize) -> Option<&str> {
     self.paths.get(key).map(String::as_str)

@@ -638,6 +638,32 @@ impl ChunkArena {
     returned
   }
 
+  /// Whether a publish + [`ChunkArena::shrink_trading`] can return or trade at least one wholly free
+  /// (or deferred-free-only) extent back to the pool while keeping at least `keep_bytes`.
+  pub fn has_releasable_extents(&self, keep_bytes: usize) -> bool {
+    let total = self.capacity();
+    if total <= keep_bytes {
+      return false;
+    }
+    self.order.iter().any(|id| {
+      self.slot(*id).is_some_and(|slot| {
+        let len = slot.buddy.region_bytes();
+        let free_after_commit = slot
+          .buddy
+          .free_bytes()
+          .saturating_add(slot.buddy.deferred_bytes());
+        if free_after_commit != len {
+          return false;
+        }
+        let left = total.saturating_sub(len);
+        left >= keep_bytes
+          || self
+            .block_len(keep_bytes.saturating_sub(left))
+            .is_some_and(|min_len| min_len < len)
+      })
+    })
+  }
+
   /// Claims a smaller extent whose buddy can supply `want` bytes and returns its id and usable capacity.
   fn claim_smaller(&mut self, want: usize, than: usize) -> Option<(u16, usize)> {
     let minimum = self.block_len(want)?;

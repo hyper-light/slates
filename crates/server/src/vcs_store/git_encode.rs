@@ -500,6 +500,7 @@ pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
   if given > 0 {
     state.count(GIVEN_BACK_IDLE, given);
   }
+  super::release_excess_extents(state);
 }
 
 /// Whether a task is making repository `id`'s encoding ahead now ([`encode_behind`]).

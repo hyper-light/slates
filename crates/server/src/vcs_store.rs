@@ -2746,7 +2746,10 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
       }
       slates_rt::futures::yield_now().await;
     }
-    let _ = crate::state::with_state_counted(|state| state.vcs_stores.letting_go.1 = false);
+    let _ = crate::state::with_state_counted(|state| {
+      state.vcs_stores.letting_go.1 = false;
+      release_excess_extents(state);
+    });
   };
   match slates_rt::futures::spawn(turns) {
     Ok(task) => {
@@ -2754,6 +2757,16 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
     }
     // No task to spare: the queue is turned by the next let-go that starts one.
     Err(_) => state.vcs_stores.letting_go.1 = false,
+  }
+}
+
+/// Releases wholly free (and deferred-free-only) content-arena extents back to the pool and OS
+/// when the arena holds excess capacity past `state.store.demand()` (A-98, A-848). Publishes the
+/// shard image once so deferred captures settle before `Store::release_idle()` unmaps/unlinks or
+/// hole-punches the empty extents.
+pub(crate) fn release_excess_extents(state: &mut ShardState) {
+  if state.store.has_releasable_extents() {
+    let _ = crate::verbs::publish_shard(state);
   }
 }
 

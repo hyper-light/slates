@@ -419,6 +419,7 @@ pub(crate) async fn let_go_committed(
     at = at.saturating_add(taken.max(1));
     slates_rt::futures::yield_now().await;
   }
+  let _ = crate::state::with_state(crate::vcs_store::release_excess_extents);
 }
 
 /// Notes each window of `identity`, one of `revision`'s objects in `repository`, with the revision for a home on this

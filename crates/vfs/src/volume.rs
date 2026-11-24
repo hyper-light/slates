@@ -335,6 +335,13 @@ impl Store {
       .saturating_add(self.budget.hold())
   }
 
+  /// Whether publishing and calling [`Store::release_idle`] can return or trade at least one wholly free
+  /// (or deferred-free-only) extent back to the content pool while keeping [`Store::demand`].
+  pub fn has_releasable_extents(&self) -> bool {
+    let keep = usize::try_from(self.demand()).unwrap_or(usize::MAX);
+    self.content.arena().has_releasable_extents(keep)
+  }
+
   /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment, the operation
   /// headroom and the pressure hold need (A-98), a free extent kept only for that traded for the smallest that keeps it
   /// (`ChunkArena::shrink_trading`): the bytes returned. Run after a committed publication, when no
