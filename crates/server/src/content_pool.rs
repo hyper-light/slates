@@ -430,7 +430,24 @@ impl ContentPool {
   /// word then given straight back (if even that is refused, the extent stays held by this partition and is released
   /// by the next daemon's `held`).
   fn hand_out(&mut self, id: u16) -> Option<(u16, Region)> {
-    match self.map(id) {
+    #[cfg(test)]
+    let mapped = if REFUSE_NEXT_MAPS.with(|left| {
+      left
+        .get()
+        .checked_sub(1)
+        .map(|after| left.set(after))
+        .is_some()
+    }) {
+      Err(ServerError::Memory(slates_mem::MemError::OsRefused {
+        call: "a test's refused extent map",
+        code: None,
+      }))
+    } else {
+      self.map(id)
+    };
+    #[cfg(not(test))]
+    let mapped = self.map(id);
+    match mapped {
       Ok(region) => Some((id, region)),
       Err(_) => {
         self.refused = self.refused.saturating_add(1);
@@ -450,8 +467,9 @@ impl ContentPool {
       }
       if matches!(self.segment.pool_release(word, POOL_HOLD_OWNER), Ok(true))
         && matches!(self.segment.pool_claim(word, self.partition), Ok(true))
+        && let Some(handed) = self.hand_out(id)
       {
-        return self.hand_out(id);
+        return Some(handed);
       }
     }
     None
@@ -540,7 +558,14 @@ impl ExtentSource for ContentPool {
   fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
     for id in self.best_fit(want) {
       match self.segment.pool_claim(usize::from(id), self.partition) {
-        Ok(true) => return self.hand_out(id),
+        // An extent the OS would not map is counted and given back (`hand_out`), and the next candidate tried: until
+        // 2026-11-23 the claim ended there, so one refused map refused the whole growth while the pool had room
+        // (main 01a20182's r578: `BudgetExceeded { available: 33945026560 }` for 1 MiB, the arena's `room_lost`).
+        Ok(true) => {
+          if let Some(handed) = self.hand_out(id) {
+            return Some(handed);
+          }
+        }
         Ok(false) => {}
         // A word the segment refuses to reach (its geometry is checked at attach, so this is a layout fault): counted,
         // and the next candidate tried.
@@ -661,6 +686,13 @@ fn answer_a_want(state: &mut ShardState) {
     Ok(_) => state.count(WANT_ANSWERED, 1),
     Err(_) => state.count(WANT_REFUSED, 1),
   }
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Test only: how many of this shard's next extent maps its pool refuses, as the OS may refuse one (an extent's
+  /// object not opened, not made again, a range not mapped).
+  pub(crate) static REFUSE_NEXT_MAPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -813,5 +845,43 @@ mod tests {
   fn ask_one_turn_whole(state: &mut ShardState) -> (u64, u64, u64) {
     let (asked, lacked, grown, _, admittable) = ask_one_turn(state);
     (asked, admittable, lacked.max(grown))
+  }
+
+  /// main 01a20182's r578 (the big Studio, 23 shards, provision_bench's 64-client sweep: 1 MiB creates refused
+  /// `BudgetExceeded { available: 33945026560 }`, the daemon's once-line reading `room_lost=1` with the pool's whole
+  /// claimable room, no debt and no hold). Do: on a one-shard daemon, have its pool refuse the next extent map, as the OS
+  /// may, and make room for a turn past what the shard holds. Expect: the room made, from the next candidate, the
+  /// refused map counted by the pool and no growth lost. Failing first: the claim ended at the refused map, so the growth
+  /// came up short and gave back what it took (`room_lost` 1), the room unmade.
+  #[test]
+  fn an_extent_the_os_will_not_map_passes_the_claim_to_the_next() {
+    let daemon = crate::daemon::audit_daemon();
+    let (asked, lacked, grown, _, admittable, room_lost, refused) =
+      crate::daemon::observe_first(&daemon, |state| {
+        let before = state.store.content.arena().source_refusals();
+        super::REFUSE_NEXT_MAPS.with(|left| left.set(1));
+        let (asked, lacked, grown, at, admittable) = ask_one_turn(state);
+        super::REFUSE_NEXT_MAPS.with(|left| left.set(0));
+        (
+          asked,
+          lacked,
+          grown,
+          at,
+          admittable,
+          state.store.content.arena().room_lost(),
+          state.store.content.arena().source_refusals() - before,
+        )
+      });
+    daemon.stop();
+    assert!(
+      lacked > 0,
+      "the turn needed the pool (non-vacuity): asked {asked}"
+    );
+    assert_eq!(refused, 1, "the refused map counted");
+    assert_eq!(room_lost, 0, "no growth came up short");
+    assert!(
+      grown >= lacked && admittable >= asked,
+      "the room made: grew {grown} of {lacked} lacked, admittable {admittable} for {asked}"
+    );
   }
 }
