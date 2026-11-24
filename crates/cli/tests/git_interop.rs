@@ -2380,12 +2380,43 @@ fn stock_clone_bytes(git: &Git, source: &str) -> u64 {
   pack_file_bytes(&stock)
 }
 
+/// Format: the daemon's counters of its encoding and derivation of a repository's versions (A-718, A-856; A-614
+/// amended): what each step of [`whole_session`] leaves of them is said after it, so a round shows when each ran and
+/// where it stopped (main 01a20182's order of 2026-11-23 23:50: the clone item's first red).
+const ENCODING_COUNTERS: [&str; 6] = [
+  "vcs_store.git_encode.encoded",
+  "vcs_store.git_encode.turns",
+  "vcs_store.git_encode.behind",
+  "vcs_store.git_encode.ahead_stopped",
+  "vcs_store.git_derive.derived",
+  "vcs_store.git_derive.turns",
+];
+
+/// Says on stderr the daemon of `instance`'s [`ENCODING_COUNTERS`] after `step` of [`whole_session`], with the time
+/// since the session began.
+fn encoding_after(instance: &str, step: &str, began: Instant) {
+  let counted = counters_of(instance, &ENCODING_COUNTERS).map(|values| {
+    ENCODING_COUNTERS
+      .iter()
+      .zip(values)
+      .map(|(name, value)| format!("{name}={value}"))
+      .collect::<Vec<_>>()
+      .join(" ")
+  });
+  eprintln!(
+    "whole-repository encoding after {step} over {instance} at {:?}: {}",
+    began.elapsed(),
+    counted.unwrap_or_else(|| "(the daemon's status could not be read)".to_owned())
+  );
+}
+
 /// The whole-repository session against `url`, an empty repository on the daemon of `instance`, from `source`
 /// ([`tagged_source`]): every branch and tag pushed; the listing equal to the source's; a mirror clone that `fsck --full
 /// --strict` passes, its refs the source's, its pack bytes and paths said beside `stock`'s bytes ([`CloneReport`]); a
 /// push from a work clone fetched back into the mirror, the listings equal again; a shallow clone one commit deep,
 /// deepened by one; a partial clone (`--filter=blob:none`) that checks its tip out, its archive's bytes the source's.
 fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u64)) {
+  let began = Instant::now();
   git.ok(
     source,
     &[
@@ -2396,7 +2427,9 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
       "refs/tags/*:refs/tags/*",
     ],
   );
+  encoding_after(instance, "the push", began);
   let listed = git.ok(&git.scratch, &["ls-remote", url]);
+  encoding_after(instance, "the listing", began);
   let local = git.ok(&git.scratch, &["ls-remote", source]);
   assert_eq!(
     compared(&listed),
@@ -2415,7 +2448,9 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
     };
     git.ok(&git.scratch, &["clone", "-q", "--mirror", url, &mirror]);
   }
+  encoding_after(instance, "the mirror clone", began);
   git.ok(&mirror, &["fsck", "--full", "--strict", "--no-progress"]);
+  encoding_after(instance, "the mirror's fsck", began);
   assert_eq!(
     refs_of(git, &mirror),
     refs_of(git, source),
@@ -2427,6 +2462,7 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
     let _report = reported("work clone", (instance, &work_git, stock));
     git.ok(&git.scratch, &["clone", "-q", url, &work]);
   }
+  encoding_after(instance, "the work clone", began);
   let branch = git
     .ok(&work, &["symbolic-ref", "--short", "HEAD"])
     .trim()
@@ -2457,6 +2493,7 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
     let _report = reported("mirror fetch", (instance, &mirror, stock));
     git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);
   }
+  encoding_after(instance, "the mirror fetch", began);
   let listed = git.ok(&git.scratch, &["ls-remote", url]);
   let mirrored = git.ok(&git.scratch, &["ls-remote", &mirror]);
   assert_eq!(
@@ -2474,6 +2511,7 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
       &["clone", "-q", "--depth", "1", url, &shallow],
     );
   }
+  encoding_after(instance, "the shallow clone", began);
   assert_eq!(
     git.ok(&shallow, &["rev-list", "--count", "HEAD"]).trim(),
     "1",
@@ -2495,6 +2533,7 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
       &["clone", "-q", "--filter=blob:none", url, &partial],
     );
   }
+  encoding_after(instance, "the partial clone", began);
   git.ok(&partial, &["fsck", "--no-progress"]);
   let tip = git.commit_of(&partial, "HEAD");
   let ours = archive(git, &partial, &tip, &git.copy("partial.tar"));
