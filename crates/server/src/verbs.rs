@@ -6181,6 +6181,9 @@ fn dispatch_inner(
       cursor,
     } => crate::listing::read_dir(state, principal, (volume, &path, at), cursor),
     RequestBody::StageBegin { work, len } => stage_begin(state, principal, work, len),
+    RequestBody::StageOpen { volume, attachment } => {
+      stage_open(state, principal, volume, attachment)
+    }
     RequestBody::StagePut {
       work,
       token,
@@ -9394,6 +9397,48 @@ fn stage_begin(
   }
 }
 
+/// `StageOpen` (`crate::staging`, A-880): a buffer of no stated length for an `FsWriteStaged` under the caller's write
+/// `attachment` of a plain `volume`, living as long as the attachment. Checked as the write it stages is: the volume as
+/// `StageBegin` checks it and as the file verbs do (a plain volume), the attachment as a write through it
+/// (`fs_verbs::writer_attachment`, which renews a CLI attachment as any use does).
+fn stage_open(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  attachment: u64,
+) -> ReplyBody {
+  let volume_id = match staging_volume(state, principal, volume) {
+    Ok(id) => id,
+    Err(refusal) => return refused(refusal),
+  };
+  // A file write's buffer, so a plain volume's, refused as the file verbs refuse any other (`fs_verbs::serve`).
+  if let Err(refusal) = crate::fs_verbs::plain(state, volume) {
+    return refused(refusal);
+  }
+  if let Err(refusal) =
+    crate::fs_verbs::writer_attachment(state, principal, (volume, attachment), "stage")
+  {
+    return refused(refusal);
+  }
+  let now = state.clock.monotonic_ns();
+  state.staging.expire(now, &mut state.store.metadata);
+  match state.staging.open(
+    (volume_id, principal),
+    attachment,
+    state.partition,
+    &mut state.store.metadata,
+  ) {
+    Ok(token) => {
+      state.count(STAGES_OPENED, 1);
+      ReplyBody::Staged { token }
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Counter: open staging buffers begun (A-880, `StageOpen`): the non-vacuity count of a write streamed in pages.
+pub const STAGES_OPENED: &str = "staging.opened";
+
 /// `StagePut` (`crate::staging`): the next bytes of a staging buffer.
 fn stage_put(
   state: &mut ShardState,
@@ -9409,10 +9454,12 @@ fn stage_put(
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
   let expires = now.saturating_add(state.failover_ns);
-  match state
-    .staging
-    .put((work_id, principal, token), offset, bytes, expires)
-  {
+  match state.staging.put(
+    (work_id, principal, token),
+    offset,
+    bytes,
+    (expires, &mut state.store.metadata),
+  ) {
     Ok(filled) => {
       crate::deadlines::noted(state, expires);
       ReplyBody::StagePutDone { filled }

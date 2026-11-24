@@ -2657,6 +2657,8 @@ fn settled(taking: Taking) -> Option<Forked> {
     count_bases(state, &forked.intaken);
     state.count(INDEX_LOOKUPS, lookups.lookups);
     state.count(INDEX_RUNS_VISITED, lookups.runs_visited);
+    state.count(INDEX_RESOLVES, lookups.resolves);
+    state.count(INDEX_FILTER_REJECTIONS, lookups.filter_rejections);
   });
   Some(forked)
 }
@@ -2669,6 +2671,14 @@ pub(crate) const INDEX_LOOKUPS: &str = "vcs.hg.push_index_lookups";
 /// Counter: the runs those lookups visited, a miss every run ([`INDEX_LOOKUPS`]): runs a lookup is the one over the
 /// other. Format: a counter name in the status report.
 pub(crate) const INDEX_RUNS_VISITED: &str = "vcs.hg.push_index_runs_visited";
+
+/// Counter: the tables those lookups resolved through the store, a run each at most ([`INDEX_LOOKUPS`]; goal 93, r536:
+/// under load the reland's cost was a resolve a sealed run). Format: a counter name in the status report.
+pub(crate) const INDEX_RESOLVES: &str = "vcs.hg.push_index_resolves";
+
+/// Counter: the runs those lookups passed over on their key filter's word, resolving nothing ([`INDEX_LOOKUPS`]):
+/// the filter's non-vacuity counter. Format: a counter name in the status report.
+pub(crate) const INDEX_FILTER_REJECTIONS: &str = "vcs.hg.push_index_filter_rejections";
 
 /// Counter: a push admitted its known need up front at its begin, past the room it was first given (main 01a20182's
 /// ruling (a) of 2026-11-22 04:23). Format: a counter name in the status report.
