@@ -664,3 +664,11 @@
   answers report-status `ng <ref> unable to commit`; reds: v3_takeover release+debug and a fleet double-push at f=1;
   record git/git build time at f=1. Read w-shared notes ~/.local/state/main-fanout/progress/w-shared.md 355-383 first.
   Then: (iii) plan/footprint O(G), B1/B2, pack shape vs stock, LANDED_LET_GO decision.
+- 2026-11-23 ~20:45: holder replica (1)+(2) built in w-git-p2, uncommitted: vcs_store::object_record (partition or
+  ShardState::vcs_replica_records), vcs_store/replica.rs (records_of, begin, adopt; oracle green at 6 cuts + adoption),
+  takeover adopts; crate::replica_build (lazy on REPLICA_OWES, Building over replica, counters). LOCAL v3_takeover
+  (debug) PASSES: pushes 1,2 acked 31/74 ms, begun 2 made 2 versions_waited 3. NEXT (3): ContentMessage::ReplicaBuilding
+  {object, sequence, slices_done} (main approved; golden vector, hostile tests, unknown-kind refusal shown, §4.8
+  amendment + amendment log + GAPS + refusal table), owner keeps latest per holder per record, barrier window from
+  record plane live estimates with progress = placed/acks/slices_done rising; expiry -> report-status ng "unable to
+  commit". Then strip W-GIT-DIAG, f=1 double-push test, release+debug v3 runs (main's gate), land as one piece.
