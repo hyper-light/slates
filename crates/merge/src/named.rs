@@ -117,17 +117,18 @@ impl<'a> Post<'a> {
     )
   }
 
-  /// The run whose bytes are exactly the `len` bytes at `src`, by its place: what a whole text's file is made of.
-  pub(crate) fn whole_run(&self, src: u64, len: u64) -> Option<usize> {
-    let mut start = u64::try_from(self.inline.len()).ok()?;
+  /// Each run by its place in the address space and its length, the first of runs alike: the run whose bytes are
+  /// exactly the `len` bytes at `src` is the one under `(src, len)`, what a whole text's file is made of. Made once for
+  /// a version's files (`Green::sole_runs`), so each file's lookup is a logarithm of the runs, not a walk of them all.
+  pub(crate) fn run_places(&self) -> std::collections::BTreeMap<(u64, u64), usize> {
+    let mut places = std::collections::BTreeMap::new();
+    let mut start = u64::try_from(self.inline.len()).unwrap_or(u64::MAX);
     for at in 0..self.run_count() {
       let run_len = self.run_len(at);
-      if src == start && len == run_len {
-        return Some(at);
-      }
+      places.entry((start, run_len)).or_insert(at);
       start = start.saturating_add(run_len);
     }
-    None
+    places
   }
 
   /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was); a run's bytes not read span none.
