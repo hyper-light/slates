@@ -12,8 +12,8 @@
 //! at a time as a live push is (`slates_git::store::Staging`); then the record's moves are admitted an object a unit
 //! (A-722 part 4g) and the commit follows, as [`super::replay_push`] runs them.
 //!
-//! **Not stepped.** An owed commit's record, an LFS record and a record carrying no pack replay whole in their turn,
-//! as before: none holds a pack's objects.
+//! **Not stepped.** An owed commit's record (refused typed, A-896), an LFS record and a record carrying no pack replay
+//! whole in their turn, as before: none holds a pack's objects.
 //!
 //! **Given back.** A replay refused, or ended by its rebuild's end, gives back what its push held ([`GitReplay::abandon`]).
 

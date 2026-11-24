@@ -4881,7 +4881,7 @@ pub enum Refusal {
     owner: Option<u64>,
   },
   /// A submit to the green of a repository whose server makes a commit of each version (a Subversion repository's: its
-  /// revision) ran outside a recorded request, a dispatch no answer can wait on (goal 93, main's rulings of 2026-11-23:
+  /// revision; a git repository's: its commit, since 2026-11-24, A-896) ran outside a recorded request, a dispatch no answer can wait on (goal 93, main's rulings of 2026-11-23:
   /// the store is the truth, with no second path). The version, its commit on the node's changeset store and the
   /// register's entry are one durable step whose answer waits for the store's landing, so only a recorded verb can
   /// make it. Nothing was judged or recorded, and the same dispatch again is refused the same way. Until 2026-11-23
