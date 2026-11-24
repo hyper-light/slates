@@ -59,6 +59,24 @@ impl Held for IndexHeld<'_> {
     self.revision_text(Log::Manifest, node).map(Cow::Owned)
   }
 
+  /// The changelog's row, no text read (goal 93, C1 (1)).
+  fn holds_changeset(&self, node: &Node) -> bool {
+    self
+      .index
+      .rev(self.store, Log::Changelog, node)
+      .and_then(|rev| self.index.changeset(self.store, rev))
+      .is_some_and(|row| row.node == *node)
+  }
+
+  /// The manifest log's row, no text read (goal 93, C1 (1)).
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self
+      .index
+      .rev(self.store, Log::Manifest, node)
+      .and_then(|rev| self.index.revision(self.store, Log::Manifest, rev))
+      .is_some_and(|row| row.node == *node)
+  }
+
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
     self.revision_text(Log::File(path), node).map(Cow::Owned)
   }
@@ -124,6 +142,19 @@ impl TextAsk {
       most,
       text: None,
     }
+  }
+
+  /// The path and node asked.
+  pub fn asked(&self) -> (&[u8], Node) {
+    (&self.path, self.node)
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the ask with `text` at once, none where it keeps
+  /// none.
+  #[cfg(test)]
+  pub(crate) fn answered(&mut self, text: Option<Vec<u8>>) {
+    self.want = None;
+    self.text = text;
   }
 
   /// The text the store gave, with its path and node; none where the store kept no such revision or gave no text.
@@ -216,6 +247,60 @@ pub fn log_text_held(
     }
     Log::File(_) => None,
   }
+}
+
+/// The revision whose text a read of the changelog's or the manifest log's revision `rev` needs from the node's
+/// changeset store (goal 93, C1 (1): those logs' texts let go once landed): the first of its chain, from `rev` down, whose
+/// object `store` does not hold whole, by node with its text's length; none where every object it reads is held. With
+/// that one's text given, [`HgIndex::revision_text_over`] rebuilds `rev`'s from it.
+pub fn text_wanted(
+  (index, store): (&HgIndex, &ContentStore),
+  log: Log<'_>,
+  rev: u32,
+) -> Option<(Node, u64)> {
+  if log == Log::Changelog {
+    let row = index.changeset(store, rev)?;
+    return (!store.holds_whole(&row.text)).then_some((row.node, row.len));
+  }
+  let mut at = rev;
+  let mut row = index.revision(store, log, at)?;
+  loop {
+    if !store.holds_whole(&row.bytes) {
+      return Some((row.node, row.len));
+    }
+    // Each base is before its revision, so the walk takes at most `rev` steps.
+    if row.base == crate::index::NONE || row.base >= at {
+      return None;
+    }
+    at = row.base;
+    row = index.revision(store, log, at)?;
+  }
+}
+
+/// The length of the text of the changelog's or the manifest log's revision `node` that `index` holds, and whether its
+/// text is at hand: the object its row names held whole, and for a manifest kept as a delta every object of its chain
+/// (A-729), so [`HgIndex::revision_text`] would read it (goal 93, C1 (1): what the push's intake checks before a step
+/// that reads it). None where the index holds no such revision, or `log` is a file log.
+pub fn log_text_at_hand(
+  (index, store): (&HgIndex, &ContentStore),
+  log: Log<'_>,
+  node: &Node,
+) -> Option<(u64, bool)> {
+  let held = log_text_held((index, store), log, node)?;
+  if log == Log::Changelog || !held.whole {
+    return Some((held.len, held.whole));
+  }
+  let mut at = index.rev(store, log, node)?;
+  let mut row = index.revision(store, log, at)?;
+  // Each base is before its revision, so the walk takes at most `at` steps.
+  while row.base != crate::index::NONE && row.base < at {
+    at = row.base;
+    row = index.revision(store, log, at)?;
+    if !store.holds_whole(&row.bytes) {
+      return Some((held.len, false));
+    }
+  }
+  Some((held.len, true))
 }
 
 /// A changelog's or a manifest log's revision as [`log_text_held`] reads it.

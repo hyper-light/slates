@@ -1777,23 +1777,50 @@ async fn built_works(
       base: base.as_ref(),
       head: &head,
     };
-    let mut layout_room = *room;
-    let begun = crate::state::with_state(|state| {
-      vcs_store::lent_state(state, |state| {
-        let held = held_over(state, repository, forked)?;
-        let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-        Some(tree::begin_work(
-          &moved,
-          (&verified, &held),
-          (room.left(), pace),
-          &mut layout_room,
-        ))
+    let mut layout_texts = 0_u32;
+    let mut building = loop {
+      let mut layout_room = *room;
+      let begun = crate::state::with_state(|state| {
+        vcs_store::lent_state(state, |state| {
+          let held = held_over(state, repository, forked)?;
+          let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+          Some(tree::begin_work(
+            &moved,
+            (&verified, &held),
+            (room.left(), pace),
+            &mut layout_room,
+          ))
+        })
       })
-    })
-    .flatten()?;
-    let mut building = match begun {
-      Ok(building) => building,
-      Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
+      .flatten()?;
+      match begun {
+        Ok(building) => break building,
+        // A changeset or manifest the repository holds whose text was let go once landed (goal 93, C1 (1)): read from the
+        // node's changeset store, brought back over the push's fork, and the trees laid out again; each text once.
+        Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node }))
+          if layout_texts < LAYOUT_TEXTS =>
+        {
+          layout_texts = layout_texts.saturating_add(1);
+          let path = match log {
+            slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
+            _ => slates_hg::push::intake::MANIFEST_PATH,
+          };
+          if bring_back_log_on(
+            &mut ThisShard,
+            repository,
+            forked,
+            (log, path.to_vec()),
+            node,
+          )
+          .await
+          .is_err()
+          {
+            return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+          }
+          let _ = crate::state::with_state(|state| state.count(WORK_LOG_TEXTS_READ, 1));
+        }
+        Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
+      }
     };
     loop {
       let advanced = crate::state::with_state(|state| {
@@ -1952,6 +1979,17 @@ fn brought_back(
 /// status report.
 pub(crate) const LANDED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_texts_brought_back";
 
+/// Derived: the most texts a work's layout reads from the node's changeset store before it lays both trees out
+/// (goal 93, C1 (1)): it lays out two trees, the move's base and its head, each from a changeset and its manifest, and
+/// each text brought back is at hand when it lays out again.
+const LAYOUT_TEXTS: u32 = 4;
+
+/// Counter: a changeset's or a manifest's text a push's work read from the node's changeset store, its windows let go
+/// once landed (goal 93, C1 (1)), before its trees were laid out: what main's P5 measures as a push's asks, the parent's
+/// manifest read back named apart from [`LANDED_LOG_TEXTS_BROUGHT_BACK`]'s homes. Format: a counter name in the status
+/// report.
+pub(crate) const WORK_LOG_TEXTS_READ: &str = "vcs.hg.push_work_log_texts_read";
+
 /// Counter: a landed revision's bring-back refused, the repository holding no such revision on the shard
 /// ([`BringBackRefused::NotHeld`]). Format: a counter name in the status report.
 pub(crate) const BRING_BACK_NOT_HELD: &str = "vcs.hg.landed_bring_back_not_held";
@@ -2022,7 +2060,7 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
   (path, node): (Vec<u8>, Node),
 ) -> Result<(), BringBackRefused> {
   let brought = match whole_log(&path) {
-    Some(log) => bring_back_log_on(lender, repository, (log, path), node).await,
+    Some(log) => bring_back_log_on(lender, repository, None, (log, path), node).await,
     None => bring_back_file_on(lender, repository, (path, node)).await,
   };
   if let Err(refused) = brought {
@@ -2102,11 +2140,12 @@ fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
 async fn bring_back_log_on<L: ShardLender>(
   lender: &mut L,
   repository: RepositoryId,
+  forked: Option<&Forked>,
   (log, path): (slates_hg::index::Log<'static>, Vec<u8>),
   node: Node,
 ) -> Result<(), BringBackRefused> {
   let held = lender
-    .lend(|state| log_held(state, repository, log, &node))
+    .lend(|state| log_held(state, (repository, forked), log, &node))
     .flatten()
     .ok_or(BringBackRefused::NotHeld)?;
   if held.whole {
@@ -2116,7 +2155,7 @@ async fn bring_back_log_on<L: ShardLender>(
   let against = match held.against {
     Some(against) => {
       let len = lender
-        .lend(|state| log_held(state, repository, log, &against))
+        .lend(|state| log_held(state, (repository, forked), log, &against))
         .flatten()
         .ok_or(BringBackRefused::NotHeld)?
         .len;
@@ -2126,7 +2165,13 @@ async fn bring_back_log_on<L: ShardLender>(
     None => None,
   };
   lender
-    .lend(|state| log_put_back(state, (repository, log, &node), (&text, against.as_deref())))
+    .lend(|state| {
+      log_put_back(
+        state,
+        (repository, forked, log, &node),
+        (&text, against.as_deref()),
+      )
+    })
     .unwrap_or(Err(BringBackRefused::NotHeld))
 }
 
@@ -2135,7 +2180,12 @@ async fn bring_back_log_on<L: ShardLender>(
 /// any `lent_state`, as [`file_put_back`] puts a file's.
 fn log_put_back(
   state: &mut ShardState,
-  (repository, log, node): (RepositoryId, slates_hg::index::Log<'static>, &Node),
+  (repository, forked, log, node): (
+    RepositoryId,
+    Option<&Forked>,
+    slates_hg::index::Log<'static>,
+    &Node,
+  ),
   (text, against): (&[u8], Option<&[u8]>),
 ) -> Result<(), BringBackRefused> {
   let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
@@ -2143,9 +2193,10 @@ fn log_put_back(
     let (content, store) = stores
       .mercurial(repository)
       .ok_or(BringBackRefused::NotHeld)?;
-    slates_hg::push::held::bring_back_log((&store.index, content), log, node, (text, against))
+    let index = forked.map_or(&store.index, |forked| &forked.fork);
+    slates_hg::push::held::bring_back_log((index, content), log, node, (text, against))
       .map_err(BringBackRefused::Content)?;
-    slates_hg::push::held::log_text_held((&store.index, content), log, node)
+    slates_hg::push::held::log_text_held((index, content), log, node)
       .ok_or(BringBackRefused::NotHeld)
   })?;
   if !held.whole {
@@ -2174,14 +2225,15 @@ async fn asked_text_on<L: ShardLender>(
 /// [`slates_hg::push::held::log_text_held`] in repository `id`, read with the shard's chunks lent.
 fn log_held(
   state: &mut ShardState,
-  id: RepositoryId,
+  (id, forked): (RepositoryId, Option<&Forked>),
   log: slates_hg::index::Log<'static>,
   node: &Node,
 ) -> Option<slates_hg::push::held::LogTextHeld> {
   vcs_store::lent_state(state, |state| {
     vcs_store::within_budget(state, 0, |stores| {
       let (content, store) = stores.mercurial(id)?;
-      slates_hg::push::held::log_text_held((&store.index, content), log, node)
+      let index = forked.map_or(&store.index, |forked| &forked.fork);
+      slates_hg::push::held::log_text_held((index, content), log, node)
     })
   })
 }
