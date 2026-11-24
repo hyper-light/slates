@@ -104,6 +104,8 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   out: Vec<u8>,
   /// Whether the advertisement was made.
   advertised: bool,
+  /// Whether the store's versions were readied for a fetch (A-718): once, before the session's first fetch.
+  readied: bool,
   /// The answer being written.
   answer: Option<Answer<<L::Packs as PackSource>::Pack>>,
   /// The generation a request's answer began on, held until the answer is written (A-745 rule 4).
@@ -149,6 +151,7 @@ impl<L: StoreLender> UploadCommand<L> {
       input_ended: false,
       out: Vec::new(),
       advertised: false,
+      readied: false,
       answer: None,
       generation: None,
       admission: Admission::new(0),
@@ -464,6 +467,12 @@ impl<L: StoreLender> UploadCommand<L> {
       Err(_) => self.input.len(),
     };
     let request: Vec<u8> = self.input.drain(..length).collect();
+    // A-718: the store's versions derived and encoded once, before the session's first fetch is answered; a listing reads
+    // neither (goal 93, r405: `git ls-remote` after a whole push waited 29 to 54 s for them).
+    if !self.readied && crate::vcs_http::git::upload::fetches(self.version, &request) {
+      self.readied = true;
+      self.lender.encode(self.repository).await;
+    }
     self.serve(Some(&request)).await?;
     Ok(Stepped {
       consumed: length,
@@ -523,8 +532,6 @@ impl<L: StoreLender> Command for UploadCommand<L> {
       if !matches!(self.version, Version::V2) {
         return self.refuse_version();
       }
-      // A-718: the store's versions encoded and kept once, before any of the session's fetches is answered.
-      self.lender.encode(self.repository).await;
       self.serve(None).await?;
       return Ok(Stepped {
         consumed: 0,

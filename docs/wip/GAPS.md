@@ -1367,6 +1367,14 @@
 > windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
 > answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
 > r130's verbs with the lift on.
+> A ref listing waits for nothing a fetch reads BUILT (2026-11-23, w-git; main 01a20182's r405: stock `git ls-remote`
+> right after git/git's whole push took 29 to 54 s in every run, where stock lists its 4,451 refs in under a second).
+> Every upload-pack request but the advertisement derived the repository's unwalked versions whole and waited up to a
+> liveness window on its encoding (A-718's `encode`), a v2 `ls-refs` too; the SSH edge did it at each session's start.
+> Now only a request that may fetch waits (`vcs_http::git::upload::fetches`: every request before v2, and a v2 request
+> naming `fetch` or no command this crate reads; `slates_git::v2::request::command_of`), and SSH before its session's
+> first fetch (`a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding`: 4 turns during the listing before, 0
+> after, the fetch after it still readying the store). Owed: main's rerun of r405's push answer to refs listable.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed

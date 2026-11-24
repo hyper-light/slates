@@ -4318,6 +4318,66 @@ fn a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth() {
   }
 }
 
+/// A v2 `ls-refs` request for every ref, peeled, as `git ls-remote` asks.
+fn ls_refs_all() -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=ls-refs\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [b"peel\n".as_slice(), b"symrefs\n", b"ref-prefix refs/\n"] {
+    pktline::write(Packet::Data(argument), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// Goal 93 (main 01a20182's r405: stock `git ls-remote` right after git/git's whole push waited 29 to 54 s in every
+/// run, where stock lists its 4,451 refs in under a second). Do: start a store-backed daemon with its edge; push a
+/// create of `main` at [`chained_create`]'s tip, a version neither derived nor encoded yet (neither is made ahead while
+/// no fetch is answered, A-856); list its refs over v2 `ls-refs`; then fetch `main`. Expect: the listing `200`, naming
+/// `main` at the tip, with the derivation's and the encoding's turns unmoved by it; and the fetch after it moving them,
+/// so the work the listing skipped is still done for the fetch that reads it. Red before: a listing waited for the
+/// repository's derivation, whole, and its encoding, as a fetch does.
+#[test]
+fn a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let chained = chained_create(CHAIN_FILE, CHAIN_SHALLOW);
+  let created = pushed(edge, &name, &chained.request);
+  let tip = chained.commits.last().expect("a tip").0;
+  let turns = || {
+    counted_on(&daemon, REPOSITORY, "vcs_store.git_derive.turns")
+      + counted_on(&daemon, REPOSITORY, "vcs_store.git_encode.turns")
+  };
+  let before = turns();
+  let listed = uploaded(edge, &name, &ls_refs_all());
+  let after_listing = turns();
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let after_fetch = turns();
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(listed.0, 200);
+  let main = format!("{tip} refs/heads/main");
+  assert!(
+    String::from_utf8_lossy(&listed.1).contains(&main),
+    "the listing names main at the tip: {}",
+    String::from_utf8_lossy(&listed.1)
+  );
+  assert_eq!(
+    after_listing, before,
+    "the listing waited for the derivation or the encoding"
+  );
+  assert_eq!(fetched.0, 200);
+  assert!(
+    after_fetch > after_listing,
+    "the fetch readied the store: {before} {after_listing} {after_fetch}"
+  );
+}
+
 /// The two clones of [`a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole`]: the one commit
 /// deep one (`shallow`) and the whole one (`fetched`) each `200`, each pack's objects the `pushed` bytes.
 fn assert_both_clones_whole(
