@@ -4978,6 +4978,13 @@ async fn init_shard(
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
     nfs_v4_files: None,
+    nfs_parked: Default::default(),
+    #[cfg(target_os = "linux")]
+    fuse_parked: Default::default(),
+    #[cfg(windows)]
+    winfsp_parked: Default::default(),
+    verb_parked: Default::default(),
+    verb_resuming: Default::default(),
     recall_queues: std::collections::BTreeMap::new(),
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
@@ -9212,6 +9219,7 @@ mod tests {
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
     let identity = text.identity;
+    let size = text.size;
     let read = || {
       second
         .observe(shard, move |state| {
@@ -9223,10 +9231,10 @@ mod tests {
           let recovered = state.vcs_stores.unrecovered(repository).is_none()
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
-          let kept = state
-            .vcs_stores
-            .content()
-            .is_some_and(|content| content.contains(&slates_vcs::ContentId(identity)));
+          // RAM keeps no byte of it (A-760 (b) 4d, main's (B)): the recovered green's name keeps its entry, no window.
+          let kept = state.vcs_stores.content().is_some_and(|content| {
+            crate::vcs_store::name_holds::resident(content, identity, size)
+          });
           (recovered, refused, kept)
         })
         .ok()

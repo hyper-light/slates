@@ -1937,6 +1937,29 @@ impl ContentStore {
     Some((identity, start, u64::try_from(away).ok()?))
   }
 
+  /// The window holding byte `offset` of the object `root` names (`len` bytes long), let go or held: its identity and its
+  /// range in the object, for a reader that keeps it while it reads (A-760 (b) 4d). `None` past the object's end, or
+  /// where the store does not hold the path down to it.
+  pub fn window_holding(
+    &self,
+    root: &ContentId,
+    len: u64,
+    offset: u64,
+  ) -> Option<(ContentId, u64, u64)> {
+    let root = &self.resolve(root);
+    let window = u64::try_from(self.window.get()).ok()?;
+    let fanout = u64::try_from(self.fanout.get()).ok()?;
+    let windows = len.div_ceil(window).max(1);
+    let index = offset.checked_div(window)?;
+    if index >= windows {
+      return None;
+    }
+    let height = list_levels(windows, fanout)?;
+    let identity = self.window_identity(root, (height, fanout), index)?;
+    let start = index.checked_mul(window)?;
+    Some((identity, start, len.saturating_sub(start).min(window)))
+  }
+
   /// The identity (the plain BLAKE3 of its bytes) of the object this store keeps as `root`: the name the node's store
   /// keys it by. A root that is a window is its own identity.
   pub fn object_identity(&self, root: &ContentId) -> ContentId {

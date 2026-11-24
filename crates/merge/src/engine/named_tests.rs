@@ -1,7 +1,7 @@
 //! A-760's tests: an increment whose content is named by identity, read in bounded steps, then judged and committed.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -45,6 +45,18 @@ impl Objects for Plane {
   }
 }
 
+/// `path`'s bytes in `green` read through `plane` as a reader does (A-760 (b) 4d): the green's own, or its object's for
+/// a file held by name alone, which then holds no byte.
+fn read_through(green: &Green, path: &str, plane: &Plane) -> Option<Vec<u8>> {
+  match green.content(path)? {
+    super::Content::Bytes(bytes) => Some(bytes.to_vec()),
+    super::Content::Named(identity) => {
+      assert_eq!(green.named_bytes_held(), 0, "a named block holds bytes");
+      plane.objects.get(&identity.hash).cloned()
+    }
+  }
+}
+
 /// A work creating `path` whose bytes are the whole of `object`, named rather than carried.
 fn named_create(path: &str, object: Identity) -> Increment {
   let journal = vec![
@@ -78,7 +90,8 @@ fn named_create(path: &str, object: Identity) -> Increment {
 /// A-760 (main's ruling ~09:10: a large text's landing applied in bounded steps). Do: name a 4 MiB text a work creates;
 /// submit it unread; read its run 64 KiB a step from the plane; submit it again; encode and decode it. Expect: refused
 /// `ContentUnread` before any verdict while unread; read in 64 steps, no read past 64 KiB; then accepted, the green's
-/// file the text's bytes; its encoding the names alone (shorter than the text), decoded with its run unread again.
+/// file the text's name alone (A-760 (b) 4d); its encoding the names alone (shorter than the text), decoded with its run
+/// unread again.
 #[test]
 fn a_named_text_is_read_a_slice_a_step_then_lands_whole() {
   const TEXT: usize = 4 << 20;
@@ -105,7 +118,8 @@ fn a_named_text_is_read_a_slice_a_step_then_lands_whole() {
   let encoded = work.encode();
   assert!(encoded.len() < 4096, "{} bytes encoded", encoded.len());
   assert_eq!(green.submit(&work), Outcome::Accepted { version: 1 });
-  assert_eq!(green.content_bytes("big"), Some(bytes.as_slice()));
+  assert_eq!(green.content("big"), Some(super::Content::Named(object)));
+  assert_eq!(read_through(&green, "big", &plane), Some(bytes));
   round_trips_by_name(&work, &encoded, object);
 }
 
@@ -167,12 +181,12 @@ fn a_named_run_the_plane_lacks_is_refused_typed() {
   assert!(work.post_state.is_empty());
 }
 
-/// A-760 part 2 (Ada's sizing rule: a landing holds a large text once, beside the plane). Do: name a 4 MiB text a work
-/// creates, read it, judge it with `judge_named` and commit the verdict. Expect: accepted as version 1, the green's file
-/// the text's bytes, made of the very buffer the run was read into (the same allocation: no copy, the work left holding
-/// none), and a verdict that never built the file (the work's own buffer is the only one made).
+/// A-760 part 2 (Ada's sizing rule: a landing holds a large text once, beside the plane), and A-760 (b) 4d (a named block
+/// holds no bytes). Do: name a 4 MiB text a work creates, read it, judge it with `judge_named` and commit the verdict.
+/// Expect: accepted as version 1, the work left holding none of the text, and the green's file the text's name alone:
+/// no byte held of it, one hold of its object taken, its bytes the plane's.
 #[test]
-fn a_named_texts_buffer_becomes_the_greens_file_with_no_copy() {
+fn a_named_texts_file_is_its_name_alone() {
   const TEXT: usize = 4 << 20;
   let bytes: Vec<u8> = (0..TEXT)
     .map(|at| u8::try_from(at % 241).unwrap())
@@ -181,8 +195,8 @@ fn a_named_texts_buffer_becomes_the_greens_file_with_no_copy() {
   let object = plane.put(bytes.clone());
   let mut work = named_create("big", object);
   while !work.read_step(&plane, 1 << 20).unwrap() {}
-  let buffer = work.post().runs[0].as_ptr();
   let mut green = Green::new();
+  assert!(green.track_name_holds().is_empty());
   let judged = match green.judge_named(&mut work) {
     super::Judgment::Accepted(judged) => judged,
     other => panic!("not accepted: {other:?}"),
@@ -195,9 +209,14 @@ fn a_named_texts_buffer_becomes_the_greens_file_with_no_copy() {
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
-  let file = green.content_bytes("big").unwrap();
-  assert_eq!(file, bytes.as_slice());
-  assert_eq!(file.as_ptr(), buffer, "the file is not the run's buffer");
+  assert_eq!(green.content("big"), Some(super::Content::Named(object)));
+  assert_eq!(green.named_bytes_held(), 0, "the file holds bytes");
+  assert_eq!(green.take_name_holds(), vec![super::NameHold::Take(object)]);
+  assert_eq!(read_through(&green, "big", &plane), Some(bytes));
+  assert_eq!(
+    green.give_back_name_holds(),
+    vec![super::NameHold::Give(object)]
+  );
 }
 
 /// A-760 part 2. Do: create two files from one named run (the same text twice) and commit. Expect: both files the text's
@@ -249,8 +268,8 @@ fn a_run_two_files_make_is_copied_never_moved_twice() {
     panic!("not accepted");
   };
   green.commit_judged(judged).unwrap();
-  assert_eq!(green.content_bytes("a"), Some(bytes.as_slice()));
-  assert_eq!(green.content_bytes("b"), Some(bytes.as_slice()));
+  assert_eq!(read_through(&green, "a", &plane), Some(bytes.clone()));
+  assert_eq!(read_through(&green, "b", &plane), Some(bytes));
 }
 
 /// A-760 part 2's bug, found 2026-11-20 closing A-760 (C1). Do: a work whose file `a` is the whole of named run 0 (its
@@ -314,8 +333,11 @@ fn a_run_moved_into_its_file_leaves_later_runs_where_they_were() {
     panic!("not accepted");
   };
   green.commit_judged(judged).unwrap();
-  assert_eq!(green.content_bytes("a"), Some(first.as_slice()));
-  assert_eq!(green.content_bytes("b"), second.get(..5));
+  assert_eq!(read_through(&green, "a", &plane), Some(first));
+  assert_eq!(
+    read_through(&green, "b", &plane).as_deref(),
+    second.get(..5)
+  );
 }
 
 /// A green at version 1 holding `base` as the file `big`.
@@ -432,7 +454,6 @@ fn a_splice_into_a_large_file_is_made_a_slice_a_step_before_its_commit() {
     Some(splice_object.len)
   );
   while !work.read_step(&plane, 8).unwrap() {}
-  let whole_buffer = work.post().runs[1].as_ptr();
   let super::Judgment::Accepted(mut judged) = green.judge_named(&mut work) else {
     panic!("not accepted");
   };
@@ -447,14 +468,14 @@ fn a_splice_into_a_large_file_is_made_a_slice_a_step_before_its_commit() {
     "the commit made a file"
   );
   assert_eq!(green.files_made_in_steps(), stepped_before + 1);
-  spliced_and_created(&green, (base, &splice), (&whole, whole_buffer));
+  spliced_and_created(&green, (base, &splice), (&whole, &plane));
 }
 
-/// `big` is `base` with `splice` in its middle, and `new` is `whole`, in the run's own buffer at `whole_buffer`.
+/// `big` is `base` with `splice` in its middle, and `new` is `whole`, held by its name alone (A-760 (b) 4d).
 fn spliced_and_created(
   green: &Green,
   (base, splice): (Vec<u8>, &[u8]),
-  (whole, whole_buffer): (&[u8], *const u8),
+  (whole, plane): (&[u8], &Plane),
 ) {
   let middle = base.len() / 2;
   let mut expected = base;
@@ -463,19 +484,22 @@ fn spliced_and_created(
     green.content_bytes("big") == Some(expected.as_slice()),
     "the spliced file differs"
   );
-  let created = green.content_bytes("new").unwrap();
-  assert_eq!(created, whole);
-  assert_eq!(created.as_ptr(), whole_buffer, "the whole run was copied");
+  assert!(
+    matches!(green.content("new"), Some(super::Content::Named(_))),
+    "the whole run's file is not named"
+  );
+  assert_eq!(read_through(green, "new", plane).as_deref(), Some(whole));
 }
 
 /// Goal 93, A-760 for a recorded version (main 01a20182's ruling of 2026-11-22 ~13:35, the Subversion import's batch:
 /// its real green applies each version as its entry records it, after the scratch member judged it). Do: judge and
 /// commit a work creating `big` from a 4 MiB named run on one green; on a fresh green, apply the version as its entry
-/// records it (`Green::apply_recorded`) from the same work read again. Expect: the replayed file the text's bytes and
-/// the very buffer its run was read into (no copy), its head identity the judged green's. Failing first: the recorded
-/// apply made the file with `apply`, a copy of the run's bytes (the import's 12.3 MB `apply` ← `apply_recorded` site).
+/// records it (`Green::apply_recorded`) from the same work read again. Expect: the replayed file the text's name alone,
+/// holding no byte (A-760 (b) 4d; before, the very buffer its run was read into), its head identity the judged green's.
+/// Failing first: the recorded apply made the file with `apply`, a copy of the run's bytes (the import's 12.3 MB `apply`
+/// ← `apply_recorded` site).
 #[test]
-fn a_recorded_versions_whole_run_becomes_the_file_with_no_copy() {
+fn a_recorded_versions_whole_run_becomes_the_file_by_name() {
   const TEXT: usize = 4 << 20;
   let bytes: Vec<u8> = (0..TEXT)
     .map(|at| u8::try_from(at % 239).unwrap())
@@ -492,17 +516,14 @@ fn a_recorded_versions_whole_run_becomes_the_file_with_no_copy() {
   let (version, applied) = judging.commit_judged(judged).unwrap();
   let mut work = named_create("big", object);
   while !work.read_step(&plane, 1 << 20).unwrap() {}
-  let buffer = work.post().runs[0].as_ptr();
   let mut replaying = Green::new();
   assert_eq!(replaying.apply_recorded(&mut work, &applied), version);
   assert_eq!(replaying.head_identity(), judging.head_identity());
-  let file = replaying.content_bytes("big").unwrap();
-  assert_eq!(file, bytes.as_slice());
   assert_eq!(
-    file.as_ptr(),
-    buffer,
-    "the recorded file is a copy of its run"
+    replaying.content("big"),
+    Some(super::Content::Named(object))
   );
+  assert_eq!(read_through(&replaying, "big", &plane), Some(bytes));
 }
 
 /// Shape: the paths a generated history changes.
@@ -567,6 +588,9 @@ struct NameCensus {
   restored: u64,
   restored_below: u64,
   named_restored: u64,
+  /// Judges and replays refused over an unlent named text, then lent its object and run again (A-760 (b) 4d).
+  judges_lent: u64,
+  replays_lent: u64,
 }
 
 impl NameCensus {
@@ -579,6 +603,8 @@ impl NameCensus {
       && self.restored > 0
       && self.restored_below > 0
       && self.named_restored > 0
+      && self.judges_lent > 0
+      && self.replays_lent > 0
   }
 }
 
@@ -810,10 +836,25 @@ fn point_ops(work: &mut Increment, srcs: &BTreeMap<String, u64>) {
 
 /// `green`'s files and their names are `model`'s, for every one of [`PATHS`].
 fn holds_model(green: &Green, model: &Model, which: &str) -> Result<(), TestCaseError> {
+  // A-760 (b) 4d: a named file holds its object by name alone, so no named block holds a byte.
+  prop_assert_eq!(
+    green.named_bytes_held(),
+    0,
+    "{}'s named blocks hold bytes",
+    which
+  );
   for path in PATHS {
     let held = model.get(path);
+    // Read through the seam: a file's bytes, or the object it is held by, whose bytes are the model's.
+    let read = match green.content(path) {
+      None => None,
+      Some(super::Content::Bytes(bytes)) => Some(bytes.to_vec()),
+      Some(super::Content::Named(identity)) => held
+        .filter(|(bytes, _)| identity.hash == *blake3::hash(bytes).as_bytes())
+        .map(|(bytes, _)| bytes.clone()),
+    };
     prop_assert_eq!(
-      green.content_bytes(path),
+      read.as_deref(),
       held.map(|(bytes, _)| bytes.as_slice()),
       "{}'s bytes at {}",
       which,
@@ -830,6 +871,103 @@ fn holds_model(green: &Green, model: &Model, which: &str) -> Result<(), TestCase
   Ok(())
 }
 
+/// The holds a content store keeps of each object (A-760 (b) 4d): `green`'s drained into it, checked in step with the
+/// green's named blocks, one hold each, never one given back that was not taken.
+fn holds_in_step(
+  green: &mut Green,
+  holds: &mut BTreeMap<Identity, u64>,
+  which: &str,
+) -> Result<(), TestCaseError> {
+  for hold in green.take_name_holds() {
+    match hold {
+      super::NameHold::Take(identity) => *holds.entry(identity).or_default() += 1,
+      super::NameHold::Give(identity) => {
+        let held = holds.get_mut(&identity).filter(|held| **held > 0);
+        let Some(held) = held else {
+          return Err(TestCaseError::fail(format!(
+            "{which} gave back a hold of {identity:?} it never took"
+          )));
+        };
+        *held -= 1;
+        if *held == 0 {
+          holds.remove(&identity);
+        }
+      }
+    }
+  }
+  prop_assert_eq!(
+    holds.values().sum::<u64>(),
+    green.named_blocks() as u64,
+    "{}'s holds out of step with its named blocks",
+    which
+  );
+  Ok(())
+}
+
+/// Lends `green` each of `objects` whole from `plane` (A-760 (b) 4d, a refused verdict's or replay's objects).
+fn lend_all(green: &mut Green, objects: &BTreeSet<Identity>, plane: &Plane) {
+  for identity in objects {
+    let bytes = plane
+      .objects
+      .get(&identity.hash)
+      .expect("the plane holds it")
+      .clone();
+    assert!(
+      green.lend(*identity, bytes) > 0,
+      "a block took {identity:?}"
+    );
+  }
+}
+
+/// `work` judged on `green`, its unlent named texts lent from `plane` and judged again where it was refused for them
+/// (bounded: once lent, a verdict reads nothing more of them).
+fn judge_lending(
+  green: &mut Green,
+  work: &mut Increment,
+  plane: &Plane,
+  census: &mut NameCensus,
+) -> super::Judgment {
+  for _ in 0..3 {
+    let judgment = green.judge_named(work);
+    let super::Judgment::ContentUnread { identity } = judgment else {
+      return judgment;
+    };
+    let unlent = green.unlent_reads(work);
+    assert!(
+      unlent.contains(&identity),
+      "unlent_reads names {identity:?}"
+    );
+    lend_all(green, &unlent, plane);
+    census.judges_lent += 1;
+  }
+  panic!("a judge refused again with its objects lent");
+}
+
+/// `applied` applied to `green` for `work` as its entry records it, its unlent named texts lent from `plane` first,
+/// then let go: the version it committed.
+fn apply_lending(
+  green: &mut Green,
+  work: &mut Increment,
+  applied: &[crate::chain_entry::Applied],
+  (plane, census): (&Plane, &mut NameCensus),
+) -> u64 {
+  let unlent = green.recorded_unlent(work, applied);
+  if !unlent.is_empty() {
+    // Applied unlent, the entry commits nothing.
+    let head = green.head();
+    assert_eq!(
+      green.apply_recorded(&mut work.clone(), applied),
+      head,
+      "applied over an unlent text"
+    );
+    lend_all(green, &unlent, plane);
+    census.replays_lent += 1;
+  }
+  let version = green.apply_recorded(work, applied);
+  green.let_named_bytes_go();
+  version
+}
+
 /// Reads `work`'s runs from `plane` a few bytes a step, so a run is read over several steps.
 fn read_all(work: &mut Increment, plane: &Plane) {
   while !work.read_step(plane, 7).unwrap() {}
@@ -842,6 +980,9 @@ struct History {
   identities: Vec<Identity>,
   judging: Green,
   replaying: Green,
+  /// Each green's content store's holds of the objects (A-760 (b) 4d).
+  judging_holds: BTreeMap<Identity, u64>,
+  replaying_holds: BTreeMap<Identity, u64>,
   model: Model,
   committed: Vec<Committed>,
 }
@@ -851,11 +992,16 @@ impl History {
   fn new() -> History {
     let mut plane = Plane::default();
     let identities = (0..OBJECTS).map(|k| plane.put(object_bytes(k))).collect();
+    // Each green's holds tracked by its owner's store from the start.
+    let (mut judging, mut replaying) = (Green::new(), Green::new());
+    assert!(judging.track_name_holds().is_empty() && replaying.track_name_holds().is_empty());
     History {
       plane,
       identities,
-      judging: Green::new(),
-      replaying: Green::new(),
+      judging,
+      replaying,
+      judging_holds: BTreeMap::new(),
+      replaying_holds: BTreeMap::new(),
       model: Model::new(),
       committed: Vec::new(),
     }
@@ -880,16 +1026,19 @@ impl History {
       return Ok(());
     };
     read_all(&mut work, &self.plane);
-    let super::Judgment::Accepted(mut judged) = self.judging.judge_named(&mut work) else {
+    let judgment = judge_lending(&mut self.judging, &mut work, &self.plane, census);
+    let super::Judgment::Accepted(mut judged) = judgment else {
       return Err(TestCaseError::fail(format!("version {index} not accepted")));
     };
     let moved =
-      |moved: super::HeadMoved| TestCaseError::fail(format!("version {index}: {moved:?}"));
+      |moved: super::CommitRefused| TestCaseError::fail(format!("version {index}: {moved:?}"));
     if version.stepped {
       while !self.judging.make_step(&mut judged, 5).map_err(moved)?.done {}
       census.stepped += 1;
     }
     let (number, applied) = self.judging.commit_judged(judged).map_err(moved)?;
+    // Lent for the verdict and its commit, let go once it is committed.
+    self.judging.let_named_bytes_go();
     let (mut recorded, _) = version_work(
       index,
       self.replaying.head(),
@@ -900,7 +1049,12 @@ impl History {
     .ok_or_else(|| TestCaseError::fail(format!("version {index} changed nothing again")))?;
     read_all(&mut recorded, &self.plane);
     prop_assert_eq!(
-      self.replaying.apply_recorded(&mut recorded, &applied),
+      apply_lending(
+        &mut self.replaying,
+        &mut recorded,
+        &applied,
+        (&self.plane, census)
+      ),
       number
     );
     count_names(&self.model, &after, version, census);
@@ -914,12 +1068,22 @@ impl History {
     });
     holds_model(&self.judging, &self.model, "the judging green")?;
     holds_model(&self.replaying, &self.model, "the replaying green")?;
+    holds_in_step(
+      &mut self.judging,
+      &mut self.judging_holds,
+      "the judging green",
+    )?;
+    holds_in_step(
+      &mut self.replaying,
+      &mut self.replaying_holds,
+      "the replaying green",
+    )?;
     prop_assert_eq!(self.replaying.head_identity(), self.judging.head_identity());
     Ok(())
   }
 
   /// The replaying green replaced by one restored from the judging green's checkpoint at the committed version `pick`
-  /// chooses ([`decoded_and_read`]), caught up by every later committed version applied as its entry records it, then
+  /// chooses ([`decoded`]), caught up by every later committed version applied as its entry records it, then
   /// held to the model (A-869).
   fn restore(&mut self, pick: u8, census: &mut NameCensus) -> Result<(), TestCaseError> {
     if self.committed.is_empty() {
@@ -931,10 +1095,12 @@ impl History {
       .judging
       .checkpoint(at)
       .ok_or_else(|| TestCaseError::fail(format!("no checkpoint at {at}")))?;
-    let mut checkpoint = decoded_and_read(&taken, &self.plane);
+    let checkpoint = decoded(&taken);
     census.named_restored += checkpoint.named.len() as u64;
-    let mut green = Green::restore(crate::origin::Origin::default(), &mut checkpoint)
-      .map_err(|unrestored| TestCaseError::fail(format!("unread: {:?}", unrestored.identity)))?;
+    let mut green = Green::restore(crate::origin::Origin::default(), &checkpoint);
+    // The restored green's holds tracked from its restore: one taken for each named block it restored; the replaying
+    // green it replaces gives back every one of its before it is dropped.
+    let restored_holds = green.track_name_holds();
     census.restored += 1;
     for later in &self.committed[from + 1..] {
       census.restored_below += 1;
@@ -948,25 +1114,56 @@ impl History {
       .ok_or_else(|| TestCaseError::fail(format!("version {} changed nothing", later.index)))?;
       read_all(&mut work, &self.plane);
       prop_assert_eq!(
-        green.apply_recorded(&mut work, &later.applied),
+        apply_lending(&mut green, &mut work, &later.applied, (&self.plane, census)),
         later.number
       );
     }
-    self.replaying = green;
+    let named_before = self.replaying.named_blocks();
+    let given = self.replaying.give_back_name_holds();
+    drop(std::mem::replace(&mut self.replaying, green));
+    prop_assert_eq!(
+      given.len(),
+      named_before,
+      "the replaced green gave back one hold a named block"
+    );
+    for hold in given {
+      let super::NameHold::Give(identity) = hold else {
+        return Err(TestCaseError::fail("a dropped green took a hold"));
+      };
+      let held = self
+        .replaying_holds
+        .get_mut(&identity)
+        .expect("given back what it took");
+      *held -= 1;
+      if *held == 0 {
+        self.replaying_holds.remove(&identity);
+      }
+    }
+    prop_assert!(
+      self.replaying_holds.is_empty(),
+      "holds left after the drop: {:?}",
+      self.replaying_holds
+    );
+    for hold in restored_holds {
+      if let super::NameHold::Take(identity) = hold {
+        *self.replaying_holds.entry(identity).or_default() += 1;
+      }
+    }
+    holds_in_step(
+      &mut self.replaying,
+      &mut self.replaying_holds,
+      "the restored green",
+    )?;
     holds_model(&self.replaying, &self.model, "the restored green")?;
     prop_assert_eq!(self.replaying.head_identity(), self.judging.head_identity());
     Ok(())
   }
 }
 
-/// `taken`'s encoding decoded, equal to it, and its named files read from `plane` a few bytes a step.
-fn decoded_and_read(
-  taken: &crate::checkpoint::Checkpoint,
-  plane: &Plane,
-) -> crate::checkpoint::Checkpoint {
-  let mut checkpoint = crate::checkpoint::Checkpoint::decode(&taken.encode()).unwrap();
+/// `taken`'s encoding decoded, equal to it: its named files read by nothing (A-760 (b) 4d).
+fn decoded(taken: &crate::checkpoint::Checkpoint) -> crate::checkpoint::Checkpoint {
+  let checkpoint = crate::checkpoint::Checkpoint::decode(&taken.encode()).unwrap();
   assert_eq!(&checkpoint, taken, "the checkpoint's encoding round trip");
-  while !checkpoint.read_step(plane, 5).unwrap() {}
   checkpoint
 }
 
@@ -979,6 +1176,9 @@ fn run_names(versions: &[Version], census: &mut NameCensus) -> Result<(), TestCa
       history.restore(pick, census)?;
     }
   }
+  // Every green given back its holds before it is dropped, as an owner does.
+  let _ = history.judging.give_back_name_holds();
+  let _ = history.replaying.give_back_name_holds();
   Ok(())
 }
 
@@ -1057,6 +1257,13 @@ fn generated_version() -> impl Strategy<Value = Version> {
 /// files read from the plane a few bytes a step, restored, and caught up by every later version as its entry records it,
 /// in place of the replaying green. Expect it the model's bytes and names, and the judging green's head identity.
 /// Failing first: a restored green named no file (`left: None`, the checkpoint carried every file's bytes).
+///
+/// A-760 (b) 4c+4d (main's order of 2026-11-23): a named block holds no bytes and one hold of its object. Every judge,
+/// commit and replay reads a named text only lent it from the plane: a judge or replay that would read one unlent is
+/// refused, its objects lent ([`Green::unlent_reads`], [`Green::recorded_unlent`]), and run again, the bytes let go
+/// once it is committed; a restore reads nothing. Expect, after every step, no byte held by a named block and each
+/// green's holds (drained into a model store) in step with its named blocks, a restore's taken afresh. Failing first:
+/// 80 bytes held by named blocks.
 #[test]
 fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
   let fixed = vec![
@@ -1089,6 +1296,7 @@ fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
       restore: Some(2),
     },
   ];
+  let leaked_before = super::dropped_with_name_holds();
   let mut census = NameCensus::default();
   if let Err(failure) = run_names(&fixed, &mut census) {
     panic!("the fixed history: {failure}");
@@ -1110,5 +1318,10 @@ fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
   if let Err(failure) = result {
     panic!("{failure}");
   }
+  assert_eq!(
+    super::dropped_with_name_holds(),
+    leaked_before,
+    "a tracked green was dropped with a hold live"
+  );
   eprintln!("name oracle census: {:?}", census.into_inner());
 }

@@ -209,10 +209,11 @@ impl Source {
     }
   }
 
-  /// The chunk's bytes.
-  fn bytes<'a>(&'a self, blocks: &'a Blocks) -> &'a [u8] {
+  /// The chunk's bytes: none for a block held by its object's name alone (A-760 (b) 4d), which its reader reads
+  /// through its plane.
+  fn bytes<'a>(&'a self, blocks: &'a Blocks) -> Option<&'a [u8]> {
     match self {
-      Source::Owned(bytes) => bytes,
+      Source::Owned(bytes) => Some(bytes),
       Source::Block { block, .. } => blocks.bytes(*block),
     }
   }
@@ -527,18 +528,18 @@ impl Chunks {
     out.extend(painted.into_iter().map(|(_, piece)| piece));
   }
 
-  /// The bytes of `piece`, or none if its chunk is gone (never, while a value names it).
-  fn bytes_of<'a>(&'a self, blocks: &'a Blocks, piece: &Piece) -> &'a [u8] {
+  /// The bytes of `piece`: none if its chunk is gone (never, while a value names it) or is a block held by its
+  /// object's name alone (A-760 (b) 4d).
+  fn bytes_of<'a>(&'a self, blocks: &'a Blocks, piece: &Piece) -> Option<&'a [u8]> {
     self
       .slots
       .get(piece.chunk)
       .and_then(Option::as_ref)
       .and_then(|(source, _)| {
         source
-          .bytes(blocks)
+          .bytes(blocks)?
           .get(piece.at..piece.at.saturating_add(piece.len))
       })
-      .unwrap_or_default()
   }
 }
 
@@ -861,23 +862,26 @@ impl Value {
     }
   }
 
-  /// The value's bytes, copied out of its chunks.
-  pub(crate) fn materialize(&self, chunks: &Chunks, blocks: &Blocks) -> Vec<u8> {
+  /// The value's bytes, copied out of its chunks: none where a piece lies in a block held by its object's name alone
+  /// (A-760 (b) 4d), which its reader reads through its plane ([`Value::whole_block`] names it).
+  pub(crate) fn materialize(&self, chunks: &Chunks, blocks: &Blocks) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(self.len);
     for piece in self.concrete(chunks).iter() {
-      out.extend_from_slice(chunks.bytes_of(blocks, piece));
+      out.extend_from_slice(chunks.bytes_of(blocks, piece)?);
     }
-    out
+    Some(out)
   }
 
   /// The value's bytes in `[from, to)` (clamped to its length), copied out of only the pieces that hold them: what a
   /// paged read of an earlier version takes, without the whole file.
+  ///
+  /// None where a piece it reads lies in a block held by its object's name alone (A-760 (b) 4d).
   pub(crate) fn read(
     &self,
     (chunks, blocks): (&Chunks, &Blocks),
     from: usize,
     to: usize,
-  ) -> Vec<u8> {
+  ) -> Option<Vec<u8>> {
     let to = to.min(self.len);
     let mut out = Vec::with_capacity(to.saturating_sub(from));
     let mut logical = 0usize;
@@ -888,12 +892,12 @@ impl Value {
       if end <= from || start >= to {
         continue;
       }
-      let run = chunks.bytes_of(blocks, piece);
+      let run = chunks.bytes_of(blocks, piece)?;
       let lo = from.max(start).saturating_sub(start);
       let hi = to.min(end).saturating_sub(start);
       out.extend_from_slice(run.get(lo..hi).unwrap_or_default());
     }
-    out
+    Some(out)
   }
 
   /// Whether the value's bytes are `bytes`, compared piece by piece without a copy.
@@ -904,7 +908,9 @@ impl Value {
     }
     let mut at = 0usize;
     for piece in self.concrete(chunks).iter() {
-      let run = chunks.bytes_of(blocks, piece);
+      let Some(run) = chunks.bytes_of(blocks, piece) else {
+        return false;
+      };
       let end = at.saturating_add(run.len());
       if run.len() != piece.len || bytes.get(at..end) != Some(run) {
         return false;
@@ -953,15 +959,21 @@ impl Value {
         let same = match run {
           Applied::Shared(mine) => {
             (mine.chunk == piece.chunk && mine.at == piece.at)
-              || chunks.bytes_of(blocks, &Piece { len: step, ..mine })
-                == chunks.bytes_of(blocks, &Piece { len: step, ..piece })
+              || chunks
+                .bytes_of(blocks, &Piece { len: step, ..mine })
+                .is_some_and(|mine| {
+                  chunks.bytes_of(blocks, &Piece { len: step, ..piece }) == Some(mine)
+                })
           }
           Applied::Post { src, .. } => {
             let added = post_state.span(
               u64::try_from(src).unwrap_or(u64::MAX),
               u64::try_from(step).unwrap_or(u64::MAX),
             );
-            added.len() == step && *added == *chunks.bytes_of(blocks, &Piece { len: step, ..piece })
+            added.len() == step
+              && chunks
+                .bytes_of(blocks, &Piece { len: step, ..piece })
+                .is_some_and(|theirs| *added == *theirs)
           }
         };
         if !same {
@@ -1053,7 +1065,7 @@ impl Value {
       match run {
         Pending::Shared(piece) => {
           let end = out.saturating_add(piece.len);
-          if next.get(out..end) != Some(chunks.bytes_of(blocks, &piece)) {
+          if next.get(out..end) != chunks.bytes_of(blocks, &piece) || next.get(out..end).is_none() {
             return None;
           }
           kept.push(Kept {
@@ -1231,8 +1243,13 @@ pub(crate) fn reanchor(
     return Some(overlaid);
   }
   let latest = values.last()?;
-  let kept = latest.kept_runs((chunks, blocks), ops, blocks.bytes(block))?;
-  let len = blocks.bytes(block).len();
+  // A new block held by its object's name alone (A-760 (b) 4d) is a whole replace by that object: such a block is made
+  // only of one named run that is its object whole, its identity the run's (main 01a20182's ruling of 2026-11-23: the
+  // check is by identity, not skipped), so it keeps nothing, as a whole replace does, and the earlier block stays that
+  // version's.
+  let next = blocks.bytes(block)?;
+  let kept = latest.kept_runs((chunks, blocks), ops, next)?;
+  let len = next.len();
   let latest_before = latest.list_bytes();
   let lists_before = values
     .iter()
@@ -1268,8 +1285,10 @@ pub(crate) fn reanchor(
   }
   let (blocks_cut, bytes_cut) = cut_superseded_blocks(&mut values, chunks, blocks, &kept);
   for value in &mut values {
-    if value.list_bytes() > value.len {
-      let bytes = value.materialize(chunks, blocks);
+    // A value reading a block held by its object's name alone keeps its pieces: there are no bytes to own.
+    if value.list_bytes() > value.len
+      && let Some(bytes) = value.materialize(chunks, blocks)
+    {
       let whole = Value::owned(chunks, bytes);
       let old = std::mem::replace(&mut **value, whole);
       old.release(chunks, blocks);
@@ -1345,7 +1364,7 @@ fn overlay(
     return None;
   };
   let (old, len) = (*old, *len);
-  if len != latest.len || old == block || blocks.bytes(block).len() != len {
+  if len != latest.len || old == block || blocks.len(block) != u64::try_from(len).ok() {
     return None;
   }
   let ranges = overwritten(ops, len)?;
@@ -1353,7 +1372,8 @@ fn overlay(
   if ranges.first() == Some(&(0, len)) {
     return None;
   }
-  let (before, after) = (blocks.bytes(old), blocks.bytes(block));
+  // A block held by its object's name alone has no bytes to layer: the full re-anchor's rule (a whole replace) holds.
+  let (before, after) = (blocks.bytes(old)?, blocks.bytes(block)?);
   // A change that leaves every byte as it was has nothing to layer: the full re-anchor keeps it as before (its new block
   // may be the old one, where content is held once).
   if before == after {
@@ -1514,7 +1534,8 @@ fn cut_superseded_blocks(
       .flat_map(|value| value.pieces.iter())
       .filter(|piece| piece.chunk == chunk)
       .count();
-    if blocks.holders(*block) != 1 || named_here != *refs {
+    // A block held by its object's name alone (A-760 (b) 4d) has no bytes to cut to: it is left whole, its hold with it.
+    if blocks.holders(*block) != 1 || named_here != *refs || blocks.bytes(*block).is_none() {
       continue;
     }
     // The union of the runs still named, in chunk order: each run's place in the owned copy.
@@ -1532,29 +1553,37 @@ fn cut_superseded_blocks(
         Some((_, last_end, _)) if start <= *last_end => {
           if end > *last_end {
             let from = *last_end;
-            owned.extend_from_slice(chunks.bytes_of(
-              blocks,
-              &Piece {
-                chunk,
-                at: from,
-                len: end.saturating_sub(from),
-                epoch: CURRENT,
-              },
-            ));
+            owned.extend_from_slice(
+              chunks
+                .bytes_of(
+                  blocks,
+                  &Piece {
+                    chunk,
+                    at: from,
+                    len: end.saturating_sub(from),
+                    epoch: CURRENT,
+                  },
+                )
+                .unwrap_or_default(),
+            );
             *last_end = end;
           }
         }
         _ => {
           let place = owned.len();
-          owned.extend_from_slice(chunks.bytes_of(
-            blocks,
-            &Piece {
-              chunk,
-              at: start,
-              len: end.saturating_sub(start),
-              epoch: CURRENT,
-            },
-          ));
+          owned.extend_from_slice(
+            chunks
+              .bytes_of(
+                blocks,
+                &Piece {
+                  chunk,
+                  at: start,
+                  len: end.saturating_sub(start),
+                  epoch: CURRENT,
+                },
+              )
+              .unwrap_or_default(),
+          );
           union.push((start, end, place));
         }
       }
@@ -1816,7 +1845,7 @@ mod tests {
         for (value, expected) in values.iter().zip(&bytes) {
           prop_assert!(value.list_bytes() <= value.len().max(PIECE_BYTES));
           prop_assert!(value.equals((&chunks, files.blocks()), expected));
-          prop_assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+          prop_assert_eq!(&value.materialize(&chunks, files.blocks()).unwrap(), expected);
         }
         prop_assert_eq!(chunks.referenced_bytes(values.iter()), chunks.bytes());
       }
@@ -1969,7 +1998,7 @@ mod tests {
         for ((value, tree), expected) in values.iter().zip(&versions).zip(&bytes) {
           let read = tree_bytes(&trees, tree, &sources);
           prop_assert_eq!(&read, expected);
-          prop_assert_eq!(&read, &value.materialize(&chunks, files.blocks()));
+          prop_assert_eq!(&read, &value.materialize(&chunks, files.blocks()).unwrap());
           let len = expected.len();
           let from = if len == 0 { 0 } else { usize::from(range.0) % len };
           let take = usize::from(range.1) % (len - from + 1);
@@ -1977,7 +2006,7 @@ mod tests {
           trees.read(tree, (from as u64, take as u64), &mut |run| {
             cut.extend_from_slice(&sources[run.source][run.at as usize..(run.at + run.len) as usize]);
           }).unwrap();
-          let reanchored = value.read((&chunks, files.blocks()), from, from + take);
+          let reanchored = value.read((&chunks, files.blocks()), from, from + take).unwrap();
           prop_assert_eq!(&cut, &reanchored);
           prop_assert_eq!(&cut[..], &expected[from..from + take]);
         }
@@ -2052,12 +2081,12 @@ mod tests {
         };
         for ((value, tree), expected) in values.iter().zip(&versions).zip(&bytes).skip(floor) {
           prop_assert_eq!(&read(tree, (0, expected.len() as u64)), expected);
-          prop_assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+          prop_assert_eq!(&value.materialize(&chunks, files.blocks()).unwrap(), expected);
           let len = expected.len();
           let from = if len == 0 { 0 } else { usize::from(range.0) % len };
           let take = usize::from(range.1) % (len - from + 1);
           let cut = read(tree, (from as u64, take as u64));
-          prop_assert_eq!(&cut, &value.read((&chunks, files.blocks()), from, from + take));
+          prop_assert_eq!(&cut, &value.read((&chunks, files.blocks()), from, from + take).unwrap());
         }
         let held: usize = stored.iter().map(Vec::len).sum();
         prop_assert!(held <= removed);
@@ -2108,7 +2137,10 @@ mod tests {
     );
     assert_eq!(files.blocks().live(), 1, "the current file's block alone");
     for (value, expected) in values.iter().zip(&versions) {
-      assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+      assert_eq!(
+        &value.materialize(&chunks, files.blocks()).unwrap(),
+        expected
+      );
     }
     release_all(&mut chunks, &mut files, values);
   }
@@ -2161,7 +2193,10 @@ mod tests {
     expected: &[&Vec<u8>],
   ) {
     for (value, expected) in values.iter().zip(expected) {
-      assert_eq!(&&value.materialize(chunks, files.blocks()), expected);
+      assert_eq!(
+        &&value.materialize(chunks, files.blocks()).unwrap(),
+        expected
+      );
     }
     for value in values {
       value.release(chunks, files.blocks_mut());
@@ -2196,7 +2231,10 @@ mod tests {
     );
     files.blocks_mut().release(held);
     for (value, expected) in values.iter().zip([&first, &next]) {
-      assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+      assert_eq!(
+        &value.materialize(&chunks, files.blocks()).unwrap(),
+        expected
+      );
     }
     release_all(&mut chunks, &mut files, values);
     FULL_REANCHOR_ONLY.with(|full| full.set(false));
@@ -2224,7 +2262,10 @@ mod tests {
       "the current block alone once the holder goes"
     );
     for (value, expected) in values.iter().zip([&first, &next]) {
-      assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+      assert_eq!(
+        &value.materialize(&chunks, files.blocks()).unwrap(),
+        expected
+      );
     }
     release_all(&mut chunks, &mut files, values);
   }

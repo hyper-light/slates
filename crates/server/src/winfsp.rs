@@ -207,6 +207,10 @@ pub(crate) struct WinFspMount {
   /// Flush replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
   /// first ([`settle_held`]); bounded by `live_ship::reply_hold_bound`. WinFsp's dispatcher waits on each meanwhile.
   held: VecDeque<HeldFlush>,
+  /// The request parked on a read of a named text's let-go window while it comes back (A-760 (b) 4d): a copy of it
+  /// answering on its reply channel, served again in its place once the windows are back (`ready`); its dispatcher
+  /// thread waits on the reply meanwhile. One a mount: a mount serves one request a turn.
+  parked: Option<ParkedRequest>,
   /// What this mount's journal reader's rounds have shown of Windows' pace (A-548): the reader's patience is learned
   /// from them after every turn (`crate::reader_patience`).
   patience: crate::learned_wait::LearnedWait,
@@ -707,6 +711,7 @@ fn keep(
       released: false,
       _own: own,
       held: VecDeque::new(),
+      parked: None,
       patience: crate::learned_wait::LearnedWait::default(),
     },
   );
@@ -970,6 +975,9 @@ async fn idle_or_sleep(ns: u64) {
 enum Turned {
   /// Nothing waited: the task waits for a request, a change, or the mount thread.
   Idle,
+  /// A request read a named text's let-go window: parked unanswered (`WinFspMount::parked`) for its windows to come
+  /// back (A-760 (b) 4d).
+  Parked,
   /// A request was served.
   Served,
   /// A round's gather stopped where its slice ended and no round went out whose return would wake the task (A-562): it
@@ -985,10 +993,72 @@ enum Turned {
   Ended,
 }
 
+/// A request parked on reads of a named text's let-go windows (A-760 (b) 4d; main's ruling: one entry per parked request
+/// in the shard's table, bounded by the bridge's in-flight bound): its copy, the reads it waits on, its entry, and
+/// whether its windows are back for it to be served again.
+struct ParkedRequest {
+  request: Request,
+  reads: Vec<crate::vcs_store::named_objects::AwayRead>,
+  entry: u64,
+  ready: bool,
+}
+
+/// Format: requests parked on a read of a named text's let-go window while it came back from the node's store, then
+/// served again (A-760 (b) 4d; main's ruling (B)).
+const PARKED_ON_AWAY: &str = "winfsp.parked_on_away";
+/// Format: requests refused a park because the shard's table was at its bound: answered as served, an I/O error.
+const PARK_REFUSED: &str = "winfsp.park_refused";
+/// Format: a request served again over the windows it was parked on that met a let-go window again: a bug, answered as
+/// served (an I/O error) and logged naming the object, never parked again.
+const AWAY_AGAIN: &str = "winfsp.away_again";
+/// Format: a parked request whose windows the node's store did not give back: answered `STATUS_UNEXPECTED_IO_ERROR`.
+const BRING_BACK_REFUSED: &str = "winfsp.bring_back_refused";
+
 /// The serve task of one mount, once it is recorded: turn until the mount ends, then tear it down and reap its thread.
+/// A request parked on a let-go window (A-760 (b) 4d) has its windows brought back here, kept until its next turn serves
+/// it again.
 async fn serve(attachment: u64) {
+  let mut _pins: Vec<crate::vcs_store::named_objects::ReadPin> = Vec::new();
   loop {
-    match state::with_state(|s| turn(s, attachment)) {
+    let turned = state::with_state(|s| turn(s, attachment));
+    _pins = Vec::new();
+    if let Some(Turned::Parked) = turned {
+      let reads = state::with_state(|s| {
+        s.winfsp_mounts
+          .get(&attachment)
+          .and_then(|mount| mount.parked.as_ref())
+          .map(|parked| parked.reads.clone())
+      })
+      .flatten()
+      .unwrap_or_default();
+      let _ = state::with_state_counted(|s| s.count(PARKED_ON_AWAY, 1));
+      match crate::vcs_store::named_objects::bring_back_reads(&reads).await {
+        Ok(pins) => {
+          _pins = pins;
+          let _ = state::with_state(|s| {
+            if let Some(parked) = s
+              .winfsp_mounts
+              .get_mut(&attachment)
+              .and_then(|mount| mount.parked.as_mut())
+            {
+              parked.ready = true;
+            }
+          });
+        }
+        Err(refused) => {
+          let _ = state::with_state_counted(|s| {
+            s.count(BRING_BACK_REFUSED, 1);
+            refuse_parked(s, attachment);
+          });
+          slates_machine::log_line!(
+            "slates-server: a WinFsp request parked on {:?} was not brought back: {refused:?}",
+            reads.first().map(|read| read.identity)
+          );
+        }
+      }
+      continue;
+    }
+    match turned {
       Some(Turned::Ended) | None => {
         if let Some(Some((thread, released))) = state::with_state_counted(|s| ended(s, attachment))
         {
@@ -1010,7 +1080,8 @@ async fn wait_after(turned: Turned) {
       slates_rt::registry::with_current(|ctx| ctx.note_activity());
       let _ = futures::yield_now().await;
     }
-    Turned::Continued => {
+    // A parked request's windows are brought back by the serve loop before it waits (A-760 (b) 4d).
+    Turned::Continued | Turned::Parked => {
       let _ = futures::yield_now().await;
     }
     // `Ended` never reaches here: the loop ends the mount before it waits.
@@ -1093,10 +1164,28 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     .volumes
     .get_mut(handle)
     .is_ok_and(|slot| slot.volume.wait_for_change(mount.seen, &mount.waker));
-  let request = match mount.requests.as_ref().map(Receiver::try_recv) {
-    Some(Ok(request)) => Some(request),
-    Some(Err(TryRecvError::Empty)) => None,
-    Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
+  // A parked request whose windows are back is served again before any other (A-760 (b) 4d), once: its entry goes.
+  let reserved = match mount.parked.take() {
+    Some(parked) if parked.ready => {
+      s.winfsp_parked.release(parked.entry);
+      Some(parked.request)
+    }
+    still => {
+      mount.parked = still;
+      None
+    }
+  };
+  if mount.parked.is_some() {
+    return Turned::Parked;
+  }
+  let again = reserved.is_some();
+  let request = match reserved {
+    Some(request) => Some(request),
+    None => match mount.requests.as_ref().map(Receiver::try_recv) {
+      Some(Ok(request)) => Some(request),
+      Some(Err(TryRecvError::Empty)) => None,
+      Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
+    },
   };
   if request.is_none() && !changed && !mount.owed {
     let retry_in = earliest(send_due_retries(s, mount), held_in);
@@ -1111,82 +1200,93 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   };
   // A round's gather runs a slice a turn (A-562), timed against the shard's live quantum as every clock-bounded slice is.
   let slice_ns = s.config.copy_slice_ns();
-  let turned = {
-    // A mounted work whose base moved shows its new base (A-774 R4).
-    crate::mounted_work::refresh(s, mount.volume);
-    let ShardState {
-      store,
-      volumes,
-      greens,
-      merge,
-      ..
-    } = &mut *s;
-    // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774, C1).
-    let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
-    let green_tree = lent_green
-      .as_ref()
-      .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
-    let mut tree_lens = None;
-    volumes.get_mut(handle).ok().map(|slot| {
-      let WinFspMount {
-        handles,
-        names,
-        ledger,
-        takeover,
-        coherence,
-        round_out,
-        purge_out,
-        owed,
-        siblings,
-        siblings_widened,
-        thread,
-        told,
-        volume,
-        ..
-      } = &mut *mount;
-      let mut bridge = VolumeBridge::attached(
-        *volume,
-        &mut slot.volume,
+  // A mounted work's base held by name is read through the content store, its chunks lent for the turn (A-760 (b) 4d).
+  let lend = crate::mounted_work::reads_named(s, mount.volume);
+  // Kept where a read of its base may meet a let-go window, to be parked and served again (A-760 (b) 4d).
+  let keep = request.as_ref().filter(|_| lend).map(Request::kept);
+  let (turned, away) = crate::vcs_store::named_objects::away_scope(|| {
+    crate::vcs_store::svn_presenter::lent_if(s, lend, |s| {
+      // A mounted work whose base moved shows its new base (A-774 R4).
+      crate::mounted_work::refresh(s, mount.volume);
+      let ShardState {
         store,
-        handles,
-        slot
-          .host
-          .as_mut()
-          .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens)),
-      );
-      let delivered = deliver_owed(
-        &mut bridge,
-        &cx,
-        Rounds {
-          coherence,
+        volumes,
+        greens,
+        merge,
+        vcs_stores,
+        ..
+      } = &mut *s;
+      // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774, C1).
+      let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
+      let green_tree = lent_green.as_ref().map(|(green, version)| {
+        crate::green_tree::GreenTree::reading(
+          green,
+          *version,
+          crate::vcs_store::named_objects::plane(vcs_stores, &()),
+        )
+      });
+      let mut tree_lens = None;
+      volumes.get_mut(handle).ok().map(|slot| {
+        let WinFspMount {
+          handles,
           names,
+          ledger,
+          takeover,
+          coherence,
           round_out,
-          purge_out: *purge_out,
+          purge_out,
           owed,
-          siblings: Siblings {
-            owed: siblings,
-            widened: siblings_widened,
-          },
+          siblings,
+          siblings_widened,
           thread,
           told,
-          takeover,
-        },
-        slice_ns,
-      );
-      let served = request.map(|request| {
-        let served = request.serve(&mut bridge, &cx, names, ledger);
-        if let Some(sibling) = served.sibling_change() {
-          // The file's other names have file nodes and caches of their own (A-360): the next round tells them. Telling
-          // them before this reply would make the receive worker wait on a notification whose purge may need it.
-          owe_siblings(siblings, siblings_widened, names, sibling);
-          *owed = true;
-        }
-        coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
-        served
-      });
-      (served, delivered)
+          volume,
+          ..
+        } = &mut *mount;
+        let mut bridge = VolumeBridge::attached(
+          *volume,
+          &mut slot.volume,
+          store,
+          handles,
+          slot
+            .host
+            .as_mut()
+            .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens)),
+        );
+        let delivered = deliver_owed(
+          &mut bridge,
+          &cx,
+          Rounds {
+            coherence,
+            names,
+            round_out,
+            purge_out: *purge_out,
+            owed,
+            siblings: Siblings {
+              owed: siblings,
+              widened: siblings_widened,
+            },
+            thread,
+            told,
+            takeover,
+          },
+          slice_ns,
+        );
+        let served = request.map(|request| {
+          let served = request.serve(&mut bridge, &cx, names, ledger);
+          if let Some(sibling) = served.sibling_change() {
+            // The file's other names have file nodes and caches of their own (A-360): the next round tells them. Telling
+            // them before this reply would make the receive worker wait on a notification whose purge may need it.
+            owe_siblings(siblings, siblings_widened, names, sibling);
+            *owed = true;
+          }
+          coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
+          served
+        });
+        (served, delivered)
+      })
     })
-  };
+  });
   s.attachments.end(mount.registry);
   let Some((served, delivered)) = turned else {
     return Turned::Ended;
@@ -1212,6 +1312,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   }
   let retry_in = earliest(send_due_retries(s, mount), held_in);
   match served {
+    // Its read met a let-go window (A-760 (b) 4d): parked unanswered, its copy served again once the windows are back.
+    Some(served) if !away.is_empty() => park(s, mount, served, (keep, away, again)),
     Some(served) => {
       answer(s, mount, served);
       Turned::Served
@@ -1221,6 +1323,64 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     None if mount.owed && mount.round_out.is_none() && !mount.purge_out => Turned::Continued,
     None => retry_in.map_or(Turned::Idle, Turned::RetryIn),
   }
+}
+
+/// A request whose serve met reads of let-go windows (`away`; A-760 (b) 4d): parked, `served` dropped unanswered and its
+/// copy `keep` kept (its dispatcher thread waits on the copy's reply), for the windows to come back; answered as served
+/// (an I/O error) where it cannot be (no copy, or the shard's table at its bound), counted; and one served again over
+/// windows it was parked on that met one again (`again`) is a bug, answered so, counted and logged.
+fn park(
+  s: &mut ShardState,
+  mount: &mut WinFspMount,
+  served: slates_bridge_winfsp::host::Served,
+  (keep, away, again): (
+    Option<Request>,
+    Vec<crate::vcs_store::named_objects::AwayRead>,
+    bool,
+  ),
+) -> Turned {
+  if again {
+    s.count(AWAY_AGAIN, 1);
+    slates_machine::log_line!(
+      "slates-server: a WinFsp request served again over its brought-back windows met {:?} let go again",
+      away.first().map(|read| read.identity)
+    );
+    answer(s, mount, served);
+    return Turned::Served;
+  }
+  // One a mount, a mount an attachment: bounded by the attachments a shard admits.
+  let bound = slates_bridge_core::authority::MAX_ATTACHMENTS;
+  let entry = keep
+    .is_some()
+    .then(|| s.winfsp_parked.park(away.clone(), bound))
+    .flatten();
+  let (Some(request), Some(entry)) = (keep, entry) else {
+    s.count(PARK_REFUSED, 1);
+    answer(s, mount, served);
+    return Turned::Served;
+  };
+  drop(served);
+  mount.parked = Some(ParkedRequest {
+    request,
+    reads: away,
+    entry,
+    ready: false,
+  });
+  Turned::Parked
+}
+
+/// Answers `attachment`'s parked request `STATUS_UNEXPECTED_IO_ERROR` without serving it, its entry released: a refused
+/// bring-back, or a mount ending with one parked (A-760 (b) 4d).
+fn refuse_parked(s: &mut ShardState, attachment: u64) {
+  let Some(parked) = s
+    .winfsp_mounts
+    .get_mut(&attachment)
+    .and_then(|mount| mount.parked.take())
+  else {
+    return;
+  };
+  s.winfsp_parked.release(parked.entry);
+  let _ = parked.request.refuse_io();
 }
 
 /// Settles the image's open-reference counts before taking a captured cleanup/close or any fresh operation. A missing
@@ -1698,6 +1858,8 @@ fn answer(
 /// reader closed, its registry attachment revoked and drained, and its attachment ended as a recorded operation when it
 /// still stands. Returns its thread, for the task to reap off the shard, and whether the anchor has released it.
 fn ended(s: &mut ShardState, attachment: u64) -> Option<(MountThread, bool)> {
+  // A parked request is answered before the mount goes (A-760 (b) 4d), its entry released.
+  refuse_parked(s, attachment);
   let mut mount = s.winfsp_mounts.remove(&attachment)?;
   mount.requests = None;
   close_journal_reader(s, &mount);

@@ -147,12 +147,6 @@ fn answered(number: u64) -> Result<Committed, Uncommitted> {
   })
 }
 
-/// What the green holds at `path`: a file's bytes.
-fn green_file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
-  let engine = state.greens.get(&green)?;
-  engine.content_bytes(path).map(<[u8]>::to_vec)
-}
-
 /// Whether the green holds a directory at `path`.
 fn green_dir(state: &ShardState, green: DbVolumeId, path: &str) -> bool {
   state
@@ -345,8 +339,8 @@ fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
     assert_eq!(committed, answered(1));
     let seen = (
       on(|state| green_head(state, green)),
-      on(|state| green_file(state, green, "trunk/a.txt")),
-      on(|state| green_file(state, green, "trunk/sub/b.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await,
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/sub/b.txt").await,
       on(|state| green_dir(state, green, "trunk/sub")),
       on(|state| green_props(state, green, "trunk")),
     );
@@ -426,10 +420,10 @@ fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
     assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let after_copy = (
       on(|state| green_props(state, green, "branches/b")),
-      on(|state| green_file(state, green, "branches/b/a.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "branches/b/a.txt").await,
       on(|state| green_dir(state, green, "branches/b/sub")),
-      on(|state| green_file(state, green, "branches/b/sub/b.txt")),
-      on(|state| green_file(state, green, "trunk/a.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "branches/b/sub/b.txt").await,
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await,
     );
     let expected = (
       Some(identity(&ignores()).to_vec()),
@@ -448,7 +442,7 @@ fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
     let gone = (
       on(|state| green_dir(state, green, "trunk")),
       on(|state| green_dir(state, green, "trunk/sub")),
-      on(|state| green_file(state, green, "trunk/sub/b.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/sub/b.txt").await,
     );
     assert_eq!(gone, (false, false, None));
     let native = list("svn:eol-style", "native");
@@ -460,7 +454,7 @@ fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
     assert_eq!(commit((&owner(), svn), replacing, None).await, answered(4));
     let after = (
       on(|state| green_head(state, green)),
-      on(|state| green_file(state, green, "branches/b/a.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "branches/b/a.txt").await,
       on(|state| green_props(state, green, "branches/b/a.txt")),
     );
     let expected = (
@@ -502,8 +496,8 @@ fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
     assert_eq!(commit((&owner(), svn), two, judged).await, answered(3));
     let both = (
       on(|state| green_head(state, green)),
-      on(|state| green_file(state, green, "trunk/a.txt")),
-      on(|state| green_file(state, green, "trunk/sub/b.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await,
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/sub/b.txt").await,
     );
     assert_eq!(
       both,
@@ -922,8 +916,8 @@ fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
     assert_eq!(committed, answered(2));
     let seen = (
       on(|state| green_head(state, green)),
-      on(|state| green_file(state, green, "trunk/a.txt")),
-      on(|state| green_file(state, green, "trunk/b.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await,
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/b.txt").await,
     );
     assert_eq!(
       seen,
@@ -1087,6 +1081,14 @@ fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
   stored(|| async move {
     let (svn, _) = subversion("held").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    // The text's windows, let go once it landed (A-760 (b) 4d, main's (B)), brought back and kept while it is read.
+    let alpha_text = slates_merge::named::Identity {
+      hash: identity(b"alpha\n"),
+      len: 6,
+    };
+    let _pin = crate::vcs_store::named_objects::bring_back_range(alpha_text, (0, alpha_text.len))
+      .await
+      .expect("brought back");
     let (_, _, charged) = on(|state| kept(state, svn));
     let retained = on(|state| state.store.budget.retained());
     let hold =
@@ -1141,10 +1143,20 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
     pieces: None,
   };
   use slates_svn::migration::TextSource;
-  assert!(matches!(
-    texts.text(&identity(b"gamma\n")),
-    Some(std::borrow::Cow::Borrowed(b"gamma\n"))
-  ));
+  // The head's text is the green's by its name alone (A-760 (b) 4c): no byte of it held, so a view without the content
+  // store reads none of it from the green; a reader with the store reads it there (`named_objects::read_held_brought`).
+  let gamma = identity(b"gamma\n");
+  assert_eq!(
+    engine.held(&gamma),
+    Some(slates_merge::engine::Content::Named(
+      slates_merge::named::Identity {
+        hash: gamma,
+        len: 6
+      }
+    ))
+  );
+  assert_eq!(engine.named_bytes_held(), 0, "a named block holds bytes");
+  assert!(texts.text(&gamma).is_none(), "read from the green's RAM");
   // An earlier text is its changeset's on the node's store: the records name it, RAM holds none of it (C2 stage B
   // part 2 (b)), and a reader reads it through the store.
   let alpha = identity(b"alpha\n");
@@ -1160,28 +1172,30 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
 /// deleting `/trunk`; 4, replacing `/branches/b/a.txt` by another text; reading each text through the sources' text
 /// source after each. Expect: after 1 the green holds both texts; after 2 those of `trunk` and the branch's changed
 /// `a.txt`, each once though two rows reach it; after 3 the branch's alone; after 4 only the replacing text; each held
-/// text read from the green, borrowed, and an earlier text nowhere in RAM (its changeset's on the node's store).
+/// text read through the green's name for it from the content plane (A-760 (b) 4d), and an earlier text nowhere in RAM (its changeset's on the node's store).
 #[test]
 fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
   stored(|| async move {
     let (svn, green) = subversion("svn").await;
-    let held_by_green = |state: &mut ShardState| {
-      let engine = state.greens.get(&green).expect("the green");
+    // Each text read through the green's name for it, its windows brought back from the node's store first.
+    let held_by_green = || async move {
+      let count = on(|state| state.greens.get(&green).expect("the green").held_count());
       let texts: [&[u8]; 5] = [b"alpha\n", b"beta\n", b"alpha 2\n", b"gamma\n", b"never\n"];
-      let each: Vec<bool> = texts
-        .iter()
-        .map(|bytes| engine.held_bytes(&identity(bytes)) == Some(*bytes))
-        .collect();
-      (engine.held_count(), each)
+      let mut each = Vec::new();
+      for bytes in texts {
+        let read = crate::vcs_store::named_objects::read_held_brought(green, identity(bytes)).await;
+        each.push(read.as_deref() == Some(bytes));
+      }
+      (count, each)
     };
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     assert_eq!(
-      on(|state| held_by_green(state)),
+      held_by_green().await,
       (2, vec![true, true, false, false, false])
     );
     assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     assert_eq!(
-      on(|state| held_by_green(state)),
+      held_by_green().await,
       (3, vec![true, true, true, false, false])
     );
     let deleted = revision(
@@ -1191,7 +1205,7 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
     );
     assert_eq!(commit((&owner(), svn), deleted, None).await, answered(3));
     assert_eq!(
-      on(|state| held_by_green(state)),
+      held_by_green().await,
       (1, vec![false, false, true, false, false])
     );
     let replacing = revision(
@@ -1201,7 +1215,7 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
     );
     assert_eq!(commit((&owner(), svn), replacing, None).await, answered(4));
     assert_eq!(
-      on(|state| held_by_green(state)),
+      held_by_green().await,
       (1, vec![false, false, false, true, false])
     );
     on(|state| assert_read_through_the_green(state, (svn, green)));
@@ -1230,14 +1244,14 @@ fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
       drop(engine);
       crate::vcs_store::svn_texts::rehold_head(state, svn, green);
       crate::vcs_store::svn_texts::rehold_head(state, svn, green);
-      let engine = state.greens.get(&green).expect("the green");
-      let held: Vec<bool> = texts
-        .iter()
-        .map(|bytes| engine.held_bytes(&identity(bytes)) == Some(*bytes))
-        .collect();
-      (engine.held_count(), held)
+      state.greens.get(&green).expect("the green").held_count()
     });
-    assert_eq!(seen, (3, vec![true, true, true]));
+    let mut held = Vec::new();
+    for bytes in texts {
+      let read = crate::vcs_store::named_objects::read_held_brought(green, identity(bytes)).await;
+      held.push(read.as_deref() == Some(bytes));
+    }
+    assert_eq!((seen, held), (3, vec![true, true, true]));
   });
 }
 
@@ -1341,19 +1355,31 @@ fn a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increm
     },
     std::time::Duration::from_secs(60),
   );
-  let (file, kept, fetched) = crate::daemon::observe_first(&daemon, move |state| {
-    let green = super::green_of(state, id).ok();
-    let file = green.and_then(|green| green_file(state, green, "trunk/b.bin"));
-    let kept = state
-      .vcs_stores
-      .content()
-      .is_some_and(|content| content.contains(&slates_vcs::ContentId(named.identity)));
-    let fetched = state
+  // RAM holds none of what the commit brought (main's (B)): the green's name keeps its entry, no window resident;
+  // looked at before the read below brings its windows back.
+  let kept = crate::daemon::observe_first(&daemon, move |state| {
+    resident(state, (named.identity, named.size))
+  });
+  let green = crate::daemon::observe_first(&daemon, move |state| super::green_of(state, id).ok());
+  // The green's file read through its name, its windows brought back from the node's store (A-760 (b) 4d).
+  let file = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      match green {
+        Some(green) => {
+          crate::vcs_store::named_objects::read_file_brought(green, "trunk/b.bin").await
+        }
+        None => None,
+      }
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let fetched = crate::daemon::observe_first(&daemon, move |state| {
+    state
       .refusals
       .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
       .copied()
-      .unwrap_or(0);
-    (file, kept, fetched)
+      .unwrap_or(0)
   });
   daemon.stop();
   assert!(matches!(landed, Some(Ok(2))), "{landed:?}");
@@ -1609,6 +1635,13 @@ fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is
 /// the green's file the text, and the session's read whole (the head's files are the green's; a text nothing in RAM
 /// holds is read through the store, held by the stage's (a) tests). Before, the content store held every committed text
 /// until the deltify job made it a delta in RAM.
+///
+/// A-760 (b) 4c+4d (main's ruling (B) of 2026-11-23): the property is that RAM holds none of a landed text's bytes. The
+/// green now holds its file by the text's name with one hold of the content store, so the store's entry legitimately
+/// stays and `ContentStore::contains` is true; the assertion moved from "no entry" to what it always meant, no window of
+/// the text resident (the landing lets them go once its changeset is durable), with the green's one hold and no byte
+/// held by its named blocks. It did not weaken: an entry holds no bytes. The green's file and the session's read bring
+/// the windows back from the node's store.
 #[test]
 fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() {
   use slates_svn::commit::drive::TextSink;
@@ -1659,15 +1692,23 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
     },
     std::time::Duration::from_secs(60),
   );
-  let kept = crate::daemon::observe_first(&daemon, move |state| {
-    state
-      .vcs_stores
-      .content()
-      .is_some_and(|content| content.contains(&slates_vcs::ContentId(named.identity)))
+  let (kept, holders, named_held) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      resident(state, (named.identity, named.size)),
+      store_holders(state, named.identity),
+      state
+        .greens
+        .get(&green)
+        .map(|engine| engine.named_bytes_held()),
+    )
   });
-  let file = crate::daemon::observe_first(&daemon, move |state| {
-    green_file(state, green, "trunk/a.bin")
-  });
+  let file = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.bin").await
+    },
+    std::time::Duration::from_secs(60),
+  );
   // A session's read: a piece at a time, waiting for each piece the view does not hold (C2 stage B part 2 (a)).
   let read = crate::test_store::run_on_first(
     &daemon,
@@ -1715,6 +1756,11 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
   daemon.stop();
   assert!(matches!(landed, Some(Ok(1))), "{landed:?}");
   assert!(!kept, "the content store kept the committed text");
+  assert_eq!(
+    holders, 1,
+    "the green's one hold of its text (A-760 (b) 4c)"
+  );
+  assert_eq!(named_held, Some(0), "the green's named blocks hold bytes");
   assert!(
     file.as_deref() == Some(bytes.as_slice()),
     "the green's file is not the text"
@@ -1722,12 +1768,49 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
   assert!(read == Some(bytes), "the read is not the text");
 }
 
+/// Whether the content store keeps any of the text `identity` (`len` bytes) resident: under main's ruling (B) of
+/// 2026-11-23 (A-760 (b) 4d) a landed text's entry stays, held once by the green's name for it, and its windows go
+/// once its changeset is durable on the node's store, so RAM holds nothing of it.
+fn resident(state: &ShardState, (identity, len): (ContentIdentity, u64)) -> bool {
+  let Some(content) = state.vcs_stores.content() else {
+    return false;
+  };
+  let root = slates_vcs::ContentId(identity);
+  let mut at = 0u64;
+  while at < len.max(1) {
+    let Some((window, start, width)) = content.window_holding(&root, len, at) else {
+      return false;
+    };
+    if !content.is_away(&window) {
+      return true;
+    }
+    at = start.saturating_add(width.max(1));
+  }
+  false
+}
+
+/// The content store's holders of the text `identity`: one, the green's, for a text the head names (A-760 (b) 4c).
+fn store_holders(state: &ShardState, identity: ContentIdentity) -> u64 {
+  state.vcs_stores.content().map_or(0, |content| {
+    content.holders(&slates_vcs::ContentId(identity))
+  })
+}
+
+/// What a reader of `green`'s engine sees once its texts are brought back: its head and the bytes at `path` there.
+async fn read_green_brought(green: DbVolumeId, path: &str) -> Option<(u64, Option<Vec<u8>>)> {
+  let head = on(|state| state.greens.get(&green).map(|engine| engine.head()))?;
+  Some((
+    head,
+    crate::vcs_store::named_objects::read_file_brought(green, path).await,
+  ))
+}
+
 /// What a reader of `green`'s engine sees: its head and the bytes at `path` there.
 fn read_green(state: &ShardState, green: DbVolumeId, path: &str) -> Option<(u64, Option<Vec<u8>>)> {
   let engine = state.greens.get(&green)?;
   Some((
     engine.head(),
-    engine.content_bytes(path).map(<[u8]>::to_vec),
+    crate::vcs_store::named_objects::read_file(state, green, path),
   ))
 }
 
@@ -1763,7 +1846,7 @@ fn a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head() {
       read_green(state, green, "trunk/a.txt")
     });
     youngest_reaches(svn, 1).await;
-    let after = on(|state| read_green(state, green, "trunk/a.txt"));
+    let after = read_green_brought(green, "trunk/a.txt").await;
     assert_eq!(
       while_held,
       Some((0, None)),
@@ -1950,9 +2033,9 @@ fn a_copy_from_an_older_revision_commits_after_the_green_folded_its_history() {
     );
     let committed = commit((&owner(), svn), branched, None).await;
     let seen = (
-      on(|state| green_file(state, green, "branches/b/a.txt")),
-      on(|state| green_file(state, green, "branches/b/sub/b.txt")),
-      on(|state| green_file(state, green, "trunk/a.txt")),
+      crate::vcs_store::named_objects::read_file_brought(green, "branches/b/a.txt").await,
+      crate::vcs_store::named_objects::read_file_brought(green, "branches/b/sub/b.txt").await,
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await,
     );
     assert_eq!(committed, answered(3));
     assert_eq!(
@@ -1992,6 +2075,31 @@ fn subtree(tree: &ModelTree, path: &str) -> Vec<String> {
 /// A green's tree as a test reads it: each path's directory flag, its bytes, and its property list.
 type GreenTree = BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)>;
 
+/// [`green_tree`], each file's text read through the green's name for it, its windows brought back first (A-760 (b) 4d).
+async fn green_tree_brought(green: DbVolumeId) -> GreenTree {
+  let paths: Vec<(String, bool)> = on(|state| {
+    state
+      .greens
+      .get(&green)
+      .expect("the green")
+      .beneath("")
+      .into_iter()
+      .collect()
+  });
+  let mut tree = on(|state| green_tree(state, green));
+  for (path, directory) in &paths {
+    if !directory {
+      let text = crate::vcs_store::named_objects::read_file_brought(green, path)
+        .await
+        .unwrap_or_default();
+      if let Some(node) = tree.get_mut(path) {
+        node.1 = text;
+      }
+    }
+  }
+  tree
+}
+
 /// The green `green`'s tree as the model writes one: every node, its text and its property list's identity.
 fn green_tree(state: &ShardState, green: DbVolumeId) -> GreenTree {
   let engine = state.greens.get(&green).expect("the green");
@@ -1999,10 +2107,8 @@ fn green_tree(state: &ShardState, green: DbVolumeId) -> GreenTree {
     .beneath("")
     .into_iter()
     .map(|(path, directory)| {
-      let text = engine
-        .content_bytes(&path)
-        .map(<[u8]>::to_vec)
-        .unwrap_or_default();
+      let text =
+        crate::vcs_store::named_objects::read_file(state, green, &path).unwrap_or_default();
       let props = engine.xattr(&path, PROPS).map(<[u8]>::to_vec);
       (
         path,
@@ -2238,7 +2344,7 @@ fn copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then() {
           (head + 1, head + 1),
           "seed {seed}: the green kept a version"
         );
-        let seen = on(|state| green_tree(state, green));
+        let seen = green_tree_brought(green).await;
         assert!(
           seen == as_green(&tree),
           "seed {seed} revision {}: {rows:?}\ngreen {seen:?}\nmodel {:?}",
@@ -2520,4 +2626,204 @@ fn a_named_works_verdict_takes_its_read_texts_and_clones_none() {
     })
   });
   assert_eq!(counted, (50_000, 0), "(read, cloned)");
+}
+
+/// Request `id`'s recorded answer, once it has one (a parked request answers when it runs again), waited for up to
+/// [`PATIENCE`].
+async fn answer_of(
+  origin: u64,
+  id: slates_wire::request::RequestId,
+) -> slates_ipc::protocol::ReplyBody {
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+  loop {
+    let seen = on(|state| {
+      state
+        .db
+        .partition()
+        .completion(origin, id.client, id.sequence)
+    });
+    if let slates_wire::request::Seen::Completed(bytes) = seen {
+      return <slates_ipc::protocol::ReplyBody as slates_wire::Wire>::from_bytes(&bytes)
+        .expect("a reply");
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "request {id:?} never answered"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// A-760 (b) 4c+4d (main's order of 2026-11-23: a server test reading an svn file over a work after its text left the
+/// green, through the refuse-and-bring-back, with its window let go; and a work over an svn green editing a named file,
+/// its verdict the oracle's with the base's window let go). Do: commit revision 1 (`trunk/a.txt` "alpha\n"), whose
+/// landing lets the text's windows go (main's (B)); over a work on the green, read `trunk/a.txt` as a client's recorded
+/// request; let the windows go again, insert "x" at offset 1 of `trunk/a.txt` in the work and submit it. Expect: the
+/// text resident nowhere after the landing; the green holding it by name, one store hold, no byte; the read parked once
+/// (`verbs.parked_on_away`), then answered the text whole; the submit landing revision 2, the green's file "axlpha\n"
+/// (the edit applied to the text, as the model makes it), read through its name.
+#[test]
+fn a_work_over_a_subversion_green_reads_and_edits_a_named_text_its_windows_let_go() {
+  stored(|| async move {
+    use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody};
+    let (svn, green) = subversion("let-go-work").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    let alpha = identity(b"alpha\n");
+    let landed = on(|state| {
+      (
+        resident(state, (alpha, 6)),
+        store_holders(state, alpha),
+        state
+          .greens
+          .get(&green)
+          .map(|engine| engine.named_bytes_held()),
+      )
+    });
+    assert_eq!(
+      landed,
+      (false, 1, Some(0)),
+      "the landed text's windows let go"
+    );
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("let-go-reader", "trunk/c.txt", b"c\n")));
+    let parked_before = on(|state| {
+      state
+        .refusals
+        .get("verbs.parked_on_away")
+        .copied()
+        .unwrap_or(0)
+    });
+    let read = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let first_answer = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, read),
+        &owner(),
+        RequestBody::ReadRange {
+          volume: work,
+          path: "trunk/a.txt".to_owned(),
+          at: ReadAt::Head,
+          offset: 0,
+          max: 64,
+        },
+      )
+    });
+    assert_eq!(first_answer, None, "the read parked on the let-go window");
+    let ReplyBody::ReadPage { bytes, total, .. } = answer_of(7, read).await else {
+      panic!("the read was not answered a page");
+    };
+    assert_eq!(
+      (bytes.as_slice(), total),
+      (&b"alpha\n"[..], 6),
+      "the text read whole"
+    );
+    let parked = on(|state| {
+      state
+        .refusals
+        .get("verbs.parked_on_away")
+        .copied()
+        .unwrap_or(0)
+    });
+    assert!(parked > parked_before, "no read parked");
+    // The base's windows let go again, then the work edits the named file in place and is submitted.
+    on(|state| crate::vcs_store::name_holds::let_go_landed_texts(state, &[alpha]));
+    assert!(!on(|state| resident(state, (alpha, 6))), "let go again");
+    let edited = on(|state| {
+      crate::vcs_store::paths::tests::ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: "trunk/a.txt".to_owned(),
+          at: 1,
+          delete_len: 0,
+          bytes: b"x".to_vec(),
+        },
+      )
+    });
+    assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+    let submit = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 2,
+    };
+    let _ = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, submit),
+        &owner(),
+        crate::identities::authored(work, "edit a named text"),
+      )
+    });
+    let submitted = answer_of(7, submit).await;
+    assert!(
+      !matches!(submitted, ReplyBody::Refused { .. }),
+      "{submitted:?}"
+    );
+    youngest_reaches(svn, 2).await;
+    let file = crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await;
+    assert_eq!(file.as_deref(), Some(&b"axlpha\n"[..]), "the oracle's file");
+  });
+}
+
+/// A-760 (b) 4d (main's order: a server test reading an svn file over a mount after its text left the green, through the
+/// refuse-and-bring-back, with its window let go). A mount's read reaches a green's file through one chain whatever
+/// its bridge (`GreenTree::read_at`, under NFS's, FUSE's and WinFsp's `Bridge::read`), so it is read here as a mount
+/// reads it. Do: commit revision 1 (`trunk/a.txt` "alpha\n"), whose landing lets the text's windows go; read the file
+/// through the green's tree inside a call's scope (`named_objects::away_scope`), as a bridge's serve does; bring the
+/// noted windows back as the bridge's async frame does (`bring_back_reads`) and read again over them. Expect: the first
+/// read refused and its miss noted (the text, its range), never answered as bytes; the second the text whole, and
+/// nothing noted.
+#[test]
+fn a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again() {
+  stored(|| async move {
+    use slates_vfs::host::tree::TreeSource;
+    let (svn, green) = subversion("let-go-mount").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    let read = || {
+      on(|state| {
+        crate::vcs_store::lent_state(state, |state| {
+          let engine = state.greens.get(&green).expect("the green");
+          let tree = crate::green_tree::GreenTree::reading(
+            &engine,
+            engine.head(),
+            crate::vcs_store::named_objects::plane(&state.vcs_stores, &()),
+          );
+          crate::vcs_store::named_objects::away_scope(|| {
+            let mut into = [0u8; 64];
+            tree
+              .read_at("trunk/a.txt", 0, &mut into)
+              .map(|read| into.get(..read).unwrap_or_default().to_vec())
+          })
+        })
+      })
+    };
+    let (first_read, away) = read();
+    assert!(first_read.is_err(), "a let-go window answered as bytes");
+    let alpha = slates_merge::named::Identity {
+      hash: identity(b"alpha\n"),
+      len: 6,
+    };
+    assert_eq!(
+      away,
+      vec![crate::vcs_store::named_objects::AwayRead {
+        identity: alpha,
+        offset: 0,
+        len: 6
+      }],
+      "the miss noted"
+    );
+    let _pins = crate::vcs_store::named_objects::bring_back_reads(&away)
+      .await
+      .expect("brought back");
+    let (again, away_again) = read();
+    assert_eq!(
+      again.ok().as_deref(),
+      Some(&b"alpha\n"[..]),
+      "read again whole"
+    );
+    assert!(away_again.is_empty(), "met a let-go window again");
+  });
 }

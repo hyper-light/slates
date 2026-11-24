@@ -438,7 +438,8 @@ pub(crate) async fn supply_owed_base(id: RepositoryId) -> Option<Result<(), Load
     importing.base_owed = None;
     let bytes = brought.then(|| base_in_ram(state, id, &text)).flatten();
     if brought {
-      svn_commit::release_texts(state, None, &[text]);
+      // Given back, and its windows let go again once read (A-760 (b) 4d, main's (B)).
+      crate::vcs_store::name_holds::give_back_brought(state, &[text]);
     }
     let supplied = match bytes {
       Some(bytes) => supply(state, id, &mut importing, (&text, bytes)),

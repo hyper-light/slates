@@ -2013,6 +2013,20 @@ fn step_beginning(
   writer: &mut Writer,
   beginning: &mut slates_land::engine::Beginning,
 ) -> Option<Result<slates_land::engine::Planned, LandingRefusal>> {
+  // A green view's files held by name are read through the content store, its chunks lent for the unit (A-760 (b) 4d).
+  let lend = crate::mounted_work::view_reads_named(state, handle);
+  crate::vcs_store::svn_presenter::lent_if(state, lend, |state| {
+    step_beginning_lent(state, handle, writer, beginning)
+  })
+}
+
+/// [`step_beginning`], the content store's chunks lent where its green view reads a file held by name.
+fn step_beginning_lent(
+  state: &mut ShardState,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  writer: &mut Writer,
+  beginning: &mut slates_land::engine::Beginning,
+) -> Option<Result<slates_land::engine::Planned, LandingRefusal>> {
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return Some(Err(LandingRefusal::Volume(
       slates_vfs::error::VfsError::StaleHandle,
@@ -2032,9 +2046,13 @@ fn step_beginning(
   // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
   let lent_green =
     crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
-  let tree = lent_green
-    .as_ref()
-    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let tree = lent_green.as_ref().map(|(green, version)| {
+    crate::green_tree::GreenTree::reading(
+      green,
+      *version,
+      crate::vcs_store::named_objects::plane(&state.vcs_stores, &()),
+    )
+  });
   let mut lens = None;
   let base: Option<&mut dyn slates_vfs::host::HostFs> = match (slot.host.as_mut(), tree.as_ref()) {
     (Some(BaseHost::Tree(host)), Some(tree)) => Some(lens.insert(host.lend(tree))),
@@ -2149,6 +2167,13 @@ const PERMILLE: u64 = 1_000;
 /// back after. A volume gone meanwhile (destroyed) or whose base host is away ends the run, its entries left in
 /// the overlay as a crash leaves them.
 fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
+  // A green view's files held by name are read through the content store, its chunks lent for the slice (A-760 (b) 4d).
+  let lend = crate::mounted_work::view_reads_named(state, granted.handle);
+  crate::vcs_store::svn_presenter::lent_if(state, lend, |state| step_granted_lent(state, granted))
+}
+
+/// [`step_granted`], the content store's chunks lent where its green view reads a file held by name.
+fn step_granted_lent(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
   let budget_ns = state
     .config
     .step_quantum_ns()
@@ -2168,9 +2193,13 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
   // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
   let lent_green =
     crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
-  let tree = lent_green
-    .as_ref()
-    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let tree = lent_green.as_ref().map(|(green, version)| {
+    crate::green_tree::GreenTree::reading(
+      green,
+      *version,
+      crate::vcs_store::named_objects::plane(&state.vcs_stores, &()),
+    )
+  });
   let mut lens = None;
   let base: Option<&mut dyn slates_vfs::host::HostFs> = match (slot.host.as_mut(), tree.as_ref()) {
     (Some(BaseHost::Tree(host)), Some(tree)) => Some(lens.insert(host.lend(tree))),

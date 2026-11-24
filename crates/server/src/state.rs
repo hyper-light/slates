@@ -385,6 +385,20 @@ pub struct ShardState {
   /// listener or connection made them, created with the first v4 state call under the configuration's
   /// derived bounds.
   pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
+  /// The NFS calls parked on reads of a named text's let-go windows while they come back (A-760 (b) 4d), bounded by
+  /// the connections the listener holds (each serves one call at a time).
+  pub(crate) nfs_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The FUSE requests parked so (A-760 (b) 4d), one a mount, bounded by the attachments a shard admits.
+  #[cfg(target_os = "linux")]
+  pub(crate) fuse_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The WinFsp requests parked so (A-760 (b) 4d), one a mount, bounded by the attachments a shard admits.
+  #[cfg(windows)]
+  pub(crate) winfsp_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The client requests parked so (A-760 (b) 4d), bounded as a shard's parked requests are (its clients' slots).
+  pub(crate) verb_parked: crate::vcs_store::named_objects::ParkedReads,
+  /// The parked requests being run again over their brought-back windows: one met a let-go window again is a bug,
+  /// answered as it ran, never parked twice.
+  pub(crate) verb_resuming: std::collections::BTreeSet<(u64, slates_wire::request::RequestId)>,
   /// The delegation recalls waiting for each session's back channel (`crate::delegation`; bounded by the delegations
   /// each client holds).
   pub(crate) recall_queues: std::collections::BTreeMap<

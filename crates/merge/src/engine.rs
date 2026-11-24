@@ -417,6 +417,14 @@ pub struct Judged {
   making: Making,
 }
 
+pub use crate::dims::NameHold;
+
+/// How many tracked greens' blocks were dropped with a hold still live in this process (A-760 (b) 4d): a leaked hold's
+/// bug signal, zero in every correct use, since the owner gives them back first ([`Green::give_back_name_holds`]).
+pub fn dropped_with_name_holds() -> u64 {
+  crate::dims::dropped_with_holds()
+}
+
 /// A file's current content as a reader outside the engine takes it (A-760 (b) 4b, main 01a20182's ruling of
 /// 2026-11-23): its bytes, lent, or, for a file the green holds by its content-plane object alone (piece 4d), that
 /// object's name, which the reader reads through its own plane. Only a Subversion green holds a file so; a reader of a
@@ -451,6 +459,14 @@ impl<'a> Content<'a> {
       Content::Named(identity) => Err(identity),
     }
   }
+
+  /// The file's length and the plain BLAKE3 of its bytes, its identity entry's (A-873): read off its name, or hashed.
+  pub fn digest(&self) -> (u64, [u8; 32]) {
+    match self {
+      Content::Bytes(bytes) => (self.len(), *blake3::hash(bytes).as_bytes()),
+      Content::Named(identity) => (identity.len, identity.hash),
+    }
+  }
 }
 
 /// A file's content at a version ([`Content`]'s, read off the history where the file changed since): its bytes, lent
@@ -478,6 +494,14 @@ impl<'a> ContentAt<'a> {
     self.len() == 0
   }
 
+  /// [`Content::digest`] of the file at the version.
+  pub fn digest(&self) -> (u64, [u8; 32]) {
+    match self {
+      ContentAt::Bytes(bytes) => (self.len(), *blake3::hash(bytes).as_bytes()),
+      ContentAt::Named(identity) => (identity.len, identity.hash),
+    }
+  }
+
   /// The bytes, or the object they are held by when the green holds none ([`Content::bytes`]).
   pub fn into_bytes(self) -> Result<Cow<'a, [u8]>, crate::named::Identity> {
     match self {
@@ -494,17 +518,6 @@ impl<'a> From<Content<'a>> for ContentAt<'a> {
       Content::Named(identity) => ContentAt::Named(identity),
     }
   }
-}
-
-/// A checkpoint refused by a restore while a file it names is unread (A-869, [`Green::with_checkpoint`]): the object
-/// not read yet, and the green as it was before the restore, which its caller takes back (a lineage member's engine
-/// holds its lineage's arenas).
-#[derive(Debug)]
-pub struct Unrestored {
-  /// The first named file's object not read yet.
-  pub identity: crate::named::Identity,
-  /// The green, as it was seeded.
-  pub green: Box<Green>,
 }
 
 /// A held verdict's files made a copy slice a step before its commit ([`Green::make_step`], A-760): the files a run
@@ -624,6 +637,26 @@ pub struct HeadMoved {
   pub judged_at: u64,
   /// The green's head now.
   pub head: u64,
+}
+
+/// A held verdict's commit (or a step of its making) refused, nothing applied ([`Green::commit_judged`],
+/// [`Green::make_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitRefused {
+  /// The green moved since the verdict (A-635).
+  Moved(HeadMoved),
+  /// A file the commit makes over the head's bytes is held by its object's name alone and was let go since the verdict
+  /// was lent it (A-760 (b) 4d): lent again ([`Green::commit_unlent`] names them all), the commit is the verdict's.
+  Unlent {
+    /// One such object.
+    identity: crate::named::Identity,
+  },
+}
+
+impl From<HeadMoved> for CommitRefused {
+  fn from(moved: HeadMoved) -> CommitRefused {
+    CommitRefused::Moved(moved)
+  }
 }
 
 /// A verdict computed anywhere (A-658; A-645 "Merges computed anywhere, committed by position"): what
@@ -909,6 +942,20 @@ fn file_entry(path: &str, (len, digest): (u64, [u8; 32])) -> crate::identity::En
     .field(path.as_bytes())
     .fixed(&len.to_le_bytes())
     .fixed(&digest)
+}
+
+/// Whether `bytes` (none: absent) are `content`'s: the same bytes, or the object a file is held by alone, told by its
+/// digest (A-873; A-760 (b) 4d).
+fn same_content(bytes: Option<&[u8]>, content: Option<Content<'_>>) -> bool {
+  match (bytes, content) {
+    (None, None) => true,
+    (Some(bytes), Some(Content::Bytes(held))) => bytes == held,
+    (Some(bytes), Some(Content::Named(identity))) => {
+      identity.len == u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        && identity.hash == *blake3::hash(bytes).as_bytes()
+    }
+    _ => false,
+  }
 }
 
 /// [`file_entry`] of a file holding `bytes`: their length and plain BLAKE3, hashed now (an older version's bytes read from
@@ -1618,7 +1665,34 @@ fn fits_base(ops: &[Op], base_len: u64, post_len: u64) -> bool {
 /// buffer sized once at their length ([`made_len`]; goal 93, P7 finding (2): grown a piece at a time it doubled, about
 /// twice every file an import's increments made, the largest of its churners after A-862).
 fn apply(base: &[u8], ops: &[Op], post_state: crate::named::Post<'_>) -> Vec<u8> {
-  let base_len = base.len() as u64;
+  apply_over((base, base.len() as u64), ops, post_state)
+}
+
+/// Whether [`apply`] reads any byte of a base of `base_len` bytes under `ops`: a run of it the ops leave between them or
+/// after the last. A file the ops replace whole reads none, so a base held by its object's name alone (A-760 (b) 4d) is
+/// made over with its length alone, never brought back for bytes nothing keeps.
+fn keeps_base(base_len: u64, ops: &[Op]) -> bool {
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos && pos < base_len {
+      return true;
+    }
+    pos = pos.max(op.at);
+    match op.kind {
+      OpKind::Delete | OpKind::Overwrite => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      _ => {}
+    }
+  }
+  pos < base_len
+}
+
+/// [`apply`] over a base of `base_len` bytes whose bytes are `base`: empty for one [`keeps_base`] says nothing reads.
+fn apply_over(
+  (base, base_len): (&[u8], u64),
+  ops: &[Op],
+  post_state: crate::named::Post<'_>,
+) -> Vec<u8> {
   let made = made_len(base_len, ops, post_state.len());
   let mut out = Vec::with_capacity(usize::try_from(made).unwrap_or(0));
   let mut pos = 0u64;
@@ -2234,17 +2308,17 @@ impl Green {
 
   /// The text held under `identity`, if held ([`Content`], A-760 (b) 4b).
   pub fn held(&self, identity: &crate::held::Identity) -> Option<Content<'_>> {
-    self.held_bytes(identity).map(Content::Bytes)
+    self
+      .held
+      .entries
+      .get(identity)
+      .and_then(|entry| self.content.block_content(entry.block))
   }
 
   /// The bytes held under `identity`, if held, for a reader that holds no content plane (the engine's own and its
   /// tests'): none for a text the green holds by name alone.
   pub fn held_bytes(&self, identity: &crate::held::Identity) -> Option<&[u8]> {
-    self
-      .held
-      .entries
-      .get(identity)
-      .map(|entry| self.content.block_bytes(entry.block))
+    self.held(identity).and_then(|content| content.bytes().ok())
   }
 
   /// How many identities the green holds.
@@ -2318,7 +2392,6 @@ impl Green {
         .collect(),
       files,
       named,
-      read: crate::checkpoint::NamedRead::default(),
       dirs: self
         .dir_history
         .iter()
@@ -2350,38 +2423,27 @@ impl Green {
   /// key the checkpoint names set to its value there (its history one entry, its last change the checkpoint's), the
   /// accepted identities restored, and the head at the checkpoint's version with no delta before it, so every later
   /// increment replays onto it as onto the green the checkpoint was taken from, and a base below it is refused
-  /// ([`Outcome::BaseUnavailable`]). Deterministic: the same origin and checkpoint restore the same green. A checkpoint
-  /// naming a file it has not read (A-869, [`crate::checkpoint::Checkpoint::read_step`]) is refused, typed: a missing
-  /// byte is never a zero.
+  /// ([`Outcome::BaseUnavailable`]). Deterministic: the same origin and checkpoint restore the same green. A file the
+  /// checkpoint names (A-869) is restored by its name alone, its bytes read by nothing (A-760 (b) 4d).
   pub fn restore(
     origin: crate::origin::Origin,
-    checkpoint: &mut crate::checkpoint::Checkpoint,
-  ) -> Result<Green, Unrestored> {
+    checkpoint: &crate::checkpoint::Checkpoint,
+  ) -> Green {
     Green::with_origin(origin).with_checkpoint(checkpoint)
   }
 
   /// This green, seeded from its origin and at version 0 with no increment yet, with `checkpoint` applied: what
   /// [`Green::restore`] does after its seeding, so a recovery that seeds the origin a share at a time ([`OriginLoad`])
-  /// restores the same green as the one call does. Each named file takes the buffer its bytes were read into, with no
-  /// copy, and its block is named for its object, as the version that made it named it (A-869). Refused [`Unrestored`],
-  /// the green handed back as it was seeded and the checkpoint as it was, while a named file is unread.
-  pub fn with_checkpoint(
-    mut self,
-    checkpoint: &mut crate::checkpoint::Checkpoint,
-  ) -> Result<Green, Unrestored> {
-    if let Some(file) = checkpoint.unread() {
-      return Err(Unrestored {
-        identity: file.identity,
-        green: Box::new(self),
-      });
-    }
-    let named = checkpoint.take_named().unwrap_or_default();
+  /// restores the same green as the one call does. Each named file is a block named for its object holding no bytes,
+  /// as the version that made it named it (A-869; A-760 (b) 4d): nothing is read, and the block's hold of its object is
+  /// drained by the owner ([`Green::take_name_holds`]) as every named block's is.
+  pub fn with_checkpoint(mut self, checkpoint: &crate::checkpoint::Checkpoint) -> Green {
     let green = &mut self;
     for changed in &checkpoint.files {
       green.restore_file(changed);
     }
-    for (file, bytes) in named {
-      green.restore_named_file(file, bytes);
+    for file in &checkpoint.named {
+      green.restore_named_file(file);
     }
     for changed in &checkpoint.dirs {
       green.restore_dir(changed);
@@ -2415,17 +2477,17 @@ impl Green {
     if let Some(sum) = &checkpoint.sum {
       green.take_sum(sum);
     }
-    Ok(self)
+    self
   }
 
-  /// A named file of a checkpoint (A-869): placed of `bytes`, its object's whole, and named for it; then recorded as
-  /// [`Green::restore_file`] records a carried one.
-  fn restore_named_file(&mut self, file: crate::checkpoint::NamedFile, bytes: Vec<u8>) {
-    self.place_named_file(&file.key, bytes, file.identity);
+  /// A named file of a checkpoint (A-869): a block named for its object, holding no bytes (A-760 (b) 4d); then
+  /// recorded as [`Green::restore_file`] records a carried one.
+  fn restore_named_file(&mut self, file: &crate::checkpoint::NamedFile) {
+    self.place_named_file(&file.key, file.identity);
     self.last_changed.insert(file.key.clone(), file.at);
     self.clear_content_history(&file.key);
     let value = self.named_value(&file.key);
-    self.push_content(file.key, file.at, Some(value));
+    self.push_content(file.key.clone(), file.at, Some(value));
   }
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
@@ -2647,8 +2709,8 @@ impl Green {
     match key {
       IdentityKey::File(path) => (
         self
-          .content_ref_at_bytes(path, since)
-          .map(|bytes| file_entry_of(path, &bytes)),
+          .digest_at(path, since)
+          .map(|digest| file_entry(path, digest)),
         self
           .content
           .digest_of(path)
@@ -2843,9 +2905,13 @@ impl Green {
     for (path, node) in self.specials.iter() {
       set.add(&special_entry(&path, node));
     }
-    // The oracle hashes every file's bytes itself, never a block's digest, so a digest made wrong is a difference here.
-    for (path, bytes) in self.content.iter() {
-      set.add(&file_entry_of(&path, bytes));
+    // The oracle hashes every file's bytes itself, never a block's digest, so a digest made wrong is a difference here; a
+    // file held by its object's name alone takes the name, the plain BLAKE3 of its bytes (A-873).
+    for (path, content) in self.content.iter() {
+      set.add(&match content {
+        Content::Bytes(bytes) => file_entry_of(&path, bytes),
+        Content::Named(identity) => file_entry(&path, (identity.len, identity.hash)),
+      });
     }
     for path in self.dirs.keys() {
       set.add(&dir_entry(&path));
@@ -3105,47 +3171,140 @@ impl Green {
   /// A file's current content ([`Content`], A-760 (b) 4b), or `None` when it is absent: what every reader outside the
   /// engine takes, so a file held by its content-plane object alone is read through the reader's plane.
   pub fn content(&self, path: &str) -> Option<Content<'_>> {
-    self.content_bytes(path).map(Content::Bytes)
+    self.content.get(path)
   }
 
   /// A file's current bytes, or `None` when it is absent, for a reader that holds no content plane (the engine's own
   /// reads and its tests): none for a file the green holds by its object's name alone.
   pub fn content_bytes(&self, path: &str) -> Option<&[u8]> {
-    self.content.get(path)
+    self.head_bytes(path)
+  }
+
+  /// A file's bytes where its block holds them: an unnamed file's, or a named one's lent it for the verdict that reads
+  /// it ([`Green::lend`]). None for an absent file, and for an unlent named one, whose read is noted
+  /// (`crate::unlent`): the verdict reading it is refused, never computed over it as if it were empty.
+  fn head_bytes(&self, path: &str) -> Option<&[u8]> {
+    match self.content.get(path)? {
+      Content::Bytes(bytes) => Some(bytes),
+      Content::Named(identity) => {
+        crate::unlent::note(identity);
+        None
+      }
+    }
+  }
+
+  /// [`Green::head_bytes`] at `version`: a file's bytes there, none where it is absent or held unlent by name (noted).
+  fn bytes_at(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
+    match self.content_ref_at(path, version)? {
+      ContentAt::Bytes(bytes) => Some(bytes),
+      ContentAt::Named(identity) => {
+        crate::unlent::note(identity);
+        None
+      }
+    }
+  }
+
+  /// A file's length and digest at `version` ([`ContentAt::digest`]): its identity entry's, read with no bytes for a
+  /// named file.
+  fn digest_at(&self, path: &str, version: u64) -> Option<(u64, [u8; 32])> {
+    self
+      .content_ref_at(path, version)
+      .map(|content| content.digest())
   }
 
   /// The content-plane object a file's current bytes are the whole of (A-760 (b), item 3's first piece): set when a
   /// version made the file of exactly one named run spanning its whole object, kept while the file's block stands
   /// (a version that leaves the file alone, a copy, a hold), gone with any other change. `None` for an absent file or
-  /// one made otherwise. A checkpoint carries a file's bytes, not its name, so a green restored from one names none of
-  /// the files it restored (owed: item 3's second piece, a checkpoint naming them).
+  /// one made otherwise. A checkpoint names the files it restores so (A-869).
   pub fn name_of(&self, path: &str) -> Option<crate::named::Identity> {
     self.content.name_of(path)
   }
 
-  /// The bytes of every object `wanted` names that a live block of this green is named for (A-866): its current files'
-  /// and its history's alike, copied. What a refused publication's remake reads its checkpoint's and chain's named
-  /// files from when the content store does not hold them whole, before this engine is let go (the server's
-  /// `verbs::remake_green`).
-  pub fn bytes_named(
-    &self,
-    wanted: &std::collections::BTreeSet<crate::named::Identity>,
-  ) -> Vec<(crate::named::Identity, Vec<u8>)> {
-    self.content.blocks().named_bytes(wanted)
+  /// The bytes this green's blocks named for a content-plane object hold (A-760 (b) 4d): zero, since such a block holds
+  /// its object by name alone and readers read it through their plane. The non-vacuity counter of the bytes held once.
+  pub fn named_bytes_held(&self) -> u64 {
+    self.content.blocks().named_bytes_held()
+  }
+
+  /// How many live blocks of this green are named for a content-plane object (A-760 (b) 4d): each holds one hold of it
+  /// in the owner's content store, taken and given back through [`Green::take_name_holds`].
+  pub fn named_blocks(&self) -> usize {
+    self.content.blocks().named_blocks()
+  }
+
+  /// Lends every block named for `identity` the object's `bytes` for the verdict, replay or reader that reads them
+  /// (A-760 (b) 4d): until [`Green::let_named_bytes_go`]. How many blocks took them: none for bytes that are not the
+  /// object's (length or digest), or an object no live block is named for. What an owner does with the objects a
+  /// refused verdict names ([`ComputeRefused::ContentUnread`], [`Green::unlent_reads`]) before it judges again; a held
+  /// verdict's commit reads them too, so they are let go once it is committed.
+  pub fn lend(&mut self, identity: crate::named::Identity, bytes: Vec<u8>) -> usize {
+    self.content.lend_named(identity, bytes)
+  }
+
+  /// Lets go every lent block's bytes ([`Green::lend`]), so named blocks hold none between steps. O(the blocks lent).
+  pub fn let_named_bytes_go(&mut self) {
+    self.content.let_named_bytes_go();
+  }
+
+  /// The holds this green's named blocks took and gave back on their objects since the last call, in order
+  /// ([`NameHold`]): one taken for each block made named, one given back as each is freed; none until its owner tracks
+  /// them ([`Green::track_name_holds`]). The owner applies them to its content store, so the store holds an object
+  /// while a block names it.
+  pub fn take_name_holds(&mut self) -> Vec<NameHold> {
+    self.content.take_holds()
+  }
+
+  /// This green's holds tracked from now on, by the owner whose content store holds its named objects (A-760 (b) 4d): a
+  /// hold taken for each live named block, the first time; then as [`Green::take_name_holds`]. An untracked one (a
+  /// replica, a scratch engine, a replay not yet installed) records none. The owner gives them back before it drops
+  /// the green ([`Green::give_back_name_holds`]); one dropped with a hold live is counted ([`dropped_with_name_holds`]).
+  pub fn track_name_holds(&mut self) -> Vec<NameHold> {
+    self.content.blocks_mut().track()
+  }
+
+  /// Every hold this green's named blocks still take given back, with those owed, its tracking ended (A-760 (b) 4d):
+  /// what its owner applies to its content store before it lets the green go. None for an untracked green.
+  pub fn give_back_name_holds(&mut self) -> Vec<NameHold> {
+    self.content.blocks_mut().give_back()
+  }
+
+  /// Every object a verdict on `inc` at this head reads that no block holds the bytes of now (A-760 (b) 4d): what its
+  /// owner lends ([`Green::lend`]) once a judge was refused [`ComputeRefused::ContentUnread`], so the next judge reads
+  /// them all. Empty where nothing is unlent, or the work is refused before any byte is read. Changes nothing a reader
+  /// sees.
+  pub fn unlent_reads(&mut self, inc: &Increment) -> BTreeSet<crate::named::Identity> {
+    let judged_again = self.judged_again;
+    let fast_path = self.fast_path_hits.get();
+    let ((), unlent) = crate::unlent::scope(|| {
+      if let Ok(computed) = self.compute_read(inc)
+        && let Reached::Verdict { units, .. } = computed.reached
+        && inc.base >= self.deltas_from
+      {
+        let units = self.at_head(inc, (computed.at, computed.floor), units);
+        if let Ok(effects) = position::verdict(units) {
+          self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
+        }
+      }
+    });
+    self.judged_again = judged_again;
+    self.fast_path_hits.set(fast_path);
+    unlent
   }
 
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
   /// the base content it inherits and edits splice against it. Each path is assembled by the walk (a persistent map's
   /// keys are its edges, [`crate::dims`]), so it is owned.
   pub fn files(&self) -> impl Iterator<Item = (String, Content<'_>)> {
-    self
-      .files_bytes()
-      .map(|(path, bytes)| (path, Content::Bytes(bytes)))
+    self.content.iter()
   }
 
-  /// [`Green::files`]' bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
+  /// [`Green::files`]' bytes, for a reader that holds no content plane ([`Green::content_bytes`]): the files the green
+  /// holds bytes of, none held by name alone.
   pub fn files_bytes(&self) -> impl Iterator<Item = (String, &[u8])> {
-    self.content.iter()
+    self
+      .content
+      .iter()
+      .filter_map(|(path, content)| Some((path, content.bytes().ok()?)))
   }
 
   /// Every symbolic link the green currently holds, with its target. With [`Green::files`], [`Green::hardlinks`] and
@@ -3616,20 +3775,26 @@ impl Green {
   /// when it changed after (W2: the history holds what each version changed, not a whole copy of the file to lend).
   /// A file with no history has held its current bytes since version 0 (the one history rule, A-534).
   pub fn content_ref_at(&self, path: &str, version: u64) -> Option<ContentAt<'_>> {
-    self
-      .content_ref_at_bytes(path, version)
-      .map(ContentAt::Bytes)
-  }
-
-  /// [`Green::content_ref_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
-  pub fn content_ref_at_bytes(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
     match self.content_read(path, version) {
-      ContentRead::Head => self.content.get(path).map(Cow::Borrowed),
-      ContentRead::Value(value) => Some(Cow::Owned(
-        value.materialize(&self.chunks, self.content.blocks()),
-      )),
+      ContentRead::Head => self.content.get(path).map(ContentAt::from),
+      ContentRead::Value(value) => match value.materialize(&self.chunks, self.content.blocks()) {
+        Some(bytes) => Some(ContentAt::Bytes(Cow::Owned(bytes))),
+        None => self.value_name(value).map(ContentAt::Named),
+      },
       ContentRead::Absent => None,
     }
+  }
+
+  /// The object a history value is the whole of when it reads a block held by that object's name alone (A-760 (b)
+  /// 4d): a superseded named file's.
+  fn value_name(&self, value: &crate::history::Value) -> Option<crate::named::Identity> {
+    self.content.blocks().name(value.whole_block(&self.chunks)?)
+  }
+
+  /// [`Green::content_ref_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]): none for a
+  /// file held by its object's name alone.
+  pub fn content_ref_at_bytes(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
+    self.content_ref_at(path, version)?.into_bytes().ok()
   }
 
   /// Where `path`'s bytes at `version` are read from, by the module's one history rule and its copies (A-534, A-586):
@@ -3672,53 +3837,63 @@ impl Green {
     &self,
     path: &str,
     version: u64,
-    range: (u64, u64),
-  ) -> Option<(ContentAt<'static>, u64)> {
-    self
-      .content_page_at_bytes(path, version, range)
-      .map(|(page, total)| (ContentAt::Bytes(Cow::Owned(page)), total))
-  }
-
-  /// [`Green::content_page_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
-  pub fn content_page_at_bytes(
-    &self,
-    path: &str,
-    version: u64,
     (offset, want): (u64, u64),
-  ) -> Option<(Vec<u8>, u64)> {
-    let page_of = |bytes: &[u8]| {
-      let total = bytes.len();
+  ) -> Option<(ContentAt<'static>, u64)> {
+    let range_of = |total: usize| {
       let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
       let end = usize::try_from(offset.saturating_add(want))
         .unwrap_or(usize::MAX)
         .min(total);
-      (
-        bytes.get(start..end).unwrap_or_default().to_vec(),
-        u64::try_from(total).unwrap_or(u64::MAX),
-      )
+      (start, end)
     };
     let value = match self.content_read(path, version) {
-      ContentRead::Head => return self.content.get(path).map(page_of),
+      ContentRead::Head => {
+        let content = self.content.get(path)?;
+        let total = content.len();
+        return Some(match content {
+          Content::Bytes(bytes) => {
+            let (start, end) = range_of(bytes.len());
+            (
+              ContentAt::Bytes(Cow::Owned(
+                bytes.get(start..end).unwrap_or_default().to_vec(),
+              )),
+              total,
+            )
+          }
+          Content::Named(identity) => (ContentAt::Named(identity), total),
+        });
+      }
       ContentRead::Value(value) => value,
       ContentRead::Absent => return None,
     };
     let total = value.len();
-    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
-    let end = usize::try_from(offset.saturating_add(want))
-      .unwrap_or(usize::MAX)
-      .min(total);
-    Some((
-      value.read((&self.chunks, self.content.blocks()), start, end),
-      u64::try_from(total).unwrap_or(u64::MAX),
-    ))
+    let (start, end) = range_of(total);
+    let total = u64::try_from(total).unwrap_or(u64::MAX);
+    match value.read((&self.chunks, self.content.blocks()), start, end) {
+      Some(page) => Some((ContentAt::Bytes(Cow::Owned(page)), total)),
+      None => Some((ContentAt::Named(self.value_name(value)?), total)),
+    }
+  }
+
+  /// [`Green::content_page_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]): none for
+  /// a file held by its object's name alone.
+  pub fn content_page_at_bytes(
+    &self,
+    path: &str,
+    version: u64,
+    range: (u64, u64),
+  ) -> Option<(Vec<u8>, u64)> {
+    let (page, total) = self.content_page_at(path, version, range)?;
+    Some((page.into_bytes().ok()?.into_owned(), total))
   }
 
   /// Every file at `version` with its length, in path order: [`Green::files_at`] without the bytes.
   pub fn file_lens_at(&self, version: u64) -> Vec<(String, usize)> {
     if version >= self.head() {
       return self
-        .files_bytes()
-        .map(|(path, bytes)| (path, bytes.len()))
+        .content
+        .iter()
+        .map(|(path, content)| (path, usize::try_from(content.len()).unwrap_or(usize::MAX)))
         .collect();
     }
     union_keys(self.content.keys(), self.content_history.keys().cloned())
@@ -3733,7 +3908,10 @@ impl Green {
   /// head's when the file has no history (the one history rule, A-534).
   pub fn content_len_at(&self, path: &str, version: u64) -> Option<usize> {
     match self.content_read(path, version) {
-      ContentRead::Head => self.content.get(path).map(<[u8]>::len),
+      ContentRead::Head => self
+        .content
+        .len_of(path)
+        .map(|len| usize::try_from(len).unwrap_or(usize::MAX)),
       ContentRead::Value(value) => Some(value.len()),
       ContentRead::Absent => None,
     }
@@ -3772,12 +3950,16 @@ impl Green {
           at: *version,
           identity,
         }),
+        // A value no block named for an object stands for holds its bytes: only a block held by a name alone holds none,
+        // and that value was named above.
         None => carried.push(crate::checkpoint::Changed {
           key: path.clone(),
           at: *version,
-          value: value
-            .as_ref()
-            .map(|value| value.materialize(&self.chunks, self.content.blocks())),
+          value: value.as_ref().map(|value| {
+            value
+              .materialize(&self.chunks, self.content.blocks())
+              .unwrap_or_default()
+          }),
         }),
       }
     }
@@ -3832,7 +4014,11 @@ impl Green {
     let Some(block) = self.content.hold_block_of(path) else {
       return crate::history::Value::default();
     };
-    let len = self.content.block_bytes(block).len();
+    let len = self
+      .content
+      .blocks()
+      .len(block)
+      .map_or(0, |len| usize::try_from(len).unwrap_or(usize::MAX));
     let value =
       crate::history::Value::named(&mut self.chunks, self.content.blocks_mut(), block, len);
     if value.len() > 0 {
@@ -3958,13 +4144,31 @@ impl Green {
     base: u64,
     ops_and_post: (&[Op], crate::named::Post<'_>),
   ) -> bool {
+    // Ops that keep no byte of the base make a file of what they add alone: told from the head by its digest, the
+    // identity entry's, so neither the base nor a head held by name (A-760 (b) 4d) is read.
+    let base_len = self
+      .content_len_at(path, base)
+      .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX));
+    if !keeps_base(base_len, ops_and_post.0) {
+      let made = apply_over((&[], base_len), ops_and_post.0, ops_and_post.1);
+      let digest = (
+        u64::try_from(made.len()).unwrap_or(u64::MAX),
+        *blake3::hash(&made).as_bytes(),
+      );
+      let head = self
+        .content
+        .digest_of(path)
+        .unwrap_or((0, *blake3::hash(&[]).as_bytes()));
+      return digest == head;
+    }
     let history = self.content_history.get(path);
     let Some(history) = history.filter(|_| self.covered_since(path, last_entry(history)).is_none())
     else {
       // No history, or a copy's value (A-586), whose history's last value is no head's: the bytes at the base against
       // the head's (at the base they are the head's, unless a copy since replaced them).
-      let head = self.content.get(path).unwrap_or_default();
-      let at_base = self.content_ref_at_bytes(path, base).unwrap_or_default();
+      // An unlent named text reads as none, noted: the verdict is refused, never judged over it (`crate::unlent`).
+      let head = self.head_bytes(path).unwrap_or_default();
+      let at_base = self.bytes_at(path, base).unwrap_or_default();
       let (ops, post_state) = ops_and_post;
       return apply(&at_base, ops, post_state) == head;
     };
@@ -4278,7 +4482,7 @@ impl Green {
     let replaced = self.replaced_by_rename(dst, (base, cleared), source_is_file)?;
     // Move whatever the source names, capturing its current value so an intervening change to the
     // source follows the move, and removing the source name.
-    if let Some(source) = self.content.get(from) {
+    if let Some(source) = self.head_bytes(from) {
       let edits = self.edits_after_rename((dst, ops), base, from)?;
       effects.extend(replaced);
       let bytes = apply(source, &edits, post_state);
@@ -4321,7 +4525,7 @@ impl Green {
     } else {
       self.intervening(from, base)
     };
-    let source_len = self.content.get(from).map_or(0, len_of);
+    let source_len = self.content.len_of(from).unwrap_or(0);
     ops
       .iter()
       .map(
@@ -4353,7 +4557,16 @@ impl Green {
     match self.content.get(path) {
       // A file stands there: the create is the same file or a conflict, which only its bytes tell.
       Some(current) => {
-        if current == apply(&[], declared, post).as_slice() {
+        // A file held by its object's name alone is told by its digest, the plain BLAKE3 of its bytes (A-873).
+        let made = apply(&[], declared, post);
+        let same = match current {
+          Content::Bytes(bytes) => bytes == made.as_slice(),
+          Content::Named(identity) => {
+            identity.len == u64::try_from(made.len()).unwrap_or(u64::MAX)
+              && identity.hash == *blake3::hash(&made).as_bytes()
+          }
+        };
+        if same {
           Ok(None)
         } else {
           Err(Green::window(path, MergeConflictClass::CreateCreate))
@@ -4502,7 +4715,7 @@ impl Green {
     let mut mapped = Vec::with_capacity(ops.len());
     let mut candidates: Vec<(&Op, u64)> = Vec::new();
     let mut shifting_overlap: Option<Range> = None;
-    let head_len = self.content.get(path).map_or(0, len_of);
+    let head_len = self.content.len_of(path).unwrap_or(0);
     for (op, place) in ops.iter().zip(placed) {
       match place.range() {
         crate::map::Mapped::Shifted(shifted) => {
@@ -4561,11 +4774,30 @@ impl Green {
     path: &str,
     candidates: &[(&Op, u64)],
   ) -> Vec<ConflictWindow> {
-    let current = self.content.get(path).unwrap_or_default();
+    // A head held by its object's name alone that an overwrite covers whole is told apart by its digest, unread (a
+    // Subversion text is whole); an unlent named head any other span reads is none, noted: the verdict is refused
+    // (`crate::unlent`).
+    let named = match self.content.get(path) {
+      Some(Content::Named(identity)) => Some(identity),
+      _ => None,
+    };
+    let whole =
+      |op: &Op, head_start: u64| named.filter(|identity| head_start == 0 && op.len == identity.len);
+    let all_whole = candidates
+      .iter()
+      .all(|(op, head_start)| whole(op, *head_start).is_some());
+    let current = if named.is_some() && all_whole {
+      &[][..]
+    } else {
+      self.head_bytes(path).unwrap_or_default()
+    };
     candidates
       .iter()
       .filter(|(op, head_start)| {
         let agent_bytes = inc.post().span(op.src, op.len);
+        if let Some(identity) = whole(op, *head_start) {
+          return *blake3::hash(&agent_bytes).as_bytes() != identity.hash;
+        }
         let start = usize::try_from(*head_start).unwrap_or(usize::MAX);
         let end = start.saturating_add(agent_bytes.len());
         current.get(start..end) != Some(agent_bytes.as_ref())
@@ -5185,7 +5417,7 @@ impl Green {
     }
     let edits = self.edits_after_rename((heir, ops), base, home)?;
     let bytes = apply(
-      self.content.get(home).unwrap_or_default(),
+      self.head_bytes(home).unwrap_or_default(),
       &edits,
       post_state,
     );
@@ -5378,6 +5610,23 @@ impl Green {
   /// Applies the accepted effects, committing version `version`: the copies first (`commit_copies`, A-586 and A-626),
   /// so what the version does to a copied tree lands on what the copy brought, then every other effect, the content's
   /// removals and sets last.
+  /// Notes every unlent named file a commit of `effects` reads (`crate::unlent`, A-760 (b) 4d), with no byte read: each
+  /// file [`Green::make_mapped`] makes over the head's bytes, all but those a named run makes whole. What a verdict's
+  /// judge checks before it is held, so a commit never makes a file over a text the green did not hold.
+  fn commit_reads(&self, effects: &[Effect], (inline, read): (&[u8], &[Vec<u8>])) {
+    let wholes = alone(self.sole_runs(effects, inline, read));
+    for (place, effect) in effects.iter().enumerate() {
+      if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
+        effect
+        && !wholes.iter().any(|(whole, _)| *whole == place)
+        && let Some(Content::Named(identity)) = self.content.get(path)
+        && keeps_base(identity.len, ops)
+      {
+        crate::unlent::note(identity);
+      }
+    }
+  }
+
   /// Makes each file a verdict left unmade ([`Effect::SetContent`] with no bytes, `ContentSource::Mapped`): the head's
   /// file with the mapped ops applied, its added bytes from `post_state`. Called first by a commit and a rebase's
   /// restatement, at the head the verdict judged (a held verdict commits only there, [`Green::commit_judged`]), so the
@@ -5398,8 +5647,15 @@ impl Green {
         let made = match source {
           // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
           ContentSource::Created(declared) => apply(&[], declared, post_state),
+          // A named base the ops replace whole is made over with its length alone; any other unlent one reads as none,
+          // noted: the verdict is refused (`crate::unlent`).
           ContentSource::Mapped | ContentSource::Copied(..) => {
-            apply(self.content.get(path).unwrap_or_default(), ops, post_state)
+            match self.content.get(path.as_str()) {
+              Some(Content::Named(identity)) if !keeps_base(identity.len, ops) => {
+                apply_over((&[], identity.len), ops, post_state)
+              }
+              _ => apply(self.head_bytes(path).unwrap_or_default(), ops, post_state),
+            }
           }
         };
         *bytes = Some(made);
@@ -5558,7 +5814,9 @@ impl Green {
       return;
     };
     let heir_path = heir.to_owned();
-    if let Some(bytes) = self.content.get(home) {
+    // A file held by its object's name alone is never a node's home here: only a Subversion green holds one, and
+    // Subversion has no hard links; such a home's heir reads it where its bytes are held.
+    if let Some(bytes) = self.head_bytes(home) {
       let whole = insert_whole(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
       moves.push(Effect::SetContent(
         heir_path.clone(),
@@ -5767,7 +6025,11 @@ impl Green {
     self.seed_content(&path, version);
     // The file first, so the value names its block (A-728); the value it supersedes marked so before the path's history
     // is re-anchored on that block (A-793).
-    self.content.insert_named(&path, bytes, name);
+    // A file made whole of one named object holds it by its name alone (A-760 (b) 4d): its bytes, the run's, let go.
+    match name {
+      Some(name) => self.content.insert_named(&path, name),
+      None => self.content.insert(&path, bytes),
+    }
     self.supersede_latest(&path);
     let value = self.content_value(&path, &ops);
     self.last_changed.insert(path.clone(), version);
@@ -6095,7 +6357,21 @@ impl Green {
   /// rebuilt from the chain's entries) computes the same [`Computed`], and moves it to the owner, which commits it by
   /// position. An increment this green accepted before is answered its version. Refused, typed, when this green lacks a
   /// version the work is judged over: its base below the version this green was restored at, or past its head.
+  ///
+  /// A verdict that reads a file held by its object's name alone with no bytes lent it (A-760 (b) 4d, `crate::unlent`)
+  /// is refused [`ComputeRefused::ContentUnread`] naming one such object; [`Green::unlent_reads`] names them all.
   pub fn compute(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
+    let (computed, unlent) = crate::unlent::scope(|| self.compute_read(inc));
+    match unlent.first() {
+      Some(identity) => Err(ComputeRefused::ContentUnread {
+        identity: *identity,
+      }),
+      None => computed,
+    }
+  }
+
+  /// [`Green::compute`], its reads of unlent named blocks noted rather than refused (`crate::unlent`).
+  fn compute_read(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
     let (at, floor) = (self.head(), self.floor());
     let computed = |reached| Computed {
       id: inc.id,
@@ -6161,7 +6437,7 @@ impl Green {
     {
       return Err(PositionRefused::NotRecorded { version });
     }
-    let mut judgment = self.hold_computed(inc, computed);
+    let mut judgment = self.hold_unlent(inc, computed);
     if let Judgment::Accepted(held) = &mut judgment {
       held.read = inc.named.read.0.clone();
     }
@@ -6209,7 +6485,7 @@ impl Green {
       };
     }
     match self.compute(inc) {
-      Ok(computed) => self.hold_computed(inc, computed),
+      Ok(computed) => self.hold_unlent(inc, computed),
       Err(ComputeRefused::BaseUnavailable { base, floor }) => {
         Judgment::BaseUnavailable { base, floor }
       }
@@ -6221,6 +6497,25 @@ impl Green {
       },
       Err(ComputeRefused::CopyRefused { path, case }) => Judgment::CopyRefused { path, case },
       Err(ComputeRefused::ContentUnread { identity }) => Judgment::ContentUnread { identity },
+    }
+  }
+
+  /// [`Green::hold_computed`], refused [`Judgment::ContentUnread`] where bringing the verdict to the head or committing
+  /// it reads a file held by name alone with no bytes lent it (A-760 (b) 4d, `crate::unlent`): nothing is held or
+  /// cached of it, so the owner lends the objects ([`Green::unlent_reads`]) and judges again.
+  fn hold_unlent(&mut self, inc: &Increment, computed: Computed) -> Judgment {
+    let (judgment, unlent) = crate::unlent::scope(|| self.hold_computed(inc, computed));
+    match (unlent.first(), judgment) {
+      (None, judgment) => judgment,
+      (Some(identity), judgment) => {
+        // A conflict judged over an unlent text is no verdict: its cached windows go with it.
+        if let Judgment::Conflict { .. } = judgment {
+          self.rejected.remove(&inc.id);
+        }
+        Judgment::ContentUnread {
+          identity: *identity,
+        }
+      }
     }
   }
 
@@ -6249,6 +6544,7 @@ impl Green {
     };
     match position::verdict(units) {
       Ok(effects) => {
+        self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
         let applied = effects.iter().map(Effect::applied).collect();
         Judgment::Accepted(Judged {
           id: inc.id,
@@ -6325,32 +6621,52 @@ impl Green {
   }
 
   /// Commits a held verdict as the version after the head it was judged at (A-635), with what the chain records of it:
-  /// refused [`HeadMoved`], nothing applied, once the green has moved since.
+  /// refused, nothing applied, once the green has moved since ([`CommitRefused::Moved`]), or while a file it makes over
+  /// the head's bytes is held by name with none lent ([`CommitRefused::Unlent`], A-760 (b) 4d).
   pub fn commit_judged(
     &mut self,
     judged: Judged,
-  ) -> Result<(u64, Vec<crate::chain_entry::Applied>), HeadMoved> {
+  ) -> Result<(u64, Vec<crate::chain_entry::Applied>), CommitRefused> {
     let head = self.head();
     if judged.at != head {
-      return Err(HeadMoved {
+      return Err(CommitRefused::Moved(HeadMoved {
         judged_at: judged.at,
         head,
+      }));
+    }
+    if let Some(identity) = self.commit_unlent(&judged).first() {
+      return Err(CommitRefused::Unlent {
+        identity: *identity,
       });
     }
     Ok(self.commit_held(judged))
   }
 
+  /// Every object a held verdict's commit (or the rest of its making) reads that no block holds the bytes of now
+  /// (A-760 (b) 4d): what its owner lends ([`Green::lend`]) before [`Green::commit_judged`] or [`Green::make_step`],
+  /// which refuse while any is unlent. Empty for a verdict whose files are made, or that reads no named text.
+  pub fn commit_unlent(&self, judged: &Judged) -> BTreeSet<crate::named::Identity> {
+    crate::unlent::scope(|| self.commit_reads(&judged.effects, (&judged.post_state, &judged.read)))
+      .1
+  }
+
   /// Makes `judged`'s files a copy slice of `slice_bytes` a step (A-760; at least a byte), so its commit copies none:
   /// a file a work splices into, a large text's or any other, is made over as many steps as its bytes take, never in
   /// the commit's one step. Every file but those a named run makes whole is made first, then each whole run's buffer is
-  /// moved into its file (no copy), as the commit does. Refused [`HeadMoved`] once the green has moved since the
-  /// verdict, as its commit is: the files are made from the head it was judged at.
-  pub fn make_step(&self, judged: &mut Judged, slice_bytes: u64) -> Result<Made, HeadMoved> {
+  /// moved into its file (no copy), as the commit does. Refused, as its commit is, once the green has moved since the
+  /// verdict (the files are made from the head it was judged at), or while a file still to make is held by name with
+  /// none lent ([`CommitRefused`]).
+  pub fn make_step(&self, judged: &mut Judged, slice_bytes: u64) -> Result<Made, CommitRefused> {
     let head = self.head();
     if judged.at != head {
-      return Err(HeadMoved {
+      return Err(CommitRefused::Moved(HeadMoved {
         judged_at: judged.at,
         head,
+      }));
+    }
+    if let Some(identity) = self.commit_unlent(judged).first() {
+      return Err(CommitRefused::Unlent {
+        identity: *identity,
       });
     }
     let budget = slice_bytes.max(1);
@@ -6409,10 +6725,9 @@ impl Green {
       };
       let (base_len, ops) = match source {
         ContentSource::Created(declared) => (0, declared.as_slice()),
-        ContentSource::Mapped | ContentSource::Copied(..) => (
-          u64::try_from(self.content.get(path).unwrap_or_default().len()).unwrap_or(u64::MAX),
-          ops.as_slice(),
-        ),
+        ContentSource::Mapped | ContentSource::Copied(..) => {
+          (self.content.len_of(path).unwrap_or(0), ops.as_slice())
+        }
       };
       let length = usize::try_from(applied_len(base_len, ops)).unwrap_or(0);
       return Some(FileMaking {
@@ -6430,7 +6745,8 @@ impl Green {
   fn copy_some(&self, judged: &Judged, file: &mut FileMaking, budget: u64) -> u64 {
     let base: &[u8] = match judged.effects.get(file.place) {
       Some(Effect::SetContent(_, _, _, ContentSource::Created(_))) | None => &[],
-      Some(effect) => self.content.get(effect.path()).unwrap_or_default(),
+      // An unlent named base reads as none, noted: the verdict is refused (`crate::unlent`).
+      Some(effect) => self.head_bytes(effect.path()).unwrap_or_default(),
     };
     let post = crate::named::Post::of(&judged.post_state, &judged.read);
     let mut copied = 0u64;
@@ -6526,10 +6842,7 @@ impl Green {
       };
       let (base_len, ops) = match source {
         ContentSource::Created(declared) => (0, declared.as_slice()),
-        ContentSource::Mapped => (
-          u64::try_from(self.content.get(path).unwrap_or_default().len()).unwrap_or(u64::MAX),
-          ops.as_slice(),
-        ),
+        ContentSource::Mapped => (self.content.len_of(path).unwrap_or(0), ops.as_slice()),
         ContentSource::Copied(..) => continue,
       };
       if let Some(run) = sole_run(base_len, ops, &post) {
@@ -6568,11 +6881,12 @@ impl Green {
     if inc.unread().is_some() {
       return self.head();
     }
-    let copies = copy::EntryCopies::of(applied);
-    let mut effects: Vec<Effect> = applied
-      .iter()
-      .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
-      .collect();
+    // Nor over a text held by name alone with no bytes lent it (A-760 (b) 4d): nothing commits, and its owner lends the
+    // objects [`Green::recorded_unlent`] names and applies the entry again.
+    let (mut effects, unlent) = crate::unlent::scope(|| self.recorded_effects(inc, applied));
+    if !unlent.is_empty() {
+      return self.head();
+    }
     // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
     // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
     let mut read = core::mem::take(&mut inc.named.read.0);
@@ -6595,6 +6909,36 @@ impl Green {
     );
     self.accepted.insert(inc.id, version);
     version
+  }
+
+  /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked
+  /// ([`Green::commit_reads`]): what [`Green::apply_recorded`] commits.
+  fn recorded_effects(
+    &self,
+    inc: &Increment,
+    applied: &[crate::chain_entry::Applied],
+  ) -> Vec<Effect> {
+    let copies = copy::EntryCopies::of(applied);
+    let effects: Vec<Effect> = applied
+      .iter()
+      .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
+      .collect();
+    self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
+    effects
+  }
+
+  /// Every object applying `applied` for `inc` at this head reads that no block holds the bytes of now (A-760 (b) 4d):
+  /// what a replay lends ([`Green::lend`]) before [`Green::apply_recorded`] commits the entry, which commits nothing
+  /// while any is unlent. Empty for an entry applied already, or one a green owing a push keeps for later.
+  pub fn recorded_unlent(
+    &self,
+    inc: &Increment,
+    applied: &[crate::chain_entry::Applied],
+  ) -> BTreeSet<crate::named::Identity> {
+    if self.owed.is_some() || self.accepted.contains_key(&inc.id) || inc.unread().is_some() {
+      return BTreeSet::new();
+    }
+    crate::unlent::scope(|| self.recorded_effects(inc, applied)).1
   }
 
   /// Records how the signature of the submit that committed `version` was judged (signed work, A-321): what the service
@@ -6658,11 +7002,15 @@ impl Green {
       }
       Applied::Copied { dst, from, ops } => {
         // A file a copy brings and the same version edits reads the bytes the copy brings (A-626 part 2).
-        let source = copies
-          .source_at(self, dst)
-          .content(from)
-          .unwrap_or_default();
-        let bytes = apply(source, ops, post_state);
+        // A named source the ops replace whole is made over with its length alone; any other unlent one reads as
+        // none, noted: the replay is refused (`Green::recorded_unlent`).
+        let brought = copies.source_at(self, dst);
+        let bytes = match brought.content(from) {
+          Some(Content::Named(identity)) if !keeps_base(identity.len, ops) => {
+            apply_over((&[], identity.len), ops, post_state)
+          }
+          _ => apply(brought.bytes(from).unwrap_or_default(), ops, post_state),
+        };
         let whole = vec![insert_whole(bytes.len() as u64)];
         Effect::SetContent(
           dst.clone(),
@@ -6881,9 +7229,14 @@ impl Green {
     let history = self.content_history.get(path);
     let covered = self.covered_since(path, last_entry(history)).is_some();
     let Some(history) = history.filter(|_| !covered) else {
-      return self.content.get(path).map_or(0, |bytes| {
-        crate::history::Value::whole_cost(bytes.len()).saturating_add(split(1))
-      });
+      // A file held by its object's name alone retains no bytes here.
+      return self
+        .content
+        .get(path)
+        .and_then(|content| content.bytes().ok())
+        .map_or(0, |bytes| {
+          crate::history::Value::whole_cost(bytes.len()).saturating_add(split(1))
+        });
     };
     let Some(latest) = history.last().and_then(|(_, value)| value.as_ref()) else {
       return 0;
@@ -6909,10 +7262,11 @@ impl Green {
   /// rejected figures read off running totals; the current files' figure is a walk of them.
   pub fn retained_bytes(&self) -> RetainedBytes {
     RetainedBytes {
+      // The bytes the green holds: a file held by its object's name alone holds none here (A-760 (b) 4d).
       content: self
         .content
         .values()
-        .map(<[u8]>::len)
+        .map(|content| content.bytes().map_or(0, <[u8]>::len))
         .sum::<usize>()
         .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
       history: self.history_bytes(),
@@ -7124,7 +7478,21 @@ impl Green {
   /// brings into being at the head, so the work's kept mode and attribute changes on them are judged as on a path the
   /// work establishes (a file the head removed, written anew by the replacement), never as a change to the removed one.
   /// Nothing else of the verdict changes; with no path named it is the rebase.
+  ///
+  /// A rebase that reads a file held by its object's name alone with no bytes lent it (A-760 (b) 4d) is refused
+  /// [`Rebased::ContentUnread`] naming one such object ([`Green::unlent_reads`] names a verdict's all).
   pub fn rebase_establishing(&self, inc: &Increment, established: BTreeSet<String>) -> Rebased {
+    let (rebased, unlent) = crate::unlent::scope(|| self.rebase_read(inc, established));
+    match unlent.first() {
+      Some(identity) => Rebased::ContentUnread {
+        identity: *identity,
+      },
+      None => rebased,
+    }
+  }
+
+  /// [`Green::rebase_establishing`], its reads of unlent named blocks noted rather than refused (`crate::unlent`).
+  fn rebase_read(&self, inc: &Increment, established: BTreeSet<String>) -> Rebased {
     if inc.base < self.deltas_from {
       return Rebased::BaseUnavailable {
         base: inc.base,
@@ -7302,7 +7670,7 @@ impl Green {
     changed.extend(heirs);
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
     // removal of a file the head does not hold, are no change.
-    changed.retain(|path, after| after.as_deref() != self.content.get(path));
+    changed.retain(|path, after| !same_content(after.as_deref(), self.content.get(path)));
     Rebased::Rebased {
       version: to,
       changed,

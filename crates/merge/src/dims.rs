@@ -169,16 +169,42 @@ impl<V: Clone> Dim<V> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Block(usize);
 
-/// One block: its bytes, its holders, the content-plane object its bytes are whole, if it was made so (A-760 (b),
-/// [`Blocks::name`]), and the plain BLAKE3 of its bytes, made once with the block ([`Blocks::digest`], A-760 (b) 4a):
-/// what the green's identity entry for a file holds in place of its bytes. `None` only once a staged text's piece is
-/// appended, until it is read again.
+/// One block: its bytes, its length, its holders, the content-plane object its bytes are whole, if it was made so (A-760
+/// (b), [`Blocks::name`]), and the plain BLAKE3 of its bytes ([`Blocks::digest`], A-873): what the green's identity
+/// entry for a file holds in place of its bytes. A named block holds no bytes (A-760 (b) 4d): its object holds them in
+/// the owner's content plane, held there for as long as the block stands ([`NameHold`]); its bytes are lent to it only
+/// for a judge that reads them ([`Blocks::hydrate`]), and let go after ([`Blocks::let_named_bytes_go`]). The digest is
+/// `None` only once a staged text's piece is appended, until it is read again.
 #[derive(Debug)]
 struct Slot {
-  bytes: Vec<u8>,
+  bytes: Option<Vec<u8>>,
+  len: u64,
   holders: u64,
   name: Option<crate::named::Identity>,
   digest: Option<[u8; 32]>,
+}
+
+/// A hold the green's blocks take or give back on a content-plane object (A-760 (b) 4d): one for each block named for
+/// it that holds no bytes, taken when the block is made and given back when it is freed, drained by the owner
+/// ([`Blocks::take_holds`]), which holds the object in its plane for as long as a block names it. Recorded only once
+/// the owner tracks the blocks ([`Blocks::track`]): a replica's or a scratch engine's record none. The owner gives a
+/// tracked engine's holds back before it drops it ([`Blocks::give_back`]); blocks dropped tracked with a hold still
+/// live are a bug, counted ([`dropped_with_holds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameHold {
+  /// A block named for the object was made.
+  Take(crate::named::Identity),
+  /// A block named for the object was freed.
+  Give(crate::named::Identity),
+}
+
+/// What a file taken out of [`Files`] held: its bytes, or the object it was held by alone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Taken {
+  /// Its bytes.
+  Bytes(Vec<u8>),
+  /// The object it was held by.
+  Named(crate::named::Identity),
 }
 
 /// The bytes of current files, each block with the count of the map nodes naming it (module docs, "Files hold
@@ -189,20 +215,66 @@ pub(crate) struct Blocks {
   slots: Vec<Option<Slot>>,
   /// Freed slots, reused before the arena grows.
   free: Vec<usize>,
+  /// The holds made and freed blocks named for an object took and gave back since the owner last drained them.
+  holds: Vec<NameHold>,
+  /// The live blocks named for each object, so a lend finds them with no walk.
+  named: std::collections::BTreeMap<crate::named::Identity, Vec<usize>>,
+  /// The named blocks lent their bytes since the last [`Blocks::let_named_bytes_go`].
+  lent: Vec<usize>,
+  /// Whether the owner tracks the blocks' holds ([`Blocks::track`]).
+  track: bool,
+}
+
+/// Tracked blocks dropped with a hold still live (taken and not given back, or owed to the owner): the bug signal of a
+/// leaked hold, zero in every correct use.
+static DROPPED_WITH_HOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many tracked blocks were dropped with a hold still live, in this process ([`Blocks::give_back`]).
+pub(crate) fn dropped_with_holds() -> u64 {
+  DROPPED_WITH_HOLDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Drop for Blocks {
+  fn drop(&mut self) {
+    if self.track && !(self.holds.is_empty() && self.named.is_empty()) {
+      DROPPED_WITH_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+  }
 }
 
 impl Blocks {
-  /// A new block holding `bytes`, with one holder and named `name` (A-760 (b)).
-  fn add(&mut self, bytes: Vec<u8>, name: Option<crate::named::Identity>) -> Block {
-    // A named block's object is named by the plain BLAKE3 of its bytes (`crate::named::Identity`), which is its digest:
-    // only an unnamed block's bytes are hashed.
-    let digest = name.map_or_else(|| *blake3::hash(&bytes).as_bytes(), |name| name.hash);
-    let slot = Slot {
-      bytes,
+  /// A new block holding `bytes`, with one holder.
+  fn add(&mut self, bytes: Vec<u8>) -> Block {
+    let digest = *blake3::hash(&bytes).as_bytes();
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.place(Slot {
+      bytes: Some(bytes),
+      len,
       holders: 1,
-      name,
+      name: None,
       digest: Some(digest),
-    };
+    })
+  }
+
+  /// A new block holding the object `name` by name alone (A-760 (b) 4d), with one holder; its hold taken
+  /// ([`NameHold::Take`]). Its digest is the object's identity, the plain BLAKE3 of its bytes (A-873).
+  fn add_named(&mut self, name: crate::named::Identity) -> Block {
+    if self.track {
+      self.holds.push(NameHold::Take(name));
+    }
+    let block = self.place(Slot {
+      bytes: None,
+      len: name.len,
+      holders: 1,
+      name: Some(name),
+      digest: Some(name.hash),
+    });
+    self.named.entry(name).or_default().push(block.0);
+    block
+  }
+
+  /// `slot` placed in a free slot, or one more.
+  fn place(&mut self, slot: Slot) -> Block {
     if let Some(at) = self.free.pop()
       && let Some(place) = self.slots.get_mut(at)
     {
@@ -213,18 +285,40 @@ impl Blocks {
     Block(self.slots.len().saturating_sub(1))
   }
 
-  /// A block's bytes; none for a block that is gone (never, while a node names it).
-  pub(crate) fn bytes(&self, block: Block) -> &[u8] {
+  /// A block's bytes, where it holds them: none for a block held by its object's name alone (A-760 (b) 4d) and for one
+  /// that is gone (never, while a node names it). A named block's unlent read is noted for the verdict reading it
+  /// (`crate::unlent`), which is then refused rather than computed over the missing bytes.
+  pub(crate) fn bytes(&self, block: Block) -> Option<&[u8]> {
+    let slot = self.slots.get(block.0).and_then(Option::as_ref)?;
+    if slot.bytes.is_none()
+      && let Some(name) = slot.name
+    {
+      crate::unlent::note(name);
+    }
+    slot.bytes.as_deref()
+  }
+
+  /// A block's content: its bytes, or the object it is held by alone (A-760 (b) 4d). None for a block that is gone.
+  pub(crate) fn content(&self, block: Block) -> Option<crate::engine::Content<'_>> {
+    let slot = self.slots.get(block.0).and_then(Option::as_ref)?;
+    match (&slot.bytes, slot.name) {
+      (Some(bytes), _) => Some(crate::engine::Content::Bytes(bytes)),
+      (None, Some(name)) => Some(crate::engine::Content::Named(name)),
+      (None, None) => None,
+    }
+  }
+
+  /// A block's length, whether it holds its bytes or its object's name. None for a block that is gone.
+  pub(crate) fn len(&self, block: Block) -> Option<u64> {
     self
       .slots
       .get(block.0)
       .and_then(Option::as_ref)
-      .map(|slot| slot.bytes.as_slice())
-      .unwrap_or_default()
+      .map(|slot| slot.len)
   }
 
-  /// The content-plane object `block`'s bytes are the whole of, when it was made of one ([`Files::insert_named`]):
-  /// the name a later piece of A-760 (b) holds the block by in place of its bytes. None for any other block.
+  /// The content-plane object `block`'s bytes are the whole of, when it was made of one ([`Files::insert_named`]).
+  /// None for any other block.
   pub(crate) fn name(&self, block: Block) -> Option<crate::named::Identity> {
     self
       .slots
@@ -233,34 +327,112 @@ impl Blocks {
       .and_then(|slot| slot.name)
   }
 
-  /// The bytes of the live blocks named for each object `wanted` holds (A-866), one each, in one pass over the blocks: a
-  /// block named for an object holds that object's bytes, whichever file or version holds it.
-  pub(crate) fn named_bytes(
-    &self,
-    wanted: &std::collections::BTreeSet<crate::named::Identity>,
-  ) -> Vec<(crate::named::Identity, Vec<u8>)> {
-    let mut found: std::collections::BTreeMap<crate::named::Identity, Vec<u8>> =
-      std::collections::BTreeMap::new();
-    for slot in self.slots.iter().flatten() {
-      if let Some(name) = slot.name
-        && wanted.contains(&name)
-        && !found.contains_key(&name)
-      {
-        found.insert(name, slot.bytes.clone());
-      }
+  /// Lends every live block named for `name` the object's `bytes` for the verdict that reads them (A-760 (b) 4d; main
+  /// 01a20182's ruling: a base is read through the owner's plane, as runs are), until [`Blocks::let_named_bytes_go`].
+  /// How many blocks took them: none for bytes of another length or digest than the name's, or a name no block holds.
+  pub(crate) fn lend(&mut self, name: crate::named::Identity, bytes: Vec<u8>) -> usize {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if len != name.len || *blake3::hash(&bytes).as_bytes() != name.hash {
+      return 0;
     }
-    found.into_iter().collect()
+    let Some(places) = self.named.get(&name) else {
+      return 0;
+    };
+    let mut bytes = Some(bytes);
+    let mut lent = 0usize;
+    for (at, place) in places.iter().enumerate() {
+      let Some(Some(slot)) = self.slots.get_mut(*place) else {
+        continue;
+      };
+      if slot.bytes.is_some() {
+        continue;
+      }
+      // The last block takes the buffer itself; any other a copy (two files of one text: rare).
+      slot.bytes = if at.saturating_add(1) == places.len() {
+        bytes.take()
+      } else {
+        bytes.clone()
+      };
+      self.lent.push(*place);
+      lent = lent.saturating_add(1);
+    }
+    lent
   }
 
-  /// A block's length and the plain BLAKE3 of its bytes (A-760 (b) 4a): its digest made with it, or its bytes hashed now
-  /// for a staged block a piece was appended to. None for a block that is gone.
+  /// Lets go every lent named block's bytes ([`Blocks::lend`]): what the owner does once the verdict that read them is
+  /// committed, so a named block holds no bytes between steps. O(the blocks lent).
+  pub(crate) fn let_named_bytes_go(&mut self) {
+    for place in std::mem::take(&mut self.lent) {
+      if let Some(Some(slot)) = self.slots.get_mut(place)
+        && slot.name.is_some()
+      {
+        slot.bytes = None;
+      }
+    }
+  }
+
+  /// The holds taken and given back since the last drain ([`NameHold`]), handed over: none while untracked.
+  pub(crate) fn take_holds(&mut self) -> Vec<NameHold> {
+    std::mem::take(&mut self.holds)
+  }
+
+  /// Every hold the blocks still take given back, with those owed, and their tracking ended: what the owner applies
+  /// before it lets the engine go, so the store holds nothing for it. Untracked blocks owe none.
+  pub(crate) fn give_back(&mut self) -> Vec<NameHold> {
+    if !self.track {
+      return Vec::new();
+    }
+    let mut given = std::mem::take(&mut self.holds);
+    for (name, places) in &self.named {
+      given.extend(places.iter().map(|_| NameHold::Give(*name)));
+    }
+    self.track = false;
+    given
+  }
+
+  /// The blocks' holds tracked from now on ([`NameHold`]), and those owed: a hold taken for every live named block when
+  /// tracking begins, so the owner's store holds each object once a block, else what changed since the last drain.
+  pub(crate) fn track(&mut self) -> Vec<NameHold> {
+    if self.track {
+      return self.take_holds();
+    }
+    self.track = true;
+    self
+      .named
+      .iter()
+      .flat_map(|(name, places)| places.iter().map(|_| NameHold::Take(*name)))
+      .collect()
+  }
+
+  /// A block's length and the plain BLAKE3 of its bytes (A-873): its digest made with it, a named block's its object's
+  /// identity, or its bytes hashed now for a staged block a piece was appended to. None for a block that is gone.
   pub(crate) fn digest(&self, block: Block) -> Option<(u64, [u8; 32])> {
     let slot = self.slots.get(block.0).and_then(Option::as_ref)?;
-    let len = u64::try_from(slot.bytes.len()).unwrap_or(u64::MAX);
-    let digest = slot
-      .digest
-      .unwrap_or_else(|| *blake3::hash(&slot.bytes).as_bytes());
-    Some((len, digest))
+    let digest = match (slot.digest, &slot.bytes) {
+      (Some(digest), _) => digest,
+      (None, Some(bytes)) => *blake3::hash(bytes).as_bytes(),
+      (None, None) => return None,
+    };
+    Some((slot.len, digest))
+  }
+
+  /// The bytes the blocks named for a content-plane object hold (A-760 (b) 4d): none between steps, since such a block
+  /// holds its object by name alone. The non-vacuity counter of the bytes held once.
+  pub(crate) fn named_bytes_held(&self) -> u64 {
+    self
+      .slots
+      .iter()
+      .flatten()
+      .filter(|slot| slot.name.is_some())
+      .fold(0u64, |total, slot| {
+        let held = slot.bytes.as_ref().map_or(0, Vec::len);
+        total.saturating_add(u64::try_from(held).unwrap_or(u64::MAX))
+      })
+  }
+
+  /// How many live blocks are named for an object (A-760 (b) 4d), each one hold of it.
+  pub(crate) fn named_blocks(&self) -> usize {
+    self.named.values().map(Vec::len).sum()
   }
 
   /// One more holder of `block`.
@@ -279,50 +451,55 @@ impl Blocks {
   }
 
   /// Appends `bytes` to `block`'s bytes: a staged text's next piece (A-716, [`crate::held::Staged`]), whose block no
-  /// other holder shares while it is staged. A staged block is named by nothing, and its bytes change, so it keeps no
-  /// name.
+  /// other holder shares while it is staged and which holds its bytes. A staged block is named by nothing, and its bytes
+  /// change, so it keeps no name.
   pub(crate) fn append(&mut self, block: Block, bytes: &[u8]) {
-    if let Some(Some(slot)) = self.slots.get_mut(block.0) {
-      slot.bytes.extend_from_slice(bytes);
+    if let Some(Some(slot)) = self.slots.get_mut(block.0)
+      && let Some(held) = slot.bytes.as_mut()
+    {
+      held.extend_from_slice(bytes);
+      slot.len = u64::try_from(held.len()).unwrap_or(u64::MAX);
       slot.name = None;
       slot.digest = None;
     }
   }
 
-  /// One holder of `block` fewer; the block is freed with its last.
+  /// One holder of `block` fewer; the block is freed with its last, a named one's hold given back.
   pub(crate) fn release(&mut self, block: Block) {
-    let Some(place) = self.slots.get_mut(block.0) else {
-      return;
-    };
-    if let Some(slot) = place.as_mut()
-      && slot.holders > 1
-    {
-      slot.holders = slot.holders.saturating_sub(1);
-      return;
-    }
-    if place.take().is_some() {
-      self.free.push(block.0);
-    }
+    let _ = self.take(block);
   }
 
-  /// One holder of `block` fewer, and its bytes: moved out with the last holder, copied while another remains.
-  fn take(&mut self, block: Block) -> Vec<u8> {
-    let Some(place) = self.slots.get_mut(block.0) else {
-      return Vec::new();
-    };
-    if let Some(slot) = place.as_mut()
-      && slot.holders > 1
-    {
+  /// One holder of `block` fewer, and what it held: its bytes moved out with the last holder (copied while another
+  /// remains), or the object it was held by alone. None for a block that is gone.
+  fn take(&mut self, block: Block) -> Option<Taken> {
+    let place = self.slots.get_mut(block.0)?;
+    let slot = place.as_mut()?;
+    if slot.holders > 1 {
       slot.holders = slot.holders.saturating_sub(1);
-      return slot.bytes.clone();
+      return Some(match (&slot.bytes, slot.name) {
+        (Some(bytes), None) => Taken::Bytes(bytes.clone()),
+        (_, Some(name)) => Taken::Named(name),
+        (None, None) => Taken::Bytes(Vec::new()),
+      });
     }
-    match place.take() {
-      Some(slot) => {
-        self.free.push(block.0);
-        slot.bytes
+    let slot = place.take()?;
+    self.free.push(block.0);
+    Some(match (slot.bytes, slot.name) {
+      (_, Some(name)) => {
+        if self.track {
+          self.holds.push(NameHold::Give(name));
+        }
+        if let Some(places) = self.named.get_mut(&name) {
+          places.retain(|place| *place != block.0);
+          if places.is_empty() {
+            self.named.remove(&name);
+          }
+        }
+        Taken::Named(name)
       }
-      None => Vec::new(),
-    }
+      (Some(bytes), None) => Taken::Bytes(bytes),
+      (None, None) => Taken::Bytes(Vec::new()),
+    })
   }
 
   /// The blocks alive.
@@ -350,9 +527,17 @@ pub(crate) struct Files {
 }
 
 impl Files {
-  /// A file's bytes.
-  pub(crate) fn get(&self, path: impl AsRef<[u8]>) -> Option<&[u8]> {
-    self.map.get(path).map(|block| self.blocks.bytes(*block))
+  /// A file's content: its bytes, or the object it is held by alone (A-760 (b) 4d).
+  pub(crate) fn get(&self, path: impl AsRef<[u8]>) -> Option<crate::engine::Content<'_>> {
+    self
+      .map
+      .get(path)
+      .and_then(|block| self.blocks.content(*block))
+  }
+
+  /// A file's length, whether its block holds its bytes or its object's name.
+  pub(crate) fn len_of(&self, path: impl AsRef<[u8]>) -> Option<u64> {
+    self.map.get(path).and_then(|block| self.blocks.len(*block))
   }
 
   /// Whether `path` is a file.
@@ -362,18 +547,19 @@ impl Files {
 
   /// Sets `path`'s bytes; the bytes it replaced are let go.
   pub(crate) fn insert(&mut self, path: impl AsRef<[u8]>, bytes: Vec<u8>) {
-    self.insert_named(path, bytes, None);
+    let block = self.blocks.add(bytes);
+    self.set_block(path, block);
   }
 
-  /// Sets `path`'s bytes, which are the whole of the content-plane object `name` when one is given (A-760 (b): a file
-  /// made whole of one named run); the bytes it replaced are let go.
-  pub(crate) fn insert_named(
-    &mut self,
-    path: impl AsRef<[u8]>,
-    bytes: Vec<u8>,
-    name: Option<crate::named::Identity>,
-  ) {
-    let block = self.blocks.add(bytes, name);
+  /// Sets `path` to the whole of the content-plane object `name`, held by its name alone (A-760 (b) 4d: a file made
+  /// whole of one named run, or restored named); the content it replaced is let go.
+  pub(crate) fn insert_named(&mut self, path: impl AsRef<[u8]>, name: crate::named::Identity) {
+    let block = self.blocks.add_named(name);
+    self.set_block(path, block);
+  }
+
+  /// Sets `path` to `block`, its one holder; the block it replaced is let go.
+  fn set_block(&mut self, path: impl AsRef<[u8]>, block: Block) {
     let replaced =
       self
         .map
@@ -384,21 +570,21 @@ impl Files {
     }
   }
 
-  /// Takes `path` out; its bytes.
-  pub(crate) fn remove(&mut self, path: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+  /// Takes `path` out; what it held ([`Taken`]).
+  pub(crate) fn remove(&mut self, path: impl AsRef<[u8]>) -> Option<Taken> {
     let removed = self
       .map
       .root
       .remove(&mut self.map.nodes, path.as_ref(), &mut self.blocks)?;
-    Some(self.blocks.take(removed))
+    self.blocks.take(removed)
   }
 
-  /// Every file and its bytes, in path order.
-  pub(crate) fn iter(&self) -> impl Iterator<Item = (String, &[u8])> + '_ {
+  /// Every file and its content, in path order.
+  pub(crate) fn iter(&self) -> impl Iterator<Item = (String, crate::engine::Content<'_>)> + '_ {
     self
       .map
       .iter()
-      .map(|(path, block)| (path, self.blocks.bytes(*block)))
+      .filter_map(|(path, block)| Some((path, self.blocks.content(*block)?)))
   }
 
   /// Every file's path, in order.
@@ -406,17 +592,38 @@ impl Files {
     self.map.keys()
   }
 
-  /// Every file's bytes, in path order.
-  pub(crate) fn values(&self) -> impl Iterator<Item = &[u8]> + '_ {
-    self.map.values().map(|block| self.blocks.bytes(*block))
+  /// Every file's content, in path order.
+  pub(crate) fn values(&self) -> impl Iterator<Item = crate::engine::Content<'_>> + '_ {
+    self
+      .map
+      .values()
+      .filter_map(|block| self.blocks.content(*block))
   }
 
-  /// The files under `prefix` and their bytes, in path order.
-  pub(crate) fn prefix(&self, prefix: &str) -> impl Iterator<Item = (String, &[u8])> + '_ {
+  /// The files under `prefix` and their content, in path order.
+  pub(crate) fn prefix(
+    &self,
+    prefix: &str,
+  ) -> impl Iterator<Item = (String, crate::engine::Content<'_>)> + '_ {
     self
       .map
       .prefix(prefix)
-      .map(|(path, block)| (path, self.blocks.bytes(*block)))
+      .filter_map(|(path, block)| Some((path, self.blocks.content(*block)?)))
+  }
+
+  /// [`Blocks::lend`].
+  pub(crate) fn lend_named(&mut self, name: crate::named::Identity, bytes: Vec<u8>) -> usize {
+    self.blocks.lend(name, bytes)
+  }
+
+  /// [`Blocks::let_named_bytes_go`].
+  pub(crate) fn let_named_bytes_go(&mut self) {
+    self.blocks.let_named_bytes_go();
+  }
+
+  /// [`Blocks::take_holds`].
+  pub(crate) fn take_holds(&mut self) -> Vec<NameHold> {
+    self.blocks.take_holds()
   }
 
   /// `path`'s file's length and the plain BLAKE3 of its bytes ([`Blocks::digest`]): what its identity entry holds.
@@ -450,7 +657,7 @@ impl Files {
 
   /// A new block holding `bytes`, with one holder and named by no path (A-716: a text held before any file names it).
   pub(crate) fn add_unnamed_block(&mut self, bytes: Vec<u8>) -> Block {
-    self.blocks.add(bytes, None)
+    self.blocks.add(bytes)
   }
 
   /// Appends `bytes` to a staged text's block (A-716, [`crate::held::Staged`]).
@@ -458,9 +665,10 @@ impl Files {
     self.blocks.append(block, bytes);
   }
 
-  /// A held block's bytes; none for a block that is gone (never, while the table holds it).
-  pub(crate) fn block_bytes(&self, block: Block) -> &[u8] {
-    self.blocks.bytes(block)
+  /// A held block's content: its bytes, or the object it is held by alone; none for a block that is gone (never, while
+  /// the table holds it).
+  pub(crate) fn block_content(&self, block: Block) -> Option<crate::engine::Content<'_>> {
+    self.blocks.content(block)
   }
 
   /// One holder of a held block fewer; the block is freed with its last.
@@ -851,16 +1059,19 @@ mod tests {
     let mut fork = files.fork();
     files.lend(&mut fork);
     fork.insert("a", b"changed".to_vec());
-    assert_eq!(fork.remove("b"), Some(b"two".to_vec()));
+    assert_eq!(fork.remove("b"), Some(Taken::Bytes(b"two".to_vec())));
     fork.lend(&mut files);
-    assert_eq!(files.get("a"), Some(b"one".as_slice()));
-    assert_eq!(files.get("b"), Some(b"two".as_slice()));
+    assert_eq!(files.get("a"), Some(crate::engine::Content::Bytes(b"one")));
+    assert_eq!(files.get("b"), Some(crate::engine::Content::Bytes(b"two")));
     files.lend(&mut fork);
-    assert_eq!(fork.get("a"), Some(b"changed".as_slice()));
+    assert_eq!(
+      fork.get("a"),
+      Some(crate::engine::Content::Bytes(b"changed"))
+    );
     assert_eq!(fork.get("b"), None);
     release_a_node_a_step(&mut fork);
     fork.lend(&mut files);
-    assert_eq!(files.get("a"), Some(b"one".as_slice()));
+    assert_eq!(files.get("a"), Some(crate::engine::Content::Bytes(b"one")));
     release_a_node_a_step(&mut files);
     assert_eq!(files.map.nodes.live(), 0, "every node freed");
     assert_eq!(files.blocks.live(), 0, "every block freed");

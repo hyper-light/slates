@@ -190,6 +190,9 @@ pub(crate) struct FuseMount {
   /// `fsync` replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
   /// first, bounded by `live_ship::reply_hold_bound` ([`settle_held`]).
   held: std::collections::VecDeque<HeldFsync>,
+  /// The request parked on a read of a named text's let-go window while it comes back (A-760 (b) 4d): served again
+  /// once it is, its reply never sent before. One a mount, since a mount serves one request a turn.
+  parked: Option<ParkedRequest>,
   /// What this mount's journal reader's rounds have shown of its kernel's pace (A-548): the reader's patience is
   /// learned from them after every turn (`crate::reader_patience`).
   patience: crate::learned_wait::LearnedWait,
@@ -655,6 +658,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       change,
       seen: 0,
       held: std::collections::VecDeque::new(),
+      parked: None,
       patience: crate::learned_wait::LearnedWait::default(),
       _own: own,
     },
@@ -689,6 +693,9 @@ fn release_unmounted_lease(s: &mut ShardState, record: &AttachmentRecord) {
 enum Turned {
   /// No request was waiting.
   Idle,
+  /// A request read a named text's let-go window: parked unanswered (`FuseMount::parked`) for its windows to come
+  /// back (A-760 (b) 4d).
+  Parked,
   /// A request was served (or a malformed one dropped).
   Served,
   /// The owner may not serve the volume's latest state now (AUD-29-83): nothing was read from the device, so
@@ -696,6 +703,83 @@ enum Turned {
   Fenced,
   /// The mount ended.
   Ended,
+}
+
+/// A request parked on reads of a named text's let-go windows (A-760 (b) 4d; main's ruling: one entry per parked
+/// request in the shard's table, bounded by the bridge's in-flight bound): the request as the kernel sent it, unanswered,
+/// the reads it waits on, and its entry.
+struct ParkedRequest {
+  request: Vec<u8>,
+  unique: u64,
+  reads: Vec<crate::vcs_store::named_objects::AwayRead>,
+  entry: u64,
+}
+
+/// Counter: FUSE requests parked on a read of a named text's let-go window while it came back from the node's store,
+/// then served again (A-760 (b) 4d; main's ruling (B)). Format: a counter name.
+const PARKED_ON_AWAY: &str = "fuse.parked_on_away";
+/// Counter: FUSE requests refused a park because the shard's table was at its bound: answered `EIO`. Format: a counter
+/// name.
+const PARK_REFUSED: &str = "fuse.park_refused";
+/// Counter: a request served again over the windows it was parked on that met a let-go window again: a bug, answered
+/// `EIO` and logged naming the object, never parked again. Format: a counter name.
+const AWAY_AGAIN: &str = "fuse.away_again";
+/// Counter: a parked request whose windows the node's store did not give back: answered `EIO`. Format: a counter name.
+const BRING_BACK_REFUSED: &str = "fuse.bring_back_refused";
+
+/// Answers `attachment`'s parked request `errno`, its entry released: what a refused bring-back, or a mount ending
+/// with one parked, leaves the kernel.
+fn answer_parked(s: &mut ShardState, attachment: u64, errno: i32) {
+  let Some(mount) = s.fuse_mounts.get_mut(&attachment) else {
+    return;
+  };
+  let Some(parked) = mount.parked.take() else {
+    return;
+  };
+  s.fuse_parked.release(parked.entry);
+  let mut header = [0u8; slates_bridge_fuse::abi::OUT_HEADER_LEN];
+  if let Ok(length) =
+    slates_bridge_fuse::ReplyHeader::write_error(parked.unique, errno, &mut header)
+  {
+    let _ = mount
+      .channel
+      .write_reply(header.get(..length).unwrap_or(&[]));
+  }
+}
+
+/// A request whose dispatch met reads of let-go windows (`away`; A-760 (b) 4d): parked unanswered for them to come back,
+/// its reply never sent; refused `EIO` at the shard's table's bound, counted; and a request served again over windows
+/// it was parked on that met one again (`again`) is a bug, answered `EIO`, counted and logged, never parked again.
+fn park(
+  s: &mut ShardState,
+  mount: &mut FuseMount,
+  dispatched: Dispatched,
+  (away, again): (Vec<crate::vcs_store::named_objects::AwayRead>, bool),
+) -> Turned {
+  if again {
+    s.count(AWAY_AGAIN, 1);
+    slates_machine::log_line!(
+      "slates-server: a FUSE request served again over its brought-back windows met {:?} let go again",
+      away.first().map(|read| read.identity)
+    );
+    let _ = send_reply(&mount.channel, &mut mount.serve, &dispatched, Some(EIO));
+    return Turned::Served;
+  }
+  // One a mount, a mount an attachment: bounded by the attachments a shard admits.
+  let bound = slates_bridge_core::authority::MAX_ATTACHMENTS;
+  let Some(entry) = s.fuse_parked.park(away.clone(), bound) else {
+    s.count(PARK_REFUSED, 1);
+    let _ = send_reply(&mount.channel, &mut mount.serve, &dispatched, Some(EIO));
+    return Turned::Served;
+  };
+  let unique = dispatched.unique();
+  mount.parked = Some(ParkedRequest {
+    request: dispatched.into_request(),
+    unique,
+    reads: away,
+    entry,
+  });
+  Turned::Parked
 }
 
 /// What woke a mount's task.
@@ -713,6 +797,8 @@ enum Woke {
 enum TurnKind {
   /// Read and serve a waiting request, delivering the owed round first.
   Request,
+  /// Serve again the request parked on a let-go window, its windows back (A-760 (b) 4d).
+  Parked,
   /// Deliver the owed round alone, reading no request (`serve_step` with `Wake::Change`).
   Change,
 }
@@ -870,8 +956,41 @@ async fn change_turn(attachment: u64) -> bool {
 /// The mount's request turns ([`serve`]): requests taken until none waits, yielding between them; whether the mount
 /// still serves (it ended otherwise, and is ended here).
 async fn request_turns(attachment: u64) -> bool {
+  // A parked request's windows, kept until it is served again (A-760 (b) 4d), then the next request read.
+  let mut kind = TurnKind::Request;
+  let mut _pins: Vec<crate::vcs_store::named_objects::ReadPin> = Vec::new();
   loop {
-    match state::with_state(|s| turn(s, attachment, TurnKind::Request)) {
+    let turned = state::with_state(|s| turn(s, attachment, kind));
+    kind = TurnKind::Request;
+    _pins = Vec::new();
+    match turned {
+      Some(Turned::Parked) => {
+        let reads = state::with_state(|s| {
+          s.fuse_mounts
+            .get(&attachment)
+            .and_then(|mount| mount.parked.as_ref())
+            .map(|parked| parked.reads.clone())
+        })
+        .flatten()
+        .unwrap_or_default();
+        let _ = state::with_state_counted(|s| s.count(PARKED_ON_AWAY, 1));
+        match crate::vcs_store::named_objects::bring_back_reads(&reads).await {
+          Ok(pins) => {
+            _pins = pins;
+            kind = TurnKind::Parked;
+          }
+          Err(refused) => {
+            let _ = state::with_state_counted(|s| {
+              s.count(BRING_BACK_REFUSED, 1);
+              answer_parked(s, attachment, EIO);
+            });
+            slates_machine::log_line!(
+              "slates-server: a FUSE request parked on {:?} was not brought back: {refused:?}",
+              reads.first().map(|read| read.identity)
+            );
+          }
+        }
+      }
       Some(Turned::Idle) => return true,
       Some(Turned::Served) => {
         // A served request is client activity, as an NFS call and a guest's request are: the shard spins out its
@@ -1004,82 +1123,116 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   let view = crate::vcs_store::svn_presenter::view_of(&s.svn_views, mount.volume);
   let view_green =
     view.and_then(|repository| crate::repository::svn_commit::green_of(s, repository).ok());
-  let lent_turn = crate::vcs_store::svn_presenter::lent_if(s, view.is_some(), |s| {
-    // A mounted work whose base moved shows its new base (A-774 R4).
-    crate::mounted_work::refresh(s, mount.volume);
-    let ShardState {
-      store,
-      volumes,
-      attachments,
-      greens,
-      merge,
-      vcs_stores,
-      ..
-    } = &mut *s;
-    let view_source =
-      crate::vcs_store::svn_presenter::view_source(vcs_stores, greens, view, view_green);
-    let view_texts = view_source
-      .as_ref()
-      .map(crate::vcs_store::svn_presenter::ViewSource::texts);
-    let view_seam = view_texts
-      .as_ref()
-      .map(crate::vcs_store::svn_presenter::ViewTexts);
-    // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
-    let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
-    let green_tree = lent_green
-      .as_ref()
-      .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
-    let mut tree_lens = None;
-    let Ok(slot) = volumes.get_mut(handle) else {
-      return None;
-    };
-    let host = slot
-      .host
+  // So is a mounted work's base held by name (A-760 (b) 4d).
+  let lend = view.is_some() || crate::mounted_work::reads_named(s, mount.volume);
+  // The request parked on a let-go window, served again now its windows are back (A-760 (b) 4d).
+  let kept = match kind {
+    TurnKind::Parked => mount
+      .parked
       .as_mut()
-      .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens));
-    let dispatched = {
-      let mut bridge = VolumeBridge::attached(
-        mount.volume,
-        &mut slot.volume,
+      .map(|parked| std::mem::take(&mut parked.request)),
+    TurnKind::Request | TurnKind::Change => None,
+  };
+  // The reads of let-go windows the dispatch met, noted for the park (`named_objects::away_scope`).
+  let (lent_turn, away) = crate::vcs_store::named_objects::away_scope(|| {
+    crate::vcs_store::svn_presenter::lent_if(s, lend, |s| {
+      // A mounted work whose base moved shows its new base (A-774 R4).
+      crate::mounted_work::refresh(s, mount.volume);
+      let ShardState {
         store,
-        &mut mount.handles,
-        host,
-      )
-      .with_lost_writes(&mut mount.lost);
-      if let Some(seam) = view_seam.as_ref() {
-        bridge = bridge.reading_referenced(seam);
-      }
-      let mut scoped = None;
-      let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
-      match kind {
-        TurnKind::Request => dispatch_ready(
-          &mut mount.channel,
-          served,
-          attachments,
-          mount.registry,
-          &mut mount.serve,
-          slice_bytes,
-        ),
-        TurnKind::Change => {
-          mount.change.drain();
-          serve_step(
+        volumes,
+        attachments,
+        greens,
+        merge,
+        vcs_stores,
+        ..
+      } = &mut *s;
+      let view_source =
+        crate::vcs_store::svn_presenter::view_source(vcs_stores, greens, view, view_green);
+      let view_texts = view_source
+        .as_ref()
+        .map(crate::vcs_store::svn_presenter::ViewSource::texts);
+      let view_seam = view_texts
+        .as_ref()
+        .map(crate::vcs_store::svn_presenter::ViewTexts);
+      // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
+      let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
+      let green_tree = lent_green.as_ref().map(|(green, version)| {
+        crate::green_tree::GreenTree::reading(
+          green,
+          *version,
+          crate::vcs_store::named_objects::plane(vcs_stores, &()),
+        )
+      });
+      let mut tree_lens = None;
+      let Ok(slot) = volumes.get_mut(handle) else {
+        return None;
+      };
+      let host = slot
+        .host
+        .as_mut()
+        .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens));
+      let dispatched = {
+        let mut bridge = VolumeBridge::attached(
+          mount.volume,
+          &mut slot.volume,
+          store,
+          &mut mount.handles,
+          host,
+        )
+        .with_lost_writes(&mut mount.lost);
+        if let Some(seam) = view_seam.as_ref() {
+          bridge = bridge.reading_referenced(seam);
+        }
+        let mut scoped = None;
+        let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
+        match kind {
+          TurnKind::Request => dispatch_ready(
             &mut mount.channel,
             served,
             attachments,
             mount.registry,
             &mut mount.serve,
-            Wake::Change,
-          )
-          .map(|step| match step {
-            Step::Ended => Turn::Ended,
-            // A change wake reads no request, so it only delivers or ends; the other steps are a request's.
-            Step::Change(_) | Step::Request { .. } | Step::Dropped => Turn::Idle,
-          })
+            slice_bytes,
+          ),
+          TurnKind::Parked => slates_bridge_fuse::channel::dispatch_kept(
+            &mut mount.channel,
+            served,
+            attachments,
+            mount.registry,
+            &mut mount.serve,
+            slice_bytes,
+            kept.unwrap_or_default(),
+          ),
+          TurnKind::Change => {
+            mount.change.drain();
+            serve_step(
+              &mut mount.channel,
+              served,
+              attachments,
+              mount.registry,
+              &mut mount.serve,
+              Wake::Change,
+            )
+            .map(|step| match step {
+              Step::Ended => Turn::Ended,
+              // A change wake reads no request, so it only delivers or ends; the other steps are a request's.
+              Step::Change(_) | Step::Request { .. } | Step::Dropped => Turn::Idle,
+            })
+          }
         }
-      }
-    };
-    Some(dispatched)
+      };
+      Some(dispatched)
+    })
   });
+  // A parked request is served again once: its entry goes whatever this turn did.
+  let reserved = match kind {
+    TurnKind::Parked => mount.parked.take().map(|parked| {
+      s.fuse_parked.release(parked.entry);
+      parked
+    }),
+    TurnKind::Request | TurnKind::Change => None,
+  };
   let Some(dispatched) = lent_turn else {
     return Turned::Ended;
   };
@@ -1090,7 +1243,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // did, and a change made while a spurious device wake was being served was marked seen and never delivered.
   let delivered = match kind {
     TurnKind::Change => dispatched.is_ok(),
-    TurnKind::Request => matches!(dispatched, Ok(Turn::Dispatched(_))),
+    TurnKind::Request | TurnKind::Parked => matches!(dispatched, Ok(Turn::Dispatched(_))),
   };
   let turned = match dispatched {
     Ok(Turn::Idle) => Turned::Idle,
@@ -1101,6 +1254,9 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
       Turned::Served
     }
     Ok(Turn::Ended) => return Turned::Ended,
+    Ok(Turn::Dispatched(dispatched)) if !away.is_empty() => {
+      park(s, mount, dispatched, (away, reserved.is_some()))
+    }
     Ok(Turn::Dispatched(dispatched)) => {
       log_write(s, mount.volume, &dispatched);
       if dispatched.resent() {
@@ -1536,6 +1692,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       change,
       seen: 0,
       held: std::collections::VecDeque::new(),
+      parked: None,
       patience: crate::learned_wait::LearnedWait::default(),
       _own: own,
     },
@@ -1557,6 +1714,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
 /// The mount has ended: its device dropped, its registry attachment revoked and drained, and its catalog
 /// attachment ended as a recorded operation (unless a `detach` or destroy already ended it).
 fn ended(s: &mut ShardState, attachment: u64) {
+  // A parked request is answered before the mount goes (A-760 (b) 4d), its entry released.
+  answer_parked(s, attachment, EIO);
   if let Some(mount) = s.fuse_mounts.remove(&attachment) {
     close_journal_reader(s, &mount);
     release_states(s, &mount);
@@ -1944,6 +2103,7 @@ mod tests {
           change,
           seen: 0,
           held: std::collections::VecDeque::new(),
+          parked: None,
           patience: crate::learned_wait::LearnedWait::default(),
           _own: OwnMountRecord(0),
         },
