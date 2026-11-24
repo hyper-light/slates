@@ -592,3 +592,11 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   compared in text order (stock lists them in APR's freshly seeded hash order), and tree_of holds a symbolic link as
   "link TARGET" (git-2000's IsADirectory). GAPS: A-645 (a) by use (r202; the long-history test closed by A-877
   c1da780ec per main's bisect r378, green 3/3 in r351), and both matrices 66/66. Owed to main: rerun (d) over HTTP.
+- READY 54e4a9a4c (main pushed it: run 45316568372): goal 93's Linux counts, the git and svn matrices (svn over both
+  routes) on ubuntu-latest, unloaded, against release slates, datasets fetched in the job. hg's Linux rows are
+  arena-19's (24/24). When the rows come back, record them in GAPS' per-platform counts.
+- LANDED 253c5d68f, 2026-11-23: goal 93 perf harness. crates/cli/bench/interop_speed.sh runs the three harnesses
+  interleaved, with load and per-server-kind peak RSS and CPU sampled; git_scale gains stock-http (git http-backend
+  under Apache, httpd in its own session). BENCHMARKS has the entry's shape, NOT YET RUN: main runs it on the big
+  Studio. mod_dav_svn is absent there.
+- WAITING: r546 (the svn use test over HTTP at c40775ea2); svn on Windows waits on Ada's go.
