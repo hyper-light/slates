@@ -22,6 +22,16 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 00:30 on 11-24:
+- Goal 84a: the session's stop hook holds the pre-11-22 text and asks for every run under 1 ms on Linux, macOS and Windows
+  at main's current tree. Read back from the machines, the 11-22/11-23 bare-metal rounds had every run under 1 ms on
+  Linux (worst p999 761 us) and macOS (289 us), but on Windows 1 of 12 accept runs had a 6.1 ms p999 (the goal's met text
+  quotes the middle-of-three figure). Confirming rounds at main 55650fef1 are running: r791 Studio
+  (~/.cache/main-rounds/84a-confirm-2/summary.txt), r792 jupiter (~/.cache/main-84a-win/c2-summary.txt), r793 adacachy2
+  (~/.cache/main-84a-c2-summary.txt; waits up to 4 h for load under 8, since other projects held it at 66). If Windows
+  shows the outlier again, it is a real tail to name (jupiter's rounds run at Normal through WMI, outside kiln's job).
+- w-shared's CLI test fix landed (ca73f5c4c, merge 55650fef1). w-perf is building A-887 (B).
+
 Updates at 00:17 on 11-24:
 - F2 rerun 2 RUNNING: GitHub run 45354317783 (branch diag-measurer-main-f2-2, worktree ~/slates-work/main-f2diag) at
   w-shared's fix 427ad2389 (catch-up 1.11 s -> 0.25 s: a family's directory no longer cloned at each mark and page).
