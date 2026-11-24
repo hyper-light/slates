@@ -596,11 +596,9 @@ fn true_up_holding(state: &mut ShardState, id: RepositoryId) {
   };
   let (holding, charged) = (import.holding(), *reserved);
   let short = if holding > charged {
-    state
-      .store
-      .budget
-      .charge_retention(holding.saturating_sub(charged))
-      .is_err()
+    let more = holding.saturating_sub(charged);
+    state.store.make_room(more);
+    state.store.budget.charge_retention(more).is_err()
   } else {
     state
       .store

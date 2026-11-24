@@ -99,11 +99,15 @@ impl Rates {
   }
 
   /// The rates measured on `clock` (the owner's), over a corpus of two deflate windows of text-like bytes made by a
-  /// seeded generator: each level deflating the corpus once, and one delta search of the corpus against a copy of it
-  /// with a byte changed in every [`KIB`]. The corpus and the copy are what a pushed text file and its next version
-  /// are like; the measure is the owner's to make once and keep.
+  /// seeded generator: each level deflating the corpus once, and two delta searches — one of the corpus against a copy
+  /// with a byte changed in every [`KIB`] (matching) and one against a second independent draw of the same length
+  /// (non-matching) — so `search_ns_per_kib` reflects both matching copies and full rolling-hash scans rather than the
+  /// best-case matching path alone. The measure is the owner's to make once and keep.
   pub fn measure(clock: &mut dyn Clock) -> Rates {
-    let corpus = corpus(DEFLATE_WINDOW.saturating_mul(2));
+    let window_pair = DEFLATE_WINDOW.saturating_mul(2);
+    let mut drawn = corpus(window_pair.saturating_mul(2));
+    let other = drawn.split_off(window_pair);
+    let corpus = drawn;
     let kib = (u64::try_from(corpus.len()).unwrap_or(u64::MAX) / KIB).max(1);
     let len = u64::try_from(corpus.len()).unwrap_or(u64::MAX).max(1);
     let mut deflate_ns_per_kib = [0_u64; LEVELS_USIZE];
@@ -131,12 +135,16 @@ impl Rates {
     for byte in changed.iter_mut().step_by(step) {
       *byte = byte.wrapping_add(1);
     }
+    /// Shape: two delta searches (matching and non-matching), each over a source and target of
+    /// `kib` KiB (`2` searches × `2` inputs = `4` × `kib` KiB total input bytes).
+    const SEARCH_INPUT_MULTIPLIER: u64 = 4;
     let start = clock.now_ns();
     let _ = super::deltas::delta_of(&corpus, &changed);
+    let _ = super::deltas::delta_of(&corpus, &other);
     let search_ns_per_kib = clock
       .now_ns()
       .saturating_sub(start)
-      .checked_div(kib.saturating_mul(2))
+      .checked_div(kib.saturating_mul(SEARCH_INPUT_MULTIPLIER))
       .unwrap_or(0);
     Rates {
       deflate_ns_per_kib,
@@ -276,6 +284,28 @@ impl Levels {
       }
     }
     best.map(|(_, level)| level)
+  }
+
+  /// Whether every zlib level `0..LEVELS` has been sampled for `kind`.
+  pub fn has_kind(&self, kind: Kind) -> bool {
+    let number = kind.pack_number();
+    (0..LEVELS).all(|level| self.samples.contains_key(&(number, level)))
+  }
+
+  /// Copies sampled level statistics from `from` for any object kind not yet sampled in `self`,
+  /// keeping the repository's once-per-kind learning rule intact across concurrent fetches.
+  pub fn merge_missing(&mut self, from: &Levels) {
+    for kind in [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag] {
+      if self.has_kind(kind) || !from.has_kind(kind) {
+        continue;
+      }
+      let number = kind.pack_number();
+      for level in 0..LEVELS {
+        if let Some(&sums) = from.samples.get(&(number, level)) {
+          self.samples.insert((number, level), sums);
+        }
+      }
+    }
   }
 
   /// `kind`'s object of `input` bytes deflated to `output` at `level`, taking `ns`.

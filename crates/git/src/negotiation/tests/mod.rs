@@ -622,12 +622,17 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
     Some(acknowledgments)
   };
   let cut = oracle_cut(graph, asks, &wants, &client)?;
-  let objects = oracle_objects(graph, asks, &walk_wants, &one_round, &common, &cut, &runs);
+  let (objects, held) = oracle_objects(graph, asks, &walk_wants, &one_round, &common, &cut, &runs);
   let pack = Pack {
     acknowledgments,
     shallow_info: cut.info.clone(),
     runs,
     objects: Positions::of(objects.iter().map(|node| u64::from(*node)).collect()),
+    held: if asks.thin && asks.filter.is_none() && !common.is_empty() {
+      Positions::of(held.iter().map(|node| u64::from(*node)).collect())
+    } else {
+      Positions::new()
+    },
     _node: core::marker::PhantomData,
   };
   Ok(Expected {
@@ -867,6 +872,7 @@ fn oracle_left_out(
       .iter()
       .filter(|parent| !sent.contains(parent))
     {
+      left_out.insert(*parent);
       left_out.extend(graph.reach([graph.objects[at(*parent)].tree]));
     }
   }
@@ -1086,7 +1092,7 @@ fn oracle_objects(
   common: &[u32],
   cut: &OracleCut,
   runs: &[Run<u32>],
-) -> Vec<u32> {
+) -> (Vec<u32>, BTreeSet<u32>) {
   let filter = asks.filter.as_ref();
   let sent = oracle_sent(graph, walk_wants, one_round, common, cut);
   let left_out = oracle_left_out(graph, asks, common, cut, &sent);
@@ -1125,7 +1131,7 @@ fn oracle_objects(
     let carried = oracle_carried(graph, filter, runs);
     oracle_tags(graph, &carried, &mut chosen);
   }
-  chosen.into_iter().collect()
+  (chosen.into_iter().collect(), left_out)
 }
 
 /// The plan of a generated history and request: every choice an index taken modulo what it picks from.

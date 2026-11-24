@@ -33,9 +33,55 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasher, Hasher};
 
 use flate2::{FlushDecompress, Status};
 use slates_vcs::{ContentId, ContentStore};
+
+/// Derived: Knuth's 64-bit golden-ratio multiplier for mixing `(ContentId, u64)` pack-place keys
+/// whose `ContentId` is already a 256-bit cryptographic BLAKE3 digest.
+const PLACE_HASH_MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Format: bytes of the BLAKE3 identity prefix folded into one 64-bit hash word.
+const HASH_WORD_BYTES: usize = core::mem::size_of::<u64>();
+
+/// Zero-SipHash hasher for `(ContentId, u64)` keys in [`Recent`]: folds the BLAKE3 identity prefix
+/// with the pack entry offset directly instead of running `RandomState` per object read.
+#[derive(Default)]
+struct PackPlaceHasher(u64);
+
+impl Hasher for PackPlaceHasher {
+  #[inline]
+  fn write(&mut self, bytes: &[u8]) {
+    let word = bytes
+      .first_chunk::<HASH_WORD_BYTES>()
+      .map_or(0_u64, |head| u64::from_le_bytes(*head));
+    self.0 = self.0.wrapping_mul(PLACE_HASH_MIX) ^ word;
+  }
+
+  #[inline]
+  fn write_u64(&mut self, value: u64) {
+    self.0 = (self.0 ^ value).wrapping_mul(PLACE_HASH_MIX);
+  }
+
+  #[inline]
+  fn finish(&self) -> u64 {
+    self.0 ^ (self.0 >> u32::BITS)
+  }
+}
+
+/// Deterministic [`BuildHasher`] for [`Recent`]'s pack-place table.
+#[derive(Clone, Copy, Debug, Default)]
+struct PackPlaceBuildHasher;
+
+impl BuildHasher for PackPlaceBuildHasher {
+  type Hasher = PackPlaceHasher;
+
+  #[inline]
+  fn build_hasher(&self) -> PackPlaceHasher {
+    PackPlaceHasher::default()
+  }
+}
 
 use crate::admission::Admission;
 use crate::delta;
@@ -208,6 +254,8 @@ pub struct Scratch {
   chain: Vec<Link>,
   /// An entry's header's bytes, gathered across windows.
   header: Vec<u8>,
+  /// Reusable copy buffer holding a reference tree while diffing two packed trees in place.
+  aux: Vec<u8>,
   /// The objects read lately (module docs, "Objects read lately").
   recent: Recent,
 }
@@ -221,9 +269,10 @@ pub struct Scratch {
 /// its length, and a budget that grows (a push's, as its pack arrives) adds chunks.
 #[derive(Debug, Default)]
 pub struct Recent {
-  /// Where each object kept lies: its type and its chunk's range. A hash table, which once grown to the budget's objects
-  /// allocates nothing as they come and go, where a B-tree split and gave back a node every few (142 bytes an object).
-  objects: HashMap<(ContentId, u64), (Kind, Lent)>,
+  /// Where each object kept lies: its type and its chunk's range. A hash table keyed by the
+  /// BLAKE3 pack identity and byte offset with [`PackPlaceBuildHasher`] allocates nothing once
+  /// grown and avoids SipHash on every read.
+  objects: HashMap<(ContentId, u64), (Kind, Lent), PackPlaceBuildHasher>,
   /// The chunks, oldest first.
   chunks: VecDeque<Chunk>,
   /// The objects kept, oldest first, each with its chunk's number: one queue, which stops growing once the budget is
@@ -441,7 +490,7 @@ impl Recent {
       .first
       .saturating_add(u64::try_from(self.chunks.len()).unwrap_or(u64::MAX));
     self.chunks = VecDeque::new();
-    self.objects = HashMap::new();
+    self.objects = HashMap::with_hasher(PackPlaceBuildHasher);
     self.order = VecDeque::new();
     self.bytes = 0;
     self.held = 0;
@@ -510,10 +559,16 @@ impl Scratch {
 
   /// What it holds now (the memory status's gauges): its buffers' room, and the bytes of the objects read lately.
   pub fn held(&self) -> (u64, u64) {
-    let room = [&self.built, &self.next, &self.delta, &self.header]
-      .iter()
-      .map(|buffer| buffer.capacity())
-      .fold(0usize, usize::saturating_add);
+    let room = [
+      &self.built,
+      &self.next,
+      &self.delta,
+      &self.header,
+      &self.aux,
+    ]
+    .iter()
+    .map(|buffer| buffer.capacity())
+    .fold(0usize, usize::saturating_add);
     (
       u64::try_from(room).unwrap_or(u64::MAX),
       u64::try_from(self.recent.bytes).unwrap_or(u64::MAX),
@@ -523,7 +578,12 @@ impl Scratch {
   /// Gives back every buffer's room past `keep` bytes: the work's working set, learned by its caller (MEMORY SIZING:
   /// nothing stays resident because a past object was large).
   pub fn shrink(&mut self, keep: usize) {
-    for buffer in [&mut self.built, &mut self.next, &mut self.delta] {
+    for buffer in [
+      &mut self.built,
+      &mut self.next,
+      &mut self.delta,
+      &mut self.aux,
+    ] {
       buffer.clear();
       buffer.shrink_to(keep);
     }
@@ -565,6 +625,51 @@ pub fn read_in_place<'a>(
   }
   let kind = read_into_scratch(store, (place, format), bases, (scratch, room))?;
   Ok((kind, scratch.built.as_slice()))
+}
+
+/// Reads two packed objects (`first` and `second`) and lends both slices simultaneously from
+/// `scratch`: zero-copy when both hit [`Recent`], otherwise stashes `second` into `scratch.aux`
+/// without allocating per call.
+pub fn read_pair_in_place<'a>(
+  store: &dyn PackSource,
+  (first, second, format): (InPack, InPack, ObjectFormat),
+  bases: &dyn Bases,
+  (scratch, room_first, room_second): (&'a mut Scratch, u64, u64),
+) -> Result<(&'a [u8], &'a [u8]), PackedRefused> {
+  if let (Some((_, c1, a1, l1)), Some((_, c2, a2, l2))) = (
+    scratch.recent.get_slot(first),
+    scratch.recent.get_slot(second),
+  ) {
+    let b1 = scratch
+      .recent
+      .slice(c1, a1, l1)
+      .ok_or(PackedRefused::Unread { at: first.offset })?;
+    let b2 = scratch
+      .recent
+      .slice(c2, a2, l2)
+      .ok_or(PackedRefused::Unread { at: second.offset })?;
+    return Ok((b1, b2));
+  }
+  // Resolve `second` into `scratch.aux` first so resolving `first` into `scratch.built` leaves `aux` intact.
+  if let Some((_, c2, a2, l2)) = scratch.recent.get_slot(second) {
+    scratch.aux.clear();
+    if let Some(bytes) = scratch.recent.slice(c2, a2, l2) {
+      scratch.aux.extend_from_slice(bytes);
+    }
+  } else {
+    read_into_scratch(store, (second, format), bases, (scratch, room_second))?;
+    scratch.aux.clear();
+    scratch.aux.extend_from_slice(&scratch.built);
+  }
+  if let Some((_, c1, a1, l1)) = scratch.recent.get_slot(first) {
+    let b1 = scratch
+      .recent
+      .slice(c1, a1, l1)
+      .ok_or(PackedRefused::Unread { at: first.offset })?;
+    return Ok((b1, scratch.aux.as_slice()));
+  }
+  read_into_scratch(store, (first, format), bases, (scratch, room_first))?;
+  Ok((scratch.built.as_slice(), scratch.aux.as_slice()))
 }
 
 /// Core packed reader that leaves the resolved object bytes in `scratch.built`.

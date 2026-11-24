@@ -649,29 +649,9 @@ impl ExtentSource for ContentPool {
   }
 
   fn available(&self) -> usize {
-    let hold_open = self.hold_open;
-    let mut total = 0usize;
-    for slice in 0..usize::from(self.partitions) {
-      let base = slice.saturating_mul(POOL_EXTENTS_PER_PARTITION);
-      for (part, &(_, len)) in self.parts.iter().enumerate() {
-        let id = base.saturating_add(part);
-        let Ok(id_u16) = u16::try_from(id) else {
-          continue;
-        };
-        if !claimable_now(id_u16) {
-          continue;
-        }
-        let free = match self.segment.pool_owner(id) {
-          Ok(None) => true,
-          Ok(Some(POOL_HOLD_OWNER)) => hold_open,
-          _ => false,
-        };
-        if free {
-          total = total.saturating_add(len);
-        }
-      }
-    }
-    total
+    self
+      .segment
+      .pool_available_bytes(&self.parts, self.hold_open, POOL_HOLD_OWNER, claimable_now)
   }
 
   #[cfg(windows)]

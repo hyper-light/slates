@@ -191,6 +191,14 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
 
 /// [`turn`]'s work: what it came to, and the bytes of the fragments it kept (zero unless a version was finished).
 fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
+  let has_work = state.vcs_stores.encodings.0.contains_key(&id)
+    || state
+      .vcs_stores
+      .git_ref(id)
+      .is_some_and(|(_, store)| store.repository.first_unencoded().is_some());
+  if !has_work {
+    return (Turned::Idle, 0);
+  }
   let quantum_ns = state.config.step_quantum_ns();
   let exchange = exchange(state);
   let mut clock = ShardClock;

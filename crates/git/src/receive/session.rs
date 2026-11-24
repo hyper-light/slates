@@ -543,6 +543,8 @@ impl<S: Keep + Repository + ?Sized> Keep for Fscking<'_, S> {
     admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {
     if self.refused.is_none()
+      && object.kind != crate::object_name::Kind::Blob
+      && !self.site.holds(&object.id)
       && let Some(finding) =
         super::fsck::check_object(object.kind, &object.content, self.format, self.special)
     {

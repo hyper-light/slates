@@ -1145,11 +1145,14 @@ struct Unmade;
 
 /// Runs `step` with repository `id`'s miss-ratio curve lent to the shard's content store, so every content its step
 /// reads is noted in it (A-724 piece 2d; §4.17.5 "Learned demand"): taken from its usage row, bounded to the windows
-/// its floor holds ([`curve_keys`]), lent for the step and given back, the curve lent before restored, so a step inside
-/// a step is noted in its own repository's. With no content store made yet, `step` runs unobserved.
-pub(crate) fn observed<R>(
+/// its floor holds ([`curve_keys_in_room`]), lent for the step and given back, the curve lent before restored, so a
+/// step inside a step is noted in its own repository's. Uses an already-computed `admittable` room budget and clock
+/// reading `now`, avoiding a second cross-shard pool scan and clock read when the caller also lends that room. With no
+/// content store made yet, `step` runs unobserved.
+pub(crate) fn observed_in_room<R>(
   state: &mut ShardState,
   id: RepositoryId,
+  (admittable, now): (u64, u64),
   step: impl FnOnce(&mut ShardState) -> R,
 ) -> R {
   let Some(granule) = state
@@ -1159,8 +1162,7 @@ pub(crate) fn observed<R>(
   else {
     return step(state);
   };
-  let now = slates_rt::futures::now_ns();
-  let capacity = curve_keys(state);
+  let capacity = curve_keys_in_room(state, admittable);
   let curve = state.vcs_usage.take_curve(&id, (capacity, granule), now);
   let before = state
     .vcs_stores
@@ -1178,11 +1180,12 @@ pub(crate) fn observed<R>(
 }
 
 /// The sampled keys a repository's curve keeps (A-724 piece 2d): the content windows its floor of the shard's room
-/// holds, `room / (repositories served × window)`, at least one. A curve need resolve no more than its floor could
-/// cache: a working set that fits it is sampled whole, a larger one at that resolution, the curve costing about
-/// `56 / window` of the floor (0.09% at a 64 KiB window). Measured accuracy (`slates_vcs::mrc`): 8,000 keys, a floor of
-/// about 512 MiB, erred 0.008 to 0.049; a smaller floor's curve is coarser.
-pub(crate) fn curve_keys(state: &ShardState) -> usize {
+/// holds, `room / (repositories served × window)`, at least one, computed from an already-measured `admittable` room
+/// byte count. A curve need resolve no more than its floor could cache: a working set that fits it is sampled whole, a
+/// larger one at that resolution, the curve costing about `56 / window` of the floor (0.09% at a 64 KiB window).
+/// Measured accuracy (`slates_vcs::mrc`): 8,000 keys, a floor of about 512 MiB, erred 0.008 to 0.049; a smaller floor's
+/// curve is coarser.
+fn curve_keys_in_room(state: &ShardState, admittable: u64) -> usize {
   let served = u64::try_from(state.vcs_usage.rows().count())
     .unwrap_or(u64::MAX)
     .max(1);
@@ -1193,9 +1196,7 @@ pub(crate) fn curve_keys(state: &ShardState) -> usize {
       u64::try_from(content.window()).unwrap_or(u64::MAX)
     })
     .max(1);
-  let keys = state
-    .store
-    .admittable()
+  let keys = admittable
     .checked_div(served)
     .and_then(|floor| floor.checked_div(window))
     .unwrap_or(0);
@@ -1288,12 +1289,9 @@ pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
     .copied()
     .unwrap_or(0);
   if held > charged {
-    if state
-      .store
-      .budget
-      .charge_retention(held.saturating_sub(charged))
-      .is_err()
-    {
+    let more = held.saturating_sub(charged);
+    state.store.make_room(more);
+    if state.store.budget.charge_retention(more).is_err() {
       state.count(CHARGE_SHORT, 1);
     }
   } else {
@@ -1442,12 +1440,15 @@ fn settle_in(store: &mut Store, stores: &mut VcsStores) -> bool {
   let mut whole = true;
   if used > stores.charged {
     let more = used.saturating_sub(stores.charged);
+    // `lend` exposed `store.admittable()` (which includes pool extents claimable beyond the
+    // currently mapped arena), so grow the arena from the pool to cover `more` before charging.
+    store.make_room(more);
     if store.budget.charge_retention(more).is_ok() {
       stores.charged = used;
     } else {
       whole = false;
     }
-  } else {
+  } else if used < stores.charged {
     store
       .budget
       .credit_retention(stores.charged.saturating_sub(used));
@@ -1534,6 +1535,7 @@ pub(crate) fn reserve_svn(state: &mut ShardState, id: RepositoryId, bytes: u64) 
   let Some(svn) = vcs_stores.subversion(id) else {
     return Err(0);
   };
+  store.make_room(bytes);
   if store.budget.charge_retention(bytes).is_err() {
     return Err(store.admittable());
   }
@@ -1575,11 +1577,9 @@ fn settle_records(store: &mut Store, svn: &mut SvnStore) -> bool {
   let held = records.held();
   let mut whole = true;
   if held > svn.charged {
-    if store
-      .budget
-      .charge_retention(held.saturating_sub(svn.charged))
-      .is_ok()
-    {
+    let more = held.saturating_sub(svn.charged);
+    store.make_room(more);
+    if store.budget.charge_retention(more).is_ok() {
       svn.charged = held;
     } else {
       whole = false;
@@ -1606,6 +1606,25 @@ pub(crate) fn within_budget<T>(
   step: impl FnOnce(&mut VcsStores) -> T,
 ) -> T {
   lend(&mut state.store, &mut state.vcs_stores, bytes);
+  let answer = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    step(&mut *lent.stores)
+  };
+  settle(state);
+  answer
+}
+
+/// Like [`within_budget`] with `bytes = 0`, reusing an already-measured `admittable` room count so
+/// callers that also observe a miss-ratio curve scan the shared content pool once per step.
+pub(crate) fn within_known_room<T>(
+  state: &mut ShardState,
+  admittable: u64,
+  step: impl FnOnce(&mut VcsStores) -> T,
+) -> T {
+  let budget = state.vcs_stores.charged.saturating_add(admittable);
+  if let Some(content) = state.vcs_stores.content.as_mut() {
+    content.set_budget(budget);
+  }
   let answer = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     step(&mut *lent.stores)
@@ -2319,11 +2338,14 @@ impl GitPush {
     let repository = self.repository;
     let push = &mut self.push;
     let begun = within_budget(state, 0, |stores| match stores.git(repository) {
-      Some((content, store)) => store
-        .repository
-        .sealing(content, push)
-        .map(|staging| (staging, store.repository.stage_room(push)))
-        .map_err(GitRefused::Store),
+      Some((content, store)) => {
+        push.trim_for_sealing(content);
+        store
+          .repository
+          .sealing(content, push)
+          .map(|staging| (staging, store.repository.stage_room(push)))
+          .map_err(GitRefused::Store)
+      }
       None => Err(GitRefused::NoStore),
     });
     match begun {
@@ -2660,13 +2682,27 @@ pub(crate) fn let_go_read(
   freed
 }
 
+/// Whether any work on repository `id` beyond the caller's own (`own_intakes`, `own_fetches`) is active now
+/// (another fetch, another intake, or an encoding under way). While sibling works are live on the same repository,
+/// a finishing push or fetch unpins its resident pack windows without evicting them back to disk so concurrent peers
+/// reuse the already-resident windows instead of re-reading and re-hashing them; the last work to finish lets every
+/// resident landed window go (`let_go_behind`, `let_go_owed_as_push_ends`, `give_back_idle`).
+pub(crate) fn other_works_live(
+  state: &ShardState,
+  id: RepositoryId,
+  own_intakes: u64,
+  own_fetches: u64,
+) -> bool {
+  crate::vcs_share::fetches_live(id) > own_fetches
+    || crate::vcs_share::intakes_live(id) > own_intakes
+    || git_encode::ahead_under_way(state, id)
+}
+
 /// Whether repository `id`'s landed packs may be let go now (goal 93 item 2b): no fetch of it answered, no encoding of
 /// it under way, and no intake of it under way but `own` (a push's own, as it ends): a push still deciding its refs
 /// reads the objects its pack staged (w-git and main 01a20182, 2026-11-22: a non-atomic many-ref push's later refs).
 fn landed_let_go_may(state: &ShardState, id: RepositoryId, own: u64) -> bool {
-  crate::vcs_share::fetches_live(id) == 0
-    && !git_encode::ahead_under_way(state, id)
-    && crate::vcs_share::intakes_live(id) <= own
+  !other_works_live(state, id, own, 0)
 }
 
 /// Lets go of the landed packs repository `id` owes a let-go ([`VcsStores`]'s `landed_owed`): what its going idle runs

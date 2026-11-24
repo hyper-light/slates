@@ -105,6 +105,16 @@ pub(crate) trait StoreLender {
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
 
+  /// Runs `step` over the generation `hold` holds for pack-streaming turns that need objects alone
+  /// (no ref slice allocation). Defaults to [`Self::lend_held`].
+  fn lend_held_objects<R>(
+    &mut self,
+    hold: &Self::Hold,
+    step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
+  ) -> Option<R> {
+    self.lend_held(hold, step)
+  }
+
   /// The answer made over `hold` wrote `bytes` more (A-724 piece 3d): what its fetch is learned to use once it ends. A
   /// lender that learns nothing does nothing.
   fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
@@ -120,6 +130,11 @@ pub(crate) trait StoreLender {
     PackReads::default()
   }
 
+  /// Whether an answer's `pack` stopped at a let-go window not yet taken by [`Self::pack_reads`].
+  fn pack_waiting(_pack: &<Self::Packs as PackSource>::Pack) -> bool {
+    false
+  }
+
   /// Brings back, before an answer's next turn, the let-go window its last turn stopped at and those its next turn
   /// reads first (A-864 piece 2). Nothing by default.
   async fn read_ahead(&mut self, _reads: PackReads, _resident: &mut Resident) {}
@@ -132,6 +147,18 @@ pub(crate) trait StoreLender {
     _resident: &mut Resident,
     _next: Option<slates_git::store::packed::Waited>,
   ) {
+  }
+
+  /// Releases `resident` at the end of a fetch of repository `id` (`generation_held` records whether
+  /// the caller still holds its live fetch guard): defaults to letting every window go immediately,
+  /// while the shard lender unpins without evicting while sibling pushes or fetches are active on `id`.
+  fn let_go_finished(
+    &mut self,
+    _id: RepositoryId,
+    resident: &mut Resident,
+    _generation_held: bool,
+  ) {
+    self.let_go_behind(resident, None);
   }
 
   /// Brings back the let-go window `waited` names (A-864's readers): whether it is back. False by default, for a lender
@@ -268,6 +295,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       pacing: crate::vcs_store::upload::Pacing::default(),
       resident: Resident::new(),
       last_away: None,
+      fetch_turn: None,
     })
   }
 }
@@ -315,9 +343,19 @@ pub(crate) struct Upload<L: StoreLender> {
   resident: Resident,
   /// The let-go window its answer was last held for, until it writes again (A-864's readers' progress).
   last_away: Option<slates_git::store::packed::Waited>,
+  /// Per-repository FIFO pack-generation turn acquired for `command=fetch` requests so concurrent
+  /// fetches complete in order with hot cache and bounded memory rather than lockstepping hundreds
+  /// of pack encoders; released on completion, overdue reply, room wait, or drop.
+  fetch_turn: Option<crate::vcs_share::turns::FetchGuard>,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
+  /// Releases the repository's fetch turn when the client stops draining past its learned write
+  /// bound so a slow or stalled peer never head-of-line blocks sibling fetches.
+  fn reply_overdue(&mut self) {
+    self.fetch_turn = None;
+  }
+
   /// A write of the answer (A-859 part A): learned into the shard's link price once a write of it has waited for the
   /// peer; an advertisement's teaches nothing, its bytes too few to fill a socket.
   fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
@@ -339,77 +377,12 @@ impl<L: StoreLender> Exchange for Upload<L> {
   }
 
   async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
-    let Self {
-      lender,
-      repository,
-      reader,
-      version,
-      advertise,
-      admission,
-      request,
-      answer,
-      generation,
-      resident,
-      ..
-    } = self;
-    let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
-    // A-864's readers: an answer refused where a read of it met a let-go window is made again once the window is back,
-    // nothing of it written yet; the same window met twice with none brought back between ends the retries.
-    let mut last = None;
-    let made = if *advertise {
-      loop {
-        let (made, away) = lender
-          .lend((*repository, reader), |served, packs| {
-            let made = upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission);
-            let away = made.refusal().and(served.repository.waiting());
-            (made, away)
-          })
-          .ok_or(unavailable)?;
-        match away {
-          Some(waited)
-            if last != Some(waited) && lender.bring_back_tracked(waited, resident).await =>
-          {
-            last = Some(waited)
-          }
-          _ => break made,
-        }
-      }
+    let made = if self.advertise {
+      self.advertise_answer().await?
     } else {
-      // A-718: the store's versions derived and encoded before a fetch is answered; a protocol v2 command other than
-      // `fetch` reads neither (goal 93, r405: `git ls-remote` after a whole push waited 29 to 54 s for them).
-      if fetches(*version, request) {
-        lender.encode(*repository).await;
-      }
-      let held = lender.hold(*repository, reader).ok_or(unavailable)?;
-      // A-855: a negotiation run past its room is held, not answered, until the room grows (`Upload::wait_for_room`).
-      let made = loop {
-        let (made, away) = lender
-          .lend_held(&held, |served, packs| {
-            let made = upload::serve_in_turns(
-              served,
-              *version,
-              Asked::Request(request.as_slice()),
-              packs,
-              admission,
-            )
-            .holding();
-            let away = made.refusal().and(served.repository.waiting());
-            (made, away)
-          })
-          .ok_or(unavailable)?;
-        match away {
-          Some(waited)
-            if last != Some(waited) && lender.bring_back_tracked(waited, resident).await =>
-          {
-            last = Some(waited)
-          }
-          _ => break made,
-        }
-      };
-      *generation = Some(held);
-      made
+      self.request_answer().await?
     };
-    *answer = Some(made);
+    self.answer = Some(made);
     Ok(())
   }
 
@@ -424,6 +397,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
       last_written_ns,
       resident,
       last_away,
+      fetch_turn,
       ..
     } = self;
     let Some(made) = answer.as_mut() else {
@@ -431,22 +405,29 @@ impl<L: StoreLender> Exchange for Upload<L> {
     };
     read_ahead_of(lender, made, resident).await;
     let before = out.len();
+    let streaming_pack = made.pack_source().is_some();
+    let start = slates_rt::futures::now_ns();
+    let quantum = slates_rt::futures::step_budget_ns().unwrap_or(0);
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
-      let mut spent = packs.turn();
-      made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
+      step_within_quantum::<L>(
+        (made, served, packs),
+        (admission, out, before),
+        (start, quantum),
+      )
     };
     let written = match generation.as_ref() {
+      Some(held) if streaming_pack => lender.lend_held_objects(held, step),
       Some(held) => lender.lend_held(held, step),
       None => lender.lend_objects(*repository, step),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    let now = slates_rt::futures::now_ns();
     if let Some(held) = generation.as_ref() {
       lender.wrote(
         held,
         u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
       );
     }
-    let now = slates_rt::futures::now_ns();
     if out.len() > before {
       *last_away = None;
     }
@@ -464,10 +445,12 @@ impl<L: StoreLender> Exchange for Upload<L> {
       return Ok(true);
     }
     if written != Written::More {
-      // The answer is written: unpin and let go every window it held first, then give back its generation so the last
-      // fetch's idle give-back sees zero pins left on this exchange.
-      lender.let_go_behind(resident, None);
+      // The answer is written: unpin (and let go if no sibling work is live on this repository)
+      // before giving back its generation so the last fetch's idle give-back sees zero pins left,
+      // and release the repository's fetch turn so the next queued fetch begins immediately.
+      lender.let_go_finished(*repository, resident, generation.is_some());
       *generation = None;
+      *fetch_turn = None;
       // A refused answer (a pack the store could not finish ends with git's abort words, A-639) is counted and named in
       // the log by its typed refusal, so a client's "possible repository corruption" has its cause on the server.
       if let Some(refusal) = made.refusal() {
@@ -478,6 +461,38 @@ impl<L: StoreLender> Exchange for Upload<L> {
       }
     }
     Ok(written == Written::More)
+  }
+}
+
+/// Drives `made.write_within` inside one shard lend until `out` reaches a full pkt-line
+/// (`MAX_LEN`), one shard quantum elapses (so accept loops and sibling tasks are never starved
+/// behind multi-millisecond bursts), or the answer ends/pauses for room or a let-go window.
+fn step_within_quantum<L: StoreLender>(
+  (made, served, packs): (
+    &mut Answer<<L::Packs as PackSource>::Pack>,
+    &Served<'_>,
+    &mut L::Packs,
+  ),
+  (admission, out, before): (&mut Admission, &mut Vec<u8>, usize),
+  (start, quantum): (u64, u64),
+) -> Written {
+  loop {
+    let left = MAX_LEN.saturating_sub(out.len().saturating_sub(before));
+    if left == 0 {
+      return Written::More;
+    }
+    let mut spent = packs.turn();
+    let written = made.write_within(served, packs, admission, out, left, &mut spent);
+    let stopped_pack = made.pack_source().is_some_and(L::pack_waiting);
+    if written != Written::More
+      || made.held().is_some()
+      || made.held_away().is_some()
+      || stopped_pack
+      || quantum == 0
+      || slates_rt::futures::now_ns().saturating_sub(start) >= quantum
+    {
+      return written;
+    }
   }
 }
 
@@ -500,12 +515,106 @@ async fn read_ahead_of<L: StoreLender>(
 impl<L: StoreLender> Drop for Upload<L> {
   fn drop(&mut self) {
     if !self.resident.is_empty() {
-      self.lender.let_go_behind(&mut self.resident, None);
+      self.lender.let_go_finished(
+        self.repository,
+        &mut self.resident,
+        self.generation.is_some(),
+      );
     }
   }
 }
 
 impl<L: StoreLender> Upload<L> {
+  /// Builds the ref advertisement answer, bringing back any let-go window encountered during the
+  /// initial read (A-864).
+  async fn advertise_answer(&mut self) -> Result<Answer<<L::Packs as PackSource>::Pack>, Failed> {
+    let Self {
+      lender,
+      repository,
+      reader,
+      version,
+      admission,
+      resident,
+      ..
+    } = self;
+    let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
+    let mut last = None;
+    loop {
+      let (made, away) = lender
+        .lend((*repository, reader), |served, packs| {
+          let made = upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission);
+          let away = made.refusal().and(served.repository.waiting());
+          (made, away)
+        })
+        .ok_or(unavailable)?;
+      match away {
+        Some(waited)
+          if last != Some(waited) && lender.bring_back_tracked(waited, resident).await =>
+        {
+          last = Some(waited);
+        }
+        _ => return Ok(made),
+      }
+    }
+  }
+
+  /// Builds a POST upload-pack answer, serializing active pack-generating fetches per repository
+  /// (FIFO) while leaving metadata verbs (`ls-refs`, `object-info`, `bundle-uri`) unqueued.
+  async fn request_answer(&mut self) -> Result<Answer<<L::Packs as PackSource>::Pack>, Failed> {
+    let Self {
+      lender,
+      repository,
+      reader,
+      version,
+      admission,
+      request,
+      generation,
+      resident,
+      fetch_turn,
+      ..
+    } = self;
+    let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
+    // A-718: the store's versions derived and encoded before a fetch is answered; a protocol v2 command other than
+    // `fetch` reads neither (goal 93, r405: `git ls-remote` after a whole push waited 29 to 54 s for them).
+    if fetches(*version, request) {
+      // Serialize active pack-generating fetches per repository on this shard (FIFO) so concurrent
+      // fetches finish in order with hot L1/L2 cache and bounded memory rather than lockstepping
+      // hundreds of pack streams; metadata verbs (`info/refs`, `ls-refs`, `object-info`) never
+      // wait here, and slow/overdue peers release the turn in `reply_overdue`.
+      *fetch_turn = Some(crate::vcs_share::turns::take_fetch(*repository).await);
+      lender.encode(*repository).await;
+    }
+    let held = lender.hold(*repository, reader).ok_or(unavailable)?;
+    let mut last = None;
+    // A-855: a negotiation run past its room is held, not answered, until the room grows (`Upload::wait_for_room`).
+    let made = loop {
+      let (made, away) = lender
+        .lend_held(&held, |served, packs| {
+          let made = upload::serve_in_turns(
+            served,
+            *version,
+            Asked::Request(request.as_slice()),
+            packs,
+            admission,
+          )
+          .holding();
+          let away = made.refusal().and(served.repository.waiting());
+          (made, away)
+        })
+        .ok_or(unavailable)?;
+      match away {
+        Some(waited)
+          if last != Some(waited) && lender.bring_back_tracked(waited, resident).await =>
+        {
+          last = Some(waited);
+        }
+        _ => break made,
+      }
+    };
+    *generation = Some(held);
+    Ok(made)
+  }
+
   /// A turn of an answer held for a let-go window its read met before its pack (A-864's readers; main 01a20182's r52):
   /// the window brought back and tracked in `self.resident` so it is released when the fetch ends;
   /// when the negotiation paused in place, resumes it without restarting; otherwise rebuilds the
@@ -582,6 +691,7 @@ impl<L: StoreLender> Upload<L> {
       admitted,
       held_since,
       room_patience_ns,
+      fetch_turn,
       ..
     } = self;
     let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
@@ -621,6 +731,9 @@ impl<L: StoreLender> Upload<L> {
       made.give_up();
       return Ok(());
     }
+    // Release the fetch turn while sleeping for shard room so a smaller fetch on this repository
+    // can make progress instead of waiting behind this sleep.
+    *fetch_turn = None;
     // A sleep the runtime refuses (no timer here) ends the wait early: the next turn asks again.
     let _ =
       slates_rt::futures::sleep((*keepalive_ns).min(room_patience_ns.saturating_sub(waited))).await;

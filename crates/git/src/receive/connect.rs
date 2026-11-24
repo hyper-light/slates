@@ -243,6 +243,13 @@ impl Walk {
     object: &Placed,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
   ) -> Result<WalkStep, Refusal> {
+    // Blobs name no edges, and an object whose collision-checked identity already lives in
+    // `repository` is already complete (matching `connected()` and out-of-pack edge checks).
+    if object.kind == Kind::Blob || repository.holds(&object.id) {
+      self.stopped = None;
+      self.at = self.at.saturating_add(1);
+      return Ok(WalkStep::More);
+    }
     let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
     let read = edges_of(

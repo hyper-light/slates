@@ -51,6 +51,104 @@ struct Turns {
 std::thread_local! {
   /// This shard's turns.
   static TURNS: RefCell<Turns> = RefCell::new(Turns::default());
+  /// Per-repository FIFO push intake gates on this shard: serializes active pack body intake per
+  /// repository so concurrent pushes keep body bytes in kernel TCP flow control instead of
+  /// interleaving thousands of partial packs in userspace RAM, while different repositories and
+  /// all read/fetch requests continue sharing the shard cooperatively.
+  static INTAKE: RefCell<Turns> = RefCell::new(Turns::default());
+  /// Per-repository FIFO pack-generation gates on this shard: serializes active `command=fetch`
+  /// pack builds per repository so thousands of concurrent fetches do not run in lockstep
+  /// round-robin (which multiplies per-upload RAM, destroys L1/L2 cache locality, floods kernel
+  /// socket buffers, and makes every fetch finish together at the tail), while metadata queries
+  /// (`info/refs`, `ls-refs`, `object-info`), pushes, and other repositories never wait.
+  static FETCH: RefCell<Turns> = RefCell::new(Turns::default());
+}
+
+/// Polls a thread-local FIFO line in `cell` for `repository`, returning `Ok(())` when acquired or
+/// `Err(ticket)` when queued.
+fn poll_line(
+  cell: &'static std::thread::LocalKey<RefCell<Turns>>,
+  repository: RepositoryId,
+  ticket: Option<u64>,
+  waker: &Waker,
+) -> Result<(), Option<u64>> {
+  cell.with(|turns| {
+    let Ok(mut turns) = turns.try_borrow_mut() else {
+      return Err(ticket);
+    };
+    let Turns { lines, next } = &mut *turns;
+    let line = lines.entry(repository).or_default();
+    let first = line.waiting.front().map(|(id, _)| *id);
+    let mine = ticket.is_some() && first == ticket;
+    if !line.held && (line.waiting.is_empty() || mine) {
+      if mine {
+        line.waiting.pop_front();
+      }
+      line.held = true;
+      return Ok(());
+    }
+    let ticket = ticket.unwrap_or_else(|| {
+      let id = *next;
+      *next = next.wrapping_add(1);
+      line.waiting.push_back((id, None));
+      id
+    });
+    if let Some((_, slot)) = line.waiting.iter_mut().find(|(id, _)| *id == ticket) {
+      *slot = Some(waker.clone());
+    }
+    Err(Some(ticket))
+  })
+}
+
+/// Removes a cancelled waiter `ticket` from `repository`'s line in `cell` and wakes the next
+/// waiter if the line is free.
+fn cancel_wait(
+  cell: &'static std::thread::LocalKey<RefCell<Turns>>,
+  repository: RepositoryId,
+  ticket: u64,
+) {
+  // Through `try_with`: a wait dropped in the thread's local storage teardown has no line left to leave.
+  let woken = cell
+    .try_with(|turns| {
+      let mut turns = turns.try_borrow_mut().ok()?;
+      let line = turns.lines.get_mut(&repository)?;
+      line.waiting.retain(|(id, _)| *id != ticket);
+      let woken = if line.held {
+        None
+      } else {
+        line.waiting.front_mut().and_then(|(_, waker)| waker.take())
+      };
+      if !line.held && line.waiting.is_empty() {
+        turns.lines.remove(&repository);
+      }
+      woken
+    })
+    .ok()
+    .flatten();
+  if let Some(waker) = woken {
+    waker.wake();
+  }
+}
+
+/// Releases `repository`'s line in `cell` and wakes the next FIFO waiter, if any.
+fn release_line(cell: &'static std::thread::LocalKey<RefCell<Turns>>, repository: RepositoryId) {
+  // Through `try_with`, as a dropped wait's: no line left to give the turn back to in the thread's teardown.
+  let woken = cell
+    .try_with(|turns| {
+      let mut turns = turns.try_borrow_mut().ok()?;
+      let line = turns.lines.get_mut(&repository)?;
+      line.held = false;
+      let woken = line.waiting.front_mut().and_then(|(_, waker)| waker.take());
+      if line.waiting.is_empty() {
+        turns.lines.remove(&repository);
+      }
+      woken
+    })
+    .ok()
+    .flatten();
+  if let Some(waker) = woken {
+    waker.wake();
+  }
 }
 
 /// Waits for `repository`'s turn on this shard (module docs): the turn, held until it is dropped or yielded holding.
@@ -72,37 +170,9 @@ impl Future for Taking {
   type Output = Turn;
 
   fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Turn> {
-    let repository = self.repository;
-    let ticket = self.ticket;
-    let taken = TURNS.with(|turns| {
-      let Ok(mut turns) = turns.try_borrow_mut() else {
-        return Err(ticket);
-      };
-      let Turns { lines, next } = &mut *turns;
-      let line = lines.entry(repository).or_default();
-      let first = line.waiting.front().map(|(id, _)| *id);
-      let mine = ticket.is_some() && first == ticket;
-      if !line.held && (line.waiting.is_empty() || mine) {
-        if mine {
-          line.waiting.pop_front();
-        }
-        line.held = true;
-        return Ok(());
-      }
-      let ticket = ticket.unwrap_or_else(|| {
-        let id = *next;
-        *next = next.wrapping_add(1);
-        line.waiting.push_back((id, None));
-        id
-      });
-      if let Some((_, slot)) = line.waiting.iter_mut().find(|(id, _)| *id == ticket) {
-        *slot = Some(context.waker().clone());
-      }
-      Err(Some(ticket))
-    });
-    match taken {
+    match poll_line(&TURNS, self.repository, self.ticket, context.waker()) {
       Ok(()) => Poll::Ready(Turn {
-        repository: Some(repository),
+        repository: Some(self.repository),
       }),
       Err(ticket) => {
         if ticket.is_none() {
@@ -119,30 +189,8 @@ impl Future for Taking {
 impl Drop for Taking {
   /// A wait given up (its push dropped) leaves its line, waking the next if the turn is free.
   fn drop(&mut self) {
-    let Some(ticket) = self.ticket else {
-      return;
-    };
-    let repository = self.repository;
-    // Through `try_with`: a wait dropped in the thread's local storage teardown has no line left to leave.
-    let woken = TURNS
-      .try_with(|turns| {
-        let mut turns = turns.try_borrow_mut().ok()?;
-        let line = turns.lines.get_mut(&repository)?;
-        line.waiting.retain(|(id, _)| *id != ticket);
-        let woken = if line.held {
-          None
-        } else {
-          line.waiting.front_mut().and_then(|(_, waker)| waker.take())
-        };
-        if !line.held && line.waiting.is_empty() {
-          turns.lines.remove(&repository);
-        }
-        woken
-      })
-      .ok()
-      .flatten();
-    if let Some(waker) = woken {
-      waker.wake();
+    if let Some(ticket) = self.ticket {
+      cancel_wait(&TURNS, self.repository, ticket);
     }
   }
 }
@@ -163,25 +211,122 @@ impl Turn {
 
 impl Drop for Turn {
   fn drop(&mut self) {
-    let Some(repository) = self.repository.take() else {
-      return;
-    };
-    // Through `try_with`, as a dropped wait's: no line left to give the turn back to in the thread's teardown.
-    let woken = TURNS
-      .try_with(|turns| {
-        let mut turns = turns.try_borrow_mut().ok()?;
-        let line = turns.lines.get_mut(&repository)?;
-        line.held = false;
-        let woken = line.waiting.front_mut().and_then(|(_, waker)| waker.take());
-        if line.waiting.is_empty() {
-          turns.lines.remove(&repository);
+    if let Some(repository) = self.repository.take() {
+      release_line(&TURNS, repository);
+    }
+  }
+}
+
+/// Waits for `repository`'s FIFO push intake slot on this shard: resolves synchronously on the first
+/// poll when no other push to `repository` is currently intaking a pack body, and holds the slot
+/// until [`IntakeGuard`] drops (when intake completes, pauses for a slow/overdue peer, runs a hook,
+/// or disconnects).
+pub(crate) fn take_intake(repository: RepositoryId) -> TakingIntake {
+  TakingIntake {
+    repository,
+    ticket: None,
+  }
+}
+
+/// The wait for a repository's push intake slot ([`take_intake`]).
+pub(crate) struct TakingIntake {
+  repository: RepositoryId,
+  ticket: Option<u64>,
+}
+
+impl Future for TakingIntake {
+  type Output = IntakeGuard;
+
+  fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<IntakeGuard> {
+    match poll_line(&INTAKE, self.repository, self.ticket, context.waker()) {
+      Ok(()) => Poll::Ready(IntakeGuard {
+        repository: Some(self.repository),
+      }),
+      Err(ticket) => {
+        if ticket.is_none() {
+          context.waker().wake_by_ref();
         }
-        woken
-      })
-      .ok()
-      .flatten();
-    if let Some(waker) = woken {
-      waker.wake();
+        self.ticket = ticket;
+        Poll::Pending
+      }
+    }
+  }
+}
+
+impl Drop for TakingIntake {
+  fn drop(&mut self) {
+    if let Some(ticket) = self.ticket {
+      cancel_wait(&INTAKE, self.repository, ticket);
+    }
+  }
+}
+
+/// Guard holding a repository's push intake slot on this shard ([`take_intake`]).
+pub(crate) struct IntakeGuard {
+  repository: Option<RepositoryId>,
+}
+
+impl Drop for IntakeGuard {
+  fn drop(&mut self) {
+    if let Some(repository) = self.repository.take() {
+      release_line(&INTAKE, repository);
+    }
+  }
+}
+
+/// Waits for `repository`'s FIFO pack-generation slot on this shard: resolves synchronously on the
+/// first poll when no other `command=fetch` pack stream is active for `repository`, and holds the
+/// slot until [`FetchGuard`] drops (when the pack finishes, the peer becomes overdue, or the
+/// connection disconnects).
+pub(crate) fn take_fetch(repository: RepositoryId) -> TakingFetch {
+  TakingFetch {
+    repository,
+    ticket: None,
+  }
+}
+
+/// The wait for a repository's pack-generation slot ([`take_fetch`]).
+pub(crate) struct TakingFetch {
+  repository: RepositoryId,
+  ticket: Option<u64>,
+}
+
+impl Future for TakingFetch {
+  type Output = FetchGuard;
+
+  fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<FetchGuard> {
+    match poll_line(&FETCH, self.repository, self.ticket, context.waker()) {
+      Ok(()) => Poll::Ready(FetchGuard {
+        repository: Some(self.repository),
+      }),
+      Err(ticket) => {
+        if ticket.is_none() {
+          context.waker().wake_by_ref();
+        }
+        self.ticket = ticket;
+        Poll::Pending
+      }
+    }
+  }
+}
+
+impl Drop for TakingFetch {
+  fn drop(&mut self) {
+    if let Some(ticket) = self.ticket {
+      cancel_wait(&FETCH, self.repository, ticket);
+    }
+  }
+}
+
+/// Guard holding a repository's pack-generation slot on this shard ([`take_fetch`]).
+pub(crate) struct FetchGuard {
+  repository: Option<RepositoryId>,
+}
+
+impl Drop for FetchGuard {
+  fn drop(&mut self) {
+    if let Some(repository) = self.repository.take() {
+      release_line(&FETCH, repository);
     }
   }
 }
@@ -251,6 +396,70 @@ mod tests {
     assert!(
       most_between <= 1,
       "the large repository took {most_between} turns between two of the small one's: {log:?}"
+    );
+  }
+
+  /// Do: spawn three push intakes for the same repository and one for a different repository on
+  /// one shard, yielding once while holding each intake guard. Expect: the three intakes on the
+  /// same repository complete strictly in FIFO order without overlapping (each starts only after
+  /// the prior drops), while the other repository proceeds concurrently.
+  #[test]
+  fn a_repositorys_push_intakes_serialize_fifo_without_blocking_other_repos() {
+    std::thread_local! {
+      static INTAKE_LOG: RefCell<Vec<(u8, &'static str)>> = const { RefCell::new(Vec::new()) };
+    }
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |_| {
+      let task = slates_rt::futures::spawn(async move {
+        INTAKE_LOG.with(|log| log.borrow_mut().clear());
+        let repo_a = RepositoryId { bytes: [11; 16] };
+        let repo_b = RepositoryId { bytes: [22; 16] };
+        let mut handles = Vec::new();
+        for (id, repo) in [(1_u8, repo_a), (2, repo_a), (3, repo_a), (4, repo_b)] {
+          let handle = slates_rt::futures::spawn(async move {
+            let guard = super::take_intake(repo).await;
+            INTAKE_LOG.with(|log| log.borrow_mut().push((id, "enter")));
+            slates_rt::futures::yield_now().await;
+            INTAKE_LOG.with(|log| log.borrow_mut().push((id, "leave")));
+            drop(guard);
+          })
+          .unwrap();
+          handles.push(handle);
+        }
+        for handle in handles {
+          let _ = slates_rt::futures::join(handle).await;
+        }
+        let _ = sent.send(INTAKE_LOG.with(|log| log.borrow().clone()));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let events = answered.recv().unwrap();
+    let repo_a_events: Vec<(u8, &'static str)> =
+      events.iter().copied().filter(|(id, _)| *id != 4).collect();
+    assert_eq!(
+      repo_a_events,
+      vec![
+        (1, "enter"),
+        (1, "leave"),
+        (2, "enter"),
+        (2, "leave"),
+        (3, "enter"),
+        (3, "leave"),
+      ]
+    );
+    let b_enter = events
+      .iter()
+      .position(|e| *e == (4, "enter"))
+      .expect("repo B entered");
+    let a3_enter = events
+      .iter()
+      .position(|e| *e == (3, "enter"))
+      .expect("repo A push 3 entered");
+    assert!(
+      b_enter < a3_enter,
+      "repo B was blocked behind repo A's queue: {events:?}"
     );
   }
 }

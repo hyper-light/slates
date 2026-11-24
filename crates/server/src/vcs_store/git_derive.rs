@@ -68,6 +68,14 @@ pub(crate) enum Turned {
 
 /// One turn of repository `id`'s derivation (the module doc), within the shard's quantum on its clock.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+  let has_work = state.vcs_stores.derivings.0.contains_key(&id)
+    || state
+      .vcs_stores
+      .git_ref(id)
+      .is_some_and(|(_, store)| store.repository.derivations_due());
+  if !has_work {
+    return Turned::Idle;
+  }
   let quantum_ns = state.config.step_quantum_ns();
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
   let (turned, derived, refused) =
@@ -139,45 +147,40 @@ fn paced(
   deriving: &mut Deriving,
   quantum_ns: u64,
 ) -> (Result<Turned, slates_git::store::StoreRefused>, u64) {
-  let began = slates_rt::futures::now_ns();
-  let ceiling = slates_rt::futures::step_ceiling_ns()
-    .unwrap_or(quantum_ns)
-    .max(quantum_ns);
-  let go_on = || {
-    !slates_rt::futures::others_waiting()
-      && slates_rt::futures::now_ns().saturating_sub(began) < ceiling.saturating_sub(quantum_ns)
-  };
+  let mut costs = super::TurnCosts::ZERO;
+  let mut pacer = super::paced_turn(quantum_ns, slates_rt::futures::now_ns());
   let mut clock = ShardClock;
   let mut derived = 0u64;
-  loop {
+  let result = loop {
+    if !pacer.more(super::ANSWER_STEP, &mut costs) {
+      break Ok(Turned::More);
+    }
     let quantum = Quantum {
       clock: &mut clock,
       ns: quantum_ns,
     };
     match repository.derive_turn(content, deriving, quantum) {
-      Ok(Derived::More) if go_on() => {}
-      Ok(Derived::More) => return (Ok(Turned::More), derived),
+      Ok(Derived::More) => {}
       Ok(Derived::Sets {
         green,
         version,
         sets,
       }) => {
         if let Err(refused) = repository.keep_derived(content, (green, version), &sets) {
-          return (Err(refused), derived);
+          break Err(refused);
         }
         derived = derived.saturating_add(1);
-        if !go_on() {
-          return (Ok(Turned::More), derived);
-        }
       }
       // Done with the versions it queued; a push meanwhile may have left more, which the next turn queues.
       Ok(Derived::Done) => {
         let due = repository.derivations_due();
-        return (Ok(if due { Turned::More } else { Turned::Idle }), derived);
+        break Ok(if due { Turned::More } else { Turned::Idle });
       }
-      Err(refused) => return (Err(refused), derived),
+      Err(refused) => break Err(refused),
     }
-  }
+  };
+  pacer.close(slates_rt::futures::now_ns(), &mut costs);
+  (result, derived)
 }
 
 /// Drops repository `id`'s derivation under way, if any: its repository is freed.

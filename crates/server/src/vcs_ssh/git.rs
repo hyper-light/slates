@@ -378,10 +378,6 @@ impl<L: StoreLender> UploadCommand<L> {
       self.lender.read_ahead(reads, &mut self.resident).await;
     }
     let next = self.write_answer()?;
-    // A-864 piece 3: an answer written lets go every window it brought back.
-    if self.answer.is_none() {
-      self.lender.let_go_behind(&mut self.resident, None);
-    }
     Ok(Stepped { consumed: 0, next })
   }
 
@@ -398,6 +394,7 @@ impl<L: StoreLender> UploadCommand<L> {
       keepalive_ns,
       last_written_ns,
       last_away,
+      resident,
       ..
     } = self;
     let Some(made) = answer.as_mut() else {
@@ -441,7 +438,9 @@ impl<L: StoreLender> UploadCommand<L> {
       *after = After::Die;
     }
     *answer = None;
-    // The answer is written: its generation is given back.
+    // The answer is written: unpin (and let go if no sibling work is live on this repository)
+    // before giving back its generation so the last fetch's idle give-back sees zero pins left.
+    lender.let_go_finished(*repository, resident, generation.is_some());
     *generation = None;
     Ok(match after {
       After::Next => Next::More,
@@ -512,7 +511,11 @@ impl<L: StoreLender> UploadCommand<L> {
 impl<L: StoreLender> Drop for UploadCommand<L> {
   fn drop(&mut self) {
     if !self.resident.is_empty() {
-      self.lender.let_go_behind(&mut self.resident, None);
+      self.lender.let_go_finished(
+        self.repository,
+        &mut self.resident,
+        self.generation.is_some(),
+      );
     }
   }
 }

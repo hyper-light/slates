@@ -28,6 +28,7 @@
 //! client did not say `ofs-delta`. A version's fragments and a base pack are encoded with it an
 //! object a unit too, under the owner's quantum (`encoding`, A-653 continued (2)).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
 use flate2::{Compress, FlushCompress, Status};
@@ -35,7 +36,7 @@ use flate2::{Compress, FlushCompress, Status};
 use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
 use crate::object_name::{Kind, ObjectId};
 
-use super::deltas::{Search, SearchStep};
+use super::deltas::{BlockIndex, Search, SearchStep};
 use super::learn::{Exchange, LEVELS, Levels, Window};
 
 /// An object to encode: its id, position, type and bytes, and the object its path held in the
@@ -283,11 +284,13 @@ pub(crate) enum Put {
   Done(Vec<u8>, Placed),
 }
 
-/// An earlier entry a delta may name: its object, where its entry begins, its chain's depth.
+/// An earlier entry a delta may name: its object, its incrementally built block index (built at
+/// most once across every trial that tests it), where its entry begins, and its chain's depth.
 struct Recent {
   id: ObjectId,
   position: u64,
   bytes: Vec<u8>,
+  index: RefCell<BlockIndex>,
   at: u64,
   depth: u64,
 }
@@ -421,19 +424,42 @@ impl Encoder {
       };
       return Ok(());
     };
-    let base: &[u8] = match candidate {
-      Candidate::Named => putting
-        .object
-        .named
-        .as_ref()
-        .map_or(&[][..], |named| &named.bytes),
-      Candidate::Recent(index) => self
+    let (base_len, step) = match candidate {
+      Candidate::Named => {
+        let base: &[u8] = putting
+          .object
+          .named
+          .as_ref()
+          .map_or(&[][..], |named| &named.bytes);
+        let step = putting
+          .search
+          .step_bounded(base, &putting.object.bytes, window, putting.best);
+        (base.len(), step)
+      }
+      Candidate::Recent(index) => match self
         .recent
         .get(&putting.object.kind)
         .and_then(|recent| recent.get(index))
-        .map_or(&[][..], |recent| &recent.bytes),
+      {
+        Some(recent) => {
+          let mut block_index = recent.index.borrow_mut();
+          let step = putting.search.step_indexed(
+            &recent.bytes,
+            &mut block_index,
+            &putting.object.bytes,
+            window,
+            putting.best,
+          );
+          (recent.bytes.len(), step)
+        }
+        None => {
+          let step = putting
+            .search
+            .step_bounded(&[], &putting.object.bytes, window, putting.best);
+          (0, step)
+        }
+      },
     };
-    let step = putting.search.step(base, &putting.object.bytes, window);
     let SearchStep::Done(delta) = step else {
       return Ok(());
     };
@@ -441,7 +467,7 @@ impl Encoder {
     putting.trial_ns = learning
       .exchange
       .rates
-      .search_ns(to_u64(base.len()), to_u64(putting.object.bytes.len()));
+      .search_ns(to_u64(base_len), to_u64(putting.object.bytes.len()));
     let rank = putting.trying.saturating_add(1);
     let len = delta.as_ref().map_or(usize::MAX, Vec::len);
     let saved = u64::try_from(putting.best.saturating_sub(len)).unwrap_or(u64::MAX);
@@ -570,12 +596,18 @@ impl Encoder {
       id: object.id,
       position: object.position,
       bytes: object.bytes,
+      index: RefCell::new(BlockIndex::default()),
       at,
       depth,
     });
     while recent.len() > keep {
       recent.pop_front();
     }
+  }
+
+  /// Drops every kept window candidate and its block index once no further object will be encoded.
+  pub(crate) fn clear_recent(&mut self) {
+    self.recent.clear();
   }
 }
 

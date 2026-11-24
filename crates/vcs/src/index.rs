@@ -60,7 +60,7 @@ use crate::filter::{KeyFilter, KeyHash};
 use crate::rule::Compaction;
 use crate::table::{
   RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, compare_keys, encode_body,
-  row_bytes,
+  key_prefix_at, row_bytes,
 };
 
 /// Shape: what one tail row costs the budget beyond its key's and its body's bytes: its boxed key and boxed body, the
@@ -78,9 +78,9 @@ pub const TIER_RATIO: u64 = 2;
 /// Derived: the base of the size-tiered bound's logarithm, [`TIER_RATIO`] + 1 (three).
 pub const TIER_BASE: u64 = TIER_RATIO.saturating_add(1);
 
-/// Shape: what one table of a run costs the budget beside the store beyond its first key's bytes: its fence's record.
-/// Derived from the type.
-pub const FENCE_SLOT_BYTES: usize = size_of::<Fence>();
+/// Shape: what one table of a run costs the budget beside the store beyond its first key's bytes:
+/// its fence record plus its 8-byte L1-resident search prefix. Derived from the types.
+pub const FENCE_SLOT_BYTES: usize = size_of::<Fence>() + size_of::<u64>();
 
 /// Why the index refused a request. Each leaves the index and the store as they were, unless it says otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,21 +169,27 @@ pub struct IndexCounters {
   pub filter_rejections: u64,
 }
 
-/// One table of a run: its identity, its first key (the fence a lookup searches) and its rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One table of a run: its identity, the byte range of its first key inside its [`Run`]'s
+/// contiguous `fence_keys` buffer (zero per-table heap allocations), and its row count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Fence {
   table: ContentId,
-  first: Box<[u8]>,
+  first_start: u32,
+  first_len: u32,
   rows: u64,
 }
 
-/// A run (module docs): its tables in key order, their rows and their bytes (what the size-tiered rule weighs,
-/// [`Index::tiered_due`]), what their fences and its key filter charged the store,
-/// whether another index may hold its tables too (set at a fork or when a table's bytes were stored already; read again
-/// from the store's counts before each merge), and its key filter ([`crate::filter`]; none in a fork's copy).
+/// A run (module docs): its tables in key order, their L1-compact big-endian 8-byte key prefixes
+/// (`prefixes`), their contiguous first-key bytes (`fence_keys`), their rows and their bytes (what
+/// the size-tiered rule weighs, [`Index::tiered_due`]), what their fences and its key filter
+/// charged the store, whether another index may hold its tables too (set at a fork or when a
+/// table's bytes were stored already; read again from the store's counts before each merge), and
+/// its key filter ([`crate::filter`]; none in a fork's copy).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Run {
   fences: Vec<Fence>,
+  prefixes: Vec<u64>,
+  fence_keys: Vec<u8>,
   rows: u64,
   bytes: u64,
   charged: u64,
@@ -192,10 +198,42 @@ struct Run {
 }
 
 impl Run {
+  /// Appends a table's fence to `fences`, `prefixes`, and `fence_keys`.
+  fn push_fence(
+    fences: &mut Vec<Fence>,
+    prefixes: &mut Vec<u64>,
+    fence_keys: &mut Vec<u8>,
+    table: ContentId,
+    first: &[u8],
+    rows: u64,
+  ) {
+    let start = u32::try_from(fence_keys.len()).unwrap_or(u32::MAX);
+    let len = u32::try_from(first.len()).unwrap_or(u32::MAX);
+    fence_keys.extend_from_slice(first);
+    prefixes.push(key_prefix_at(first, 0));
+    fences.push(Fence {
+      table,
+      first_start: start,
+      first_len: len,
+      rows,
+    });
+  }
+
+  /// First key slice of fence `at`.
+  #[inline]
+  fn fence_key(&self, at: usize) -> Option<&[u8]> {
+    let fence = self.fences.get(at)?;
+    let start = usize::try_from(fence.first_start).ok()?;
+    let end = start.checked_add(usize::try_from(fence.first_len).ok()?)?;
+    self.fence_keys.get(start..end)
+  }
+
   /// A fork's copy of this run: its fences, charged for them alone, and no key filter (module docs, "A fork").
   fn fork_copy(&self) -> Run {
     Run {
       fences: self.fences.clone(),
+      prefixes: self.prefixes.clone(),
+      fence_keys: self.fence_keys.clone(),
       rows: self.rows,
       bytes: self.bytes,
       charged: self.charged.saturating_sub(self.filter.bytes()),
@@ -204,12 +242,42 @@ impl Run {
     }
   }
 
-  /// The table that may hold `key`: the last whose first key is not after it.
-  fn fence_for(&self, key: &[u8]) -> Option<&Fence> {
-    let after = self.fences.partition_point(|fence| {
-      compare_keys(fence.first.as_ref(), key) != std::cmp::Ordering::Greater
-    });
-    self.fences.get(after.checked_sub(1)?)
+  /// Index of the table that may hold `key`: the last whose first key is not after it. Binary
+  /// searches the L1-compact `prefixes` slice first so 99.9% of lookups resolve with zero fence-key
+  /// dereferences.
+  #[inline]
+  fn fence_index(&self, key: &[u8]) -> Option<usize> {
+    let key_prefix = key_prefix_at(key, 0);
+    let after = self.prefixes.partition_point(|&prefix| prefix < key_prefix);
+    if self.prefixes.get(after) != Some(&key_prefix) {
+      return after.checked_sub(1);
+    }
+    // At least one fence shares the same 8-byte prefix: narrow only across the equal-prefix span.
+    let eq_end = if self.prefixes.get(after.saturating_add(1)) == Some(&key_prefix) {
+      let eq_len = self.prefixes.get(after..).map_or(0, |tail| {
+        tail.partition_point(|&prefix| prefix == key_prefix)
+      });
+      let extra = self
+        .fences
+        .get(after..after.saturating_add(eq_len))
+        .map_or(0, |slice| {
+          slice.partition_point(|fence| {
+            let start = usize::try_from(fence.first_start).unwrap_or(0);
+            let end = start.saturating_add(usize::try_from(fence.first_len).unwrap_or(0));
+            let first = self.fence_keys.get(start..end).unwrap_or_default();
+            compare_keys(first, key) != std::cmp::Ordering::Greater
+          })
+        });
+      after.saturating_add(extra)
+    } else if self
+      .fence_key(after)
+      .is_some_and(|first| compare_keys(first, key) != std::cmp::Ordering::Greater)
+    {
+      after.saturating_add(1)
+    } else {
+      after
+    };
+    eq_end.checked_sub(1)
   }
 
   /// Every row, in key order.
@@ -228,10 +296,7 @@ impl Run {
     store: &'s ContentStore,
     start: &[u8],
   ) -> impl Iterator<Item = RowRef<'s>> + use<'s> {
-    let first = self
-      .fences
-      .partition_point(|fence| fence.first.as_ref() <= start)
-      .saturating_sub(1);
+    let first = self.fence_index(start).unwrap_or(0);
     let first_rows = self
       .fences
       .get(first)
@@ -330,6 +395,10 @@ struct MergeWork {
   begun: u64,
   /// The merged run's tables put so far.
   fences: Vec<Fence>,
+  /// Their L1-compact big-endian 8-byte key prefixes.
+  prefixes: Vec<u64>,
+  /// Their contiguous first-key bytes.
+  fence_keys: Vec<u8>,
   /// Their rows.
   rows: u64,
   /// Their bytes.
@@ -377,6 +446,9 @@ pub struct Index {
   resolves: Cell<u64>,
   /// The runs those lookups passed over on their filters ([`IndexCounters::filter_rejections`]).
   filter_rejections: Cell<u64>,
+  /// Lookups since the last report that visited zero runs only this index holds (`depths[0]` fast path
+  /// avoiding a `RefCell` borrow on read-only forks and single-shared-run lookups).
+  depth_zero: Cell<u64>,
   /// `depths[p]`: the lookups since then that visited `p` runs only this index holds.
   depths: RefCell<Vec<u64>>,
   /// Rows inserted since the caller last reported its inserts' time.
@@ -413,7 +485,7 @@ pub enum AdoptRefused {
 
 /// A table, opened.
 fn view<'s>(store: &'s ContentStore, table: &ContentId) -> Option<TableView<'s>> {
-  TableView::open_known(store.get(table)?).ok()
+  TableView::open_known(store.get_table(table)?).ok()
 }
 
 /// What a tail row of `key` and `body` is charged.
@@ -595,17 +667,24 @@ fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64, filter: KeyFilter) ->
     bytes.saturating_add(u64::try_from(cut.bytes.len()).unwrap_or(u64::MAX))
   });
   let shared = stored.iter().any(|put| !put.fresh);
-  let fences = cuts
-    .into_iter()
-    .zip(stored)
-    .map(|(cut, put)| Fence {
-      table: put.identity,
-      first: cut.first,
-      rows: cut.rows,
-    })
-    .collect();
+  let key_bytes: usize = cuts.iter().map(|cut| cut.first.len()).sum();
+  let mut fences = Vec::with_capacity(cuts.len());
+  let mut prefixes = Vec::with_capacity(cuts.len());
+  let mut fence_keys = Vec::with_capacity(key_bytes);
+  for (cut, put) in cuts.into_iter().zip(stored) {
+    Run::push_fence(
+      &mut fences,
+      &mut prefixes,
+      &mut fence_keys,
+      put.identity,
+      &cut.first,
+      cut.rows,
+    );
+  }
   Run {
     fences,
+    prefixes,
+    fence_keys,
     rows,
     bytes,
     charged,
@@ -684,7 +763,9 @@ impl Index {
     self
       .filter_rejections
       .set(self.filter_rejections.get().saturating_add(visit.rejected));
-    if let Ok(mut depths) = self.depths.try_borrow_mut() {
+    if visit.compactable == 0 {
+      self.depth_zero.set(self.depth_zero.get().saturating_add(1));
+    } else if let Ok(mut depths) = self.depths.try_borrow_mut() {
       let at = usize::try_from(visit.compactable).unwrap_or(usize::MAX);
       if depths.len() <= at {
         depths.resize(at.saturating_add(1), 0);
@@ -724,9 +805,12 @@ impl Index {
           return None;
         }
       }
-      let fence = run.fence_for(key)?;
+      let idx = run.fence_index(key)?;
+      let fence = run.fences.get(idx)?;
+      let lo_key = run.fence_key(idx)?;
+      let hi_key = run.fence_key(idx.saturating_add(1));
       visit.resolves = visit.resolves.saturating_add(1);
-      view(store, &fence.table)?.get(key)
+      view(store, &fence.table)?.get_hinted(key, lo_key, hi_key)
     })
   }
 
@@ -921,6 +1005,8 @@ impl Index {
       self.sealing = Some(self.compactable());
       self.runs.push(Run {
         fences: Vec::new(),
+        prefixes: Vec::new(),
+        fence_keys: Vec::new(),
         rows: 0,
         bytes: 0,
         charged: filter_bytes,
@@ -931,11 +1017,14 @@ impl Index {
     let rows = table.cut.rows;
     if let Some(run) = self.runs.last_mut() {
       note_all(&mut run.filter, &hashes);
-      run.fences.push(Fence {
-        table: put.identity,
-        first: table.cut.first,
+      Run::push_fence(
+        &mut run.fences,
+        &mut run.prefixes,
+        &mut run.fence_keys,
+        put.identity,
+        &table.cut.first,
         rows,
-      });
+      );
       run.rows = run.rows.saturating_add(rows);
       run.bytes = run
         .bytes
@@ -1075,6 +1164,7 @@ impl Index {
   /// Drops the lookups not yet timed: they were counted against runs that changed (module docs).
   fn drop_untimed(&mut self) {
     self.visits.set(0);
+    self.depth_zero.set(0);
     self.depths.get_mut().clear();
   }
 
@@ -1313,11 +1403,14 @@ impl Index {
     }
     let work = &mut self.merge_work;
     note_all(&mut work.filter, &hashes);
-    work.fences.push(Fence {
-      table: put.identity,
-      first: cut.first,
-      rows: cut.rows,
-    });
+    Run::push_fence(
+      &mut work.fences,
+      &mut work.prefixes,
+      &mut work.fence_keys,
+      put.identity,
+      &cut.first,
+      cut.rows,
+    );
     work.rows = work.rows.saturating_add(cut.rows);
     work.bytes = work
       .bytes
@@ -1348,6 +1441,8 @@ impl Index {
     let built = u64::try_from(work.fences.len()).unwrap_or(u64::MAX);
     let run = Run {
       fences: work.fences,
+      prefixes: work.prefixes,
+      fence_keys: work.fence_keys,
       rows: work.rows,
       bytes: work.bytes,
       charged: work.charged,
@@ -1637,7 +1732,15 @@ impl Index {
   /// The caller's lookups since its last report took `elapsed_ns`: the merge rule's rent.
   pub fn lookups_took(&mut self, elapsed_ns: u64) {
     let visits = self.visits.replace(0);
-    let depths = take(self.depths.get_mut());
+    let zero = self.depth_zero.replace(0);
+    let mut depths = take(self.depths.get_mut());
+    if zero > 0 {
+      if depths.is_empty() {
+        depths.push(zero);
+      } else if let Some(slot) = depths.first_mut() {
+        *slot = slot.saturating_add(zero);
+      }
+    }
     self.rule.lookups(elapsed_ns, visits, &depths);
   }
 

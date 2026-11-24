@@ -157,7 +157,7 @@ impl UdpSocket {
       Inner::Real { socket } => loop {
         match netsys::send_to(socket, buf, addr)? {
           Io::Ready(sent) => return Ok(Some(sent)),
-          Io::WouldBlock => return Ok(None),
+          Io::WouldBlock | Io::NoBufs => return Ok(None),
           Io::Interrupted => {}
         }
       },
@@ -239,7 +239,7 @@ impl UdpSocket {
       Inner::Real { socket } => loop {
         match netsys::recv_from(socket, buf)? {
           Io::Ready(out) => return Ok(Some(out)),
-          Io::WouldBlock => return Ok(None),
+          Io::WouldBlock | Io::NoBufs => return Ok(None),
           Io::Interrupted => {}
         }
       },

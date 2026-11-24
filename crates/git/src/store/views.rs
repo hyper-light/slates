@@ -153,7 +153,7 @@ impl receive::Repository for IndexedObjects<'_> {
   }
 
   fn holds(&self, id: &ObjectId) -> bool {
-    self.repository.object(self.store, id).is_some()
+    self.repository.indexed_position(self.store, id).is_some()
   }
 
   fn away(&self) -> Option<u64> {

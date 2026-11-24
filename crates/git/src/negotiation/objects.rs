@@ -120,10 +120,19 @@ pub(super) struct Selecting<N, G> {
   sent: Held,
   /// What the client holds of trees and blobs.
   held: Held,
-  /// The trees being marked held, not yet taken.
-  mark: Vec<N>,
+  /// The trees being marked held, not yet taken, each optionally paired with an already-held
+  /// counterpart tree for structural diffing.
+  mark: Vec<(N, Option<N>)>,
   /// That stack's cost: its deepest.
   mark_peak: Peak,
+  /// Most recently visited root tree already present in `held` or `chosen.opened`, used as the
+  /// structural diff base for subsequent trees so unchanged entries skip index lookups.
+  last_root: Option<N>,
+  /// Ancestor root trees queued in parent-first order so each commit's tree diffs against its own
+  /// first parent's tree rather than an unrelated SHA-1-adjacent commit.
+  choose_stack: Vec<(N, Option<N>)>,
+  /// That stack's cost: its deepest.
+  choose_peak: Peak,
   /// The objects chosen, and the tree walks choosing them.
   chosen: Sets<N>,
   /// What the runs carry, for `include-tag`.
@@ -197,8 +206,9 @@ struct Sets<N> {
   opened: Opened<N>,
   /// Under a `sparse:oid` filter, each tree no blob below which was left out: never walked again.
   done: Held,
-  /// Trees to open, each with the depth its entries are met at.
-  open: Vec<(N, u64)>,
+  /// Trees to open, each with the depth its entries are met at and an optional already-visited
+  /// counterpart tree whose identical entries can be skipped without index lookups.
+  open: Vec<(N, u64, Option<N>)>,
   /// That stack's cost: its deepest.
   open_peak: Peak,
   /// The `sparse:oid` walk's frames, the tree being walked last: none outside one.
@@ -320,6 +330,9 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       held: Held::default(),
       mark: Vec::new(),
       mark_peak: Peak::default(),
+      last_root: None,
+      choose_stack: Vec::new(),
+      choose_peak: Peak::default(),
       carried: RunsCarried::default(),
       reached_targets,
       gathered: Positions::new(),
@@ -341,20 +354,26 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     })
   }
 
-  /// Does units of the selection until `spent` says the owner's quantum is spent, at least one: the objects chosen, as
-  /// runs, once the last is done; `None` while more are left or a read paused on a let-go pack window.
+  /// Does units of the selection until `spent` says the owner's quantum is spent, at least one: the objects chosen and
+  /// (for an unfiltered thin pack) the objects the client already holds, as runs, once the last is done; `None` while
+  /// more are left or a read paused on a let-go pack window.
   pub(super) fn step<S: Graph<Node = N, Green = G>>(
     &mut self,
     graph: &S,
     admission: &mut Admission,
     counters: &mut Counters,
     spent: &mut dyn FnMut() -> bool,
-  ) -> Result<Option<Positions>, Refusal> {
+  ) -> Result<Option<(Positions, Positions)>, Refusal> {
     loop {
       if self.unit(graph, admission, counters)? {
-        return Ok(Some(
-          core::mem::take(&mut self.chosen.objects).into_positions(),
-        ));
+        let objects = core::mem::take(&mut self.chosen.objects).into_positions();
+        let held =
+          if self.asked.thin && self.asked.filter.is_none() && !self.sides.common.is_empty() {
+            core::mem::take(&mut self.held).into_positions()
+          } else {
+            Positions::new()
+          };
+        return Ok(Some((objects, held)));
       }
       if graph.is_waiting() || spent() {
         return Ok(None);
@@ -369,8 +388,8 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<bool, Refusal> {
-    if let Some(node) = self.mark.pop() {
-      self.mark_one(graph, node, admission)?;
+    if let Some((node, against)) = self.mark.pop() {
+      self.mark_one(graph, node, against, admission)?;
       return Ok(false);
     }
     let view = View {
@@ -380,6 +399,18 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     };
     if self.chosen.walking() {
       self.chosen.walk_one(graph, &view, admission, counters)?;
+      return Ok(false);
+    }
+    if let Some((tree, against)) = self.choose_stack.pop() {
+      let base = against.or(self.last_root);
+      self
+        .chosen
+        .root(graph, &view, tree, base, admission, counters)?;
+      if graph.is_waiting() {
+        self.choose_stack.push((tree, against));
+        return Ok(false);
+      }
+      self.last_root = Some(tree);
       return Ok(false);
     }
     match self.stage {
@@ -412,24 +443,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
         self.stage = Stage::Choose { next: 0 };
       }
       Stage::Choose { next } => match self.sent.next_from(next) {
-        Some(position) => {
-          if let Ok(commit) = N::try_from(position) {
-            if let Some(row) = graph.commit(commit) {
-              self
-                .chosen
-                .root(graph, &view, row.tree, admission, counters)?;
-              if graph.is_waiting() {
-                return Ok(false);
-              }
-            }
-            if view.admits(Kind::Commit, 0, 0) {
-              self.chosen.objects.insert(commit, admission)?;
-            }
-          }
-          self.stage = Stage::Choose {
-            next: position.saturating_add(1),
-          };
-        }
+        Some(position) => self.choose_one(graph, position, admission, counters)?,
         None => self.stage = Stage::Wants { at: 0 },
       },
       Stage::Wants { at } => {
@@ -618,6 +632,135 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     Ok(())
   }
 
+  /// Processes one sent commit at `position` during [`Stage::Choose`].
+  fn choose_one<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    position: u64,
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    if let Ok(commit) = N::try_from(position) {
+      if let Some(row) = graph.commit(commit) {
+        if self.asked.sparse.is_none() && matches!(self.chosen.opened, Opened::Once(_)) {
+          if !self.is_tree_visited(row.tree) {
+            self.queue_commit_tree(graph, (commit, row), admission, counters)?;
+            if graph.is_waiting() {
+              return Ok(());
+            }
+          }
+        } else {
+          let against = self.last_root;
+          self.open_root_tree(graph, row.tree, against, admission, counters)?;
+          if graph.is_waiting() {
+            return Ok(());
+          }
+        }
+      }
+      if self
+        .asked
+        .filter
+        .as_ref()
+        .is_none_or(|filter| filter.admits(Kind::Commit, 0, 0))
+      {
+        self.chosen.objects.insert(commit, admission)?;
+      }
+    }
+    self.stage = Stage::Choose {
+      next: position.saturating_add(1),
+    };
+    Ok(())
+  }
+
+  /// Opens root `tree` against optional diff base `against` and records it as `last_root`.
+  fn open_root_tree<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    tree: N,
+    against: Option<N>,
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    let view = View {
+      filter: self.asked.filter.as_ref(),
+      patterns: self.asked.sparse.as_ref(),
+      held: &self.held,
+    };
+    self
+      .chosen
+      .root(graph, &view, tree, against, admission, counters)?;
+    if !graph.is_waiting() {
+      self.last_root = Some(tree);
+    }
+    Ok(())
+  }
+
+  /// Whether `tree` is already present in `held` or has already been opened under `Opened::Once`.
+  fn is_tree_visited(&self, tree: N) -> bool {
+    if self.held.contains(tree) {
+      return true;
+    }
+    matches!(&self.chosen.opened, Opened::Once(opened) if opened.contains(tree))
+  }
+
+  /// Returns `cur`'s first non-graft parent and its commit row, if present.
+  fn first_parent<S: Graph<Node = N, Green = G>>(
+    &self,
+    graph: &S,
+    cur: N,
+  ) -> Option<(N, super::CommitRow<N>)> {
+    if self.sides.cut.grafts.contains(&cur) {
+      return None;
+    }
+    let parent = graph.parents(cur).next()?;
+    Some((parent, graph.commit(parent)?))
+  }
+
+  /// Opens `commit`'s root tree against its own first parent's tree, queuing unvisited first-parent
+  /// ancestors in `self.sent` onto `choose_stack` in parent-first order so every commit diffs
+  /// against its actual parent rather than an unrelated SHA-1-adjacent commit. When the first
+  /// parent's tree is already visited (or the commit has no parent), opens `row.tree` directly with
+  /// zero stack usage.
+  fn queue_commit_tree<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    (commit, row): (N, super::CommitRow<N>),
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    let mut cur = commit;
+    let mut cur_row = row;
+    let mut queued = false;
+    let base = loop {
+      let Some((parent, parent_row)) = self.first_parent(graph, cur) else {
+        break None;
+      };
+      if self.is_tree_visited(parent_row.tree) {
+        break Some(parent_row.tree);
+      }
+      if self.sent.contains(parent) && parent_row.generation < cur_row.generation {
+        if cur_row.tree != parent_row.tree {
+          self
+            .choose_stack
+            .push((cur_row.tree, Some(parent_row.tree)));
+          queued = true;
+        }
+        cur = parent;
+        cur_row = parent_row;
+        continue;
+      }
+      break None;
+    };
+    if !queued {
+      let against = base.or(self.last_root);
+      return self.open_root_tree(graph, cur_row.tree, against, admission, counters);
+    }
+    self.choose_stack.push((cur_row.tree, base));
+    self
+      .choose_peak
+      .reach::<(N, Option<N>)>(self.choose_stack.len(), admission)
+  }
+
   /// The edges of the sent commit at `position`: each had parent's tree marked held, as git leaves out the trees of
   /// `mark_edges_uninteresting`; nothing for a graft.
   fn edges_of<S: Graph<Node = N, Green = G>>(
@@ -637,8 +780,14 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       .filter(|parent| !self.sent.contains(*parent))
     {
       if let Some(row) = graph.commit(parent) {
-        self.mark.push(row.tree);
-        self.mark_peak.reach::<N>(self.mark.len(), admission)?;
+        self.held.insert(parent, admission)?;
+        self.mark.push((row.tree, self.last_root));
+        self
+          .mark_peak
+          .reach::<(N, Option<N>)>(self.mark.len(), admission)?;
+        if self.last_root.is_none() {
+          self.last_root = Some(row.tree);
+        }
       }
     }
     Ok(())
@@ -656,7 +805,10 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       let listed = listed_haves(graph, &self.asked.haves, admission)?;
       for had in listed.iter().chain(&self.sides.cut.haves) {
         if let Some(row) = graph.commit(*had) {
-          self.mark.push(row.tree);
+          self.mark.push((row.tree, self.last_root));
+          if self.last_root.is_none() {
+            self.last_root = Some(row.tree);
+          }
         }
       }
     }
@@ -667,10 +819,12 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       .filter_map(|node| peel(graph, *node))
     {
       if graph.commit(have).is_none() {
-        self.mark.push(have);
+        self.mark.push((have, None));
       }
     }
-    self.mark_peak.reach::<N>(self.mark.len(), admission)
+    self
+      .mark_peak
+      .reach::<(N, Option<N>)>(self.mark.len(), admission)
   }
 
   /// Every want not answered by a run, paired with the `(green, version)` whose precomputed
@@ -721,20 +875,26 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     &mut self,
     graph: &S,
     node: N,
+    against: Option<N>,
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
     if self.held.contains(node) {
       return Ok(());
     }
     if graph.kind(node) == Kind::Tree {
-      let entries: Vec<N> = graph.entries(node).collect();
+      let entries: Vec<(N, Option<N>)> = match against {
+        Some(base) if base != node && self.held.contains(base) => graph.diff_entries(node, base),
+        _ => graph.entries(node).map(|entry| (entry, None)).collect(),
+      };
       if graph.is_waiting() {
-        self.mark.push(node);
+        self.mark.push((node, against));
         return Ok(());
       }
       self.held.insert(node, admission)?;
       self.mark.extend(entries);
-      self.mark_peak.reach::<N>(self.mark.len(), admission)?;
+      self
+        .mark_peak
+        .reach::<(N, Option<N>)>(self.mark.len(), admission)?;
     } else {
       self.held.insert(node, admission)?;
     }
@@ -756,8 +916,8 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
-    if let Some((tree, depth)) = self.open.pop() {
-      return self.open_one(graph, view, tree, depth, admission, counters);
+    if let Some((tree, depth, against)) = self.open.pop() {
+      return self.open_one(graph, view, (tree, depth, against), admission, counters);
     }
     let Some(patterns) = view.patterns else {
       return Ok(());
@@ -788,6 +948,7 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     graph: &S,
     view: &View<'_>,
     tree: N,
+    against: Option<N>,
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
@@ -800,8 +961,10 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     if view.admits(Kind::Tree, 0, 0) {
       self.objects.insert(tree, admission)?;
     }
-    self.open.push((tree, 1));
-    self.open_peak.reach::<(N, u64)>(self.open.len(), admission)
+    self.open.push((tree, 1, against));
+    self
+      .open_peak
+      .reach::<(N, u64, Option<N>)>(self.open.len(), admission)
   }
 
   /// Opens `tree`, its entries met at `depth`: each one the filter admits chosen, each tree among them queued.
@@ -810,8 +973,7 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     &mut self,
     graph: &S,
     view: &View<'_>,
-    tree: N,
-    depth: u64,
+    (tree, depth, against): (N, u64, Option<N>),
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
@@ -825,12 +987,28 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     if opened_before {
       return Ok(());
     }
-    let entries: Vec<N> = graph
-      .entries(tree)
-      .filter(|entry| !view.held.contains(*entry))
-      .collect();
+    let can_diff = match (&self.opened, against) {
+      (Opened::Once(opened), Some(base))
+        if base != tree && (view.held.contains(base) || opened.contains(base)) =>
+      {
+        Some(base)
+      }
+      _ => None,
+    };
+    let entries: Vec<(N, Option<N>)> = match can_diff {
+      Some(base) => graph
+        .diff_entries(tree, base)
+        .into_iter()
+        .filter(|(entry, _)| !view.held.contains(*entry))
+        .collect(),
+      None => graph
+        .entries(tree)
+        .filter(|entry| !view.held.contains(*entry))
+        .map(|entry| (entry, None))
+        .collect(),
+    };
     if graph.is_waiting() {
-      self.open.push((tree, depth));
+      self.open.push((tree, depth, against));
       return Ok(());
     }
     match &mut self.opened {
@@ -844,17 +1022,19 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       }
     }
     counters.trees = counters.trees.saturating_add(1);
-    for entry in entries {
+    for (entry, counterpart) in entries {
       let kind = graph.kind(entry);
       let size = view.size_of(graph, entry, kind);
       if view.admits(kind, size, depth) {
         self.objects.insert(entry, admission)?;
       }
       if kind == Kind::Tree {
-        self.open.push((entry, depth.saturating_add(1)));
+        self
+          .open
+          .push((entry, depth.saturating_add(1), counterpart));
         self
           .open_peak
-          .reach::<(N, u64)>(self.open.len(), admission)?;
+          .reach::<(N, u64, Option<N>)>(self.open.len(), admission)?;
       }
     }
     Ok(())
@@ -885,8 +1065,10 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
           if let Some(patterns) = view.patterns {
             return self.enter(graph, view, patterns, current, &[], admission, counters);
           }
-          self.open.push((current, 0));
-          return self.open_peak.reach::<(N, u64)>(self.open.len(), admission);
+          self.open.push((current, 0, None));
+          return self
+            .open_peak
+            .reach::<(N, u64, Option<N>)>(self.open.len(), admission);
         }
         Kind::Blob => {
           self.objects.insert(current, admission)?;

@@ -575,7 +575,7 @@ pub struct Repository {
   landings_charged: u64,
   counters: Cell<StoreCounters>,
   window: Window,
-  levels: Levels,
+  levels: RefCell<Levels>,
   depth: Depth,
   /// Count of committed objects stored whole outside a pack (e.g., VFS-authored commits rather than
   /// pushed pack entries): zero when every object in the repository already has a packed entry that
@@ -627,7 +627,7 @@ impl Repository {
       landings_charged: 0,
       counters: Cell::new(StoreCounters::default()),
       window: Window::default(),
-      levels: Levels::default(),
+      levels: RefCell::new(Levels::default()),
       depth: Depth::default(),
       unpacked_objects: 0,
       kept_fragment_bytes: 0,
@@ -721,6 +721,51 @@ impl Repository {
   /// The row of the object `id` names.
   pub fn object(&self, store: &ContentStore, id: &ObjectId) -> Option<ObjectRow> {
     self.indexed(store, id).map(|(row, _)| row)
+  }
+
+  /// The position of the object `id` names, decoded directly from its index row without allocating
+  /// commit parent lists or decoding packed entry metadata.
+  pub(super) fn indexed_position(&self, store: &ContentStore, id: &ObjectId) -> Option<u64> {
+    let found = self.index.get(store, &rows::object_key(id))?;
+    rows::decode_position(found.payload())
+  }
+
+  /// The byte length of the object at `position`, decoded directly without allocating.
+  pub(super) fn len_at(&self, store: &ContentStore, position: u64) -> Option<u64> {
+    let id = self.id_at(store, position)?;
+    let found = self.index.get(store, &rows::object_key(&id))?;
+    rows::decode_len(found.payload())
+  }
+
+  /// `(tree, date, generation)` of the commit at `position`, decoded directly without heap-allocating
+  /// its parent vector.
+  pub(super) fn commit_header_at(
+    &self,
+    store: &ContentStore,
+    position: u64,
+  ) -> Option<(u64, u64, u64)> {
+    let id = self.id_at(store, position)?;
+    let found = self.index.get(store, &rows::object_key(&id))?;
+    rows::decode_commit_header(found.payload())
+  }
+
+  /// Parent positions of the commit at `position`, stack-backed for 0/1/2-parent commits.
+  pub(super) fn commit_parents_at(
+    &self,
+    store: &ContentStore,
+    position: u64,
+  ) -> Option<rows::SmallParents> {
+    let id = self.id_at(store, position)?;
+    let found = self.index.get(store, &rows::object_key(&id))?;
+    rows::decode_commit_parents(found.payload())
+  }
+
+  /// Indexed target position of the annotated tag at `position`, decoded directly without
+  /// allocating.
+  pub(super) fn tag_target_at(&self, store: &ContentStore, position: u64) -> Option<Option<u64>> {
+    let id = self.id_at(store, position)?;
+    let found = self.index.get(store, &rows::object_key(&id))?;
+    rows::decode_tag_target(found.payload())
   }
 
   /// The type, place and length of the object `id` the index holds: where its bytes are read from (A-753: a pack
@@ -1135,10 +1180,16 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<(ObjectId, Vec<u8>)>, StoreRefused> {
+    /// Format: shortest valid git tree entry overhead before the raw object id (`"0 a\0"`).
+    const MIN_TREE_ENTRY_OVERHEAD: usize = 4;
     let malformed = StoreRefused::Malformed { id: *id };
+    let min_entry = self
+      .format
+      .raw_len()
+      .saturating_add(MIN_TREE_ENTRY_OVERHEAD);
     self.with_bytes_of(store, id, place, |bytes| {
       let mut admission = Admission::new(store.room());
-      let mut refs = Vec::new();
+      let mut refs = Vec::with_capacity(bytes.len().checked_div(min_entry).unwrap_or(0));
       for entry in crate::objects::tree::entries(bytes, self.format) {
         let entry = entry.map_err(|_| malformed)?;
         admission
@@ -1160,10 +1211,16 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<ObjectId>, StoreRefused> {
+    /// Format: shortest valid git tree entry overhead before the raw object id (`"0 a\0"`).
+    const MIN_TREE_ENTRY_OVERHEAD: usize = 4;
     let malformed = StoreRefused::Malformed { id: *id };
+    let min_entry = self
+      .format
+      .raw_len()
+      .saturating_add(MIN_TREE_ENTRY_OVERHEAD);
     self.with_bytes_of(store, id, place, |bytes| {
       let mut admission = Admission::new(store.room());
-      let mut refs = Vec::new();
+      let mut refs = Vec::with_capacity(bytes.len().checked_div(min_entry).unwrap_or(0));
       for entry in crate::objects::tree::entries(bytes, self.format) {
         let entry = entry.map_err(|_| malformed)?;
         admission
@@ -1176,6 +1233,85 @@ impl Repository {
       }
       Ok(refs)
     })
+  }
+
+  /// Exact structural diff of indexed tree `row`/`content` against already-visited indexed tree
+  /// `base_row`/`base_content`: validates every entry of `tree`, skips entries with identical
+  /// `(name, kind, id)` in `base` (avoiding index lookups for unchanged subtrees and blobs), and
+  /// pairs changed subdirectories with their counterpart in `base`. Because `base` was already
+  /// validated when first opened, any entry-aligned prefix or suffix of `tree` that is byte-for-byte
+  /// identical to `base` is skipped directly in word-sized chunks without re-parsing octal modes or
+  /// comparing names. If `base` cannot be read without pausing on a let-go window, falls back cleanly
+  /// to reading `tree` alone.
+  fn tree_diff_references(
+    &self,
+    store: &ContentStore,
+    (id, row, content): (&ObjectId, &ObjectRow, ContentId),
+    (base_row, base_content): (&ObjectRow, ContentId),
+  ) -> Result<Vec<(ObjectId, Option<ObjectId>)>, StoreRefused> {
+    let stored = self.stored_of(row, content);
+    let base_stored = self.stored_of(base_row, base_content);
+    let malformed = StoreRefused::Malformed { id: *id };
+    let unreadable = StoreRefused::Unreadable { id: *id };
+    let format = self.format;
+    let room = store.room();
+    let diff = |tree_bytes: &[u8], base_bytes: &[u8]| {
+      diff_tree_bytes(tree_bytes, base_bytes, format, room, malformed)
+    };
+    match (stored, base_stored) {
+      (StoredAt::InPack(place), StoredAt::InPack(base_place)) => {
+        let bases = IndexBases {
+          repository: self,
+          store,
+        };
+        let mut reading = self.reading.borrow_mut();
+        match packed::read_pair_in_place(
+          store,
+          (place, base_place, self.format),
+          &bases,
+          (
+            &mut *reading,
+            self.largest.max(row.len),
+            self.largest.max(base_row.len),
+          ),
+        ) {
+          Ok((tree_bytes, base_bytes))
+            if u64::try_from(tree_bytes.len()).ok() == Some(row.len)
+              && u64::try_from(base_bytes.len()).ok() == Some(base_row.len) =>
+          {
+            diff(tree_bytes, base_bytes)
+          }
+          _ => {
+            drop(reading);
+            let place = Place::Indexed {
+              row: row.clone(),
+              content,
+            };
+            self
+              .tree_references(store, id, &place)
+              .map(|ids| ids.into_iter().map(|oid| (oid, None)).collect())
+          }
+        }
+      }
+      (stored, base_stored) => {
+        let Some(base_bytes) = self.read_stored(store, &base_stored, base_row.len) else {
+          // Clear any waiting mark from reading the optional base and read `tree` alone.
+          let _ = self.waiting();
+          let place = Place::Indexed {
+            row: row.clone(),
+            content,
+          };
+          return self
+            .tree_references(store, id, &place)
+            .map(|ids| ids.into_iter().map(|oid| (oid, None)).collect());
+        };
+        self
+          .with_stored_bytes(store, &stored, row.len, |tree_bytes| {
+            diff(tree_bytes, &base_bytes)
+          })
+          .ok_or(unreadable)?
+      }
+    }
   }
 
   /// The object a tag names.
@@ -2218,7 +2354,7 @@ impl Repository {
       landings_charged: self.landings_charged,
       counters: Cell::new(StoreCounters::default()),
       window: self.window.clone(),
-      levels: self.levels.clone(),
+      levels: RefCell::new(self.levels.borrow().clone()),
       depth: self.depth,
       unpacked_objects: self.unpacked_objects,
       kept_fragment_bytes: self.kept_fragment_bytes,
@@ -2707,7 +2843,7 @@ impl Repository {
   pub(super) fn learning(&mut self, exchange: Exchange) -> Learning<'_> {
     Learning {
       window: &mut self.window,
-      levels: &mut self.levels,
+      levels: self.levels.get_mut(),
       depth: self.depth.limit(),
       exchange,
     }
@@ -2866,7 +3002,34 @@ impl Repository {
 impl Repository {
   /// A copy of the learned rules a stream encodes with: the window, the levels and the depth.
   pub(super) fn rules(&self) -> (Window, Levels, u64) {
-    (self.window.clone(), self.levels.clone(), self.depth.limit())
+    (
+      self.window.clone(),
+      self.levels.borrow().clone(),
+      self.depth.limit(),
+    )
+  }
+
+  /// Copies any zlib level statistics learned on this repository into `into` for kinds `into` has
+  /// not yet sampled, so concurrent fetches started before the first sample reuse it immediately.
+  pub(super) fn copy_levels_into(&self, into: &mut Levels) {
+    if let Ok(levels) = self.levels.try_borrow() {
+      into.merge_missing(&levels);
+    }
+  }
+
+  /// Records newly-sampled zlib level statistics for any object kind not yet learned by this
+  /// repository so concurrent and subsequent fetches reuse the once-per-kind sample without
+  /// re-deflating across all ten zlib levels.
+  pub fn note_levels(&self, learned: &Levels) {
+    if let Ok(mut levels) = self.levels.try_borrow_mut() {
+      levels.merge_missing(learned);
+    }
+  }
+
+  /// Snapshot of the repository's learned zlib level statistics (propagated from a released fetch
+  /// fork back to the live repository).
+  pub fn learned_levels(&self) -> Levels {
+    self.levels.borrow().clone()
   }
 
   /// `green`'s version `version`'s fragment of blobs, or of the other kinds, once encoded.
@@ -2938,4 +3101,226 @@ impl Repository {
     let stored = self.stored_of(&row, content);
     Ok((id, row, stored))
   }
+}
+
+/// Index of the first `0x00` byte in `bytes`, scanned a machine word at a time using Mycroft's
+/// zero-byte test (`(w - 0x0101...) & !w & 0x8080...`). Reading words little-endian places byte 0
+/// in the least significant lane on every endianness so carries never corrupt earlier lanes.
+#[inline]
+fn find_nul(bytes: &[u8]) -> Option<usize> {
+  /// Shape: word width for SWAR zero-byte scan.
+  const WORD: usize = core::mem::size_of::<u64>();
+  /// Derived: Mycroft SWAR per-lane 1 mask (`0x01` repeated across `u64`).
+  const LOW_BYTE_MASK: u64 = 0x0101_0101_0101_0101;
+  /// Derived: Mycroft SWAR per-lane MSB mask (`0x80` repeated across `u64`).
+  const HIGH_BIT_MASK: u64 = 0x8080_8080_8080_8080;
+  let (chunks, rem) = bytes.as_chunks::<WORD>();
+  let mut offset = 0_usize;
+  for chunk in chunks {
+    let word = u64::from_le_bytes(*chunk);
+    let has_zero = word.wrapping_sub(LOW_BYTE_MASK) & !word & HIGH_BIT_MASK;
+    if has_zero != 0 {
+      let lane = usize::try_from(has_zero.trailing_zeros() / u8::BITS).unwrap_or(0);
+      return Some(offset.saturating_add(lane));
+    }
+    offset = offset.saturating_add(WORD);
+  }
+  rem
+    .iter()
+    .position(|&byte| byte == b'\0')
+    .map(|at| offset.saturating_add(at))
+}
+
+/// Byte offset of the first entry in `tree_bytes` not wholly contained within the `prefix`-byte
+/// identical validated prefix shared with `base_bytes`.
+fn skip_identical_tree_prefix(tree_bytes: &[u8], prefix: usize, raw_len: usize) -> usize {
+  let mut start = 0_usize;
+  while start < prefix {
+    let Some(tail) = tree_bytes.get(start..prefix) else {
+      break;
+    };
+    let Some(nul) = find_nul(tail) else {
+      break;
+    };
+    let next = start
+      .saturating_add(nul)
+      .saturating_add(1)
+      .saturating_add(raw_len);
+    if next > prefix {
+      break;
+    }
+    start = next;
+  }
+  start
+}
+
+/// Advances the cursor over `base_bytes` until its current entry is no longer less than `entry`.
+fn advance_base_to<'a>(
+  base_bytes: &'a [u8],
+  base_pos: &mut usize,
+  base_next: &mut Option<(crate::objects::tree::Entry<'a>, usize)>,
+  entry: &crate::objects::tree::Entry<'_>,
+  format: ObjectFormat,
+) {
+  loop {
+    let current = match *base_next {
+      Some(found) => Some(found),
+      None => match crate::objects::tree::entry_after(base_bytes, *base_pos, format) {
+        Ok(Some(found)) => {
+          *base_next = Some(found);
+          Some(found)
+        }
+        _ => None,
+      },
+    };
+    let Some((base_entry, next_base)) = current else {
+      break;
+    };
+    if crate::objects::tree::compare(&base_entry, entry) == std::cmp::Ordering::Less {
+      *base_pos = next_base;
+      *base_next = None;
+    } else {
+      break;
+    }
+  }
+}
+
+/// Structural diff of `tree_bytes` against already-validated `base_bytes`, skipping entry-aligned
+/// byte-identical prefixes, middle runs, and suffixes directly in word-sized chunks.
+fn diff_tree_bytes(
+  tree_bytes: &[u8],
+  base_bytes: &[u8],
+  format: ObjectFormat,
+  room: u64,
+  malformed: StoreRefused,
+) -> Result<Vec<(ObjectId, Option<ObjectId>)>, StoreRefused> {
+  /// Shape: word width for entry-aligned middle-run equality pre-check.
+  const WORD: usize = core::mem::size_of::<u64>();
+  let prefix = common_prefix_len(tree_bytes, base_bytes);
+  if prefix == tree_bytes.len() && prefix == base_bytes.len() {
+    return Ok(Vec::new());
+  }
+  let suffix = match (tree_bytes.get(prefix..), base_bytes.get(prefix..)) {
+    (Some(t_rest), Some(b_rest)) => common_suffix_len(t_rest, b_rest),
+    _ => 0,
+  };
+  let raw_len = format.raw_len();
+  let start = skip_identical_tree_prefix(tree_bytes, prefix, raw_len);
+  let mut admission = Admission::new(room);
+  let mut tree_pos = start;
+  let mut base_pos = start;
+  let mut base_next: Option<(crate::objects::tree::Entry<'_>, usize)> = None;
+  let mut out = Vec::new();
+  while tree_pos < tree_bytes.len() {
+    let t_rem = tree_bytes.len().saturating_sub(tree_pos);
+    let b_rem = base_bytes.len().saturating_sub(base_pos);
+    if t_rem == b_rem && t_rem <= suffix {
+      break;
+    }
+    if base_next.is_none()
+      && let (Some(t_tail), Some(b_tail)) = (tree_bytes.get(tree_pos..), base_bytes.get(base_pos..))
+      && let (Some(tw), Some(bw)) = (t_tail.first_chunk::<WORD>(), b_tail.first_chunk::<WORD>())
+      && tw == bw
+    {
+      let mid = common_prefix_len(t_tail, b_tail);
+      let skip = skip_identical_tree_prefix(t_tail, mid, raw_len);
+      if skip > 0 {
+        tree_pos = tree_pos.saturating_add(skip);
+        base_pos = base_pos.saturating_add(skip);
+        continue;
+      }
+    }
+    let Some((entry, next_tree)) =
+      crate::objects::tree::entry_after(tree_bytes, tree_pos, format).map_err(|_| malformed)?
+    else {
+      break;
+    };
+    tree_pos = next_tree;
+    admission
+      .charge_items::<crate::objects::tree::Entry<'_>>(1)
+      .map_err(|_| malformed)?;
+    if entry.kind() == Kind::Commit {
+      continue;
+    }
+    advance_base_to(base_bytes, &mut base_pos, &mut base_next, &entry, format);
+    if let Some((base_entry, next_base)) = base_next
+      && base_entry.name == entry.name
+    {
+      base_pos = next_base;
+      base_next = None;
+      if base_entry.id == entry.id && base_entry.kind() == entry.kind() {
+        continue;
+      }
+      let object = entry.object_id(format).ok_or(malformed)?;
+      let counterpart = (base_entry.kind() == Kind::Tree && entry.kind() == Kind::Tree)
+        .then(|| base_entry.object_id(format))
+        .flatten();
+      out.push((object, counterpart));
+      continue;
+    }
+    out.push((entry.object_id(format).ok_or(malformed)?, None));
+  }
+  Ok(out)
+}
+
+/// Length of the longest identical byte prefix of `left` and `right`, compared in machine-word
+/// chunks using XOR + `trailing_zeros` on little-endian words (exact on all architectures).
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+  /// Shape: word width for chunked slice prefix/suffix comparisons.
+  const WORD: usize = core::mem::size_of::<u64>();
+  let limit = left.len().min(right.len());
+  let mut matched = 0_usize;
+  let (Some(left_head), Some(right_head)) = (left.get(..limit), right.get(..limit)) else {
+    return 0;
+  };
+  let (left_chunks, left_rem) = left_head.as_chunks::<WORD>();
+  let (right_chunks, right_rem) = right_head.as_chunks::<WORD>();
+  for (l, r) in left_chunks.iter().zip(right_chunks.iter()) {
+    let diff = u64::from_le_bytes(*l) ^ u64::from_le_bytes(*r);
+    if diff != 0 {
+      let equal = usize::try_from(diff.trailing_zeros() / u8::BITS).unwrap_or(0);
+      return matched.saturating_add(equal);
+    }
+    matched = matched.saturating_add(WORD);
+  }
+  matched.saturating_add(
+    left_rem
+      .iter()
+      .zip(right_rem.iter())
+      .take_while(|(a, b)| a == b)
+      .count(),
+  )
+}
+
+/// Length of the longest identical byte suffix of `left` and `right`, compared in machine-word
+/// chunks from the end using XOR + `trailing_zeros` on big-endian words (exact on all architectures).
+fn common_suffix_len(left: &[u8], right: &[u8]) -> usize {
+  /// Shape: word width for chunked slice prefix/suffix comparisons.
+  const WORD: usize = core::mem::size_of::<u64>();
+  let limit = left.len().min(right.len());
+  let mut matched = 0_usize;
+  let (Some(left_tail), Some(right_tail)) = (
+    left.get(left.len().saturating_sub(limit)..),
+    right.get(right.len().saturating_sub(limit)..),
+  ) else {
+    return 0;
+  };
+  let (left_rem, left_chunks) = left_tail.as_rchunks::<WORD>();
+  let (right_rem, right_chunks) = right_tail.as_rchunks::<WORD>();
+  for (l, r) in left_chunks.iter().rev().zip(right_chunks.iter().rev()) {
+    let diff = u64::from_be_bytes(*l) ^ u64::from_be_bytes(*r);
+    if diff != 0 {
+      let equal = usize::try_from(diff.trailing_zeros() / u8::BITS).unwrap_or(0);
+      return matched.saturating_add(equal);
+    }
+    matched = matched.saturating_add(WORD);
+  }
+  matched.saturating_add(
+    left_rem
+      .iter()
+      .rev()
+      .zip(right_rem.iter().rev())
+      .take_while(|(a, b)| a == b)
+      .count(),
+  )
 }

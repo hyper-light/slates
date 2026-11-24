@@ -1293,6 +1293,19 @@ impl ContentStore {
     held.here()
   }
 
+  /// The bytes of an immutable index table (`Form::Table`) named `identity`, read directly without
+  /// consulting the multi-window `objects` map or polluting the evictable-window miss-ratio curve.
+  pub fn get_table(&self, identity: &ContentId) -> Option<&[u8]> {
+    let held = self.entries.get(identity)?;
+    if held.form != Form::Table {
+      return None;
+    }
+    let tick = self.reads.get().saturating_add(1);
+    self.reads.set(tick);
+    held.last_read.set(tick);
+    held.here()
+  }
+
   /// Lends `curve` to the store, every read noted in it until the next call, and gives back the curve it held: what a
   /// repository's step reads is that repository's working set (A-724 piece 2d, §4.17.5 "Learned demand"). The caller
   /// brackets a step with it, putting back what it took, so a step inside a step restores its outer curve.
@@ -1536,12 +1549,15 @@ impl ContentStore {
   }
 
   /// One read of `held`, named `identity`, noted in the curve lent ([`ContentStore::observe`]): its key the identity's
-  /// first eight bytes (uniform, BLAKE3's), its length the content's.
+  /// first eight bytes (uniform, BLAKE3's), its length the content's. Only evictable content windows (`Form::Window`)
+  /// feed the miss-ratio curve (§4.17.5 "Learned demand"), because index tables, lists, and derived nodes are pinned
+  /// store metadata that are never let go and would otherwise drown out window reuse distances.
   fn note(&self, identity: &ContentId, held: &Held) {
     let tick = self.reads.get().saturating_add(1);
     self.reads.set(tick);
     held.last_read.set(tick);
-    if let Ok(mut slot) = self.observing.try_borrow_mut()
+    if held.form == Form::Window
+      && let Ok(mut slot) = self.observing.try_borrow_mut()
       && let Some(curve) = slot.as_mut()
       && let Some(key) = identity.0.first_chunk::<{ size_of::<u64>() }>()
     {

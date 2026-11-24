@@ -311,6 +311,20 @@ impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
       upload.sent(sent);
     }
   }
+
+  fn body_overdue(&mut self) {
+    match self {
+      HalfExchange::Upload(upload) => upload.body_overdue(),
+      HalfExchange::Receive(receive) => receive.body_overdue(),
+    }
+  }
+
+  fn reply_overdue(&mut self) {
+    match self {
+      HalfExchange::Upload(upload) => upload.reply_overdue(),
+      HalfExchange::Receive(receive) => receive.reply_overdue(),
+    }
+  }
 }
 
 impl<U: GitServices, R: GitServices> GitServices for Halves<U, R> {
@@ -358,6 +372,14 @@ impl<E: Exchange> Exchange for GitExchange<E> {
 
   fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
     self.service.sent(sent);
+  }
+
+  fn body_overdue(&mut self) {
+    self.service.body_overdue();
+  }
+
+  fn reply_overdue(&mut self) {
+    self.service.reply_overdue();
   }
 }
 
@@ -523,6 +545,18 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
   fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
     if let SiteExchange::Git(git) = self {
       git.sent(sent);
+    }
+  }
+
+  fn body_overdue(&mut self) {
+    if let SiteExchange::Git(git) = self {
+      git.body_overdue();
+    }
+  }
+
+  fn reply_overdue(&mut self) {
+    if let SiteExchange::Git(git) = self {
+      git.reply_overdue();
     }
   }
 }

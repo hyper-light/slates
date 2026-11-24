@@ -130,6 +130,10 @@ pub trait Answered {
   fn objects(&self) -> &Positions;
   /// Whether the client said `thin-pack`: a delta may name a base the client holds.
   fn thin(&self) -> bool;
+  /// Objects the client already holds that an unfiltered thin pack may reference as `REF_DELTA` bases.
+  fn held(&self) -> Option<&Positions> {
+    None
+  }
   /// Whether the client said `ofs-delta`: a delta may name its base by its offset back.
   fn ofs_delta(&self) -> bool;
   /// Whether the request's filter sends an object of `kind` and `size` that a run brought (A-615's per-object filter,
@@ -1029,6 +1033,10 @@ impl<A: Answered> Upload<A> {
         (Cow::Owned(first), Deflated::Read(bytes))
       }
     };
+    if !self.levels.has_kind(row.kind) {
+      cx.repository.copy_levels_into(&mut self.levels);
+    }
+    let had_level = self.levels.has_kind(row.kind);
     let mut learning = Learning {
       window: &mut self.window,
       levels: &mut self.levels,
@@ -1036,6 +1044,9 @@ impl<A: Answered> Upload<A> {
       exchange: cx.exchange,
     };
     let level = fragment::level(row.kind, &first, &mut learning).map_err(StoreRefused::Encoding)?;
+    if !had_level && self.levels.has_kind(row.kind) {
+      cx.repository.note_levels(&self.levels);
+    }
     self.emit(&written, out);
     Ok(Some(Pending::Deflate(Deflating {
       from,
@@ -1297,7 +1308,7 @@ impl<A: Answered> Upload<A> {
   }
 
   /// Whether a unit stopped at a let-go window ([`Upload::waiting`]) not yet taken.
-  fn is_waiting(&self) -> bool {
+  pub fn is_waiting(&self) -> bool {
     let waiting = self.waiting.take();
     self.waiting.set(waiting);
     waiting.is_some()
@@ -1394,6 +1405,7 @@ impl<A: Answered> Upload<A> {
     }
     let Some(&(_, _, position)) = usize::try_from(from).ok().and_then(|at| self.order.get(at))
     else {
+      self.encoder.clear_recent();
       return Err(Stage::Trailer);
     };
     let next = Stage::Loose {
@@ -1487,6 +1499,11 @@ impl<A: Answered> Upload<A> {
     object: ToEncode,
     out: &mut impl Out,
   ) -> Result<(), StoreRefused> {
+    let kind = object.kind;
+    if !self.levels.has_kind(kind) {
+      cx.repository.copy_levels_into(&mut self.levels);
+    }
+    let had_level = self.levels.has_kind(kind);
     let mut learning = Learning {
       window: &mut self.window,
       levels: &mut self.levels,
@@ -1497,6 +1514,9 @@ impl<A: Answered> Upload<A> {
       .encoder
       .put(object, self.at, &mut learning)
       .map_err(StoreRefused::Encoding)?;
+    if !had_level && self.levels.has_kind(kind) {
+      cx.repository.note_levels(&self.levels);
+    }
     if placed.stored == Stored::Whole {
       self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
     } else {
@@ -1637,6 +1657,16 @@ impl<A: Answered> Upload<A> {
     }))
   }
 
+  /// Whether the client already holds `base` so an unfiltered thin pack may emit a `REF_DELTA`
+  /// against it without re-encoding the object (gitprotocol-capabilities `thin-pack`).
+  #[inline]
+  fn client_holds(&self, base: u64) -> bool {
+    self.answer.thin()
+      && self.sends_all
+      && !self.wanted.contains(base)
+      && self.answer.held().is_some_and(|held| held.contains(base))
+  }
+
   /// `row`'s pushed entry sent on as it lies by what its row keeps of it (A-864, `rows::PackedRow`; git's
   /// `write_reuse_object`): its header read, the CRC32 of its raw bytes checked against the kept one, a delta's base by
   /// the position its row names, placed first where it is still wanted (git's `write_one`); then its data copied, no
@@ -1648,6 +1678,19 @@ impl<A: Answered> Upload<A> {
     (row, place, packed): (&ObjectRow, InPack, rows::PackedRow),
     out: &mut impl Out,
   ) -> Result<Option<Reuse>, StoreRefused> {
+    // Check base placement before reading the entry header or hashing its raw bytes: a delta whose
+    // base is not yet placed (and not held by a thin-pack client) either defers for `BaseFirst` or
+    // encodes afresh without copying raw bytes.
+    if let Some(base) = packed.base {
+      let placed =
+        self.sent.contains(base) || self.loose_at.contains_key(&base) || self.client_holds(base);
+      if !placed {
+        if self.wanted.contains(base) && to_u64(self.ahead.len()) < cx.repository.learned_depth() {
+          return Ok(Some(Reuse::BaseFirst(base)));
+        }
+        return Ok(Some(Reuse::Encode));
+      }
+    }
     let (header, data, mut hasher, mut checked) = match self.pending_crc.take() {
       Some(pending) if pending.place == place => (
         pending.header,
@@ -1691,14 +1734,6 @@ impl<A: Answered> Upload<A> {
     let representation = match (header.representation, packed.base) {
       (Representation::Whole(kind), None) if kind == row.kind => Representation::Whole(kind),
       (Representation::OfsDelta { .. } | Representation::RefDelta { .. }, Some(base)) => {
-        let placed = self.sent.contains(base) || self.loose_at.contains_key(&base);
-        if !placed {
-          if self.wanted.contains(base) && to_u64(self.ahead.len()) < cx.repository.learned_depth()
-          {
-            return Ok(Some(Reuse::BaseFirst(base)));
-          }
-          return Ok(Some(Reuse::Encode));
-        }
         match self.loose_at.get(&base) {
           Some(base_at) if self.answer.ofs_delta() => Representation::OfsDelta { base: *base_at },
           _ => Representation::RefDelta {
@@ -1781,8 +1816,9 @@ impl<A: Answered> Upload<A> {
     let Some((base_row, _)) = cx.repository.indexed(cx.store, &base) else {
       return Ok(DeltaReuse::No);
     };
-    let before =
-      self.sent.contains(base_row.position) || self.loose_at.contains_key(&base_row.position);
+    let before = self.sent.contains(base_row.position)
+      || self.loose_at.contains_key(&base_row.position)
+      || self.client_holds(base_row.position);
     if !before {
       let first = self.wanted.contains(base_row.position)
         && to_u64(self.ahead.len()) < cx.repository.learned_depth();
@@ -1905,13 +1941,17 @@ impl<A: Answered> Upload<A> {
     let step = if self.read_window(cx, base, &mut searching.base_bytes)? {
       SearchStep::More
     } else {
+      let best = searching
+        .best
+        .as_ref()
+        .map_or(searching.target_bytes.len(), |(_, kept)| kept.len());
       let Searching {
         search,
         base_bytes,
         target_bytes,
         ..
       } = &mut *searching;
-      search.step(base_bytes, target_bytes, cx.store.window())
+      search.step_bounded(base_bytes, target_bytes, cx.store.window(), best)
     };
     if let SearchStep::Done(delta) = step {
       // The trial's time is the machine's measured rate over the bytes it searched (`Rates`), never the clock's.
@@ -1993,6 +2033,10 @@ impl<A: Answered> Upload<A> {
     let mut written = Vec::new();
     entry::write(header, self.at, &mut written).map_err(entry_refused)?;
     let first = delta.get(..cx.store.window()).unwrap_or(delta.as_slice());
+    if !self.levels.has_kind(row.kind) {
+      cx.repository.copy_levels_into(&mut self.levels);
+    }
+    let had_level = self.levels.has_kind(row.kind);
     let mut learning = Learning {
       window: &mut self.window,
       levels: &mut self.levels,
@@ -2000,6 +2044,9 @@ impl<A: Answered> Upload<A> {
       exchange: cx.exchange,
     };
     let level = fragment::level(row.kind, first, &mut learning).map_err(StoreRefused::Encoding)?;
+    if !had_level && self.levels.has_kind(row.kind) {
+      cx.repository.note_levels(&self.levels);
+    }
     let large = Large {
       id,
       kind: row.kind,

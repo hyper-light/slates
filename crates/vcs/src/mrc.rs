@@ -416,34 +416,43 @@ impl Curve {
     self.expected *= factor;
   }
 
-  /// Gives the live keys slots `0..` in their order and rebuilds the tree over twice their count and one more, at most
-  /// twice the capacity (module docs): so the slots grow with the keys a repository actually has, and at least as many
-  /// reads follow a renumbering as it moved keys.
+  /// Gives the live keys slots `0..` in their order and rebuilds the tree in place without heap
+  /// allocation, growing the slot table geometrically up to `2 * capacity` so hot small-working-set
+  /// repositories (e.g. a handful of index tables read millions of times) amortize renumbering to
+  /// `O(1)` instead of renumbering every few reads.
   fn renumber(&mut self) {
-    let live: Vec<u64> = self.slot_keys.iter().flatten().copied().collect();
-    let slots = live
-      .len()
-      .saturating_add(1)
-      .saturating_mul(2)
-      .min(self.capacity.saturating_mul(2))
-      .max(live.len().saturating_add(1));
-    self.slot_keys.clear();
+    let mut write = 0usize;
+    for read in 0..self.slot_keys.len() {
+      if let Some(Some(key)) = self.slot_keys.get(read).copied() {
+        if let Some(dst) = self.slot_keys.get_mut(write) {
+          *dst = Some(key);
+        }
+        write = write.saturating_add(1);
+      }
+    }
+    let live = write;
+    let cap_slots = self.capacity.saturating_mul(2);
+    let min_slots = live.saturating_add(1).saturating_mul(2);
+    let grown = self.slot_keys.len().saturating_mul(2);
+    let slots = grown
+      .max(min_slots)
+      .min(cap_slots)
+      .max(live.saturating_add(1));
+    self.slot_keys.truncate(live);
     self.slot_keys.resize(slots, None);
     self.sums.clear();
     self.sums.resize(slots, 0);
     self.total_bytes = 0;
-    self.next_slot = 0;
-    for key in live {
+    self.next_slot = live;
+    for slot in 0..live {
+      let Some(Some(key)) = self.slot_keys.get(slot).copied() else {
+        continue;
+      };
       let bytes = self.keys.get(&key).map_or(0, |(_, bytes)| *bytes);
-      let slot = self.next_slot;
-      if let Some(entry) = self.slot_keys.get_mut(slot) {
-        *entry = Some(key);
-      }
       self.add(slot, bytes, true);
       if let Some(entry) = self.keys.get_mut(&key) {
         *entry = (slot, bytes);
       }
-      self.next_slot = slot.saturating_add(1);
     }
   }
 

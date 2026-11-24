@@ -31,6 +31,8 @@ pub struct Planned {
   runs: Vec<Versions>,
   /// The single objects, by position, in the form the negotiation kept them (A-745).
   objects: Positions,
+  /// Objects the client already holds that an unfiltered thin pack may reference as `REF_DELTA` bases.
+  held: Positions,
   /// The request's filter, one that decides by an object's own row.
   filter: Option<Filter>,
   /// `thin-pack`.
@@ -42,9 +44,11 @@ pub struct Planned {
 impl Planned {
   /// The answer `plan` names, its lists charged to `admission` before they are copied.
   fn of(plan: &PackPlan<'_>, admission: &mut Admission) -> Result<Planned, PackRefused> {
+    let held_bytes = plan.held.map_or(0, Positions::bytes);
     admission
       .charge_items::<Versions>(plan.runs.len())
       .and_then(|()| admission.charge(plan.objects.bytes()))
+      .and_then(|()| admission.charge(held_bytes))
       .map_err(PackRefused::PastAdmission)?;
     Ok(Planned {
       runs: plan
@@ -57,6 +61,7 @@ impl Planned {
         })
         .collect(),
       objects: plan.objects.clone(),
+      held: plan.held.cloned().unwrap_or_default(),
       filter: plan.filter.cloned(),
       thin: plan.thin,
       ofs_delta: plan.ofs_delta,
@@ -71,6 +76,10 @@ impl Answered for Planned {
 
   fn objects(&self) -> &Positions {
     &self.objects
+  }
+
+  fn held(&self) -> Option<&Positions> {
+    (!self.held.is_empty()).then_some(&self.held)
   }
 
   fn thin(&self) -> bool {
@@ -106,6 +115,11 @@ impl Streamed {
   /// copied whole or read entry by entry and the objects encoded afresh.
   pub fn counters(&self) -> UploadCounters {
     self.upload.counters()
+  }
+
+  /// Whether the stream's last turn stopped at a let-go window not yet taken by [`Self::pack_reads`].
+  pub fn is_waiting(&self) -> bool {
+    self.upload.is_waiting()
   }
 
   /// Where the stream's next turn begins to read a pushed pack, and the let-go window its last turn stopped at, taken

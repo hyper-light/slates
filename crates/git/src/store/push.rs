@@ -748,6 +748,21 @@ impl Push {
     self.reading.get_mut().recent().release(store);
   }
 
+  /// Releases buffers only needed while unpacking and checking the incoming pack once the push
+  /// enters sealing: always drops `recent` (discharging its `ContentStore` hold), and when every
+  /// object in the pack was already indexed by the repository (`!has_placed() && !has_loose()`),
+  /// drops the raw pack bytes, entry maps, and read scratch immediately so concurrent pushes that
+  /// introduce no new objects hold zero pack memory while awaiting turns, homing, or landing.
+  pub fn trim_for_sealing(&mut self, store: &mut ContentStore) {
+    self.release_recent(store);
+    if self.placed.is_empty() && self.quarantine.is_empty() {
+      self.entries = BTreeMap::new();
+      self.passed_over = BTreeMap::new();
+      self.pack = Vec::new();
+      *self.reading.get_mut() = Scratch::default();
+    }
+  }
+
   /// Gives back every hold the push took, its staged rows' included, leaving nothing behind.
   pub fn abandon(mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     self.release_recent(store);

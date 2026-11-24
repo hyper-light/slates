@@ -288,6 +288,15 @@ pub(crate) trait Exchange {
   /// peer took them in, and whether the write found the socket full. Nothing by default; git's fetch learns its link's
   /// price from it.
   fn sent(&mut self, _sent: crate::vcs_store::upload::Sent) {}
+  /// Notifies the exchange that reading the next bytes of its request body exceeded the learned
+  /// phase wait bound (a slow or stalled peer), allowing a push intake gate to release so fast
+  /// sibling pushes are never head-of-line blocked. Nothing by default.
+  fn body_overdue(&mut self) {}
+
+  /// Called when a reply write stalls past the connection's learned write wait bound, allowing a
+  /// pack-streaming service to release its per-repository fetch gate so a slow reader never
+  /// head-of-line blocks sibling fetches.
+  fn reply_overdue(&mut self) {}
 }
 
 /// How a site answers a request's head.
@@ -450,6 +459,22 @@ impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
       Self::Git(exchange) => exchange.sent(sent),
       Self::Hg(exchange) => exchange.sent(sent),
       Self::Svn(exchange) => exchange.sent(sent),
+    }
+  }
+
+  fn body_overdue(&mut self) {
+    match self {
+      Self::Git(exchange) => exchange.body_overdue(),
+      Self::Hg(exchange) => exchange.body_overdue(),
+      Self::Svn(exchange) => exchange.body_overdue(),
+    }
+  }
+
+  fn reply_overdue(&mut self) {
+    match self {
+      Self::Git(exchange) => exchange.reply_overdue(),
+      Self::Hg(exchange) => exchange.reply_overdue(),
+      Self::Svn(exchange) => exchange.reply_overdue(),
     }
   }
 }
@@ -1111,12 +1136,25 @@ impl<S: Site> Parts<S> {
     let Ok((deadline_ns, overdue)) = self.armed(phase) else {
       return Flow::End(Why::Failed);
     };
-    let marker = self.marker(overdue);
     let bytes = u64::try_from(connection.output().len()).unwrap_or(u64::MAX);
-    let waited = self
-      .socket
-      .write(connection.output(), deadline_ns, marker)
-      .await;
+    let waited = {
+      let Self {
+        socket,
+        state,
+        slot,
+        service,
+        ..
+      } = self;
+      let state = *state;
+      let slot = *slot;
+      let marker = move || {
+        let _ = state.with(|state| state.mark(slot, Some(overdue)));
+        if let Some(started) = service.as_mut() {
+          started.exchange.reply_overdue();
+        }
+      };
+      socket.write(connection.output(), deadline_ns, marker).await
+    };
     connection.written();
     let took = match &waited.0 {
       Waited::Done { waited_ns, .. } => Some(*waited_ns),
@@ -1144,15 +1182,30 @@ impl<S: Site> Parts<S> {
     let Ok((deadline_ns, overdue)) = self.armed(phase) else {
       return Flow::End(Why::Failed);
     };
-    let marker = self.marker(overdue);
     let mut receiving_ns = 0_u64;
-    let waited = self
-      .socket
-      .read_with(deadline_ns, marker, |bytes| {
-        receiving_ns = now_ns();
-        connection.receive(bytes);
-      })
-      .await;
+    let waited = {
+      let Self {
+        socket,
+        state,
+        slot,
+        service,
+        ..
+      } = self;
+      let state = *state;
+      let slot = *slot;
+      let marker = move || {
+        let _ = state.with(|state| state.mark(slot, Some(overdue)));
+        if let Some(started) = service.as_mut() {
+          started.exchange.body_overdue();
+        }
+      };
+      socket
+        .read_with(deadline_ns, marker, |bytes| {
+          receiving_ns = now_ns();
+          connection.receive(bytes);
+        })
+        .await
+    };
     match waited {
       (Waited::Done { value: 0, .. }, overdue) => {
         if overdue {

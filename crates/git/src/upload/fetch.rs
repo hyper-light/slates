@@ -351,6 +351,7 @@ fn written<P: PackSource>(
       let plan = PackPlan {
         runs: &pack.runs,
         objects: &pack.objects,
+        held: (!pack.held.is_empty()).then_some(&pack.held),
         filter: asked.filter.as_ref(),
         thin: asked.flags.thin,
         ofs_delta: asked.flags.ofs_delta,

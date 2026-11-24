@@ -851,12 +851,49 @@ impl SparseObject {
   }
 
   /// Word `index` of the declared 64-bit run `id`, committed first, as an atomic, in constant time.
+  #[inline]
   pub fn run_u64(&self, id: RunId, index: usize) -> Result<&AtomicU64, MemError> {
     let offset = run_word(&self.words, id, index, Width::U64)?;
     self
       .commits
       .commit(&self.inner, offset, Width::U64.bytes())?;
     word_view(&self.inner, offset)
+  }
+
+  /// Folds relaxed loads over the first `count` words of the declared 64-bit run `id`, validating
+  /// the run and committing its backing range once up front (sound across macOS, Linux, and Windows
+  /// `SEC_RESERVE`) rather than per word.
+  #[inline]
+  pub fn run_u64_fold_relaxed<B>(
+    &self,
+    id: RunId,
+    count: usize,
+    init: B,
+    mut fold: impl FnMut(B, usize, u64) -> B,
+  ) -> Result<B, MemError> {
+    let run = self
+      .words
+      .run(id)
+      .filter(|run| run.width() == Width::U64)
+      .ok_or_else(|| refused(0, Width::U64.bytes(), LayoutRefusal::NotAWord))?;
+    let span = run
+      .span_bytes(count)
+      .ok_or_else(|| refused(count, Width::U64.bytes(), LayoutRefusal::OutOfRange))?;
+    if count == 0 {
+      return Ok(init);
+    }
+    let first = run.first_offset();
+    let stride = run.stride();
+    self.commits.commit(&self.inner, first, span)?;
+    let mut acc = init;
+    let mut offset = first;
+    for index in 0..count {
+      let value =
+        word_view::<AtomicU64>(&self.inner, offset)?.load(std::sync::atomic::Ordering::Relaxed);
+      acc = fold(acc, index, value);
+      offset = offset.saturating_add(stride);
+    }
+    Ok(acc)
   }
 }
 
@@ -964,6 +1001,7 @@ fn resolve(layout: &Layout, run: &WordRun) -> Result<RunId, MemError> {
 
 /// The offset of word `index` of run `id` of `width` in `layout`: constant time, and only a word the
 /// layout declared (validated in range and aligned when the layout was built).
+#[inline]
 fn run_word(layout: &Layout, id: RunId, index: usize, width: Width) -> Result<usize, MemError> {
   layout
     .run(id)
@@ -988,6 +1026,7 @@ impl Word for AtomicU64 {}
 
 /// The declared word at `offset` (checked by the caller: inside the map, aligned to `W`, declared of `W`'s
 /// width, touched by no copy) as the atomic `W`.
+#[inline]
 fn word_view<W: Word>(inner: &platform::Inner, offset: usize) -> Result<&W, MemError> {
   let word = inner.base().wrapping_add(offset);
   if !(word as usize).is_multiple_of(align_of::<W>()) {

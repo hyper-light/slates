@@ -283,11 +283,193 @@ pub fn decode(payload: &[u8]) -> Option<ObjectRow> {
   })
 }
 
+/// Format: words in an in-pack object row's entry (`offset`, `len`, `crc`, `base`).
+const PACKED_ENTRY_WORDS: usize = 4;
+
+/// Format: bytes of an in-pack object row's entry.
+const PACKED_ENTRY_BYTES: usize = PACKED_ENTRY_WORDS * WORD_BYTES;
+
+/// Format: words in a commit row's fixed header (`tree`, `date`, `generation`).
+const COMMIT_HEADER_WORDS: usize = 3;
+
+/// Format: bytes of a commit row's fixed header before its parent count.
+const COMMIT_HEADER_BYTES: usize = COMMIT_HEADER_WORDS * WORD_BYTES;
+
+/// Format: regular commits carry 0 or 1 parent and standard merges carry 2 parents
+/// (`gitformat-commit`); storing up to two parents inline avoids a heap allocation on 99.9%+ of
+/// commit parent lookups while octopus merges spill seamlessly to a `Vec`.
+const INLINE_PARENTS: usize = 2;
+
+/// Stack-backed parent position list returned by [`decode_commit_parents`]: zero heap allocations
+/// for regular commits and two-way merges, spilling to `Vec<u64>` only for octopus merges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SmallParents {
+  /// At most [`INLINE_PARENTS`] parents stored inline.
+  Inline {
+    /// Inline parent slots; only the first `len` are valid.
+    items: [u64; INLINE_PARENTS],
+    /// Number of valid parent positions (`0..=INLINE_PARENTS`).
+    len: usize,
+  },
+  /// More than [`INLINE_PARENTS`] parents (octopus merge).
+  Spilled(Vec<u64>),
+}
+
+impl Default for SmallParents {
+  fn default() -> SmallParents {
+    SmallParents::Inline {
+      items: [0; INLINE_PARENTS],
+      len: 0,
+    }
+  }
+}
+
+/// Iterator over [`SmallParents`].
+pub enum SmallParentsIter {
+  /// Iterating over inline slots.
+  Inline {
+    /// Inline parent slots.
+    items: [u64; INLINE_PARENTS],
+    /// Next slot index.
+    at: usize,
+    /// Valid slot count.
+    len: usize,
+  },
+  /// Iterating over spilled octopus parents.
+  Spilled(std::vec::IntoIter<u64>),
+}
+
+impl Iterator for SmallParentsIter {
+  type Item = u64;
+
+  fn next(&mut self) -> Option<u64> {
+    match self {
+      SmallParentsIter::Inline { items, at, len } => {
+        if *at >= *len {
+          return None;
+        }
+        let item = *items.get(*at)?;
+        *at = at.saturating_add(1);
+        Some(item)
+      }
+      SmallParentsIter::Spilled(iter) => iter.next(),
+    }
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    match self {
+      SmallParentsIter::Inline { at, len, .. } => {
+        let rem = len.saturating_sub(*at);
+        (rem, Some(rem))
+      }
+      SmallParentsIter::Spilled(iter) => iter.size_hint(),
+    }
+  }
+}
+
+impl IntoIterator for SmallParents {
+  type Item = u64;
+  type IntoIter = SmallParentsIter;
+
+  fn into_iter(self) -> SmallParentsIter {
+    match self {
+      SmallParents::Inline { items, len } => SmallParentsIter::Inline { items, at: 0, len },
+      SmallParents::Spilled(vec) => SmallParentsIter::Spilled(vec.into_iter()),
+    }
+  }
+}
+
+/// Decodes only the position word of an object row payload without decoding pack metadata, commit
+/// parents, or allocating on the heap.
+pub fn decode_position(payload: &[u8]) -> Option<u64> {
+  let (&marked, rest) = payload.split_first()?;
+  kind_of(marked & !IN_PACK)?;
+  let mut fields = Fields { bytes: rest };
+  let _len = fields.word()?;
+  fields.word()
+}
+
+/// Decodes only the byte length of an object row payload without allocating.
+pub fn decode_len(payload: &[u8]) -> Option<u64> {
+  let (&marked, rest) = payload.split_first()?;
+  kind_of(marked & !IN_PACK)?;
+  let mut fields = Fields { bytes: rest };
+  fields.word()
+}
+
+/// Advances `payload` past the object row prefix and optional packed entry into the commit part,
+/// returning `None` for non-commit rows or truncated payloads.
+fn commit_fields(payload: &[u8]) -> Option<Fields<'_>> {
+  let (&marked, rest) = payload.split_first()?;
+  if kind_of(marked & !IN_PACK)? != Kind::Commit {
+    return None;
+  }
+  let mut fields = Fields { bytes: rest };
+  let _len = fields.word()?;
+  let _position = fields.word()?;
+  if marked & IN_PACK != 0 {
+    fields.take(PACKED_ENTRY_BYTES)?;
+  }
+  Some(fields)
+}
+
+/// Decodes `(tree, date, generation)` from a commit object row payload without heap-allocating its
+/// parent list. Returns `None` for non-commit rows or malformed payloads.
+pub fn decode_commit_header(payload: &[u8]) -> Option<(u64, u64, u64)> {
+  let mut fields = commit_fields(payload)?;
+  Some((fields.word()?, fields.word()?, fields.word()?))
+}
+
+/// Decodes only the parent positions from a commit object row payload into a zero-allocation
+/// [`SmallParents`]. Returns `None` for non-commit rows or truncated payloads.
+pub fn decode_commit_parents(payload: &[u8]) -> Option<SmallParents> {
+  let mut fields = commit_fields(payload)?;
+  fields.take(COMMIT_HEADER_BYTES)?;
+  let count = usize::try_from(fields.count()?).ok()?;
+  if fields.bytes.len() != count.checked_mul(WORD_BYTES)? {
+    return None;
+  }
+  if count <= INLINE_PARENTS {
+    let mut items = [0_u64; INLINE_PARENTS];
+    for slot in items.iter_mut().take(count) {
+      *slot = fields.word()?;
+    }
+    return Some(SmallParents::Inline { items, len: count });
+  }
+  let mut parents = Vec::with_capacity(count);
+  for _ in 0..count {
+    parents.push(fields.word()?);
+  }
+  Some(SmallParents::Spilled(parents))
+}
+
+/// Decodes the indexed target position of an annotated tag row payload without allocating.
+/// Returns `None` for non-tag rows or malformed payloads, `Some(None)` if the tag's target was not
+/// indexed in the row.
+pub fn decode_tag_target(payload: &[u8]) -> Option<Option<u64>> {
+  let (&marked, rest) = payload.split_first()?;
+  if kind_of(marked & !IN_PACK)? != Kind::Tag {
+    return None;
+  }
+  let mut fields = Fields { bytes: rest };
+  let _len = fields.word()?;
+  let _position = fields.word()?;
+  if marked & IN_PACK != 0 {
+    fields.take(PACKED_ENTRY_BYTES)?;
+  }
+  let raw = fields.word()?;
+  fields.bytes.is_empty().then_some(raw.checked_sub(1))
+}
+
 /// A commit's part, read from `fields`.
 fn decode_commit(fields: &mut Fields<'_>) -> Option<CommitRow> {
   let (tree, date, generation) = (fields.word()?, fields.word()?, fields.word()?);
   let count = usize::try_from(fields.count()?).ok()?;
-  let mut parents = Vec::new();
+  let bound = fields.bytes.len().checked_div(WORD_BYTES).unwrap_or(0);
+  if count > bound {
+    return None;
+  }
+  let mut parents = Vec::with_capacity(count);
   for _ in 0..count {
     parents.push(fields.word()?);
   }
@@ -302,4 +484,71 @@ fn decode_commit(fields: &mut Fields<'_>) -> Option<CommitRow> {
 /// The id a position row carries, in `format`.
 pub fn position_id(format: ObjectFormat, payload: &[u8]) -> Option<ObjectId> {
   ObjectId::from_bytes(format, payload)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A-614. Do: encode commit (0, 1, 2, and 4 octopus parents), blob, and annotated tag rows both
+  /// whole and in-pack, then read them with the zero-allocation partial decoders. Expect: every
+  /// partial decoder agrees identically with full `decode`.
+  #[test]
+  fn partial_row_decoders_match_full_decode_across_kinds_and_parent_counts() {
+    let pack = Some(PackedRow {
+      offset: 1234,
+      len: 567,
+      crc: 0xDEAD_BEEF,
+      base: Some(42),
+    });
+    for packed in [None, pack] {
+      for parents in [vec![], vec![7], vec![7, 9], vec![1, 2, 3, 4]] {
+        let row = ObjectRow {
+          kind: Kind::Commit,
+          len: 321,
+          position: 99,
+          pack: packed,
+          commit: Some(CommitRow {
+            tree: 55,
+            date: 1_700_000_000,
+            generation: 12,
+            parents: parents.clone(),
+          }),
+          tag_target: None,
+        };
+        let encoded = encode(&row);
+        assert_eq!(decode(&encoded), Some(row));
+        assert_eq!(decode_position(&encoded), Some(99));
+        assert_eq!(decode_len(&encoded), Some(321));
+        assert_eq!(
+          decode_commit_header(&encoded),
+          Some((55, 1_700_000_000, 12))
+        );
+        assert_eq!(
+          decode_commit_parents(&encoded)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
+          parents
+        );
+        assert_eq!(decode_tag_target(&encoded), None);
+      }
+
+      let tag = ObjectRow {
+        kind: Kind::Tag,
+        len: 140,
+        position: 101,
+        pack: packed,
+        commit: None,
+        tag_target: Some(99),
+      };
+      let encoded_tag = encode(&tag);
+      assert_eq!(decode(&encoded_tag), Some(tag));
+      assert_eq!(decode_position(&encoded_tag), Some(101));
+      assert_eq!(decode_len(&encoded_tag), Some(140));
+      assert_eq!(decode_commit_header(&encoded_tag), None);
+      assert_eq!(decode_commit_parents(&encoded_tag), None);
+      assert_eq!(decode_tag_target(&encoded_tag), Some(Some(99)));
+    }
+  }
 }

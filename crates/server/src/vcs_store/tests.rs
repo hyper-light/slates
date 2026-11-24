@@ -2541,3 +2541,52 @@ fn t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_
   assert_eq!((freed, pinned), (len, 0), "the whole pack let go");
   assert!(!whole_after, "the pack held whole no more");
 }
+
+/// Regression: `lend` gives `ContentStore` `store.admittable()`, which includes extents claimable
+/// from the shared pool beyond the shard's current mapped arena capacity. When a step charges
+/// retention (e.g., `Recent::true_up` or index metadata) past the current mapped capacity while
+/// still inside `admittable()`, `settle` must grow the arena from the pool instead of failing
+/// `charge_retention` and counting `CHARGE_SHORT`.
+#[test]
+fn t_wave6c3_settle_grows_from_pool_when_lend_promised_pool_room() {
+  use super::CHARGE_SHORT;
+  let (charged, short, used) = crate::test_store::audit_on_stored_shard(
+    "settle-grows-pool",
+    |state| {
+      let _id = crate::git_push::tests::git_repository(state, "settle-grows-pool");
+      let current_cap = state.store.budget.capacity();
+      let pool_room = state.store.admittable();
+      assert!(
+        pool_room > current_cap,
+        "audit shard pool must offer room beyond initial arena capacity ({pool_room} <= {current_cap})"
+      );
+      let charge_bytes = current_cap.saturating_add(1 << 20).min(pool_room);
+      super::within_budget(state, 0, |stores| {
+        stores
+          .content_mut()
+          .expect("content store")
+          .charge(charge_bytes)
+          .expect("within lent pool room");
+      });
+      let charged = state.vcs_stores.charged;
+      let used = state.vcs_stores.content().map_or(0, ContentStore::used);
+      let short = state.refusals.get(CHARGE_SHORT).copied().unwrap_or(0);
+      // Clean up the charge before shard teardown.
+      super::within_budget(state, 0, |stores| {
+        let _ = stores
+          .content_mut()
+          .expect("content store")
+          .discharge(charge_bytes);
+      });
+      (charged, short, used)
+    },
+  );
+  assert_eq!(
+    short, 0,
+    "settle must not record CHARGE_SHORT when pool has room"
+  );
+  assert_eq!(
+    charged, used,
+    "shard charge must match content store used bytes"
+  );
+}

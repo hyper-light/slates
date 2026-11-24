@@ -367,6 +367,7 @@ fn a_pack_through_the_source_is_read_from_the_kept_parts() {
   let plan = PackPlan {
     runs: &[],
     objects: &objects,
+    held: None,
     filter: None,
     thin: false,
     ofs_delta: true,
@@ -411,6 +412,7 @@ fn a_plan_past_its_admission_is_refused() {
   let plan = PackPlan {
     runs: &[],
     objects: &objects,
+    held: None,
     filter: None,
     thin: true,
     ofs_delta: true,
@@ -440,6 +442,7 @@ fn a745_a_plans_objects_are_charged_as_runs_never_an_object_at_a_time() {
     let plan = PackPlan {
       runs: &[],
       objects,
+      held: None,
       filter: None,
       thin: true,
       ofs_delta: true,
@@ -486,6 +489,7 @@ fn a745_a_deepenings_scattered_objects_are_planned_within_a_slices_room() {
   let plan = PackPlan {
     runs: &[],
     objects: &objects,
+    held: None,
     filter: None,
     thin: true,
     ofs_delta: true,

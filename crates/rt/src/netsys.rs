@@ -20,12 +20,15 @@ pub(crate) use core::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::error::RtError;
 
-/// The outcome of a non-blocking receive: bytes and a sender, or a signal to await readiness and retry.
+/// The outcome of a non-blocking socket operation: completed, or a signal to await readiness/backpressure and retry.
 pub(crate) enum Io<T> {
   /// The operation completed with this value.
   Ready(T),
-  /// The socket is not ready (`EAGAIN`/`WSAEWOULDBLOCK`); await the read edge through the driver.
+  /// The socket is not ready (`EAGAIN`/`WSAEWOULDBLOCK`); await the edge through the driver.
   WouldBlock,
+  /// The kernel is transiently short of socket buffers (`ENOBUFS`/`WSAENOBUFS`); yield/pause briefly
+  /// so other tasks drain buffers and retry within the caller's deadline.
+  NoBufs,
   /// The call was interrupted before doing anything (`EINTR`); retry at once.
   Interrupted,
 }
@@ -545,30 +548,79 @@ mod imp {
     rustix::net::listen(&socket.fd, backlog).map_err(|e| refused("listen", e))
   }
 
+  /// Whether an `accept`/`accept4` error means only that the queued peer reset or aborted before
+  /// the socket was dequeued (Linux `accept(2)` and BSD transient peer errors): the listener is
+  /// healthy and must keep accepting subsequent connections.
+  fn accept_peer_aborted(err: rustix::io::Errno) -> bool {
+    matches!(
+      err,
+      rustix::io::Errno::CONNABORTED
+        | rustix::io::Errno::CONNRESET
+        | rustix::io::Errno::PROTO
+        | rustix::io::Errno::NETDOWN
+        | rustix::io::Errno::HOSTUNREACH
+        | rustix::io::Errno::NOPROTOOPT
+        | rustix::io::Errno::HOSTDOWN
+        | rustix::io::Errno::NETUNREACH
+        | rustix::io::Errno::OPNOTSUPP
+        | rustix::io::Errno::NETRESET
+    )
+  }
+
+  /// Whether configuring an already-accepted client descriptor (`setsockopt(TCP_NODELAY)`) failed
+  /// solely because the peer reset or closed its half before configuration ran (macOS/BSD returns
+  /// `EINVAL`; Linux/BSD can return `ECONNRESET`/`ENOTCONN`/`EPIPE`/`ECONNABORTED`): drop that one
+  /// dead client socket without failing the listener.
+  fn accepted_peer_gone(err: rustix::io::Errno) -> bool {
+    matches!(
+      err,
+      rustix::io::Errno::INVAL
+        | rustix::io::Errno::CONNRESET
+        | rustix::io::Errno::NOTCONN
+        | rustix::io::Errno::PIPE
+        | rustix::io::Errno::CONNABORTED
+    )
+  }
+
   /// The next pending connection on `listener`, made ready to serve: on Linux close-on-exec and non-blocking as it is
-  /// accepted (`accept4`, the reason [`new_socket`] gives), then `TCP_NODELAY`.
+  /// accepted (`accept4`, the reason [`new_socket`] gives), then `TCP_NODELAY`. A peer that aborted in the backlog is
+  /// dropped and reported as [`Io::Interrupted`] so the listener keeps serving healthy peers.
   #[cfg(target_os = "linux")]
   pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
     match rustix::net::accept_with(&listener.fd, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
       Ok(fd) => {
         let socket = Socket { fd };
-        set_nodelay(&socket)?;
-        Ok(Io::Ready(socket))
+        match rustix::net::sockopt::set_tcp_nodelay(&socket.fd, true) {
+          Ok(()) => Ok(Io::Ready(socket)),
+          Err(e) if accepted_peer_gone(e) => Ok(Io::Interrupted),
+          Err(e) => Err(refused("setsockopt(TCP_NODELAY)", e)),
+        }
       }
       Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
       Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) if accept_peer_aborted(e) => Ok(Io::Interrupted),
       Err(e) => Err(refused("accept4", e)),
     }
   }
 
   /// The next pending connection on `listener`, made ready to serve ([`prepared`]): macOS has no `accept4`, so the
-  /// flags are set right after the accept.
+  /// flags are set right after the accept. A peer that aborted in the backlog is dropped and reported as
+  /// [`Io::Interrupted`] so the listener keeps serving healthy peers.
   #[cfg(not(target_os = "linux"))]
   pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
     match rustix::net::accept(&listener.fd) {
-      Ok(fd) => prepared(fd).map(Io::Ready),
+      Ok(fd) => {
+        set_nonblocking_cloexec(&fd)?;
+        let socket = Socket { fd };
+        match rustix::net::sockopt::set_tcp_nodelay(&socket.fd, true) {
+          Ok(()) => Ok(Io::Ready(socket)),
+          Err(e) if accepted_peer_gone(e) => Ok(Io::Interrupted),
+          Err(e) => Err(refused("setsockopt(TCP_NODELAY)", e)),
+        }
+      }
       Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
       Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) if accept_peer_aborted(e) => Ok(Io::Interrupted),
       Err(e) => Err(refused("accept", e)),
     }
   }
@@ -613,6 +665,7 @@ mod imp {
     match rustix::io::write(&socket.fd, buf) {
       Ok(n) => Ok(Io::Ready(n)),
       Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::NOBUFS) => Ok(Io::NoBufs),
       Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
       Err(e) => Err(refused("write", e)),
     }
@@ -625,6 +678,7 @@ mod imp {
     match rustix::io::writev(&socket.fd, slices) {
       Ok(n) => Ok(Io::Ready(n)),
       Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::NOBUFS) => Ok(Io::NoBufs),
       Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
       Err(e) => Err(refused("writev", e)),
     }
@@ -997,11 +1051,11 @@ mod imp {
     SO_ERROR, SO_EXCLUSIVEADDRUSE, SO_RCVBUF, SO_RCVLOWAT, SO_SNDBUF, SO_TYPE, SOCK_DGRAM,
     SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_NODELAY,
     TCPSTATE_ESTABLISHED, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSABUF, WSADATA,
-    WSAEINTR, WSAEINVAL, WSAENOBUFS, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl,
-    WSASend, WSASocketW, WSAStartup, accept as ws_accept, bind as ws_bind, closesocket,
-    connect as ws_connect, getsockname, getsockopt, ioctlsocket, listen as ws_listen,
-    recv as ws_recv, recvfrom as ws_recvfrom, send as ws_send, sendto as ws_sendto, setsockopt,
-    shutdown as ws_shutdown,
+    WSAECONNABORTED, WSAECONNRESET, WSAEINTR, WSAEINVAL, WSAENETRESET, WSAENOBUFS, WSAENOTCONN,
+    WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSASend, WSASocketW, WSAStartup,
+    accept as ws_accept, bind as ws_bind, closesocket, connect as ws_connect, getsockname,
+    getsockopt, ioctlsocket, listen as ws_listen, recv as ws_recv, recvfrom as ws_recvfrom,
+    send as ws_send, sendto as ws_sendto, setsockopt, shutdown as ws_shutdown,
   };
 
   use super::{Io, Ipv4Addr, SocketAddrV4};
@@ -1409,14 +1463,6 @@ mod imp {
     Ok(())
   }
 
-  /// A connected stream made ready to serve: no child inherits it, non-blocking, and `TCP_NODELAY` ([`set_nodelay`]).
-  fn prepared(socket: Socket) -> Result<Socket, RtError> {
-    not_inherited(&socket)?;
-    set_nonblocking(&socket)?;
-    set_nodelay(&socket)?;
-    Ok(socket)
-  }
-
   /// Creates a non-blocking INET stream socket that no child process inherits and whose address no other socket may
   /// share ([`exclusive_socket`]): without `SO_EXCLUSIVEADDRUSE` another process could bind a listener's port with
   /// `SO_REUSEADDR` and take its connections.
@@ -1432,7 +1478,25 @@ mod imp {
     Ok(())
   }
 
-  /// The next pending connection on `listener`, made ready to serve ([`prepared`]).
+  /// Whether a Winsock `accept` error means only that the queued peer reset or aborted before
+  /// being dequeued: the listener stays healthy and retries the next connection.
+  fn accept_peer_aborted(code: i32) -> bool {
+    matches!(code, WSAECONNRESET | WSAECONNABORTED | WSAENETRESET)
+  }
+
+  /// Whether configuring an accepted Winsock client socket (`setsockopt(TCP_NODELAY)`) failed
+  /// solely because the peer already aborted/closed: drop that dead client without killing the
+  /// listener.
+  fn accepted_peer_gone(code: i32) -> bool {
+    matches!(
+      code,
+      WSAEINVAL | WSAECONNRESET | WSAENOTCONN | WSAECONNABORTED | WSAENETRESET
+    )
+  }
+
+  /// The next pending connection on `listener`, made ready to serve ([`prepared`]). A peer that
+  /// aborted in the backlog is dropped and reported as [`Io::Interrupted`] so the listener keeps
+  /// serving healthy peers.
   pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
     // SAFETY: an accept on a listening socket this value owns, asking for no peer address.
     let raw = unsafe { ws_accept(listener.socket, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -1440,10 +1504,20 @@ mod imp {
       return Ok(match last_code() {
         WSAEWOULDBLOCK => Io::WouldBlock,
         WSAEINTR => Io::Interrupted,
+        code if accept_peer_aborted(code) => Io::Interrupted,
         _ => return Err(last("accept")),
       });
     }
-    prepared(Socket { socket: raw }).map(Io::Ready)
+    let socket = Socket { socket: raw };
+    not_inherited(&socket)?;
+    set_nonblocking(&socket)?;
+    match set_nodelay(&socket) {
+      Ok(()) => Ok(Io::Ready(socket)),
+      Err(RtError::DriverRefused {
+        code: Some(code), ..
+      }) if accepted_peer_gone(code) => Ok(Io::Interrupted),
+      Err(error) => Err(error),
+    }
   }
 
   /// Begins `socket`'s connection to `addr`: `Ready` when it connected at once, `WouldBlock` while the handshake runs
@@ -1533,6 +1607,7 @@ mod imp {
     if rc == SOCKET_ERROR {
       return Ok(match last_code() {
         WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAENOBUFS => Io::NoBufs,
         WSAEINTR => Io::Interrupted,
         _ => return Err(last("send")),
       });
@@ -1572,6 +1647,7 @@ mod imp {
     if rc == SOCKET_ERROR {
       return Ok(match last_code() {
         WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAENOBUFS => Io::NoBufs,
         WSAEINTR => Io::Interrupted,
         _ => return Err(last("WSASend")),
       });

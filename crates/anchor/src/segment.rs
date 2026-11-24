@@ -1196,6 +1196,54 @@ impl AnchorSegment {
     )
   }
 
+  /// Advisory relaxed read of pool extent `extent`'s owner for snapshot headroom scans
+  /// (`ContentPool::available`), avoiding per-word acquire barriers when no memory dependent on
+  /// ownership is accessed through the result.
+  #[inline]
+  pub fn pool_owner_relaxed(&self, extent: usize) -> Result<Option<u16>, AnchorError> {
+    let word = self.pool_word(extent)?.load(Ordering::Relaxed);
+    Ok(
+      word
+        .checked_sub(1)
+        .and_then(|owner| u16::try_from(owner).ok()),
+    )
+  }
+
+  /// Sums the available bytes across all pool extents in one batched relaxed pass over the
+  /// resolved pool word run, committing the run once rather than per extent.
+  pub fn pool_available_bytes(
+    &self,
+    parts: &[(usize, usize)],
+    hold_open: bool,
+    hold_owner: u16,
+    claimable: impl Fn(u16) -> bool,
+  ) -> usize {
+    let per_partition = crate::layout::POOL_EXTENTS_PER_PARTITION;
+    let count = self.pool_extents();
+    let hold_word = u64::from(hold_owner).saturating_add(1);
+    self
+      .object
+      .run_u64_fold_relaxed(self.pool_run, count, 0_usize, |total, id, word| {
+        let part = id.checked_rem(per_partition).unwrap_or(0);
+        let Some(&(_, len)) = parts.get(part) else {
+          return total;
+        };
+        let free = word == 0 || (hold_open && word == hold_word);
+        if !free {
+          return total;
+        }
+        let Ok(id_u16) = u16::try_from(id) else {
+          return total;
+        };
+        if claimable(id_u16) {
+          total.saturating_add(len)
+        } else {
+          total
+        }
+      })
+      .unwrap_or(0)
+  }
+
   /// Claims pool extent `extent` for `partition` if it is free: whether this call took it. One compare-and-swap of
   /// the extent's owner word, so of any number of claimants exactly one wins, and the claim outlives the daemon as
   /// the content does (A-98).

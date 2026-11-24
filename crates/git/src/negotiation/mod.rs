@@ -85,6 +85,17 @@ pub trait Graph {
   /// A tree's entries the store holds: its subtrees and blobs, never a submodule's commit (a gitlink, which no
   /// repository but the submodule's holds).
   fn entries(&self, tree: Self::Node) -> impl Iterator<Item = Self::Node>;
+  /// Exact structural diff of `tree` against an already-visited `against` tree: returns every
+  /// entry of `tree` that is not identically present in `against`, paired with its counterpart
+  /// subtree in `against` when both entries are subtrees with the same name. Default implementation
+  /// yields all entries of `tree` with no counterpart.
+  fn diff_entries(
+    &self,
+    tree: Self::Node,
+    _against: Self::Node,
+  ) -> Vec<(Self::Node, Option<Self::Node>)> {
+    self.entries(tree).map(|entry| (entry, None)).collect()
+  }
   /// The same entries, in the tree's order, each with its name: what a sparse filter asks its patterns of (A-640
   /// part 4).
   fn named_entries(&self, tree: Self::Node) -> impl Iterator<Item = (Self::Node, Vec<u8>)>;
@@ -237,6 +248,9 @@ pub struct Pack<G, N> {
   /// Objects sent one by one, by position, as runs (A-745: a fetch holds what it sends as runs, which one push's objects
   /// make one of, never an object at a time); `N` names the graph's objects elsewhere in the answer.
   pub objects: Positions,
+  /// Objects the client already holds that a thin pack without a filter may reference as delta bases
+  /// (`REF_DELTA`, gitprotocol-capabilities `thin-pack`), empty otherwise.
+  pub held: Positions,
   /// The graph's objects, named in the answer's other sections.
   pub(crate) _node: core::marker::PhantomData<N>,
 }
@@ -714,7 +728,7 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
       }
       Phase::Selecting(mut selecting) => {
         let chosen = selecting.step(graph, admission, &mut self.counters, spent)?;
-        let Some(objects) = chosen else {
+        let Some((objects, held)) = chosen else {
           self.phase = Phase::Selecting(selecting);
           return Ok(None);
         };
@@ -724,6 +738,7 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
             shallow_info: self.shallow_info.take(),
             runs: core::mem::take(&mut self.runs),
             objects,
+            held,
             _node: core::marker::PhantomData,
           }),
           counters: self.counters,

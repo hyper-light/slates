@@ -621,6 +621,7 @@ fn with_pack<P: PackSource>(
   let plan = PackPlan {
     runs: &pack.runs,
     objects: &pack.objects,
+    held: (!pack.held.is_empty()).then_some(&pack.held),
     filter: request.filter,
     thin: chosen.thin,
     ofs_delta: chosen.ofs_delta,

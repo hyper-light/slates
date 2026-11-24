@@ -128,8 +128,8 @@ impl Checking {
   ) -> Result<bool, Refusal> {
     let Quantum { clock, ns } = quantum;
     let begun = clock.now_ns();
+    let mut spent = 0_u64;
     while !self.is_done() {
-      let spent = clock.now_ns().saturating_sub(begun);
       let left = Quantum {
         clock: &mut *clock,
         ns: ns.saturating_sub(spent),
@@ -137,7 +137,8 @@ impl Checking {
       if self.unit((repository, contents), admission, left)? {
         break;
       }
-      if clock.now_ns().saturating_sub(begun) >= ns {
+      spent = clock.now_ns().saturating_sub(begun);
+      if spent >= ns {
         break;
       }
     }
@@ -167,23 +168,25 @@ impl Checking {
     let contents: &dyn Contents = contents;
     match stage {
       Stage::Fsck { at } => match objects.get(*at) {
-        Some(object) => match fsck_one(object, *at, (contents, request.format), special) {
-          Some(finding) => {
-            if let Some(away) = contents.away()
-              && *stopped != Some((0, *at, away))
-            {
-              *stopped = Some((0, *at, away));
-              return Ok(true);
+        Some(object) => {
+          match fsck_one(object, *at, (repository, contents, request.format), special) {
+            Some(finding) => {
+              if let Some(away) = contents.away()
+                && *stopped != Some((0, *at, away))
+              {
+                *stopped = Some((0, *at, away));
+                return Ok(true);
+              }
+              *stopped = None;
+              let (count, id) = (objects.len(), object.id);
+              refuse_pack(unpacked, stage, count, id, finding);
             }
-            *stopped = None;
-            let (count, id) = (objects.len(), object.id);
-            refuse_pack(unpacked, stage, count, id, finding);
+            None => {
+              *stopped = None;
+              *at = at.saturating_add(1);
+            }
           }
-          None => {
-            *stopped = None;
-            *at = at.saturating_add(1);
-          }
-        },
+        }
         None => {
           *stopped = None;
           let pushed = Pushed::new(objects, Some(contents), admission)?;
@@ -346,15 +349,17 @@ fn check_special_entry<R: Repository + ?Sized>(
 }
 
 /// What a push's check finds against the object `placed` at position `at`, its bytes read from
-/// `contents`: a blob passes unread until referenced as a special dotfile by a tree; one whose
-/// bytes are not lent is refused as git refuses an object it cannot read.
-fn fsck_one(
+/// `contents`: a blob passes unread until referenced as a special dotfile by a tree; an object
+/// whose collision-checked identity (SHA-1DC / SHA-256) already lives in `repository` passed fsck
+/// on its original admission; one whose bytes are not lent is refused as git refuses an object it
+/// cannot read.
+fn fsck_one<R: Repository + ?Sized>(
   placed: &crate::unpack::Placed,
   at: usize,
-  (contents, format): (&dyn Contents, crate::object_name::ObjectFormat),
+  (repository, contents, format): (&R, &dyn Contents, crate::object_name::ObjectFormat),
   special: &mut Vec<SpecialBlob>,
 ) -> Option<crate::objects::FsckId> {
-  if placed.kind == Kind::Blob {
+  if placed.kind == Kind::Blob || repository.holds(&placed.id) {
     return None;
   }
   match contents.content(at, &placed.id) {

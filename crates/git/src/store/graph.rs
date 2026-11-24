@@ -156,6 +156,65 @@ impl<'r> StoreGraph<'r> {
     }
   }
 
+  /// Entries of `tree` that differ from already-visited tree `against`, paired with matching-name
+  /// changed subtrees so unchanged entries skip index lookups completely.
+  fn diff_named(&self, tree: u64, against: u64) -> Vec<(u64, Option<u64>)> {
+    let Some((id, row, content)) = self.indexed_at(tree) else {
+      return Vec::new();
+    };
+    if row.kind != Kind::Tree {
+      return Vec::new();
+    }
+    let base = self
+      .repository
+      .id_at(self.store, against)
+      .and_then(|base_id| self.repository.indexed(self.store, &base_id));
+    let Some((base_row, base_content)) = base else {
+      let place = Place::Indexed { row, content };
+      return match self.repository.tree_references(self.store, &id, &place) {
+        Ok(ids) => ids
+          .iter()
+          .filter_map(|oid| self.position_of(oid).map(|pos| (pos, None)))
+          .collect(),
+        Err(refused) => {
+          self.failed(GraphFault::Store(refused));
+          Vec::new()
+        }
+      };
+    };
+    if base_row.kind != Kind::Tree {
+      let place = Place::Indexed { row, content };
+      return match self.repository.tree_references(self.store, &id, &place) {
+        Ok(ids) => ids
+          .iter()
+          .filter_map(|oid| self.position_of(oid).map(|pos| (pos, None)))
+          .collect(),
+        Err(refused) => {
+          self.failed(GraphFault::Store(refused));
+          Vec::new()
+        }
+      };
+    }
+    match self.repository.tree_diff_references(
+      self.store,
+      (&id, &row, content),
+      (&base_row, base_content),
+    ) {
+      Ok(pairs) => pairs
+        .iter()
+        .filter_map(|(oid, counterpart)| {
+          let pos = self.position_of(oid)?;
+          let base_pos = counterpart.as_ref().and_then(|base| self.position_of(base));
+          Some((pos, base_pos))
+        })
+        .collect(),
+      Err(refused) => {
+        self.failed(GraphFault::Store(refused));
+        Vec::new()
+      }
+    }
+  }
+
   /// The entries of the tree at `position`, each with its name, read from its bytes: none when it is no tree or the
   /// store cannot read it (kept as a fault).
   fn named_entries_of(&self, position: u64) -> Vec<(u64, Vec<u8>)> {
@@ -253,10 +312,7 @@ impl<'r> StoreGraph<'r> {
 
   /// The position of `id`, a fault when the store does not hold it.
   fn position_of(&self, id: &ObjectId) -> Option<u64> {
-    let position = self
-      .repository
-      .object(self.store, id)
-      .map(|row| row.position);
+    let position = self.repository.indexed_position(self.store, id);
     if position.is_none() {
       self.failed(GraphFault::Store(StoreRefused::Missing { id: *id }));
     }
@@ -410,14 +466,17 @@ impl Graph for StoreGraph<'_> {
   type Green = u64;
 
   fn node(&self, id: &ObjectId) -> Option<u64> {
-    self
-      .repository
-      .object(self.store, id)
-      .map(|row| row.position)
+    self.repository.indexed_position(self.store, id)
   }
 
   fn id(&self, node: u64) -> ObjectId {
-    self.row(node).map_or(self.null, |(id, _)| id)
+    match self.repository.id_at(self.store, node) {
+      Some(id) => id,
+      None => {
+        self.failed(GraphFault::NoRow { position: node });
+        self.null
+      }
+    }
   }
 
   fn kind(&self, node: u64) -> Kind {
@@ -429,25 +488,34 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn commit(&self, node: u64) -> Option<CommitRow<u64>> {
-    let (_, row) = self.row(node)?;
-    row.commit.map(|commit| CommitRow {
-      generation: commit.generation,
-      date: commit.date,
-      tree: commit.tree,
-    })
+    if let Some((tree, date, generation)) = self.repository.commit_header_at(self.store, node) {
+      return Some(CommitRow {
+        generation,
+        date,
+        tree,
+      });
+    }
+    // Preserve exact fault reporting when the position has no object row at all.
+    let _ = self.row(node);
+    None
   }
 
   fn parents(&self, commit: u64) -> impl Iterator<Item = u64> {
-    self
-      .row(commit)
-      .and_then(|(_, row)| row.commit)
-      .map(|commit| commit.parents)
-      .unwrap_or_default()
-      .into_iter()
+    match self.repository.commit_parents_at(self.store, commit) {
+      Some(parents) => parents.into_iter(),
+      None => {
+        let _ = self.row(commit);
+        super::rows::SmallParents::default().into_iter()
+      }
+    }
   }
 
   fn entries(&self, tree: u64) -> impl Iterator<Item = u64> {
     self.named(tree).into_iter()
+  }
+
+  fn diff_entries(&self, tree: u64, against: u64) -> Vec<(u64, Option<u64>)> {
+    self.diff_named(tree, against)
   }
 
   fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {
@@ -455,15 +523,24 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn size(&self, blob: u64) -> u64 {
-    self.row(blob).map_or(0, |(_, row)| row.len)
+    match self.repository.len_at(self.store, blob) {
+      Some(len) => len,
+      None => {
+        self.failed(GraphFault::NoRow { position: blob });
+        0
+      }
+    }
   }
 
   fn target(&self, tag: u64) -> Option<u64> {
-    let (_, row) = self.row(tag)?;
-    if let Some(target) = row.tag_target {
-      return Some(target);
+    match self.repository.tag_target_at(self.store, tag) {
+      Some(Some(target)) => Some(target),
+      Some(None) => self.named(tag).first().copied(),
+      None => {
+        let _ = self.row(tag);
+        None
+      }
     }
-    self.named(tag).first().copied()
   }
 
   fn tips(&self) -> impl Iterator<Item = u64> {

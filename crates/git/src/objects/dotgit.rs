@@ -30,8 +30,13 @@ const REFUSED_NONCHARACTERS: [char; 2] = ['\u{fffe}', '\u{ffff}'];
 /// and U+FFFE and U+FFFF, which only git's refuses.
 fn character_at(name: &[u8], from: usize) -> Option<(u32, usize)> {
   let rest = name.get(from..).unwrap_or_default();
-  if rest.is_empty() {
+  let Some(&first) = rest.first() else {
     return Some((0, from.saturating_add(1)));
+  };
+  // ASCII bytes are always single-byte valid UTF-8 code points and never HFS+ ignorable or
+  // refused noncharacters, so bypass `from_utf8` + `chars()` for the 99.9%+ ASCII filename path.
+  if first.is_ascii() {
+    return Some((u32::from(first), from.saturating_add(1)));
   }
   let window = rest.get(..UTF8_LONGEST).unwrap_or(rest);
   let valid = match core::str::from_utf8(window) {
@@ -72,6 +77,12 @@ fn next_hfs(name: &[u8], from: Option<usize>) -> (u32, Option<usize>) {
 /// `is_hfs_dot_generic`: whether `name` is `.` and then `needle` (lower-case ASCII) as HFS+ reads it, ending there or
 /// at a `/` (`is_dir_sep` in git for Linux and macOS).
 fn is_hfs_dot(name: &[u8], needle: &[u8]) -> bool {
+  if name
+    .first()
+    .is_some_and(|&byte| byte.is_ascii() && byte != b'.')
+  {
+    return false;
+  }
   let (first, mut from) = next_hfs(name, Some(0));
   if first != u32::from(b'.') {
     return false;

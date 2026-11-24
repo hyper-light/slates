@@ -559,6 +559,7 @@ impl<K> Answer<K> {
     let plan = PackPlan {
       runs: &pack.runs,
       objects: &pack.objects,
+      held: (!pack.held.is_empty()).then_some(&pack.held),
       filter: choosing.filter.as_ref(),
       thin: choosing.thin,
       ofs_delta: choosing.ofs_delta,

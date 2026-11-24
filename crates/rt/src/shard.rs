@@ -752,29 +752,31 @@ impl ShardContext {
   /// task, or a task of the step's batch not yet polled. Counted ([`Counters::waiting_asked`],
   /// [`Counters::waiting_found`]).
   pub fn others_waiting(&self) -> bool {
-    let now = self.now_ns();
-    let mut waiting = self.has_inbound();
-    let inner = self
-      .with_inner(|inner| {
-        let pending = inner.driver.has_pending();
-        let pollers = self.wake_ready_pollers(inner);
-        let due = inner
-          .timers
-          .next_deadline_ns()
-          .is_some_and(|deadline| deadline <= now);
-        pending || pollers || due
-      })
-      .unwrap_or(false);
-    waiting = waiting || inner;
-    waiting = self.harvest_io() || waiting;
-    // The rest of this step's batch waits too: taken from the queue with the task asking, it is in no queue now.
-    waiting = waiting || !self.local.is_empty() || self.batch_left.get() > 0;
+    // Check zero-syscall local queues first: when ready work is already queued on this shard,
+    // yielding immediately avoids redundant clock reads and `kevent`/`epoll_wait` syscalls
+    // while `ShardContext::run` harvests I/O on the very next turn.
+    let mut waiting = !self.local.is_empty() || self.batch_left.get() > 0 || self.has_inbound();
     if !waiting {
-      // No one waits: the step may go on another quantum from here, or as long as this ask took if longer (the step
-      // asks no sooner than an ask costs), and the poll is judged against that.
-      let asked = self.now_ns();
-      let room = self.quantum_ns().max(asked.saturating_sub(now));
-      self.poll_allowed_until_ns.set(asked.saturating_add(room));
+      let now = self.now_ns();
+      let inner = self
+        .with_inner(|inner| {
+          let pending = inner.driver.has_pending();
+          let pollers = self.wake_ready_pollers(inner);
+          let due = inner
+            .timers
+            .next_deadline_ns()
+            .is_some_and(|deadline| deadline <= now);
+          pending || pollers || due
+        })
+        .unwrap_or(false);
+      waiting = inner || self.harvest_io();
+      if !waiting {
+        // No one waits: the step may go on another quantum from here, or as long as this ask took if longer (the step
+        // asks no sooner than an ask costs), and the poll is judged against that.
+        let asked = self.now_ns();
+        let room = self.quantum_ns().max(asked.saturating_sub(now));
+        self.poll_allowed_until_ns.set(asked.saturating_add(room));
+      }
     }
     self.with_inner(|inner| {
       inner.counters.waiting_asked = inner.counters.waiting_asked.saturating_add(1);
@@ -1417,8 +1419,12 @@ impl ShardContext {
         let now = self.now_ns();
         let quantum = self.quantum_ns();
         if busy_harvest_due(last_wait_ns, now, quantum, self.harvest_cost_ns()) {
-          let _ = self.harvest_io();
-          last_wait_ns = self.now_ns();
+          let harvested = self.harvest_io();
+          let after = self.now_ns();
+          if !harvested {
+            self.learn_turn(after.saturating_sub(now));
+          }
+          last_wait_ns = after;
         } else if now.saturating_sub(last_wait_ns) >= quantum {
           self.with_inner(|inner| {
             inner.counters.harvests_deferred = inner.counters.harvests_deferred.saturating_add(1)

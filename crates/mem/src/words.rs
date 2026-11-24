@@ -111,11 +111,47 @@ impl WordRun {
   }
 
   /// The run's first byte.
+  #[inline]
   pub const fn first_offset(&self) -> usize {
     self.first
   }
 
+  /// Bytes between consecutive words in this run.
+  #[inline]
+  pub const fn stride(&self) -> usize {
+    self.stride
+  }
+
+  /// Number of words in this run.
+  #[inline]
+  pub const fn count(&self) -> usize {
+    self.count
+  }
+
+  /// Width of each word in this run.
+  #[inline]
+  pub const fn width(&self) -> Width {
+    self.width
+  }
+
+  /// Byte span covered by the first `count` words of this run (`0` when `count == 0`), or `None` if
+  /// `count` exceeds the run or overflows.
+  #[inline]
+  pub const fn span_bytes(&self, count: usize) -> Option<usize> {
+    let Some(prev) = count.checked_sub(1) else {
+      return Some(0);
+    };
+    if count > self.count {
+      return None;
+    }
+    let Some(last) = prev.checked_mul(self.stride) else {
+      return None;
+    };
+    last.checked_add(self.width.bytes())
+  }
+
   /// The offset of word `index` of this run, if the run has that word and it is `width` wide.
+  #[inline]
   pub fn word(&self, index: usize, width: Width) -> Option<usize> {
     if width != self.width || index >= self.count {
       return None;
@@ -368,6 +404,7 @@ impl Layout {
   }
 
   /// The run `id` names, if this layout has it.
+  #[inline]
   pub fn run(&self, id: RunId) -> Option<&WordRun> {
     self.runs.get(id.0)
   }

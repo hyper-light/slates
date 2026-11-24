@@ -171,8 +171,61 @@ pub struct TableView<'a> {
   rows: usize,
 }
 
-/// Lexicographical key comparison, reading eight-byte big-endian words inline before falling back
-/// to byte comparison so short hash-prefixed keys never bounce through `memcmp`.
+/// Format: bytes in a 32-bit big-endian tail word compared inline in [`compare_keys`].
+const HALF_WORD_BYTES: usize = core::mem::size_of::<u32>();
+
+/// Derived: consecutive non-halving interpolation probes before [`TableView::get_hinted`] forces a
+/// binary midpoint step (Interpolation-Binary Search, Santoro & Sidney 1985 \[A\]), preserving
+/// O(1) hits on sequential keys and O(log log N) hits on uniform hash keys while guaranteeing
+/// strict O(log N) worst-case probes on arbitrarily skewed distributions.
+const INTERPOLATION_STALL_LIMIT: u8 = 2;
+
+/// Big-endian 8-byte key slice starting at `offset`, zero-padded when fewer than 8 bytes remain.
+/// Preserves lexicographical order (`key_prefix_at(a, c) < key_prefix_at(b, c)` implies `a < b`
+/// whenever `a` and `b` agree on `..c`) and provides the numeric coordinate for guarded
+/// interpolation search without calling `memcpy` on short tails (such as 9-byte position keys).
+#[inline]
+pub(crate) fn key_prefix_at(key: &[u8], offset: usize) -> u64 {
+  let Some(tail) = key.get(offset..) else {
+    return 0;
+  };
+  if let Some(chunk) = tail.first_chunk::<WORD_BYTES>() {
+    return u64::from_be_bytes(*chunk);
+  }
+  let mut word = 0_u64;
+  let mut shift = u64::BITS.saturating_sub(u8::BITS);
+  for &byte in tail {
+    word |= u64::from(byte).wrapping_shl(shift);
+    shift = shift.saturating_sub(u8::BITS);
+  }
+  word
+}
+
+/// Computes an interpolated probe index inside `[low, low + span)` using 64-bit hardware `mul` +
+/// `udiv` (normalizing `range` into the top 32 bits so sequential position tables are exact and
+/// full 64-bit hash ranges avoid software 128-bit `__udivti3`).
+#[inline]
+fn interpolate_probe(low: usize, span: usize, lo_val: u64, hi_val: u64, key_val: u64) -> usize {
+  let range = hi_val.saturating_sub(lo_val);
+  let diff = key_val.saturating_sub(lo_val);
+  let shift = range.leading_zeros();
+  let r_hi = range.wrapping_shl(shift).wrapping_shr(u32::BITS).max(1);
+  let d_hi = diff.wrapping_shl(shift).wrapping_shr(u32::BITS);
+  let span_u64 = u64::try_from(span).unwrap_or(u64::MAX);
+  let off =
+    usize::try_from(d_hi.saturating_mul(span_u64).checked_div(r_hi).unwrap_or(0)).unwrap_or(span);
+  low.saturating_add(off.min(span.saturating_sub(1)))
+}
+
+/// First byte index where `left` and `right` differ, capped at their shorter length.
+#[inline]
+fn common_key_prefix(left: &[u8], right: &[u8]) -> usize {
+  left.iter().zip(right).take_while(|(a, b)| a == b).count()
+}
+
+/// Lexicographical key comparison, reading eight-byte and four-byte big-endian words and any
+/// remaining 1–3 bytes inline so short hash-prefixed keys (9-byte position and 21-byte object keys)
+/// never bounce through `memcmp`.
 #[inline]
 pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
   let mut left = a;
@@ -189,7 +242,24 @@ pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
     left = lr;
     right = rr;
   }
-  left.cmp(right)
+  if let (Some((la, lr)), Some((ra, rr))) = (
+    left.split_first_chunk::<HALF_WORD_BYTES>(),
+    right.split_first_chunk::<HALF_WORD_BYTES>(),
+  ) {
+    let lw = u32::from_be_bytes(*la);
+    let rw = u32::from_be_bytes(*ra);
+    if lw != rw {
+      return lw.cmp(&rw);
+    }
+    left = lr;
+    right = rr;
+  }
+  for (lb, rb) in left.iter().zip(right) {
+    if lb != rb {
+      return lb.cmp(rb);
+    }
+  }
+  left.len().cmp(&right.len())
 }
 
 impl<'a> TableView<'a> {
@@ -318,6 +388,77 @@ impl<'a> TableView<'a> {
         Ordering::Equal => return self.row(middle),
         Ordering::Less => low = middle.checked_add(1)?,
         Ordering::Greater => high = middle,
+      }
+    }
+    None
+  }
+
+  /// The row whose key is `key`, using guarded Interpolation-Binary Search (Perl, Itai & Avni 1978
+  /// \[A\]; Santoro & Sidney 1985 \[A\]) bounded by the table's known first key `lo_key` and
+  /// optional exclusive upper-bound key `hi_key` (the next table's fence in the same run).
+  /// Sequential integer keys hit on probe 1 and uniform hash keys hit in O(log log N) probes while
+  /// skewed distributions fall back to binary midpoints for guaranteed O(log N) worst-case probes.
+  pub fn get_hinted(&self, key: &[u8], lo_key: &[u8], hi_key: Option<&[u8]>) -> Option<RowRef<'a>> {
+    if self.rows <= WORD_BYTES {
+      return self.get(key);
+    }
+    let (mut low, mut high) = (0_usize, self.rows);
+    // Use the next table's fence only when it stays in the same key-tag namespace as `lo_key`;
+    // otherwise read this table's own last key so sequential tables at a namespace boundary (such
+    // as the last `P` position table before `R`/`T`) keep a tight interpolation coordinate range.
+    let same_namespace = hi_key.is_some_and(|hi| hi.first() == lo_key.first());
+    let (hi_slice, exact_end) = match hi_key.filter(|_| same_namespace) {
+      Some(hi) => (hi, false),
+      None => {
+        let last_idx = self.rows.checked_sub(1)?;
+        let last = self.key_at(last_idx)?;
+        match compare_keys(last, key) {
+          Ordering::Equal => return self.row(last_idx),
+          Ordering::Less => return None,
+          Ordering::Greater => (last, true),
+        }
+      }
+    };
+    if exact_end {
+      high = self.rows.saturating_sub(1);
+    }
+    let common = common_key_prefix(lo_key, hi_slice);
+    let mut lo_val = key_prefix_at(lo_key, common);
+    let mut hi_val = key_prefix_at(hi_slice, common);
+    let key_val = key_prefix_at(key, common);
+    let mut stall: u8 = 0;
+    while low < high {
+      let span = high.saturating_sub(low);
+      let interpolated = span > WORD_BYTES
+        && stall < INTERPOLATION_STALL_LIMIT
+        && lo_val < hi_val
+        && key_val >= lo_val
+        && key_val <= hi_val;
+      let middle = if interpolated {
+        interpolate_probe(low, span, lo_val, hi_val, key_val)
+      } else {
+        stall = 0;
+        low.midpoint(high)
+      };
+      let row_key = self.key_at(middle)?;
+      match compare_keys(row_key, key) {
+        Ordering::Equal => return self.row(middle),
+        Ordering::Less => {
+          low = middle.checked_add(1)?;
+          lo_val = key_prefix_at(row_key, common);
+        }
+        Ordering::Greater => {
+          high = middle;
+          hi_val = key_prefix_at(row_key, common);
+        }
+      }
+      if interpolated {
+        let next_span = high.saturating_sub(low);
+        stall = if next_span.saturating_mul(2) > span {
+          stall.saturating_add(1)
+        } else {
+          0
+        };
       }
     }
     None
@@ -625,7 +766,20 @@ mod tests {
       let counted = rows.iter().map(|(key, body)| row_bytes(key, body).unwrap()).sum::<usize>();
       prop_assert_eq!(bytes.len(), TABLE_FRAME_BYTES + counted);
       for probe in probes.iter().chain(rows.keys()) {
-        prop_assert_eq!(view.get(probe).map(|row| row.body().to_vec()), rows.get(probe).cloned());
+        let expected = rows.get(probe).cloned();
+        prop_assert_eq!(view.get(probe).map(|row| row.body().to_vec()), expected.clone());
+        if let Some(first_key) = rows.keys().next() {
+          prop_assert_eq!(
+            view.get_hinted(probe, first_key, None).map(|row| row.body().to_vec()),
+            expected.clone()
+          );
+          let mut upper = rows.keys().next_back().cloned().unwrap_or_default();
+          upper.push(0xFF);
+          prop_assert_eq!(
+            view.get_hinted(probe, first_key, Some(&upper)).map(|row| row.body().to_vec()),
+            expected
+          );
+        }
       }
     }
 
@@ -646,5 +800,57 @@ mod tests {
         }
       }
     }
+  }
+
+  /// A-581. Do: query sequential position keys, uniform hash-prefixed keys, and severely skewed
+  /// shared-prefix keys with `TableView::get_hinted` under both bounded and unbounded upper hints.
+  /// Expect: every hit and every miss matches `TableView::get` identically.
+  #[test]
+  fn hinted_interpolation_matches_binary_search_across_key_distributions() {
+    // 1. Sequential big-endian position keys (git `p` + u64::to_be_bytes).
+    let mut seq = BTreeMap::new();
+    for pos in 10_000_u64..10_512 {
+      let mut key = vec![b'p'];
+      key.extend_from_slice(&pos.to_be_bytes());
+      seq.insert(key, body(&[], &pos.to_le_bytes()));
+    }
+    let seq_bytes = table(&seq);
+    let seq_view = TableView::open(&seq_bytes).unwrap();
+    let seq_lo = seq.keys().next().unwrap().as_slice();
+    let mut seq_hi = vec![b'p'];
+    seq_hi.extend_from_slice(&10_512_u64.to_be_bytes());
+    for pos in 9_998_u64..10_515 {
+      let mut key = vec![b'p'];
+      key.extend_from_slice(&pos.to_be_bytes());
+      assert_eq!(
+        seq_view.get_hinted(&key, seq_lo, Some(&seq_hi)),
+        seq_view.get(&key)
+      );
+      assert_eq!(seq_view.get_hinted(&key, seq_lo, None), seq_view.get(&key));
+    }
+
+    // 2. Uniform hash-like keys + skewed shared-prefix cluster.
+    let mut skewed = BTreeMap::new();
+    for i in 0_u32..200 {
+      let mut key = b"drivers/gpu/drm/shared/prefix/".to_vec();
+      key.extend_from_slice(&i.to_be_bytes());
+      skewed.insert(key, body(&[], &i.to_le_bytes()));
+    }
+    skewed.insert(b"zzzzzzzzzzzzzzzzzzzzzzzz".to_vec(), body(&[], b"tail"));
+    let skewed_bytes = table(&skewed);
+    let skewed_view = TableView::open(&skewed_bytes).unwrap();
+    let skewed_lo = skewed.keys().next().unwrap().as_slice();
+    for key in skewed.keys() {
+      assert_eq!(
+        skewed_view.get_hinted(key, skewed_lo, None),
+        skewed_view.get(key)
+      );
+      assert_eq!(
+        skewed_view.get_hinted(key, skewed_lo, Some(b"zzzzzzzzzzzzzzzzzzzzzzzzz")),
+        skewed_view.get(key)
+      );
+    }
+    let miss = b"drivers/gpu/drm/shared/prefix/\xff\xff\xff\xff";
+    assert_eq!(skewed_view.get_hinted(miss, skewed_lo, None), None);
   }
 }

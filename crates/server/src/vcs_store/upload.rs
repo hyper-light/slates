@@ -114,6 +114,15 @@ impl StoreLender for ShardStores {
     crate::state::with_state_counted(|state| lend_held_in(state, hold, step)).flatten()
   }
 
+  fn lend_held_objects<R>(
+    &mut self,
+    hold: &GitGeneration,
+    step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
+  ) -> Option<R> {
+    crate::state::with_state_counted(|state| lend_held_with_refs(state, hold, false, step))
+      .flatten()
+  }
+
   fn wrote(&mut self, hold: &GitGeneration, bytes: u64) {
     hold.written.set(hold.written.get().saturating_add(bytes));
     if bytes > 0 {
@@ -124,6 +133,10 @@ impl StoreLender for ShardStores {
   fn pack_reads(pack: &Streamed) -> crate::vcs_http::git::upload::PackReads {
     let (next, stopped) = pack.pack_reads();
     crate::vcs_http::git::upload::PackReads { next, stopped }
+  }
+
+  fn pack_waiting(pack: &Streamed) -> bool {
+    pack.is_waiting()
   }
 
   async fn read_ahead(
@@ -152,6 +165,25 @@ impl StoreLender for ShardStores {
     next: Option<slates_git::store::packed::Waited>,
   ) {
     let _ = crate::state::with_state_counted(|state| let_go_behind(state, resident, next));
+  }
+
+  fn let_go_finished(
+    &mut self,
+    id: RepositoryId,
+    resident: &mut crate::vcs_http::git::upload::Resident,
+    generation_held: bool,
+  ) {
+    if resident.is_empty() {
+      return;
+    }
+    let own_fetches = u64::from(generation_held);
+    let _ = crate::state::with_state_counted(|state| {
+      if super::other_works_live(state, id, 0, own_fetches) {
+        resident.clear();
+      } else {
+        let_go_behind(state, resident, None);
+      }
+    });
   }
 
   fn paced(&mut self, taught: (u64, u64)) {
@@ -488,7 +520,10 @@ pub(crate) fn lend_on<R>(
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
 ) -> Option<R> {
   let began = slates_rt::futures::now_ns();
-  let lent = super::observed(state, id, |state| lend_uncounted(state, (id, reader), step));
+  let admittable = state.store.admittable();
+  let lent = super::observed_in_room(state, id, (admittable, began), |state| {
+    lend_uncounted(state, (id, reader, admittable), step)
+  });
   // A-724 piece 1: a request's step (one with a reader) begins a fetch on the repository's usage row; every step that
   // was lent is counted with its time. Its answer is counted, and its bytes learned, as its generation is given back
   // (`GitGeneration`'s drop, A-724 piece 3d).
@@ -509,7 +544,7 @@ pub(crate) fn lend_on<R>(
 /// [`lend_on`]'s step, uncounted.
 fn lend_uncounted<R>(
   state: &mut ShardState,
-  (id, reader): (RepositoryId, Option<&Principal>),
+  (id, reader, admittable): (RepositoryId, Option<&Principal>, u64),
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
 ) -> Option<R> {
   let (head, named) = match reader {
@@ -527,7 +562,7 @@ fn lend_uncounted<R>(
     })
     .collect();
   let mut packs = ShardPacks::of(state);
-  let lent = super::within_budget(state, 0, |stores| {
+  let lent = super::within_known_room(state, admittable, |stores| {
     let answer = {
       let (content, store) = stores.git_ref(id)?;
       let served = Served {
@@ -651,18 +686,35 @@ fn lend_held_in<R>(
   hold: &GitGeneration,
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
 ) -> Option<R> {
+  lend_held_with_refs(state, hold, true, step)
+}
+
+/// Runs `step` over the generation `hold` holds, counted as [`lend_on`] counts a step; none when its fork is gone.
+/// When `with_refs` is false (pack-streaming turns), lends empty refs and head without allocating a `Vec<NamedRef>`.
+fn lend_held_with_refs<R>(
+  state: &mut ShardState,
+  hold: &GitGeneration,
+  with_refs: bool,
+  step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
+) -> Option<R> {
   let began = slates_rt::futures::now_ns();
-  let refs: Vec<NamedRef<'_>> = hold
-    .refs
-    .iter()
-    .map(|(name, green)| NamedRef {
-      name,
-      green: *green,
-    })
-    .collect();
+  let refs: Vec<NamedRef<'_>> = if with_refs {
+    hold
+      .refs
+      .iter()
+      .map(|(name, green)| NamedRef {
+        name,
+        green: *green,
+      })
+      .collect()
+  } else {
+    Vec::new()
+  };
+  let head: &[u8] = if with_refs { &hold.head } else { &[] };
   let mut packs = ShardPacks::of(state);
-  let lent = super::observed(state, hold.id, |state| {
-    super::within_budget(state, 0, |stores| {
+  let admittable = state.store.admittable();
+  let lent = super::observed_in_room(state, hold.id, (admittable, began), |state| {
+    super::within_known_room(state, admittable, |stores| {
       let answer = {
         let fork = stores
           .git_forks
@@ -673,7 +725,7 @@ fn lend_held_in<R>(
           repository: &fork.repository,
           store: stores.content.as_ref()?,
           refs: &refs,
-          head: &hold.head,
+          head,
         };
         step(&served, &mut packs)
       };
@@ -717,6 +769,12 @@ fn release_fork(state: &mut ShardState, id: RepositoryId, stamp: (u64, u64)) {
   let fork = forks.remove(at);
   if forks.is_empty() {
     state.vcs_stores.git_forks.remove(&id);
+  }
+  // Propagate any newly-learned zlib levels back to the live repository so subsequent generations
+  // inherit them without re-sampling all ten zlib levels.
+  let learned = fork.repository.learned_levels();
+  if let Some((_, store)) = state.vcs_stores.git_ref(id) {
+    store.repository.note_levels(&learned);
   }
   let released = super::within_budget(state, 0, |stores| {
     stores
@@ -970,11 +1028,42 @@ impl PackSource for ShardPacks {
   type Pack = Streamed;
 
   /// The shard's step quantum, begun now, on the shard's clock (§4.3; A-745): a fetch's choice of its pack's objects
-  /// stops between units once it is spent.
+  /// stops between units once it is spent. Uses a data-derived adaptive check stride (geometric
+  /// halving of the estimated remaining units from the latest interval's rate in 64-bit integer
+  /// arithmetic) so fast sub-microsecond selection units avoid calling `clock_gettime` on every
+  /// unit while slow units and `quantum == 0` check after unit 1.
   fn turn(&self) -> impl FnMut() -> bool + 'static {
     let began = slates_rt::futures::now_ns();
     let quantum = self.quantum_ns;
-    move || slates_rt::futures::now_ns().saturating_sub(began) >= quantum
+    let mut last_check = began;
+    let mut since_check = 0_u64;
+    let mut stride = 1_u64;
+    move || {
+      since_check = since_check.saturating_add(1);
+      if since_check < stride {
+        return false;
+      }
+      let now = slates_rt::futures::now_ns();
+      let elapsed = now.saturating_sub(began);
+      if elapsed >= quantum {
+        return true;
+      }
+      let delta = now.saturating_sub(last_check);
+      let checked = since_check;
+      last_check = now;
+      since_check = 0;
+      let remaining = quantum.saturating_sub(elapsed);
+      let ns_per_unit = delta.checked_div(checked).unwrap_or(0);
+      stride = if ns_per_unit == 0 {
+        stride.saturating_mul(2).max(1)
+      } else {
+        remaining
+          .checked_div(ns_per_unit.saturating_mul(2).max(1))
+          .unwrap_or(1)
+          .max(1)
+      };
+      false
+    }
   }
 
   fn begin(

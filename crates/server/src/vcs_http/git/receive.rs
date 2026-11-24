@@ -206,6 +206,7 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
       last_written_ns: slates_rt::futures::now_ns(),
       carrying: None,
       held_report: None,
+      intake: None,
     })
   }
 }
@@ -240,9 +241,18 @@ pub(crate) struct Receive<L> {
   /// The push's report, written and held back until its records are held at `f + 1` (A-724 piece 8c's commit rule), and
   /// when that wait began: given then, git's keepalive written meanwhile (R2).
   held_report: Option<HeldReport>,
+  /// Per-repository FIFO push intake guard acquired on the first body chunk and released once
+  /// intake completes, hits a slow/overdue peer, launches a hook, or drops.
+  intake: Option<crate::vcs_share::turns::IntakeGuard>,
 }
 
 impl<L: ShardLender> Exchange for Receive<L> {
+  /// Releases the repository's intake gate if the peer stalled past its learned read wait bound,
+  /// so a slow or paused client never head-of-line blocks sibling pushes.
+  fn body_overdue(&mut self) {
+    self.intake = None;
+  }
+
   /// git's keepalive while the push's pack is still being read (A-722; the module doc): once its commands show
   /// side-band-64k, whenever the keepalive interval has passed since the exchange last wrote.
   fn interim(&mut self, out: &mut Vec<u8>) {
@@ -260,6 +270,9 @@ impl<L: ShardLender> Exchange for Receive<L> {
     // An advertisement's request is a `GET`, whose body asks nothing: `http-backend` reads none for it.
     if self.advertise {
       return Ok(());
+    }
+    if !run.is_empty() && self.intake.is_none() {
+      self.intake = Some(crate::vcs_share::turns::take_intake(self.push.repository()).await);
     }
     let Self { lender, push, .. } = self;
     lender
@@ -298,6 +311,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
         return Ok(());
       }
     }
+    self.intake = None;
     // Not answered within the interval: its keepalive is due now, the reply's first run (R2: it was written only after
     // the reply's own interval more, so the first byte after the body came two intervals in, 10 s, the client's patience
     // in the edge tests, which failed 18 of 18 under load).
@@ -345,6 +359,7 @@ impl<L: ShardLender> Receive<L> {
     self.answering = false;
     self.carrying = None;
     self.held_report = None;
+    self.intake = None;
     let _ = self
       .lender
       .lend(|state| state.count(PUSH_REFUSED_AFTER_BODY, 1));
@@ -379,8 +394,11 @@ impl<L: ShardLender> Receive<L> {
       sent,
       carrying,
       held_report,
+      intake,
       ..
     } = self;
+    #[cfg(not(unix))]
+    let _ = intake;
     let repository = push.repository();
     loop {
       // A homing or a landing in flight (R2): awaited no longer than the answer may stay silent, then its keepalive is
@@ -435,8 +453,9 @@ impl<L: ShardLender> Receive<L> {
         }
         #[cfg(unix)]
         Answering::Hook(call) => {
-          // A hook runs off the shard: its repository's other pushes take their turns meanwhile.
+          // A hook runs off the shard: its repository's other pushes take their turns and intakes meanwhile.
           drop(turn);
+          *intake = None;
           let answer = call.run(gone.gone()).await;
           lender
             .lend(|state| push.hook_ran(state, answer, given))

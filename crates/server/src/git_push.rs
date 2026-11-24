@@ -1370,12 +1370,18 @@ impl<P> Drop for ReceivePack<P> {
       }
     }
     // Goal 93 item 2b: unpin any let-go pack windows this push brought back before letting go
-    // the repository's owed/resident packs.
+    // the repository's owed/resident packs. While sibling pushes, fetches, or encoding are active
+    // on the same repository, only drop our read pins so concurrent peers do not immediately
+    // re-read and re-hash the same windows from disk; the last active work lets them all go.
     let repository = self.repository;
     let resident = &mut self.resident;
     let _ = crate::state::with_state(|state| {
       if !resident.is_empty() {
-        crate::vcs_store::upload::let_go_behind(state, resident, None);
+        if crate::vcs_store::other_works_live(state, repository, 1, 0) {
+          resident.clear();
+        } else {
+          crate::vcs_store::upload::let_go_behind(state, resident, None);
+        }
       }
       crate::vcs_store::let_go_owed_as_push_ends(state, repository);
     });

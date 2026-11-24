@@ -147,7 +147,7 @@ impl TcpListener {
     loop {
       match netsys::accept(&self.socket)? {
         Io::Ready(socket) => return Ok(Some(TcpStream { socket })),
-        Io::WouldBlock => return Ok(None),
+        Io::WouldBlock | Io::NoBufs => return Ok(None),
         Io::Interrupted => continue,
       }
     }
@@ -164,11 +164,36 @@ impl TcpListener {
     loop {
       match netsys::accept(&self.socket)? {
         Io::Ready(socket) => return Ok(TcpStream { socket }),
-        Io::WouldBlock => readable(self.socket.raw_id()).await?,
+        Io::WouldBlock | Io::NoBufs => readable(self.socket.raw_id()).await?,
         Io::Interrupted => continue,
       }
     }
   }
+}
+
+/// Yields once on the first transient kernel buffer shortage (`ENOBUFS`/`WSAENOBUFS`) so sibling
+/// tasks on this shard can drain socket buffers immediately, then backs off exponentially from the
+/// shard's derived step quantum (capped at the shard's idle window) so stalled writers park
+/// cooperatively instead of spinning polls while kernel buffers recover.
+async fn wait_for_buffers(stalls: &mut u32) -> Result<(), RtError> {
+  if *stalls == 0 {
+    crate::futures::yield_now().await;
+  } else {
+    let quantum = crate::futures::step_budget_ns().unwrap_or(1).max(1);
+    let ceiling = crate::futures::idle_window_ns()
+      .or_else(crate::futures::step_ceiling_ns)
+      .unwrap_or(quantum)
+      .max(quantum);
+    // Binary exponential backoff (RFC 1122): doubles each consecutive shortage from the shard's
+    // derived step quantum, capped at the shard's derived idle window.
+    let shift = stalls.saturating_sub(1).min(u64::BITS - 1);
+    let delay = quantum
+      .checked_shl(shift)
+      .map_or(ceiling, |scaled| scaled.min(ceiling));
+    crate::futures::sleep(delay).await?;
+  }
+  *stalls = stalls.saturating_add(1);
+  Ok(())
 }
 
 impl TcpStream {
@@ -179,7 +204,7 @@ impl TcpStream {
     let socket = netsys::stream_socket()?;
     match netsys::connect(&socket, addr)? {
       Io::Ready(()) => {}
-      Io::WouldBlock | Io::Interrupted => {
+      Io::WouldBlock | Io::NoBufs | Io::Interrupted => {
         writable(socket.raw_id()).await?;
         netsys::connected(&socket)?;
       }
@@ -222,7 +247,7 @@ impl TcpStream {
     loop {
       match netsys::read(&self.socket, &mut *buf)? {
         Io::Ready(n) => return Ok(n),
-        Io::WouldBlock => readable(self.socket.raw_id()).await?,
+        Io::WouldBlock | Io::NoBufs => readable(self.socket.raw_id()).await?,
         Io::Interrupted => continue,
       }
     }
@@ -236,7 +261,7 @@ impl TcpStream {
     loop {
       match netsys::read(&self.socket, &mut *buf)? {
         Io::Ready(n) => return Ok(Some(n)),
-        Io::WouldBlock => return Ok(None),
+        Io::WouldBlock | Io::NoBufs => return Ok(None),
         Io::Interrupted => continue,
       }
     }
@@ -258,7 +283,7 @@ impl TcpStream {
     loop {
       match netsys::peek(&self.socket, &mut *buf)? {
         Io::Ready(n) => return Ok(Some(n)),
-        Io::WouldBlock => return Ok(None),
+        Io::WouldBlock | Io::NoBufs => return Ok(None),
         Io::Interrupted => continue,
       }
     }
@@ -280,7 +305,7 @@ impl TcpStream {
         Io::Ready(0) => return Err(netsys::broken_pipe("recv(discard)")),
         Io::Ready(n) => left = left.saturating_sub(n.min(take)),
         Io::Interrupted => continue,
-        Io::WouldBlock => return Err(netsys::would_block("recv(discard)")),
+        Io::WouldBlock | Io::NoBufs => return Err(netsys::would_block("recv(discard)")),
       }
     }
     Ok(())
@@ -292,6 +317,7 @@ impl TcpStream {
   /// at a record boundary (A-113). A short send is completed by this call and answered [`Sent::Completed`] so the caller
   /// can count it: the stream crossed a moment when it ended mid-record.
   pub async fn send_records(&self, records: &[u8]) -> Result<Sent, RtError> {
+    let mut nobufs = 0_u32;
     loop {
       match netsys::write(&self.socket, records)? {
         Io::Ready(0) if !records.is_empty() => return Err(netsys::broken_pipe("write")),
@@ -300,7 +326,11 @@ impl TcpStream {
           self.write_all(records.get(n..).unwrap_or_default()).await?;
           return Ok(Sent::Completed);
         }
-        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::WouldBlock => {
+          nobufs = 0;
+          writable(self.socket.raw_id()).await?;
+        }
+        Io::NoBufs => wait_for_buffers(&mut nobufs).await?,
         Io::Interrupted => continue,
       }
     }
@@ -321,6 +351,7 @@ impl TcpStream {
       .iter()
       .map(|record| std::io::IoSlice::new(record))
       .collect();
+    let mut nobufs = 0_u32;
     loop {
       match netsys::write_vectored(&self.socket, &slices)? {
         Io::Ready(0) if total > 0 => return Err(netsys::broken_pipe("writev")),
@@ -329,7 +360,11 @@ impl TcpStream {
           self.write_all_from(records, n).await?;
           return Ok(Sent::Completed);
         }
-        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::WouldBlock => {
+          nobufs = 0;
+          writable(self.socket.raw_id()).await?;
+        }
+        Io::NoBufs => wait_for_buffers(&mut nobufs).await?,
         Io::Interrupted => continue,
       }
     }
@@ -444,13 +479,18 @@ impl TcpStream {
     if buf.is_empty() {
       return Ok(0);
     }
+    let mut nobufs = 0_u32;
     loop {
       match netsys::write(&self.socket, buf)? {
         // A non-blocking write of a non-empty slice returns bytes written, a would-block, or an error; a zero here
         // would mean the kernel accepted nothing without blocking, which is a broken pipe.
         Io::Ready(0) => return Err(netsys::broken_pipe("write")),
         Io::Ready(n) => return Ok(n),
-        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::WouldBlock => {
+          nobufs = 0;
+          writable(self.socket.raw_id()).await?;
+        }
+        Io::NoBufs => wait_for_buffers(&mut nobufs).await?,
         Io::Interrupted => continue,
       }
     }
@@ -460,13 +500,21 @@ impl TcpStream {
   /// so a stalled peer yields the shard rather than blocking it. Returns when every byte is accepted.
   pub async fn write_all(&self, buf: &[u8]) -> Result<(), RtError> {
     let mut sent = 0;
+    let mut nobufs = 0_u32;
     while let Some(unsent) = buf.get(sent..).filter(|unsent| !unsent.is_empty()) {
       match netsys::write(&self.socket, unsent)? {
         // A non-blocking write of a non-empty slice returns bytes written, a would-block, or an error; a zero here
         // would mean the kernel accepted nothing without blocking, which is a broken pipe.
         Io::Ready(0) => return Err(netsys::broken_pipe("write")),
-        Io::Ready(n) => sent = sent.saturating_add(n),
-        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::Ready(n) => {
+          nobufs = 0;
+          sent = sent.saturating_add(n);
+        }
+        Io::WouldBlock => {
+          nobufs = 0;
+          writable(self.socket.raw_id()).await?;
+        }
+        Io::NoBufs => wait_for_buffers(&mut nobufs).await?,
         Io::Interrupted => continue,
       }
     }
@@ -502,5 +550,52 @@ mod round_trip_tests {
     };
     assert_eq!(round_trip.resolution_ns, resolution_ns);
     assert!(round_trip.ns < 1_000_000_000, "{round_trip:?}");
+  }
+
+  /// Regression (Wave 6C.8): a peer that resets its connection while queued in the listen backlog
+  /// causes macOS/BSD `setsockopt(TCP_NODELAY)` on the accepted descriptor to fail with `EINVAL`
+  /// (and Linux/Windows `accept`/`setsockopt` to report `ECONNABORTED`/`ECONNRESET`/`WSAEINVAL`).
+  /// `accept_now` and `accept` must drop that aborted peer and continue serving subsequent healthy
+  /// connections rather than failing the listener permanently.
+  #[test]
+  #[cfg(unix)]
+  #[cfg_attr(miri, ignore = "Miri's isolation has no sockets; plain lanes run it")]
+  fn accept_skips_aborted_peer_and_serves_next_connection() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 64).unwrap();
+    let address = listener.local_addr().unwrap();
+    // Queue several peers that immediately RST before accept_now() runs, followed by a healthy peer.
+    for _ in 0..8 {
+      let aborted = std::net::TcpStream::connect(address).unwrap();
+      rustix::net::sockopt::set_socket_linger(&aborted, Some(Duration::ZERO)).unwrap();
+      drop(aborted);
+    }
+    let mut healthy = std::net::TcpStream::connect(address).unwrap();
+    healthy.write_all(b"ping").unwrap();
+    // Allow loopback RST packets to settle in the kernel accept queue before draining.
+    std::thread::sleep(Duration::from_millis(20));
+
+    let mut accepted_healthy = false;
+    for _ in 0..32 {
+      match listener.accept_now() {
+        Ok(Some(stream)) => {
+          let mut buf = [0u8; 4];
+          if let Ok(Some(4)) = stream.read_now(&mut buf)
+            && &buf == b"ping"
+          {
+            accepted_healthy = true;
+            break;
+          }
+        }
+        Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+        Err(error) => panic!("aborted peer must not fail the listener: {error:?}"),
+      }
+    }
+    assert!(
+      accepted_healthy,
+      "listener must still accept the healthy connection after aborted peers"
+    );
   }
 }

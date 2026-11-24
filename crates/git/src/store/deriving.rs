@@ -583,6 +583,17 @@ impl Repository {
             return Ok(Begun::Needs(base));
           }
           let reached = self.sets(store, base.0, base.1)?.reached;
+          let base_head = self
+            .chains
+            .get(&base.0)
+            .and_then(|chain| chain.versions.get(base.1))
+            .and_then(|record| record.head);
+          if !before && base_head.is_some() && base_head == record.head {
+            return Ok(Begun::Sets(Sets {
+              brought: Positions::new(),
+              reached,
+            }));
+          }
           let set = self.base_set(store, (base, record.head), reached);
           return Ok(now(Step::Reached {
             walk: Walk::from(head, set.clone()),

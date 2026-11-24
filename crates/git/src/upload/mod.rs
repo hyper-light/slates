@@ -119,6 +119,8 @@ pub struct PackPlan<'p> {
   pub runs: &'p [Run<u64>],
   /// Objects the pack carries one by one, by position, as runs (A-745: never listed an object at a time).
   pub objects: &'p crate::positions::Positions,
+  /// Objects the client already holds that an unfiltered thin pack may reference as `REF_DELTA` bases.
+  pub held: Option<&'p crate::positions::Positions>,
   /// The filter the runs' objects are held to, one that decides each object by its own row
   /// ([`Filter::is_per_object`]); the single objects were chosen under it already.
   pub filter: Option<&'p Filter>,
