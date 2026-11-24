@@ -1357,6 +1357,16 @@
 > lineage, and the empty engine each lend makes and drops (`Lent::new`), with w-svn's lend work; the commit's clone of
 > the whole head map and its footprint's walk of every chain (`Repository::plan`, `footprint`), O(greens) a push;
 > main's git/git push before and after on the Studio.
+> Shallow clone over a let-go pack BUILT (2026-11-23, w-git; main 01a20182's r130, the lift on: stock `git clone
+> --depth 1` of git/git refused `Pack(Store(Unreadable))` on a 785,414-byte blob). A one-commit-deep pack sends an object
+> whose stored delta's base it does not carry whole, its chain resolved from the pushed pack, each base earlier there
+> than the stream's cursor. The window that read stopped at was brought back and, in the same turn, let go behind the
+> cursor (`vcs_store::upload::let_go_behind`), so the read met it again and refused. Now a stopped window is held while
+> the stream still reads the object it stopped for (`Brought::pinned`, counted `vcs_store.git_resident.pinned_held`):
+> at most the object's chain, a push's deepest, each entry its bytes' windows and one more, charged as brought-back
+> windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
+> answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
+> r130's verbs with the lift on.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
