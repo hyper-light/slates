@@ -529,3 +529,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Clippy findings in A-877's tests were fixed by main first (80ef30c1e).
   - Parked: (3) the window record, patch ~/.cache/w-perf/record-wip.patch + test_heap.rs.saved (371 -> 270 B a window,
     bound 192; ~600 KB in 4,000 puts still unplaced). Next: finish (3), then system_live's 230 MB by owner.
+- 2026-11-23 ~17:30 PST:
+  - Windows diag 45289973863 (diag-measurer-w-perf-1): with bug.patch 0 of 3 on both runners, with the fix 3 of 3 for
+    three rounds, Windows clippy clean. 41bf83bf0 verified on Windows.
+  - LANDED d821dc7a5 (merge 62b56b936), main's (3): a window's record keeps its identity, length, slot and slab key
+    (56 B), and the slab keeps the placement. tests/window_records_heap.rs (own counting allocator): red 250 B a window,
+    now 150, bound 192. doc(hidden) slates_server::chunk_window_storage for that test alone.
+  - Lesson: a #[global_allocator] under the lib's tests changed memory_gauges' status test (it failed 4/4; the probe
+    read carried_in_entry=1 and no manifest held). Counting allocators go in their own integration binaries.
+  - Next (main's order): (1) the chunk record slab's segment, min(max_chunks, page) -> a page of records as TagStore
+    does, red by heap count, AC-0.4 provisioning A/B via kiln; (2) the gauge test's placement dependence (GAPS OPEN);
+    (3) system_live by owner.
