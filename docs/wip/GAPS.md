@@ -175,11 +175,14 @@
 > ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
 > resolved). BUILT (A-894, 2026-11-24): a repository's creation answers once its record is placed at f + 1 (its reply
 > held on the destroy's hold, made general: `live_ship::defer_until_placed`), so `git_fleet` no longer waits for it.
-> **OPEN (A-894, w-shared, 2026-11-24): after a repository's takeover, a push to it is refused at both survivors.** In
-> `a894_...served_by_a_survivor` (three daemons at f = 1, the owner killed as its creation answered), the successor
-> rebuilt it and its edge listed it (`git ls-remote`), but a push was refused `unable to commit` there (the push
-> barrier). The other survivor's edge answered "repository not found": it holds the record as a register, not in its
-> partition. Untested before: no fleet test pushed after a repository's takeover. For main to place.
+> **FIXED (A-903, w-shared, 2026-11-24): after a repository's takeover, a push to its successor was refused `unable to
+> commit`.** The successor wrote its adopted state logs' parts at its own host epoch, below the takeover's fence, and
+> the other survivor refused each `StaleEpoch`; now at the adopted epoch (A-894's takeover test pushes to it, red first).
+> **OPEN (w-shared, 2026-11-24): a repository is reachable only at its owner's edge.** `vcs_http::git::Repositories::locate`
+> looks over this node's shards alone, so another node's edge answers "repository not found", before a death as after
+> one (A-894's takeover test: the survivor that is not the successor). After a takeover the dead owner's address is gone
+> and a client must find the successor's edge itself. For main and w-git: the edge forwarding to the owner, or sending
+> the client there.
 > **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
 > home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
 > 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
