@@ -1134,19 +1134,28 @@ impl Store {
     path: &[u8],
     tool_ids: &[Vec<u8>],
   ) -> Result<Vec<Option<(Identity, TextRow)>>, StoreError> {
+    if tool_ids.is_empty() {
+      return Ok(Vec::new());
+    }
     // The path's tool id rows share their key's prefix, so they are read in one scan of it, a page as large as the
     // ask, keeping the ones asked: a stream asks for a log's every version, one random lookup each before (r27 on
     // hg-src: about 230,000 a stream, 1.35 s of its 3.7 s waiting on the store).
     let hash = *blake3::hash(path).as_bytes();
     let start = tool_key(repository, &hash, &[]);
     let end = prefix_end(&start);
-    let wanted: std::collections::BTreeSet<&[u8]> = tool_ids.iter().map(Vec::as_slice).collect();
-    let mut kept: std::collections::BTreeMap<Vec<u8>, (Identity, TextRow)> =
-      std::collections::BTreeMap::new();
+    let mut index_by_id: std::collections::HashMap<&[u8], usize> =
+      std::collections::HashMap::with_capacity(tool_ids.len());
+    for (idx, tool_id) in tool_ids.iter().enumerate() {
+      index_by_id.entry(tool_id.as_slice()).or_insert(idx);
+    }
+    let unique = index_by_id.len();
+    let mut results: Vec<Option<(Identity, TextRow)>> = vec![None; tool_ids.len()];
+    let mut matched = 0usize;
     let mut from = start.clone();
     let mut next = Vec::new();
+    let mut out = mantle_engine::rows::Rows::default();
     loop {
-      let mut out = mantle_engine::rows::Rows::default();
+      out.clear();
       self.tool_read();
       let more = self.rows_mut().scan(
         &from,
@@ -1159,21 +1168,32 @@ impl Store {
         let Some(tool_id) = key.strip_prefix(start.as_slice()) else {
           continue;
         };
-        if wanted.contains(tool_id) {
-          kept.insert(tool_id.to_vec(), decode_tool_value(value)?);
+        if let Some(&slot) = index_by_id.get(tool_id)
+          && let Some(entry) = results.get_mut(slot)
+          && entry.is_none()
+        {
+          *entry = Some(decode_tool_value(value)?);
+          matched = matched.saturating_add(1);
         }
       }
-      if !more || kept.len() == wanted.len() {
+      if !more || matched == unique {
         break;
       }
       core::mem::swap(&mut from, &mut next);
     }
-    Ok(
-      tool_ids
-        .iter()
-        .map(|tool_id| kept.get(tool_id).copied())
-        .collect(),
-    )
+    if unique < tool_ids.len() {
+      for idx in 0..tool_ids.len() {
+        if results.get(idx).is_some_and(Option::is_none)
+          && let Some(tool_id) = tool_ids.get(idx)
+          && let Some(&first) = index_by_id.get(tool_id.as_slice())
+          && let Some(found) = results.get(first).copied().flatten()
+          && let Some(slot) = results.get_mut(idx)
+        {
+          *slot = Some(found);
+        }
+      }
+    }
+    Ok(results)
   }
 
   /// The bytes at `place` in the log (an edit or a whole as its `T` row names it), read whole: what a stream sends as a

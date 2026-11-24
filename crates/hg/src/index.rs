@@ -133,34 +133,126 @@ pub enum Log<'a> {
   File(&'a [u8]),
 }
 
-impl Log<'_> {
-  /// Appends the log's key.
-  fn put_key(&self, out: &mut Vec<u8>) {
+/// Shape: two 64-byte cache lines hold every changelog, manifest, node, marker, and endings key
+/// plus file log keys for paths up to 120 bytes inline on the stack without heap allocation.
+const INLINE_KEY_CAP: usize = 128;
+
+/// An index lookup key kept inline on the stack up to [`INLINE_KEY_CAP`] bytes, spilling to one
+/// exact-capacity `Vec<u8>` only for long file paths.
+enum SmallKey {
+  Inline { buf: [u8; INLINE_KEY_CAP], len: u8 },
+  Heap(Vec<u8>),
+}
+
+impl SmallKey {
+  /// Builds a key of `exact_len` bytes using `fill` (which must write `exact_len` bytes).
+  fn build(exact_len: usize, fill: impl FnOnce(&mut [u8])) -> Self {
+    if exact_len <= INLINE_KEY_CAP {
+      let mut buf = [0u8; INLINE_KEY_CAP];
+      if let Some(slice) = buf.get_mut(..exact_len) {
+        fill(slice);
+      }
+      Self::Inline {
+        buf,
+        len: u8::try_from(exact_len).unwrap_or(0),
+      }
+    } else {
+      let mut vec = vec![0u8; exact_len];
+      fill(&mut vec);
+      Self::Heap(vec)
+    }
+  }
+
+  /// Borrows the key bytes.
+  fn as_slice(&self) -> &[u8] {
     match self {
-      Self::Changelog => out.push(CHANGELOG_KEY),
-      Self::Manifest => out.push(MANIFEST_KEY),
+      Self::Inline { buf, len } => buf.get(..usize::from(*len)).unwrap_or_default(),
+      Self::Heap(vec) => vec.as_slice(),
+    }
+  }
+}
+
+impl Log<'_> {
+  /// Exact byte length of this log's key portion.
+  fn key_len(&self) -> usize {
+    match self {
+      Self::Changelog | Self::Manifest => 1,
+      Self::File(path) => path.len().saturating_add(2),
+    }
+  }
+
+  /// Writes this log's key portion into `dst` (which must be `self.key_len()` bytes long).
+  fn write_key(&self, dst: &mut [u8]) {
+    match self {
+      Self::Changelog => {
+        if let Some(first) = dst.first_mut() {
+          *first = CHANGELOG_KEY;
+        }
+      }
+      Self::Manifest => {
+        if let Some(first) = dst.first_mut() {
+          *first = MANIFEST_KEY;
+        }
+      }
       Self::File(path) => {
-        out.push(FILE_KEY);
-        out.extend_from_slice(path);
-        out.push(PATH_END);
+        let end = 1usize.saturating_add(path.len());
+        if let Some(first) = dst.first_mut() {
+          *first = FILE_KEY;
+        }
+        if let Some(mid) = dst.get_mut(1..end) {
+          mid.copy_from_slice(path);
+        }
+        if let Some(last) = dst.get_mut(end) {
+          *last = PATH_END;
+        }
       }
     }
   }
 
-  /// The key of this log's row numbered `rev`.
-  fn row_key(&self, rev: u32) -> Vec<u8> {
-    let mut key = vec![LOG_ROW];
-    self.put_key(&mut key);
-    key.extend_from_slice(&rev.to_be_bytes());
-    key
+  /// Stack-preferred key of this log's row numbered `rev` (zero heap allocation for paths <= 120 B).
+  fn row_key_small(&self, rev: u32) -> SmallKey {
+    let log_len = self.key_len();
+    let mid_end = 1usize.saturating_add(log_len);
+    let total = mid_end.saturating_add(REV_BYTES);
+    SmallKey::build(total, |buf| {
+      if let Some(first) = buf.first_mut() {
+        *first = LOG_ROW;
+      }
+      if let Some(mid) = buf.get_mut(1..mid_end) {
+        self.write_key(mid);
+      }
+      if let Some(tail) = buf.get_mut(mid_end..total) {
+        tail.copy_from_slice(&rev.to_be_bytes());
+      }
+    })
   }
 
-  /// The key of `node`'s row in this log.
+  /// Stack-preferred key of `node`'s row in this log (zero heap allocation for paths <= 105 B).
+  fn node_key_small(&self, node: &Node) -> SmallKey {
+    let log_len = self.key_len();
+    let node_end = 1usize.saturating_add(NODE_LEN);
+    let total = node_end.saturating_add(log_len);
+    SmallKey::build(total, |buf| {
+      if let Some(first) = buf.first_mut() {
+        *first = NODE_ROW;
+      }
+      if let Some(mid) = buf.get_mut(1..node_end) {
+        mid.copy_from_slice(node);
+      }
+      if let Some(tail) = buf.get_mut(node_end..total) {
+        self.write_key(tail);
+      }
+    })
+  }
+
+  /// Owned key of this log's row numbered `rev` (single exact-capacity allocation, zero reallocs).
+  fn row_key(&self, rev: u32) -> Vec<u8> {
+    self.row_key_small(rev).as_slice().to_vec()
+  }
+
+  /// Owned key of `node`'s row in this log (single exact-capacity allocation, zero reallocs).
   fn node_key(&self, node: &Node) -> Vec<u8> {
-    let mut key = vec![NODE_ROW];
-    key.extend_from_slice(node);
-    self.put_key(&mut key);
-    key
+    self.node_key_small(node).as_slice().to_vec()
   }
 }
 
@@ -580,7 +672,7 @@ impl Endings {
     let chunk = |number: u32| -> Result<Vec<Ending>, Refused> {
       let row = index
         .rows
-        .get(store, &endings_key(number))
+        .get(store, &endings_key_bytes(number))
         .ok_or(Refused::Unread { rev })?;
       let (pairs, rest) = row.payload().as_chunks::<ENDING_BYTES>();
       if !rest.is_empty() || pairs.is_empty() {
@@ -601,7 +693,7 @@ impl Endings {
     let last_by = |number: u32| -> Result<u32, Refused> {
       let row = index
         .rows
-        .get(store, &endings_key(number))
+        .get(store, &endings_key_bytes(number))
         .ok_or(Refused::Unread { rev })?;
       let (_, last) = row
         .payload()
@@ -654,12 +746,15 @@ fn endings_a_chunk(store: &ContentStore) -> usize {
   (store.window().saturating_sub(ENDINGS_ROW_FRAME) / ENDING_BYTES).clamp(1, ENDINGS_CHUNK)
 }
 
+/// The stack key of the sealed chunk of endings numbered `number`: `E` followed by big-endian `u32`.
+fn endings_key_bytes(number: u32) -> [u8; 1 + REV_BYTES] {
+  let [b0, b1, b2, b3] = number.to_be_bytes();
+  [ENDINGS_ROW, b0, b1, b2, b3]
+}
+
 /// The key of the sealed chunk of endings numbered `number`.
 fn endings_key(number: u32) -> Vec<u8> {
-  let mut key = Vec::with_capacity(core::mem::size_of::<u32>().saturating_add(1));
-  key.push(ENDINGS_ROW);
-  key.extend_from_slice(&number.to_be_bytes());
-  key
+  endings_key_bytes(number).to_vec()
 }
 
 /// A repository's revlog-shaped index, every row in one shared [`Index`].
@@ -675,6 +770,9 @@ pub struct HgIndex {
   manifest_len: u32,
   /// Exact count of obsolescence markers (maintained on every marker append; O(1) for `Indexed::new`).
   markers_len: u64,
+  /// Monotonic mutation counter incremented on every [`HgIndex::insert`] so concurrent fetches can
+  /// share one immutable fork per unchanged index state.
+  mutation: u64,
   /// The buffers [`HgIndex::revision_text`] rebuilds a chain through ([`TextBuffers`]).
   buffers: core::cell::RefCell<TextBuffers>,
   /// Seals the store refused after an append (its room): the append stood, its rows charged within the budget, and
@@ -710,9 +808,15 @@ impl HgIndex {
       changelog_len: 0,
       manifest_len: 0,
       markers_len: 0,
+      mutation: 0,
       buffers: core::cell::RefCell::new(TextBuffers::default()),
       seals_refused: 0,
     }
+  }
+
+  /// Monotonic stamp incremented on every row insertion into this index.
+  pub fn stamp(&self) -> u64 {
+    self.mutation
   }
 
   /// The shared index holding the rows: for its seals, compactions, timings and counters.
@@ -736,6 +840,7 @@ impl HgIndex {
   /// the next append seals instead. A fork's sealed runs are its own, given back by [`HgIndex::release`].
   fn insert(&mut self, store: &mut ContentStore, rows: &[NewRow<'_>]) -> Result<Batch, Refused> {
     let batch = self.rows.insert_all(store, rows)?;
+    self.mutation = self.mutation.saturating_add(1);
     if self.rows.seal_due(store) && self.rows.seal(store).is_err() {
       self.seals_refused = self.seals_refused.saturating_add(1);
     }
@@ -765,6 +870,7 @@ impl HgIndex {
       changelog_len: self.changelog_len,
       manifest_len: self.manifest_len,
       markers_len: self.markers_len,
+      mutation: self.mutation,
       buffers: core::cell::RefCell::new(TextBuffers::default()),
       seals_refused: 0,
     })
@@ -810,7 +916,11 @@ impl HgIndex {
 
   /// The object row of `node`: its kind, its length and its root content, if the index holds one.
   pub fn object(&self, store: &ContentStore, node: &Node) -> Option<(u8, u64, ContentId)> {
-    object_row(&self.rows.get(store, &object_key(node))?)
+    let mut key = [OBJECT_ROW; 1 + NODE_LEN];
+    if let Some(rest) = key.get_mut(1..) {
+      rest.copy_from_slice(node);
+    }
+    object_row(&self.rows.get(store, &key)?)
   }
 
   /// Appends obsolescence markers in the order they arrived, each a content holding it alone in its format, numbered
@@ -854,7 +964,11 @@ impl HgIndex {
 
   /// The content of the marker numbered `number`: the marker alone in its format.
   pub fn marker(&self, store: &ContentStore, number: u64) -> Option<ContentId> {
-    let row = self.rows.get(store, &marker_key(number))?;
+    let mut key = [MARKER_ROW; 1 + core::mem::size_of::<u64>()];
+    if let Some(rest) = key.get_mut(1..) {
+      rest.copy_from_slice(&number.to_be_bytes());
+    }
+    let row = self.rows.get(store, &key)?;
     let mut contents = row.contents();
     let marker = contents.next()?;
     contents.next().is_none().then_some(marker)
@@ -862,7 +976,8 @@ impl HgIndex {
 
   /// The number `node` has in `log`, if the log holds it.
   pub fn rev(&self, store: &ContentStore, log: Log<'_>, node: &Node) -> Option<u32> {
-    let row = self.rows.get(store, &log.node_key(node))?;
+    let key = log.node_key_small(node);
+    let row = self.rows.get(store, key.as_slice())?;
     let bytes = <[u8; REV_BYTES]>::try_from(row.payload()).ok()?;
     Some(u32::from_le_bytes(bytes))
   }
@@ -899,7 +1014,7 @@ impl HgIndex {
       if !within {
         break;
       }
-      if key != Log::Changelog.node_key(&node).as_slice() {
+      if key != Log::Changelog.node_key_small(&node).as_slice() {
         continue;
       }
       let Some(rev) = <[u8; REV_BYTES]>::try_from(row.payload())
@@ -925,7 +1040,10 @@ impl HgIndex {
       Log::Manifest => self.manifest_len,
       Log::File(_) => {
         let held = |rev: u64| {
-          u32::try_from(rev).is_ok_and(|rev| self.rows.get(store, &log.row_key(rev)).is_some())
+          u32::try_from(rev).is_ok_and(|rev| {
+            let key = log.row_key_small(rev);
+            self.rows.get(store, key.as_slice()).is_some()
+          })
         };
         u32::try_from(first_missing(u64::from(NONE), held)).unwrap_or(NONE)
       }
@@ -955,8 +1073,8 @@ impl HgIndex {
     store: &ContentStore,
     (path, rev): (&[u8], u32),
   ) -> Option<(Vec<u8>, u32, RevisionRow)> {
-    let start = Log::File(path).row_key(rev);
-    let row = self.rows.iter_from(store, &start).next()?;
+    let start = Log::File(path).row_key_small(rev);
+    let row = self.rows.iter_from(store, start.as_slice()).next()?;
     let rest = row.key().strip_prefix(&[LOG_ROW, FILE_KEY])?;
     let (found, number) = rest.split_last_chunk::<REV_BYTES>()?;
     let found = found.strip_suffix(&[PATH_END])?;
@@ -969,7 +1087,9 @@ impl HgIndex {
 
   /// The changelog's row numbered `rev`.
   pub fn changeset<'s>(&'s self, store: &'s ContentStore, rev: u32) -> Option<ChangesetRow<'s>> {
-    let row = self.rows.get(store, &Log::Changelog.row_key(rev))?;
+    let [b0, b1, b2, b3] = rev.to_be_bytes();
+    let key = [LOG_ROW, CHANGELOG_KEY, b0, b1, b2, b3];
+    let row = self.rows.get(store, &key)?;
     read_changeset(&row)
   }
 
@@ -978,7 +1098,8 @@ impl HgIndex {
     if log == Log::Changelog {
       return None;
     }
-    let row = self.rows.get(store, &log.row_key(rev))?;
+    let key = log.row_key_small(rev);
+    let row = self.rows.get(store, key.as_slice())?;
     read_revision(&row)
   }
 

@@ -277,6 +277,10 @@ pub(crate) struct VcsStores {
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
   git_forks: BTreeMap<RepositoryId, Vec<upload::GitFork>>,
+  /// The generations Mercurial fetches hold, by repository (A-745 rule 4, [`hg_view::Generation`]):
+  /// one fork per `(store.generation, index.stamp())`, shared across all concurrent fetches on that
+  /// unchanged index state and released with its last holder.
+  hg_forks: BTreeMap<RepositoryId, Vec<hg_view::HgFork>>,
   /// The price of a byte git's fetches send over this shard's links, learned from the time their writes waited for the
   /// peer (A-859 part A, [`upload::LinkPrice`]).
   pub(crate) git_link: upload::LinkPrice,

@@ -1708,8 +1708,9 @@ fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
     .map(|(_, bytes)| bytes.len())
     .sum();
   let revisions = entries / 64;
-  // Counted twice by the walk (the count, then the writing), the store's bytes are half its tally.
-  let delta_bytes = usize::try_from(deltas.delta_bytes / 2).unwrap();
+  // Every revision's stored chunk bytes were tallied once when its log's rows were read (when all logs fit the room,
+  // `Stage::Counting` retains its batch for `Stage::Index`, so `rows` is asked once).
+  let delta_bytes = usize::try_from(deltas.delta_bytes).unwrap();
   assert!(
     chunks <= delta_bytes + revisions,
     "chunks {chunks}, deltas {delta_bytes}, revisions {revisions}"
@@ -1766,8 +1767,9 @@ const MANY_LOGS: u64 = 64;
 /// the serving shard idle half the stream, waiting on one store ask a log, both passes, about 12,000 of them, each a turn
 /// with its view made afresh). Do: build a repository of one changeset and [`MANY_LOGS`] file logs of one revision
 /// each; stream it whole, in a room that holds it, from a store that counts its asks. Expect the store asked for rows
-/// once a pass (the count, then the writing) and for chunks once, whatever the logs; and the same bytes as the stream
-/// made a step at a time in a room that holds one log's rows or one chunk (which asks more).
+/// once total (retained from the count pass into the index pass when every log fits the room) and for chunks once,
+/// whatever the logs; and the same bytes as the stream made a step at a time in a room that holds one log's rows or
+/// one chunk (which asks more).
 #[test]
 fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
   use super::super::stream::stream_out;
@@ -1846,7 +1848,8 @@ fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
       counted.chunks
     ),
     // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written.
-    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 1),
+    // Every log's rows fit the room in one batch and are retained from counting into index writing (1 row ask).
+    (usize::try_from(MANY_LOGS).unwrap() + 1, 1, 1),
     "(index files, row asks, chunk asks)"
   );
 }

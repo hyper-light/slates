@@ -475,6 +475,8 @@ struct StoredLog {
   log: Walked,
   revisions: Vec<StoredRevision>,
   first: BTreeMap<[u8; 32], u32>,
+  /// Whether every revision of this log has a zero-byte data chunk (inline revlog header).
+  no_data: bool,
 }
 
 /// `stream_out`'s answer made a step at a time (A-745; §4.17.1 "A fetch's answer"), each revision sent as the changeset
@@ -507,6 +509,11 @@ pub struct Streaming {
   wanted_logs: Vec<Walked>,
   /// The rows of the logs held, the one being walked first.
   held: VecDeque<StoredLog>,
+  /// Cursor into `held` during `Stage::Counting` so logs that fit `room_hint` are retained into
+  /// `Stage::Index` without a second `Want::Rows` pass.
+  held_at: usize,
+  /// Byte cost of `StoredRevision` rows currently retained in `held`.
+  held_bytes: u64,
   /// The number the next log given takes.
   next_seq: u64,
   /// The log number and revision each asked chunk is for, in order.
@@ -546,6 +553,8 @@ impl Default for Streaming {
       want: None,
       wanted_logs: Vec::new(),
       held: VecDeque::new(),
+      held_at: 0,
+      held_bytes: 0,
       next_seq: 0,
       wanted_chunks: Vec::new(),
       chunks: VecDeque::new(),
@@ -596,23 +605,30 @@ impl Streaming {
     if rows.len() != wanted.len() {
       self.not_served = true;
     }
+    let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
     for (log, rows) in wanted.into_iter().zip(rows) {
       let mut revisions = Vec::with_capacity(rows.len());
       let mut first = BTreeMap::new();
+      let mut no_data = true;
       for (rev, row) in (0_u32..).zip(rows) {
         match row {
           Some(row) => {
+            no_data &= sent_len(&row) == Some(0);
             first.entry(row.text).or_insert(rev);
             revisions.push(row);
           }
           None => self.not_served = true,
         }
       }
+      self.held_bytes = self
+        .held_bytes
+        .saturating_add(to_u64(revisions.len()).saturating_mul(row_bytes));
       self.held.push_back(StoredLog {
         seq: self.next_seq,
         log,
         revisions,
         first,
+        no_data,
       });
       self.next_seq = self.next_seq.saturating_add(1);
     }
@@ -669,62 +685,82 @@ impl Streaming {
     Ok(self.stage != Stage::Done)
   }
 
-  /// Whether the rows of `log` are held, the logs walked before it let go; asks for them when not, with the logs after
-  /// it, as many as the room the last step was given holds (one at least). The ask's nodes are gathered at most a
-  /// content window's worth of rows a step ([`rows_a_step`]), so no step reads a whole log's rows, however long.
+  /// Checks whether `log` is already in `self.held`, evicting consumed logs if needed, and starts
+  /// a new [`Gathering`] batch if not. When `keep_prior` is true (`Stage::Counting`), a single
+  /// batch that covers the whole repository is retained into `Stage::Index` without a second
+  /// `Want::Rows` pass; if a second batch is needed, the counted prefix cannot be reused at
+  /// `Stage::Index` and is evicted immediately so the next batch gets the full `room_hint`.
+  fn prepare_held(&mut self, log: &Walked, keep_prior: bool, row_bytes: u64) -> bool {
+    if keep_prior {
+      if self.held.get(self.held_at).is_some_and(|h| h.log == *log) {
+        return true;
+      }
+      for _ in 0..self.held_at {
+        if let Some(dropped) = self.held.pop_front() {
+          self.held_bytes = self
+            .held_bytes
+            .saturating_sub(to_u64(dropped.revisions.len()).saturating_mul(row_bytes));
+        }
+      }
+      self.held_at = 0;
+    } else {
+      while let Some(front) = self.held.front() {
+        if front.log == *log {
+          return true;
+        }
+        if let Some(dropped) = self.held.pop_front() {
+          self.held_bytes = self
+            .held_bytes
+            .saturating_sub(to_u64(dropped.revisions.len()).saturating_mul(row_bytes));
+        }
+      }
+    }
+    self.gathering = Some(Gathering {
+      logs: Vec::new(),
+      wanted: Vec::new(),
+      bytes: self.held_bytes,
+      at: (log.clone(), 0, Vec::new()),
+    });
+    false
+  }
+
+  /// Whether the rows of `log` are held, retaining counted logs within `room_hint` when `keep_prior`
+  /// is set; asks for them when not, with the logs after it, as many as the room the last step was
+  /// given holds (one at least). The ask's nodes are gathered at most a content window's worth of
+  /// rows a step ([`rows_a_step`]), so no step reads a whole log's rows, however long.
   fn rows_held(
     &mut self,
     index: &HgIndex,
     store: &ContentStore,
     log: &Walked,
+    keep_prior: bool,
   ) -> Result<bool, Refused> {
-    if self.gathering.is_none() {
-      while let Some(front) = self.held.front() {
-        if front.log == *log {
-          return Ok(true);
-        }
-        self.held.pop_front();
-      }
-      self.gathering = Some(Gathering {
-        logs: Vec::new(),
-        wanted: Vec::new(),
-        bytes: 0,
-        at: (log.clone(), 0, Vec::new()),
-      });
-    }
     let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
+    if self.gathering.is_none() && self.prepare_held(log, keep_prior, row_bytes) {
+      return Ok(true);
+    }
     let mut budget = rows_a_step(store);
     let Some(gathering) = self.gathering.as_mut() else {
       return Ok(false);
     };
     loop {
-      let (at, rev, nodes) = &mut gathering.at;
-      let count = index.len(store, at.log());
-      if *rev == 0 {
-        let cost = u64::from(count).saturating_mul(row_bytes);
-        if !gathering.logs.is_empty() && gathering.bytes.saturating_add(cost) > self.room_hint {
-          break;
+      match gather_log_nodes(
+        gathering,
+        (index, store),
+        (self.room_hint, row_bytes, &mut budget),
+      )? {
+        GatherStep::Yield => return Ok(false),
+        GatherStep::Full => break,
+        GatherStep::LogDone => {
+          let next = next_log(&gathering.at.0, index, store);
+          let done = core::mem::take(&mut gathering.at.2);
+          gathering.logs.push((gathering.at.0.stored_name(), done));
+          gathering.wanted.push(gathering.at.0.clone());
+          match next {
+            Some(next) => gathering.at = (next, 0, Vec::new()),
+            None => break,
+          }
         }
-        gathering.bytes = gathering.bytes.saturating_add(cost);
-        nodes
-          .try_reserve_exact(usize::try_from(count).map_err(|_| Refused::TooLong)?)
-          .map_err(|_| Refused::TooLong)?;
-      }
-      while *rev < count {
-        if budget == 0 {
-          return Ok(false);
-        }
-        nodes.push(node_of(index, store, at, *rev)?);
-        *rev = rev.saturating_add(1);
-        budget = budget.saturating_sub(1);
-      }
-      let next = next_log(at, index, store);
-      let done = core::mem::take(nodes);
-      gathering.logs.push((at.stored_name(), done));
-      gathering.wanted.push(at.clone());
-      match next {
-        Some(next) => gathering.at = (next, 0, Vec::new()),
-        None => break,
       }
     }
     if let Some(gathering) = self.gathering.take() {
@@ -743,13 +779,13 @@ impl Streaming {
     store: &ContentStore,
     log: Walked,
   ) -> Result<Stage, Refused> {
-    if !self.rows_held(index, store, &log)? {
+    if !self.rows_held(index, store, &log, true)? {
       return Ok(Stage::Counting(log));
     }
     if self.not_served {
       return Ok(Stage::Head);
     }
-    let stored = self.held.front().ok_or(Refused::TooLong)?;
+    let stored = self.held.get(self.held_at).ok_or(Refused::TooLong)?;
     let entries = to_u64(stored.revisions.len()).saturating_mul(to_u64(ENTRY_BYTES));
     let data = stored.revisions.iter().try_fold(0_u64, |data, row| {
       sent_len(row).map(|sent| data.saturating_add(sent))
@@ -765,6 +801,7 @@ impl Streaming {
         self.counted.1 = self.counted.1.saturating_add(bytes);
       }
     }
+    self.held_at = self.held_at.saturating_add(1);
     Ok(next_log(&log, index, store).map_or(Stage::Head, Stage::Counting))
   }
 
@@ -778,6 +815,7 @@ impl Streaming {
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
+    self.held_at = 0;
     if self.format == WireFormat::V2 {
       if self.not_served {
         return Ok(Stage::Done);
@@ -830,7 +868,7 @@ impl Streaming {
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
-    if !self.rows_held(index, store, &log)? {
+    if !self.rows_held(index, store, &log, false)? {
       return Ok(Stage::Index(log, rev, offset));
     }
     // The log's length is its held rows' count: asked of the index, each entry took a search of the log's keys.
@@ -873,15 +911,26 @@ impl Streaming {
         .filter(|base| *base < rev)
         .ok_or_else(unreadable)?,
     };
-    let (parents, link) = numbers(index, store, log.log(), rev).ok_or_else(unreadable)?;
-    let (node, flags, text) = match log.log() {
+    let (parents, link, node, flags, text) = match log.log() {
       Log::Changelog => {
         let found = index.changeset(store, rev).ok_or_else(unreadable)?;
-        (found.node, found.flags, found.len)
+        (
+          [found.p1, found.p2],
+          rev,
+          found.node,
+          found.flags,
+          found.len,
+        )
       }
       other => {
         let found = index.revision(store, other, rev).ok_or_else(unreadable)?;
-        (found.node, found.flags, found.len)
+        (
+          [found.p1, found.p2],
+          found.link,
+          found.node,
+          found.flags,
+          found.len,
+        )
       }
     };
     // A revision against the null base is sent as its text alone, which its place holds (a whole kept raw, A-767 C1).
@@ -905,8 +954,11 @@ impl Streaming {
       && let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len()))
     {
       // Once a log, at its first entry: inline where no revision has a chunk to send.
-      let no_data = stored.revisions.iter().all(|row| sent_len(row) == Some(0));
-      header.copy_from_slice(if no_data { &INLINE_HEADER } else { &HEADER });
+      header.copy_from_slice(if stored.no_data {
+        &INLINE_HEADER
+      } else {
+        &HEADER
+      });
     }
     Ok(Stage::Index(
       log,
@@ -1029,6 +1081,64 @@ fn next_log(log: &Walked, index: &HgIndex, store: &ContentStore) -> Option<Walke
   } else {
     next_log(&after, index, store)
   }
+}
+
+/// Outcome of gathering nodes for the current log in [`Streaming::rows_held`].
+enum GatherStep {
+  /// Step row budget exhausted; resume on the next turn.
+  Yield,
+  /// Room hint reached before starting this log; emit the batch gathered so far.
+  Full,
+  /// Every revision of the current log has been gathered.
+  LogDone,
+}
+
+/// Gathers up to `*budget` revision nodes for `gathering.at`: file logs are scanned sequentially
+/// from `rev = 0` without calling `HgIndex::len` (avoiding `2 * log2(len)` binary-search lookups
+/// per file log), while changelog and manifest logs use their O(1) lengths to pre-size `nodes`.
+fn gather_log_nodes(
+  gathering: &mut Gathering,
+  (index, store): (&HgIndex, &ContentStore),
+  (room_hint, row_bytes, budget): (u64, u64, &mut u64),
+) -> Result<GatherStep, Refused> {
+  let (at, rev, nodes) = &mut gathering.at;
+  if matches!(at, Walked::File(_)) {
+    if *rev == 0 && !gathering.logs.is_empty() && gathering.bytes >= room_hint {
+      return Ok(GatherStep::Full);
+    }
+    loop {
+      if *budget == 0 {
+        return Ok(GatherStep::Yield);
+      }
+      let Some(row) = index.revision(store, at.log(), *rev) else {
+        return Ok(GatherStep::LogDone);
+      };
+      nodes.push(row.node);
+      *rev = rev.saturating_add(1);
+      *budget = budget.saturating_sub(1);
+      gathering.bytes = gathering.bytes.saturating_add(row_bytes);
+    }
+  }
+  let count = index.len(store, at.log());
+  if *rev == 0 {
+    let cost = u64::from(count).saturating_mul(row_bytes);
+    if !gathering.logs.is_empty() && gathering.bytes.saturating_add(cost) > room_hint {
+      return Ok(GatherStep::Full);
+    }
+    gathering.bytes = gathering.bytes.saturating_add(cost);
+    nodes
+      .try_reserve_exact(usize::try_from(count).map_err(|_| Refused::TooLong)?)
+      .map_err(|_| Refused::TooLong)?;
+  }
+  while *rev < count {
+    if *budget == 0 {
+      return Ok(GatherStep::Yield);
+    }
+    nodes.push(node_of(index, store, at, *rev)?);
+    *rev = rev.saturating_add(1);
+    *budget = budget.saturating_sub(1);
+  }
+  Ok(GatherStep::LogDone)
 }
 
 /// The log's name in a refusal: a file log's path, the manifest log's one byte, the changelog's none.

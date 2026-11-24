@@ -352,15 +352,29 @@ pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
   held(state, id)
 }
 
+/// A shared immutable fork of a Mercurial repository's index as it stood at `stamp`
+/// (`(store.generation, index.stamp())`), matching [`super::upload::GitFork`]: shared across every
+/// concurrent fetch on that unchanged index state and released when its last holder drops.
+#[derive(Debug)]
+pub(crate) struct HgFork {
+  /// The repository generation and index mutation stamp when this fork was taken.
+  stamp: (u64, u64),
+  /// The forked index.
+  index: HgIndex,
+  /// Active [`Generation`] handles referencing this fork.
+  holders: u64,
+}
+
 /// A fetch's hold on the generation of a repository's index it began on (A-745, §4.17.1 "A fetch's answer" rule 4): a
-/// fork of the index (its rows as they stood, their tables shared) and the register's roots, bookmarks and markers as they
-/// stood, so every turn of the fetch's answer reads the view its first turn read, whatever lands, is re-based or is
-/// rebuilt meanwhile. Given back by its drop, on the shard that holds its store; a refused release counted.
+/// shared reference to the shard's [`HgFork`] at `(store.generation, index.stamp())` and the register's roots,
+/// bookmarks and markers as they stood, so every turn of the fetch's answer reads the view its first turn read,
+/// whatever lands, is re-based or is rebuilt meanwhile. Given back by its drop, on the shard that holds its store;
+/// the fork is released with its last holder and any refused release is counted.
 pub(crate) struct Generation {
   /// The repository.
   id: RepositoryId,
-  /// The fork of its index, until it is given back.
-  index: Option<HgIndex>,
+  /// The fork stamp held in `VcsStores::hg_forks`, or `None` once explicitly given back.
+  stamp: Option<(u64, u64)>,
   /// The register's phase roots, bookmarks and obsolescence markers as they stood.
   register: Register,
   /// The fetch counted live while its streamed answer holds this generation (A-724 piece 3d: a fetch's room is a claim
@@ -375,8 +389,8 @@ impl Generation {
   /// Gives the fork back on `state`, for a caller that holds the shard's state (the tests), which its drop cannot reach.
   #[cfg(test)]
   pub(crate) fn give_back(mut self, state: &mut ShardState) {
-    if let Some(index) = self.index.take() {
-      release_generation(state, index);
+    if let Some(stamp) = self.stamp.take() {
+      release_fork(state, self.id, stamp);
     }
   }
 }
@@ -386,10 +400,10 @@ impl Drop for Generation {
   /// bytes (A-724 piece 3d). A generation held for a batch's lookup writes nothing and teaches nothing.
   fn drop(&mut self) {
     let (id, written) = (self.id, self.written.get());
-    let index = self.index.take();
+    let stamp = self.stamp.take();
     crate::state::with_state(|state| {
-      if let Some(index) = index {
-        release_generation(state, index);
+      if let Some(stamp) = stamp {
+        release_fork(state, id, stamp);
       }
       if written > 0 {
         let now = slates_rt::futures::now_ns();
@@ -400,6 +414,29 @@ impl Drop for Generation {
     })
     .unwrap_or_default();
   }
+}
+
+/// Decrements one holder on repository `id`'s shared [`HgFork`] at `stamp`, releasing the forked
+/// index when the last holder drops.
+fn release_fork(state: &mut ShardState, id: RepositoryId, stamp: (u64, u64)) {
+  let Some(forks) = state.vcs_stores.hg_forks.get_mut(&id) else {
+    return;
+  };
+  let Some(at) = forks.iter().position(|fork| fork.stamp == stamp) else {
+    return;
+  };
+  let last = forks.get_mut(at).is_some_and(|fork| {
+    fork.holders = fork.holders.saturating_sub(1);
+    fork.holders == 0
+  });
+  if !last {
+    return;
+  }
+  let removed = forks.swap_remove(at);
+  if forks.is_empty() {
+    state.vcs_stores.hg_forks.remove(&id);
+  }
+  release_generation(state, removed.index);
 }
 
 /// Gives a generation's fork back, a refused release counted.
@@ -418,8 +455,9 @@ fn release_generation(state: &mut ShardState, index: HgIndex) {
 /// every run's fences; goal 93, the index seal's reland). Format: a counter name in the status report.
 pub(crate) const FORK_FENCES_COPIED: &str = "vcs.hg.fork_fences_copied";
 
-/// Holds repository `id`'s generation as `state` holds it now ([`Generation`]), the register's copies charged to `room`;
-/// none when it is not lent (module docs).
+/// Holds repository `id`'s generation as `state` holds it now ([`Generation`]), sharing an existing
+/// [`HgFork`] whenever the repository's `(generation, index.stamp())` is unchanged; the register's
+/// copies are charged to `room`; none when it is not lent (module docs).
 pub(crate) fn hold_in(
   state: &mut ShardState,
   id: RepositoryId,
@@ -429,15 +467,39 @@ pub(crate) fn hold_in(
     return None;
   }
   let register = register_of(state, id, room).ok()?;
-  let (index, fences) = super::within_budget(state, 0, |stores| {
-    let (content, store) = stores.mercurial(id)?;
-    let fences = store.index.rows().fences();
-    store.index.fork(content).ok().map(|fork| (fork, fences))
-  })?;
-  state.count(FORK_FENCES_COPIED, fences);
+  let stamp = {
+    let (_, store) = state.vcs_stores.mercurial_ref(id)?;
+    (store.generation, store.index.stamp())
+  };
+  let kept = state
+    .vcs_stores
+    .hg_forks
+    .get_mut(&id)
+    .and_then(|forks| forks.iter_mut().find(|fork| fork.stamp == stamp));
+  match kept {
+    Some(fork) => fork.holders = fork.holders.saturating_add(1),
+    None => {
+      let (index, fences) = super::within_budget(state, 0, |stores| {
+        let (content, store) = stores.mercurial(id)?;
+        let fences = store.index.rows().fences();
+        store.index.fork(content).ok().map(|fork| (fork, fences))
+      })?;
+      state.count(FORK_FENCES_COPIED, fences);
+      state
+        .vcs_stores
+        .hg_forks
+        .entry(id)
+        .or_default()
+        .push(HgFork {
+          stamp,
+          index,
+          holders: 1,
+        });
+    }
+  }
   Some(Generation {
     id,
-    index: Some(index),
+    stamp: Some(stamp),
     register,
     _fetching: crate::vcs_share::Live::fetch(id),
     written: core::cell::Cell::new(0),
@@ -452,11 +514,17 @@ pub(crate) fn lend_held_in<R>(
   room: &mut Admission,
   step: impl for<'s> FnOnce(&Indexed<'s>, &mut Admission) -> R,
 ) -> Option<R> {
-  let index = generation.index.as_ref()?;
+  let stamp = generation.stamp?;
   let made = super::lent_state(state, |state| {
     let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
+    let fork = state
+      .vcs_stores
+      .hg_forks
+      .get(&generation.id)?
+      .iter()
+      .find(|fork| fork.stamp == stamp)?;
     let read = generation.register.state();
-    let view = Indexed::new(index, content, read, room).ok()?;
+    let view = Indexed::new(&fork.index, content, read, room).ok()?;
     Some(step(&view, room))
   });
   if made.is_none() {

@@ -175,7 +175,12 @@ fn append(
 ) -> Result<(), Unindexed> {
   changesets(fork, store, &verified.changesets, puts, admission)?;
   let manifests = revisions(store, (&verified.manifests, None), puts, admission, false)?;
-  fork.append_revisions(store, Log::Manifest, &manifests)?;
+  let given: Vec<(Node, &[u8])> = verified
+    .manifests
+    .iter()
+    .map(|revision| (revision.node, revision.text.as_slice()))
+    .collect();
+  fork.append_revisions_after(store, Log::Manifest, &manifests, (None, &given))?;
   for (path, arrived) in &verified.files {
     let group = revisions(store, (arrived, None), puts, admission, true)?;
     fork.append_revisions(store, Log::File(path), &group)?;
@@ -261,8 +266,10 @@ fn revisions(
       };
       (p1, p2, bytes, block)
     } else {
-      let text = puts.put(store, &revision.text)?;
-      (revision.p1, revision.p2, text, None)
+      /// Format: placeholder identity replaced by `HgIndex::kept_as` with either the encoded
+      /// manifest delta or lazily stored whole manifest text.
+      const PENDING_MANIFEST: ContentId = ContentId([0u8; 32]);
+      (revision.p1, revision.p2, PENDING_MANIFEST, None)
     };
     group.push(NewRevision {
       node: revision.node,
