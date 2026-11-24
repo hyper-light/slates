@@ -30,6 +30,14 @@
 //! `goal` lines compare each p99 with Ada's two bounds. Nothing is gated: the bounds are the goal, recorded beside the
 //! measurement.
 //!
+//! Every judgment carries its context (A-897, goal 84a). Before each sweep a `floor` line times the operating system's
+//! own wake of a parked thread under the sweep's load, with nothing of slates in it. Each verdict form prints a `cpu`
+//! line, the CPU its shards and its client thread spent over the form's wall time. Each sample over the required bound
+//! prints a `slow` line that splits its edit and its submit on one clock into the client's send, the seat's pickup,
+//! the service and the client's take, so the line says whose time it was. On jupiter (2026-11-24) the client's own
+//! thread held 177 of 239 such samples, its send or its take, and the seat's pickup 29
+//! (`docs/wip/BENCHMARKS.md`, "84a on Windows bare metal: whose time a slow sample is").
+//!
 //! Command: `cargo build --release -p slates-client --example edit_merge_bench`, then
 //! `target/release/examples/edit_merge_bench [--quiet-only] [--files N].. [--form F]..` (`--form new_file` or
 //! `one_file` selects a growth form; with no `--form`, every form runs).
@@ -43,7 +51,7 @@
 )]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_client::{Client, ClientError, Deadlines, ReadAt, Rebased, Submitted, VolumeId};
@@ -86,6 +94,14 @@ const PERMILLE: u64 = 1000;
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// Format: the offset of the second, disjoint edit range in a file: its second half.
 const SECOND_RANGE: u64 = (FILE_BYTES / 2) as u64;
+/// Shape: the wakes the noise floor's probe times under each load ([`wake_floor`]): as many as a form's timed requests
+/// over its runs, an edit and a submit a sample, so the floor's share over the required bound is read at the bench's own
+/// count.
+const FLOOR_WAKES: usize = RUNS * SAMPLES * 2;
+/// Format: parts per million, the unit the floor's share over the required bound is printed in.
+const PER_MILLION: u64 = 1_000_000;
+/// Format: nanoseconds per microsecond, the unit the `cpu` line prints in.
+const NS_PER_US: u64 = 1_000;
 
 fn ns(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
@@ -155,15 +171,55 @@ impl Form {
   }
 }
 
-/// One sample's parts, in nanoseconds.
+/// One timed call, on the host clock the rings' stamps and the shards' spans are read on
+/// (`slates_machine::clock::monotonic_ns`), so a slow one splits into its parts on one clock ([`split_slow`]): when the
+/// bench sent it and had it back, when its request landed in the command ring and its reply in the completion ring (the
+/// slots' stamps, A-559), and its request's sequence, to find its spans. A call not made is all zero.
+#[derive(Clone, Copy, Default)]
+struct Call {
+  sent_ns: u64,
+  request_landed_ns: u64,
+  reply_landed_ns: u64,
+  back_ns: u64,
+  /// The request's sequence (`Client::last_request`).
+  request: u32,
+}
+
+impl Call {
+  /// Makes `call` on `client`, timed.
+  fn time<T>(client: &mut Client, call: impl FnOnce(&mut Client) -> T) -> (T, Call) {
+    let sent_ns = slates_machine::clock::monotonic_ns();
+    let answer = call(client);
+    let back_ns = slates_machine::clock::monotonic_ns();
+    let landed = |stamp| slates_ipc::slot::landed_ns(stamp, back_ns).unwrap_or(0);
+    let timed = Call {
+      sent_ns,
+      request_landed_ns: landed(client.request_stamp()),
+      reply_landed_ns: landed(client.reply_stamp()),
+      back_ns,
+      request: client.last_request().sequence,
+    };
+    (answer, timed)
+  }
+
+  /// How long the call took the bench, nanoseconds.
+  fn took_ns(&self) -> u64 {
+    self.back_ns.saturating_sub(self.sent_ns)
+  }
+}
+
+/// One sample: its edit and its submit (the rebase in the rebase form).
 #[derive(Clone, Copy)]
 struct Sample {
-  edit: u64,
-  submit: u64,
-  /// The edit's request sequence (`Client::last_request`), to find its spans.
-  edit_request: u32,
-  /// The submit's (or rebase's) request sequence.
-  submit_request: u32,
+  edit: Call,
+  submit: Call,
+}
+
+impl Sample {
+  /// The whole sample, nanoseconds: what an agent pays to change a file and learn the verdict.
+  fn total_ns(&self) -> u64 {
+    self.edit.took_ns().saturating_add(self.submit.took_ns())
+  }
 }
 
 /// A green, its model and the works that edit it.
@@ -336,45 +392,34 @@ impl Fixture {
       Form::Accept => {
         let bytes = fresh_bytes(self.next_stamp());
         let leader = self.leader;
-        let started = Instant::now();
-        self
-          .client
-          .edit(leader, &path, 0, EDIT_BYTES as u64, &bytes)
-          .unwrap();
-        let edited = Instant::now();
-        let edit_request = self.client.last_request().sequence;
-        let answer = self.client.submit(leader).unwrap();
-        let done = Instant::now();
-        let submit_request = self.client.last_request().sequence;
+        let ((), edit) = Call::time(&mut self.client, |client| {
+          client
+            .edit(leader, &path, 0, EDIT_BYTES as u64, &bytes)
+            .unwrap()
+        });
+        let (answer, submit) =
+          Call::time(&mut self.client, |client| client.submit(leader).unwrap());
         self.expect_accept(answer, "an edit based on the head");
         self.model_overwrite(&path, 0, &bytes);
         self.check(&path);
-        Sample {
-          edit: ns(edited - started),
-          submit: ns(done - edited),
-          edit_request,
-          submit_request,
-        }
+        Sample { edit, submit }
       }
       Form::AcceptOne => {
         let bytes = fresh_bytes(self.next_stamp());
         let leader = self.leader;
-        let started = Instant::now();
-        let answer = self
-          .client
-          .edit_and_submit((leader, &path), 0, EDIT_BYTES as u64, &bytes, &[])
-          .unwrap();
-        let done = Instant::now();
-        let submit_request = self.client.last_request().sequence;
+        let (answer, submit) = Call::time(&mut self.client, |client| {
+          client
+            .edit_and_submit((leader, &path), 0, EDIT_BYTES as u64, &bytes, &[])
+            .unwrap()
+        });
         self.expect_accept(answer, "an edit and submit based on the head");
         self.model_overwrite(&path, 0, &bytes);
         self.check(&path);
-        // One request: sequence 0 for the edit, which no request carries, so its spans are the submit's alone.
+        // One request: no edit call, so the edit is all zero (sequence 0, which no request carries, so its spans are
+        // the submit's alone).
         Sample {
-          edit: 0,
-          submit: ns(done - started),
-          edit_request: 0,
-          submit_request,
+          edit: Call::default(),
+          submit,
         }
       }
       Form::Ranged => {
@@ -382,65 +427,46 @@ impl Fixture {
         self.lead(&path, &lead);
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
-        let started = Instant::now();
-        self
-          .client
-          .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
-          .unwrap();
-        let edited = Instant::now();
-        let edit_request = self.client.last_request().sequence;
-        let answer = self.client.submit(follower).unwrap();
-        let done = Instant::now();
-        let submit_request = self.client.last_request().sequence;
+        let ((), edit) = Call::time(&mut self.client, |client| {
+          client
+            .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
+            .unwrap()
+        });
+        let (answer, submit) =
+          Call::time(&mut self.client, |client| client.submit(follower).unwrap());
         self.expect_accept(answer, "a disjoint edit behind the head");
         self.model_overwrite(&path, SECOND_RANGE, &bytes);
         self.check(&path);
-        Sample {
-          edit: ns(edited - started),
-          submit: ns(done - edited),
-          edit_request,
-          submit_request,
-        }
+        Sample { edit, submit }
       }
       Form::Identical => {
         let lead = fresh_bytes(self.next_stamp());
         self.lead(&path, &lead);
         let follower = self.follower;
-        let started = Instant::now();
-        self
-          .client
-          .edit(follower, &path, 0, EDIT_BYTES as u64, &lead)
-          .unwrap();
-        let edited = Instant::now();
-        let edit_request = self.client.last_request().sequence;
-        let answer = self.client.submit(follower).unwrap();
-        let done = Instant::now();
-        let submit_request = self.client.last_request().sequence;
+        let ((), edit) = Call::time(&mut self.client, |client| {
+          client
+            .edit(follower, &path, 0, EDIT_BYTES as u64, &lead)
+            .unwrap()
+        });
+        let (answer, submit) =
+          Call::time(&mut self.client, |client| client.submit(follower).unwrap());
         // An identical edit accepts at a new version with no effect: the model's bytes stay.
         self.expect_accept(answer, "an identical edit behind the head");
         self.check(&path);
-        Sample {
-          edit: ns(edited - started),
-          submit: ns(done - edited),
-          edit_request,
-          submit_request,
-        }
+        Sample { edit, submit }
       }
       Form::Conflict => {
         let lead = fresh_bytes(self.next_stamp());
         self.lead(&path, &lead);
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
-        let started = Instant::now();
-        self
-          .client
-          .edit(follower, &path, 0, EDIT_BYTES as u64, &bytes)
-          .unwrap();
-        let edited = Instant::now();
-        let edit_request = self.client.last_request().sequence;
-        let answer = self.client.submit(follower).unwrap();
-        let done = Instant::now();
-        let submit_request = self.client.last_request().sequence;
+        let ((), edit) = Call::time(&mut self.client, |client| {
+          client
+            .edit(follower, &path, 0, EDIT_BYTES as u64, &bytes)
+            .unwrap()
+        });
+        let (answer, submit) =
+          Call::time(&mut self.client, |client| client.submit(follower).unwrap());
         match answer {
           Submitted::Conflict(windows)
             if windows
@@ -452,12 +478,7 @@ impl Fixture {
         }
         self.check(&path);
         self.replace_follower();
-        Sample {
-          edit: ns(edited - started),
-          submit: ns(done - edited),
-          edit_request,
-          submit_request,
-        }
+        Sample { edit, submit }
       }
       Form::Rebase => {
         // The lagging work's disjoint edit is rebased onto the head (timed in the submit's place), then
@@ -467,16 +488,13 @@ impl Fixture {
         self.lead(&path, &lead);
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
-        let started = Instant::now();
-        self
-          .client
-          .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
-          .unwrap();
-        let edited = Instant::now();
-        let edit_request = self.client.last_request().sequence;
-        let answer = self.client.rebase(follower).unwrap();
-        let done = Instant::now();
-        let submit_request = self.client.last_request().sequence;
+        let ((), edit) = Call::time(&mut self.client, |client| {
+          client
+            .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
+            .unwrap()
+        });
+        let (answer, submit) =
+          Call::time(&mut self.client, |client| client.rebase(follower).unwrap());
         if answer != Rebased::Rebased(self.head) {
           wrong(&format!(
             "a disjoint edit behind the head rebased as {answer:?}, not onto {}",
@@ -496,12 +514,7 @@ impl Fixture {
         self.expect_accept(answer, "a rebased edit");
         self.model_overwrite(&path, SECOND_RANGE, &bytes);
         self.check(&path);
-        Sample {
-          edit: ns(edited - started),
-          submit: ns(done - edited),
-          edit_request,
-          submit_request,
-        }
+        Sample { edit, submit }
       }
     }
   }
@@ -523,6 +536,103 @@ fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
   out
 }
 
+/// The operating system's own wake of a blocked thread under `load`, with nothing of slates in it: the noise floor of
+/// every sample that waits on a park (the pattern of `destroy_rows` in `crates/vfs/examples/vfs_bench.rs`, which
+/// measures its scheduling jitter before it judges). Two threads of this process ping-pong [`FLOOR_WAKES`] times through
+/// `std::thread::park`; before each wake the waker idles R9's floor, the least idle window a shard parks after, so the
+/// waiter has parked as a shard does, and the waiter times its wake from the waker's stamp. Main's AutoResetEvent
+/// ping-pong on jupiter (2026-11-24) is the out-of-process form: 36 of 200,000 such wakes over 1 ms after 50 µs idle,
+/// 224 after 500 µs.
+fn wake_floor(load: &str) {
+  let epoch = Instant::now();
+  let gap = Duration::from_nanos(slates_server::config::PROVISION_FLOOR_NS);
+  let sent = AtomicU64::new(0);
+  let turn = AtomicU64::new(0);
+  let taken = AtomicU64::new(0);
+  let waker = std::thread::current();
+  let wakes = u64::try_from(FLOOR_WAKES).unwrap_or(u64::MAX);
+  let latencies = std::thread::scope(|scope| {
+    let waiter = scope.spawn(|| {
+      let mut latencies = Vec::with_capacity(FLOOR_WAKES);
+      for wake in 1..=wakes {
+        while turn.load(Ordering::Acquire) < wake {
+          std::thread::park();
+        }
+        latencies.push(ns(epoch.elapsed()).saturating_sub(sent.load(Ordering::Acquire)));
+        taken.store(wake, Ordering::Release);
+        waker.unpark();
+      }
+      latencies
+    });
+    for wake in 1..=wakes {
+      let idle_until = Instant::now() + gap;
+      while Instant::now() < idle_until {
+        std::hint::spin_loop();
+      }
+      sent.store(ns(epoch.elapsed()), Ordering::Release);
+      turn.store(wake, Ordering::Release);
+      waiter.thread().unpark();
+      while taken.load(Ordering::Acquire) < wake {
+        std::thread::park();
+      }
+    }
+    waiter.join().unwrap()
+  });
+  let over = latencies
+    .iter()
+    .filter(|latency| **latency > GOAL_REQUIRED_NS)
+    .count();
+  let over = u64::try_from(over).unwrap_or(u64::MAX);
+  let shown: Vec<String> = percentiles(latencies)
+    .into_iter()
+    .map(|(name, value)| format!("{name} {value} ns"))
+    .collect();
+  println!(
+    "floor\t{load}: {FLOOR_WAKES} wakes of a thread parked {} ns, the OS's own: {}; {over} over the required 1 ms ({} per million)",
+    gap.as_nanos(),
+    shown.join(", "),
+    over.saturating_mul(PER_MILLION) / wakes.max(1)
+  );
+}
+
+/// What this process's slates threads have run so far and when: the daemon's shards, each read from its own thread
+/// clock (`Daemon::shard_cpu_ns`), and the client, the bench's main thread (`slates_rt::registry::calling_thread_cpu`).
+/// The loaded form's spinners are in neither, so the difference over a form is what slates spent on it.
+#[derive(Clone, Copy)]
+struct Spent {
+  shards_ns: u64,
+  client_ns: u64,
+  at: Instant,
+}
+
+impl Spent {
+  fn now(daemon: &Daemon) -> Spent {
+    Spent {
+      shards_ns: daemon.shard_cpu_ns().iter().map(|(_, spent)| *spent).sum(),
+      client_ns: slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+      at: Instant::now(),
+    }
+  }
+
+  /// The CPU spent since `self` and the wall time it took, as the `cpu` line prints them for `samples` timed samples.
+  fn print_since(self, key: &str, daemon: &Daemon, samples: u64) {
+    let now = Spent::now(daemon);
+    let shards = now.shards_ns.saturating_sub(self.shards_ns);
+    let client = now.client_ns.saturating_sub(self.client_ns);
+    let wall = ns(now.at - self.at).max(1);
+    let samples = samples.max(1);
+    println!(
+      "cpu\tmerge.{key}: shards {} us, client {} us of CPU over {} us of wall ({} cores per thousand); per sample shards {} ns, client {} ns",
+      shards / NS_PER_US,
+      client / NS_PER_US,
+      wall / NS_PER_US,
+      shards.saturating_add(client).saturating_mul(PERMILLE) / wall,
+      shards / samples,
+      client / samples
+    );
+  }
+}
+
 /// One form on one green shape: per part, per percentile, the per-run values.
 /// One request's server-side time, from its spans (§4.14): the ring span on the shard that read its slot (read to
 /// reply written), the shard ops of its verb on the shards that ran it, and the merge verdict inside a submit.
@@ -531,6 +641,8 @@ struct Served {
   ring: u64,
   op: u64,
   verdict: u64,
+  /// When its shard read the request, the earliest `ring.request` span's start on the host clock; zero for none.
+  ring_from_ns: u64,
 }
 
 /// Every span of this client's requests the shards hold, drained (each drain is bounded, so a shard is drained until
@@ -556,7 +668,13 @@ fn drain(client: &mut Client, shards: u16, into: &mut BTreeMap<u32, Served>) -> 
         let took = span.end_ns.saturating_sub(span.start_ns);
         let served = into.entry(span.request_sequence).or_default();
         match name(span.point).as_str() {
-          "ring.request" => served.ring = served.ring.saturating_add(took),
+          "ring.request" => {
+            served.ring = served.ring.saturating_add(took);
+            served.ring_from_ns = match served.ring_from_ns {
+              0 => span.start_ns,
+              earlier => earlier.min(span.start_ns),
+            };
+          }
           "shard.op" => served.op = served.op.saturating_add(took),
           "merge.verdict" => served.verdict = served.verdict.saturating_add(took),
           _ => {}
@@ -576,12 +694,23 @@ fn median(mut values: Vec<u64>) -> u64 {
   values.get(values.len() / 2).copied().unwrap_or(0)
 }
 
+/// A timed sample, where it ran, and what its requests' spans say (§4.14).
+struct Attributed {
+  /// The run it was taken in and its place in that run.
+  run: usize,
+  place: usize,
+  sample: Sample,
+  edit: Served,
+  submit: Served,
+}
+
 /// Where a form's time went (§4.14 spans): for its median samples and for its samples at or above p99 of the total,
 /// the median of the client's total, of the ring spans (the server's time from reading the slot to writing the
 /// reply), of the shard ops and of the verdicts. The total less the ring is the client's own time and the wake: the
-/// doorbell, the shard's wake from its park and the client's wake.
-fn attribute(key: &str, samples: &[(Sample, Served, Served)], shed: u64) {
-  let total = |s: &(Sample, Served, Served)| s.0.edit.saturating_add(s.0.submit);
+/// doorbell, the shard's wake from its park and the client's wake. Then each sample over the required bound, split
+/// ([`split_slow`]).
+fn attribute(key: &str, samples: &[Attributed], shed: u64) {
+  let total = |s: &Attributed| s.sample.total_ns();
   let mut totals: Vec<u64> = samples.iter().map(total).collect();
   totals.sort_unstable();
   let at = |permille: usize| {
@@ -593,7 +722,7 @@ fn attribute(key: &str, samples: &[(Sample, Served, Served)], shed: u64) {
   let (p49, p51, p99) = (at(490), at(510), at(990));
   let unmatched = samples
     .iter()
-    .filter(|s| s.1.ring == 0 || s.2.ring == 0)
+    .filter(|s| s.edit.ring == 0 || s.submit.ring == 0)
     .count();
   for (band, keep) in [
     (
@@ -602,18 +731,79 @@ fn attribute(key: &str, samples: &[(Sample, Served, Served)], shed: u64) {
     ),
     ("p99_tail", Box::new(|t: u64| t >= p99)),
   ] {
-    let chosen: Vec<&(Sample, Served, Served)> =
-      samples.iter().filter(|s| keep(total(s))).collect();
-    let pick =
-      |f: &dyn Fn(&(Sample, Served, Served)) -> u64| median(chosen.iter().map(|s| f(s)).collect());
+    let chosen: Vec<&Attributed> = samples.iter().filter(|s| keep(total(s))).collect();
+    let pick = |f: &dyn Fn(&Attributed) -> u64| median(chosen.iter().map(|s| f(s)).collect());
     let client = pick(&|s| total(s));
-    let ring = pick(&|s| s.1.ring.saturating_add(s.2.ring));
-    let op = pick(&|s| s.1.op.saturating_add(s.2.op));
-    let verdict = pick(&|s| s.2.verdict);
-    let outside = pick(&|s| total(s).saturating_sub(s.1.ring.saturating_add(s.2.ring)));
+    let ring = pick(&|s| s.edit.ring.saturating_add(s.submit.ring));
+    let op = pick(&|s| s.edit.op.saturating_add(s.submit.op));
+    let verdict = pick(&|s| s.submit.verdict);
+    let outside = pick(&|s| total(s).saturating_sub(s.edit.ring.saturating_add(s.submit.ring)));
     println!(
       "attrib\tmerge.{key}_{band}: {} samples; client {client} ns, ring {ring} ns, shard ops {op} ns, verdict {verdict} ns, outside the ring {outside} ns (median of each); spans shed {shed}, samples unmatched {unmatched}",
       chosen.len()
+    );
+  }
+  split_slow(key, samples);
+}
+
+/// One call's time split into its parts on the host clock, nanoseconds (A-897): the client's send (the call made to its
+/// request landing in the command ring), the seat's pickup (the request landing to its shard reading it, the
+/// `ring.request` span's start), the service (that span: read to reply written, the shard ops and the verdict inside
+/// it), and the client's take (the reply landing to the call returning: its wake, or what held it after). The four add
+/// up to the call. `None` for a call whose spans were shed or never made.
+fn split(call: &Call, served: &Served) -> Option<[u64; 4]> {
+  (served.ring_from_ns > 0 && call.request_landed_ns > 0 && call.reply_landed_ns > 0).then(|| {
+    [
+      call.request_landed_ns.saturating_sub(call.sent_ns),
+      served.ring_from_ns.saturating_sub(call.request_landed_ns),
+      served.ring,
+      call.back_ns.saturating_sub(call.reply_landed_ns),
+    ]
+  })
+}
+
+/// A call's split as the `slow` line prints it.
+fn shown(call: &Call, served: &Served) -> String {
+  match split(call, served) {
+    Some([send, pickup, service, take]) => format!(
+      "{} ns = send {send} + pickup {pickup} + service {service} (ops {}, verdict {}) + take {take}",
+      call.took_ns(),
+      served.op,
+      served.verdict
+    ),
+    None => format!("{} ns (its spans shed)", call.took_ns()),
+  }
+}
+
+/// Each sample of a form over the required bound, the slowest first, its edit and its submit split into whose time
+/// they were ([`split`]), so 84a's judgment names it (on jupiter on 2026-11-24 the client's own thread held 177 of 239
+/// of them, its send or its take, and the seat's pickup 29; A-897). At most a form's share of samples past its p99 is
+/// printed: past that the p99 is over the bound itself, and the percentiles say so.
+fn split_slow(key: &str, samples: &[Attributed]) {
+  let p99 = PERCENTILES
+    .iter()
+    .find(|(name, _)| *name == "p99")
+    .map_or(PERMILLE, |(_, permille)| *permille);
+  let most = u64::try_from(samples.len())
+    .unwrap_or(u64::MAX)
+    .saturating_mul(PERMILLE.saturating_sub(p99))
+    / PERMILLE;
+  let mut slow: Vec<&Attributed> = samples
+    .iter()
+    .filter(|s| s.sample.total_ns() > GOAL_REQUIRED_NS)
+    .collect();
+  slow.sort_unstable_by_key(|s| std::cmp::Reverse(s.sample.total_ns()));
+  for s in slow
+    .iter()
+    .take(usize::try_from(most).unwrap_or(usize::MAX))
+  {
+    println!(
+      "slow\tmerge.{key}: run {} sample {}: {} ns: edit {}; submit {}",
+      s.run,
+      s.place,
+      s.sample.total_ns(),
+      shown(&s.sample.edit, &s.edit),
+      shown(&s.sample.submit, &s.submit)
     );
   }
 }
@@ -625,7 +815,7 @@ fn measure(
   shards: u16,
 ) -> Result<BTreeMap<String, Vec<u64>>, String> {
   let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-  let mut attributed: Vec<(Sample, Served, Served)> = Vec::new();
+  let mut attributed: Vec<Attributed> = Vec::new();
   let mut shed = 0u64;
   for run in 0..RUNS {
     let tag = format!("{}-{files}-{load}-{run}", form.key());
@@ -646,9 +836,9 @@ fn measure(
         std::thread::park_timeout(*pause);
       }
       let sample = fixture.sample(form, n % files);
-      edits.push(sample.edit);
-      submits.push(sample.submit);
-      totals.push(sample.edit.saturating_add(sample.submit));
+      edits.push(sample.edit.took_ns());
+      submits.push(sample.submit.took_ns());
+      totals.push(sample.total_ns());
       run_samples.push(sample);
       // Drained after every sample (untimed): a shard's span ring holds as many spans as a client region has slots
       // (`crates/server/src/daemon.rs`, `telemetry_capacity`), fewer than a few samples emit; the shed count printed
@@ -656,16 +846,22 @@ fn measure(
       shed = shed.saturating_add(drain(&mut fixture.client, shards, &mut served));
     }
     shed = shed.saturating_add(drain(&mut fixture.client, shards, &mut served));
-    for sample in run_samples {
+    for (place, sample) in run_samples.into_iter().enumerate() {
       let edit = served
-        .get(&sample.edit_request)
+        .get(&sample.edit.request)
         .copied()
         .unwrap_or_default();
       let submit = served
-        .get(&sample.submit_request)
+        .get(&sample.submit.request)
         .copied()
         .unwrap_or_default();
-      attributed.push((sample, edit, submit));
+      attributed.push(Attributed {
+        run,
+        place,
+        sample,
+        edit,
+        submit,
+      });
     }
     rows
       .entry("samples".to_owned())
@@ -932,11 +1128,13 @@ impl Selection {
   }
 }
 
-/// Runs every selected form over every selected shape, under `load`.
-fn sweep(instance: &str, load: &str, selection: &Selection) {
+/// Runs every selected form over every selected shape, under `load`, each form's CPU read from `daemon`'s shards and the
+/// client's thread ([`Spent`]).
+fn sweep(daemon: &Daemon, instance: &str, load: &str, selection: &Selection) {
   for files in &selection.shapes {
     for form in selection.forms.iter().copied() {
       let key = format!("{}_f{files}_{load}", form.key());
+      let spent = Spent::now(daemon);
       let rows = match measure(instance, (form, *files, load), selection.shards) {
         Ok(rows) => rows,
         Err(refused) => {
@@ -944,6 +1142,7 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
           continue;
         }
       };
+      spent.print_since(&key, daemon, rows["samples"].iter().sum());
       print_rows(&key, &rows);
       let p99 = median_of(&rows, "total_p99");
       let p999 = median_of(&rows, "total_p999");
@@ -954,10 +1153,12 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
         LOADED_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
       }
       println!(
-        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {p999} ns, max {} ns: {verdict}",
+        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {p999} ns, max {} ns: {verdict}; every run's p99 {:?} ns and p999 {:?} ns",
         rows["samples"],
         median_of(&rows, "total_p50"),
         median_of(&rows, "total_max"),
+        rows["total_p99"],
+        rows["total_p999"],
       );
     }
   }
@@ -993,7 +1194,10 @@ fn main() {
   let mut selection = Selection::parse();
   selection.shards = shards;
   if selection.quiet {
-    sweep(&instance, "quiet", &selection);
+    if !selection.forms.is_empty() {
+      wake_floor("quiet");
+    }
+    sweep(&daemon, &instance, "quiet", &selection);
     growth_sweep(&instance, &selection);
   }
   if selection.loaded {
@@ -1010,21 +1214,27 @@ fn main() {
           }
         });
       }
-      sweep(&instance, "loaded", &selection);
+      if !selection.forms.is_empty() {
+        wake_floor("loaded");
+      }
+      sweep(&daemon, &instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);
     });
   }
   // Each shard's pulse as the runtime holds it (§4.14): its longest step tells a request held behind a long task from
-  // one whose shard was woken late; its overrun says how late its timed waits ran.
+  // one whose shard was woken late; its overrun says how late its timed waits ran; its idle window and the idle turn a
+  // request meets say how long it spun before it parked and whether a hold paid (A-387).
   for pulse in daemon.shard_pulses() {
     println!(
-      "pulse\tshard {}: steps {}, waits {}, longest step {} ns, scheduler overrun {} ns, wake cost {} ns, kicks skipped {}",
+      "pulse\tshard {}: steps {}, waits {}, longest step {} ns, scheduler overrun {} ns, wake cost {} ns, idle window {} ns, held turn {} ns, kicks skipped {}",
       pulse.shard,
       pulse.steps,
       pulse.waits,
       pulse.longest_step_ns,
       pulse.scheduler_overrun_ns,
       pulse.wake_cost_ns,
+      pulse.idle_window_ns,
+      pulse.held_turn_ns,
       pulse.kicks_skipped
     );
   }
@@ -1080,5 +1290,31 @@ mod tests {
       against_goal((40_000, 300_000)),
       "within the preferred 50 us at p99, the required 1 ms at p999"
     );
+  }
+
+  /// A-897 (84a: a slow sample names whose time it was). Do: split a call sent at 1,000 ns whose request landed 3 µs
+  /// later, was read by its shard 1 µs after that, was served 40 µs (its reply landing as the span ended), and came back
+  /// 7 µs after its reply landed; then the same call with its spans shed, and one not made. Expect: send 3 µs, pickup
+  /// 1 µs, service 40 µs and take 7 µs, which add up to the call's 51 µs; nothing split for the other two.
+  #[test]
+  fn a_slow_calls_split_names_each_part_and_adds_up_to_the_call() {
+    let call = Call {
+      sent_ns: 1_000,
+      request_landed_ns: 4_000,
+      reply_landed_ns: 45_000,
+      back_ns: 52_000,
+      request: 7,
+    };
+    let served = Served {
+      ring: 40_000,
+      op: 30_000,
+      verdict: 0,
+      ring_from_ns: 5_000,
+    };
+    let parts = split(&call, &served).expect("a call whose spans came back splits");
+    assert_eq!(parts, [3_000, 1_000, 40_000, 7_000]);
+    assert_eq!(parts.iter().sum::<u64>(), call.took_ns());
+    assert_eq!(split(&call, &Served::default()), None, "spans shed");
+    assert_eq!(split(&Call::default(), &served), None, "no call made");
   }
 }

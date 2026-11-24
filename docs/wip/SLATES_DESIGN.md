@@ -5624,6 +5624,17 @@ idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is 
 > destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
 > `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
 
+> **Status (2026-11-24, A-901: an observation holds no shard).** A request that is no work of its client's keeps a
+> closed loop's clock as A-326's acknowledgement does: within F of the shard's last client I/O it continues the loop,
+> after a longer pause it ends it. It never lengthens a run or holds a shard. Two kinds: a client's acknowledgement
+> (§4.9), and the daemon's observations of itself, §4.14's telemetry drain and status pages (`verbs::holds_nothing`).
+> Holds are bought for the verbs R9 and 84a hold to a bar, and no bar governs an observation's latency. Judged as the
+> loop's, `edit_merge_bench`'s telemetry drain after every sample held every shard it reached, about 7 of the bench's
+> ~10 shard cores on jupiter, for no measured latency (A-897: with every hold off, 2.7–3.3 cores and the same failed
+> runs). Test: `crates/server/tests/closed_loop.rs`
+> (`an_observation_holds_no_shard_while_a_closed_loop_still_does`: 200 rounds draining three shards asked 390 holds
+> before and none after, and a closed loop run after them still asks its owners for holds).
+
 > **Status (2026-11-18, A-361: Windows' own window, and every idle spin under the watchdog's).** Windows wakes a thread
 > blocked on an event, a semaphore or an address a priority level up, and a thread dequeued from an I/O completion port
 > at its own level, which is how a parked shard waited. Beside two spinners a logical CPU at the shard's level, on CI's
@@ -56056,6 +56067,39 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
     `git_push::tests::t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region` (red first: the
     names' hold stayed for the home's life), `t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object`,
     and slates-cluster `homes::tests::a_home_message_of_another_version_or_without_an_owner_is_refused_typed`.
+  - **(d1a-3) A crash-left attempt's holds are resolved from the homes' side** (main 01a20182's rulings of 2026-11-23,
+    (u), and of 2026-11-24 01:36). A home's holds for an attempt whose process ended (`homes::process_ended`: this
+    member's earlier process, a member dead, or one announcing another process nonce) are asked of the repository's
+    holder (`homes::resolve_one`: this node first, then its routing, then the committed configuration's lineage, then a
+    location round), which walks the repository's records a slice a turn (`homes::resolve_step`): named, the hold moves
+    to the records; not named, it is let go; unanswered, it stays, counted `vcs_store.homes.resolve_kept`. A pass is owed
+    by an event, never a timer: a member's death, a member's new process, this node's start, the healer's pass at a new
+    configuration, **and a repository's rebuild on its successor** (`homes::rebuilt`, at `takeover`'s rebuild, A-636
+    part 2c-2): the answer a resolution asks for exists only once the repository stands there, so a pass the death or the
+    configuration owed, run before the rebuild, keeps every hold, and before this nothing asked again (flaky by
+    construction: three of four runs of the unreachable test red, the green one where a pass fell after the rebuild).
+    The rebuilder owes itself a pass and owes each other member of the configuration word of the rebuild
+    (`HomeMessage::Rebuilt`, home wire version 0x83), told from its period until the member answers that it owes itself a
+    pass (`HomeOutcome::Owed`; owing twice is harmless), an unanswered one asked again next period and counted
+    (`vcs_store.homes.rebuilt_unanswered`), one whose member left the configuration dropped: bounded by the members a
+    rebuild, one word each per takeover, at membership-change time (D-14). A member of version 0x82 is refused at once,
+    typed, by (d1a)'s version rule. **An ended attempt is never spread, only resolved, so the resolution's answer is
+    the only way a hold changes owner** (main 01a20182's ruling of 2026-11-24 04:40): the healer offers an object for
+    every owner its hold has except an ended attempt (`homes::heal_one`, judged by `process_ended` on the control
+    shard; counted `vcs_store.homes.heal_ended_withheld`), and one whose every owner is an ended attempt waits where it
+    is until its resolution moves it to the records or lets it go. Before, a home not yet resolved offered the attempt
+    to one that had moved it to the records, which joined it back after its last owed pass, and the hold stayed an
+    attempt's (the group runs' flake, 1 in 4: the logs showed each hold moved to the records, then the attempt back
+    beside them). Tests: `git_push::tests::t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records`
+    (N = 1), and the fleet's `t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_next_pass`
+    (every survivor's rebuild held until a pass ran and kept every hold, then let go with nothing more owed: resolved by
+    the rebuild's event alone; red without it), `..._an_owner_killed_after_its_entry_before_its_homes_heard_...`,
+    `..._an_owner_killed_after_homing_before_its_entry_...` (the other nodes refuse the owner's register records once its
+    repository is made, so its push is refused after homing), `..._a_healer_never_spreads_an_ended_attempt_to_a_home_that_resolved_it`
+    (one survivor resolved and its resolutions then held, the other walks its holds still the attempt's: the first's stay
+    its records' alone; red without the filter) and `..._a_push_homing_to_a_node_of_another_home_wire_version_...`
+    (judged by the homing's own time with its other homes against its deadline,
+    `vcs_store.homes.longest_homing_region_ns`, never a push's wall time).
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
 - **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
@@ -57938,7 +57982,11 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
   a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
   captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
-  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after. Since 2026-11-24 the test snapshots
+  the clone before sharing it and asserts the carry it waits for. A clone's head is its origin's until its first
+  snapshot, so nothing was carried. The wait was unasserted, so it ran out its whole budget and the test passed late:
+  407 s on a Mac (4.29 s now). Windows CI's 240 s per-test deadline killed it first, a red on every Windows run of main. The red
+  with the assertion alone failed on the Mac at the carry.
 
 ### A-754 — The Linux issuer surface: the anchor prints an issuer route and its secret, and a separate process that presents the secret is handed the segment (2026-11-20, w-reaper, main's ruling; §4.13 "Grants", A-299; closes the Linux issuer surface owed since 2026-09-13)
 
@@ -58087,7 +58135,10 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   base and from any), its object whole, and read by no other change nor by a payload of the document (an attribute's,
   a node's, a link's value). The replay reads those (`read_step_among`), the apply waits on those alone
   (`unread_among`), and a recovery's pre-pass brings back no other (`svn_texts::named_lacking`). The post-state places
-  each run by its declared length (`named::Post`), so a run never read moves no later run's address. Red:
+  each run by its declared length (`named::Post`), so a run never read moves no later run's address. The choice is n log
+  n in the entry's operations (a whole operation's run found by halving the runs' ascending spans, each run's other
+  readers marked in one pass): first written cubic, it ran past a shard's liveness window on a push of a history's
+  tree (docs/bugs/2026-11-24-a-replays-choice-of-named-runs-was-cubic-in-a-pushs-files.md). Red:
   `repository::hg_push::tests::a_restart_replays_a_push_naming_its_files_without_reading_their_texts` (the green fenced
   `ContentMissing { version: 1 }`, the push's runs read from a content store that had let them go).
 
@@ -62650,7 +62701,9 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   needs an index and the branches made from them (`verbs::rebuilt_after_stores`, counted
   `merge.recovery.greens_after_stores`), in the same recovery. Their works wait as a work over a green awaiting
   adoption does (`work_home.unbuilt`), replayed through the green once it is in, before any client is admitted. The
-  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). Rejected: recovering
+  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). A takeover's
+  re-adoption runs the same plan on its live shard before it replays (`hg_named::bring_back_named_live` beside
+  `svn_texts::bring_back_named_live` in `green_adopt::readopt_with`; one planner, `hg_named::to_bring`). Rejected: recovering
   one repository's store before its greens (a store's replay reads greens: an import's bookmarks, a cycle), and a
   second resolver over the node's store without the index.
 - **Counters.** `repository.push.files_named` (named rather than made); `vcs.hg.pushed_texts_brought_back` (a named
@@ -63029,3 +63082,53 @@ Applied in the same change to: GAPS (GAP-A9-14's row), `crates/server/src/{virti
   tests and the server's lend-heavy filters pass (counts in the commit). Owed: main's push profile again.
 
 Applied in the same change to: `crates/merge/src/engine/branch.rs` and its tests.
+
+### A-897 — 84a's every-run bar on Windows bare metal is held back by stalls of the path's own threads, which no scheduling change on slates' side removes; the bench names whose time each slow sample is (2026-11-24, w-84a-win for main 01a20182, its rulings of 2026-11-24 04:55 and 05:35; goal 84a; A-871, A-799, A-326, A-559)
+
+- **Why.** A-871 held jupiter's p99 and p999 under 1 ms as each invocation's median of three runs, but single runs
+  still crossed it. The bar is every run (a run of 1,000 samples may hold one sample over 1 ms). Two directions were to
+  be built: (a) a shard's idle window priced on its measured wake tail, rent or buy, and (b) a client spinning for its
+  reply within a window derived from the service time.
+- **Measured instead of built** (BENCHMARKS "84a on Windows bare metal: whose time a slow sample is"; 143 invocations
+  at Normal outside kiln's job, six rounds, every arm against main in the same round). Main failed 1 of 96 loaded runs
+  and 15 of 114 quiet runs, a quiet rate of 3-7e-4 samples over 1 ms a sample. Split on one clock with the slots'
+  stamps (A-559), 177 of 239 slow samples were the client's own thread (its send path stalled 1-29 ms, or its take), and
+  29 were the seat's pickup. No arm moved the rate:
+  - (a) as a 2 ms window tied main, at 4-5 more shard cores.
+  - (b) helped quiet and hurt loaded (with (a): 5 of 24 loaded runs failed against 0). A client spinning for its
+    replies uses up its quantum, and is then round-robined behind the load in its own normal-level code.
+  - Neither did the client's shard holding for its loop, A-326's holds off, the client's thread at ABOVE_NORMAL,
+    HIGHEST or TIME_CRITICAL, or fixed to one of four CPUs.
+  The client stalls 3-12 ms even at TIME_CRITICAL, DPC and interrupt time ran 1.6-2.7% on every CPU, and the hypervisor
+  is present: hypervisor- or DPC-class preemption, inferred, not measured. The operating system's own floor
+  (`pingpong.ps1`: a blocked thread woken 1-12 ms late at 2e-4 to 1e-3 a wake) sits around slates' rate.
+- **The change.** No scheduling change: §4.3's idle window and §4.7's reply wait stand as A-223, A-326 and A-799 left
+  them. `crates/client/examples/edit_merge_bench.rs` carries each judgment's context. A `floor` line before each sweep
+  times the operating system's own wake of a parked thread under the sweep's load. A `cpu` line per form gives the
+  CPU of the shards and of the client thread. The `goal` line lists every run's p99 and p999 beside w-perf's verdict.
+  A `slow` line per sample over the bound splits its edit and its submit into the client's send, the seat's pickup,
+  the service and the client's take, which add up to the call.
+- **Found on the way.** The bench's per-sample telemetry drain touches every shard, and A-326's holds keep each one
+  spinning: about 7 of its ~10 shard cores, for no measured latency (holds off: 2.7-3.3 cores, failed runs unchanged).
+  That observations hold no shard is its own amendment (main's ruling).
+
+Applied in the same change to: `crates/client/examples/edit_merge_bench.rs` (and its unit test of the split),
+`crates/client/Cargo.toml` (`slates-rt` for the client thread's clock), BENCHMARKS, GAPS (84a).
+
+### A-901 — An observation keeps a closed loop's clock and holds no shard (2026-11-24, w-84a-win for main 01a20182, its ruling of 2026-11-24 05:35; A-897's measured waste; amends A-326's acknowledgement rule)
+
+- **Why.** A-326 judges every request a client's ring brings, except its acknowledgement, as its closed loop's, and a
+  forward made for one carries a hold for its owner. `edit_merge_bench` drains every shard's telemetry after every
+  sample, so its drain was a loop over every shard, and A-326 held all of them: about 7 of the bench's ~10 shard cores
+  on jupiter. With every hold off the same rounds measured 2.7-3.3 shard cores and the same failed runs (A-897). The
+  CPU bought no latency, and no bar governs an observation's.
+- **The change.** `verbs::holds_nothing` names the requests that are no work of their client's: an acknowledgement,
+  `Telemetry`, `DaemonStatus` and `DaemonStatusNext`. Each keeps a loop's clock as an acknowledgement did, and none
+  lengthens a run or sets a forward's hold.
+- **Test** (macOS arm64, debug, 2026-11-24). Red first: `an_observation_holds_no_shard_while_a_closed_loop_still_does`
+  (`crates/server/tests/closed_loop.rs`). 200 rounds draining a three-shard daemon's telemetry asked 390 holds (1 kept,
+  389 declined) before the change and none after. A closed loop of creates and destroys run after the drain still asked
+  its owners for holds, so the count can see one. A-326's own test passes unchanged.
+
+Applied in the same change to: §4.7 (a status), `crates/server/src/verbs.rs`, `crates/server/tests/closed_loop.rs`,
+GAPS (84a's owed line).

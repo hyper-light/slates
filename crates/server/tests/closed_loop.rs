@@ -47,6 +47,10 @@ const VOLUME_BYTES: u64 = 1 << 20;
 /// Shape: names tried for the ones each shard owns: about a third of names land on each of three partitions, so this
 /// finds every name the test needs with room to spare.
 const NAME_TRIES: usize = 8 * (LOOP_CYCLES + PACED_CYCLES);
+/// Shape: the drain test's rounds, each draining every shard's telemetry once, back to back, as `edit_merge_bench` does
+/// after every sample: as many as the loop's measured cycles, so a drain judged as a loop would have run far past its
+/// first, unheld, requests into holds on every shard it reaches.
+const DRAIN_ROUNDS: usize = LOOP_CYCLES;
 
 /// The shard (by position) that serves the client `client_id`.
 fn serving(daemon: &Daemon, client_id: u32) -> usize {
@@ -387,6 +391,80 @@ fn a_closed_loops_owners_hold_only_while_their_idle_turns_poll_faster_than_they_
     judge_loop(in_loop, &scenario.looped, scenario.hold);
   }
   judge_paced(&scenario);
+}
+
+/// Holds asked of every shard between two readings, kept and declined alike (A-326, A-387).
+fn holds_asked(from: &[Reading], to: &[Reading]) -> u64 {
+  from
+    .iter()
+    .zip(to)
+    .map(|(from, to)| (to.holds - from.holds) + (to.declined - from.declined))
+    .sum()
+}
+
+/// A-901 (§4.7; A-326's acknowledgement rule; main 01a20182's ruling of 2026-11-24 05:35). Do: on a three-shard daemon,
+/// drain every shard's telemetry from one client back to back, round after round, as `edit_merge_bench` does after
+/// every sample; then run a closed loop of creates and destroys on the two shards that do not serve the client. Expect:
+/// the drain asks no hold of any shard, kept or declined; the loop still asks holds of its owners, so the count can see
+/// one. Judged as the client's loop, a drain held every shard it reached: about 7 of the bench's ~10 shard cores on
+/// jupiter, for no measured latency (A-897).
+#[test]
+fn an_observation_holds_no_shard_while_a_closed_loop_still_does() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-closed-loop-drain-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let spin_ns = closed_loop_hold(TEST_SHARDS).get();
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "closed-loop-drain"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = common::client::connect(&instance);
+  client.spin_for(Some(spin_ns));
+  let origin = serving(&daemon, client.client_id());
+  let owners: Vec<usize> = (0..usize::from(TEST_SHARDS))
+    .filter(|shard| *shard != origin)
+    .collect();
+  let cycles = usize::try_from(loop_revisit_cycles(TEST_SHARDS)).unwrap() + LOOP_CYCLES;
+  let looped_specs: Vec<Vec<CreateSpec>> = owners
+    .iter()
+    .map(|owner| {
+      names_on(*owner, cycles.div_ceil(owners.len()))
+        .into_iter()
+        .map(spec)
+        .collect()
+    })
+    .collect();
+  let before = readings(&daemon);
+  for _ in 0..DRAIN_ROUNDS {
+    for partition in 0..TEST_SHARDS {
+      client.telemetry(partition).unwrap();
+    }
+  }
+  let drained = readings(&daemon);
+  let looped = run_loop(&mut client, &looped_specs, 0..cycles);
+  let after = readings(&daemon);
+  drop(client);
+  daemon.stop();
+  println!(
+    "observation: {DRAIN_ROUNDS} drains of {TEST_SHARDS} shards, then {looped:?}; readings before {before:?}, drained \
+     {drained:?}, after the loop {after:?}"
+  );
+  assert_eq!(
+    holds_asked(&before, &drained),
+    0,
+    "the drain asked holds: before {before:?}, drained {drained:?}"
+  );
+  assert!(
+    holds_asked(&drained, &after) > 0,
+    "the closed loop asked no hold of its owners, so the count could not see one: {after:?}"
+  );
 }
 
 /// The verdict of a loop whose owners kept no hold (A-387): they parked at least once for every return of the loop

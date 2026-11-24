@@ -274,10 +274,9 @@ pub(crate) async fn bring_back_named(
   green: VolumeId,
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Vec<[u8; 32]> {
-  let Some(repository) = repository_of(state, green) else {
+  let Some((repository, plan)) = to_bring(state, green) else {
     return Vec::new();
   };
-  let plan = named_bases(state, green);
   let mut brought = Vec::new();
   for (changeset, wanted) in plan {
     let mut lender = super::HeldShard(&mut *state);
@@ -292,6 +291,42 @@ pub(crate) async fn bring_back_named(
     slices.unit_done().await;
   }
   brought
+}
+
+/// [`bring_back_named`] on a live shard: a takeover's re-adoption, which replays a green's own checkpoint and chain onto
+/// the engine it is handed (`green_adopt::readopt_with`; main 01a20182's order of 2026-11-24 04:40, beside
+/// `svn_texts::bring_back_named_live`). The same plan ([`to_bring`]), each group brought back over this shard's state
+/// lent a step at a time, so it runs as a task of the owner shard between its other work. What it brought, for the
+/// caller to let go again once the green is installed or fenced.
+pub(crate) async fn bring_back_named_live(green: VolumeId) -> Vec<[u8; 32]> {
+  let Some(Some((repository, plan))) = crate::state::with_state(|state| to_bring(state, green))
+  else {
+    return Vec::new();
+  };
+  let mut brought = Vec::new();
+  for (changeset, wanted) in plan {
+    if bring_back_on(&mut ThisShard, repository, changeset, &wanted)
+      .await
+      .is_ok()
+    {
+      let count = u64::try_from(wanted.len()).unwrap_or(u64::MAX);
+      let _ = crate::state::with_state(|state| state.count(RECOVERY_BROUGHT_BACK, count));
+      brought.extend(wanted.iter().map(|(identity, _)| identity.hash));
+    }
+  }
+  brought
+}
+
+/// What a replay of Mercurial green `green` needs brought back first ([`bring_back_named`], [`bring_back_named_live`]):
+/// its repository, and the named bases its plan reads that the content store does not hold whole ([`named_bases`]), by
+/// the changeset that resolves them. None with nothing to bring, or for a green of no Mercurial repository held here.
+fn to_bring(
+  state: &ShardState,
+  green: VolumeId,
+) -> Option<(RepositoryId, Vec<(Node, Vec<(Identity, String)>)>)> {
+  let repository = repository_of(state, green)?;
+  let plan = named_bases(state, green);
+  (!plan.is_empty()).then_some((repository, plan))
 }
 
 /// Whether Mercurial green `green`'s replay reads a named base the content store does not hold whole ([`named_bases`]),
@@ -326,6 +361,8 @@ struct Planning {
   changeset: Option<Node>,
   /// The bases to bring back, by the changeset that resolves them.
   plan: Vec<(Node, Vec<(Identity, String)>)>,
+  /// Each base planned, by its changeset: so each is planned once, found in log time.
+  planned: std::collections::BTreeSet<(Node, Identity, String)>,
 }
 
 impl Planning {
@@ -335,6 +372,7 @@ impl Planning {
       named: std::collections::BTreeMap::new(),
       changeset: None,
       plan: Vec::new(),
+      planned: std::collections::BTreeSet::new(),
     };
     let Some((_, checkpointed)) = state.db.partition().green_checkpoint(green) else {
       return planning;
@@ -415,9 +453,12 @@ impl Planning {
     let Some(changeset) = self.changeset.filter(|_| !held) else {
       return;
     };
+    if !self.planned.insert((changeset, identity, path.to_owned())) {
+      return;
+    }
     let entry = (identity, path.to_owned());
+    // The changesets a chain names are its pushes', a few; the files under each, many.
     match self.plan.iter_mut().find(|(at, _)| *at == changeset) {
-      Some((_, set)) if set.contains(&entry) => {}
       Some((_, set)) => set.push(entry),
       None => self.plan.push((changeset, vec![entry])),
     }
