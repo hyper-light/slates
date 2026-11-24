@@ -930,8 +930,9 @@
 >   it is durable on the changeset store its windows are let go (`hg_run::let_go_landed`, `let_go_object_landed` with
 >   `vcs_store::landed_pin`, as a landed git pack's), and once more when the entry commits, since the push's works
 >   bring back the texts they read between. Entries stay; a read brings a text back from the store, the works' own
->   included (`brought_back`, now within a lent budget and the chunk store's lend: its bring-back was refused
->   `OverBudget { room: 0 }` outside them). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
+>   included (`brought_back`, within a lent budget: its bring-back was refused `OverBudget { room: 0 }` with none; a
+>   `lent_state` wrapper put on it then hid the pool, and since 2026-11-23 room asked inside a lend is refused
+>   `OutOfReach`, docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
 >   `a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land` (120 files of 8 KiB: every window let go
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
@@ -939,7 +940,8 @@
 >   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
 >   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
 >   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
->   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   then put back within its lent room; refused by kind since 2026-11-23, `BringBackRefused`, each counted), counted
+>   `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
 >   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
 >   (`hg_run::Run::settle`) or an import lands, each file revision's windows a home holds (held for the region,
@@ -26708,8 +26710,16 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   go before; 81 brought back", file 81's bring-back false. Not a patience: the bring-backs run in one task on the
   shard, whose 60 s wait held. `hg_push::bring_back` answers a bare false for each of four refusals (no such revision,
   no text from the store, nothing taken, no room in the content store), each through `.ok()?`, so nothing says which.
-  **Open:** reproduced first, then a typed refusal passed on through `homes::bring_back_landed`, a counter for each
-  kind (main 01a20182's ruling of 2026-11-23 20:08, §2 item 9).
+  **Fixed (2026-11-23, w-tsan; main 01a20182's rulings of 21:25 and 21:30):** the content store's room, asked inside
+  `lent_state`, where the shard's chunk store, and with it the arena's pool, is the content store's for the step. The
+  step had only the arena's slack, which a publication's give-back (`Store::release_idle`) leaves at 407,277 bytes, so
+  the 49th file of 120 was refused `OverBudget { need: 8192, room: 5869 }`. Plainly 2 runs of 100 on adacachy2 at a load
+  of 47; with a publication pinned before the bring-backs 10 of 10 red, and 10 of 10 green with the room made outside
+  the lend. Six steps asked so (`bring_back`, `bring_back_log`, two `brought_back` sites in `hg_push`, two in
+  `hg_import`), all moved out. Room asked inside a lend is now refused by its own kind at its first put
+  (`ContentRefused::OutOfReach`, counted `vcs_store.room_out_of_reach`), and the bring-back's refusal is typed through
+  `homes::bring_back_landed` and `homes::read` (`BringBackRefused`, `LandedRefused`, `HomeReadRefused`), each kind
+  counted. docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md.
 
 ### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
 CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's

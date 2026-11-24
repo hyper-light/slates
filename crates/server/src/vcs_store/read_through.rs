@@ -506,10 +506,10 @@ mod tests {
       std::time::Duration::from_secs(60),
     );
     daemon.stop();
-    assert_eq!(warm, Some((expected, true)), "the retry read every byte");
+    assert_eq!(warm, Ok((expected, true)), "the retry read every byte");
     assert_eq!(
       cold,
-      Some((expected, true)),
+      Ok((expected, true)),
       "the original cold read must also succeed"
     );
   }
@@ -585,7 +585,7 @@ mod tests {
           (offsets, window),
           (gone, windows),
           (let_go_bytes, len, pinned),
-          (read == Some(bytes), brought),
+          (read == Ok(bytes), brought),
         ));
       })
       .unwrap();

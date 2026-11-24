@@ -62,7 +62,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
           continue;
         };
         homes.insert(home_of(&shards, &identity));
-        if read(origin, &shards, identity, budget).await != Some(bytes) {
+        if read(origin, &shards, identity, budget).await != Ok(bytes) {
           outcome.push(format!("window {index} not read back"));
         }
       }
@@ -87,7 +87,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
           outcome.push(format!("window {index} not let go"));
         }
       }
-      if read(origin, &shards, identity, budget).await.is_some() {
+      if read(origin, &shards, identity, budget).await.is_ok() {
         outcome.push("a window kept twice for the region outlived its one let-go".to_owned());
       }
       if let_go_region_at_home(origin, &shards, identity, Some(super::TEST_OWNER), budget)
@@ -99,7 +99,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       for index in 0..WINDOWS {
         if read(origin, &shards, ContentId::of(&window(index)), budget)
           .await
-          .is_some()
+          .is_ok()
         {
           outcome.push(format!("window {index} kept after its last let-go"));
         }
@@ -690,7 +690,7 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
     .expect("an independent file whose window may leave this shard");
   let (before, after, freed) = crate::daemon::observe_at(&daemon, partition, move |state| {
     let (object, _) = super::keep_for_region(state, &bytes, &[super::TEST_OWNER]).unwrap();
-    let before = super::read_here(state, &object).as_deref() == Some(bytes.as_slice());
+    let before = super::read_here(state, &object).as_deref() == Ok(bytes.as_slice());
     let files =
       crate::vcs_store::within_budget(state, (window + independent.len()) as u64, |stores| {
         let content = stores.content_mut().unwrap();
@@ -726,7 +726,7 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
   );
   assert_eq!(
     after,
-    Some(window + 1),
+    Ok(window + 1),
     "the region's object must remain readable after the release of a shared window; {freed} bytes left RAM"
   );
 }
@@ -793,7 +793,7 @@ fn a_segments_texts_that_rank_on_their_shard_are_let_go_at_its_durability() {
   assert!(freed > 0, "the bytes let go counted");
   assert_eq!(
     read.as_deref(),
-    Some(b"an object the region holds here".as_slice()),
+    Ok(b"an object the region holds here".as_slice()),
     "the region's object still read whole from its home"
   );
 }
