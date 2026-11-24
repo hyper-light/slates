@@ -124,6 +124,7 @@ pub(crate) mod read_through;
 pub(crate) mod record;
 #[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
 pub(crate) mod record_names;
+pub(crate) mod replica;
 // Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod referenced;
@@ -589,6 +590,40 @@ fn content_refused(refused: ContentRefused) -> GitRefused {
   GitRefused::Store(StoreRefused::Content(refused))
 }
 
+/// The records of each repository this node holds a replica store of and does not own (A-813's limit, main 01a20182's
+/// ruling of 2026-11-23 20:00; [`replica`]): its push records as the names log's parts its acceptors hold carry them, in
+/// order, read in place of the partition's, which holds none for a repository another node owns ([`object_record`]).
+/// Bounded by the repositories this node holds a replica of; a takeover adopts the store, the partition's records then
+/// standing for them.
+pub(crate) type ReplicaRecords = BTreeMap<RepositoryId, Vec<Vec<u8>>>;
+
+/// Repository `id`'s record `index`: a replica store's held records where this node holds one ([`ReplicaRecords`]),
+/// else the partition's. Every replay reads its records here, so a replica store is
+/// made by the same steps as the owner's (the equality oracle, `replica`'s tests).
+pub(crate) fn object_record<'a>(
+  db: &'a slates_db::Db,
+  replicas: &'a ReplicaRecords,
+  id: RepositoryId,
+  index: usize,
+) -> Option<&'a [u8]> {
+  match replicas.get(&id) {
+    Some(records) => records.get(index).map(Vec::as_slice),
+    None => db.partition().repositories().object_record(id, index),
+  }
+}
+
+/// Every record of repository `id`, in order, read as [`object_record`] reads one.
+pub(crate) fn object_records<'a>(
+  db: &'a slates_db::Db,
+  replicas: &'a ReplicaRecords,
+  id: RepositoryId,
+) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+  match replicas.get(&id) {
+    Some(records) => Box::new(records.iter().map(Vec::as_slice)),
+    None => Box::new(db.partition().repositories().objects(id)),
+  }
+}
+
 impl VcsStores {
   /// Stores whose content store, once made, keeps its windows in `storage` (A-727 slice a2: the shard's repository
   /// arena).
@@ -754,6 +789,11 @@ impl VcsStores {
   /// What the stores hold of the shard's budget.
   pub(crate) fn charged(&self) -> u64 {
     self.charged
+  }
+
+  /// Whether repository `id`'s store is being made again from its records, lent to nothing until it is whole.
+  pub(crate) fn is_rebuilding(&self, id: RepositoryId) -> bool {
+    self.rebuilding.contains(&id)
   }
 
   /// Repository `id`'s store, if held.
@@ -1136,6 +1176,7 @@ pub(crate) fn curve_keys(state: &ShardState) -> usize {
 /// given back to the content store, then the shard's charge trued up to what remains. A refusal while giving back is
 /// counted, and the rest is given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
+  state.vcs_replica_records.remove(&id);
   // A git or Subversion rebuild under way ends with its store: its task finds its turns gone and stops.
   if state.vcs_stores.rebuild_turns.remove(&id).is_some() {
     state.vcs_stores.rebuilding.remove(&id);
@@ -1174,11 +1215,7 @@ pub(crate) fn record_holds(state: &ShardState, id: RepositoryId) -> Vec<slates_v
   else {
     return Vec::new();
   };
-  state
-    .db
-    .partition()
-    .repositories()
-    .objects(id)
+  object_records(&state.db, &state.vcs_replica_records, id)
     .filter(|bytes| !owed::is_owed(bytes) && !lfs_record::is_lfs(bytes))
     .filter_map(|bytes| Record::decode(bytes, format).ok())
     .flat_map(|record| {
@@ -1204,8 +1241,15 @@ pub(crate) fn release_record_holds(state: &mut ShardState, id: RepositoryId) {
 /// its tool store is, so a repository's bound is what its shard can hold, never the partition's merge budget. A charge
 /// the budget would not take is counted ([`CHARGE_SHORT`]) and kept as charged, as the store's own true-up keeps it.
 pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
-  let held =
-    u64::try_from(state.db.partition().repositories().objects_bytes(id)).unwrap_or(u64::MAX);
+  // A replica store's records are charged as the owner's are (`replica`): what this node holds of them.
+  let held = match state.vcs_replica_records.get(&id) {
+    Some(records) => records
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add),
+    None => state.db.partition().repositories().objects_bytes(id),
+  };
+  let held = u64::try_from(held).unwrap_or(u64::MAX);
   let charged = state
     .vcs_stores
     .objects_charged
@@ -3218,9 +3262,10 @@ fn replay_record(
     db,
     store,
     vcs_stores,
+    vcs_replica_records,
     ..
   } = &mut *state;
-  let bytes = db.partition().repositories().object_record(id, index)?;
+  let bytes = object_record(db, vcs_replica_records, id, index)?;
   let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   lend(store, vcs_stores, brought);
   let room = vcs_stores.svn_unlent(id).map(|svn| {
@@ -3285,11 +3330,7 @@ fn svn_fetched_record(
   id: RepositoryId,
   index: usize,
 ) -> Option<Result<Vec<u8>, ReplayRefused>> {
-  let named = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let named = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let sequence = crate::repository::svn_commit::landing::sequence_of(named);
   if sequence != u64::try_from(index).ok() {
     return Some(Err(ReplayRefused::SvnReference));
@@ -3335,11 +3376,7 @@ fn svn_to_fetch(
   {
     return None;
   }
-  let named = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let named = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let sequence = crate::repository::svn_commit::landing::sequence_of(named)?;
   Some((state.vcs_disk.clone(), sequence))
 }
@@ -3458,9 +3495,10 @@ fn hg_record_step(
     db,
     store,
     vcs_stores,
+    vcs_replica_records,
     ..
   } = &mut *state;
-  let bytes = db.partition().repositories().object_record(id, index)?;
+  let bytes = object_record(db, vcs_replica_records, id, index)?;
   let lent = if replay.is_none() {
     u64::try_from(bytes.len()).unwrap_or(u64::MAX)
   } else {
@@ -3641,11 +3679,7 @@ fn changeset_wanted(
   let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
     return None;
   };
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let record = Record::decode(bytes, git.repository.format()).ok()?;
   if record.sequence == 0 {
     return None;
@@ -3827,11 +3861,7 @@ fn hg_reference(
   id: RepositoryId,
   index: usize,
 ) -> Option<slates_hg::import::record::Reference> {
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   slates_hg::import::record::reference_of(bytes)
 }
 
@@ -4326,11 +4356,7 @@ fn hg_run(
   id: RepositoryId,
   index: usize,
 ) -> Option<slates_hg::import::record::Run> {
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   slates_hg::import::record::run_of(bytes)
 }
 
@@ -4639,7 +4665,14 @@ fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
     return;
   };
-  make(state, &record);
+  rebuild_sliced_from(state, &record);
+}
+
+/// [`rebuild_sliced`] of the repository `record` names, its store freed first by the caller: its records read through
+/// [`object_record`], the partition's or a replica's ([`replica`]).
+fn rebuild_sliced_from(state: &mut ShardState, record: &RepositoryRecord) {
+  let id = record.id;
+  make(state, record);
   let generation = state.vcs_stores.rebuild_generations.wrapping_add(1);
   state.vcs_stores.rebuild_generations = generation;
   state.vcs_stores.rebuild_turns.insert(id, (generation, 0));
@@ -4735,11 +4768,7 @@ fn names_to_fetch(
   let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
     return None;
   };
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let record = Record::decode(bytes, git.repository.format()).ok()?;
   let content = state.vcs_stores.content.as_ref();
   let identity = [record.named, record.packed]
@@ -4816,9 +4845,10 @@ fn record_turn(
     db,
     store,
     vcs_stores,
+    vcs_replica_records,
     ..
   } = &mut *state;
-  let bytes = db.partition().repositories().object_record(id, index)?;
+  let bytes = object_record(db, vcs_replica_records, id, index)?;
   let format = match vcs_stores.entries.get(&id) {
     Some(RepositoryStore::Git(git)) => Some(git.repository.format()),
     _ => None,

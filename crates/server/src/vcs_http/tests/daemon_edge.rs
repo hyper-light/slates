@@ -4318,6 +4318,74 @@ fn a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth() {
   }
 }
 
+/// Shape: the version of `main`'s green the barrier is told a push owes in
+/// [`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`]: one no record ever places.
+const NEVER_PLACED: u64 = 1 << 40;
+
+/// The push barrier's give-up (main 01a20182's ruling of 2026-11-23 18:55: an expired barrier answers git in its own
+/// words, a typed refusal it can act on, never a dropped connection). Do: start a store-backed daemon with its edge;
+/// push a create of `main` ([`large_create`]); tell the repository's barrier that an operation moved `main`'s green to a
+/// version no record ever places ([`NEVER_PLACED`], `StateLogs::note_greens`); then push a create of `other` at the same
+/// commit, asking a report. Expect: the first create `200` with `ok refs/heads/main`; the second `200` too, its report
+/// `unpack ok` and `ng refs/heads/other unable to commit` once the barrier's window passed with nothing moving, the push
+/// refused uncommitted counted. Red before: the barrier's give-up was answered with no report at all (a cut connection).
+#[test]
+fn a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(1 << 10);
+  let created = pushed(edge, &name, &request);
+  let owed_name = name.clone();
+  crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let repositories = state.db.partition().repositories();
+    let repository = repositories
+      .repository_named(&owed_name)
+      .expect("the repository")
+      .id;
+    let main = repositories.branch(repository, "main").expect("main");
+    let owed = slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to: 0,
+      identity: [0; 32],
+      spans: vec![slates_db::catalog::LogSpan {
+        log: slates_db::catalog::LogName::Green { green: main },
+        from: 0,
+        to: NEVER_PLACED,
+      }],
+      changes: Vec::new(),
+    };
+    state.state_logs.note_greens(&owed);
+  });
+  let mut other = Vec::new();
+  let line = format!("{ZERO} {commit} refs/heads/other\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut other).expect("the command");
+  pktline::write(Packet::Flush, &mut other).expect("the flush");
+  other.extend_from_slice(&stored_pack(&[]));
+  let answered = pushed(edge, &name, &other);
+  let uncommitted = counted_on(&daemon, REPOSITORY, crate::state_log::PUSH_UNCOMMITTED);
+  daemon.stop();
+  assert_eq!(created.0, 200);
+  assert!(
+    String::from_utf8_lossy(&created.1).contains("ok refs/heads/main"),
+    "{}",
+    String::from_utf8_lossy(&created.1)
+  );
+  assert_eq!(answered.0, 200);
+  let report = String::from_utf8_lossy(&answered.1).into_owned();
+  assert!(
+    report.contains("unpack ok") && report.contains("ng refs/heads/other unable to commit"),
+    "{report}"
+  );
+  assert_eq!(uncommitted, 1);
+}
+
 /// A v2 `ls-refs` request for every ref, peeled, as `git ls-remote` asks.
 fn ls_refs_all() -> Vec<u8> {
   let mut request = Vec::new();

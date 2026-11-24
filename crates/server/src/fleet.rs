@@ -2334,6 +2334,16 @@ pub(crate) fn serve_merge_shipment(
   if !accepted.is_empty() {
     return accepted;
   }
+  // A record that waits on this holder's replica's build (A-813's limit): its progress, the build's turns done, so the
+  // owner's push barrier holds the record while the build runs (`crate::replica_build`).
+  if let Some(slices_done) = crate::replica_build::slices_done(s, record.object) {
+    return slates_cluster::content::ContentMessage::ReplicaBuilding {
+      object: record.object,
+      sequence: record.sequence,
+      slices_done,
+    }
+    .encode();
+  }
   let may_place = content_authorized(
     s.council.configuration(),
     s.holder_records.as_map(),

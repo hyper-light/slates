@@ -341,7 +341,7 @@ pub(crate) const BRING_BACK_PAST_PATIENCE: &str = "vcs_store.git_resident.bring_
 /// `read_through::bring_back(waited)`, given up once it has run past the patience every wait for room keeps
 /// (`vcs_share::wait::PATIENCE_NS`), counted [`BRING_BACK_PAST_PATIENCE`]: a read that waits for it then refuses
 /// typed, never a fetch that waits forever.
-async fn bring_back_within(
+pub(crate) async fn bring_back_within(
   waited: slates_git::store::packed::Waited,
 ) -> Result<u64, super::read_through::ReadThroughRefused> {
   match slates_rt::futures::within(

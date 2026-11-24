@@ -780,6 +780,10 @@ pub struct ShardState {
   /// repository's tool store with its derived values, made with its record and made again by a recovery from its
   /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
   pub(crate) vcs_stores: crate::vcs_store::VcsStores,
+  /// The records of each repository this node holds a replica store of and does not own (`crate::vcs_store::replica`),
+  /// read in place of the partition's (`crate::vcs_store::object_record`). Apart from [`ShardState::vcs_stores`] so a
+  /// replay borrows a record while it lends the stores.
+  pub(crate) vcs_replica_records: crate::vcs_store::ReplicaRecords,
   /// The node's version-control store on disk, when the daemon has one (A-767; `DaemonConfig::vcs_disk`): this shard's
   /// handle to its owner thread, through which a repository's landings reach the changeset log.
   pub vcs_disk: Option<slates_store::owner::StoreHandle>,
@@ -903,6 +907,9 @@ pub struct ShardState {
   pub(crate) made_commits: crate::made_commit::MadeCommits,
   /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
   pub(crate) materializations: crate::green_ready::Materializations,
+  /// The replica builds under way on this holder (`crate::replica_build`): one a green whose replica owes its push and
+  /// whose later version waits on it.
+  pub(crate) replica_builds: crate::replica_build::ReplicaBuilds,
   /// The shard's reads of Mercurial repositories' `.hgtags` for an owner's verb, and the requests parked on them
   /// (A-767 C1, `crate::vcs_store::hg_tags`).
   pub(crate) hg_tags: crate::vcs_store::hg_tags::HgTags,

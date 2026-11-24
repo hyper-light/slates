@@ -6286,6 +6286,18 @@ reconnaissance because the touched partitions are named up front).
    cadence; a volume with policy `live-shipped` additionally ships its op log to f+1 of its
    candidates and is acknowledged at f+1.
 
+**An operation over several registers is acknowledged once every part is at f+1 (A-886).** A repository's push moves
+its names log and each green it moves, every one its own register. A push is answered only once each is held at f+1:
+the names log through its position, and each green's merge record through the version the push took it to
+(`state_log::names_committed`; until A-886 the names log alone, and a successor holding a push's names but not its
+greens' versions rebuilt the repository without it). The barrier waits on progress, not a clock: it gives up only
+after a whole window in which none of what it waits for moved (the versions placed, the holders' replica builds'
+turns done, the names log's acknowledgements), the window three passes of the record plane's pace over the shard as
+measured between its last two plus the plane's exchange budget, never under the commit's own deadline. Given up, each
+command the push applied is reported `ng <ref> unable to commit` in the client's own report (`git_push::UNCOMMITTED`),
+a typed answer it can act on and retry, never a dropped connection. At f = 0 every part is placed at its append and the
+barrier passes at once (R8).
+
 > **Status (2026-11-04, a commit returns at its quorum).** Every quorum dispatch (record commits, ledger promotions,
 > group rounds, content puts) is collected by a loop that is woken by each reply, not only by its poll: a dispatch
 > task sends its reply and wakes the collector (`ReplyTx`, `DispatchWait::keep_waiting` in `crates/cluster/src/lib.rs`).
@@ -11801,6 +11813,14 @@ the inputs were cut, so inputs that repeat a chunk's bytes (one chunk named at s
 they are; what the recomputation holds of them, the gathered bytes and the increment decoded from them, is charged to
 the holder's shard's budget before a byte is reserved and released once it has recomputed, and a record whose inputs
 the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose inputs are not yet held (A-383).
+A holder whose replica owes its push (a created ref's, P2) cannot judge a version after the owed one, so it makes the
+replica through the same door its owner makes the green (A-886): the owed push built over a replica store of the
+repository, its names-log parts replayed by the owner's own replay (`vcs_store::replica`, held equal to the owner's
+store by an oracle at every push and after a takeover adopts it), lazily when the first later version's record finds
+the replica owing, a turn at a time (`crate::replica_build`). While it builds, such a record is answered
+`ReplicaBuilding { object, sequence, slices_done }` on the shipment's own channel (`ContentMessage`, kind 10), the
+build's turns done so far, which only rise: the owner keeps the latest a holder, and a push's barrier reads it rising
+as progress. A takeover adopts the replica store as it stands, so it is warm.
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -62000,3 +62020,25 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - GAPS.
   - docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md and
     docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md.
+
+### A-886 — A holder makes a replica that owes its push from the repository's records, and a push is answered once every part it moved is at f+1 (2026-11-23, w-git; main 01a20182's rulings of 2026-11-23 17:27, 18:55, 20:00 and 20:28; A-724 piece 8c, A-812, A-813, A-884)
+
+w-chaos's `v3_takeover` lost acknowledged pushes 1 and 2 of 3 at f = 1, 7 of 7 runs: the push barrier waited for the
+names log alone, while each push also moved `main`'s green, whose versions 2 and 3 never placed. The holders' counters
+named why (`merge.replica.owes` about 1,173 a holder): `main`'s version 1 was a deferred push (P2), the holders'
+replicas owed it, and a replica that owes cannot judge the increment after it (A-813's open limit). Now:
+1. The barrier waits for every green the push's operations moved, through the version they took it to, beside the
+   names log (`StateLogs::note_greens`, `greens_placed`), giving up only after a window with no progress, from the
+   record plane's live pace (`state_log::Waited`, `barrier_window_ns`), and then reporting `ng <ref> unable to commit`.
+2. A holder whose replica owes makes it when a later version needs it: a replica store of the repository from the
+   names-log parts it holds (`vcs_store::replica`; every replay reads its records through `vcs_store::object_record`,
+   the partition's or these), then the owed push's build over it (`replica_build`); a takeover adopts the store.
+3. A record waiting on that build is answered `ReplicaBuilding { object, sequence, slices_done }` (work done, never
+   work left, which can rise as a build finds more, A-884), which the owner keeps a holder and the barrier reads.
+Rejected: a holder accepting a version after an owed one unjudged (it breaks "every holder recomputes before
+accepting"), and materializing eagerly at f > 0 (a mode switch, R8).
+
+Applied in the same change to: §4.8 (an operation over several registers); §4.16 (Apply on holders); `slates-cluster`
+(`ContentMessage::ReplicaBuilding`, its golden vector and refusals); `slates-server` (`state_log`, `vcs_store`,
+`vcs_store::replica`, `replica_build`, `merge_service`, `fleet::serve_merge_shipment`, `takeover::rebuild_repository`,
+`git_push::uncommitted_report`, the HTTP and SSH receive drivers); GAPS (A-812 (b)).

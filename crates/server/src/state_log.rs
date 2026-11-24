@@ -268,18 +268,26 @@ pub(crate) fn names_committed(
   })
 }
 
-/// Waits until `repository`'s names log is held at `f + 1` through its position now ([`names_committed`]), re-asking at
-/// the record plane's poll within its exchange deadline (`crate::fleet::live_budget`): whether it was. A push is
-/// answered only then (A-724 piece 8c: a push acknowledged before its records reached `f + 1` was lost with its owner).
+/// Waits until every part `repository`'s operations moved is held at `f + 1` ([`names_committed`]), re-asking at the
+/// record plane's poll: whether it was. A push is answered only then (A-724 piece 8c: a push acknowledged before its
+/// records reached `f + 1` was lost with its owner). The wait follows progress, not a clock alone (main 01a20182's ruling
+/// of 2026-11-23 20:00, A-884's rule): it gives up only after a whole window ([`barrier_window_ns`]) in which nothing the
+/// push waits for moved ([`push_progress`]), so a version whose holders are making their replicas is held while their
+/// builds' turns go on, and a hung one is refused within a window.
 pub(crate) async fn names_committed_within(repository: slates_db::catalog::RepositoryId) -> bool {
   let budget = crate::fleet::live_budget();
-  let began = slates_rt::futures::now_ns();
+  let mut waited =
+    Waited::new(crate::state::with_state(|state| push_progress(state, repository)).unwrap_or(0));
   loop {
     if crate::state::with_state(|state| names_committed(state, repository)) != Some(false) {
       return true;
     }
-    if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
-      crate::state::with_state(|state| state.count(PUSH_UNCOMMITTED, 1));
+    let reading = crate::state::with_state(|state| barrier_reading(state, repository));
+    if reading.is_none_or(|reading| waited.expired(reading)) {
+      crate::state::with_state(|state| {
+        state.count(PUSH_UNCOMMITTED, 1);
+        log_uncommitted(state, repository);
+      });
       return false;
     }
     // A refused timer (no shard) ends the wait unheld: the push is answered refused, never acknowledged unheld.
@@ -290,6 +298,157 @@ pub(crate) async fn names_committed_within(repository: slates_db::catalog::Repos
       return false;
     }
   }
+}
+
+/// A push barrier's wait ([`names_committed_within`], and the HTTP edge's held report): the progress last seen
+/// ([`push_progress`]) and when it last moved.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Waited {
+  mark: u64,
+  moved_ns: u64,
+}
+
+impl Waited {
+  /// A wait begun now, having seen `mark`.
+  pub(crate) fn new(mark: u64) -> Waited {
+    Waited {
+      mark,
+      moved_ns: slates_rt::futures::now_ns(),
+    }
+  }
+
+  /// Whether a whole `window` has passed with the progress still `mark` (a [`barrier_reading`]); a mark that moved
+  /// begins the window again.
+  pub(crate) fn expired(&mut self, (mark, window): (u64, u64)) -> bool {
+    let now = slates_rt::futures::now_ns();
+    if mark != self.mark {
+      self.mark = mark;
+      self.moved_ns = now;
+      return false;
+    }
+    now.saturating_sub(self.moved_ns) >= window
+  }
+}
+
+/// A push to `repository`'s barrier reading now: its progress ([`push_progress`]) and its window
+/// ([`barrier_window_ns`]).
+pub(crate) fn barrier_reading(
+  state: &ShardState,
+  repository: slates_db::catalog::RepositoryId,
+) -> (u64, u64) {
+  (push_progress(state, repository), barrier_window_ns(state))
+}
+
+/// What a push to `repository` waiting at its barrier has seen move: the versions placed of every green owed, the turns
+/// done of every replica build their records wait on (`merge_service::replica_builds_done`), and the positions the
+/// names log's candidates acknowledged, summed. It only rises, and rises while any of them progresses.
+pub(crate) fn push_progress(
+  state: &ShardState,
+  repository: slates_db::catalog::RepositoryId,
+) -> u64 {
+  let greens = state
+    .state_logs
+    .greens_owed
+    .get(&repository)
+    .into_iter()
+    .flat_map(BTreeMap::keys)
+    .map(|green| {
+      let object = ObjectId(green.bytes);
+      crate::merge_service::placed_version(state, object)
+        .unwrap_or(0)
+        .saturating_add(crate::merge_service::replica_builds_done(state, object))
+    })
+    .fold(0u64, u64::saturating_add);
+  let register = slates_db::catalog::LogName::State {
+    repository,
+    log: StateLog::Names,
+  }
+  .register();
+  let names = state.state_logs.logs.get(&register).map_or(0, |log| {
+    log
+      .acked
+      .values()
+      .fold(0u64, |sum, at| sum.saturating_add(*at))
+  });
+  greens.saturating_add(names)
+}
+
+/// Format: the record plane's passes a version's merge record takes to place once its owner enqueued it (§4.16
+/// "Commit": the pass under way when it was enqueued, the pass that places its inputs, and the pass that ships the
+/// record, which never reorder).
+const PLACEMENT_PASSES: u64 = 3;
+
+/// The window a push barrier gives up after when nothing it waits for moved ([`Waited`]), from the record plane's own
+/// live figures (main 01a20182's ruling of 2026-11-23 18:55): [`PLACEMENT_PASSES`] of the plane's passes over this shard
+/// as measured between its last two (`merge_service::MergeShardState::pass_ns`; the heartbeat, its period, before any
+/// was measured), and the plane's exchange budget, its measured round's full span (`fleet::record_exchange_budget_ns`);
+/// never less than the commit's own deadline (`fleet::live_budget`). A busy machine stretches the passes and the
+/// exchanges, and the window with them.
+pub(crate) fn barrier_window_ns(state: &ShardState) -> u64 {
+  let pass = state.merge.pass_ns.max(crate::daemon::HEARTBEAT_NS);
+  PLACEMENT_PASSES
+    .saturating_mul(pass)
+    .saturating_add(crate::fleet::record_exchange_budget_ns())
+    .max(crate::fleet::live_budget().deadline_ns)
+}
+
+/// Logs what a push refused at the barrier still waited for: each green owed and the version placed of it, and the
+/// names log's position beside its holders' acknowledgements, so a refusal names its cause.
+pub(crate) fn log_uncommitted(state: &ShardState, repository: slates_db::catalog::RepositoryId) {
+  let greens: Vec<(String, u64, Option<u64>)> = state
+    .state_logs
+    .greens_owed
+    .get(&repository)
+    .map(|owed| {
+      owed
+        .iter()
+        .map(|(green, version)| {
+          (
+            green
+              .bytes
+              .iter()
+              .map(|byte| format!("{byte:02x}"))
+              .collect::<String>(),
+            *version,
+            state.merge.placed.get(&ObjectId(green.bytes)).copied(),
+          )
+        })
+        .collect()
+    })
+    .unwrap_or_default();
+  let position = state
+    .db
+    .partition()
+    .repositories()
+    .log_position(repository, StateLog::Names);
+  let register = slates_db::catalog::LogName::State {
+    repository,
+    log: StateLog::Names,
+  }
+  .register();
+  let acked: Vec<(u64, u64)> = state
+    .state_logs
+    .logs
+    .get(&register)
+    .map(|log| log.acked.iter().map(|(host, at)| (host.0, *at)).collect())
+    .unwrap_or_default();
+  let merge: Vec<(&str, u64)> = state
+    .refusals
+    .iter()
+    .filter(|(kind, _)| kind.starts_with("merge."))
+    .map(|(kind, count)| (*kind, *count))
+    .collect();
+  let pending: Vec<(String, Vec<u64>)> = state
+    .merge
+    .pending
+    .iter()
+    .map(|(object, green)| (format!("{object:?}"), green.versions()))
+    .collect();
+  slates_machine::log_line!(
+    "slates-server: partition {}: a push was refused at its barrier: greens owed (green, version, placed) {greens:?}; \
+     names log at {position:?}, acknowledged {acked:?}; merge counters {merge:?}; pending {pending:?}",
+    state.partition
+  );
 }
 
 /// Counter: pushes answered refused because their records did not reach `f + 1` within the wait (A-724 piece 8c).

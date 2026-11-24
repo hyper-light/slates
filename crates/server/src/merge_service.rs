@@ -64,6 +64,11 @@ pub struct MergeShardState {
   /// an owner shard: the period of the record plane's latest pass over it, which a version enqueued here is stamped
   /// with (`PendingMergeRecord::first_period`).
   pub coordinator_period: u64,
+  /// On an owner shard: when the record plane's latest pass over it began, on the shard's clock, and the time between its
+  /// last two: the plane's live pace, which a push's barrier window follows (`crate::state_log::barrier_window_ns`).
+  pub pass_at_ns: u64,
+  /// The time between the record plane's last two passes over this shard; 0 before two were seen.
+  pub pass_ns: u64,
   /// The version each green attachment pins, by attachment id (§4.16 "Attachments and versions").
   pub attachments: BTreeMap<u64, PinnedAttachment>,
   /// The merge records this owner shard still owes its candidate holders, by green then version
@@ -2487,6 +2492,11 @@ pub struct PendingGreen {
 }
 
 impl PendingGreen {
+  /// The versions whose records are not yet placed, oldest first: what a refused push barrier names.
+  pub(crate) fn versions(&self) -> Vec<u64> {
+    self.records.keys().copied().collect()
+  }
+
   /// The oldest version whose record is not yet placed, if any: its inputs are read from the chain until it is.
   fn oldest(&self) -> Option<u64> {
     self.records.keys().next().copied()
@@ -2593,6 +2603,10 @@ pub struct PendingMergeRecord {
   /// these, so inputs larger than one shipment cross in several; a target not here is sent the inputs from their
   /// first chunk. Bounded by the candidates times the inputs' chunks; a target leaves once it holds the inputs.
   pub lacking: BTreeMap<HostId, Vec<[u8; 32]>>,
+  /// Each target whose replica's build the record waits on, with the build's turns done as its latest answer said
+  /// (`ContentMessage::ReplicaBuilding`, A-813's limit): the latest alone, so it holds one word a target; a push's
+  /// barrier reads it rising as progress ([`replica_builds_done`]).
+  pub building: BTreeMap<HostId, u64>,
   /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
   pub enqueued_ns: u64,
   /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
@@ -3284,6 +3298,7 @@ pub(crate) fn insert_pending(
       first_period: stamped,
       work,
       lacking: BTreeMap::new(),
+      building: BTreeMap::new(),
       enqueued_ns: slates_machine::clock::monotonic_ns(),
       shipments: 0,
       inputs_manifest: None,
@@ -3502,6 +3517,14 @@ pub(crate) fn next_merge_work(
   local: HostId,
   period: u64,
 ) -> Vec<MergeWork> {
+  // The plane's live pace over this shard, between its last two passes (a push's barrier window follows it).
+  if period != state.merge.coordinator_period {
+    let now = slates_rt::futures::now_ns();
+    if state.merge.pass_at_ns > 0 {
+      state.merge.pass_ns = now.saturating_sub(state.merge.pass_at_ns);
+    }
+    state.merge.pass_at_ns = now;
+  }
   // The period a version enqueued on this shard from now on is stamped with.
   state.merge.coordinator_period = period;
   // A green's version 0 inputs whose task could not be spawned are started again (A-286).
@@ -4161,6 +4184,15 @@ fn record_inputs_answers(
           .is_none_or(|before| missing.len() < before.len());
         pending.inputs.acked.retain(|held| *held != host);
         pending.lacking.insert(host, missing);
+      }
+      // A target that holds the inputs and waits on its replica's build (A-813's limit): its latest progress kept.
+      Ok(slates_cluster::content::ContentMessage::ReplicaBuilding {
+        object: waiting,
+        sequence,
+        slices_done,
+      }) if waiting == object && sequence == version => {
+        pending.lacking.remove(&host);
+        pending.building.insert(host, slices_done);
       }
       _ if !carried => {
         pending.inputs.acked.retain(|held| *held != host);
@@ -5038,6 +5070,11 @@ fn recompute(
     if let Err(reason) = applied {
       // Given back as it was: a later record or an adoption meets it again.
       state.merge.replicas.insert(object, replica);
+      // A replica owing its push is made from the repository's objects on this node, and the record judged once it is
+      // (A-813's limit, `crate::replica_build`).
+      if reason == REPLICA_OWES {
+        crate::replica_build::wanted(state, object);
+      }
       return Err(reason);
     }
     replica
@@ -5127,6 +5164,18 @@ pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeS
     version: state.merge.replicas.get(&object).map(Green::reached),
     refused: state.merge.refused.contains(&object),
   }
+}
+
+/// The turns done of every replica build `object`'s pending records wait on, as the targets last answered, summed: it
+/// rises while any of them progresses (a push's barrier reads it, `crate::state_log`).
+pub(crate) fn replica_builds_done(state: &ShardState, object: ObjectId) -> u64 {
+  state.merge.pending.get(&object).map_or(0, |pending| {
+    pending
+      .records
+      .values()
+      .flat_map(|record| record.building.values())
+      .fold(0u64, |sum, done| sum.saturating_add(*done))
+  })
 }
 
 /// The highest version of `object` whose record this owner has placed at quorum, if any.
@@ -5307,6 +5356,7 @@ mod tests {
       first_period: None,
       work: None,
       lacking: BTreeMap::new(),
+      building: BTreeMap::new(),
       enqueued_ns: 0,
       shipments: 0,
       inputs_manifest: None,
@@ -5411,6 +5461,7 @@ mod tests {
             first_period: None,
             work: None,
             lacking: BTreeMap::new(),
+            building: BTreeMap::new(),
             enqueued_ns: 0,
             shipments: 0,
             inputs_manifest: None,
@@ -5971,6 +6022,7 @@ mod tests {
           first_period: None,
           work: None,
           lacking: BTreeMap::new(),
+          building: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
           inputs_manifest: None,
