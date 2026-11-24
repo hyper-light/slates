@@ -218,6 +218,40 @@ fn moved(before: Counts, driven: &Driven) -> ([u64; 5], u64) {
   (deltas, driven.counts.1.saturating_sub(before.1))
 }
 
+/// What each driver moved of the counters, and what each left ([`by_task`], [`by_turns`]).
+type BothDriven = (([u64; 5], u64), ([u64; 5], u64), Driven, Driven);
+
+/// Two whole-file rewrites of one green on a stored audit daemon's shard ([`two_rewrites`]), the first refined by the
+/// shard's own task and the second by `refined_now`: what each moved and left.
+fn driven_both_ways() -> BothDriven {
+  let (store, daemon) = crate::test_store::audit_daemon_stored();
+  let history = || async move {
+    let (task_work, turns_work) = on(two_rewrites);
+    let before = on(|state| counted(state));
+    let task = by_task(task_work, 2).await;
+    let held = on(|state| by_turns(state, turns_work, 3));
+    (moved(before, &task), moved(task.counts, &held), task, held)
+  };
+  let driven = crate::test_store::run_on_first(&daemon, history, PATIENCE);
+  daemon.stop();
+  drop(store);
+  driven
+}
+
+/// `driven`'s submit parked on its refinement and was not answered before its job ran.
+fn assert_parked_until_its_job(driven: &Driven) {
+  assert!(
+    driven.parked.is_none(),
+    "parked on its refinement: {:?}",
+    driven.parked
+  );
+  assert!(
+    driven.before_job.is_none(),
+    "answered before its job: {:?}",
+    driven.before_job
+  );
+}
+
 /// A-787 part 2 (the job's drivers; main's ruling of 2026-11-24 02:17). Do: make two works on one green, each
 /// re-indenting the green's 2,000-function file whole; submit the first as a client's recorded request and let the
 /// shard's own refinement task run it, awaited; then submit the second the same way under a held shard and take its
@@ -227,41 +261,17 @@ fn moved(before: Counts, driven: &Driven) -> ([u64; 5], u64) {
 /// (the slicing's non-vacuity count), so the held driver takes the turns the task takes.
 #[test]
 fn t_a787_a_recorded_submits_refinement_by_its_task_and_by_refined_now_agree() {
-  let (store, daemon) = crate::test_store::audit_daemon_stored();
-  let history = || async move {
-    let (task_work, turns_work) = on(two_rewrites);
-    let before = on(|state| counted(state));
-    let task = by_task(task_work, 2).await;
-    let held = on(|state| by_turns(state, turns_work, 3));
-    (moved(before, &task), moved(task.counts, &held), task, held)
-  };
-  let (task_moved, held_moved, task, held) =
-    crate::test_store::run_on_first(&daemon, history, PATIENCE);
-  daemon.stop();
-  drop(store);
-  for driven in [&task, &held] {
-    assert!(
-      driven.parked.is_none(),
-      "parked on its refinement: {:?}",
-      driven.parked
-    );
-    assert!(
-      driven.before_job.is_none(),
-      "answered before its job: {:?}",
-      driven.before_job
-    );
-  }
-  assert!(
-    matches!(
-      task.answer,
-      Some(ReplyBody::Submitted {
-        version: Some(_),
-        ..
-      })
-    ),
-    "{:?}",
-    task.answer
+  let (task_moved, held_moved, task, held) = driven_both_ways();
+  assert_parked_until_its_job(&task);
+  assert_parked_until_its_job(&held);
+  let accepted = matches!(
+    task.answer,
+    Some(ReplyBody::Submitted {
+      version: Some(_),
+      ..
+    })
   );
+  assert!(accepted, "{:?}", task.answer);
   assert!(
     held.answer.is_some(),
     "the held submit was answered once its job ended"
@@ -277,8 +287,9 @@ fn t_a787_a_recorded_submits_refinement_by_its_task_and_by_refined_now_agree() {
     held_moved.0, task_moved.0,
     "the held job moved the task's counters"
   );
-  assert!(
-    task_moved.1 > 1 && held_moved.1 > 1,
+  assert_eq!(
+    (task_moved.1 > 1, held_moved.1 > 1),
+    (true, true),
     "both took turns: {} and {}",
     task_moved.1,
     held_moved.1
