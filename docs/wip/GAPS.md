@@ -5565,13 +5565,26 @@
 >     of 7.2 to 15.3 s, and the give-up then came 53 to 89 periods after the death was held, against a budget of about
 >     144 to 177. Record:
 >     `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`.
->   - **Open (found with it, measured 2026-11-23):** the failover delay's detection term (A-363) leaves out a detection
->     the timer judges. While a member's pool has no verdict, its timer-judged pairs take about 7 s to condemn in a
->     three-node fleet, where its delay said 2.2 to 5.1 s, so every wait that reads the delay reads the smaller figure
->     for those seconds. A fix would count a crashed peer's two unanswered probes at the run the detector bounds them by
->     now (hyper-swim's `longest_unanswered`), which falls back once the pool has a verdict. That is an amendment of A-363
->     and of each consumer. In the same regime `lease::horizon_ns`'s doc ("the longest a peer can go unanswered before
->     this node's detector declares it dead", 0.9 s) is untrue, though the lease's safety rests on answers, not on it.
+>   - **FIXED 2026-11-23 (A-882, w-fleet; found with it):** the failover delay's detection term (A-363) left out a
+>     detection the timer judges. While a member's pool has no verdict, its timer-judged pairs take seconds to condemn:
+>     7.2 s on adacachy2, where the delay said 2.2 to 5.1 s, and 6.0 s on the simulated network, where the term said
+>     20 ms. Every wait that reads the delay read the smaller figure for those seconds. Now, while any pair is judged by
+>     its own timer, the term is at least the detector's `least_detection_bound`, its own stated bound for the deadlines
+>     it judges by. It is taken at answered periods, as the period tail is, and a member never answered keeps the first
+>     bound stated. Not the ratcheting `detection_bound`, which read 28.0 s after one detection where the other read
+>     75 to 80 ms. Every reader of the delay was checked against the corrected figure. `departure_learned_periods` now
+>     counts the survivors' detection term instead of a nine-period horizon, and `lease::horizon_ns`'s doc now says
+>     what the detector keeps. Record:
+>     `docs/bugs/2026-11-23-the-failover-delay-left-out-a-detection-the-detectors-timer-judged.md`.
+>     - **Open (found with it, measured):** before the detector's first period has ended it states no bound, so the
+>       delay takes the anchor's supervision (1.0 s). That covered both survivors at the cut in 7 of 30 logged
+>       readmission runs, whose first probes had gone unanswered. Closing it needs hyper-swim to state a bound before a
+>       period, a change to the vendored detector.
+>     - **Open (found with it, measured):** a bound read at a crash is outgrown by a detection that needs further
+>       expiries. Two of 40 readmission runs took 15.3 s to condemn. The term follows such a detection as the member's
+>       answered periods restate the bound, and the bound stated at each condemnation held in every run measured.
+>     - **Open (found with it):** `FailoverReport` does not say whether the timer's bound set the detection term. Adding
+>       it is an appended field and a contract bump.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to

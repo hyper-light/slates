@@ -19,6 +19,7 @@ use slates_db::register::{
 };
 
 use hyper_datagram::{ExporterSecret, Role, SECRET_BYTES};
+use hyper_swim::detector::Judge;
 use hyper_swim::membership::Liveness;
 
 /// Shape: the members of the simulated fleet.
@@ -519,15 +520,15 @@ fn a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut() {
   let mut fleet = Network::new();
   let measured = fleet.run_until(HORIZON_NS, |fleet| {
     fleet.members[&1]
-      .detection()
+      .detection(fleet.now_ns)
       .is_some_and(|term| term.samples >= MEASURED_PERIODS)
   });
   assert!(measured, "member 1's detector timed its periods");
-  let before = fleet.members[&1].detection().unwrap();
+  let before = fleet.members[&1].detection(fleet.now_ns).unwrap();
   let cut_at = fleet.now_ns;
   fleet.cut_off.push(1);
   fleet.run_until(cut_at + CUT_OFF_OBSERVED_NS, |_| false);
-  let after = fleet.members[&1].detection().unwrap();
+  let after = fleet.members[&1].detection(fleet.now_ns).unwrap();
   let reports: Vec<_> = [2, 3]
     .iter()
     .map(|peer| {
@@ -559,6 +560,195 @@ fn a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut() {
   assert_eq!(
     after, before,
     "the detection term member 1 measured before the cut, kept while no probe of its is answered"
+  );
+}
+
+/// Whether `member`'s detector judges its probes of `peer` by the pair's own retransmission timer (RFC 6298): no
+/// estimator, the pair's own or the member's pooled one, judges the pair yet.
+fn timer_judges(member: &MemberPlane, peer: u64) -> bool {
+  member
+    .detector()
+    .report(hyper_swim::HostId(peer))
+    .is_some_and(|report| report.judge == Judge::Timer)
+}
+
+/// What a survivor held when member 3 was killed: its id, its detection term in nanoseconds, and the two bounds its
+/// detector stated then (`detection_bound` and `least_detection_bound`).
+type HeldAtKill = (
+  u64,
+  u64,
+  Option<std::time::Duration>,
+  Option<std::time::Duration>,
+);
+
+/// A-882 (A-363's detection term in a member's first seconds; found with A-351's readmission test on adacachy2,
+/// 2026-11-23, where a leader cut off 0.9 s into the test was condemned 7.2 s after its last answer while every node's
+/// detection term said about 0.7 s). Do: three members; run until members 1 and 2 have each timed an answered period,
+/// and member 3 has answered each, while each still judges member 3 by the pair's own retransmission timer (no estimator
+/// yet); read each one's detection term and the bound its detector states for the deadlines it judges by now; kill
+/// member 3; then run until each survivor judges the other by an estimator. Expect: each term at least that bound; both
+/// survivors hold member 3 dead; each that condemned it by its own probes did so within the detection term it held at
+/// the kill, which is what the failover delay's detection term stands for, from a crashed peer's last answer to its
+/// condemnation; and once no pair is on its timer, each term falls back to the period count. Before A-882 each term was
+/// SWIM's period count alone, about 20 ms, and member 3 was condemned 6.0 s after its last answer.
+#[test]
+fn a_young_members_detection_term_covers_a_detection_its_timer_judges() {
+  let mut fleet = Network::new();
+  let young = fleet.run_until(HORIZON_NS, |fleet| {
+    [1, 2].iter().all(|me| {
+      let member = &fleet.members[me];
+      member.detection(fleet.now_ns).is_some()
+        && timer_judges(member, 3)
+        && member
+          .detector()
+          .report(hyper_swim::HostId(3))
+          .is_some_and(|report| report.last_answer_ns.is_some())
+    })
+  });
+  assert!(
+    young,
+    "members 1 and 2 timed an answered period, and member 3 answered each, while each judged member 3 by its timer"
+  );
+  let killed_at = fleet.now_ns;
+  let held: Vec<HeldAtKill> = [1, 2]
+    .iter()
+    .map(|me| {
+      let member = &fleet.members[me];
+      (
+        *me,
+        member.detection(killed_at).unwrap().ns,
+        member.detector().detection_bound(killed_at),
+        member.detector().least_detection_bound(killed_at),
+      )
+    })
+    .collect();
+  fleet.killed.push(3);
+  let condemned = fleet.run_until(killed_at + HORIZON_NS, |fleet| {
+    [1, 2]
+      .iter()
+      .all(|me| matches!(fleet.liveness(*me, 3), Some(Liveness::Dead) | None))
+  });
+  let reports: Vec<_> = [1, 2]
+    .iter()
+    .map(|me| fleet.members[me].detector().report(hyper_swim::HostId(3)))
+    .collect();
+  let bounds_after: Vec<_> = [1, 2]
+    .iter()
+    .map(|me| {
+      let detector = fleet.members[me].detector();
+      (
+        detector.detection_bound(fleet.now_ns),
+        detector.least_detection_bound(fleet.now_ns),
+      )
+    })
+    .collect();
+  println!(
+    "young kill at {killed_at} ns: held (member, term ns, detection_bound, least_detection_bound) {held:?}; condemned \
+     {condemned} at {} ns; reports {reports:?}; bounds after (detection_bound, least_detection_bound) {bounds_after:?}",
+    fleet.now_ns
+  );
+  assert!(condemned, "both survivors hold member 3 dead");
+  for (me, term_ns, _, stated) in &held {
+    assert!(
+      stated.is_some_and(|stated| u128::from(*term_ns) >= stated.as_nanos()),
+      "member {me}'s detection term {term_ns} ns is at least the bound its detector stated, {stated:?}"
+    );
+  }
+  let own: Vec<(u64, u64, std::time::Duration)> = held
+    .iter()
+    .zip(&reports)
+    .filter_map(|((me, term_ns, _, _), report)| {
+      let report = (*report)?;
+      (report.condemnations > 0).then_some((*me, *term_ns, report.condemned_after?))
+    })
+    .collect();
+  assert!(
+    !own.is_empty(),
+    "a survivor's own probes condemned member 3: {reports:?}"
+  );
+  for (me, term_ns, after) in &own {
+    assert!(
+      after.as_nanos() <= u128::from(*term_ns),
+      "member {me} condemned member 3 {after:?} after its last answer, within the detection term it held, {term_ns} ns"
+    );
+  }
+  let judged = fleet.run_until(fleet.now_ns + HORIZON_NS, |fleet| {
+    !timer_judges(&fleet.members[&1], 2) && !timer_judges(&fleet.members[&2], 1)
+  });
+  let after_death: Vec<HeldAtKill> = [1, 2]
+    .iter()
+    .map(|me| {
+      let member = &fleet.members[me];
+      (
+        *me,
+        member.detection(fleet.now_ns).unwrap().ns,
+        member.detector().detection_bound(fleet.now_ns),
+        member.detector().least_detection_bound(fleet.now_ns),
+      )
+    })
+    .collect();
+  println!(
+    "once the survivors judge each other by an estimator ({judged}, at {} ns): (member, term ns, detection_bound, \
+     least_detection_bound) {after_death:?}",
+    fleet.now_ns
+  );
+  assert!(judged, "an estimator came to judge each survivor's pair");
+  for ((me, term_ns, _, _), (_, young_term_ns, _, _)) in after_death.iter().zip(&held) {
+    assert!(
+      term_ns < young_term_ns,
+      "member {me}'s detection term fell back from the timer's bound once no pair was on its timer: {term_ns} ns, \
+       from {young_term_ns} ns"
+    );
+  }
+}
+
+/// Shape: RFC 6298's timeout before any round trip is measured, and its least timeout until the member's pool has
+/// measured the host's stalls, nanoseconds: a second (§2.1, §2.4), what a forming member's timer-judged probes run.
+const RFC6298_SECOND_NS: u64 = 1_000_000_000;
+
+/// Shape: SWIM's periods from a crashed peer's last answer to its condemnation pending with two members besides this
+/// one, `2(2m − 1) + 1` (Das, Gupta & Motivala, DSN 2002, §4.3).
+const SWIM_PERIODS_OF_THREE: u64 = 7;
+
+/// A-882 (a member never answered; the forming survivors of A-351's readmission test on adacachy2, 2026-11-23, whose
+/// first probes went unanswered and who had timed no period when a leader was cut off). Do: three members, member 1
+/// cut off from the start, so no probe of its is ever answered; run until its detection term is stated; read it; keep
+/// it cut off for 40 s while its probes' timers double at each expiry. Expect: a term though no period of member 1's
+/// was answered, its samples zero, at least SWIM's seven periods at RFC 6298's second; the bound its detector states
+/// grew past it as the timers doubled (non-vacuous); and the term is the one first stated, kept while no probe of its
+/// is answered (Karn's rule, as for a member answered once and then cut off).
+#[test]
+fn a_member_never_answered_keeps_the_first_bound_its_detector_stated() {
+  let mut fleet = Network::new();
+  fleet.cut_off.push(1);
+  let stated = fleet.run_until(HORIZON_NS, |fleet| {
+    fleet.members[&1].detection(fleet.now_ns).is_some()
+  });
+  assert!(stated, "member 1's detector stated a bound");
+  let first = fleet.members[&1].detection(fleet.now_ns).unwrap();
+  let began = fleet.now_ns;
+  fleet.run_until(began + CUT_OFF_OBSERVED_NS, |_| false);
+  let later = fleet.members[&1].detection(fleet.now_ns).unwrap();
+  let grown = fleet.members[&1]
+    .detector()
+    .least_detection_bound(fleet.now_ns);
+  println!(
+    "never answered: first term {first:?}, after 40 s {later:?}, the bound stated then {grown:?}; {} datagrams sent \
+     while cut off",
+    fleet.sent_while_cut_off
+  );
+  assert_eq!(first.samples, 0, "no period of member 1's was answered");
+  assert!(
+    first.ns >= SWIM_PERIODS_OF_THREE * RFC6298_SECOND_NS,
+    "the term is at least SWIM's seven periods at RFC 6298's second: {first:?}"
+  );
+  assert!(
+    grown.is_some_and(|grown| grown.as_nanos() > u128::from(first.ns)),
+    "the bound member 1's detector states grew as its timers doubled: {grown:?}, from {first:?}"
+  );
+  assert_eq!(
+    later, first,
+    "the first bound member 1's detector stated, kept while no probe of its is answered"
   );
 }
 

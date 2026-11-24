@@ -3817,6 +3817,17 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.failover_ns)
   }
 
+  /// The detection term of this node's failover estimate now, nanoseconds (A-363's `D`, A-882): SWIM's count of its
+  /// detector's periods at their measured tail, at least the bound its detector states while a pair is still judged by
+  /// its own retransmission timer; the anchor's supervision where no peer's detector judges the node; `None` before
+  /// either. A one-shot control-shard question; an observation the daemon could not make is its typed refusal. Exposed so
+  /// a fleet test sizes a wait on a member's detection by the detection its survivors state, not by a fixed window.
+  pub fn failover_detection_ns(&self) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      s.failover.estimate().detection.map(|term| term.ns)
+    })
+  }
+
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
   /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
   pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {

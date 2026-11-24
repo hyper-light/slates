@@ -39,7 +39,7 @@ use std::num::NonZeroUsize;
 use hyper_datagram::{AdmitAll, Epoch, LENGTH_BYTES, OVERHEAD_BYTES, Plane, PlaneLimits};
 use hyper_datagram::{ExporterSecret, Role};
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, PingReq};
+use hyper_swim::detector::{Detector, Judge, PingReq};
 use hyper_swim::membership::MemberState;
 use hyper_timing::Exposure;
 use slates_db::register::HostId;
@@ -286,6 +286,16 @@ pub struct MemberPlane {
   period_probe: Option<(u64, u64)>,
   /// See [`MemberPlane::period_probe`].
   period_answered: bool,
+  /// Whether the latest period the detector ended was answered ([`MemberPlane::period_probed`]): while it was, the
+  /// detection term reads the bound a timer-judged pair is stated at now ([`MemberPlane::timer_bound`]); once one was not,
+  /// it reads [`MemberPlane::answered_timer_bound`] (Karn's rule, as for the period's length).
+  answered_lately: bool,
+  /// Whether any period the detector ended was answered.
+  ever_answered: bool,
+  /// [`MemberPlane::timer_bound`] as the latest answered period ended, nanoseconds: what a member no peer answers keeps.
+  /// Before any period was answered, the first bound the detector stated, as its first period ended: a member that was
+  /// never answered keeps that, not the bound its timers state as they double at each expiry.
+  answered_timer_bound: Option<u64>,
 }
 
 impl std::fmt::Debug for MemberPlane {
@@ -360,6 +370,9 @@ impl MemberPlane {
       last_probe_ns: None,
       period_probe: None,
       period_answered: false,
+      answered_lately: false,
+      ever_answered: false,
+      answered_timer_bound: None,
     };
     member.gossip_room = member.room_beside_ack();
     member.view_room = member.room_beside_sync();
@@ -500,12 +513,55 @@ impl MemberPlane {
     &self.detector
   }
 
-  /// The detection term of this node's failover estimate (A-363): [`crate::failover::detection`] over the members the
-  /// detector's view holds besides this one, its own `m`, and the detector's period as this plane timed it.
-  pub fn detection(&self) -> Option<crate::failover::Term> {
+  /// The detection term of this node's failover estimate at `now_ns` (A-363, A-882): [`crate::failover::detection`] over
+  /// the members the detector's view holds besides this one, its own `m`, the detector's period as this plane timed it,
+  /// and the bound a pair still judged by its own retransmission timer is stated at ([`MemberPlane::timer_bound`]). Once
+  /// a period of the detector's ended unanswered, that bound is the one stated as the latest answered period ended: an
+  /// unanswered probe's timer doubles at each expiry, which measures the timer, not a detection (Karn's rule, as for the
+  /// period's length), so a member no peer answers keeps the bound it was stated at while they did, and one never
+  /// answered keeps the first bound its detector stated. Before the detector's first period has ended it states none,
+  /// and the term is `None`: the failover estimate takes the anchor's supervision then (A-574).
+  pub fn detection(&self, now_ns: u64) -> Option<crate::failover::Term> {
     let others =
       u64::try_from(self.detector.membership().len().saturating_sub(1)).unwrap_or(u64::MAX);
-    crate::failover::detection(others, &self.periods)
+    let timer_bound = if self.answered_lately {
+      self.timer_bound(now_ns)
+    } else {
+      self.answered_timer_bound
+    };
+    crate::failover::detection(others, &self.periods, timer_bound)
+  }
+
+  /// The detection bound the detector states at `now_ns` for the deadlines it judges by now, nanoseconds, while a pair it
+  /// probes is still judged by the pair's own retransmission timer (RFC 6298; hyper-swim's `Judge::Timer`: before the
+  /// member's pool has a verdict, or once a late answer took the pair out of the pool's); `None` while an estimator, the
+  /// pair's own or the pool's, judges every pair. The bound is hyper-swim's `Detector::least_detection_bound`: each of
+  /// SWIM's `2(2m − 1) + 1` periods at what an unanswered probe's deadlines allow now (the span of the verdict judging
+  /// the pair, a timer's a second and more before the pool has measured the host's stalls, then the relay stage), and
+  /// the member's latest wake lateness. Not `detection_bound`, which counts each period at the longest any ever ran as
+  /// well, a ratchet: after one detection its unanswered periods kept it at 28.0 s once every pair was judged by an
+  /// estimator again, where the deadlines judged by then allowed 75 to 80 ms (`crates/cluster/tests/member_plane.rs`,
+  /// A-882), so any later fall back to a timer would have read the old detection's periods.
+  fn timer_bound(&self, now_ns: u64) -> Option<u64> {
+    let membership = self.detector.membership();
+    let local = hyper_swim::HostId(self.local.0);
+    let timer_judged = membership
+      .alive()
+      .chain(membership.suspects().map(|(host, _)| host))
+      .filter(|host| *host != local)
+      .any(|host| {
+        self
+          .detector
+          .report(host)
+          .is_some_and(|report| report.judge == Judge::Timer)
+      });
+    if !timer_judged {
+      return None;
+    }
+    self
+      .detector
+      .least_detection_bound(now_ns)
+      .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX))
   }
 
   /// The detector sent a period's probe at `now_ns`: the time since the last is the length of the period it ends, a
@@ -523,6 +579,13 @@ impl MemberPlane {
       self.periods.on_sample(length);
     }
     self.last_probe_ns = Some(now_ns);
+    self.answered_lately = self.period_answered;
+    if self.period_answered {
+      self.ever_answered = true;
+      self.answered_timer_bound = self.timer_bound(now_ns);
+    } else if !self.ever_answered && self.answered_timer_bound.is_none() {
+      self.answered_timer_bound = self.timer_bound(now_ns);
+    }
   }
 
   /// An answer to probe `nonce` of `target` came, directly or through a relay: when it is the period's own probe, the
