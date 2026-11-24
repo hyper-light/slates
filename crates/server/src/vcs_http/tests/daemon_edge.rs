@@ -5517,8 +5517,11 @@ fn a_push_whose_works_base_was_let_go_reads_it_from_the_changeset_store() {
 /// clone each whole (`getbundle`), and pull the second's last changeset over its line before it. Expect every such
 /// object let go (no window of it held), before the clones and after; each clone's and the pull's changegroup verified
 /// by the push's own verifier, every text hashing to its node (the pull's over what the line's clone brought); the
-/// second push's intake asked its texts of the node's changeset store, the parent manifest's read-back counted apart.
-/// Red before: the import and the push kept every changelog and manifest object whole.
+/// second push's intake asked its texts of the node's changeset store, the parent manifest's read-back counted apart;
+/// the pull's changelog and manifest texts read whole counted as such (`vcs_store.hg_pull_log_texts`), never as file
+/// revisions sent whole (`vcs_store.hg_pull_whole_texts` unmoved: main's hg_interop round at a30ffbdb8,
+/// `a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does`, counted 3). Red before: the import and the
+/// push kept every changelog and manifest object whole.
 #[test]
 fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify() {
   let (identity, certificate) = identity();
@@ -5566,7 +5569,29 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   let imported_clone = hg_getbundle_over(edge, &imported, (&null, &imported_heads));
   let line_clone = hg_getbundle_over(edge, &pushed, (&null, &before));
   let whole_clone = hg_getbundle_over(edge, &pushed, (&null, &tip));
+  let whole_before = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::PULL_WHOLE_TEXTS,
+  );
+  let logs_before = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::PULL_LOG_TEXTS,
+  );
   let pull = hg_getbundle_over(edge, &pushed, (&before, &tip));
+  let pulled_whole = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::PULL_WHOLE_TEXTS,
+  )
+  .saturating_sub(whole_before);
+  let pulled_logs = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::PULL_LOG_TEXTS,
+  )
+  .saturating_sub(logs_before);
   let held_after = ids.map(|id| log_windows_held(&daemon, id));
   let asked = counted_on(
     &daemon,
@@ -5622,6 +5647,11 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   assert!(
     asked > 0,
     "the last push's intake asked its texts of the store"
+  );
+  assert_eq!(pulled_whole, 0, "no file revision the pull sent whole");
+  assert!(
+    pulled_logs > 0,
+    "the pull read its changeset's and manifests' texts whole from the store"
   );
 }
 

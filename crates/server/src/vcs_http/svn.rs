@@ -59,7 +59,7 @@
 use crate::repository::svn_commit::{Committed, Uncommitted};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_store::svn_texts::SvnView;
-use crate::vcs_store::svn_view::FetchedPiece;
+use crate::vcs_store::svn_view::{BroughtBases, FetchedPiece};
 use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, run_hook};
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
@@ -74,7 +74,7 @@ use slates_svn::commit::drive::Due;
 use slates_svn::commit::drive::{Setup, Work};
 use slates_svn::dav::Bounds as XmlBounds;
 use slates_svn::dav::commit::{
-  self as commit, DavCommit, Hooks, MergeStep, Merged, PutStart, World as CommitWorld,
+  self as commit, Chunked, DavCommit, Hooks, MergeStep, Merged, PutStart, World as CommitWorld,
 };
 use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
 use slates_svn::dav::response::MergeResponse;
@@ -678,6 +678,9 @@ struct Streamed {
   begun: bool,
   /// The refusal met, which the PUT is answered with.
   refused: Option<HttpAnswer>,
+  /// The base its delta waited for and the exchange brought back (`Due::Text`), held while the PUT's runs read it and
+  /// given back as it ends (its drop).
+  brought: BroughtBases,
 }
 
 /// The streamed PUT `method` on `path` names, when it is a PUT under a transaction's root (`!svn/txr/NAME/...`) or a
@@ -698,6 +701,7 @@ fn streamed_put(method: &str, path: &str) -> Option<Streamed> {
     path: format!("/{}", rest.join("/")),
     begun: false,
     refused: None,
+    brought: BroughtBases::default(),
   })
 }
 
@@ -1025,6 +1029,8 @@ impl<S: SvnStores> SvnExchange<S> {
       .unwrap_or_default();
     let named = match &due {
       Due::StartCommit { transaction } | Due::PreCommit { transaction } => transaction.clone(),
+      // Only a PUT's run waits for a base (`put_step`).
+      Due::Text { .. } => return Err(commit::unserved("A base waited for outside a PUT")),
     };
     let ran = run_hook(
       HookSite::Http(gone, &self.policy),
@@ -1411,6 +1417,8 @@ impl<S: SvnStores> SvnExchange<S> {
         // pre-commit, run where `mod_dav_svn` runs it: before the verdict (A-733).
         let named = match &due {
           Due::StartCommit { transaction } | Due::PreCommit { transaction } => transaction.clone(),
+          // Only a PUT's run waits for a base (`put_step`).
+          Due::Text { .. } => return commit::unserved("A base waited for outside a PUT"),
         };
         let tokens: Vec<LockToken> = presented
           .into_iter()
@@ -1479,17 +1487,46 @@ impl<S: SvnStores> SvnExchange<S> {
 
 impl<S: SvnStores> SvnExchange<S> {
   /// One run of a streamed PUT's body handed to its transaction's drive (the file begun at the first run, its `If`
-  /// tokens presented then), and held no longer; a run after a refusal is dropped.
-  fn stream(&mut self, run: &[u8]) {
+  /// tokens presented then), and held no longer; a run after a refusal is dropped. A run whose delta's base was let go
+  /// (A-760 (b) 4d) waits while the base is brought back whole, then is taken again: once, since the run taken again
+  /// waits for nothing.
+  async fn stream(&mut self, run: &[u8]) {
     let Some(mut streamed) = self.streamed.take() else {
       return;
     };
     if streamed.refused.is_none() {
-      let outcome = self.put_step(&streamed, Some(run));
+      let mut outcome = self.put_step(&streamed, Some(run));
       streamed.begun = true;
-      streamed.refused = outcome.err();
+      if let Ok(Chunked::Wants(identity)) = outcome {
+        let answer = streamed.brought.bring(self.repository, identity).await;
+        outcome = self.resume_put(&streamed, answer);
+      }
+      streamed.refused = match outcome {
+        Ok(Chunked::Taken) => None,
+        Ok(Chunked::Wants(_)) => Some(commit::unserved("A base waited for twice")),
+        Err(refused) => Some(refused),
+      };
     }
     self.streamed = Some(streamed);
+  }
+
+  /// The run a streamed PUT left waiting for its base, taken again with `answer` (`DavCommit::resume_chunk`).
+  fn resume_put(
+    &mut self,
+    streamed: &Streamed,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Result<Chunked, HttpAnswer> {
+    let name = self.streamed_transaction(streamed)?;
+    let hooks = self.hooks();
+    match self
+      .stores
+      .on_commit(self.repository, &self.principal, &name, |commit, world| {
+        commit.resume_chunk(world, &hooks, answer)
+      }) {
+      Some(Some(resumed)) => resumed,
+      Some(None) => Err(commit::no_such_transaction(&name)),
+      None => Err(commit::unserved("Commits")),
+    }
   }
 
   /// A streamed PUT's end: its refusal, or its file begun (a body with no run) and ended.
@@ -1500,7 +1537,7 @@ impl<S: SvnStores> SvnExchange<S> {
     let started = if streamed.begun {
       Ok(())
     } else {
-      self.put_step(&streamed, None)
+      self.put_step(&streamed, None).map(|_| ())
     };
     if let Err(refused) = started {
       return refused;
@@ -1526,7 +1563,7 @@ impl<S: SvnStores> SvnExchange<S> {
 
   /// One step of a streamed PUT on its transaction: the file begun where it is not yet, then `run` as the delta's next
   /// chunk where one is given.
-  fn put_step(&mut self, streamed: &Streamed, run: Option<&[u8]>) -> Result<(), HttpAnswer> {
+  fn put_step(&mut self, streamed: &Streamed, run: Option<&[u8]>) -> Result<Chunked, HttpAnswer> {
     let name = self.streamed_transaction(streamed)?;
     let headers = self.commit_headers.clone();
     let hooks = self.hooks();
@@ -1546,7 +1583,9 @@ impl<S: SvnStores> SvnExchange<S> {
             };
             commit.begin_put(world, &hooks, path, &start)?;
           }
-          run.map_or(Ok(()), |run| commit.put_chunk(world, &hooks, run))
+          run.map_or(Ok(Chunked::Taken), |run| {
+            commit.put_chunk(world, &hooks, run)
+          })
         });
     match stepped {
       Some(Some(stepped)) => stepped,
@@ -2087,7 +2126,7 @@ fn status_of(code: u16) -> Status {
 impl<S: SvnStores> Exchange for SvnExchange<S> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     if self.streamed.is_some() {
-      self.stream(run);
+      self.stream(run).await;
       return Ok(());
     }
     self

@@ -2049,13 +2049,16 @@ jobs:
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      # The step's timeout is about three times its slowest measured pass, as the Miri and loom steps' are: a copy of this
-      # job took 20 min 38 s with no cache (diag run 45315777446, 2026-11-24: the builds about 5 min 30 s, the four
-      # crates' suites 2 min 48 s, the server's 12 min 20 s). A hang then fails the lane in bounded time; the bounded
-      # sweep test once sat past 90 minutes here (main run 45294047051), and since this workflow's concurrency group never
-      # cancels a run in progress, every main run behind it waited and was replaced unrun.
+      # The step's timeout is about three times its slowest measured pass, as the Miri and loom steps' are: diag run
+      # 45411303175 (7d6874639, 2026-11-24, ubuntu-latest, its step held to 300 min) took 31 min 41 s without the bounded
+      # sweep test (the canary, the builds and the four crates' suites 10 min 9 s; the server's library 16 min 15 s; its
+      # daemon, recovery and attach suites 5 min 17 s), 3 x 31 min 41 s = 95 min. The sweep alone ran 3 h 26 min there
+      # (and past 90 minutes in main run 45294047051), so the lane leaves it out (`SERVER_SKIPPED` in xtask/src/tsan.rs:
+      # one shard, no second thread to race). The 62 minutes before were three times 20 min 38 s (diag 45315777446);
+      # main run 45461883678 failed at them, 62.6 min in. A hang still fails the lane in bounded time; since this
+      # workflow's concurrency group never cancels a run in progress, every main run behind it waits that long.
       - name: TSan (the race canary must be reported; then the suites, any report fails)
-        timeout-minutes: 62
+        timeout-minutes: 95
         env:
           # ThreadSanitizer's 10-20x slowdown inflates the restart-detection publish window far past a native run, so
           # the slow-restart client test needs a larger scale than the plain Test lane (same reason; the invariant
