@@ -215,6 +215,8 @@ pub struct Asked<'a> {
   pub bundlecaps: &'a [u8],
   /// Whether to send the changegroup (sent unless `0`).
   pub cg: Option<&'a [u8]>,
+  /// Whether to send a `STREAM2` streaming-clone part (`stream=1`, Mercurial 7.2 `getbundle`).
+  pub stream: Option<&'a [u8]>,
   /// Whether to send the phase heads.
   pub phases: Option<&'a [u8]>,
   /// Whether to send the bookmarks.
@@ -286,10 +288,27 @@ pub fn getbundle(
 /// one payload chunk, or the parts after it and the stream's end. What the answer holds across steps is the parts after
 /// the changegroup (made when it begins: bookmarks, `listkeys`, markers, phase heads), the missing changesets as ranges
 /// ([`pull::Ranges`]) and its place in the changegroup ([`Walk`]); never a revision's text past its step.
+/// A `STREAM2` bundle2 part being streamed inside [`Answering`]: counts files and bytes across
+/// turns via [`crate::render::Streaming`], writes the `HG20` stream head and `STREAM2` part header
+/// once counts are known, then emits payload chunks until done.
+#[derive(Debug)]
+struct Stream2State {
+  /// The revlog + extra store files streamer in `WireFormat::V2`.
+  streaming: Box<crate::render::Streaming>,
+  /// Whether the `HG20` stream head and `STREAM2` part header have been emitted.
+  head_written: bool,
+}
+
+/// A `getbundle`'s answer made a slice at a time (A-745; §4.17.1 "A fetch's answer"): what [`getbundle`] writes whole,
+/// cut into steps its owner advances, each lent the served view anew and charged to the room it is given. A step writes
+/// the stream's head and the changegroup or `STREAM2` part's header, or one unit of the stream as one payload chunk, or
+/// the parts after it and the stream's end.
 #[derive(Debug)]
 pub struct Answering {
   /// The stream's head and the changegroup part's header, until the first step writes them.
   head: Option<Vec<u8>>,
+  /// A `STREAM2` part streamed first when `stream=1` was asked.
+  stream2: Option<Stream2State>,
   /// The changegroup, while one is sent.
   walk: Option<Walk>,
   /// The parts after the changegroup and the stream's end, until the last step writes them.
@@ -297,13 +316,25 @@ pub struct Answering {
 }
 
 impl Answering {
-  /// What the answer's next step asks of the changeset store, if anything (its changegroup's file section, [`Walk`]).
+  /// What the answer's next step asks of the changeset store, if anything (a `STREAM2` part or
+  /// a changegroup's file section, [`Walk`]).
   pub fn wants(&self) -> Option<&crate::render::Want> {
+    if let Some(stream2) = &self.stream2 {
+      return stream2.streaming.wants();
+    }
     self.walk.as_ref()?.wants()
   }
 
   /// The changeset store's answer to [`Answering::wants`].
   pub fn give(&mut self, given: Given) {
+    if let Some(stream2) = &mut self.stream2 {
+      match given {
+        Given::Rows(rows) => stream2.streaming.give_rows(rows),
+        Given::Chunks(chunks) => stream2.streaming.give_chunks(chunks),
+        Given::Texts(_) | Given::TextsPast => {}
+      }
+      return;
+    }
     if let Some(walk) = &mut self.walk {
       walk.give(given);
     }
@@ -318,6 +349,7 @@ impl Answering {
   ) -> Result<Answering, Refusal> {
     let mut unquoted = Vec::new();
     let caps = bundle2_capabilities(asked.bundlecaps, admission, &mut unquoted)?;
+    let stream2 = stream2_state(store, asked.stream, &caps, admission)?;
     let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
     let changegroup = changegroup_part(&outgoing, asked.cg, &caps)?;
     let mut parts = Vec::new();
@@ -331,15 +363,18 @@ impl Answering {
     if flag(asked.phases, false) {
       parts.push(phases_part(store, &outgoing.heads, &caps, admission)?);
     }
+    let cg_id = u32::from(stream2.is_some());
     let mut head = Vec::new();
-    crate::bundle2::put_stream_head(&mut head);
+    if stream2.is_none() {
+      crate::bundle2::put_stream_head(&mut head);
+    }
     let first = match &changegroup {
       Some(built) => {
-        let header = built_part(built, 0);
+        let header = built_part(built, cg_id);
         crate::bundle2::put_part_header(&header, &mut head).map_err(|_| unencodable("a part"))?;
-        1
+        cg_id.saturating_add(1)
       }
-      None => 0,
+      None => cg_id,
     };
     let tail = frame_after(&parts, first, admission)?;
     admission.charge(to_u64(head.len()))?;
@@ -353,7 +388,8 @@ impl Answering {
       None => None,
     };
     Ok(Answering {
-      head: Some(head),
+      head: (!head.is_empty()).then_some(head),
+      stream2,
       walk,
       tail: Some(tail),
     })
@@ -367,6 +403,9 @@ impl Answering {
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
+    if self.stream2.is_some() {
+      return self.step_stream2(store, room, out);
+    }
     if let Some(head) = self.head.take() {
       out.extend_from_slice(&head);
       return Ok(true);
@@ -388,6 +427,139 @@ impl Answering {
     }
     Ok(false)
   }
+
+  /// Advances a `STREAM2` part one step: counts files and bytes, writes the `HG20` head and
+  /// `STREAM2` part header once counted, then streams payload chunks until the part closes.
+  fn step_stream2(
+    &mut self,
+    store: &impl Store,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    let Some(stream2) = &mut self.stream2 else {
+      return Ok(true);
+    };
+    let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
+    if !stream2.head_written {
+      if !stream2.streaming.at_head() {
+        stream2
+          .streaming
+          .step(index, content, room, out)
+          .map_err(super::stream::revlog_refused)?;
+        return Ok(true);
+      }
+      if stream2.streaming.is_not_served() {
+        return Err(Refusal::Store { what: "a revlog" });
+      }
+      let (filecount, bytecount) = stream2.streaming.counts();
+      write_stream2_head(filecount, bytecount, room, out)?;
+      stream2.head_written = true;
+      let mut scratch = Vec::new();
+      let more = stream2
+        .streaming
+        .step(index, content, room, &mut scratch)
+        .map_err(super::stream::revlog_refused)?;
+      if !more {
+        crate::bundle2::put_payload_chunk(out, &[]).map_err(|_| unencodable("a chunk"))?;
+        self.stream2 = None;
+      }
+      return Ok(true);
+    }
+    let mut chunk = Vec::new();
+    let more = stream2
+      .streaming
+      .step(index, content, room, &mut chunk)
+      .map_err(super::stream::revlog_refused)?;
+    if !chunk.is_empty() {
+      crate::bundle2::put_payload_chunk(out, &chunk).map_err(|_| unencodable("a chunk"))?;
+    }
+    if !more {
+      crate::bundle2::put_payload_chunk(out, &[]).map_err(|_| unencodable("a chunk"))?;
+      self.stream2 = None;
+    }
+    Ok(true)
+  }
+}
+
+/// Validates and starts `STREAM2` streaming state when `stream=1` was asked.
+fn stream2_state(
+  store: &impl Store,
+  stream: Option<&[u8]>,
+  caps: &Bundle2Capabilities<'_>,
+  admission: &mut Admission,
+) -> Result<Option<Stream2State>, Refusal> {
+  if !flag(stream, false) {
+    return Ok(None);
+  }
+  if !store.streams() || store.revlogs().is_none() || !offers(caps, b"stream", Some(b"v2")) {
+    return Err(Refusal::NoCommonExchange { what: "stream" });
+  }
+  let mut extra = Vec::new();
+  if !store.publishing() {
+    let mut roots: Vec<Node> = store.draft_roots().collect();
+    roots.sort_unstable();
+    roots.dedup();
+    if !roots.is_empty() {
+      // Format: `<phase> <40-hex-node>\n` per draft root (`phases.py` `phaseroots`).
+      let line_bytes = 2_u64
+        .saturating_add(to_u64(crate::NODE_LEN).saturating_mul(2))
+        .saturating_add(1);
+      admission.charge(to_u64(roots.len()).saturating_mul(line_bytes))?;
+      let mut bytes = Vec::with_capacity(
+        roots
+          .len()
+          .saturating_mul(usize::try_from(line_bytes).unwrap_or(0)),
+      );
+      for node in roots {
+        bytes.extend_from_slice(b"1 ");
+        pushkey::encode_hex(&node, &mut bytes);
+        bytes.push(b'\n');
+      }
+      extra.push((b"phaseroots".to_vec(), bytes));
+    }
+  }
+  Ok(Some(Stream2State {
+    streaming: Box::new(crate::render::Streaming::v2(extra)),
+    head_written: false,
+  }))
+}
+
+/// Writes the `HG20` bundle2 stream head and mandatory `STREAM2` part header (`part_id = 0`) with
+/// Mercurial 7.2's `bytecount`, `filecount`, and URL-quoted `requirements` parameters.
+fn write_stream2_head(
+  filecount: u64,
+  bytecount: u64,
+  room: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refusal> {
+  let bytecount = crate::decimal::Decimal::unsigned(bytecount);
+  let filecount = crate::decimal::Decimal::unsigned(filecount);
+  let part = Part {
+    kind: b"STREAM2",
+    id: 0,
+    params: vec![
+      Param {
+        key: b"bytecount",
+        value: bytecount.as_bytes(),
+      },
+      Param {
+        key: b"filecount",
+        value: filecount.as_bytes(),
+      },
+      Param {
+        key: b"requirements",
+        value: crate::render::STREAM2_REQUIREMENTS,
+      },
+    ],
+    mandatory_params: 3,
+    depth: 0,
+  };
+  let mut head = Vec::new();
+  crate::bundle2::put_stream_head(&mut head);
+  crate::bundle2::put_part_header(&part, &mut head).map_err(|_| unencodable("a part"))?;
+  room.charge(to_u64(head.len()))?;
+  out.extend_from_slice(&head);
+  Ok(())
 }
 
 /// A boolean argument as 7.2 reads one: `default` where absent, false for `0` or nothing, true otherwise.

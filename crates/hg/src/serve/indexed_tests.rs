@@ -1250,6 +1250,167 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   assert!(sent.iter().any(|(name, _)| name == b"00changelog.i"));
 }
 
+/// Reads one unsigned LEB128 varint from `payload` at `*at`.
+fn read_stream2_varint(payload: &[u8], at: &mut usize) -> usize {
+  let (mut val, mut shift) = (0_usize, 0_u32);
+  loop {
+    let b = payload[*at];
+    *at += 1;
+    val |= usize::from(b & 0x7f) << shift;
+    if b & 0x80 == 0 {
+      return val;
+    }
+    shift += 7;
+  }
+}
+
+/// One file unpacked from a `STREAM2` bundle2 part payload.
+struct Stream2File {
+  name: Vec<u8>,
+  data: Vec<u8>,
+}
+
+/// Parses `filecount` entries from a `STREAM2` bundle2 part payload.
+fn parse_stream2_entries(payload: &[u8], filecount: usize) -> (Vec<Stream2File>, usize) {
+  let mut at = 0_usize;
+  let mut files = Vec::with_capacity(filecount);
+  let mut total_bytes = 0_usize;
+  for _ in 0..filecount {
+    assert_eq!(payload[at], b's');
+    at += 1;
+    let name_len = read_stream2_varint(payload, &mut at);
+    let data_len = read_stream2_varint(payload, &mut at);
+    let name = payload[at..at + name_len].to_vec();
+    at += name_len;
+    let data = payload[at..at + data_len].to_vec();
+    at += data_len;
+    total_bytes += data.len();
+    files.push(Stream2File { name, data });
+  }
+  assert_eq!(at, payload.len());
+  (files, total_bytes)
+}
+
+/// Drives a streaming `Answering` to completion using `source`, returning the raw bundle2 wire bytes.
+fn drive_stream2_answering(
+  view: &Indexed<'_>,
+  asked: &super::super::getbundle::Asked<'_>,
+  source: &mut impl crate::render::StoredSource,
+) -> Vec<u8> {
+  use super::super::getbundle::{Answering, Given};
+  let mut answering = Answering::begin(view, asked, &mut room()).unwrap();
+  let mut bytes = Vec::new();
+  loop {
+    while let Some(want) = answering.wants().cloned() {
+      match want {
+        crate::render::Want::Rows { logs } => {
+          answering.give(Given::Rows(source.rows(&logs).unwrap()));
+        }
+        crate::render::Want::Chunks { places } => {
+          answering.give(Given::Chunks(source.chunks(&places).unwrap()));
+        }
+        crate::render::Want::Texts { .. } => panic!("unexpected texts want in stream2"),
+      }
+    }
+    if !answering.step(view, &mut room(), &mut bytes).unwrap() {
+      return bytes;
+    }
+  }
+}
+
+/// Collects all payload chunks of the first part from a decoded bundle2 stream.
+fn first_bundle2_part_payload(decoded: &crate::bundle2::Bundle2<'_>) -> Vec<u8> {
+  let mut payload = Vec::new();
+  let mut in_first = false;
+  for event in &decoded.events {
+    match event {
+      crate::bundle2::Event::Open(0) => in_first = true,
+      crate::bundle2::Event::Chunk(chunk) if in_first => payload.extend_from_slice(chunk),
+      crate::bundle2::Event::Close if in_first => in_first = false,
+      _ => {}
+    }
+  }
+  payload
+}
+
+/// Mercurial 7.2 `stream=v2` bundle2 streaming clone (`getbundle` with `stream=1`): verifies the
+/// server advertises `stream=v2` inside `bundle2` when streaming is allowed and answers `getbundle`
+/// with a `STREAM2` mandatory part carrying `bytecount`, `filecount`, URL-quoted `requirements`,
+/// and every unencoded store file framed with `'s'` + unsigned LEB128 varints.
+#[test]
+fn getbundle_stream2_sends_bundle2_stream2_part_with_unencoded_revlogs() {
+  use super::super::getbundle::Asked;
+  use crate::bundle2::Bundle2;
+  use crate::render::STREAM2_REQUIREMENTS;
+  let (imported, store) = imported("states");
+  let public: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  // Advertised capabilities include `stream=v2` in `bundle2`.
+  let (mut caps_out, mut caps_err) = (Vec::new(), Vec::new());
+  super::super::session::serve(
+    &view,
+    b"capabilities\n",
+    &mut room(),
+    &mut caps_out,
+    &mut caps_err,
+  );
+  let caps_text = String::from_utf8_lossy(&caps_out);
+  assert!(
+    caps_text.contains("stream%3Dv2"),
+    "missing stream=v2 in {caps_text}"
+  );
+  // Request `getbundle` with `stream=1`, `cg=0`, `bookmarks=1`.
+  let asked = Asked {
+    heads: b"",
+    common: b"",
+    bundlecaps: b"HG20,bundle2=HG20%0Abookmarks%0Astream%3Dv2%0A",
+    cg: Some(b"0"),
+    stream: Some(b"1"),
+    bookmarks: Some(b"1"),
+    phases: None,
+    obsmarkers: None,
+    listkeys: None,
+  };
+  let mut source = whole_texts(&imported.index, &store);
+  let bytes = drive_stream2_answering(&view, &asked, &mut source);
+  let decoded = Bundle2::decode(&bytes, &mut room()).unwrap();
+  let part = decoded.parts.first().expect("STREAM2 part");
+  assert_eq!(part.kind, b"STREAM2");
+  assert_eq!(part.mandatory_params, 3);
+  let param = |k: &[u8]| part.params.iter().find(|p| p.key == k).unwrap().value;
+  assert_eq!(param(b"requirements"), STREAM2_REQUIREMENTS);
+  let filecount: usize = std::str::from_utf8(param(b"filecount"))
+    .unwrap()
+    .parse()
+    .unwrap();
+  let bytecount: usize = std::str::from_utf8(param(b"bytecount"))
+    .unwrap()
+    .parse()
+    .unwrap();
+  let payload = first_bundle2_part_payload(&decoded);
+  let (files, total_bytes) = parse_stream2_entries(&payload, filecount);
+  assert_eq!(total_bytes, bytecount);
+  assert!(
+    files
+      .iter()
+      .any(|file| file.name == b"00changelog.i" && !file.data.is_empty())
+  );
+  assert!(
+    files
+      .iter()
+      .any(|file| file.name == b"phaseroots" && !file.data.is_empty())
+  );
+}
+
 /// Each manifest and file revision a changegroup carries, with its link, as a set: what a fetch brings, whatever the
 /// order its packer took.
 fn carried(packed: &[u8]) -> BTreeSet<(Vec<u8>, Node, Node)> {

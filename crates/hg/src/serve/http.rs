@@ -214,6 +214,9 @@ pub struct Streamed {
   compressor: compression::StreamCompressor,
   /// Its engine, whose bound is charged before each slice is compressed.
   engine: Engine,
+  /// Cumulative uncompressed bytes fed into the compressor so the caller's learned estimator can
+  /// measure both compression ratio and throughput (bytes/ns).
+  plain_bytes: u64,
   /// A slice made and not yet compressed, its bound refused: compressed first by the next step, within its room.
   pending: Option<(Vec<u8>, bool)>,
   /// The answer.
@@ -252,6 +255,16 @@ impl Streamed {
     self.media_type
   }
 
+  /// The compression engine chosen for this streamed answer.
+  pub fn engine(&self) -> Engine {
+    self.engine
+  }
+
+  /// Cumulative uncompressed bytes handed to the compressor across all steps so far.
+  pub fn plain_bytes(&self) -> u64 {
+    self.plain_bytes
+  }
+
   /// Appends the body's next slice to `out`, what it makes charged to `room`: whether more follow. Refused, the body
   /// cannot be finished, and its owner ends the reply unfinished.
   pub fn step(
@@ -278,6 +291,7 @@ impl Streamed {
       self.pending = Some((plain, more));
       return Err(Refused::from(past));
     }
+    self.plain_bytes = self.plain_bytes.saturating_add(to_u64(plain.len()));
     self
       .compressor
       .put(&plain, out)
@@ -321,6 +335,7 @@ pub fn begin(
       head: None,
       compressor: compression::StreamCompressor::Uncompressed,
       engine: Engine::Uncompressed,
+      plain_bytes: 0,
       pending: None,
       answering: session::Producing::Revlogs(Box::default()),
     }));
@@ -337,6 +352,7 @@ pub fn begin(
           head: None,
           compressor: compression::StreamCompressor::Uncompressed,
           engine: Engine::Uncompressed,
+          plain_bytes: 0,
           pending: None,
           answering: looking,
         }));
@@ -424,6 +440,7 @@ fn streaming(
     head: Some(head),
     compressor,
     engine: choice.engine,
+    plain_bytes: 0,
     pending: None,
     answering,
   })

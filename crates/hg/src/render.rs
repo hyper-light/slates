@@ -41,6 +41,9 @@ const DATA: &[u8] = b"data/";
 /// Format: the requirements a rendered store needs of a stream clone's client, as `streamreqs` lists them (7.2's
 /// `streamed_requirements`: the store's formats among `.hg/requires`, sorted and joined by commas).
 pub const STREAM_REQUIREMENTS: &[u8] = b"generaldelta,revlogv1,sparserevlog";
+/// Format: [`STREAM_REQUIREMENTS`] URL-quoted as Mercurial 7.2's `bundle2._formatrequirementsspec` writes the
+/// `STREAM2` part's mandatory `requirements` parameter.
+pub const STREAM2_REQUIREMENTS: &[u8] = b"generaldelta%2Crevlogv1%2Csparserevlog";
 /// Format: `.hg/requires`, sorted as 7.2 writes it.
 const REQUIRES: &[u8] = b"dotencode\nfncache\ngeneraldelta\nrevlogv1\nsparserevlog\nstore\n";
 /// Format: the most bytes a count takes as decimal text (`u64::MAX`'s 20 digits).
@@ -283,19 +286,38 @@ impl Walked {
   }
 }
 
-/// Where a streamed `stream_out` stands (A-745).
+/// Wire framing for a [`Streaming`] revlog transfer: legacy `stream_out` v1 (`encodedir` paths + decimal sizes) or
+/// bundle2 `STREAM2` v2 (unencoded store paths + LEB128 varints prefixed with `_srcstore` `'s'`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WireFormat {
+  /// Legacy `stream_out` v1 (`0\n<files> <bytes>\n`, then `<encodedir>\0<size>\n<bytes>`).
+  #[default]
+  V1,
+  /// Bundle2 `STREAM2` v2 payload (`'s'`, `uvarint(name_len)`, `uvarint(size)`, `<unencoded_name>`, `<bytes>`).
+  V2,
+}
+
+/// Format: Mercurial 7.2's `_srcstore` destination tag in `stream2` entries (`streamclone.py`).
+const STREAM2_SRC_STORE: u8 = b's';
+
+/// Format: most bytes an unsigned 64-bit LEB128 varint takes (`ceil(64 / 7)` = 10).
+const UVARINT_MAX_BYTES: u64 = 10;
+
+/// Where a streamed `stream_out` or `STREAM2` stands (A-745).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stage {
   /// Not begun: the first log the walk writes is found.
   Start,
   /// Counting the files and their bytes, which the answer's head names first: the log next.
   Counting(Walked),
-  /// The head: `0`, then the files' count and bytes; or `1`, no stream served.
+  /// The head: `0`, then the files' count and bytes; or `1`, no stream served (or `STREAM2` part header in V2).
   Head,
   /// A log's index file: its next revision, and its data file's bytes before it.
   Index(Walked, u32, u64),
   /// A log's data file: its next revision.
   Data(Walked, u32),
+  /// Extra store files emitted after the revlogs in `STREAM2` (such as `phaseroots`), indexed by position.
+  Extra(usize),
   /// Ended.
   Done,
 }
@@ -471,6 +493,10 @@ struct StoredLog {
 /// ([`Streaming::give_rows`], [`Streaming::give_chunks`]).
 #[derive(Debug)]
 pub struct Streaming {
+  /// Wire framing (`V1` for `stream_out`, `V2` for bundle2 `STREAM2`).
+  format: WireFormat,
+  /// Extra store files (e.g. `phaseroots`) emitted after the revlogs in `V2`.
+  extra: Vec<(Vec<u8>, Vec<u8>)>,
   /// Where it stands.
   stage: Stage,
   /// The files counted, and their bytes.
@@ -513,6 +539,8 @@ struct Gathering {
 impl Default for Streaming {
   fn default() -> Self {
     Streaming {
+      format: WireFormat::V1,
+      extra: Vec::new(),
       stage: Stage::Start,
       counted: (0, 0),
       want: None,
@@ -529,6 +557,31 @@ impl Default for Streaming {
 }
 
 impl Streaming {
+  /// A bundle2 `STREAM2` stream over the repository's revlogs plus any non-empty `extra` store
+  /// files (such as `phaseroots`).
+  pub fn v2(extra: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+    Streaming {
+      format: WireFormat::V2,
+      extra,
+      ..Streaming::default()
+    }
+  }
+
+  /// Whether counting has finished and the stream is paused at `Stage::Head`, ready to write the
+  /// `STREAM2` part header with [`Self::counts`].
+  pub fn at_head(&self) -> bool {
+    self.stage == Stage::Head
+  }
+
+  /// Whether counting met a revision the changeset store does not keep.
+  pub fn is_not_served(&self) -> bool {
+    self.not_served
+  }
+
+  /// The `(filecount, bytecount)` counted so far (exact once [`Self::at_head`] is true).
+  pub fn counts(&self) -> (u64, u64) {
+    self.counted
+  }
   /// What the next step needs of the changeset store, if anything: given back by [`Streaming::give_rows`] or
   /// [`Streaming::give_chunks`] before the next step.
   pub fn wants(&self) -> Option<&Want> {
@@ -593,13 +646,24 @@ impl Streaming {
     self.room_hint = admission.left();
     let stage = self.stage.clone();
     self.stage = match stage {
-      Stage::Start => first_log(index, store).map_or(Stage::Head, Stage::Counting),
+      Stage::Start => {
+        if self.format == WireFormat::V2 {
+          for (_, bytes) in &self.extra {
+            if !bytes.is_empty() {
+              self.counted.0 = self.counted.0.saturating_add(1);
+              self.counted.1 = self.counted.1.saturating_add(to_u64(bytes.len()));
+            }
+          }
+        }
+        first_log(index, store).map_or(Stage::Head, Stage::Counting)
+      }
       Stage::Counting(log) => self.count(index, store, log)?,
       Stage::Head => self.head(index, store, admission, out)?,
       Stage::Index(log, rev, offset) => {
         self.index_entry(index, store, (log, rev, offset), admission, out)?
       }
       Stage::Data(log, rev) => self.data_chunk(index, store, (log, rev), admission, out)?,
+      Stage::Extra(at) => self.extra_file(at, admission, out)?,
       Stage::Done => return Ok(false),
     };
     Ok(self.stage != Stage::Done)
@@ -704,7 +768,9 @@ impl Streaming {
     Ok(next_log(&log, index, store).map_or(Stage::Head, Stage::Counting))
   }
 
-  /// The answer's head: `0` and the counts, or `1` where a revision the store does not keep was met.
+  /// The answer's head: in V1, `0` and the counts, or `1` where a revision the store does not keep
+  /// was met; in V2, the bundle2 caller writes the `STREAM2` part header itself, so this advances
+  /// directly to the first log (or extra file).
   fn head(
     &mut self,
     index: &HgIndex,
@@ -712,6 +778,15 @@ impl Streaming {
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
+    if self.format == WireFormat::V2 {
+      if self.not_served {
+        return Ok(Stage::Done);
+      }
+      return Ok(first_log(index, store).map_or_else(
+        || next_extra(self.format, &self.extra, 0),
+        |log| Stage::Index(log, 0, 0),
+      ));
+    }
     if self.not_served {
       // Format: 7.2's "operation forbidden by server", two bytes.
       admission.charge(2)?;
@@ -726,6 +801,24 @@ impl Streaming {
     out.extend_from_slice(crate::decimal::Decimal::unsigned(self.counted.1).as_bytes());
     out.push(b'\n');
     Ok(first_log(index, store).map_or(Stage::Done, |log| Stage::Index(log, 0, 0)))
+  }
+
+  /// Emits one extra store file (such as `phaseroots`) in `STREAM2` format.
+  fn extra_file(
+    &mut self,
+    at: usize,
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Stage, Refused> {
+    let Some((name, bytes)) = self.extra.get(at) else {
+      return Ok(Stage::Done);
+    };
+    if !bytes.is_empty() {
+      stream2_entry_head(name, to_u64(bytes.len()), admission, out)?;
+      admission.charge(to_u64(bytes.len()))?;
+      out.extend_from_slice(bytes);
+    }
+    Ok(next_extra(self.format, &self.extra, at.saturating_add(1)))
   }
 
   /// The index file's next entry (its line first, at its first), or the index file's end and the data file next.
@@ -746,12 +839,13 @@ impl Streaming {
     })?;
     if rev >= count {
       if offset == 0 {
-        return Ok(
-          next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)),
-        );
+        return Ok(next_log(&log, index, store).map_or_else(
+          || next_extra(self.format, &self.extra, 0),
+          |next| Stage::Index(next, 0, 0),
+        ));
       }
       let name = [log.radix().as_slice(), b".d"].concat();
-      file_line(&name, offset, admission, out)?;
+      entry_head(self.format, &name, offset, admission, out)?;
       return Ok(Stage::Data(log, 0));
     }
     let unreadable = || Refused::Unreadable {
@@ -761,7 +855,7 @@ impl Streaming {
     if rev == 0 {
       let name = [log.radix().as_slice(), b".i"].concat();
       let size = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
-      file_line(&name, size, admission, out)?;
+      entry_head(self.format, &name, size, admission, out)?;
     }
     admission.charge(to_u64(ENTRY_BYTES))?;
     let stored = self.held.front().ok_or_else(unreadable)?;
@@ -839,7 +933,10 @@ impl Streaming {
     let count = u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)?;
     if rev >= count {
       // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
-      return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
+      return Ok(next_log(&log, index, store).map_or_else(
+        || next_extra(self.format, &self.extra, 0),
+        |next| Stage::Index(next, 0, 0),
+      ));
     }
     let seq = stored.seq;
     if self
@@ -956,6 +1053,70 @@ fn chunk_len(stored: u64) -> u64 {
     0
   } else {
     stored.saturating_add(1)
+  }
+}
+
+/// The next non-empty extra store file stage under `format`, or `Stage::Done`.
+fn next_extra(format: WireFormat, extra: &[(Vec<u8>, Vec<u8>)], from: usize) -> Stage {
+  if format != WireFormat::V2 {
+    return Stage::Done;
+  }
+  extra
+    .iter()
+    .enumerate()
+    .skip(from)
+    .find(|(_, (_, bytes))| !bytes.is_empty())
+    .map_or(Stage::Done, |(at, _)| Stage::Extra(at))
+}
+
+/// Writes a file's entry header in `format` (`V1` `encodedir` line or `V2` `STREAM2` varint record).
+fn entry_head(
+  format: WireFormat,
+  name: &[u8],
+  size: u64,
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
+  match format {
+    WireFormat::V1 => file_line(name, size, admission, out),
+    WireFormat::V2 => stream2_entry_head(name, size, admission, out),
+  }
+}
+
+/// Writes one `STREAM2` entry header (`streamclone._emit2`): `_srcstore` (`'s'`), `uvarint(name.len())`,
+/// `uvarint(size)`, and the unencoded internal store filename `name`.
+fn stream2_entry_head(
+  name: &[u8],
+  size: u64,
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
+  admission.charge(
+    1_u64
+      .saturating_add(UVARINT_MAX_BYTES.saturating_mul(2))
+      .saturating_add(to_u64(name.len())),
+  )?;
+  out.push(STREAM2_SRC_STORE);
+  uvarint_encode(to_u64(name.len()), out);
+  uvarint_encode(size, out);
+  out.extend_from_slice(name);
+  Ok(())
+}
+
+/// Unsigned LEB128 varint matching Mercurial 7.2's `util.uvarintencode`.
+fn uvarint_encode(mut value: u64, out: &mut Vec<u8>) {
+  // Format: 7 payload bits per varint byte, MSB set on all but the final byte (LEB128).
+  const PAYLOAD_MASK: u64 = 0x7f;
+  const CONTINUE_BIT: u8 = 0x80;
+  const SHIFT: u32 = 7;
+  loop {
+    let bits = u8::try_from(value & PAYLOAD_MASK).unwrap_or(0);
+    value >>= SHIFT;
+    if value == 0 {
+      out.push(bits);
+      break;
+    }
+    out.push(bits | CONTINUE_BIT);
   }
 }
 

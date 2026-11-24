@@ -44,13 +44,14 @@
 //! admitted what its repository's shard can hold instead (`HgStores::push_room`, A-711, as A-704 admits git's), and one
 //! past it is answered in Mercurial's words (`pusherr`), never `413`.
 //!
-//! **Compression** ([`Fastest`]). §4.17.3's estimator (the connection's delivery rate, and this repository's
-//! compression speed and ratio per engine and level) is owed; until it lands a stream takes the design's first value,
-//! the fastest form the client reads: `none` where it reads it, which costs no compression time, else its first
-//! engine at that engine's fastest level; zlib at level 0 to a client that reads `application/mercurial-0.1` alone.
-//!
-//! **Differs from hgweb, on purpose.** A principal whose credentials hold and whom the policy refuses is `403` (RFC
-//! 9110 §15.5.4: the credentials are "insufficient to grant access"), where hgweb answers `401` without a challenge.
+//! **Compression** ([`LearnedCompressor`]). Implements §4.17.3's learned response compression estimator per shard:
+//! measures actual socket link wait time (`Exchange::sent` via [`crate::vcs_store::upload::Pacing`]) and per-engine
+//! compression speed and output ratio (`Streamed::step`), choosing among the client's offered engines the one that
+//! minimizes expected wall-clock time per uncompressed byte (`encode_ns / in_bytes + ratio * link_ns / wire_bytes`).
+//! On fast/uncongested links where writes never wait, uncompressed wins automatically; when links pace writes, the
+//! estimator probes and selects the compressed engine (zstd/zlib) whose bandwidth saving beats its CPU cost.
+
+use core::cell::RefCell;
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_hg::compression::Engine;
@@ -201,23 +202,189 @@ enum Made {
   Streamed(Box<hg_http::Streamed>),
 }
 
-/// The design's first value for a stream's compression (§4.17.3 "Learned tunables": "each named engine at its fastest
-/// level"), until the estimator lands: the fastest form the client reads (the module doc).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Fastest;
+/// Format: bytes remembered by the per-shard link and engine statistics before both sums are halved, matching
+/// `crate::vcs_store::upload::LINK_MEMORY` (64 MiB, a few clones of a mid-sized repository so old links fade).
+const COMPRESSION_MEMORY_BYTES: u64 = 64 << 20;
 
-impl Compressor for Fastest {
-  fn choose(&mut self, _media: Media, engines: &[Engine], _length: u64) -> Compression {
-    let engine = engines
+/// Format: bytes waited on a link before compression trade-offs trust the link price, matching
+/// `crate::vcs_store::upload::LINK_LEARNED_FROM` (1 MiB, past typical socket send buffers).
+const LINK_LEARNED_FROM: u64 = 1 << 20;
+
+/// Format: fastest compressing level for zlib (RFC 1950 / `deflateInit` level 1; level 0 is stored uncompressed),
+/// bzip2 (level 1), and positive-level zstd (libzstd level 1).
+const FASTEST_COMPRESSING_LEVEL: i32 = 1;
+
+/// Observed throughput and ratio of one compression engine on this shard.
+#[derive(Clone, Copy, Debug, Default)]
+struct EngineStats {
+  /// Cumulative nanoseconds spent producing and compressing bytes.
+  encode_ns: u64,
+  /// Cumulative uncompressed input bytes compressed.
+  in_bytes: u64,
+  /// Cumulative compressed wire bytes emitted.
+  out_bytes: u64,
+}
+
+impl EngineStats {
+  /// Records one measured compression turn, halving sums past [`COMPRESSION_MEMORY_BYTES`].
+  fn record(&mut self, encode_ns: u64, in_bytes: u64, out_bytes: u64) {
+    if in_bytes == 0 {
+      return;
+    }
+    self.encode_ns = self.encode_ns.saturating_add(encode_ns);
+    self.in_bytes = self.in_bytes.saturating_add(in_bytes);
+    self.out_bytes = self.out_bytes.saturating_add(out_bytes);
+    while self.in_bytes > COMPRESSION_MEMORY_BYTES {
+      self.encode_ns /= 2;
+      self.in_bytes /= 2;
+      self.out_bytes /= 2;
+    }
+  }
+}
+
+/// Per-shard learned link price and per-engine compression measurements (§4.17.3 "Learned tunables").
+#[derive(Clone, Copy, Debug, Default)]
+struct CompressionLearner {
+  /// Measured link wait time past first full-socket write (`ns`, `wire_bytes`).
+  link_ns: u64,
+  /// Measured wire bytes corresponding to `link_ns`.
+  link_bytes: u64,
+  /// Observed stats per engine, indexed by [`engine_slot`].
+  engines: [EngineStats; 4],
+}
+
+/// Dense array slot for each [`Engine`].
+const fn engine_slot(engine: Engine) -> usize {
+  match engine {
+    Engine::Uncompressed => 0,
+    Engine::Zstd => 1,
+    Engine::Zlib => 2,
+    Engine::Bzip2 => 3,
+  }
+}
+
+/// Fastest CPU level of `engine` when the link is not pacing writes (stored/minimum level the engine's codec accepts).
+fn unpaced_level(engine: Engine) -> i32 {
+  *engine.levels().start()
+}
+
+/// Fastest compressing level of `engine` when the link is pacing writes (0 for uncompressed, level 1 for codecs).
+const fn paced_level(engine: Engine) -> i32 {
+  match engine {
+    Engine::Uncompressed => 0,
+    Engine::Zstd | Engine::Zlib | Engine::Bzip2 => FASTEST_COMPRESSING_LEVEL,
+  }
+}
+
+impl CompressionLearner {
+  /// Records a paced socket write `(ns, wire_bytes)`.
+  fn learn_link(&mut self, (ns, bytes): (u64, u64)) {
+    self.link_ns = self.link_ns.saturating_add(ns);
+    self.link_bytes = self.link_bytes.saturating_add(bytes);
+    while self.link_bytes > COMPRESSION_MEMORY_BYTES {
+      self.link_ns /= 2;
+      self.link_bytes /= 2;
+    }
+  }
+
+  /// Records one measured compression turn for `engine`.
+  fn learn_engine(&mut self, engine: Engine, encode_ns: u64, in_bytes: u64, out_bytes: u64) {
+    if let Some(slot) = self.engines.get_mut(engine_slot(engine)) {
+      slot.record(encode_ns, in_bytes, out_bytes);
+    }
+  }
+
+  /// Chooses the offered engine and level minimizing expected wall-clock time per uncompressed byte.
+  fn choose(&self, media: Media, engines: &[Engine]) -> Compression {
+    if media == Media::V1 {
+      let level = if self.link_bytes >= LINK_LEARNED_FROM && self.link_ns > 0 {
+        FASTEST_COMPRESSING_LEVEL
+      } else {
+        0
+      };
+      return Compression {
+        engine: Engine::Zlib,
+        level,
+      };
+    }
+    // Until link backpressure is observed past a socket buffer, avoid burning CPU on compression.
+    if self.link_bytes < LINK_LEARNED_FROM || self.link_ns == 0 {
+      let engine = engines
+        .iter()
+        .copied()
+        .find(|engine| *engine == Engine::Uncompressed)
+        .or_else(|| engines.first().copied())
+        .unwrap_or(Engine::Zlib);
+      return Compression {
+        engine,
+        level: unpaced_level(engine),
+      };
+    }
+    // Once the link paces writes, probe any unmeasured fast compressed engine (zstd, then zlib) to measure
+    // its real speed and ratio on this machine and workload, then pick the minimum total-time winner.
+    for probe in [Engine::Zstd, Engine::Zlib] {
+      if engines.contains(&probe)
+        && self
+          .engines
+          .get(engine_slot(probe))
+          .is_some_and(|stats| stats.in_bytes == 0)
+      {
+        return Compression {
+          engine: probe,
+          level: paced_level(probe),
+        };
+      }
+    }
+    let best = engines
       .iter()
       .copied()
-      .find(|engine| *engine == Engine::Uncompressed)
-      .or_else(|| engines.first().copied())
+      .min_by(|&a, &b| self.compare_cost(a, b))
       .unwrap_or(Engine::Zlib);
     Compression {
-      engine,
-      level: *engine.levels().start(),
+      engine: best,
+      level: paced_level(best),
     }
+  }
+
+  /// Compares expected total ns per input byte of `a` vs `b`:
+  /// `cost(e) = encode_ns / in_bytes + (out_bytes / in_bytes) * (link_ns / link_bytes)`.
+  fn compare_cost(&self, a: Engine, b: Engine) -> core::cmp::Ordering {
+    let cost_num = |engine: Engine| -> (u128, u128) {
+      let stats = self
+        .engines
+        .get(engine_slot(engine))
+        .copied()
+        .unwrap_or_default();
+      if stats.in_bytes == 0 {
+        // Unmeasured engine: compare as pure link cost (ratio 1.0, zero measured encode cost).
+        return (u128::from(self.link_ns), u128::from(self.link_bytes.max(1)));
+      }
+      let link_b = u128::from(self.link_bytes.max(1));
+      let link_n = u128::from(self.link_ns);
+      let num = u128::from(stats.encode_ns)
+        .saturating_mul(link_b)
+        .saturating_add(u128::from(stats.out_bytes).saturating_mul(link_n));
+      let den = u128::from(stats.in_bytes).saturating_mul(link_b);
+      (num, den.max(1))
+    };
+    let (na, da) = cost_num(a);
+    let (nb, db) = cost_num(b);
+    na.saturating_mul(db).cmp(&nb.saturating_mul(da))
+  }
+}
+
+thread_local! {
+  /// Per-shard learned Mercurial HTTP response compression state (thread-per-core, zero locks).
+  static HG_COMPRESSION: RefCell<CompressionLearner> = RefCell::new(CompressionLearner::default());
+}
+
+/// §4.17.3 learned response compression chooser for Mercurial HTTP answers on this shard.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LearnedCompressor;
+
+impl Compressor for LearnedCompressor {
+  fn choose(&mut self, media: Media, engines: &[Engine], _length: u64) -> Compression {
+    HG_COMPRESSION.with(|cell| cell.borrow().choose(media, engines))
   }
 }
 
@@ -527,6 +694,8 @@ pub(crate) struct HgExchange<S: HgStores> {
   past_room: bool,
   /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
   costs: crate::vcs_store::TurnCosts,
+  /// Write-wait tracker feeding the shard's learned compression estimator (§4.17.3).
+  pacing: crate::vcs_store::upload::Pacing,
 }
 
 impl<S: HgStores> HgExchange<S> {
@@ -576,6 +745,7 @@ impl<S: HgStores> HgExchange<S> {
       request_room: room,
       past_room: false,
       costs: crate::vcs_store::TurnCosts::ZERO,
+      pacing: crate::vcs_store::upload::Pacing::default(),
     })
   }
 }
@@ -640,7 +810,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
         .await
         .map(|answered| Made::Whole(answered.media_type, answered.body)),
       None => self.stores.lend(id, &mut answering, |store, room| {
-        match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
+        match hg_http::begin(store, &request, header_line(), &mut LearnedCompressor, room) {
           hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
           hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
         }
@@ -705,6 +875,12 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       None => Ok(false),
     }
   }
+
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    if let Some(taught) = self.pacing.sent(sent) {
+      HG_COMPRESSION.with(|cell| cell.borrow_mut().learn_link(taught));
+    }
+  }
 }
 
 impl<S: HgStores> HgExchange<S> {
@@ -724,7 +900,9 @@ impl<S: HgStores> HgExchange<S> {
       .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
     let costs = &mut self.costs;
     let mut paced = crate::vcs_store::paced_turn(quantum, start);
-    let before = out.len();
+    let before_out = out.len();
+    let before_plain = streamed.plain_bytes();
+    let engine = streamed.engine();
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
@@ -749,13 +927,23 @@ impl<S: HgStores> HgExchange<S> {
           }
         }
       });
-    paced.close(slates_rt::futures::now_ns(), costs);
+    let finished = slates_rt::futures::now_ns();
+    paced.close(finished, costs);
     crate::vcs_store::hg_view::turn_taken();
+    let out_delta = u64::try_from(out.len().saturating_sub(before_out)).unwrap_or(u64::MAX);
+    let plain_delta = streamed.plain_bytes().saturating_sub(before_plain);
+    if plain_delta > 0 {
+      HG_COMPRESSION.with(|cell| {
+        cell.borrow_mut().learn_engine(
+          engine,
+          finished.saturating_sub(start),
+          plain_delta,
+          out_delta,
+        );
+      });
+    }
     // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
-    self.stores.wrote(
-      generation,
-      u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
-    );
+    self.stores.wrote(generation, out_delta);
     match turned {
       Some(Ok(more)) => Ok(more),
       Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),

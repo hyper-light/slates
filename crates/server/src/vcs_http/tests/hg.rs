@@ -23,7 +23,7 @@ use slates_http_edge::connection::Fields;
 use slates_http_edge::credential::Credential;
 
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
-use super::{Fastest, HgSite, HgStores};
+use super::{CompressionLearner, HgSite, HgStores, LearnedCompressor};
 use crate::repository::hg_push::Pushing;
 use crate::vcs_http::{Answer, ClientGone, Decided, Exchange, Failed, Site};
 
@@ -750,16 +750,16 @@ impl HgStores for Vanishing {
   }
 }
 
-/// A-650 part 1: do ask the first value's compressor for a `0.2` client listing `none`, one listing zstd and zlib, and a
-/// `0.1` client. Expect `none`, zstd at libzstd's fastest level, and zlib at level 0 (stored), the fastest form each
-/// client reads.
+/// A-650 part 1 / §4.17.3: on an unpaced link, the learned compressor picks `none`, zstd at libzstd's fastest level,
+/// and zlib at level 0 (stored). When link backpressure is observed and zstd's measured bandwidth saving beats its CPU
+/// cost, it switches to zstd level 1; when the link is fast relative to CPU, uncompressed stays the winner.
 #[test]
 fn streams_take_the_fastest_form_the_client_reads() {
-  let mut fastest = Fastest;
+  let mut learned = LearnedCompressor;
   let chosen = [
-    fastest.choose(Media::V2, &[Engine::Zstd, Engine::Uncompressed], 1),
-    fastest.choose(Media::V2, &[Engine::Zstd, Engine::Zlib], 1),
-    fastest.choose(Media::V1, &[Engine::Zlib], 1),
+    learned.choose(Media::V2, &[Engine::Zstd, Engine::Uncompressed], 1),
+    learned.choose(Media::V2, &[Engine::Zstd, Engine::Zlib], 1),
+    learned.choose(Media::V1, &[Engine::Zlib], 1),
   ];
   let fastest_zstd = *Engine::Zstd.levels().start();
   assert_eq!(
@@ -778,6 +778,33 @@ fn streams_take_the_fastest_form_the_client_reads() {
         level: 0
       },
     ]
+  );
+
+  // Slow link (10 MB/s = 100 ns/byte): zstd (5 ns/byte encode, 3:1 ratio -> 38 ns/byte total) beats uncompressed (100 ns/byte).
+  let mut slow = CompressionLearner::default();
+  slow.learn_link((200_000_000, 2 << 20));
+  assert_eq!(
+    slow.choose(Media::V2, &[Engine::Zstd, Engine::Uncompressed]),
+    Compression {
+      engine: Engine::Zstd,
+      level: 1
+    }
+  );
+  slow.learn_engine(Engine::Zstd, 5_000_000, 1_000_000, 333_333);
+  slow.learn_engine(Engine::Uncompressed, 100_000, 1_000_000, 1_000_000);
+  assert_eq!(
+    slow.choose(Media::V2, &[Engine::Zstd, Engine::Uncompressed]),
+    Compression {
+      engine: Engine::Zstd,
+      level: 1
+    }
+  );
+  assert_eq!(
+    slow.choose(Media::V1, &[Engine::Zlib]),
+    Compression {
+      engine: Engine::Zlib,
+      level: 1
+    }
   );
 }
 

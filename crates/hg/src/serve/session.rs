@@ -648,7 +648,11 @@ fn advertised(
     names.sort_unstable();
   }
   let mut blob = Vec::new();
-  capabilities::encode_bundle2(&BUNDLE2_SERVED, &mut blob);
+  let mut b2: Vec<(&[u8], &[&[u8]])> = BUNDLE2_SERVED.to_vec();
+  if streams {
+    b2.push((b"stream", &[b"v2"]));
+  }
+  capabilities::encode_bundle2(&b2, &mut blob);
   let mut quoted = Vec::new();
   capabilities::encode_bundle2_value(&blob, &mut quoted);
   let header_line = Decimal::unsigned(header_line);
@@ -965,6 +969,7 @@ pub(crate) fn getbundle_asked<'a>(arguments: &Arguments<'a>) -> Asked<'a> {
     common: arguments.entry(b"common").unwrap_or_default(),
     bundlecaps: arguments.entry(b"bundlecaps").unwrap_or_default(),
     cg: arguments.entry(b"cg"),
+    stream: arguments.entry(b"stream"),
     phases: arguments.entry(b"phases"),
     bookmarks: arguments.entry(b"bookmarks"),
     obsmarkers: arguments.entry(b"obsmarkers"),
