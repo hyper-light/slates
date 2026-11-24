@@ -47,6 +47,10 @@ The first run never needed the record, since it kept the object in its `adopted`
     a rerun after a warm restart lists the adoption as the successor's own promise and answers it by name.
   - The rerun reaches the end of the first run: the object adopted by the successor, at the rerun's epoch.
   - A moved volume's adoption (A-291) records none. A later retirement of the same host never counts it (A-883).
+- **Why the second adoption is harmless (main's ruling of 2026-11-23).** The rerun re-adopts the object one epoch
+  above the first run's and fences its holders there. That is not A-883's spurious self-takeover returning. The warm
+  restart has already ended every request in flight from the first run, so the extra fence costs nothing a client can
+  see beyond the restart itself.
 - **A round never promises again what it adopted.** `promise_local_copies` leaves out the objects in `adopted`. A round
   started over above its epoch therefore never fences the adoption this node writes under.
 

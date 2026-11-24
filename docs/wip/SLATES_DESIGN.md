@@ -62311,6 +62311,12 @@ Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A
     started over above its epoch never fences an adoption its successor writes under.
   - A moved volume's adoption (A-291) records no move. A later retirement of the same host never counts this one
     (A-883).
+- **Why the rerun's second adoption is harmless (main's ruling of 2026-11-23).**
+  - The rerun adopts the object again at its own epoch, one above the first run's, and fences its holders there.
+  - That is not A-883's spurious self-takeover coming back. There, a live owner's own object was taken over again by
+    another host's later round, with its requests in flight.
+  - Here, the warm restart has already ended every request in flight from the first run. So the extra fence costs
+    nothing a client can see beyond the restart itself, and the successor's next writes go out under the new epoch.
 - **Rejected (main's ruling):** clearing a copy's move once its successor has written it (A-484's ownership rule).
   That widens what a move means for every copy, and still misses a restart that comes before any write.
 - **Tests** (adacachy2):
