@@ -1,9 +1,8 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 12:35 PST): gate 12 at a551b0a88, current main with w-shared's A-907 (113c937b6: broadcast
-# stragglers settled by one fleet::settled_stragglers for homes' exchange_round, put_whole and credentials; Stragglers'
-# Drop hands unsettled sessions to an orphan hook; HOME_STREAM served on its own task). Gate 10 (d48863ddb, A-902 alone)
-# failed 31 of 31 "no survivor served the repository"; gate 9 (7d6874639) passed 37 of 40. Twenty release then twenty
-# debug runs, stopped after the first three if all three fail. Run only from diag-measurer-main-v3-* branches.
+# main 01a20182 (2026-11-24 13:19 PST): gate 13 at 6eae8b2a4, main e7c265c6c with main's lint commit moving serve_peer_records'
+# dispatch to dispatched_request (the fleet's record-serving loop, which v3_takeover drives across processes). Gate 12
+# (a551b0a88, A-907) passed 40 of 40. Twenty release then twenty debug runs, stopped after the first three if all three
+# fail. Run only from diag-measurer-main-v3-* branches.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -13,13 +12,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 12 at a551b0a88)
+    name: v3_takeover (gate 13 at 6eae8b2a4)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a551b0a8822c9abed2e3307b221961c5c53be346
+          ref: 6eae8b2a41113353f5550a97ad670be48b9e92b3
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -50,7 +49,7 @@ jobs:
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 12: $pass of $ran passed"
+          echo "== gate 13: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -60,5 +59,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate12
+          name: v3-gate13
           path: ${{ runner.temp }}/*.log
