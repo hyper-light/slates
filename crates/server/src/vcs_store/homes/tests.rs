@@ -964,3 +964,32 @@ fn a_home_message_of_another_version_is_refused_at_once_and_typed() {
   assert_eq!(refused, Some(1), "counted");
   assert_eq!(held, 0, "nothing kept");
 }
+
+/// A recovered region hold is taken only once the region's set can name it (main 01a20182's commit-2 list: a hold taken
+/// first, then given back with its release's refusal dropped, could leave the store's count and the set apart). Do:
+/// keep an object in a content store; borrow the region's set, as a step already holding it would; restore a region hold
+/// of the object. Expect: the hold refused, the object's holders as before (no hold taken that the set could not name);
+/// with the set free, the hold restored and counted in the store. Not driven red: a release of a hold just taken is
+/// never refused, so the old order's dropped refusal cannot be met.
+#[test]
+fn a_region_hold_the_set_cannot_name_is_never_taken_in_the_store() {
+  let mut content = slates_vcs::ContentStore::new(1 << 16, 1 << 8).unwrap();
+  let object = content
+    .put(b"an object a recovery holds for the region")
+    .unwrap();
+  let before = content.holders(&object);
+  let holds = [(object, vec![super::TEST_OWNER])];
+  let borrowed = super::REGION_HELD.with(|region| {
+    let _named = region.borrow_mut();
+    super::restore_region_holds(&mut content, &holds)
+  });
+  assert_eq!(
+    borrowed,
+    (0, vec![object]),
+    "refused while the set is borrowed"
+  );
+  assert_eq!(content.holders(&object), before, "no hold taken unnamed");
+  let free = super::restore_region_holds(&mut content, &holds);
+  assert_eq!(free, (1, Vec::new()), "restored once the set is free");
+  assert_eq!(content.holders(&object), before + 1, "held once more");
+}
