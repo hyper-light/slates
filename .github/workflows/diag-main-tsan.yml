@@ -1,0 +1,60 @@
+name: diag-main-tsan
+# main 01a20182 (2026-11-24 06:10 PST): CI's TSan job at 7d6874639 (current main) measured whole, to derive its step's
+# limit again. Main CI run 45398791868 (21b8b5311) ran out of the step's 62 minutes inside the server library's suite,
+# with no race reported and no test failed; the limit had been set at about three times a pass of 20 min 38 s (diag
+# 45315777446, the server's suites 12 min 20 s). The step is copied unchanged but for a limit only a hang reaches, and
+# each suite's own "finished in" line is printed after it. Run only from diag-measurer-main-tsan-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-tsan-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tsan-nightly:
+    name: TSan (mem, rt, ipc, client; every push to main and nightly)
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # The step's timeout is about three times its slowest measured pass, as the Miri and loom steps' are: a copy of this
+      # job took 20 min 38 s with no cache (diag run 45315777446, 2026-11-24: the builds about 5 min 30 s, the four
+      # crates' suites 2 min 48 s, the server's 12 min 20 s). A hang then fails the lane in bounded time; the bounded
+      # sweep test once sat past 90 minutes here (main run 45294047051), and since this workflow's concurrency group never
+      # cancels a run in progress, every main run behind it waited and was replaced unrun.
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        timeout-minutes: 300
+        env:
+          # ThreadSanitizer's 10-20x slowdown inflates the restart-detection publish window far past a native run, so
+          # the slow-restart client test needs a larger scale than the plain Test lane (same reason; the invariant
+          # publish << reply << recovery << reconnect holds at any scale). crates/client/tests/client.rs.
+          #
+          # Since 2026-10-20 this also scales START_WAIT, how long a client retries the rendezvous while a daemon
+          # starts. That budget was a flat five seconds and read this knob not at all, so the lane declared itself
+          # 25x slow and one of the two budgets that needed to hear it did not: run 39527867650 failed
+          # a_client_maps_files_across_shards_and_always_gets_the_bytes with "the daemon did not answer the claim
+          # within the claim wait" while that daemon was still starting (a shard took 15 753 us against 2 106 us
+          # unloaded).
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+        run: |
+          start=$(date +%s)
+          set +e
+          cargo xtask tsan 2>&1 | tee "$RUNNER_TEMP/tsan.log"
+          rc=${PIPESTATUS[0]}
+          echo "== tsan rc=$rc, step wall $(( $(date +%s) - start )) s"
+          grep -aE "Running |^test result|has been running for over|^tsan: " "$RUNNER_TEMP/tsan.log" | cut -c1-200
+          exit 0
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-main
+          path: ${{ runner.temp }}/tsan.log
