@@ -4,7 +4,8 @@
 # records each run of it; the command there is the contract.
 #
 # The servers, a fresh one for every run, the two alternating (stock first):
-# - slates: `slates anchor --vcs-http 127.0.0.1:0` from the release build, its daemon's shards and budget derived from
+# - slates: `slates anchor --vcs-http 127.0.0.1:0 --vcs-store WORK/store-N` from the release build (its repositories kept
+#   on the node's changeset store, which a git repository needs since C2), its daemon's shards and budget derived from
 #   this machine (no `--quick`, no `--shards`); a git repository made by `slates repository create --tool git` with
 #   SOURCE's default branch; a token from `slates credential token`, run with the anchor's issuer surface, which git
 #   sends as a bearer credential (`http.extraHeader`);
@@ -109,7 +110,8 @@ first() { sed -n "$2" "$1" | head -1; }
 # Starts a fresh slates anchor for run $1 and makes the repository and a token: sets URL, AUTH, ANCHOR, DAEMON.
 start_slates() {
   local instance="g309-scale-$$-$1" log="$WORK/anchor-$1.log" exports token streak=0
-  "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 > /dev/null 2> "$log" &
+  mkdir -p "$WORK/store-$1"
+  "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 --vcs-store "$WORK/store-$1" > /dev/null 2> "$log" &
   ANCHOR=$!
   for _ in $(seq 1 1200); do
     if grep -q "^slates daemon: instance $instance serving on" "$log" \
@@ -128,7 +130,8 @@ start_slates() {
     sleep 0.1
   done
   "$SLATES" --instance "$instance" bootstrap root > /dev/null
-  "$SLATES" --instance "$instance" repository create project --tool git --default-branch "$DEFAULT" > /dev/null
+  "$SLATES" --instance "$instance" repository create project --tool git --default-branch "$DEFAULT" > /dev/null \
+    || { echo "slates run $1: repository create refused" | tee -a "$RESULTS"; return 1; }
   # shellcheck disable=SC2086 # the surface's NAME=VALUE pairs are words
   token=$(env $exports "$SLATES" --instance "$instance" credential token | sed -n 's/^token: //p')
   URL="http://127.0.0.1:$port/project"
@@ -262,7 +265,7 @@ for run in $(seq 1 "$RUNS"); do
         rm -rf "$WORK/stock-http-$run"
         ;;
       slates)
-        if start_slates "$run"; then steps slates "$run"; else echo "slates run $run: the anchor did not start" | tee -a "$RESULTS"; fi
+        if start_slates "$run"; then steps slates "$run"; else echo "slates run $run: the anchor did not start or its repository was refused" | tee -a "$RESULTS"; fi
         stop_servers
         ;;
       *) echo "unknown server $server" >&2; exit 1 ;;
@@ -271,12 +274,26 @@ for run in $(seq 1 "$RUNS"); do
 done
 
 echo "== results (seconds; every run shown)"
+FAILED_ROWS=""
 for step in push clone clone-again incremental-push incremental-fetch shallow partial; do
+  grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
     printf '%-18s %-10s' "$step" "$server"
     grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
-      $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  best %s", (best == "" ? "-" : best) }'
+      $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  %s", (best == "" ? "FAILED" : "best " best) }'
     echo
+    if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
+# A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
+# could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round
+# exited 0). A server that timed no step at all (its setup refused) fails it too, though it left no row to mark.
+for server in $SERVERS; do
+  grep -qE "^$server [^ ]+ [0-9]+ [0-9.]+ " "$RESULTS" || FAILED_ROWS="$FAILED_ROWS $server:every-step"
+done
+if [ -n "$FAILED_ROWS" ]; then
+  echo "FAILED: every run failed for$FAILED_ROWS"
+  exit 1
+fi
+
