@@ -222,6 +222,9 @@ struct Svn {
   /// The environment every command runs with beside `LC_ALL` (a route's own switches: HTTP v1's,
   /// [`HTTP_V1_SWITCH`]); none for most routes.
   env: Vec<(String, String)>,
+  /// The wall time this session's commands have taken ([`Svn::run`], and the tools charged to it by [`Svn::charged`]),
+  /// so the use test can print each verb's time a leg (main's r546: a round cut at its bound had said nothing).
+  spent: std::cell::Cell<Duration>,
 }
 
 impl Svn {
@@ -239,7 +242,19 @@ impl Svn {
       session: session.to_owned(),
       options,
       env: Vec::new(),
+      spent: std::cell::Cell::new(Duration::ZERO),
     }
+  }
+
+  /// Runs `step` (a stock tool's command on this session's behalf: `svnrdump`, `svnsync`, `svnadmin`), its wall time
+  /// added to the session's [`Svn::spent`].
+  fn charged<T>(&self, step: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let answer = step();
+    self
+      .spent
+      .set(self.spent.get().saturating_add(started.elapsed()));
+    answer
   }
 
   /// The path of the session's working copy `name`.
@@ -260,9 +275,13 @@ impl Svn {
       .stderr(Stdio::piped())
       .spawn()
       .unwrap();
+    let started = Instant::now();
     let out = read_on_a_thread(child.stdout.take().unwrap());
     let err = read_on_a_thread(child.stderr.take().unwrap());
-    let code = exit_within(&mut child, &format!("svn {args:?} in {dir}"));
+    let code = exited_within(child, PATIENCE, &format!("svn {args:?} in {dir}"));
+    self
+      .spent
+      .set(self.spent.get().saturating_add(started.elapsed()));
     (code, out.join().unwrap(), err.join().unwrap())
   }
 
@@ -283,21 +302,42 @@ fn read_on_a_thread(mut from: impl Read + Send + 'static) -> std::thread::JoinHa
   })
 }
 
-/// Waits for `child` to end within [`PATIENCE`], killing it and failing the test past that: its exit code, -1 where a
-/// signal ended it.
-fn exit_within(child: &mut Child, what: &str) -> i32 {
-  let started = Instant::now();
-  loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      return status.code().unwrap_or(-1);
+/// Waits for `child` to end within `bound`, killing it and failing the test past that: its exit code, -1 where a signal
+/// ended it. The wait blocks on the child's own exit, on a thread that owns it, and this thread waits on that thread's
+/// word with the bound, so the command costs what it takes: until 2026-11-23 the harness polled every [`POLL`], a timed
+/// sleep a host's timer policy stretches (launchd's, 10 ms to about 76 ms), paid by every one of a round's thousands of
+/// commands (main's r546, killed at 5,400 s; [`a_commands_wait_takes_no_timed_pause`]).
+fn exited_within(child: Child, bound: Duration, what: &str) -> i32 {
+  let pid = child.id();
+  let (told, word) = std::sync::mpsc::channel();
+  let waiter = std::thread::spawn(move || {
+    let mut child = child;
+    let _ = told.send(child.wait());
+  });
+  match word.recv_timeout(bound) {
+    Ok(status) => {
+      let _ = waiter.join();
+      status.unwrap().code().unwrap_or(-1)
     }
-    if started.elapsed() > PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{what} ran past {PATIENCE:?} and was killed");
+    Err(_) => {
+      // Still unreaped (its waiter has not returned), so the pid is still this child's.
+      killed(pid);
+      let _ = waiter.join();
+      panic!("{what} ran past {bound:?} and was killed");
     }
-    pause();
   }
+}
+
+/// Kills process `pid`, a child of this process that its waiter has not reaped.
+fn killed(pid: u32) {
+  #[cfg(unix)]
+  let _ = Command::new("kill")
+    .args(["-KILL", &pid.to_string()])
+    .status();
+  #[cfg(windows)]
+  let _ = Command::new("taskkill")
+    .args(["/F", "/PID", &pid.to_string()])
+    .status();
 }
 
 fn pause() {
@@ -2833,18 +2873,7 @@ fn tool_with(
     .unwrap();
   let out = read_on_a_thread(child.stdout.take().unwrap());
   let err = read_on_a_thread(child.stderr.take().unwrap());
-  let started = Instant::now();
-  let code = loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      break status.code().unwrap_or(-1);
-    }
-    if started.elapsed() > USE_PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{program} {args:?} in {dir} ran past {USE_PATIENCE:?}");
-    }
-    pause();
-  };
+  let code = exited_within(child, USE_PATIENCE, &format!("{program} {args:?} in {dir}"));
   (code, out.join().unwrap(), err.join().unwrap())
 }
 
@@ -3212,16 +3241,49 @@ fn use_verb_compared(
       words(&["proplist", "--revprop", "-v", "--xml", "-r", at, "{url}"])
     }),
     "dump" => {
-      let [a, b] = legs.map(|leg| rdump_of(leg, scratch));
+      let [a, b] = legs.map(|leg| leg.svn.charged(|| rdump_of(leg, scratch)));
       compare(failed, "svnrdump dump", "0:HEAD", &a, &b);
     }
     "svnsync" => {
-      let [a, b] = legs.map(|leg| mirror_dump_of(leg, (scratch, root)));
+      let [a, b] = legs.map(|leg| leg.svn.charged(|| mirror_dump_of(leg, (scratch, root))));
       compare(failed, "svnsync", "0:HEAD", &a, &b);
     }
     "commit" | "copy" | "merge" | "propset" => {}
     other => failed.push(format!("{other}: no such verb in the comparison")),
   }
+}
+
+/// Runs one verb's comparison, `run`, printing as it starts and as it ends: its wall time, each leg's share of it (the
+/// time its commands took, [`Svn::spent`]) and the differences found so far, so a round cut at its bound shows how far
+/// it got and which server was slow (main's r546, killed at 5,400 s, had printed nothing past its daemon's start).
+fn timed_verb<T>(
+  verb: &str,
+  legs: [&UseLeg; 2],
+  failed: &mut Vec<String>,
+  run: impl FnOnce(&mut Vec<String>) -> T,
+) -> T {
+  eprintln!("svn use: {verb}: started");
+  let before = legs.map(|leg| leg.svn.spent.get());
+  let started = Instant::now();
+  let answer = run(failed);
+  let [a, b] = [0, 1].map(|at| {
+    legs
+      .get(at)
+      .zip(before.get(at))
+      .map_or(Duration::ZERO, |(leg, then)| {
+        leg.svn.spent.get().saturating_sub(*then)
+      })
+  });
+  eprintln!(
+    "svn use: {verb}: {:.1} s ({} {:.1} s, {} {:.1} s); {} differences so far",
+    started.elapsed().as_secs_f64(),
+    legs[0].name,
+    a.as_secs_f64(),
+    legs[1].name,
+    b.as_secs_f64(),
+    failed.len()
+  );
+  answer
 }
 
 /// `verb` (checkout, update, switch or blame) at each of `sampled` as a working copy on both legs, compared.
@@ -3549,7 +3611,9 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
   let mut ran = Vec::new();
   for verb in &verbs {
     ran.push(verb.clone());
-    use_verb_compared(verb, legs, (&scratch.path, &root), &sampled, &mut failed);
+    timed_verb(verb, legs, &mut failed, |failed| {
+      use_verb_compared(verb, legs, (&scratch.path, &root), &sampled, failed);
+    });
   }
   // The writing verbs, as one session of edits on each server, then each written revision's log, the servers' own
   // stamps (author, date) left out.
@@ -3558,8 +3622,11 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     .filter(|verb| verbs.iter().any(|named| named == verb))
     .collect();
   if !writes.is_empty() {
-    let logs = legs.map(|leg| use_writes_logged(leg, &scratch.path, &writes));
-    compare(&mut failed, &writes.join("+"), "HEAD", &logs[0], &logs[1]);
+    let named = writes.join("+");
+    let logs = timed_verb(&named, legs, &mut failed, |_| {
+      legs.map(|leg| use_writes_logged(leg, &scratch.path, &writes))
+    });
+    compare(&mut failed, &named, "HEAD", &logs[0], &logs[1]);
   }
   println!(
     "svn correctness by use: {} revisions, sampled {:?}; verbs {ran:?}; {} differences between {} and {}",

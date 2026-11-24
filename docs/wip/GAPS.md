@@ -4618,8 +4618,12 @@
 > - `info`'s entries compared in stock svn's hash order, which APR seeds afresh each run;
 > - a working copy's symbolic link read through as a file (`IsADirectory` over git-2000).
 >
-> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Owed:** main's rerun of the
-> use test over HTTP with reads.dump and git-2000.dump.
+> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Rerun (main's r546, at
+> c40775ea2):** reads.dump passed, 0 differences over all 14 verbs. git-2000.dump was killed at its 5,400 s bound, the
+> test thread sleeping in the harness's poll between `svn` children. Each stock command's wait is now a blocking wait
+> on its exit, not a stretched poll, and each verb prints its time and each leg's share as it goes
+> (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). **Owed:** git-2000's rerun, its
+> bound sized from those times; its `blame` verb alone is 155,904 commands (4,872 files × 16 samples × 2 legs).
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
