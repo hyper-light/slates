@@ -230,6 +230,8 @@ FAILED_ROWS=""
 for step in load import checkout log commit update "update-$UPDATE_SPAN"; do
   grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
+  # A step only another server runs (svn's load is stock's, its import slates') is no line for this one.
+  grep -q "^$server $step " "$RESULTS" || continue
   printf '%-18s %-6s' "$step" "$server"
   grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
     $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  %s", (best == "" ? "FAILED" : "best " best) }'

@@ -87,7 +87,9 @@ rss_of() { ps -o rss= -p "$1" 2> /dev/null | awk '{ printf "%.0f", $1 / 1024 }' 
 DEFAULT=$(g -C "$SOURCE" symbolic-ref --short HEAD)
 echo "dataset: $SOURCE at $(g -C "$SOURCE" rev-parse HEAD) ($DEFAULT); $(g -C "$SOURCE" for-each-ref refs/heads | wc -l | tr -d ' ') branches, $(g -C "$SOURCE" for-each-ref refs/tags | wc -l | tr -d ' ') tags, $(g -C "$SOURCE" rev-list --all --count) commits"
 g -C "$SOURCE" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort > "$WORK/source.refs"
-g -C "$SOURCE" rev-list --all --objects | cut -d' ' -f1 | sort > "$WORK/source.objects"
+# What the first push sends: the objects reachable from the branches and tags, not every ref of the source (a clone of
+# git/git also has refs no push here sends, and r655's check read 436,736 objects "missing" on every server, stock too).
+g -C "$SOURCE" rev-list --objects --branches --tags | cut -d' ' -f1 | sort > "$WORK/source.objects"
 echo "objects: $(wc -l < "$WORK/source.objects" | tr -d ' '); git: $(git --version); slates: $("$SLATES" version 2> /dev/null || echo none)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
@@ -145,8 +147,11 @@ start_stock() {
   g init -q --bare -b "$DEFAULT" "$root/project.git"
   g -C "$root/project.git" config uploadpack.allowFilter true
   port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-  g daemon --reuseaddr --listen=127.0.0.1 --port="$port" --base-path="$root" --export-all --enable=receive-pack \
-    "$root" > /dev/null 2> "$WORK/stock-$1.log" &
+  # `git-daemon` itself, `env` execing it in place, so STOCK is the daemon: `git daemon` starts it as a child that
+  # killing the wrapper missed, and r655's samples held a stray daemon from the git leg onward.
+  env "HOME=$WORK/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 LC_ALL=C \
+    "$(git --exec-path)/git-daemon" --reuseaddr --listen=127.0.0.1 --port="$port" --base-path="$root" --export-all \
+    --enable=receive-pack "$root" > /dev/null 2> "$WORK/stock-$1.log" &
   STOCK=$!
   URL="git://127.0.0.1:$port/project.git"
   AUTH=()
@@ -278,6 +283,8 @@ FAILED_ROWS=""
 for step in push clone clone-again incremental-push incremental-fetch shallow partial; do
   grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
+    # A step only another server runs (svn's load is stock's, its import slates') is no line for this one.
+    grep -q "^$server $step " "$RESULTS" || continue
     printf '%-18s %-10s' "$step" "$server"
     grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
       $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  %s", (best == "" ? "FAILED" : "best " best) }'

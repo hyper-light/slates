@@ -40,3 +40,18 @@ On the MacBook (debug slates, a 3-commit repository, load ~45):
   and objects, and its incremental fetch held the new commit.
 - Not run here: `svn_scale.sh` and `hg_scale.sh`, which need stock svn and hg. Their edits are the same lines, checked
   with `bash -n`.
+
+## Round 2's findings in the harness itself (main's r655, 2026-11-24)
+Round 2 measured git and hg (BENCHMARKS, "round 2, the first measured"). Svn was blocked by slates' import refusal,
+w-svn's. It also showed four faults of the harness:
+- **git's object check compared a clone with every object of the source** (`rev-list --all`), though the push sends only
+  branches and tags. A clone of git/git has other refs, so every server, stock included, read 436,736 objects short. It
+  now compares with the objects the branches and tags reach (`rev-list --objects --branches --tags`). On the MacBook a
+  3-commit repository with a `refs/notes` object reads identical on all three servers.
+- **A step only one server runs printed FAILED for the other:** svn's `load` (stock's) and `import` (slates'). A server
+  that never ran a step now prints no line for it; FAILED is a step a server ran and never passed.
+- **The sampler matched `hg serve`**, and the harness runs `hg -R ROOT serve`, so hg serve was never sampled. It now
+  matches `hg … serve `.
+- **`git daemon` outlived its run.** git starts `git-daemon` as a child, and the harness killed only its wrapper; r655's
+  samples held a stray daemon from the git leg onward, using no CPU. The harness now starts `git-daemon` itself under
+  `env`, so the kill reaches it: on the MacBook no daemon is left after a run.
