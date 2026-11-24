@@ -754,3 +754,10 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Load flakes seen (pass alone): vcs_ssh tunnel hooks test; verbs an_unbuilt_works_shard_asks_its_greens_owner_again.
 - NEXT: import BudgetExceeded on 23 shards (batch reservation > green_chain_bytes cap; scripts /tmp/w-svn-imp/{red,fix}.py),
   then dump order (patch /tmp/w-svn-p2/dump_order.patch: sibling deletes are APR hash order), then svn info 500 diag.
+## A-892 LANDED a51883940; A-893 LANDED d27106abc (2026-11-24 ~02:20)
+- A-892: import batch within the green's retention room (Flush::Retention, Deferred); lone revision past room refused
+  ImportFault::RetentionPastRoom (tag 11, contract 64). Owed (GAPS): batch chain entries vs green_chains cap.
+- A-893: depth-1 PROPFIND of a collection streamed (PropfindWalk, 207); 500s name their cause; edge logs 5xx.
+- NEXT: dump-order normalization in crates/cli/tests/svn_interop.rs (uncommitted in worktree, unit test
+  a_dumps_order_of_a_directorys_deletions_is_no_part_of_an_answer); then speed list (writes 24x, svnsync piece_fetched,
+  svn:// update), lend borrow items, made-commit held verdict item 2, virtio-fs park.
