@@ -1595,18 +1595,30 @@ jobs:
       # lane sets no environment variable and explores exactly what a laptop run explores. The models
       # print the interleavings they explored (`--nocapture`), so the log carries the numbers
       # `docs/wip/concurrency.md` records.
+      # Each step's timeout is about three times its slowest measured pass, so a stall fails the lane in bounded time:
+      # the runtime step below sat 3 h 49 min in main run 45251228315 (2026-11-23, Miri retagging the cell table's
+      # 4 MiB at every claim), and since this workflow's concurrency group never cancels a run in progress, every
+      # main run behind it waited and was replaced unrun. loom's slowest pass in the eleven main runs read was 1 min
+      # 59 s (78ba9b117).
       - name: loom (every bounded interleaving of the rings, the handle core, the parking and doorbell protocols)
+        timeout-minutes: 6
         run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc -p slates-bridge-winfsp --lib --release loom -- --nocapture
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      # Its slowest pass read: 17 min 18 s (4b12a582e, 2026-11-19); 13 min 19 s in 45294047051.
       - name: "Miri (memory and wire: leak check on)"
+        timeout-minutes: 52
         run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
       # The runtime leaks its shard contexts, rings and registry entries on purpose (they live
       # for the process; the leak is what makes every reference to them a plain `&'static`), so
       # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
       # marked ignored under Miri, which cannot model kqueue or eventfd.
+      # Its last full pass took 3 min 9 s (29ef4521d, 2026-11-17); in 45294047051 it ran 3 min 17 s to its first
+      # failure, a test Miri cannot run, with the retirement and channel tests added since. 15 minutes is about four
+      # and a half times the longer, since that failure left the step's later tests unrun.
       - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
+        timeout-minutes: 15
         run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness --test alone
 
   windows-nightly:

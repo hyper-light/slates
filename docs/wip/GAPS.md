@@ -945,7 +945,12 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   Decision 3's rewrite admission BUILT (2026-11-23, w-hg): a new head may take a line it does not descend from (an
+>   amend's or a rebase's successor) after every line it does, only where every changeset the move drops from the
+>   line's history is a draft a held or pushed marker obsoletes, its public history kept (`classify::rewrites`,
+>   `rewrite_admitted`); else it makes a line, as before. Held by
+>   `a_rewrite_moves_its_line_only_when_it_drops_obsolete_drafts_alone` (red: the amend's `b'` made `default:1`, the
+>   obsolete `b` keeping `default:0`). Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
 >   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
 >   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
 >   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
@@ -1111,6 +1116,20 @@
 >   826 MB from 1,261 MB on x86, vcs_windows 154 MB held for 121 MB asked). Its piece reader lost every window in a
 >   trimmed chunk of its own at a restart; FIXED the same day (w-win2's Windows run 45269168513;
 >   `docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md`).
+>   The windows' records BUILT smaller the same day (main's (3); w-perf's 57k push: 22,107,816 bytes live for 114,200
+>   windows): a window keeps what it alone names (its identity, length, slot and slab's key, 56 bytes), and its slab
+>   keeps the placement its windows share. Held by `tests/window_records_heap.rs` through a count of the test thread's
+>   live heap: red 250 bytes a window on main's record, now 150, against a derived 192.
+> - A chunk store's table of chunk records grows a page of records at a time BUILT (w-perf, 2026-11-23, main's (1)):
+>   its segment was `min(max_chunks, page)` records, so a shard's first chunk made 2.2 MB of records at a 16 KiB page.
+>   Held by `slates-vfs`'s `tests/chunk_records_heap.rs` (red 2,228,320 bytes, now 8,800). Owed: main's AC-0.4
+>   provisioning A/B on a quiet Studio.
+> - The memory status test's content hold row depends on where the work was computed. OPEN (w-perf, 2026-11-23,
+>   main's (2)). `memory_gauges::a_memory_status_names_its_holders_and_a_plain_one_none` asserts
+>   `mem.gauge.held.content_manifests`, which exists only when the submit's increment was held at compose, on a holder
+>   (`work_home.rs`, `hold_composed_inputs`). Under a counting allocator installed for the library's tests it failed 4
+>   of 4, and the probe read `merge.inputs.carried_in_entry=1` and no manifest held: the increment rode its chain entry.
+>   Owed: a red pinning each placement, and the test asserting what the product guarantees in both.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
@@ -1338,6 +1357,16 @@
 > lineage, and the empty engine each lend makes and drops (`Lent::new`), with w-svn's lend work; the commit's clone of
 > the whole head map and its footprint's walk of every chain (`Repository::plan`, `footprint`), O(greens) a push;
 > main's git/git push before and after on the Studio.
+> Shallow clone over a let-go pack BUILT (2026-11-23, w-git; main 01a20182's r130, the lift on: stock `git clone
+> --depth 1` of git/git refused `Pack(Store(Unreadable))` on a 785,414-byte blob). A one-commit-deep pack sends an object
+> whose stored delta's base it does not carry whole, its chain resolved from the pushed pack, each base earlier there
+> than the stream's cursor. The window that read stopped at was brought back and, in the same turn, let go behind the
+> cursor (`vcs_store::upload::let_go_behind`), so the read met it again and refused. Now a stopped window is held while
+> the stream still reads the object it stopped for (`Brought::pinned`, counted `vcs_store.git_resident.pinned_held`):
+> at most the object's chain, a push's deepest, each entry its bytes' windows and one more, charged as brought-back
+> windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
+> answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
+> r130's verbs with the lift on.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -26493,4 +26522,11 @@ Borrows and 3.19 s with them off. **Fixed:** two levels, 512 directories of 512 
 two arrays of 512. The cell test then took 2.74 s of CPU, and the retirement test passed in 3.98 s; with CI's flags,
 `retirement::` and `sync::cell::` passed 4 of 4 in 158 s of CPU. The plain build pays about 2 ns a claim (12 to 14 ns,
 least against least, 8 interleaved rounds at load 79-103), which main accepted (BENCHMARKS). CI's Miri lane is the check
-of the whole crate.
+of the whole crate. Its first run with the fix (45294047051) ran the runtime step 3 min 17 s, through the retirement
+and cell tests, to a red the stall had hidden since 11-20: four channel tests in `sync::tests` run a shard on the OS
+driver, whose epoll `timerfd_create` Miri cannot call ("unsupported operation"). They are left out under Miri with that
+reason, as `driver.rs`'s OS-driver tests are, and run in every plain lane. The lane's loom and Miri steps now carry
+timeouts of about three times their slowest measured pass (6, 52 and 15 minutes; `ci.yml` names each pass), so a
+stall fails the lane in bounded time rather than holding main's CI group: the stall sat 3 h 49 min in main run
+45251228315, and every main run behind it waited and was replaced unrun. Not run on a Mac first: this MacBook was at
+load 87 to 145, kiln's Studios refused the tree's sync, and adacachy2 has no Miri component.

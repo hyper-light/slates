@@ -132,14 +132,11 @@ struct TagStore {
 }
 
 impl TagStore {
-  /// A tag slab for `max_chunks` chunk records, growing a base page of slots at a time.
+  /// A tag slab for `max_chunks` chunk records, growing a base page of slots at a time (`Slab::slots_a_page`: a slot's
+  /// own size, not the run's pointer alone, which made a segment of 1,024 slots of 24 bytes at a 16 KiB page).
   fn new(max_chunks: usize, page: usize) -> TagStore {
-    let per_page = page
-      .checked_div(std::mem::size_of::<Box<[Tag]>>())
-      .unwrap_or(0)
-      .max(1);
     TagStore {
-      runs: Slab::new(per_page, max_chunks),
+      runs: Slab::new(Slab::<Box<[Tag]>>::slots_a_page(page), max_chunks),
     }
   }
 
@@ -328,7 +325,13 @@ impl ChunkStore {
     let chunk_bytes = chunk_bytes(page).get();
     Self {
       arena,
-      chunks: Slab::new(max_chunks.min(page), max_chunks),
+      // A page of records a segment (`Slab::slots_a_page`), so a store's first chunk makes a page of records, not the
+      // page's byte count of them: until 2026-11-23 a shard's first chunk made 16,384 records at a 16 KiB page, 2.2 MB
+      // (`tests/chunk_records_heap.rs`).
+      chunks: Slab::new(
+        Slab::<Chunk>::slots_a_page(page).min(max_chunks.max(1)),
+        max_chunks,
+      ),
       page,
       granule,
       chunk_bytes,

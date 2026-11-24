@@ -1492,25 +1492,7 @@ impl Repository {
           .or_insert((movement.green, version));
       }
     }
-    // Goal 93: each version's head, the green noted under it with this version, its newest.
-    for (movement, version) in moves.iter().zip(&versions) {
-      let version = usize::try_from(*version).unwrap_or(usize::MAX);
-      let head = self
-        .chains
-        .get(&movement.green)
-        .and_then(|chain| chain.versions.get(version))
-        .and_then(|record| record.head);
-      if let Some(head) = head
-        && self
-          .holders
-          .entry(head)
-          .or_default()
-          .insert(movement.green, version)
-          .is_none()
-      {
-        self.holder_entries = self.holder_entries.saturating_add(1);
-      }
-    }
+    self.note_holders(moves, &versions);
     // Each version committed with its value is a base a later derivation may search back to (`deriving`).
     for (movement, version) in moves.iter().zip(&versions) {
       let version = usize::try_from(*version).unwrap_or(usize::MAX);
@@ -1529,6 +1511,30 @@ impl Repository {
     // The push's objects read lately go with it, their charge given back (A-861).
     push.release_recent(store);
     Ok(versions)
+  }
+
+  /// Goal 93: each version `moves` committed (`versions`, in the same order) noted under its head in the holders' map,
+  /// the green with this version, its newest; a green new under a head counted in `holder_entries`, what the map
+  /// charges the store.
+  fn note_holders(&mut self, moves: &[Move], versions: &[u64]) {
+    for (movement, version) in moves.iter().zip(versions) {
+      let version = usize::try_from(*version).unwrap_or(usize::MAX);
+      let head = self
+        .chains
+        .get(&movement.green)
+        .and_then(|chain| chain.versions.get(version))
+        .and_then(|record| record.head);
+      if let Some(head) = head
+        && self
+          .holders
+          .entry(head)
+          .or_default()
+          .insert(movement.green, version)
+          .is_none()
+      {
+        self.holder_entries = self.holder_entries.saturating_add(1);
+      }
+    }
   }
 
   /// Every move's green is where it was when the move was admitted, and no green is moved twice.
