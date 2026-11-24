@@ -94,8 +94,17 @@ idle-sweep tests kept the Windows server lanes red.
   to 124 s and failed 2 of 5 before), windows-11-arm (10.8 s) and ubuntu (11.4 s); macOS 4 of 4 (25.9 s). The server
   unit suite on both Windows runners: 1,197 passed, the 2 failures A-877's store tests (w-perf's, not this change).
   Windows clippy of the server failed only on A-877's arena_windows lints (fixed on main by 80ef30c1e).
-- Red, the lost wake (2026-11-23, macOS): `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_out_a_park`
-  failed without the run loop's change: the woken task did not run within 2 s (idle_work.rs:194).
+- Red, the lost wake: `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_out_a_park` failed without the run
+  loop's change on macOS (2026-11-23) and on ubuntu (diag run 45309498515): the woken task did not run within 2 s
+  (idle_work.rs:198). Green with it (the same run): every rt test binary on ubuntu and macOS, loom 6 of 6, and rt
+  clippy for x86_64 and aarch64 Linux and Windows. CI's Miri set on slates-rt (diag run 45310233924): the library's
+  68 tests, with the OS runtime's sync tests skipped as on main, and the alone, differential, ownership, readiness and
+  timers files.
+- Not this change. `idle_spin` failed two of its three tests on kiln's adacachy at a load average of 35.5, its control
+  arm lost to a runner restart, and passed 5 of 5 rounds with the change and 5 of 5 without on ubuntu (diag run
+  45309498515). `spin_kick`'s `a_kick_the_spins_harvest_takes_still_gets_its_ring_served` failed once on macos-latest
+  with the change (the same run), then passed 10 of 10 rounds with it and 9 of 10 without it (diag run 45311228860):
+  an older race, recorded open in GAPS.
 - The first build of the drift-free test's poller was itself the load that held the pass off: it took its baseline
   after the pass's first step and took turns until a second, which a pass waiting for the idle point never took (macOS:
   "running true", one idle step, nothing resumed, at the 60-interval bound). It now stops at the first step since it

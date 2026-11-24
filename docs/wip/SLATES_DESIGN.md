@@ -62012,7 +62012,10 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   the_shards_idle_points`, a poller the keeper wakes beside each pass) red with the resume off on windows-latest,
   windows-11-arm and ubuntu; the idle sweep's tests 5 of 5 rounds on all three, about 10.5 s a round where
   windows-latest's took 35 to 124 s and failed 2 of 5; macOS 4 of 4. The server's unit suite on both Windows runners
-  kept every test but A-877's two store tests.
+  kept every test but A-877's two store tests. The lost wake (diag run 45309498515): red without the loop's change on
+  ubuntu and on macOS; green with it, every rt test binary on ubuntu and macOS, loom 6 of 6, and rt clippy for the two
+  Linux and two Windows targets; CI's Miri set on slates-rt clean (diag run 45310233924). `spin_kick`'s one failure on
+  macos-latest in that run is older than the change: 10 of 10 rounds with it, 9 of 10 without (diag run 45311228860).
 
 Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A-491's entry),
 `crates/rt/src/shard.rs`, `crates/rt/tests/idle_work.rs`, `crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
