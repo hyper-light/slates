@@ -821,12 +821,12 @@ mod scheduling {
     let mut role = 0i32;
     let mut count = TASK_CATEGORY_POLICY_COUNT;
     let mut get_default = 0u32;
-    // SAFETY: this task's own port, a one-integer policy buffer and its count, and the default flag, all locals the call
-    // writes within the count it is given.
     #[allow(
       deprecated,
       reason = "libc's mach_task_self works; the mach2 crate it points to is no dependency of this workspace"
     )]
+    // SAFETY: this task's own port, a one-integer policy buffer and its count, and the default flag, all locals the call
+    // writes within the count it is given.
     let rc = unsafe {
       task_policy_get(
         libc::mach_task_self(),
