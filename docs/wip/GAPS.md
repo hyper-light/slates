@@ -1530,8 +1530,14 @@
 > side-band and no command to give words to, so nothing was written. GUARDED (w-git, 2026-11-24): such a reply is failed,
 > counted `vcs_http.git.push_ended_empty` and logged with the bytes read, and every refusal after the body is logged with
 > its cause (`a_push_whose_request_never_arrived_is_failed_never_answered_with_an_empty_body`, red then green; the probe
-> of a flush alone still answered with nothing). OPEN: why the 385 bytes git sent never reached the exchange; gate 5's
-> log line names the bytes read.
+> of a flush alone still answered with nothing). Gate 5 (run 45386968890) named it: the body arrived whole (385 bytes),
+> the push was refused `Unlanded` while it was answered, and the log said "side-band false" though git asked it: the
+> session lets its request go once the push is checked and taken, and side-band was read from it. FIXED (w-git,
+> 2026-11-24): the push keeps what its request asked (`ReceivePack::side_band`), so such a refusal goes on band 3
+> (`a_push_refused_while_answered_is_still_answered_on_band_three`, red at the shard fenced for the third lend after
+> the body: "side-band false", failed empty; green after); and `Unlanded` names where it fell short
+> (`git_push::Unlanded`: names not put, homing untaken, pack not held, homed short of f + 1, no landing, landing
+> untaken, store refused), in the log and in the client's words. OPEN: which of them gate 6 names, and its fix.
 > Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
