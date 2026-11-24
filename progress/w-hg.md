@@ -586,3 +586,11 @@ Waiting: main's route; arena-7 and arena-8.
 - Hypothesis: merge_step's last step does the whole merge's landing at once (puts every table, takes their holds, releases the merged runs); r499's 89.7 ms step.
 - Proposed piece: put each table as it is cut. Waiting on r536 and main's ruling.
 - Still to do: (B) the tiered rule and bound stated in bytes; then optimize the pending steps (72% of intake time).
+
+## 2026-11-23: merge-step slicing landed (8933770f2, merge 97caa43f1)
+- Each merge step now puts one table or gives one back. The index holds a merge's work between steps; a given-up, refused or dropped merge gives back what it put.
+- The upkeep lends one table and its fence per step (Merge::step_room). merge_begin now returns Result<Option<Merge>>.
+- Red: no_merge_step_puts_more_than_one_table failed "step 8 put 7 tables" on the old code.
+- r536 (main, 19:10): the reland costs +20% under load (84 s against 70 s). The cost is Index::get walking sealed runs, each run resolved through ContentStore::get and the shared object's atomics.
+- Next: cut resolves per lookup. Red: a test counting resolves per lookup. Proposed fix: a per-run key filter. Asked main to choose between it and (B).
+- Still to do: (B) the bound in bytes; then the pending steps (72% of intake time).
