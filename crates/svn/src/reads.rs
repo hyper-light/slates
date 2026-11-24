@@ -1204,7 +1204,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
   }
 
   /// A directory's entries as `get_dir` writes them (`svn_fs_dir_entries`), each one the session may not read left out
-  /// (`lookup_access`); refused for an absent path and for a file.
+  /// (`lookup_access`); refused for an absent path and for a file. Uses [`Index::listing`] directly so each child
+  /// resolves by [`NodeRevisionId`] in O(1) without repeating path canonicalization or ancestor shape walks.
   fn entries(
     &self,
     path: &str,
@@ -1220,41 +1221,62 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
         String::from("Can't get entries of non-directory"),
       ));
     }
-    let names = self
-      .repository
-      .entries(path, revision)
+    let listed = self
+      .index
+      .listing(path, revision)
+      .map_err(|refusal| Failure::of_index(&refusal))?
       .ok_or_else(Failure::corrupt)?;
-    names
-      .into_iter()
-      .filter(|name| self.readable(&child_path(path, name)))
-      .map(|name| self.dirent_of(path, name, revision, fields))
-      .collect()
+    let mut out = Vec::with_capacity(listed.len());
+    for (name, id) in listed {
+      if self.authz.is_some() && !self.readable(&child_path(path, &name)) {
+        continue;
+      }
+      let child = self
+        .index
+        .node_revision(id)
+        .map_err(|_| Failure::corrupt())?;
+      out.push(self.dirent_of_node(name, &child, fields)?);
+    }
+    Ok(out)
   }
 
   /// One entry's dirent: each field the request asked for, and `get_dir`'s defaults for the rest (kind `none`, size 0,
   /// no properties, revision 0, the date of time 0).
-  fn dirent_of(
+  fn dirent_of_node(
     &self,
-    directory: &str,
     name: String,
-    revision: Revision,
+    node: &Node<'reads>,
     fields: Fields,
   ) -> Result<DirectoryEntry<'reads>, Failure> {
-    let path = child_path(directory, &name);
-    let node = self.node(&path, revision)?.ok_or_else(Failure::corrupt)?;
     let size = match node.kind() {
       NodeKind::File if fields.size => node.text().map_or(0, |text| text.size),
       _ => 0,
     };
     let committed = fields.reads_commit().then(|| node.created_revision());
+    let (date, author) = match committed {
+      Some(created) => {
+        let revprops = self
+          .repository
+          .revision_properties(created)
+          .unwrap_or_default();
+        let find = |prop: &[u8]| {
+          revprops
+            .iter()
+            .find(|(found, _)| *found == prop)
+            .map(|(_, value)| *value)
+        };
+        (find(DATE_PROPERTY), find(AUTHOR_PROPERTY))
+      }
+      None => (None, None),
+    };
     Ok(DirectoryEntry {
       name,
       kind: fields.kind.then(|| node.kind()),
       size,
-      has_properties: fields.has_properties && self.has_properties(&node),
+      has_properties: fields.has_properties && self.has_properties(node),
       created: committed.unwrap_or(0),
-      date: committed.and_then(|created| self.revision_property(created, DATE_PROPERTY)),
-      author: committed.and_then(|created| self.revision_property(created, AUTHOR_PROPERTY)),
+      date,
+      author,
     })
   }
 

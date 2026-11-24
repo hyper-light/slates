@@ -757,16 +757,24 @@ impl<S: SvnStores> SvnExchange<S> {
       Ok(Some(value)) => String::from_utf8(value.to_vec()).ok(),
       _ => None,
     };
-    let commit_headers = CommitHeaders {
-      version_name: text(b"X-SVN-Version-Name").and_then(|value| value.trim().parse().ok()),
-      base_md5: text(b"X-SVN-Base-Fulltext-MD5"),
-      result_md5: text(b"X-SVN-Result-Fulltext-MD5"),
-      destination: text(b"Destination"),
-      version_text: text(b"X-SVN-Version-Name"),
-      presented: text(b"If"),
-      options: text(b"X-SVN-Options"),
-      timeout: text(b"Timeout"),
-      lock_token: text(b"Lock-Token"),
+    let read_only = matches!(
+      method.as_str(),
+      "GET" | "HEAD" | "OPTIONS" | "PROPFIND" | "REPORT"
+    );
+    let commit_headers = if read_only {
+      CommitHeaders::default()
+    } else {
+      CommitHeaders {
+        version_name: text(b"X-SVN-Version-Name").and_then(|value| value.trim().parse().ok()),
+        base_md5: text(b"X-SVN-Base-Fulltext-MD5"),
+        result_md5: text(b"X-SVN-Result-Fulltext-MD5"),
+        destination: text(b"Destination"),
+        version_text: text(b"X-SVN-Version-Name"),
+        presented: text(b"If"),
+        options: text(b"X-SVN-Options"),
+        timeout: text(b"Timeout"),
+        lock_token: text(b"Lock-Token"),
+      }
     };
     let label = text(b"Label");
     let held = [
@@ -2213,7 +2221,10 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           .stores
           .lend(self.repository, &self.principal, |lent| {
             match lent.repository.text(&text.identity, at) {
-              Some(piece) => TextRead::Piece(piece.into_owned()),
+              Some(piece) => {
+                out.extend_from_slice(&piece);
+                TextRead::Written(piece.len())
+              }
               None if lent.repository.fetchable(&text.identity, at) => TextRead::Waiting,
               None => TextRead::Missing,
             }
@@ -2221,8 +2232,8 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
         // The piece the last wait fetched was read whole by this call (C2 stage B part 2).
         self.fetched = None;
-        let piece = match read {
-          TextRead::Piece(piece) => piece,
+        let written = match read {
+          TextRead::Written(written) => written,
           TextRead::Waiting => {
             let wanted = slates_svn::reads::Wanted {
               text: text.identity,
@@ -2237,9 +2248,8 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           }
           TextRead::Missing => return Err(Failed(Status::SERVICE_UNAVAILABLE)),
         };
-        *offset = at.saturating_add(to_u64(piece.len()));
-        out.extend_from_slice(&piece);
-        Ok(!piece.is_empty() && *offset < text.size)
+        *offset = at.saturating_add(to_u64(written));
+        Ok(written > 0 && *offset < text.size)
       }
       Some(Answered::Report {
         report,
@@ -2294,8 +2304,8 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
 
 /// What a GET's read of its text's next piece came to.
 enum TextRead {
-  /// The piece, from the offset to the end of the window holding it.
-  Piece(Vec<u8>),
+  /// The piece was appended directly into the reply buffer, with its byte length.
+  Written(usize),
   /// The piece is the node's store's to read (C2 stage B part 2): fetch it, then read again.
   Waiting,
   /// Nothing holds the text.

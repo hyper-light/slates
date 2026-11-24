@@ -76,20 +76,39 @@ pub(crate) fn youngest_copy_root(
   path: &str,
   revision: Revision,
 ) -> Result<Option<(Revision, String)>, IndexRefusal> {
-  let mut youngest: Option<(Revision, String)> = None;
-  for place in chain(path) {
-    let Some(node) = present(index, place, revision)? else {
-      continue;
-    };
-    let root = index.node_revision(node.copy_root())?;
-    if youngest
-      .as_ref()
-      .is_none_or(|(kept, _)| root.created_revision() >= *kept)
-    {
-      youngest = Some((root.created_revision(), root.created_path().to_owned()));
+  if !index.has_copies() {
+    if revision > index.youngest() {
+      return Err(IndexRefusal::NoSuchRevision { revision });
+    }
+    return Ok(None);
+  }
+  let mut youngest: Option<(Revision, &str)> = None;
+  if crate::index::is_canonical(path) {
+    for place in chain(path) {
+      let Some(node) = index.node_canonical(place, revision)? else {
+        continue;
+      };
+      let root = index.node_revision(node.copy_root())?;
+      if youngest.is_none_or(|(kept, _)| root.created_revision() >= kept) {
+        youngest = Some((root.created_revision(), root.created_path()));
+      }
+    }
+  } else {
+    for place in chain(path) {
+      let Some(node) = present(index, place, revision)? else {
+        continue;
+      };
+      let root = index.node_revision(node.copy_root())?;
+      if youngest.is_none_or(|(kept, _)| root.created_revision() >= kept) {
+        youngest = Some((root.created_revision(), root.created_path()));
+      }
     }
   }
-  Ok(youngest.filter(|(copied_in, _)| *copied_in != 0))
+  Ok(
+    youngest
+      .filter(|(copied_in, _)| *copied_in != 0)
+      .map(|(copied_in, created)| (copied_in, created.to_owned())),
+  )
 }
 
 /// The paths from the root down to `path`: `/`, `/a`, `/a/b` for `/a/b`.

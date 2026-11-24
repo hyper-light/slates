@@ -833,24 +833,73 @@ fn referenced(entity: &str, at: usize) -> Result<char, XmlRefusal> {
     .ok_or(XmlRefusal::BadCharacterReference { at })
 }
 
+/// Appends `text` quoted for XML (`apr_xml_quote_string`) into `out` in contiguous byte runs,
+/// escaping `&`, `<`, `>`, and (when `quotes`) `"`.
+pub(crate) fn push_quoted(out: &mut String, text: &str, quotes: bool) {
+  let bytes = text.as_bytes();
+  let mut run_start = 0usize;
+  for (at, &byte) in bytes.iter().enumerate() {
+    let replacement = match byte {
+      b'&' => "&amp;",
+      b'<' => "&lt;",
+      b'>' => "&gt;",
+      b'"' if quotes => "&quot;",
+      _ => continue,
+    };
+    if run_start < at
+      && let Some(slice) = text.get(run_start..at)
+    {
+      out.push_str(slice);
+    }
+    out.push_str(replacement);
+    run_start = at.saturating_add(1);
+  }
+  if run_start < text.len()
+    && let Some(tail) = text.get(run_start..)
+  {
+    out.push_str(tail);
+  }
+}
+
+/// Appends `text` escaped as `svn_xml_escape_cdata_string` into `out` in contiguous byte runs:
+/// `&`, `<`, `>`, and `\r` (`&#13;`).
+pub(crate) fn push_quoted_cdata(out: &mut String, text: &str) {
+  let bytes = text.as_bytes();
+  let mut run_start = 0usize;
+  for (at, &byte) in bytes.iter().enumerate() {
+    let replacement = match byte {
+      b'&' => "&amp;",
+      b'<' => "&lt;",
+      b'>' => "&gt;",
+      b'\r' => "&#13;",
+      _ => continue,
+    };
+    if run_start < at
+      && let Some(slice) = text.get(run_start..at)
+    {
+      out.push_str(slice);
+    }
+    out.push_str(replacement);
+    run_start = at.saturating_add(1);
+  }
+  if run_start < text.len()
+    && let Some(tail) = text.get(run_start..)
+  {
+    out.push_str(tail);
+  }
+}
+
 /// `text` as `apr_xml_quote_string` writes it: `&`, `<` and `>` escaped, and `"` too when `quotes`.
 pub fn quote(text: &str, quotes: bool) -> Cow<'_, str> {
   let needs = text
-    .chars()
-    .any(|character| matches!(character, '&' | '<' | '>') || (quotes && character == '"'));
+    .as_bytes()
+    .iter()
+    .any(|&byte| matches!(byte, b'&' | b'<' | b'>') || (quotes && byte == b'"'));
   if !needs {
     return Cow::Borrowed(text);
   }
   let mut out = String::with_capacity(text.len());
-  for character in text.chars() {
-    match character {
-      '&' => out.push_str("&amp;"),
-      '<' => out.push_str("&lt;"),
-      '>' => out.push_str("&gt;"),
-      '"' if quotes => out.push_str("&quot;"),
-      other => out.push(other),
-    }
-  }
+  push_quoted(&mut out, text, quotes);
   Cow::Owned(out)
 }
 

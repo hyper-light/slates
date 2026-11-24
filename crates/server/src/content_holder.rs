@@ -969,11 +969,16 @@ async fn image_catch_up() {
         return false;
       }
       state.image_encoder.stop_catching_up();
-      if state.image_encoder.owed() && catch_up_publication(state).is_err() {
-        // Refused (its room, a recovery not complete, …): the publication stays owed, never dropped, and the shard's
-        // sweep, which an owed publication with no catch-up arms (`idle_sweep::after_borrow`), begins it again
-        // (`image_retry_owed`); counted.
-        state.count(IMAGE_CATCH_UP_PUBLISH_REFUSED, 1);
+      if state.image_encoder.owed() {
+        if catch_up_publication(state).is_err() {
+          // Refused (its room, a recovery not complete, …): the publication stays owed, never dropped, and the shard's
+          // sweep, which an owed publication with no catch-up arms (`idle_sweep::after_borrow`), begins it again
+          // (`image_retry_owed`); counted.
+          state.count(IMAGE_CATCH_UP_PUBLISH_REFUSED, 1);
+        } else {
+          // Release any idle arena extents freed once the caught-up publication committed.
+          crate::vcs_store::release_excess_extents(state);
+        }
       }
       true
     });

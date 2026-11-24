@@ -942,6 +942,13 @@ pub struct Index {
   map_items: Vec<(u32, u32)>,
   /// The bytes those nodes cost (`children::FlatNode::bytes`), charged to the room in [`Index::ENTRY_BYTES`] units.
   map_bytes: usize,
+  /// Highest revision containing any path [`Shape`] event (`Fresh`, `Copied`, `Deleted`), or `None`
+  /// when no path shape has ever changed, letting [`Index::shape_above`] return `None` in O(1)
+  /// whenever `own` is at or after every shape change.
+  latest_shape_revision: Option<Revision>,
+  /// Whether any revision has ever recorded a [`Shape::Copied`] event, allowing copy-root walks
+  /// (`youngest_copy_root`) to short-circuit in O(1) on repositories without copies.
+  has_copies: bool,
 }
 
 impl Default for Index {
@@ -995,12 +1002,19 @@ impl Index {
       map_nodes: Vec::new(),
       map_items: Vec::new(),
       map_bytes: 0,
+      latest_shape_revision: None,
+      has_copies: false,
     }
   }
 
   /// The youngest revision.
   pub fn youngest(&self) -> Revision {
     self.youngest
+  }
+
+  /// Whether any revision in this index recorded a directory or file copy (`Shape::Copied`).
+  pub fn has_copies(&self) -> bool {
+    self.has_copies
   }
 
   /// Derived: the fewest bytes an entry of the index takes in memory, the smaller of a node row's and a deletion's
@@ -1105,6 +1119,15 @@ impl Index {
   /// The node at `path` in `revision`, or `None` when the path is absent there.
   pub fn node(&self, path: &str, revision: Revision) -> Result<Option<Node<'_>>, IndexRefusal> {
     let path = checked_path(path)?;
+    self.node_canonical(path, revision)
+  }
+
+  /// Like [`Index::node`] for an internal caller whose `path` is already validated canonical.
+  pub(crate) fn node_canonical(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<Node<'_>>, IndexRefusal> {
     self.check_revision(revision)?;
     match self.resolve(path, revision)? {
       Some(id) => self.node_revision(id).map(Some),
@@ -1245,6 +1268,35 @@ impl Index {
     })
   }
 
+  /// Like [`Index::relation`] for already-validated canonical paths and revisions, avoiding
+  /// redundant [`is_canonical`] scans on internal checks such as `safe_created`.
+  pub(crate) fn relation_canonical(
+    &self,
+    first: (&str, Revision),
+    second: (&str, Revision),
+  ) -> Result<NodeRelation, IndexRefusal> {
+    let first = self
+      .node_canonical(first.0, first.1)?
+      .ok_or_else(|| IndexRefusal::NotFound {
+        path: first.0.to_owned(),
+        revision: first.1,
+      })?;
+    let second =
+      self
+        .node_canonical(second.0, second.1)?
+        .ok_or_else(|| IndexRefusal::NotFound {
+          path: second.0.to_owned(),
+          revision: second.1,
+        })?;
+    Ok(if first.id() == second.id() {
+      NodeRelation::Unchanged
+    } else if first.node_id() == second.node_id() {
+      NodeRelation::CommonAncestor
+    } else {
+      NodeRelation::Unrelated
+    })
+  }
+
   /// The history list of `path`: the revisions at which a node-revision was created there, deletions included,
   /// oldest first; empty for a path no revision named.
   pub fn history(&self, path: &str) -> Result<&[HistoryEntry], IndexRefusal> {
@@ -1363,6 +1415,10 @@ impl Index {
     at: Revision,
     own: Option<Revision>,
   ) -> Option<(ShapeEntry, usize)> {
+    let latest_shape = self.latest_shape_revision?;
+    if own.is_some_and(|own| latest_shape <= own) {
+      return None;
+    }
     let mut latest: Option<(ShapeEntry, usize)> = None;
     for (ancestor, end) in inner_ancestors(path) {
       let Some(&change) = self
@@ -1446,6 +1502,12 @@ impl Index {
       }));
     self.map_bytes = self.map_bytes.saturating_add(plan.map_bytes);
     for (number, staged) in plan.events {
+      if let Some(shape) = staged.shape {
+        self.latest_shape_revision = Some(revision);
+        if matches!(shape, Shape::Copied { .. }) {
+          self.has_copies = true;
+        }
+      }
       if let Some(entry) = self.paths.get_mut(number) {
         entry.record(revision, staged);
       }

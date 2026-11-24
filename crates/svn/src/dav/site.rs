@@ -71,14 +71,14 @@
 #[cfg(test)]
 mod tests;
 
-use super::drive::uri_encode;
+use super::drive::{push_uri_encoded, uri_encode};
 use super::locking::{
   DAV_XML_CONTENT_TYPE, HttpAnswer, convert_status, error_answer, lockdiscovery,
 };
 use super::request::{self, PropertyName, PropfindRequest, Report as Asked, SvnDepth, svn_time};
 use super::response::{self, Body, BulkUpdates, Capability, Httpv2};
 use super::update::{UpdateWalk, Walked};
-use super::xml::{is_xml_safe, quote};
+use super::xml::{is_xml_safe, push_quoted, push_quoted_cdata, quote};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Index, Node, NodeKind, NodeRelation, PropertyList, Revision, Text};
@@ -681,7 +681,7 @@ fn get<R: Repository + ?Sized>(served: &Served<'_, R>, resource: &Resource) -> A
       "A directory's listing is not served here",
     ));
   }
-  match subject(served, place, &node) {
+  match subject_for(served, place, &node, SubjectNeeds::for_get(place.public)) {
     Ok(subject) => Answer::Text {
       headers: text_headers(&subject),
       text: node.text(),
@@ -1042,40 +1042,126 @@ enum Kind {
   Baseline,
 }
 
-/// The subject `node` at `place` is; refused `500` where the green lacks a property list the index names.
-fn subject<'p, R: Repository + ?Sized>(
+/// Which expensive fields of [`Subject`] a request actually reads, so PROPFIND/GET requests skip
+/// loading revision properties, dead properties, lock discovery, or copy-root `safe_created`
+/// walks when the caller never asks for them.
+#[derive(Clone, Copy, Debug)]
+struct SubjectNeeds {
+  /// Needs `svn:author` / `svn:date` from `repository.revision_properties(created)`.
+  revprops: bool,
+  /// Needs the node's own properties from `repository.properties(&identity)`.
+  dead_props: bool,
+  /// Needs `safe_created` (`checked-in` href).
+  safe_created: bool,
+  /// Needs `DAV:lockdiscovery` for non-target children.
+  lock: bool,
+}
+
+impl SubjectNeeds {
+  /// What a GET/HEAD needs: dead properties (for `svn:mime-type`) and, on a public URL,
+  /// revision properties (for `Last-Modified`).
+  fn for_get(public: bool) -> Self {
+    Self {
+      revprops: public,
+      dead_props: true,
+      safe_created: false,
+      lock: false,
+    }
+  }
+
+  /// What a PROPFIND request needs across the target and its depth-1 children.
+  fn for_propfind(asked: &PropfindRequest) -> Self {
+    match asked {
+      PropfindRequest::AllProp | PropfindRequest::PropName => Self {
+        revprops: true,
+        dead_props: true,
+        safe_created: true,
+        lock: true,
+      },
+      PropfindRequest::Prop(names) => {
+        let mut needs = Self {
+          revprops: false,
+          dead_props: false,
+          safe_created: false,
+          lock: false,
+        };
+        for prop in names {
+          if prop.namespace == SVN_PROPS || prop.namespace == CUSTOM_PROPS {
+            needs.dead_props = true;
+            continue;
+          }
+          if prop.namespace == DAV {
+            match prop.name.as_str() {
+              "creationdate" | "getlastmodified" | "creator-displayname" => needs.revprops = true,
+              "getcontenttype" => needs.dead_props = true,
+              "checked-in" => needs.safe_created = true,
+              "lockdiscovery" => needs.lock = true,
+              _ => {}
+            }
+          } else if prop.namespace == SVN_DAV && prop.name == "deadprop-count" {
+            needs.dead_props = true;
+          }
+        }
+        needs
+      }
+    }
+  }
+}
+
+/// The subject `node` at `place` is, loading only the fields named in `needs`; refused `500` where
+/// the green lacks a property list the index names and `needs.dead_props` is set.
+fn subject_for<'p, R: Repository + ?Sized>(
   served: &'p Served<'_, R>,
   place: &'p Place,
   node: &Node<'_>,
+  needs: SubjectNeeds,
 ) -> Result<Subject<'p>, HttpAnswer> {
   let created = node.created_revision();
-  let revision_properties = served
-    .repository
-    .revision_properties(created)
-    .unwrap_or_default();
-  let find = |name: &[u8]| {
-    revision_properties
-      .iter()
-      .find(|(found, _)| *found == name)
-      .map(|(_, value)| *value)
-  };
-  let mut properties = match node.properties() {
-    PropertyList::Empty => Vec::new(),
-    PropertyList::Held { identity, .. } => served
+  let (author, date) = if needs.revprops {
+    let revision_properties = served
       .repository
-      .properties(&identity)
-      .ok_or_else(corrupt)?,
+      .revision_properties(created)
+      .unwrap_or_default();
+    let find = |name: &[u8]| {
+      revision_properties
+        .iter()
+        .find(|(found, _)| *found == name)
+        .map(|(_, value)| *value)
+    };
+    (
+      find(AUTHOR),
+      find(DATE).and_then(|date| std::str::from_utf8(date).ok()),
+    )
+  } else {
+    (None, None)
   };
-  properties.sort();
+  let properties = if needs.dead_props {
+    let mut properties = match node.properties() {
+      PropertyList::Empty => Vec::new(),
+      PropertyList::Held { identity, .. } => served
+        .repository
+        .properties(&identity)
+        .ok_or_else(corrupt)?,
+    };
+    properties.sort();
+    properties
+  } else {
+    Vec::new()
+  };
+  let safe = if needs.safe_created {
+    safe_created(served.index, place, node)
+  } else {
+    created
+  };
   Ok(Subject {
     place,
     collection: node.kind() == NodeKind::Directory,
     created,
-    author: find(AUTHOR),
-    date: find(DATE).and_then(|date| std::str::from_utf8(date).ok()),
+    author,
+    date,
     text: node.text(),
     properties,
-    safe_created: safe_created(served.index, place, node),
+    safe_created: safe,
     kind: if place.version {
       Kind::Version
     } else {
@@ -1112,7 +1198,7 @@ fn safe_created(index: &Index, place: &Place, node: &Node<'_>) -> Revision {
       Err(_) => return place.revision,
     }
   };
-  match index.relation(
+  match index.relation_canonical(
     (place.path.as_str(), place.revision),
     (place.path.as_str(), history),
   ) {
@@ -1347,7 +1433,7 @@ fn private_propfind<R: Repository + ?Sized>(
   };
   let mut body = Body::new(room);
   let mut described = Described::default();
-  let answered = one_response(served, &subject, &asked, &mut described).and_then(|headers| {
+  let answered = one_response(served, &subject, &asked, true, &mut described).and_then(|headers| {
     body
       .push(MULTISTATUS_OPEN)
       .and_then(|()| write_response(&described, &href_of(&place.url, false), &mut body))
@@ -1507,6 +1593,26 @@ fn decimal_in(digits: &mut [u8; 20], mut number: usize) -> &str {
   std::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or_default()
 }
 
+/// Appends `number` in decimal into `out` via a stack buffer, avoiding `core::fmt::write`.
+fn push_u64(out: &mut String, mut number: u64) {
+  let mut digits = [0u8; 20];
+  let mut at = digits.len();
+  loop {
+    at = at.saturating_sub(1);
+    // Format: decimal, base 10.
+    if let Some(digit) = digits.get_mut(at) {
+      *digit = b'0'.saturating_add(u8::try_from(number % 10).unwrap_or(0));
+    }
+    number /= 10;
+    if number == 0 || at == 0 {
+      break;
+    }
+  }
+  if let Ok(text) = std::str::from_utf8(digits.get(at..).unwrap_or_default()) {
+    out.push_str(text);
+  }
+}
+
 /// The responses a PROPFIND of `node` at `place` writes at `depth`, each written into `body` as it is described through
 /// one [`Described`]; the lock headers its own lock gives.
 fn described<R: Repository + ?Sized>(
@@ -1516,52 +1622,54 @@ fn described<R: Repository + ?Sized>(
   depth: Depth,
   body: &mut Body,
 ) -> Result<Headers, HttpAnswer> {
+  let needs = SubjectNeeds::for_propfind(asked);
   let mut scratch = Described::default();
-  let target = subject(served, place, node)?;
+  let target = subject_for(served, place, node, needs)?;
   let href = href_of(&place.url, target.collection);
-  let headers = one_response(served, &target, asked, &mut scratch)?;
+  let headers = one_response(served, &target, asked, true, &mut scratch)?;
   write_response(&scratch, &href, body).map_err(|refused| refused_body(&refused))?;
   if depth == Depth::One && target.collection {
-    for name in children(served, place) {
-      let child = Place {
-        url: format!("{}/{name}", place.url),
-        path: child_path(&place.path, &name),
-        revision: place.revision,
-        public: place.public,
-        version: place.version,
-      };
-      let Ok(Some(child_node)) = node_at(served, &child) else {
+    let entries = served
+      .index
+      .listing(&place.path, place.revision)
+      .ok()
+      .flatten()
+      .unwrap_or_default();
+    let mut child_href = String::with_capacity(href.len());
+    child_href.push_str(&href);
+    let mut child_place = Place {
+      url: String::new(),
+      path: String::with_capacity(place.path.len()),
+      revision: place.revision,
+      public: place.public,
+      version: place.version,
+    };
+    let parent_is_root = place.path == "/";
+    for (name, node_id) in entries {
+      child_place.path.clear();
+      if !parent_is_root {
+        child_place.path.push_str(&place.path);
+      }
+      child_place.path.push('/');
+      child_place.path.push_str(&name);
+      if served.rules.is_some() && !may_read(served.rules, &child_place.path) {
+        continue;
+      }
+      let Ok(child_node) = served.index.node_revision(node_id) else {
         continue;
       };
-      let child_subject = subject(served, &child, &child_node)?;
-      let slash = if child_subject.collection { "/" } else { "" };
-      let child_href = format!("{href}{}{slash}", uri_encode(&name));
+      let child_subject = subject_for(served, &child_place, &child_node, needs)?;
+      child_href.truncate(href.len());
+      push_uri_encoded(&mut child_href, &name);
+      if child_subject.collection {
+        child_href.push('/');
+      }
       scratch.clear();
-      one_response(served, &child_subject, asked, &mut scratch)?;
+      one_response(served, &child_subject, asked, needs.lock, &mut scratch)?;
       write_response(&scratch, &child_href, body).map_err(|refused| refused_body(&refused))?;
     }
   }
   Ok(headers)
-}
-
-/// The names of the directory at `place` the principal may read, in name order.
-fn children<R: Repository + ?Sized>(served: &Served<'_, R>, place: &Place) -> Vec<String> {
-  let mut names = served
-    .repository
-    .entries(&place.path, place.revision)
-    .unwrap_or_default();
-  names.sort();
-  names.retain(|name| may_read(served.rules, &child_path(&place.path, name)));
-  names
-}
-
-/// The path of `name` in the directory at `parent`.
-fn child_path(parent: &str, name: &str) -> String {
-  if parent == "/" {
-    format!("/{name}")
-  } else {
-    format!("{parent}/{name}")
-  }
 }
 
 /// The href of the URL path `url`: URL-encoded, a collection's ending in a slash, as `mod_dav_svn`'s walker writes it.
@@ -1574,28 +1682,37 @@ fn href_of(url: &str, collection: bool) -> String {
 }
 
 /// One response for `subject`, described into `described`, with the lock headers its lock gives.
+/// `inspect_lock` may be false for depth-1 children whose lock headers are discarded and whose
+/// request does not ask for `DAV:lockdiscovery`.
 fn one_response<'a, R: Repository + ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
   asked: &'a PropfindRequest,
+  inspect_lock: bool,
   described: &mut Described<'a>,
 ) -> Result<Headers, HttpAnswer> {
-  let discovery = lockdiscovery(
-    served.locks.get_lock(&subject.place.path, served.now),
-    served.now,
-  )
-  .map_err(|refused| refused_body(&refused))?;
-  let lock = (discovery.property, discovery.headers);
+  let (lock_prop, headers) = if inspect_lock {
+    match served.locks.get_lock(&subject.place.path, served.now) {
+      Some(found) => {
+        let discovery =
+          lockdiscovery(Some(found), served.now).map_err(|refused| refused_body(&refused))?;
+        (discovery.property, discovery.headers)
+      }
+      None => (String::new(), Vec::new()),
+    }
+  } else {
+    (String::new(), Vec::new())
+  };
   match asked {
-    PropfindRequest::AllProp => all_properties(served, subject, &lock.0, false, described),
-    PropfindRequest::PropName => all_properties(served, subject, &lock.0, true, described),
+    PropfindRequest::AllProp => all_properties(served, subject, &lock_prop, false, described),
+    PropfindRequest::PropName => all_properties(served, subject, &lock_prop, true, described),
     PropfindRequest::Prop(names) => {
       for name in names {
-        named_property(served, subject, &lock.0, name, described);
+        named_property(served, subject, &lock_prop, name, described);
       }
     }
   }
-  Ok(lock.1)
+  Ok(headers)
 }
 
 /// Where a live property is written: `mod_dav`'s own (`D:`), or a provider's (`lp1` for `DAV:`, `lp2` for
@@ -1682,7 +1799,11 @@ fn write_live(
     Group::Svn => "lp2",
   };
   let mark = out.len();
-  let _ = write!(out, "<{prefix}:{name}>");
+  out.push('<');
+  out.push_str(prefix);
+  out.push(':');
+  out.push_str(name);
+  out.push('>');
   let opened = out.len();
   if !value(out) {
     out.truncate(mark);
@@ -1695,7 +1816,11 @@ fn write_live(
     out.truncate(opened.saturating_sub(1));
     out.push_str("/>\n");
   } else {
-    let _ = writeln!(out, "</{prefix}:{name}>");
+    out.push_str("</");
+    out.push_str(prefix);
+    out.push(':');
+    out.push_str(name);
+    out.push_str(">\n");
   }
   true
 }
@@ -1709,7 +1834,11 @@ fn push_dead(out: &mut String, name: &[u8], value: &[u8], names_only: bool) {
     None => ("C", name.as_ref()),
   };
   if names_only || value.is_empty() {
-    let _ = writeln!(out, "<{prefix}:{local}/>");
+    out.push('<');
+    out.push_str(prefix);
+    out.push(':');
+    out.push_str(local);
+    out.push_str("/>\n");
     return;
   }
   match std::str::from_utf8(value)
@@ -1717,22 +1846,30 @@ fn push_dead(out: &mut String, name: &[u8], value: &[u8], names_only: bool) {
     .filter(|_| is_xml_safe(value))
   {
     Some(text) => {
-      let _ = write!(out, "<{prefix}:{local}>");
-      for character in text.chars() {
-        match character {
-          '&' => out.push_str("&amp;"),
-          '<' => out.push_str("&lt;"),
-          '>' => out.push_str("&gt;"),
-          '\r' => out.push_str("&#13;"),
-          other => out.push(other),
-        }
-      }
-      let _ = writeln!(out, "</{prefix}:{local}>");
+      out.push('<');
+      out.push_str(prefix);
+      out.push(':');
+      out.push_str(local);
+      out.push('>');
+      push_quoted_cdata(out, text);
+      out.push_str("</");
+      out.push_str(prefix);
+      out.push(':');
+      out.push_str(local);
+      out.push_str(">\n");
     }
     None => {
-      let _ = write!(out, "<{prefix}:{local} V:encoding=\"base64\">");
+      out.push('<');
+      out.push_str(prefix);
+      out.push(':');
+      out.push_str(local);
+      out.push_str(" V:encoding=\"base64\">");
       super::xml::push_base64_lines(out, value);
-      let _ = writeln!(out, "</{prefix}:{local}>");
+      out.push_str("</");
+      out.push_str(prefix);
+      out.push(':');
+      out.push_str(local);
+      out.push_str(">\n");
     }
   }
 }
@@ -1882,7 +2019,7 @@ fn baseline_value<R: ?Sized>(
       let _ = write!(out, "/{SPECIAL}/bc/{revision}/</D:href>");
     }
     "version-name" => {
-      let _ = write!(out, "{revision}");
+      push_u64(out, revision);
     }
     _ => return false,
   }
@@ -1922,7 +2059,7 @@ fn dav_value<R: ?Sized>(
       }
     }
     "getcontentlength" if !subject.collection => {
-      let _ = write!(out, "{}", subject.text.map_or(0, |text| text.size));
+      push_u64(out, subject.text.map_or(0, |text| text.size));
     }
     "getcontenttype" => match subject.live_media_type() {
       Some(media) => push_quoted(out, media, false),
@@ -1946,20 +2083,30 @@ fn dav_version_value<R: ?Sized>(
   name: &str,
   out: &mut String,
 ) -> bool {
-  let root = uri_encode(served.root);
   match name {
     "checked-in" => {
+      let root = uri_encode(served.root);
       out.push_str("<D:href>");
       push_quoted(out, &root, true);
-      let _ = write!(out, "/{SPECIAL}/ver/{}", subject.safe_created);
+      out.push('/');
+      out.push_str(SPECIAL);
+      out.push_str("/ver/");
+      push_u64(out, subject.safe_created);
       push_quoted(out, &uri_encode(&subject.place.path), true);
       out.push_str("</D:href>");
     }
     "version-controlled-configuration" => {
-      let _ = write!(out, "<D:href>{root}/{SPECIAL}/vcc/{DEFAULT_VCC}</D:href>");
+      let root = uri_encode(served.root);
+      out.push_str("<D:href>");
+      out.push_str(&root);
+      out.push('/');
+      out.push_str(SPECIAL);
+      out.push_str("/vcc/");
+      out.push_str(DEFAULT_VCC);
+      out.push_str("</D:href>");
     }
     "version-name" => {
-      let _ = write!(out, "{}", subject.created);
+      push_u64(out, subject.created);
     }
     "creator-displayname" => match subject.author {
       Some(author) => push_author(out, author),
@@ -1974,26 +2121,16 @@ fn dav_version_value<R: ?Sized>(
 /// cannot carry, then quoted.
 fn push_author(out: &mut String, author: &[u8]) {
   let text = String::from_utf8_lossy(author);
-  let safe = is_xml_safe(author);
+  if is_xml_safe(author) {
+    push_quoted(out, &text, true);
+    return;
+  }
   let mut kept = [0u8; 4];
   for character in text.chars() {
-    if !safe && character.is_ascii_control() {
+    if character.is_ascii_control() {
       continue;
     }
     push_quoted(out, character.encode_utf8(&mut kept), true);
-  }
-}
-
-/// `text` quoted for XML into `out` as [`quote`] quotes it (`apr_xml_quote_string`), with no copy aside.
-fn push_quoted(out: &mut String, text: &str, quotes: bool) {
-  for character in text.chars() {
-    match character {
-      '&' => out.push_str("&amp;"),
-      '<' => out.push_str("&lt;"),
-      '>' => out.push_str("&gt;"),
-      '"' if quotes => out.push_str("&quot;"),
-      other => out.push(other),
-    }
   }
 }
 
@@ -2051,10 +2188,21 @@ const EMPTY_SHA1: [u8; 20] = [
   0xaf, 0xd8, 0x07, 0x09,
 ];
 
+/// Format: lowercase hex digits (`svn_checksum_to_cstring`).
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
 /// `bytes` in lowercase hexadecimal into `out`, as `svn_checksum_to_cstring` writes a digest.
 fn push_hex(out: &mut String, bytes: &[u8]) {
-  for byte in bytes {
-    let _ = write!(out, "{byte:02x}");
+  /// Format: high nibble shift for one hex digit (4 bits).
+  const NIBBLE_BITS: u32 = 4;
+  /// Format: low nibble bitmask (`0x0f`).
+  const NIBBLE_MASK: u8 = 0x0f;
+  out.reserve(bytes.len().saturating_mul(2));
+  for &byte in bytes {
+    let hi = usize::from(byte.checked_shr(NIBBLE_BITS).unwrap_or(0));
+    let lo = usize::from(byte & NIBBLE_MASK);
+    out.push(HEX_LOWER.get(hi).map_or('0', |digit| char::from(*digit)));
+    out.push(HEX_LOWER.get(lo).map_or('0', |digit| char::from(*digit)));
   }
 }
 

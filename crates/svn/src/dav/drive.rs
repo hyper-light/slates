@@ -683,33 +683,89 @@ fn hex_digest<const N: usize>(digest: &[u8; N]) -> Option<String> {
   Some(text)
 }
 
+/// Format: bit width of one `u64` mask word covering 64 ASCII byte values.
+const MASK_BITS: u8 = 64;
+
+/// Format: upper exclusive bound of 7-bit ASCII (RFC 20); non-ASCII bytes are always percent-encoded.
+const ASCII_LIMIT: u8 = 128;
+
+/// Builds a 64-bit membership mask for `svn_uri__char_validity` bytes in `[base, base + 64)`.
+const fn uri_safe_mask(base: u8) -> u64 {
+  let mut mask = 0u64;
+  let mut offset = 0u8;
+  while offset < MASK_BITS {
+    let byte = base.saturating_add(offset);
+    let mut safe = byte.is_ascii_alphanumeric();
+    let mut rest = URI_SAFE_MARKS;
+    while let Some((&mark, tail)) = rest.split_first() {
+      if mark == byte {
+        safe = true;
+        break;
+      }
+      rest = tail;
+    }
+    if safe {
+      mask |= 1u64.wrapping_shl(offset as u32);
+    }
+    offset = offset.saturating_add(1);
+  }
+  mask
+}
+
+/// Derived: bitmask of `svn_uri__char_validity` bytes in `0..64` (`0..=9` and [`URI_SAFE_MARKS`]).
+const URI_SAFE_LO: u64 = uri_safe_mask(0);
+
+/// Derived: bitmask of `svn_uri__char_validity` bytes in `64..128` (`A..=Z`, `a..=z`, and [`URI_SAFE_MARKS`]).
+const URI_SAFE_HI: u64 = uri_safe_mask(MASK_BITS);
+
+/// Whether `byte` is kept unescaped by `svn_path_uri_encode` (branchless 64-bit register mask).
+fn is_uri_safe(byte: u8) -> bool {
+  if byte < MASK_BITS {
+    (URI_SAFE_LO.wrapping_shr(u32::from(byte)) & 1) != 0
+  } else if byte < ASCII_LIMIT {
+    (URI_SAFE_HI.wrapping_shr(u32::from(byte.saturating_sub(MASK_BITS))) & 1) != 0
+  } else {
+    false
+  }
+}
+
+/// Appends `path` encoded as `svn_path_uri_encode` encodes it into `out` in contiguous safe runs.
+pub(crate) fn push_uri_encoded(out: &mut String, path: &str) {
+  let (upper, _) = HEX_DIGITS;
+  let bytes = path.as_bytes();
+  let mut run_start = 0usize;
+  for (at, &byte) in bytes.iter().enumerate() {
+    if is_uri_safe(byte) {
+      continue;
+    }
+    if run_start < at
+      && let Some(slice) = path.get(run_start..at)
+    {
+      out.push_str(slice);
+    }
+    out.push('%');
+    let hi = usize::from(byte.checked_shr(NIBBLE_BITS).unwrap_or(0));
+    let lo = usize::from(byte & NIBBLE_MASK);
+    out.push(upper.get(hi).map_or('0', |digit| char::from(*digit)));
+    out.push(upper.get(lo).map_or('0', |digit| char::from(*digit)));
+    run_start = at.saturating_add(1);
+  }
+  if run_start < path.len()
+    && let Some(tail) = path.get(run_start..)
+  {
+    out.push_str(tail);
+  }
+}
+
 /// `path` encoded as `svn_path_uri_encode` encodes it: each byte but letters, digits and the marks a path segment keeps
 /// as `%` and two upper-case hex digits.
 pub(crate) fn uri_encode(path: &str) -> Cow<'_, str> {
-  let safe = |byte: &u8| byte.is_ascii_alphanumeric() || URI_SAFE_MARKS.contains(byte);
-  if path.as_bytes().iter().all(safe) {
+  if path.as_bytes().iter().all(|&byte| is_uri_safe(byte)) {
     return Cow::Borrowed(path);
   }
-  let (upper, _) = HEX_DIGITS;
   // Format: an escaped byte is three, `%` and its two hex digits.
   let mut text = String::with_capacity(path.len().saturating_mul(3));
-  for byte in path.bytes() {
-    if safe(&byte) {
-      text.push(char::from(byte));
-      continue;
-    }
-    text.push('%');
-    for nibble in [
-      byte.checked_shr(NIBBLE_BITS).unwrap_or(0),
-      byte & NIBBLE_MASK,
-    ] {
-      text.push(
-        upper
-          .get(usize::from(nibble))
-          .map_or('0', |digit| char::from(*digit)),
-      );
-    }
-  }
+  push_uri_encoded(&mut text, path);
   Cow::Owned(text)
 }
 

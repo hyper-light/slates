@@ -360,9 +360,9 @@ impl ListenerState {
     let _ = self.with_seats(|seats| seats.set_task(slot, task));
   }
 
-  /// Marks seat `slot`'s connection overdue since `since_ns`, waking one waiter.
-  fn mark(&self, slot: usize, since_ns: u64) {
-    if let Some((_, Some(waker))) = self.with_seats(|seats| seats.mark(slot, Some(since_ns))) {
+  /// Marks seat `slot`'s connection overdue since `since_ns`, or clears its mark (`None`), waking one waiter if marked.
+  fn mark(&self, slot: usize, since_ns: Option<u64>) {
+    if let Some((_, Some(waker))) = self.with_seats(|seats| seats.mark(slot, since_ns)) {
       waker.wake();
     }
   }
@@ -410,7 +410,13 @@ impl Seat {
     crate::fleet::count_refusal(OVERDUE);
     let slot = self.slot;
     // Off its shard (the runtime ending) no listener is left to tell.
-    let _ = self.state.with(|state| state.mark(slot, since_ns));
+    let _ = self.state.with(|state| state.mark(slot, Some(since_ns)));
+  }
+
+  /// Clears this connection's overdue mark once its wait completes.
+  fn clear_overdue(&self) {
+    let slot = self.slot;
+    let _ = self.state.with(|state| state.mark(slot, None));
   }
 }
 
@@ -722,8 +728,8 @@ struct Conversation {
   input: Vec<u8>,
   /// Its limits.
   limits: Limits,
-  /// When a wait on the client becomes overdue.
-  deadline_ns: u64,
+  /// Per-wait overdue bound derived from the TCP handshake RTT (`first_rto_ns`).
+  bound_ns: u64,
   /// The repository opened, once it is, on its owner shard.
   opened: Option<Opened>,
   /// The principal the client's token proved, once it authenticated.
@@ -779,7 +785,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     connection,
     input: Vec::new(),
     limits,
-    deadline_ns: now_ns().saturating_add(bound_ns),
+    bound_ns,
     opened: None,
     principal: None,
     commits: 0,
@@ -796,6 +802,17 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
   let mut out = Vec::new();
   let mut last_poll = None;
   loop {
+    // When no buffered client bytes are waiting and no streamed fetch is in flight, wait directly
+    // for the socket instead of invoking `answer` + `held_sources` on an empty buffer.
+    if conversation.input.is_empty() && !conversation.connection.fetching() {
+      out = Vec::new();
+      if matches!(
+        read_step(&stream, &mut conversation, &seat).await,
+        Stepped::End
+      ) {
+        return;
+      }
+    }
     // The shard's polls so far: unchanged since the last turn began, this turn follows it with nothing run between.
     let poll = futures::polls_so_far();
     if poll.is_some() && poll == last_poll {
@@ -893,58 +910,38 @@ async fn follow(
     Next::Read => return read_step(stream, conversation, seat).await,
     Next::Consume(taken) => {
       consume(conversation, taken);
-      // When no buffered pipelined bytes remain and no streamed fetch is in flight, wait for the next client
-      // command directly instead of running a no-op turn + `yield_now()` behind thousands of ready tasks.
-      if conversation.input.is_empty() && !conversation.connection.fetching() {
-        *out = Vec::new();
-        return read_step(stream, conversation, seat).await;
-      }
-      return Stepped::Go;
+      Stepped::Go
     }
     Next::Again => return Stepped::Go,
-    Next::Fetch(wanted) => {
-      let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
-        return Stepped::End;
-      };
-      // The drive moved on from the piece held to another.
-      conversation.fetched = None;
-      let fetching = now_ns();
-      let fetched = FetchedPiece::fetch(repository, wanted).await;
-      count_since(FETCH_WAIT_NS, fetching);
-      // A piece the node's store cannot give ends the conversation: the drive would wait for it again.
-      let Some(piece) = fetched else {
-        return Stepped::End;
-      };
-      conversation.fetched = Some(piece);
-      return Stepped::Go;
-    }
-    Next::NeedText(need) => {
-      let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
-        return Stepped::End;
-      };
-      conversation.brought = None;
-      let fetching = now_ns();
-      let brought = BroughtText::bring(repository, need).await;
-      count_since(FETCH_WAIT_NS, fetching);
-      let Some(brought) = brought else {
-        return Stepped::End;
-      };
-      conversation.brought = Some(brought);
-      return Stepped::Go;
-    }
+    Next::Fetch(wanted) => return fetch_piece(conversation, wanted).await,
+    Next::NeedText(need) => return bring_text(conversation, need).await,
     Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
       consume(conversation, consumed);
-      return challenge(stream, &mut conversation.connection, out).await;
+      challenge(stream, &mut conversation.connection, out).await
     }
     Next::Key { user, consumed } => {
       consume(conversation, consumed);
-      return keyed(stream, conversation, &user, out).await;
+      keyed(stream, conversation, &user, out).await
     }
     Next::Locate { found, consumed } => {
       consume(conversation, consumed);
-      return located_step(stream, conversation, found, out).await;
+      located_step(stream, conversation, found, out).await
     }
+    write_next => return follow_write(stream, conversation, write_next, out).await,
+  };
+  read_if_idle(stream, conversation, out, seat, went).await
+}
+
+/// Handles write/mutation turns (`CommitAsked`, `LockAsked`, `RevisionProperty`, `Hook`,
+/// `Accepted`) and flushes their encoded output to `stream`.
+async fn follow_write(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  next: Next,
+  out: &mut Vec<u8>,
+) -> Stepped {
+  let went = match next {
     Next::CommitAsked(consumed) => {
       consume(conversation, consumed);
       begin_commit(conversation, out)
@@ -966,18 +963,78 @@ async fn follow(
       let _doing = slates_rt::futures::doing("vcs_svn::land");
       land(stream, conversation, *work, out).await
     }
+    _ => false,
   };
   written(stream, went, out).await
+}
+
+/// Fetches the next text piece a read drive waited on from the node's changeset store.
+async fn fetch_piece(
+  conversation: &mut Conversation,
+  wanted: slates_svn::reads::Wanted,
+) -> Stepped {
+  let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+    return Stepped::End;
+  };
+  conversation.fetched = None;
+  let fetching = now_ns();
+  let fetched = FetchedPiece::fetch(repository, wanted).await;
+  count_since(FETCH_WAIT_NS, fetching);
+  let Some(piece) = fetched else {
+    return Stepped::End;
+  };
+  conversation.fetched = Some(piece);
+  Stepped::Go
+}
+
+/// Brings a landed base text back whole into the shard's content store for an open commit delta.
+async fn bring_text(
+  conversation: &mut Conversation,
+  need: slates_svn::commit::drive::NeedText,
+) -> Stepped {
+  let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+    return Stepped::End;
+  };
+  conversation.brought = None;
+  let fetching = now_ns();
+  let brought = BroughtText::bring(repository, need).await;
+  count_since(FETCH_WAIT_NS, fetching);
+  let Some(brought) = brought else {
+    return Stepped::End;
+  };
+  conversation.brought = Some(brought);
+  Stepped::Go
+}
+
+/// If `went` continues the conversation with no buffered client bytes left and no streamed fetch in
+/// flight, releases `out` and awaits the next socket read directly instead of bouncing through an
+/// extra yield turn.
+async fn read_if_idle(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  out: &mut Vec<u8>,
+  seat: &Seat,
+  went: Stepped,
+) -> Stepped {
+  if matches!(went, Stepped::Go)
+    && conversation.input.is_empty()
+    && !conversation.connection.fetching()
+  {
+    *out = Vec::new();
+    return read_step(stream, conversation, seat).await;
+  }
+  went
 }
 
 /// Reads more of the client's bytes into the conversation's input: on, or the end if none came.
 async fn read_step(stream: &TcpStream, conversation: &mut Conversation, seat: &Seat) -> Stepped {
   let reading = now_ns();
+  let deadline_ns = reading.saturating_add(conversation.bound_ns);
   let read = read_more(
     stream,
     &mut conversation.input,
     conversation.limits,
-    conversation.deadline_ns,
+    deadline_ns,
     seat,
   )
   .await;
@@ -2321,6 +2378,7 @@ async fn read_more(
           seat.overdue(deadline_ns)
         })
         .await;
+        seat.clear_overdue();
         if !matches!(ready, Ok((Ok(()), _))) {
           return false;
         }
