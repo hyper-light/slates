@@ -62,7 +62,7 @@
 //! **Owed**: the svn:// connection task's call of the step (A-656 part 2); the lock verbs' entries recorded as the
 //! commits' are; the records' texts read from the green's content rather than held beside it and in the record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::catalog::{Principal, RepositoryId, VcsTool, VolumeId as DbVolumeId};
 use slates_merge::engine::{Green, Increment};
@@ -590,6 +590,8 @@ async fn stage_texts(
   imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
+  // Taking the texts and beginning their put are steps of their own (goal 93).
+  slates_rt::futures::yield_now().await;
   let begun = crate::state::with_state(|state| {
     match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
       Ok(mut storing) => {
@@ -641,12 +643,15 @@ fn hand_over(
   storing: &mut Storing,
 ) {
   let mut spare = Vec::new();
+  // What `storing` put, by identity: a lookup a text, not a search of every one put (goal 93: 166 ms of one step for a
+  // revision of 9,000 texts, debug).
+  let mut put: BTreeSet<ContentIdentity> = storing.put.iter().copied().collect();
   for identity in imported {
     let held = state
       .vcs_stores
       .subversion_records(repository)
       .is_none_or(|records| records.holds(&identity));
-    if revision.stored.contains_key(&identity) && !held && !storing.put.contains(&identity) {
+    if revision.stored.contains_key(&identity) && !held && put.insert(identity) {
       storing.put.push(identity);
     } else {
       spare.push(identity);
