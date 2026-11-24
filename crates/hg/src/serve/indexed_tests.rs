@@ -2142,3 +2142,150 @@ fn a_node_prefixs_lookup_reads_its_matches_not_the_history() {
     "the walk read every revision: {walked_reads}"
   );
 }
+
+/// What a fetch of `outgoing` over a view sent, each group's texts in order: the changesets', the manifests', and each
+/// file group's name and texts.
+type Sent = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<Vec<u8>>)>);
+
+/// The texts a changegroup of `outgoing` in 7.2's third version carries over `view`.
+fn sent_over(view: &Indexed<'_>, outgoing: &pull::Outgoing) -> Sent {
+  let packed = changegroup(view, outgoing, Version::V03, &mut room()).unwrap();
+  let packed = Changegroup::decode(&packed, Version::V03, &mut room()).unwrap();
+  let texts = |revisions| {
+    texts_of(&packed, revisions)
+      .into_iter()
+      .map(|(_, text)| text)
+      .collect::<Vec<_>>()
+  };
+  let files = packed
+    .files
+    .iter()
+    .map(|group| (group.name.to_vec(), texts(&group.revisions)))
+    .collect();
+  (texts(&packed.changelog), texts(&packed.manifests), files)
+}
+
+/// What a clone and a pull of every changeset past the first sent over `imported`'s view, its changeset store answering
+/// the changelog's and the manifests' texts from `saved`, and how many of those it answered.
+fn clone_and_pull(
+  imported: &Imported,
+  store: &ContentStore,
+  saved: BTreeMap<(Vec<u8>, Node), Vec<u8>>,
+) -> (Sent, Sent, u64) {
+  let view = Indexed::new(&imported.index, store, state_of(imported), &mut room())
+    .unwrap()
+    .answering_log_texts(saved);
+  let clone = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
+  let common = hex(&view.node(0).unwrap());
+  let pulled = pull::outgoing(&view, b"", common.as_bytes(), &mut room()).unwrap();
+  (
+    sent_over(&view, &clone),
+    sent_over(&view, &pulled),
+    view.log_texts_answered(),
+  )
+}
+
+/// Every changeset's and manifest's text `index` holds, by (log path, node), and the objects their rows name.
+fn log_texts_and_objects(
+  index: &HgIndex,
+  store: &ContentStore,
+) -> (BTreeMap<(Vec<u8>, Node), Vec<u8>>, Vec<ContentId>) {
+  let (mut texts, mut objects) = (BTreeMap::new(), Vec::new());
+  for rev in 0..index.len(store, Log::Changelog) {
+    let row = index.changeset(store, rev).unwrap();
+    let text = store.object_bytes(&row.text, row.len).unwrap();
+    texts.insert(
+      (crate::push::intake::CHANGELOG_PATH.to_vec(), row.node),
+      text,
+    );
+    objects.push(row.text);
+  }
+  for rev in 0..index.len(store, Log::Manifest) {
+    let row = index.revision(store, Log::Manifest, rev).unwrap();
+    let text = index.revision_text(store, Log::Manifest, rev).unwrap();
+    texts.insert(
+      (crate::push::intake::MANIFEST_PATH.to_vec(), row.node),
+      text,
+    );
+    objects.push(row.bytes);
+  }
+  (texts, objects)
+}
+
+/// Goal 93, C1 (1) P2 (main's ruling of 2026-11-23 20:53: the changelog's and the manifests' texts off the content
+/// store, a fetch reading one not at hand from the changeset store as it reads a file revision). Do: clone `states`
+/// and pull every changeset past its first over its served view; save every changeset's and manifest's text; let go
+/// every object those rows name; clone and pull again, the tests' changeset store answering those logs' texts from what
+/// was saved. Expect: objects let go; each fetch sending the same texts as before (a manifest whose stored delta was let
+/// go sent whole, the same text); texts answered by the store (the non-vacuity count). Red before: refused, no
+/// changeset text.
+#[test]
+fn a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store() {
+  let (imported, mut store) = imported("states");
+  let (before_clone, before_pull, _) = clone_and_pull(&imported, &store, BTreeMap::new());
+  let (saved, objects) = log_texts_and_objects(&imported.index, &store);
+  let let_go: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(let_go > 0, "objects let go");
+  let (clone, pulled, answered) = clone_and_pull(&imported, &store, saved);
+  assert_eq!(clone, before_clone, "the clone sends the same texts");
+  assert_eq!(pulled, before_pull, "the pull sends the same texts");
+  assert!(answered > 0, "texts answered by the changeset store");
+}
+
+/// Goal 93, C1 (1) P2 (lookup's half). Do: over `hidden-tag` (a visible head whose `.hgtags` tags the root `seen`), save
+/// every changeset's and manifest's text; let go every object those rows name; read the heads' `.hgtags` through a view
+/// whose changeset store answers those logs' texts from what was saved, and look up `seen`. Expect: objects let go; the
+/// first want the rows of every served head's manifest under the manifest log's path, then their texts, then the one
+/// `.hgtags` revision's row and text (one head's manifest names none); `seen` the root, as stock 7.2 resolves it. Red before: refused `tags`, the head's manifest
+/// read from the content store at the read's begin.
+#[test]
+fn a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store() {
+  use super::super::lookup::{TagsRead, lookup};
+  use crate::render::Want;
+  let (imported, mut store) = imported("hidden-tag");
+  let (saved, objects) = log_texts_and_objects(&imported.index, &store);
+  let let_go: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(let_go > 0, "objects let go");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_log_texts(saved);
+  let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
+  let mut asks = Vec::new();
+  while let Some(want) = tags.wants().cloned() {
+    tags.give(view.stored_now(&want).unwrap());
+    asks.push(want);
+  }
+  let rows_of = |want: &Want| match want {
+    Want::Rows { logs } => logs
+      .iter()
+      .map(|(path, nodes)| (path.clone(), nodes.len()))
+      .collect(),
+    _ => Vec::new(),
+  };
+  assert_eq!(
+    asks.len(),
+    4,
+    "manifest rows, manifest text, .hgtags rows, .hgtags text: {asks:?}"
+  );
+  let heads = super::super::discovery::head_revs(&view, &mut room())
+    .unwrap()
+    .len();
+  assert_eq!(
+    rows_of(&asks[0]),
+    [(crate::push::intake::MANIFEST_PATH.to_vec(), heads)],
+    "every served head's manifest, its text not at hand"
+  );
+  assert_eq!(rows_of(&asks[2]), [(b".hgtags".to_vec(), 1)]);
+  let mut out = Vec::new();
+  lookup(&view, Some(&tags), b"seen", &mut room(), &mut out).unwrap();
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n"
+  );
+}

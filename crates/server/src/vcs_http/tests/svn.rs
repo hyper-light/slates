@@ -657,6 +657,10 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
 #[test]
 fn the_daemons_lender_serves_a_repositorys_committed_records() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  // The read below takes the text with one synchronous `Repository::text`, which can bring back no window: a landed
+  // text's windows go once its changeset is durable (A-760 (b) 4d, main's ruling (B)), and every production reader
+  // waits for such a piece through the node's store instead (`svn_texts::fetch_piece`). So the committed texts stay.
+  crate::test_store::keep_landed(&daemon);
   let id = crate::test_store::run_on_first(
     &daemon,
     committed_repository,

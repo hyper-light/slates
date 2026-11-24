@@ -56,7 +56,7 @@ use std::borrow::Cow;
 
 use slates_vcs::{ContentId, ContentStore};
 
-use super::getbundle::{Linked, Logged, Store, StoredDelta};
+use super::getbundle::{FileEntry, Linked, Logged, Store, StoredDelta, WholeLog};
 use super::{Refusal, Repository, Rev};
 use crate::filerev::MARKER;
 use crate::index::{ChangesetRow, HgIndex, Log, NONE};
@@ -177,6 +177,13 @@ pub struct Indexed<'a> {
   /// each text by its identity as the rows named it; none in the daemon, whose changeset store answers between steps.
   #[cfg(test)]
   from_texts: Option<core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>>,
+  /// The changelog's and the manifests' texts the tests' changeset store answers with, by (log path, node), saved
+  /// before their windows were let go ([`Indexed::answering_log_texts`]); and how many it answered.
+  #[cfg(test)]
+  log_texts: (
+    std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
+    Cell<u64>,
+  ),
 }
 
 impl<'a> Indexed<'a> {
@@ -219,6 +226,8 @@ impl<'a> Indexed<'a> {
       lends,
       #[cfg(test)]
       from_texts: None,
+      #[cfg(test)]
+      log_texts: Default::default(),
     })
   }
 
@@ -228,6 +237,24 @@ impl<'a> Indexed<'a> {
   pub(crate) fn answering_from_its_texts(mut self) -> Self {
     self.from_texts = Some(core::cell::RefCell::new(std::collections::BTreeMap::new()));
     self
+  }
+
+  /// The view answering as [`Indexed::answering_from_its_texts`] does, the changelog's and the manifests' texts from
+  /// `texts`, by (log path, node), saved before their windows were let go (goal 93, C1 (1)).
+  #[cfg(test)]
+  pub(crate) fn answering_log_texts(
+    mut self,
+    texts: std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
+  ) -> Self {
+    self.log_texts.0 = texts;
+    self.answering_from_its_texts()
+  }
+
+  /// How many of the changelog's and the manifests' texts the tests' changeset store answered
+  /// ([`Indexed::answering_log_texts`]).
+  #[cfg(test)]
+  pub(crate) fn log_texts_answered(&self) -> u64 {
+    self.log_texts.1.get()
   }
 
   /// [`Store::stored_now`] from the index's own texts ([`Indexed::answering_from_its_texts`]).
@@ -245,9 +272,21 @@ impl<'a> Indexed<'a> {
           let mut log = Vec::new();
           for node in nodes {
             let mut room = Admission::new(u64::MAX);
-            let logged = self.logged(Log::File(path), node, &mut room).ok()?;
-            log.push(logged.map(|logged| {
-              let text = logged.text.into_owned();
+            let saved = self.log_texts.0.get(&(path.clone(), *node)).cloned();
+            if saved.is_some() {
+              self
+                .log_texts
+                .1
+                .set(self.log_texts.1.get().saturating_add(1));
+            }
+            let text = match saved {
+              Some(text) => Some(text),
+              None => self
+                .logged(Log::File(path), node, &mut room)
+                .ok()?
+                .map(|logged| logged.text.into_owned()),
+            };
+            log.push(text.map(|text| {
               let identity = *blake3::hash(&text).as_bytes();
               let len = to_u64(text.len());
               texts.borrow_mut().insert(identity, text);
@@ -494,6 +533,28 @@ impl Repository for Indexed<'_> {
     self.draft_roots.iter().copied()
   }
 
+  fn manifest_not_at_hand(&self, rev: Rev) -> Option<(Node, u64)> {
+    let row = self.row(rev)?;
+    if row.manifest == NULL_NODE {
+      return None;
+    }
+    let log = Log::Manifest;
+    let at = self.index.rev(self.store, log, &row.manifest)?;
+    let manifest = self.index.revision(self.store, log, at)?;
+    // Its text is at hand where every object of its chain is held whole (a delta's base before it, A-729).
+    let (mut link, mut walked) = (manifest, 0_u32);
+    loop {
+      if !self.store.holds_whole(&link.bytes) {
+        return Some((row.manifest, manifest.len));
+      }
+      if link.base == NONE || walked >= at {
+        return None;
+      }
+      walked = walked.saturating_add(1);
+      link = self.index.revision(self.store, log, link.base)?;
+    }
+  }
+
   fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal> {
     let row = self.row(rev).ok_or(Refusal::Graph { rev })?;
     if row.manifest == NULL_NODE {
@@ -628,6 +689,37 @@ impl Store for Indexed<'_> {
 
   fn holds_manifest(&self, node: &Node) -> bool {
     self.index.rev(self.store, Log::Manifest, node).is_some()
+  }
+
+  fn log_text_len(&self, log: WholeLog, node: &Node) -> Option<u64> {
+    match log {
+      WholeLog::Changelog => {
+        let rev = self.index.rev(self.store, Log::Changelog, node)?;
+        let row = self.index.changeset(self.store, rev)?;
+        (row.node == *node).then_some(row.len)
+      }
+      WholeLog::Manifest => {
+        let rev = self.index.rev(self.store, Log::Manifest, node)?;
+        let row = self.index.revision(self.store, Log::Manifest, rev)?;
+        (row.node == *node).then_some(row.len)
+      }
+    }
+  }
+
+  fn manifest_entry(&self, node: &Node) -> Option<FileEntry> {
+    let log = Log::Manifest;
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self
+      .index
+      .revision(self.store, log, rev)
+      .filter(|row| row.node == *node)?;
+    let link = self.index.changeset(self.store, row.link)?.node;
+    Some(FileEntry {
+      position: u64::from(rev),
+      parents: [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
+      link,
+      flags: row.flags,
+    })
   }
 
   fn serves_every_changeset(&self) -> bool {

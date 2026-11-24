@@ -1935,3 +1935,55 @@ fn a_push_whose_keeping_and_its_widest_step_pass_its_repositorys_ceiling_is_refu
     assert_eq!(passes.err(), Some(super::past_ceiling()));
   });
 }
+
+/// A push's wait for room ends typed when its sleep is refused (main 01a20182's commit-2 list: the room wait dropped the
+/// sleep's refusal, so it turned again at once and spun its shard through the wait's patience). Do: on a store-backed
+/// daemon, make a Mercurial repository; from a task on its shard, poll a wait for room past the repository's room now,
+/// with a waker that is no task's, so its sleep is refused (`RtError::NotOnShardThread`). Expect: the first poll
+/// answers the wait ended by that refusal, within its first turn, counted once. Red before: the poll turned the wait
+/// again at once for its whole patience, past the watchdog's window.
+#[test]
+fn a_rooms_wait_whose_sleep_is_refused_ends_at_once_with_the_refusal() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (id, _) = crate::test_store::create_on(
+    &daemon,
+    0,
+    &owner(),
+    ("room-wait", VcsTool::Mercurial, ObjectFormat::Sha1, "main"),
+  );
+  let (polled, spent, counted) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let room =
+        crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes).unwrap_or(0);
+      let mut wait = std::pin::pin!(super::room_after_wait(id, room, None));
+      let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+      let started = slates_rt::futures::now_ns();
+      let polled = wait.as_mut().poll(&mut cx);
+      let spent = slates_rt::futures::now_ns().saturating_sub(started);
+      let counted = crate::state::with_state(|state| {
+        state
+          .refusals
+          .get(super::INTAKE_ROOM_WAIT_SLEEP_REFUSED)
+          .copied()
+          .unwrap_or(0)
+      })
+      .unwrap_or(0);
+      (polled, spent, counted)
+    },
+    TASK_WAIT,
+  );
+  daemon.stop();
+  assert_eq!(
+    polled,
+    std::task::Poll::Ready(Some(Err(super::WaitEnded::SleepRefused(
+      slates_rt::RtError::NotOnShardThread
+    )))),
+    "the wait ended by its sleep's refusal"
+  );
+  assert!(
+    spent < crate::vcs_share::wait::PATIENCE_NS,
+    "ended within its first turn, not after its patience: {spent} ns"
+  );
+  assert_eq!(counted, 1, "the refused sleep counted once");
+}

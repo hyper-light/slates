@@ -413,6 +413,33 @@ pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
   audit_on_stored_shard_configured(name, history, |_| {})
 }
 
+/// [`audit_on_stored_shard`] for a history that begins by making a repository: `asked` is made first, by `principal`, as
+/// a client's creation is made, the test's thread waiting for its record ([`create_on`]); then `history` runs on the
+/// shard with the repository's id and its root green. The shard is never held through the creation's commit
+/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md), and the history keeps its landed
+/// packs resident, as [`audit_on_stored_shard`]'s does.
+pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
+  (principal, asked): (&slates_db::catalog::Principal, Asked<'_>),
+  history: impl FnOnce(
+    &mut crate::state::ShardState,
+    (
+      slates_db::catalog::RepositoryId,
+      slates_db::catalog::VolumeId,
+    ),
+  ) -> T
+  + Clone
+  + Send
+  + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  keep_landed(&daemon);
+  let made = create_on(&daemon, 0, principal, asked);
+  let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
+  daemon.stop();
+  drop(store);
+  answer
+}
+
 /// [`audit_on_stored_shard`] with the daemon's configuration changed by `configure` first
 /// ([`crate::daemon::audit_on_shard_configured`]).
 pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(

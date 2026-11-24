@@ -18910,65 +18910,77 @@ Every run: oracle failures 0, refusals 0, lost 0.
   The table now grows a page at a time, every 64 chunks at a 16 KiB page, and nothing reserves its segments ahead
   (`Slab::reserve_segments`); main's AC-0.4 provisioning A/B reads whether that moves the seal path.
 
-## Slates against every stock server of each tool, interleaved on one machine (goal 93 perf, §4.17.1's method; harness ready 2026-11-23, NOT YET RUN)
+## Slates against every stock server of each tool, interleaved on one machine: round 2, the first measured (goal 93 perf, §4.17.1's method; main 01a20182's r655, 2026-11-24 05:28 to 06:42 UTC)
 
 The order-of-magnitude record: each stock client against slates and against its stock servers, one machine, the servers
-interleaved run by run (stock first), best of N with all N shown, the host's load and each server kind's peak memory
-and CPU beside the times. This entry is the shape and the contract; its numbers are main's run on a quiet big Studio.
+interleaved run by run (stock first), best of five with all five shown, the host's load and each server kind's peak
+memory and CPU beside the times. Round 1 (r592) measured no slates git or svn step: the harness ran slates' anchor
+without `--vcs-store`, fixed in a51b627f5
+(`docs/bugs/2026-11-23-the-speed-harness-ran-slates-git-and-svn-without-a-store.md`).
 
-- **Command** (repository root, release slates, stock svn 1.15 first on the PATH):
-  `PATH=/opt/homebrew/bin:$PATH crates/cli/bench/interop_speed.sh target/release/slates WORK src.git HG hg-src git-2000.dump src.git master 5 3600`.
-  It runs `git_scale.sh` (`SERVERS="stock stock-http slates"`), `hg_scale.sh` and `svn_scale.sh` (`SERVERS="stock
-  slates"`), and samples every 5 s.
-- **Competitors, exact:**
-  - git: `git daemon --reuseaddr --listen=127.0.0.1 --port=P --base-path=ROOT --export-all --enable=receive-pack ROOT`
-    (`uploadpack.allowFilter` on), and `git http-backend` under Apache httpd. The latter is prefork with mod_cgi,
-    `ScriptAlias /git/ $(git --exec-path)/git-http-backend/`, `GIT_PROJECT_ROOT` and `GIT_HTTP_EXPORT_ALL`, with
-    `http.receivepack` and `uploadpack.allowFilter` on.
-  - Mercurial: `hg serve` over HTTP, `web.push_ssl=False`, `web.allow-push=*`.
-  - Subversion: `svnserve -d` over svn://.
-  - `mod_dav_svn`: measured by no harness. The record says whether the host has it; the big Studio has Apache 2.4 with
-    mod_dav but no mod_dav_svn (checked 2026-11-23).
-- **Datasets:** git/git bare (its refs and tags pushed whole); Mercurial's own repository; git-2000.dump
-  (`git_to_svn_dump.py src.git master 2000`).
-- **The record's parts, in this order:** the date and machine; slates' version and commit; every client's and server's
-  version; which competitors the host has; each harness's table; each server kind's peak resident memory and most CPU
-  time seen; the highest 1-minute load sampled.
+- **Machine:** the big Studio (Mac15,14, Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4). Load average 1.86 at the start
+  and 5.73 at the end. It peaked at 43.63 and 59.11 (1-minute) during git's slates runs 4 and 5, from other work on the
+  box, and at 48.84 during an hg stock run: the git rows' runs 4 and 5, of every server, were taken under that load.
+- **Builds and versions:** slates 0.1.0, release, at a51b627f5. git 2.50.1 (Apple Git-155); Mercurial 7.2 (through
+  `uvx`); Subversion 1.15.0 (Homebrew); Apache 2.4.66 (`/usr/sbin/httpd`) with the Command Line Tools'
+  `git-http-backend`. `mod_dav_svn` is absent from the box, so it was not measured.
+- **Datasets:** git/git bare at f7de81456940 (8 branches, 1,019 tags, 206,375 commits); Mercurial's own repository at
+  57035:a933409955d2 (57,036 changesets, 308 tags); git-2000.dump (437 MiB, `git_to_svn_dump.py src.git master 2000`).
+- **Command:** `crates/cli/bench/interop_speed.sh target/release/slates WORK git-git.git HG hg-src git-2000.dump
+  git-git.git master 5 3600` (HG a wrapper of `uvx --from mercurial==7.2 hg`). The record is
+  `~/.cache/main-rounds/interop-speed/work/interop-speed.txt` on the Studio, with `samples.txt` and every log.
+- **Checks:** refs identical on all three git servers (1,027), each incremental fetch holding its new commit. hg's
+  changesets (57,036) and tags (307) were identical on both servers, each incremental pull holding its new changeset.
+  git's object check read every server, stock included, as 436,736 objects short, because it compared a clone with every
+  object of the source while the push sends branches and tags only. The harness now compares with what the push
+  sends; the refs check stands.
 
-| git | stock (git daemon) 1..N | best | stock-http (http-backend) 1..N | best | slates 1..N | best |
-|---|---|---|---|---|---|---|
-| push, every branch and tag | | | | | | |
-| clone `--mirror` | | | | | | |
-| clone again | | | | | | |
-| one-commit push | | | | | | |
-| fetch of it | | | | | | |
-| clone `--depth 1` | | | | | | |
-| clone `--filter=blob:none` | | | | | | |
+Seconds, wall clock at the client, every run shown (runs 4 and 5 of git under load 43 to 59):
 
-| Mercurial | stock (hg serve) 1..N | best | slates 1..N | best |
-|---|---|---|---|---|
-| push, every changeset | | | | |
-| clone `-U` | | | | |
-| one-changeset push | | | | |
-| pull of it | | | | |
-| clone `--stream` | | | | |
+| git | git daemon 1-5 | best | git http-backend 1-5 | best | slates 1-5 | best | slates ÷ best stock |
+|---|---|---|---|---|---|---|---|
+| push, every branch and tag | 11.646 11.544 11.602 13.728 12.700 | 11.544 | 13.328 13.428 13.309 13.050 40.234 | 13.050 | 89.051 89.786 87.834 95.429 95.226 | 87.834 | 7.6× slower |
+| clone `--mirror` | 10.926 10.933 10.965 34.713 31.608 | 10.926 | 10.949 11.026 10.969 14.305 10.551 | 10.551 | 149.374 156.865 151.884 174.969 191.667 | 149.374 | 14.2× slower |
+| clone again | 10.864 10.971 10.953 10.539 46.417 | 10.539 | 10.987 10.965 11.081 36.192 10.615 | 10.615 | 92.535 93.503 148.896 99.609 216.787 | 92.535 | 8.8× slower |
+| one-commit push | 0.137 0.139 0.146 0.128 0.156 | 0.128 | 0.167 0.164 0.171 0.410 0.154 | 0.154 | 0.103 0.084 0.211 0.078 0.120 | 0.078 | 1.6× faster |
+| fetch of it | 0.145 0.155 0.154 0.134 0.168 | 0.134 | 0.181 0.173 0.174 0.546 0.160 | 0.160 | 2.247 2.243 2.601 2.183 0.166 | 0.166 | 1.2× slower |
+| clone `--depth 1` | 0.955 0.969 0.974 0.919 1.064 | 0.919 | 0.987 0.993 1.004 9.428 0.938 | 0.938 | 3.798 5.376 11.980 5.116 1.801 | 1.801 | 2.0× slower |
+| clone `--filter=blob:none` | 6.436 6.523 6.523 6.239 8.828 | 6.239 | 6.619 6.576 6.564 33.004 6.613 | 6.564 | 73.254 74.574 94.116 109.241 92.908 | 73.254 | 11.7× slower |
 
-| Subversion | stock (svnserve) 1..N | best | slates 1..N | best |
-|---|---|---|---|---|
-| load / import (once) | | | | |
-| checkout of trunk | | | | |
-| `log -q`, whole history | | | | |
-| one-file commit | | | | |
-| update to it | | | | |
-| update across 1,000 revisions | | | | |
+| Mercurial | hg serve 1-5 | best | slates 1-5 | best | slates ÷ stock |
+|---|---|---|---|---|---|
+| push, every changeset | 12.708 17.180 40.893 11.524 11.877 | 11.524 | 91.426 75.746 66.836 66.403 66.398 | 66.398 | 5.8× slower |
+| clone `-U` | 7.726 8.065 9.296 8.416 8.605 | 7.726 | 18.107 63.100 10.166 10.108 10.086 | 10.086 | 1.3× slower |
+| one-changeset push | 0.832 0.167 0.192 0.183 0.202 | 0.167 | 0.246 0.342 0.205 0.196 0.195 | 0.195 | 1.2× slower |
+| pull of it | 0.778 0.159 0.185 0.170 0.193 | 0.159 | 0.255 0.597 0.203 0.203 0.201 | 0.201 | 1.3× slower |
+| clone `--stream` | 0.532 0.417 0.491 0.455 0.480 | 0.417 | 7.787 57.005 3.925 3.829 3.927 | 3.829 | 9.2× slower |
 
-| server kind | peak resident MiB | most CPU s |
+Subversion: **blocked**. stock `svnadmin load` took 103.969 s (once), and its checkout of trunk 3.374 s best (3.712
+3.374 3.635 4.080 4.161), whole-history `log -q` 0.172, one-file commit 2.882 and update 0.950. Every slates import was
+refused `BudgetExceeded { available: 373475417 }` on git-2000.dump, w-svn's open item, so slates has no Subversion
+number. Its `log` rows (0.04 s) read a repository of no revisions and are not a result. The table then marked `load` on
+slates and `import` on stock FAILED, steps those servers do not run; the harness no longer does.
+
+| server kind | peak resident | most CPU |
 |---|---|---|
-| slates daemon / anchor, git daemon, httpd with git-http-backend, hg serve, svnserve | | |
+| slates daemon | 2,934 MiB | 414 s (git's slates run 5) |
+| slates anchor | 42 MiB | 1 s |
+| git daemon | 42 MiB | 0 s (its forked `upload-pack`s are not counted) |
+| httpd with git-http-backend | 29 MiB | 1 s |
+| svnserve | 35 MiB | 1 s |
+| hg serve | not sampled: the sampler matched `hg serve`, and the harness runs `hg -R ROOT serve` (fixed) | |
 
-The verdict per row is slates' best against the best stock server's best, as a ratio; "an order of magnitude" is a ratio
-of 10 or better.
+What it says against the 10× goal: slates is nowhere near it. The whole-history transfers are 6 to 14 times slower
+than the stock servers (git clone 14.2×, partial clone 11.7×, push 7.6×; hg push 5.8×, stream clone 9.2×). Only the
+one-commit git push is faster (1.6×), and hg's small steps are within 1.3×. The slates daemon held about 2.9 GB through
+each git run, against stock servers of 30 to 40 MB.
 
-Tried on the MacBook (2026-11-23, Apple M5 Max, load ~70, a 3-commit repository, `SERVERS="stock stock-http"`, one
-run): every step of both stock servers passed, each clone identical to the source in refs and objects. That only proves
-the harness runs; its seconds are no record.
+Outliers, explained where the logs can:
+- **git runs 4 and 5, every server:** the host's load (43.63 and 59.11) during them. The stock rows' fourth and fifth
+  runs rose the same way (git daemon clone 34.7 and 31.6 s against 10.9).
+- **hg slates run 2:** clone 63.1 s and stream 57.0 s, against about 10.1 and 3.9 in runs 3 to 5. Its daemon used 64 s
+  of CPU over the run against 66 s in run 1 and 59 to 61 in runs 3 to 5. Its log shows no restart, spin or refusal, and
+  the host's load stayed at or under 17. So the extra time was spent waiting outside slates' daemon, by the client or
+  the host; the logs cannot say which. The best rests on runs 3 to 5, which agree within 0.1 s.
+- **A stray `git daemon`:** the samples show one of about 40 MB from the git leg onward, which used no CPU. The harness
+  kills `git daemon`'s wrapper, and git starts the daemon as a child the kill does not reach (fixed with the rest).

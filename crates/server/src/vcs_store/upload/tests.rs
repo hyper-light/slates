@@ -971,20 +971,13 @@ fn t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing() {
   assert_eq!(learned.ns * (1 << 20) / learned.bytes, 1_000_000);
 }
 
-/// Goal 93 item 2a (main 01a20182's ruling of 2026-11-22 05:45; w-git's driver hook: a fetch's and an encoding's packs
-/// made resident before they read). Do: on a store-backed daemon, put a pack of three windows and a part in the shard's
-/// content store, land its bytes on the node's store as a changeset's `Payload`, mark every window landed and let it
-/// go; list what [`super::away_in`] finds of it, bring that back ([`super::brought_back_all`]), list again, and read the
-/// pack whole. Expect: its four windows found let go, all brought back (their bytes the pack's), none found after, and
-/// the pack read whole as it was put. Failing first: nothing made a repository's packs resident, so a clone's read of a
-/// let-go window refused `Unread`.
-#[test]
-fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
-  use slates_vcs::ContentId;
-  let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (sent, got) = std::sync::mpsc::channel();
-  crate::daemon::observe_first(&daemon, move |state| {
-    let _ = crate::git_push::tests::git_repository(state, "resident");
+/// Makes git repository `name` on `daemon`'s first shard, puts a pack of three windows and a part in the shard's content
+/// store and lands its bytes on the node's store as a changeset's `Payload`, the creation and the landing each waited
+/// for on this thread, so the shard is never held through the store's commit: the window, the pack's bytes, its length
+/// and its root.
+fn landed_pack(daemon: &crate::Daemon, name: &str) -> (usize, Vec<u8>, u64, slates_vcs::ContentId) {
+  crate::git_push::tests::git_repository_on(daemon, name);
+  let (disk, header, parts, landed) = crate::daemon::observe_first(daemon, |state| {
     let window = state
       .vcs_stores
       .content()
@@ -1007,11 +1000,31 @@ fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
       sections: 0,
     };
     let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
-    assert!(crate::test_store::land_blocking(
+    (
       state.vcs_disk.clone().unwrap(),
       header,
-      parts
-    ));
+      parts,
+      (window, bytes, len, root),
+    )
+  });
+  assert!(crate::test_store::land_blocking(disk, header, parts));
+  landed
+}
+
+/// Goal 93 item 2a (main 01a20182's ruling of 2026-11-22 05:45; w-git's driver hook: a fetch's and an encoding's packs
+/// made resident before they read). Do: on a store-backed daemon, put a pack of three windows and a part in the shard's
+/// content store, land its bytes on the node's store as a changeset's `Payload`, mark every window landed and let it
+/// go; list what [`super::away_in`] finds of it, bring that back ([`super::brought_back_all`]), list again, and read the
+/// pack whole. Expect: its four windows found let go, all brought back (their bytes the pack's), none found after, and
+/// the pack read whole as it was put. Failing first: nothing made a repository's packs resident, so a clone's read of a
+/// let-go window refused `Unread`.
+#[test]
+fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  let (window, bytes, len, root) = landed_pack(&daemon, "resident");
+  crate::daemon::observe_first(&daemon, move |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().unwrap();
       let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
@@ -1063,35 +1076,8 @@ fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
   use slates_vcs::ContentId;
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (sent, got) = std::sync::mpsc::channel();
+  let (window, bytes, len, root) = landed_pack(&daemon, "look-ahead");
   crate::daemon::observe_first(&daemon, move |state| {
-    let _ = crate::git_push::tests::git_repository(state, "look-ahead");
-    let window = state
-      .vcs_stores
-      .content()
-      .map_or(1 << 18, slates_vcs::ContentStore::window);
-    let bytes: Vec<u8> = (0..3 * window + 100)
-      .map(|at| u8::try_from(at % 251).unwrap())
-      .collect();
-    let len = u64::try_from(bytes.len()).unwrap();
-    let root = crate::vcs_store::within_budget(state, len, |stores| {
-      stores.content_mut().unwrap().put_object(&bytes).unwrap()
-    });
-    let header = slates_store::log::Header {
-      tool: slates_store::log::Tool::Git,
-      repository: 1,
-      sequence: 0,
-      judged_over: 0,
-      grant: 0,
-      work: 0,
-      time_ns: slates_rt::futures::now_ns(),
-      sections: 0,
-    };
-    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
-    assert!(crate::test_store::land_blocking(
-      state.vcs_disk.clone().unwrap(),
-      header,
-      parts
-    ));
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().unwrap();
       for id in bytes.chunks(window).map(ContentId::of) {
@@ -1161,35 +1147,8 @@ fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
   use slates_vcs::ContentId;
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (sent, got) = std::sync::mpsc::channel();
+  let (window, bytes, len, root) = landed_pack(&daemon, "behind");
   crate::daemon::observe_first(&daemon, move |state| {
-    let _ = crate::git_push::tests::git_repository(state, "behind");
-    let window = state
-      .vcs_stores
-      .content()
-      .map_or(1 << 18, slates_vcs::ContentStore::window);
-    let bytes: Vec<u8> = (0..3 * window + 100)
-      .map(|at| u8::try_from(at % 251).unwrap())
-      .collect();
-    let len = u64::try_from(bytes.len()).unwrap();
-    let root = crate::vcs_store::within_budget(state, len, |stores| {
-      stores.content_mut().unwrap().put_object(&bytes).unwrap()
-    });
-    let header = slates_store::log::Header {
-      tool: slates_store::log::Tool::Git,
-      repository: 1,
-      sequence: 0,
-      judged_over: 0,
-      grant: 0,
-      work: 0,
-      time_ns: slates_rt::futures::now_ns(),
-      sections: 0,
-    };
-    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
-    assert!(crate::test_store::land_blocking(
-      state.vcs_disk.clone().unwrap(),
-      header,
-      parts
-    ));
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().unwrap();
       for id in bytes.chunks(window).map(ContentId::of) {

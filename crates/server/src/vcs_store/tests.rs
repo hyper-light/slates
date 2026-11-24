@@ -2541,3 +2541,56 @@ fn t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_
   assert_eq!((freed, pinned), (len, 0), "the whole pack let go");
   assert!(!whole_after, "the pack held whole no more");
 }
+
+/// The guard on room asked inside a lend (main 01a20182's ruling of 2026-11-23 21:30; w-tsan found six steps asking for
+/// room inside `lent_state`, where the pool is out of reach, each refused `OverBudget` only once the arena's slack ran
+/// out). Do: on a store-backed shard holding a repository's content store, grow the arena by a window's room outside
+/// any lend, so it holds slack; put a window within room asked inside `lent_state`, then within room asked outside one.
+/// Expect: inside, the slack able to take the put, yet the put refused `ContentRefused::OutOfReach` with its need,
+/// nothing kept, and the ask counted once (`vcs_store.room_out_of_reach`); outside, the put taken and nothing more
+/// counted. Red without the guard: the put inside taken from the slack, the misuse unseen (2026-11-23).
+#[test]
+fn room_asked_inside_a_lend_is_refused_out_of_reach_at_its_first_put() {
+  let bytes = b"a window put within the room asked for it".to_vec();
+  let need = u64::try_from(bytes.len()).unwrap();
+  let (slack_inside, inside, held_after, outside, counted) =
+    crate::test_store::audit_on_stored_shard("room-out-of-reach", move |state| {
+      crate::git_push::tests::git_repository(state, "room-out-of-reach");
+      let window = u64::try_from(state.store.content.chunk_bytes()).unwrap();
+      super::within_budget(state, window, |_| ());
+      let put =
+        |stores: &mut super::VcsStores| stores.content_mut().map(|content| content.put(&bytes));
+      let (slack_inside, inside) = super::lent_state(state, |state| {
+        (
+          state.store.admittable(),
+          super::within_budget(state, need, put),
+        )
+      });
+      let held_after = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.contains(&ContentId::of(&bytes)));
+      let outside = super::within_budget(state, need, put);
+      let counted = state
+        .refusals
+        .get(super::ROOM_OUT_OF_REACH)
+        .copied()
+        .unwrap_or(0);
+      (slack_inside, inside, held_after, outside, counted)
+    });
+  assert!(
+    slack_inside >= need,
+    "the slack inside the lend could take the put ({slack_inside} bytes), so the kind alone refuses"
+  );
+  assert_eq!(
+    inside,
+    Some(Err(ContentRefused::OutOfReach { need })),
+    "room asked inside a lend refused by its own kind at the first put"
+  );
+  assert!(!held_after, "nothing kept by the refused put");
+  assert!(
+    matches!(outside, Some(Ok(_))),
+    "the same put within room asked outside the lend taken: {outside:?}"
+  );
+  assert_eq!(counted, 1, "the ask inside the lend counted once");
+}

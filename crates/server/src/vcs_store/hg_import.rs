@@ -514,6 +514,36 @@ pub(crate) async fn let_go_landed_import(
   .await;
 }
 
+/// [`land_imported`] for a test whose own thread waits on the node's store, never `daemon`'s shard of partition
+/// `partition`: each segment the import cut is taken in one observation, landed from this thread
+/// (`crate::test_store::land_blocking`) and counted in the next, as [`run`] lands them between turns; then the import is
+/// landed in one more. A history that held the shard through a segment's commit outlasted the watchdog's window on a slow
+/// `fdatasync` (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
+#[cfg(test)]
+pub(crate) fn land_imported_on(
+  daemon: &crate::Daemon,
+  partition: usize,
+  id: RepositoryId,
+) -> Result<(), ImportFailed> {
+  while let Some((disk, header, parts, identity)) =
+    crate::daemon::observe_at(daemon, partition, move |state| segment_changeset(state, id))
+  {
+    let sequence = header.sequence;
+    let landed = crate::test_store::land_blocking(disk, header, parts);
+    crate::daemon::observe_at(daemon, partition, move |state| {
+      segment_landed(state, id, (sequence, identity), landed)
+    })?;
+  }
+  crate::daemon::observe_at(daemon, partition, move |state| {
+    built_works_whole(state, id)?;
+    let contents = land(state, id)?;
+    let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
+    state.count(FILE_TEXT_BYTES_LET_GO, freed);
+    state.count(FILE_TEXTS_PINNED, pinned);
+    Ok(())
+  })
+}
+
 /// Every segment repository `id`'s import has cut, landed on the changeset store, waiting on a thread of its own for
 /// each (`crate::test_store::land_blocking`): [`run`]'s landing for a test that holds the shard's state.
 #[cfg(test)]
@@ -1083,10 +1113,8 @@ async fn built_works(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
           if !super::hg_view::answer_store_wants(&mut building, id).await {
             return None;
           }
-          let brought = crate::state::with_state(|state| {
-            super::lent_state(state, |state| brought_back(state, id, &mut building))
-          })
-          .flatten();
+          let brought =
+            crate::state::with_state(|state| brought_back(state, id, &mut building)).flatten();
           if brought.is_none() {
             return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
           }
@@ -1134,6 +1162,8 @@ fn done_held<T>(
 
 /// The text `building` was given for the file revision it waited for, brought back into the content store by the
 /// identities repository `id`'s done import's index names; none where nothing was given or the store refused it.
+/// Called outside any `lent_state`, since its `within_budget` grows the arena before it lends the chunks (refused
+/// `OutOfReach` inside one).
 fn brought_back(
   state: &mut ShardState,
   id: RepositoryId,
@@ -1227,8 +1257,7 @@ fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), Imp
           ) {
             return Err(unavailable());
           }
-          super::lent_state(state, |state| brought_back(state, id, &mut building))
-            .ok_or_else(unavailable)?;
+          brought_back(state, id, &mut building).ok_or_else(unavailable)?;
         }
         None => {}
         Some(Ok(built)) => {
