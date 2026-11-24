@@ -71,15 +71,8 @@ pub(crate) fn serve(
   (volume, attachment): (VolumeId, u64),
   op: FsOp<'_>,
 ) -> ReplyBody {
-  let (_, record) = match find(state, volume) {
-    Ok(found) => found,
-    Err(reply) => return *reply,
-  };
-  if record.policy.role != Role::Plain {
-    return refused(Refusal::BadRequest {
-      reason: "the file verbs change a plain volume; a work changes through edit and declare"
-        .to_owned(),
-    });
+  if let Err(refusal) = plain(state, volume) {
+    return refused(refusal);
   }
   match with_writer(
     state,
@@ -92,6 +85,48 @@ pub(crate) fn serve(
     Ok(Err(e)) => refused(refusal_of_vfs(&e)),
     Err(refusal) => refused(refusal),
   }
+}
+
+/// Whether `volume` is a plain volume, the only kind the file verbs change, refused as [`find`] refuses it and, for a
+/// green or a work, as a request the file verbs do not serve (a work changes through edit and declare). Shared with an
+/// open staging buffer's check (`verbs::stage_open`, A-880).
+pub(crate) fn plain(state: &ShardState, volume: VolumeId) -> Result<(), Refusal> {
+  let (_, record) = find(state, volume).map_err(|reply| refusal_in(*reply))?;
+  if record.policy.role != Role::Plain {
+    return Err(Refusal::BadRequest {
+      reason: "the file verbs change a plain volume; a work changes through edit and declare"
+        .to_owned(),
+    });
+  }
+  Ok(())
+}
+
+/// The caller's write `attachment` of `volume`, checked as every write through the typed channel checks it
+/// ([`with_writer`]): a CLI attachment is renewed by the use or refused once its term lapsed (A-230); one that is gone
+/// is `NotFound`; one that is not the caller's, of this volume, for writing and not a snapshot's, or another host's, is
+/// `Forbidden` naming `verb`. An open staging buffer is opened under the same check (`verbs::stage_open`, A-880).
+pub(crate) fn writer_attachment(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, attachment): (VolumeId, u64),
+  verb: &str,
+) -> Result<slates_db::catalog::AttachmentRecord, Refusal> {
+  crate::verbs::use_attachment(state, principal, attachment)?;
+  let Some(catalog) = state.db.partition().attachment(attachment).cloned() else {
+    return Err(Refusal::NotFound);
+  };
+  if catalog.volume != to_db_volume(volume)
+    || catalog.principal != *principal
+    || !catalog.rights.write
+    || catalog.snapshot.is_some()
+    // Another host's attachment serves only that host's forwards, and this node's only this node (A-222).
+    || !crate::remote_attach::may_use(state, &catalog)
+  {
+    return Err(Refusal::Forbidden {
+      verb: verb.to_owned(),
+    });
+  }
+  Ok(catalog)
 }
 
 /// Runs `f` on the bridge and context a write under the caller's write `attachment` of `volume` runs with (the module
@@ -112,22 +147,7 @@ pub(crate) fn with_writer<T>(
     Ok((handle, _)) => handle,
     Err(reply) => return Err(refusal_in(*reply)),
   };
-  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
-  crate::verbs::use_attachment(state, principal, attachment)?;
-  let Some(catalog) = state.db.partition().attachment(attachment).cloned() else {
-    return Err(Refusal::NotFound);
-  };
-  if catalog.volume != to_db_volume(volume)
-    || catalog.principal != *principal
-    || !catalog.rights.write
-    || catalog.snapshot.is_some()
-    // Another host's attachment serves only that host's forwards, and this node's only this node (A-222).
-    || !crate::remote_attach::may_use(state, &catalog)
-  {
-    return Err(Refusal::Forbidden {
-      verb: verb.to_owned(),
-    });
-  }
+  let catalog = writer_attachment(state, principal, (volume, attachment), verb)?;
   let registry =
     admit(state, volume, attachment, &catalog).ok_or(Refusal::Overloaded { shard: state.shard })?;
   let scope = catalog.form.scope();

@@ -3792,6 +3792,248 @@ fn a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse() {
   );
 }
 
+/// Shape: the bytes of the streamed-write tests' input: many pages of a request's one bulk chunk (4 KiB, a `StagePut`
+/// carries what it holds past its framing), past the two a write reads before it chooses, and no whole number of pages,
+/// so the last put is short.
+const STREAMED_BYTES: usize = 37 * 1000 + 13;
+
+/// A file's input as a reader yields it: `bytes` in runs of `chunk`, waiting `pause` before each run after the first, as
+/// a producer slower than a CLI attachment's term between runs is (A-880). A read never crosses into the next run.
+struct PacedInput {
+  bytes: Vec<u8>,
+  at: usize,
+  chunk: usize,
+  pause: Duration,
+}
+
+impl std::io::Read for PacedInput {
+  fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+    if self.at >= self.bytes.len() {
+      return Ok(0);
+    }
+    let chunk = self.chunk.max(1);
+    if self.at > 0 && self.at.is_multiple_of(chunk) {
+      #[allow(clippy::disallowed_methods)]
+      // the producer's own pace is what the test gives the write
+      std::thread::sleep(self.pause);
+    }
+    let run_end = (self.at / chunk).saturating_add(1).saturating_mul(chunk);
+    let end = self
+      .at
+      .saturating_add(into.len())
+      .min(run_end)
+      .min(self.bytes.len());
+    let piece = self.bytes.get(self.at..end).unwrap_or_default();
+    let Some(into) = into.get_mut(..piece.len()) else {
+      return Ok(0);
+    };
+    into.copy_from_slice(piece);
+    self.at = end;
+    Ok(piece.len())
+  }
+}
+
+/// The streamed-write tests' input: [`STREAMED_BYTES`] of a pattern no page repeats.
+fn streamed_input() -> Vec<u8> {
+  (0..STREAMED_BYTES)
+    .map(|at| u8::try_from((at * 7 + at / 4093) % 251).unwrap())
+    .collect()
+}
+
+/// A-880, by use. Do: on a one-shard daemon, write [`STREAMED_BYTES`] to a file from a reader with `fs_write_from`
+/// under a write attachment, then a file of a few bytes the same way, and read both back. Expect both read back as
+/// written, and exactly one open staging buffer begun (`staging.opened`): the long input went a page at a time through
+/// a buffer of no stated length, and the short one whole in one request. Before A-880 a caller had to hold the whole
+/// input to stage it, its length stated first (`slates write` read all of stdin before its first verb).
+#[test]
+fn a_write_from_a_reader_streams_it_through_an_open_buffer() {
+  let (daemon, mut client, _instance) = one_shard_daemon("streamed");
+  let volume = client
+    .create(&room_for("streamed", STREAMED_BYTES))
+    .unwrap();
+  let attachment = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Termed,
+    )
+    .unwrap()
+    .attachment;
+  let long = streamed_input();
+  let wrote = client.fs_write_from(
+    (volume, attachment),
+    "/long.bin",
+    &mut std::io::Cursor::new(long.clone()),
+    0o644,
+  );
+  let short = b"short".to_vec();
+  let wrote_short = client.fs_write_from(
+    (volume, attachment),
+    "/short.bin",
+    &mut std::io::Cursor::new(short.clone()),
+    0o644,
+  );
+  let read = client.read(volume, "/long.bin", slates_client::ReadAt::Head);
+  let read_short = client.read(volume, "/short.bin", slates_client::ReadAt::Head);
+  let opened = daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("staging.opened")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  daemon.stop();
+  assert_eq!(
+    wrote,
+    Ok(u64::try_from(STREAMED_BYTES).unwrap()),
+    "the long input written"
+  );
+  assert_eq!(wrote_short, Ok(5), "the short input written");
+  assert!(
+    read.as_ref().is_ok_and(|bytes| *bytes == long),
+    "the long file reads back as written"
+  );
+  assert_eq!(
+    read_short,
+    Ok(short),
+    "the short file reads back as written"
+  );
+  assert_eq!(
+    opened, 1,
+    "the long input went through one open buffer, the short one whole"
+  );
+}
+
+/// A-880, by use. Do: on a one-shard daemon, attach a volume for write, open a staging buffer under the attachment and
+/// put a page into it, then detach the attachment and put the next page. Expect the open and the page charged to the
+/// shard's metadata ledger, and after the detach the next put refused `NotFound` and the ledger back to no more than it
+/// held before the open, the release counted (`staging.released_with_attachment`): the buffer went with its attachment,
+/// which a detach, a lapse, a reap of its client or a destroy ends alike (`staging::after_borrow`).
+#[test]
+fn an_open_staging_buffer_goes_with_its_attachment() {
+  use slates_ipc::protocol::ReplyBody;
+  let (daemon, mut client, _instance) = one_shard_daemon("open-stage-detach");
+  let volume = client.create(&room_for("open-stage", 4096)).unwrap();
+  let attachment = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Termed,
+    )
+    .unwrap()
+    .attachment;
+  let committed = |client: &mut Client| -> u64 {
+    client
+      .daemon_status()
+      .unwrap()
+      .shards
+      .iter()
+      .map(|shard| shard.committed_metadata)
+      .sum()
+  };
+  let before = committed(&mut client);
+  let token = match client.call(&RequestBody::StageOpen { volume, attachment }) {
+    Ok(ReplyBody::Staged { token }) => token,
+    other => panic!("an open buffer: {other:?}"),
+  };
+  let page = vec![1u8; 1000];
+  let put = client.call(&RequestBody::StagePut {
+    work: volume,
+    token,
+    offset: 0,
+    bytes: page.clone(),
+  });
+  let during = committed(&mut client);
+  let detached = client.detach(attachment);
+  let late = client.call(&RequestBody::StagePut {
+    work: volume,
+    token,
+    offset: 1000,
+    bytes: page,
+  });
+  let after = committed(&mut client);
+  let released = daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("staging.released_with_attachment")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(put, Ok(ReplyBody::StagePutDone { filled: 1000 })),
+    "the first page put: {put:?}"
+  );
+  assert!(
+    during >= before.saturating_add(1000),
+    "the buffer and its page charged: {before} then {during}"
+  );
+  assert!(detached.is_ok(), "detached: {detached:?}");
+  assert!(
+    matches!(late, Err(ClientError::Refused(Refusal::NotFound))),
+    "the buffer went with its attachment: {late:?}"
+  );
+  assert!(
+    after <= before,
+    "its charge went with it: {before} before the open, {after} after the detach"
+  );
+  assert_eq!(released, 1, "released because its attachment ended");
+}
+
+/// A-880 with A-879, by use. Do: on a one-shard daemon whose failover delay is held at [`HOLD_CEILING`], attach a
+/// volume for write in the CLI's form, hold it, and write [`STREAMED_BYTES`] with `fs_write_from` from a reader that
+/// waits two ceilings before each page after the first; read the file back. Expect it written and read back as
+/// written: the open buffer lived as long as the held attachment, though no put came within a lease of the last. A
+/// buffer with a deadline would have expired a lease after its last put, and the next put been refused `NotFound`.
+#[test]
+fn a_streamed_write_slower_than_a_lease_between_pages_lands_under_a_hold() {
+  let (daemon, mut client, instance) = one_shard_daemon("streamed-slow");
+  daemon
+    .inject_failover(Some(u64::try_from(HOLD_CEILING.as_nanos()).unwrap()))
+    .expect("the failover delay is held");
+  let volume = client
+    .create(&room_for("streamed-slow", STREAMED_BYTES))
+    .unwrap();
+  let attachment = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Termed,
+    )
+    .unwrap()
+    .attachment;
+  let hold = slates_client::Hold::new(&instance, deadlines(), attachment)
+    .expect("the attachment is renewed")
+    .expect("a CLI attachment has a term to hold");
+  let bytes = streamed_input();
+  // Four runs, the three after the first each two ceilings after the one before: more than a lease between two puts.
+  let chunk = STREAMED_BYTES.div_ceil(4);
+  let mut input = PacedInput {
+    bytes: bytes.clone(),
+    at: 0,
+    chunk,
+    pause: HOLD_CEILING.saturating_mul(2),
+  };
+  let wrote = client.fs_write_from((volume, attachment), "/slow.bin", &mut input, 0o644);
+  let lost = hold.end();
+  let read = client.read(volume, "/slow.bin", slates_client::ReadAt::Head);
+  drop(client);
+  daemon.stop();
+  assert_eq!(
+    wrote,
+    Ok(u64::try_from(STREAMED_BYTES).unwrap()),
+    "a write slower than a lease between pages: {lost:?}"
+  );
+  assert!(lost.is_none(), "the hold lasted the write: {lost:?}");
+  assert!(
+    read.as_ref().is_ok_and(|read| *read == bytes),
+    "the file reads back as written"
+  );
+}
+
 /// Shape: how often the ended-hold test looks for its hold's renewals to have met their refusal: a small part of a
 /// renewal's cadence, which is a third of the term at most.
 const HOLD_LOOK: Duration = Duration::from_millis(20);

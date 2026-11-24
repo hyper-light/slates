@@ -882,6 +882,74 @@ fn a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put() {
   assert_empty(&store);
 }
 
+/// A key as a hash names one: eight bytes of SplitMix64 (Steele, Lea and Flood 2014) of `at`, so keys scatter over the
+/// key space as Mercurial's node ids do, and every run's fences span nearly all of it.
+fn scattered_key(at: u64) -> [u8; 8] {
+  let mut mixed = at.wrapping_add(0x9e37_79b9_7f4a_7c15);
+  mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+  mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+  (mixed ^ (mixed >> 31)).to_be_bytes()
+}
+
+/// Shape: the rows the resolves test appends, and the absent keys it looks up.
+const FILTERED_ROWS: u64 = 600;
+/// Shape: see [`FILTERED_ROWS`].
+const ABSENT_LOOKUPS: u64 = 2_000;
+
+/// Goal 93 (r536, main's ruling of 2026-11-23 19:54: under load a push's lookups spent their time resolving a table for
+/// every sealed run they walked, its duplicate checks nearly all misses; a key filter a run, sized so a miss's false
+/// resolves over every run are under one). Do: append [`FILTERED_ROWS`] scattered keys, sealing when due and merging
+/// what the size-tiered rule names, so several runs are left; look up [`ABSENT_LOOKUPS`] keys the index never held,
+/// then every key it holds. Expect: the misses resolve under half a table each over all the runs (before, a table a
+/// run: every run's fences span the keys); the filters passed runs over (the non-vacuity counter); every held key
+/// found, a hit resolving under one and a half tables on average.
+#[test]
+fn a_lookup_of_a_key_no_run_holds_resolves_almost_no_table() {
+  let mut store = store();
+  let mut index = Index::new();
+  for at in 0..FILTERED_ROWS {
+    let key = scattered_key(at);
+    index
+      .insert(&mut store, row(&key, &[], b"payload"))
+      .unwrap();
+    if index.seal_due(&store) {
+      index.seal(&mut store).unwrap();
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
+        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
+      }
+    }
+  }
+  index.seal_all(&mut store).unwrap();
+  let runs = index.run_tables().len();
+  assert!(runs >= 3, "runs to walk: {runs}");
+  let before = index.counters();
+  for at in 0..ABSENT_LOOKUPS {
+    let absent = scattered_key(FILTERED_ROWS + at);
+    assert!(index.get(&store, &absent).is_none());
+  }
+  let missed = index.counters();
+  let miss_resolves = missed.resolves - before.resolves;
+  assert!(
+    miss_resolves * 2 < ABSENT_LOOKUPS,
+    "{miss_resolves} resolves over {ABSENT_LOOKUPS} misses of {runs} runs"
+  );
+  assert!(
+    missed.filter_rejections > before.filter_rejections,
+    "the filters passed runs over"
+  );
+  for at in 0..FILTERED_ROWS {
+    assert!(index.get(&store, &scattered_key(at)).is_some(), "key {at}");
+  }
+  let hit_resolves = index.counters().resolves - missed.resolves;
+  assert!(
+    hit_resolves * 2 < FILTERED_ROWS * 3,
+    "{hit_resolves} resolves over {FILTERED_ROWS} hits of {runs} runs"
+  );
+  index.release(&mut store).unwrap();
+  assert_empty(&store);
+}
+
 /// The first byte of the key of each row `index` reads from `start`.
 fn keys_from(index: &Index, store: &ContentStore, start: &[u8]) -> Vec<u8> {
   index
