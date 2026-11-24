@@ -22,6 +22,22 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 23:52:
+- Gate 3 is RUNNING: GitHub run 45350914168 (branch diag-measurer-main-v3-gate3, commit 509d46e3c), v3_takeover at
+  b98233544 (w-git's edge-failure logging ba4e4e35e): 3 release then 4 debug back to back; artifact v3-gate3 holds each
+  run's whole log, anchor and daemon lines included. Send w-git the disconnecting run's edge lines.
+- r678 is explained: the ls-refs fix moved derive and encode from the post-push listing (A 30.0 s, B 0.03 s) to the first
+  clone; push + listing + mirror clone total the same. w-git folds "derive and encode behind the push, off every fetch's
+  path" into the clone speed item, after commits.rs's version-alone sites.
+- w-tsan owes a test fix: daemon_edge.rs:5274 (its 21323f227) asserts the arena grew, which the machine's slack decides
+  (3 of 3 fail on w-hg's Mac at load); assert the counted asks instead, red-checked.
+- w-hg's C1(1) P2 is committed green and landing.
+- Unmerged branches holding open GAPS items, untouched since 11-21: origin/agents/w-bugs-backstop-6 (A-837 part 3, the
+  typed DescriptorsExhausted refusal; 4 commits; w-bugs idle since 11-22 06:05 on another machine, and whether its session
+  is off the API key is unverified, so check before waking it or give the piece to another agent) and
+  origin/agents/w-shared-gitbuild (A-752's owed red: a large git file built a slice a unit). The w-perf-84a-* and
+  w-multirepo-learned-weights branches are measurement arms and never land.
+
 Updates at 23:35 (newest first; they supersede the table where they differ):
 - w-git: the push-0 disconnect did not reproduce locally (4 debug runs passed). Its logging commit (why the edge ends a response
   early) is landing. OWED by the coordinator: gate 3 at that commit on ubuntu, v3_takeover 3x release then 4x debug back to back,
