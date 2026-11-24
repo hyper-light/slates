@@ -3009,6 +3009,42 @@ fn info_entries_in_order(text: &str) -> String {
   head + &entries.concat() + &tail
 }
 
+/// The files a blame at revision `at` reads (main 01a20182's ruling of 2026-11-23): those revision `at` added or
+/// modified, as `leg`'s `svn log -v -r AT` names them, that `copy` (a working copy of the repository's root at `at`)
+/// holds; where `at` changed no file the copy holds, those of the nearest earlier revision that did. The paths beneath
+/// the copy, and the revision they were taken from. Read from one leg (the control), so both legs blame the same files.
+fn blamed_files(leg: &UseLeg, scratch: &str, at: u64, copy: &str) -> (Vec<String>, u64) {
+  for revision in (1..=at).rev() {
+    let rev = revision.to_string();
+    let log = leg.answer(scratch, &["log", "-v", "--xml", "-r", &rev, "{url}"]);
+    let files: Vec<String> = files_changed_in(&log)
+      .into_iter()
+      .filter(|path| std::path::Path::new(copy).join(path).is_file())
+      .collect();
+    if !files.is_empty() {
+      return (files, revision);
+    }
+  }
+  (Vec::new(), 0)
+}
+
+/// The files `log`, an `svn log -v --xml` answer made plain (each `<path ...>` tag one line, [`UseLeg::plain`]), names
+/// as added, modified or replaced, by their repository paths without the leading `/`; a deletion and a directory are left
+/// out.
+fn files_changed_in(log: &str) -> Vec<String> {
+  log
+    .lines()
+    .filter(|line| line.contains("<path ") && line.contains("kind=\"file\""))
+    .filter(|line| !line.contains("action=\"D\""))
+    .filter_map(|line| {
+      let start = line.find('>')?.checked_add(1)?;
+      let end = line.find("</path>")?;
+      line.get(start..end)
+    })
+    .map(|path| path.trim_start_matches('/').to_owned())
+    .collect()
+}
+
 /// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out. A symbolic link is held
 /// as `link TARGET`, the text Subversion keeps for a link (`svn:special`), never read through: a link may name a
 /// directory, and r202's git-2000 round read one as a file ([`a_working_copys_symbolic_links_are_held_as_links`]).
@@ -3286,7 +3322,10 @@ fn timed_verb<T>(
   answer
 }
 
-/// `verb` (checkout, update, switch or blame) at each of `sampled` as a working copy on both legs, compared.
+/// `verb` (checkout, update, switch or blame) at each of `sampled` as a working copy on both legs, compared. Blame is of
+/// the files the sampled revision changed ([`blamed_files`]), not of every file: main 01a20182's ruling of 2026-11-23
+/// (r546), since every file at every sample was 155,904 whole-history fetches over git-2000 and checked the same
+/// attributions again and again, where a file the revision changed is where its newest attribution can go wrong.
 #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
 fn working_copies_compared(
   verb: &str,
@@ -3325,7 +3364,12 @@ fn working_copies_compared(
         }
       }
       held_by.push(if verb == "blame" {
-        let files: Vec<String> = tree_of(&copy).into_keys().collect();
+        let (files, from) = blamed_files(legs[0], scratch, *at, &copy);
+        eprintln!(
+          "svn use: blame r{at} on {}: {} files, those r{from} changed",
+          leg.name,
+          files.len()
+        );
         files
           .iter()
           .map(|file| leg.answer(&copy, &["blame", "-v", "-r", &rev, file]))
@@ -3529,7 +3573,8 @@ fn use_slates_leg(
 /// import the same revisions into a slates repository (`slates repository import`) served on the route
 /// `SLATES_SVN_USE_ROUTE` names (`svn`, the default: the svn:// listener; `http`: the HTTP edge as HTTPv2; `http-v1`: the
 /// same, its client told to speak HTTPv1 ([`HTTP_V1_SWITCH`]); `ssh`: the SSH edge as svn+ssh, by an enrolled key); then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
-/// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`), and the writing verbs
+/// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`; blame of the files each
+/// sampled revision changed, [`blamed_files`]), and the writing verbs
 /// (commit, copy, merge, propset of a revision property) as the same edits on both, then their logs. Expect every
 /// answer byte for byte alike once each server's URL is made plain ([`USE_URL`]; a written revision's author and date,
 /// which the servers stamp, left out): log -v, info, a checkout's files and properties, `update -r`, `switch`, blame,
@@ -3762,6 +3807,25 @@ fn an_infos_entry_order_is_no_part_of_an_answer() {
   assert_ne!(
     info_entries_in_order(&stock),
     info_entries_in_order(&changed)
+  );
+}
+
+/// The blame rule's reading of a revision's changes ([`files_changed_in`], main 01a20182's ruling of 2026-11-23). Do: read
+/// a plain `svn log -v --xml` answer naming a modified file, an added file, a deleted file, a replaced file and a changed
+/// directory. Expect the three files still there after the revision, by their paths without the leading `/`, in the
+/// log's order.
+#[test]
+fn a_revisions_changed_files_are_read_from_its_log() {
+  let log = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<logentry revision=\"7\">\n<author>t</author>\n<paths>\n\
+<path action=\"M\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/a.c</path>\n\
+<path action=\"A\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/dir/new.h</path>\n\
+<path action=\"D\" kind=\"file\" prop-mods=\"false\" text-mods=\"false\">/trunk/gone.c</path>\n\
+<path action=\"R\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/again.c</path>\n\
+<path action=\"M\" kind=\"dir\" prop-mods=\"true\" text-mods=\"false\">/trunk/dir</path>\n\
+</paths>\n<msg>m</msg>\n</logentry>\n</log>\n";
+  assert_eq!(
+    files_changed_in(log),
+    ["trunk/a.c", "trunk/dir/new.h", "trunk/again.c"]
   );
 }
 
