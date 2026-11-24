@@ -1187,23 +1187,17 @@ fn name_on(partition: usize) -> String {
     .expect("a name routes there")
 }
 
-/// Creates the git repository `name` on its partition `partition`, owned by [`owner`].
+/// Creates the git repository `name` on its partition `partition`, owned by [`owner`], as a client's creation is made:
+/// answered from a task of the shard while this thread waits for its record ([`crate::test_store::create_on`]), so the
+/// shard is never held through the store's commit
+/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
 fn create(daemon: &Daemon, partition: usize, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name,
-        tool: VcsTool::Git,
-        format: ObjectFormat::Sha1,
-        default_branch: "main".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  crate::test_store::create_on(
+    daemon,
+    partition,
+    &owner(),
+    (name, VcsTool::Git, ObjectFormat::Sha1, "main"),
+  );
 }
 
 /// Enrolls the held key for [`owner`] on the partition its id routes to, as the human surface enrolls one (§4.13).
