@@ -781,3 +781,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - A-899 held on Linux (run 45395756328, 32/0/1 twice).
 - NEXT item 5, speed: HTTPv2 writes 24x (0.6 vs 14.7 s); svnsync per-piece room round trip (piece_fetched 14.7/rev);
   svn:// update (round 3: 0.999 vs 0.891 s); bring-back before the made step (A-891 GAPS note).
+
+## 2026-11-24 ~09:45
+- Import spin closed: red `t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window` (b2bea8d2c); cause A-887's cubic replay_reads, fixed by w-perf 5606962eb.
+- Diff r251 red was the harness: canonical_tags on non-XML answers (a0c46b705, `a_diffs_text_is_compared_as_written_whatever_its_blocks_order`). Main's next HTTP round confirms nothing else differs past line 362.
+- read_named O(R^2) fixed (a0c46b705, `a_works_runs_are_read_a_slice_a_call_across_runs`).
+- Next: locate the judge's superlinear part (batch.stage 290 ms @3k files vs 1,865 ms @6k, debug) by a counter, then fix; then item 5.1 (HTTPv2 writes).
