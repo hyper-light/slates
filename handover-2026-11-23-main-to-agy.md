@@ -22,6 +22,13 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 02:20 on 11-24:
+- Gate 4 NAMED the push-0 failure (run 45363070862, 6 of 7): the server answered the push 200 OK, chunked, and ended the
+  body cleanly with zero bytes 3.5 ms later; no report-status. It was never a disconnect. w-git now hunts the path that
+  completes a receive-pack response with no report (a just-created repository's push is the suspect), red first, and the
+  edge must refuse to complete an empty receive-pack result. Gate 5 runs on its fix the same way.
+- w-hg is uds 38517 since a restart. w-perf's mechanical bring-back split (ShardLender seam) lands alone before A-887.
+
 Updates at 02:18 on 11-24:
 - 84a Linux, a second current-main round (A arm of the client-RR A/B at a51883940, adacachy2, CPUWeight 10000, the box
   at load 58 rising to 214): every reported p99 <= 415 us and p999 <= 961 us. The client-RR arm (D'') was dead even
