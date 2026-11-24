@@ -1651,6 +1651,105 @@ async fn established_peer(endpoint: &mut Endpoint) -> Option<CertificateDer<'sta
   certificate
 }
 
+/// [`serve_peer_records`]' dispatch of one request `next`: a kind served on a task of its own, spawned on `forwards` (a
+/// forwarded verb, a takeover's live fetch, a large live message, a home exchange, a work route's question), so it holds
+/// no other request of the peer; any other kept for the loop to serve, one at a time.
+fn dispatched_request(
+  next: crate::forward_lane::Next,
+  forwards: &mut crate::forward_lane::ServedForwards,
+  (control, local, peer_anchor, seed): (u16, HostId, HostId, HostId),
+  enrolled: bool,
+) -> PeerRequestServed {
+  match next {
+    crate::forward_lane::Next::Forwarded { stream_id, reply } => {
+      PeerRequestServed::Spawned(stream_id, Some(reply))
+    }
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if kind == FORWARD_STREAM && enrolled => {
+      let served = forwards.spawn(stream_id, async move {
+        injected_serve_delay().await;
+        verbs::injected_forward_silence(&request).await;
+        verbs::serve_forward(control, peer_anchor, &request).await
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
+    // A takeover's fetch of a live log is laid out in turns of this shard (g251), so it too runs on its own task: a
+    // long log's answer holds no other request of the peer.
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if enrolled && is_live_fetch(kind, &request) => {
+      let peer_host = learned_host(peer_anchor, seed);
+      let served = forwards.spawn(stream_id, async move {
+        withheld_live_state().await;
+        crate::live_ship::serve_fetch(local, peer_host, request).await
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
+    // A large live message is taken in turns of its own (A-757 part 4): its entries' identities are hashed a slice a
+    // turn before they are taken, so it holds no other request of the peer and no poll of this shard long. The owner
+    // sends a holder's next message only once this one is answered, so its entries stay in order.
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if enrolled && is_large_live_message(kind, &request) => {
+      let peer_host = learned_host(peer_anchor, seed);
+      let served = forwards.spawn(stream_id, async move {
+        let object = slates_db::live::object_of(&request);
+        let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+        match admission.refusal() {
+          Some(refusal) => refusal,
+          None => {
+            let batch = kind == slates_cluster::live::LIVE_ENTRIES_STREAM;
+            crate::live_ship::serve_entries_hashed(local, peer_host, batch, request).await
+          }
+        }
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
+    // A home exchange (A-724 piece 6) runs on its own task (A-907): its waits (a put's for its image's publication,
+    // A-727; a home's for its own install, A-902) held every other request of the peer, its configuration steps among
+    // them, which a home behind its sender was waiting for.
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if kind == slates_cluster::homes::HOME_STREAM && enrolled => {
+      let peer_host = learned_host(peer_anchor, seed);
+      let served = forwards.spawn(stream_id, async move {
+        crate::vcs_store::homes::serve_remote(
+          (control, peer_host),
+          &request,
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
+    // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if kind == crate::work_route::STREAM && enrolled => {
+      let served = forwards.spawn(stream_id, async move {
+        crate::work_route::serve(control, &request).await
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } => PeerRequestServed::Here(stream_id, kind, request),
+  }
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1705,94 +1804,12 @@ async fn serve_peer_records(
     let Some(next) = next_or_end(&mut endpoint, &mut forwards).await else {
       return;
     };
-    let dispatched = match next {
-      crate::forward_lane::Next::Forwarded { stream_id, reply } => {
-        PeerRequestServed::Spawned(stream_id, Some(reply))
-      }
-      crate::forward_lane::Next::Request {
-        stream_id,
-        kind,
-        request,
-      } if kind == FORWARD_STREAM && enrolled => {
-        let served = forwards.spawn(stream_id, async move {
-          injected_serve_delay().await;
-          verbs::injected_forward_silence(&request).await;
-          verbs::serve_forward(control, peer_anchor, &request).await
-        });
-        PeerRequestServed::Spawned(stream_id, served)
-      }
-      // A takeover's fetch of a live log is laid out in turns of this shard (g251), so it too runs on its own task: a
-      // long log's answer holds no other request of the peer.
-      crate::forward_lane::Next::Request {
-        stream_id,
-        kind,
-        request,
-      } if enrolled && is_live_fetch(kind, &request) => {
-        let peer_host = learned_host(peer_anchor, seed);
-        let served = forwards.spawn(stream_id, async move {
-          withheld_live_state().await;
-          crate::live_ship::serve_fetch(local, peer_host, request).await
-        });
-        PeerRequestServed::Spawned(stream_id, served)
-      }
-      // A large live message is taken in turns of its own (A-757 part 4): its entries' identities are hashed a slice a
-      // turn before they are taken, so it holds no other request of the peer and no poll of this shard long. The owner
-      // sends a holder's next message only once this one is answered, so its entries stay in order.
-      crate::forward_lane::Next::Request {
-        stream_id,
-        kind,
-        request,
-      } if enrolled && is_large_live_message(kind, &request) => {
-        let peer_host = learned_host(peer_anchor, seed);
-        let served = forwards.spawn(stream_id, async move {
-          let object = slates_db::live::object_of(&request);
-          let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
-          match admission.refusal() {
-            Some(refusal) => refusal,
-            None => {
-              let batch = kind == slates_cluster::live::LIVE_ENTRIES_STREAM;
-              crate::live_ship::serve_entries_hashed(local, peer_host, batch, request).await
-            }
-          }
-        });
-        PeerRequestServed::Spawned(stream_id, served)
-      }
-      // A home exchange (A-724 piece 6) runs on its own task (A-907): its waits (a put's for its image's publication,
-      // A-727; a home's for its own install, A-902) held every other request of the peer, its configuration steps among
-      // them, which a home behind its sender was waiting for.
-      crate::forward_lane::Next::Request {
-        stream_id,
-        kind,
-        request,
-      } if kind == slates_cluster::homes::HOME_STREAM && enrolled => {
-        let peer_host = learned_host(peer_anchor, seed);
-        let served = forwards.spawn(stream_id, async move {
-          crate::vcs_store::homes::serve_remote(
-            (control, peer_host),
-            &request,
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await
-        });
-        PeerRequestServed::Spawned(stream_id, served)
-      }
-      // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
-      crate::forward_lane::Next::Request {
-        stream_id,
-        kind,
-        request,
-      } if kind == crate::work_route::STREAM && enrolled => {
-        let served = forwards.spawn(stream_id, async move {
-          crate::work_route::serve(control, &request).await
-        });
-        PeerRequestServed::Spawned(stream_id, served)
-      }
-      crate::forward_lane::Next::Request {
-        stream_id,
-        kind,
-        request,
-      } => PeerRequestServed::Here(stream_id, kind, request),
-    };
+    let dispatched = dispatched_request(
+      next,
+      &mut forwards,
+      (control, local, peer_anchor, seed),
+      enrolled,
+    );
     let (stream_id, stream, request) = match dispatched {
       PeerRequestServed::Spawned(stream_id, served) => {
         if !replied(&mut endpoint, stream_id, served) {
