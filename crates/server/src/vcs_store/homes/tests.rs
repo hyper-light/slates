@@ -1007,3 +1007,41 @@ fn a_region_hold_the_set_cannot_name_is_never_taken_in_the_store() {
   assert_eq!(free, (1, Vec::new()), "restored once the set is free");
   assert_eq!(content.holders(&object), before + 1, "held once more");
 }
+
+/// Main 01a20182's gate 7 (run 45398593779, release run 6: a push's pack homed short 0.9 ms after its body, never waiting
+/// its homing's budget), w-shared agreeing the instrumentation in writing, 2026-11-24. Do: on an audit daemon's shard, wait
+/// for its own image of a generation no publication will reach, so its ticket is stranded (not published and no image
+/// owed). Expect: answered not durable at once, far inside the wait's budget, never left to run it out; counted
+/// `vcs_store.homes.ticket_stranded` (and the branch logged), the counter that names this fast branch in a gate's log.
+#[test]
+fn a_stranded_tickets_wait_is_answered_not_durable_at_once_and_counted() {
+  let budget = crate::daemon::LIVENESS_BUDGET_NS;
+  let (answer, took_ns, stranded) = crate::test_store::run_on_first(
+    &crate::daemon::audit_daemon(),
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      let ticket = super::HomeTicket {
+        shard,
+        generation: u64::MAX >> 1,
+      };
+      let began = slates_rt::futures::now_ns();
+      let answer = super::published_within(shard, ticket, budget).await;
+      let took_ns = slates_rt::futures::now_ns().saturating_sub(began);
+      let stranded = crate::state::with_state(|state| {
+        state
+          .refusals
+          .get(super::HOME_TICKET_STRANDED)
+          .copied()
+          .unwrap_or(0)
+      })
+      .unwrap_or(0);
+      (answer, took_ns, stranded)
+    },
+    std::time::Duration::from_nanos(budget.saturating_mul(4)),
+  );
+  assert_eq!((answer, stranded), (Some(false), 1));
+  assert!(
+    took_ns < budget / 2,
+    "answered at once, not at the budget: {took_ns} of {budget} ns"
+  );
+}
