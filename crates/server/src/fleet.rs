@@ -5500,7 +5500,10 @@ async fn materialize_green(
 /// installed after. The green is then no longer pending.
 async fn served_already(origin: u16, (object, target): (ObjectId, u16)) -> bool {
   let replica_gone = state::with_state(|s| {
-    !s.merge.replicas.contains_key(&object) && !s.merge.seeding.contains(&object)
+    !s.merge
+      .replicas
+      .contains_key(&crate::merge_service::replica_key(object))
+      && !s.merge.seeding.contains(&object)
   })
   .unwrap_or(false);
   if !replica_gone {
@@ -10601,24 +10604,27 @@ impl Fanned {
   /// as its routing names it, else the green's creator): a change since the last fanned list is a new generation. An
   /// unchanged list, a period's usual case, is compared in place and copies nothing.
   fn observe_holding(&mut self, state: &ShardState) {
-    let now = state.merge.replicas.keys().map(|object| {
-      (
-        *object,
-        state
-          .fleet
-          .object_owner(*object)
-          .unwrap_or_else(|| object.creator()),
-      )
-    });
+    let now = || {
+      state.merge.replicas.keys().map(|green| {
+        let object = ObjectId(green.bytes);
+        (
+          object,
+          state
+            .fleet
+            .object_owner(object)
+            .unwrap_or_else(|| object.creator()),
+        )
+      })
+    };
     if self
       .holding
       .iter()
       .map(|(object, owner)| (*object, *owner))
-      .eq(now.clone())
+      .eq(now())
     {
       return;
     }
-    self.holding = now.collect();
+    self.holding = now().collect();
     self.holding_generation = self.holding_generation.saturating_add(1);
   }
 
@@ -13674,9 +13680,10 @@ mod tests {
   fn a_replica_taken_reaches_the_other_shards_with_its_owner_once() {
     crate::daemon::audit_on_shard(|s| {
       let green = ObjectId::new(HostId(7), 1);
-      s.merge
-        .replicas
-        .insert(green, slates_merge::engine::Green::new());
+      s.merge.replicas.insert(
+        crate::merge_service::replica_key(green),
+        slates_merge::engine::Green::new(),
+      );
       let mut fanned = std::mem::take(&mut s.fanned);
       fanned.observe_holding(s);
       s.fanned = fanned;
