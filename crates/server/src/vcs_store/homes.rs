@@ -1049,7 +1049,9 @@ pub(crate) fn region_changes_committed() {
 /// one until something holds it, and is freed once every record is replayed, `release_unheld`). How many were held, and
 /// the ones it could not take back (the store lacks the window, refused its hold, or the set was borrowed), never skipped
 /// unseen: a region hold is the pin that keeps a landed window in RAM (goal 93 item 2b, main 01a20182's ruling of
-/// 2026-11-22 07:33), so one lost is counted and logged by the recovery.
+/// 2026-11-22 07:33), so one lost is counted and logged by the recovery. The store's hold is taken only once the set can
+/// name it, so the two always agree: before 2026-11-23 a hold was taken first and given back where the set was
+/// borrowed, its release's refusal dropped (w-tsan's sweep, main 01a20182's commit-2 list).
 pub(crate) fn restore_region_holds(
   content: &mut slates_vcs::ContentStore,
   holds: &[(ContentId, Vec<HomeOwner>)],
@@ -1057,22 +1059,20 @@ pub(crate) fn restore_region_holds(
   let mut held = 0u64;
   let mut refused = Vec::new();
   for (identity, owners) in holds {
-    if owners.is_empty() || !content.contains(identity) || content.hold(identity).is_err() {
-      refused.push(*identity);
-      continue;
-    }
     let kept = REGION_HELD.with(|region| {
-      region
-        .try_borrow_mut()
-        .map(|mut region| region.insert(*identity, owners.iter().copied().collect()))
-        .is_ok()
+      let Ok(mut region) = region.try_borrow_mut() else {
+        return false;
+      };
+      if owners.is_empty() || !content.contains(identity) || content.hold(identity).is_err() {
+        return false;
+      }
+      region.insert(*identity, owners.iter().copied().collect());
+      true
     });
     if kept {
       held = held.saturating_add(1);
       region_windows_changed(content, identity, true);
     } else {
-      // Held in the store, but not named as the region's: given back, so the store's count and the set agree.
-      let _ = content.release(identity);
       refused.push(*identity);
     }
   }
@@ -1733,6 +1733,9 @@ pub(crate) const SETTLED: &str = "vcs_store.homes.settled";
 /// Counter: one some home did not answer, its hold left to the resolution of the attempt (A-727 (d1a-3)). Format: a
 /// counter name.
 pub(crate) const SETTLE_UNANSWERED: &str = "vcs_store.homes.settle_unanswered";
+/// Counter: the task settling what this shard owes the region not started, or started and not detached
+/// ([`settle_later`]): its settles wait for the next settle to start one. Format: a counter name.
+pub(crate) const SETTLE_TASK_REFUSED: &str = "vcs_store.homes.settle_task_refused";
 
 /// Owes `settle` to the region (A-727 (d1a)), and starts the task that settles what this shard owes where none runs.
 pub(crate) fn settle_later(settle: Settle) {
@@ -1744,12 +1747,11 @@ pub(crate) fn settle_later(settle: Settle) {
   if SETTLING.with(|settling| settling.replace(true)) {
     return;
   }
-  match slates_rt::futures::spawn(settle_owed()) {
-    Ok(task) => {
-      let _ = slates_rt::futures::detach(task);
-    }
-    // No task to spare: what is owed is settled by the next settle that starts one.
-    Err(_) => SETTLING.with(|settling| settling.set(false)),
+  // Detached as it is spawned, since nobody joins it: a joinable task holds its slot once it ends. Refused (no task to
+  // spare, or the detach refused): counted, and what is owed is settled by the next settle that starts one.
+  if slates_rt::futures::spawn_detached(settle_owed()).is_err() {
+    SETTLING.with(|settling| settling.set(false));
+    crate::state::with_state(|state| state.count(SETTLE_TASK_REFUSED, 1));
   }
 }
 
