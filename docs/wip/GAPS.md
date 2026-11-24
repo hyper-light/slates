@@ -4738,7 +4738,9 @@
 > Past twice that a run is stuck, not slow. It ended with 18 differences, server reds sent to w-svn by main: `info`
 > answered 500 on `/project/!svn/rvr/N/trunk/t` at all 17 samples, and svnrdump's dump differs in one deletion's order.
 > Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
-> w-svn. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
+> w-svn. Since then (main's ruling) blame leaves out a file added without a source, whose blame names its one revision
+> on every line, so revision 1's import is blamed no more; a later sample that changes such a file blames its whole
+> history. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
