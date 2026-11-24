@@ -618,3 +618,8 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   up to 9.2x slower than stock on whole-history transfers; svn is blocked by slates' import BudgetExceeded (w-svn). The
   harness now checks git objects against what the push sends, prints no line for a step a server doesn't run, samples
   `hg -R serve`, and leaves no stray git-daemon. Owed: round 3 after w-svn's import fix.
+- LANDED 886323342: a check that finds served data unlike the source (DIFFER/MISSED) fails every harness, and git refuses
+  an empty source. LANDED 6ea0ceebe: round 3 in BENCHMARKS (r811): svn at parity, git and hg 5.6-12x slower on whole
+  histories, git fetch and shallow fast on run 1 then slow (w-git). LANDED 9f3c3ad80, 2026-11-24: the git harness keeps
+  status --json after each slates push, fetch and shallow, and prints w-git's encode and derive counters. Waiting:
+  r865 (git-2000 svn use leg, rerun after the runner restart) and main's git-leg run at 9f3c3ad80.
