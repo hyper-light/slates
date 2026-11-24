@@ -268,15 +268,29 @@ impl Push {
   where
     N: Naming<Id = ObjectId, Refused = NameRefused>,
   {
-    let number = incoming.kind.pack_number();
     let id = naming
-      .name(number, &[], incoming.content)
+      .name(incoming.kind.pack_number(), &[], incoming.content)
       .map_err(|reason| PushRefused::NotNamed { reason })?;
     if let Some(claimed) = incoming.claimed
       && claimed != id
     {
       return Err(PushRefused::IdMismatch { id: claimed });
     }
+    self.admit_placed_named(store, (incoming, offset), id)
+  }
+
+  /// [`Push::admit_placed`] of an object `id` names already: named by git's rule from these very bytes, in this
+  /// repository's format, by the pack's reader (`crate::unpack::Reader`, `name_of` as this store's naming runs it), so
+  /// named again it is the same id. A pushed object was hashed twice, once to be named as its delta resolved and once
+  /// to be admitted (gate r870, main 01a20182: SHA-1 with collision detection was 13,182 of a push's 23,218 samples,
+  /// half of them the second). An id another source claims is admitted through [`Push::admit_placed`], which names it.
+  pub fn admit_placed_named<R>(
+    &mut self,
+    store: &ContentStore,
+    (incoming, offset): (Incoming<'_>, u64),
+    id: ObjectId,
+  ) -> Result<(ObjectId, Admitted), PushRefused<R>> {
+    let number = incoming.kind.pack_number();
     let identity = store.object_id(incoming.content);
     let again = match (self.placed.get(&id), self.quarantine.object(id.as_bytes())) {
       (Some(placed), _) => Some((placed.number, placed.identity)),
