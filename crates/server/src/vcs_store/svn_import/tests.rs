@@ -977,3 +977,42 @@ fn t_c2c_a_large_batch_is_applied_a_slice_at_a_time() {
     assert!(slices >= 2, "the batch's apply took {slices} slice(s)");
   });
 }
+
+/// Shape: the files the one-wide-revision import adds, each [`WIDE_TEXT_BYTES`]: git-2000's first revision's width and
+/// more. A replay's read plan was cubic in them (A-887 part 3's `Increment::replay_reads`): 3,000 held the shard past
+/// its window in the batch's first apply.
+const WIDE_REVISION_FILES: usize = 3000;
+
+/// Shape: each wide file's bytes, a source file's (about 1 KiB): a text the content store names (A-760).
+const WIDE_TEXT_BYTES: usize = 1024;
+
+/// Goal 93 (main's order of 2026-11-24 05:29: git-2000's import over HTTP spun shard 0 1,189 ms in one poll). Do: import
+/// [`wide_revisions`]'s one revision adding [`WIDE_REVISION_FILES`] files of [`WIDE_TEXT_BYTES`]. Expect: the import
+/// whole, and the shard's longest step (its registry's counted `longest_step_ns`) under its watchdog window. Red at
+/// 77397a5f4: the batch's first apply planned its replay's reads over every run, change and whole named (A-887 part 3's
+/// cubic `Increment::replay_reads`) in one poll, and the watchdog ended the process (3,480 ms against its 3,480 ms
+/// window); green since 5606962eb made the plan n log n.
+#[test]
+fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
+  let (loaded, longest_ns, window_ns) = stored(|| async move {
+    let (svn, _green) = subversion("wide-revision").await;
+    let (loaded, _turns) = imported(
+      svn,
+      wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false)),
+    )
+    .await;
+    let shard = slates_rt::registry::current_shard().expect("on a shard");
+    let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
+      .expect("the shard's entry");
+    (
+      loaded.map(|loaded| loaded.youngest),
+      longest_ns,
+      crate::watchdog::own_window_ns(),
+    )
+  });
+  assert_eq!(loaded, Ok(1));
+  assert!(
+    longest_ns < window_ns,
+    "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
