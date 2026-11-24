@@ -450,6 +450,9 @@ impl Staging {
         .collect();
       crate::vcs_store::svn_texts::follow(state, green, &self.released, &holding);
       super::release_texts(state, None, &self.put);
+      // Durable on the node's store since the changeset landed: RAM holds nothing of the batch's texts, the green's
+      // holds keep their entries (A-760 (b) 4d, main's (B)).
+      crate::vcs_store::name_holds::let_go_landed_texts(state, &self.put);
       self.put.clear();
       if let Some(turn) = self.turn.take() {
         turn.give_back(state);

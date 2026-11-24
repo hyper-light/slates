@@ -44,6 +44,8 @@ pub struct Greens {
   pending: VecDeque<(RepositoryId, Release)>,
   /// Whether this shard's release task is running.
   releasing: bool,
+  /// The holds the engines let go gave back (A-760 (b) 4d), owed to the content store's next free decision.
+  given_back: Vec<slates_merge::engine::NameHold>,
 }
 
 /// A held verdict previewed as a member of its green's lineage ([`Greens::preview`]).
@@ -226,21 +228,50 @@ impl Greens {
       )
   }
 
-  /// Installs a lone engine for `id`; the engine it replaced.
-  pub fn insert(&mut self, id: VolumeId, green: Green) -> Option<Green> {
-    self.alone.insert(id, green)
+  /// The holds every engine here took and gave back on its named objects since the last call (A-760 (b) 4d), each
+  /// engine tracked from its first drain (`Green::track_name_holds`: a hold for each named block it holds then), and
+  /// those given back by the engines let go since: what the shard applies at its next free decision
+  /// (`vcs_store::name_holds::freeing`). A lineage with a member taken out keeps its own until it is put back.
+  pub fn take_name_holds(&mut self) -> Vec<slates_merge::engine::NameHold> {
+    let mut holds = std::mem::take(&mut self.given_back);
+    for green in self.alone.values_mut() {
+      holds.extend(green.track_name_holds());
+    }
+    for lineage in self.lineages.values_mut() {
+      if let Ok(taken) = lineage.get_mut().take_name_holds() {
+        holds.extend(taken);
+      }
+    }
+    holds
   }
 
-  /// Takes `id`'s lone engine out; a member is retired from its lineage instead ([`Greens::retire`]).
+  /// Installs a lone engine for `id`; the engine it replaced, its holds given back (it is the caller's, untracked).
+  pub fn insert(&mut self, id: VolumeId, green: Green) -> Option<Green> {
+    let mut replaced = self.alone.insert(id, green)?;
+    self.given_back.extend(replaced.give_back_name_holds());
+    Some(replaced)
+  }
+
+  /// Takes `id`'s lone engine out, its holds given back (A-760 (b) 4d: the engine is the caller's, untracked, tracked
+  /// again if it is installed again); a member is retired from its lineage instead ([`Greens::retire`]).
   pub fn remove(&mut self, id: &VolumeId) -> Option<Green> {
-    self.alone.remove(id)
+    let mut green = self.alone.remove(id)?;
+    self.given_back.extend(green.give_back_name_holds());
+    Some(green)
   }
 
   /// Keeps the greens `keep` holds to, the others dropped: a lone engine at once, a member retired and released whole.
   /// Only a rolled-back verb's greens leave this way (`verbs::reconcile_unpublished_effects`), each made by that one
   /// verb, so a member's release frees only the nodes its own writes copied.
   pub fn retain(&mut self, mut keep: impl FnMut(&VolumeId) -> bool) {
-    self.alone.retain(|id, _| keep(id));
+    let given_back = &mut self.given_back;
+    self.alone.retain(|id, green| {
+      let kept = keep(id);
+      if !kept {
+        given_back.extend(green.give_back_name_holds());
+      }
+      kept
+    });
     let gone: Vec<VolumeId> = self
       .members
       .keys()
@@ -438,6 +469,10 @@ impl Greens {
       .ok_or(LineageRefused::Stale)?;
     let more = lineage.get_mut().release_step(release)?;
     if !more && lineage.get_mut().is_empty() {
+      // Its holds given back before its arenas go (A-760 (b) 4d).
+      if let Ok(given) = lineage.get_mut().give_back_name_holds() {
+        self.given_back.extend(given);
+      }
       self.lineages.remove(&repository);
     }
     Ok(more)

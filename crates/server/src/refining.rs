@@ -234,6 +234,14 @@ struct Copy {
   post: Vec<u8>,
 }
 
+/// Format: copy steps that met a named text's let-go window, its windows brought back and the step copied again
+/// (A-760 (b) 4d).
+const COPY_BROUGHT_BACK: &str = "refining.copy_brought_back";
+/// Format: copy steps whose let-go windows the node's store did not give back: the job given up, unrefined.
+const COPY_NOT_BROUGHT_BACK: &str = "refining.copy_not_brought_back";
+/// Format: a copy step copied again over windows brought back that met one let go again: a bug, the job given up.
+const COPY_AWAY_AGAIN: &str = "refining.copy_away_again";
+
 /// Which file of a pair a copy step reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
@@ -259,6 +267,32 @@ fn copy_from(bytes: std::borrow::Cow<'_, [u8]>, into: &mut Vec<u8>, slice: usize
       Some(into.len() == bytes.len())
     }
   }
+}
+
+/// The next slice of the named text `identity` into `into`, at most `slice` bytes, read through the shard's content plane
+/// (A-760 (b) 4d): whether `into` now holds it all; `None` where the plane refused (a let-go window noted for the job).
+fn copy_named(
+  state: &ShardState,
+  identity: slates_merge::named::Identity,
+  into: &mut Vec<u8>,
+  slice: usize,
+) -> Option<bool> {
+  let total = usize::try_from(identity.len).ok()?;
+  if into.capacity() < total {
+    into.reserve_exact(total.saturating_sub(into.len()));
+  }
+  let from = into.len();
+  let take = slice.min(total.saturating_sub(from));
+  let plane = crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content);
+  let page = crate::vcs_store::named_objects::page_of(
+    "",
+    slates_merge::engine::ContentAt::Named(identity),
+    (u64::try_from(from).ok()?, u64::try_from(take).ok()?),
+    plane.as_ref(),
+  )
+  .ok()?;
+  into.extend_from_slice(&page);
+  Some(into.len() == total)
 }
 
 /// One copy step: the next slice of `side` of `copy` from where this shard holds it, at most `slice` bytes: the base
@@ -293,8 +327,14 @@ fn copy_step(
     Side::Base => {
       if let Some(engine) = state.greens.get(&green) {
         let content = engine.content_ref_at(&copy.base_path, base_version)?;
-        // A base held by its content-plane object alone (A-760 (b) 4b, never met until piece 4d): not copied.
-        let bytes = crate::vcs_store::named_objects::bytes_of(&copy.base_path, content).ok()?;
+        // A base held by its content-plane object alone is read through the plane a slice a step (A-760 (b) 4d); a
+        // let-go window is noted (`named_objects::away_scope`) for the job to bring back and copy again.
+        let bytes = match content {
+          slates_merge::engine::ContentAt::Named(identity) => {
+            return copy_named(state, identity, &mut copy.base, slice);
+          }
+          bytes => crate::vcs_store::named_objects::bytes_of(&copy.base_path, bytes).ok()?,
+        };
         return copy_from(bytes, &mut copy.base, slice);
       }
       if let Some(replica) = state
@@ -324,6 +364,7 @@ fn with_base<R>(
       fetched: None,
       version,
       entries: None,
+      plane: crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content),
     });
   }
   if let Some(replica) = state
@@ -336,6 +377,7 @@ fn with_base<R>(
       fetched: None,
       version,
       entries: None,
+      plane: None,
     });
   }
   f(crate::work_files::Base {
@@ -343,6 +385,7 @@ fn with_base<R>(
     fetched: crate::work_home::parked_fetched(state, work),
     version,
     entries: None,
+    plane: None,
   })
 }
 
@@ -373,23 +416,44 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
       .collect();
     let mut turns = (0u64, [0u64; PAST_MULTIPLES.len()]);
     let mut longest = 0u64;
+    // The windows a copy step's read brought back, kept until that step is copied again (A-760 (b) 4d).
+    let mut pins: Vec<crate::vcs_store::named_objects::ReadPin> = Vec::new();
     // The copies, a slice a turn.
     for index in 0..copies.len() {
       for side in [Side::Base, Side::Post] {
         loop {
           let began = slates_rt::futures::now_ns();
-          let step = crate::state::with_state(|s| {
+          let stepped = crate::state::with_state(|s| {
             // Half the quantum's copying: the turn's budget, as a refinement turn's is.
             let slice = s
               .config
               .copy_slice_bytes_within(s.config.step_quantum_ns() / 2);
             let slice = usize::try_from(slice).unwrap_or(usize::MAX).max(1);
-            copies
-              .get_mut(index)
-              .and_then(|copy| copy_step(s, at, (copy, side, slice)))
-          })
-          .flatten();
+            crate::vcs_store::named_objects::away_scope(|| {
+              copies
+                .get_mut(index)
+                .and_then(|copy| copy_step(s, at, (copy, side, slice)))
+            })
+          });
+          let (step, away) = stepped.unwrap_or((None, Vec::new()));
           turn(&mut turns, &mut longest, began);
+          // A read of a let-go window (A-760 (b) 4d) is never lost: its windows are brought back, kept, and the same
+          // slice copied again, which meets none let go; a store that cannot give them back gives the job up, counted.
+          if step.is_none() && !away.is_empty() && pins.is_empty() {
+            match crate::vcs_store::named_objects::bring_back_reads(&away).await {
+              Ok(brought) => {
+                pins = brought;
+                let _ = crate::state::with_state(|s| s.count(COPY_BROUGHT_BACK, 1));
+                continue;
+              }
+              Err(_) => {
+                let _ = crate::state::with_state(|s| s.count(COPY_NOT_BROUGHT_BACK, 1));
+              }
+            }
+          } else if step.is_none() && !away.is_empty() {
+            let _ = crate::state::with_state(|s| s.count(COPY_AWAY_AGAIN, 1));
+          }
+          pins = Vec::new();
           match step {
             Some(true) => break,
             Some(false) => slates_rt::futures::yield_now().await,
@@ -742,6 +806,7 @@ async fn laid_post_state(
         fetched: None,
         version: key.0,
         entries: None,
+        plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
       };
       // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
       crate::verbs::lay_ops(

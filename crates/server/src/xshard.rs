@@ -254,14 +254,20 @@ pub fn send_back(origin: u16, back: SpawnRequest) {
 /// what a shard keeps is at most what the daemon has in flight, and the derived bound is that sum. Every kept message is
 /// counted as a wait for room ([`room_waits`]).
 fn carry(target: u16, message: Control) -> Result<(), RtError> {
-  let behind = KEPT.with(|kept| {
+  // Through `try_with`: a message sent from a value dropped in the thread's local storage teardown (a write-back's
+  // footprint through `run_on_waiting`) finds no keeper and no carrier left, and is refused as one sent after the
+  // shard's shutdown is, its reply guards standing down.
+  let Ok(behind) = KEPT.try_with(|kept| {
     kept.try_borrow().is_ok_and(|kept| {
       kept
         .queues
         .get(&target)
         .is_some_and(|queue| !queue.is_empty())
     })
-  });
+  }) else {
+    discarding_unsent(|| drop(message));
+    return Err(RtError::ControlFull { shard: target });
+  };
   let unsent = if behind {
     message
   } else {
@@ -2298,8 +2304,12 @@ pub(crate) fn hand_reply_home(
 /// the refusal.
 fn discarding_unsent<T>(drop_or_hand: impl FnOnce() -> T) -> T {
   // The flag as it was, restored after: a stand-down inside another keeps the outer one standing down.
-  let before = DISCARDING_UNSENT.with(|discarding| discarding.replace(true));
+  // Through `try_with`: in the thread's local storage teardown the flag is gone with the guards that read it
+  // (`AnswerUnstarted`, `RunUnstarted`, which then stand down as discarding).
+  let before = DISCARDING_UNSENT
+    .try_with(|discarding| discarding.replace(true))
+    .unwrap_or(true);
   let result = drop_or_hand();
-  DISCARDING_UNSENT.with(|discarding| discarding.set(before));
+  let _ = DISCARDING_UNSENT.try_with(|discarding| discarding.set(before));
   result
 }

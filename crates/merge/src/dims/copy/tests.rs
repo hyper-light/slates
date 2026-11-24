@@ -122,11 +122,13 @@ fn a_copy_costs_its_paths_never_its_tree() {
       "{gained} nodes gained for {count} files, at most {bound}"
     );
     for index in 0..count {
-      let source = files.get(format!("{SOURCE}/{index}")).map(<[u8]>::to_vec);
+      let source = files
+        .get(format!("{SOURCE}/{index}"))
+        .map(|content| content.bytes().unwrap().to_vec());
       assert_eq!(
         files
           .get(format!("{DESTINATION}/{index}"))
-          .map(<[u8]>::to_vec),
+          .map(|content| content.bytes().unwrap().to_vec()),
         source
       );
     }
@@ -269,7 +271,7 @@ fn root_copy_reads_as_the_reference(
   assert!(!walked.contains_key("snap/"));
   let walked: BTreeMap<String, Vec<u8>> = files
     .iter()
-    .map(|(key, bytes)| (key, bytes.to_vec()))
+    .map(|(key, content)| (key, content.bytes().unwrap().to_vec()))
     .collect();
   assert_eq!(&walked, file_model);
   let walked: BTreeMap<(String, String), Vec<u8>> = attributes
@@ -495,7 +497,7 @@ impl Maps {
     let files: BTreeMap<String, Vec<u8>> = self
       .files
       .iter()
-      .map(|(key, bytes)| (key, bytes.to_vec()))
+      .map(|(key, content)| (key, content.bytes().unwrap().to_vec()))
       .collect();
     prop_assert_eq!(&files, &self.file_model);
     let modes: BTreeMap<String, u32> = self

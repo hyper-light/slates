@@ -427,8 +427,11 @@ mod tests {
   }
 
   /// The memory status's `process.malloc_*` gauges (main 01a20182, 2026-11-23). Do: read the control shard's gauges.
-  /// Expect, on Linux with glibc, glibc's arena and free bytes among them (the main arena and its top exist once anything
-  /// allocated); elsewhere no `malloc_*` row at all (they are glibc's figures alone).
+  /// Expect, where glibc's allocator serves the program, glibc's arena and free bytes among them (the main arena and its
+  /// top exist once anything allocated); elsewhere no `malloc_*` row at all (they are glibc's figures alone). glibc's
+  /// allocator serves a Linux build on glibc, but not under Miri, which models its own allocations, nor in the
+  /// ThreadSanitizer lane (`--cfg slates_tsan`), whose runtime's allocator replaces glibc's: there glibc's figures read
+  /// zero and the rows are left out (diag run 45315777446, 2026-11-24, read none).
   #[test]
   fn the_control_shards_memory_status_names_glibcs_bytes_where_glibc_runs() {
     let rows = crate::daemon::audit_on_shard(|state| super::rows(state, true));
@@ -437,7 +440,12 @@ mod tests {
       .filter(|row| row.kind.starts_with("mem.gauge.process.malloc_"))
       .map(|row| (row.kind.as_str(), row.count))
       .collect();
-    if cfg!(all(target_os = "linux", target_env = "gnu", not(miri))) {
+    if cfg!(all(
+      target_os = "linux",
+      target_env = "gnu",
+      not(miri),
+      not(slates_tsan)
+    )) {
       assert!(
         malloc.contains_key("mem.gauge.process.malloc_arena_bytes"),
         "{malloc:?}"

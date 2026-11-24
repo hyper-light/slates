@@ -55,10 +55,10 @@
 //! records and durable in the node's changeset store before any entry names them (A-865), so the checkpoint no longer
 //! holds them a second time. The content store need not hold them: a recovery brings back what it lacks from the
 //! node's store first (`svn_texts::bring_back_named`), and a refused publication's remake reads what it lacks from the
-//! engine it replaces (`verbs::remake_green`; the bug record of 2026-11-23). A restore reads them first, a slice a step from the owner's plane
-//! ([`Checkpoint::read_step`], as an increment's runs are read), and refuses, typed, a checkpoint whose files are not
-//! all read (`crate::engine::Unrestored`): a missing byte is never a zero. Each restored file takes the buffer it was
-//! read into, with no copy, and is named for its object again.
+//! engine it replaces (`verbs::remake_green`; the bug record of 2026-11-23). A restore reads none of them (A-760 (b) 4d): each
+//! restored file is a block named for its object holding no bytes and one hold of it in the content store
+//! (`crate::engine::Green::take_name_holds`), read through the plane by whatever reads it later, as every named file
+//! is.
 //!
 //! The section follows the head check, and only when a file is named, so every checkpoint written before decodes as it
 //! did and one that names nothing keeps version 5's bytes. The version word stays 5: a decoder from before refuses a
@@ -118,30 +118,6 @@ pub struct NamedFile {
   /// The object its bytes are the whole of.
   pub identity: crate::named::Identity,
 }
-
-/// The named files' bytes read so far ([`Checkpoint::read_step`]), one buffer a file in the table's order: what the
-/// plane holds, read here a slice a step for a restore to take. Not part of the checkpoint's value, as an increment's
-/// read runs are not its (`crate::named::Read`): two checkpoints naming the same files are equal whatever each has
-/// read, and a clone names them and reads them again, so it carries none.
-#[derive(Debug, Default)]
-pub struct NamedRead {
-  /// Each file's bytes so far: every buffer but the last whole.
-  buffers: Vec<Vec<u8>>,
-}
-
-impl Clone for NamedRead {
-  fn clone(&self) -> NamedRead {
-    NamedRead::default()
-  }
-}
-
-impl PartialEq for NamedRead {
-  fn eq(&self, _other: &NamedRead) -> bool {
-    true
-  }
-}
-
-impl Eq for NamedRead {}
 
 /// One copy made at or before the checkpoint's version (A-586): where it was made, when, and what it copied.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -271,8 +247,6 @@ pub struct Checkpoint {
   /// Regular files changed since the origin whose bytes are the whole of a content-plane object, named (A-869, module
   /// docs "Named files"): never a key [`Checkpoint::files`] holds.
   pub named: Vec<NamedFile>,
-  /// The named files' bytes read so far, for a restore ([`Checkpoint::read_step`]).
-  pub read: NamedRead,
   /// Directories created or removed since the origin (present: `Some(())`).
   pub dirs: Vec<Changed<String, ()>>,
   /// Explicit modes changed since the origin.
@@ -304,12 +278,7 @@ impl Checkpoint {
     self.accepted.sort();
     self.signatures.sort_by_key(|(version, _)| *version);
     self.files.sort_by(|a, b| a.key.cmp(&b.key));
-    // The named files are read in this order, so a sort drops what was read under another (none, in practice: a
-    // checkpoint is canonical as the engine takes it and as it decodes).
-    if !self.named.is_sorted_by(|a, b| a.key <= b.key) {
-      self.named.sort_by(|a, b| a.key.cmp(&b.key));
-      self.read = NamedRead::default();
-    }
+    self.named.sort_by(|a, b| a.key.cmp(&b.key));
     self.dirs.sort_by(|a, b| a.key.cmp(&b.key));
     self.modes.sort_by(|a, b| a.key.cmp(&b.key));
     self.symlinks.sort_by(|a, b| a.key.cmp(&b.key));
@@ -369,84 +338,6 @@ impl Checkpoint {
     }
     put_named(&mut out, &canonical.named);
     out
-  }
-
-  /// The first named file whose bytes are not all read yet ([`Checkpoint::read_step`]): none once every one is.
-  pub fn unread(&self) -> Option<&NamedFile> {
-    self.named.get(self.unread_at()?)
-  }
-
-  /// Where [`Checkpoint::unread`]'s file is in the table: the last buffer begun while it is short, else the next file.
-  /// Read from the buffers' count, so no step scans the files read before.
-  fn unread_at(&self) -> Option<usize> {
-    let started = self.read.buffers.len();
-    let short = started.checked_sub(1).filter(|at| {
-      let read = self.read.buffers.get(*at).map_or(0, Vec::len);
-      self
-        .named
-        .get(*at)
-        .is_some_and(|file| u64::try_from(read).unwrap_or(u64::MAX) < file.identity.len)
-    });
-    short.or_else(|| (started < self.named.len()).then_some(started))
-  }
-
-  /// Reads the next at most `slice` bytes (at least one) of the named files from `objects`, the owner's content plane
-  /// (a step of its, its copy slice, as an increment's runs are read, `crate::engine::Increment::read_step`): each file
-  /// into a buffer of its own reserved once at its length, the files in the table's order, so no step reads more than
-  /// its slice and none scans the files read before. Whether every file is read. A refused read keeps nothing of the
-  /// step.
-  pub fn read_step(
-    &mut self,
-    objects: &impl crate::named::Objects,
-    slice: u64,
-  ) -> Result<bool, crate::named::ObjectMissing> {
-    let Some(at) = self.unread_at() else {
-      return Ok(true);
-    };
-    let Some(identity) = self.named.get(at).map(|file| file.identity) else {
-      return Ok(true);
-    };
-    let missing = crate::named::ObjectMissing { identity };
-    let whole = usize::try_from(identity.len).map_err(|_| missing)?;
-    let began = self.read.buffers.len() <= at;
-    if began {
-      let mut buffer = Vec::new();
-      buffer.try_reserve_exact(whole).map_err(|_| missing)?;
-      self.read.buffers.push(buffer);
-    }
-    let Some(buffer) = self.read.buffers.get_mut(at) else {
-      return Err(missing);
-    };
-    let from = buffer.len();
-    let take = whole
-      .saturating_sub(from)
-      .min(usize::try_from(slice.max(1)).unwrap_or(usize::MAX));
-    let to = from.saturating_add(take);
-    buffer.resize(to, 0);
-    // An empty object has no byte to read, so no plane is asked for it.
-    let read = match buffer.get_mut(from..to) {
-      Some([]) => Ok(()),
-      Some(into) => objects.read(&identity, u64::try_from(from).unwrap_or(u64::MAX), into),
-      None => Err(missing),
-    };
-    if let Err(refused) = read {
-      buffer.truncate(from);
-      if began {
-        self.read.buffers.pop();
-      }
-      return Err(refused);
-    }
-    Ok(self.unread_at().is_none())
-  }
-
-  /// The named files with their bytes, taken out for a restore once every one is read ([`Checkpoint::unread`] none);
-  /// none before, so a restore never takes a file short.
-  pub(crate) fn take_named(&mut self) -> Option<Vec<(NamedFile, Vec<u8>)>> {
-    if self.unread().is_some() {
-      return None;
-    }
-    let buffers = std::mem::take(&mut self.read.buffers);
-    Some(self.named.iter().cloned().zip(buffers).collect())
   }
 
   /// The bytes [`Checkpoint::into_encoded`] writes, exactly: the fixed words, the accepted and signature records, the
@@ -568,7 +459,6 @@ impl Checkpoint {
       signatures,
       files: changed.files,
       named,
-      read: NamedRead::default(),
       dirs: changed.dirs,
       modes: changed.modes,
       symlinks: changed.symlinks,

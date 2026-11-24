@@ -514,7 +514,7 @@ async fn readopt_one(control: u16, owner: u16, id: DbVolumeId, through: u64) -> 
 /// (`svn_texts::bring_back_named_live`; A-869), so the replay reads every name through the plane; their holds are given
 /// back once the green is installed or fenced. End to end this stays unreachable for a Subversion green until A-727
 /// (d): the engine handed is the holder's replica, which reads no named content, so an svn takeover fails today at
-/// the replica's build (`merge.replica.checkpoint_unread`).
+/// the replica's build, whose recomputed versions' named runs it does not read.
 pub(crate) async fn readopt_with(
   control: u16,
   owner: u16,
@@ -542,7 +542,7 @@ pub(crate) async fn readopt_with(
     let _ = crate::xshard::call_in_shard_time(
       control,
       owner,
-      move |s| crate::repository::svn_commit::release_texts(s, None, &brought),
+      move |s| crate::vcs_store::name_holds::give_back_brought(s, &brought),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;

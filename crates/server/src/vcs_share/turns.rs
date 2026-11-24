@@ -123,20 +123,24 @@ impl Drop for Taking {
       return;
     };
     let repository = self.repository;
-    let woken = TURNS.with(|turns| {
-      let mut turns = turns.try_borrow_mut().ok()?;
-      let line = turns.lines.get_mut(&repository)?;
-      line.waiting.retain(|(id, _)| *id != ticket);
-      let woken = if line.held {
-        None
-      } else {
-        line.waiting.front_mut().and_then(|(_, waker)| waker.take())
-      };
-      if !line.held && line.waiting.is_empty() {
-        turns.lines.remove(&repository);
-      }
-      woken
-    });
+    // Through `try_with`: a wait dropped in the thread's local storage teardown has no line left to leave.
+    let woken = TURNS
+      .try_with(|turns| {
+        let mut turns = turns.try_borrow_mut().ok()?;
+        let line = turns.lines.get_mut(&repository)?;
+        line.waiting.retain(|(id, _)| *id != ticket);
+        let woken = if line.held {
+          None
+        } else {
+          line.waiting.front_mut().and_then(|(_, waker)| waker.take())
+        };
+        if !line.held && line.waiting.is_empty() {
+          turns.lines.remove(&repository);
+        }
+        woken
+      })
+      .ok()
+      .flatten();
     if let Some(waker) = woken {
       waker.wake();
     }
@@ -162,16 +166,20 @@ impl Drop for Turn {
     let Some(repository) = self.repository.take() else {
       return;
     };
-    let woken = TURNS.with(|turns| {
-      let mut turns = turns.try_borrow_mut().ok()?;
-      let line = turns.lines.get_mut(&repository)?;
-      line.held = false;
-      let woken = line.waiting.front_mut().and_then(|(_, waker)| waker.take());
-      if line.waiting.is_empty() {
-        turns.lines.remove(&repository);
-      }
-      woken
-    });
+    // Through `try_with`, as a dropped wait's: no line left to give the turn back to in the thread's teardown.
+    let woken = TURNS
+      .try_with(|turns| {
+        let mut turns = turns.try_borrow_mut().ok()?;
+        let line = turns.lines.get_mut(&repository)?;
+        line.held = false;
+        let woken = line.waiting.front_mut().and_then(|(_, waker)| waker.take());
+        if line.waiting.is_empty() {
+          turns.lines.remove(&repository);
+        }
+        woken
+      })
+      .ok()
+      .flatten();
     if let Some(waker) = woken {
       waker.wake();
     }

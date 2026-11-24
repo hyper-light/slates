@@ -117,6 +117,7 @@ pub(crate) mod hg_view;
 pub(crate) mod homes;
 pub(crate) mod index_upkeep;
 pub(crate) mod lfs_record;
+pub(crate) mod name_holds;
 pub(crate) mod named_objects;
 pub(crate) mod owed;
 pub(crate) mod paths;
@@ -1001,6 +1002,23 @@ impl VcsStores {
         },
       );
     }
+  }
+
+  /// The Subversion repository whose records keep the text `identity` stored on the node's store (C2 stage B), where
+  /// one held here does: whose changesets a let-go window of it is read back from (A-760 (b) 4d).
+  pub(crate) fn subversion_storing(&self, identity: &[u8; 32]) -> Option<RepositoryId> {
+    self.entries.iter().find_map(|(id, entry)| match entry {
+      RepositoryStore::Subversion(store)
+        if !self.rebuild_turns.contains_key(id)
+          && store
+            .records
+            .as_ref()
+            .is_some_and(|records| records.stored_len(identity).is_some()) =>
+      {
+        Some(*id)
+      }
+      _ => None,
+    })
   }
 
   pub(crate) fn subversion_records(&self, id: RepositoryId) -> Option<&SvnRecords> {
@@ -2888,6 +2906,10 @@ pub(crate) fn landed_pin(window: &slates_vcs::ContentId) -> Option<&'static str>
   if homes::landed(window).is_some() {
     return None;
   }
+  // A reader brought it back and reads it still (A-760 (b) 4d): kept until that read's last step.
+  if named_objects::read_pinned(window) {
+    return Some("reader");
+  }
   // Held for the region here, itself or as a window of an object the region holds (a region hold names its object).
   (homes::region_holds_here(window) > 0 || homes::region_holds_window(window)).then_some("homes")
 }
@@ -4282,18 +4304,14 @@ fn release_unheld_windows(state: &mut ShardState) {
   state.count(NODES_RESTORED, restored);
   state.count(NODES_UNRESTORED, refused);
   count_region_restored(state);
-  let freed = {
-    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
-    lent
-      .stores
-      .content
-      .as_mut()
-      .map_or(0, ContentStore::release_unheld)
-  };
+  // The free decision: the replayed greens' holds on their named objects taken first (A-760 (b) 4d), so no window a
+  // green names is freed as unheld.
+  let freed = name_holds::freeing(state, |content| {
+    content.map_or(0, ContentStore::release_unheld)
+  });
   if freed > 0 {
     state.count(WINDOWS_UNHELD, freed);
   }
-  settle(state);
 }
 
 /// A Mercurial record `index` replayed a revision a unit (A-732): by the changeset its reference names, or sliced from
