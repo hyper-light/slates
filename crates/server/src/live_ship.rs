@@ -753,11 +753,12 @@ pub(crate) struct LiveState {
   awaiting: BTreeMap<([u8; 16], u64), Vec<Awaiting>>,
   /// The awaiting verbs by request, so a retry joins its wait ([`join`]).
   awaiting_by_request: BTreeMap<(u64, u32, u32), ([u8; 16], u64)>,
-  /// Destroys whose reply waits for their volume's tombstone to be placed at `f + 1` ([`defer_destroy`]): by volume, the
-  /// tombstone's sequence and the verbs. Any volume's, live-shipped or not. Bounded with [`LiveState::awaiting`].
-  destroys: BTreeMap<[u8; 16], (u64, Vec<Awaiting>)>,
-  /// The waiting destroys by request, so a retry joins its wait ([`join`]).
-  destroys_by_request: BTreeMap<(u64, u32, u32), [u8; 16]>,
+  /// Verbs whose reply waits for a register's record to be placed at `f + 1` ([`defer_until_placed`]): a destroy's
+  /// volume's tombstone (any volume's, live-shipped or not) or a repository's creation's own register (A-894). By
+  /// register, what it places, the sequence and the verbs. Bounded with [`LiveState::awaiting`].
+  placements: BTreeMap<[u8; 16], (PlacementOf, u64, Vec<Awaiting>)>,
+  /// The verbs waiting for a placement, by request, so a retry joins its wait ([`join`]).
+  placements_by_request: BTreeMap<(u64, u32, u32), [u8; 16]>,
   /// The asynchronous outcomes whose reply may wait for a live volume's durability (a mapped file's write-back, a
   /// checkout), each seated among the held replies when its task began ([`take_seat`]), by request: counted against
   /// [`awaiting_bound`] from then, so the bound is met before the task changes anything, never after its effects
@@ -1327,7 +1328,7 @@ fn owed_position(
 /// and the shard already holds its bound of such replies ([`awaiting_bound`]): `Overloaded`, counted. Judged before
 /// the verb, so a refused verb changed nothing and its resend under the same id runs it once, as on a plain volume. A
 /// verb could be held when it changes a live-shipped volume ([`defer`]), or destroys one while the fleet places
-/// tombstones (`f > 0`, [`defer_destroy`]). Until 2026-11-18 the bound was judged only in [`defer`], after the verb's
+/// tombstones (`f > 0`, [`defer_until_placed`]). Until 2026-11-18 the bound was judged only in [`defer`], after the verb's
 /// effects had committed with no completion record: the resend ran the verb again over them, so a directory's resend
 /// was refused `AlreadyExists` and an append landed twice (g232's finding).
 pub(crate) fn refuse_over_bound(
@@ -1444,23 +1445,23 @@ pub(crate) fn join(
 ) -> bool {
   if let Some(volume) = state
     .live
-    .destroys_by_request
+    .placements_by_request
     .get(&(origin, id.client, id.sequence))
     .copied()
   {
     let route = state.reply_route.take();
     let first = state
       .live
-      .destroys
+      .placements
       .get(&volume)
-      .and_then(|(_, waiting)| waiting.first())
+      .and_then(|(_, _, waiting)| waiting.first())
       .map(|first| (first.origin, first.id, first.reply.clone()));
     if let (Some((first_origin, first_id, reply)), Some(route)) = (first, route) {
       let joined = Awaiting::held(
         (Some(route), first_origin, first_id, reply),
         slates_rt::futures::now_ns(),
       );
-      if let Some((_, waiting)) = state.live.destroys.get_mut(&volume) {
+      if let Some((_, _, waiting)) = state.live.placements.get_mut(&volume) {
         waiting.push(joined);
       }
     }
@@ -1538,18 +1539,18 @@ pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   }
 }
 
-/// The replies this shard holds for durability or a tombstone's placement, and the seats taken for asynchronous
-/// outcomes that may wait so ([`take_seat`]), which [`awaiting_bound`] bounds together.
+/// The replies this shard holds for durability or a register's placement, and the seats taken for asynchronous
+/// outcomes that may wait so ([`take_seat`], [`take_placement_seat`]), which [`awaiting_bound`] bounds together.
 fn held_replies(state: &ShardState) -> usize {
   let live: usize = state.live.awaiting.values().map(Vec::len).sum();
-  let destroys: usize = state
+  let placements: usize = state
     .live
-    .destroys
+    .placements
     .values()
-    .map(|(_, waiting)| waiting.len())
+    .map(|(_, _, waiting)| waiting.len())
     .sum();
   live
-    .saturating_add(destroys)
+    .saturating_add(placements)
     .saturating_add(state.live.seats.len())
 }
 
@@ -1632,56 +1633,146 @@ pub(crate) fn tombstone_target(
   volume: slates_db::catalog::VolumeId,
 ) -> Option<u64> {
   let sequence = state.db.partition().tombstone_sequence(volume)?;
-  (!tombstone_placed(state, volume.bytes, sequence)).then_some(sequence)
+  (!register_placed(state, volume.bytes, sequence)).then_some(sequence)
 }
 
-/// Whether `volume`'s register is region-placed at `sequence` or past it (always at `f = 0`).
-fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool {
+/// The sequence of `repository`'s own register (its record, A-636 part 2c-1) a creation that just committed must see
+/// placed at `f + 1` before it answers (A-894), or `None` when it need not wait: at `f = 0` (R8), placed already, or no
+/// record of it here.
+pub(crate) fn repository_target(
+  state: &ShardState,
+  repository: slates_db::catalog::RepositoryId,
+) -> Option<u64> {
+  let repositories = state.db.partition().repositories();
+  let record = repositories.repository(repository)?;
+  let names = repositories
+    .log_position(repository, slates_db::catalog::StateLog::Names)
+    .unwrap_or(0);
+  let sequence = crate::catalog::repository_sequence(record, names);
+  (!register_placed(state, repository.bytes, sequence)).then_some(sequence)
+}
+
+/// Whether `register`'s record is region-placed at `sequence` or past it (always at `f = 0`).
+fn register_placed(state: &ShardState, register: [u8; 16], sequence: u64) -> bool {
   let configuration = state.fleet.configuration();
   configuration.quorum.f == 0
     || state
       .placed_heads
-      .get(&ObjectId(volume))
-      .is_some_and(|head| head.sequence >= sequence && head.placed_under(state, ObjectId(volume)))
+      .get(&ObjectId(register))
+      .is_some_and(|head| head.sequence >= sequence && head.placed_under(state, ObjectId(register)))
 }
 
-/// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
-/// committed; its completion is recorded and its reply delivered then ([`resolve_destroys`]). The shard's bound of held
-/// replies was judged before the destroy ran ([`refuse_over_bound`]), so it is never refused here, after its effects.
-pub(crate) fn defer_destroy(
+/// What a reply held for a register's placement waits to make durable ([`defer_until_placed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementOf {
+  /// A destroy's volume's tombstone (AUD-29-43): until it is placed, a takeover adopts the last live head and serves the
+  /// volume again.
+  Tombstone,
+  /// A repository's creation's own register, its record (A-894): until it is placed, an owner lost after the answer
+  /// leaves no node to take the repository over.
+  Repository,
+}
+
+impl PlacementOf {
+  /// The counter of replies held for this kind of placement.
+  fn awaited(self) -> &'static str {
+    match self {
+      PlacementOf::Tombstone => DESTROY_AWAITED,
+      PlacementOf::Repository => CREATION_AWAITED,
+    }
+  }
+
+  /// The counter of replies held for it and told `DurabilityPending` at the failover SLO.
+  fn gave_up(self) -> &'static str {
+    match self {
+      PlacementOf::Tombstone => DESTROY_HELD_GAVE_UP,
+      PlacementOf::Repository => CREATION_HELD_GAVE_UP,
+    }
+  }
+
+  /// The counter of the nanoseconds its replies were held, summed as each is answered placed (A-894: the creation's
+  /// wait); none for a destroy.
+  fn held_ns(self) -> Option<&'static str> {
+    match self {
+      PlacementOf::Tombstone => None,
+      PlacementOf::Repository => Some(CREATION_AWAITED_NS),
+    }
+  }
+
+  /// What is held, for a log line.
+  fn held(self) -> &'static str {
+    match self {
+      PlacementOf::Tombstone => "destroy",
+      PlacementOf::Repository => "repository's creation",
+    }
+  }
+}
+
+/// Holds a verb's reply until `register`'s record is placed at `f + 1` at `sequence` (a destroy's tombstone,
+/// [`tombstone_target`]; a repository's creation, [`repository_target`]): its effects are committed; its completion is
+/// recorded and its reply delivered then ([`resolve_placed`]), refused at the failover SLO meanwhile as a held write is
+/// ([`judge_held_placements`]), and a retry joins it ([`join`]). Its seat is taken here where one was
+/// ([`take_placement_seat`]); a destroy's bound was judged before it ran ([`refuse_over_bound`]), so it is never refused
+/// here, after its effects.
+pub(crate) fn defer_until_placed(
   state: &mut ShardState,
-  (volume, sequence): (slates_db::catalog::VolumeId, u64),
+  (kind, register, sequence): (PlacementOf, [u8; 16], u64),
   (origin, id): (u64, slates_wire::request::RequestId),
   route: Option<crate::merge_service::ReplyRoute>,
   reply: slates_ipc::protocol::ReplyBody,
 ) {
+  state.live.seats.remove(&(origin, id.client, id.sequence));
   let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
-  let (target, waiting) = state
+  let (_, target, waiting) = state
     .live
-    .destroys
-    .entry(volume.bytes)
-    .or_insert_with(|| (sequence, Vec::new()));
+    .placements
+    .entry(register)
+    .or_insert_with(|| (kind, sequence, Vec::new()));
   *target = (*target).max(sequence);
   waiting.push(held);
   state
     .live
-    .destroys_by_request
-    .insert((origin, id.client, id.sequence), volume.bytes);
-  state.count(DESTROY_AWAITED, 1);
+    .placements_by_request
+    .insert((origin, id.client, id.sequence), register);
+  state.count(kind.awaited(), 1);
 }
 
-/// Answers the destroys waiting on `volume` once its tombstone is region-placed ([`defer_destroy`]).
-pub(crate) fn resolve_destroys(state: &mut ShardState, volume: [u8; 16]) {
-  let Some((sequence, _)) = state.live.destroys.get(&volume) else {
+/// Seats a repository's creation among the replies this shard may hold (A-894), before its landing changes anything:
+/// `Ok` with no seat at `f = 0`, where it never waits; `Ok` seated; or `Overloaded`, counted and nothing seated, when the
+/// shard holds its bound already ([`awaiting_bound`]), so the creation lands nothing and its resend runs it once. The
+/// seat becomes the creation's hold ([`defer_until_placed`]) or is given back ([`release_seat`]).
+pub(crate) fn take_placement_seat(
+  state: &mut ShardState,
+  (origin, id): (u64, slates_wire::request::RequestId),
+) -> Result<(), slates_ipc::protocol::Refusal> {
+  if state.fleet.configuration().quorum.f == 0 {
+    return Ok(());
+  }
+  if held_replies(state) >= awaiting_bound(state) {
+    state.count(LIVE_OVER_BOUND, 1);
+    return Err(slates_ipc::protocol::Refusal::Overloaded { shard: state.shard });
+  }
+  state.live.seats.insert((origin, id.client, id.sequence));
+  state.count(LIVE_SEATED, 1);
+  Ok(())
+}
+
+/// Answers the verbs waiting on `register` once its record is region-placed at their sequence ([`defer_until_placed`]).
+pub(crate) fn resolve_placed(state: &mut ShardState, register: [u8; 16]) {
+  let Some((_, sequence, _)) = state.live.placements.get(&register) else {
     return;
   };
-  if !tombstone_placed(state, volume, *sequence) {
+  if !register_placed(state, register, *sequence) {
     return;
   }
-  let Some((_, waiting)) = state.live.destroys.remove(&volume) else {
+  let Some((kind, _, waiting)) = state.live.placements.remove(&register) else {
     return;
   };
+  let now = slates_rt::futures::now_ns();
   for entry in waiting {
+    if let Some(counter) = kind.held_ns() {
+      state.count(counter, now.saturating_sub(entry.held_since_ns));
+    }
     let reply = entry.reply.clone();
     answer(state, entry, reply);
   }
@@ -1689,17 +1780,24 @@ pub(crate) fn resolve_destroys(state: &mut ShardState, volume: [u8; 16]) {
 
 /// Counter: destroys whose reply waited for their tombstone's placement at `f + 1`.
 const DESTROY_AWAITED: &str = "fleet.destroy.awaited";
+/// Counter: repository creations whose reply waited for their record's placement at `f + 1` (A-894).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const CREATION_AWAITED: &str = "fleet.creation.awaited";
+/// Counter: the nanoseconds repository creations' replies were held for their record's placement, summed (A-894): over
+/// [`CREATION_AWAITED`], the mean wait a creation pays for its f + 1.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const CREATION_AWAITED_NS: &str = "fleet.creation.awaited_ns";
 
 /// Refuses every verb waiting on `volume` `StaleEpoch` once a holder has fenced its owner at `current`: each refusal is
 /// recorded as the verb's completion, so a retry meets it, and delivered as a resolved reply is.
 fn refuse_awaiting(state: &mut ShardState, volume: [u8; 16], current: HostEpoch) {
-  let destroys = state
+  let placements = state
     .live
-    .destroys
+    .placements
     .remove(&volume)
-    .map(|(_, waiting)| waiting)
+    .map(|(_, _, waiting)| waiting)
     .unwrap_or_default();
-  for entry in take_awaiting(state, volume).into_iter().chain(destroys) {
+  for entry in take_awaiting(state, volume).into_iter().chain(placements) {
     state.count(LIVE_FENCED, 1);
     answer(state, entry, stale_epoch(current));
   }
@@ -1798,20 +1896,21 @@ fn outcome_word(decided: bool) -> &'static str {
 /// Tells each destroy this shard has held past the failover SLO for its tombstone's placement
 /// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] tells a write: the same bound, the same refusal recorded
 /// nowhere, and the request's place kept, so its resend joins the wait and its completion is recorded once decided:
-/// `Destroyed` once the tombstone places ([`resolve_destroys`]), a refusal at a fence or a yield. A destroy on a log this
+/// `Destroyed` once the tombstone places ([`resolve_placed`]), a refusal at a fence or a yield. A repository's creation
+/// held for its record's placement (A-894) is judged the same way. A destroy on a log this
 /// node yielded is decided now, as [`judge_held`] decides a write. Judged once a record period on each shard
 /// ([`period`]); bounded by the shard's held replies ([`awaiting_bound`]). From 2026-11-20 to 2026-11-23 the destroy's
 /// own reply was recorded here, so its resend was answered `Destroyed` for a tombstone no quorum held (`live_chaos`'s
 /// unheard-destroy flows, CI nightly 2026-11-21 and 2026-11-22: "the unheard destroy exited 0").
 ///
 /// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
-fn judge_held_destroys(state: &mut ShardState) {
+fn judge_held_placements(state: &mut ShardState) {
   let now = slates_rt::futures::now_ns();
   // The rule's own total, as [`judge_held`] reads it.
   let bound_ns = durable_spans(state).total_ns;
-  let volumes: Vec<[u8; 16]> = state.live.destroys.keys().copied().collect();
+  let volumes: Vec<[u8; 16]> = state.live.placements.keys().copied().collect();
   for volume in volumes {
-    let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
+    let Some((kind, sequence, waiting)) = state.live.placements.remove(&volume) else {
       continue;
     };
     let decided = lost(state, volume);
@@ -1819,15 +1918,16 @@ fn judge_held_destroys(state: &mut ShardState) {
     for (entry, held_ns) in past {
       if !entry.told {
         slates_machine::log_line!(
-          "slates-server: a held destroy was refused after {} ms, the failover SLO (shard {}), {}: volume {}'s \
-           tombstone at sequence {} not placed at f + 1",
+          "slates-server: a held {} was refused after {} ms, the failover SLO (shard {}), {}: register {} at \
+           sequence {} not placed at f + 1",
+          kind.held(),
           held_ns / NS_PER_MS,
           state.shard,
           outcome_word(decided),
           crate::verbs::hex_of(&volume),
           sequence
         );
-        state.count(DESTROY_HELD_GAVE_UP, 1);
+        state.count(kind.gave_up(), 1);
       }
       if decided {
         answer(state, entry, durability_pending(held_ns));
@@ -1839,7 +1939,7 @@ fn judge_held_destroys(state: &mut ShardState) {
       }
     }
     if !kept.is_empty() {
-      state.live.destroys.insert(volume, (sequence, kept));
+      state.live.placements.insert(volume, (kind, sequence, kept));
     }
   }
 }
@@ -1885,9 +1985,13 @@ fn durability_pending(held_ns: u64) -> slates_ipc::protocol::ReplyBody {
 /// Format: a counter name in the daemon's status report.
 const LIVE_HELD_GAVE_UP: &str = "fleet.live.held_gave_up";
 
-/// Counter: a destroy held for its tombstone's placement, refused at the failover SLO ([`judge_held_destroys`], A-354).
+/// Counter: a destroy held for its tombstone's placement, refused at the failover SLO ([`judge_held_placements`],
+/// A-354).
 /// Format: a counter name in the daemon's status report.
 const DESTROY_HELD_GAVE_UP: &str = "fleet.destroy.held_gave_up";
+/// Counter: a repository's creation held for its record's placement, refused at the failover SLO (A-894).
+/// Format: a counter name in the daemon's status report.
+const CREATION_HELD_GAVE_UP: &str = "fleet.creation.held_gave_up";
 
 /// The refusal a superseded owner gives a write to the volume it lost.
 fn stale_epoch(current: HostEpoch) -> slates_ipc::protocol::ReplyBody {
@@ -1936,13 +2040,13 @@ fn lost(state: &ShardState, volume: [u8; 16]) -> bool {
 /// volume to the creator 1,714 times in one run (A-409).
 pub(crate) fn yielded(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   let now = slates_rt::futures::now_ns();
-  let destroys = state
+  let placements = state
     .live
-    .destroys
+    .placements
     .remove(&id.bytes)
-    .map(|(_, waiting)| waiting)
+    .map(|(_, _, waiting)| waiting)
     .unwrap_or_default();
-  for entry in take_awaiting(state, id.bytes).into_iter().chain(destroys) {
+  for entry in take_awaiting(state, id.bytes).into_iter().chain(placements) {
     let held_ns = now.saturating_sub(entry.held_since_ns);
     state.count(LIVE_YIELD_REFUSED, 1);
     answer(state, entry, durability_pending(held_ns));
@@ -2056,7 +2160,7 @@ const LIVE_FENCED: &str = "fleet.live.fenced";
 fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::ReplyBody) {
   let request = entry.request();
   state.live.awaiting_by_request.remove(&request);
-  state.live.destroys_by_request.remove(&request);
+  state.live.placements_by_request.remove(&request);
   state.db.begin();
   let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, reply);
   if state.db.commit(&mut state.segment).is_err() {
@@ -2075,7 +2179,7 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
 
 /// Attaches a forwarded request's exchange to the reply `(origin, id)` holds here for its volume's durability or its
 /// tombstone's placement (A-200, AUD-29-43): `waiter` is the exchange's control shard and its awaited call, answered
-/// where the hold ends. That is the verb's own reply once durable ([`resolve`], [`resolve_destroys`]),
+/// where the hold ends. That is the verb's own reply once durable ([`resolve`], [`resolve_placed`]),
 /// `DurabilityPending` when it is told at the failover SLO ([`tell_given_up`]), or the fence's, the yield's or the
 /// destroy's refusal ([`refuse_awaiting`], [`yielded`], [`forget`]); every decided one through [`answer`]. An entry told
 /// already waits for its decision. A later exchange for the request, its origin's resend, takes the place of an earlier
@@ -2097,12 +2201,12 @@ pub(crate) fn await_forwarded(
       .awaiting
       .get_mut(&key)
       .and_then(|waiting| waiting.iter_mut().find(|entry| entry.request() == request))
-  } else if let Some(volume) = state.live.destroys_by_request.get(&request).copied() {
+  } else if let Some(volume) = state.live.placements_by_request.get(&request).copied() {
     state
       .live
-      .destroys
+      .placements
       .get_mut(&volume)
-      .and_then(|(_, waiting)| waiting.iter_mut().find(|entry| entry.request() == request))
+      .and_then(|(_, _, waiting)| waiting.iter_mut().find(|entry| entry.request() == request))
   } else {
     None
   };
@@ -5939,7 +6043,7 @@ pub(crate) async fn period(origin: u16, shard: u16) {
         move |s| {
           if counted {
             s.count(LIVE_PERIODS, 1);
-            judge_held_destroys(s);
+            judge_held_placements(s);
           }
           period_slice(s, after)
         },

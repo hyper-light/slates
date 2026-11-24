@@ -36235,6 +36235,27 @@ fn git_fleet(name: &str) -> GitFleet {
     })
     .unwrap()
     .bytes;
+  // A-894: a creation answers once its record is at f + 1, so at f = 1 another node holds it as the creation answers,
+  // never waited for here. Before, the creation answered before its record shipped, and a test that killed the owner
+  // at once left no node to take the repository over (the A-727 (d1a-3) tests red one run in three or four by that).
+  let holders = daemons[1..]
+    .iter()
+    .filter(|daemon| {
+      daemon
+        .repository_takeover(repository)
+        .is_ok_and(|([holds, ..], _)| holds)
+    })
+    .count();
+  let awaited = move_counter(&daemons[0], "fleet.creation.awaited").unwrap_or(0);
+  let awaited_ns = move_counter(&daemons[0], "fleet.creation.awaited_ns").unwrap_or(0);
+  eprintln!(
+    "{name}: the creation's answer held {awaited_ns} ns for its record's f + 1 ({awaited} held)"
+  );
+  assert!(
+    holders >= 1 && awaited == 1,
+    "another node holds the repository's record as its creation answers ({holders} of 2), its answer held for it \
+     ({awaited} held, {awaited_ns} ns)"
+  );
   let token = format!("{name}-token-{}", std::process::id());
   let principal = Principal::Uid {
     host: client.daemon_status().unwrap().anchor,
@@ -36258,19 +36279,6 @@ fn git_fleet(name: &str) -> GitFleet {
       Err(error) => panic!("the credential enrolled: {error:?}"),
     }
   }
-  // The repository's record at every other node before a test kills its owner (A-636 part 2c-1: its successor takes it
-  // over from it). Its creation answers before the record ships (A-894, owed: the creation is to wait for its f + 1),
-  // and a test that killed the owner sooner left no node to take the repository over, so nothing answered a resolution:
-  // the A-727 (d1a-3) tests red one run in three or four by that alone.
-  let others: Vec<&Daemon> = daemons[1..].iter().collect();
-  let shipped = poll_until(&others, PLACEMENT_DEADLINE, || {
-    Ok(others.iter().all(|daemon| {
-      daemon
-        .repository_takeover(repository)
-        .is_ok_and(|([holds, ..], _)| holds)
-    }))
-  });
-  assert!(shipped, "every other node holds the repository's record");
   GitFleet {
     daemons,
     hosts,
@@ -36599,6 +36607,58 @@ fn t_a727_d1a3_an_owner_killed_after_homing_before_its_entry_has_its_homes_let_t
     "the other homes held its objects for its attempt"
   );
   assert!(released, "each hold let go: {held:?}; {state}");
+}
+
+/// A-894 (NoLoss for a repository's creation; main 01a20182's order of 2026-11-24 02:17). Do: create a git repository
+/// on node a of a three-node `f = 1` fleet ([`git_fleet`], which holds the creation to have its record at another node
+/// as it answers), kill a at once, and once a survivor has taken the repository over, list its refs by name at each
+/// survivor's edge (`git ls-remote`). Expect: a survivor takes the repository over and rebuilds it, and a survivor's edge
+/// serves it by its name. Red before A-894 at `git_fleet`'s own check: the creation answered before any other node held
+/// its record (0 of 2).
+#[test]
+fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_served_by_a_survivor()
+ {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("creation-owner-killed");
+  fleet.daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let repository = fleet.repository;
+  let taken = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(survivors.iter().any(|daemon| {
+      daemon
+        .repository_takeover(repository)
+        .is_ok_and(|(_, [_, rebuilt, _])| rebuilt >= 1)
+    }))
+  });
+  let views: Vec<_> = survivors
+    .iter()
+    .map(|daemon| daemon.repository_takeover(repository))
+    .collect();
+  let listed: Vec<(bool, String)> = (0..fleet.daemons.len())
+    .map(|node| {
+      let port = fleet.daemons[node]
+        .vcs_http_port()
+        .expect("the edge listens");
+      let dir = common::target::target_dir();
+      let header = format!("http.extraHeader=Authorization: Bearer {}", fleet.token);
+      let url = format!("http://127.0.0.1:{port}/project");
+      let out = git_in(&dir.path, &["-c", &header, "ls-remote", &url]);
+      (
+        out.status.success(),
+        format!(
+          "node {node}: {}{}",
+          String::from_utf8_lossy(&out.stdout),
+          String::from_utf8_lossy(&out.stderr)
+        ),
+      )
+    })
+    .collect();
+  fleet.stop();
+  assert!(taken, "a survivor took the repository over: {views:?}");
+  assert!(
+    listed.iter().any(|(served, _)| *served),
+    "a survivor's edge served the repository by its name: {listed:?}; {views:?}"
+  );
 }
 
 /// A-727 (d1a-3), a holder unreachable at first, and the rebuild that makes its answer exist (main 01a20182's ruling of

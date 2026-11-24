@@ -1900,7 +1900,7 @@ async fn serve_peer_records(
           // for it, apart from the content plane's holds, and answered once its image is published.
           slates_cluster::homes::HOME_STREAM => {
             crate::vcs_store::homes::serve_remote(
-              control,
+              (control, learned_host(peer_anchor, seed)),
               &request,
               crate::daemon::LIVENESS_BUDGET_NS,
             )
@@ -11883,8 +11883,9 @@ fn record_acks_in(
   // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
   // the last thing they waited for.
   crate::live_ship::resolve(state, object.0);
-  // A destroy is answered once its tombstone is placed (`live_ship::defer_destroy`).
-  crate::live_ship::resolve_destroys(state, object.0);
+  // A destroy is answered once its tombstone is placed, and a repository's creation once its record is (A-894;
+  // `live_ship::defer_until_placed`).
+  crate::live_ship::resolve_placed(state, object.0);
   // A live shipper waits for its holders' catalog to be placed before it ships (A-240).
   crate::live_ship::catalog_placed(state, object);
 }

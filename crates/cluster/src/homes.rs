@@ -41,8 +41,10 @@ pub const HOME_STREAM: u64 = 30;
 /// Format: the version byte every message begins with (A-727 (d1a): owners on the wire). Version 1 had none, its first
 /// byte a kind of 1 to 6, so neither version reads the other's messages as its own. 0x83 (A-727 (d1a-3), main
 /// 01a20182's ruling of 2026-11-24 01:36) adds a repository's rebuild ([`HomeMessage::Rebuilt`]) and its answer
-/// ([`HomeOutcome::Owed`]); a member of 0x82 is refused at once, typed, by the version rule.
-pub const VERSION: u8 = 0x83;
+/// ([`HomeOutcome::Owed`]); a member of 0x82 is refused at once, typed, by the version rule. 0x84 (A-902, main
+/// 01a20182's order of 2026-11-24 06:01, agreed with w-git) adds to a put and a put's part the configuration version its
+/// sender ranked the object's homes by, so a member behind it waits for its own install rather than refusing.
+pub const VERSION: u8 = 0x84;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;
 /// Format: the kind byte of a read.
@@ -250,6 +252,9 @@ pub enum HomeMessage {
   Put {
     /// The window's identity: the BLAKE3 of its bytes.
     identity: [u8; 32],
+    /// The configuration version the sender ranked the window's homes by (A-902): a member whose own installed version
+    /// is older waits for its install before it judges whether it is a home.
+    configuration: u64,
     /// Who it is kept for (at least one).
     owners: Vec<HomeOwner>,
     /// Its bytes.
@@ -272,6 +277,8 @@ pub enum HomeMessage {
   PutPart {
     /// The object's identity: the BLAKE3 of its whole bytes.
     identity: [u8; 32],
+    /// The configuration version the sender ranked the object's homes by (A-902), judged at the first part.
+    configuration: u64,
     /// Who it is kept for, once whole (at least one).
     owners: Vec<HomeOwner>,
     /// The object's length.
@@ -364,11 +371,13 @@ impl HomeMessage {
     match self {
       HomeMessage::Put {
         identity,
+        configuration,
         owners,
         bytes,
       } => {
         out.push(KIND_PUT);
         out.extend_from_slice(identity);
+        out.extend_from_slice(&configuration.to_le_bytes());
         put_owners(&mut out, owners);
         put_blob(&mut out, bytes);
       }
@@ -389,6 +398,7 @@ impl HomeMessage {
       }
       HomeMessage::PutPart {
         identity,
+        configuration,
         owners,
         total,
         offset,
@@ -396,6 +406,7 @@ impl HomeMessage {
       } => {
         out.push(KIND_PUT_PART);
         out.extend_from_slice(identity);
+        out.extend_from_slice(&configuration.to_le_bytes());
         put_owners(&mut out, owners);
         out.extend_from_slice(&total.to_le_bytes());
         out.extend_from_slice(&offset.to_le_bytes());
@@ -472,6 +483,7 @@ impl HomeMessage {
     let message = match kind {
       KIND_PUT => HomeMessage::Put {
         identity,
+        configuration: reader.long()?,
         owners: reader.owners()?,
         bytes: reader.blob()?,
       },
@@ -486,6 +498,7 @@ impl HomeMessage {
       },
       KIND_PUT_PART => HomeMessage::PutPart {
         identity,
+        configuration: reader.long()?,
         owners: reader.owners()?,
         total: reader.long()?,
         offset: reader.long()?,
@@ -677,12 +690,15 @@ mod tests {
     let bytes = proptest::collection::vec(any::<u8>(), 0..2048);
     let owners = || proptest::collection::vec(owner(), 1..4);
     proptest::strategy::Union::new([
-      (identity, owners(), bytes.clone())
-        .prop_map(|(identity, owners, bytes)| HomeMessage::Put {
-          identity,
-          owners,
-          bytes,
-        })
+      (identity, any::<u64>(), owners(), bytes.clone())
+        .prop_map(
+          |(identity, configuration, owners, bytes)| HomeMessage::Put {
+            identity,
+            configuration,
+            owners,
+            bytes,
+          },
+        )
         .boxed(),
       identity
         .prop_map(|identity| HomeMessage::Read { identity })
@@ -692,14 +708,16 @@ mod tests {
         .boxed(),
       (
         identity,
+        any::<u64>(),
         owners(),
         any::<u64>(),
         any::<u64>(),
         bytes.clone(),
       )
         .prop_map(
-          |(identity, owners, total, offset, bytes)| HomeMessage::PutPart {
+          |(identity, configuration, owners, total, offset, bytes)| HomeMessage::PutPart {
             identity,
+            configuration,
             owners,
             total,
             offset,
@@ -838,6 +856,7 @@ mod tests {
   fn hostile_home_messages_are_refused_by_kind() {
     let mut long = vec![VERSION, 1u8];
     long.extend_from_slice(&[0; 32]);
+    long.extend_from_slice(&0u64.to_le_bytes());
     long.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(HomeMessage::decode(&long), Err(HomeWireError::BadLength));
     let mut unknown = vec![VERSION, super::KIND_REBUILT + 1];
@@ -896,6 +915,7 @@ mod tests {
     );
     let mut ownerless = vec![VERSION, 1u8];
     ownerless.extend_from_slice(&[5; 32]);
+    ownerless.extend_from_slice(&0u64.to_le_bytes());
     ownerless.extend_from_slice(&0u32.to_le_bytes());
     ownerless.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(
@@ -904,6 +924,7 @@ mod tests {
     );
     let mut counted = vec![VERSION, 1u8];
     counted.extend_from_slice(&[5; 32]);
+    counted.extend_from_slice(&0u64.to_le_bytes());
     counted.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(HomeMessage::decode(&counted), Err(HomeWireError::BadLength));
   }

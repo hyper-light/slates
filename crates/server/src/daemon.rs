@@ -8163,6 +8163,7 @@ mod tests {
     first
       .observe(shard, move |state| {
         let origin = state.shard;
+        let local = state.fleet.host();
         let put = put.clone();
         let sent = sent.clone();
         let task = slates_rt::futures::spawn(async move {
@@ -8170,6 +8171,7 @@ mod tests {
           let mut answers = Vec::new();
           for (at, chunk) in put.chunks(part).enumerate() {
             let request = HomeMessage::PutPart {
+              configuration: 0,
               owners: vec![crate::vcs_store::homes::TEST_OWNER],
               identity,
               total,
@@ -8178,7 +8180,7 @@ mod tests {
             }
             .encode();
             let reply = crate::vcs_store::homes::serve_remote(
-              origin,
+              (origin, local),
               &request,
               crate::daemon::LIVENESS_BUDGET_NS,
             )
@@ -8203,6 +8205,7 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     let read = move |state: &mut crate::state::ShardState| {
       let origin = state.shard;
+      let local = state.fleet.host();
       let sent = sent.clone();
       if let Ok(task) = slates_rt::futures::spawn(async move {
         // The read only once the repository is recovered, so every restored window nothing held is freed by then.
@@ -8225,7 +8228,7 @@ mod tests {
           }
           .encode();
           let reply = crate::vcs_store::homes::serve_remote(
-            origin,
+            (origin, local),
             &request,
             crate::daemon::LIVENESS_BUDGET_NS,
           )

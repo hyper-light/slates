@@ -263,6 +263,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
   let (sent, answered) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |state| {
     let origin = state.shard;
+    let local = state.fleet.host();
     let shards = state.shards.clone();
     let task = slates_rt::futures::spawn(async move {
       let budget = crate::daemon::LIVENESS_BUDGET_NS;
@@ -272,6 +273,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       let identity = ContentId::of(&bytes).0;
       let home = home_of(&shards, &ContentId(identity)).unwrap();
       let put = HomeMessage::Put {
+        configuration: 0,
         owners: vec![super::TEST_OWNER],
         identity,
         bytes: bytes.clone(),
@@ -279,7 +281,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       .encode();
       // The put's wait publishes its home itself when nothing else has (group commit): kept only once an image of the
       // generation it names is published there.
-      let before = HomeMessage::decode(&serve_remote(origin, &put, short).await);
+      let before = HomeMessage::decode(&serve_remote((origin, local), &put, short).await);
       let durable = match &before {
         Ok(HomeMessage::Answer {
           outcome: HomeOutcome::Kept { generation },
@@ -311,7 +313,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       .await;
       // Kept again, held once more, under a ticket its home has published (A-870 F2: a cut's generation and the
       // publication's after it are two, so the ticket's number is not fixed here; that it is published is the rule).
-      let again = HomeMessage::decode(&serve_remote(origin, &put, budget).await);
+      let again = HomeMessage::decode(&serve_remote((origin, local), &put, budget).await);
       let published = match &again {
         Ok(HomeMessage::Answer {
           outcome: HomeOutcome::Kept { generation },
@@ -327,7 +329,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
         other => outcome.push(format!("not kept once published: {other:?}")),
       }
       let read = HomeMessage::Read { identity }.encode();
-      match HomeMessage::decode(&serve_remote(origin, &read, budget).await) {
+      match HomeMessage::decode(&serve_remote((origin, local), &read, budget).await) {
         Ok(HomeMessage::Answer {
           outcome: HomeOutcome::Bytes(got),
           ..
@@ -338,7 +340,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       // frees it, and a second finds it no longer held for the region.
       let answer = HomeMessage::decode(
         &serve_remote(
-          origin,
+          (origin, local),
           &HomeMessage::LetGo {
             identity,
             owner: Some(super::TEST_OWNER),
@@ -359,7 +361,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       }
       let again = HomeMessage::decode(
         &serve_remote(
-          origin,
+          (origin, local),
           &HomeMessage::LetGo {
             identity,
             owner: Some(super::TEST_OWNER),
@@ -378,7 +380,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       ) {
         outcome.push(format!("a second region let-go found a hold: {again:?}"));
       }
-      let gone = HomeMessage::decode(&serve_remote(origin, &read, budget).await);
+      let gone = HomeMessage::decode(&serve_remote((origin, local), &read, budget).await);
       if !matches!(
         gone,
         Ok(HomeMessage::Answer {
@@ -389,12 +391,13 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
         outcome.push(format!("read after its last let-go: {gone:?}"));
       }
       let misnamed = HomeMessage::Put {
+        configuration: 0,
         owners: vec![super::TEST_OWNER],
         identity,
         bytes: b"other bytes".to_vec(),
       }
       .encode();
-      let refused = HomeMessage::decode(&serve_remote(origin, &misnamed, budget).await);
+      let refused = HomeMessage::decode(&serve_remote((origin, local), &misnamed, budget).await);
       if !matches!(
         refused,
         Ok(HomeMessage::Answer {
@@ -952,8 +955,10 @@ fn a_home_message_of_another_version_is_refused_at_once_and_typed() {
       first.extend_from_slice(&[5; 32]);
       first.extend_from_slice(&3u32.to_le_bytes());
       first.extend_from_slice(b"abc");
-      let origin = crate::state::with_state(|state| state.shard).unwrap();
-      let answer = super::serve_remote(origin, &first, crate::daemon::LIVENESS_BUDGET_NS).await;
+      let (origin, local) =
+        crate::state::with_state(|state| (state.shard, state.fleet.host())).unwrap();
+      let answer =
+        super::serve_remote((origin, local), &first, crate::daemon::LIVENESS_BUDGET_NS).await;
       let refused = crate::state::with_state(|state| {
         state
           .refusals
@@ -1044,4 +1049,183 @@ fn a_stranded_tickets_wait_is_answered_not_durable_at_once_and_counted() {
     took_ns < budget / 2,
     "answered at once, not at the budget: {took_ns} of {budget} ns"
   );
+}
+
+/// A-902 (gate 8 and 9's homing short: a fresh fleet's first push refused `HomedShort`, a home answering `NotAHome`
+/// about 1 ms into a 2 s budget while it had not installed the configuration its sender ranked by). One node plays the
+/// home, its shard's configuration installed by the test. Do: install a configuration (one past the node's own) that
+/// ranks every window at another member, then serve puts from the region:
+/// (a) from a member carrying the next version, installing that version (ranking this node) once the put waits;
+/// (b) from a member carrying a version this node never installs, under a short budget;
+/// (c) from a member carrying this node's own version;
+/// (d) from a sender this node's configuration does not name, at this node's own version, under a short budget.
+/// Expect: (a) kept once the install lands, the wait counted caught up; (b) refused `NotAHome` once its budget is spent,
+/// counted elapsed; (c) refused `NotAHome` at once, no wait begun; (d) waited for (the sender unknown here means this
+/// node has not installed the region's configuration) and refused `NotAHome` past its budget. Red before A-902: (a) and
+/// (d) refused at once, no wait begun.
+#[test]
+fn a_home_behind_its_senders_configuration_waits_for_its_install_and_refuses_at_once_when_not_behind()
+ {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
+  let outcome = crate::test_store::run_on_first(
+    &crate::daemon::audit_daemon_of(2),
+    || async {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let short = budget / 50;
+      let mut outcome: Vec<String> = Vec::new();
+      let Some((origin, local, own)) = crate::state::with_state(|state| {
+        (
+          state.shard,
+          state.fleet.host(),
+          state.fleet.configuration().clone(),
+        )
+      }) else {
+        return vec!["no shard state".to_owned()];
+      };
+      let other = slates_db::HostId(local.0 ^ 1);
+      let stranger = slates_db::HostId(local.0 ^ 2);
+      let counts = || {
+        crate::state::with_state(|state| {
+          [
+            super::INSTALL_WAITS,
+            super::INSTALL_WAIT_CAUGHT_UP,
+            super::INSTALL_WAIT_ELAPSED,
+          ]
+          .map(|name| state.refusals.get(name).copied().unwrap_or(0))
+        })
+        .unwrap_or_default()
+      };
+      let install = |version: u64, members: Vec<slates_db::HostId>| {
+        let mut configuration = own.clone();
+        configuration.version = version;
+        let _ = crate::state::with_state(|state| {
+          state.fleet.install_configuration(configuration, &members)
+        });
+      };
+      let put = |index: usize, configuration: u64| {
+        let bytes = window(1000 + index);
+        HomeMessage::Put {
+          identity: ContentId::of(&bytes).0,
+          configuration,
+          owners: vec![super::TEST_OWNER],
+          bytes,
+        }
+        .encode()
+      };
+      let refused_not_a_home = |reply: &[u8]| {
+        matches!(
+          HomeMessage::decode(reply),
+          Ok(HomeMessage::Answer {
+            outcome: HomeOutcome::Refused(HomeRefusal::NotAHome),
+            ..
+          })
+        )
+      };
+      let behind = own.version.saturating_add(1);
+      let ahead = behind.saturating_add(1);
+      install(behind, vec![other]);
+
+      // (a) One behind, the install landing within the budget.
+      let before = counts();
+      let (sent, got) = std::sync::mpsc::channel();
+      let request = put(0, ahead);
+      let Ok(serving) = slates_rt::futures::spawn(async move {
+        let _ = sent.send(super::serve_remote((origin, other), &request, budget).await);
+      }) else {
+        return vec!["the put's task".to_owned()];
+      };
+      // The put runs to its wait (or its answer) before the install: until its wait is counted or it has answered.
+      let mut answered = None;
+      let _ = slates_rt::futures::within(budget, async {
+        loop {
+          if let Ok(reply) = got.try_recv() {
+            answered = Some(reply);
+            break;
+          }
+          if counts()[0] > before[0] {
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      })
+      .await;
+      install(ahead, vec![local]);
+      let _ = slates_rt::futures::join(serving).await;
+      let reply = answered.or_else(|| got.try_recv().ok()).unwrap_or_default();
+      let after = counts();
+      if !matches!(
+        HomeMessage::decode(&reply),
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Kept { .. },
+          ..
+        })
+      ) {
+        outcome.push(format!(
+          "(a) not kept once its install landed: {:?}",
+          HomeMessage::decode(&reply)
+        ));
+      }
+      if after[1] != before[1] + 1 {
+        outcome.push(format!(
+          "(a) the wait not counted caught up: {before:?} -> {after:?}"
+        ));
+      }
+
+      // (b) One behind, no install within the budget.
+      let stale = ahead.saturating_add(1);
+      install(stale, vec![other]);
+      let before = counts();
+      let began = slates_rt::futures::now_ns();
+      let reply =
+        super::serve_remote((origin, other), &put(1, stale.saturating_add(1)), short).await;
+      let waited = slates_rt::futures::now_ns().saturating_sub(began);
+      let after = counts();
+      if !refused_not_a_home(&reply) {
+        outcome.push(format!(
+          "(b) not refused NotAHome: {:?}",
+          HomeMessage::decode(&reply)
+        ));
+      }
+      if after[2] != before[2] + 1 || waited < short {
+        outcome.push(format!(
+          "(b) not refused past its budget ({waited} ns of {short}): {before:?} -> {after:?}"
+        ));
+      }
+
+      // (c) The same version: refused at once.
+      let before = counts();
+      let reply = super::serve_remote((origin, other), &put(2, stale), budget).await;
+      let after = counts();
+      if !refused_not_a_home(&reply) {
+        outcome.push(format!(
+          "(c) not refused NotAHome: {:?}",
+          HomeMessage::decode(&reply)
+        ));
+      }
+      if after[0] != before[0] {
+        outcome.push(format!(
+          "(c) a wait begun at the same version: {before:?} -> {after:?}"
+        ));
+      }
+
+      // (d) A sender this node's configuration does not name.
+      let before = counts();
+      let reply = super::serve_remote((origin, stranger), &put(3, stale), short).await;
+      let after = counts();
+      if !refused_not_a_home(&reply) {
+        outcome.push(format!(
+          "(d) not refused NotAHome: {:?}",
+          HomeMessage::decode(&reply)
+        ));
+      }
+      if after[0] != before[0] + 1 || after[2] != before[2] + 1 {
+        outcome.push(format!(
+          "(d) a sender unknown here not waited for: {before:?} -> {after:?}"
+        ));
+      }
+      outcome
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert!(outcome.is_empty(), "{outcome:#?}");
 }
