@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 4 (main 01a20182, 2026-11-24 12:06 PST): at current main (4664f8d26) with main's three lint commits; run 3 found a
+# type in daemon_edge.rs, a complexity of 11 and a push's assertions in fleet.rs, which the third commit takes.
 # Run 3 (main 01a20182, 2026-11-24 11:33 PST): run 2 found two sites the first three hid (fleet.rs's Unix-only getuid on
 # Windows, daemon_edge.rs's log_rows type); main's next commit takes both.
 # Run 2 (main 01a20182, 2026-11-24 11:20 PST): the wall again at c45aff536 with main's e7f18e4d1, which takes the three
