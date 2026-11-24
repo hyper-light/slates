@@ -21426,17 +21426,75 @@ pub(crate) fn begin_readoption(
   {
     return false;
   }
-  let Ok(phase) = chain_phase(state, id, Some(engine)) else {
-    return false;
+  // A branch member whose source stands in its lineage here is rebuilt over that source, as a recovery rebuilds one
+  // (`rebuild_member_sliced`): branched again at its version, then its own checkpoint and chain replayed, so it joins its
+  // lineage and a server-made commit's preview over it is made through the lineage (A-891). The handed engine, the
+  // replica's over arenas of its own, goes.
+  let replay = match branch_source(state, id) {
+    Some(source) => {
+      drop(engine);
+      let Some(seeded) = branched_again(state, id, source) else {
+        return false;
+      };
+      match GreenReplay::seeded(state, id, seeded) {
+        Ok(replay) => replay,
+        Err((_, engine)) => {
+          give_back_to_lineage(state, id, *engine);
+          return false;
+        }
+      }
+    }
+    None => {
+      let Ok(phase) = chain_phase(state, id, Some(engine)) else {
+        return false;
+      };
+      GreenReplay {
+        id,
+        phase,
+        load_steps: 0,
+      }
+    }
   };
   if let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) {
-    awaiting.replay = Some(Box::new(GreenReplay {
-      id,
-      phase,
-      load_steps: 0,
-    }));
+    awaiting.replay = Some(Box::new(replay));
   }
   true
+}
+
+/// The source green `id` was branched from and the version it was branched at, where `id` is a lineage's branch member
+/// and that source stands in the lineage here (A-575): what a re-adoption rebuilds it over ([`begin_readoption`]).
+fn branch_source(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, u64)> {
+  let member = state.db.partition().repositories().member(id).cloned()?;
+  let slates_db::catalog::MemberOrigin::Branch { from, version } = member.origin else {
+    return None;
+  };
+  (state.greens.lineage_of(&from) == Some(member.repository)).then_some((from, version))
+}
+
+/// Green `id` branched again from `source` at its version, its engine taken out of the lineage for its own replay; none
+/// where the lineage refuses it.
+fn branched_again(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  (from, version): (DbVolumeId, u64),
+) -> Option<slates_merge::engine::Green> {
+  state
+    .greens
+    .branch(&from, version, id)
+    .and_then(|()| state.greens.take(&id))
+    .ok()
+}
+
+/// Gives green `id`'s engine back to its lineage after its replay, where it was taken out of one; counted where the
+/// lineage refuses it ([`MEMBER_ENGINE_LOST`]).
+fn give_back_to_lineage(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  engine: slates_merge::engine::Green,
+) {
+  if state.greens.lineage_of(&id).is_some() && state.greens.put_back(&id, engine).is_err() {
+    state.count(MEMBER_ENGINE_LOST, 1);
+  }
 }
 
 /// What one call of a green's re-adoption replay did ([`step_readoption`]).
@@ -21477,6 +21535,9 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
       }
       Err(fence) => {
         state.merge.awaiting_adoption.remove(&id);
+        if let Some(engine) = replay.into_engine() {
+          give_back_to_lineage(state, id, *engine);
+        }
         if let Some(record) = state.db.partition().volume(id).cloned() {
           fence_green(state, &record, fence);
         }
@@ -21489,7 +21550,7 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
     return ReadoptionStep::Installed;
   };
   let replayed = replay.finish(state);
-  for version in install_green(state, &record, replayed) {
+  for version in install_readopted(state, &record, replayed) {
     crate::merge_service::enqueue_recovered_record(state, id, version);
   }
   // The adopted version was placed at the quorum before the restart (the takeover re-committed it); only the versions
@@ -21505,6 +21566,58 @@ pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> Readopt
     *placed = (*placed).max(adoption.version);
   }
   ReadoptionStep::Installed
+}
+
+/// Counter: a re-adopted green its lineage's records name as a member that is installed standing alone, outside its
+/// lineage (a branch whose source does not stand in its lineage here, whose engine the replica built over arenas of its
+/// own, or a root whose repository has a lineage here already): it serves, but a server-made commit over it is refused,
+/// since a held verdict is previewed through the lineage (`Greens::preview`, A-891). A branch whose source stands is
+/// rebuilt over it instead ([`begin_readoption`]). Format: a counter name in the daemon's status report.
+pub(crate) const READOPTED_OUTSIDE_LINEAGE: &str = "merge.readoption.outside_lineage";
+
+/// Installs a re-adopted green's replay ([`step_readoption`]) the way its lineage's records say it joined, as a
+/// recovery's does (A-575, `install_member_root`): a lineage's root whose repository has no lineage here founds it again
+/// with its engine, nothing copied, so a server-made commit's preview of a held verdict over it (`Greens::preview`,
+/// A-891) is made as before the takeover; any other green is installed standing alone (`install_green`), a member among
+/// them counted ([`READOPTED_OUTSIDE_LINEAGE`]). Red before (main's order of 2026-11-24 05:51): a Mercurial edit over a
+/// re-adopted root refused `NotHead`, its preview `Stale`.
+fn install_readopted(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  replayed: Result<ReplayedGreen, crate::merge_service::GreenFence>,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  let member = state
+    .db
+    .partition()
+    .repositories()
+    .member(record.id)
+    .cloned();
+  match member {
+    Some(member)
+      if matches!(member.origin, slates_db::catalog::MemberOrigin::Root)
+        && !state.greens.has_lineage(member.repository) =>
+    {
+      install_member_root(state, record, &member, replayed)
+    }
+    // A branch rebuilt over its source ([`begin_readoption`]): its engine back in its lineage, as a recovery's.
+    Some(member)
+      if matches!(
+        member.origin,
+        slates_db::catalog::MemberOrigin::Branch { .. }
+      ) && state.greens.lineage_of(&record.id) == Some(member.repository) =>
+    {
+      let (replayed, engine) = match replayed {
+        Ok((engine, versions)) => (Ok(versions), Some(Box::new(engine))),
+        Err(fence) => (Err(fence), None),
+      };
+      finish_member_branch(state, record, replayed, engine)
+    }
+    Some(_) => {
+      state.count(READOPTED_OUTSIDE_LINEAGE, 1);
+      install_green(state, record, replayed)
+    }
+    None => install_green(state, record, replayed),
+  }
 }
 
 /// Fences green `id`, awaiting its re-adoption here, whose boot could not re-adopt it from this node's ledger (A-333):
