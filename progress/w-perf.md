@@ -1,5 +1,12 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~13:00 PST
+- Main's (a) LANDED 31bf5e5c7: a submit over a green whose repository a takeover adopted but has not rebuilt is
+  refused Overloaded in made_commit::take_turn (Taken::Unbuilt), counted merge.made.unbuilt, logged once. hg/git/svn
+  twins red with the fix out (committed v2 bare); hg and git resends land after the rebuild.
+- (b) under way (A-636 part 2c-2's store objects): first checking whether svn's Unlanded is my test helper's sync
+  settle (no fetch_svn) rather than the store; hg's missing parent texts after.
+
 ## 2026-11-24 ~06:15 PST
 - A-887 takeover gap closed (readopt_with runs hg_named::bring_back_named_live, one planner to_bring).
 - Recovery spin (r854 57k hg restart; likely r865 svn too): replay_reads/named_whole_files were cubic in a push's
