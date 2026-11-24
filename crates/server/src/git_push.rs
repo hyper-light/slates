@@ -211,10 +211,30 @@ pub(crate) enum PushFailed {
   },
   /// `answer` asked of a push not yet read whole and checked, or already answered.
   Unchecked,
-  /// The push's objects were not homed in the region and landed on the node's changeset store (a homing short, its pack
-  /// not held, no store, the store busy, gone or its write failed; A-767 C5, part 2b): nothing of it is in the
-  /// register, so the push is refused whole, for its client's retry.
-  Unlanded,
+  /// The push's objects were not homed in the region and landed on the node's changeset store (A-767 C5, part 2b), and
+  /// where it fell short: nothing of it is in the register, so the push is refused whole, for its client's retry.
+  Unlanded(Unlanded),
+}
+
+/// Where a push's homing and landing fell short ([`PushFailed::Unlanded`]; main 01a20182's gate 5, 2026-11-24: one
+/// refusal named six conditions, so the log and the client could not tell which). The underlying refusal, where there
+/// is one, is logged where it is met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unlanded {
+  /// The names the record would carry were not put in the repository's content store.
+  NamesNotPut,
+  /// A homing (the names' or the pack's) was asked and no edge took it by the turn after.
+  HomingUntaken,
+  /// The pack the staging put in the store was not held for the record.
+  PackNotHeld,
+  /// A homing came back short of `f + 1` homes in the region, or homed under another identity.
+  HomedShort,
+  /// The node holds no changeset store, or the repository's changeset count could not be taken.
+  NoLanding,
+  /// The changeset was asked and no edge took it by the turn after.
+  LandingUntaken,
+  /// The node's changeset store refused the changeset (busy, gone, or its write failed).
+  StoreRefused,
 }
 
 /// One git push over one connection, on its repository's owner shard (module docs), its hooks'
@@ -235,6 +255,12 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// The client's bytes this push read, in all: what it brought, learned as its repository's demand once it is answered
   /// (A-724 piece 2, `slates_vcs::Rates`).
   read_bytes: u64,
+  /// Whether its request, read whole, named no command: stock git's probe of a flush alone (`remote-curl.c`'s
+  /// `probe_rpc`), which git's receive-pack answers with nothing. False until a request is read.
+  asked_nothing: bool,
+  /// Whether its request, read whole, asked side-band-64k: kept, since the session lets the request go once the push is
+  /// checked and taken (gate 5: a push refused while answered was logged "side-band false" and answered nothing).
+  side_band_asked: bool,
   /// The push counted decoding on its shard until it drops (A-724, `crate::vcs_share::place`): the load the placement
   /// of A-722's intake off the owner shard reads.
   _decoding: crate::vcs_share::place::Decoding,
@@ -391,8 +417,8 @@ enum Homing {
   LandAsked(Box<Landing>),
   /// The changeset taken by the edge, the store's answer awaited, at its sequence.
   LandWaiting(u64),
-  /// The store refused the changeset: the push is refused.
-  Unlanded,
+  /// Its homing or landing fell short, and where: the push is refused.
+  Unlanded(Unlanded),
   /// Done, or never asked: the decision goes on.
   Done,
 }
@@ -486,9 +512,10 @@ impl<P> ReceivePack<P> {
     self.repository
   }
 
-  /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
+  /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read: kept after the session
+  /// lets the request go, so a refusal while the push is answered goes on git's band 3.
   pub(crate) fn side_band(&self) -> bool {
-    self.session.side_band()
+    self.side_band_asked || self.session.side_band()
   }
 
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
@@ -550,6 +577,8 @@ impl<P> ReceivePack<P> {
       _live: crate::vcs_share::Live::begin(repository),
       room_bound: room.bound,
       read_bytes: 0,
+      asked_nothing: false,
+      side_band_asked: false,
       _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
@@ -595,10 +624,30 @@ impl<P> ReceivePack<P> {
     self.read_bytes = self.read_bytes.saturating_add(bytes_in);
     charge_step(state, self.repository, began, bytes_in);
     let read = read.map_err(|failed| self.bounded(failed))?;
+    self.note_asked();
     self
       .keep_refusal_names()
       .map_err(|failed| self.bounded(failed))?;
     Ok(read)
+  }
+
+  /// Notes whether the request, once read whole, named no command ([`ReceivePack::asked_nothing`]).
+  fn note_asked(&mut self) {
+    if let Some(request) = self.session.request() {
+      self.asked_nothing = request.commands.is_empty();
+      self.side_band_asked = request.requested.side_band_64k;
+    }
+  }
+
+  /// Whether the push's request, read whole, named no command: a probe, answered with nothing, as git's receive-pack
+  /// answers one. False for a push whose request was never read whole.
+  pub(crate) fn asked_nothing(&self) -> bool {
+    self.asked_nothing
+  }
+
+  /// The client's bytes the push has read, in all.
+  pub(crate) fn read_bytes(&self) -> u64 {
+    self.read_bytes
   }
 
   /// Keeps the commands' names for a refusal's report (`refusal_names`) once the request is read, charged to the push's
@@ -650,6 +699,7 @@ impl<P> ReceivePack<P> {
     });
     charge_step(state, self.repository, began, 0);
     let ended = ended.map_err(|failed| self.bounded(failed))?;
+    self.note_asked();
     self
       .keep_refusal_names()
       .map_err(|failed| self.bounded(failed))?;
@@ -960,7 +1010,7 @@ impl<P> ReceivePack<P> {
           return Ok(true);
         };
         let Some(identity) = crate::vcs_store::put_names(state, &bytes) else {
-          return Err(PushFailed::Unlanded);
+          return Err(PushFailed::Unlanded(Unlanded::NamesNotPut));
         };
         // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
         let _ = decision.sealed.home_owner(state);
@@ -974,7 +1024,7 @@ impl<P> ReceivePack<P> {
         decision.sealed.release_unhomed(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
         decision.sealed.release_homed(state);
-        Err(PushFailed::Unlanded)
+        Err(PushFailed::Unlanded(Unlanded::HomingUntaken))
       }
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge;
       // a push whose pack is not held is refused (C5 part 2b).
@@ -985,7 +1035,7 @@ impl<P> ReceivePack<P> {
         }
         _ => {
           decision.sealed.release_homed(state);
-          Err(PushFailed::Unlanded)
+          Err(PushFailed::Unlanded(Unlanded::PackNotHeld))
         }
       },
       // The changeset asked of the edge, as the names and the pack are, in the turn before the edge takes it.
@@ -997,11 +1047,11 @@ impl<P> ReceivePack<P> {
       Homing::LandAsked(_) => {
         crate::vcs_store::homes::count_untaken(state);
         decision.sealed.release_homed(state);
-        Err(PushFailed::Unlanded)
+        Err(PushFailed::Unlanded(Unlanded::LandingUntaken))
       }
-      Homing::Unlanded => {
+      Homing::Unlanded(why) => {
         decision.sealed.release_homed(state);
-        Err(PushFailed::Unlanded)
+        Err(PushFailed::Unlanded(why))
       }
       waiting @ (Homing::Waiting(_) | Homing::PackWaiting(..) | Homing::LandWaiting(_)) => {
         decision.homing = waiting;
@@ -1058,33 +1108,59 @@ impl<P> ReceivePack<P> {
           decision.homing = Homing::PackDue(homed.bytes);
           return;
         }
+        log_homed_short(state, "names", &homed.outcome);
         decision.sealed.release_unhomed(state, &identity);
-        decision.homing = Homing::Unlanded;
+        decision.homing = Homing::Unlanded(Unlanded::HomedShort);
       }
       (Homing::PackWaiting((identity, len), names), Carried::Homed(homed)) => {
         if !homed.outcome.as_ref().is_ok_and(|homed| *homed == identity) {
+          log_homed_short(state, "pack", &homed.outcome);
           decision.sealed.release_unhomed(state, &identity);
-          decision.homing = Homing::Unlanded;
+          decision.homing = Homing::Unlanded(Unlanded::HomedShort);
           return;
         }
         decision.sealed.pack_homed_as((identity, len));
         decision.homing = match landing_of(state, repository, (names, homed.bytes)) {
           Some(landing) => Homing::LandDue(Box::new(landing)),
-          None => Homing::Unlanded,
+          None => Homing::Unlanded(Unlanded::NoLanding),
         };
       }
       (Homing::LandWaiting(sequence), Carried::Landed(landed)) => {
-        let ok = landed.is_ok();
-        state.count(if ok { PUSH_LANDED } else { PUSH_UNLANDED }, 1);
-        if ok {
-          decision.sealed.landed_as(sequence);
-        } else {
-          decision.homing = Homing::Unlanded;
+        state.count(
+          if landed.is_ok() {
+            PUSH_LANDED
+          } else {
+            PUSH_UNLANDED
+          },
+          1,
+        );
+        match landed {
+          Ok(_) => decision.sealed.landed_as(sequence),
+          Err(refused) => {
+            slates_machine::log_line!(
+              "slates-server: partition {}: a git push's changeset {sequence} was refused by the node's store: {refused:?}",
+              state.partition
+            );
+            decision.homing = Homing::Unlanded(Unlanded::StoreRefused);
+          }
         }
       }
       (other, _) => decision.homing = other,
     }
   }
+}
+
+/// Logs a push's homing of its `what` (its names or its pack) that came back short: `outcome` names the region's refusal,
+/// or the identity it homed under instead (gate 5: the cause was not named anywhere).
+fn log_homed_short(
+  state: &ShardState,
+  what: &str,
+  outcome: &Result<slates_vcs::ContentId, crate::vcs_store::homes::HomeRefused>,
+) {
+  slates_machine::log_line!(
+    "slates-server: partition {}: a git push's {what} homed short of f + 1 homes: {outcome:?}",
+    state.partition
+  );
 }
 
 /// Counter: git pushes landed as one changeset on the node's changeset store before their entry (A-767 C5). Format: a

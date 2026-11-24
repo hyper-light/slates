@@ -51,6 +51,8 @@ pub(crate) struct Served {
   hgrc: String,
   /// The daemon's instance name, which a client connects by.
   instance: String,
+  /// The token the hgrc authenticates with, and the hgrc's other lines: written again for a restarted edge's port.
+  auth: (String, String),
 }
 
 impl Served {
@@ -86,6 +88,31 @@ impl Served {
       .expect("the daemon serves until stopped")
   }
 
+  /// Restarts the daemon and the store's owner over the same anchor and store directory, as a crash's successor does: the
+  /// daemon recovers from its segment and the store, and its edge listens again, on a port of its own, which the URL and
+  /// the hgrc name from then on. A test that needs a restart's recovery (A-887's) runs through it.
+  pub(crate) fn restart(&mut self) {
+    if let Some(daemon) = self.daemon.take() {
+      daemon.stop();
+    }
+    if let Some(owner) = self.owner.take() {
+      owner.stop().unwrap();
+    }
+    let owner = start_owner(self.base());
+    let profile = super::machine_profile();
+    let config = daemon_config(&profile, &self.instance, &owner);
+    let anchor = self
+      .anchor
+      .as_ref()
+      .expect("the anchor holds until stopped");
+    let daemon = Daemon::start(&profile, config, source_of(anchor)).unwrap();
+    let port = daemon.vcs_http_port().expect("the edge listens");
+    self.url = format!("http://127.0.0.1:{port}/project");
+    self.scratch.seed("hgrc", hgrc(port, &self.auth).as_bytes());
+    self.daemon = Some(daemon);
+    self.owner = Some(owner);
+  }
+
   /// Stops the daemon, then its anchor, then the store's owner.
   pub(crate) fn stop(mut self) {
     if let Some(daemon) = self.daemon.take() {
@@ -98,10 +125,8 @@ impl Served {
   }
 }
 
-/// Starts a daemon named after `name` serving `project` (module docs), its hgrc the token's `[auth]` and `extra`.
-pub(crate) fn serve(name: &str, extra: &str) -> Served {
-  let scratch = target_dir();
-  let base = scratch.path.clone();
+/// The store's owner over the store directory under `base`, made the first time.
+fn start_owner(base: &str) -> StoreOwner {
   let store_dir = format!("{base}/store");
   // The store's directory inside the fixture's own, in the build output (`common::target`).
   #[allow(clippy::disallowed_methods)]
@@ -112,20 +137,44 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
     target: StoreRoot::identify(&store_dir).unwrap(),
     issued_ns: 0,
   };
-  let owner = StoreOwner::start(
+  StoreOwner::start(
     StoreRoot::open(&store_dir, &grant).unwrap(),
     SIZING,
     WAITING,
   )
-  .unwrap();
-  let profile = super::machine_profile();
-  let instance = format!("{name}-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  .unwrap()
+}
+
+/// The daemon's configuration: [`SHARDS`] shards, its edge on loopback, `owner`'s store its disk.
+fn daemon_config(
+  profile: &slates_machine::MachineProfile,
+  instance: &str,
+  owner: &StoreOwner,
+) -> DaemonConfig {
+  let mut config = DaemonConfig::derive(profile, instance, Some(SHARDS));
   config.vcs_http = Some(VcsHttpConfig {
     address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
     identity: None,
   });
   config.vcs_disk = Some(owner.handle());
+  config
+}
+
+/// The hgrc for the edge at `port`: the token's `[auth]`, then the other lines.
+fn hgrc(port: u16, (token, extra): &(String, String)) -> String {
+  format!(
+    "[auth]\nslates.prefix = http://127.0.0.1:{port}/\nslates.username = slates\nslates.password = {token}\n{extra}"
+  )
+}
+
+/// Starts a daemon named after `name` serving `project` (module docs), its hgrc the token's `[auth]` and `extra`.
+pub(crate) fn serve(name: &str, extra: &str) -> Served {
+  let scratch = target_dir();
+  let base = scratch.path.clone();
+  let owner = start_owner(&base);
+  let profile = super::machine_profile();
+  let instance = format!("{name}-{}", std::process::id());
+  let config = daemon_config(&profile, &instance, &owner);
   let anchor = held_anchor(&instance, &profile, &config);
   let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon.bootstrap(true).unwrap();
@@ -157,21 +206,17 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
   client
     .enroll_credential(principal, material, None, proof)
     .unwrap();
-  let hgrc = format!("{base}/hgrc");
-  scratch.seed(
-    "hgrc",
-    format!(
-      "[auth]\nslates.prefix = http://127.0.0.1:{port}/\nslates.username = slates\nslates.password = {token}\n{extra}"
-    )
-    .as_bytes(),
-  );
+  let hgrc_path = format!("{base}/hgrc");
+  let auth = (token, extra.to_owned());
+  scratch.seed("hgrc", hgrc(port, &auth).as_bytes());
   Served {
     daemon: Some(daemon),
     anchor: Some(anchor),
     owner: Some(owner),
     scratch,
     url: format!("http://127.0.0.1:{port}/project"),
-    hgrc,
+    hgrc: hgrc_path,
     instance,
+    auth,
   }
 }

@@ -95,7 +95,7 @@ g -C "$SOURCE" rev-list --objects --branches --tags | cut -d' ' -f1 | sort > "$W
 echo "objects: $(wc -l < "$WORK/source.objects" | tr -d ' '); git: $(git --version); slates: $("$SLATES" version 2> /dev/null || echo none)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
-ANCHOR="" DAEMON="" STOCK=""
+ANCHOR="" DAEMON="" STOCK="" INSTANCE=""
 stop_servers() {
   if [ -n "$ANCHOR" ]; then kill -9 "$ANCHOR" 2> /dev/null || true; wait "$ANCHOR" 2> /dev/null || true; fi
   if [ -n "$DAEMON" ]; then
@@ -106,14 +106,49 @@ stop_servers() {
   ANCHOR="" DAEMON="" STOCK=""
 }
 # KEEP_LOGS in the environment names a directory the servers' logs and each step's output are copied into at the end.
-trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
+trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/status.*.json "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
 
 # The value of the first line of FILE matching the sed expression, or nothing.
 first() { sed -n "$2" "$1" | head -1; }
 
-# Starts a fresh slates anchor for run $1 and makes the repository and a token: sets URL, AUTH, ANCHOR, DAEMON.
+# The counters w-git reads (`git_interop.rs` `counters_of`): whether a fetch meets the push's encode or derive still
+# behind, which slates' later runs of fetch and shallow (2.8-8.9 times their first, r811) may and run 1 may escape.
+COUNTERS="vcs_store.git_encode.encoded vcs_store.git_encode.turns vcs_store.git_encode.behind \
+vcs_store.git_encode.ahead_stopped vcs_store.git_derive.derived vcs_store.git_derive.turns"
+
+# After slates' step $1 of run $2: the daemon's `status --json` kept beside the logs (status.STEP-RUN.json), and a line
+# of COUNTERS, each summed over every shard's report of it as `counters_of` sums them. Read after the step's timing
+# ends, so it costs the step nothing.
+counters_after() {
+  local file="$WORK/status.$1-$2.json"
+  if ! "$SLATES" --instance "$INSTANCE" status --json > "$file" 2> /dev/null; then
+    echo "slates counters after $1 $2: status refused" | tee -a "$RESULTS"
+    return 0
+  fi
+  # shellcheck disable=SC2086 # the counters' names are words
+  python3 -I - "$file" $COUNTERS << 'PY' | sed "s/^/slates counters after $1 $2: /" | tee -a "$RESULTS"
+import json, sys
+names = sys.argv[2:]
+sums = dict.fromkeys(names, 0)
+def walk(node):
+    if isinstance(node, dict):
+        if node.get("kind") in sums and isinstance(node.get("count"), int):
+            sums[node["kind"]] += node["count"]
+        for value in node.values():
+            walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value)
+walk(json.load(open(sys.argv[1])))
+print(" ".join(f"{name.split('vcs_store.git_')[-1]}={sums[name]}" for name in names))
+PY
+}
+
+# Starts a fresh slates anchor for run $1 and makes the repository and a token: sets URL, AUTH, ANCHOR, DAEMON and
+# INSTANCE.
 start_slates() {
   local instance="g309-scale-$$-$1" log="$WORK/anchor-$1.log" exports token streak=0
+  INSTANCE=$instance
   mkdir -p "$WORK/store-$1"
   "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 --vcs-store "$WORK/store-$1" > /dev/null 2> "$log" &
   ANCHOR=$!
@@ -231,6 +266,7 @@ steps() {
   timed "$server push $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$SOURCE" push -q "$URL" 'refs/heads/*:refs/heads/*' \
     'refs/tags/*:refs/tags/*'
   [ "$server" = slates ] && echo "slates daemon rss after push: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
+  [ "$server" = slates ] && counters_after push "$run"
   timed "$server clone $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$mirror"
   [ "$run" = 1 ] && check "$mirror" "$server"
   # A second clone: what every clone after the first meets, once a server has kept what the first one made (A-718).
@@ -245,12 +281,14 @@ steps() {
   new=$(g -C "$scratch" commit-tree "$tree" -p HEAD -m "one more commit")
   timed "$server incremental-push $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$scratch" push -q "$URL" "$new:refs/heads/$DEFAULT"
   timed "$server incremental-fetch $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$mirror" fetch -q
+  [ "$server" = slates ] && counters_after incremental-fetch "$run"
   if [ "$(g -C "$mirror" rev-parse "refs/heads/$DEFAULT" 2> /dev/null)" = "$new" ]; then
     echo "$server incremental check fetched" | tee -a "$RESULTS"
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
   timed "$server shallow $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --depth 1 "$URL" "$WORK/$server-shallow-$run"
+  [ "$server" = slates ] && counters_after shallow "$run"
   timed "$server partial $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --filter=blob:none "$URL" "$WORK/$server-partial-$run"
   [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   rm -rf "$mirror" "$scratch" "$WORK/$server-shallow-$run" "$WORK/$server-partial-$run"

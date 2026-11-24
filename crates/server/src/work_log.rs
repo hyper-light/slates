@@ -530,6 +530,7 @@ pub(crate) fn replay(
       } => {
         let base = Base {
           green,
+          green_id: None,
           fetched: None,
           version,
           entries: None,
@@ -550,6 +551,7 @@ pub(crate) fn replay(
           (&mut files, &mut journal),
           Base {
             green,
+            green_id: None,
             fetched: None,
             version,
             entries: None,
@@ -578,6 +580,7 @@ mod tests {
   fn no_base() -> Base<'static> {
     Base {
       green: None,
+      green_id: None,
       fetched: None,
       version: 0,
       entries: None,

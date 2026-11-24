@@ -19,9 +19,7 @@
 //! moves to the green's newest head once ([`moved`]): each path the change index names since its version loses what
 //! was put of it and is put again from the head, and everything else put stays. So a storm of pushes adds its changed
 //! paths to the build, never its whole head again, and the build ends. Only a change holding a copy, which the index
-//! names at its destination alone, starts the build again from nothing ([`RESTARTED`]). A commit a submit owed of the
-//! version the build began at is then not made over the newer map (`super::super::commits::make_owed` checks its
-//! version) and is settled by the push's own move, counted unmade.
+//! names at its destination alone, starts the build again from nothing ([`RESTARTED`]).
 //!
 //! **A push's change, too** (A-752 part 3; main's order of 2026-11-20: a push changing every file of a 1,500-file head
 //! stepped its map in its answer's step, 52 ms debug). Where the green keeps the map of the version before, a push's
@@ -116,8 +114,8 @@ struct Build {
   parked: Vec<ParkedSubmit>,
   /// The task driving it.
   task: Option<slates_rt::TaskId>,
-  /// Whether the green's map of `version` is kept already (a recovery made it again, and a commit is owed of it): the
-  /// build then puts nothing and keeps nothing, and its end makes the owed commit alone.
+  /// Whether the green's map of `version` is kept already (a recovery made it again): the build then puts nothing and
+  /// keeps nothing, and its end runs the submits parked behind it alone.
   kept: bool,
   /// Whether it makes a map again after a store was made again from the log (`super::super::rebuild`): counted
   /// `paths::REMADE` at its end, as a recovery's remake is, not `paths::BUILT`.
@@ -238,37 +236,6 @@ fn kept_at(state: &ShardState, repository: RepositoryId, green: DbVolumeId) -> O
   let key = super::super::green_key(green);
   let (_, git) = state.vcs_stores.git_ref(repository)?;
   git.heads.get(&key).map(|head| head.version)
-}
-
-/// Starts a build for each commit `repository`'s store owes once it is made again from the log (`super::super::owed`):
-/// the green's map is kept already, made again by the recovery, so the build's end makes the commit alone, from what
-/// was staged. A commit owed of a version that is not its green's head is left owed, counted unmade.
-pub(crate) fn resume_owed(state: &mut ShardState, repository: RepositoryId) {
-  let owed: Vec<(u64, u64)> = state
-    .vcs_stores
-    .git_ref(repository)
-    .map(|(_, git)| {
-      git
-        .owed
-        .values()
-        .map(|owed| (owed.key, owed.version))
-        .collect()
-    })
-    .unwrap_or_default();
-  for (key, version) in owed {
-    let green = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(repository)
-      .map(|member| member.green)
-      .find(|green| super::super::green_key(*green) == key);
-    let head = green.and_then(|green| state.greens.get(&green).map(|engine| engine.head()));
-    match (green, head) {
-      (Some(green), Some(head)) if head == version => start(state, repository, green, version),
-      _ => state.count(super::super::commits::UNMADE, 1),
-    }
-  }
 }
 
 /// The head's paths that git holds a file at, in the map's order (`super::whole_head`'s names).
@@ -625,9 +592,6 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
       if remade { super::REMADE } else { BUILT },
     );
   }
-  // The commit a submit owes of this version, made from what it staged, before the submits parked behind it run, so
-  // each names it as its parent (A-664's live whole builds, part 2).
-  super::super::commits::make_owed(state, green);
   crate::verbs::resume_all(state, parked);
 }
 
@@ -718,8 +682,6 @@ pub(crate) fn settle(state: &mut ShardState) {
   for green in greens {
     while slice(state, green, 0) {}
   }
-  // A build's end makes the commit owed (`commits::make_owed`), a job of the shard's queue: made here too.
-  crate::vcs_store::commits::made_after_now(state);
 }
 
 /// One slice of each build of the shard, given no budget (one file): what a test interleaving pushes with a build runs

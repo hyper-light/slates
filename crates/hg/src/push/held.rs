@@ -81,6 +81,12 @@ impl Held for IndexHeld<'_> {
     self.revision_text(Log::File(path), node).map(Cow::Owned)
   }
 
+  /// The content store keeps each file revision's bytes as an object of their own, its metadata block apart (the
+  /// intake's `bytes_from`; A-767 C1).
+  fn stores_bytes(&self) -> bool {
+    true
+  }
+
   /// The row's own names (A-767 C1): its block's and its bytes' identities as the intake kept them, no text read.
   fn file_names(&self, path: &[u8], node: &Node) -> Option<FileNames> {
     let log = Log::File(path);
@@ -144,6 +150,19 @@ impl TextAsk {
     }
   }
 
+  /// The path and node asked.
+  pub fn asked(&self) -> (&[u8], Node) {
+    (&self.path, self.node)
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the ask with `text` at once, none where it keeps
+  /// none.
+  #[cfg(test)]
+  pub(crate) fn answered(&mut self, text: Option<Vec<u8>>) {
+    self.want = None;
+    self.text = text;
+  }
+
   /// The text the store gave, with its path and node; none where the store kept no such revision or gave no text.
   pub fn taken(self) -> Option<(Vec<u8>, Node, Vec<u8>)> {
     let text = self.text?;
@@ -175,6 +194,92 @@ impl crate::render::StoreWants for TextAsk {
   fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
     self.want = None;
     self.text = texts.into_iter().next();
+  }
+}
+
+/// The texts of revisions of one log asked of the node's changeset store at once, by node (goal 93, C1 (1); main's ruling
+/// of 2026-11-24 03:17: a replay reads the changesets' texts let go once landed, as many as a unit's room holds in one
+/// want): their rows under the log's path, then their texts within `most` bytes. Taken, each node with its text, in
+/// the order asked; none where the store kept a row of none of them or gave fewer texts.
+pub struct TextsAsk {
+  /// The log's path in the store.
+  path: Vec<u8>,
+  /// The revisions asked, by node.
+  nodes: Vec<Node>,
+  /// What is asked next.
+  want: Option<crate::render::Want>,
+  /// The most bytes the texts may hold together.
+  most: u64,
+  /// The texts, once given.
+  texts: Option<Vec<Vec<u8>>>,
+}
+
+impl TextsAsk {
+  /// The ask of the texts of `nodes` kept under `path`, within `most` bytes: their rows first.
+  pub fn new(path: Vec<u8>, nodes: Vec<Node>, most: u64) -> Self {
+    TextsAsk {
+      want: Some(crate::render::Want::Rows {
+        logs: vec![(path.clone(), nodes.clone())],
+      }),
+      path,
+      nodes,
+      most,
+      texts: None,
+    }
+  }
+
+  /// The log's path asked under.
+  pub fn path(&self) -> &[u8] {
+    &self.path
+  }
+
+  /// The nodes asked.
+  pub fn nodes(&self) -> &[Node] {
+    &self.nodes
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the ask at once with `texts`, in the order asked.
+  #[cfg(test)]
+  pub(crate) fn answered(&mut self, texts: Option<Vec<Vec<u8>>>) {
+    self.want = None;
+    self.texts = texts;
+  }
+
+  /// Each node asked with its text, in the order asked; none where the store gave fewer.
+  pub fn taken(self) -> Option<Vec<(Node, Vec<u8>)>> {
+    let texts = self.texts?;
+    (texts.len() == self.nodes.len()).then(|| self.nodes.into_iter().zip(texts).collect())
+  }
+}
+
+impl crate::render::StoreWants for TextsAsk {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.want.as_ref()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    let identities: Option<Vec<[u8; 32]>> = rows
+      .into_iter()
+      .next()
+      .filter(|log| log.len() == self.nodes.len())
+      .and_then(|log| log.into_iter().map(|row| row.map(|row| row.text)).collect());
+    self.want = identities.map(|texts| crate::render::Want::Texts {
+      texts,
+      most: self.most,
+    });
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    self.want = None;
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.want = None;
+    self.texts = Some(texts);
+  }
+
+  fn texts_past(&mut self) {
+    self.want = None;
   }
 }
 
@@ -233,6 +338,34 @@ pub fn log_text_held(
       })
     }
     Log::File(_) => None,
+  }
+}
+
+/// The revision whose text a read of the changelog's or the manifest log's revision `rev` needs from the node's
+/// changeset store (goal 93, C1 (1): those logs' texts let go once landed): the first of its chain, from `rev` down, whose
+/// object `store` does not hold whole, by node with its text's length; none where every object it reads is held. With
+/// that one's text given, [`HgIndex::revision_text_over`] rebuilds `rev`'s from it.
+pub fn text_wanted(
+  (index, store): (&HgIndex, &ContentStore),
+  log: Log<'_>,
+  rev: u32,
+) -> Option<(Node, u64)> {
+  if log == Log::Changelog {
+    let row = index.changeset(store, rev)?;
+    return (!store.holds_whole(&row.text)).then_some((row.node, row.len));
+  }
+  let mut at = rev;
+  let mut row = index.revision(store, log, at)?;
+  loop {
+    if !store.holds_whole(&row.bytes) {
+      return Some((row.node, row.len));
+    }
+    // Each base is before its revision, so the walk takes at most `rev` steps.
+    if row.base == crate::index::NONE || row.base >= at {
+      return None;
+    }
+    at = row.base;
+    row = index.revision(store, log, at)?;
   }
 }
 

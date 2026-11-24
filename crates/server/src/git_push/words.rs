@@ -37,7 +37,21 @@ pub(crate) fn failed(failed: &PushFailed, name: &str) -> String {
       past.asked, past.left
     ),
     PushFailed::Unchecked => format!("{name}: the push was answered before it was read whole"),
-    PushFailed::Unlanded => format!("{name}: the node's store refused the push's changeset"),
+    PushFailed::Unlanded(why) => format!("{name}: {}: retry", unlanded_words(*why)),
+  }
+}
+
+/// Where a push's homing and landing fell short ([`crate::git_push::Unlanded`]), in words a client's user can act on.
+fn unlanded_words(why: crate::git_push::Unlanded) -> &'static str {
+  use crate::git_push::Unlanded;
+  match why {
+    Unlanded::NamesNotPut => "the push's object names could not be put in the repository's store",
+    Unlanded::HomingUntaken => "the push's objects were not carried to their homes in the region",
+    Unlanded::PackNotHeld => "the push's pack was not held for its record",
+    Unlanded::HomedShort => "the push's objects were not kept by enough homes in the region yet",
+    Unlanded::NoLanding => "this node holds no changeset store for the repository",
+    Unlanded::LandingUntaken => "the push's changeset was not carried to the node's store",
+    Unlanded::StoreRefused => "the node's store refused the push's changeset",
   }
 }
 

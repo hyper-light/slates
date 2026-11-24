@@ -134,7 +134,35 @@ struct ShardBridge {
   /// Whether the device offers its guest a DAX window: its files are then offered per-inode DAX
   /// (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX`) while the shard's fill budget has room (A-163, A-168).
   dax: bool,
+  /// The reads the last pass noted not at hand: its kept chain's (the device keeps the first chain that noted any and
+  /// serves nothing after it in that pass), what [`BridgeAccess::bring_back`] brings back.
+  away: Vec<crate::vcs_store::named_objects::AwayRead>,
+  /// What the last bring-back brought, pinned until the pass that serves the kept chain again has ended.
+  brought: Vec<crate::vcs_store::named_objects::ReadPin>,
 }
+
+/// The probe a pass hands its device ([`slates_bridge_virtiofs::serve::AwayProbe`]): whether the chain just dispatched
+/// noted a read of a let-go window in the pass's scope (`named_objects::away_scope`).
+struct PassProbe {
+  /// The notes the pass's scope held at the last ask.
+  seen: usize,
+}
+
+impl slates_bridge_virtiofs::serve::AwayProbe for PassProbe {
+  fn take_noted_away(&mut self) -> bool {
+    let noted = crate::vcs_store::named_objects::noted_in_scope();
+    let met = noted > self.seen;
+    self.seen = noted;
+    met
+  }
+}
+
+/// Counter: a guest's chain kept because its dispatch met a let-go window, its content brought back before it was
+/// served again (A-760 (b) 4d's park for virtio-fs). Format: a counter name in the status report.
+const BROUGHT_BACK: &str = "virtiofs.brought_back";
+/// Counter: a bring-back the node's store or the content store refused: the kept chain's second dispatch meets the
+/// window again and is answered. Format: a counter name in the status report.
+const BRING_BACK_REFUSED: &str = "virtiofs.bring_back_refused";
 
 /// Closes device `attachment`'s snapshot view, if it has one, and removes its record, if it has one (its loop's
 /// end, or a refusal); a refused removal is counted.
@@ -152,10 +180,16 @@ fn close_device(attachment: u64) {
 /// Format: the refusal-ledger name of a guest record whose removal at the device's end was refused.
 const RECORD_END_REFUSED: &str = "virtiofs.record_end_refused";
 
-impl BridgeAccess for ShardBridge {
-  fn with_bridge<R>(
+impl ShardBridge {
+  /// [`BridgeAccess::with_bridge`]'s pass, inside its away scope: the bridge over the volume (its head, one directory
+  /// of it, or its snapshot view), the owner's attachments and the pass's probe handed to `f`.
+  fn with_bridge_scoped<R>(
     &mut self,
-    f: impl FnOnce(&mut dyn Bridge, &mut slates_bridge_core::Attachments) -> R,
+    f: impl FnOnce(
+      &mut dyn Bridge,
+      &mut slates_bridge_core::Attachments,
+      &mut dyn slates_bridge_virtiofs::serve::AwayProbe,
+    ) -> R,
   ) -> Result<R, VfsError> {
     let volume = self.volume;
     let (scope, attachment, presents_snapshot, dax) = (
@@ -176,60 +210,123 @@ impl BridgeAccess for ShardBridge {
       } else {
         slates_bridge_core::DaxOffer::Withheld
       };
-      let ShardState {
-        store,
-        volumes,
-        attachments,
-        snapshot_views,
-        write_log,
-        content,
-        ..
-      } = s;
-      // Each write the guest is told succeeded is kept in the shard's write log before its used element is published,
-      // as a FUSE mount's and a Shards stream's are (A-63, A-410): a log with no room for it, or a span the content
-      // object refused, leaves it to the publication the device then runs before the reply (A-358's rule). Without a
-      // log (no anchor's content object) nothing outlives the daemon, and nothing is owed.
-      let mut log_write =
-        |inode: u64, offset: u64, bytes: &[u8]| match (write_log.as_mut(), content.as_mut()) {
-          (Some(log), Some(object)) => log
-            .append(object, (volume.bytes, inode), offset, bytes)
-            .is_ok(),
-          _ => true,
-        };
-      // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
-      let bridge = if presents_snapshot {
-        let view = snapshot_views.get_mut(&attachment)?;
-        VolumeBridge::attached(volume, &mut view.volume, store, handles, None)
-      } else {
-        let slot = volumes.get_mut(handle).ok()?;
-        VolumeBridge::attached(
-          volume,
-          &mut slot.volume,
+      // A mounted work's base held by name is read with its texts lent for the pass (A-760 (b) 4d), as a FUSE mount's
+      // turn reads it.
+      let lend = crate::mounted_work::reads_named(s, volume);
+      crate::vcs_store::svn_presenter::lent_if(s, lend, |s| {
+        // A mounted work whose base moved shows its new base (A-774 R4).
+        crate::mounted_work::refresh(s, volume);
+        let ShardState {
           store,
-          handles,
-          slot
-            .host
-            .as_mut()
-            .map(|host| host as &mut dyn slates_vfs::host::HostFs),
-        )
-      };
-      // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
-      let mut bridge = bridge
-        .offering_dax(offer)
-        .serving_a_guest()
-        .logging_writes(&mut log_write);
-      let mut scoped;
-      let served: &mut dyn Bridge = match scope {
-        Some(scope) => {
-          scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
-          &mut scoped
-        }
-        None => &mut bridge,
-      };
-      Some(f(served, attachments))
+          volumes,
+          attachments,
+          snapshot_views,
+          write_log,
+          content,
+          greens,
+          merge,
+          vcs_stores,
+          ..
+        } = s;
+        // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774): the lend NFS's, FUSE's
+        // and WinFsp's turns make (`mounted_work::source`, `mounted_work::lend`).
+        let lent_green = crate::mounted_work::source(greens, &merge.mounted, volume);
+        let green_tree = lent_green.as_ref().map(|(green, version)| {
+          crate::green_tree::GreenTree::reading(
+            green,
+            *version,
+            crate::vcs_store::named_objects::plane(vcs_stores, &()),
+          )
+        });
+        let mut tree_lens = None;
+        // Each write the guest is told succeeded is kept in the shard's write log before its used element is published,
+        // as a FUSE mount's and a Shards stream's are (A-63, A-410): a log with no room for it, or a span the content
+        // object refused, leaves it to the publication the device then runs before the reply (A-358's rule). Without a
+        // log (no anchor's content object) nothing outlives the daemon, and nothing is owed.
+        let mut log_write =
+          |inode: u64, offset: u64, bytes: &[u8]| match (write_log.as_mut(), content.as_mut()) {
+            (Some(log), Some(object)) => log
+              .append(object, (volume.bytes, inode), offset, bytes)
+              .is_ok(),
+            _ => true,
+          };
+        // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
+        let bridge = if presents_snapshot {
+          let view = snapshot_views.get_mut(&attachment)?;
+          VolumeBridge::attached(volume, &mut view.volume, store, handles, None)
+        } else {
+          let slot = volumes.get_mut(handle).ok()?;
+          VolumeBridge::attached(
+            volume,
+            &mut slot.volume,
+            store,
+            handles,
+            slot
+              .host
+              .as_mut()
+              .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens)),
+          )
+        };
+        // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
+        let mut bridge = bridge
+          .offering_dax(offer)
+          .serving_a_guest()
+          .logging_writes(&mut log_write);
+        let mut scoped;
+        let served: &mut dyn Bridge = match scope {
+          Some(scope) => {
+            scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+            &mut scoped
+          }
+          None => &mut bridge,
+        };
+        Some(f(served, attachments, &mut PassProbe { seen: 0 }))
+      })
     })
     .flatten()
     .ok_or(VfsError::NotFound)
+  }
+}
+
+impl BridgeAccess for ShardBridge {
+  fn with_bridge<R>(
+    &mut self,
+    f: impl FnOnce(
+      &mut dyn Bridge,
+      &mut slates_bridge_core::Attachments,
+      &mut dyn slates_bridge_virtiofs::serve::AwayProbe,
+    ) -> R,
+  ) -> Result<R, VfsError> {
+    // What a bring-back brought stays pinned through this pass, which serves the kept chain again, and goes after it.
+    let brought = std::mem::take(&mut self.brought);
+    let (served, away) = crate::vcs_store::named_objects::away_scope(|| self.with_bridge_scoped(f));
+    self.away = away;
+    drop(brought);
+    served
+  }
+
+  type Brought = Vec<crate::vcs_store::named_objects::ReadPin>;
+
+  type BringBack = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Vec<crate::vcs_store::named_objects::ReadPin>> + Send>,
+  >;
+
+  fn bring_back(&mut self) -> Self::BringBack {
+    let reads = std::mem::take(&mut self.away);
+    Box::pin(async move {
+      let _ = state::with_state(|s| s.count(BROUGHT_BACK, 1));
+      match crate::vcs_store::named_objects::bring_back_reads(&reads).await {
+        Ok(pins) => pins,
+        Err(_) => {
+          let _ = state::with_state(|s| s.count(BRING_BACK_REFUSED, 1));
+          Vec::new()
+        }
+      }
+    })
+  }
+
+  fn hold_brought(&mut self, brought: Self::Brought) {
+    self.brought = brought;
   }
 
   /// The §4.8 barrier the daemon's other transports run before a mutation's reply (NFS's stable
@@ -504,7 +601,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
       let outcome = refused;
       // The terminal step still runs to its end: nothing admitted outlives a refused loop (AUD-29-70) — through
       // the bridge, or the registry alone when the volume is gone; a sweep that could not run is counted.
-      let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
+      let reclaimed = match bridge.with_bridge(|b, registry, _| admitted.reclaim(b, registry)) {
         Ok(reclaimed) => reclaimed,
         Err(_) => bridge
           .with_registry(|registry| admitted.abandon(registry))
@@ -706,6 +803,8 @@ fn attach_handed(
   let db_volume = DbVolumeId {
     bytes: volume.bytes,
   };
+  // A work is served like any volume (A-774): its slot is made here, on its owner, at its first attach.
+  crate::mounted_work::ensure_slot(s, db_volume);
   if !s.by_id.contains_key(&db_volume) {
     return Err(Refusal::NotFound);
   }
@@ -984,6 +1083,8 @@ fn open_view(
   volume: DbVolumeId,
   view: &GuestView,
 ) -> Result<ShardBridge, Refusal> {
+  // A work is served like any volume (A-774): its slot is made here, on its owner, at its device's attach.
+  crate::mounted_work::ensure_slot(s, volume);
   let scope = match (&view.subtree, view.snapshot) {
     (Some(_), Some(_)) => {
       return Err(Refusal::AttachmentUnsupported {
@@ -1014,6 +1115,8 @@ fn open_view(
     attachment,
     presents_snapshot: view.snapshot.is_some(),
     dax: false,
+    away: Vec::new(),
+    brought: Vec::new(),
   })
 }
 

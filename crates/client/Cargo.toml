@@ -62,5 +62,11 @@ windows-sys = { workspace = true }
 name = "load_bench"
 test = true
 
+# The edit-and-merge bench's goal verdict (goal 84a: p99 and p999 under the required bound) is unit-tested in the
+# example itself.
+[[example]]
+name = "edit_merge_bench"
+test = true
+
 [lints]
 workspace = true

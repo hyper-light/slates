@@ -321,6 +321,27 @@ impl<H: Held + ?Sized> PushObjects for Trees<'_, H> {
   fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable> {
     self.bytes(id)
   }
+
+  /// The file revision `id`'s bytes named by their identity (A-887): the repository's content store holds a revision's
+  /// bytes as an object of their own, its metadata block apart (`verify::FileNames`, A-767 C1), so a file written whole
+  /// from them is named for that object, with or without a copy's metadata. A revision the push brought is named from
+  /// its text; one the repository holds, by its names, unread.
+  fn blob_named(&self, id: ObjectKey) -> Option<slates_merge::named::Identity> {
+    if !self.held.stores_bytes() {
+      return None;
+    }
+    let node = Node::try_from(id.as_bytes()).ok()?;
+    let path = self.paths.get(&node)?;
+    let names = match self.verified.file(path, &node) {
+      Some(arrived) => crate::push::verify::FileNames::of(&arrived.text)?,
+      None => self.held.file_names(path, &node)?,
+    };
+    let len = self.bytes_len(id).ok()?;
+    Some(slates_merge::named::Identity {
+      hash: names.bytes.0,
+      len,
+    })
+  }
 }
 
 /// Whether the directory `open` holds the directory `dir`: it is `dir`, or the root, or one of `dir`'s ancestors.

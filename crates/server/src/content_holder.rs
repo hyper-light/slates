@@ -1260,10 +1260,10 @@ fn cut_page_frozen(
 fn count_cut_preimages(state: &mut ShardState) {
   let mut counts = crate::vcs_store::homes::take_cut_counts();
   if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
-    counts += windows.take_cut_counts();
+    counts = counts.and(windows.take_cut_counts());
   }
   if let Some(content) = state.vcs_stores.content_mut() {
-    counts += content.take_cut_counts();
+    counts = counts.and(content.take_cut_counts());
   }
   state.count(IMAGE_CUT_PREIMAGES_OLD, counts.old);
   state.count(IMAGE_CUT_PREIMAGES_ABSENT, counts.absent);

@@ -608,6 +608,18 @@ pub fn encode_carrying(
   out
 }
 
+/// The bytes [`encode`] writes for `increment`'s entry carrying none of its encoding, with `applied`'s effects, no
+/// completion or signature, and the head's identity where `identity` (what an import's batch records of each version,
+/// `push::recorded_entry`): the entry's exact length, without writing it (A-895: a batch held to its chains' room).
+pub fn encoded_len(increment: &Increment, applied: &[Applied], identity: bool) -> usize {
+  entry_bytes(
+    0,
+    &Declared::of(increment),
+    applied,
+    (None, identity.then_some([0; HASH_BYTES]), None),
+  )
+}
+
 /// The bytes [`encode_carrying`] writes for an entry carrying `carried` bytes of its increment's encoding, with `applied`'s
 /// effects and its trailers, without writing them: the entry's exact length, which its buffer is reserved at.
 fn entry_bytes(

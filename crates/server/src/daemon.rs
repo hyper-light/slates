@@ -8627,8 +8627,22 @@ mod tests {
             bytes: blob.clone(),
           },
         );
-        ask(state, crate::identities::authored(work, "held"));
-        crate::vcs_store::paths::whole_build::settle(state);
+        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
+        // taken in this step.
+        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
+          state,
+          crate::identities::authored(work, "held"),
+        );
+        assert!(
+          matches!(
+            submitted,
+            Some(ReplyBody::Submitted {
+              version: Some(_),
+              ..
+            })
+          ),
+          "{submitted:?}"
+        );
         let packs: Vec<slates_vcs::ContentId> = state
           .vcs_stores
           .git_ref(repository)
@@ -8956,8 +8970,22 @@ mod tests {
             bytes: written,
           },
         );
-        ask(state, crate::identities::authored(work, "large"));
-        crate::vcs_store::paths::whole_build::settle(state);
+        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
+        // taken in this step.
+        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
+          state,
+          crate::identities::authored(work, "large"),
+        );
+        assert!(
+          matches!(
+            submitted,
+            Some(ReplyBody::Submitted {
+              version: Some(_),
+              ..
+            })
+          ),
+          "{submitted:?}"
+        );
         read(state)
       })
       .unwrap();
@@ -9112,8 +9140,22 @@ mod tests {
             bytes: written.clone(),
           },
         );
-        ask(state, crate::identities::authored(work, "large"));
-        crate::vcs_store::paths::whole_build::settle(state);
+        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
+        // taken in this step.
+        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
+          state,
+          crate::identities::authored(work, "large"),
+        );
+        assert!(
+          matches!(
+            submitted,
+            Some(ReplyBody::Submitted {
+              version: Some(_),
+              ..
+            })
+          ),
+          "{submitted:?}"
+        );
         let window = state
           .vcs_stores
           .content()

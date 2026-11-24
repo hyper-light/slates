@@ -107,6 +107,8 @@ pub(crate) struct Importing {
   /// The revisions staged since the last landing, landed as one changeset and one register entry (C2 stage C,
   /// `svn_commit::staging`).
   staging: Option<Staging>,
+  /// Its batches landed, by cause ([`Batches`]).
+  batches: Batches,
   /// The texts the import put into the content store for the revision it reads ([`texts`]).
   texts: texts::ImportTexts,
   /// The texts the owed record's revision brought, each holding one count of the content store: handed to its landing.
@@ -200,6 +202,46 @@ pub(crate) struct Loaded {
   pub(crate) youngest: u64,
   /// The turns it took.
   pub(crate) turns: u64,
+  /// Its batches, by why each landed.
+  pub(crate) batches: Batches,
+}
+
+/// An import's batches, by why each landed (`staging::Flush`): what an operator reads to see why an import took the
+/// batches it did (main's ruling of 2026-11-24 02:46), logged at its end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Batches {
+  /// The next revision's charge would not have been admitted.
+  pub(crate) admission: u64,
+  /// The changeset held its most records.
+  pub(crate) sections: u64,
+  /// The next revision would have taken the batch past its green's retention room (A-892).
+  pub(crate) retention: u64,
+  /// The next revision's chain entry would have taken the batch past its chains' room (A-895).
+  pub(crate) chain: u64,
+  /// The import's end, or a record that moves no version.
+  pub(crate) end: u64,
+}
+
+impl Batches {
+  /// One more batch, landed for `cause`.
+  fn add(&mut self, cause: Flush) {
+    let count = match cause {
+      Flush::Admission => &mut self.admission,
+      Flush::Sections => &mut self.sections,
+      Flush::Retention => &mut self.retention,
+      Flush::Chain => &mut self.chain,
+      Flush::End => &mut self.end,
+    };
+    *count = count.saturating_add(1);
+  }
+}
+
+/// Counts a batch of repository `id`'s import landed for `cause` ([`Batches`]); nothing where no import of it is under
+/// way.
+pub(crate) fn batch_landed(state: &mut ShardState, id: RepositoryId, cause: Flush) {
+  if let Some(importing) = state.vcs_stores.svn_imports.get_mut(&id) {
+    importing.batches.add(cause);
+  }
 }
 
 /// Where a turn left an import.
@@ -255,6 +297,7 @@ pub(crate) fn begin(
     owed: None,
     base_owed: None,
     staging: None,
+    batches: Batches::default(),
     texts: texts::ImportTexts::default(),
     owed_texts: Vec::new(),
     flush_end: false,
@@ -673,43 +716,56 @@ async fn stage_owed(
     Vec<slates_svn::index::ContentIdentity>,
   ),
 ) -> Option<Result<(), Uncommitted>> {
-  let give_back = |texts: &[slates_svn::index::ContentIdentity]| {
-    crate::state::with_state(|state| svn_commit::release_texts(state, None, texts))
+  let mut batch = match batch_for((principal, id), staging, &revision).await? {
+    Ok(batch) => batch,
+    Err(refused) => {
+      crate::state::with_state(|state| svn_commit::release_texts(state, None, &texts))?;
+      return Some(Err(refused));
+    }
   };
+  match batch.stage(revision, texts).await? {
+    Ok(None) => {
+      *staging = Some(batch);
+      Some(Ok(()))
+    }
+    Ok(Some(deferred)) => staged_in_the_next((principal, id), staging, (batch, deferred)).await,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| batch.abandon(state));
+      Some(Err(refused))
+    }
+  }
+}
+
+/// The batch `revision` stages in: `staging`'s, landed first where the revision is due after it
+/// (`Staging::due_before`), or a new one where none is under way. Refused, nothing of the revision's is given back here.
+async fn batch_for(
+  (principal, id): (&Principal, RepositoryId),
+  staging: &mut Option<Staging>,
+  revision: &slates_svn::commit::revision::Revision,
+) -> Option<Result<Staging, Uncommitted>> {
   let due = staging.as_ref().and_then(|batch| {
-    crate::state::with_state(|state| batch.due_before(state, &revision)).flatten()
+    crate::state::with_state(|state| batch.due_before(state, revision)).flatten()
   });
   if let Some(cause) = due
     && let Some(batch) = staging.take()
     && let Err(refused) = batch.land(principal, cause).await?
   {
-    give_back(&texts)?;
     return Some(Err(refused));
   }
-  let mut batch = match staging.take() {
-    Some(batch) => batch,
-    None => match Staging::begin(id).await? {
-      Ok(batch) => batch,
-      Err(refused) => {
-        give_back(&texts)?;
-        return Some(Err(refused));
-      }
-    },
-  };
-  let deferred = match batch.stage(revision, texts).await? {
-    Ok(None) => {
-      *staging = Some(batch);
-      return Some(Ok(()));
-    }
-    Ok(Some(deferred)) => deferred,
-    Err(refused) => {
-      let _ = crate::state::with_state(|state| batch.abandon(state));
-      return Some(Err(refused));
-    }
-  };
-  // The batch has no room in the green's retention for the revision (goal 93, main's red of 2026-11-23): it lands, and
-  // the revision begins the next.
-  if let Err(refused) = batch.land(principal, Flush::Retention).await? {
+  match staging.take() {
+    Some(batch) => Some(Ok(batch)),
+    None => Staging::begin(id).await,
+  }
+}
+
+/// Lands `batch`, which had no room for `deferred` (its green's retention, A-892, or its chains', A-895), and stages
+/// `deferred` in a batch begun after it. Refused, `deferred`'s texts are given back.
+async fn staged_in_the_next(
+  (principal, id): (&Principal, RepositoryId),
+  staging: &mut Option<Staging>,
+  (batch, deferred): (Staging, svn_commit::staging::Deferred),
+) -> Option<Result<(), Uncommitted>> {
+  if let Err(refused) = batch.land(principal, deferred.cause()).await? {
     crate::state::with_state(|state| deferred.give_back(state))?;
     return Some(Err(refused));
   }
@@ -788,10 +844,24 @@ fn done(state: &ShardState, id: RepositoryId, importing: &Importing) -> Result<L
     .subversion_records(id)
     .map(slates_svn::migration::Repository::youngest)
     .ok_or(LoadFailed::NoStore)?;
+  let batches = importing.batches;
+  slates_machine::log_line!(
+    "slates-server: partition {}: a Subversion import ended at revision {youngest}, {} revisions in {} turns; its \
+     batches landed for admission {}, sections {}, retention {}, chain {}, end {}",
+    state.partition,
+    importing.revisions,
+    importing.turns,
+    batches.admission,
+    batches.sections,
+    batches.retention,
+    batches.chain,
+    batches.end
+  );
   Ok(Loaded {
     revisions: importing.revisions,
     youngest,
     turns: importing.turns,
+    batches,
   })
 }
 

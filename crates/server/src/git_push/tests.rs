@@ -1952,7 +1952,7 @@ pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P
 
 /// `carry` carried as [`carry_blocking`] stands in for the edge: content kept for the region on this shard as its home
 /// keeps it, a changeset landed on the node's store from a thread of its own. What a git commit the server makes is
-/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_after_now`).
+/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_landing_now`).
 pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
   match carry {
     super::Carry::Home(bytes, owner) => {
@@ -2045,7 +2045,7 @@ pub(crate) async fn homed_drive(
 
 /// C5 part 2b (main's ruling of 2026-11-21 00:50: a homing that falls short refuses the push, never a record naming its
 /// objects inline). Do: on a store-backed shard, push stock git's `create`, driving its answer as an edge does but
-/// handing its names' homing back fallen short (no region home answered). Expect: the push refused `Unlanded`, and the
+/// handing its names' homing back fallen short (no region home answered). Expect: the push refused `Unlanded(HomedShort)`, and the
 /// repository's register holding no record. Red before part 2b: answered `ok`, its record version 2.
 #[test]
 fn t_a767_c5b_a_push_whose_homing_falls_short_is_refused_and_records_nothing() {
@@ -2068,7 +2068,7 @@ fn t_a767_c5b_a_push_whose_homing_falls_short_is_refused_and_records_nothing() {
     slates_rt::futures::detach(task).expect("detached");
   });
   let (outcome, records) = got.recv().expect("the push ended");
-  assert_eq!(outcome, Err("Unlanded".to_owned()));
+  assert_eq!(outcome, Err("Unlanded(HomedShort)".to_owned()));
   assert_eq!(records, Some(0), "nothing of the push in the register");
 }
 
@@ -3313,7 +3313,7 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
 
 /// A-724 piece 8c and C5 part 2b piece 2 (a decision never waits for a homing nobody runs, found by the takeover test;
 /// and no record names a push's objects inline). Do: push stock git's `create` through a driver that never takes the
-/// homing its decision asks for. Expect: the push refused `Unlanded`, the untaken homing counted, and the repository's
+/// homing its decision asks for. Expect: the push refused `Unlanded(HomingUntaken)`, the untaken homing counted, and the repository's
 /// register holding no record. Red before piece 2: answered `ok`, its record version 2.
 #[test]
 fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
@@ -3339,7 +3339,7 @@ fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
         Err(failed) => break Some(format!("{failed:?}")),
       }
     };
-    assert_eq!(refused.as_deref(), Some("Unlanded"));
+    assert_eq!(refused.as_deref(), Some("Unlanded(HomingUntaken)"));
     assert_eq!(
       state
         .refusals
@@ -3730,7 +3730,7 @@ async fn settled(settles: u64) -> bool {
 
 /// A-727 (d1a) (main 01a20182's rulings of 2026-11-23: a region hold names its owner, and a refused attempt releases its
 /// own). Do: on a store-backed shard, push stock git's `create`, its names homed in the region and its pack's homing
-/// handed back fallen short. Expect: the push refused `Unlanded`, its attempt's release settled, and nothing held for the
+/// handed back fallen short. Expect: the push refused `Unlanded(HomedShort)`, its attempt's release settled, and nothing held for the
 /// region. Failing first: the names' region hold stayed, no record naming them, for the life of the home.
 #[test]
 fn t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region() {
@@ -3761,7 +3761,7 @@ fn t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_re
     slates_rt::futures::detach(task).expect("detached");
   });
   let (outcome, settled, held, unanswered) = got.recv().expect("the push ended");
-  assert_eq!(outcome, Err("Unlanded".to_owned()));
+  assert_eq!(outcome, Err("Unlanded(HomedShort)".to_owned()));
   assert!(settled, "the attempt's release settled");
   assert_eq!(unanswered, Some(0), "every home answered it");
   assert!(held.is_empty(), "nothing held for the region: {held:?}");
@@ -3770,7 +3770,7 @@ fn t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_re
 /// A-727 (d1a), two repositories on one identity (main's ruling: a refused attempt's release leaves another repository's
 /// hold of the same object untouched). Do: on a store-backed shard, push stock git's `create` to repository `a` whole,
 /// its holds settled to its records; then the same push to repository `b`, its names homed (the same object as `a`'s)
-/// and its pack's homing fallen short. Expect: `a`'s push answered, `b`'s refused `Unlanded`; afterwards every object
+/// and its pack's homing fallen short. Expect: `a`'s push answered, `b`'s refused `Unlanded(HomedShort)`; afterwards every object
 /// held for the region held for `a`'s records alone, as many as after `a`'s push: `b`'s release took nothing of `a`'s.
 #[test]
 fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object() {
@@ -3812,7 +3812,7 @@ fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object(
     "a's push answered, its holds moved to its records"
   );
   assert!(before > 0, "a's push held something for the region");
-  assert_eq!(refused, Err("Unlanded".to_owned()));
+  assert_eq!(refused, Err("Unlanded(HomedShort)".to_owned()));
   assert!(released, "b's release settled");
   assert_eq!(after, before, "nothing of a's let go");
   let records = slates_cluster::homes::HomeOwner::Record {

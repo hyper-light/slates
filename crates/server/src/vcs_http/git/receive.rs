@@ -36,7 +36,11 @@
 //! refused past its room in its answer, 6 of 6 cut at 57 to 63 s (w-interop, 2026-11-21). A command's own refusal is no
 //! failure: the report answers it, as `http-backend`'s does. A request that asks nothing (a flush alone, the probe stock
 //! git's client posts before a large push to learn whether it may, `remote-curl.c`'s `probe_rpc`) is answered with no
-//! report, as git's receive-pack writes none for it.
+//! report, as git's receive-pack writes none for it. Any other push whose reply would end having given nothing (a
+//! refusal before its first command was read, so neither side-band nor a command to report is known) is failed
+//! instead, counted [`PUSH_ENDED_EMPTY`] and logged with the bytes it read, and every refusal after the body is logged
+//! with its cause: an empty `200` is what stock git reads as "unexpected disconnect while reading sideband packet" with
+//! no word of why, and the edge counted it completed (main 01a20182's gate 4, run 45363070862, 2026-11-24).
 
 use slates_git::http::{Service, Version};
 use slates_git::pktline::{self, MAX_LEN, Packet};
@@ -61,6 +65,11 @@ const VERSION_1: &[u8] = b"version 1\n";
 /// Counter: pushes refused once their body was read whole, whose reply ended in git's words (the module doc,
 /// "Refusals").
 pub(crate) const PUSH_REFUSED_AFTER_BODY: &str = "vcs_http.git.push_refused_after_body";
+
+/// Counter: pushes whose reply would have ended with nothing given though they were no probe (a request of no command):
+/// failed instead, so the client sees its connection cut, and logged with what the push took (main 01a20182's gate 4,
+/// 2026-11-24). Zero in every correct use.
+pub(crate) const PUSH_ENDED_EMPTY: &str = "vcs_http.git.push_ended_empty";
 
 /// Where receive-pack is lent its repository's owner shard's state, afresh for each step of a push (the module doc); the
 /// SSH site's receive-pack is lent it the same way (`crate::vcs_ssh`'s `receive`, A-683).
@@ -353,7 +362,11 @@ impl<L: ShardLender> Exchange for Receive<L> {
     let run = rest.get(..MAX_LEN).unwrap_or(rest);
     out.extend_from_slice(run);
     self.sent = self.sent.saturating_add(run.len());
-    Ok(self.answering || self.sent < self.given.len())
+    let more = self.answering || self.sent < self.given.len();
+    if !more && self.ended_empty() {
+      return Err(Failed(Status::INTERNAL_SERVER_ERROR));
+    }
+    Ok(more)
   }
 }
 
@@ -367,6 +380,23 @@ enum Cut {
 }
 
 impl<L: ShardLender> Receive<L> {
+  /// Whether the reply, ending now, gave nothing in all though it answered a push that was no probe: a `200` with an
+  /// empty body, which stock git reads as "unexpected disconnect while reading sideband packet" with no word of why, and
+  /// the edge as completed (main 01a20182's gate 4, 2026-11-24). The reply is failed instead, so the client sees its
+  /// connection cut and the edge logs it; counted [`PUSH_ENDED_EMPTY`] and logged here with what the push took.
+  fn ended_empty(&mut self) -> bool {
+    if !self.given.is_empty() || self.advertise || self.push.asked_nothing() {
+      return false;
+    }
+    let read = self.push.read_bytes();
+    let _ = self.lender.lend(|state| state.count(PUSH_ENDED_EMPTY, 1));
+    slates_machine::log_line!(
+      "slates-server: a push to {} would have ended its reply with nothing given ({read} bytes read): failed",
+      self.name
+    );
+    true
+  }
+
   /// Ends the reply to a push refused once its body was read whole, `cut`, in git's words (the module doc, "Refusals"):
   /// on band 3 after what was given already, when the client asked its answer multiplexed, and otherwise as the report
   /// `unpack <words>` with each command `ng`, when it asked a report; nothing more is answered.
@@ -377,6 +407,18 @@ impl<L: ShardLender> Receive<L> {
     let _ = self
       .lender
       .lend(|state| state.count(PUSH_REFUSED_AFTER_BODY, 1));
+    // Logged with what the push took, since the client reads only the words below, if any (gate 4: a push refused before
+    // its first command was read had none to give, and nothing named it).
+    let cause = match &cut {
+      Cut::Failed(failure) => format!("{failure:?}"),
+      Cut::Unserved => "its shard not lent or its records not held".to_owned(),
+    };
+    slates_machine::log_line!(
+      "slates-server: a push to {} was refused after its body ({} bytes read, side-band {}): {cause}",
+      self.name,
+      self.push.read_bytes(),
+      self.push.side_band()
+    );
     let words = match cut {
       Cut::Failed(failure) => words::failed(&failure, &self.name),
       Cut::Unserved => NOT_SERVED.to_owned(),
@@ -491,7 +533,7 @@ fn refused(failure: PushFailed) -> ServiceRefused {
     PushFailed::Policy(_) => ServiceRefused::Unreadable,
     PushFailed::Exchange(_) | PushFailed::Unchecked => ServiceRefused::Unwritable,
     // Past a share or the snapshot's room (A-724 piece 3b): retryable, so the site's unavailable.
-    PushFailed::Unlanded | PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => {
+    PushFailed::Unlanded(_) | PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => {
       ServiceRefused::Unavailable
     }
   }
@@ -505,7 +547,7 @@ fn failed(failure: PushFailed) -> Failed {
     PushFailed::NoStore => Status::SERVICE_UNAVAILABLE,
     PushFailed::Policy(_) => Status::INTERNAL_SERVER_ERROR,
     PushFailed::Unchecked => Status::BAD_REQUEST,
-    PushFailed::Unlanded => Status::SERVICE_UNAVAILABLE,
+    PushFailed::Unlanded(_) => Status::SERVICE_UNAVAILABLE,
     // Past a share or the snapshot's room (A-724 piece 3b): retryable once other pushes end or the slot grows, never
     // `413`, which says the push is too large for the server whatever else happens.
     PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => Status::SERVICE_UNAVAILABLE,
