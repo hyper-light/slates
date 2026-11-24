@@ -349,9 +349,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 62: a file write streams its input (A-880): the wire's appended `RequestBody::StageOpen` opens a staging buffer of no
 /// stated length that lives with the caller's write attachment, reserved put by put; the re-exported [`Client`] gains
 /// `fs_write_from`, which writes everything a reader yields as one verb holding two pages of it at most (2026-11-23).
+/// 63: a submit to a Subversion repository's green outside a recorded request is refused (goal 93, the store the truth
+/// with no second path): [`Invalid::RecordedSubmitRequired`] (appended), naming the tool, the wire's appended
+/// `Refusal::RecordedSubmitRequired`; until then such a submit committed its version and a task landed its revision
+/// after it (2026-11-23).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 62;
+pub const CONTRACT: u32 = 63;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

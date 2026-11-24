@@ -5699,6 +5699,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::StaleMergeView => "stale_merge_view",
     Refusal::StoreRefused { .. } => "store_refused",
     Refusal::NotOwnerHere { .. } => "not_owner_here",
+    Refusal::RecordedSubmitRequired { .. } => "recorded_submit_required",
   }
 }
 
@@ -10917,18 +10918,22 @@ fn submit(
       // A Subversion repository's green: the repository's landing turn before the verdict, or the submit waits for it,
       // parked (`crate::made_commit`, main's landing order).
       let recorded = state.current_request.is_some();
-      if let crate::made_commit::Taken::Busy(repository) =
-        crate::made_commit::take_turn(state, green_id, Some(work_id), recorded)
-      {
-        let kind = ParkedKind::Local {
-          principal: principal.clone(),
-          work,
-          evidence,
-          signature,
-          authorship,
-          approval,
-        };
-        return park_on_turn(state, repository, kind);
+      match crate::made_commit::take_turn(state, green_id, Some(work_id), recorded) {
+        crate::made_commit::Taken::Busy(repository) => {
+          let kind = ParkedKind::Local {
+            principal: principal.clone(),
+            work,
+            evidence,
+            signature,
+            authorship,
+            approval,
+          };
+          return park_on_turn(state, repository, kind);
+        }
+        crate::made_commit::Taken::Unrecorded(tool) => {
+          return refused(Refusal::RecordedSubmitRequired { tool });
+        }
+        crate::made_commit::Taken::Held | crate::made_commit::Taken::Unhooked => {}
       }
       let Some(sealed) = take_sealed(state, work_id) else {
         crate::made_commit::release(state);
@@ -11446,9 +11451,11 @@ fn retention_secured(
   secured_now.map_err(|available| Refusal::BudgetExceeded { available })
 }
 
-/// An accepted (or identical) verdict answered: a Subversion green's held verdict deferred to the task holding the
-/// repository's landing turn (`crate::made_commit`), else committed here; the version made into the revision or
-/// changeset its repository's server makes of it; and published once its merge record is committed at the quorum.
+/// An accepted (or identical) verdict answered: a held verdict (a Subversion, Mercurial or git repository's green)
+/// deferred to the task holding the repository's landing turn (`crate::made_commit`), else committed here; a Mercurial
+/// version made into the changeset its repository's server makes of it; and published once its merge record is
+/// committed at the quorum. A Subversion green's version is made only through the held verdict: a submit outside a
+/// recorded request is refused before its verdict (`made_commit::Taken::Unrecorded`).
 fn accepted_answer(
   state: &mut ShardState,
   (green_id, version): (DbVolumeId, u64),
@@ -11467,22 +11474,22 @@ fn accepted_answer(
   if let Some(judged) = held_verdict {
     match crate::made_commit::take_held(state, green_id) {
       Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
-      // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
+      // No turn to hold it with (not reached: `holds` said one was held): refused as a submit outside a recorded
+      // request is, nothing of the verdict applied, never committed in this step with its commit made after it
+      // (main's ruling of 2026-11-23 20:40: no second path).
       None => {
-        let committed =
-          crate::vcs_store::name_holds::commit_judged_lent(state, green_id, judged).is_some();
-        if !committed {
-          return refused(Refusal::Overloaded { shard: state.shard });
-        }
+        drop(judged);
+        crate::merge_service::release_refused_increment(state, green_id, parts.held_increment);
+        let _ = crate::merge_service::settle_green_retention(state, green_id);
+        let tool = crate::made_commit::tool_of(state, green_id)
+          .unwrap_or(slates_ipc::protocol::VcsTool::Subversion);
+        return refused(Refusal::RecordedSubmitRequired { tool });
       }
     }
   }
   if let Err(refusal) = commit_accepted(state, parts) {
     return refused(refusal);
   }
-  // A Subversion repository's green, run outside a recorded request (a bare dispatch, which no answer waits on): the
-  // version becomes the revision the server makes of it, landed by a task after this step (`vcs_store::svn_made`).
-  crate::vcs_store::svn_made::make(state, green_id, version, authorship, &copies);
   // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
   // transaction (A-731, `vcs_store::hg_made`).
   crate::vcs_store::hg_made::make(state, green_id, version, authorship, &copies);
@@ -12955,10 +12962,14 @@ fn submit_computed(
   // `Overloaded`, unrecorded, for the forwarding node to retry; its answer waits for the made commit's step, which its
   // completion records.
   let recorded = state.current_request.is_some();
-  if let crate::made_commit::Taken::Busy(_) =
-    crate::made_commit::take_turn(state, sealed.green, None, recorded)
-  {
-    return refused(Refusal::Overloaded { shard: state.shard });
+  match crate::made_commit::take_turn(state, sealed.green, None, recorded) {
+    crate::made_commit::Taken::Busy(_) => {
+      return refused(Refusal::Overloaded { shard: state.shard });
+    }
+    crate::made_commit::Taken::Unrecorded(tool) => {
+      return refused(Refusal::RecordedSubmitRequired { tool });
+    }
+    crate::made_commit::Taken::Held | crate::made_commit::Taken::Unhooked => {}
   }
   let reply = judge_submission(state, &sealed, evidence, policy);
   crate::made_commit::release(state);
