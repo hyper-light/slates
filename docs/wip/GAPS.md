@@ -4258,10 +4258,13 @@
 > preview of the held verdict (`Lineage::preview`, a branch at the head, retired in the submit's step) and the verdict is
 > applied at the commit as its chain entry records it; held by `a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head`
 > and `a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once` (red before: a read in the
-> submit's step saw head 1 and the new bytes). Owed: (b) a submit dispatched outside a recorded request (no answer
-> waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
-> takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
-> after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
+> submit's step saw head 1 and the new bytes). (b) BUILT (A-888, 2026-11-23): a submit dispatched outside a recorded
+> request (no answer waits on it) is refused `RecordedSubmitRequired` before its verdict, and the old path (the version
+> committed in its step, its revision landed after it) is gone; held by
+> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. (c) a Mercurial
+> repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
+> changeset committed in one step after it, then the answer;
+> `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
 > `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`). Since A-767 C1 its
 > changeset lands on the node's store before the step, as a push's does (w-hg, below). A client's hg push still takes no
 > landing turn: one landed between a made changeset's making and its commit leaves the made fork stale, and the version
