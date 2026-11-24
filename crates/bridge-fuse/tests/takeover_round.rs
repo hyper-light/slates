@@ -5,8 +5,10 @@
 //!
 //! What the round must be, by the design's words (§4.6, A-158): the epoch bump first where the kernel takes it, then an
 //! inode invalidation with all data for the root (node 1) and for every inode the volume's takeover set names, each
-//! once, sent in slices no longer than the owner's budget. A zero budget sends one inode a slice, so the slicing is
-//! exercised on every inode.
+//! once, sent in slices no longer than the owner's budget and each holding at least one inode the walk reached, the
+//! first carrying the root (`channel::takeover_told`; A-562: "at least one item each, so every round owed moves on at
+//! every turn"). A zero budget sends one walked inode a slice, so the slicing is exercised on every inode; how many
+//! slices that is depends on which inodes the walk names, so the test asserts the rule, never a count of slices.
 #![cfg(target_os = "linux")]
 #![allow(
   clippy::unwrap_used,
@@ -217,11 +219,36 @@ fn takeover_round(kernel_bumps_epoch: bool) -> Delivered {
   }
 }
 
+/// The round's slices by the design's rule under a zero budget (§4.6, A-158, A-562; `channel::takeover_told`): every
+/// slice tells at least one inode, so the round moves on at every turn; the first tells the root and at most one inode
+/// the walk reached, each after it at most one, since a zero budget lets a slice walk one inode; and together they
+/// tell `inodes`. The walk may reach the root itself, which the round tells once, as node 1; then the first slice tells
+/// the root alone (since 6f0804bbd named every inode of the head; before, it named the references alone).
+fn slices_hold_the_rule(slices: &[u64], inodes: usize) {
+  assert!(
+    slices.iter().all(|told| *told >= 1),
+    "every slice tells at least one inode: {slices:?}"
+  );
+  assert!(
+    slices.first().is_some_and(|first| *first <= 2),
+    "the first slice: the root and at most one inode the walk reached: {slices:?}"
+  );
+  assert!(
+    slices.iter().skip(1).all(|told| *told == 1),
+    "a zero budget: one inode a slice after the first: {slices:?}"
+  );
+  assert_eq!(
+    slices.iter().sum::<u64>(),
+    u64::try_from(inodes).unwrap(),
+    "the slices tell every inode: {slices:?}"
+  );
+}
+
 /// A-158 (the takeover round, sliced). Do: restore a mount whose owner holds references to 40 files, with a kernel that
 /// takes the epoch bump, and turn it with a zero slice budget until the device has the whole set, then a while longer.
-/// Expect the epoch bump first and only once, then an all-data invalidation of the root (node 1) and of every file,
-/// each exactly once and nothing else; 40 slices, the first carrying the root and one file and each after it one file;
-/// the counts to say one bump and 41 inodes; and nothing more sent or owed after.
+/// Expect the epoch bump first and only once, then an all-data invalidation of the root (node 1) first and of every
+/// file, each exactly once and nothing else; slices by the rule ([`slices_hold_the_rule`]); the counts to say one bump
+/// and 41 inodes; and nothing more sent or owed after.
 #[test]
 fn a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once() {
   let Delivered {
@@ -254,18 +281,14 @@ fn a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode
     distinct, expected,
     "the root and every looked-up file, nothing else"
   );
-  let mut sliced = vec![2];
-  sliced.extend(std::iter::repeat_n(1, LOOKED_UP - 1));
-  assert_eq!(
-    slices, sliced,
-    "a zero budget: the root and one file, then one file a slice"
-  );
+  assert_eq!(inodes.first(), Some(&1), "the root first: {inodes:?}");
+  slices_hold_the_rule(&slices, LOOKED_UP + 1);
   assert_eq!(counts, (1, 0, u64::try_from(LOOKED_UP + 1).unwrap()));
 }
 
 /// A-158 (a kernel before FUSE 7.44). Do: the same restore, with a kernel that cannot bump its epoch. Expect no epoch
-/// bump at all, the root and every file each once, the same slices, and the counts to say the bump was unsupported
-/// once.
+/// bump at all, the root and every file each once, slices by the same rule, and the counts to say the bump was
+/// unsupported once.
 #[test]
 fn a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted() {
   let Delivered {
@@ -291,6 +314,6 @@ fn a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted() {
     files.iter().copied().chain(std::iter::once(1)).collect(),
     "the root and every looked-up file"
   );
-  assert_eq!(slices.len(), LOOKED_UP, "the same slices");
+  slices_hold_the_rule(&slices, LOOKED_UP + 1);
   assert_eq!(counts, (0, 1, u64::try_from(LOOKED_UP + 1).unwrap()));
 }

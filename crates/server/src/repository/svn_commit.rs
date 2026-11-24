@@ -318,6 +318,8 @@ async fn landed_work(
       return Some(Err(refused));
     }
   };
+  // The texts it put, let go to the node's store once the landing made them durable there (A-760 (b) 4d, main's (B)).
+  let put = storing.put.clone();
   let storing = core::cell::Cell::new(Some(storing));
   let give_back = |state: &mut ShardState| {
     if let Some(storing) = storing.take() {
@@ -349,6 +351,13 @@ async fn landed_work(
   let _ = crate::state::with_state(|state| {
     release_texts(state, None, &brought);
     release_texts(state, None, &restoring);
+    // Durable on the node's store now: RAM holds nothing of the committed texts, nor of those brought back whole for the
+    // increment, the green's holds keeping their entries.
+    if matches!(landed, Some(Ok(_))) {
+      crate::vcs_store::name_holds::let_go_landed_texts(state, &put);
+    }
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &brought);
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &restoring);
   });
   landed
 }
@@ -512,6 +521,8 @@ pub(crate) async fn land_revision(
       return Some(Err(refused));
     }
   };
+  // The texts it put, let go to the node's store once the landing made them durable there (A-760 (b) 4d, main's (B)).
+  let put = storing.put.clone();
   let storing = core::cell::Cell::new(Some(storing));
   let give_back = |state: &mut ShardState| {
     if let Some(storing) = storing.take() {
@@ -544,6 +555,13 @@ pub(crate) async fn land_revision(
     give_back(state);
     release_texts(state, None, &brought);
     release_texts(state, None, &restoring);
+    // Durable on the node's store now: RAM holds nothing of the committed texts, nor of those brought back whole for the
+    // increment, the green's holds keeping their entries.
+    if matches!(landed, Some(Ok(_))) {
+      crate::vcs_store::name_holds::let_go_landed_texts(state, &put);
+    }
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &brought);
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &restoring);
   });
   landed
 }
@@ -913,8 +931,10 @@ pub(crate) fn release_texts(
   writing: Option<slates_vcs::Writing>,
   texts: &[ContentIdentity],
 ) {
-  crate::vcs_store::within_budget(state, 0, |stores| {
-    let Some(store) = stores.content_mut() else {
+  // A free decision: the greens' holds on their named texts taken first (A-760 (b) 4d), so a text a green named in
+  // this turn outlives the landing's own hold given back here.
+  crate::vcs_store::name_holds::freeing(state, |store| {
+    let Some(store) = store else {
       return;
     };
     if let Some(writing) = writing {
@@ -1096,6 +1116,8 @@ pub(crate) async fn land_made<T>(
       return Some(Err(refused));
     }
   };
+  // The texts it put, let go to the node's store once the landing made them durable there (A-760 (b) 4d, main's (B)).
+  let put = storing.put.clone();
   let storing = core::cell::Cell::new(Some(storing));
   let give_back = |state: &mut ShardState| {
     if let Some(storing) = storing.take() {
@@ -1126,7 +1148,13 @@ pub(crate) async fn land_made<T>(
     give_back,
   )
   .await;
-  let _ = crate::state::with_state(give_back);
+  let _ = crate::state::with_state(|state| {
+    give_back(state);
+    // Durable on the node's store now: RAM holds nothing of the committed texts, the green's holds keep their entries.
+    if matches!(landed, Some(Ok(_))) {
+      crate::vcs_store::name_holds::let_go_landed_texts(state, &put);
+    }
+  });
   landed
 }
 
