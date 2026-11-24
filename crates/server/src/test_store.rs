@@ -884,23 +884,35 @@ pub(crate) fn awaiting_rebuild(
 }
 
 /// Rebuilds `record`'s repository from `parts`, its state logs' parts, as its successor does once its record and logs are
-/// adopted
-/// (`takeover::rebuild_repository`, its store made from the log a step a turn, driven to its end here), and takes it out
-/// of the pending set as the fleet's period does.
+/// adopted (`takeover::rebuild_repository`, its store made from the log a step a turn, driven to its end here), and
+/// takes it out of the pending set as the fleet's period does. A Subversion store's records are read back from the
+/// node's store by its rebuild's task, which this step does not run: a history on the shard rebuilds it with
+/// [`rebuild_after_takeover`] and awaits `vcs_store::rebuilt`.
 pub(crate) fn rebuilt_after_takeover(
+  state: &mut crate::state::ShardState,
+  adopted: (
+    slates_db::catalog::RepositoryRecord,
+    Vec<slates_db::catalog::StateLogRecord>,
+  ),
+) {
+  let id = adopted.0.id;
+  rebuild_after_takeover(state, adopted);
+  crate::vcs_store::settle_rebuild(state, id);
+}
+
+/// [`rebuilt_after_takeover`]'s rebuild begun, its turns left to its task.
+pub(crate) fn rebuild_after_takeover(
   state: &mut crate::state::ShardState,
   (record, parts): (
     slates_db::catalog::RepositoryRecord,
     Vec<slates_db::catalog::StateLogRecord>,
   ),
 ) {
-  let id = record.id;
   state
     .pending_repositories
-    .remove(&slates_db::register::ObjectId(id.bytes));
+    .remove(&slates_db::register::ObjectId(record.id.bytes));
   assert!(
     crate::takeover::rebuild_repository(state, record, parts),
     "rebuilt"
   );
-  crate::vcs_store::settle_rebuild(state, id);
 }
