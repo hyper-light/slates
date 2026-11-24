@@ -732,3 +732,8 @@
   writing) and f7c70b076 (TSan: room_needed sliced a write a step, caller asserts >2 steps). Gate 6 7/7 with no Unlanded;
   gate 7 (10+10 at 3d65116a6) running. WAITING: t_a614a's TSan words (run 45398791868; passes natively 2.7 s), gate 7's
   cause, clone profile (git_scale.sh widened by w-interop).
+- 05:30: gate 7 named Unlanded(HomedShort) for push 1's pack, 0.9 ms after the body (fast, not live_budget's ~3 s).
+  LANDED ee9571813: homes.rs short-homing instrumentation (w-shared agreed in writing): home_in_region log line with
+  branch/elapsed, publish_refused counter+log, stranded log; test a_stranded_tickets_wait_is_answered_not_durable_at_once_and_counted.
+  Gate 8 at ee9571813 (main). Parked: retry-until-failover in git_push's Homing (second step if a home is truly late).
+  If stranded fires -> F2 bug to w-shared.
