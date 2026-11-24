@@ -1,5 +1,13 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 13:10 PST 11-24: LANDED A-907, main a551b0a88 (113c937b6): every broadcast's stragglers end on their links (one
+  settle for homes' exchange, the healer and credentials; Stragglers' Drop and ReplyTx::send hand sessions to an
+  installed orphan hook), HOME_STREAM served on its own task. Gate 10's cause (A-902's slow home outlasting the healer's
+  round, the dropped straggler's link lent for good). Red/green fleet a907_. OWED (main): gate 12. FOUND (GAPS OPEN): a
+  second push creating a new branch refused `unable to commit` in GitFleet (new green unplaced, inputs_unplaced 4).
+  PARKED: A-905 (red in scratch a905-red.diff, design a905-design.md; w-git's Q1 open; part 1 = Move carries a started
+  exchange).
+
 ## 12:30 PST 11-24: A-904 recorded for Ada (GAPS 929baef80; red kept in scratch a904-red.diff). ACTIVE: A-905, intake
   off the owner (claimed). Seam agreed with w-git (A1 per-queue owner reads, A2 budgets, A3 Decoding where read).
   Red in worktree w-shared-a894 (uncommitted; scratch a905-red.diff): daemon_edge::a905_..., read_bytes [0, 149152].
