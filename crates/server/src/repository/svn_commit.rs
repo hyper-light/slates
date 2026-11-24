@@ -62,7 +62,7 @@
 //! **Owed**: the svn:// connection task's call of the step (A-656 part 2); the lock verbs' entries recorded as the
 //! commits' are; the records' texts read from the green's content rather than held beside it and in the record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::catalog::{Principal, RepositoryId, VcsTool, VolumeId as DbVolumeId};
 use slates_merge::engine::{Green, Increment};
@@ -198,6 +198,9 @@ impl Uncommitted {
   /// its own words; the others, which no FSFS commit meets, in slates' words under Subversion's nearest error.
   pub(crate) fn answered(&self) -> slates_svn::serve::Uncommitted {
     use slates_svn::serve::Uncommitted as Answered;
+    // Named in the daemon's log, since a client sees one word of it (main's finding of 2026-11-24: the Linux matrix's
+    // bare "Corrupt" left no line).
+    slates_machine::log_line!("slates-server: a Subversion commit answered refused: {self:?}");
     let (code, message) = match self {
       Uncommitted::Step(refusal) => return Answered::Step(refusal.clone()),
       Uncommitted::NotHeld => (
@@ -590,6 +593,8 @@ async fn stage_texts(
   imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
+  // Taking the texts and beginning their put are steps of their own (goal 93).
+  slates_rt::futures::yield_now().await;
   let begun = crate::state::with_state(|state| {
     match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
       Ok(mut storing) => {
@@ -641,12 +646,15 @@ fn hand_over(
   storing: &mut Storing,
 ) {
   let mut spare = Vec::new();
+  // What `storing` put, by identity: a lookup a text, not a search of every one put (goal 93: 166 ms of one step for a
+  // revision of 9,000 texts, debug).
+  let mut put: BTreeSet<ContentIdentity> = storing.put.iter().copied().collect();
   for identity in imported {
     let held = state
       .vcs_stores
       .subversion_records(repository)
       .is_none_or(|records| records.holds(&identity));
-    if revision.stored.contains_key(&identity) && !held && !storing.put.contains(&identity) {
+    if revision.stored.contains_key(&identity) && !held && put.insert(identity) {
       storing.put.push(identity);
     } else {
       spare.push(identity);
@@ -751,8 +759,14 @@ fn commit_prepared(
   landed
 }
 
-/// The refusal of records that do not hold together.
+/// The refusal of records that do not hold together, its site named in the daemon's log: the client's answer is the
+/// one word.
+#[track_caller]
 fn corrupt() -> Uncommitted {
+  slates_machine::log_line!(
+    "slates-server: a Subversion commit refused Corrupt at {}",
+    std::panic::Location::caller()
+  );
   Uncommitted::Step(StepRefusal::Corrupt)
 }
 

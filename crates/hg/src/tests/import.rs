@@ -1111,6 +1111,89 @@ fn t_a687_the_states_record_holds_its_markers_and_history() {
   );
 }
 
+/// Every changeset's, manifest's and file revision's whole text `index` holds, by its log's path as the node's changeset
+/// store keeps it (`\0changelog`, `\0manifest`, a file's tracked path) and its node.
+fn whole_texts(index: &HgIndex, store: &ContentStore) -> BTreeMap<(Vec<u8>, crate::Node), Vec<u8>> {
+  use crate::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
+  let mut texts = BTreeMap::new();
+  for rev in 0..index.len(store, Log::Changelog) {
+    let row = index.changeset(store, rev).unwrap();
+    let text = store.object_bytes(&row.text, row.len).unwrap();
+    texts.insert((CHANGELOG_PATH.to_vec(), row.node), text);
+  }
+  let paths: BTreeSet<Vec<u8>> = index.file_logs(store).map(<[u8]>::to_vec).collect();
+  let logs = std::iter::once((MANIFEST_PATH.to_vec(), Log::Manifest))
+    .chain(paths.iter().map(|path| (path.clone(), Log::File(path))));
+  for (path, log) in logs {
+    for rev in 0..index.len(store, log) {
+      let node = index.revision(store, log, rev).unwrap().node;
+      let text = index.revision_text(store, log, rev).unwrap();
+      texts.insert((path.clone(), node), text);
+    }
+  }
+  texts
+}
+
+/// A-636 part 2c-2 (main 01a20182's ruling of 2026-11-24 12:25; w-hg's review of the same hour): a takeover's successor
+/// makes a Mercurial store again from its records over a content store that never held their texts. Do: write the
+/// `states` repository's record; save every changeset's, manifest's and file revision's whole text by its log's path,
+/// as the node's changeset store keeps them; replay the record a step at a time into a new store's empty index, each ask
+/// answered from what was saved. Expect: every revision replayed, each log's whole texts the import's by node; texts
+/// and rows asked for identities the store never knew (`Replayed::unknown_asked`), none counted as let go
+/// (`texts_asked`); the changelog's texts asked in one ask, the record's room holding them all. A whole replay, which
+/// asks nothing, is still refused `Unheld` (`t_a687_the_states_record_holds_its_markers_and_history`). Failing first:
+/// refused `Unheld` naming the changelog's revision 0, nothing asked.
+#[test]
+fn a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store() {
+  use crate::push::intake::CHANGELOG_PATH;
+  let (imported, source, bytes) = recorded("states");
+  let saved = whole_texts(&imported.index, &source);
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut replay = record::Replay::begin(&bytes, &mut index, &mut store).unwrap();
+  let mut asks: Vec<(Vec<u8>, usize)> = Vec::new();
+  loop {
+    match replay.step(&bytes, &mut store) {
+      Ok(true) => {}
+      Ok(false) => break,
+      Err(refused) => panic!("refused {refused:?} after asks {asks:?}"),
+    }
+    if let Some((path, nodes)) = replay.asked_texts()
+      && replay.asking()
+    {
+      let texts = nodes
+        .iter()
+        .map(|node| saved.get(&(path.clone(), *node)).cloned())
+        .collect();
+      asks.push((path, nodes.len()));
+      replay.answer_texts(texts);
+    }
+  }
+  let replayed = replay.finish(&mut index, &mut store).unwrap();
+  assert_eq!(whole_texts(&index, &store), saved, "every revision's text");
+  assert_eq!(
+    (
+      replayed.changesets,
+      replayed.manifests,
+      replayed.file_revisions,
+      replayed.markers
+    ),
+    kept_counts(&imported)
+  );
+  assert!(replayed.unknown_asked > 0, "asked for unknown identities");
+  assert_eq!(replayed.texts_asked, 0, "none let go");
+  let changesets = usize::try_from(index.len(&store, Log::Changelog)).unwrap();
+  assert_eq!(
+    asks
+      .iter()
+      .filter(|(path, _)| path == CHANGELOG_PATH)
+      .map(|(_, asked)| *asked)
+      .collect::<Vec<_>>(),
+    vec![changesets],
+    "the changelog's texts in one ask: {asks:?}"
+  );
+}
+
 /// A record by hand: no revision, then `markers`, each as one marker entry.
 fn markers_only(markers: &[&[u8]]) -> Vec<u8> {
   let mut bytes = Vec::new();

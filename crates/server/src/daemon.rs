@@ -986,6 +986,8 @@ impl Daemon {
     // installs the same one.
     #[cfg(target_os = "linux")]
     slates_seal::install();
+    // A dispatch's session whose stragglers were dropped goes back to its link, never to nobody (A-907).
+    slates_cluster::on_orphaned_session(crate::fleet::orphaned_session);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
@@ -1770,6 +1772,18 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |_| {
       crate::vcs_store::homes::answer_as_another_version(on);
     })
+  }
+
+  /// Test support (A-907): this node waits `delay_ns` before serving each home message from the region while it is not
+  /// 0, on every shard (`vcs_store::homes::delay_answers`): a home slower than its sender's round, as one waiting for its
+  /// own install is (A-902).
+  pub fn delay_home_answers(&self, delay_ns: u64) -> Result<(), ObserveError> {
+    for shard in self.shards.clone() {
+      self.observe(Some(shard), move |_| {
+        crate::vcs_store::homes::delay_answers(delay_ns);
+      })?;
+    }
+    Ok(())
   }
 
   /// Test support: the version at which the council's configuration fixed `member`'s settled neighbourhood

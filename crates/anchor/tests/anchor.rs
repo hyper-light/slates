@@ -1947,25 +1947,20 @@ fn a906_the_pool_generation_moves_at_each_claim_and_release_that_wins_and_no_oth
   let id = identity();
   let name = unique_name("slates-anchor-test-pool-generation");
   let segment = AnchorSegment::create(&name, &id, geometry()).unwrap();
-  let generation = || segment.pool_generation().unwrap();
-  let start = generation();
+  let start = segment.pool_generation().unwrap();
   assert!(segment.pool_claim(3, 1).unwrap());
-  assert_eq!(generation(), start + 1, "a winning claim");
+  generation_is(&segment, start + 1, "a winning claim");
   assert!(!segment.pool_claim(3, 2).unwrap());
-  assert_eq!(generation(), start + 1, "a lost claim moves nothing");
+  generation_is(&segment, start + 1, "a lost claim moves nothing");
   assert!(!segment.pool_release(3, 2).unwrap());
-  assert_eq!(generation(), start + 1, "a refused release moves nothing");
+  generation_is(&segment, start + 1, "a refused release moves nothing");
   segment.post_pool_want(1, 4096).unwrap();
-  assert_eq!(generation(), start + 1, "a want moves nothing");
+  generation_is(&segment, start + 1, "a want moves nothing");
   assert!(segment.pool_release(3, 1).unwrap());
-  assert_eq!(generation(), start + 2, "a winning release");
+  generation_is(&segment, start + 2, "a winning release");
   let (handoff, len) = handoff_of(&segment);
   let again = AnchorSegment::attach(&handoff, len, &id).unwrap();
-  assert_eq!(
-    again.pool_generation().unwrap(),
-    start + 2,
-    "one word every mapping reads"
-  );
+  generation_is(&again, start + 2, "one word every mapping reads");
   let partitions = geometry().partitions;
   let offset = slates_anchor::layout::pool_generation_offset(partitions);
   let words_before = slates_anchor::layout::pool_owner_and_want_words(partitions)
@@ -1976,6 +1971,11 @@ fn a906_the_pool_generation_moves_at_each_claim_and_release_that_wins_and_no_oth
     "on a line's start"
   );
   assert!(offset >= words_before, "past every owner and want word");
+}
+
+/// The pool generation `segment` reads is `expected`, `what` naming the step it follows (A-906's test above).
+fn generation_is(segment: &AnchorSegment, expected: u64, what: &str) {
+  assert_eq!(segment.pool_generation().unwrap(), expected, "{what}");
 }
 
 /// A-98: do have one claimant per partition, each through its own mapping of the segment (as shards of racing daemons

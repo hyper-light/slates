@@ -388,7 +388,7 @@ impl Increment {
     let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let post_state = reader.bytes(post_len)?.to_vec();
     for op in doc.ops.iter().filter(|op| op.kind == OpKind::Mknod) {
-      special_payload(&doc, crate::named::Post::of(&post_state, &[], &[]), op)?;
+      special_payload(&doc, crate::named::Post::inline(&post_state), op)?;
     }
     let evidence_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     if evidence_count > reader.remaining() / EVIDENCE_BYTES {
@@ -434,7 +434,7 @@ fn decode_named(
   if count == 0 || count > reader.remaining() / RUN_BYTES {
     return Err(DocDecodeError::Truncated);
   }
-  let mut runs = Vec::with_capacity(count);
+  let mut runs = crate::named::RunTable::default();
   for _ in 0..count {
     let mut hash = [0u8; 32];
     let hash_len = hash.len();
@@ -548,7 +548,7 @@ pub struct Judged {
   /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760): a whole text's buffer becomes the file.
   read: Vec<Vec<u8>>,
   /// Its named runs, which name the objects a file made whole of one is named for (A-760 (b), [`Green::name_of`]).
-  runs: Vec<crate::named::NamedRun>,
+  runs: crate::named::RunTable,
   /// Its files made so far, a slice a step before the commit ([`Green::make_step`], A-760).
   making: Making,
 }
@@ -733,6 +733,10 @@ impl core::fmt::Debug for Judged {
 }
 
 /// A verdict held (A-635): what [`Green::judge`] reached, nothing of it applied.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "an accepted verdict is the common outcome: boxing it would allocate per judgment, to shrink the rare refusals"
+)]
 #[derive(Debug)]
 pub enum Judgment {
   /// Accepted, and held until [`Green::commit_judged`].
@@ -2092,7 +2096,7 @@ fn named_files(
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
 #[cfg(test)]
 pub(crate) fn apply_for_tests(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
-  apply(base, ops, crate::named::Post::of(post_state, &[], &[]))
+  apply(base, ops, crate::named::Post::inline(post_state))
 }
 
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.

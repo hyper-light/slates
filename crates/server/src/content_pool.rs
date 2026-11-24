@@ -565,7 +565,8 @@ impl ContentPool {
       .sum()
   }
 
-  /// Counts of the pool's free room answered without a scan (A-906's non-vacuity count).
+  /// Counts of the pool's free room answered without a scan (A-906's non-vacuity count; its test reads it).
+  #[cfg(test)]
   pub(crate) fn scans_skipped(&self) -> u64 {
     self.scans_skipped.get()
   }
@@ -857,6 +858,13 @@ mod tests {
     (pool.available(), pool.count_available())
   }
 
+  /// [`both_counts`] of `pool`, held equal: the kept answer is a full count's, `what` naming the move it follows.
+  fn counts_agree(pool: &super::ContentPool, what: &str) -> (usize, usize) {
+    let counts = both_counts(pool);
+    assert_eq!(counts.0, counts.1, "{what}");
+    counts
+  }
+
   /// A-906 (main 01a20182's gate r935: every lend counted the pool's free room by reading every owner word, 3,516 of a
   /// clone's 24,971 samples; its ruling of 2026-11-24 11:27). Do: over a fresh two-partition segment, open partition 0's
   /// pool and ask its room twice with nothing moved; then claim an extent, give it back, have partition 1 claim one
@@ -877,8 +885,7 @@ mod tests {
       slates_anchor::AnchorSegment::attach(&handoff, len, &profile.facts.identity).unwrap();
     let geometry = super::PoolGeometry::of(&config);
     let mut pool = super::ContentPool::open(&config, 0, &[], segment);
-    let first = both_counts(&pool);
-    assert_eq!(first.0, first.1);
+    let first = counts_agree(&pool, "at the open");
     let skipped = pool.scans_skipped();
     assert_eq!(both_counts(&pool), first, "nothing moved");
     assert!(
@@ -886,20 +893,14 @@ mod tests {
       "the kept count answered (non-vacuity)"
     );
     let (id, region) = pool.claim(config.pool_unit()).expect("a claim");
-    let claimed = both_counts(&pool);
-    assert_eq!(claimed.0, claimed.1, "after a claim");
+    let claimed = counts_agree(&pool, "after a claim");
     assert!(claimed.0 < first.0, "the claim took room");
     pool.release(id, region);
-    let given = both_counts(&pool);
-    assert_eq!(given.0, given.1, "after a give-back");
+    let given = counts_agree(&pool, "after a give-back");
     let theirs = (0..other.pool_extents())
       .find(|extent| other.pool_claim(*extent, 1).unwrap())
       .expect("another partition's claim");
-    let after_theirs = both_counts(&pool);
-    assert_eq!(
-      after_theirs.0, after_theirs.1,
-      "after another partition's claim"
-    );
+    let after_theirs = counts_agree(&pool, "after another partition's claim");
     assert!(
       after_theirs.0 < given.0,
       "their claim took room this pool counts"
@@ -910,17 +911,13 @@ mod tests {
       u64::try_from(config.pool_unit()).unwrap(),
     )
     .unwrap();
-    let held = both_counts(&pool);
-    assert_eq!(held.0, held.1, "after the hold moved");
+    counts_agree(&pool, "after the hold moved");
     pool.open_hold(true);
-    let open = both_counts(&pool);
-    assert_eq!(open.0, open.1, "with the hold open");
+    counts_agree(&pool, "with the hold open");
     pool.open_hold(false);
-    let closed = both_counts(&pool);
-    assert_eq!(closed.0, closed.1, "with the hold closed again");
+    counts_agree(&pool, "with the hold closed again");
     assert!(other.pool_release(theirs, 1).unwrap());
-    let back = both_counts(&pool);
-    assert_eq!(back.0, back.1, "after their give-back");
+    counts_agree(&pool, "after their give-back");
   }
 
   /// Shape: the turns each shard lends in [`two_shards_lending_small_rooms_in_turn_are_both_admitted`]: enough that a
