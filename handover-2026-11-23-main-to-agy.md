@@ -22,6 +22,15 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 01:53 on 11-24:
+- CORRECTION, 84a: the goal's instrument is edit_merge_bench's own verdict (each invocation judged by its three runs'
+  median). At current main 55650fef1 it reads "within the required 1 ms" in 20 of 20 verdicts on macOS (loaded p99
+  126-158 us, p999 134-172 us) and 20 of 20 on Windows (loaded p99 120-194 us, p999 168-345 us). The coordinator's
+  "every run" bar was an over-reading; Windows' single-run excursions are jupiter's OS wake tail. w-perf's Windows
+  latency-path work is tail hardening after A-887, not a blocker. Linux at current main is not yet measured: both
+  Linux bare-metal runners are loaded by other projects (adacachy2 load 33, adacachy 68); r793 waits on adacachy2
+  until ~04:33 for load under 8, then runs 8 loaded and 2 quiet rounds plus R9.
+
 Updates at 01:50 on 11-24:
 - 84a Windows: the cause is jupiter's OS, measured with no slates involved. A kernel-event ping-pong
   (~/.cache/main-84a-win/pingpong.ps1 on jupiter, Normal through WMI) wakes a blocked thread 1-12 ms late at 2e-4 to
