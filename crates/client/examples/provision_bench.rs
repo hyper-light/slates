@@ -546,6 +546,58 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   ok
 }
 
+/// T-2.6's spinning sweep over [`CLIENT_COUNTS`] clients, each level's CPU, parks and rows printed: the single client's
+/// p99 held to [`PROVISION_FLOOR_NS`] (AC-2.1), and each level that `cores` past the `shards` can run ratcheted. The
+/// single client's p99, and whether it failed the floor.
+fn spinning_sweep(daemon: &Daemon, instance: &str, shards: u16, cores: usize) -> (u64, bool) {
+  // A client thread spins for its reply while the shards spin serving; a run with more of
+  // those than the machine has cores past the shards measures the scheduler oversubscribing,
+  // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
+  // is measured on the reference machine, whose cores hold the concurrency).
+  let runnable = cores.saturating_sub(usize::from(shards)).max(1);
+  let mut failed = false;
+  let mut quiet_spinning = 0;
+  for clients in CLIENT_COUNTS {
+    let key = format!("spinning_{clients}");
+    let before = daemon.shard_pulses();
+    let (rows, cpu) = form(instance, &key, (*clients, SPINNING_SAMPLES, None), None);
+    print_cpu(&key, shards, &cpu);
+    print_parks(
+      &key,
+      &before,
+      &daemon.shard_pulses(),
+      RUNS * clients * SPINNING_SAMPLES,
+    );
+    // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
+    // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
+    // recorded so the ratchet catches regressions, but only the single-client p99 is held to
+    // the 50 µs floor here (a concurrency level's tail is contention on shared owner shards,
+    // reported and ratcheted, not floored).
+    let ratchet_gated = *clients <= runnable;
+    print_rows_gated(&key, &rows, ratchet_gated);
+    let p99 = p99_median(&rows);
+    let floor_gated = *clients == 1;
+    if floor_gated {
+      quiet_spinning = p99;
+      let ok = p99 <= PROVISION_FLOOR_NS;
+      failed |= !ok;
+      println!(
+        "ac-2.1: {clients} client spinning ({cores} cores, {shards} shards), provisioning p99 {p99} ns vs floor {PROVISION_FLOOR_NS} ns: {}",
+        if ok { "ok" } else { "FAIL" }
+      );
+    } else if ratchet_gated {
+      println!(
+        "ac-2.1: {clients} clients spinning, p99 {p99} ns (T-2.6 histogram; recorded and ratcheted, not floored)"
+      );
+    } else {
+      println!(
+        "ac-2.1: {clients} clients oversubscribes {runnable} runnable core(s); p99 {p99} ns reported, not gated here"
+      );
+    }
+  }
+  (quiet_spinning, failed)
+}
+
 fn main() {
   if std::env::args().any(|argument| argument == SPIN_ARGUMENT) {
     spin();
@@ -598,52 +650,8 @@ fn main() {
     cores_permille(cpu_now_ns().saturating_sub(cpu_before), started.elapsed()),
     started.elapsed().as_millis()
   );
-  // A client thread spins for its reply while the shards spin serving; a run with more of
-  // those than the machine has cores past the shards measures the scheduler oversubscribing,
-  // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
-  // is measured on the reference machine, whose cores hold the concurrency).
-  let cores = profile.facts.cpus_at_once();
-  let runnable = cores.saturating_sub(usize::from(shards)).max(1);
-  let mut failed = false;
-  let mut quiet_spinning = 0;
-  for clients in CLIENT_COUNTS {
-    let key = format!("spinning_{clients}");
-    let before = daemon.shard_pulses();
-    let (rows, cpu) = form(&instance, &key, (*clients, SPINNING_SAMPLES, None), None);
-    print_cpu(&key, shards, &cpu);
-    print_parks(
-      &key,
-      &before,
-      &daemon.shard_pulses(),
-      RUNS * clients * SPINNING_SAMPLES,
-    );
-    // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
-    // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
-    // recorded so the ratchet catches regressions, but only the single-client p99 is held to
-    // the 50 µs floor here (a concurrency level's tail is contention on shared owner shards,
-    // reported and ratcheted, not floored).
-    let ratchet_gated = *clients <= runnable;
-    print_rows_gated(&key, &rows, ratchet_gated);
-    let p99 = p99_median(&rows);
-    let floor_gated = *clients == 1;
-    if floor_gated {
-      quiet_spinning = p99;
-      let ok = p99 <= PROVISION_FLOOR_NS;
-      failed |= !ok;
-      println!(
-        "ac-2.1: {clients} client spinning ({cores} cores, {shards} shards), provisioning p99 {p99} ns vs floor {PROVISION_FLOOR_NS} ns: {}",
-        if ok { "ok" } else { "FAIL" }
-      );
-    } else if ratchet_gated {
-      println!(
-        "ac-2.1: {clients} clients spinning, p99 {p99} ns (T-2.6 histogram; recorded and ratcheted, not floored)"
-      );
-    } else {
-      println!(
-        "ac-2.1: {clients} clients oversubscribes {runnable} runnable core(s); p99 {p99} ns reported, not gated here"
-      );
-    }
-  }
+  let (quiet_spinning, mut failed) =
+    spinning_sweep(&daemon, &instance, shards, profile.facts.cpus_at_once());
   // The single spinning client again, each name one its own shard owns: no create crosses to another shard, so its
   // rows beside `spinning_1`'s split the cross-shard hop and its wakes from the rest (informational, never gated;
   // GAPS' open AC-2.1 entry at many shards on macOS, main 01a20182's order of 2026-11-23).

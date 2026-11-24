@@ -3,7 +3,8 @@
 //! the edge's production site and services on an audit daemon's shard, the repository's owner shard, where A-654 part
 //! 2's driver lands it; the session's protocols, v1's `version 1` line and v2 answered at v0, with a flush alone, git's
 //! push of nothing, answered with nothing; and the command's refusals before its push starts, a shard not lent and a
-//! repository gone, each in its words.
+//! repository gone, each in its words. A child of the edge's tests, so each push runs over the real edge with their
+//! client.
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
