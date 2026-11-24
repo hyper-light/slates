@@ -568,3 +568,14 @@ Waiting: main's route; arena-7 and arena-8.
 - arena-17 (cuts 2 and 3 plus w-perf's slab): RSS after push-all about 797-826 MB, down a third. The goal is about
   410 MiB.
 - Next: decision 3's rewrite admission (evolution's last item), unless main reorders.
+- Landed cdfeae794 (evolution decision 3: a rewrite moves its line only when it drops obsolete drafts alone;
+  evolution is done, per main) and c9a39f7d2 (Intake::unit and merging, plus the intake_steps example, which times
+  steps by kind).
+- A/B (local, release, at main's direction before CLAUDE.md §8 was re-read): at 57k, C (seal + tiered merge)
+  1,183.6 s against A (no seal) 1,188.6 s, merges 5.29 s. So the reland costs the intake nothing; arena-18's slowdown
+  is outside it, or another commit (main's arena-19 decides). Synthetic: C 20.5/18.0 s, B 30.0/25.0 s,
+  A 18.9/15.8 s.
+- Per §8, measurement is main's. The 57k step-kind attribution is a run request to main (exact command in the
+  message). Waiting for: its reading (then fix the biggest long-step kind red first, and restate the bound with the
+  seals one merge spans), and arena-19 (if the reland costs time outside the intake: reads of sealed runs, fork fence
+  copies, the store's own merge).
