@@ -414,6 +414,10 @@ fn release_generation(state: &mut ShardState, index: HgIndex) {
   }
 }
 
+/// Counter: the run fences the generations of fetches copied as they forked a repository's index (`Index::fork` copies
+/// every run's fences; goal 93, the index seal's reland). Format: a counter name in the status report.
+pub(crate) const FORK_FENCES_COPIED: &str = "vcs.hg.fork_fences_copied";
+
 /// Holds repository `id`'s generation as `state` holds it now ([`Generation`]), the register's copies charged to `room`;
 /// none when it is not lent (module docs).
 pub(crate) fn hold_in(
@@ -425,10 +429,12 @@ pub(crate) fn hold_in(
     return None;
   }
   let register = register_of(state, id, room).ok()?;
-  let index = super::within_budget(state, 0, |stores| {
+  let (index, fences) = super::within_budget(state, 0, |stores| {
     let (content, store) = stores.mercurial(id)?;
-    store.index.fork(content).ok()
+    let fences = store.index.rows().fences();
+    store.index.fork(content).ok().map(|fork| (fork, fences))
   })?;
+  state.count(FORK_FENCES_COPIED, fences);
   Some(Generation {
     id,
     index: Some(index),

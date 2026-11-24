@@ -378,8 +378,9 @@ fn step_clock_ns() -> u64 {
 /// Spaced by its own length: a sweep is armed no sooner after the last one completed than that one took. So the sweeps
 /// take at most half of a shard's time over any span however often status is asked (a poller asking every few
 /// milliseconds kept every shard sweeping), and what a request reads is at most two sweeps old. A request that finds the
-/// last sweep too recent is counted (`content_range.sweep.spaced`) and reads it. The shard has one idle-work slot and
-/// this is the daemon's only use of it since A-777 removed the arena reserve's refill.
+/// last sweep too recent is counted (`content_range.sweep.spaced`) and reads it. The shard has one idle-work slot,
+/// registered once at its start (`crate::idle_sweep::idle_work`, which also resumes an interrupted give-back there), and
+/// it advances an armed sweep through [`idle_slice`]; until 2026-11-23 arming registered this sweep's slice in it.
 fn arm(state: &mut ShardState) {
   if state.content_sweep.running {
     return;
@@ -393,19 +394,15 @@ fn arm(state: &mut ShardState) {
     state.content_sweep.spaced = state.content_sweep.spaced.saturating_add(1);
     return;
   }
-  let registered =
-    slates_rt::registry::with_current(|context| context.set_idle_work(Box::new(idle_slice)));
-  if matches!(registered, Some(Ok(()))) {
-    state.content_sweep.running = true;
-    state.content_sweep.armed = (now, state.content_sweep.sweeps);
-    state.content_sweep.armed_count = state.content_sweep.armed_count.saturating_add(1);
-  }
+  state.content_sweep.running = true;
+  state.content_sweep.armed = (now, state.content_sweep.sweeps);
+  state.content_sweep.armed_count = state.content_sweep.armed_count.saturating_add(1);
 }
 
 /// One slice of an armed sweep on the shard's idle time ([`arm`]): one [`advance`], bounded by half the step quantum as
 /// the shard's idle work must be. Whether it did anything: `false` once the armed sweep has completed (or none is armed,
 /// or the state is out of reach), so the shard parks, and an idle shard pays one flag read before each park after that.
-fn idle_slice() -> bool {
+pub(crate) fn idle_slice() -> bool {
   crate::state::with_state(|state| {
     if !state.content_sweep.running {
       return false;

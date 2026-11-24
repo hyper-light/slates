@@ -5232,6 +5232,7 @@ async fn init_shard(
     idle_sweep_at: None,
     idle_sweeper: None,
     idle_sweep_running: false,
+    give_back_waits_idle: false,
     idle_sweep_seen: (0, 0),
     placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
@@ -5352,6 +5353,12 @@ async fn init_shard(
   // The idle sweep (A-715): one pass a sweep's interval after what owes it, none while nothing does.
   let sweeper = futures::spawn(crate::idle_sweep::sweeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(sweeper);
+  // The shard's idle work, its one slot: an interrupted give-back resumes there, at the shard's next idle point, and an
+  // armed content-range sweep advances (`idle_sweep::idle_work`). A shard that cannot register it is a typed
+  // initialization failure, as one whose sweep the arena refuses is.
+  registry::with_current(|context| context.set_idle_work(Box::new(crate::idle_sweep::idle_work)))
+    .unwrap_or(Err(slates_rt::RtError::NotOnShardThread))
+    .map_err(ServerError::Runtime)?;
   // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
   let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reaper);
@@ -5445,9 +5452,11 @@ async fn rebuild_and_report(
 /// tick before): every volume ages its writes, then the open extents of files idle a whole pass are sealed in
 /// cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in the shard's step quantum; AES-256-GCM seals
 /// at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's 9–10 here), yielding between slices so the shard
-/// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
-/// volume owes another pass; otherwise the sweep arms its next.
-pub(crate) async fn seal_idle_content() -> bool {
+/// keeps serving, until none is left. How the pass ended ([`PassEnd`]): settled, when it reached an idle purge that
+/// finished, no volume owes another pass and no image publication is owed; its give-back left for the shard's next idle
+/// point, when other work ran across one of its steps ([`purge_if_idle`]); otherwise owing the next pass a sweep's
+/// interval on.
+pub(crate) async fn seal_idle_content() -> PassEnd {
   // An image publication owed is begun again where no catch-up makes it, first of all (A-870 piece 2: a refused catch-up
   // publication is never dropped), and the shard is not settled while it is owed.
   let image_owed = state::with_state(crate::content_holder::image_retry_owed).unwrap_or(false);
@@ -5457,7 +5466,7 @@ pub(crate) async fn seal_idle_content() -> bool {
     }
   });
   if aged.is_none() {
-    return true;
+    return PassEnd::Settled;
   }
   // Idle base directories give their descriptors back first (A-838): a pass that kept any is not settled.
   let directories_idle = crate::idle_sweep::close_idle_directories().await;
@@ -5511,16 +5520,53 @@ pub(crate) async fn seal_idle_content() -> bool {
         1,
       );
     });
-    return false;
+    return PassEnd::Owed;
   }
-  let purged = purge_if_idle().await;
-  let owes = state::with_state(|s| {
-    s.volumes
-      .iter_mut_all()
-      .any(|(_, slot)| slot.volume.sweep_owes())
-  })
-  .unwrap_or(false);
-  purged && !owes && !image_owed && directories_idle
+  pass_end(purge_if_idle().await, image_owed || !directories_idle)
+}
+
+/// How a sweep pass ended (A-715; `crate::idle_sweep`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassEnd {
+  /// Nothing owes another pass: none is armed after it, and an idle shard is never woken for the sweep.
+  Settled,
+  /// Something owes the next pass a sweep's interval on: a file written but not yet aged, a seal or a deferred free that
+  /// published, a busy arena, an idle base directory kept, an image publication owed.
+  Owed,
+  /// The pass's give-back left the rest because other work ran across one of its steps (A-226): the rest is idle-time
+  /// work, resumed at the shard's next idle point ([`resume_give_back`]), and the pass is under way until it ends.
+  GiveBackLeft {
+    /// Whether the pass owes the next one for something besides its give-back: a base directory it kept (A-838), or an
+    /// image publication owed (A-870 piece 2).
+    owed_besides: bool,
+  },
+}
+
+/// The end of a pass whose give-back ended as `give_back`, owing the next pass besides it or not.
+fn pass_end(give_back: GiveBack, owed_besides: bool) -> PassEnd {
+  match give_back {
+    GiveBack::Interrupted => PassEnd::GiveBackLeft { owed_besides },
+    GiveBack::Busy => PassEnd::Owed,
+    GiveBack::Settled => {
+      let owes = state::with_state(|s| {
+        s.volumes
+          .iter_mut_all()
+          .any(|(_, slot)| slot.volume.sweep_owes())
+      })
+      .unwrap_or(false);
+      if owes || owed_besides {
+        PassEnd::Owed
+      } else {
+        PassEnd::Settled
+      }
+    }
+  }
+}
+
+/// The rest of a pass's give-back, resumed at the shard's idle point after other work interrupted it
+/// ([`PassEnd::GiveBackLeft`]): the purge again, from where it stopped, and how the pass ends now.
+pub(crate) async fn resume_give_back(owed_besides: bool) -> PassEnd {
+  pass_end(purge_if_idle().await, owed_besides)
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
@@ -5552,11 +5598,25 @@ fn give_back_slice(s: &ShardState) -> usize {
   s.give_back_rate.slice_bytes.max(page)
 }
 
-/// The shard thread's own CPU clock now, nanoseconds (`slates_rt::registry::calling_thread_cpu`, the clock the
-/// watchdog reads): what a give-back step is timed by, since a loaded host stretches the wall time a step takes and
-/// not the CPU it spends. `None` where the platform reads none.
+/// The shard thread's own CPU time now, nanoseconds, to the nanosecond: what a give-back step is timed by, since a
+/// loaded host stretches the wall time a step takes and not the CPU it spends (A-491). Linux and macOS: the thread's
+/// CPU clock (`slates_rt::registry::calling_thread_cpu`, the clock the watchdog reads). `None` where the platform reads
+/// none.
+#[cfg(not(windows))]
 fn shard_thread_cpu_ns() -> Option<u64> {
   registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// [`shard_thread_cpu_ns`] on Windows: the thread's cycles at the rate measured once a process, before any shard runs
+/// (`slates_machine::own_cpu`, the clock the long-poll attribution reads, A-871). The thread time Windows keeps
+/// (`GetThreadTimes`) is charged a scheduler tick at a time, about 15.6 ms, so a give-back step of a few microseconds
+/// read no CPU unless a tick fell inside it, and taught nothing ([`GiveBackRate::fold`]): until 2026-11-23 the slice
+/// stayed a page, and an idle shard's give-back of its emptied write log, opened over the whole area a predecessor may
+/// have written, never ended while its passes were cut short (CI's windows-latest, diag run 45238179939: 332 one-page
+/// steps in the first pass, then one a pass).
+#[cfg(windows)]
+fn shard_thread_cpu_ns() -> Option<u64> {
+  slates_machine::own_cpu::own_cpu_ns()
 }
 
 /// The CPU a step spent between the readings `started` and `ended`, `None` unless both were read.
@@ -5593,9 +5653,9 @@ pub(crate) struct GiveBackRate {
 impl GiveBackRate {
   /// Folds one step that walked `walked` bytes and spent `spent` nanoseconds of its shard thread's CPU (`None` where
   /// the thread's clock reads nothing), learning the slice, the bytes one `quantum_ns` of that CPU walks, once the
-  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step (Windows charges thread
-  /// time a scheduler tick at a time) shows most steps' CPU as none and one step's as a whole tick, so the steps are
-  /// folded until one shows any: their bytes over the CPU shown.
+  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step shows most steps' CPU as
+  /// none and one step's as a whole tick, so the steps are folded until one shows any: their bytes over the CPU shown.
+  /// Every platform's clock is finer than a step now ([`shard_thread_cpu_ns`]; Windows' since 2026-11-23).
   pub(crate) fn fold(&mut self, walked: usize, spent: Option<u64>, quantum_ns: u64) {
     let Some(spent) = spent.filter(|_| walked > 0) else {
       return;
@@ -5633,7 +5693,7 @@ async fn probe_give_back(neighbour: bool) {
     let _ = futures::detach(task);
   }
   let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
-  let _settled = purge_if_idle().await;
+  let _ended = purge_if_idle().await;
   let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
   GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
 }
@@ -5743,7 +5803,10 @@ fn return_dead_recovery_timed(
 /// the last write burst's worth of free pages resident and faulted them back in at idle, so one large push left its whole
 /// burst resident behind it (w-hg's release run after hg's history push: 4,931.4 MiB, and 3.5 GB more faulted at idle).
 /// Measured against none: BENCHMARKS, "The idle prefault reserve, measured against none".
-async fn purge_if_idle() -> bool {
+///
+/// How it ended ([`GiveBack`]). A step across whose yield another task ran ends it (A-226), the rest left for the
+/// shard's next idle point (`crate::idle_sweep::idle_work`), never interleaved with the shard's work.
+async fn purge_if_idle() -> GiveBack {
   loop {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
@@ -5779,12 +5842,16 @@ async fn purge_if_idle() -> bool {
     .flatten();
     if step != Some(true) {
       // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
-      return step == Some(false);
+      return if step == Some(false) {
+        GiveBack::Settled
+      } else {
+        GiveBack::Busy
+      };
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
-    // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
-    // as a granted landing does, and a step of a whole quantum between each of its short ones made it 4 to 5 times
-    // slower under load (A-226). The poll this replaced stays gone: a step is no longer than it was.
+    // shard's next idle point. The arena's idle test cannot see such work when it allocates nothing, as a granted
+    // landing does, and a step of a whole quantum between each of its short ones made it 4 to 5 times slower under load
+    // (A-226). The poll this replaced stays gone: a step is no longer than it was.
     let polls_before = futures::polls_so_far();
     futures::yield_now().await;
     let others_ran = polls_before
@@ -5792,13 +5859,24 @@ async fn purge_if_idle() -> bool {
       .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
     if others_ran {
       let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
-      return false;
+      return GiveBack::Interrupted;
     }
   }
 }
 
-/// Counter: give-backs that left the rest for the next sweep pass because another task ran on the shard (A-226), the
-/// non-vacuity count of the check in [`purge_if_idle`].
+/// How an idle give-back ended ([`purge_if_idle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GiveBack {
+  /// A step found the shard idle and left nothing to give back.
+  Settled,
+  /// A step found the arena allocated since the step before: a busy shard, which owes the next pass.
+  Busy,
+  /// Another task ran across a step's yield (A-226): the rest waits for the shard's next idle point.
+  Interrupted,
+}
+
+/// Counter: give-backs that left the rest for the shard's next idle point because another task ran on the shard (A-226),
+/// the non-vacuity count of the check in [`purge_if_idle`].
 pub const GIVE_BACK_LEFT: &str = "content.give_back.left_for_next_tick";
 
 /// Counter: sweep passes that sealed content, and so published and left the purge for a later pass (A-105).
@@ -10435,6 +10513,35 @@ mod tests {
     let mut clock = || readings.next().flatten();
     let (_, more) = super::return_dead_recovery_timed(state, &mut clock);
     (state.give_back_rate.slice_bytes, more)
+  }
+
+  /// Shape: the steps of a give-back's size the clock test times, each a spin of [`STEP_SPIN_NS`] on the thread.
+  const TIMED_STEPS: usize = 8;
+  /// Shape: one timed step's spin: tens of microseconds, a give-back step's order (about 13 µs on CI's windows-latest,
+  /// diag run 45275623386), far under Windows' 15.6 ms charge of a thread's time.
+  const STEP_SPIN_NS: u64 = 50_000;
+
+  /// A-491 on Windows (2026-11-23). Do: time [`TIMED_STEPS`] spins of [`STEP_SPIN_NS`] each on the clock a give-back step
+  /// is timed by (`shard_thread_cpu_ns`). Expect every one read, as CPU no less than a hundredth of its spin and no more
+  /// than its wall time and a millisecond: a step of microseconds teaches the rate it folds. Red on Windows with the
+  /// thread's charged time as that clock, which reads such a step as no CPU unless a 15.6 ms tick falls inside it.
+  #[test]
+  fn the_give_back_clock_reads_a_step_of_microseconds() {
+    for step in 0..TIMED_STEPS {
+      let before = super::shard_thread_cpu_ns().expect("the thread's clock reads");
+      let began = std::time::Instant::now();
+      while u64::try_from(began.elapsed().as_nanos()).unwrap() < STEP_SPIN_NS {
+        std::hint::spin_loop();
+      }
+      let wall = u64::try_from(began.elapsed().as_nanos()).unwrap();
+      let spent = super::shard_thread_cpu_ns()
+        .expect("the thread's clock reads")
+        .saturating_sub(before);
+      assert!(
+        spent >= STEP_SPIN_NS / 100 && spent <= wall + 1_000_000,
+        "step {step}: a {wall} ns spin read {spent} ns of the thread's CPU"
+      );
+    }
   }
 
   /// A-491 (A-226's slice; CLAUDE.md "Bounded work everywhere": a step is held to its shard's quantum of its own CPU).

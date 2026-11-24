@@ -3900,6 +3900,11 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   release_long_push(&daemon);
   let long = long.join().expect("the long push answered");
   let rebased = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED);
+  let lookups = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::INDEX_LOOKUPS,
+  );
   let after = hg_command(edge, &name, "heads");
   daemon.stop();
   println!(
@@ -3923,6 +3928,10 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   assert_eq!(
     rebased, 1,
     "the long push's fork re-based over the small push's entry"
+  );
+  assert!(
+    lookups > 0,
+    "a settled push counts its fork's index lookups (goal 93, arena-20's counters)"
   );
   let after = String::from_utf8_lossy(&after.1).into_owned();
   for tip in [crate::verbs::hex_of(&long_tip), small_tip] {

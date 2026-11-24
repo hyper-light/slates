@@ -7662,7 +7662,42 @@
 > thread's own CPU clock, steps a coarse clock (Windows) shows no CPU for folded into the next it shows
 > (`daemon::GiveBackRate`; `a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock`). **Owed (main's):**
 > `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` under load, and the give-back's step count at load against
-> the 2,572 to 3,042 above.
+> the 2,572 to 3,042 above. **Fixed 2026-11-23 (w-win2): on Windows a step read no CPU.** `GetThreadTimes` charges a
+> thread a scheduler tick at a time, so a give-back step of a few microseconds read none and taught nothing: the slice
+> stayed a page, and an idle shard's give-back of its emptied write log, opened over the whole area a predecessor may
+> have written, never ended while other tasks cut its passes short. Both idle-sweep tests failed on both Windows
+> runners (diag run 45238179939 on windows-latest: 332 one-page steps in the first pass, then one a pass). A step on
+> Windows is now timed by the thread's cycles at the rate the runtime measures once before any shard runs
+> (`slates_machine::own_cpu::own_cpu_ns`, the long-poll attribution's clock, A-871). A first fix that scaled the cycles
+> by the thread's own charged time still taught nothing on a shard not yet charged a tick: both tests failed on
+> windows-latest, each shard started with 0 µs of its CPU (diag run 45260798132). With the cycle clock the slice is
+> learned within eight steps (about 11 MB a 13 µs quantum on windows-latest), and windows-latest still passed only 3
+> and then 4 of 5 rounds (diag runs 45269168513, 45275623386). **A-881 (same day): an interrupted give-back resumes at
+> the shard's next idle point.** It had waited for the next pass, a whole interval on, which the test's look once an
+> interval cut short again at its first step, both landing on the same 15.6 ms scheduler tick on windows-latest: 60
+> one-step passes, 680 MB of a 1.43 GB walk left at the 60-interval bound, where one uninterrupted pass walks it in 2.6
+> to 5.9 ms. The shard's idle work now wakes the sweep to resume it; A-226's stop is unchanged. Registered from the
+> start, that idle work's state borrow runs before every park, and a borrow's hooks may wake a task, which the shard's
+> loop then left ready through the park: a lost wake (a CLI attachment's lapse handled late once on windows-latest).
+> The loop now runs such a task, and the runtime counts every park begun with one ready (`parked_with_ready`), held to
+> 0 by every deadlines and idle-sweep test. Red then green:
+> the drift-free test with the resume off on windows-latest, windows-11-arm and ubuntu, and
+> the idle sweep's tests 5 of 5 rounds on all three, about 10.5 s a round where windows-latest's took 35 to 124 s (diag
+> run 45286588671) (`docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`).
+> The lost wake's red: `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_out_a_park` failed without the loop's
+> change on ubuntu (diag run 45309498515, the woken task not run within 2 s) and on macOS. Green with it: every rt test
+> binary on ubuntu and macOS, loom 6 of 6, rt clippy for the two Linux and two Windows targets (the same run), and CI's
+> Miri set on slates-rt (diag run 45310233924). **Seen beside it, not this change.** `idle_spin` failed two of its
+> three tests on kiln's adacachy at a load average of 35.5 with the change, its control arm lost to a runner restart;
+> on ubuntu-latest it passed 5 of 5 rounds with the change and 5 of 5 without (diag run 45309498515): load starvation.
+> **Open, found 2026-11-23:** `spin_kick`'s `a_kick_the_spins_harvest_takes_still_gets_its_ring_served` failed once on
+> macos-latest with the change (diag run 45309498515: the poller never injected the ring within its 20 s backstop,
+> spin_kick.rs:146), and in ten rounds each way passed 10 of 10 with the change and 9 of 10 without it (diag run
+> 45311228860, the same line at 20.02 s): a race older than this change, unexplained.
+> **Open, waits (main's ruling): a residency-aware walk of the emptied write log.** A log opened over a predecessor's
+> object is walked over its whole area (`written = capacity`), and the walk gives back almost nothing when the
+> predecessor wrote little: 1.43 GB walked for 12,288 bytes purged on windows-latest (diag run 45275623386). With A-881 a
+> whole walk takes 2.6 to 5.9 ms of idle time, so reading residency first (A-744's sweep) waits.
 
 > **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
 > The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran

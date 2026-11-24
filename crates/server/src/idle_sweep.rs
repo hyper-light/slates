@@ -10,8 +10,15 @@
 //! once its publication committed), or frees are deferred behind the committed image. Then the pass is armed a sweep's
 //! interval on ([`interval_ns`]), on the shard's deadline keeper (`crate::deadlines`), which wakes this task at it. A
 //! pass that does not settle the shard (a file written but not yet aged, a seal or deferred free that published, a
-//! busy arena, a give-back that left slices) arms the next one; a pass that settles it arms nothing, so an idle shard
-//! is never woken for the sweep. While a pass is asked for or runs nothing arms another.
+//! busy arena) arms the next one; a pass that settles it arms nothing, so an idle shard is never woken for the sweep.
+//! While a pass is asked for or runs nothing arms another.
+//!
+//! **A give-back is idle-time work.** A pass's give-back (the free content, the dead recovery memory, the emptied write
+//! log) stops at the first step across whose yield another task ran (A-226), and resumes at the shard's next idle
+//! point, where the shard's idle work wakes this task ([`idle_work`]); the pass stays under way meanwhile. Until
+//! 2026-11-23 it resumed only in the next pass, a whole interval on, which anything running once an interval cut short
+//! again at its first step (CI's windows-latest: a test's look once an interval on the same scheduler tick as each
+//! pass, one step a pass, a 1.43 GB walk 680 MB short at the 60-interval bound; diag run 45275623386).
 //!
 //! **The aging rule is unchanged**: a file is sealed one to two intervals after its last write (`Volume::age_writes`),
 //! as ZFS commits a transaction group and Linux writes back a page past `dirty_expire_centisecs`; the purge still waits
@@ -31,6 +38,7 @@
 
 use slates_vfs::clock::Clock;
 
+use crate::daemon::PassEnd;
 use crate::state::{self, ShardState};
 
 /// Format: the status count of base directories the idle sweep closed (A-838): each unused a whole interval.
@@ -48,7 +56,9 @@ pub(crate) fn interval_ns() -> u64 {
 }
 
 /// The idle sweep's task (A-715): one a shard, made at its start. It arms the first pass, then runs a pass each time the
-/// keeper asks for one, arming the next while the shard is not settled.
+/// keeper asks for one, arming the next while the shard is not settled. A pass whose give-back other work interrupted
+/// ([`PassEnd::GiveBackLeft`]) stays under way and resumes the give-back at the shard's next idle point ([`idle_work`]),
+/// as often as it is interrupted, until it settles or finds the shard busy.
 pub(crate) async fn sweeper() {
   let started = state::with_state(|s| {
     s.idle_sweeper = slates_rt::futures::current_task();
@@ -65,11 +75,69 @@ pub(crate) async fn sweeper() {
       Some(false) => continue,
       Some(true) => {}
     }
-    let settled = crate::daemon::seal_idle_content().await;
-    if state::with_state(|s| finish(s, settled)).is_none() {
+    if state::with_state(|s| s.count(PASSES_STARTED, 1)).is_none() {
+      return;
+    }
+    let mut ended = crate::daemon::seal_idle_content().await;
+    while let PassEnd::GiveBackLeft { owed_besides } = ended {
+      if state::with_state(|s| s.give_back_waits_idle = true).is_none() {
+        return;
+      }
+      slates_rt::futures::idle().await;
+      // Woken at the idle point, or by anything else: either way the give-back goes on, and stops again if other work
+      // runs across its next step.
+      if state::with_state(|s| s.give_back_waits_idle = false).is_none() {
+        return;
+      }
+      ended = crate::daemon::resume_give_back(owed_besides).await;
+    }
+    if state::with_state(|s| finish(s, ended == PassEnd::Settled)).is_none() {
       return;
     }
   }
+}
+
+/// Counter: give-backs resumed at the shard's idle point after other work interrupted them (A-226): the non-vacuity count
+/// of [`idle_work`]'s resume. Format: a counter name in the status report.
+pub(crate) const GIVE_BACK_RESUMED: &str = "content.give_back.resumed_at_idle";
+
+/// Counter: sweep passes started, each when the keeper asked for it (A-715). Format: a counter name in the status report.
+pub(crate) const PASSES_STARTED: &str = "sweep.passes_started";
+
+#[cfg(test)]
+thread_local! {
+  /// Test support: a task the keeper wakes beside each pass it starts (`crate::deadlines`), on the shard's thread: the
+  /// poller of the tests' hostile-look case, set from the shard.
+  pub(crate) static TEST_POLLER: std::cell::Cell<Option<slates_rt::TaskId>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// The shard's idle work (`ShardContext::set_idle_work`, the shard's one idle-work slot, registered at its start): what
+/// the shard does when it finds nothing ready and its idle spin has run out, before it parks. A pass whose give-back
+/// other work interrupted waits for this point, so here the sweep is woken to resume it; otherwise an armed
+/// content-range sweep advances a slice (`crate::content_ranges::idle_slice`, A-744). Whether it did anything, so the
+/// shard looks for work again rather than park.
+///
+/// Until 2026-11-23 an interrupted give-back waited a whole sweep's interval for the next pass, which anything running
+/// once an interval cut short again at its first step: on CI's windows-latest a test looking once an interval landed on
+/// the same 15.6 ms scheduler tick as each pass, so each pass gave back one slice (60 passes of one step, 680 MB of a
+/// 1.43 GB walk left at the 60-interval bound; diag run 45275623386), where one uninterrupted pass walks the rest in 2.6
+/// to 5.9 ms. A client polling once a second does the same in the field. At the idle point a give-back never runs
+/// beside ready work (A-226's rule is unchanged), and under sustained load there is no idle point, so it waits.
+pub(crate) fn idle_work() -> bool {
+  let resumed = state::with_state(|s| {
+    if !std::mem::take(&mut s.give_back_waits_idle) {
+      return false;
+    }
+    let Some(sweeper) = s.idle_sweeper else {
+      return false;
+    };
+    s.count(GIVE_BACK_RESUMED, 1);
+    slates_rt::registry::wake(sweeper.0);
+    true
+  })
+  .unwrap_or(false);
+  resumed || crate::content_ranges::idle_slice()
 }
 
 /// Ends a pass: what the arena holds now is what the next borrow compares against, and a pass that did not settle the
@@ -175,6 +243,14 @@ mod tests {
 
   use slates_vfs::clock::Clock;
 
+  /// A-881's lost-wake signal: parks `daemon`'s shard began with a task ready on its own queue (`parked_with_ready`),
+  /// which a healthy shard never does: such a task waits out the park.
+  fn parked_with_ready(daemon: &crate::daemon::Daemon) -> u64 {
+    crate::daemon::observe_first(daemon, |_state| {
+      slates_rt::registry::with_current(|context| context.counters().parked_with_ready).unwrap_or(0)
+    })
+  }
+
   /// Shape: how many sweep intervals a test allows the first pass to settle the shard in: a start leaves the free
   /// content it sized to be given back a slice a pass whenever another task (the control shard's 100 ms heartbeat)
   /// runs during it, 3.2 GB over about ten passes on the Mac Studio; a look returns as soon as it has settled.
@@ -237,9 +313,100 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(interval * 3);
     let after = crate::daemon::observe_first(&daemon, passes);
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(first, "the first pass ran and settled the shard");
     assert_eq!(after, before, "no pass ran on the idle shard");
+  }
+
+  /// A step counter of the sweep's give-back: its idle steps and its busy ones.
+  fn give_back_steps(state: &mut crate::state::ShardState) -> u64 {
+    [crate::daemon::TICKS_IDLE, crate::daemon::TICKS_BUSY]
+      .iter()
+      .map(|kind| state.refusals.get(kind).copied().unwrap_or(0))
+      .sum()
+  }
+
+  /// The hostile poller: each time the keeper starts a pass it takes turns on the shard until the pass has taken a
+  /// give-back step since the poller last looked, or is not running, so it runs across that step's yield and cuts the
+  /// pass short there, whichever of the two the shard polls first; then it waits for the next pass. It never waits for
+  /// a second step: a pass that waits for the shard's idle point after the cut would never get one while the poller
+  /// kept taking turns (the poller's first build did, and was itself the load that held the pass off, on macOS).
+  async fn poller() {
+    let Some(mut seen) = super::state::with_state(give_back_steps) else {
+      return;
+    };
+    loop {
+      slates_rt::futures::idle().await;
+      loop {
+        match super::state::with_state(|state| (give_back_steps(state), state.idle_sweep_running)) {
+          None => return,
+          Some((steps, running)) if steps > seen || !running => {
+            seen = steps;
+            break;
+          }
+          Some(_) => {}
+        }
+        slates_rt::futures::yield_now().await;
+      }
+    }
+  }
+
+  /// A-226, A-715 (main 01a20182's ruling of 2026-11-23; the drift-free case). Do: on a one-shard daemon, set a poller
+  /// that the keeper wakes beside each pass it starts and that takes turns on the shard until the pass has taken a
+  /// step, so it cuts every pass short at its first step on every platform. A look once an interval did that on
+  /// windows-latest, landing on the same 15.6 ms scheduler tick as each pass, and arm64's timing drifted out of it after
+  /// a few passes. Then look until the sweep has settled. Expect: the first pass settles the shard by itself, its
+  /// give-back resumed at the shard's idle points (counted) and no second pass started. Until 2026-11-23 a cut pass's
+  /// give-back resumed only in the next pass, an interval on, which the poller cut again at its first step: one step an
+  /// interval, and every pass's first step walks one page, since a fresh shard has learned no rate.
+  #[test]
+  fn a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points() {
+    let interval = Duration::from_nanos(super::interval_ns());
+    let daemon = crate::daemon::audit_daemon_of(1);
+    // What a start leaves to give back is given back first, as the tests above do.
+    let _ = daemon.give_back_recovery_on_every_shard();
+    let polling = crate::daemon::observe_first(&daemon, |_state| {
+      let task = slates_rt::futures::spawn(poller()).ok();
+      if let Some(task) = task {
+        let _ = slates_rt::futures::detach(task);
+      }
+      super::TEST_POLLER.set(task);
+      task.is_some()
+    });
+    let first = look_until(&daemon, interval * FIRST_SETTLE_INTERVALS, |state| {
+      passes(state) > 0 && settled(state)
+    });
+    let (started, resumed, seen) = crate::daemon::observe_first(&daemon, |state| {
+      let count = |state: &crate::state::ShardState, kind: &str| {
+        state.refusals.get(kind).copied().unwrap_or(0)
+      };
+      (
+        count(state, super::PASSES_STARTED),
+        count(state, super::GIVE_BACK_RESUMED),
+        describe(state),
+      )
+    });
+    let parked = parked_with_ready(&daemon);
+    daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
+    assert!(polling, "the poller is on the shard");
+    assert!(first, "the first pass ran and settled the shard: {seen}");
+    assert!(
+      resumed > 0,
+      "the poller cut the pass, and its give-back resumed at the shard's idle point: {seen}"
+    );
+    assert_eq!(
+      started, 1,
+      "one pass settled the shard, its give-back resumed in it rather than in later passes: {seen}"
+    );
   }
 
   /// A-715. Do: on a one-shard daemon whose sweep has settled, create a volume and write a file into it, then look
@@ -262,7 +429,12 @@ mod tests {
     let armed = crate::daemon::observe_first(&daemon, |state| !settled(state));
     let swept = look_until(&daemon, interval * 10, move |state| passes(state) > before);
     let seen = crate::daemon::observe_first(&daemon, describe);
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(first, "the first pass ran and settled the shard");
     assert!(wrote, "the file was written");
     assert!(armed, "the write armed a pass");
@@ -385,7 +557,12 @@ mod tests {
           .unwrap_or(0),
       )
     });
+    let parked = parked_with_ready(&daemon);
     daemon.stop();
+    assert_eq!(
+      parked, 0,
+      "no park of the shard began with a task ready (A-881)"
+    );
     assert!(first, "the first pass ran and settled the shard");
     let (rooted, opened) = listed.expect("the overlay was made and its directories listed");
     assert_eq!(
