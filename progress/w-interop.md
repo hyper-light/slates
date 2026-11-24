@@ -600,3 +600,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   under Apache, httpd in its own session). BENCHMARKS has the entry's shape, NOT YET RUN: main runs it on the big
   Studio. mod_dav_svn is absent there.
 - WAITING: r546 (the svn use test over HTTP at c40775ea2); svn on Windows waits on Ada's go.
+- LANDED a00650fe2: GAPS records Linux's interop counts (git 27/27, svn 33/33 on both routes, hg 24/24). Goal 93's
+  Linux counts are closed.
+- LANDED 487baa195 (red adda1f16e), 2026-11-23: the svn use test's command waits block on the child's exit (no
+  stretched 20 ms poll), and each verb prints its time and each leg's share. r546's git-2000 round had been killed at
+  5,400 s with nothing printed. Owed to main: the sizing run (every verb but blame, then blame at one sample), then
+  git-2000's rerun with its bound stated. Blame is 155,904 commands at 16 samples.
