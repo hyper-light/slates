@@ -718,7 +718,7 @@
 - LANDED 337bd72c6 (drift test 12/10), 49d801ec6 (daemon:: 3 git tests recorded; sweep in commit), 77397a5f4 (gate 5:
   ReceivePack keeps side_band_asked so a refusal while answered goes on band 3; git_push::Unlanded typed x7, logged;
   red a_push_refused_while_answered_is_still_answered_on_band_three at lent 3).
-- OPEN: receive test fenced at lend 6 after body hung >10 min (pushed_fenced_after(.., (6,1))) — find the wait.
+- WITHDRAWN: the lend-6 'hang' was the 600 s command budget spent recompiling per probe step; built first, lend 6 passes in 4.75 s. Main told.
 - WAITING: gate 6 at 77397a5f4 (names the Unlanded cause; HomedShort/repo-at-f+1 -> w-shared's A-894). Main to run
   interop git leg dumping `status --json` git_encode/git_derive counters per step (runs 2-5 fetch 9x, shallow 3x).
 - NEXT: clone speed item.
