@@ -1171,7 +1171,10 @@
 >   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
 >   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
 >   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
->   makes each extent's object afresh at a claim after a release), should refusals remain.
+>   makes each extent's object afresh at a claim after a release), should refusals remain. r633 named it: no OS
+>   refusal, but an extent object a run before had left under the bench's fixed segment name, at another length. FIXED
+>   at the cause the same day: a created content object clears its extents' names and its creator removes them as it
+>   drops (`docs/bugs/2026-11-23-a-content-extents-object-outlived-its-daemon-and-met-the-next-run.md`).
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
