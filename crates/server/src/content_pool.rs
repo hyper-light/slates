@@ -208,6 +208,22 @@ pub(crate) struct ContentPool {
   /// Whether this shard may take the pressure hold's extents as well as free ones: open only while a takeover's
   /// recovery runs past the hold ([`ExtentSource::open_hold`]).
   hold_open: bool,
+  /// The pool's free room as last counted in full, and what it was counted at ([`Counted`]): reused while nothing it
+  /// depends on moved (A-906).
+  counted: core::cell::Cell<Option<Counted>>,
+  /// Counts of the pool's free room answered from [`ContentPool::counted`] without a scan: the cache's non-vacuity
+  /// count (A-906).
+  scans_skipped: core::cell::Cell<u64>,
+}
+
+/// The pool's free room as counted in full ([`ExtentSource::available`]), and what it was counted at: the segment's pool
+/// generation (moved at every claim and release by any partition), whether the hold was open, and how many times an
+/// extent's readiness had moved in this process (Windows; 0 elsewhere). Gate r935 (main 01a20182): every lend counted
+/// the pool by reading every extent's owner word, 3,516 of a clone's 24,971 samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Counted {
+  at: (u64, bool, u64),
+  available: usize,
 }
 
 impl ContentPool {
@@ -232,6 +248,8 @@ impl ContentPool {
       huge_pages: config.huge_pages,
       refused: 0,
       hold_open: false,
+      counted: core::cell::Cell::new(None),
+      scans_skipped: core::cell::Cell::new(0),
     };
     pool.make_own_extents();
     pool
@@ -516,7 +534,43 @@ fn claimable_now(_id: u16) -> bool {
   true
 }
 
+/// How many times an extent's readiness moved in this process: what [`claimable_now`] answers moves only with it
+/// (A-906, part of the pool's count's key).
+#[cfg(windows)]
+fn readiness_moved() -> u64 {
+  crate::content_extents::readiness_moved()
+}
+
+/// [`readiness_moved`] off Windows: an extent's readiness never moves.
+#[cfg(not(windows))]
+fn readiness_moved() -> u64 {
+  0
+}
+
 impl ContentPool {
+  /// The pool's free room counted in full: every candidate extent's owner word read, the free ones a claim can take now
+  /// summed, and the hold's while it is open (A-98, A-853, A-789). What [`ExtentSource::available`] answers whenever
+  /// anything its count depends on moved (A-906).
+  fn count_available(&self) -> usize {
+    let hold_open = self.hold_open;
+    self
+      .candidates()
+      .filter(|id| claimable_now(*id))
+      .filter(|id| match self.segment.pool_owner(usize::from(*id)) {
+        Ok(None) => true,
+        Ok(Some(POOL_HOLD_OWNER)) => hold_open,
+        _ => false,
+      })
+      .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
+      .sum()
+  }
+
+  /// Counts of the pool's free room answered without a scan (A-906's non-vacuity count; its test reads it).
+  #[cfg(test)]
+  pub(crate) fn scans_skipped(&self) -> u64 {
+    self.scans_skipped.get()
+  }
+
   /// Gives a released extent's memory back to the system where it is an object of its own (macOS): its name removed,
   /// so the object and every page in it go with the mapping just dropped, then made again, empty, for its next claim
   /// (main's condition (a): never made on the provisioning path). Before, a released extent was only unmapped, and its
@@ -648,18 +702,24 @@ impl ExtentSource for ContentPool {
     self.refused
   }
 
+  /// The pool's free room (A-906): its last full count while the segment's pool generation, the hold and (Windows) the
+  /// extents' readiness read as they did then, else counted in full again ([`ContentPool::count_available`]). The
+  /// generation is read before the count, and every claim and release moves it after its owner word, so a count never
+  /// outlives a claim it missed.
   fn available(&self) -> usize {
-    let hold_open = self.hold_open;
-    self
-      .candidates()
-      .filter(|id| claimable_now(*id))
-      .filter(|id| match self.segment.pool_owner(usize::from(*id)) {
-        Ok(None) => true,
-        Ok(Some(POOL_HOLD_OWNER)) => hold_open,
-        _ => false,
-      })
-      .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
-      .sum()
+    let Ok(generation) = self.segment.pool_generation() else {
+      return self.count_available();
+    };
+    let at = (generation, self.hold_open, readiness_moved());
+    if let Some(counted) = self.counted.get().filter(|counted| counted.at == at) {
+      self
+        .scans_skipped
+        .set(self.scans_skipped.get().saturating_add(1));
+      return counted.available;
+    }
+    let available = self.count_available();
+    self.counted.set(Some(Counted { at, available }));
+    available
   }
 
   #[cfg(windows)]
@@ -790,6 +850,74 @@ mod tests {
       "a {SEAL_TURN_BYTES}-byte lend grew the arena by {grown} bytes (lacked {lacked}, unit {unit}, capacity before \
        {before}, slice arena {slice})"
     );
+  }
+
+  /// The pool's room as [`ExtentSource::available`] answers it and as a full count reads it now.
+  fn both_counts(pool: &super::ContentPool) -> (usize, usize) {
+    use slates_mem::arena::ExtentSource;
+    (pool.available(), pool.count_available())
+  }
+
+  /// [`both_counts`] of `pool`, held equal: the kept answer is a full count's, `what` naming the move it follows.
+  fn counts_agree(pool: &super::ContentPool, what: &str) -> (usize, usize) {
+    let counts = both_counts(pool);
+    assert_eq!(counts.0, counts.1, "{what}");
+    counts
+  }
+
+  /// A-906 (main 01a20182's gate r935: every lend counted the pool's free room by reading every owner word, 3,516 of a
+  /// clone's 24,971 samples; its ruling of 2026-11-24 11:27). Do: over a fresh two-partition segment, open partition 0's
+  /// pool and ask its room twice with nothing moved; then claim an extent, give it back, have partition 1 claim one
+  /// through a mapping of its own, move the pressure hold toward a target, and open and close the hold, asking the room
+  /// after each. Expect: after every move the answer equals a full count of the owner words, and the answers between
+  /// moves came from the count kept, not a scan (its skipped count moved: the cache's non-vacuity).
+  #[test]
+  fn a906_the_pools_room_equals_a_full_count_after_every_move_and_is_kept_between() {
+    use slates_mem::arena::ExtentSource;
+    let profile = crate::daemon::test_profile();
+    let instance = format!("pool-count-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(2));
+    let segment =
+      slates_anchor::AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+        .unwrap();
+    let (handoff, len) = segment.handoff().unwrap();
+    let other =
+      slates_anchor::AnchorSegment::attach(&handoff, len, &profile.facts.identity).unwrap();
+    let geometry = super::PoolGeometry::of(&config);
+    let mut pool = super::ContentPool::open(&config, 0, &[], segment);
+    let first = counts_agree(&pool, "at the open");
+    let skipped = pool.scans_skipped();
+    assert_eq!(both_counts(&pool), first, "nothing moved");
+    assert!(
+      pool.scans_skipped() > skipped,
+      "the kept count answered (non-vacuity)"
+    );
+    let (id, region) = pool.claim(config.pool_unit()).expect("a claim");
+    let claimed = counts_agree(&pool, "after a claim");
+    assert!(claimed.0 < first.0, "the claim took room");
+    pool.release(id, region);
+    let given = counts_agree(&pool, "after a give-back");
+    let theirs = (0..other.pool_extents())
+      .find(|extent| other.pool_claim(*extent, 1).unwrap())
+      .expect("another partition's claim");
+    let after_theirs = counts_agree(&pool, "after another partition's claim");
+    assert!(
+      after_theirs.0 < given.0,
+      "their claim took room this pool counts"
+    );
+    super::hold_toward(
+      &other,
+      &geometry,
+      u64::try_from(config.pool_unit()).unwrap(),
+    )
+    .unwrap();
+    counts_agree(&pool, "after the hold moved");
+    pool.open_hold(true);
+    counts_agree(&pool, "with the hold open");
+    pool.open_hold(false);
+    counts_agree(&pool, "with the hold closed again");
+    assert!(other.pool_release(theirs, 1).unwrap());
+    counts_agree(&pool, "after their give-back");
   }
 
   /// Shape: the turns each shard lends in [`two_shards_lending_small_rooms_in_turn_are_both_admitted`]: enough that a

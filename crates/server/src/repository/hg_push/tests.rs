@@ -808,10 +808,8 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
   assert_eq!(readopted, Some(true), "re-adopted");
   assert_eq!(brought, 1, "the splice's base brought back first");
   assert_eq!(read.as_deref(), Some(&b"bx\n"[..]), "the edited file");
-  assert!(
-    matches!(&edited, Some(reply) if !matches!(reply, ReplyBody::Refused { .. })),
-    "{edited:?}"
-  );
+  let edited = edited.expect("the second edit submitted");
+  assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
   assert_eq!(after.as_deref(), Some(&b"bxx\n"[..]), "edited again");
 }
 
@@ -958,6 +956,160 @@ fn a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it() {
   assert_eq!(fenced, None, "not fenced while its source awaits");
   assert_eq!(readopted, Some(true), "the root re-adopted");
   assert_eq!(read.as_deref(), Some(&b"b\n"[..]), "`main` rebuilt over it");
+}
+
+/// A green taken over before its repository is rebuilt (main 01a20182's rulings of 2026-11-24 09:26 and 09:46, item
+/// (2)'s second half, from w-hg's sweep for 259b0db84): between a takeover's adoption of a repository's green and the
+/// repository's rebuild (`takeover::rebuild_repository`, which joins its members and makes its store), no membership names
+/// it a repository's here, its record pending (`ShardState::pending_repositories`). Do: on a store-backed daemon,
+/// rebuild the fixtures' repository as one push; leave it awaiting its rebuild, its store and texts gone as a successor
+/// holds none (`test_store::awaiting_rebuild`); edit `b` over a work on its root and submit it as a client's recorded
+/// request; then rebuild the repository (`test_store::rebuilt_after_takeover`) and send the same request again, as a
+/// client resends one answered `Overloaded`. Expect: the first refused `Overloaded`, counted `merge.made.unbuilt`, the
+/// root's head unmoved; the rebuild asked the node's changeset store for the texts its content store never knew
+/// (`vcs_store.hg_replay_unknown_asked`, A-636 part 2c-2); the resend accepted, a changeset made of it (the root's
+/// Mercurial head moved). Failing first: the first submit committed a version with no changeset made of it; then, its
+/// store gone, the rebuild refused `Unheld` at the changelog's revision 0 and the resend `ContentUnavailable`.
+#[test]
+fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  // Its texts kept resident: the submit's own commit is what is judged here, not a read back of a let-go base.
+  crate::test_store::keep_landed(&daemon);
+  let (root, record, head, node) = crate::daemon::observe_first(&daemon, |state| {
+    // The state logs' parts as the partition makes them, taken as they come, as a successor's acceptors hold them: what
+    // its rebuild keeps (A-636 part 2c-2).
+    let mut hg = Hg::new(state, "pending-rebuild");
+    let mut parts = state.db.take_state_log_records();
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    parts.extend(state.db.take_state_log_records());
+    let node = crate::vcs_store::hg_made::head_of(state, hg.root);
+    // Its store gone too: a successor holds none, nor any of its texts, until its rebuild makes them from the log.
+    let record = crate::test_store::awaiting_rebuild(state, hg.repository, true);
+    (
+      hg.root,
+      (record, parts),
+      state.db.partition().green_head(hg.root),
+      node,
+    )
+  });
+  let submit = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let (first, unbuilt, after_first) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::repository::svn_commit::tests::on;
+      let work = edited_work(root, "edit-pending").await;
+      let first = on(|state| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, submit),
+          &owner(),
+          crate::identities::authored(work, "edit a file"),
+        )
+      });
+      let counted = on(|state| {
+        state
+          .refusals
+          .get(crate::made_commit::MADE_UNBUILT)
+          .copied()
+          .unwrap_or(0)
+      });
+      let head = on(|state| state.db.partition().green_head(root));
+      let repository = record.0.id;
+      on(|state| crate::test_store::rebuilt_after_takeover(state, record));
+      // Its store made from the log by the shard's own task, a step a turn: the resend comes once it stands, as a
+      // client's does after its backoff.
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(NAMED_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      while on(|state| state.vcs_stores.rebuilding(repository)) {
+        assert!(
+          slates_rt::futures::now_ns() < deadline,
+          "the store never stood"
+        );
+        slates_rt::futures::yield_now().await;
+      }
+      let unknown = on(|state| {
+        state
+          .refusals
+          .get(crate::vcs_store::HG_REPLAY_UNKNOWN_ASKED)
+          .copied()
+          .unwrap_or(0)
+      });
+      let _ = on(|state| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, submit),
+          &owner(),
+          crate::identities::authored(work, "edit a file"),
+        )
+      });
+      let again = recorded_answer(7, submit).await;
+      (first, counted, (head, again, unknown))
+    },
+    NAMED_PATIENCE,
+  );
+  let (moved, node_after) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.db.partition().green_head(root),
+      crate::vcs_store::hg_made::head_of(state, root),
+    )
+  });
+  daemon.stop();
+  assert!(
+    matches!(
+      first,
+      Some(ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
+      })
+    ),
+    "the first refused Overloaded, retryable: {first:?}"
+  );
+  assert_eq!(unbuilt, 1, "counted merge.made.unbuilt");
+  let (head_after_first, again, unknown) = after_first;
+  assert_eq!(head_after_first, head, "nothing committed while it awaited");
+  assert!(
+    unknown > 0,
+    "the rebuild asked for the texts its store never knew"
+  );
+  assert!(
+    !matches!(again, ReplyBody::Refused { .. }),
+    "the resend after the rebuild: {again:?}"
+  );
+  assert!(moved > head, "the resend committed");
+  assert_ne!(node_after, node, "a changeset made of it");
+}
+
+/// A work over green `green` named `name`, `x` inserted at offset 1 of `b`: the work.
+async fn edited_work(green: DbVolumeId, name: &str) -> slates_ipc::protocol::VolumeId {
+  use crate::repository::svn_commit::tests::on;
+  let made = on(|state| {
+    crate::vcs_store::paths::tests::ask(
+      state,
+      RequestBody::CreateWork {
+        green: slates_ipc::protocol::VolumeId { bytes: green.bytes },
+        name: name.to_owned(),
+      },
+    )
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  let edited = on(|state| {
+    crate::vcs_store::paths::tests::ask(
+      state,
+      RequestBody::Edit {
+        work,
+        path: "b".to_owned(),
+        at: 1,
+        delete_len: 0,
+        bytes: b"x".to_vec(),
+      },
+    )
+  });
+  assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+  work
 }
 
 /// A daemon over `instance`'s segment and `store`, the anchor's, with a Mercurial repository rebuilt from the fixtures by

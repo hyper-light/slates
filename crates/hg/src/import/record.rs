@@ -546,6 +546,10 @@ pub struct Replayed {
   /// The changesets' and manifests' texts the replay asked of the node's changeset store, let go once landed (goal 93,
   /// C1 (1)): what a recovery read back.
   pub texts_asked: u64,
+  /// The changesets' texts and the manifests' and file revisions' rows the replay asked of the node's changeset store
+  /// for identities the content store never knew (A-636 part 2c-2: a takeover's successor makes the store again over a
+  /// content store that never held them), apart from those let go once landed ([`Replayed::texts_asked`]).
+  pub unknown_asked: u64,
 }
 
 /// One revision a push's record holds ([`write_revisions`]): its node, parents, link (the null node for a changeset,
@@ -1406,7 +1410,7 @@ pub fn replay(
   loop {
     // A whole replay waits on no store: a text let go once landed is refused, never awaited (goal 93, C1 (1)).
     let stepped = match replay.step(bytes, store) {
-      Ok(true) if replay.asking() => Err(Refused::StoreWanted),
+      Ok(true) if replay.asking() => Err(replay.unheld().unwrap_or(Refused::StoreWanted)),
       other => other,
     };
     match stepped {
@@ -1464,6 +1468,17 @@ struct Revisions {
   given_changesets: Vec<(Node, Vec<u8>)>,
   /// The manifests' texts the store gave for the unit being replayed, given up once it is.
   given_manifests: Vec<(Node, Vec<u8>)>,
+  /// Whether the ask under way is of rows the content store never knew ([`Revisions::ask_rows`]), its texts given to
+  /// [`Revisions::given_rows`].
+  asking_rows: bool,
+  /// The manifests' and file revisions' whole texts the store gave for rows whose content the content store never knew,
+  /// by node, each taken by its row's unit: as many as a unit's room held.
+  given_rows: Vec<(Node, Vec<u8>)>,
+  /// What a replay that asks nothing refuses in place of the ask under way: [`Refused::Unheld`] where it asks for a
+  /// content the store never knew ([`replay`]).
+  unheld: Option<Refused>,
+  /// How many of the ask under way's texts are for identities the store never knew ([`Replay::asked_unknown`]).
+  asked_unknown: u64,
 }
 
 /// A record replayed a unit at a time (A-732: a recovery of a large repository's record in one step spun its shard past
@@ -1685,6 +1700,24 @@ impl Replay {
       .is_some_and(|wants| wants.wants().is_some())
   }
 
+  /// How many of the texts the ask under way asks are for identities the content store never knew (A-636 part 2c-2),
+  /// apart from those let go once landed: what its driver counts as it answers the ask.
+  pub fn asked_unknown(&self) -> u64 {
+    match &self.kind {
+      Kind::Revisions(revisions) if revisions.asked.is_some() => revisions.asked_unknown,
+      _ => 0,
+    }
+  }
+
+  /// What a replay that waits on no store refuses in place of the ask under way ([`replay`]): [`Refused::Unheld`] where
+  /// the ask is for a content the store never knew; none for a text let go once landed.
+  fn unheld(&self) -> Option<Refused> {
+    match &self.kind {
+      Kind::Revisions(revisions) => revisions.unheld.clone(),
+      _ => None,
+    }
+  }
+
   /// The ask the replay waits on, by its log's path and nodes, if any: the tests' stand-in for the store reads it.
   #[cfg(test)]
   pub(crate) fn asked_texts(&self) -> Option<(Vec<u8>, Vec<Node>)> {
@@ -1865,6 +1898,7 @@ impl Retaken {
       whole: replaced.release(store).is_ok(),
       made,
       texts_asked: intaken.log_texts_asked,
+      unknown_asked: 0,
     })
   }
 }
@@ -1906,6 +1940,10 @@ impl Revisions {
       asked: None,
       given_changesets: Vec::new(),
       given_manifests: Vec::new(),
+      asking_rows: false,
+      given_rows: Vec::new(),
+      unheld: None,
+      asked_unknown: 0,
     })
   }
 
@@ -1925,8 +1963,12 @@ impl Revisions {
     if let Some(asked) = self.asked.take() {
       let changesets = asked.path() == crate::push::intake::CHANGELOG_PATH;
       let given = asked.taken().ok_or(Refused::TextsUnread)?;
+      self.unheld = None;
+      self.asked_unknown = 0;
       if changesets {
         self.given_changesets.extend(given);
+      } else if core::mem::take(&mut self.asking_rows) {
+        self.given_rows.extend(given);
       } else {
         self.given_manifests.extend(given);
       }
@@ -1938,7 +1980,10 @@ impl Revisions {
       // A text let go once landed: asked, nothing taken; the unit is taken again once the store gives it.
       Err(Refused::TextsWanted) => {
         if self.asked.is_none() {
-          self.ask_changesets(bytes, store)?;
+          match self.group {
+            Some((CHANGELOG_TAG, ..)) => self.ask_changesets(bytes, store)?,
+            _ => self.ask_rows(bytes, store)?,
+          }
         }
         return Ok(true);
       }
@@ -1961,7 +2006,7 @@ impl Revisions {
       rest: bytes.get(self.at..).ok_or(Refused::Truncated)?,
     };
     let room = self.room.left();
-    let (mut nodes, mut most) = (Vec::new(), 0_u64);
+    let (mut nodes, mut most, mut unknown) = (Vec::new(), 0_u64, 0_u64);
     for _ in 0..left {
       let node = reader.node()?;
       let _parents = (reader.node()?, reader.node()?);
@@ -1982,19 +2027,159 @@ impl Revisions {
       }
       most = most.saturating_add(len);
       nodes.push(node);
+      unknown = unknown.saturating_add(u64::from(store.len_of(&text).is_none()));
     }
     if nodes.is_empty() {
       return Err(Refused::TextsUnread);
     }
+    self.replayed.unknown_asked = self.replayed.unknown_asked.saturating_add(unknown);
+    self.asked_unknown = unknown;
     self.replayed.texts_asked = self
       .replayed
       .texts_asked
-      .saturating_add(to_u64(nodes.len()));
+      .saturating_add(to_u64(nodes.len()).saturating_sub(unknown));
     self.asked = Some(crate::push::held::TextsAsk::new(
       crate::push::intake::CHANGELOG_PATH.to_vec(),
       nodes,
       most,
     ));
+    Ok(())
+  }
+
+  /// Asks the node's changeset store for the whole texts of the manifest or file log group's rows from this unit's
+  /// whose contents the content store never knew (A-636 part 2c-2) and none given yet, by node under the log's path as
+  /// the store keeps it (`\0manifest`, a file's tracked path), as many as the room the record was written within holds
+  /// (one at least), read ahead from the record's bytes without replaying them. Counted
+  /// ([`Replayed::unknown_asked`]).
+  fn ask_rows(&mut self, bytes: &[u8], store: &ContentStore) -> Result<(), Refused> {
+    let Some((tag, (start, end), left, _)) = self.group else {
+      return Err(Refused::TextsUnread);
+    };
+    let (log, path) = match tag {
+      MANIFEST_TAG => (Log::Manifest, crate::push::intake::MANIFEST_PATH),
+      FILE_TAG => {
+        let path = bytes.get(start..end).ok_or(Refused::Truncated)?;
+        (Log::File(path), path)
+      }
+      _ => return Err(Refused::TextsUnread),
+    };
+    let mut reader = Reader {
+      rest: bytes.get(self.at..).ok_or(Refused::Truncated)?,
+    };
+    let room = self.room.left();
+    let (mut nodes, mut most) = (Vec::new(), 0_u64);
+    for _ in 0..left {
+      let (node, p1, p2) = (reader.node()?, reader.node()?, reader.node()?);
+      let stored = stored_row(&mut reader, self.base_by_node)?;
+      let row = NewRevision {
+        node,
+        p1,
+        p2,
+        link: stored.link,
+        flags: stored.flags,
+        len: stored.len,
+        bytes: stored.bytes,
+        block: stored.block,
+      };
+      let held = (self.base_by_node && self.fork.rev(store, log, &node).is_some())
+        || known(store, &row)
+        || self.given_rows.iter().any(|(given, _)| *given == node);
+      if held {
+        continue;
+      }
+      if !nodes.is_empty() && most.saturating_add(row.len) > room {
+        break;
+      }
+      most = most.saturating_add(row.len);
+      nodes.push(node);
+    }
+    if nodes.is_empty() {
+      return Err(Refused::TextsUnread);
+    }
+    self.replayed.unknown_asked = self
+      .replayed
+      .unknown_asked
+      .saturating_add(to_u64(nodes.len()));
+    self.asking_rows = true;
+    self.asked_unknown = to_u64(nodes.len());
+    self.asked = Some(crate::push::held::TextsAsk::new(path.to_vec(), nodes, most));
+    Ok(())
+  }
+
+  /// Keeps `row`, whose content the store never knew, from `text`, its whole text the node's changeset store gave
+  /// ([`Revisions::ask_rows`]): held to its length and to its node with its parents (`node::compute`, as a push's
+  /// verify holds a revision), else refused [`Refused::Unheld`]. A manifest kept again over it as the index keeps a new
+  /// one ([`Revisions::append_over_given`]): the row's object may then differ from the one the record named, which no
+  /// later step compares, rows matching by node. A file revision's block and bytes put whole, each held to the record's
+  /// identities where the record stored it whole, and appended whole.
+  fn given_row(
+    &mut self,
+    store: &mut ContentStore,
+    (log, radix, rev): (Log<'_>, &[u8], u32),
+    (mut row, base): (NewRevision, Base),
+    text: Vec<u8>,
+  ) -> Result<(), Refused> {
+    let unheld = || Refused::Unheld {
+      revlog: Box::from(radix),
+      rev,
+    };
+    if to_u64(text.len()) != row.len
+      || node::compute(&row.p1, &row.p2, &text).ok() != Some(row.node)
+    {
+      return Err(unheld());
+    }
+    let content = |refused| {
+      Refused::Import(ImportRefused::Index(crate::index::Refused::Index(
+        IndexRefused::Content(refused),
+      )))
+    };
+    if log == Log::Manifest {
+      // Put whole first: a manifest the index keeps whole (a log's first, or one past its chain's bound) is held by its
+      // row's object, which no delta replaces.
+      let put = store.put_object(&text).map_err(content)?;
+      row.bytes = put;
+      self.given_manifests.push((row.node, text));
+      let appended = self.append_over_given(store, log, row);
+      drop(store.release(&put));
+      settle::<Infallible>(
+        radix,
+        rev,
+        &appended.map_err(ImportRefused::<Infallible>::Index)?,
+      )?;
+      return Ok(());
+    }
+    let split = filerev::split(&text).map_err(|_| unheld())?;
+    let mut puts = Vec::with_capacity(2);
+    let put = store.put_object(split.bytes).map_err(content)?;
+    puts.push(put);
+    let block = match split.metadata {
+      Some(metadata) => {
+        let block = store.put_object(metadata);
+        if let Ok(block) = block {
+          puts.push(block);
+        }
+        Some(block.map_err(content))
+      }
+      None => None,
+    }
+    .transpose();
+    let whole =
+      matches!(base, Base::Number(NONE)) || matches!(base, Base::Node(node) if node == NULL_NODE);
+    let kept = block.and_then(|block| {
+      if whole && (put != row.bytes || block != row.block) {
+        return Err(unheld());
+      }
+      row.bytes = put;
+      row.block = block;
+      self
+        .fork
+        .append_stored(store, log, &[(row, (NONE, 0, 0))])
+        .map_err(|refused| Refused::Import(ImportRefused::Index(refused)))
+    });
+    for put in &puts {
+      drop(store.release(put));
+    }
+    settle::<Infallible>(radix, rev, &kept?)?;
     Ok(())
   }
 
@@ -2201,8 +2386,14 @@ impl Revisions {
             }
             text
           }
-          None if store.len_of(&text_id).is_some() => return Err(Refused::TextsWanted),
-          None => return Err(unheld()),
+          // Let go once landed, or never known here (A-636 part 2c-2: a takeover's successor makes the store again over a
+          // content store that never held it): asked alike, a replay that asks nothing refused `Unheld` for the latter.
+          None => {
+            if store.len_of(&text_id).is_none() {
+              self.unheld = Some(unheld());
+            }
+            return Err(Refused::TextsWanted);
+          }
         },
       };
       let read = Read {
@@ -2215,26 +2406,18 @@ impl Revisions {
       };
       return replay_changeset(&mut self.fork, store, (rev, &read), self.room);
     }
-    let link = reader.node()?;
-    let flags = flags_of(reader)?;
-    let len = reader.long()?;
-    let base = if self.base_by_node {
-      Base::Node(reader.node()?)
-    } else {
-      Base::Number(reader.word()?)
-    };
-    let (delta_len, chain) = (reader.long()?, reader.long()?);
-    let bytes = identity_of(reader)?;
-    let block = match reader.byte()? {
-      0 => None,
-      1 => Some(identity_of(reader)?),
-      tag => return Err(Refused::Tag { tag }),
-    };
+    let StoredRow {
+      link,
+      flags,
+      len,
+      base,
+      delta_len,
+      chain,
+      bytes,
+      block,
+    } = stored_row(reader, self.base_by_node)?;
     if held {
       return Ok(());
-    }
-    if store.len_of(&bytes).is_none() || block.is_some_and(|block| store.len_of(&block).is_none()) {
-      return Err(unheld());
     }
     let row = NewRevision {
       node,
@@ -2246,6 +2429,16 @@ impl Revisions {
       bytes,
       block,
     };
+    // A content the store never knew (A-636 part 2c-2: a takeover's successor makes the store again over a content store
+    // that never held it): its whole text asked of the node's changeset store by node, checked, then kept.
+    if !known(store, &row) {
+      let Some(at) = self.given_rows.iter().position(|(given, _)| *given == node) else {
+        self.unheld = Some(unheld());
+        return Err(Refused::TextsWanted);
+      };
+      let (_, text) = self.given_rows.swap_remove(at);
+      return self.given_row(store, (log, radix, rev), (row, base), text);
+    }
     let keeping = self.stored_on(store, log, base);
     let again = match keeping {
       Keeping::AsStored(_, Some(below)) => below.saturating_add(delta_len) > len,
@@ -2405,6 +2598,60 @@ enum Base {
   Number(u32),
   /// By node ([`PUSH_SEGMENT_VERSION`]), the null node for a whole text.
   Node(Node),
+}
+
+/// A manifest's or file revision's row as a record that names identities stores it, past its node and parents.
+struct StoredRow {
+  /// The node of the changeset that brought it.
+  link: Node,
+  /// 7.2's index flags.
+  flags: u16,
+  /// Its whole text's length, its block included.
+  len: u64,
+  /// What its stored delta rests on.
+  base: Base,
+  /// Its stored delta's length.
+  delta_len: u64,
+  /// Its chain's delta bytes.
+  chain: u64,
+  /// Its stored content's identity.
+  bytes: ContentId,
+  /// A file revision's metadata block's identity, when it has one.
+  block: Option<ContentId>,
+}
+
+/// A [`StoredRow`] read, its base by node where `base_by_node`.
+fn stored_row(reader: &mut Reader<'_>, base_by_node: bool) -> Result<StoredRow, Refused> {
+  let link = reader.node()?;
+  let flags = flags_of(reader)?;
+  let len = reader.long()?;
+  let base = if base_by_node {
+    Base::Node(reader.node()?)
+  } else {
+    Base::Number(reader.word()?)
+  };
+  let (delta_len, chain) = (reader.long()?, reader.long()?);
+  let bytes = identity_of(reader)?;
+  let block = match reader.byte()? {
+    0 => None,
+    1 => Some(identity_of(reader)?),
+    tag => return Err(Refused::Tag { tag }),
+  };
+  Ok(StoredRow {
+    link,
+    flags,
+    len,
+    base,
+    delta_len,
+    chain,
+    bytes,
+    block,
+  })
+}
+
+/// Whether the content store knows every content `row` names, held or let go once landed.
+fn known(store: &ContentStore, row: &NewRevision) -> bool {
+  store.len_of(&row.bytes).is_some() && row.block.is_none_or(|block| store.len_of(&block).is_some())
 }
 
 /// A revision's flags, read.

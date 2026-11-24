@@ -219,6 +219,15 @@ pub(crate) fn recorded_git_submit(state: &mut ShardState, body: RequestBody) -> 
       sequence
     }),
   };
+  recorded_git_submit_as(state, id, body)
+}
+
+/// [`recorded_git_submit`] under request `id` of [`TEST_CLIENT`]: a resend of one answered retryable runs it again.
+pub(crate) fn recorded_git_submit_as(
+  state: &mut ShardState,
+  id: slates_wire::request::RequestId,
+  body: RequestBody,
+) -> Option<ReplyBody> {
   crate::refining::HELD_FOR_TEST.with(|held| held.set(true));
   crate::vcs_store::commits::MADE_HELD_FOR_TEST.with(|held| held.set(true));
   let answered =
@@ -866,4 +875,74 @@ fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
     case: slates_ipc::protocol::CopyCase::SourceEmpty,
   };
   assert_eq!(reply, Some(ReplyBody::Refused { refusal: expected }));
+}
+
+/// The git twin of `hg_push::tests::a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt`
+/// (main 01a20182's ruling of 2026-11-24 09:46: the refusal is tool-neutral, so its tests hold every tool). Do: submit a
+/// file to a git repository's root green; leave the repository awaiting its rebuild (`test_store::awaiting_rebuild`);
+/// over a work on the root create `/g` and submit it as a client's recorded request; rebuild the repository from its
+/// state logs' parts (`test_store::rebuilt_after_takeover`) and send the same request again. Expect: the first refused
+/// `Overloaded`, counted `merge.made.unbuilt`, the head unmoved; the resend accepted and committed. Failing first: the
+/// first committed a version with no commit made of it.
+#[test]
+fn a_submit_over_a_git_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt() {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
+    let at = git_repository(state, "pending-git");
+    let mut parts = state.db.take_state_log_records();
+    version(state, at.1, 1, vec![create("/f", b"one")]);
+    parts.extend(state.db.take_state_log_records());
+    let green = crate::verbs::to_db_volume(at.1);
+    let head = state.db.partition().green_head(green);
+    let record = crate::test_store::awaiting_rebuild(state, at.0, true);
+    let made = ask(
+      state,
+      RequestBody::CreateWork {
+        green: at.1,
+        name: "pending-work".to_owned(),
+      },
+    );
+    let ReplyBody::WorkCreated { id: work, .. } = made else {
+      panic!("no work: {made:?}")
+    };
+    let edited = ask(
+      state,
+      RequestBody::Edit {
+        work,
+        path: "/g".to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: b"two".to_vec(),
+      },
+    );
+    assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+    let id = slates_wire::request::RequestId {
+      client: TEST_CLIENT,
+      sequence: 1_000,
+    };
+    let body = || crate::identities::authored(work, "pending");
+    let first = recorded_git_submit_as(state, id, body());
+    let unbuilt = count(state, crate::made_commit::MADE_UNBUILT);
+    let unmoved = state.db.partition().green_head(green) == head;
+    crate::test_store::rebuilt_after_takeover(state, (record, parts));
+    let again = recorded_git_submit_as(state, id, body());
+    let moved = state.db.partition().green_head(green) > head;
+    (first, unbuilt, unmoved, again, moved)
+  });
+  let (first, unbuilt, unmoved, again, moved) = seen;
+  assert!(
+    matches!(
+      first,
+      Some(ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
+      })
+    ),
+    "the first refused Overloaded: {first:?}"
+  );
+  assert_eq!(unbuilt, 1, "counted merge.made.unbuilt");
+  assert!(unmoved, "nothing committed while it awaited");
+  assert!(
+    matches!(again, Some(ReplyBody::Submitted { .. })),
+    "the resend after the rebuild: {again:?}"
+  );
+  assert!(moved, "the resend committed");
 }

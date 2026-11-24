@@ -1937,6 +1937,47 @@ fn releases_by_their_holder_only(segment: &AnchorSegment) {
   assert!(segment.pool_claim(128, 0).is_err(), "past the pool");
 }
 
+/// A-906 (main 01a20182's gate r935: every lend counted the pool's free room by reading every owner word). Do: on a fresh
+/// segment, claim a free extent, claim it again for another partition, release it by another partition, release it by
+/// its holder, post a want. Expect: the pool's generation moved by one at the winning claim and the winning release
+/// alone, never at a lost claim, a refused release or a want; read the same through a second mapping; and its word on
+/// a line of its own, past every owner and want word.
+#[test]
+fn a906_the_pool_generation_moves_at_each_claim_and_release_that_wins_and_no_other() {
+  let id = identity();
+  let name = unique_name("slates-anchor-test-pool-generation");
+  let segment = AnchorSegment::create(&name, &id, geometry()).unwrap();
+  let start = segment.pool_generation().unwrap();
+  assert!(segment.pool_claim(3, 1).unwrap());
+  generation_is(&segment, start + 1, "a winning claim");
+  assert!(!segment.pool_claim(3, 2).unwrap());
+  generation_is(&segment, start + 1, "a lost claim moves nothing");
+  assert!(!segment.pool_release(3, 2).unwrap());
+  generation_is(&segment, start + 1, "a refused release moves nothing");
+  segment.post_pool_want(1, 4096).unwrap();
+  generation_is(&segment, start + 1, "a want moves nothing");
+  assert!(segment.pool_release(3, 1).unwrap());
+  generation_is(&segment, start + 2, "a winning release");
+  let (handoff, len) = handoff_of(&segment);
+  let again = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  generation_is(&again, start + 2, "one word every mapping reads");
+  let partitions = geometry().partitions;
+  let offset = slates_anchor::layout::pool_generation_offset(partitions);
+  let words_before = slates_anchor::layout::pool_owner_and_want_words(partitions)
+    * slates_anchor::layout::POOL_WORD_BYTES as u64;
+  assert_eq!(
+    offset % slates_anchor::layout::HOT_LINE_BYTES as u64,
+    0,
+    "on a line's start"
+  );
+  assert!(offset >= words_before, "past every owner and want word");
+}
+
+/// The pool generation `segment` reads is `expected`, `what` naming the step it follows (A-906's test above).
+fn generation_is(segment: &AnchorSegment, expected: u64, what: &str) {
+  assert_eq!(segment.pool_generation().unwrap(), expected, "{what}");
+}
+
 /// A-98: do have one claimant per partition, each through its own mapping of the segment (as shards of racing daemons
 /// would), claim every extent at once; expect each extent taken by exactly one partition, the owner words agreeing
 /// with the winners, and the claims still there through a fresh attachment (a daemon restart keeps them).

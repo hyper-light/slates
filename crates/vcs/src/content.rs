@@ -2005,6 +2005,34 @@ impl ContentStore {
       .and_then(|held| u64::try_from(held.len()).ok())
   }
 
+  /// The bytes the store holds under the content `identity` names, its whole tree: each window and each list naming
+  /// them, as held now (an object one window long, that window alone). What letting it go gives back where no other
+  /// content shares a node of it; [`ContentStore::len_of`] is the root node's alone (main 01a20182's ruling of
+  /// 2026-11-24: a git fragment kept as a tree was weighed at its root's length, a few dozen bytes).
+  pub fn tree_bytes(&self, identity: &ContentId) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![self.resolve(identity)];
+    while let Some(node) = pending.pop() {
+      let Some(held) = self.entries.get(&node) else {
+        continue;
+      };
+      total = total.saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX));
+      if held.form == Form::List
+        && let Some(list) = held.here()
+      {
+        pending.extend(
+          list
+            .as_chunks::<IDENTITY_BYTES>()
+            .0
+            .iter()
+            .copied()
+            .map(ContentId),
+        );
+      }
+    }
+    total
+  }
+
   /// The form of the content `identity` names.
   pub fn form(&self, identity: &ContentId) -> Option<Form> {
     let identity = &self.resolve(identity);
@@ -3602,18 +3630,24 @@ mod tests {
     assert_eq!(alone.let_go(&single), Err(LetGoRefused::Empty));
     assert_eq!(alone.let_go_object(&single), 0);
     for held in [&store, &alone] {
-      assert!(!held.is_away(&id), "the empty window held");
-      assert_eq!(held.len_of(&id), Some(0));
-      assert_eq!(held.bytes_of(&id).as_deref(), Some(&b""[..]));
-      let aways: Vec<(ContentId, u64)> = held.aways().collect();
-      assert!(aways.is_empty(), "nothing let go to carry: {aways:?}");
-      let mut after = ContentStore::new(1 << 20, 4096).unwrap();
-      assert_eq!(
-        after.restore_away(aways),
-        0,
-        "nothing refused at the restart"
-      );
+      assert_the_empty_window_is_held(held, &id);
     }
+  }
+
+  /// The empty window as a store that kept it shows it: held, never away, read as no bytes, and nothing let go for a
+  /// restart's image to carry, so a fresh store refuses nothing.
+  fn assert_the_empty_window_is_held(held: &ContentStore, id: &ContentId) {
+    assert!(!held.is_away(id), "the empty window held");
+    assert_eq!(held.len_of(id), Some(0));
+    assert_eq!(held.bytes_of(id).as_deref(), Some(&b""[..]));
+    let aways: Vec<(ContentId, u64)> = held.aways().collect();
+    assert!(aways.is_empty(), "nothing let go to carry: {aways:?}");
+    let mut after = ContentStore::new(1 << 20, 4096).unwrap();
+    assert_eq!(
+      after.restore_away(aways),
+      0,
+      "nothing refused at the restart"
+    );
   }
 
   /// A-724 piece 4. Do: let go a landed window, then put the same bytes again (a new push bringing them). Expect: the put

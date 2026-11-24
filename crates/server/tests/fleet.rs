@@ -7085,10 +7085,9 @@ fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
     };
     // A clone's head is its origin's until its first snapshot, and only a head of its own carries the capture (A-503).
     let snapshotted = client_a.call(&RequestBody::Snapshot { volume: clone });
-    assert!(
-      matches!(snapshotted, ReplyBody::Snapshotted { .. }),
-      "a snapshot of the clone: {snapshotted:?}"
-    );
+    let ReplyBody::Snapshotted { .. } = snapshotted else {
+      panic!("a snapshot of the clone: {snapshotted:?}");
+    };
     share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
     let carried = poll_until(&fleet, SERVE_DEADLINE, || {
       Ok(move_counter(&members.daemons[0], CARRY_RECORDED)? >= 1)
@@ -36300,7 +36299,7 @@ fn git_fleet(name: &str) -> GitFleet {
   let token = format!("{name}-token-{}", std::process::id());
   let principal = Principal::Uid {
     host: client.daemon_status().unwrap().anchor,
-    uid: rustix::process::getuid().as_raw(),
+    uid: this_account(),
   };
   let material = CredentialMaterial::HttpToken {
     id: slates_server::credentials::token_id(token.as_bytes()),
@@ -36342,31 +36341,73 @@ fn git_in(dir: &str, args: &[&str]) -> std::process::Output {
     .unwrap()
 }
 
+/// A fresh repository in `dir` with `bytes` committed as `file` on `main`. A git step that fails here fails the test,
+/// so a push's refusal is never a setup that went wrong.
+fn committed_in(dir: &common::target::TargetDir, (file, bytes): (&str, &[u8])) {
+  let work = dir.path.clone();
+  for args in [
+    vec!["init", "-q", "-b", "main"],
+    vec!["config", "user.email", "fleet@example.invalid"],
+    vec!["config", "user.name", "fleet"],
+  ] {
+    assert!(git_in(&work, &args).status.success());
+  }
+  dir.seed(file, bytes);
+  assert!(git_in(&work, &["add", file]).status.success());
+  assert!(
+    git_in(&work, &["commit", "-q", "-m", file])
+      .status
+      .success()
+  );
+}
+
 impl GitFleet {
-  /// Commits `bytes` as `file` in a fresh clone-less repository and pushes `main` to node `node`'s edge: git's stderr
-  /// where it failed.
+  /// Commits `bytes` as `file` in a fresh clone-less repository ([`committed_in`]) and pushes `main` to node `node`'s
+  /// edge: git's stderr where the push failed.
   fn push(&self, node: usize, (file, bytes): (&str, &[u8])) -> Result<(), String> {
     let dir = common::target::target_dir();
     let work = dir.path.clone();
+    committed_in(&dir, (file, bytes));
+    let port = self.daemons[node]
+      .vcs_http_port()
+      .expect("the edge listens");
+    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
+    let url = format!("http://127.0.0.1:{port}/project");
+    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, "main"]);
+    if pushed.status.success() {
+      Ok(())
+    } else {
+      Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    }
+  }
+
+  /// Clones the repository through node `node`'s edge, commits `bytes` as `file` on top of `main`, and pushes `main` back
+  /// through the same edge: a fast-forward of the green the earlier pushes moved. git's stderr where it failed.
+  fn push_on_top(&self, node: usize, (file, bytes): (&str, &[u8])) -> Result<(), String> {
+    let dir = common::target::target_dir();
+    let port = self.daemons[node]
+      .vcs_http_port()
+      .expect("the edge listens");
+    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
+    let url = format!("http://127.0.0.1:{port}/project");
+    let cloned = git_in(&dir.path, &["-c", &header, "clone", "-q", &url, "copy"]);
+    if !cloned.status.success() {
+      return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
+    }
+    let work = format!("{}/copy", dir.path);
     for args in [
-      vec!["init", "-q", "-b", "main"],
       vec!["config", "user.email", "fleet@example.invalid"],
       vec!["config", "user.name", "fleet"],
     ] {
       assert!(git_in(&work, &args).status.success());
     }
-    dir.seed(file, bytes);
+    dir.seed(&format!("copy/{file}"), bytes);
     assert!(git_in(&work, &["add", file]).status.success());
     assert!(
       git_in(&work, &["commit", "-q", "-m", file])
         .status
         .success()
     );
-    let port = self.daemons[node]
-      .vcs_http_port()
-      .expect("the edge listens");
-    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
-    let url = format!("http://127.0.0.1:{port}/project");
     let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, "main"]);
     if pushed.status.success() {
       Ok(())
@@ -36722,6 +36763,67 @@ fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_
     pushed,
     Some(Ok(())),
     "its successor took a push to it: {views:?}"
+  );
+}
+
+/// Shape: the share of a push's homing budget each home waits before it answers in
+/// [`a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`]: a quarter, past the coordinator's round
+/// stall (two periods), which bounds the healer's offers, and inside that round's whole span, so the answer comes late
+/// but comes.
+const SLOW_HOME_SHARE: u64 = 4;
+
+/// A-907 (gate 10, 31 of 31 runs: no survivor took a repository over). Do: on a three-node `f = 1` fleet with a git
+/// repository on a, push to a, so its homes hold windows; make b and c wait a quarter of a's homing budget before they
+/// answer each home message (`Daemon::delay_home_answers`), past the coordinator's round stall that bounds the healer's
+/// offers, as a home waiting for its own install does (A-902); owe a a heal walk and wait for it to run through, its
+/// offers answered late. Then answer at once again, and push a commit on top of `main` to a. Expect: a counted its late homes'
+/// sessions put back on their links (`fleet.stragglers.returned`), and the second push lands, its homing and its
+/// records reaching the homes the healer's rounds left. Red before A-907: the healer dropped its stragglers, so each slow
+/// home's session never returned to its link and stayed lent for good, and nothing a sent reached that home again
+/// (gate 10: a survivor's council appends and takeover pages to the other unsent for the whole run).
+#[test]
+fn a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("slow-home");
+  let first = fleet.push(0, ("first.txt", b"windows for the healer to offer\n"));
+  let delay_ns = fleet.daemons[0].homing_budget_ns() / SLOW_HOME_SHARE;
+  for daemon in &fleet.daemons[1..] {
+    daemon.delay_home_answers(delay_ns).unwrap();
+  }
+  fleet.daemons[0].owe_heal_walk().unwrap();
+  let sender: Vec<&Daemon> = fleet.daemons[..1].iter().collect();
+  // The walk is done once it has run through and offered a window: a walk that ran before the windows were held here
+  // offers none, and a later one is owed by the next period's turn.
+  let offered_of = || move_counter(&fleet.daemons[0], "vcs_store.homes.heal_offered");
+  let walked = poll_until(&sender, PLACEMENT_DEADLINE, || {
+    Ok(fleet.daemons[0].heal_walk_done()? && offered_of()? >= 1)
+  });
+  let offered = offered_of().unwrap_or(0);
+  for daemon in &fleet.daemons[1..] {
+    daemon.delay_home_answers(0).unwrap();
+  }
+  let after = fleet.push_on_top(
+    0,
+    ("after.txt", b"pushed once the homes answer at once again\n"),
+  );
+  let settled = [
+    move_counter(&fleet.daemons[0], "fleet.stragglers.returned").unwrap_or(0),
+    move_counter(&fleet.daemons[0], "fleet.stragglers.redialed").unwrap_or(0),
+  ];
+  fleet.stop();
+  assert_eq!(first, Ok(()), "the first push landed");
+  assert!(
+    walked && offered >= 1,
+    "a's heal walk ran through, offering windows to its slow homes ({offered} offered)"
+  );
+  assert_eq!(
+    after,
+    Ok(()),
+    "a's next push reached the homes its healer's slow rounds left: {settled:?}"
+  );
+  assert!(
+    settled[0] >= 1,
+    "a put its late homes' sessions back on their links (returned, redialed): {settled:?}"
   );
 }
 

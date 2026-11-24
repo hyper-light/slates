@@ -85,6 +85,9 @@ pub(crate) struct MadeCommits {
   waiting: BTreeSet<RepositoryId>,
   /// Whether a made commit's one step runs ([`committing`]).
   committing: bool,
+  /// The repositories a submit was refused for while they await their rebuild here ([`Taken::Unbuilt`]), each logged
+  /// once: bounded by the repositories a takeover left pending, pruned as each is rebuilt.
+  unbuilt_logged: BTreeSet<RepositoryId>,
 }
 
 /// A landing turn the running submit holds.
@@ -132,6 +135,12 @@ pub(crate) enum Taken {
   Held,
   /// Held by another landing: the submit parks.
   Busy(RepositoryId),
+  /// The green of a repository this node took over and has not yet rebuilt (A-636 part 2c-1, `pending_repositories`):
+  /// its membership not joined here yet, so no made commit could be made of it; the submit is refused `Overloaded`,
+  /// unrecorded, retryable once the rebuild has made the repository and its store (main 01a20182's ruling of 2026-11-24
+  /// 09:46). Before, it was taken for no repository's green and committed with no commit, revision or changeset made of
+  /// it. Counted [`MADE_UNBUILT`].
+  Unbuilt,
   /// A Subversion, git or Mercurial repository's green, with no recorded request running (a bare dispatch, which no
   /// answer can wait on):
   /// its version, its revision on the node's store and the register's entry are one step whose answer waits for the
@@ -150,7 +159,10 @@ pub(crate) fn take_turn(
   recorded: bool,
 ) -> Taken {
   let Some((repository, tool)) = made_repository_of(state, green) else {
-    return Taken::Unhooked;
+    return match pending_rebuild_of(state, green) {
+      Some((repository, tool)) => unbuilt(state, repository, tool),
+      None => Taken::Unhooked,
+    };
   };
   if !recorded {
     return match tool {
@@ -179,6 +191,53 @@ pub(crate) fn take_turn(
     }
     None => Taken::Busy(repository),
   }
+}
+
+/// Counted: a submit refused because its green's repository awaits its rebuild here ([`Taken::Unbuilt`]). Format: a
+/// counter name in the status report.
+pub(crate) const MADE_UNBUILT: &str = "merge.made.unbuilt";
+
+/// The repository `green`'s family names that this node took over and has not yet rebuilt, with its tool
+/// (`ShardState::pending_repositories`, matched by the family's line key).
+fn pending_rebuild_of(state: &ShardState, green: DbVolumeId) -> Option<(RepositoryId, VcsTool)> {
+  let family = slates_db::register::ObjectId(green.bytes).line_key();
+  state
+    .pending_repositories
+    .iter()
+    .find(|(object, _)| object.line_key() == family)
+    .map(|(_, (_, record))| (record.id, protocol_tool(record.tool)))
+}
+
+/// The protocol's name of a catalog's tool.
+fn protocol_tool(tool: slates_db::catalog::VcsTool) -> VcsTool {
+  match tool {
+    slates_db::catalog::VcsTool::Git => VcsTool::Git,
+    slates_db::catalog::VcsTool::Mercurial => VcsTool::Mercurial,
+    slates_db::catalog::VcsTool::Subversion => VcsTool::Subversion,
+  }
+}
+
+/// [`Taken::Unbuilt`] for `repository`, counted, and logged once a repository while it waits.
+fn unbuilt(state: &mut ShardState, repository: RepositoryId, tool: VcsTool) -> Taken {
+  state.count(MADE_UNBUILT, 1);
+  let pending: BTreeSet<RepositoryId> = state
+    .pending_repositories
+    .values()
+    .map(|(_, record)| record.id)
+    .collect();
+  state
+    .made_commits
+    .unbuilt_logged
+    .retain(|logged| pending.contains(logged));
+  if state.made_commits.unbuilt_logged.insert(repository) {
+    slates_machine::log_line!(
+      "slates-server: partition {}: a submit over a green of {tool:?} repository {} was refused Overloaded: the repository \
+       was taken over and awaits its rebuild here, so no commit could be made of it (retryable)",
+      state.partition,
+      crate::verbs::hex_of(&repository.bytes)
+    );
+  }
+  Taken::Unbuilt
 }
 
 /// Gives back the turn the running submit took where its verdict did not use it (a refusal, a conflict).
