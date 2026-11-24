@@ -1789,3 +1789,162 @@ fn a_pushs_intake_reads_a_manifest_let_go_from_the_changeset_store() {
   assert!(intaken.log_texts_asked > 0, "a manifest asked of the store");
   let _ = fork.rows();
 }
+
+/// The stock bundle taken into a repository and a made changeset over its tip taken into a fork of it (a client's push
+/// of one changeset); every changeset's and manifest's text of the repository saved by (log path, node) and the objects
+/// their rows name let go: the repository, the push's fork and what it brought, and what was saved.
+#[allow(clippy::type_complexity)]
+fn a_push_over_a_let_go_repository(
+  store: &mut ContentStore,
+) -> (
+  HgIndex,
+  HgIndex,
+  Intaken,
+  std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
+) {
+  use crate::push::made::{Authored, Change, changegroup, made};
+  let mut empty = HgIndex::new();
+  let (mut repository, _, _) = intake(&stock(), &mut empty, store, &mut room()).unwrap();
+  let tip = {
+    let len = repository.len(store, Log::Changelog);
+    repository.changeset(store, len - 1).unwrap().node
+  };
+  let authored = Authored {
+    user: b"Client <c@example.com>",
+    seconds: 1,
+    branch: b"default",
+    message: b"one more",
+  };
+  let change = [Change {
+    path: b"one-more.txt",
+    after: Some((b"one more\n", crate::manifest::Flag::Regular)),
+    copied_from: None,
+  }];
+  let verified = made(
+    &crate::push::held::IndexHeld::new(&repository, store),
+    tip,
+    &change,
+    &authored,
+    &mut room(),
+  )
+  .unwrap();
+  let payload = changegroup(&verified, &mut room()).unwrap();
+  let mut pushing = Intake::begin(
+    (crate::push::made::CHANGEGROUP_VERSION, &payload),
+    &mut repository,
+    store,
+    &mut room(),
+  )
+  .unwrap();
+  let mut admission = room();
+  loop {
+    match pushing.step(&payload, store, &mut admission).unwrap() {
+      Stepped::Store => pushing.answer_from_fork(store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  let (pushed, intaken) = finished(pushing);
+  let mut saved = std::collections::BTreeMap::new();
+  let mut objects = Vec::new();
+  for rev in 0..repository.len(store, Log::Changelog) {
+    let row = repository.changeset(store, rev).unwrap();
+    saved.insert(
+      (super::CHANGELOG_PATH.to_vec(), row.node),
+      store.object_bytes(&row.text, row.len).unwrap(),
+    );
+    objects.push(row.text);
+  }
+  for rev in 0..repository.len(store, Log::Manifest) {
+    let row = repository.revision(store, Log::Manifest, rev).unwrap();
+    saved.insert(
+      (super::MANIFEST_PATH.to_vec(), row.node),
+      repository.revision_text(store, Log::Manifest, rev).unwrap(),
+    );
+    objects.push(row.bytes);
+  }
+  let let_go: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(let_go > 0, "objects let go");
+  (repository, pushed, intaken, saved)
+}
+
+/// Goal 93, C1 (1) (main's ruling of 2026-11-24 02:55: a stale re-base reads a manifest's text not at hand through the
+/// changeset store, as the intake does). Do: push a made changeset over the stock bundle's repository into a fork; let
+/// go every changeset's and manifest's object of the repository; re-base the push's fork onto the repository, its asks
+/// answered from what was saved. Expect: the push's changeset re-based into the new fork, its manifest's text the same
+/// as in the stale fork, and texts asked of the store. Red before: refused, the push's manifest kept as a delta against
+/// the repository's tip, whose text was let go (`record::kept` reading its chain).
+#[test]
+fn a_stale_re_base_reads_a_manifest_let_go_from_the_changeset_store() {
+  let mut store = store();
+  let (mut repository, stale, intaken, saved) = a_push_over_a_let_go_repository(&mut store);
+  let manifest_rev = stale.len(&store, Log::Manifest) - 1;
+  let expected = stale
+    .revision_text_over(
+      &store,
+      Log::Manifest,
+      manifest_rev,
+      &saved_manifests(&saved),
+    )
+    .unwrap();
+  let mut rebase = super::Rebase::begin(stale, &intaken, &mut repository, &mut store)
+    .ok()
+    .unwrap();
+  loop {
+    match rebase.step(&mut store).unwrap() {
+      Stepped::More => {}
+      Stepped::Store => {
+        let asked = rebase.asked_text().unwrap();
+        rebase.answer_text(saved.get(&asked).cloned());
+      }
+      _ => break,
+    }
+  }
+  let (fork, again) = rebase.finish(&mut store).unwrap();
+  assert!(again.log_texts_asked > 0, "texts asked of the store");
+  let made_node = intaken.changesets[0];
+  assert!(
+    fork.rev(&store, Log::Changelog, &made_node).is_some(),
+    "the push re-based"
+  );
+  let rev = fork.len(&store, Log::Manifest) - 1;
+  assert_eq!(
+    fork.revision_text_over(&store, Log::Manifest, rev, &saved_manifests(&saved)),
+    Some(expected)
+  );
+}
+
+/// The manifests' texts of `saved`, by node.
+fn saved_manifests(
+  saved: &std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
+) -> Vec<(Node, Vec<u8>)> {
+  saved
+    .iter()
+    .filter(|((path, _), _)| path == super::MANIFEST_PATH)
+    .map(|((_, node), text)| (*node, text.clone()))
+    .collect()
+}
+
+/// Goal 93, C1 (1), a guard (main's ruling of 2026-11-24 03:05): a push's segment record names each revision by its
+/// contents' identities (`record::write_identity_revision`), reading no text, so it is written whole over a repository
+/// whose changesets' and manifests' texts were let go. Do: push a made changeset over the stock bundle's repository into
+/// a fork; let go every changeset's and manifest's object of the repository; write the push's segment record of every
+/// revision it kept, a step at a time. Expect it written whole. Kept so the invariant holds if that writer ever reads a
+/// text: it would be refused `Unreadable` here.
+#[test]
+fn a_pushs_segment_record_is_written_whole_over_let_go_logs() {
+  use crate::import::record::{Source, Writer};
+  let mut store = store();
+  let (_repository, pushed, intaken, _) = a_push_over_a_let_go_repository(&mut store);
+  let ranges: Vec<(Log<'_>, u32, u32)> = intaken
+    .logs
+    .iter()
+    .map(|(log, first)| (super::log_named(log), *first, u32::MAX))
+    .collect();
+  let mut writer = Writer::begin_segment(Source::Push, &ranges, 1 << 20, false).unwrap();
+  while writer.step(&pushed, &store).unwrap() {}
+  assert!(writer.finish().is_some(), "the record written whole");
+}

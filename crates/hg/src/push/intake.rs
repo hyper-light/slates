@@ -2170,6 +2170,39 @@ pub struct Rebase {
   logged: bool,
   /// What the push brings over the index as it is now.
   intaken: Intaken,
+  /// A manifest's text not at hand, asked of the node's changeset store ([`Rebase::texts_ready`]).
+  asked: Option<crate::push::held::TextAsk>,
+  /// The manifests' texts the store gave for the row being re-appended: the one its chain rests on and the one the fork
+  /// holds last, two at most, given up once the row is appended (goal 93, C1 (1); main's ruling of 2026-11-24 02:55:
+  /// one way to read a text not at hand, everywhere).
+  given: Vec<(Node, Vec<u8>)>,
+}
+
+impl crate::render::StoreWants for Rebase {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self
+      .asked
+      .as_ref()
+      .and_then(crate::render::StoreWants::wants)
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_rows(rows);
+    }
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_chunks(chunks);
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_texts(texts);
+    }
+  }
 }
 
 impl Rebase {
@@ -2201,6 +2234,8 @@ impl Rebase {
       at: (0, 0),
       logged: false,
       intaken,
+      asked: None,
+      given: Vec::new(),
     })
   }
 
@@ -2217,9 +2252,83 @@ impl Rebase {
       self.logged = false;
       return Ok(Stepped::More);
     }
+    if let Some(stepped) = self.texts_ready(log, rev, store)? {
+      return Ok(stepped);
+    }
     self.again(log, &named, rev, store)?;
+    self.given.clear();
     self.at = (at, rev.saturating_add(1));
     Ok(Stepped::More)
+  }
+
+  /// The ask of the node's changeset store the re-base waits on, by its path and node, if any: the tests' stand-in for
+  /// the store reads it.
+  #[cfg(test)]
+  pub(crate) fn asked_text(&self) -> Option<(Vec<u8>, Node)> {
+    self.asked.as_ref().map(|asked| {
+      let (path, node) = asked.asked();
+      (path.to_vec(), node)
+    })
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the ask with `text`, none where it keeps none.
+  #[cfg(test)]
+  pub(crate) fn answer_text(&mut self, text: Option<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.answered(text);
+    }
+  }
+
+  /// Whether the manifests' texts re-appending the stale fork's manifest `rev` reads are at hand (goal 93, C1 (1)): the
+  /// one its chain rests on whose object was let go ([`crate::push::held::text_wanted`]), and the one the fork holds
+  /// last, which the fork keeps it as a delta against. One not at hand is asked of the node's changeset store and the
+  /// step taken again once given, nothing re-appended meanwhile: `Store`. None where the step may go on; refused where
+  /// the store gave no text for the one asked.
+  fn texts_ready(
+    &mut self,
+    log: Log<'_>,
+    rev: u32,
+    store: &ContentStore,
+  ) -> Result<Option<Stepped>, Unindexed> {
+    if log != Log::Manifest {
+      return Ok(None);
+    }
+    if let Some(asked) = self.asked.take() {
+      if crate::render::StoreWants::wants(&asked).is_some() {
+        self.asked = Some(asked);
+        return Ok(Some(Stepped::Store));
+      }
+      let (node, text) = asked
+        .taken()
+        .map(|(_, node, text)| (node, text))
+        .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+      self.given.push((node, text));
+    }
+    let rests_on = crate::push::held::text_wanted((&self.stale, store), log, rev);
+    let held_last = self
+      .fork
+      .len(store, log)
+      .checked_sub(1)
+      .and_then(|last| self.fork.revision(store, log, last))
+      .and_then(|row| {
+        let (len, at_hand) =
+          crate::push::held::log_text_at_hand((&self.fork, store), log, &row.node)?;
+        (!at_hand).then_some((row.node, len))
+      });
+    let wanted = [rests_on, held_last]
+      .into_iter()
+      .flatten()
+      .find(|(node, _)| !self.given.iter().any(|(given, _)| given == node));
+    let Some((node, most)) = wanted else {
+      return Ok(None);
+    };
+    self.asked = Some(crate::push::held::TextAsk::new(
+      MANIFEST_PATH.to_vec(),
+      node,
+      most,
+    ));
+    self.intaken.log_texts_asked = self.intaken.log_texts_asked.saturating_add(1);
+    Ok(Some(Stepped::Store))
   }
 
   /// The fork of the index as it is now, holding the push, and what it brings over that index; the stale fork given
@@ -2252,7 +2361,7 @@ impl Rebase {
     rev: u32,
     store: &mut ContentStore,
   ) -> Result<(), Unindexed> {
-    let kept = crate::import::record::kept(&self.stale, store, log, rev).ok_or(
+    let kept = crate::import::record::kept_over(&self.stale, store, log, rev, &self.given).ok_or(
       Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE }),
     )?;
     let node = kept.node;
@@ -2302,7 +2411,7 @@ impl Rebase {
       } else {
         let text = self
           .stale
-          .revision_text(store, log, rev)
+          .revision_text_over(store, log, rev, &self.given)
           .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
         Some(store.put_object(&text)?)
       };
@@ -2316,7 +2425,24 @@ impl Rebase {
         bytes: rebuilt.unwrap_or(row.bytes),
         block: row.block,
       };
-      let appended = self.fork.append_revisions(store, log, &[again]);
+      // The fork keeps it as its own delta against the manifest it holds last, whose text the store may have given.
+      let held_last = self
+        .fork
+        .len(store, log)
+        .checked_sub(1)
+        .and_then(|last| self.fork.revision(store, log, last))
+        .map(|row| row.node);
+      let previous = held_last.and_then(|held_last| {
+        self
+          .given
+          .iter()
+          .find(|(node, _)| *node == held_last)
+          .map(|(node, text)| (node, text.as_slice()))
+      });
+      let appended = self
+        .fork
+        .append_revisions_after(store, log, &[again], (previous, &[]))
+        .map(drop);
       if let Some(put) = rebuilt {
         store.release(&put)?;
       }
