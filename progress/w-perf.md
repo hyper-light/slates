@@ -1,5 +1,12 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~04:50 PST: after A-887
+- Lint splits of A-887's four complexity reds: 4d9d2fc0b (main: clean under clippy at 8f9e38262).
+- hg_push_restart (ignored run, 57k via SLATES_HG_PUSH_SOURCE): 8f9e38262; local 400-changeset run 0/0, tip served.
+  Main runs the 57k on the big Studio behind r851.
+- edit_merge_bench verdict and LOADED_OVER judge p99 and p999: 7ff7c5276 (red: p999 1,164,984 ns read "within").
+- Nothing queued. Disk: target pruned after each link (rcgu.o, duplicates), CARGO_INCREMENTAL=0.
+
 ## A-887 LANDED 2026-11-24 ~04:10 PST: main 7e356fa8b (split prep 8cd23c967 first)
 - A push names each file whose bytes the content store holds whole (no green heap copy); a read that meets its let-go
   windows parks and brings them back by the revision the green's changeset names (vcs_store::hg_named::resolve_at, one
