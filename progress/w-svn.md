@@ -766,3 +766,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   (Flush::Chain); lone entry past room = typed TableAtCapacity; Loaded::batches logged at import end.
 - NEXT (main's order 02:25): 3 virtio-fs park; 4 lend items (borrow read-only lends, no Green::default per lend);
   5 speed (HTTPv2 writes 24x, svnsync per-piece room round trip, svn:// update; apply bring-back before the made step).
+## 2026-11-24 ~04:15: stage_owed lint split eea0c46d7; A-898 virtio-fs park 40f7c2414
+- A-898: BridgeAccess::with_bridge hands an AwayProbe (one signature); device keeps one away chain unpublished; loop
+  awaits bring_back (server: bring_back_reads, Send) and re-serves first; second miss answered (away_again).
+- Owed (main): Linux guest over a work on an svn green, crates/server/tests/virtiofs.rs.
+- NEXT (main's order 02:25): 4 lend items (borrow read-only lends; no Green::default per lend); 5 speed.
