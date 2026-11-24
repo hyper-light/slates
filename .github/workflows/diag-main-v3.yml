@@ -1,0 +1,63 @@
+name: diag-main-v3
+# main 01a20182 (2026-11-23): the gate for w-git's push barrier (07b384f4c: a push is answered only once every green it
+# moved is placed at f + 1 through its version). crates/cli/tests/v3_takeover.rs, red on main 7 of 7 (w-chaos, adacachy2:
+# the successor served acknowledged push 0 of 3). Before = bbe4a27e0 (main with the shallow fix, no barrier change),
+# after = 07b384f4c. Each arm: three release runs, then two debug runs, one test thread. Run only from
+# diag-measurer-main-v3-* branches, never main; kiln's syncs from the coordinator's Mac fail today, so this runs here.
+on:
+  push:
+    branches: ["diag-measurer-main-v3-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  v3:
+    name: v3_takeover (${{ matrix.arm.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arm:
+          - { name: before, ref: bbe4a27e02dc96cbd6a6f3b873f3765ba0c2e4f2 }
+          - { name: after, ref: 07b384f4cf1e295ca937f4cc0f098ae4e595f7ba }
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.arm.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the test, release and debug
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo test --release --locked -p slates-cli --test v3_takeover --no-run
+          cargo test --locked -p slates-cli --test v3_takeover --no-run
+      - name: Run it, three release and two debug
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          set +e
+          pass=0
+          for n in 1 2 3; do
+            timeout 1200 cargo test --release --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/release-$n.log" 2>&1
+            rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
+            echo "release $n rc=$rc: $(grep -a '^test result' "$RUNNER_TEMP/release-$n.log" | tail -1)"
+            grep -a -A2 'panicked at' "$RUNNER_TEMP/release-$n.log" | head -4 | cut -c1-300
+          done
+          for n in 1 2; do
+            timeout 1800 cargo test --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/debug-$n.log" 2>&1
+            rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
+            echo "debug $n rc=$rc: $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
+            grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
+          done
+          echo "== ${{ matrix.arm.name }}: $pass of 5 passed"
+          exit 0
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v3-${{ matrix.arm.name }}
+          path: ${{ runner.temp }}/*.log
