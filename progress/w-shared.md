@@ -1,5 +1,37 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 11:55 PST 11-24: LANDED the lint-only commit d9cabf2cc (my five sites at d48863ddb: RegionHold, caught_up while-let,
+  serve_remote / exchange / heal_one split by meaning) and the must_use sweep cd4e2bf04 (poll_until,
+  poll_for_periods, poll_for_live_periods #[must_use]; 14 sites: nine asserted, five helpers commented as settles;
+  8 of 8 tests green in 116 s, no finding). Edge-to-owner routing: owed per D-14 (w-git's reading), w-git's after
+  the clone work, awaiting main's ruling on (a) forward vs (b) redirect. Nothing active; waiting for main's next piece.
+
+## 11:20 PST 11-24: LANDED A-903, main 29f45e606: a successor writes its adopted state logs' parts at the adopted
+  epoch (was its host epoch; 19 StaleEpoch refusals a run, no push to a taken-over repository committed). Red/green in
+  A-894's takeover test (push to the successor). OPEN for main and w-git: a repository is reachable only at its
+  owner's edge (Repositories::locate is node-local): forward at the edge, or send the client to the owner. NEXT:
+  main's ruling on that; then the poll #[must_use] sweep.
+
+## 10:45 PST 11-24: LANDED A-894, main 87a0b1b8c: a repository's creation answers once its record is placed at f + 1
+  (63.8 ms at f = 1, debug), held on the destroy's hold made general (live_ship::defer_until_placed). Red: git_fleet's
+  immediate check 0 of 2 holders. FOUND (GAPS OPEN): after a repository's takeover, a push is refused at both survivors
+  ("not found" at the non-successor's edge, "unable to commit" at the successor). NEXT (scheduled by main): the poll
+  #[must_use] sweep. Gate 10 (A-902) result pending from main.
+
+## 09:55 PST 11-24: LANDED A-902, main d48863ddb: a home behind its sender's configuration waits for its own install
+  within the put's budget (gate 9: NotAHome 0.83-1.89 ms into 2 s, 3 of 40). Home wire 0x84; agreed in writing with
+  w-git. Red in-process (a) refused at once, (b)/(d) no wait; green 2.25 s. OWED (main): gate 10 at d48863ddb, 0 of 40.
+  NEXT: A-894 (claimed; a repository's creation answers once its record is at f+1), then the poll #[must_use] sweep.
+
+## 06:25 PST 11-24: LANDED the Windows fleet hang fix, main 866374d85: a_captured_clone_moved_to_another_node_is_found_there_by_its_name
+  now snapshots its clone, so the carry is made and asserted (red with the assertion alone after 4,027 periods; green
+  4.29 s, was 407 s on the Mac and killed at 240 s on Windows). OWED, for main to schedule, as a separate piece after A-894:
+  make poll_until, poll_for_periods and poll_for_live_periods #[must_use]. Every site the compiler then names (34 calls
+  in fleet.rs begin a statement) is either asserted or shown to be a deliberate settle. A site that goes red is a
+  finding to report, not to quiet. ACTIVE: gate 8's homing short. w-git logged each non-Kept answer and each host left
+  unanswered (7d6874639); I'll write the one-wait proposal from gate 9's lines. Reading the code makes (i) unlikely:
+  session_returned waits for a session to be installed, up to the budget. A-894 (claimed) follows.
+
 ## 14:23 PST: goal status reviewed (inbox close note). OPEN: the lane's proof (320/512 MiB 10/10). Branch
   agents/w-shared-slice 0deb19aea, worktree ~/slates-work/w-shared-slice: (1) no re-encode/re-hash at the owner
   (ec245f32e), (2) the fetched increment moved to the owner shard a chunk a call (0deb19aea). kiln r2: holder tests +

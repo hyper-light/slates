@@ -1,5 +1,14 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~06:15 PST
+- A-887 takeover gap closed (readopt_with runs hg_named::bring_back_named_live, one planner to_bring).
+- Recovery spin (r854 57k hg restart; likely r865 svn too): replay_reads/named_whole_files were cubic in a push's
+  files; now n log n. e7596c80b. Red 2,000 files 94.7 s vs 1 s window. Bug record in docs/bugs.
+- Anchor failed starts: the daemon marked serving before its shards' starts ended; the control loop marks it after
+  boot now. 39a1dcd4a. Red recovery::a_daemon_serves_only_once_every_shards_start_has_ended.
+- Reported to main: NotHead on an edit after a re-adoption (946484875, w-hg's to fix).
+- Waiting on main's reruns: r854 57k hg restart, r865 svn use round. Queue after: A-887 git half; AC-2.1 QoS.
+
 ## 2026-11-24 ~04:50 PST: after A-887
 - Lint splits of A-887's four complexity reds: 4d9d2fc0b (main: clean under clippy at 8f9e38262).
 - hg_push_restart (ignored run, 57k via SLATES_HG_PUSH_SOURCE): 8f9e38262; local 400-changeset run 0/0, tip served.

@@ -732,3 +732,18 @@
   writing) and f7c70b076 (TSan: room_needed sliced a write a step, caller asserts >2 steps). Gate 6 7/7 with no Unlanded;
   gate 7 (10+10 at 3d65116a6) running. WAITING: t_a614a's TSan words (run 45398791868; passes natively 2.7 s), gate 7's
   cause, clone profile (git_scale.sh widened by w-interop).
+- 05:30: gate 7 named Unlanded(HomedShort) for push 1's pack, 0.9 ms after the body (fast, not live_budget's ~3 s).
+  LANDED ee9571813: homes.rs short-homing instrumentation (w-shared agreed in writing): home_in_region log line with
+  branch/elapsed, publish_refused counter+log, stranded log; test a_stranded_tickets_wait_is_answered_not_durable_at_once_and_counted.
+  Gate 8 at ee9571813 (main). Parked: retry-until-failover in git_push's Homing (second step if a home is truly late).
+  If stranded fires -> F2 bug to w-shared.
+- 09:30: gate 9 = (ii) NotAHome; w-shared landed A-902 (d48863ddb; OR clause agreed in writing). Clone item:
+  LANDED 2dfda25d4 (Positions word-wise for bit tables: union/intersection/difference/settle/run_pairs/runs; oracle
+  r870_bit_tables_combined...) and 0ebf10cf4 (push: reader-named objects admitted without a second SHA-1,
+  Push::admit_placed_named, Named::ByReader; test r870_an_object_admitted_under_its_readers_name...). Push's remaining
+  hashing is one SHA-1, one BLAKE3 (content identity, needed) and zlib inflate per object, one shard. WAITING: r935 git
+  leg at 2dfda25d4+ (first-byte split vs r870's 102-111 s; new clone sample callers; push sample).
+- 09:50 queue (main agreed): (a) r935 clone sample -> git_derive's remaining frames (Tree::parse, put_derived blake3);
+  (b) clone-again's per-fetch gather (55 s first byte); (c) "intake off the owner" (§4.17.5 piece 5, owed; measure =
+  many concurrent pushes to one repo using every core); (d) GAPS: one push over several shards not in the design,
+  with r870 80.872 s / r940 / stock 10.797 s, for Ada, once r940 lands.

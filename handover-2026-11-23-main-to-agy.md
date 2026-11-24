@@ -22,6 +22,92 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 10:58 on 11-24:
+- NEEDS ADA, a naming-model decision (A-904, GAPS): any node other than a repository's owner answers "repository not found"
+  (always so; after a takeover a client can't find the successor), and names are unique per node only (two nodes could each
+  create "project"; untested). Main's 10:54 ruling to forward over the fleet session rested on a wrong premise (owner_of_name
+  is node-local; the configuration routes ids, not names), now withdrawn. w-shared's options: (1) name homes, a per-name
+  record (name -> id) at f+1 homes by the name's hash, claimed at creation (region-unique names), like A-724's content
+  homing [recommended]; (2) place the repository at the name's first-ranked member (breaks on membership changes); (3) a
+  location round. It sits beside §2 item 12 / D-14 ("no global catalog or index"), so the call is Ada's. Nothing built.
+- Closed today: the 57k hg restart (53e09728f, r942 green), the svn use round on git-2000 (0 differences, r938), push 0
+  (A-902 for NotAHome, A-903 for the successor's epoch), the Windows fleet hang (a test), the must_use sweep, A-894.
+- In flight: w-git on the clone (197b0bc4f landed; next Kept::len, then the content pool's one-word free count, then
+  derive), w-shared on intake off the owner, w-perf on (a) the taken-over green's typed refusal, w-hg on P5, w-svn on
+  per-revision slicing. Gate 10 (A-902, 40 runs) ran past its usual time; it's read at the GitHub limit's reset.
+
+Updates at 09:31 on 11-24:
+- Goal 84a measured at current main on every platform:
+  - macOS: met. Big Studio bare metal, r931 at 259b0db84. Every one of 30 runs is under 1 ms at p99 and p999, loaded
+    and quiet; the worst loaded p999 is 579 µs.
+  - Windows: met on GitHub's windows-latest and windows-11-arm (diag 45446126735 at afa579483). Every run's p99 and p999
+    is under 1 ms; the worst p999 is 469 µs. On jupiter's bare metal the every-run bar sits below the machine's own wake
+    floor (A-897), which is Ada's to rule on.
+  - Linux: quiet met on both ubuntu runners. Loaded is not met: p99 2.4-6.0 ms at whole milliseconds. The runners
+    grant no real-time priority (NoPriorityGranted, RLIMIT_RTPRIO 0), and the OS's own wake floor under the same load
+    is fine (p999 19 µs). So slates' per-sample CPU (shards 175-300 µs) is time-sliced behind the spinners. w-perf takes
+    it after its re-adoption piece (a).
+- Gate 9 named push 0's cause, Refused(NotAHome) from a remote home whose configuration is still settling (3 of 3).
+  w-shared builds A-902, the single wait, agreed with w-git.
+- w-git landed 2dfda25d4 (bit tables combined a word at a time). The git leg reruns at it as r935, after the load falls.
+- Landed: w-perf afa579483, d22209019 and cf8ecbde5 (re-adoption items 1 and 2a), w-svn 0c1cc4707 (the 3,000-file
+  import red). The svn import spin is closed (the cubic replay). w-perf has (a) next: a taken-over Mercurial green
+  refuses a made commit typed until the store moves with a takeover.
+
+Updates at 08:58 on 11-24:
+- Main and the fleet were paused by a usage limit from 06:27 to 08:51. The in-process subagent w-84a-win was stopped
+  during it, after A-897 and A-901 had landed; its jupiter A/Bs for A-901 were not run (main's macOS half was: neutral).
+- The restart rounds at 39a1dcd4a (r915): no start_shard spin and no anchor restart anywhere, so w-perf's cubic-replay fix
+  and the failed-start fix hold. Two new reds: (1) the 57k hg repository is not made again after its restart ("a
+  repository's store was not made again from its records: Mercurial(Unheld { revlog: 00manifest, rev: 4222 })", so the edge
+  answers 503): a durability red, w-hg's, ahead of P5. (2) the svn use round on git-2000 completed every step for the first
+  time, with one difference ("diff r251: line 362"): w-svn's, ahead of its speed items. svn timings, stock svnserve / slates
+  over HTTPv2: checkout 61.3/56.0, update 94.7/89.1, blame 85.0/62.4, dump 2.6/8.0, svnsync 298.9/302.1 s.
+- The git leg (r870, 21b8b5311): best of 5, stock / slates: push 10.8/80.9, clone 10.5/122.4, clone-again 10.5/80.7,
+  partial 6.2/73.4 s; a clone's first pack byte at 102-111 s (git_derive's reach sets on one shard); the push hashes SHA-1
+  in admit_object and again in the unpacker's delta apply. Callers written to ~/.cache/main-rounds/git-leg-2/callers.txt.
+- w-hg fixed the re-adopted green's NotHead (259b0db84); w-perf took the two re-adoption gaps it found. Gate 9, the TSan
+  measurement and the Linux svn matrices were unread at 08:58 (GitHub API limit spent until 09:02).
+- Disk on this Mac: 15 GiB free. Holders not slates': ~/.cache/kiln-reaudit-* 124 GiB, astack-review 18 GiB (new),
+  amphora-target 25 GiB, kiln-move-stuck-target 24 GiB.
+
+Updates at 06:07 on 11-24:
+- A-897 landed (fb50fbd61): the bench now names whose time each slow sample is (client send, seat pickup, service, client
+  take, on one clock), every run's p99/p999 beside the verdict, the floor and CPU per form; BENCHMARKS and GAPS 84a carry
+  the measured-and-rejected arms and the OS floor. Of 239 slow samples in rounds 3-6: client send 97, client take 80,
+  seat pickup 29, service or spread 33. w-84a-win now builds A-901 (an observation holds no shard; CPU only).
+- Restart loop fixed at its root (w-perf f6b3717e8/39a1dcd4a): a daemon marks itself serving only once every shard's start
+  has ended, so a start that never ends is a failed start and the anchor backs off. The cubic replay (e7596c80b) was the
+  start_shard spin. The hg 57k restart and the svn git-2000 rounds run again at 39a1dcd4a as r901 after the git leg.
+- Gate 8 (38 of 40): push 0's homing right after creation gets a fast non-Kept answer from a remote home. The best fit is
+  the remote's membership view still settling (NotAHome). w-git lands the answer-kind line, gate 9 names it, then w-git
+  and w-shared agree one wait (A-894's creation wait or NotAHome waited out within budget).
+- The Windows fleet hang was a test that never snapshots its clone, and its unasserted poll passed vacuously on the Mac
+  after 407 s. w-shared lands the fix, then a #[must_use] sweep of the poll helpers (34 statement calls). The Windows
+  fleet step's limit is 55 minutes and its deadline 289 s (5618d46db).
+- The kiln server stopped answering at 06:05. Restarting it is Ada's call. jupiter's C: is at 8.8 GB free.
+
+Updates at 05:37 on 11-24:
+- 84a Windows VERDICT (w-84a-win's A-897, accepted): no scheduling change on slates' side holds the every-run bar on
+  jupiter. 6 interleaved rounds, 143 invocations (corrected at 06:07 from 254): main fails 1/114 loaded and 14/120 quiet runs (p999 > 1 ms). Every arm
+  lost or tied: a 2 ms shard window, client spins, seat holds, A-326's holds off, the client thread raised up to
+  TIME_CRITICAL (it still stalls 3-12 ms there; at HIGHEST 3 of 24 quiet runs failed, corrected from 1 of 24), and the client pinned to one CPU. About 80% of slow samples are the
+  client thread stalled in its own send path, and about 15% are the seat's pickup. Main's quiet stall rate (3-7e-4 a
+  sample) sits inside the OS's own measured wake tail (pingpong.ps1: 1-12 ms late at 2e-4 to 1e-3 a wake). WHP is on,
+  and the hypervisor/DPC cause is inferred. Landing: the bench's attribution, no product latency change, the
+  measured-and-rejected table, then (separately) observations that hold no shard (CPU only). The bar is Ada's to restate,
+  or she gives a hypervisor-free Windows box or turns WHP off on jupiter.
+- svn use round (r865, 77397a5f4) STOPPED in a crash loop: an import poll ran 1,189 ms (import.rs:235), and after the
+  kill every restart's shard 0 spun in start_shard (daemon.rs:1190): 1,189 restarts in 44 minutes, which the anchor
+  never counted as failed starts. Likely a regression in d27106abc..77397a5f4 (r817 and the Linux matrix imported
+  git-2000 cleanly). w-svn owns the import poll (A-895 is in the window). w-perf owns the start's recovery slicing
+  (A-887 is in the window; the same site as r854's hg restart red) and the anchor counting a half-started daemon as
+  served. Evidence: Studio ~/.cache/main-rounds/svn-use-3/excerpt.txt.
+- Gate 8 runs at ee9571813 (45405128575; w-git's homing instrumentation, 20 release + 20 debug runs) to name the
+  branch that answers short. The Linux interop matrices run again at 8466f48b3 (45404800642). The git leg (r870) runs on
+  the big Studio since 05:28.
+- Landed: w-hg's A-891 Mercurial half (946484875; made_commit::commit removed), w-git's ee9571813.
+
 Updates at 05:24 on 11-24:
 - Push-0/1's cause, narrowed: gate 7 (45398593779, 3d65116a6) passed 19 of 20. In the failure, push 1's pack homing came
   back Err(Unanswered) 0.9 ms after the body was sent (13:08:46.350264 sent, 13:08:46.351179 refused on band 3 "not kept
