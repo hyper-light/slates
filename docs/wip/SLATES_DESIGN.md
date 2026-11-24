@@ -61702,7 +61702,8 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   A publication first takes the changes since into dirty pages (`content_holder::image_drain`, the encoder their one
   reader) and runs one turn (`image_turn`: dirty pages re-encoded from the source maps until the copy slice is spent,
   at least one page). Where nothing is dirty after it, the publication carries the re-encoded pages, and they and the
-  committed ones are the shard's entries at that moment exactly (`content_holder::image_cut`). Otherwise it carries the
+  committed ones are the shard's entries at that moment exactly (`content_holder::image_cut`; since F2, below, the
+  moment its cut began, carried once the cut's pages are encoded whatever is dirty after). Otherwise it carries the
   committed cut again, so an image is always one moment's cut, never a mix of two. It is then counted skipped
   (`vcs_store.image.publications_skipped`), every block the arena would free at its commit is kept
   (`capture_deferred`, A-64: the cut may name it; kept whole, a selective keep only if the counters show deferred
@@ -61744,10 +61745,76 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   `catch_up_retried`) and does not settle the shard while it is owed. Test
   `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first, the
   retry cut out: the wait unanswered after six sweep intervals; green: answered, the refusal and the retry counted).
-- **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
-  bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
-  pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
-  a publication, so a put stream that outpaces it is a measurement owed, not seen.
+- **F2, a cut of one moment encoded over turns (BUILT 2026-11-23; main 01a20182's rulings of 2026-11-23: F2 over F1,
+  copy-on-write by entry, the E + I bound, the shapes, the pause kept).** Red first: a ticket's wait on a shard that
+  homes 256 fresh objects a turn was refused `Unanswered` (r8): a publication carried the encoder's pages only where no
+  page was dirty, so a shard that kept dirtying pages never carried one, and every homing waited out its budget (the
+  git mirror stall's hypothesis). Encoding a cut's pages in one step instead (F1) is user-scaled work in a step, a bug
+  signal; reading each page as it stands when encoded mixes two moments (a window let go after the cut placed in the
+  windows page and away in the aways page, its block not deferred, since no committed image names it yet). So a turn
+  begins a cut where none is in flight (`content_holder::image_begin`, after the changes are taken): the pages dirty
+  then are the cut's, each frozen in its store (`slates_vcs::preimage`: the content store's lists, names and windows let
+  go, `ChunkWindows`' pieces, homes' region holds and landed records). A store about to change an entry in a frozen page
+  keeps its value at the cut first, once (its old value, or an absent marker of its key alone); a turn encodes the cut's
+  pages read through those pre-images, at least one a turn, and thaws each as it is encoded; the publication carries the
+  cut once every page of it is encoded, whatever is dirtied after (`Encoder::complete`), so a cut of P pages is carried
+  within P turns. A change after the cut marks its page for the next cut, which the carrying publication's commit
+  begins and owes, so a ticket kept after a cut is never left with nothing to publish it. Homes' tickets move to the
+  cut's moment: its generation begun as it begins (`homes::cut_begun`) and published as it is carried. `ChunkWindows`
+  holds every chunk it would free while a cut is in flight and frees them at the carry, A-64's deferral taking over
+  from there, since the cut may name a block no committed image yet does. A ticket's wait that finds its image
+  unpublished and nothing owed is answered not durable at once and counted (`vcs_store.homes.ticket_stranded`), a bug
+  signal; its only wakes are publications and its first poll publishes, so it is checked at every poll. A page a gap
+  left (a family's first: its directory empty, so one page covers every coordinate) can hold the family's every entry,
+  which one turn encoded whole (327,620 bytes at a 4,096-byte page, found by F2; unseen before, since the step test's
+  check compared the journal with the encoder's committed cut, which it always equals while a cut is in flight). So a
+  turn reads a page only until twice the page size (`Encoder::read_cap`); a read stopped there is planned over the
+  page as a whole page's would be, the planned pages that end before its last coordinate encoded and the rest put back
+  in the cut, still frozen (`Encoder::split_at_stop`; thawing is interval subtraction, so a split page's other part
+  stays frozen). Pages stay aligned halves rather than ending at the read's stop: a page piece's key names its depth
+  and start, the image's format, from which a recovered directory is rebuilt, and piece 1's bound on a family's pages
+  rests on halving by bytes. A read counts every entry it visits against the cap, the ones inserted since the cut that
+  it passes over too, else a frozen page's tail (where every handle put after the cut lands) is walked whole each
+  read; where it kept too little to complete a planned page, the page is halved instead, shrinking toward the stop.
+  What a split visits and does not keep is at most the cap and an entry, a turn splitting once at most, read again
+  later. Bounds, each on a `Derived:` line and asserted by the oracle: the
+  pre-images at most E + I (E the entries in the cut's pages at the cut; I at most a turn's inserts into them times the
+  turns the cut lasts, its pages and the pages its splits put back), the chunks held at most a turn's frees times those
+  turns. A turn, a drain and a split read and change a family's directory in place: `Directories::of` copied it whole
+  at every mark (each family, every drain) and every page encoded, a family's size of work a turn, which made a third
+  of the catch-up's time (CI's macOS debug runs of the starvation test red 4 of 10, the cut of 65,536 windows and as
+  many region holds needing about 1,754 turns against the about 1,700 a 3-core debug runner fit in the wait's 1 s of
+  shard CPU; measured on a loaded Mac, debug: the catch-up's 1.11 s in all, 0.32 s of it the begin's drain and count;
+  after, 0.24 to 0.26 s, the drain 6 to 9 ms; red `a_turn_and_a_drain_copy_no_directory_however_many_pages_it_holds`,
+  20,000 directory pages copied by one mark and one turn over 10,000, now none). The catch-up's step no longer drains
+  twice. CI run 45354317783 at 427ad2389, the starvation test ten times on each: release and debug, ubuntu-latest and
+  macos-latest, 10/10 every one (macOS debug 6/10 at 2cdd88fa3, run 45336582846). The catch-up spends a copy slice's bytes a wake, turns until then (`content_holder::image_catch_up_slice`;
+  main's ruling (a) of 2026-11-23 19:16): a turn spends the page size, which a test sets far below the slice, so the
+  slice is what a yield's work is judged by, a step's share of the shard's own owed work whatever the page size. The
+  pause stays (main's ruling (a)): with F2 it is reached only while publications are refused, where it bounds
+  the let-gos, and so the deferred frees, that pile up meanwhile. Counters: `vcs_store.image.{cuts,
+  cut_preimages_old, cut_preimages_absent, longest_cut_step_bytes, cut_left, pages_split, split_discarded_bytes,
+  longest_split_discard_bytes}` (`cut_left` a bug signal).
+- **Evidence (F2).** `vcs_store::durable::tests::a_tickets_wait_is_answered_while_the_shard_keeps_dirtying_its_image`
+  (red `Err(Unanswered)` at 256 objects a turn, r8; its dirtier then shaped as a landing in the field, main's ruling (c)
+  of 2026-11-23 20:26: a round keeps objects until half the shard's step quantum is spent, the 65,536-object backlog
+  before the wait asserted reached and the dirtier asserted keeping objects in every round of the wait; green: durable,
+  publications skipped meanwhile; red again with a publication carrying only where nothing is dirty, the rule before
+  F2). Measured on a loaded Mac (debug): the field-shaped dirtier leaves the encoder CPU enough that the test stays
+  green with the catch-up's byte slice removed and with the capped read's hole put back, so each has its own red:
+  `image_pages::tests::a_catch_up_wake_spends_a_copy_slice_not_one_turn` (red: one turn, 5,055 of 41,509 bytes) and
+  `slates_vcs::preimage::tests::a_capped_read_of_a_frozen_range_stops_within_its_cap_however_much_was_inserted_since`
+  (red: no stop, every inserted key walked).
+  `image_pages::tests::a_window_let_go_while_its_cut_is_encoded_leaves_the_carried_image_one_moment` (the committed
+  image equal to the shard's at the cut, the window let go after it placed and not let go, its chunk held then freed,
+  an old value kept; red with the stores' hooks turned off). The oracle
+  (`generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound`) now holds every
+  carried image to the shard's entries at its cut's moment, the E + I and held-frees bounds, and no stranded ticket or
+  pre-image left; it no longer asks that a history pause.
+  `a_publication_encodes_at_most_a_slice_in_its_step_and_its_cuts_catch_up` now checks the committed image against the
+  shard's entries now, asserts pages split (the capped read ran on every family's first page) and holds each
+  publication's discarded read within the read's cap and an entry. The pause under refusals:
+  `a_cut_owed_past_its_bound_while_its_publications_are_refused_pauses_let_gos_until_one_commits`.
 
 ### A-871 — On Windows the OS places every shard, and a client waits for its reply one level above normal (2026-11-23, main 01a20182; goal 84a; A-361, A-834, A-831, A-41, A-208)
 

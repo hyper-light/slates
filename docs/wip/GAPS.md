@@ -188,9 +188,14 @@
 > (`capture_deferred` whole) and the publication owed; past its bound elective let-gos pause, woken by the publication
 > that carries the cut; red 1,068,980 bytes encoded in one publication's step at a 4,096-byte page, now at most three
 > pages; held by an oracle of generated let-go, put, publish and crash histories, one continuous (A-870 "Evidence (piece
-> 2)"). OPEN: the lag bound holds only while the encoder outpaces the changes that never pause (puts, bring-backs);
-> a put stream that outpaces a turn a yield is unmeasured until arena-12 reads it: `vcs_store.image.paused_encoded_bytes`
-> against `paused_imposed_bytes` over `paused_turns`, and `longest_lag_turns` (main's addition of 2026-11-23). Counters
+> 2)"). F2 BUILT (main's rulings of 2026-11-23): a cut of one moment encoded over turns, each store keeping an entry's
+> value at the cut before it changes in a page not yet encoded (`slates_vcs::preimage`), so a publication carries a cut
+> of P pages within P turns whatever is dirtied after; red a ticket's wait `Unanswered` while the shard homed 256
+> objects a turn, now durable; the pre-images within E + I and the chunks held for a cut within a turn's frees times
+> its pages, both asserted by the oracle (A-870 "Evidence (F2)"). CI run 45354317783 at 427ad2389, the starvation test
+> ten times each: release ubuntu-latest 10/10, debug ubuntu-latest 10/10, release macos-latest 10/10, debug
+> macos-latest 10/10 (6/10 at 2cdd88fa3, run 45336582846, before the directory was read in place). The pause stays, reached only under refused
+> publications. Counters
 > for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
 > piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
 > the step budget (the volumes' images paged too only if past it).
