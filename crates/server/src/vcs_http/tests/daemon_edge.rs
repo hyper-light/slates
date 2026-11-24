@@ -5011,6 +5011,140 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
   );
 }
 
+/// Goal 93, C1 (1) P1 (main's ruling of 2026-11-23 20:53: the changelog's and the manifests' texts off the content
+/// store, brought back through the node's changeset store; a manifest delta made again from its two texts). Do: start a
+/// two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; on the repository's shard, let go every
+/// object the repository's changelog and manifest rows name; bring each revision back by its log's path and its node
+/// (`hg_push::bring_back`); read every text again. Expect the push `200`; objects let go (the non-vacuity count); every
+/// bring-back true; every changeset's and manifest's text read back the same; each let go counted once
+/// (`vcs.hg.landed_log_texts_brought_back`). Red before: a bring-back by those paths looked for a file revision.
+#[test]
+fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_and_node() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let (_, _, pushed) = a_long_push_of_own_texts(&daemon, (port, &certificate), &name);
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  let named = name.clone();
+  let repository = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&named)
+      .map(|record| record.id)
+  })
+  .expect("the repository's record");
+  let before = log_texts(&daemon, repository);
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let (content, store) = stores.mercurial(repository)?;
+        let index = &store.index;
+        let mut identities = Vec::new();
+        for rev in 0..index.len(content, slates_hg::index::Log::Changelog) {
+          identities.push(index.changeset(content, rev)?.text);
+        }
+        for rev in 0..index.len(content, slates_hg::index::Log::Manifest) {
+          identities.push(
+            index
+              .revision(content, slates_hg::index::Log::Manifest, rev)?
+              .bytes,
+          );
+        }
+        Some(
+          identities
+            .iter()
+            .filter(|identity| content.let_go_object(identity) > 0)
+            .count(),
+        )
+      })
+    })
+  })
+  .expect("the repository's rows");
+  let asks: Vec<(Vec<u8>, slates_hg::Node)> = before
+    .0
+    .iter()
+    .map(|(node, _)| (slates_hg::push::intake::CHANGELOG_PATH.to_vec(), *node))
+    .chain(
+      before
+        .1
+        .iter()
+        .map(|(node, _)| (slates_hg::push::intake::MANIFEST_PATH.to_vec(), *node)),
+    )
+    .collect();
+  let brought = crate::test_store::run_at(
+    &daemon,
+    REPOSITORY,
+    move || async move {
+      let mut brought = Vec::with_capacity(asks.len());
+      for ask in asks {
+        brought.push(crate::repository::hg_push::bring_back(repository, ask).await);
+      }
+      brought
+    },
+    Duration::from_secs(60),
+  );
+  let after = log_texts(&daemon, repository);
+  let counted = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_LOG_TEXTS_BROUGHT_BACK,
+  );
+  daemon.stop();
+  println!(
+    "{let_go} of {} changelog and manifest objects let go; {counted} brought back",
+    brought.len()
+  );
+  assert!(let_go > 0, "objects let go");
+  assert!(brought.iter().all(|brought| *brought), "{brought:?}");
+  assert_eq!(after, before, "every text read back the same");
+  assert_eq!(
+    counted,
+    u64::try_from(let_go).unwrap(),
+    "each let go brought back once"
+  );
+}
+
+/// A log's revisions as [`log_texts`] reads them: each one's node and its text, none where it is not held.
+type LogTexts = Vec<(slates_hg::Node, Option<Vec<u8>>)>;
+
+/// Every changeset's and every manifest's (node, text) of `repository`, read from its shard's content store (a text
+/// not held reads as none).
+fn log_texts(
+  daemon: &Daemon,
+  repository: slates_db::catalog::RepositoryId,
+) -> (LogTexts, LogTexts) {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let (content, store) = stores.mercurial(repository)?;
+        let index = &store.index;
+        let changesets = (0..index.len(content, slates_hg::index::Log::Changelog))
+          .map(|rev| {
+            let row = index.changeset(content, rev)?;
+            Some((row.node, content.object_bytes(&row.text, row.len)))
+          })
+          .collect::<Option<Vec<_>>>()?;
+        let manifests = (0..index.len(content, slates_hg::index::Log::Manifest))
+          .map(|rev| {
+            let row = index.revision(content, slates_hg::index::Log::Manifest, rev)?;
+            Some((
+              row.node,
+              index.revision_text(content, slates_hg::index::Log::Manifest, rev),
+            ))
+          })
+          .collect::<Option<Vec<_>>>()?;
+        Some((changesets, manifests))
+      })
+    })
+  })
+  .expect("the repository's rows")
+}
+
 /// Whether the repository's shard's content store reads each of `texts`' windows (none for one let go).
 fn windows_held(daemon: &Daemon, texts: &'static [Vec<u8>]) -> Vec<bool> {
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {

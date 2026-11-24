@@ -1627,3 +1627,110 @@ fn an_imports_run_reference_reads_back_whole_or_not_at_all() {
     Err(Refused::Version { version: 9 })
   ));
 }
+
+/// Goal 93, C1 (1) P1 (main's ruling of 2026-11-23 20:53: the changelog's and the manifests' texts off the content store,
+/// read back through the node's changeset store; a let-go manifest delta made again from its two texts and checked
+/// against its row's identity). Do: import each fixture repository; read every changeset's and every manifest's text;
+/// let go every object those rows name; bring each one not held whole back from its text alone, a manifest kept as a
+/// delta from its text and the text of the revision it is against ([`crate::push::held::log_text_held`]); then let a
+/// delta go again and bring it back against a wrong text. Expect: objects let go (the non-vacuity count) and each read
+/// as not whole until brought back; every text read back the same after; a delta against the wrong text refused
+/// `NotHeld`, nothing brought back.
+#[test]
+fn a_changelog_or_manifest_revision_let_go_is_brought_back_from_its_text_a_delta_made_again() {
+  use crate::push::held::{bring_back_log, log_text_held};
+  let (mut deltas_brought, mut refused) = (0u64, 0u64);
+  for name in REPOSITORIES {
+    let mut repository = repository(name);
+    let mut store = store();
+    let imported = import(&mut repository, &mut store, room()).unwrap();
+    let index = &imported.index;
+    let changesets: Vec<(crate::Node, ContentId, Vec<u8>)> = (0..imported.changesets)
+      .map(|rev| {
+        let row = index.changeset(&store, rev).unwrap();
+        let text = store.object_bytes(&row.text, row.len).unwrap();
+        (row.node, row.text, text)
+      })
+      .collect();
+    let manifests: Vec<(crate::Node, ContentId, Vec<u8>)> = (0..index.len(&store, Log::Manifest))
+      .map(|rev| {
+        let row = index.revision(&store, Log::Manifest, rev).unwrap();
+        let text = index.revision_text(&store, Log::Manifest, rev).unwrap();
+        (row.node, row.bytes, text)
+      })
+      .collect();
+    let text_of: BTreeMap<crate::Node, Vec<u8>> = manifests
+      .iter()
+      .map(|(node, _, text)| (*node, text.clone()))
+      .collect();
+    let mut let_go = 0u64;
+    for (_, identity, _) in changesets.iter().chain(&manifests) {
+      let_go += store.let_go_object(identity);
+    }
+    assert!(let_go > 0, "{name}: objects let go");
+    let mut brought = 0u64;
+    for (node, _, text) in &changesets {
+      let held = log_text_held((index, &store), Log::Changelog, node).unwrap();
+      if !held.whole {
+        bring_back_log((index, &mut store), Log::Changelog, node, (text, None)).unwrap();
+        brought += 1;
+      }
+    }
+    let mut deltas = Vec::new();
+    for (node, identity, text) in &manifests {
+      let held = log_text_held((index, &store), Log::Manifest, node).unwrap();
+      if let Some(against) = held.against {
+        deltas.push((*node, *identity, against));
+      }
+      if !held.whole {
+        let against = held.against.map(|against| text_of[&against].as_slice());
+        bring_back_log((index, &mut store), Log::Manifest, node, (text, against)).unwrap();
+        brought += 1;
+        deltas_brought += u64::from(against.is_some());
+      }
+    }
+    assert!(brought > 0, "{name}: revisions brought back");
+    for (rev, (node, _, text)) in changesets.iter().enumerate() {
+      let row = index
+        .changeset(&store, u32::try_from(rev).unwrap())
+        .unwrap();
+      assert_eq!(row.node, *node);
+      assert_eq!(
+        store.object_bytes(&row.text, row.len).as_ref(),
+        Some(text),
+        "{name}: changeset {rev}"
+      );
+    }
+    for (rev, (_, _, text)) in manifests.iter().enumerate() {
+      let read = index.revision_text(&store, Log::Manifest, u32::try_from(rev).unwrap());
+      assert_eq!(read.as_ref(), Some(text), "{name}: manifest {rev}");
+    }
+    let wrong = changesets[0].2.as_slice();
+    if let Some((node, identity, _)) = deltas.first()
+      && store.let_go_object(identity) > 0
+    {
+      let text = text_of[node].as_slice();
+      assert_eq!(
+        bring_back_log(
+          (index, &mut store),
+          Log::Manifest,
+          node,
+          (text, Some(wrong))
+        ),
+        Err(slates_vcs::ContentRefused::NotHeld),
+        "{name}: a delta made against the wrong text"
+      );
+      assert!(
+        !log_text_held((index, &store), Log::Manifest, node)
+          .unwrap()
+          .whole
+      );
+      refused += 1;
+    }
+  }
+  assert!(
+    deltas_brought > 0,
+    "manifest deltas made again and brought back"
+  );
+  assert!(refused > 0, "a delta against the wrong text refused");
+}
