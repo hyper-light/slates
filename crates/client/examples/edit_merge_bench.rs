@@ -76,7 +76,7 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 /// thinking (the paced form of 2026-11-06, A-226; goal 84b's quiet-Mac run).
 static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
-/// Whether a loaded form's p99 passed the required bound on a platform that gates it (84a): the run then exits 1.
+/// Whether a loaded form's p99 or p999 passed the required bound on a platform that gates it (84a): the run then exits 1.
 static LOADED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
@@ -820,25 +820,36 @@ fn growth_sweep(instance: &str, selection: &Selection) {
     }
     for verb in ["edit", "merge"] {
       let p99 = median_of(&rows, &format!("{verb}_p99"));
+      let p999 = median_of(&rows, &format!("{verb}_p999"));
       println!(
-        "goal\tclient.{}.{verb}: p50 {} ns, p99 {p99} ns: {}",
+        "goal\tclient.{}.{verb}: p50 {} ns, p99 {p99} ns, p999 {p999} ns: {}",
         form.key(),
         median_of(&rows, &format!("{verb}_p50")),
-        against_goal(p99)
+        against_goal((p99, p999))
       );
     }
   }
 }
 
-/// Where a p99 stands against Ada's two bounds.
-fn against_goal(p99: u64) -> &'static str {
-  if p99 <= GOAL_PREFERRED_NS {
-    "within the preferred 50 us"
-  } else if p99 <= GOAL_REQUIRED_NS {
-    "within the required 1 ms"
-  } else {
-    "OVER the required 1 ms"
+/// Where a run stands against Ada's two bounds, judged at its p99 and its p999 (goal 84a's bar is both under the required
+/// bound; main 01a20182's order of 2026-11-24 01:57: a run whose p999 alone crossed 1 ms once read "within"): over the
+/// required bound, naming the percentile over it, or within it, the preferred bound judged at the p99 as before.
+fn against_goal((p99, p999): (u64, u64)) -> &'static str {
+  match (p99 > GOAL_REQUIRED_NS, p999 > GOAL_REQUIRED_NS) {
+    (true, true) => "OVER the required 1 ms at p99 and p999",
+    (true, false) => "OVER the required 1 ms at p99",
+    (false, true) => "OVER the required 1 ms at p999",
+    (false, false) if p99 <= GOAL_PREFERRED_NS => {
+      "within the preferred 50 us at p99, the required 1 ms at p999"
+    }
+    (false, false) => "within the required 1 ms at p99 and p999",
   }
+}
+
+/// Whether a run is over the required bound at its p99 or its p999 ([`against_goal`]'s rule): what fails a loaded run
+/// on a platform that gates it (84a).
+fn over_required((p99, p999): (u64, u64)) -> bool {
+  p99 > GOAL_REQUIRED_NS || p999 > GOAL_REQUIRED_NS
 }
 
 /// What the command line selects: the shapes and forms to run, and whether to run the loaded sweep.
@@ -935,17 +946,17 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
       };
       print_rows(&key, &rows);
       let p99 = median_of(&rows, "total_p99");
-      let verdict = against_goal(p99);
-      // 84a's gate: a loaded full edit and merge under the required bound at its p99, on Linux, where the runner's
-      // lane is the controlled load (A-224); the other platforms record it until their lanes gate.
-      if load == "loaded" && cfg!(target_os = "linux") && p99 > GOAL_REQUIRED_NS {
+      let p999 = median_of(&rows, "total_p999");
+      let verdict = against_goal((p99, p999));
+      // 84a's gate: a loaded full edit and merge under the required bound at its p99 and its p999, on Linux, where the
+      // runner's lane is the controlled load (A-224); the other platforms record it until their lanes gate.
+      if load == "loaded" && cfg!(target_os = "linux") && over_required((p99, p999)) {
         LOADED_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
       }
       println!(
-        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}",
+        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {p999} ns, max {} ns: {verdict}",
         rows["samples"],
         median_of(&rows, "total_p50"),
-        median_of(&rows, "total_p999"),
         median_of(&rows, "total_max"),
       );
     }
@@ -1020,8 +1031,54 @@ fn main() {
   daemon.stop();
   if LOADED_OVER.load(std::sync::atomic::Ordering::Relaxed) {
     eprintln!(
-      "edit_merge_bench: a loaded full edit and merge passed the required 1 ms at its p99 (84a)"
+      "edit_merge_bench: a loaded full edit and merge passed the required 1 ms at its p99 or p999 (84a)"
     );
     std::process::exit(1);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Goal 84a (main 01a20182's order of 2026-11-24 01:57: the bar is p99 and p999 under the required 1 ms). Do: judge a
+  /// run whose p99 is well within the required bound and whose p999 alone crosses it (Linux at 55650fef1 under its own
+  /// load: L5 accept p999 1,164,984 ns, p99 under 605 us). Expect: OVER, naming p999.
+  #[test]
+  fn a_run_whose_p999_alone_crosses_the_required_bound_is_over_at_p999() {
+    let verdict = against_goal((605_000, 1_164_984));
+    assert!(
+      verdict.starts_with("OVER the required 1 ms") && verdict.contains("p999"),
+      "{verdict}"
+    );
+  }
+
+  /// Goal 84a (the same order: the loaded gate's exit under the same rule). Do: ask whether a loaded run fails the gate
+  /// for each of: both percentiles within the required bound, its p999 alone over it, its p99 alone over it, both over
+  /// it. Expect: within passes; each of the others fails, and its verdict names the percentiles over the bound.
+  #[test]
+  fn the_loaded_gate_fails_a_run_over_the_required_bound_at_either_percentile() {
+    let within = (605_000, 999_999);
+    assert!(!over_required(within), "within");
+    assert_eq!(
+      against_goal(within),
+      "within the required 1 ms at p99 and p999"
+    );
+    for (run, named) in [
+      ((605_000, 1_164_984), "at p999"),
+      ((1_000_001, 999_999), "at p99"),
+      ((1_000_001, 3_738_000), "at p99 and p999"),
+    ] {
+      assert!(over_required(run), "{run:?} over");
+      assert_eq!(
+        against_goal(run),
+        format!("OVER the required 1 ms {named}"),
+        "{run:?}"
+      );
+    }
+    assert_eq!(
+      against_goal((40_000, 300_000)),
+      "within the preferred 50 us at p99, the required 1 ms at p999"
+    );
   }
 }
