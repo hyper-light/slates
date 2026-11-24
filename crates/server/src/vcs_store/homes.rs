@@ -2945,11 +2945,33 @@ async fn exchange(
       break;
     }
     // A session out on another exchange's loan: wait for its return (or its link's change), then look again.
-    if crate::fleet::session_returned(&left, spend.saturating_sub(spent)).await != Some(true) {
-      break;
+    match crate::fleet::session_returned(&left, spend.saturating_sub(spent)).await {
+      Some(true) => {}
+      waited => {
+        log_unanswered(&left, began, waited);
+        return answers;
+      }
     }
   }
+  if !left.is_empty() {
+    log_unanswered(&left, began, Some(false));
+  }
   answers
+}
+
+/// Logs the hosts of an exchange that never answered, how long it ran, and why it stopped (gate 8: a homing short in about
+/// 1 ms told no answer from a refusal; w-shared agreed this line in writing, 2026-11-24): `waited` the session wait's
+/// answer, none where no wait could be made, false at the deadline.
+fn log_unanswered(left: &[slates_db::HostId], began: u64, waited: Option<bool>) {
+  slates_machine::log_line!(
+    "slates-server: a region exchange ended with {left:?} unanswered after {} ns: {}",
+    slates_rt::futures::now_ns().saturating_sub(began),
+    match waited {
+      None => "no session to them, and no wait for one could be made",
+      Some(false) => "its budget spent, no session or no reply from them",
+      Some(true) => "a session came back",
+    }
+  );
 }
 
 /// The object `bytes` named `identity` sent to the other homes `homes` (A-724 piece 8c), whole within one message or a
@@ -2977,14 +2999,29 @@ async fn put_remote(
     HomeMessage::Put { bytes, .. } => bytes,
     _ => Vec::new(),
   };
+  let began = slates_rt::futures::now_ns();
   let kept = exchange(&homes, &request, budget)
     .await
     .into_iter()
-    .filter(|(_, reply)| {
-      matches!(
-        HomeMessage::decode(reply),
+    .filter(|(host, reply)| {
+      let decoded = HomeMessage::decode(reply);
+      let kept = matches!(
+        decoded,
         Ok(HomeMessage::Answer { identity: answered, outcome: HomeOutcome::Kept { .. } }) if answered == identity.0
-      )
+      );
+      if !kept {
+        // What a home answered other than kept, and when (gate 8; w-shared agreed this line in writing, 2026-11-24).
+        slates_machine::log_line!(
+          "slates-server: home {host:?} answered a put of {identity:?} other than kept after {} ns: {}",
+          slates_rt::futures::now_ns().saturating_sub(began),
+          match &decoded {
+            Ok(HomeMessage::Answer { outcome, .. }) => format!("{outcome:?}"),
+            Ok(_) => "another message than an answer".to_owned(),
+            Err(refused) => format!("unreadable: {refused:?}"),
+          }
+        );
+      }
+      kept
     })
     .count();
   (kept, bytes)

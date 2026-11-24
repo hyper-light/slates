@@ -57982,7 +57982,11 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
   a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
   captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
-  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after. Since 2026-11-24 the test snapshots
+  the clone before sharing it and asserts the carry it waits for. A clone's head is its origin's until its first
+  snapshot, so nothing was carried. The wait was unasserted, so it ran out its whole budget and the test passed late:
+  407 s on a Mac (4.29 s now). Windows CI's 240 s per-test deadline killed it first, a red on every Windows run of main. The red
+  with the assertion alone failed on the Mac at the carry.
 
 ### A-754 — The Linux issuer surface: the anchor prints an issuer route and its secret, and a separate process that presents the secret is handed the segment (2026-11-20, w-reaper, main's ruling; §4.13 "Grants", A-299; closes the Linux issuer surface owed since 2026-09-13)
 
