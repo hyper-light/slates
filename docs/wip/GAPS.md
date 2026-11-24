@@ -1348,8 +1348,18 @@
 >   `Store::log_text_len`, `Store::manifest_entry`, `Walk::log_texts_asked`), and a lookup's `.hgtags` reading asks the
 >   heads' manifests first (`Repository::manifest_not_at_hand`); held by
 >   `a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store` (a clone and a pull) and
->   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. Next: P3 (the push's work), P4 (the intake and
->   the record), P5.
+>   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. P3 BUILT (5de28ccb2): a push's work lays its
+>   trees out again once a changeset or manifest `NotAtHand` is brought back (`LAYOUT_TEXTS`,
+>   `vcs.hg.push_work_log_texts_read`). P4 BUILT (63e25a1ca): the intake asks its delta base and previous manifest
+>   through `Stepped::Store`. The reach BUILT: a stale re-base (a313f83d9) and a replay (b82590ddf; changeset texts
+>   batched by the record's room, `vcs_store.hg_replay_texts_asked`) ask likewise; a push's segment record reads no
+>   text (a guard). P4b BUILT: a made changeset brings its parent's texts back before it is made, in one place
+>   (`hg_made::parent_texts_at_hand`, `vcs.hg.made_parent_texts_read`; the deferred path makes in its landing task).
+>   Found and closed with it: a Mercurial green's second deferred submit was unmade `NotHead` and its version committed
+>   with nothing behind it, the held verdict's preview (a branch whose head is its version 1, `Lineage::preview`) read at
+>   the green's own versions; every made-changeset test submitted once, which hid it
+>   (`a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset`). Next: the commit-alone reds with w-svn's
+>   `commit_held` guard (A-891), then P5.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.

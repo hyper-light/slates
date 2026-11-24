@@ -2189,7 +2189,7 @@ fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
 /// let go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of
 /// the revision it is against too, the delta made again from the two and put back only as the very delta its row names
 /// ([`slates_hg::push::held::bring_back_log`]). Ok where its object is held whole after; its refusal not yet counted.
-async fn bring_back_log_on<L: ShardLender>(
+pub(crate) async fn bring_back_log_on<L: ShardLender>(
   lender: &mut L,
   repository: RepositoryId,
   forked: Option<&Forked>,
