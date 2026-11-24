@@ -1547,6 +1547,16 @@ pub(crate) fn region_held_here() -> Vec<ContentId> {
 /// Counter: a home message of another version this member refused at once, typed (A-727 (d1a): no mixed-version
 /// homing). Format: a counter name.
 pub(crate) const VERSION_REFUSED: &str = "vcs_store.homes.version_refused";
+/// Format: the status count of a put a home not ranked by its own configuration waited on because it is behind its
+/// sender (the carried configuration newer than its own installed one, or the sender not among its members): A-902's
+/// wait for its own install, begun.
+pub(crate) const INSTALL_WAITS: &str = "vcs_store.homes.install_waits";
+/// Format: such waits that an install ended, this node ranked a home or no longer behind its sender, the put then judged
+/// as any other.
+pub(crate) const INSTALL_WAIT_CAUGHT_UP: &str = "vcs_store.homes.install_wait_caught_up";
+/// Format: such waits that met their budget still not ranked a home, the put refused `NotAHome`: the bound a sender pays
+/// once for a home that never installs its configuration (removed, or cut off).
+pub(crate) const INSTALL_WAIT_ELAPSED: &str = "vcs_store.homes.install_wait_elapsed";
 /// Counter: a home's reply refusing this member's version, or one it could not read, its exchange failed at once
 /// (A-727 (d1a)). Format: a counter name.
 pub(crate) const REPLY_OTHER_VERSION: &str = "vcs_store.homes.reply_other_version";
@@ -1705,13 +1715,118 @@ async fn read_part(
   })
 }
 
+/// Waits, within `budget_ns`, until this node is not behind the configuration a put's `sender` ranked the window's homes
+/// by, `carried` (A-902; gate 8 and 9: a fresh fleet's first push refused `HomedShort` by a home answering `NotAHome`
+/// about 1 ms into its budget, before it had installed the region's configuration). Behind means: this node's own
+/// configuration does not rank it among the window's homes, and either `carried` is newer than its own installed version
+/// or `sender` is not among its members (a joiner's configuration before the region's comes from its own council, whose
+/// versions are not the region's). Each changing install wakes the wait ([`InstallChange`]), and it ranks again; no
+/// timer. A node ranked a home, or at the sender's version with the sender among its members, is not behind: a true
+/// `NotAHome` or a stale sender is answered at once. Returns the nanoseconds spent; past the budget the put is judged as
+/// it stands, refused `NotAHome`, counted [`INSTALL_WAIT_ELAPSED`].
+async fn caught_up(
+  identity: &[u8; 32],
+  (sender, carried): (slates_db::HostId, u64),
+  budget_ns: u64,
+) -> u64 {
+  let began = slates_rt::futures::now_ns();
+  let mut waited = false;
+  loop {
+    let Some((behind, seen)) = crate::state::with_state(|state| {
+      let local = state.fleet.host();
+      let members = state.fleet.members();
+      let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
+      let ranked = slates_db::identity_homes::homes(identity, members, f).contains(&local);
+      let behind =
+        !ranked && (carried > state.fleet.configuration().version || !members.contains(&sender));
+      (behind, state.fleet.installs())
+    }) else {
+      break;
+    };
+    if !behind {
+      if waited {
+        let _ = crate::state::with_state(|state| state.count(INSTALL_WAIT_CAUGHT_UP, 1));
+      }
+      break;
+    }
+    if !waited {
+      waited = true;
+      let _ = crate::state::with_state(|state| state.count(INSTALL_WAITS, 1));
+    }
+    let spent = slates_rt::futures::now_ns().saturating_sub(began);
+    let left = budget_ns.saturating_sub(spent);
+    let woken = if left == 0 {
+      None
+    } else {
+      match slates_rt::futures::within(left, InstallChange { seen, token: None }).await {
+        Ok(Some(true)) => Some(true),
+        Ok(Some(false)) | Err(_) => Some(false),
+        Ok(None) => None,
+      }
+    };
+    match woken {
+      Some(true) => {}
+      // No wait could be made (off a shard): judged as it stands, never a spin.
+      Some(false) => break,
+      None => {
+        let _ = crate::state::with_state(|state| state.count(INSTALL_WAIT_ELAPSED, 1));
+        break;
+      }
+    }
+  }
+  slates_rt::futures::now_ns().saturating_sub(began)
+}
+
+/// The wait of [`caught_up`] (A-902): ready once this shard's fleet node has made a changing install since `seen`
+/// (`true`), its waker registered with the node under its token meanwhile; `false` when the shard's state cannot be read
+/// (off a shard). Dropped, it takes its registration away, so none outlives it.
+struct InstallChange {
+  seen: u64,
+  token: Option<u64>,
+}
+
+impl std::future::Future for InstallChange {
+  type Output = bool;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<bool> {
+    let this = self.get_mut();
+    let polled = crate::state::with_state(|state| {
+      if state.fleet.installs() != this.seen {
+        if let Some(token) = this.token.take() {
+          state.fleet.forget_install_waiter(token);
+        }
+        return std::task::Poll::Ready(true);
+      }
+      this.token = Some(state.fleet.await_install(this.token, cx.waker()));
+      std::task::Poll::Pending
+    });
+    polled.unwrap_or(std::task::Poll::Ready(false))
+  }
+}
+
+impl Drop for InstallChange {
+  fn drop(&mut self) {
+    if let Some(token) = self.token.take() {
+      let _ = crate::state::with_state(|state| state.fleet.forget_install_waiter(token));
+    }
+  }
+}
+
 /// Serves one home exchange from another member of the region on shard `origin` (module docs, "From the region";
 /// `slates_cluster::homes`): a put kept only where the configuration this node knows ranks it among the window's homes
 /// and its bytes hash to their name, on the node's own home shard for the window, and answered `Kept` only once that
 /// shard's image holding it is published ([`published`], A-727's barrier); a read answered with the bytes; a let-go
 /// answered once its holder is let go. Each wait is judged in its target's own time within `budget_ns`. Malformed bytes
-/// answer nothing, as the session's other streams do.
-pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
+/// answer nothing, as the session's other streams do. A put (or a put's first part) from `sender` that this node is
+/// behind waits first for this node's own install ([`caught_up`], A-902).
+pub(crate) async fn serve_remote(
+  (origin, sender): (u16, slates_db::HostId),
+  request: &[u8],
+  budget_ns: u64,
+) -> Vec<u8> {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
   if OTHER_VERSION.with(std::cell::Cell::get) {
     return Vec::new();
@@ -1730,6 +1845,23 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
     }
     Err(_) => return Vec::new(),
   };
+  // A put (or a put's first part) is judged only once this node is not behind its sender's configuration (A-902): the
+  // wait spends the message's budget, and what is left of it is the keep's.
+  let spent = match &message {
+    HomeMessage::Put {
+      identity,
+      configuration,
+      ..
+    }
+    | HomeMessage::PutPart {
+      identity,
+      configuration,
+      offset: 0,
+      ..
+    } => caught_up(identity, (sender, *configuration), budget_ns).await,
+    _ => 0,
+  };
+  let budget_ns = budget_ns.saturating_sub(spent);
   let Some((local, members, f, shards)) = crate::state::with_state(|state| {
     state.count(REMOTE_SERVED, 1);
     (
@@ -1746,6 +1878,7 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
       identity,
       owners,
       bytes,
+      ..
     } => (
       identity,
       keep_put(
@@ -1763,6 +1896,7 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
       total,
       offset,
       bytes,
+      ..
     } => {
       let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
       let outcome = match staged {
@@ -2974,6 +3108,12 @@ fn log_unanswered(left: &[slates_db::HostId], began: u64, waited: Option<bool>) 
   );
 }
 
+/// The configuration version this node ranks an object's homes by now (A-902), carried on a put so that a home behind it
+/// waits for its own install rather than refusing: zero off a shard, which no member's install is behind.
+fn installed_configuration() -> u64 {
+  crate::state::with_state(|state| state.fleet.configuration().version).unwrap_or(0)
+}
+
 /// The object `bytes` named `identity` sent to the other homes `homes` (A-724 piece 8c), whole within one message or a
 /// part at a time past it ([`put_in_parts`]): how many answered kept. Run on the control shard.
 async fn put_remote(
@@ -2991,6 +3131,7 @@ async fn put_remote(
   }
   let message = HomeMessage::Put {
     identity: identity.0,
+    configuration: installed_configuration(),
     owners,
     bytes,
   };
@@ -3061,6 +3202,7 @@ async fn put_in_parts(
     let end = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
     let request = HomeMessage::PutPart {
       identity: identity.0,
+      configuration: installed_configuration(),
       owners: owners.to_vec(),
       total,
       offset,
@@ -3330,6 +3472,7 @@ async fn put_whole(
   use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
   let request = HomeMessage::Put {
     identity: identity.0,
+    configuration: installed_configuration(),
     owners,
     bytes,
   }
