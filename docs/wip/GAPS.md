@@ -4694,8 +4694,24 @@
 > (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). Blame was of every file at every
 > sample, 155,904 commands over git-2000 (4,872 files × 16 samples × 2 legs). By main 01a20182's ruling it is now of
 > the files each sampled revision changed, or those of the nearest earlier change (`blamed_files`,
-> `files_changed_in`), the count printed at each sample. **Owed:** the sizing run (a diag lane on ubuntu-latest,
-> stock svn 1.15 built in the job), then git-2000's rerun on the big Studio, its bound derived from the per-verb lines.
+> `files_changed_in`), the count printed at each sample. **Sized (run 45330574435, diag 1a3f1079b, ubuntu-latest, 4
+> CPUs, load 1.2 to 2.3, stock svn 1.15.0 built in the job, git-2000.dump made in it):** the whole use test over HTTP
+> took 900.37 s, its verbs about 851 s of it, in seconds per leg:
+> - checkout 78.4 (stock 33.5, slates 37.6);
+> - update 126.4 (54.9, 58.6);
+> - switch 81.7 (36.2, 38.1);
+> - blame 393.0 (308.4, 72.8), most of it revision 1, whose 4,523 added files the rule blames, the later samples 1 to
+>   10 files each;
+> - svnsync 137.4 (67.3, 70.0);
+> - svnrdump's dump 9.1 (2.3, 6.6);
+> - the writing session 15.3 (0.6, 14.7);
+> - info, diff, revprops and log about 10 together.
+>
+> **The bound for git-2000's run is 1,800 s:** twice the slowest whole run measured (2 × 900.37 s on a 4-CPU runner).
+> Past twice that a run is stuck, not slow. It ended with 18 differences, server reds sent to w-svn by main: `info`
+> answered 500 on `/project/!svn/rvr/N/trunk/t` at all 17 samples, and svnrdump's dump differs in one deletion's order.
+> Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
+> w-svn. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
