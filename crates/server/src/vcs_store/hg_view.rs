@@ -176,11 +176,21 @@ pub(crate) async fn answer_store_wants(
   wants: &mut dyn slates_hg::render::StoreWants,
   id: RepositoryId,
 ) -> bool {
+  answer_store_wants_on(&mut crate::vcs_http::git::ThisShard, wants, id).await
+}
+
+/// [`answer_store_wants`] over the shard's state as `lender` lends it a step at a time: this thread's (`ThisShard`), or
+/// one a caller holds already (`vcs_store::HeldShard`, a recovery's).
+pub(crate) async fn answer_store_wants_on<L: crate::vcs_http::git::ShardLender>(
+  lender: &mut L,
+  wants: &mut dyn slates_hg::render::StoreWants,
+  id: RepositoryId,
+) -> bool {
   use slates_hg::render::Want;
   let repository = u128::from_be_bytes(id.bytes);
   while let Some(want) = wants.wants().cloned() {
     let asked_at = slates_rt::futures::now_ns();
-    let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
+    let disk = lender.lend(|state| state.vcs_disk.clone()).flatten();
     let Some(disk) = disk else {
       // A daemon holding no store keeps no revision: a rows' want is answered none, any other refused.
       let Want::Rows { logs } = want else {
@@ -199,7 +209,7 @@ pub(crate) async fn answer_store_wants(
     };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
     let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
-    let _ = crate::state::with_state(|state| {
+    let _ = lender.lend(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
       if tags {

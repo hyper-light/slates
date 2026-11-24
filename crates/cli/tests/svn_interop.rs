@@ -3284,6 +3284,7 @@ fn use_verb_compared(
     }),
     "dump" => {
       let [a, b] = legs.map(|leg| leg.svn.charged(|| rdump_of(leg, scratch)));
+      let [a, b] = [a, b].map(|dump| sibling_deletes_in_order(&dump));
       compare(failed, "svnrdump dump", "0:HEAD", &a, &b);
     }
     "svnsync" => {
@@ -3396,6 +3397,126 @@ fn working_copies_compared(
     }
     compare(failed, verb, &format!("r{at}"), &held_by[0], &held_by[1]);
   }
+}
+
+/// `dump`, an `svnrdump dump` stream, with each run of deletions of one directory's children in path order and
+/// everything else as written: stock's dump editor queues a directory's deletions in a hash and writes them when it
+/// closes the directory, in the order its hash iterates (`libsvn_repos/dump_editor.c` `close_directory`, over
+/// `apr_hash_first` of `deleted_entries`, unsorted; `svnrdump` wraps that editor), and APR seeds every hash afresh from
+/// the clock and the table's and the stack's addresses (`tables/apr_hash.c` `apr_hash_make`), so two stock runs over
+/// one repository may write them in two orders. Found by main's round of 2026-11-23 (run 45330574435, git-2000 over
+/// HTTP): one difference at line 1,608,541, the same deletions of `trunk/templates/` in another order. A record's body
+/// is skipped by its `Content-length`, so no text it carries is read as a record.
+fn sibling_deletes_in_order(dump: &str) -> String {
+  let bytes = dump.as_bytes();
+  // Each record: its bytes, and the path it deletes where it is a deletion alone.
+  let mut records: Vec<(&[u8], Option<&str>)> = Vec::new();
+  let mut at = 0;
+  while at < bytes.len() {
+    let start = at;
+    let mut path = None;
+    let mut deletes = false;
+    let mut other_header = false;
+    let mut content = 0usize;
+    // Its headers, to the blank line that ends them.
+    while at < bytes.len() {
+      let end = bytes[at..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |line| at + line + 1);
+      let line = std::str::from_utf8(&bytes[at..end])
+        .unwrap_or("")
+        .trim_end_matches('\n');
+      at = end;
+      if line.is_empty() {
+        break;
+      }
+      if let Some(named) = line.strip_prefix("Node-path: ") {
+        path = Some(named);
+      } else if line == "Node-action: delete" {
+        deletes = true;
+      } else if let Some(length) = line.strip_prefix("Content-length: ") {
+        content = length.parse().unwrap_or(0);
+        other_header = true;
+      } else {
+        other_header = true;
+      }
+    }
+    // Its body, then the blank lines after it.
+    at = (at + content).min(bytes.len());
+    while bytes.get(at) == Some(&b'\n') {
+      at += 1;
+    }
+    let deletion = (deletes && !other_header).then_some(path).flatten();
+    records.push((&bytes[start..at], deletion));
+  }
+  let parent = |path: &str| {
+    path
+      .rsplit_once('/')
+      .map_or("", |(parent, _)| parent)
+      .to_owned()
+  };
+  let mut out = Vec::with_capacity(bytes.len());
+  let mut index = 0;
+  while index < records.len() {
+    let Some(first) = records[index].1 else {
+      out.extend_from_slice(records[index].0);
+      index += 1;
+      continue;
+    };
+    let mut end = index + 1;
+    while records
+      .get(end)
+      .and_then(|record| record.1)
+      .is_some_and(|path| parent(path) == parent(first))
+    {
+      end += 1;
+    }
+    let mut run: Vec<&(&[u8], Option<&str>)> = records[index..end].iter().collect();
+    run.sort_by_key(|record| record.1);
+    for record in run {
+      out.extend_from_slice(record.0);
+    }
+    index = end;
+  }
+  String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Stock's dump order of a directory's deletions is its hash's ([`sibling_deletes_in_order`]). Do: put two dumps that
+/// differ only in the order of one revision's deletions in one directory (and one that differs in which paths it
+/// deletes, and one that deletes in two directories) through it. Expect: the first two alike; the others not; the record
+/// bodies untouched, a body holding a deletion's lines read as a body.
+#[test]
+fn a_dumps_order_of_a_directorys_deletions_is_no_part_of_an_answer() {
+  let deletion = |path: &str| format!("Node-path: {path}\nNode-action: delete\n\n\n");
+  let body = "Node-path: trunk/f\nNode-kind: file\nNode-action: add\nText-content-length: 40\nContent-length: 40\n\nNode-path: trunk/z\nNode-action: delete\n\n\n";
+  let head = "SVN-fs-dump-format-version: 3\n\nRevision-number: 1\nProp-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n";
+  let dump = |paths: &[&str]| {
+    let mut text = head.to_owned();
+    for path in paths {
+      text.push_str(&deletion(path));
+    }
+    text.push_str(body);
+    text
+  };
+  let stock = dump(&["trunk/t/this--description", "trunk/t/hooks--x.sample"]);
+  let slates = dump(&["trunk/t/hooks--x.sample", "trunk/t/this--description"]);
+  let other = dump(&["trunk/t/hooks--x.sample", "trunk/t/another"]);
+  let two_directories = dump(&["trunk/u/b", "trunk/t/a"]);
+  let two_directories_swapped = dump(&["trunk/t/a", "trunk/u/b"]);
+  assert_eq!(
+    sibling_deletes_in_order(&stock),
+    sibling_deletes_in_order(&slates)
+  );
+  assert_ne!(
+    sibling_deletes_in_order(&stock),
+    sibling_deletes_in_order(&other)
+  );
+  assert_ne!(
+    sibling_deletes_in_order(&two_directories),
+    sibling_deletes_in_order(&two_directories_swapped)
+  );
+  assert!(sibling_deletes_in_order(&stock).ends_with(body));
 }
 
 /// `svnrdump dump` of `leg`'s repository, or its exit and error.

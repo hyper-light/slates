@@ -62762,3 +62762,30 @@ Applied in the same change to: GAPS (C2 stage C), `crates/ipc/src/protocol.rs`, 
 `crates/api/src/lib.rs`, `crates/server/src/{import_batch,verbs}.rs`,
 `crates/server/src/repository/{import,svn_commit}.rs`, `crates/server/src/repository/svn_commit/staging.rs`,
 `crates/server/src/vcs_store/svn_import.rs`, and the tests named above.
+
+### A-893 — A depth-1 PROPFIND of a collection streams its children's responses, and a server error names its cause (2026-11-24, w-svn for main 01a20182, its order of 2026-11-23 22:52 and ruling of 2026-11-24 01:57; goal 93's svn use test over HTTP; A-681, A-749)
+
+- **What was there.** The HTTP edge's PROPFIND (`slates_svn::dav::site::propfind`) wrote a collection's multistatus,
+  its own response and then every child's, into one body bounded by the request's room, and a body past it was refused
+  `OutputRoom`, answered as a bare `500`. Main's svn use test over HTTP with git-2000.dump on ubuntu (run
+  45330574435, stock svn 1.15.0) failed `svn info -R` at all 17 sampled revisions: "E175002: Unexpected server error
+  500 'Internal Server Error' on '/project/!svn/rvr/N/trunk/t'", git's test directory past the room; stock answered
+  the entries. The daemon's log named nothing.
+- **The rule.** `mod_dav` streams a multistatus however many children a directory holds. A depth-1 PROPFIND of a
+  collection is now answered as a streamed walk (`Walk::Propfind`, `PropfindWalk`), its status `207`
+  (`Report::status`; a REPORT's stays `200`): the opening and the collection's own response are written when the
+  request is read, then its children's, the repository lent again for each slice, until a slice's bytes reach its
+  room or its steps are spent, at least one; then the multistatus is closed. One child's response past the request's
+  room alone, or the index's refusal of a child, ends the answer after it began (`ReportProgress::Broken`), as
+  `mod_dav` ends a multistatus it cannot finish. Depth 0, and every other PROPFIND, is answered whole as before.
+- **A server error says why.** A site refusal answered `500` (a body past its room, a drive out of order, an aborted
+  drive, a value an answer cannot carry) names its cause in Subversion's error form (`site::refused_body`,
+  `cause_of`); a request's own fault stays a bare `4xx`, as `mod_dav` answers it. The edge logs each `5xx` it answers
+  with the method, the path and that cause (`server_refusal_logged`, counted `vcs.svn.http_server_refusals`).
+- **Evidence.** Red first (macOS, debug, on main a51883940): `a_depth_one_propfind_past_its_room_is_streamed_whole`
+  (`svn info`'s PROPFIND of a directory at depth 1, within a room half its multistatus) answered `(500, "")`; green
+  after: `207` and the same multistatus as within a room for all of it. `slates-svn --lib` and the server's svn and
+  HTTP tests pass (the counts in the commit). Owed: main's git-2000 info round over HTTP.
+
+Applied in the same change to: GAPS (the svn HTTP edge), `crates/svn/src/dav/site.rs` and its tests,
+`crates/server/src/vcs_http/svn.rs`.

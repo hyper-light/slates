@@ -93,6 +93,7 @@ use crate::hook_driver::{self, Launch};
 use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
+use crate::vcs_http::git::{ShardLender, ThisShard};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
 use crate::vcs_store::hg_view;
 use crate::vcs_store::{self, VcsStores};
@@ -2004,35 +2005,48 @@ impl BringBackRefused {
 /// ([`hg_run::let_go_windows`](super::hg_run::let_go_windows)), its whole text is read from the node's changeset store
 /// off the shard's step ([`hg_view::answer_store_wants`]), then put back by the identities the repository's index
 /// names, within the room its bytes take ([`file_put_back`]). Ok where it is held whole after (brought back, or never
-/// let go); otherwise the refusal, counted by its kind.
+/// let go); otherwise the refusal, counted by its kind. The shard's state is this thread's, lent a step at a time
+/// ([`bring_back_on`] over `ThisShard`).
 pub(crate) async fn bring_back(
+  repository: RepositoryId,
+  revision: (Vec<u8>, Node),
+) -> Result<(), BringBackRefused> {
+  bring_back_on(&mut ThisShard, repository, revision).await
+}
+
+/// [`bring_back`] over the shard's state as `lender` lends it a step at a time: this thread's (`ThisShard`), or one a
+/// caller holds already (`vcs_store::HeldShard`, a recovery's).
+pub(crate) async fn bring_back_on<L: ShardLender>(
+  lender: &mut L,
   repository: RepositoryId,
   (path, node): (Vec<u8>, Node),
 ) -> Result<(), BringBackRefused> {
   let brought = match whole_log(&path) {
-    Some(log) => bring_back_log(repository, (log, path), node).await,
-    None => bring_back_file(repository, (path, node)).await,
+    Some(log) => bring_back_log_on(lender, repository, (log, path), node).await,
+    None => bring_back_file_on(lender, repository, (path, node)).await,
   };
   if let Err(refused) = brought {
-    crate::state::with_state(|state| state.count(refused.counter(), 1));
+    lender.lend(|state| state.count(refused.counter(), 1));
   }
   brought
 }
 
-/// [`bring_back`] for a file's revision, its refusal not yet counted.
-async fn bring_back_file(
+/// [`bring_back_on`] for a file's revision, its refusal not yet counted.
+async fn bring_back_file_on<L: ShardLender>(
+  lender: &mut L,
   repository: RepositoryId,
   (path, node): (Vec<u8>, Node),
 ) -> Result<(), BringBackRefused> {
-  let (len, whole) =
-    crate::state::with_state(|state| held_whole(state, repository, (&path, &node)))
-      .flatten()
-      .ok_or(BringBackRefused::NotHeld)?;
+  let (len, whole) = lender
+    .lend(|state| held_whole(state, repository, (&path, &node)))
+    .flatten()
+    .ok_or(BringBackRefused::NotHeld)?;
   if whole {
     return Ok(());
   }
-  let (path, node, text) = asked_text(repository, (path, node), len).await?;
-  crate::state::with_state(|state| file_put_back(state, repository, (&path, &node), &text))
+  let (path, node, text) = asked_text_on(lender, repository, (path, node), len).await?;
+  lender
+    .lend(|state| file_put_back(state, repository, (&path, &node), &text))
     .unwrap_or(Err(BringBackRefused::NotHeld))
 }
 
@@ -2081,37 +2095,39 @@ fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
   }
 }
 
-/// [`bring_back`] for the changelog's or the manifest log's revision `node` (goal 93, C1 (1)): where its object was let
-/// go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of the
-/// revision it is against too, the delta made again from the two and put back only as the very delta its row names
+/// [`bring_back_on`] for the changelog's or the manifest log's revision `node` (goal 93, C1 (1)): where its object was
+/// let go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of
+/// the revision it is against too, the delta made again from the two and put back only as the very delta its row names
 /// ([`slates_hg::push::held::bring_back_log`]). Ok where its object is held whole after; its refusal not yet counted.
-async fn bring_back_log(
+async fn bring_back_log_on<L: ShardLender>(
+  lender: &mut L,
   repository: RepositoryId,
   (log, path): (slates_hg::index::Log<'static>, Vec<u8>),
   node: Node,
 ) -> Result<(), BringBackRefused> {
-  let held = crate::state::with_state(|state| log_held(state, repository, log, &node))
+  let held = lender
+    .lend(|state| log_held(state, repository, log, &node))
     .flatten()
     .ok_or(BringBackRefused::NotHeld)?;
   if held.whole {
     return Ok(());
   }
-  let (path, _, text) = asked_text(repository, (path, node), held.len).await?;
+  let (path, _, text) = asked_text_on(lender, repository, (path, node), held.len).await?;
   let against = match held.against {
     Some(against) => {
-      let len = crate::state::with_state(|state| log_held(state, repository, log, &against))
+      let len = lender
+        .lend(|state| log_held(state, repository, log, &against))
         .flatten()
         .ok_or(BringBackRefused::NotHeld)?
         .len;
-      let (_, _, text) = asked_text(repository, (path, against), len).await?;
+      let (_, _, text) = asked_text_on(lender, repository, (path, against), len).await?;
       Some(text)
     }
     None => None,
   };
-  crate::state::with_state(|state| {
-    log_put_back(state, (repository, log, &node), (&text, against.as_deref()))
-  })
-  .unwrap_or(Err(BringBackRefused::NotHeld))
+  lender
+    .lend(|state| log_put_back(state, (repository, log, &node), (&text, against.as_deref())))
+    .unwrap_or(Err(BringBackRefused::NotHeld))
 }
 
 /// Puts the changelog's or the manifest log's revision `node` back into repository `repository`'s content store from its
@@ -2140,15 +2156,16 @@ fn log_put_back(
 }
 
 /// The whole text of the revision `node` kept under `path`, at most `most` bytes, read from the node's changeset store
-/// off the shard's step ([`hg_view::answer_store_wants`]), with the path and node it was asked by: refused where the
-/// store did not answer, or kept no such revision or gave no text.
-async fn asked_text(
+/// off the shard's step ([`hg_view::answer_store_wants_on`], over the state `lender` lends), with the path and node it
+/// was asked by: refused where the store did not answer, or kept no such revision or gave no text.
+async fn asked_text_on<L: ShardLender>(
+  lender: &mut L,
   repository: RepositoryId,
   (path, node): (Vec<u8>, Node),
   most: u64,
 ) -> Result<(Vec<u8>, Node, Vec<u8>), BringBackRefused> {
   let mut ask = slates_hg::push::held::TextAsk::new(path, node, most);
-  if !hg_view::answer_store_wants(&mut ask, repository).await {
+  if !hg_view::answer_store_wants_on(lender, &mut ask, repository).await {
     return Err(BringBackRefused::StoreUnanswered);
   }
   ask.taken().ok_or(BringBackRefused::NoText)
