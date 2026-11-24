@@ -1455,6 +1455,11 @@
 >   `landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify` (an import and a push
 >   in two: every changelog and manifest object let go before and after a clone and a pull, each changegroup verified
 >   by the push's own verifier; red: 10 and 14 held). Owed: stock 7.2's clone, pull and verify (main's `hg_interop`).
+>   Found by main's `hg_interop` round at a30ffbdb8 and closed: a fetch's changelog and manifest texts read whole from
+>   the changeset store (to send a changeset, or diff a manifest against the client's) were counted as file revisions
+>   sent whole (`vcs_store.hg_pull_whole_texts`: 3 for a one-changeset pull, its changeset, its manifest and the parent
+>   manifest), though the pull sent the stored delta; now counted apart (`StoreWants::reads_logs`,
+>   `vcs_store.hg_pull_log_texts`). Held by P5's red above (red: 3 whole, 0 log texts).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
