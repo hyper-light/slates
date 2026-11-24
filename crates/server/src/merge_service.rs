@@ -870,6 +870,7 @@ pub(crate) fn with_work_base<R>(
   let lent = state.greens.get(&work.green);
   read(crate::work_files::Base {
     green: lent.as_deref(),
+    green_id: Some(work.green),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
     entries: Some(&work.entries),
@@ -1752,7 +1753,12 @@ fn read_green_range(
   let plane = crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content);
   match engine.content_page_at(path, version, range) {
     Some((page, total)) => {
-      match crate::vcs_store::named_objects::page_of(path, page, range, plane.as_ref()) {
+      match crate::vcs_store::named_objects::page_of(
+        (path, Some((green, version))),
+        page,
+        range,
+        plane.as_ref(),
+      ) {
         Ok(bytes) => ReplyBody::ReadPage {
           bytes: bytes.into_owned(),
           total,

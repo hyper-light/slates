@@ -355,6 +355,21 @@ pub struct Built {
   pub increment: Increment,
   /// What building it read.
   pub reads: Reads,
+  /// Each file the work names by its stored object (A-887): what the tool brings the object back by, should its
+  /// windows be let go before the work lands (a Mercurial push's file texts leave once their segment is durable).
+  pub named: Vec<NamedObject>,
+}
+
+/// A file a push's work names by its stored object (A-887): the object, the file's path and the tool's name for the
+/// object (a Mercurial file revision's node).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedObject {
+  /// The object.
+  pub identity: crate::named::Identity,
+  /// The file's path in the work.
+  pub path: String,
+  /// The tool's name for the object.
+  pub key: ObjectKey,
 }
 
 /// Builds `push`'s work against `green`, reading its objects from `objects`, within `room` bytes (module docs): the
@@ -1568,7 +1583,7 @@ struct Hashing {
   /// The post-state.
   post_state: Vec<u8>,
   /// Each operation that writes a file whole from an object the store holds, and that object (A-887), named once hashed.
-  named: Vec<(usize, crate::named::Identity)>,
+  named: Vec<WholeRun>,
   /// What the walk read.
   reads: Reads,
   /// The next piece of the document.
@@ -1584,7 +1599,7 @@ impl Hashing {
   fn new(
     (name, base): (&[u8; 32], u64),
     doc: OpsDoc,
-    (post_state, named): (Vec<u8>, Vec<(usize, crate::named::Identity)>),
+    (post_state, named): (Vec<u8>, Vec<WholeRun>),
     reads: Reads,
   ) -> Hashing {
     let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_CONTEXT);
@@ -1636,14 +1651,42 @@ impl Hashing {
       named: Default::default(),
     };
     let mut reads = self.reads;
-    reads.named = name_runs(&mut increment, self.named);
-    Built { increment, reads }
+    let mut named: Vec<NamedObject> = self
+      .named
+      .iter()
+      .filter_map(|(at, identity, key)| {
+        let op = increment.doc.ops.get(*at)?;
+        Some(NamedObject {
+          identity: *identity,
+          path: increment.doc.paths.path(op.path)?.to_owned(),
+          key: *key,
+        })
+      })
+      .collect();
+    let runs = self.named.into_iter().map(|(at, identity, _)| (at, identity));
+    reads.named = name_runs(&mut increment, runs.collect());
+    named.retain(|object| {
+      increment
+        .named
+        .runs
+        .iter()
+        .any(|run| run.identity == object.identity)
+    });
+    Built {
+      increment,
+      reads,
+      named,
+    }
   }
 }
 
 /// What a [`Posting`] lays: the document, the post-state, what the walk read, and each operation that writes a file
 /// whole from an object the store holds, with that object ([`whole_named_runs`]).
-type Laid = (OpsDoc, Vec<u8>, Reads, Vec<(usize, crate::named::Identity)>);
+type Laid = (OpsDoc, Vec<u8>, Reads, Vec<WholeRun>);
+
+/// An operation that writes a file whole from an object the store holds ([`whole_named_runs`]): its index, the object's
+/// stored identity, and the tool's name for the object.
+type WholeRun = (usize, crate::named::Identity, ObjectKey);
 
 /// Each operation of `doc` that writes a file's blob whole, from its first byte, the only operation adding bytes to its
 /// path, where `objects` holds the blob as an object of its own (A-887, [`PushObjects::blob_named`]): its index and the
@@ -1654,7 +1697,7 @@ fn whole_named_runs<O: PushObjects + ?Sized>(
   plan: &PostStatePlan,
   walk: &Walk,
   objects: &O,
-) -> Vec<(usize, crate::named::Identity)> {
+) -> Vec<WholeRun> {
   let mut adding: BTreeMap<u64, usize> = BTreeMap::new();
   for op in &doc.ops {
     if op.src != u64::MAX && adds_bytes(op.kind) {
@@ -1680,7 +1723,7 @@ fn whole_named_runs<O: PushObjects + ?Sized>(
         return None;
       }
       let identity = objects.blob_named(id)?;
-      (identity.len == len).then_some((at, identity))
+      (identity.len == len).then_some((at, identity, id))
     })
     .collect()
 }

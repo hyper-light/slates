@@ -62523,19 +62523,51 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   default); a file the work writes whole from such a blob is taken out of the inline post-state into a named run of
   that identity (A-760), its read buffer the bytes the builder already holds. The commit then names the file
   (`named_files`) and keeps no bytes (`Green::set_file`'s `insert_named`). The work's identity is hashed before the
-  runs are named, so it is the one it was. Mercurial first: a file revision's stored text is its object, so a file
-  whose text carries no copy metadata is named; one that carries it (the `\x01\n` block) is not its object whole and
-  stays inline, counted. Git once its blobs are content-plane objects by that identity.
-- **Recovery and reads.** A recovery brings back what a green's checkpoint and chain name and the content store does
-  not hold whole before the green replays (`svn_texts::bring_back_named`, and its live twin for a takeover), now for a
-  Mercurial repository's greens as for a Subversion one's: a Mercurial text let go (A-767 C1) is its landed changeset's
-  Payload, found by its identity. A read of a named file brings back its let-go windows (`named_objects::bring_back_range`,
-  tool-neutral already).
-- **Not changed here.** A work that edits a named file in place, its text let go, is refused at its judge until the text
-  is brought back, as for a Subversion green's named files; a push replaces its files whole and reads no base.
-- **Counters.** `repository.push.files_named` (named rather than made), `repository.push.files_inline_metadata`.
-- **Proven** (to be filled as it lands): `repository::hg_push::tests::a_pushed_file_the_content_store_holds_whole_is_held_by_its_name`
-  (red: both of the fixtures' files held as bytes, none named).
+  runs are named, so it is the one it was. Mercurial first: the content store keeps a file revision's bytes as an
+  object of their own, its metadata block apart (`verify::FileNames`, A-767 C1), so a file is named for that object
+  with or without a copy's metadata. A holder must say whether it keeps bytes so (`Held::stores_bytes`, required: a
+  holder with no store names nothing). Git once its blobs are content-plane objects by that identity. The builder
+  hands back each file it named with its path and the tool's name for the object (`slates_merge::push::NamedObject`,
+  a Mercurial node).
+- **Reads: one bring-back path, its source by the reader's site** (main's ruling (B) of 2026-11-24 00:16; A-760 (b)
+  4d). A read that meets a let-go window notes what the reader knew: the object, its range, and where it read it, the
+  green, the path there and the version (`named_objects::AwayRead::at`; a mount's tree, a work's base, a green's page,
+  and a judge's or a commit's or a replay's lend, whose path and version are found among its increment's paths at the
+  head and its base, `name_holds::ReadIn`). The parked call's frame brings them back (`bring_back_reads`): a
+  Subversion text by its repository and identity, a landed pack's by identity, and a Mercurial green's file by the
+  revision its green's changeset names there (`vcs_store::hg_named`). No record per named file is kept for it: the
+  green's head attribute at the version (`Green::xattr_at`) names the changeset, its text names the manifest, the
+  manifest names the path's revision (found by halving its sorted lines), and the repository's index gives the
+  revision's bytes' object and length, which must be the identity the green named, or the read is refused
+  `Mismatch`, naming both. Each green's and version's paths resolve in one read of one manifest; a changeset's or a
+  manifest's text let go comes back first through the same bring-back by its log's name, at most two before the third
+  resolution finds the revisions (`RESOLUTIONS`). The content store hashes the bytes given back against the identity
+  before it takes them. Rejected: a record per named file, about 100 bytes and the path for as long as its green
+  lives, paid always for a cold path (main, 00:16).
+- **The window before a push's entry commits.** A push's file texts leave the content store once its segment is
+  durable, before its entry commits, and its revisions are then its fork's alone. A work moved to several greens is
+  judged as a clone for all but one, and a clone carries no run's bytes (`slates_merge::named::Read`), so its judge
+  reads them from the content store (`svn_commit::read_named`). Before the landing's step, the driver brings back each
+  named text whose windows are away through the push's fork by its path and node (`hg_push::bring_back_named`,
+  `bring_back_file` over the fork's index), pinned until the landing ends; a text it cannot bring back refuses the push
+  (`WORK_TEXT_UNREAD`). The tests' driver does the same after its segments land (`bring_back_named_whole`).
+- **Recovery** (owed, main's ruling pending, 2026-11-24): a restart fences the green `ContentMissing` at the push's
+  version, since the replay reads each named run of an entry from the plane before it applies it, and the push's texts
+  are away. Reds: `a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited`.
+- **Counters.** `repository.push.files_named` (named rather than made); `vcs.hg.pushed_texts_brought_back` (a named
+  text brought back through the fork before a landing); `merge.name_read.brought_back` counts a Mercurial set's reads
+  as any other's.
+- **Proven.** In `repository::hg_push::tests`: `a_pushed_file_the_content_store_holds_whole_is_held_by_its_name`
+  (red: both of the fixtures' files held as bytes, none named); `a_named_pushed_file_let_go_is_read_back_through_its_name`
+  (a mount's read; red: none, the read-through finding no object of that identity on the node's store);
+  `a_work_editing_a_named_pushed_file_in_place_brings_its_text_back_and_lands` (red: the parked submit's bring-back
+  refused `Missing`, its judge's note naming no green or path);
+  `a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back` (red: the push refused
+  `ContentUnavailable`, a clone's run unread). w-svn's two reds hold (`svn_commit::tests`).
+- **Applied in the same change to:** `crates/merge/src/{push,engine}.rs`, `crates/hg/src/push/{verify,held,tree}.rs`
+  and its tests' holders, `crates/server/src/vcs_store/{hg_named,named_objects,name_holds,read_through}.rs`,
+  `crates/server/src/repository/{hg_push,hg_run,push}.rs`, the readers that note a site (`green_tree`, `work_files`,
+  `merge_service`, `mounted_work`, `landing`, `fuse`, `nfs`, `winfsp`, `verbs`), GAPS.
 
 ### A-889 — The record period publishes a live volume that owes an install image while a change no verb recorded leaves it unpublished (2026-11-24, w-ci for main 01a20182, its approval of 2026-11-23 21:49; amends §4.10 "An install image beside the log (2026-11-07)"; A-377, A-64)
 

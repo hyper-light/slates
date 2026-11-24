@@ -1287,7 +1287,8 @@ fn judged_lent(
     return Some(first);
   }
   let wanted = state.greens.get_mut(&green)?.unlent_reads(work);
-  if name_holds::lend_from_plane(state, green, &wanted).is_err() {
+  let head = state.greens.get(&green)?.head();
+  if name_holds::lend_from_plane(state, &name_holds::ReadIn::verdict(green, head, work), &wanted).is_err() {
     return Some(first);
   }
   state.count(name_holds::NAME_LENT_VERDICTS, 1);

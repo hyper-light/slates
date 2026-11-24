@@ -583,8 +583,9 @@ fn a_pushed_file_the_content_store_holds_whole_is_held_by_its_name() {
 /// repository as one push to its empty first line; check its root green holds file `b` by its object's name, that
 /// object let go from the content store, as a push's texts are once kept; then read `b` through its name on the shard,
 /// as a mount's read does (`named_objects::read_file_brought`). Expect: `b`'s bytes, `b\n`, its windows brought back by
-/// identity through homes' records. Failing first: none, the read-through finding no object of that identity on the
-/// node's store (a Mercurial file revision's bytes lie there as a delta, by its text's name).
+/// the revision the green's changeset names for `b` (`hg_named`, main's ruling (B) of 2026-11-24). Failing first: none,
+/// the read-through finding no object of that identity on the node's store (a Mercurial file revision's bytes lie there
+/// as a delta, by its text's name).
 #[test]
 fn a_named_pushed_file_let_go_is_read_back_through_its_name() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
@@ -621,6 +622,259 @@ fn a_named_pushed_file_let_go_is_read_back_through_its_name() {
     Some(&b"b\n"[..]),
     "read back through its name"
   );
+}
+
+/// The reply recorded for request `id` of `origin`, waited for a step at a time within [`NAMED_PATIENCE`]. A parked
+/// request whose bring-back was refused is answered unrecorded (`verbs::park_on_away`), so the wait fails at once on
+/// one (`verbs.bring_back_refused`).
+async fn recorded_answer(
+  origin: u64,
+  id: slates_wire::request::RequestId,
+) -> ReplyBody {
+  use crate::repository::svn_commit::tests::on;
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(NAMED_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+  loop {
+    let seen = on(|state| {
+      state
+        .db
+        .partition()
+        .completion(origin, id.client, id.sequence)
+    });
+    if let slates_wire::request::Seen::Completed(bytes) = seen {
+      return <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).expect("a reply");
+    }
+    let refused = on(|state| {
+      state
+        .refusals
+        .get("verbs.bring_back_refused")
+        .copied()
+        .unwrap_or(0)
+    });
+    assert_eq!(refused, 0, "request {id:?}'s bring-back was refused");
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "request {id:?} never answered"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Shape: how long a named-file test's history may run on its shard.
+const NAMED_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Over a work on green `green`, `x` inserted at offset 1 of `b`, then the work submitted as a client's recorded request
+/// (A-887's in-place edit of a named file): the submit's answer, and how many requests parked on a let-go window meanwhile
+/// (`verbs.parked_on_away`).
+async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64) {
+  use crate::repository::svn_commit::tests::on;
+  let parked = || {
+    on(|state| {
+      state
+        .refusals
+        .get("verbs.parked_on_away")
+        .copied()
+        .unwrap_or(0)
+    })
+  };
+  let made = on(|state| {
+    crate::vcs_store::paths::tests::ask(
+      state,
+      RequestBody::CreateWork {
+        green: slates_ipc::protocol::VolumeId { bytes: green.bytes },
+        name: "edit-named".to_owned(),
+      },
+    )
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  let edited = on(|state| {
+    crate::vcs_store::paths::tests::ask(
+      state,
+      RequestBody::Edit {
+        work,
+        path: "b".to_owned(),
+        at: 1,
+        delete_len: 0,
+        bytes: b"x".to_vec(),
+      },
+    )
+  });
+  assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+  let before = parked();
+  let submit = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let _ = on(|state| {
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, submit),
+      &owner(),
+      crate::identities::authored(work, "edit a named file"),
+    )
+  });
+  let submitted = recorded_answer(7, submit).await;
+  (submitted, parked().saturating_sub(before))
+}
+
+/// A-887 (main 01a20182's ruling (B) of 2026-11-24 00:16: a restart's recovery). Do: on a daemon over a segment and a
+/// store, rebuild the fixtures' repository as one push, its root green holding `b` by its object's name and that object
+/// let go, then edit `b` in place over a work and submit it (`edited_named`); stop the daemon and the store's owner,
+/// start both again over the same segment and store, and read `b` through its name. Expect: the submit landed before the
+/// restart; after it, the green recovered at the submit's version and `b` read `bx\n`, its let-go windows brought back
+/// by the revision the recovered green's changeset names. Failing first: the green fenced, or `b` unread.
+#[test]
+fn a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited() {
+  use crate::repository::store_tests::{anchor_of, daemon_over};
+  let instance = format!("vcs-store-hg-named-{}", std::process::id());
+  let mut store = crate::test_store::TestStore::start("hg-named-restart");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let green = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "named-restart");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    hg.root
+  });
+  let (submitted, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { edited_named(green).await },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    !matches!(submitted, ReplyBody::Refused { .. }),
+    "{submitted:?}"
+  );
+  let version = crate::daemon::observe_first(&daemon, move |state| {
+    state.db.partition().green_head(green)
+  });
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let recovered = crate::daemon::observe_first(&daemon, move |state| {
+    let head = state.greens.get(&green).map(|engine| engine.head());
+    (head, state.fenced_greens.get(&green).cloned())
+  });
+  let file = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { crate::vcs_store::named_objects::read_file_brought(green, "b").await },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(
+    recovered,
+    (Some(version), None),
+    "the green recovered at the submit's version, unfenced"
+  );
+  assert_eq!(file.as_deref(), Some(&b"bx\n"[..]), "the edited file after the restart");
+}
+
+/// A-887 (main 01a20182's ruling (B) of 2026-11-24 00:16: an in-place edit after naming). Do: on a store-backed daemon,
+/// rebuild the fixtures' repository as one push, its root green holding `b` by its object's name and that object let
+/// go; over a work on the root green, insert `x` at offset 1 of `b`, then submit the work as a client's recorded
+/// request. Expect: the submit answered, not refused; the verb parked on the let-go window and resumed
+/// (`verbs.parked_on_away` moved); the green's `b` then `bx\n`, read through its name. Failing first: the parked
+/// submit's bring-back refused `Missing { at: 0 }` and the submit never answered recorded: its judge noted the read with
+/// no green or path, so the read-through looked for the object by identity on the node's store, which keeps a
+/// Mercurial revision by its path and node.
+#[test]
+fn a_work_editing_a_named_pushed_file_in_place_brings_its_text_back_and_lands() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (green, named_away) = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "named-edit");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let content = state.vcs_stores.content().unwrap();
+    let held = state
+      .greens
+      .get(&hg.root)
+      .unwrap()
+      .content("b")
+      .map(|held| match held {
+        slates_merge::engine::Content::Named(identity) => {
+          content.is_away(&slates_vcs::ContentId(identity.hash))
+        }
+        slates_merge::engine::Content::Bytes(_) => false,
+      });
+    (hg.root, held)
+  });
+  let (submitted, parked, file) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let (submitted, parked) = edited_named(green).await;
+      let file = crate::vcs_store::named_objects::read_file_brought(green, "b").await;
+      (submitted, parked, file)
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(
+    named_away,
+    Some(true),
+    "`b` held by its name, its object let go"
+  );
+  assert!(
+    !matches!(submitted, ReplyBody::Refused { .. }),
+    "{submitted:?}"
+  );
+  assert!(parked > 0, "the submit never parked on the let-go window");
+  assert_eq!(file.as_deref(), Some(&b"bx\n"[..]), "the edit landed");
+}
+
+/// A-887 (main 01a20182's ruling (B) of 2026-11-24 00:16: the window before a push's entry commits, a second work naming
+/// the same bytes). Do: on a store-backed daemon, push the fixtures' `base` and `second` to an empty repository with
+/// bookmarks `main`, `left` and `right` all at `second`, so one work is judged for three greens (two judge a clone,
+/// which carries none of the run's bytes); its works are built, then its segment lands and lets its texts go, then it
+/// is judged, as the tests' driver orders it. Expect: the push landed; each of the three bookmarks' greens holds `b` by
+/// its name and reads it `b\n` through it. Failing first: the push refused `ContentUnavailable`, a clone's named run
+/// unread at its judge, its text let go before the entry committed.
+#[test]
+fn a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let greens = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "named-twice");
+    let made = history();
+    let at = |name: &[u8]| BookmarkAt {
+      name: name.to_vec(),
+      node: Some(made[1].node),
+    };
+    let unbundle = Unbundle {
+      parts: vec![
+        taken(0, Asks::Changegroup(changegroup(&made, &[0, 1]))),
+        taken(1, Asks::Bookmarks(vec![at(b"main"), at(b"left"), at(b"right")])),
+      ],
+    };
+    let answer = hg.push(state, &unbundle, &View::default());
+    assert!(answer.is_ok(), "the push was refused: {answer:?}");
+    let greens = [b"main".as_slice(), b"left", b"right"]
+      .map(|name| hg.bound(state, &bookmark_name(name)).expect("a bookmark's green"));
+    let named = greens.map(|green| {
+      matches!(
+        state.greens.get(&green).and_then(|engine| engine.content("b").map(|held| {
+          matches!(held, slates_merge::engine::Content::Named(_))
+        })),
+        Some(true)
+      )
+    });
+    assert_eq!(named, [true; 3], "`b` held by its name in each green");
+    greens
+  });
+  let read = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut read = Vec::new();
+      for green in greens {
+        read.push(crate::vcs_store::named_objects::read_file_brought(green, "b").await);
+      }
+      read
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  for (green, file) in greens.iter().zip(&read) {
+    assert_eq!(file.as_deref(), Some(&b"b\n"[..]), "{green:?}'s `b`");
+  }
 }
 
 /// A-657, AC-HG.3 (T-HG.3; golden, by meaning and byte for byte). Do: rebuild the fixtures' repository from its texts

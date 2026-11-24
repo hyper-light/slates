@@ -527,7 +527,7 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
 
 /// A daemon of one shard over the anchor's `segment` (and its content object) holding `store`'s handle: what a node's
 /// restart starts again over the segment and store the dead daemon left.
-fn daemon_over(
+pub(crate) fn daemon_over(
   instance: &str,
   (segment, rendezvous): (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
   store: &TestStore,
@@ -546,7 +546,7 @@ fn daemon_over(
 }
 
 /// The anchor's segment and content object for `instance`, sized as the anchor sizes them, and its rendezvous.
-fn anchor_of(instance: &str) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
+pub(crate) fn anchor_of(instance: &str) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
   let profile = crate::daemon::test_profile();
   let config = crate::DaemonConfig::derive(&profile, instance, Some(1));
   let segment = slates_anchor::AnchorSegment::create(

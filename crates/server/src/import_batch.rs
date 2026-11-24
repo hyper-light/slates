@@ -172,7 +172,7 @@ impl ImportBatch {
         state.count(crate::vcs_store::name_holds::NAME_LEND_MISSED, 1);
         return Err(StageRefused::Unavailable);
       }
-      lent = crate::vcs_store::name_holds::read_from_plane(state, &unlent)
+      lent = crate::vcs_store::name_holds::read_from_plane(state, &unlent, None)
         .map_err(|_| StageRefused::Unavailable)?;
       state.count(crate::vcs_store::name_holds::NAME_LENT_VERDICTS, 1);
       judged_again = true;

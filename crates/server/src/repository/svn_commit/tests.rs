@@ -2838,7 +2838,7 @@ fn a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again() {
           let engine = state.greens.get(&green).expect("the green");
           let tree = crate::green_tree::GreenTree::reading(
             &engine,
-            engine.head(),
+            (green, engine.head()),
             crate::vcs_store::named_objects::plane(&state.vcs_stores, &()),
           );
           crate::vcs_store::named_objects::away_scope(|| {
@@ -2856,14 +2856,21 @@ fn a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again() {
       hash: identity(b"alpha\n"),
       len: 6,
     };
+    let read_at = away.first().and_then(|read| read.at.clone());
     assert_eq!(
       away,
       vec![crate::vcs_store::named_objects::AwayRead {
         identity: alpha,
         offset: 0,
-        len: 6
+        len: 6,
+        at: read_at.clone(),
       }],
       "the miss noted"
+    );
+    assert_eq!(
+      read_at.map(|at| (at.green, at.path)),
+      Some((green, "trunk/a.txt".to_owned())),
+      "noted where it was read"
     );
     let _pins = crate::vcs_store::named_objects::bring_back_reads(&away)
       .await

@@ -9705,6 +9705,7 @@ fn edit(
     let lent = greens.get(&w.green);
     let base = crate::work_files::Base {
       green: lent.as_deref(),
+      green_id: Some(w.green),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
       entries: Some(&w.entries),
@@ -9943,6 +9944,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     let lent = greens.get(&w.green);
     let base = crate::work_files::Base {
       green: lent.as_deref(),
+      green_id: Some(w.green),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
       entries: Some(&w.entries),
@@ -10162,6 +10164,7 @@ fn build_increment(
   let base = engine.base_for(base_version, &sealed.journal);
   let files_base = crate::work_files::Base {
     green: Some(&*engine),
+    green_id: Some(green_id),
     fetched: None,
     version: base_version,
     entries: None,
@@ -10252,6 +10255,7 @@ pub(crate) fn composed_whole(
   let base = engine.base_for(base_version, &w.journal);
   let files_base = crate::work_files::Base {
     green: Some(&*engine),
+    green_id: Some(green),
     fetched: None,
     version: base_version,
     entries: None,
@@ -11057,7 +11061,8 @@ fn verdict_of(
     return Some(first);
   }
   let wanted = state.greens.get_mut(&green_id)?.unlent_reads(inc);
-  if name_holds::lend_from_plane(state, green_id, &wanted).is_err() {
+  let head = state.greens.get(&green_id)?.head();
+  if name_holds::lend_from_plane(state, &name_holds::ReadIn::verdict(green_id, head, inc), &wanted).is_err() {
     return Some(first);
   }
   state.count(name_holds::NAME_LENT_VERDICTS, 1);
@@ -12381,6 +12386,7 @@ pub(crate) fn compose_on_replica(
   let base = replica.base_for(sealed.base_version, &sealed.journal);
   let files_base = crate::work_files::Base {
     green: Some(replica),
+    green_id: None,
     fetched: None,
     version: sealed.base_version,
     entries: None,
@@ -12581,6 +12587,7 @@ fn apply_replacement(
   let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
     green: Some(engine),
+    green_id: None,
     fetched: None,
     version: head,
     entries: None,

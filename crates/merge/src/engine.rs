@@ -143,17 +143,6 @@ impl Increment {
     self.named.read.0.get(at).map(Vec::as_slice)
   }
 
-  /// A copy of this work with the named runs' bytes it has read (A-887): what a push that moves several changes by one
-  /// work gives each but the last. A plain clone carries none (`crate::named::Read`), which a run let go from the
-  /// content store, as a push's texts are once kept, could not be read back for; and before its runs were named this
-  /// work carried the same bytes inline, so the copy is no larger than the clone it replaces.
-  #[must_use]
-  pub fn clone_read(&self) -> Increment {
-    let mut copy = self.clone();
-    copy.named.read = crate::named::Read(self.named.read.0.clone());
-    copy
-  }
-
   /// Names `run` as the post-state's next bytes (A-760): the offset an op's `src` gives them.
   pub fn push_named(&mut self, run: crate::named::NamedRun) -> Option<u64> {
     self.named.inline_len = u64::try_from(self.post_state.len()).ok()?;
@@ -2846,8 +2835,9 @@ impl Green {
     )
   }
 
-  /// An attribute's value at `version` ([`Green::read_at`], by the path it is on).
-  fn xattr_at(&self, path: &str, name: &str, version: u64) -> Option<Vec<u8>> {
+  /// An attribute's value at `version`, read from its history as every dimension's is: a Mercurial green's changeset at
+  /// the version its reader read, by the head attribute (A-887).
+  pub fn xattr_at(&self, path: &str, name: &str, version: u64) -> Option<Vec<u8>> {
     self.read_at(
       path,
       self.xattr_history.get(&(path.to_owned(), name.to_owned())),

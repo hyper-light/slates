@@ -646,6 +646,9 @@ impl Held {
 pub struct Base<'a> {
   /// The green, when it lives on this shard; `None` once it is destroyed or when it lives on another.
   pub green: Option<&'a Green>,
+  /// The green's id, where its files are read through the plane: a read that meets a let-go window notes where it
+  /// read (A-887: a Mercurial green's named file comes back by the revision its changeset names there).
+  pub(crate) green_id: Option<slates_db::catalog::VolumeId>,
   /// What the green's owner answered for this verb, when the green lives on another shard (A-247).
   pub fetched: Option<&'a FetchedBase>,
   /// The base version.
@@ -669,9 +672,13 @@ impl<'a> Base<'a> {
         .content_ref_at(path, self.version)
         .map(|content| match content {
           slates_merge::engine::ContentAt::Bytes(bytes) => Ok(bytes),
-          named => crate::vcs_store::named_objects::whole_of(named, self.plane.as_ref())
-            .map(Cow::Owned)
-            .ok_or(BaseGone),
+          named => crate::vcs_store::named_objects::whole_of(
+            named,
+            self.plane.as_ref(),
+            self.green_id.map(|green| (green, path, self.version)),
+          )
+          .map(Cow::Owned)
+          .ok_or(BaseGone),
         })
         .transpose();
     }
@@ -734,7 +741,8 @@ impl<'a> Base<'a> {
       let (page, _) = green
         .content_page_at(path, self.version, (at, len))
         .ok_or(BaseGone)?;
-      return unread_gone(path, page, (at, len), self.plane.as_ref())
+      let seen = self.green_id.map(|green| (green, self.version));
+      return unread_gone((path, seen), page, (at, len), self.plane.as_ref())
         .map(|page| Cow::Owned(page.into_owned()));
     }
     let fetched = self
@@ -779,12 +787,12 @@ pub struct BaseGone;
 /// A base file's page (`Green::content_page_at`'s, at `range`) as its bytes, read through `plane` for one held by its
 /// content-plane object alone (A-760 (b) 4d): refused [`BaseGone`] where the plane cannot give them now.
 fn unread_gone<'a>(
-  path: &str,
+  read: (&str, Option<(slates_db::catalog::VolumeId, u64)>),
   page: slates_merge::engine::ContentAt<'a>,
   range: (u64, u64),
   plane: Option<&crate::vcs_store::named_objects::PlaneObjects<'_>>,
 ) -> Result<Cow<'a, [u8]>, BaseGone> {
-  crate::vcs_store::named_objects::page_of(path, page, range, plane).map_err(|_| BaseGone)
+  crate::vcs_store::named_objects::page_of(read, page, range, plane).map_err(|_| BaseGone)
 }
 
 /// The footprint a work's delta holds at one key: the path and what it holds of the file, the path alone for a removal.
@@ -877,9 +885,13 @@ impl WorkFiles {
         .map(|(path, content)| {
           let bytes = match content {
             slates_merge::engine::ContentAt::Bytes(bytes) => bytes,
-            named => crate::vcs_store::named_objects::whole_of(named, base.plane.as_ref())
-              .map(Cow::Owned)
-              .ok_or(BaseGone)?,
+            named => crate::vcs_store::named_objects::whole_of(
+              named,
+              base.plane.as_ref(),
+              base.green_id.map(|green| (green, path.as_str(), base.version)),
+            )
+            .map(Cow::Owned)
+            .ok_or(BaseGone)?,
           };
           Ok((path.clone(), bytes))
         })
@@ -920,7 +932,13 @@ impl WorkFiles {
           .content_page_at(path, base.version, (offset, want))
           .map(|(page, total)| {
             Ok((
-              unread_gone(path, page, (offset, want), base.plane.as_ref())?.into_owned(),
+              unread_gone(
+                (path, base.green_id.map(|green| (green, base.version))),
+                page,
+                (offset, want),
+                base.plane.as_ref(),
+              )?
+              .into_owned(),
               total,
             ))
           })
@@ -1290,6 +1308,7 @@ mod tests {
     let green = green_with("big", pattern(BIG));
     let base = Base {
       green: Some(&green),
+      green_id: None,
       fetched: None,
       version: 0,
       entries: None,
@@ -1320,6 +1339,7 @@ mod tests {
     let green = green_with("f", pattern(4096));
     let base = Base {
       green: Some(&green),
+      green_id: None,
       fetched: None,
       version: 0,
       entries: None,
@@ -1351,6 +1371,7 @@ mod tests {
     let green = green_with("old", pattern(BIG));
     let base = Base {
       green: Some(&green),
+      green_id: None,
       fetched: None,
       version: 0,
       entries: None,
