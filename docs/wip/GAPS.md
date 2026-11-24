@@ -178,11 +178,32 @@
 > **FIXED (A-903, w-shared, 2026-11-24): after a repository's takeover, a push to its successor was refused `unable to
 > commit`.** The successor wrote its adopted state logs' parts at its own host epoch, below the takeover's fence, and
 > the other survivor refused each `StaleEpoch`; now at the adopted epoch (A-894's takeover test pushes to it, red first).
-> **OPEN (w-shared, 2026-11-24): a repository is reachable only at its owner's edge.** `vcs_http::git::Repositories::locate`
-> looks over this node's shards alone, so another node's edge answers "repository not found", before a death as after
-> one (A-894's takeover test: the survivor that is not the successor). After a takeover the dead owner's address is gone
-> and a client must find the successor's edge itself. For main and w-git: the edge forwarding to the owner, or sending
-> the client there.
+> **OPEN, FOR ADA (A-904, w-shared; main 01a20182's rulings of 2026-11-24 10:54 and 10:56): a repository is reachable
+> only at its owner's edge, and its name is not region-unique.** D-14 promises that lookups route by id to the current
+> owner, and the edges locate a repository by its name's route (A-651 part 4), so reach through any member's edge is
+> owed. Main ruled the mechanism: (a), the edge forwards the whole exchange to the owner over the fleet session, for
+> HTTP and SSH alike. w-git and w-shared agreed the edge's seam: `Located::Remote(host)`, asked only after today's local
+> locate misses, `Answer::Forward { host }` for HTTP with the exchange proved at the owner, and the SSH channel forwarded
+> after the session's key proof. What is missing is a resolver from a name to its owner:
+> - `verbs::owner_of_name` routes a name to a shard of one node, and the configuration routes ids (`RegionalConfiguration::
+>   owner_of`: creator, moved, lineage), never names.
+> - A repository is created on whichever node the client reached (A-575), so an edge holding only a name cannot find the
+>   repository's owner, or its id, without something new.
+> - From reading, unproven by test: a name is unique only within one node's partition, so two nodes can each create
+>   `project`.
+> Measured symptom (A-894's takeover test, three daemons at f = 1, its owner killed): the survivor that is not the
+> successor answers a clone and a push "repository not found"; that red is kept, not landed, until a resolver exists.
+> The resolver changes the naming model and sits beside §2 item 12 and D-14's "no global catalog or index", so it is
+> Ada's to rule. Options:
+> 1. **Name homes** (recommended, w-shared). A repository's name is a small record (name → repository id) kept at the
+>    name's f + 1 homes, ranked over the members by the name's hash, as A-724 homes content by identity, and carried
+>    across membership changes by the same healer. Creation claims the name at its homes first, which makes names
+>    region-unique. An edge whose local locate misses asks one home for the id (one directed exchange, cacheable), then
+>    reads the owner from the configuration (`owner_of`, takeovers included). This routes by hash to known homes; it is
+>    neither a broadcast nor a central catalog, but it is a per-name record.
+> 2. **The repository placed at its name's first-ranked member** at creation, a lookup ranking the name over the
+>    members. Joins and leaves move the rank, and after a takeover the successor is ranked by the id the edge lacks.
+> 3. **A location round by name** to every member. Main ruled it out (no location round).
 > **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
 > home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
 > 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
