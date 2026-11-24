@@ -2963,6 +2963,14 @@
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
 > A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
 >
+> **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
+> command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
+> session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits
+> while the git tree or its daemon's processes gain CPU, or the daemon's fetch, encoding, derivation or landing counters
+> move, and fails once none has for `process_wait::STALL` (`exit_progressing`; `Judged::progressing`, no CPU budget;
+> `a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at`). A hang fails within that window; no
+> ratio to stock's speed is a bound. Owed: hg's, svn's and git_correctness's waits the same way.
+>
 > **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
 > (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
 > first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first
