@@ -8380,7 +8380,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > - the next publication appends its change as usual, and the volume's whole state, which is that publication's
 >   state, becomes the install at the head just appended (`live_ship::refresh_image`);
 > - on the record period a volume with nothing unpublished makes it the same way, so an idle writer leaves no holder
->   waiting;
+>   waiting. A volume that holds a change no verb recorded (an orphan reclaimed at a FUSE `FORGET`, which has no
+>   barrier) is published by the period first, and the image follows that publication (A-889,
+>   `live_ship::published_for_image`). A `FORGET` does not publish itself: a publication per `FORGET` would cost the
+>   transport's hot path, and an owed image is rare;
 > - the retained tail's bound follows the image, so a laggard is sent entries while they cost less than installing the
 >   volume as it is now;
 > - nothing waits on `owes_image`; only the lagging holder is installed;
@@ -62504,3 +62507,40 @@ Applied in the same change to: §4.8 (an operation over several registers); §4.
 Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/ipc/src/protocol.rs`,
 `crates/ipc/tests/wire_order.{rs,txt}`, `crates/api/src/{error,lib}.rs`,
 `crates/server/src/{made_commit,verbs}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named above.
+
+### A-889 — The record period publishes a live volume that owes an install image while a change no verb recorded leaves it unpublished (2026-11-24, w-ci for main 01a20182, its approval of 2026-11-23 21:49; amends §4.10 "An install image beside the log (2026-11-07)"; A-377, A-64)
+
+- **Why.** CI's conformance lane failed the live-shipped fsstress in 37 of 55 main runs from 2026-11-21 06:34 to
+  2026-11-24 03:16, always over FUSE (`native-linux-fuse`, and `oci-linux` over the daemon's FUSE mount). fsstress
+  passed its own verdict every time; the fleet never converged: after the 40 s fleet wait one candidate held, for
+  example, 2149 against the owner's durable head 2195 (run 45318320246). A diagnostic build on adacachy2, pinned to
+  4 CPUs as CI's runner is, showed the owner's record period for the whole wait: the lagging candidate owed an install
+  (`Shipper::pending` answered `Install`), the image owed, no build and no lane, and the volume unpublished for one
+  reason: one inode changed, the reference of attachment 1 on it dropped, and the roots' orphan list emptied. The
+  kernel's `FORGET` of a file unlinked while open had dropped its last lookup after the run's last publication.
+  `Volume::forget_for` reclaims the orphan there, and a `FORGET` has no barrier, so nothing published the change. The
+  period made an owed image only for a volume with nothing unpublished (`published_whole`), so it made none, and the
+  candidate behind the retained tail waited for good.
+- **The rule.** On the record period, a live volume that owes an install image, owes no whole record, has no image
+  sealing and holds a change no verb recorded is published (`live_ship::published_for_image`): the shard's
+  publication, the one every mutating verb runs, sliced as any publication is (a delta captured in turns is appended at
+  its build's end). It is counted `fleet.live.image_published`, or `fleet.live.image_unpublished` when refused, and the
+  next period tries again. The image follows the entry the publication appends (`published`), or the period after that
+  entry's build, once the volume is clean. A volume owing a whole record waits for that record, since its state is past
+  its head; one whose image is sealing waits for that image.
+- **Why a `FORGET` does not publish itself (main's ruling of 2026-11-23 21:49).** A publication per `FORGET` would cost
+  the transport's hot path: the kernel sends `FORGET`s in bulk as it evicts inodes. An owed image is rare: it arises
+  only while a candidate is behind the retained tail. A volume left unpublished by a change no verb recorded is
+  already a state this design holds, as deferred frees are (A-64, `relieve_deferred`); the period's assumption that
+  every unpublished volume has a publication on its way was the fault.
+- **Tests and measurements** (adacachy2):
+  - `a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished` (`crates/server/src/live_ship.rs`):
+    a lookup on a file unlinked while open, one holder behind the retained tail and owed an image, the lookup dropped
+    as `FORGET` drops it, then the period's visit. Red on main: the holder behind sent nothing, the image still owed.
+    Green: an install at 3, past the head 2 before the `FORGET`; the holder ahead sent entry 3; one period publication.
+  - The lane (`cargo xtask conformance run --suite fsstress --live-ship --transport native-linux-fuse`, `taskset -c
+    12-15`): before, 2 of 12 runs failed; after, 0 of 30, the period's publication made in 6 of them (once each, none
+    refused), about the rate the failures had.
+- **Applied in the same change to:** `crates/server/src/live_ship.rs` (`period_volume`, `published_for_image`, the two
+  counters, the test and its helpers); §4.10 "An install image beside the log (2026-11-07)"; GAPS (the live-shipped
+  fsstress over FUSE); docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md.
