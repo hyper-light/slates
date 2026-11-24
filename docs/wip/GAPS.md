@@ -4443,7 +4443,15 @@
 > refused it; a bare Mercurial submit is refused `RecordedSubmitRequired` and the bare path is gone; held by the four
 > `hg_made` reds `a_deferred_submit_whose_*_commits_no_version_alone` and
 > `a_bare_submit_to_a_mercurial_green_is_refused_recorded_submit_required`. `made_commit::commit`, with no caller left,
-> is removed (agreed with w-git). (c) a Mercurial
+> is removed (agreed with w-git). Found after it (w-perf, main 05:51 2026-11-24) and closed: a made changeset over a
+> green re-adopted at boot was refused `NotHead`, its held verdict's preview `Stale`, since a re-adoption installed
+> every green standing alone and a preview is made through the lineage; a re-adopted lineage root now founds its lineage
+> again as a recovery's does (`verbs::install_readopted`), held by the second edit of
+> `a_readopted_green_brings_back_the_named_base_its_chain_splices_first` (red: `NotHead`). Owed: a re-adopted branch
+> member is still installed alone, its engine the replica's over arenas of its own (counted
+> `merge.readoption.outside_lineage`), so a made commit over it is refused; and a boot fences a branch member whose
+> root awaits re-adoption (`SourceUnavailable`, the branch rebuilt before its source stands). Both need a re-adopted
+> branch rebuilt over its re-adopted source. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
