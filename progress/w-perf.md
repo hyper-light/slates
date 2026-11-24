@@ -551,3 +551,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - AC-2.1 at 23 shards: never met on the M3 Ultra Studio (2026-11-18 rows 200-324 us); r509's 88-95 us is the best.
   - system_live by owner sent from the 57k sampler (pre-cuts): greens 57.5 MB, hg index tables 56.8, content entries
     25.8, window records 22.1, image pages 20.2. Asked main who runs the fresh 57k sampler at 80fbd5249.
+- 2026-11-23 ~21:20 PST:
+  - LANDED 79d4e0814: provision_bench's spinning_1_own_shard form. r590 split: at 23 shards own-shard p50 8 us (hop
+    takes p50 27 -> 8), p99 65-69 us whose tail is the client part (45-70 us, often unparked); 2 shards p99 29-31.
+  - LANDED 80b09c3f6 + 4185474ca: the pool's claim passes a refused extent map to the next candidate (r578's
+    BudgetExceeded with 33.9 GB available; red room_lost 1 -> 0), and logs the first refused map's errno once.
+    main's r633 reruns provision_bench (refusal count the gate).
+  - LANDED e16be6d81: the tail's client-part halves (parked/unparked) and the darwin role + client QoS at start.
+  - system_live by owner from main's r583 sent: greens 58.2 MB (make_mapped), index tables as content-store Here
+    tables 41.0, entries 25.5, image pages 20.5, window records 11.5 (was 22.1).
+  - Waiting on: r633 (refusals), the AC-2.1 run at e16be6d81.
