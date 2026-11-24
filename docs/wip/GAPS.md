@@ -212,6 +212,21 @@
 > (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
 > for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
 > held and dropped could be answered at once, if a gate shows it.
+> **FIXED BY CHANGE, gate 12 owed (A-907, w-shared, 2026-11-24): gate 10 failed 31 of 31 at A-902.** A-902's slow
+> home outlasted the healer's round. The healer, the homes' exchange and credentials' exchange dropped their
+> stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
+> unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
+> served on its own task. Red first (`a907_...`).
+> **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
+> creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
+> (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
+> both count `merge.recompute_mismatch` and refuse the new green at version 0 ("the recomputed identity does not match the
+> record"). A branch's green is made at a version of its source (`Lineage::branch`, A-575), so its version 0 is the
+> source's state there, while a holder recomputes every version 0 as an empty green (`merge_service::recompute`) and the
+> record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
+> `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
+> makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
+> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing).
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
