@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 12:30 PST 11-24: A-904 recorded for Ada (GAPS 929baef80; red kept in scratch a904-red.diff). ACTIVE: A-905, intake
+  off the owner (claimed). Seam agreed with w-git (A1 per-queue owner reads, A2 budgets, A3 Decoding where read).
+  Red in worktree w-shared-a894 (uncommitted; scratch a905-red.diff): daemon_edge::a905_..., read_bytes [0, 149152].
+  Design draft scratch a905-design.md, with w-git for review: two whole-connection moves (to intake_shard on head, to
+  owner with its ReceivePack after the read). NEXT: w-git's review, then the split.
+
 ## 11:55 PST 11-24: LANDED the lint-only commit d9cabf2cc (my five sites at d48863ddb: RegionHold, caught_up while-let,
   serve_remote / exchange / heal_one split by meaning) and the must_use sweep cd4e2bf04 (poll_until,
   poll_for_periods, poll_for_live_periods #[must_use]; 14 sites: nine asserted, five helpers commented as settles;
