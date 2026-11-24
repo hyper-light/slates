@@ -327,14 +327,14 @@ fn turn_lent(
 
 /// The bytes repository `id`'s version at `at` keeps as its fragments (`Repository::kept_fragments`), once encoded.
 fn encoded_bytes(stores: &super::VcsStores, id: RepositoryId, at: Option<(u64, usize)>) -> u64 {
-  let (Some(at), Some(content), Some(super::RepositoryStore::Git(store))) =
+  let (Some(at), Some(_), Some(super::RepositoryStore::Git(store))) =
     (at, stores.content.as_ref(), stores.entries.get(&id))
   else {
     return 0;
   };
   store
     .repository
-    .kept_fragments(content)
+    .kept_fragments()
     .into_iter()
     .find(|(version, _)| *version == at)
     .map_or(0, |(_, bytes)| bytes)
@@ -347,14 +347,14 @@ pub(crate) const DROPPED: &str = "vcs_store.git_encode.dropped";
 /// is derived and can be made again (A-724 piece 4). Zero for a store not a git store held here.
 pub(crate) fn kept_bytes(state: &ShardState, id: RepositoryId) -> u64 {
   let stores = &state.vcs_stores;
-  let (Some(content), Some(super::RepositoryStore::Git(store))) =
+  let (Some(_), Some(super::RepositoryStore::Git(store))) =
     (stores.content.as_ref(), stores.entries.get(&id))
   else {
     return 0;
   };
   store
     .repository
-    .kept_fragments(content)
+    .kept_fragments()
     .into_iter()
     .fold(0u64, |total, (_, bytes)| total.saturating_add(bytes))
 }
@@ -390,9 +390,7 @@ pub(crate) fn relieve(
   let kept: Vec<((u64, usize), u64)> = {
     let stores = &state.vcs_stores;
     match (stores.content.as_ref(), stores.entries.get(&id)) {
-      (Some(content), Some(super::RepositoryStore::Git(store))) => {
-        store.repository.kept_fragments(content)
-      }
+      (Some(_), Some(super::RepositoryStore::Git(store))) => store.repository.kept_fragments(),
       _ => return 0,
     }
   };

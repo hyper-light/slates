@@ -392,6 +392,7 @@ fn git_part(store: &mut ContentStore, pack: &[u8], idx: &[u8], format: ObjectFor
     offsets: 0,
     order,
     runs: 0,
+    held: 0,
   }
 }
 

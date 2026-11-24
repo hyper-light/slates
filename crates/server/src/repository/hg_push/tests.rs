@@ -768,22 +768,7 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
     );
     // As a boot leaves the repository whose root awaits its re-adoption: no lineage, since each member is rebuilt over
     // the one it was made from, and one made from the root is fenced (`verbs::rebuild_member_sliced`).
-    let members: Vec<DbVolumeId> = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(repository)
-      .map(|member| member.green)
-      .collect();
-    for member in members.into_iter().rev() {
-      if let Some((lineage, Ok(mut release))) = state.greens.retire(&member) {
-        while state
-          .greens
-          .release_step(lineage, &mut release)
-          .is_ok_and(|more| more)
-        {}
-      }
-    }
+    retire_lineage(state, repository);
     assert!(!state.greens.has_lineage(repository), "no lineage left");
     state.greens.remove(&green);
     state.merge.awaiting_adoption.insert(
@@ -828,6 +813,26 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
     "{edited:?}"
   );
   assert_eq!(after.as_deref(), Some(&b"bxx\n"[..]), "edited again");
+}
+
+/// Retires every member of `repository`'s lineage, the latest joined first, their engines and arenas released.
+fn retire_lineage(state: &mut ShardState, repository: RepositoryId) {
+  let members: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(repository)
+    .map(|member| member.green)
+    .collect();
+  for member in members.into_iter().rev() {
+    if let Some((lineage, Ok(mut release))) = state.greens.retire(&member) {
+      while state
+        .greens
+        .release_step(lineage, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
+  }
 }
 
 /// A green re-adopted at its boot's ledger, as a test leaves one (a restart's takeover, A-333): its engine gone and its

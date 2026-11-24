@@ -26,12 +26,33 @@ pub struct IndexHeld<'a> {
   index: &'a HgIndex,
   /// The store holding its rows' contents.
   store: &'a ContentStore,
+  /// Changesets' and manifests' texts given by node, read in their objects' place: texts let go once landed, read
+  /// back from the node's changeset store whole (goal 93, C1 (1)).
+  given: &'a [(Node, Vec<u8>)],
 }
 
 impl<'a> IndexHeld<'a> {
   /// What `index` holds, its rows' contents in `store`.
   pub fn new(index: &'a HgIndex, store: &'a ContentStore) -> Self {
-    IndexHeld { index, store }
+    IndexHeld {
+      index,
+      store,
+      given: &[],
+    }
+  }
+
+  /// [`IndexHeld::new`] reading the changesets' and manifests' texts `given` by node in their objects' place: a text let
+  /// go once landed, read back from the node's changeset store whole, so no chain is brought back link by link.
+  pub fn with_given(
+    index: &'a HgIndex,
+    store: &'a ContentStore,
+    given: &'a [(Node, Vec<u8>)],
+  ) -> Self {
+    IndexHeld {
+      index,
+      store,
+      given,
+    }
   }
 
   /// The text of `node` in the manifest log or a file log: a manifest's text, or a file revision's block and bytes.
@@ -41,7 +62,9 @@ impl<'a> IndexHeld<'a> {
     if row.node != *node {
       return None;
     }
-    self.index.revision_text(self.store, log, rev)
+    self
+      .index
+      .revision_text_over(self.store, log, rev, self.given)
   }
 }
 
@@ -51,6 +74,9 @@ impl Held for IndexHeld<'_> {
     let row = self.index.changeset(self.store, rev)?;
     if row.node != *node {
       return None;
+    }
+    if let Some((_, text)) = self.given.iter().find(|(given, _)| given == node) {
+      return Some(Cow::Borrowed(text.as_slice()));
     }
     self.store.object_bytes(&row.text, row.len).map(Cow::Owned)
   }
