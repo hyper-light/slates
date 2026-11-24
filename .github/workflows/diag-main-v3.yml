@@ -1,9 +1,10 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-23): the gate for w-git's push barrier (07b384f4c: a push is answered only once every green it
-# moved is placed at f + 1 through its version). crates/cli/tests/v3_takeover.rs, red on main 7 of 7 (w-chaos, adacachy2:
-# the successor served acknowledged push 0 of 3). Before = bbe4a27e0 (main with the shallow fix, no barrier change),
-# after = d72b7324b (A-886: the holder replica build and the progress-aware barrier, on main 45179367f). Each arm: three release runs, then two debug runs, one test thread. Run only from
-# diag-measurer-main-v3-* branches, never main; kiln's syncs from the coordinator's Mac fail today, so this runs here.
+# main 01a20182 (2026-11-23 23:50 PST): gate 3 for the push-0 disconnect. Gate 2 (run of 5795f8f62) showed A-886's
+# barrier fixed the f=1 push loss (after 4 of 5, before 0 of 5), but push 0 was disconnected on the second consecutive
+# debug v3_takeover run in both arms. w-git's ba4e4e35e logs why the edge ends a response early, with its cause; it is on
+# main in b98233544. One arm at that commit: three release runs, then four debug runs back to back, one test thread. The
+# anchor's stderr (and the daemons' under it) is copied to the test's stderr, so each run's log holds every daemon and
+# anchor line; all are kept as the artifact. Run only from diag-measurer-main-v3-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -13,19 +14,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (${{ matrix.arm.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        arm:
-          - { name: before, ref: bbe4a27e02dc96cbd6a6f3b873f3765ba0c2e4f2 }
-          - { name: after, ref: d72b7324b12a0d9e69f0f52514431eb7b1cc70b6 }
+    name: v3_takeover (gate 3 at b98233544)
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.arm.ref }}
+          ref: b98233544cac39b91dbd16251b87ee6076ad9625
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -35,7 +30,7 @@ jobs:
           git log -1 --format='at %h %s' | cut -c1-120
           cargo test --release --locked -p slates-cli --test v3_takeover --no-run
           cargo test --locked -p slates-cli --test v3_takeover --no-run
-      - name: Run it, three release and two debug
+      - name: Run it, three release then four debug back to back
         env:
           SLATES_TEST_CLI: "1"
         run: |
@@ -44,20 +39,23 @@ jobs:
           for n in 1 2 3; do
             timeout 1200 cargo test --release --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/release-$n.log" 2>&1
             rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
-            echo "release $n rc=$rc: $(grep -a '^test result' "$RUNNER_TEMP/release-$n.log" | tail -1)"
+            echo "release $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/release-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/release-$n.log" | head -4 | cut -c1-300
           done
-          for n in 1 2; do
+          for n in 1 2 3 4; do
             timeout 1800 cargo test --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/debug-$n.log" 2>&1
             rc=$?; [ $rc -eq 0 ] && pass=$((pass + 1))
-            echo "debug $n rc=$rc: $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
+            echo "debug $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
-          echo "== ${{ matrix.arm.name }}: $pass of 5 passed"
+          echo "== gate 3: $pass of 7 passed"
+          for f in "$RUNNER_TEMP"/*.log; do
+            echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s)"
+          done
           exit 0
       - name: Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-${{ matrix.arm.name }}
+          name: v3-gate3
           path: ${{ runner.temp }}/*.log
