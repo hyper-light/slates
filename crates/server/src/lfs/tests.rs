@@ -11,7 +11,7 @@ use slates_git::lfs::objects::LfsNaming;
 use slates_git::lfs::serve::{Access, Answer, Need, Routed, route};
 use slates_http::Admission as HttpAdmission;
 use slates_http::head::{HeadReader, Progress, Target};
-use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{ObjectFormat, VcsTool};
 
 use super::{LfsAccess, LfsCall, answer, id_of};
 use crate::state::ShardState;
@@ -38,20 +38,10 @@ fn stranger() -> Principal {
   }
 }
 
-/// Creates git repository `repo.git`, its default branch `main`, owned by [`owner`]: its id.
-fn repository(state: &mut ShardState) -> RepositoryId {
-  let create = RequestBody::CreateRepository {
-    name: "repo.git".to_owned(),
-    tool: VcsTool::Git,
-    format: ObjectFormat::Sha1,
-    default_branch: "main".to_owned(),
-    green: None,
-  };
-  let reply = crate::test_store::create(state, &owner(), create);
-  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-  let repositories = state.db.partition().repositories();
-  repositories.repository_named("repo.git").unwrap().id
-}
+/// Format: the git repository every test makes first, owned by [`owner`]: `repo.git`, its default branch `main`
+/// (`crate::test_store::audit_on_stored_shard_made`).
+const REPO: crate::test_store::Asked<'static> =
+  ("repo.git", VcsTool::Git, ObjectFormat::Sha1, "main");
 
 /// `method target`, routed as the edge routes it, and its query.
 fn routed(method: &str, target: &str) -> (Routed, Vec<u8>) {
@@ -117,8 +107,7 @@ fn logged(state: &ShardState, repository: RepositoryId) -> usize {
 /// holding none.
 #[test]
 fn the_owner_takes_lists_and_releases_a_lock_in_the_repository_s_locks_log() {
-  crate::test_store::audit_on_stored_shard("lfs", |state| {
-    let repository = repository(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), REPO), |state, (repository, _)| {
     let owner = owner();
     let me = Some(&owner);
     let taken = serve(state, me, ("POST", LOCKS, br#"{"path":"a.bin"}"#));
@@ -140,8 +129,7 @@ fn the_owner_takes_lists_and_releases_a_lock_in_the_repository_s_locks_log() {
 /// edge's challenge, and `404`; and nothing in the locks log.
 #[test]
 fn a_stranger_is_refused_and_a_request_without_credentials_is_asked_for_them() {
-  crate::test_store::audit_on_stored_shard("lfs", |state| {
-    let repository = repository(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), REPO), |state, (repository, _)| {
     let lock: &[u8] = br#"{"path":"a.bin"}"#;
     let refused = serve(state, Some(&stranger()), ("POST", LOCKS, lock));
     let asked = serve(state, None, ("POST", LOCKS, lock));
@@ -165,8 +153,7 @@ fn a_stranger_is_refused_and_a_request_without_credentials_is_asked_for_them() {
 /// (`404`) though its path is locked, and the second to release the lock.
 #[test]
 fn an_id_names_its_own_lock_and_never_one_taken_after_it() {
-  crate::test_store::audit_on_stored_shard("lfs", |state| {
-    repository(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), REPO), |state, _| {
     let owner = owner();
     let me = Some(&owner);
     let lock: &[u8] = br#"{"path":"a.bin"}"#;
@@ -282,8 +269,7 @@ fn object_bytes() -> Vec<u8> {
 /// the download `200` with the object's bytes and the batch naming a download for it.
 #[test]
 fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
-  crate::test_store::audit_on_stored_shard("lfs", |state| {
-    let repository = repository(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), REPO), |state, (repository, _)| {
     let owner = owner();
     let me = Some(&owner);
     let bytes = object_bytes();
@@ -328,8 +314,7 @@ fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
 /// download `404`: nothing of the bytes was kept or recorded.
 #[test]
 fn an_upload_whose_bytes_are_not_its_oid_is_refused_and_nothing_is_recorded() {
-  crate::test_store::audit_on_stored_shard("lfs", |state| {
-    let repository = repository(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), REPO), |state, (repository, _)| {
     let owner = owner();
     let me = Some(&owner);
     let oid = LfsNaming::oid(b"the bytes the client named");
