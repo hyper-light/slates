@@ -348,6 +348,15 @@ fn wire_tool(tool: DbTool) -> VcsTool {
   }
 }
 
+/// Counter: submits to a git repository's green refused before their verdict because git would refuse their message in
+/// a commit ([`refused_for_its_commit`]). Format: a counter name.
+pub(crate) const MESSAGE_REFUSED: &str = "identities.message_refused";
+
+/// Format: why a submit whose message holds a NUL is refused for a git repository's green: git's strict fsck refuses
+/// a commit whose message does (`fsck.c`'s `nulInCommit`).
+pub(crate) const UNWRITABLE_MESSAGE: &str =
+  "a git commit's message cannot hold a NUL byte (git fsck: nulInCommit)";
+
 /// Refuses, at `green`'s owner and before any work is built, a submit to a green of a repository that carries no message
 /// or no identity in the repository's tool (module docs); `None` for a plain green, or a submit that carries both.
 pub(crate) fn refused_for_its_commit(
@@ -361,6 +370,19 @@ pub(crate) fn refused_for_its_commit(
   if authorship.message.as_deref().is_none_or(str::is_empty) {
     state.count(NO_MESSAGE, 1);
     return Some(refused(Refusal::MessageRequired));
+  }
+  // A message git's strict fsck refuses in a commit (`nulInCommit`) is refused here, before the verdict, so a version is
+  // never committed with no commit made of it (main 01a20182's ruling of 2026-11-23 22:08, w-svn's A-888).
+  if tool == DbTool::Git
+    && authorship
+      .message
+      .as_deref()
+      .is_some_and(|message| message.contains('\0'))
+  {
+    state.count(MESSAGE_REFUSED, 1);
+    return Some(refused(Refusal::BadRequest {
+      reason: UNWRITABLE_MESSAGE.to_owned(),
+    }));
   }
   let identified = match tool {
     DbTool::Git => authorship.identities.git.is_some(),

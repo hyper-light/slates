@@ -19,7 +19,7 @@
 )]
 #![cfg(unix)]
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -377,6 +377,11 @@ fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     .args(args)
     .current_dir(dir)
     .env("GIT_TERMINAL_PROMPT", "0")
+    // What the client read before a hang-up, on its standard error, which a failed step's assertion prints (goal 93:
+    // gate 3's push-0 disconnect named nothing on the server). Credentials are redacted by git's default; no pack data.
+    .env("GIT_TRACE_PACKET", "1")
+    .env("GIT_TRACE_CURL", "1")
+    .env("GIT_TRACE_CURL_NO_DATA", "1")
     .env_remove("GIT_DIR")
     .env_remove("GIT_WORK_TREE")
     .stdin(Stdio::null())
@@ -384,6 +389,28 @@ fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
+  // Each pipe read on a thread of its own, so a trace past a pipe's buffer never holds git (`GIT_TRACE_*` above).
+  let read_all = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+    std::thread::spawn(move || {
+      let mut bytes = Vec::new();
+      if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut bytes);
+      }
+      String::from_utf8_lossy(&bytes).into_owned()
+    })
+  };
+  let stdout = read_all(
+    output
+      .stdout
+      .take()
+      .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+  );
+  let stderr = read_all(
+    output
+      .stderr
+      .take()
+      .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+  );
   // Bounded: a command that hangs fails the test at twice the fleet wait, never stalls it.
   let deadline = Instant::now() + FLEET_WAIT * 2;
   while output.try_wait().unwrap().is_none() {
@@ -393,12 +420,20 @@ fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     }
     pause();
   }
-  let output = output.wait_with_output().unwrap();
-  (
-    output.status.code().unwrap_or(-1),
-    String::from_utf8_lossy(&output.stdout).into_owned(),
-    String::from_utf8_lossy(&output.stderr).into_owned(),
-  )
+  let code = output.wait().unwrap().code().unwrap_or(-1);
+  let (out, err) = (stdout.join().unwrap(), stderr.join().unwrap());
+  // A command that spoke to a server traced it (main 01a20182's order of 2026-11-24 00:44): its packets, or at least
+  // curl's lines where no packet came (a push to an owner already killed is refused its connection). A trace gone
+  // missing would leave the next disconnect as unexplained as gate 3's, so its absence fails the test here.
+  let networked = matches!(
+    args.first().copied(),
+    Some("push" | "ls-remote" | "clone" | "fetch")
+  );
+  assert!(
+    !networked || err.contains("packet:") || err.contains("http.c:"),
+    "git {args:?} wrote no trace (GIT_TRACE_PACKET, GIT_TRACE_CURL): {err}"
+  );
+  (code, out, err)
 }
 
 /// A commit on `dir`'s `main`, a file of its own, whose id is answered.
@@ -647,7 +682,10 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     &url(&nodes[at]),
     &acknowledged,
   );
-  // The region homing's and the takeover's own counts, for the record (main's order: land the switch with them).
+  // The region homing's and the takeover's own counts, for the record (main's order: land the switch with them); and
+  // the holders' replica builds (A-886): a branch's later pushes placed at f + 1 only through them, so some survivor,
+  // a holder before the owner died, made one (the non-vacuity count of this test's NoLoss).
+  let mut replicas_made = 0usize;
   for at in &survivors {
     let node = &nodes[*at];
     let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
@@ -661,13 +699,23 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
           "push_uncommitted",
           "replayed",
           "repository_rebuilt",
+          "replica_build",
+          "vcs_store.replica",
         ]
         .iter()
         .any(|word| line.contains(word))
       })
       .collect();
+    replicas_made += counted
+      .iter()
+      .filter(|line| line.contains("merge.replica_build.made:"))
+      .count();
     eprintln!("V3TAKEOVER: node {at} counted {counted:?}");
   }
+  assert!(
+    replicas_made > 0,
+    "no survivor made a replica of the pushed branch (A-886's build never ran)"
+  );
   drop(nodes);
   drop(scratch);
 }

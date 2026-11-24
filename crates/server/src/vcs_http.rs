@@ -280,6 +280,10 @@ pub(crate) trait Exchange {
   /// peer took them in, and whether the write found the socket full. Nothing by default; git's fetch learns its link's
   /// price from it.
   fn sent(&mut self, _sent: crate::vcs_store::upload::Sent) {}
+  /// Hears that a write of what the connection sends while this exchange is served found the socket full and now waits
+  /// for the peer (A-859; main 01a20182's ruling (a) of 2026-11-23 20:08): told at the write's first pend, once the
+  /// edge counts it live ([`WRITES_WAITING`]), before its [`Exchange::sent`]. Nothing by default.
+  fn write_waits(&mut self) {}
 }
 
 /// How a site answers a request's head.
@@ -444,6 +448,14 @@ impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
       Self::Svn(exchange) => exchange.sent(sent),
     }
   }
+
+  fn write_waits(&mut self) {
+    match self {
+      Self::Git(exchange) => exchange.write_waits(),
+      Self::Hg(exchange) => exchange.write_waits(),
+      Self::Svn(exchange) => exchange.write_waits(),
+    }
+  }
 }
 
 /// Whether `head` is a Git LFS request (the batch, locks and transfer API under `<repo>/info/lfs`), read within `room`:
@@ -537,6 +549,9 @@ pub(crate) struct EdgeState {
   waits: RefCell<PhaseWaits>,
   /// The counts.
   counts: Cell<Counts>,
+  /// The writes waiting on their clients now, each from its first pend until it ends or is dropped ([`WriteWaiting`]):
+  /// at most one a seat.
+  writes_waiting: Cell<u64>,
 }
 
 impl EdgeState {
@@ -550,12 +565,18 @@ impl EdgeState {
       arriving: Cell::new(0),
       waits: RefCell::new(PhaseWaits::default()),
       counts: Cell::new(Counts::default()),
+      writes_waiting: Cell::new(0),
     }
   }
 
   /// What the edge has counted.
   pub(crate) fn counts(&self) -> Counts {
     self.counts.get()
+  }
+
+  /// The writes waiting on their clients now ([`WRITES_WAITING`]).
+  pub(crate) fn writes_waiting(&self) -> u64 {
+    self.writes_waiting.get()
   }
 
   /// The connections being served: the seats taken.
@@ -831,6 +852,44 @@ fn here() -> Option<Kept<EdgeState>> {
   HERE.with(Cell::get)
 }
 
+/// Format: the status row of the writes this shard's HTTP edge has waiting on their clients now (A-859; main
+/// 01a20182's ruling (a) of 2026-11-23 20:08): a reading at the report, not a count, each write from its first pend to
+/// its end ([`WriteWaiting`]).
+pub(crate) const WRITES_WAITING: &str = "vcs_http.writes_waiting";
+
+/// [`WRITES_WAITING`]'s reading on this shard: none where no edge is kept here.
+pub(crate) fn writes_waiting_here() -> u64 {
+  here()
+    .and_then(|edge| edge.with(EdgeState::writes_waiting))
+    .unwrap_or(0)
+}
+
+/// A write of the edge waiting on its client, counted live in the edge's state ([`WRITES_WAITING`]) from its first pend
+/// until it ends or is dropped, its connection reaped or cancelled included.
+struct WriteWaiting(Kept<EdgeState>);
+
+impl WriteWaiting {
+  /// Counts a write of `state`'s edge waiting.
+  fn begin(state: Kept<EdgeState>) -> WriteWaiting {
+    state.with(|state| {
+      state
+        .writes_waiting
+        .set(state.writes_waiting.get().saturating_add(1));
+    });
+    WriteWaiting(state)
+  }
+}
+
+impl Drop for WriteWaiting {
+  fn drop(&mut self) {
+    self.0.with(|state| {
+      state
+        .writes_waiting
+        .set(state.writes_waiting.get().saturating_sub(1));
+    });
+  }
+}
+
 /// Serves the edge `state` keeps on `listener` until the listener fails or its task ends (the module doc): each
 /// connection a child task deciding its requests with a site `site` makes for it, here or on the shard it moves to.
 /// Refused at once for a cleartext edge off loopback, and when `state` is not on this shard.
@@ -874,11 +933,17 @@ where
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
+          slates_machine::log_line!(
+            "slates-server: a version-control HTTP connection's task was not detached"
+          );
           crate::fleet::count_refusal(NOT_DETACHED);
         }
       }
       // The refused task's future, its seat with it, was dropped: the seat is given back.
       Err(_) => {
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP connection's task could not be spawned; the connection closed"
+        );
         crate::fleet::count_refusal(SPAWN_REFUSED);
       }
     }
@@ -966,20 +1031,27 @@ impl Socket {
   }
 
   /// Writes `bytes` whole, `overdue` called if `deadline_ns` passes first: whether the write found the socket full and
-  /// waited for the peer to take bytes (A-859 part A: a link's pace), and whether the wait was overdue.
-  async fn write(
+  /// waited for the peer to take bytes (A-859 part A: a link's pace), and whether the wait was overdue. At the write's
+  /// first pend `pends` is called, once, and what it gives is held until the write ends or is dropped (A-859: the live
+  /// count of writes waiting on their clients, [`WriteWaiting`]).
+  async fn write<H>(
     &mut self,
     bytes: &[u8],
     deadline_ns: u64,
-    overdue: impl FnMut(),
+    (overdue, pends): (impl FnMut(), impl FnOnce() -> H),
   ) -> (Waited<bool>, bool) {
     let started_ns = now_ns();
     let mut write = std::pin::pin!(self.stream.write_all(bytes));
-    let mut pended = false;
+    let mut pends = Some(pends);
+    let mut held = None;
     let write = std::future::poll_fn(move |cx| {
       let polled = write.as_mut().poll(cx);
-      pended |= polled.is_pending();
-      polled.map(|written| written.map(|()| pended))
+      if polled.is_pending()
+        && let Some(pends) = pends.take()
+      {
+        held = Some(pends());
+      }
+      polled.map(|written| written.map(|()| held.is_some()))
     });
     waited(awaited(write, deadline_ns, overdue).await, started_ns)
   }
@@ -1037,6 +1109,8 @@ struct Parts<S: Site> {
   service: Option<Started<S::Exchange>>,
   /// The reply's run being handed on.
   reply: Vec<u8>,
+  /// The bytes the connection has written on this shard: what an abnormal end logs beside its reason ([`count_end`]).
+  written: u64,
 }
 
 impl<S: Site> Parts<S> {
@@ -1098,9 +1172,20 @@ impl<S: Site> Parts<S> {
     };
     let marker = self.marker(overdue);
     let bytes = u64::try_from(connection.output().len()).unwrap_or(u64::MAX);
+    self.written = self.written.saturating_add(bytes);
+    // A-859: a write's first pend counted live, then heard by the service's exchange, where an operator and a test can
+    // see a write waiting on its client.
+    let (state, service) = (self.state, &mut self.service);
+    let pends = move || {
+      let waiting = WriteWaiting::begin(state);
+      if let Some(started) = service.as_mut() {
+        started.exchange.write_waits();
+      }
+      waiting
+    };
     let waited = self
       .socket
-      .write(connection.output(), deadline_ns, marker)
+      .write(connection.output(), deadline_ns, (marker, pends))
       .await;
     connection.written();
     let took = match &waited.0 {
@@ -1225,6 +1310,9 @@ impl<S: Site> Parts<S> {
         }
       }
       Err(Failed(status)) => {
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP request's body was refused {status:?}"
+        );
         self.service = None;
         connection.fail(status);
       }
@@ -1241,6 +1329,9 @@ impl<S: Site> Parts<S> {
       None => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     };
     if let Err(Failed(status)) = ended {
+      slates_machine::log_line!(
+        "slates-server: a version-control HTTP request's end was refused {status:?}"
+      );
       self.service = None;
       connection.fail(status);
     }
@@ -1289,6 +1380,10 @@ impl<S: Site> Parts<S> {
         connection.reply_end();
       }
       Err(Failed(status)) => {
+        // Its head is out, so the client sees its connection end, not this status: logged (goal 93).
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP reply under way was failed {status:?}"
+        );
         self.service = None;
         connection.fail(status);
       }
@@ -1333,9 +1428,20 @@ impl<S: Site> Parts<S> {
   /// The module doc's loop: takes `connection`'s steps until it ends or moves to another shard.
   async fn serve(&mut self, connection: &mut Connection) -> Exit {
     loop {
+      let phase = connection.phase();
       match self.step(connection).await {
         Flow::Go => {}
-        Flow::End(why) => return Exit::Ended(why),
+        Flow::End(why) => {
+          // A connection that ends on a failure, not a close, ends a client's request it may be part way through
+          // answering: logged with the phase it failed in, as nothing the client sees names it (goal 93, the
+          // `v3_takeover` gate's push-0 disconnect).
+          if matches!(why, Why::Failed) {
+            slates_machine::log_line!(
+              "slates-server: a version-control HTTP connection failed in {phase:?}"
+            );
+          }
+          return Exit::Ended(why);
+        }
         Flow::Move(shard) => return Exit::Moved(shard),
       }
     }
@@ -1392,10 +1498,11 @@ async fn drive<S, M>(
     secure: connection.secure(),
     service: None,
     reply: Vec::new(),
+    written: 0,
   };
   match parts.serve(&mut connection).await {
     Exit::Ended(why) => {
-      count_end(parts.state, why, connection.ended());
+      count_end(parts.state, why, (connection.ended(), parts.written));
       drop(seat);
     }
     Exit::Moved(shard) => {
@@ -1452,6 +1559,11 @@ where
   if slates_rt::registry::send_control(shard, slates_rt::control::Control::Spawn(Box::new(arrive)))
     .is_err()
   {
+    // Logged as well as counted (goal 93, the `v3_takeover` gate's push-0 disconnect named nothing): the client sees
+    // only its connection end.
+    slates_machine::log_line!(
+      "slates-server: a version-control HTTP connection's move to shard {shard} was refused; the connection closed"
+    );
     crate::fleet::count_refusal(MOVE_REFUSED);
   }
 }
@@ -1471,6 +1583,9 @@ where
     make,
   } = moving;
   let (Some(state), Ok(stream)) = (here(), TcpStream::from_owned(stream)) else {
+    slates_machine::log_line!(
+      "slates-server: a version-control HTTP connection moved here was lost: no edge state, or its socket not adopted"
+    );
     crate::fleet::count_refusal(ARRIVAL_LOST);
     return;
   };
@@ -1479,10 +1594,16 @@ where
   )) {
     Ok(task) => {
       if detach(task).is_err() {
+        slates_machine::log_line!(
+          "slates-server: a version-control HTTP connection's task was not detached"
+        );
         crate::fleet::count_refusal(NOT_DETACHED);
       }
     }
     Err(_) => {
+      slates_machine::log_line!(
+        "slates-server: a version-control HTTP connection's task could not be spawned; the connection closed"
+      );
       crate::fleet::count_refusal(SPAWN_REFUSED);
     }
   }
@@ -1563,9 +1684,17 @@ impl Drop for Arriving {
 /// Counts how a connection ended: by its loop's reason, then by the engine's. Called before the connection's socket
 /// closes, so its client cannot see the end before the count; a refusal was counted as it ended the connection
 /// (`Parts::close_write`), a reap as it was chosen ([`EdgeState::seating`]).
-fn count_end(state: Kept<EdgeState>, why: Why, ended: Option<Ended>) {
+fn count_end(state: Kept<EdgeState>, why: Why, (ended, written): (Option<Ended>, u64)) {
   if why == Why::Failed {
     crate::fleet::count_refusal(SOCKET_FAILED);
+  }
+  // Any end but a client's close between requests or a completed reply is logged with the engine's reason (goal 93:
+  // the `v3_takeover` gate's push-0 disconnect ended where nothing said why).
+  if why == Why::Failed || !matches!(ended, Some(Ended::Peer | Ended::Completed)) {
+    slates_machine::log_line!(
+      "slates-server: a version-control HTTP connection ended {why:?}, the engine's end {ended:?}, {written} bytes \
+       written (a chunked reply has no length to set them against)"
+    );
   }
   let failed = why == Why::Failed || matches!(ended, Some(Ended::Tls | Ended::Aborted));
   if failed {

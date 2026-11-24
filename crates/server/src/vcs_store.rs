@@ -125,6 +125,7 @@ pub(crate) mod read_through;
 pub(crate) mod record;
 #[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
 pub(crate) mod record_names;
+pub(crate) mod replica;
 // Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod referenced;
@@ -154,6 +155,9 @@ pub(crate) const RELEASE_REFUSED: &str = "vcs_store.release_refused";
 /// Counter: bytes a step held that the shard's budget would not take, which the next step's settle charges: zero in every
 /// correct use, since a step uses only the room it was lent. Format: a counter name.
 pub(crate) const CHARGE_SHORT: &str = "vcs_store.charge_short";
+/// Counter: room asked for a step while the shard's chunk store was lent ([`lent_state`]), so out of reach and refused
+/// by its kind ([`lend`]): zero in every correct use. Format: a counter name.
+pub(crate) const ROOM_OUT_OF_REACH: &str = "vcs_store.room_out_of_reach";
 /// Counter: a moved green's derived value not kept after its commit: the value is derived again when read. Format: a
 /// counter name.
 pub(crate) const VALUE_UNKEPT: &str = "vcs_store.value_unkept";
@@ -294,6 +298,10 @@ pub(crate) struct VcsStores {
   /// Where the content store keeps its windows once it is made (A-727 slice a2): the shard's repository arena, given by
   /// the shard's start; none in a test's stores, whose content store keeps them in memory.
   window_storage: Option<Box<dyn slates_vcs::WindowStorage>>,
+  /// Whether the shard's chunk store is lent to the content store, or to the storage it will be made over, now
+  /// ([`lent_state`], [`Lent`]): room asked then is out of reach, since the arena and its pool went with the chunks
+  /// ([`lend`]).
+  chunks_lent: bool,
   /// A recovery's lists and names of the content store (A-727 slice a3b), taken in when the store is made.
   restored_nodes: Option<RestoredNodes>,
   /// A recovery's windows let go of the content store, each with its length (A-767 C1 step 2b), taken in before the
@@ -590,6 +598,40 @@ fn content_refused(refused: ContentRefused) -> GitRefused {
   GitRefused::Store(StoreRefused::Content(refused))
 }
 
+/// The records of each repository this node holds a replica store of and does not own (A-813's limit, main 01a20182's
+/// ruling of 2026-11-23 20:00; [`replica`]): its push records as the names log's parts its acceptors hold carry them, in
+/// order, read in place of the partition's, which holds none for a repository another node owns ([`object_record`]).
+/// Bounded by the repositories this node holds a replica of; a takeover adopts the store, the partition's records then
+/// standing for them.
+pub(crate) type ReplicaRecords = BTreeMap<RepositoryId, Vec<Vec<u8>>>;
+
+/// Repository `id`'s record `index`: a replica store's held records where this node holds one ([`ReplicaRecords`]),
+/// else the partition's. Every replay reads its records here, so a replica store is
+/// made by the same steps as the owner's (the equality oracle, `replica`'s tests).
+pub(crate) fn object_record<'a>(
+  db: &'a slates_db::Db,
+  replicas: &'a ReplicaRecords,
+  id: RepositoryId,
+  index: usize,
+) -> Option<&'a [u8]> {
+  match replicas.get(&id) {
+    Some(records) => records.get(index).map(Vec::as_slice),
+    None => db.partition().repositories().object_record(id, index),
+  }
+}
+
+/// Every record of repository `id`, in order, read as [`object_record`] reads one.
+pub(crate) fn object_records<'a>(
+  db: &'a slates_db::Db,
+  replicas: &'a ReplicaRecords,
+  id: RepositoryId,
+) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+  match replicas.get(&id) {
+    Some(records) => Box::new(records.iter().map(Vec::as_slice)),
+    None => Box::new(db.partition().repositories().objects(id)),
+  }
+}
+
 impl VcsStores {
   /// Stores whose content store, once made, keeps its windows in `storage` (A-727 slice a2: the shard's repository
   /// arena).
@@ -755,6 +797,11 @@ impl VcsStores {
   /// What the stores hold of the shard's budget.
   pub(crate) fn charged(&self) -> u64 {
     self.charged
+  }
+
+  /// Whether repository `id`'s store is being made again from its records, lent to nothing until it is whole.
+  pub(crate) fn is_rebuilding(&self, id: RepositoryId) -> bool {
+    self.rebuilding.contains(&id)
   }
 
   /// Repository `id`'s store, if held.
@@ -1154,6 +1201,7 @@ pub(crate) fn curve_keys(state: &ShardState) -> usize {
 /// given back to the content store, then the shard's charge trued up to what remains. A refusal while giving back is
 /// counted, and the rest is given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
+  state.vcs_replica_records.remove(&id);
   // A git or Subversion rebuild under way ends with its store: its task finds its turns gone and stops.
   if state.vcs_stores.rebuild_turns.remove(&id).is_some() {
     state.vcs_stores.rebuilding.remove(&id);
@@ -1192,11 +1240,7 @@ pub(crate) fn record_holds(state: &ShardState, id: RepositoryId) -> Vec<slates_v
   else {
     return Vec::new();
   };
-  state
-    .db
-    .partition()
-    .repositories()
-    .objects(id)
+  object_records(&state.db, &state.vcs_replica_records, id)
     .filter(|bytes| !owed::is_owed(bytes) && !lfs_record::is_lfs(bytes))
     .filter_map(|bytes| Record::decode(bytes, format).ok())
     .flat_map(|record| {
@@ -1222,8 +1266,15 @@ pub(crate) fn release_record_holds(state: &mut ShardState, id: RepositoryId) {
 /// its tool store is, so a repository's bound is what its shard can hold, never the partition's merge budget. A charge
 /// the budget would not take is counted ([`CHARGE_SHORT`]) and kept as charged, as the store's own true-up keeps it.
 pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
-  let held =
-    u64::try_from(state.db.partition().repositories().objects_bytes(id)).unwrap_or(u64::MAX);
+  // A replica store's records are charged as the owner's are (`replica`): what this node holds of them.
+  let held = match state.vcs_replica_records.get(&id) {
+    Some(records) => records
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add),
+    None => state.db.partition().repositories().objects_bytes(id),
+  };
+  let held = u64::try_from(held).unwrap_or(u64::MAX);
   let charged = state
     .vcs_stores
     .objects_charged
@@ -1369,7 +1420,21 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
 
 /// Lends the stores room for one step (module docs): the arena grown by `bytes` from its pool where it can be, then
 /// every byte the shard's budget could admit now given to the content store as room beside what it holds.
+///
+/// Room asked while the shard's chunk store is lent ([`lent_state`]) is out of reach: the store left in its place is a
+/// placeholder whose arena has no pool, so it could grow nothing, and the step would have only the arena's slack, which a
+/// publication's give-back (`Store::release_idle`) shrinks. So every put of the step is refused
+/// `ContentRefused::OutOfReach` instead, at its first byte, and the caller makes its room outside the lend
+/// ([`within_budget`] lends the chunks itself). Before 2026-11-23 a home's bring-back and the works' read-backs asked
+/// inside one and were refused `OverBudget` only once the slack ran out (w-tsan: 2 runs of 100 at a load of 47).
 fn lend(store: &mut Store, stores: &mut VcsStores, bytes: u64) {
+  if bytes > 0 && stores.chunks_lent {
+    let charged = stores.charged;
+    if let Some(content) = stores.content.as_mut() {
+      content.set_budget_out_of_reach(charged);
+    }
+    return;
+  }
   store.make_room(bytes);
   let room = store.admittable();
   let budget = stores.charged.saturating_add(room);
@@ -1548,6 +1613,9 @@ pub(crate) fn within_budget<T>(
   bytes: u64,
   step: impl FnOnce(&mut VcsStores) -> T,
 ) -> T {
+  if bytes > 0 && state.vcs_stores.chunks_lent {
+    state.count(ROOM_OUT_OF_REACH, 1);
+  }
   lend(&mut state.store, &mut state.vcs_stores, bytes);
   let answer = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
@@ -1597,20 +1665,24 @@ impl VcsStores {
   /// Lends `chunks` to the content store's windows, or to the storage a content store not made yet will keep them in,
   /// so a store made inside the step finds it lent (`Lent`): whether it took them.
   fn lend_in(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
-    match (self.content.as_mut(), self.window_storage.as_mut()) {
+    let took = match (self.content.as_mut(), self.window_storage.as_mut()) {
       (Some(content), _) => content.lend_in(chunks),
       (None, Some(storage)) => storage.lend_in(chunks),
       (None, None) => false,
-    }
+    };
+    self.chunks_lent |= took;
+    took
   }
 
   /// Hands back what [`VcsStores::lend_in`] took, from the content store or the storage not made into one yet.
   fn hand_back(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
-    match (self.content.as_mut(), self.window_storage.as_mut()) {
+    let handed = match (self.content.as_mut(), self.window_storage.as_mut()) {
       (Some(content), _) => content.hand_back(chunks),
       (None, Some(storage)) => storage.hand_back(chunks),
       (None, None) => false,
-    }
+    };
+    self.chunks_lent &= !handed;
+    handed
   }
 }
 
@@ -1733,7 +1805,8 @@ pub(crate) fn with_room<T>(state: &mut ShardState, read: impl FnOnce(&ShardState
 /// Runs `step` over the whole shard state with the shard's chunk store lent to the repository content store (`Lent`'s
 /// rule, for a step that needs more of the state than the stores): taken in before and handed back after, nothing
 /// between the two able to leave another way. Within it the volume store's chunk store is the placeholder, so the step
-/// grows nothing and reads no volume chunk; [`lend`] runs before it.
+/// grows nothing and reads no volume chunk; [`lend`] runs before it, and room asked within it (a [`within_budget`] of
+/// any byte) is refused `ContentRefused::OutOfReach` at its first put, since the pool went with the chunks.
 pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut ShardState) -> T) -> T {
   let took = lend_chunks(&mut state.store.content, &mut state.vcs_stores);
   let answer = step(state);
@@ -3240,9 +3313,10 @@ fn replay_record(
     db,
     store,
     vcs_stores,
+    vcs_replica_records,
     ..
   } = &mut *state;
-  let bytes = db.partition().repositories().object_record(id, index)?;
+  let bytes = object_record(db, vcs_replica_records, id, index)?;
   let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   lend(store, vcs_stores, brought);
   let room = vcs_stores.svn_unlent(id).map(|svn| {
@@ -3307,11 +3381,7 @@ fn svn_fetched_record(
   id: RepositoryId,
   index: usize,
 ) -> Option<Result<Vec<u8>, ReplayRefused>> {
-  let named = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let named = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let sequence = crate::repository::svn_commit::landing::sequence_of(named);
   if sequence != u64::try_from(index).ok() {
     return Some(Err(ReplayRefused::SvnReference));
@@ -3357,11 +3427,7 @@ fn svn_to_fetch(
   {
     return None;
   }
-  let named = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let named = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let sequence = crate::repository::svn_commit::landing::sequence_of(named)?;
   Some((state.vcs_disk.clone(), sequence))
 }
@@ -3480,9 +3546,10 @@ fn hg_record_step(
     db,
     store,
     vcs_stores,
+    vcs_replica_records,
     ..
   } = &mut *state;
-  let bytes = db.partition().repositories().object_record(id, index)?;
+  let bytes = object_record(db, vcs_replica_records, id, index)?;
   let lent = if replay.is_none() {
     u64::try_from(bytes.len()).unwrap_or(u64::MAX)
   } else {
@@ -3663,11 +3730,7 @@ fn changeset_wanted(
   let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
     return None;
   };
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let record = Record::decode(bytes, git.repository.format()).ok()?;
   if record.sequence == 0 {
     return None;
@@ -3849,11 +3912,7 @@ fn hg_reference(
   id: RepositoryId,
   index: usize,
 ) -> Option<slates_hg::import::record::Reference> {
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   slates_hg::import::record::reference_of(bytes)
 }
 
@@ -4344,11 +4403,7 @@ fn hg_run(
   id: RepositoryId,
   index: usize,
 ) -> Option<slates_hg::import::record::Run> {
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   slates_hg::import::record::run_of(bytes)
 }
 
@@ -4657,7 +4712,14 @@ fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
     return;
   };
-  make(state, &record);
+  rebuild_sliced_from(state, &record);
+}
+
+/// [`rebuild_sliced`] of the repository `record` names, its store freed first by the caller: its records read through
+/// [`object_record`], the partition's or a replica's ([`replica`]).
+fn rebuild_sliced_from(state: &mut ShardState, record: &RepositoryRecord) {
+  let id = record.id;
+  make(state, record);
   let generation = state.vcs_stores.rebuild_generations.wrapping_add(1);
   state.vcs_stores.rebuild_generations = generation;
   state.vcs_stores.rebuild_turns.insert(id, (generation, 0));
@@ -4753,11 +4815,7 @@ fn names_to_fetch(
   let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
     return None;
   };
-  let bytes = state
-    .db
-    .partition()
-    .repositories()
-    .object_record(id, index)?;
+  let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   let record = Record::decode(bytes, git.repository.format()).ok()?;
   let content = state.vcs_stores.content.as_ref();
   let identity = [record.named, record.packed]
@@ -4834,9 +4892,10 @@ fn record_turn(
     db,
     store,
     vcs_stores,
+    vcs_replica_records,
     ..
   } = &mut *state;
-  let bytes = db.partition().repositories().object_record(id, index)?;
+  let bytes = object_record(db, vcs_replica_records, id, index)?;
   let format = match vcs_stores.entries.get(&id) {
     Some(RepositoryStore::Git(git)) => Some(git.repository.format()),
     _ => None,

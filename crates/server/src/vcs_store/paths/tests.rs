@@ -82,6 +82,59 @@ pub(crate) fn version(state: &mut ShardState, green: VolumeId, serial: u32, ops:
   version_saying(state, (green, serial), ops, &message)
 }
 
+/// A work over a Subversion repository's green `green` making `ops`, submitted with a message and identities as a
+/// client's recorded request (`verbs::run_recorded_for_test`, request `serial` of client 7): a Subversion green's
+/// version is made only through its held verdict, whose answer waits for its revision's landing (`crate::made_commit`),
+/// so the caller awaits the records' youngest revision and reads the green's head; a bare dispatch is refused
+/// `RecordedSubmitRequired` (main's ruling of 2026-11-23 20:40).
+pub(crate) fn submitted_recorded(
+  state: &mut ShardState,
+  green: VolumeId,
+  serial: u32,
+  ops: Vec<Op>,
+) {
+  let made = ask(
+    state,
+    RequestBody::CreateWork {
+      green,
+      name: format!("work-{serial}"),
+    },
+  );
+  let ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  for op in ops {
+    let reply = match op {
+      Op::Edit(path, at, delete_len, bytes) => ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: path.to_owned(),
+          at,
+          delete_len,
+          bytes: bytes.to_vec(),
+        },
+      ),
+      Op::Declare(op) => ask(state, RequestBody::Declare { work, op }),
+    };
+    assert!(!matches!(reply, ReplyBody::Refused { .. }), "{reply:?}");
+  }
+  let id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: serial,
+  };
+  let answered = crate::verbs::run_recorded_for_test(
+    state,
+    (7, id),
+    &owner(),
+    crate::identities::authored(work, &format!("version {serial}")),
+  );
+  assert!(
+    !matches!(answered, Some(ReplyBody::Refused { .. })),
+    "{answered:?}"
+  );
+}
+
 /// [`version`] submitted with `message`.
 pub(crate) fn version_saying(
   state: &mut ShardState,
@@ -218,7 +271,7 @@ fn take(model: &mut Model, path: &str) -> (FileClass, Vec<u8>) {
 }
 
 /// A named pipe as a work declares one.
-fn fifo() -> IpcNode {
+pub(crate) fn fifo() -> IpcNode {
   IpcNode {
     kind: IpcNodeKind::Fifo,
     mode: PLAIN,

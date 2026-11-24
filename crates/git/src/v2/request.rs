@@ -63,6 +63,19 @@ pub enum Request<'a> {
   Command(CommandRequest<'a>),
 }
 
+/// The command a request's first line names (`command=<name>`), read without decoding the rest: what a server asks to
+/// learn whether a request is a fetch before it readies its store for one (goal 93, main 01a20182's r405: a ref listing
+/// waited for what only a fetch reads). None where the first packet is no whole `command=` line of a command this
+/// crate reads.
+pub fn command_of(bytes: &[u8]) -> Option<Command> {
+  let (packet, _) = pktline::read(bytes, 0).ok()??;
+  let Packet::Data(line) = packet else {
+    return None;
+  };
+  let name = line.strip_prefix(b"command=")?;
+  Command::from_name(name.strip_suffix(b"\n").unwrap_or(name))
+}
+
 /// A command's request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandRequest<'a> {

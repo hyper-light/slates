@@ -521,6 +521,10 @@ pub enum Invalid {
   /// A submit to a green of a repository was made by a principal with no identity in the repository's tool (A-664): its
   /// owner sets the principal's identities (`SetIdentities`), and a session reads them at its first submit.
   IdentityRequired(VcsTool),
+  /// A submit to the green of a repository whose server makes a commit of each version (a Subversion repository's) was
+  /// sent outside a recorded request (goal 93): the version, its commit on the store and the register's entry are one
+  /// durable step whose answer waits for the store, so only a recorded verb makes it. Nothing was judged or recorded.
+  RecordedSubmitRequired(VcsTool),
   /// A green's base must be a complete immutable snapshot, and this one still serves entries from a host folder: pin the
   /// whole base and snapshot again. Or a capture's folder moved under it (`Instance::capture_base`, A-291): capture it
   /// again once nothing writes it.
@@ -990,6 +994,9 @@ impl Error {
       Refusal::EvidenceRequired => Error::Invalid(Invalid::EvidenceRequired),
       Refusal::MessageRequired => Error::Invalid(Invalid::MessageRequired),
       Refusal::IdentityRequired { tool } => Error::Invalid(Invalid::IdentityRequired(tool)),
+      Refusal::RecordedSubmitRequired { tool } => {
+        Error::Invalid(Invalid::RecordedSubmitRequired(tool))
+      }
       Refusal::ConsistentBaseUnavailable => Error::Invalid(Invalid::LiveBase),
       Refusal::DigestNotClean => Error::Invalid(Invalid::NoCleanDigest),
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),

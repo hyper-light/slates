@@ -18,6 +18,10 @@
 //!   (`Acceptor::to_persisted`, `from_persisted`), which must keep the retired owner a takeover moved the authority from
 //!   and the retirement that moved it (A-251, A-883): a holder back from a restart across a move names the same move;
 //! - owners pause and resume, and a resumed one goes on proposing under its old epoch as if nothing happened;
+//! - in the A-890 scenes, the current owner's host restarts warm, as a daemon restarted over its anchor does: its old
+//!   incarnation is gone and its durable state comes back. An owner that promoted settles (A-890's adoption record): it
+//!   goes on at its own epoch from its own state. One that had not promoted adopted nothing, so it runs phase one again
+//!   at the next epoch;
 //! - the master hands out new epochs throughout: a takeover moves the authority to a host under a new generation, the old
 //!   owner retired at that generation (`Acceptor::move_authority`, so each holder records the move and its retirement;
 //!   the three owner hosts take turns, so one host is retired again and again, as a host admitted again under its id
@@ -35,11 +39,12 @@
 //!   it named before it went down, the retired owner and the retirement that moved it, so a takeover's listing reads
 //!   the copy the same way after a warm restart (`slates_db::takeover::copy_falls_to`).
 //!
-//! Three mutations are kept as tests, so the checks are known to bite. Each broke histories (the Mac Studio, 2026-11-18,
-//! the first check each broken seed failed):
+//! Four mutations are kept as tests, so the checks are known to bite. Each broke histories (the first three on the Mac
+//! Studio, 2026-11-18, the fourth on adacachy2, 2026-11-23; the first check each broken seed failed):
 //! - a promise that raises no fence: 39 of 48 seeds at `f = 1` and 44 of 48 at `f = 2` (StaleNeverCommits, Continuity);
 //! - a holder's restart that forgets its fence: 16 and 9 of 192 seeds (StaleNeverCommits, Continuity, Agreement);
-//! - an owner that adopts on a minority's promises: 23 and 7 of 48 seeds (Continuity, Agreement).
+//! - an owner that adopts on a minority's promises: 23 and 7 of 48 seeds (Continuity, Agreement);
+//! - a warm restart that settles an owner that never promoted (A-890's scenes): 41 and 42 of 48 seeds (Continuity).
 //!
 //! ReadSafety, checked after the others in a step, broke first in none of those, so its own red check is a direct one
 //! over real holders' state: a majority whose newest entry at a committed position is another value.
@@ -93,6 +98,9 @@ const RESUME: u64 = 25;
 /// current owner's host restarts under the next epoch with its authority unchanged.
 const TAKEOVER: u64 = 6;
 const OWNER_RESTART: u64 = 4;
+/// Shape: per step, per mille, in the A-890 scenes: the current owner's host restarts warm. Five times a cold restart's
+/// rate, so one run of [`STEPS`] restarts an owner warm about thirty times, an owner that promoted twice or more.
+const WARM_RESTART: u64 = 20;
 /// Shape: per step, per mille: an owner, or the master, sends its outstanding message again.
 const RESEND: u64 = 250;
 /// Shape: per mille: a new cut that is cut both ways.
@@ -155,6 +163,9 @@ enum Mutation {
   RestartWithoutFence,
   /// An owner adopts on `f` promises, one short of a quorum.
   PromoteOnMinority,
+  /// A warm restart settles an owner that never promoted, as a successor would that took a copy for its own adoption by
+  /// anything but the adoption's own record (A-890: a record's epoch does not name its writer).
+  SettleUnpromoted,
 }
 
 /// One owner: the epoch the master handed a host, and its rounds.
@@ -185,6 +196,14 @@ struct Counts {
   cuts: u64,
   duplicates: u64,
   lost: u64,
+  /// Owners restarted warm that settled at their own epoch (A-890).
+  warm_settled: u64,
+  /// Epochs settled a second time: an owner restarted warm twice.
+  settled_twice: u64,
+  /// Owners restarted warm before they promoted, which ran phase one again at the next epoch.
+  warm_reruns: u64,
+  /// A phase one begun at a higher epoch while an owner that settled was still there.
+  settled_then_fenced: u64,
 }
 
 impl Counts {
@@ -201,6 +220,10 @@ impl Counts {
     self.cuts += other.cuts;
     self.duplicates += other.duplicates;
     self.lost += other.lost;
+    self.warm_settled += other.warm_settled;
+    self.settled_twice += other.settled_twice;
+    self.warm_reruns += other.warm_reruns;
+    self.settled_then_fenced += other.settled_then_fenced;
   }
 }
 
@@ -420,6 +443,11 @@ struct World {
   cuts: BTreeSet<(HostId, HostId)>,
   values: u64,
   history: History,
+  /// Per step, per mille: the current owner's host restarts warm (the A-890 scenes; none elsewhere, so the other runs'
+  /// seeds draw as they did).
+  warm_restarts: u64,
+  /// The times each epoch's owner settled after a warm restart.
+  settles: BTreeMap<u64, u64>,
 }
 
 impl World {
@@ -453,6 +481,8 @@ impl World {
       cuts: BTreeSet::new(),
       values: 0,
       history: History::default(),
+      warm_restarts: 0,
+      settles: BTreeMap::new(),
     }
   }
 
@@ -511,8 +541,53 @@ impl World {
     self.begin_owner(host);
   }
 
+  /// The current owner's host restarts warm (A-890): its old incarnation is gone and its durable state comes back. An
+  /// owner that promoted settles: it goes on at its own epoch from its own state, its pending record sent again, since it
+  /// shipped only what it had recorded. One that had not promoted adopted nothing to settle, so it runs phase one again at
+  /// the next epoch. Under [`Mutation::SettleUnpromoted`] it settles anyway, promoted on nothing.
+  fn warm_restart(&mut self) {
+    let host = self.authority_owner;
+    let Some(epoch) = self
+      .owners
+      .iter()
+      .rev()
+      .find(|(_, owner)| owner.prepare.owner == host)
+      .map(|(epoch, _)| *epoch)
+    else {
+      return;
+    };
+    let promoted = self.owners[&epoch].promoted;
+    if promoted || self.mutation == Mutation::SettleUnpromoted {
+      self.history.counts.warm_settled += 1;
+      let settles = self.settles.entry(epoch).or_insert(0);
+      *settles += 1;
+      if *settles == 2 {
+        self.history.counts.settled_twice += 1;
+      }
+      let owner = self.owners.get_mut(&epoch).unwrap();
+      owner.paused = false;
+      owner.acked.clear();
+      if !promoted {
+        owner.promoted = true;
+        let step = self.step;
+        self.history.adopt(step, epoch, None);
+      }
+    } else if self.epoch < MAX_EPOCHS {
+      self.history.counts.warm_reruns += 1;
+      self.owners.remove(&epoch);
+      self.begin_owner(host);
+    }
+  }
+
   /// A new owner of the next epoch on `host`, under the current generation: it installs the authority and runs phase one.
   fn begin_owner(&mut self, host: HostId) {
+    if self
+      .settles
+      .keys()
+      .any(|settled| self.owners.contains_key(settled))
+    {
+      self.history.counts.settled_then_fenced += 1;
+    }
     self.epoch += 1;
     let prepare = Prepare {
       owner: host,
@@ -567,6 +642,9 @@ impl World {
       self.owner_restart();
     } else if self.rng.chance(RESEND) {
       self.install_latest();
+    }
+    if self.warm_restarts > 0 && self.rng.chance(self.warm_restarts) {
+      self.warm_restart();
     }
     self.cut_or_heal();
     self.knock_or_return();
@@ -874,10 +952,21 @@ fn promise_without_fence(
 
 /// Runs `seeds` histories at `f` under `mutation`: the violations each broken seed found first, and what all counted.
 fn run(f: usize, seeds: u64, mutation: Mutation) -> (Vec<(u64, String)>, Counts) {
+  run_with(f, seeds, mutation, 0)
+}
+
+/// [`run`] with the current owner's host restarting warm at `warm_restarts` per mille a step (the A-890 scenes).
+fn run_with(
+  f: usize,
+  seeds: u64,
+  mutation: Mutation,
+  warm_restarts: u64,
+) -> (Vec<(u64, String)>, Counts) {
   let mut broken = Vec::new();
   let mut counts = Counts::default();
   for seed in 0..seeds {
     let mut world = World::new(seed, f, mutation);
+    world.warm_restarts = warm_restarts;
     while world.step < STEPS && world.history.violations.is_empty() {
       world.step();
     }
@@ -1041,4 +1130,66 @@ fn the_read_safety_check_finds_a_majority_whose_newest_entry_is_another_value() 
     "the check names the majority that reads w: {:?}",
     history.violations
   );
+}
+
+/// A-890, the double restart: a successor that adopted settles at its own epoch each time it restarts warm, and the
+/// register keeps its invariants. Do: run the nemesis over [`SEEDS`] seeds at `f = 1` and `f = 2` with owners restarting
+/// warm ([`WARM_RESTART`]) beside every other fault. Expect no seed to break Agreement, Continuity, StaleNeverCommits or
+/// ReadSafety, and some epoch settled twice.
+#[test]
+fn a_promoted_owner_restarted_warm_twice_keeps_the_register_invariants() {
+  for f in [1, 2] {
+    let (broken, counts) = run_with(f, SEEDS, Mutation::None, WARM_RESTART);
+    assert!(broken.is_empty(), "f = {f}: {broken:#?}");
+    assert!(
+      counts.settled_twice > 0 && counts.commits > 0,
+      "f = {f}: an owner settled twice among the commits: {counts:?}"
+    );
+  }
+}
+
+/// A-890, the chain: a successor restarted warm before it promoted holds no adoption to settle, so it runs phase one
+/// again, and the register keeps its invariants. Do: the same runs. Expect no broken seed, and warm restarts before a
+/// promotion among them.
+#[test]
+fn a_successor_restarted_warm_before_it_promoted_runs_phase_one_again() {
+  for f in [1, 2] {
+    let (broken, counts) = run_with(f, SEEDS, Mutation::None, WARM_RESTART);
+    assert!(broken.is_empty(), "f = {f}: {broken:#?}");
+    assert!(
+      counts.warm_reruns > 0 && counts.takeovers > 0,
+      "f = {f}: successors restarted warm before they promoted: {counts:?}"
+    );
+  }
+}
+
+/// A-890, the partial case at the register: an owner that settled goes on at its epoch while a later phase one, the
+/// object's next takeover or another epoch of its host, rises above it, and the register keeps its invariants. Do: the
+/// same runs. Expect no broken seed, and settled owners that a higher phase one met.
+#[test]
+fn a_settled_owner_beside_a_later_phase_one_keeps_the_register_invariants() {
+  for f in [1, 2] {
+    let (broken, counts) = run_with(f, SEEDS, Mutation::None, WARM_RESTART);
+    assert!(broken.is_empty(), "f = {f}: {broken:#?}");
+    assert!(
+      counts.settled_then_fenced > 0,
+      "f = {f}: a higher phase one met a settled owner: {counts:?}"
+    );
+  }
+}
+
+/// A-890's mutation: a warm restart that settles an owner that never promoted, as one would that judged its adoption by
+/// a record's epoch, breaks the register. Do: run the nemesis with [`Mutation::SettleUnpromoted`] at `f = 1` and `f = 2`
+/// with owners restarting warm. Expect some seed to break a check (Continuity: the owner goes on having adopted nothing
+/// over records committed under a lower epoch).
+#[test]
+fn a_warm_restart_that_settles_an_unpromoted_owner_breaks_the_register() {
+  for f in [1, 2] {
+    let (broken, _) = run_with(f, SEEDS, Mutation::SettleUnpromoted, WARM_RESTART);
+    say_broken(Mutation::SettleUnpromoted, f, SEEDS, &broken);
+    assert!(
+      !broken.is_empty(),
+      "f = {f}: no seed broke a check with warm restarts that settle an owner that never promoted"
+    );
+  }
 }

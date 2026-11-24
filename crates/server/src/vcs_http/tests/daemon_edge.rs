@@ -150,23 +150,17 @@ fn name_on_the_repositorys_partition() -> String {
     .expect("a name routes there")
 }
 
-/// Creates the git repository `name` on its partition, owned by [`owner`].
+/// Creates the git repository `name` on its partition, owned by [`owner`], as a client's creation is made: answered from
+/// a task of the shard while this thread waits for it to be recorded ([`crate::test_store::create_on`]). Made in a
+/// history holding the shard (`test_store::create`), the shard waited out the store's commit in a thread's `join`, and
+/// a commit slower than the liveness window ended the whole test binary (exit 4, "shard 1 is wedged").
 fn create(daemon: &Daemon, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Git,
-        format: ObjectFormat::Sha1,
-        default_branch: "main".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  crate::test_store::create_on(
+    daemon,
+    REPOSITORY,
+    &owner(),
+    (name, VcsTool::Git, ObjectFormat::Sha1, "main"),
+  );
 }
 
 /// Enrolls `token` for uid `uid` until `expires_ns`, on the partition its hash routes to, as the human surface does.
@@ -1452,22 +1446,18 @@ fn hg_name_on_the_repositorys_partition() -> String {
 /// `states` repository into its store there (A-675), a unit a turn to its end, and lands it (A-687): its phase roots and
 /// markers recorded, so the store serves what 7.2's `served` filter serves of it ([`STATES_SERVED_HEADS`]).
 fn create_hg_from_states(daemon: &Daemon, name: &str) {
-  let name = name.to_owned();
+  let (id, _) = crate::test_store::create_on(
+    daemon,
+    REPOSITORY,
+    &owner(),
+    (
+      name,
+      VcsTool::Mercurial,
+      ObjectFormat::Sha1,
+      "branch:default:0",
+    ),
+  );
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Mercurial,
-        format: ObjectFormat::Sha1,
-        default_branch: "branch:default:0".to_owned(),
-        green: None,
-      },
-    );
-    assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
-    let repositories = state.db.partition().repositories();
-    let id = repositories.repository_named(&name).expect("the record").id;
     let (host, directory) =
       crate::hg_base::tests::laid_out(crate::hg_base::tests::STATES.iter().copied());
     assert_eq!(
@@ -1488,12 +1478,13 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) {
       ),
       "the import did not end: {ended:?}"
     );
-    // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
-    assert_eq!(
-      crate::vcs_store::hg_import::land_imported(state, id),
-      Ok(())
-    );
   });
+  // A done import waits to land (A-687); landed from this thread, which waits, so the shard is never held through a
+  // segment's commit; landed, its index is the store's and the store is lent again.
+  assert_eq!(
+    crate::vcs_store::hg_import::land_imported_on(daemon, REPOSITORY, id),
+    Ok(())
+  );
 }
 
 /// The status and body of `GET /<name>?cmd=<command>` by the owner's bearer token, as stock hg asks a command.
@@ -1590,23 +1581,20 @@ const HG_PUSH_FIELDS: &str = "Accept-Encoding: identity\r\nContent-Type: applica
   Vary: X-HgArg-1,X-HgProto-1\r\nX-HgArg-1: heads=666f726365\r\n\
   X-HgProto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull\r\nAccept: application/mercurial-0.1\r\n";
 
-/// Creates the empty Mercurial repository `name` on its partition, owned by [`owner`].
+/// Creates the empty Mercurial repository `name` on its partition, owned by [`owner`], as [`create`] creates a git one:
+/// the shard is never held for the store's commit.
 fn create_empty_hg(daemon: &Daemon, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Mercurial,
-        format: ObjectFormat::Sha1,
-        default_branch: "branch:default:0".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  crate::test_store::create_on(
+    daemon,
+    REPOSITORY,
+    &owner(),
+    (
+      name,
+      VcsTool::Mercurial,
+      ObjectFormat::Sha1,
+      "branch:default:0",
+    ),
+  );
 }
 
 /// A bundle2 holding [`WIRE_HISTORY`] (a changegroup 03, every revision its full text) and `main` at `base`, asking no
@@ -4352,6 +4340,134 @@ fn a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth() {
   }
 }
 
+/// Shape: the version of `main`'s green the barrier is told a push owes in
+/// [`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`]: one no record ever places.
+const NEVER_PLACED: u64 = 1 << 40;
+
+/// The push barrier's give-up (main 01a20182's ruling of 2026-11-23 18:55: an expired barrier answers git in its own
+/// words, a typed refusal it can act on, never a dropped connection). Do: start a store-backed daemon with its edge;
+/// push a create of `main` ([`large_create`]); tell the repository's barrier that an operation moved `main`'s green to a
+/// version no record ever places ([`NEVER_PLACED`], `StateLogs::note_greens`); then push a create of `other` at the same
+/// commit, asking a report. Expect: the first create `200` with `ok refs/heads/main`; the second `200` too, its report
+/// `unpack ok` and `ng refs/heads/other unable to commit` once the barrier's window passed with nothing moving, the push
+/// refused uncommitted counted. Red before: the barrier's give-up was answered with no report at all (a cut connection).
+#[test]
+fn a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(1 << 10);
+  let created = pushed(edge, &name, &request);
+  let owed_name = name.clone();
+  crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let repositories = state.db.partition().repositories();
+    let repository = repositories
+      .repository_named(&owed_name)
+      .expect("the repository")
+      .id;
+    let main = repositories.branch(repository, "main").expect("main");
+    let owed = slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to: 0,
+      identity: [0; 32],
+      spans: vec![slates_db::catalog::LogSpan {
+        log: slates_db::catalog::LogName::Green { green: main },
+        from: 0,
+        to: NEVER_PLACED,
+      }],
+      changes: Vec::new(),
+    };
+    state.state_logs.note_greens(&owed);
+  });
+  let mut other = Vec::new();
+  let line = format!("{ZERO} {commit} refs/heads/other\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut other).expect("the command");
+  pktline::write(Packet::Flush, &mut other).expect("the flush");
+  other.extend_from_slice(&stored_pack(&[]));
+  let answered = pushed(edge, &name, &other);
+  let uncommitted = counted_on(&daemon, REPOSITORY, crate::state_log::PUSH_UNCOMMITTED);
+  daemon.stop();
+  assert_eq!(created.0, 200);
+  assert!(
+    String::from_utf8_lossy(&created.1).contains("ok refs/heads/main"),
+    "{}",
+    String::from_utf8_lossy(&created.1)
+  );
+  assert_eq!(answered.0, 200);
+  let report = String::from_utf8_lossy(&answered.1).into_owned();
+  assert!(
+    report.contains("unpack ok") && report.contains("ng refs/heads/other unable to commit"),
+    "{report}"
+  );
+  assert_eq!(uncommitted, 1);
+}
+
+/// A v2 `ls-refs` request for every ref, peeled, as `git ls-remote` asks.
+fn ls_refs_all() -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=ls-refs\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [b"peel\n".as_slice(), b"symrefs\n", b"ref-prefix refs/\n"] {
+    pktline::write(Packet::Data(argument), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// Goal 93 (main 01a20182's r405: stock `git ls-remote` right after git/git's whole push waited 29 to 54 s in every
+/// run, where stock lists its 4,451 refs in under a second). Do: start a store-backed daemon with its edge; push a
+/// create of `main` at [`chained_create`]'s tip, a version neither derived nor encoded yet (neither is made ahead while
+/// no fetch is answered, A-856); list its refs over v2 `ls-refs`; then fetch `main`. Expect: the listing `200`, naming
+/// `main` at the tip, with the derivation's and the encoding's turns unmoved by it; and the fetch after it moving them,
+/// so the work the listing skipped is still done for the fetch that reads it. Red before: a listing waited for the
+/// repository's derivation, whole, and its encoding, as a fetch does.
+#[test]
+fn a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let chained = chained_create(CHAIN_FILE, CHAIN_SHALLOW);
+  let created = pushed(edge, &name, &chained.request);
+  let tip = chained.commits.last().expect("a tip").0;
+  let turns = || {
+    counted_on(&daemon, REPOSITORY, "vcs_store.git_derive.turns")
+      + counted_on(&daemon, REPOSITORY, "vcs_store.git_encode.turns")
+  };
+  let before = turns();
+  let listed = uploaded(edge, &name, &ls_refs_all());
+  let after_listing = turns();
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let after_fetch = turns();
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(listed.0, 200);
+  let main = format!("{tip} refs/heads/main");
+  assert!(
+    String::from_utf8_lossy(&listed.1).contains(&main),
+    "the listing names main at the tip: {}",
+    String::from_utf8_lossy(&listed.1)
+  );
+  assert_eq!(
+    after_listing, before,
+    "the listing waited for the derivation or the encoding"
+  );
+  assert_eq!(fetched.0, 200);
+  assert!(
+    after_fetch > after_listing,
+    "the fetch readied the store: {before} {after_listing} {after_fetch}"
+  );
+}
+
 /// The two clones of [`a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole`]: the one commit
 /// deep one (`shallow`) and the whole one (`fetched`) each `200`, each pack's objects the `pushed` bytes.
 fn assert_both_clones_whole(
@@ -4858,15 +4974,29 @@ fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
   assert!(held.iter().all(|here| !here), "every file's window let go");
 }
 
-/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:
-/// start a two-shard daemon over loopback TLS; on the repository's shard, keep for the region an object one byte longer
-/// than a window, its first window ranking on the other shard (so no hold here names it); push one changeset whose file
-/// is exactly that first window; once landed, look at the window, then read the object from its home
-/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
-/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
-/// window was let go unnoted and the home read none.
-#[test]
-fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+/// A region object one byte longer than a window kept on the repository's shard, and a landed changeset whose file is
+/// exactly its first window ([`a_region_object_sharing_a_landed_files_window`]): the daemon, its shards, the object and
+/// its identity, the push's answer, and whether the shared window was held once landed.
+struct SharedWindow {
+  /// The daemon.
+  daemon: crate::test_store::StoredDaemon,
+  /// Its shards.
+  shards: Vec<u16>,
+  /// The region's object.
+  object: Vec<u8>,
+  /// Its identity.
+  object_id: slates_vcs::ContentId,
+  /// The push's answer.
+  pushed: (u16, String, Vec<u8>),
+  /// Whether the repository's content store held the shared window once the push landed.
+  window_held: Option<bool>,
+}
+
+/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push: start a two-shard daemon over
+/// loopback TLS; on the repository's shard, keep for the region an object one byte longer than a window, its first
+/// window ranking on the other shard (so no hold here names it); push one changeset whose file is exactly that first
+/// window. What it left.
+fn a_region_object_sharing_a_landed_files_window() -> SharedWindow {
   let (identity, certificate) = identity();
   let (daemon, _instance) = daemon_named(Some(identity));
   let port = daemon.vcs_http_port().expect("the edge started");
@@ -4933,31 +5063,63 @@ fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
       })
     })
   });
-  let reading = shards.clone();
-  let read = crate::test_store::run_at(
-    &daemon,
+  SharedWindow {
+    daemon,
+    shards,
+    object,
+    object_id,
+    pushed,
+    window_held,
+  }
+}
+
+/// Reads `object_id` from its home among `shards` on the listener's shard (`homes::read`), answered or refused.
+fn home_read(
+  daemon: &Daemon,
+  shards: &[u16],
+  object_id: slates_vcs::ContentId,
+) -> Result<Vec<u8>, crate::vcs_store::homes::HomeReadRefused> {
+  let reading = shards.to_vec();
+  crate::test_store::run_at(
+    daemon,
     LISTENER,
     move || async move {
       let origin = reading.first().copied().unwrap();
       crate::vcs_store::homes::read(origin, &reading, object_id, u64::MAX).await
     },
     Duration::from_secs(60),
-  );
+  )
+}
+
+/// codex-review's region-object pin through a real push, and goal 93 item 2b(b). Do: as
+/// [`a_region_object_sharing_a_landed_files_window`]; once landed, look at the window, then read the object from its home
+/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
+/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
+/// window was let go unnoted and the home read none.
+#[test]
+fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+  let shared = a_region_object_sharing_a_landed_files_window();
+  let read = home_read(&shared.daemon, &shared.shards, shared.object_id);
   let brought = counted_on(
-    &daemon,
+    &shared.daemon,
     REPOSITORY,
     crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
   );
-  daemon.stop();
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  shared.daemon.stop();
   assert_eq!(
-    window_held,
+    shared.pushed.0,
+    200,
+    "{}",
+    String::from_utf8_lossy(&shared.pushed.2)
+  );
+  assert_eq!(
+    shared.window_held,
     Some(false),
     "the shared window let go once landed"
   );
   assert_eq!(
-    read.map(|bytes| bytes == object),
-    Some(true),
+    read.map(|bytes| bytes == shared.object),
+    Ok(true),
     "the home reads its object whole"
   );
   assert_eq!(
@@ -4966,11 +5128,96 @@ fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
   );
 }
 
+/// Each kind of `hg_push::bring_back`'s refusal as the repository's shard counted it, in `BringBackRefused`'s order:
+/// not held, store unanswered, no text, content refused, not whole.
+fn bring_back_refusals(daemon: &Daemon) -> [u64; 5] {
+  use crate::repository::hg_push::{
+    BRING_BACK_CONTENT_REFUSED, BRING_BACK_NO_TEXT, BRING_BACK_NOT_HELD, BRING_BACK_NOT_WHOLE,
+    BRING_BACK_STORE_UNANSWERED,
+  };
+  [
+    BRING_BACK_NOT_HELD,
+    BRING_BACK_STORE_UNANSWERED,
+    BRING_BACK_NO_TEXT,
+    BRING_BACK_CONTENT_REFUSED,
+    BRING_BACK_NOT_WHOLE,
+  ]
+  .map(|kind| counted_on(daemon, REPOSITORY, kind))
+}
+
+/// The typed refusal a home's read passes on (main 01a20182's ruling of 2026-11-23 21:25; §2 item 9). Do: as
+/// [`a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`], then hold back the repository's
+/// shard's whole room, every byte it holds or could claim (§4.2: a host under memory pressure), read the object from its
+/// home, release the hold and read it again. Expect: the first read refused `NotBroughtBack` with the revision's
+/// bring-back refused by the content store's room (`OverBudget`, a window's need), counted once under that kind and
+/// under no other; the second read the whole object, brought back once, nothing more counted refused. Red before: the
+/// read answered a bare none and no counter named the kind.
+#[test]
+fn a_homes_read_whose_bring_back_is_refused_room_fails_with_that_refusal_counted_once() {
+  use crate::repository::hg_push::BringBackRefused;
+  use crate::vcs_store::homes::{HomeReadRefused, LandedRefused};
+  let shared = a_region_object_sharing_a_landed_files_window();
+  crate::daemon::observe_at(&shared.daemon, REPOSITORY, |state| {
+    state.pressure_pinned = true;
+    let claimable = u64::try_from(state.store.content.arena().claimable()).unwrap();
+    let all = state.store.budget.capacity().saturating_add(claimable);
+    state.store.budget.set_hold(all);
+  });
+  let refused = home_read(&shared.daemon, &shared.shards, shared.object_id);
+  let counted_refused = bring_back_refusals(&shared.daemon);
+  crate::daemon::observe_at(&shared.daemon, REPOSITORY, |state| {
+    state.store.budget.set_hold(0);
+  });
+  let read = home_read(&shared.daemon, &shared.shards, shared.object_id);
+  let counted_after = bring_back_refusals(&shared.daemon);
+  let brought = counted_on(
+    &shared.daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
+  );
+  shared.daemon.stop();
+  let window = u64::try_from(shared.object.len() - 1).unwrap();
+  assert!(
+    matches!(
+      refused,
+      Err(HomeReadRefused::NotBroughtBack(LandedRefused::Revision(
+        BringBackRefused::Content(slates_vcs::ContentRefused::OverBudget { need, .. })
+      ))) if need == window
+    ),
+    "the home's read refused with the bring-back's room refusal: {:?}",
+    refused.map(|bytes| bytes.len())
+  );
+  assert_eq!(
+    counted_refused,
+    [0, 0, 0, 1, 0],
+    "counted once, under the content store's kind alone"
+  );
+  assert_eq!(
+    read.map(|bytes| bytes == shared.object),
+    Ok(true),
+    "the hold released, the home reads its object whole"
+  );
+  assert_eq!(
+    counted_after, counted_refused,
+    "the read after the release refused nothing"
+  );
+  assert_eq!(brought, 1, "brought back once, after the release");
+}
+
 /// w-shared's seam 1 of goal 93 item 2b(b) (main's ruling of 2026-11-22 18:43): a home reads a landed file revision by
-/// its (path, node). Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; on the
-/// repository's shard, bring each file revision back by its path and node (`hg_push::bring_back`), then look at its
-/// window again. Expect the push `200`; some window let go; every bring-back true; every window held whole after, each let
-/// go read from the changeset store and counted once. Red before: none could be brought back by its (path, node).
+/// its (path, node). Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; publish
+/// the repository's shard, which gives the arena's idle extents back to the pool as the sweep's publication may at any
+/// moment ([`published_down_to_demand`]); on that shard, bring each file revision back by its path and node
+/// (`hg_push::bring_back`), then look at its window again. Expect the push `200`; some window let go; every bring-back
+/// answered `Ok`; every window held whole after, each let go read from the changeset store and counted once; and every
+/// bring-back's room made outside a lend, where the pool is reachable: each let go brought back once
+/// (`vcs.hg.landed_texts_brought_back`, the non-vacuity count) and no room asked inside a lend
+/// (`vcs_store.room_out_of_reach` 0), whatever slack this machine's publication left. Red before: none could be brought
+/// back by its (path, node); then, with the publication (w-tsan, 2026-11-23), 10 runs of 10 refused
+/// `OverBudget { need: 8192, room: 5869 }` from the 49th file, the room asked inside `lent_state`, where the pool is out
+/// of reach (plainly 2 runs of 100 at a load of 47, at the 49th and the 81st). A first form asserted the arena grew past
+/// the publication, which held only where the slack was short: on w-hg's MacBook the publication left 16 MiB, room for
+/// all 120, and it failed 3 runs of 3 with every bring-back answered.
 #[test]
 fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node() {
   let (identity, certificate) = identity();
@@ -4992,6 +5239,7 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
   })
   .expect("the repository's record");
   let before = windows_held(&daemon, texts);
+  let published = published_down_to_demand(&daemon);
   let files: Vec<(Vec<u8>, slates_hg::Node)> = made
     .iter()
     .map(|made| (made.file.0.clone(), made.file.1))
@@ -5014,14 +5262,23 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
     REPOSITORY,
     crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
   );
+  let grown = crate::daemon::observe_at(&daemon, REPOSITORY, |state| state.store.budget.capacity());
+  let out_of_reach = counted_on(&daemon, REPOSITORY, crate::vcs_store::ROOM_OUT_OF_REACH);
   daemon.stop();
   let gone = before.iter().filter(|here| !**here).count();
-  println!("{gone} of {TEXTS_CHANGESETS} files' windows let go before; {counted} brought back");
+  println!(
+    "{gone} of {TEXTS_CHANGESETS} files' windows let go before; {counted} brought back; the shard's capacity \
+     {published} after the publication, {grown} after"
+  );
   assert!(gone > 0, "some window let go");
   for (at, (brought, here)) in brought.iter().zip(&after).enumerate() {
-    assert!(brought, "file {at} brought back");
+    assert_eq!(*brought, Ok(()), "file {at} brought back");
     assert!(here, "file {at}'s window held whole after");
   }
+  assert_eq!(
+    out_of_reach, 0,
+    "no room asked inside a lend: each bring-back's room made where the pool is reachable"
+  );
   assert_eq!(
     counted,
     u64::try_from(gone).unwrap(),
@@ -5033,9 +5290,11 @@ fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and
 /// store, brought back through the node's changeset store; a manifest delta made again from its two texts). Do: start a
 /// two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; on the repository's shard, let go every
 /// object the repository's changelog and manifest rows name; bring each revision back by its log's path and its node
-/// (`hg_push::bring_back`); read every text again. Expect the push `200`; objects let go (the non-vacuity count); every
-/// bring-back true; every changeset's and manifest's text read back the same; each let go counted once
-/// (`vcs.hg.landed_log_texts_brought_back`). Red before: a bring-back by those paths looked for a file revision.
+/// (`hg_push::bring_back`) after a publication gave the arena's idle extents back ([`published_down_to_demand`]); read
+/// every text again. Expect the push `200`; objects let go (the non-vacuity count); every bring-back answered `Ok`;
+/// every changeset's and manifest's text read back the same; each let go counted once
+/// (`vcs.hg.landed_log_texts_brought_back`); no room asked inside a lend. Red before: a bring-back by those paths looked
+/// for a file revision.
 #[test]
 fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_and_node() {
   let (identity, certificate) = identity();
@@ -5058,6 +5317,7 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   .expect("the repository's record");
   let before = log_texts(&daemon, repository);
   let let_go = let_go_logs(&daemon, repository);
+  published_down_to_demand(&daemon);
   let asks: Vec<(Vec<u8>, slates_hg::Node)> = before
     .0
     .iter()
@@ -5087,13 +5347,15 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
     REPOSITORY,
     crate::repository::hg_push::LANDED_LOG_TEXTS_BROUGHT_BACK,
   );
+  let out_of_reach = counted_on(&daemon, REPOSITORY, crate::vcs_store::ROOM_OUT_OF_REACH);
   daemon.stop();
   println!(
     "{let_go} of {} changelog and manifest objects let go; {counted} brought back",
     brought.len()
   );
   assert!(let_go > 0, "objects let go");
-  assert!(brought.iter().all(|brought| *brought), "{brought:?}");
+  assert!(brought.iter().all(Result::is_ok), "{brought:?}");
+  assert_eq!(out_of_reach, 0, "no room asked inside a lend");
   assert_eq!(after, before, "every text read back the same");
   assert_eq!(
     counted,
@@ -5163,6 +5425,17 @@ fn log_texts(
     })
   })
   .expect("the repository's rows")
+}
+
+/// Publishes the repository's shard and answers its capacity after. A committed publication gives the arena's wholly free
+/// extents back to the pool (`Store::release_idle`), as the sweep's may at any moment, so what follows grows from the
+/// pool for its room, never only from the slack a push left behind (w-tsan, 2026-11-23: a bring-back that met the slack
+/// alone was refused at the 49th of 120 files).
+fn published_down_to_demand(daemon: &Daemon) -> u64 {
+  crate::daemon::observe_at(daemon, REPOSITORY, |state| {
+    crate::verbs::publish_shard(state).expect("the repository's shard published");
+    state.store.budget.capacity()
+  })
 }
 
 /// Whether the repository's shard's content store reads each of `texts`' windows (none for one let go).

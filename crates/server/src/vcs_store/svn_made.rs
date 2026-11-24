@@ -6,10 +6,10 @@
 //! nothing else made the revision of it: the green passed its records' youngest revision, so every later commit, whose
 //! step lands only while the green is at the youngest revision, was refused, and no client saw the version.
 //!
-//! **What.** As the version commits on the owner ([`make`], from `verbs::judge_submission`, after git's made commit),
-//! the revision after the records' youngest, made of the version's change: each path the change index names between the
-//! two versions (`Green::changed_between`), read before from the records at the youngest revision and after from the
-//! green's head, becomes one changed-path row as FSFS records it: `add` where nothing stood, `delete` where nothing
+//! **What.** As the submit's held verdict is deferred on the owner ([`make_deferred`], from `made_commit::defer`), the
+//! revision after the records' youngest, made of the version's change: each path the change index names between the two
+//! versions (`Green::changed_between`), read before from the records at the youngest revision and after from a preview
+//! of the verdict, becomes one changed-path row as FSFS records it: `add` where nothing stood, `delete` where nothing
 //! stands now, `replace` where the node's kind changed, `modify` where its text or its property list did; a file's text
 //! with its digests (`slates_svn::commit::drive::text_of`), its bytes brought with the revision; a node's property list
 //! the identity its reserved attribute names (`svn_commit::PROPS`), which the records must hold. A directory a row adds
@@ -23,13 +23,19 @@
 //! revision; the verdict is held, never applied before the commit (A-805): the revision is read from a preview of it
 //! ([`make_deferred`]), and a task holding the turn checks it, lands it on the node's changeset store, then applies the
 //! verdict and commits the version and the register's entry naming the sequence in one step and answers. A crash
-//! before that step leaves neither, and the retry lands once. A submit dispatched outside a recorded request ([`make`])
-//! commits its version in its own step and the task lands the revision after it (GAPS).
+//! before that step leaves neither, and the retry lands once. A submit dispatched outside a recorded request is refused
+//! `RecordedSubmitRequired` before its verdict (`made_commit::Taken::Unrecorded`; main's rulings of 2026-11-23: the
+//! store is the truth, with no second path): until then it committed its version in its own step and a task landed
+//! the revision after it, so a crash between left a version with no revision.
 //!
-//! **Not made, and counted** ([`UNMADE`]), the version standing: a version not the one after the youngest revision, a
-//! copy in the change (A-586: the index names a copy at its destination alone), a special file or a symbolic link
-//! with properties of its own (no Subversion node the step makes yet), a property list the records do not hold, the
-//! records' or the budget's refusal.
+//! **Not made, refused** (A-891; main's ruling of 2026-11-23 20:51, guard-then-apply), counted [`UNMADE`], nothing of
+//! the version applied and the refusal recorded as the request's completion (`made_commit::refuse`): a special file or
+//! a symbolic link with properties of its own (no Subversion node the step makes yet) and a path beneath a copy the
+//! submit does not declare `Unsupported`; a version not the one after the youngest revision, a property list the
+//! records do not hold, a text whose digests cannot be made and the store's check `StoreRefused`, in their words. The
+//! register entry's commit is judged before the verdict applies (`MadeEntry::guard`), so the step that commits the
+//! version and its entry is not refused after it applied anything. Until A-891 such a version was committed alone, the
+//! green past its records, and every later revision refused as not the next.
 //!
 //! **Symbolic links** become files as Subversion keeps them: the text `link ` and the target, the property list
 //! `svn:special` set to `*` alone, brought with the revision.
@@ -45,7 +51,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{RepositoryId, VcsTool, VolumeId as DbVolumeId};
-use slates_ipc::protocol::Authorship;
+use slates_ipc::protocol::{Authorship, Refusal};
 use slates_merge::engine::Green;
 use slates_svn::commit::revision::Revision;
 use slates_svn::index::{
@@ -57,8 +63,9 @@ use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
 use crate::made_commit::Pending;
-use crate::repository::svn_commit::landing::{self, Turn};
-use crate::repository::svn_commit::{PROPS, Uncommitted, land_made};
+use crate::repository::push::AppendRefused;
+use crate::repository::svn_commit::landing::Turn;
+use crate::repository::svn_commit::{GuardedMade, PROPS, Uncommitted, land_made};
 use crate::state::ShardState;
 
 #[cfg(test)]
@@ -72,8 +79,8 @@ thread_local! {
 /// Counter: a revision the server made of a submitted version. Format: a counter name in the daemon's status report.
 pub(crate) const MADE: &str = "vcs.svn.revision_made";
 
-/// Counter: a submitted version of which no revision was made (module docs). Format: a counter name in the daemon's
-/// status report.
+/// Counter: a submitted version of which no revision could be made, refused (module docs). Format: a counter name in
+/// the daemon's status report.
 pub(crate) const UNMADE: &str = "vcs.svn.revision_unmade";
 
 /// Format: the property `svn:log`.
@@ -121,34 +128,6 @@ impl std::fmt::Debug for Unmade {
   }
 }
 
-/// Makes the revision of `green`'s `version`, where `green` is a Subversion repository's (module docs; C2): the
-/// repository's landing turn taken in the submit's own step where it is free, so no client's commit lands between the
-/// version and its revision, then the revision made, landed on the node's store and committed by a task holding it
-/// ([`made_landing`]); counted.
-pub(crate) fn make(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  authorship: &Authorship,
-  copies: &[MadeCopy],
-) {
-  let Some(repository) = subversion_repository_of(state, green) else {
-    return;
-  };
-  let turn = Turn::take_now(state, repository);
-  let task = made_landing(
-    (repository, green, version),
-    (authorship.clone(), copies.to_vec()),
-    turn,
-  );
-  if slates_rt::futures::spawn(task)
-    .and_then(slates_rt::futures::detach)
-    .is_err()
-  {
-    unmade(state, &Unmade::Unrun);
-  }
-}
-
 /// Counts and logs a version of which no revision was made.
 fn unmade(state: &mut ShardState, why: &Unmade) {
   slates_machine::log_line!(
@@ -156,50 +135,6 @@ fn unmade(state: &mut ShardState, why: &Unmade) {
     state.partition
   );
   state.count(UNMADE, 1);
-}
-
-/// [`make`]'s task: the landing turn (`turn`, or awaited where the submit could not take it), then the revision made of
-/// `green`'s `version` and landed (`svn_commit::land_made`); counted.
-async fn made_landing(
-  (repository, green, version): (RepositoryId, DbVolumeId, u64),
-  (authorship, copies): (Authorship, Vec<MadeCopy>),
-  turn: Option<Turn>,
-) {
-  let turn = match turn {
-    Some(turn) => turn,
-    None => match landing::turn(repository).await {
-      Some(turn) => turn,
-      None => return,
-    },
-  };
-  let Some(made) = crate::state::with_state(|state| {
-    revision_made(state, (repository, green), version, (&authorship, &copies))
-  }) else {
-    return;
-  };
-  let revision = match made {
-    Ok(Some(revision)) => revision,
-    Ok(None) => {
-      let _ = crate::state::with_state(|state| turn.give_back(state));
-      return;
-    }
-    Err(why) => {
-      let _ = crate::state::with_state(|state| {
-        unmade(state, &why);
-        turn.give_back(state);
-      });
-      return;
-    }
-  };
-  let landed = land_made(turn, repository, revision, |state, entry| {
-    entry.commit(state)
-  })
-  .await;
-  let _ = crate::state::with_state(|state| match landed {
-    Some(Ok(_)) => state.count(MADE, 1),
-    Some(Err(refused)) => unmade(state, &Unmade::Step(refused)),
-    None => {}
-  });
 }
 
 /// Makes the revision of the version `pending` holds, of a Subversion repository's green, from its verdict `judged`,
@@ -275,24 +210,26 @@ fn revision_held(
   made.map(Some)
 }
 
-/// [`make_deferred`]'s task: the revision `made` landed on the store, then committed with the version
-/// (`made_commit::commit`); a revision not made (counted [`UNMADE`]), or one the check refused, commits the version
-/// alone, and a store that refused it gives the accept up (`made_commit::abandon`).
+/// [`make_deferred`]'s task: the revision `made` landed on the store, then committed with the version guard-then-apply
+/// (`made_commit::commit_guarded`, the entry's guard
+/// [`MadeEntry::guard`](crate::repository::svn_commit::MadeEntry::guard); main's ruling of 2026-11-23 20:51). A version
+/// no revision can be made of ([`Unmade`], counted [`UNMADE`]), one the store's check refused, or one the entry's guard
+/// refused, is refused typed and recorded with nothing applied (`made_commit::refuse`), never committed alone; a store
+/// that refused the changeset gives the accept up, retryable (`made_commit::abandon`).
 async fn made_commit_landing(
   (repository, turn): (RepositoryId, Turn),
   pending: Pending,
   made: Result<Option<Revision>, Unmade>,
 ) {
-  let (green, _) = pending.version();
   let revision = match made {
     Ok(Some(revision)) => revision,
-    // Made already, or not made: the version commits alone, the turn held until it has.
+    // No revision can be made of the version, or the records stand past it (none while the turn is held, in a correct
+    // use): refused, the turn held until it has.
     Ok(None) | Err(_) => {
+      let why = made.err().unwrap_or(Unmade::NotNext);
       let _ = crate::state::with_state(move |state| {
-        if let Err(why) = &made {
-          unmade(state, why);
-        }
-        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Uncommitted>(()));
+        unmade(state, &why);
+        crate::made_commit::refuse(state, pending, why.refusal());
         turn.give_back(state);
       });
       return;
@@ -307,9 +244,15 @@ async fn made_commit_landing(
       return Ok(None);
     }
     let pending = waiting.take().ok_or(Uncommitted::NotHeld)?;
-    Ok(crate::made_commit::commit(state, pending, |state| {
-      entry.commit(state)
-    }))
+    Ok(crate::made_commit::commit_guarded(
+      state,
+      pending,
+      |state| entry.guard(state).map_err(|refused| refusal_of(&refused)),
+      (
+        |state: &mut ShardState, guarded: GuardedMade| guarded.commit(state),
+        |state: &mut ShardState, guarded: GuardedMade| guarded.give_back(state),
+      ),
+    ))
   })
   .await;
   if killed.get() {
@@ -317,52 +260,69 @@ async fn made_commit_landing(
     return;
   }
   let _ = crate::state::with_state(move |state| match landed {
-    Some(Ok(Some(Ok(_)))) => state.count(MADE, 1),
-    Some(Ok(Some(Err(refused)))) => unmade(state, &Unmade::Step(refused)),
+    Some(Ok(Some(_))) => state.count(MADE, 1),
+    // Refused by the entry's guard (recorded), or its green made again meanwhile (given up): nothing applied.
     Some(Ok(None)) | None => {}
     Some(Err(refused)) => {
       let Some(pending) = waiting.take() else {
         return;
       };
       match refused {
-        // The store refused the changeset: nothing of the accept is applied or durable.
-        Uncommitted::Unstored => crate::made_commit::abandon(state, (pending.request(), green)),
-        // The check refused the revision: the version stands alone, as one no revision was made of.
+        // The store refused the changeset: nothing of the accept is applied or durable, and its retry runs.
+        Uncommitted::Unstored => {
+          crate::made_commit::abandon(state, (pending.request(), green_of(&pending)))
+        }
+        // The check refused the revision: refused with the check's reason, nothing applied.
         refused => {
+          let refusal = refusal_of(&refused);
           unmade(state, &Unmade::Step(refused));
-          let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Uncommitted>(()));
+          crate::made_commit::refuse(state, pending, refusal);
         }
       }
     }
   });
 }
 
-/// The revision of `green`'s `version`, made after the records' youngest; none where it is made already.
-fn revision_made(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  version: u64,
-  (authorship, copies): (&Authorship, &[MadeCopy]),
-) -> Result<Option<Revision>, Unmade> {
-  let youngest = state
-    .vcs_stores
-    .subversion_records(repository)
-    .map_or(u64::MAX, SvnRecords::youngest);
-  // A revision a client's commit landed moved the green itself: made already.
-  if youngest >= version {
-    return Ok(None);
+/// The green `pending`'s version is of.
+fn green_of(pending: &Pending) -> DbVolumeId {
+  pending.version().0
+}
+
+impl Unmade {
+  /// The typed refusal a submit whose version no revision can be made of is answered (main's ruling of 2026-11-23
+  /// 20:51): a special file, a symbolic link with properties of its own or a copy the submit did not declare
+  /// `Unsupported`; the records' or the store's refusal `StoreRefused`, in its words.
+  fn refusal(&self) -> Refusal {
+    match self {
+      Unmade::Special => Refusal::Unsupported {
+        feature: "a special file, or a symbolic link with properties of its own, in a Subversion repository"
+          .to_owned(),
+      },
+      Unmade::Copy => Refusal::Unsupported {
+        feature: "a path beneath a copy the submit does not declare, in a Subversion repository".to_owned(),
+      },
+      Unmade::Step(refused) => refusal_of(refused),
+      Unmade::NotNext | Unmade::Unreadable | Unmade::Digest | Unmade::Unrun => Refusal::StoreRefused {
+        reason: format!("no revision could be made of the version: {self:?}"),
+      },
+    }
   }
-  if youngest.checked_add(1) != Some(version) {
-    return Err(Unmade::NotNext);
+}
+
+/// The typed refusal of a made revision the store's check or the entry's guard refused: the budget's
+/// `BudgetExceeded`, the register's own refusal, else `StoreRefused` in the refusal's words.
+fn refusal_of(refused: &Uncommitted) -> Refusal {
+  match refused {
+    Uncommitted::Budget { available } => Refusal::BudgetExceeded {
+      available: *available,
+    },
+    Uncommitted::Append(AppendRefused::Repository(refusal) | AppendRefused::Entry(refusal)) => {
+      refusal.clone()
+    }
+    other => Refusal::StoreRefused {
+      reason: other.failure().1,
+    },
   }
-  let now = AprTime(state.clock.wall_ns().div_euclid(NANOS_PER_MICRO));
-  revision_of(
-    state,
-    (repository, green),
-    (youngest, version),
-    (authorship, now, copies),
-  )
-  .map(Some)
 }
 
 /// The Subversion repository `green` is the green of: a member of a repository whose tool is Subversion's.
@@ -376,29 +336,8 @@ pub(crate) fn subversion_repository_of(
   matches!(record.tool, VcsTool::Subversion).then_some(repository)
 }
 
-/// The revision of `green`'s `version`, made after the records' `youngest` (module docs).
-fn revision_of(
-  state: &ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  (youngest, version): (u64, u64),
-  (authorship, now, copies): (&Authorship, AprTime, &[MadeCopy]),
-) -> Result<Revision, Unmade> {
-  let engine = state.greens.get(&green).ok_or(Unmade::NotNext)?;
-  let records = state
-    .vcs_stores
-    .subversion_records(repository)
-    .ok_or(Unmade::NotNext)?;
-  revision_from(
-    (&engine, (youngest, version)),
-    records,
-    (youngest, version),
-    (authorship, now, copies),
-  )
-}
-
 /// The revision made after the records' `youngest` as `version`, read from `engine`, whose versions `(from, to]` hold
-/// the version's change: the green itself (`from` the youngest, `to` the version), or a preview of a verdict held with
-/// its landing (`from` 0, `to` 1; A-805, `Greens::preview`).
+/// the version's change: a preview of a verdict held with its landing (`from` 0, `to` 1; A-805, `Greens::preview`).
 fn revision_from(
   (engine, (from, to)): (&Green, (u64, u64)),
   records: &SvnRecords,

@@ -63,6 +63,18 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # The Ubuntu runner's disk. Run 45347644597 (2026-11-24, job 138289296963) ran the runner out of space during
+      # `cargo test --workspace` ("No space left on device"; the job's own log could not be written). It was the first
+      # main run since at least 2026-11-19 whose Ubuntu job got past Format and Clippy to this build, and nightly runs
+      # stopped there too, so the test build's growth went unseen. The image ships SDKs that no step of this job uses
+      # (Android, .NET, GHC, CodeQL, Swift); removing them is the room. The step prints the free space before and after,
+      # and the step after the workspace tests prints what they left, so each run records its own margin.
+      - name: Free the runner's unused SDKs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h / | tail -1 | awk '{print "free before: " $4 " of " $2}'
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h / | tail -1 | awk '{print "free after: " $4 " of " $2}'
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -137,6 +149,12 @@ jobs:
           # non-convergence is still caught at the bound, and a normal local run keeps the prompt 30 s default.
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
         run: cargo test --workspace
+      # The margin the workspace tests leave (see "Free the runner's unused SDKs"), printed pass or fail.
+      - name: Disk after the workspace tests
+        if: always()
+        run: |
+          df -h / | tail -1 | awk '{print "free after the workspace tests: " $4 " of " $2}'
+          if [ -d target ]; then du -sh target; fi
       # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
       - name: The vendored crates' suites
         run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked

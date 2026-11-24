@@ -174,6 +174,12 @@
 > for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
 > in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
 > should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
+> **The store owner's stop joined blind on a held handle (2026-11-23, w-shared; main 01a20182's ruling): CLOSED.** A
+> fleet test's harness waited 75 minutes in `StoreOwner::stop`, which joined an owner that ended only once every
+> handle was gone. The stop is now a request the owner ends at, whatever handles are still held: its open landing let
+> go, its checkpoint written, every later request refused `Gone`. Red first (the stop unanswered within 60 s), now
+> answered at once (`crates/store/tests/owner.rs`). The sweep found no other blind join in shipped code
+> (`docs/bugs/2026-11-23-the-store-owners-stop-joined-blind-on-a-held-handle.md`).
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
@@ -813,6 +819,39 @@
 > test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
 > recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
 > `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
+> **A synchronous history's landing held its shard past the watchdog's window (2026-11-24, w-ci; OPEN until every site
+> moves).** `create_blocking`, `land_blocking` and `land_segments_blocking` wait in a `join` on the shard's own thread
+> while the store commits. An `fdatasync` longer than the 1000 ms window then ends the test binary with the watchdog's
+> exit 4 (w-tsan: 1 of 100 `daemon_edge` runs at load 47; reproduced 3 of 3 on adacachy2 with the store's `fdatasync`
+> delayed 1.5 s). Each landing is one `fdatasync` of exposure, and every in-process test daemon runs its watchdog alone,
+> so one slow commit ends every test in the binary. The rule (main's ruling of 2026-11-24): the test's thread waits, never
+> the shard: a creation through `test_store::create_on`, a landing through `land_blocking` called between two
+> observations, an import's segments through `hg_import::land_imported_on`. Moved, each red under the 1.5 s `fdatasync`
+> and green after: `daemon_edge`'s creations and its import (076a4adb5 and the next change), the ssh serve test's
+> creation, `vcs_store::read_through`'s six tests, `vcs_store::upload`'s three landing tests and `hg_import`'s rebuild
+> test, and `lfs`'s five tests (`test_store::audit_on_stored_shard_made`: the repository made first, then the history).
+> - **Held by design (main's ruling of 2026-11-24 23:15; not moved).** Three families check a model deterministically by
+>   holding their shard on purpose (A-767 item 7), so a store commit slower than the shard's liveness window ends their
+>   binary with exit 4. Measured: 1 run in 100 at load 47 on adacachy2 (w-tsan), none in CI's recent runs.
+>   - `repository/hg_push/tests.rs`' push tests (`Hg`: 18 creations in 16 tests): each push lands its segments through
+>     `hg_push::land_stored` and `store_blocking` between prepare and land ("a test holds the shard's state through its
+>     push", `settled_whole`).
+>   - `git_push/tests.rs`' synchronous driver (`pushed` and `carry_blocking`, 30 calls): "a synchronous driver holds the
+>     shard", each changeset landed with `land_answered_blocking`.
+>   - `repository.rs`' creation-reply tests (`ask`, 32 calls; `create`, 17): they read the creation's own reply, which on
+>     a store-holding daemon goes by its reply route.
+>   The fix if CI ever shows the exit 4: the push tests re-targeted at the async drivers (`hg_run`; `carry_awaited` in
+>   a `run_on_first` history), the creation-reply tests at a client that captures the routed reply.
+> - **Still to move** (each in its own change, red under the 1.5 s `fdatasync` and green after; stopped and named here
+>   where a synchronous driver appears): `git_repository`'s other callers (101 calls in 12 files with the driver's),
+>   `vcs_store/paths/tests.rs` `ask`, `vcs_store/tests.rs` `repository`, `appended` and `push_unsettled`,
+>   `hg_import/tests.rs` `created` and its five direct `land_imported` histories, `repository/push/tests.rs`
+>   `repository`, `hg_view/tests.rs` `created` and `imported`, `identities/tests.rs` `ask` and `created`,
+>   `repository/import/tests.rs` `created`, `hg_made/tests.rs` `mercurial`, `vcs_share/tests.rs` `hg_repository`,
+>   `vcs_ssh/tests/hg.rs`, `commits/tests.rs` `recorded_submit`, `fleet.rs` `repository_and_branch`; the direct histories
+>   in `index_upkeep.rs`, `upload/tests.rs` and `repository.rs`; and the test helpers in product files (`commits.rs`
+>   `home_and_land_blocking` and `made_after_now`, `daemon.rs` `b1_crash` and two histories).
+>   Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
 > `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
@@ -935,8 +974,9 @@
 >   it is durable on the changeset store its windows are let go (`hg_run::let_go_landed`, `let_go_object_landed` with
 >   `vcs_store::landed_pin`, as a landed git pack's), and once more when the entry commits, since the push's works
 >   bring back the texts they read between. Entries stay; a read brings a text back from the store, the works' own
->   included (`brought_back`, now within a lent budget and the chunk store's lend: its bring-back was refused
->   `OverBudget { room: 0 }` outside them). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
+>   included (`brought_back`, within a lent budget: its bring-back was refused `OverBudget { room: 0 }` with none; a
+>   `lent_state` wrapper put on it then hid the pool, and since 2026-11-23 room asked inside a lend is refused
+>   `OutOfReach`, docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
 >   `a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land` (120 files of 8 KiB: every window let go
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
@@ -944,7 +984,8 @@
 >   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
 >   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
 >   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
->   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   then put back within its lent room; refused by kind since 2026-11-23, `BringBackRefused`, each counted), counted
+>   `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
 >   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
 >   (`hg_run::Run::settle`) or an import lands, each file revision's windows a home holds (held for the region,
@@ -1179,7 +1220,10 @@
 >   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
 >   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
 >   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
->   makes each extent's object afresh at a claim after a release), should refusals remain.
+>   makes each extent's object afresh at a claim after a release), should refusals remain. r633 named it: no OS
+>   refusal, but an extent object a run before had left under the bench's fixed segment name, at another length. FIXED
+>   at the cause the same day: a created content object clears its extents' names and its creator removes them as it
+>   drops (`docs/bugs/2026-11-23-a-content-extents-object-outlived-its-daemon-and-met-the-next-run.md`).
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
@@ -1296,6 +1340,16 @@
 > - IN FLIGHT, the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
 >   pieces): the changelog's and the manifests' texts off the content store too, read through the store as file texts
 >   are.
+>   In five pieces (main's ruling of 2026-11-23 20:53: readers first, the let-go switched on last, P5; no manifest
+>   pinned, the learned cache alone). P1 BUILT (95a6be82f): `push::held::log_text_held`, `bring_back_log` (a manifest
+>   delta made again from its two texts, checked against its row's identity), `hg_push::bring_back` for the two logs'
+>   paths, `vcs.hg.landed_log_texts_brought_back`. P2 BUILT (serving): a fetch's changeset and manifest units ask a
+>   text not at hand of the changeset store under its log's path and take the same place again (`getbundle::LogTexts`,
+>   `Store::log_text_len`, `Store::manifest_entry`, `Walk::log_texts_asked`), and a lookup's `.hgtags` reading asks the
+>   heads' manifests first (`Repository::manifest_not_at_hand`); held by
+>   `a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store` (a clone and a pull) and
+>   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. Next: P3 (the push's work), P4 (the intake and
+>   the record), P5.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
@@ -1424,6 +1478,14 @@
 > windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
 > answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
 > r130's verbs with the lift on.
+> A ref listing waits for nothing a fetch reads BUILT (2026-11-23, w-git; main 01a20182's r405: stock `git ls-remote`
+> right after git/git's whole push took 29 to 54 s in every run, where stock lists its 4,451 refs in under a second).
+> Every upload-pack request but the advertisement derived the repository's unwalked versions whole and waited up to a
+> liveness window on its encoding (A-718's `encode`), a v2 `ls-refs` too; the SSH edge did it at each session's start.
+> Now only a request that may fetch waits (`vcs_http::git::upload::fetches`: every request before v2, and a v2 request
+> naming `fetch` or no command this crate reads; `slates_git::v2::request::command_of`), and SSH before its session's
+> first fetch (`a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding`: 4 turns during the listing before, 0
+> after, the fetch after it still readying the store). Owed: main's rerun of r405's push answer to refs listable.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -1682,7 +1744,14 @@
 > - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,
 >   and a holder's replica owes the same push at the base's identity, so a takeover adopts a green that owes it
 >   (`a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`).
->   OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
+>   BUILT, A-813's limit (A-886, w-git, 2026-11-23): a holder makes a replica that owes when a later version's record
+>   needs it, from a replica store of the repository its names-log parts make (held equal to the owner's store by an
+>   oracle), through the same door; a record waiting on it answers `ReplicaBuilding`, and a push's barrier waits for
+>   every green it moved (`v3_takeover` passes at f = 1, debug, macOS arm64, locally: both holders began and made a
+>   replica, 14.2 and 17.3 ms from begun to made, 877 and 1,468 turns, most waiting out the replica store's sliced
+>   replay; 3 versions waited; the takeover made its store again rather than adopting, its parts cut by `whole_parts`).
+>   Owed: main's release and debug gate; the build's time for git/git's history at f = 1.
+>   Was OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
 >   replica cannot judge it, so the record is refused (`merge.replica.owes`, counted) and waits for placement until a
 >   holder's replica is made. Before A-813 the owed version itself never placed. The fix: a holder makes its replica
 >   through the same door over its tool's objects, which needs the repository's store on holders (w-git, w-store).
@@ -1893,6 +1962,17 @@
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
+> Lost again at ae43b42ea (w-chaos, 2026-11-23, `v3_takeover` 7 of 7): the barrier waited for the names log alone, while
+> a push also moves its greens, whose versions stood at version 1 at both survivors while pushes 1 and 2 were answered, so
+> the successor's rebuild (`whole_parts`, a green's span judged by its head) kept push 0 only. Fixed (w-git, main
+> 01a20182's ruling): the barrier (`state_log::names_committed`, all three answer paths) also waits until every green the
+> repository's operations moved is placed at f + 1 through the version they took it to (`StateLogs::note_greens` as the
+> records are taken, `greens_placed` against `merge.placed`; `a_push_is_held_until_every_green_it_moved_is_placed_…`).
+> Its first gate (GitHub 45312465577) found the barrier right and what it waited for never placing: a holder's replica
+> owing its push could not judge the next version (A-813's limit), now built (A-886, below under A-812 (b)). The barrier
+> gives up only after a window with no progress, from the record plane's live pace, and answers `ng <ref> unable to
+> commit` (`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`). Owed: main's gate again, release and
+> debug.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -4286,10 +4366,22 @@
 > preview of the held verdict (`Lineage::preview`, a branch at the head, retired in the submit's step) and the verdict is
 > applied at the commit as its chain entry records it; held by `a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head`
 > and `a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once` (red before: a read in the
-> submit's step saw head 1 and the new bytes). Owed: (b) a submit dispatched outside a recorded request (no answer
-> waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
-> takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
-> after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
+> submit's step saw head 1 and the new bytes). (b) BUILT (A-888, 2026-11-23): a submit dispatched outside a recorded
+> request (no answer waits on it) is refused `RecordedSubmitRequired` before its verdict, and the old path (the version
+> committed in its step, its revision landed after it) is gone; held by
+> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. Guard-then-apply BUILT
+> (A-891, 2026-11-23, main 20:51): a Subversion version no revision can be made of (a special file, a link with its own
+> properties, an undeclared copy, the records or the store's check refusing) is refused typed and recorded with nothing
+> applied, never committed alone (it had left the green past its records, every later revision not the next), and the
+> register entry is judged before the verdict applies (`made_commit::commit_guarded`, `MadeEntry::guard`,
+> `push::check_entry`), so the step is not refused after it applied anything; held by
+> `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` and
+> `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version` (each red before: accepted at version 1, no revision).
+> Owed to their owners (main's sweep): git's and Mercurial's made commits still commit a version alone when their
+> commit is unmade or their tool refuses, through `made_commit::commit`. (c) a Mercurial
+> repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
+> changeset committed in one step after it, then the answer;
+> `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
 > `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`). Since A-767 C1 its
 > changeset lands on the node's store before the step, as a push's does (w-hg, below). A client's hg push still takes no
 > landing turn: one landed between a made changeset's making and its commit leaves the made fork stale, and the version
@@ -4653,8 +4745,26 @@
 > (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). Blame was of every file at every
 > sample, 155,904 commands over git-2000 (4,872 files × 16 samples × 2 legs). By main 01a20182's ruling it is now of
 > the files each sampled revision changed, or those of the nearest earlier change (`blamed_files`,
-> `files_changed_in`), the count printed at each sample. **Owed:** the sizing run (a diag lane on ubuntu-latest,
-> stock svn 1.15 built in the job), then git-2000's rerun on the big Studio, its bound derived from the per-verb lines.
+> `files_changed_in`), the count printed at each sample. **Sized (run 45330574435, diag 1a3f1079b, ubuntu-latest, 4
+> CPUs, load 1.2 to 2.3, stock svn 1.15.0 built in the job, git-2000.dump made in it):** the whole use test over HTTP
+> took 900.37 s, its verbs about 851 s of it, in seconds per leg:
+> - checkout 78.4 (stock 33.5, slates 37.6);
+> - update 126.4 (54.9, 58.6);
+> - switch 81.7 (36.2, 38.1);
+> - blame 393.0 (308.4, 72.8), most of it revision 1, whose 4,523 added files the rule blames, the later samples 1 to
+>   10 files each;
+> - svnsync 137.4 (67.3, 70.0);
+> - svnrdump's dump 9.1 (2.3, 6.6);
+> - the writing session 15.3 (0.6, 14.7);
+> - info, diff, revprops and log about 10 together.
+>
+> **The bound for git-2000's run is 1,800 s:** twice the slowest whole run measured (2 × 900.37 s on a 4-CPU runner).
+> Past twice that a run is stuck, not slow. It ended with 18 differences, server reds sent to w-svn by main: `info`
+> answered 500 on `/project/!svn/rvr/N/trunk/t` at all 17 samples, and svnrdump's dump differs in one deletion's order.
+> Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
+> w-svn. Since then (main's ruling) blame leaves out a file added without a source, whose blame names its one revision
+> on every line, so revision 1's import is blamed no more; a later sample that changes such a file blames its whole
+> history. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -7691,8 +7801,23 @@
 >   `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (refused 1, then answered). Fleet
 >   leg: `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted`, the successor withholding its
 >   confirmation until its restart. Record: `docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md`.
->   **Still open (harness):** under load 55 to 73 on adacachy2 the scene's setup attach (`write_attachment`) and its
->   single-try reads (`continuity_read`) meet `Overloaded { shard: 1 }`, a retryable refusal neither retries.
+>   **Not the harness (w-chaos, 2026-11-23): the refusal never clears.** A diagnostic build named each site that
+>   refused and printed every node's counters at the scene's end (adacachy2, load 38 to 57, kiln r649). In 4 of 6 runs,
+>   3 of 3 of the A-885 leg and 1 of 3 of this test, every read was refused `Overloaded { shard: 1 }` for the whole of
+>   its 60 s window, 593 to 597 times, and in one run the write's attach was too. Both live coordinators ran 579 to 591
+>   periods a minute meanwhile. The successor's routing names it the volume's owner, but its owner shard holds no
+>   volume and no materialization is pending. So `await_materialization` ends at once and `resolve_and_forward` refuses
+>   again (`fleet.owner_location.owned_unmaterialized` 4,165 to 4,774 a run). Every run restored the volume from the
+>   image and resumed it. Only the failed runs then took it over again after the restart (`fleet.live.taken_over` 1,
+>   `fleet.live.rebuilds_begun` 1). A retry cannot turn these runs green, so round 1's retry was not landed. It also
+>   charged the client's own shard, which counts no periods on a two-shard node, and 3 of its 6 runs failed anyway, two
+>   at `FROZEN_CAP` (304 s) and one at its 900 s timeout. **Open (daemon):** the takeover a restarted successor runs on
+>   its own live volume leaves the owner shard without the volume while the routing names the node its owner.
+>   **FIXED 2026-11-23 (w-chaos; A-890, main's rulings of 22:12 to 22:30).** The cause was the rerun fencing its own
+>   adoption one epoch up through its holders' pages: a holder refused the successor's resumed log as stale, and the
+>   successor marked itself superseded. The adoption is now persisted with its copy (`Acceptor::adopted`, image 35, delta
+>   13), and the rerun settles it at its own epoch; above that epoch it asks by name only. The fleet tests retry
+>   `Overloaded`, charged in the slowest fleet coordinator. Reds: the two daemon tests in A-890.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
@@ -10513,12 +10638,20 @@
 >   suite's record now takes both from `Session::after_run`, which notes each on its own; the live note keeps each
 >   node's whole `live` status line (holders, fence, recorded holders), and the container lane keeps fsstress's output in
 >   its scratch, as the host lane does. Test: `a_record_says_whether_the_daemon_stopped_or_the_fleet_did_not_ship`.
-> - **Open (w-ci, 2026-11-24): the lane still fails after the fix, with one candidate left behind.** Run 45318320246 at
->   1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s fleet wait the
->   owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at 2149. The same
->   shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083). The
->   live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job steps),
->   so it is no regression of that window; the cause is being looked for.
+> - **Closed (w-ci, 2026-11-24, A-889): the lane still failed after the fix, with one candidate left behind.** Run
+>   45318320246 at 1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s
+>   fleet wait the owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at
+>   2149. The same shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083).
+>   The live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job
+>   steps), so it was no regression of that window. Only the FUSE lanes failed (`native-linux-fuse`, and `oci-linux`
+>   over the daemon's FUSE mount). The cause, read from a diagnostic build on adacachy2 pinned to 4 CPUs: the kernel's
+>   `FORGET` of a file unlinked while open came after the run's last publication, reclaimed the orphan with no barrier,
+>   and left the owner's volume unpublished for good; the candidate behind the retained tail was owed an install image,
+>   which the record period made only for a volume with nothing unpublished. The period now publishes such a volume and
+>   the image follows (`live_ship::published_for_image`, counted `fleet.live.image_published`). The lane on adacachy2,
+>   pinned to 4 CPUs: 2 of 12 runs failed before; 0 of 30 after, the period's publication made in 6 of them. Test:
+>   `a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished`. Record:
+>   `docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md`.
 > - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
 >   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
 
@@ -26702,9 +26835,15 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   - Both A-859 tests (`vcs_http`'s and `vcs_ssh`'s, a client that reads late): none of the edge's 63 and 30 writes
     found the socket full, the client's tenth of a liveness window over before the slowed edge had filled it.
     `vcs_ssh`'s had also failed on plain Linux at a load of 35 to 70 on adacachy2, where no slowdown is declared, so a
-    scaled lateness would leave it. **Open, next:** the edges tell the exchange or command when a write first waits,
-    and status counts the writes waiting on a client now; the client reads once one waits (main 01a20182's ruling of
-    2026-11-23 20:08).
+    scaled lateness would leave it. **Fixed (2026-11-23, w-tsan; main 01a20182's ruling (a) of 20:08):** each edge
+    counts a write live from its first pend until it ends or is dropped (`vcs_http.writes_waiting`,
+    `vcs_ssh.writes_waiting` in the status report, readings, not counts) and tells the exchange or the command at that
+    pend (`Exchange::write_waits`, `Command::write_waits`, which the SSH wrappers pass on); each test's client reads
+    nothing until a write waits, then checks every byte. The SSH test's 960 KiB never filled a loopback socket pair whose
+    reader reads nothing (with the gate, no write waited in 20 runs of 20), so it writes 8 MiB, as the HTTP test's reply.
+    On adacachy2 at a load of 45 to 70: the old SSH test 0 of 20 green and the new 20 of 20; the old HTTP test 20 of 20
+    there (it failed under TSan) and the new 20 of 20; with the gate removed the HTTP client, reading at once, saw no
+    write wait in 20 runs of 20, while the SSH client, slower than its edge, still saw one in 20 of 20.
   - `memory_gauges`'s `the_control_shards_memory_status_names_glibcs_bytes_where_glibc_runs`: no `malloc_*` row, since
     the runtime's allocator replaces glibc's and glibc's figures read zero. **Fixed:** the test tells that build by
     `cfg(slates_tsan)` and expects no row there.
@@ -26725,8 +26864,16 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   go before; 81 brought back", file 81's bring-back false. Not a patience: the bring-backs run in one task on the
   shard, whose 60 s wait held. `hg_push::bring_back` answers a bare false for each of four refusals (no such revision,
   no text from the store, nothing taken, no room in the content store), each through `.ok()?`, so nothing says which.
-  **Open:** reproduced first, then a typed refusal passed on through `homes::bring_back_landed`, a counter for each
-  kind (main 01a20182's ruling of 2026-11-23 20:08, §2 item 9).
+  **Fixed (2026-11-23, w-tsan; main 01a20182's rulings of 21:25 and 21:30):** the content store's room, asked inside
+  `lent_state`, where the shard's chunk store, and with it the arena's pool, is the content store's for the step. The
+  step had only the arena's slack, which a publication's give-back (`Store::release_idle`) leaves at 407,277 bytes, so
+  the 49th file of 120 was refused `OverBudget { need: 8192, room: 5869 }`. Plainly 2 runs of 100 on adacachy2 at a load
+  of 47; with a publication pinned before the bring-backs 10 of 10 red, and 10 of 10 green with the room made outside
+  the lend. Six steps asked so (`bring_back`, `bring_back_log`, two `brought_back` sites in `hg_push`, two in
+  `hg_import`), all moved out. Room asked inside a lend is now refused by its own kind at its first put
+  (`ContentRefused::OutOfReach`, counted `vcs_store.room_out_of_reach`), and the bring-back's refusal is typed through
+  `homes::bring_back_landed` and `homes::read` (`BringBackRefused`, `LandedRefused`, `HomeReadRefused`), each kind
+  counted. docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md.
 
 ### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
 CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's

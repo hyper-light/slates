@@ -1099,9 +1099,9 @@ fn append_record(
 /// A revision the server made of a version a work submitted to `repository`'s green (A-664's Subversion objects,
 /// `crate::vcs_store::svn_made`), made while the repository's landing turn `turn` is held: its texts staged as an
 /// import's are ([`stage_texts`], the records keeping none in RAM), checked as an import's is, landed on the node's
-/// store, then committed by `commit` ([`MadeEntry::commit`]: an entry of the register naming it alone, then applied;
-/// [`landed_with`]): in the step that commits the version too (`crate::made_commit`), or alone after a version committed
-/// already (a bare dispatch's). What `commit` answered.
+/// store, then committed by `commit` ([`MadeEntry::guard`], then [`GuardedMade::commit`]: an entry of the register
+/// naming it alone, then applied; [`landed_with`]) in the step that commits the version too
+/// (`crate::made_commit::commit_guarded`). What `commit` answered.
 pub(crate) async fn land_made<T>(
   turn: landing::Turn,
   repository: RepositoryId,
@@ -1170,74 +1170,118 @@ pub(crate) struct MadeEntry {
 }
 
 impl MadeEntry {
-  /// Commits the entry naming the landed changeset ([`commit_made`]): the revision's number.
-  pub(crate) fn commit(self, state: &mut ShardState) -> Result<u64, Uncommitted> {
-    commit_made(state, self.repository, self.reference, self.prepared)
-  }
-}
-
-/// [`land_made`]'s commit: where the records are as its check found them, the reference admitted and the revision's
-/// growth charged, the entry appended as its repository's owner, then the records applied; an apply refused once the
-/// entry recorded it is counted and the records are made again from the store.
-fn commit_made(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  reference: Vec<u8>,
-  prepared: Prepared,
-) -> Result<u64, Uncommitted> {
-  if stamp(state, repository) != prepared.stamp {
-    state.count(DIVERGED, 1);
-    return Err(Uncommitted::Diverged);
-  }
-  let owner = state
-    .db
-    .partition()
-    .repositories()
-    .repository(repository)
-    .map(|record| record.owner.clone())
-    .ok_or(Uncommitted::NotHeld)?;
-  if !crate::vcs_store::lend_svn(state, repository, prepared.brought) {
-    return Err(Uncommitted::NotHeld);
-  }
-  let made = append_made(state, (&owner, repository), (prepared.checked, reference));
-  crate::vcs_store::settle_svn(state, repository);
-  made
-}
-
-/// [`commit_made`]'s entry and apply.
-fn append_made(
-  state: &mut ShardState,
-  (owner, repository): (&Principal, RepositoryId),
-  (checked, reference): (Checked, Vec<u8>),
-) -> Result<u64, Uncommitted> {
-  crate::vcs_store::admit_objects(state, reference.len())
-    .map_err(|available| Uncommitted::Budget { available })?;
-  let growth = grown(&checked);
-  crate::vcs_store::reserve_svn(state, repository, growth)
-    .map_err(|available| Uncommitted::Budget { available })?;
-  let parts = EntryParts {
-    objects: reference,
-    ..EntryParts::default()
-  };
-  match RepositoryLogs::append(state, owner, repository, Vec::new(), parts) {
-    Ok(appended) if appended.recorded => {}
-    Ok(_) => {
-      crate::vcs_store::unreserve_svn(state, repository, growth);
+  /// The guard of the entry's commit (main's ruling of 2026-11-23 20:51, guard-then-apply; `crate::made_commit`'s
+  /// [`commit_guarded`](crate::made_commit::commit_guarded)): everything the entry's commit can refuse, judged before
+  /// anything of the accept applies: the records as the check found them and held here, the reference within what the
+  /// store admits, the register's entry judged as its append judges it, and the records' growth reserved last, so a
+  /// refusal holds nothing. What [`GuardedMade::commit`] appends then cannot be refused.
+  pub(crate) fn guard(self, state: &mut ShardState) -> Result<GuardedMade, Uncommitted> {
+    #[cfg(test)]
+    if REFUSE_MADE_ENTRY.with(|refuse| refuse.replace(false)) {
+      return Err(Uncommitted::Budget { available: 0 });
+    }
+    let MadeEntry {
+      repository,
+      reference,
+      prepared,
+    } = self;
+    if stamp(state, repository) != prepared.stamp {
       state.count(DIVERGED, 1);
       return Err(Uncommitted::Diverged);
     }
-    Err(refused) => {
-      crate::vcs_store::unreserve_svn(state, repository, growth);
-      return Err(Uncommitted::Append(refused));
+    let owner = state
+      .db
+      .partition()
+      .repositories()
+      .repository(repository)
+      .map(|record| record.owner.clone())
+      .ok_or(Uncommitted::NotHeld)?;
+    if state.vcs_stores.subversion_records(repository).is_none() {
+      return Err(Uncommitted::NotHeld);
     }
+    crate::vcs_store::admit_objects(state, reference.len())
+      .map_err(|available| Uncommitted::Budget { available })?;
+    let parts = EntryParts {
+      objects: reference,
+      ..EntryParts::default()
+    };
+    super::push::check_entry(state, repository, &parts).map_err(Uncommitted::Append)?;
+    let growth = grown(&prepared.checked);
+    crate::vcs_store::reserve_svn(state, repository, growth)
+      .map_err(|available| Uncommitted::Budget { available })?;
+    Ok(GuardedMade {
+      repository,
+      owner,
+      parts,
+      prepared,
+      growth,
+    })
   }
-  let revision = checked.revision();
-  let applied = apply_holding(state, repository, checked);
-  if applied != Some(Ok(revision)) {
-    state.count(APPLY_REFUSED, 1);
-    crate::vcs_store::rebuild(state, repository);
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's budget that refuses the next made revision's records growth: [`MadeEntry::guard`] answers `Budget`, as a
+  /// full shard does.
+  pub(crate) static REFUSE_MADE_ENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A made revision's register entry its guard passed ([`MadeEntry::guard`]): the records' growth reserved, the entry
+/// judged. Committed ([`GuardedMade::commit`]) or given back ([`GuardedMade::give_back`]) in the step that guarded it.
+pub(crate) struct GuardedMade {
+  /// The repository.
+  repository: RepositoryId,
+  /// Its owner, whose entry it is.
+  owner: Principal,
+  /// The entry's parts: the reference naming the landed changeset's sequence.
+  parts: EntryParts,
+  /// The revision, checked.
+  prepared: Prepared,
+  /// The records' growth, reserved.
+  growth: u64,
+}
+
+/// Counter: a made revision's entry its guard passed and its append refused all the same, in the same step: zero in
+/// every correct use, as the guard judged it as the append does (`push::check_entry`). The records are made again from
+/// the store. Format: a counter name in the status report.
+pub(crate) const MADE_ENTRY_REFUSED: &str = "vcs.svn.made_entry_refused";
+
+impl GuardedMade {
+  /// Appends the entry as its repository's owner and applies the records, lent what the revision brings: the
+  /// revision's number. Its guard judged everything the append can refuse, in this step; an append refused all the same
+  /// is counted [`MADE_ENTRY_REFUSED`], its reservation given back and the records made again from the store.
+  pub(crate) fn commit(self, state: &mut ShardState) -> u64 {
+    let GuardedMade {
+      repository,
+      owner,
+      parts,
+      prepared,
+      growth,
+    } = self;
+    let revision = prepared.checked.revision();
+    let _ = crate::vcs_store::lend_svn(state, repository, prepared.brought);
+    match RepositoryLogs::append(state, &owner, repository, Vec::new(), parts) {
+      Ok(appended) if appended.recorded => {
+        let applied = apply_holding(state, repository, prepared.checked);
+        if applied != Some(Ok(revision)) {
+          state.count(APPLY_REFUSED, 1);
+          crate::vcs_store::rebuild(state, repository);
+        }
+      }
+      Ok(_) | Err(_) => {
+        crate::vcs_store::unreserve_svn(state, repository, growth);
+        state.count(MADE_ENTRY_REFUSED, 1);
+        crate::vcs_store::rebuild(state, repository);
+      }
+    }
+    crate::vcs_store::settle_svn(state, repository);
+    revision
   }
-  Ok(revision)
+
+  /// Gives back what the guard reserved, its accept refused after it (`made_commit::commit_guarded`).
+  pub(crate) fn give_back(self, state: &mut ShardState) {
+    crate::vcs_store::unreserve_svn(state, self.repository, self.growth);
+  }
 }
 
 /// Applies `checked` to repository `repository`'s records and follows it in the green's held table (S4 c1,

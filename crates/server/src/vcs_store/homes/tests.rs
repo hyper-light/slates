@@ -62,7 +62,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
           continue;
         };
         homes.insert(home_of(&shards, &identity));
-        if read(origin, &shards, identity, budget).await != Some(bytes) {
+        if read(origin, &shards, identity, budget).await != Ok(bytes) {
           outcome.push(format!("window {index} not read back"));
         }
       }
@@ -87,7 +87,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
           outcome.push(format!("window {index} not let go"));
         }
       }
-      if read(origin, &shards, identity, budget).await.is_some() {
+      if read(origin, &shards, identity, budget).await.is_ok() {
         outcome.push("a window kept twice for the region outlived its one let-go".to_owned());
       }
       if let_go_region_at_home(origin, &shards, identity, Some(super::TEST_OWNER), budget)
@@ -99,7 +99,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       for index in 0..WINDOWS {
         if read(origin, &shards, ContentId::of(&window(index)), budget)
           .await
-          .is_some()
+          .is_ok()
         {
           outcome.push(format!("window {index} kept after its last let-go"));
         }
@@ -704,7 +704,7 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
     .expect("an independent file whose window may leave this shard");
   let (before, after, freed) = crate::daemon::observe_at(&daemon, partition, move |state| {
     let (object, _) = super::keep_for_region(state, &bytes, &[super::TEST_OWNER]).unwrap();
-    let before = super::read_here(state, &object).as_deref() == Some(bytes.as_slice());
+    let before = super::read_here(state, &object).as_deref() == Ok(bytes.as_slice());
     let files =
       crate::vcs_store::within_budget(state, (window + independent.len()) as u64, |stores| {
         let content = stores.content_mut().unwrap();
@@ -740,7 +740,7 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
   );
   assert_eq!(
     after,
-    Some(window + 1),
+    Ok(window + 1),
     "the region's object must remain readable after the release of a shared window; {freed} bytes left RAM"
   );
 }
@@ -807,7 +807,7 @@ fn a_segments_texts_that_rank_on_their_shard_are_let_go_at_its_durability() {
   assert!(freed > 0, "the bytes let go counted");
   assert_eq!(
     read.as_deref(),
-    Some(b"an object the region holds here".as_slice()),
+    Ok(b"an object the region holds here".as_slice()),
     "the region's object still read whole from its home"
   );
 }
@@ -977,4 +977,33 @@ fn a_home_message_of_another_version_is_refused_at_once_and_typed() {
   );
   assert_eq!(refused, Some(1), "counted");
   assert_eq!(held, 0, "nothing kept");
+}
+
+/// A recovered region hold is taken only once the region's set can name it (main 01a20182's commit-2 list: a hold taken
+/// first, then given back with its release's refusal dropped, could leave the store's count and the set apart). Do:
+/// keep an object in a content store; borrow the region's set, as a step already holding it would; restore a region hold
+/// of the object. Expect: the hold refused, the object's holders as before (no hold taken that the set could not name);
+/// with the set free, the hold restored and counted in the store. Not driven red: a release of a hold just taken is
+/// never refused, so the old order's dropped refusal cannot be met.
+#[test]
+fn a_region_hold_the_set_cannot_name_is_never_taken_in_the_store() {
+  let mut content = slates_vcs::ContentStore::new(1 << 16, 1 << 8).unwrap();
+  let object = content
+    .put(b"an object a recovery holds for the region")
+    .unwrap();
+  let before = content.holders(&object);
+  let holds = [(object, vec![super::TEST_OWNER])];
+  let borrowed = super::REGION_HELD.with(|region| {
+    let _named = region.borrow_mut();
+    super::restore_region_holds(&mut content, &holds)
+  });
+  assert_eq!(
+    borrowed,
+    (0, vec![object]),
+    "refused while the set is borrowed"
+  );
+  assert_eq!(content.holders(&object), before, "no hold taken unnamed");
+  let free = super::restore_region_holds(&mut content, &holds);
+  assert_eq!(free, (1, Vec::new()), "restored once the set is free");
+  assert_eq!(content.holders(&object), before + 1, "held once more");
 }

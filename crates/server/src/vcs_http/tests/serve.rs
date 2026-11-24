@@ -1,6 +1,6 @@
 use std::io::{Read, Write as _};
 use std::net::TcpStream as ClientStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -127,6 +127,10 @@ const LARGE_RUNS: u32 = 64;
 /// Shape: the bytes of each run of [`LARGE`]'s reply, 128 KiB.
 const LARGE_RUN: usize = 128 << 10;
 
+/// The most writes waiting on their clients the edge counted when an [`Echo`] answering [`LARGE`] heard one wait
+/// ([`Exchange::write_waits`]): set on the shard's thread, read by the client's, which reads nothing until it moves.
+static WAITING_SEEN: AtomicU64 = AtomicU64::new(0);
+
 std::thread_local! {
   /// The writes an [`Echo`] heard ([`Exchange::sent`]), on the shard's thread, which the test's thread runs.
   static SENT: std::cell::RefCell<Vec<crate::vcs_store::upload::Sent>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -196,6 +200,12 @@ impl Exchange for Echo {
   fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
     SENT.with(|log| log.borrow_mut().push(sent));
   }
+
+  fn write_waits(&mut self) {
+    if self.body == LARGE {
+      WAITING_SEEN.fetch_max(super::writes_waiting_here(), Ordering::SeqCst);
+    }
+  }
 }
 
 /// What a test reads of an edge once its client has finished.
@@ -207,6 +217,8 @@ struct Seen {
   serving: usize,
   /// Each phase's completed waits and reaps, in [`PHASES`]' order.
   learned: [(u64, u64); 6],
+  /// The writes still counted waiting on their clients ([`super::WRITES_WAITING`]).
+  writes_waiting: u64,
 }
 
 /// What `state` holds now.
@@ -215,6 +227,7 @@ fn seen(state: &EdgeState) -> Seen {
     counts: state.counts(),
     serving: state.serving(),
     learned: PHASES.map(|phase| state.learned(phase)),
+    writes_waiting: state.writes_waiting(),
   }
 }
 
@@ -270,6 +283,8 @@ where
     .context()
     .keep(EdgeState::new(bounds, identity))
     .expect("the edge's state kept on its shard");
+  // Named this shard's edge, as the daemon's `keep_here` names it, so the shard's readings find it.
+  super::HERE.with(|here| here.set(Some(state)));
   runtime
     .spawn(async move {
       let _ = serve(listener, state, || Echoes).await;
@@ -285,6 +300,7 @@ where
   let seen = state
     .with_in(runtime.context(), seen)
     .expect("the edge's state");
+  super::HERE.with(|here| here.set(None));
   (result, seen)
 }
 
@@ -768,6 +784,35 @@ fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fail
   );
 }
 
+/// Whether the edge counts a write waiting on its client within `for_ns` ([`WAITING_SEEN`]), looked at every
+/// [`TICK_NS`].
+fn a_write_waits_within(for_ns: u64) -> bool {
+  let until = Instant::now() + Duration::from_nanos(for_ns);
+  while WAITING_SEEN.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+    std::thread::park_timeout(Duration::from_nanos(TICK_NS));
+  }
+  WAITING_SEEN.load(Ordering::SeqCst) > 0
+}
+
+/// The body of the chunked reply `reply`: its head, then each chunk's size line, bytes and line end, to the last chunk;
+/// none where its framing is not whole.
+fn dechunked(reply: &[u8]) -> Option<Vec<u8>> {
+  let head_end = reply.windows(4).position(|end| end == b"\r\n\r\n")?;
+  let mut rest = reply.get(head_end + 4..)?;
+  let mut body = Vec::new();
+  loop {
+    let line_end = rest.windows(2).position(|end| end == b"\r\n")?;
+    let size = core::str::from_utf8(rest.get(..line_end)?).ok()?;
+    let size = usize::from_str_radix(size.split(';').next()?.trim(), 16).ok()?;
+    rest = rest.get(line_end + 2..)?;
+    if size == 0 {
+      return Some(body);
+    }
+    body.extend_from_slice(rest.get(..size)?);
+    rest = rest.get(size + 2..)?;
+  }
+}
+
 /// Whether [`SAW_ITS_CLIENT_GO`] is marked within `for_ns`, looked at every [`TICK_NS`].
 fn marked_within(for_ns: u64) -> bool {
   let until = Instant::now() + Duration::from_nanos(for_ns);
@@ -796,21 +841,25 @@ fn a_service_answering_after_the_body_learns_its_client_has_gone() {
 }
 
 /// A-859 part A (main 01a20182's ruling of 2026-11-22 06:32: a link's price learned from the time the edge's writes
-/// waited for the peer, from the first write that found the socket full). Do: ask for [`LARGE`]'s reply, 8 MiB, and
-/// wait a tenth of a liveness window before reading it all. Expect: the exchange hears every write of its reply but its
-/// last run's, written after the exchange is let go, their bytes within a run of the reply's; some found the socket full and waited, the first of them after writes that
-/// did not, which a buffer with room takes at once; and what a fetch's pacing learns from them, the bytes from that
-/// first wait on, is past a MiB.
+/// waited for the peer, from the first write that found the socket full), the client's late read gated on the edge's own
+/// word (main 01a20182's ruling (a) of 2026-11-23 20:08). Do: ask for [`LARGE`]'s reply, 8 MiB, and read nothing until
+/// the edge counts a write waiting on the client ([`super::WRITES_WAITING`], told to the exchange,
+/// [`Exchange::write_waits`]); then read it all. Expect: a write counted waiting before the client read a byte; the reply
+/// read whole, every byte its runs'; the exchange hears every write of its reply but its last run's, written after the
+/// exchange is let go; some found the socket full and waited, the first of them after writes that did not, which a
+/// buffer with room takes at once; what a fetch's pacing learns from them, the bytes from that first wait on, past a MiB;
+/// and no write counted waiting once the reply has ended. Red before: the client read a tenth of a liveness window late,
+/// which the TSan lane's slowed edge outlasted before its socket filled (diag run 45315777446: no write waited).
 #[test]
 fn a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each_write() {
   SENT.with(|log| log.borrow_mut().clear());
-  let (read, _) = served(TWO_SEATS, None, |address| {
+  WAITING_SEEN.store(0, Ordering::SeqCst);
+  let ((gated, read), seen) = served(TWO_SEATS, None, |address| {
     let mut stream = connect(address);
     stream.write_all(&post(LARGE, true)).expect("the request");
-    // The client reads late on purpose, so the edge's writes meet a full socket; the edge under test waits on its drivers.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(MOMENT_NS));
-    read_until(&mut stream, LAST_CHUNK)
+    // Nothing is read until the edge says a write waits on this client, however slowly the edge runs.
+    let gated = a_write_waits_within(PATIENCE_NS);
+    (gated, read_until(&mut stream, LAST_CHUNK))
   });
   let sent = SENT.with(|log| log.borrow().clone());
   let reply = u64::from(LARGE_RUNS) * u64::try_from(LARGE_RUN).unwrap();
@@ -822,7 +871,20 @@ fn a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each
     .filter_map(|sent| pacing.sent(*sent))
     .map(|(_, bytes)| bytes)
     .sum();
-  assert!(read.ends_with(LAST_CHUNK), "the reply read whole");
+  let body = dechunked(&read).unwrap_or_default();
+  assert!(
+    gated,
+    "a write counted waiting before the client read a byte"
+  );
+  assert_eq!(
+    u64::try_from(body.len()).unwrap(),
+    reply,
+    "the reply read whole"
+  );
+  assert!(
+    body.iter().all(|byte| *byte == b'x'),
+    "every byte its runs'"
+  );
   assert!(
     written.saturating_add(u64::try_from(LARGE_RUN).unwrap()) >= reply,
     "{written} written of a {reply}-byte reply"
@@ -832,4 +894,8 @@ fn a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each
     "a write waited for the client: {sent:?}"
   );
   assert!(learned > 1 << 20, "learned {learned} bytes");
+  assert_eq!(
+    seen.writes_waiting, 0,
+    "no write counted waiting once the reply ended"
+  );
 }

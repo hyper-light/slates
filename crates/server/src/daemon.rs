@@ -5152,6 +5152,7 @@ async fn init_shard(
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
     materializations: crate::green_ready::Materializations::default(),
+    replica_builds: crate::replica_build::ReplicaBuilds::default(),
     hg_tags: crate::vcs_store::hg_tags::HgTags::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
@@ -5299,6 +5300,7 @@ async fn init_shard(
     fenced_greens: std::collections::BTreeMap::new(),
     vcs_disk: config.vcs_disk.clone(),
     family_reserved_through: 0,
+    vcs_replica_records: crate::vcs_store::ReplicaRecords::new(),
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),
@@ -8432,7 +8434,11 @@ mod tests {
     assert!(records.len() > 1, "a record for each window: {records:?}");
     assert_eq!(gone, records.len(), "every recorded window let go");
     assert_eq!(restored, records, "each record taken back as it was");
-    assert!(read == Some(bytes), "the pack read whole after the restart");
+    assert!(
+      read.as_ref() == Ok(&bytes),
+      "the pack read whole after the restart: {:?}",
+      read.err()
+    );
   }
 
   /// Goal 93 item 2b(b), Mercurial's half of the seam (w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43: an hg
@@ -9842,11 +9848,14 @@ mod tests {
   /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
   /// 2026-11-18): the pair's canonical dialer keeps contact with a peer that holds a record session it dialed to it, and
   /// only the canonical dialer does. Do: make this node a non-voting member of seven at `f = 1`, scatter three, all held
-  /// alive, and take a member its role rule drops (no neighbour, no holder, no voter); learn that member under an anchor
-  /// above this node's and then below, each with no session it dialed here and with one. Expect `Dialed`, kept, only
-  /// with the session and this node the lower anchor (the pair's canonical dialer); `OutsideNeighbourhood`, dropped,
-  /// otherwise, so two nodes never keep each other by their sessions alone. Before, the learner in the flake, the pair's
-  /// lower anchor and told stale voters, dropped a voter that kept it, and the pair's plane was never keyed.
+  /// alive, one of them a member its role rule drops (no neighbour, no holder, no voter), made so from the rule itself:
+  /// two members this node's neighbourhood draw ranks above it and two that its own draw ranks above this node; learn
+  /// that member under an anchor above this node's and then below, each with no session it dialed here and with one.
+  /// Expect `Dialed`, kept, only with the session and this node the lower anchor (the pair's canonical dialer);
+  /// `OutsideNeighbourhood`, dropped, otherwise, so two nodes never keep each other by their sessions alone. Before, the
+  /// learner in the flake, the pair's lower anchor and told stale voters, dropped a voter that kept it, and the pair's
+  /// plane was never keyed. Until 2026-11-24 the six were drawn from this node's host id and searched for such a member,
+  /// and in about 1 run of 60 the rule kept all six (1 of 60 on adacachy2; CI's Windows runner, run 45328569758).
   #[test]
   fn the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it() {
     use slates_cluster::config_group::RegionalCouncil;
@@ -9855,8 +9864,29 @@ mod tests {
     use slates_db::register::{HostId, Quorum, RegionId};
     let (dropped, readings) = audit_on_shard(|state| {
       let local = state.fleet.host();
-      let others: Vec<HostId> = (1..=6u64).map(|n| HostId(local.0 ^ (n << 16))).collect();
-      let voter = others[0];
+      let candidate = |n: u64| HostId(local.0 ^ (n << 16));
+      let (voter, outside) = (candidate(1), candidate(2));
+      // Whether `owner`'s neighbourhood draw (`select_neighbourhood`: the owner and its highest-ranked members, scatter
+      // in all) ranks `a` above `b`.
+      let ranks_above = |owner: HostId, a: HostId, b: HostId| {
+        slates_db::register::select_neighbourhood(owner, &[a, b], 2) == [owner, a]
+      };
+      // At scatter three a neighbourhood is its owner and the two members it ranks highest, so two members ranked above
+      // `outside` by this node keep it out of this node's neighbourhood, and two ranked above this node by `outside` keep
+      // this node out of its: more members only push both further down.
+      let above_outside: Vec<HostId> = (3..)
+        .map(candidate)
+        .filter(|member| ranks_above(local, *member, outside))
+        .take(2)
+        .collect();
+      let above_local: Vec<HostId> = (3..)
+        .map(candidate)
+        .filter(|member| !above_outside.contains(member) && ranks_above(outside, *member, local))
+        .take(2)
+        .collect();
+      let mut others = vec![voter, outside];
+      others.extend_from_slice(&above_outside);
+      others.extend_from_slice(&above_local);
       let mut all = vec![local];
       all.extend_from_slice(&others);
       state.council = RegionalCouncil::new(
@@ -9877,13 +9907,10 @@ mod tests {
       for peer in &others {
         slates_cluster::fleet::apply_peer_state(&mut state.fleet, *peer, Some(alive));
       }
-      let Some(peer) = others
-        .iter()
-        .copied()
-        .find(|peer| crate::fleet::direct_contact_reason(state, *peer) == "OutsideNeighbourhood")
-      else {
+      if crate::fleet::direct_contact_reason(state, outside) != "OutsideNeighbourhood" {
         return (None, Vec::new());
-      };
+      }
+      let peer = outside;
       let origin = state.origin_anchor;
       let mut readings = Vec::new();
       for anchor in [
@@ -11353,6 +11380,254 @@ mod tests {
       (refused, answered),
       (0, vec![adopted_at]),
       "the rerun's question by name is answered with this node's adoption, never refused as its own"
+    );
+  }
+
+  /// [`retire_a_named_owner_of_a_held_record`] for several objects at once: each held here at position 0 under the
+  /// retired owner's authority before the takeover. The retired member and the third.
+  fn retire_the_owner_of_held_objects(
+    state: &mut crate::state::ShardState,
+    objects: &[slates_db::register::ObjectId],
+  ) -> (slates_db::HostId, slates_db::HostId) {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Quorum, Record};
+    let local = state.fleet.host();
+    let (departed, third) = (
+      slates_db::HostId(local.0 ^ 1),
+      slates_db::HostId(local.0 ^ 2),
+    );
+    state.council = RegionalCouncil::new(
+      local,
+      vec![local, departed, third],
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    install_council(state);
+    let generation = state.fleet.configuration().version;
+    for object in objects {
+      let mut acceptor = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: departed,
+        },
+      );
+      acceptor
+        .accept(&Record {
+          owner: departed,
+          object: *object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(*object, acceptor);
+      state.fleet.track_object_owner(*object, departed);
+    }
+    assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+    install_council(state);
+    crate::takeover::resolve_held_objects(state, local);
+    (departed, third)
+  }
+
+  /// Adopts `object` here as `departed`'s takeover round does at `epoch` (`takeover::adopted_acceptor`, its record
+  /// accepted here as the commit accepts it first), then restarts warm: writes the held image, drops the acceptors, the
+  /// routing and the round, which lived in memory, and restores them. Whether the restored acceptor equals the one written,
+  /// whole, its adoption record too (the recovery oracle).
+  fn adopt_then_restart_warm(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+    departed: slates_db::HostId,
+    epoch: slates_db::register::HostEpoch,
+  ) -> bool {
+    use slates_db::register::MovedFrom;
+    let local = state.fleet.host();
+    let adopted = state
+      .holder_records
+      .get(&object)
+      .and_then(|acceptor| acceptor.highest_accepted(object))
+      .unwrap();
+    let from = state
+      .council
+      .configuration()
+      .retirement_version(departed)
+      .map(|retired_at| MovedFrom {
+        owner: departed,
+        retired_at,
+      });
+    let (mut acceptor, _, _, record, _) =
+      crate::takeover::adopted_acceptor(state, object, adopted, (epoch, from), local);
+    acceptor.accept(&record).unwrap();
+    let written = acceptor.to_persisted();
+    state.holder_records.insert(object, acceptor);
+    let image = crate::content_holder::held_image(state);
+    let held: Vec<slates_db::register::ObjectId> = state.holder_records.keys().copied().collect();
+    state.holder_records.clear();
+    state.host_takeovers.clear();
+    for object in &held {
+      state.fleet.forget_object(*object);
+      state.departed_owners.remove(object);
+    }
+    let held_count = held.len();
+    let held = crate::content_holder::split_held(&image).unwrap();
+    assert_eq!(
+      crate::content_holder::restore_held_registers(state, local, held),
+      held_count
+    );
+    state
+      .holder_records
+      .get(&object)
+      .is_some_and(|restored| restored.to_persisted() == written)
+  }
+
+  /// A-890 (main 01a20182's ruling of 2026-11-23 on the rerun's second takeover): a successor restarted warm after it
+  /// adopted every object falling to it settles them in the round it runs again, at the adoption's epoch, never above it.
+  /// Do: make this node the successor of a held object of a retired member, adopt it at epoch 2 and restart warm
+  /// ([`adopt_then_restart_warm`]); then begin the round again (`takeover::begin_round`). Expect the restored acceptor
+  /// equal to the one written, the adoption counted settled once, and every question the round asks at epoch 2, so no
+  /// holder's fence for the object rises above the epoch its successor writes under. Before, the rerun counted its own
+  /// adoption's record and asked at 3: a holder fenced there refused the successor's log as stale, the successor marked
+  /// itself superseded, and every read through it was refused `Overloaded` (4 of 6 runs on adacachy2, 2026-11-23).
+  #[test]
+  fn a_successor_restarted_warm_settles_what_it_adopted_at_its_adoptions_epoch() {
+    use slates_db::register::{HostEpoch, ObjectId};
+    let (restored_whole, settled, epochs) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let (object, departed) = (1..=u8::MAX)
+        .find_map(|byte| {
+          let object = ObjectId([byte; 16]);
+          state.holder_records.clear();
+          let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+          (successor == local).then_some((object, departed))
+        })
+        .unwrap();
+      let restored_whole = adopt_then_restart_warm(state, object, departed, HostEpoch(2));
+      let requests = crate::takeover::begin_round(state, departed, local).unwrap_or_default();
+      let settled = state
+        .refusals
+        .get("fleet.takeover.settled")
+        .copied()
+        .unwrap_or(0);
+      let epochs: Vec<u64> = requests
+        .iter()
+        .map(|(_, prepare)| prepare.epoch.0)
+        .collect();
+      (restored_whole, settled, epochs)
+    });
+    assert!(
+      restored_whole,
+      "the warm restart restores the adopted acceptor whole, its adoption record too"
+    );
+    assert_eq!(settled, 1, "the rerun settled the adoption by its record");
+    assert!(
+      !epochs.is_empty() && epochs.iter().all(|epoch| *epoch == 2),
+      "every question the rerun asks is at the adoption's epoch 2: {epochs:?}"
+    );
+  }
+
+  /// A-890, the partial case: a successor restarted warm after adopting only some of the objects falling to it pages at
+  /// the adoption's epoch, adopts nothing there, and goes above by name only, for the objects it did not settle. Do: make
+  /// this node the successor of two held objects of a retired member, adopt one at epoch 2 and restart warm; begin the
+  /// round; fold the third member's whole page listing both; judge what may be adopted (`takeover::adoptable`); begin the
+  /// round again. Expect the first questions at epoch 2 with no name, nothing adopted there, the second questions at
+  /// epoch 3 naming the unsettled object alone, and the settled copy's own fence still 2. Before, the rerun went above
+  /// at once and paged there, and every page promised the settled copy at 3, fencing it above its successor's writes.
+  #[test]
+  fn a_successor_restarted_warm_after_adopting_part_asks_above_by_name_only_for_the_rest() {
+    use slates_db::register::{HostEpoch, HostPromise, ObjectId};
+    let (below, adopted_there, above, settled_fence, unsettled) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let candidates: Vec<ObjectId> = (1..=u8::MAX).map(|byte| ObjectId([byte; 16])).collect();
+      let (departed, third) = retire_the_owner_of_held_objects(state, &candidates);
+      let mut mine = candidates
+        .iter()
+        .copied()
+        .filter(|object| state.fleet.object_owner(*object) == Some(local));
+      let (adopted, unsettled) = (mine.next().unwrap(), mine.next().unwrap());
+      let others: Vec<ObjectId> = state
+        .holder_records
+        .keys()
+        .copied()
+        .filter(|object| *object != adopted && *object != unsettled)
+        .collect();
+      for object in others {
+        state.holder_records.remove(&object);
+      }
+      assert!(adopt_then_restart_warm(
+        state,
+        adopted,
+        departed,
+        HostEpoch(2)
+      ));
+      let below = crate::takeover::begin_round(state, departed, local).unwrap_or_default();
+      let generation = state.fleet.configuration().version;
+      let entries: Vec<_> = [adopted, unsettled]
+        .into_iter()
+        .map(|object| {
+          let highest = state
+            .holder_records
+            .get(&object)
+            .and_then(|acceptor| acceptor.highest_accepted(object))
+            .unwrap();
+          (object, highest)
+        })
+        .collect();
+      let page = HostPromise {
+        holder: third,
+        departed,
+        epoch: HostEpoch(2),
+        generation,
+        entries,
+        next: None,
+        fenced: None,
+        unpromised: 0,
+        nothing: Vec::new(),
+      };
+      crate::takeover::fold_answers(state, departed, vec![(third, page, false)]);
+      let ready = crate::takeover::ready_objects(state, departed, local);
+      let adopted_there = crate::takeover::adoptable(state, departed, local, ready).len();
+      let above = crate::takeover::begin_round(state, departed, local).unwrap_or_default();
+      let settled_fence = state
+        .holder_records
+        .get(&adopted)
+        .map(|acceptor| acceptor.fence());
+      let questions = |requests: Vec<(slates_db::HostId, slates_db::register::HostPrepare)>| {
+        requests
+          .into_iter()
+          .map(|(_, prepare)| (prepare.epoch.0, prepare.named))
+          .collect::<Vec<_>>()
+      };
+      (
+        questions(below),
+        adopted_there,
+        questions(above),
+        settled_fence,
+        unsettled,
+      )
+    });
+    assert!(
+      !below.is_empty()
+        && below
+          .iter()
+          .all(|(epoch, named)| *epoch == 2 && named.is_empty()),
+      "the rerun pages at the adoption's epoch 2: {below:?}"
+    );
+    assert_eq!(adopted_there, 0, "nothing is adopted at the settled epoch");
+    assert!(
+      !above.is_empty()
+        && above
+          .iter()
+          .all(|(epoch, named)| *epoch == 3 && *named == vec![unsettled]),
+      "above it, the rerun asks by name only, for the unsettled object alone: {above:?}"
+    );
+    assert_eq!(
+      settled_fence,
+      Some(HostEpoch(2)),
+      "the settled copy's own fence stays at the epoch its successor writes under"
     );
   }
 

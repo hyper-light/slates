@@ -141,3 +141,21 @@ fn publish_appended_variants() {
   #[allow(clippy::disallowed_methods)]
   std::fs::write(path, text).expect("tests/wire_order.txt is writable");
 }
+
+/// Goal 93 (golden vector; main's ruling of 2026-11-23 20:40): do encode `Refusal::RecordedSubmitRequired` naming
+/// Subversion, as a completion record keeps a reply unframed. Expect its recorded bytes, the refusal's tag 85 and the
+/// tool's 2, each four bytes little-endian, and the same refusal decoded back: a restarted daemon answers a retried
+/// dispatch with the refusal it recorded.
+#[test]
+fn the_recorded_submit_required_refusal_is_its_golden_vector() {
+  let refusal = Refusal::RecordedSubmitRequired {
+    tool: VcsTool::Subversion,
+  };
+  let bytes = refusal.to_bytes();
+  let recorded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  assert_eq!(
+    recorded, "5500000002000000",
+    "the golden vector changed: a protocol change"
+  );
+  assert_eq!(Refusal::from_bytes(&bytes).unwrap(), refusal);
+}
