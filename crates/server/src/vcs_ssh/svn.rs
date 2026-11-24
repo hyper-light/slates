@@ -492,6 +492,12 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     if !self.connection.fetching() {
       self.fetched = None;
     }
+    // A refusal the commit's drive answered, named in the daemon's log: the client is told Subversion's words alone.
+    if let Some(refused) = self.connection.take_drive_refused() {
+      slates_machine::log_line!(
+        "slates-server: a Subversion commit's drive refused over SSH: {refused}"
+      );
+    }
     // The bases a commit brought back are its own: given back once none is under way (landed, refused or aborted).
     if matches!(
       self.connection.waiting(),

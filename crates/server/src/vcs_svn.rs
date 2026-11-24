@@ -947,6 +947,12 @@ async fn follow(
       land(stream, conversation, *work, out).await
     }
   };
+  // A refusal the commit's drive answered, named in the daemon's log: the client is told Subversion's words alone.
+  if let Some(refused) = conversation.connection.take_drive_refused() {
+    slates_machine::log_line!(
+      "slates-server: a Subversion commit's drive refused over svn://: {refused}"
+    );
+  }
   // The bases a commit brought back are its own: given back once none is under way (landed, refused or aborted).
   if matches!(
     conversation.connection.waiting(),
