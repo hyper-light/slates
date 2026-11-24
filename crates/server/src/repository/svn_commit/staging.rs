@@ -182,6 +182,37 @@ fn admission_charge(revision: &Revision) -> u64 {
     .saturating_add(stored_bytes(revision))
 }
 
+/// Counter: a slice of an import batch's landing tail ([`Staging::land`]): the green's held table followed and the
+/// batch's texts given back, each a slice of the shard's budget a step; more than one a landing shows its tail was
+/// sliced. Format: a counter name in the daemon's status report.
+pub(crate) const TAIL_SLICES: &str = "repository.svn_commit.landing_tail_slices";
+
+/// Where a slice of the shard's step budget begun now ends, on its clock.
+fn slice_deadline_ns() -> u64 {
+  slates_rt::futures::now_ns().saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0))
+}
+
+/// Gives back the landing's hold of each of `put` from `at`, and lets its windows go, until the shard's clock passes
+/// `deadline_ns`, at least one: durable on the node's store since the changeset landed, RAM holds nothing of the batch's
+/// texts, the green's holds keep their entries (A-760 (b) 4d, main's (B)). `at` moved past those given back; whether
+/// every one is.
+fn give_back_put_some(
+  state: &mut ShardState,
+  put: &[ContentIdentity],
+  (at, deadline_ns): (&mut usize, u64),
+) -> bool {
+  while let Some(text) = put.get(*at) {
+    *at = at.saturating_add(1);
+    let one = core::slice::from_ref(text);
+    super::release_texts(state, None, one);
+    crate::vcs_store::name_holds::let_go_landed_texts(state, one);
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      break;
+    }
+  }
+  *at >= put.len()
+}
+
 /// An import's revisions staged since its last landing (module docs).
 pub(crate) struct Staging {
   /// The repository's landing turn, held for the batch's life.
@@ -353,6 +384,10 @@ impl Staging {
     };
     // Kept for the next batch, where this one has no room for it.
     let kept = revision.clone();
+    // The staging step is a step of its own, never the tail of the texts' last put (goal 93: a revision of 9,000 files
+    // put its texts' last slice and staged in one poll of 952 ms on a debug build). The brought texts are held across
+    // the yield, and the landing turn keeps every other commit out.
+    slates_rt::futures::yield_now().await;
     let staged = crate::state::with_state(|state| {
       let staged = self.stage_in(state, repository, (revision, plans));
       super::release_texts(state, None, &brought_texts);
@@ -561,31 +596,53 @@ impl Staging {
     };
     // The batch is the register's now: its versions applied to the green a slice a turn (`RecordedBatch`), the
     // landing turn and the import's read gate held until the last; a kill between slices recovers from the record.
+    // Each slice a step of its own, the first apart from the commit, the tail apart from the last (goal 93: a revision
+    // of 9,000 files applied its last slice and ran the tail in one poll of 833 ms on a debug build).
     let mut slices = 0usize;
     loop {
       #[cfg(test)]
       kill_at_commit_slice_where_set(slices).await;
+      slates_rt::futures::yield_now().await;
       if crate::state::with_state(|state| recorded.apply_slice(state))?.is_some() {
         break;
       }
       slices = slices.saturating_add(1);
-      slates_rt::futures::yield_now().await;
     }
+    slates_rt::futures::yield_now().await;
+    let green = self.green;
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, cause);
-      let green = self.green;
       crate::merge_service::checkpoint_green(state, green);
       super::fold_to_readers(state, green);
-      let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)
-        .into_iter()
-        .map(|(path, identity)| (identity, path))
-        .collect();
-      crate::vcs_store::svn_texts::follow(state, green, &self.released, &holding);
-      super::release_texts(state, None, &self.put);
-      // Durable on the node's store since the changeset landed: RAM holds nothing of the batch's texts, the green's
-      // holds keep their entries (A-760 (b) 4d, main's (B)).
-      crate::vcs_store::name_holds::let_go_landed_texts(state, &self.put);
+    })?;
+    // The tail's per-text work a slice of the shard's budget a step, counted (goal 93: a revision of 9,000 files ran its
+    // tail in one step of 580 ms on a debug build): the green's held table follows the batch, then the batch's texts
+    // are given back and let go.
+    let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)
+      .into_iter()
+      .map(|(path, identity)| (identity, path))
+      .collect();
+    let mut at = 0usize;
+    while !crate::state::with_state(|state| {
+      state.count(TAIL_SLICES, 1);
+      crate::vcs_store::svn_texts::follow_some(
+        state,
+        green,
+        (&self.released, &holding),
+        (&mut at, slice_deadline_ns()),
+      )
+    })? {
+      slates_rt::futures::yield_now().await;
+    }
+    let mut at = 0usize;
+    while !crate::state::with_state(|state| {
+      state.count(TAIL_SLICES, 1);
+      give_back_put_some(state, &self.put, (&mut at, slice_deadline_ns()))
+    })? {
+      slates_rt::futures::yield_now().await;
+    }
+    crate::state::with_state(|state| {
       self.put.clear();
       if let Some(turn) = self.turn.take() {
         turn.give_back(state);

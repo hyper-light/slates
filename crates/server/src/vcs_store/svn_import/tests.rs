@@ -982,8 +982,9 @@ fn t_c2c_a_large_batch_is_applied_a_slice_at_a_time() {
 /// more. A replay's read plan was cubic in them (A-887 part 3's `Increment::replay_reads`): 3,000 held the shard past
 /// its window in the batch's first apply. The staging step's judge and commit were quadratic in them (each file's run
 /// found by a walk of every run, each file's run counted against every other's, each place searched among every
-/// whole's): 6,000 held the shard 1,511 ms in that one step.
-const WIDE_REVISION_FILES: usize = 6000;
+/// whole's): 6,000 held the shard 1,511 ms in that one step. Its apply measured the post-state a file at a time and
+/// each section ran on into the next in one poll: 9,000 held it 1,208 ms.
+const WIDE_REVISION_FILES: usize = 9000;
 
 /// Shape: each wide file's bytes, a source file's (about 1 KiB): a text the content store names (A-760).
 const WIDE_TEXT_BYTES: usize = 1024;
@@ -995,16 +996,17 @@ const WIDE_TEXT_BYTES: usize = 1024;
 /// cubic `Increment::replay_reads`) in one poll, and the watchdog ended the process (3,480 ms against its 3,480 ms
 /// window); green since 5606962eb made the plan n log n. Red again at 6,000 files at a0c46b705: the staging step's
 /// judge and commit (`Green::sole_runs`, `alone`, the wholes' and names' searches) took 1,511 ms against the 1,000 ms
-/// window (debug); 592 ms once each is a lookup.
+/// window (debug); 592 ms once each is a lookup. Red again at 9,000 files at 42589bb44: 1,208 ms, the apply's
+/// `Post::len` a walk of every run a file and the staging step and the tail each run on with the section before them in
+/// one poll; 473 ms once the post-state's runs are indexed (`RunTable`) and each section yields first.
 #[test]
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
-  let (loaded, longest_ns, window_ns) = stored(|| async move {
+  // Made before the shard's history begins: the fixture's own work is no step of the import's.
+  let dump = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
+  let (loaded, longest_ns, window_ns, tail_slices) = stored(move || async move {
     let (svn, _green) = subversion("wide-revision").await;
-    let (loaded, _turns) = imported(
-      svn,
-      wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false)),
-    )
-    .await;
+    let (loaded, _turns) = imported(svn, dump).await;
+    let tail_slices = on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
     let shard = slates_rt::registry::current_shard().expect("on a shard");
     let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
       .expect("the shard's entry");
@@ -1012,9 +1014,12 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
       loaded.map(|loaded| loaded.youngest),
       longest_ns,
       crate::watchdog::own_window_ns(),
+      tail_slices,
     )
   });
   assert_eq!(loaded, Ok(1));
+  // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
+  assert!(tail_slices > 2, "the tail took {tail_slices} slice(s)");
   assert!(
     longest_ns < window_ns,
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"

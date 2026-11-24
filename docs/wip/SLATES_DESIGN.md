@@ -63238,6 +63238,32 @@ Applied in the same change to: `crates/server/src/live_ship.rs`, `crates/server/
 Applied in the same change to: `crates/server/src/fleet.rs` (`owed_state_log_parts`), `crates/server/tests/fleet.rs`,
 GAPS.
 
+### A-906 — The content pool's free room is counted once a generation of the pool, not at every lend (2026-11-24, w-git for main 01a20182, its rulings of 2026-11-24 10:56 and 11:27; goal 93's clone, gate r935; A-98, A-848, A-853, A-789; CLAUDE.md §3's hot atomics)
+
+- **What was there.** Every lend of a shard's stores, a read's too, sets the content store's budget to all the shard
+  could admit now (`vcs_store::lend`, `Store::admittable`), and that counts the pool's free room
+  (`ContentPool::available`) by reading every candidate extent's owner word in the anchor segment. A fetch lends once a
+  write step: in gate r935's clone of git/git, 3,516 of 24,971 samples (`ExtentSource::available`,
+  `SparseObject::atomic_u64`).
+- **The change.** The anchor segment's pool region gains one generation word (layout 20, an older segment refused
+  typed), on a 128-byte line of its own past the want words, moved by every claim and release of an extent that wins
+  its compare-and-swap (`AnchorSegment::pool_moved`). Each shard's pool keeps its last full count with the generation,
+  its hold's openness and (Windows) the process's count of extent readiness moves it was taken at, and counts again in
+  full only when one of them moved; the generation is read before the count and moved after the owner word, so a kept
+  count never outlives a claim it missed.
+- **Why not a free-bytes word** (main's first shape). Two words cannot move in one compare-and-swap, the extents'
+  lengths are the server's, and a crash between the swap and the add would leave the count short until a recount,
+  which at a daemon's start races other shards' claims. A generation never needs a recount: a count is always a full
+  scan, kept while nothing moved.
+- **Evidence.** `slates-anchor` `a906_the_pool_generation_moves_at_each_claim_and_release_that_wins_and_no_other`;
+  `slates-server` `content_pool::tests::a906_the_pools_room_equals_a_full_count_after_every_move_and_is_kept_between`
+  (after a claim, a give-back, another partition's claim through its own mapping, a hold move, the hold opened and
+  closed, and their give-back: the answer equals a full count each time; the kept count answered between, its skipped
+  count moved). The time saved is main's to measure.
+
+Applied in the same change to: `crates/anchor/src/{layout,segment}.rs`, `crates/anchor/tests/anchor.rs`,
+`crates/server/src/{content_pool,content_extents_windows}.rs`.
+
 ### A-907 — Every broadcast's stragglers end on their links: settled by their caller, or handed back when dropped; a home message is served on its own task (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 11:49; gate 10; fixes what A-902 exposed in A-724 piece 8c's exchange and the healer)
 
 - **Why.** Gate 10 (v3_takeover at d48863ddb, 31 of 31 runs): after the owner's death no survivor took the repository

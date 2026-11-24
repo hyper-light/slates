@@ -4543,8 +4543,16 @@
 > `merge.recovery.branches_after_source`, its works through `work_home.unbuilt`), is rebuilt over it once it is
 > re-adopted (`verbs::begin_waiting_branches`, stepped by `green_adopt::readopt_with`), and is fenced with it if it is
 > fenced, or at the boot's end if still waiting (w-perf, 2026-11-24, main's item (2) of 08:52; red
-> `a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it`: fenced `SourceUnavailable`). Owed: a green
-> taken over onto a new owner records no membership (`adopt_taken_over_green`), so `hg_made` makes no changeset over it. (c) a Mercurial
+> `a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it`: fenced `SourceUnavailable`). A submit over a
+> green whose repository a takeover adopted but has not yet rebuilt (`ShardState::pending_repositories`; no membership
+> joined here yet) is refused `Overloaded`, retryable, counted `merge.made.unbuilt` and logged once a repository
+> (`made_commit::Taken::Unbuilt`; w-perf, 2026-11-24, main's (a) of 09:46): before, it was taken for no repository's
+> green and committed with no commit, revision or changeset made of it. Reds for each tool, each committing bare with
+> the fix out; Mercurial's and git's resend after the rebuild lands. Owed by A-636 part 2c-2 ("the store's objects
+> rebuilt by content identity"), w-perf's next piece: a rebuilt store holds none of its objects, so after a successor's
+> rebuild a Mercurial made changeset lacks its parent's texts (the red keeps them), and a Subversion store made again
+> from its records on one node is refused `Unlanded`, its resend `NotNext`
+> (`svn_commit::tests::a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refused`'s doc). (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
