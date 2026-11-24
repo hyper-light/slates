@@ -18900,7 +18900,12 @@ Every run: oracle failures 0, refusals 0, lost 0.
   MB, and the test's ratio (131 of 231) at most, 9.6 MB. The push's own rerun reads it (owed with w-hg's cuts').
 - **Bound.** 3 × 64 bytes a window (`RECORD_BYTES_A_WINDOW`): an entry of 64 bytes, a B-tree's leaves at least 5 of 11
   full and handles put in order, its inner nodes about a sixth more.
-- **Found beside it, not changed here.** The chunk store's record table grows a segment at a time, to its derived bound
-  (`max_chunks`, reserve over granule), but its segment is `min(max_chunks, page)` records: a page's byte count taken as
-  a record count, with no derivation. So a shard's first chunk makes 16,384 records at once on a 16 KiB page (about
-  2.2 MB) and 4,096 on a 4 KiB page (557 KB). Sent to main.
+- **Found beside it, then fixed (main's (1)).** The chunk store's record table grows a segment at a time, to its
+  derived bound (`max_chunks`, reserve over granule), but its segment was `min(max_chunks, page)` records: a page's byte
+  count taken as a record count, with no derivation. So a shard's first chunk made 16,384 records at once on a 16 KiB
+  page and 4,096 on a 4 KiB page (557 KB). Now a segment is the records a page holds (`Slab::slots_a_page`, the largest
+  power of two of slots that fits), and the tag table takes its segment the same way (it divided by the run's pointer,
+  not its slot, 24 KiB a segment at a 16 KiB page). `cargo test -p slates-vfs --test chunk_records_heap -- --nocapture`
+  (debug, the MacBook, 2026-11-23): a store's first chunk kept 2,228,320 bytes of heap at a 16 KiB page, now 8,800.
+  The table now grows a page at a time, every 64 chunks at a 16 KiB page, and nothing reserves its segments ahead
+  (`Slab::reserve_segments`); main's AC-0.4 provisioning A/B reads whether that moves the seal path.
