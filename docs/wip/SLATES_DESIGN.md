@@ -58789,6 +58789,8 @@ on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-lin
     on `crate::lease_wait`'s pattern). It runs again as each remake ends, told across shards while any waits. Its
     deadline is one remake's bound, its two exchanges at the learned answer bound, for each remake in flight when it
     parked. A create that would not fit even then is refused at once with the room there is.
+    **Since A-884 (2026-11-23, every platform)** a teardown in flight is room on the way too, at each of a create's
+    admissions (bytes, versions, metadata), and its remaining slices at a step's budget join the deadline.
   - Held by `a_create_the_moment_the_daemon_serves_is_admitted_on_windows` and
     `a_create_during_the_released_extents_remakes_waits_for_them_on_windows`, on a real one-shard anchor; red with the
     fix reversed and green with it on both runners (diag run 45260798132, the first create refused `BudgetExceeded { available: 5722144768 }` on windows-latest (5,720,506,368 on windows-11-arm) and the create during the remakes refused `{ available: 5713756160 }` (5,712,117,760) with the fix reversed, both admitted with it, and the Node SDK suites 8 of 8 on both). Applied in the same change to:
@@ -62283,3 +62285,31 @@ GAPS (A-879, A-384's floor, and A-789's note on the extents file), `docs/cli.md`
 Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A-491's entry),
 `crates/rt/src/shard.rs`, `crates/rt/tests/idle_work.rs`, `crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
 `docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.
+
+### A-884 — A create sent at once after a destroy waits for the destroyed volume's teardown, whichever admission it met (2026-11-23, w-win2 for main 01a20182, its ruling of 2026-11-23, item 3b; §4.2, A-789)
+
+- **What was there.** A destroy is answered once its record says the volume is destroying; its teardown then frees the
+  volume's objects a slice a round of the shard's serve loop (`verbs::step_destroys`), and only the teardown's end gives
+  the volume's credits back (`verbs::release_slot_credits`): its byte reservation, its inode allowance and its records.
+  A create sent the moment the destroy was answered met them held and was refused `BudgetExceeded`, on every platform
+  (diag run 45251289894: `{ available: 1430536192 }`, the room less the destroyed volume's). The room wait of A-789
+  counted only the remakes of the pool's extents as room on the way, and only at the byte admission.
+- **The rule** (main's ruling): such a create waits for the teardowns in flight, bounded by their remaining slices at
+  the step budget. A create that would not fit even once they end is refused at once with the room there is.
+- **How.** Each of a bounded create's three admissions (bytes, versions, metadata: `room_wait::Room`) counts as room on
+  the way the credits of every volume its shard is destroying, as `release_slot_credits` will give them back
+  (`teardown_room`), and the bytes count the remakes too, as before. A create they would cover parks on A-789's pattern
+  and runs again when a teardown ends (`room_wait::teardown_ended`, from `step_destroys` once the credits are back). Its
+  deadline adds the teardowns' remaining slices at a step's budget apiece (`teardown_window_ns`) to the remakes' bound.
+  A volume's teardown counts its remaining slices at its last slice's pace (`Volume::destroy_slices_left`: its queued
+  objects over the objects that slice released, one before any slice ran, and the call that says `Done`); one not begun
+  yet counts its live inodes, each at least one object, since the destroy verb only records the volume as destroying and
+  its next destroy round builds the queue. The deadline moves on while the teardowns go on: a create run again that
+  finds fewer slices left than when it parked takes the window from now, never sooner than the one it had. So a create
+  waits at most the teardowns and one window, and is refused once a whole window passes with no progress. A teardown on
+  one shard gives room back on that shard alone, so nothing is told across shards.
+- **Evidence.** RED_AND_GREEN_3B
+
+Applied in the same change to: A-789's record (its room wait), GAPS (item 3b's entry under A-789),
+`docs/bugs/2026-11-23-a-create-at-once-after-a-destroy-met-its-teardown.md`, `crates/vfs/src/volume.rs`,
+`crates/server/src/{room_wait,verbs,daemon,state}.rs`, `crates/client/tests/client.rs`.

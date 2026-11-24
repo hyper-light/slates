@@ -1,0 +1,110 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), A-884 (item 3b), run 21: a create sent at once after a destroy waits for the
+# destroyed volume's teardown, whichever admission it met. Run 19 found the first cut's window a step long for a
+# teardown not begun yet; it now counts the volume's live inodes, and the deadline moves on while the teardowns go on.
+# Main's ruling: the test shows the bound too, a create whose teardown never progresses refused after one window. On
+# ubuntu, macOS and both Windows runners: red A (no teardown counted as room on the way: both tests fail), red B (the
+# deadline moves on with no progress: the bound test never ends, cut at 300 s), the green of both tests in rounds,
+# room_wait's unit test, the extents file on Windows, and clippy of the touched crates.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  teardown:
+    name: A-884 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: "Red A: no teardown's room counted as on the way (both tests)"
+        timeout-minutes: 60
+        run: |
+          git apply .github/diag-w-win2/a884-red.patch
+          for test in a_create_at_once_after_a_destroy_waits_for_its_teardown a_create_waiting_for_a_teardown_that_does_not_go_on_is_refused_at_its_bound; do
+            set +e
+            cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact $test > "$RUNNER_TEMP/redA-$test.log" 2>&1
+            code=$?
+            set -e
+            grep -a 'test result\|panicked' -A1 "$RUNNER_TEMP/redA-$test.log" | grep -av descriptor_limit | cut -c1-260 | head -6
+            echo "red A $test exit $code"
+            if [ "$code" -eq 0 ]; then echo "UNEXPECTED: $test passed with no teardown counted"; exit 1; fi
+          done
+          git apply -R .github/diag-w-win2/a884-red.patch
+      # Unix only: `timeout` ends cargo, and the hung test binary it leaves is ended by name on this runner's own VM.
+      - name: "Red B: the deadline moves on with no progress (the bound test never ends)"
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 40
+        run: |
+          git apply .github/diag-w-win2/a884-red-unbounded.patch
+          cargo test -p slates-client --test client --no-run > /dev/null 2>&1
+          set +e
+          timeout 300 cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact a_create_waiting_for_a_teardown_that_does_not_go_on_is_refused_at_its_bound > "$RUNNER_TEMP/redB.log" 2>&1
+          code=$?
+          pkill -f a_create_waiting_for_a_teardown_that_does_not_go_on_is_refused_at_its_bound
+          set -e
+          git apply -R .github/diag-w-win2/a884-red-unbounded.patch
+          grep -a 'test result\|panicked\|answered after' -A1 "$RUNNER_TEMP/redB.log" | grep -av descriptor_limit | cut -c1-260 | head -6
+          echo "red B exit $code (124: cut at 300 s)"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the bound test passed with an unbounded deadline"; exit 1; fi
+      - name: "Green: the create after a destroy five rounds, the bound test three"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          for round in 1 2 3 4 5; do
+            set +e
+            cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact a_create_at_once_after_a_destroy_waits_for_its_teardown > "$RUNNER_TEMP/green-$round.log" 2>&1
+            code=$?
+            set -e
+            echo "after-destroy round $round: $(grep -a 'test result' "$RUNNER_TEMP/green-$round.log" | cut -c1-120)"
+            if [ "$code" -ne 0 ]; then grep -a -A3 'panicked' "$RUNNER_TEMP/green-$round.log" | head -12; exit $code; fi
+          done
+          for round in 1 2 3; do
+            set +e
+            cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact a_create_waiting_for_a_teardown_that_does_not_go_on_is_refused_at_its_bound > "$RUNNER_TEMP/bound-$round.log" 2>&1
+            code=$?
+            set -e
+            echo "bound round $round: $(grep -a 'answered after\|test result' "$RUNNER_TEMP/bound-$round.log" | cut -c1-160 | tr '\n' ' ')"
+            if [ "$code" -ne 0 ]; then grep -a -A3 'panicked' "$RUNNER_TEMP/bound-$round.log" | head -12; exit $code; fi
+          done
+      - name: "room_wait's unit test"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          cargo test -p slates-server --lib room_wait:: 2>&1 | grep -a '^test \|test result\|panicked'
+      - name: "The extents file (Windows: its remake-window test waits in the same list)"
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        timeout-minutes: 40
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          set +e
+          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture > "$RUNNER_TEMP/extents.log" 2>&1
+          code=$?
+          grep -a '^test \|test result\|panicked' "$RUNNER_TEMP/extents.log" | cut -c1-200 | head -20
+          exit $code
+      - name: "Clippy of the touched crates, every error printed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          cargo clippy --keep-going -p slates-vfs -p slates-server -p slates-client --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
+          echo "clippy exit $?"
+          grep -a -A8 '^error' "$RUNNER_TEMP/clippy.log" | head -120
+          true
