@@ -607,3 +607,12 @@ Waiting: main's route; arena-7 and arena-8.
 - Red: 8 own runs against a bytes bound of 5 under the old rule in rows.
 - intake_steps prints own bytes, windows and the bound. Asked main for the 57k run at f9a5539b5.
 - Next: optimize the pending steps (72% of intake, 48,795 steps at 1.56 ms in r499). arena-21's resolves decide the parent's-filters follow-up.
+
+## 2026-11-23 ~21:45: C1 (1) P1 and the tiered fix landed
+- 925a1ecaf: intake_steps times pending-last apart. r618 found pending-last is 51% of the wall.
+- C1's rest is not whole (main's 20:49 order): (1) changelog and manifest texts off the content store, then (2) the intake keeping no whole text.
+  - (1) is in five pieces: P1 primitives, P2 serving, P3 Held/work, P4 intake/record, P5 switch on the let-go plus main's red. No pinned manifest: the learned cache only, with asks per push counted.
+  - P1 landed as 95a6be82f (merge 261c8b693): log_text_held, bring_back_log, and hg_push::bring_back for \0changelog and \0manifest; counter landed_log_texts_brought_back.
+- Tiered fix landed as c81dce7db (merge 14b44fb7f): merge through the deepest violation; most_own_runs sampled at the invariant point, plus _in_flight. r618 had 8 own runs against a bound of 6.
+- Before P2, merge w-tsan's lend fix (within_budget outside lent_state). bring_back_log is the fourth site.
+- After C1: the interop speed round, stream (8.7x slower than stock) then push (6x slower). Then the pending steps.
