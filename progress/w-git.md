@@ -747,3 +747,9 @@
   (b) clone-again's per-fetch gather (55 s first byte); (c) "intake off the owner" (§4.17.5 piece 5, owed; measure =
   many concurrent pushes to one repo using every core); (d) GAPS: one push over several shards not in the design,
   with r870 80.872 s / r940 / stock 10.797 s, for Ada, once r940 lands.
+- 11:45: LANDED 197b0bc4f (kept fragment len read once), a30ffbdb8 (fragments weighed by ContentStore::tree_bytes,
+  red a724_a_fragment_kept_as_a_tree...), 4664f8d26 A-906 (pool generation word, layout 20, own 128-B line; cached
+  available() keyed (generation, hold_open, Windows readiness moves); tests a906 anchor + a906 pool). r940: push 81.6 ->
+  69.0 s. Edge cross-node reach parked (Ada: name model). A-905 = w-shared (intake off owner; my review; Q1/Q2 owed when
+  asked: Move can't carry a started service today). NEXT: next git leg's clone sample -> derive's thin spread,
+  clone-again gather.
