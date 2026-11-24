@@ -310,6 +310,54 @@ fn b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_w
   }
 }
 
+/// Gate r870 (main 01a20182: SHA-1 with collision detection was 13,182 of a push's 23,218 samples, half of it each
+/// object named a second time on admission). Do: for each captured push, admit every object its reader resolved twice
+/// over, into two pushes: once named again (`admit_placed`) and once under the name the reader gave it
+/// (`admit_placed_named`). Expect: each object admitted under the same id with the same outcome in both, and every
+/// object read back alike through each: the reader's name is the store's naming of the same bytes.
+#[test]
+fn r870_an_object_admitted_under_its_readers_name_is_the_object_named_again() {
+  for (name, request, before) in PUSHES {
+    let (pack, held) = captured(request, before);
+    let whole = read_whole(&pack, &held);
+    let store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+    let naming = GitNaming {
+      format: ObjectFormat::Sha1,
+    };
+    let (mut named_again, mut named_by_reader) =
+      (Push::new(ObjectFormat::Sha1), Push::new(ObjectFormat::Sha1));
+    named_again.extend_pack(&pack);
+    named_by_reader.extend_pack(&pack);
+    for object in &whole.objects {
+      let again = named_again
+        .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
+        .unwrap_or_else(|refused| panic!("{name} at {}: {refused:?}", object.offset));
+      let by_reader = named_by_reader
+        .admit_placed_named::<Infallible>(&store, (incoming(object), object.offset), object.id)
+        .unwrap_or_else(|refused| panic!("{name} at {}: {refused:?}", object.offset));
+      assert_eq!(again, by_reader, "{name} at {}", object.offset);
+    }
+    let outside = Located {
+      entries: BTreeMap::new(),
+      held: &held,
+    };
+    for object in &whole.objects {
+      let read = |push: &Push| {
+        push
+          .bytes(&store, &outside, &object.id)
+          .and_then(Result::ok)
+          .map(|read| read.as_ref().to_vec())
+      };
+      assert_eq!(
+        read(&named_again),
+        read(&named_by_reader),
+        "{name} at {}",
+        object.offset
+      );
+    }
+  }
+}
+
 /// B2's resident bound (Ada's MEMORY SIZING rule: resident ≤ k×N + base). Do: push 64 blobs of 64 KiB each, each one
 /// byte repeated (git/git's v1.5.0 push is 9.4 MiB of pack for 304.6 MiB of objects; these deflate further), once held
 /// in the content store as they arrive (`Push::admit`, what a push did before) and once where each lies in the pack

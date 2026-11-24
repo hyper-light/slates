@@ -265,7 +265,7 @@ fn a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same(
   for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
     let mut store = store();
     let (mut repository, first, second) = two_versions(format, &mut store);
-    let kept = repository.kept_fragments(&store);
+    let kept = repository.kept_fragments();
     assert_eq!(
       kept.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
       vec![(1, 0), (1, 1)]
@@ -290,6 +290,36 @@ fn a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same(
     assert_both_versions_read_back(format, (&repository, &store), &first, &second);
     repository.release(&mut store).unwrap();
     assert!(store.is_empty());
+  }
+}
+
+/// Shape: a window so small that every fragment is kept as a tree of windows (the least window the index's rows fit, as the views' tests take).
+const TREE_WINDOW: usize = 256;
+
+/// A-724 piece 4 (main 01a20182's ruling of 2026-11-24 10:56: a fragment weighed by its root node's length is a
+/// weighting bug). Do: in a store whose window holds less than any fragment, so each is kept as a tree of windows,
+/// encode two versions, then weigh and drop each. Expect: each version weighed at least its fragments' length, and at
+/// exactly what dropping it gives back to the store. Red before: weighed at its roots' nodes, a few dozen bytes.
+#[test]
+fn a724_a_fragment_kept_as_a_tree_is_weighed_at_what_dropping_it_gives_back() {
+  for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+    let mut store = ContentStore::new(super::BUDGET, TREE_WINDOW).unwrap();
+    let (mut repository, _, _) = two_versions(format, &mut store);
+    for (at, weighed) in repository.kept_fragments() {
+      let len = repository.fragments_len(at.0, at.1).unwrap();
+      assert!(
+        len > TREE_WINDOW as u64,
+        "{at:?}: {len} bytes, kept whole in one window"
+      );
+      assert!(
+        weighed >= len,
+        "{at:?}: weighed {weighed} under its {len} bytes"
+      );
+      let used = store.used();
+      assert!(repository.drop_fragments(&mut store, at).unwrap());
+      assert_eq!(used - store.used(), weighed, "{at:?}: weighed {weighed}");
+    }
+    repository.release(&mut store).unwrap();
   }
 }
 

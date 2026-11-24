@@ -68,6 +68,15 @@ pub struct FleetNode {
   /// ([`take_members_changed`](FleetNode::take_members_changed), A-554): what tells the daemon's control shard to look
   /// for hosts that left the region at once, where it looked once a liveness window.
   members_changed: bool,
+  /// The installs that changed this node's configuration or members ([`installs`](FleetNode::installs)): a count a
+  /// waiter compares, never a version, since a joiner's configuration before the region's comes from its own council.
+  installs: u64,
+  /// The tasks waiting for this node's next changing install ([`await_install`](FleetNode::await_install), A-902), by
+  /// token, each woken and dropped at that install. Derived: at most one a home exchange this shard is serving, each
+  /// holding its session's request in hand, and each wait ends at its message's budget, its entry removed with it.
+  install_waiters: BTreeMap<u64, std::task::Waker>,
+  /// The next waiter's token.
+  next_install_waiter: u64,
   acceptor: Acceptor,
   routing: Routing,
 }
@@ -101,6 +110,9 @@ impl FleetNode {
       configuration,
       members,
       members_changed: false,
+      installs: 0,
+      install_waiters: BTreeMap::new(),
+      next_install_waiter: 0,
       acceptor,
       routing: Routing::new(),
     }
@@ -151,11 +163,21 @@ impl FleetNode {
     if configuration.host_epoch.0 > self.configuration.host_epoch.0 {
       self.routing.forget_owned_by(self.host);
     }
+    let mut changed = configuration.version != self.configuration.version;
     if self.members.as_slice() != members {
       self.members = members.to_vec();
       self.members_changed = true;
+      changed = true;
     }
     self.configuration = configuration;
+    // A changing install wakes every task waiting for one (A-902); the same configuration installed again, as each
+    // period's council sync does, wakes nothing.
+    if changed {
+      self.installs = self.installs.wrapping_add(1);
+      for (_, waker) in std::mem::take(&mut self.install_waiters) {
+        waker.wake();
+      }
+    }
     let _ = self
       .acceptor
       .install_authority(Self::authority(&self.configuration));
@@ -175,6 +197,31 @@ impl FleetNode {
   /// shards, so each installs the same `(configuration, members)` the council committed.
   pub fn members(&self) -> &[HostId] {
     &self.members
+  }
+
+  /// How many installs have changed this node's configuration or its members (A-902): what a task waiting for the
+  /// next one compares ([`await_install`](FleetNode::await_install)).
+  pub fn installs(&self) -> u64 {
+    self.installs
+  }
+
+  /// Registers `waker` under `token` (a new token when `None`) to be woken at the next install that changes this
+  /// node's configuration or members (A-902), and returns the token. The waiter calls it on each poll that finds
+  /// [`installs`](FleetNode::installs) unmoved, and [`forget_install_waiter`](FleetNode::forget_install_waiter) when
+  /// it ends, so no entry outlives its wait.
+  pub fn await_install(&mut self, token: Option<u64>, waker: &std::task::Waker) -> u64 {
+    let token = token.unwrap_or_else(|| {
+      let token = self.next_install_waiter;
+      self.next_install_waiter = token.wrapping_add(1);
+      token
+    });
+    self.install_waiters.insert(token, waker.clone());
+    token
+  }
+
+  /// Drops the waiter registered under `token`, if it is still there (A-902).
+  pub fn forget_install_waiter(&mut self, token: u64) {
+    self.install_waiters.remove(&token);
   }
 
   /// Whether an install changed the region's members since the last call, taken (A-554): the daemon's control shard

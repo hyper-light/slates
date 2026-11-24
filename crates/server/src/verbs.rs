@@ -3657,7 +3657,18 @@ fn run_recorded(
   if let Some(destroy_target) = destroy_target
     && !matches!(reply, ReplyBody::Refused { .. })
   {
-    crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+    let (volume, sequence) = destroy_target;
+    crate::live_ship::defer_until_placed(
+      state,
+      (
+        crate::live_ship::PlacementOf::Tombstone,
+        volume.bytes,
+        sequence,
+      ),
+      (origin, id),
+      route,
+      reply,
+    );
     return None;
   }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
@@ -20627,6 +20638,15 @@ fn begin_member_branch(
   record: &VolumeRecord,
   (from, version): (DbVolumeId, u64),
 ) -> Option<slates_merge::engine::Green> {
+  // A source awaiting its re-adoption here, or itself waiting on one, stands only once the boot re-adopts it: the branch
+  // waits for it rather than being fenced (main's item (2) of 2026-11-24 08:52).
+  if state.merge.awaiting_adoption.contains_key(&from)
+    || state.merge.after_source.contains_key(&from)
+  {
+    state.merge.after_source.insert(record.id, (from, version));
+    state.count(BRANCHES_AFTER_SOURCE, 1);
+    return None;
+  }
   let seeded = state
     .greens
     .branch(&from, version, record.id)
@@ -20641,6 +20661,106 @@ fn begin_member_branch(
       );
       None
     }
+  }
+}
+
+/// Counted: a boot's branch member that waited for its source's re-adoption before it was rebuilt over it
+/// ([`begin_member_branch`], [`begin_waiting_branches`]). Format: a counter name in the status report.
+const BRANCHES_AFTER_SOURCE: &str = "merge.recovery.branches_after_source";
+
+/// Begins, over `source` now re-adopted here, the replay of each branch member that waited for it
+/// ([`begin_member_branch`]): branched again at its version, its own checkpoint and chain to be replayed as a
+/// re-adoption's ([`step_readoption`], which puts its engine back in its lineage). The branches begun, for the boot to
+/// step; one that cannot be begun is fenced `SourceUnavailable`.
+pub(crate) fn begin_waiting_branches(
+  state: &mut ShardState,
+  source: DbVolumeId,
+) -> Vec<DbVolumeId> {
+  let waiting: Vec<(DbVolumeId, u64)> = state
+    .merge
+    .after_source
+    .iter()
+    .filter(|(_, (from, _))| *from == source)
+    .map(|(branch, (_, version))| (*branch, *version))
+    .collect();
+  let mut begun = Vec::with_capacity(waiting.len());
+  for (branch, version) in waiting {
+    state.merge.after_source.remove(&branch);
+    let replay = branched_again(state, branch, (source, version)).map(|seeded| {
+      GreenReplay::seeded(state, branch, seeded).map_err(|(fence, engine)| {
+        give_back_to_lineage(state, branch, *engine);
+        fence
+      })
+    });
+    match replay {
+      Some(Ok(replay)) => {
+        state.merge.awaiting_adoption.insert(
+          branch,
+          crate::green_adopt::AwaitingAdoption {
+            through: 0,
+            identity: None,
+            replay: Some(Box::new(replay)),
+          },
+        );
+        begun.push(branch);
+      }
+      Some(Err(fence)) => fence_branch(state, branch, fence),
+      None => fence_branch(
+        state,
+        branch,
+        crate::merge_service::GreenFence::SourceUnavailable,
+      ),
+    }
+  }
+  begun
+}
+
+/// Fences every branch member waiting for `source` (its re-adoption fenced, A-333), and every one waiting on those in
+/// turn: none waits past the boot.
+pub(crate) fn fence_waiting_branches(state: &mut ShardState, source: DbVolumeId) {
+  let mut sources = vec![source];
+  while let Some(source) = sources.pop() {
+    let waiting: Vec<DbVolumeId> = state
+      .merge
+      .after_source
+      .iter()
+      .filter(|(_, (from, _))| *from == source)
+      .map(|(branch, _)| *branch)
+      .collect();
+    for branch in waiting {
+      state.merge.after_source.remove(&branch);
+      fence_branch(
+        state,
+        branch,
+        crate::merge_service::GreenFence::SourceUnavailable,
+      );
+      sources.push(branch);
+    }
+  }
+}
+
+/// Fences every branch member still waiting for its source once the boot has re-adopted all it could: none waits past
+/// the boot.
+pub(crate) fn fence_stranded_branches(state: &mut ShardState) {
+  let stranded: Vec<DbVolumeId> = state.merge.after_source.keys().copied().collect();
+  state.merge.after_source.clear();
+  for branch in stranded {
+    fence_branch(
+      state,
+      branch,
+      crate::merge_service::GreenFence::SourceUnavailable,
+    );
+  }
+}
+
+/// Fences branch member `branch` with `fence`, by its record.
+fn fence_branch(
+  state: &mut ShardState,
+  branch: DbVolumeId,
+  fence: crate::merge_service::GreenFence,
+) {
+  if let Some(record) = state.db.partition().volume(branch).cloned() {
+    fence_green(state, &record, fence);
   }
 }
 
@@ -21623,6 +21743,8 @@ fn install_readopted(
 /// Fences green `id`, awaiting its re-adoption here, whose boot could not re-adopt it from this node's ledger (A-333):
 /// every verb on it refused typed from here, its records left as the evidence (AUD-29-18).
 pub(crate) fn fence_awaiting_adoption(state: &mut ShardState, id: DbVolumeId) {
+  // The branches waiting for it are fenced with it (main's item (2) of 2026-11-24 08:52).
+  fence_waiting_branches(state, id);
   if state.merge.awaiting_adoption.remove(&id).is_none() {
     return;
   }
@@ -21651,6 +21773,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
     || owner_of(to_wire_volume(green)) != state.partition
     || state.merge.awaiting_adoption.contains_key(&green)
     || state.merge.after_stores.contains(&green)
+    || state.merge.after_source.contains_key(&green)
   {
     let created_at = match record.policy.role {
       Role::Work { base_version, .. } => base_version,

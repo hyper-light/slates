@@ -274,21 +274,44 @@ impl Increment {
 
   /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]): whether every
   /// one of them is read. A run `wanted` does not reach is read.
+  ///
+  /// One call reads on from the first run unread into the next, run after run, until its `slice` is spent, so reading
+  /// R runs whole takes calls in proportion to their bytes over the slice, never one a run; and a call walks the runs
+  /// once. Read a run a call, each call searching every run twice, a revision of 6,000 named files read in 713 ms on a
+  /// debug build against 168 ms for 3,000 (quadratic), one step of an import's staging.
   pub fn read_step_among(
     &mut self,
     objects: &impl crate::named::Objects,
     slice: u64,
     wanted: &[bool],
   ) -> Result<bool, crate::named::ObjectMissing> {
-    let Some(at) = self.named.runs.iter().enumerate().position(|(at, run)| {
+    let mut budget = slice.max(1);
+    let mut at = 0usize;
+    while let Some(run) = self.named.runs.get(at).copied() {
       let read = self.named.read.0.get(at).map_or(0, Vec::len);
-      wanted.get(at).copied().unwrap_or(true) && u64::try_from(read).unwrap_or(u64::MAX) < run.len
-    }) else {
-      return Ok(true);
-    };
-    let Some(run) = self.named.runs.get(at).copied() else {
-      return Ok(true);
-    };
+      let read = u64::try_from(read).unwrap_or(u64::MAX);
+      if !wanted.get(at).copied().unwrap_or(true) || read >= run.len {
+        at = at.saturating_add(1);
+        continue;
+      }
+      // A run still owed, and nothing of the slice left for it.
+      if budget == 0 {
+        return Ok(false);
+      }
+      let took = self.read_into_run(objects, (at, run), budget)?;
+      budget = budget.saturating_sub(took);
+    }
+    Ok(true)
+  }
+
+  /// Reads the next at most `budget` bytes of run `at` (`run`) from `objects` into its buffer, reserved once at the
+  /// run's length: the bytes read. A refused read appends nothing.
+  fn read_into_run(
+    &mut self,
+    objects: &impl crate::named::Objects,
+    (at, run): (usize, crate::named::NamedRun),
+    budget: u64,
+  ) -> Result<u64, crate::named::ObjectMissing> {
     let missing = crate::named::ObjectMissing {
       identity: run.identity,
     };
@@ -301,7 +324,7 @@ impl Increment {
       buffer.try_reserve_exact(whole).map_err(|_| missing)?;
     }
     let done = u64::try_from(buffer.len()).map_err(|_| missing)?;
-    let take = run.len.saturating_sub(done).min(slice.max(1));
+    let take = run.len.saturating_sub(done).min(budget);
     let from = buffer.len();
     let to = from
       .checked_add(usize::try_from(take).map_err(|_| missing)?)
@@ -312,7 +335,7 @@ impl Increment {
       buffer.truncate(from);
       return Err(refused);
     }
-    Ok(self.unread_among(wanted).is_none())
+    Ok(take)
   }
 
   /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
@@ -2002,7 +2025,7 @@ pub(crate) fn segments(base_len: u64, ops: &[Op]) -> Vec<Segment> {
 
 /// The named run `ops` make a base of `base_len` bytes into, whole and alone, by its place in `post`: one op adds
 /// exactly that run's bytes and the file is no longer than it, so nothing else of the base or the post-state is in it.
-fn sole_run(base_len: u64, ops: &[Op], post: &crate::named::Post<'_>) -> Option<usize> {
+fn sole_run(base_len: u64, ops: &[Op], places: &BTreeMap<(u64, u64), usize>) -> Option<usize> {
   let mut adding = ops
     .iter()
     .filter(|op| matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend));
@@ -2010,7 +2033,7 @@ fn sole_run(base_len: u64, ops: &[Op], post: &crate::named::Post<'_>) -> Option<
   if adding.next().is_some() || applied_len(base_len, ops) != op.len {
     return None;
   }
-  post.whole_run(op.src, op.len)
+  places.get(&(op.src, op.len)).copied()
 }
 
 /// Moves each of `wholes`' runs' buffers into its file (A-760, [`alone`]): last, once every other file is
@@ -2027,12 +2050,27 @@ fn move_whole_runs(effects: &mut [Effect], read: &mut [Vec<u8>], wholes: &[(usiz
 
 /// The files of `sole` ([`Green::sole_runs`]) whose run no other file of the version is made of: the ones that take its
 /// buffer ([`move_whole_runs`]), since a buffer moves into one file.
+///
+/// Each run's files counted once, so the choice is the files' count times its logarithm: counted file by file against
+/// every other, a revision of 4,500 files spent 121 ms here on a debug build against 54 ms for 3,000 (goal 93).
 fn alone(sole: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+  let mut files_of: BTreeMap<usize, usize> = BTreeMap::new();
+  for (_, run) in &sole {
+    let count = files_of.entry(*run).or_insert(0);
+    *count = count.saturating_add(1);
+  }
   sole
-    .iter()
-    .copied()
-    .filter(|(_, run)| sole.iter().filter(|(_, other)| other == run).count() == 1)
+    .into_iter()
+    .filter(|(_, run)| files_of.get(run) == Some(&1))
     .collect()
+}
+
+/// Whether `place` is one of `places`' (each an effect's place first, ascending, as [`Green::sole_runs`] gives them
+/// and [`alone`] and [`named_files`] keep them): a halving search, not a walk of every one.
+fn holds_place<T>(places: &[(usize, T)], place: usize) -> bool {
+  places
+    .binary_search_by_key(&place, |(held, _)| *held)
+    .is_ok()
 }
 
 /// The files of `sole` ([`Green::sole_runs`]) named for an object (A-760 (b), [`Green::name_of`]): each whose run of
@@ -5798,7 +5836,7 @@ impl Green {
     for (place, effect) in effects.iter().enumerate() {
       if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
         effect
-        && !wholes.iter().any(|(whole, _)| *whole == place)
+        && !holds_place(&wholes, place)
         && let Some(Content::Named(identity)) = self.content.get(path)
         && keeps_base(identity.len, ops)
       {
@@ -5817,10 +5855,10 @@ impl Green {
     &self,
     effects: &mut [Effect],
     post_state: crate::named::Post<'_>,
-    skip: &[usize],
+    wholes: &[(usize, usize)],
   ) {
     for (place, effect) in effects.iter_mut().enumerate() {
-      if skip.contains(&place) {
+      if holds_place(wholes, place) {
         continue;
       }
       if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
@@ -5870,8 +5908,9 @@ impl Green {
     // The effects' places are where the verdict put them: the node moves and links are added after every one.
     for (place, effect) in effects.into_iter().enumerate() {
       let name = names
-        .iter()
-        .find(|(named, _)| *named == place)
+        .binary_search_by_key(&place, |(named, _)| *named)
+        .ok()
+        .and_then(|at| names.get(at))
         .map(|(_, identity)| *identity);
       self.apply_effect(effect, version, &mut staged, name);
     }
@@ -6886,18 +6925,11 @@ impl Green {
 
   /// The next file of `judged` still to make, with its pieces: none once every one is made or is a whole run's.
   fn next_to_make(&self, judged: &mut Judged) -> Option<FileMaking> {
-    let skip: Vec<usize> = judged
-      .making
-      .wholes
-      .as_deref()
-      .unwrap_or_default()
-      .iter()
-      .map(|(place, _)| *place)
-      .collect();
+    let wholes = judged.making.wholes.as_deref().unwrap_or_default();
     while let Some(effect) = judged.effects.get(judged.making.next) {
       let place = judged.making.next;
       judged.making.next = place.saturating_add(1);
-      if skip.contains(&place) {
+      if holds_place(wholes, place) {
         continue;
       }
       let Effect::SetContent(path, None, ops, source) = effect else {
@@ -6989,11 +7021,10 @@ impl Green {
         (alone(sole.clone()), named_files(&sole, &runs))
       }
     };
-    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
     self.make_mapped(
       &mut effects,
       crate::named::Post::of(&post_state, &read, &runs),
-      &skip,
+      &wholes,
     );
     move_whole_runs(&mut effects, &mut read, &wholes);
     self.commit(
@@ -7014,6 +7045,8 @@ impl Green {
     if post.runs.is_empty() && post.declared.is_empty() {
       return Vec::new();
     }
+    // Every run by its place and length, found once: a lookup a file, not a walk of every run (goal 93).
+    let places = post.run_places();
     let mut wanted: Vec<(usize, usize)> = Vec::new();
     for (place, effect) in effects.iter().enumerate() {
       let Effect::SetContent(path, None, ops, source) = effect else {
@@ -7024,7 +7057,7 @@ impl Green {
         ContentSource::Mapped => (self.content.len_of(path).unwrap_or(0), ops.as_slice()),
         ContentSource::Copied(..) => continue,
       };
-      if let Some(run) = sole_run(base_len, ops, &post) {
+      if let Some(run) = sole_run(base_len, ops, &places) {
         wanted.push((place, run));
       }
     }
@@ -7077,11 +7110,10 @@ impl Green {
     );
     let names = named_files(&sole, runs);
     let wholes = alone(sole);
-    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
     self.make_mapped(
       &mut effects,
       crate::named::Post::of(&inc.post_state, &read, runs),
-      &skip,
+      &wholes,
     );
     move_whole_runs(&mut effects, &mut read, &wholes);
     let version = self.head().saturating_add(1);

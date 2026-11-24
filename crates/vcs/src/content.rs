@@ -509,6 +509,10 @@ pub enum LetGoRefused {
     /// The holder that pins it.
     by: &'static str,
   },
+  /// It holds no bytes (the empty window: an empty file's, or a Mercurial manifest kept as an empty delta): letting it go
+  /// would free nothing, and a shard image carries no window let go of no length ([`ContentStore::restore_away`]), so
+  /// one let go would be lost at a restart while a row still names it. It stays held.
+  Empty,
 }
 
 /// A byte count as the store keeps it.
@@ -1368,6 +1372,9 @@ impl ContentStore {
     if !held.landed {
       return Err(LetGoRefused::NotLanded);
     }
+    if len == 0 {
+      return Err(LetGoRefused::Empty);
+    }
     if held.holders > 1 {
       return Err(LetGoRefused::Shared);
     }
@@ -1383,7 +1390,7 @@ impl ContentStore {
   /// where the identity's home is: `slates-server`'s homes), which holds across a restart. The bytes freed.
   ///
   /// # Errors
-  /// `NotHeld`, `NotAWindow`, `Away` and `NotLanded` as [`ContentStore::let_go`]; `Pinned` naming the holder.
+  /// `NotHeld`, `NotAWindow`, `Away`, `NotLanded` and `Empty` as [`ContentStore::let_go`]; `Pinned` naming the holder.
   pub fn let_go_landed(
     &mut self,
     identity: &ContentId,
@@ -1401,6 +1408,9 @@ impl ContentStore {
     };
     if !held.landed {
       return Err(LetGoRefused::NotLanded);
+    }
+    if len == 0 {
+      return Err(LetGoRefused::Empty);
     }
     if let Some(by) = pinned_by {
       return Err(LetGoRefused::Pinned { by });
@@ -1993,6 +2003,31 @@ impl ContentStore {
       .entries
       .get(identity)
       .and_then(|held| u64::try_from(held.len()).ok())
+  }
+
+  /// The bytes the store holds under the content `identity` names, its whole tree: each window and each list naming
+  /// them, as held now (an object one window long, that window alone). What letting it go gives back where no other
+  /// content shares a node of it; [`ContentStore::len_of`] is the root node's alone (main 01a20182's ruling of
+  /// 2026-11-24: a git fragment kept as a tree was weighed at its root's length, a few dozen bytes).
+  pub fn tree_bytes(&self, identity: &ContentId) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![self.resolve(identity)];
+    while let Some(node) = pending.pop() {
+      let Some(held) = self.entries.get(&node) else {
+        continue;
+      };
+      total = total.saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX));
+      if held.form == Form::List
+        && let Some(list) = held.here()
+      {
+        pending.extend(
+          list
+            .chunks_exact(IDENTITY_BYTES)
+            .filter_map(ContentId::from_slice),
+        );
+      }
+    }
+    total
   }
 
   /// The form of the content `identity` names.
@@ -3567,6 +3602,43 @@ mod tests {
       after.hold(&ContentId::of(b"never named")),
       Err(ContentRefused::NotHeld)
     );
+  }
+
+  /// Goal 93 durability (main's order of 2026-11-24 08:55: Mercurial's own history pushed and restarted, the store not
+  /// made again, `Unheld { 00manifest, rev: 4222 }`; here rev 4281 of its first 5,000). Do: hold the empty window twice,
+  /// as a Mercurial store holds it for an empty file revision's bytes and for a manifest kept as an empty delta (a
+  /// manifest whose text is its parent's); mark it landed and let it go both ways a landed text is let go
+  /// (`let_go_landed` for a push's windows, `let_go` for an import's); carry what a restart's image carries of the
+  /// windows let go into a fresh store. Expect: each refused `Empty`, nothing freed; the window held, never away; the
+  /// image carrying nothing let go; the fresh store refusing nothing. Red before: let go of no bytes, carried with a
+  /// length of 0, which `restore_away` refuses, so after a restart the manifest's row named a window the store did not
+  /// hold and its replay was refused `Unheld`.
+  #[test]
+  fn the_empty_window_is_never_let_go_so_a_restart_never_loses_it() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let id = store.put(b"").unwrap();
+    assert_eq!(store.put(b"").unwrap(), id, "one window, held twice");
+    assert!(store.mark_landed(&id));
+    assert_eq!(store.let_go_landed(&id, None), Err(LetGoRefused::Empty));
+    store.hold(&id).unwrap();
+    let mut alone = ContentStore::new(1 << 20, 4096).unwrap();
+    let single = alone.put(b"").unwrap();
+    alone.mark_landed(&single);
+    assert_eq!(alone.let_go(&single), Err(LetGoRefused::Empty));
+    assert_eq!(alone.let_go_object(&single), 0);
+    for held in [&store, &alone] {
+      assert!(!held.is_away(&id), "the empty window held");
+      assert_eq!(held.len_of(&id), Some(0));
+      assert_eq!(held.bytes_of(&id).as_deref(), Some(&b""[..]));
+      let aways: Vec<(ContentId, u64)> = held.aways().collect();
+      assert!(aways.is_empty(), "nothing let go to carry: {aways:?}");
+      let mut after = ContentStore::new(1 << 20, 4096).unwrap();
+      assert_eq!(
+        after.restore_away(aways),
+        0,
+        "nothing refused at the restart"
+      );
+    }
   }
 
   /// A-724 piece 4. Do: let go a landed window, then put the same bytes again (a new push bringing them). Expect: the put

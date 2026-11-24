@@ -139,6 +139,10 @@ pub struct Intaken {
   /// The changelog's and the manifests' texts the intake asked of the node's changeset store, their windows let go once
   /// landed (goal 93, C1 (1)): a delta's base, or the manifest a new one is kept as a delta against.
   pub log_texts_asked: u64,
+  /// Of [`Intaken::log_texts_asked`], the parent manifest's read-back: the manifest the fork holds last, which a new
+  /// manifest's row is kept as a delta against (`HgIndex::append_revisions_after`), asked where it is not also the
+  /// delta's base, so what the kept form costs is told apart from what the push's own deltas cost.
+  pub previous_manifests_asked: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -1289,6 +1293,10 @@ impl Taker {
     let Some((node, most)) = wanted else {
       return Ok(None);
     };
+    if previous == Some(node) && revision.base != node {
+      self.intaken.previous_manifests_asked =
+        self.intaken.previous_manifests_asked.saturating_add(1);
+    }
     self.asked = Some(StoreAsk {
       path: path.to_vec(),
       node,
@@ -1812,14 +1820,24 @@ impl Taker {
     match self.cutting.as_mut() {
       Some(cutting) => {
         let rev = self.fork.len(store, log).saturating_sub(1);
+        // Every log's: a file revision's bytes and block, a changeset's text and a manifest's row object, the
+        // changelog's and the manifests' under their logs' paths (goal 93, C1 (1) P5: let go once the push's entry
+        // commits, never before; `hg_run::let_go_windows`).
         let contents = match log {
-          Log::File(_) => self.fork.revision(store, log, rev).map(|row| FileContents {
-            path: path.to_vec(),
+          Log::Changelog => self.fork.changeset(store, rev).map(|row| FileContents {
+            path: CHANGELOG_PATH.to_vec(),
             node: revision.node,
-            bytes: row.bytes,
-            block: row.block,
+            bytes: row.text,
+            block: None,
           }),
-          Log::Changelog | Log::Manifest => None,
+          Log::Manifest | Log::File(_) => {
+            self.fork.revision(store, log, rev).map(|row| FileContents {
+              path: path.to_vec(),
+              node: revision.node,
+              bytes: row.bytes,
+              block: row.block,
+            })
+          }
         };
         let charged = to_u64(size_of::<KeptText>())
           .saturating_add(to_u64(path.len()))
@@ -2323,6 +2341,12 @@ impl Rebase {
     let Some((node, most)) = wanted else {
       return Ok(None);
     };
+    if held_last.is_some_and(|(last, _)| last == node)
+      && rests_on.is_none_or(|(rests, _)| rests != node)
+    {
+      self.intaken.previous_manifests_asked =
+        self.intaken.previous_manifests_asked.saturating_add(1);
+    }
     self.asked = Some(crate::push::held::TextAsk::new(
       MANIFEST_PATH.to_vec(),
       node,

@@ -55801,7 +55801,8 @@ Applied in the same change to:
   sender's batched calls and the healer's loop at each configuration change.
 - **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM` to
   `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows (`fleet.members()`,
-  its quorum's f) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
+  its quorum's f; since A-902, once this node is not behind the configuration its sender ranked by, waited for within
+  the put's budget) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
   the window, and answered `Kept` only once that shard's image holding it is published (`published`, A-727's barrier);
   reads and let-goes by identity. Until A-727 a3 calls the barrier's hooks no image holds the content store, so a put
   from the region answers `Unanswered`, never a `Kept` the image could not back; a put so answered may have kept the
@@ -63132,3 +63133,134 @@ Applied in the same change to: `crates/client/examples/edit_merge_bench.rs` (and
 
 Applied in the same change to: §4.7 (a status), `crates/server/src/verbs.rs`, `crates/server/tests/closed_loop.rs`,
 GAPS (84a's owed line).
+
+### A-902 — A home behind its sender's configuration waits for its own install, within the put's budget, rather than refusing it (2026-11-24, w-shared for main 01a20182, its orders of 2026-11-24 06:01 and 09:10; one wait agreed in writing with w-git; gate 8 and gate 9; A-724 piece 6's door rule, A-727 (d1a)'s wire version rule)
+
+- **Why.** A fresh fleet's first push, right after its repository was made, was refused `Unlanded(HomedShort)`: two
+  of gate 8's runs and three of gate 9's 40 (run 45411079579 at 7d6874639). In every one a remote home answered
+  `Refused(NotAHome)` 0.83 to 1.89 ms into a homing budget of about 2 s. A home keeps an object only where its own
+  installed configuration ranks it among the object's homes. Both sides rank over `fleet.members()`, the members of the
+  last configuration that node installed, and at formation the home had not yet installed the configuration its
+  sender ranked by. Its refusal was final, so the homing fell short. A session not yet made was ruled out by reading:
+  `fleet::session_returned` waits for an install or a drop up to the budget, about 2 s, not 1 ms. Gate 9's logging
+  (w-git, 7d6874639) named `NotAHome` in all three.
+- **The change.** A put and a put's first part carry the configuration version the sender ranked the homes by
+  (`HomeMessage::Put` and `PutPart`'s `configuration`; home wire version 0x84, so an 0x83 member is refused typed at once
+  both ways by A-727 (d1a)'s rule). A home not ranked by its own configuration that is behind its sender waits, within
+  the message's budget, for its own next changing install, then ranks again (`vcs_store::homes::caught_up`). Behind
+  means the carried version is newer than its own installed one, or the sender is not among its members. The second
+  test covers a joiner: until it installs the region's configuration it holds its own council's, whose versions are
+  not the region's. An install wakes the wait (`FleetNode::await_install`, woken only by an install that changes the
+  version or the members, so a period's repeated install wakes nothing); there is no timer. A home ranked, or at the
+  sender's version with the sender among its members, is not behind: a true `NotAHome` or a stale sender is answered
+  at once. Past the budget the put is refused `NotAHome` as before, counted, so a home that never installs that
+  version (removed, cut off) costs its sender its budget once. The wait spends the message's budget; what is left of
+  it is the keep's. Nothing in `git_push` changes: a homing comes back kept, or short as before (w-git, in writing).
+  Counters: `vcs_store.homes.install_waits`, `install_wait_caught_up`, `install_wait_elapsed`.
+- **Rejected.** A-894's creation waiting for every home's configuration instead. That condition is region-wide
+  ("every member holds every other alive") and is wrong for a push into a fleet already formed, where a member still
+  installing the last change is the same case. The sender ranking again on a refusal naming a newer version was also
+  rejected: a second path, and gate 9 showed no stale sender. A-894 stays the record's own wait.
+- **Test** (macOS arm64, debug, 2026-11-24). `vcs_store::homes::tests::
+  a_home_behind_its_senders_configuration_waits_for_its_install_and_refuses_at_once_when_not_behind`. One node plays the
+  home under a configuration the test installs, ranking every window at another member:
+  - (a) a put carrying the next version, that version installed once the put waits: kept, counted caught up;
+  - (b) a put carrying a version never installed: refused `NotAHome` once its budget is spent, counted elapsed;
+  - (c) the node's own version: refused at once, no wait begun;
+  - (d) a sender the node's configuration does not name: waited for, refused past its budget.
+  Red before the change: (a) refused `NotAHome` at once; (a), (b) and (d) began no wait, (b) answered in 7,375 ns of
+  its 20 ms budget; (c) held.
+  Green: all four (2.25 s). Focused: `vcs_store::homes` 16 of 16, `slates-cluster` homes and fleet 15 of 15 (two
+  hand-built puts given the new field), `daemon::tests` 62, `git_push` 41.
+
+Applied in the same change to: §4.10 "Content homed by identity" (piece 6's served line), `crates/cluster/src/homes.rs`
+(wire 0x84), `crates/cluster/src/fleet.rs` (`installs`, `await_install`), `crates/server/src/vcs_store/homes.rs`,
+`crates/server/src/fleet.rs` (the sender's host passed to the home), GAPS.
+
+### A-894 — A repository's creation answers once its record is placed at f + 1; a destroy's tombstone hold becomes the one hold for a register's placement (2026-11-24, w-shared for main 01a20182, its order of 2026-11-24 02:17; found tracing A-727 (d1a-3); NoLoss; A-636 part 2c-1, AUD-29-43, A-354)
+
+- **Why.** A repository's creation answered its client once its changeset landed and it was recorded on its owner.
+  Its own register (its record, A-636 part 2c-1) shipped to its candidates afterwards, so an owner lost right after
+  the answer left no node to take the repository over, and the acknowledged repository was gone. Tracing A-727
+  (d1a-3) found it: the fleet harness waited for the record at every other node by hand, and the tests that killed
+  the owner sooner were red one run in three or four.
+- **The change.** At `f > 0` a client's creation records the repository, its root and the rest in one transaction as
+  before, but not its completion. Its reply is held until the repository's register is placed at `f + 1` at the
+  sequence the creation committed (`live_ship::repository_target`). Its completion is recorded and its reply delivered
+  then; a retry meanwhile joins the wait (`live_ship::join`). At `f = 0` nothing waits (R8). The hold is the destroy's,
+  made general rather than doubled: `live_ship::defer_until_placed` holds a verb's reply until a register's record is
+  placed (`PlacementOf::Tombstone`, a destroy's, AUD-29-43; `PlacementOf::Repository`, a creation's). It is resolved
+  where every placement acknowledgement is folded (`fleet::record_acks_in` → `live_ship::resolve_placed`), with no
+  timer. It is judged at the failover SLO as a held write is (`judge_held_placements`, `DurabilityPending`, A-354),
+  refused at a fence or a yield, and bounded with the shard's other held replies. A creation takes its seat before its
+  changeset lands (`live_ship::take_placement_seat`): refused `Overloaded` with nothing changed when the shard holds
+  its bound, the seat given back if it answers without waiting. Counters: `fleet.creation.awaited`,
+  `fleet.creation.awaited_ns` (the wait's time, summed), `fleet.creation.held_gave_up`.
+- **Measured** (macOS arm64, debug, 2026-11-24, three daemons at `f = 1` on one Mac): a creation's answer held 63.8 ms
+  for its record's `f + 1`.
+- **Rejected.** Waiting in the creation's task on A-886's push barrier: it re-asks at the record plane's poll, and a
+  creation's resend would run it again instead of joining it. And a second hold beside the destroy's.
+- **Test** (macOS arm64, debug). `slates-server --test fleet
+  a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_served_by_a_survivor`: `git_fleet`
+  checks, with no wait, that another node holds the record as the creation answers, and that the answer was held.
+  Then the owner is killed at once, a survivor takes the repository over and rebuilds it, and a survivor's edge serves
+  it by name (`git ls-remote`). Red before the change at `git_fleet`'s check (0 of 2 holders). The harness's poll for
+  the record at every node is gone. Focused: `t_a727` (5) and the destroy's
+  `a_destroyed_volume_is_retired_on_its_holders_and_no_takeover_brings_it_back` green; `live_ship` and `repository`
+  lib, 163.
+- **Found, not changed (GAPS).** After the takeover, a push to the repository was refused at both survivors: "not
+  found" at the survivor that is not the successor, and `unable to commit` at the successor (the push barrier).
+
+Applied in the same change to: `crates/server/src/live_ship.rs`, `crates/server/src/repository.rs`,
+`crates/server/src/fleet.rs`, `crates/server/src/verbs.rs`, `crates/server/tests/fleet.rs` (`git_fleet`), GAPS.
+
+### A-903 — A successor writes its adopted state logs' parts at the epoch they were adopted under, so a push to a repository it took over commits (2026-11-24, w-shared for main 01a20182, its order of 2026-11-24 10:07; found by A-894's takeover test; A-636 part 2b, AUD-29-17's epoch rule for heads)
+
+- **Why.** After a repository's owner died and a survivor took it over and rebuilt it, every push to the successor
+  was refused `unable to commit` (git's `[remote rejected]`). The push's barrier logged its names log at position 3,
+  acknowledged by no candidate, every green placed. The other survivor had refused each of the successor's parts
+  `StaleEpoch`, 19 a run. At the takeover its holders fence the dead owner's registers at the takeover's epoch, and the
+  successor keeps that epoch with the adopted register (`takeover::record_adoption`'s `placed_heads`). A head ships at
+  the greater of the two (`fleet::owed_record`), but a state log's parts shipped at the successor's own host epoch
+  (`fleet::owed_state_log_parts`), below the fence. No fleet test had pushed after a repository's takeover.
+- **The change.** `owed_state_log_parts` writes each part at the greater of the host's epoch and the epoch its log's
+  register was adopted under: the rule heads follow. A log this node made itself has no adopted entry and ships at its
+  host epoch, as before.
+- **Test** (macOS arm64, debug, 2026-11-24). A-894's takeover test pushes to the successor's edge too
+  (`a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_served_by_a_survivor`). Red: `unable
+  to commit`, names log acknowledged by none, the other survivor's `fleet.record.refused.stale_epoch` 19. Green: the
+  push lands, the other survivor's `fleet.ship.state_log.placed` 1 (9.4 s). Focused: `t_a727` (5), and the
+  `state_log` and `takeover` lib tests (39).
+- **Found, not changed (GAPS).** The other survivor's edge answers "repository not found". That is not the takeover's
+  doing: an edge serves only the repositories its own node holds (`vcs_http::git::Repositories::locate` looks over this
+  node's shards alone), so a repository is reachable only at its owner's edge, before a death as after.
+
+Applied in the same change to: `crates/server/src/fleet.rs` (`owed_state_log_parts`), `crates/server/tests/fleet.rs`,
+GAPS.
+
+### A-906 — The content pool's free room is counted once a generation of the pool, not at every lend (2026-11-24, w-git for main 01a20182, its rulings of 2026-11-24 10:56 and 11:27; goal 93's clone, gate r935; A-98, A-848, A-853, A-789; CLAUDE.md §3's hot atomics)
+
+- **What was there.** Every lend of a shard's stores, a read's too, sets the content store's budget to all the shard
+  could admit now (`vcs_store::lend`, `Store::admittable`), and that counts the pool's free room
+  (`ContentPool::available`) by reading every candidate extent's owner word in the anchor segment. A fetch lends once a
+  write step: in gate r935's clone of git/git, 3,516 of 24,971 samples (`ExtentSource::available`,
+  `SparseObject::atomic_u64`).
+- **The change.** The anchor segment's pool region gains one generation word (layout 20, an older segment refused
+  typed), on a 128-byte line of its own past the want words, moved by every claim and release of an extent that wins
+  its compare-and-swap (`AnchorSegment::pool_moved`). Each shard's pool keeps its last full count with the generation,
+  its hold's openness and (Windows) the process's count of extent readiness moves it was taken at, and counts again in
+  full only when one of them moved; the generation is read before the count and moved after the owner word, so a kept
+  count never outlives a claim it missed.
+- **Why not a free-bytes word** (main's first shape). Two words cannot move in one compare-and-swap, the extents'
+  lengths are the server's, and a crash between the swap and the add would leave the count short until a recount,
+  which at a daemon's start races other shards' claims. A generation never needs a recount: a count is always a full
+  scan, kept while nothing moved.
+- **Evidence.** `slates-anchor` `a906_the_pool_generation_moves_at_each_claim_and_release_that_wins_and_no_other`;
+  `slates-server` `content_pool::tests::a906_the_pools_room_equals_a_full_count_after_every_move_and_is_kept_between`
+  (after a claim, a give-back, another partition's claim through its own mapping, a hold move, the hold opened and
+  closed, and their give-back: the answer equals a full count each time; the kept count answered between, its skipped
+  count moved). The time saved is main's to measure.
+
+Applied in the same change to: `crates/anchor/src/{layout,segment}.rs`, `crates/anchor/tests/anchor.rs`,
+`crates/server/src/{content_pool,content_extents_windows}.rs`.
+

@@ -768,22 +768,7 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
     );
     // As a boot leaves the repository whose root awaits its re-adoption: no lineage, since each member is rebuilt over
     // the one it was made from, and one made from the root is fenced (`verbs::rebuild_member_sliced`).
-    let members: Vec<DbVolumeId> = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(repository)
-      .map(|member| member.green)
-      .collect();
-    for member in members.into_iter().rev() {
-      if let Some((lineage, Ok(mut release))) = state.greens.retire(&member) {
-        while state
-          .greens
-          .release_step(lineage, &mut release)
-          .is_ok_and(|more| more)
-        {}
-      }
-    }
+    retire_lineage(state, repository);
     assert!(!state.greens.has_lineage(repository), "no lineage left");
     state.greens.remove(&green);
     state.merge.awaiting_adoption.insert(
@@ -828,6 +813,26 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
     "{edited:?}"
   );
   assert_eq!(after.as_deref(), Some(&b"bxx\n"[..]), "edited again");
+}
+
+/// Retires every member of `repository`'s lineage, the latest joined first, their engines and arenas released.
+fn retire_lineage(state: &mut ShardState, repository: RepositoryId) {
+  let members: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(repository)
+    .map(|member| member.green)
+    .collect();
+  for member in members.into_iter().rev() {
+    if let Some((lineage, Ok(mut release))) = state.greens.retire(&member) {
+      while state
+        .greens
+        .release_step(lineage, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
+  }
 }
 
 /// A green re-adopted at its boot's ledger, as a test leaves one (a restart's takeover, A-333): its engine gone and its
@@ -903,6 +908,56 @@ fn a_readopted_branch_member_is_rebuilt_over_its_source_and_takes_a_made_commit(
     matches!(&edited, Some(reply) if !matches!(reply, ReplyBody::Refused { .. })),
     "{edited:?}"
   );
+}
+
+/// A boot's branch member whose root awaits its re-adoption (main 01a20182's order of 2026-11-24 08:52, item (2), from
+/// w-hg's sweep for 259b0db84): it waits for its source rather than being fenced, and is rebuilt over it once the root is
+/// re-adopted. Do: on a store-backed daemon, rebuild the fixtures' repository as one push (its root, and bookmark
+/// `main`'s green branched from it); leave the root awaiting its re-adoption and `main` as a boot finds it, its engine
+/// gone; rebuild `main` from its records as a boot does (`verbs::rebuild_member`); re-adopt the root
+/// (`green_adopt::readopt_with`); read `b` on `main`. Expect: `main` not fenced by its rebuild; after the root's
+/// re-adoption, `main` served, `b` `b\n`. Failing first: `main` fenced `SourceUnavailable` at its rebuild, its source not
+/// yet standing, and never served.
+#[test]
+fn a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (root, branch, fenced) = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "branch-waits");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let branch = hg
+      .bound(state, &bookmark_name(b"main"))
+      .expect("`main`'s green");
+    // As a boot finds them: the branch's engine gone first, then the root's, which awaits its re-adoption.
+    if let Some((lineage, Ok(mut release))) = state.greens.retire(&branch) {
+      while state
+        .greens
+        .release_step(lineage, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
+    state.greens.remove(&branch);
+    awaiting_readoption(state, hg.root);
+    let record = state.db.partition().volume(branch).cloned().unwrap();
+    let _ = crate::verbs::rebuild_member(state, &record);
+    let fenced = state.fenced_greens.get(&branch).cloned();
+    (hg.root, branch, fenced)
+  });
+  let (readopted, read) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      let readopted =
+        crate::green_adopt::readopt_with(shard, shard, root, slates_merge::engine::Green::new())
+          .await;
+      let read = crate::vcs_store::named_objects::read_file_brought(branch, "b").await;
+      (readopted, read)
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(fenced, None, "not fenced while its source awaits");
+  assert_eq!(readopted, Some(true), "the root re-adopted");
+  assert_eq!(read.as_deref(), Some(&b"b\n"[..]), "`main` rebuilt over it");
 }
 
 /// A daemon over `instance`'s segment and `store`, the anchor's, with a Mercurial repository rebuilt from the fixtures by

@@ -1892,9 +1892,9 @@ async fn built_works(
 }
 
 /// `moved`'s work begun ([`built_works`]): its base's and its head's trees laid out in a turn of their own
-/// (`tree::begin_work`), a changeset or manifest the repository holds whose text was let go once landed read from the
-/// node's changeset store and the trees laid out again (goal 93, C1 (1)), each text once, at most [`LAYOUT_TEXTS`]. What
-/// refused it; none when the store went away.
+/// (`tree::begin_work`), a changeset or manifest the repository holds whose text was let go once landed read whole from
+/// the node's changeset store and given to the layout in its object's place, and the trees laid out again (goal 93, C1
+/// (1)), each text once, at most [`LAYOUT_TEXTS`]. What refused it; none when the store went away.
 async fn begun_work(
   repository: RepositoryId,
   forked: Option<&Forked>,
@@ -1902,12 +1902,12 @@ async fn begun_work(
   room: &Admission,
 ) -> Option<Result<tree::WorkBuild, PushOutcome>> {
   let verified = Verified::default();
-  let mut layout_texts = 0_u32;
+  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
   loop {
     let mut layout_room = *room;
     let begun = crate::state::with_state(|state| {
       vcs_store::lent_state(state, |state| {
-        let held = held_over(state, repository, forked)?;
+        let held = held_over(state, repository, forked, &given)?;
         let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
         Some(tree::begin_work(
           moved,
@@ -1921,11 +1921,18 @@ async fn begun_work(
     match begun {
       Ok(building) => return Some(Ok(building)),
       Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node }))
-        if layout_texts < LAYOUT_TEXTS =>
+        if given.len() < LAYOUT_TEXTS && !given.iter().any(|(read, _)| *read == node) =>
       {
-        layout_texts = layout_texts.saturating_add(1);
-        if !layout_text_read(repository, forked, (log, node)).await {
-          return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+        let read = match forked {
+          Some(forked) => log_text_read(&mut ThisShard, (repository, forked), (log, node)).await,
+          None => log_text_read(&mut ThisShard, (repository, Committed), (log, node)).await,
+        };
+        match read {
+          Some(text) => {
+            let _ = crate::state::with_state(|state| state.count(WORK_LOG_TEXTS_READ, 1));
+            given.push((node, text));
+          }
+          None => return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec())))),
         }
       }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
@@ -1933,27 +1940,28 @@ async fn begun_work(
   }
 }
 
-/// A changeset's or manifest's text a work's layout found not at hand (goal 93, C1 (1)): read from the node's changeset
-/// store and brought back over the push's fork, counted ([`WORK_LOG_TEXTS_READ`]). Whether it was.
-async fn layout_text_read(
-  repository: RepositoryId,
-  forked: Option<&Forked>,
+/// The whole text of the changeset or manifest `node` a reader found not at hand (goal 93, C1 (1): let go once landed;
+/// a work's layout, a made changeset's parent, a named file's resolution), read from the node's changeset store under
+/// its log's path within the length its row records over the push's fork or the store's own index (`over`): given to the reader
+/// in its object's place, so no delta chain is brought back link by link. None where the repository holds no such
+/// revision or the store gave no text.
+pub(crate) async fn log_text_read<L: ShardLender, O: IndexOver>(
+  lender: &mut L,
+  (repository, over): (RepositoryId, O),
   (log, node): (slates_hg::index::Log<'static>, Node),
-) -> bool {
+) -> Option<Vec<u8>> {
   let path = match log {
     slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
     _ => slates_hg::push::intake::MANIFEST_PATH,
   };
-  let asked = (log, path.to_vec());
-  let read = match forked {
-    Some(forked) => bring_back_log_on(&mut ThisShard, repository, forked, asked, node).await,
-    None => bring_back_log_on(&mut ThisShard, repository, Committed, asked, node).await,
-  }
-  .is_ok();
-  if read {
-    let _ = crate::state::with_state(|state| state.count(WORK_LOG_TEXTS_READ, 1));
-  }
-  read
+  let len = lender
+    .lend(|state| log_held(state, (repository, over.forked()), log, &node))
+    .flatten()?
+    .len;
+  let (_, _, text) = asked_text_on(lender, repository, (path.to_vec(), node), len)
+    .await
+    .ok()?;
+  Some(text)
 }
 
 /// `building`'s work built ([`built_works`]): its builder advanced a turn at a time over `green` under half the shard's
@@ -1978,7 +1986,7 @@ async fn work_built(
       state.count(WORK_TURNS, 1);
       vcs_store::lent_state(state, |state| {
         let engine = state.greens.get(&green)?;
-        let held = held_over(state, repository, forked)?;
+        let held = held_over(state, repository, forked, &[])?;
         Some(building.advance(&engine, (&verified, &held)))
       })
     })
@@ -2135,8 +2143,8 @@ pub(crate) const LANDED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_texts_brought_
 
 /// Derived: the most texts a work's layout reads from the node's changeset store before it lays both trees out
 /// (goal 93, C1 (1)): it lays out two trees, the move's base and its head, each from a changeset and its manifest, and
-/// each text brought back is at hand when it lays out again.
-const LAYOUT_TEXTS: u32 = 4;
+/// each text read is given to it when it lays out again.
+const LAYOUT_TEXTS: usize = 4;
 
 /// Counter: a changeset's or a manifest's text a push's work read from the node's changeset store, its windows let go
 /// once landed (goal 93, C1 (1)), before its trees were laid out: what main's P5 measures as a push's asks, the parent's
@@ -2438,15 +2446,17 @@ fn held_whole(
 }
 
 /// What repository `id` holds as a push's works read it: through the push's fork where it has one, else the store's
-/// own index; none where the store is not held here.
+/// own index, the changesets' and manifests' texts `given` by node read in their let-go objects' place; none where the
+/// store is not held here.
 fn held_over<'s>(
   state: &'s ShardState,
   id: RepositoryId,
   forked: Option<&'s Forked>,
+  given: &'s [(Node, Vec<u8>)],
 ) -> Option<IndexHeld<'s>> {
   let (content, store) = state.vcs_stores.mercurial_ref(id)?;
   let index = forked.map_or(&store.index, |forked| &forked.fork);
-  Some(IndexHeld::new(index, content))
+  Some(IndexHeld::with_given(index, content, given))
 }
 
 /// A push's record once its run of segment changesets landed ([`hg_run`](super::hg_run); main's ruling (b1)): the run's
@@ -3362,6 +3372,23 @@ async fn room_after_wait(
   }
 }
 
+/// Counted: the changelog's and the manifests' texts a push's intake asked of the node's changeset store, let go once
+/// landed (goal 93, C1 (1) P5): a delta's base, or the manifest a new one is kept as a delta against. Format: a counter
+/// name in the status report.
+pub(crate) const LOG_TEXTS_ASKED: &str = "vcs.hg.push_log_texts_asked";
+
+/// Counted most: the most [`LOG_TEXTS_ASKED`] one push's intake asked. Format: a counter name in the status report.
+pub(crate) const MOST_LOG_TEXTS_ASKED: &str = "vcs.hg.push_log_texts_asked_most";
+
+/// Counted: of [`LOG_TEXTS_ASKED`], the parent manifest's read-back, named apart: the manifest the fork holds last, which
+/// a new manifest's row is kept as a delta against, asked where it is not also the delta's base (goal 93, C1 (1) P5).
+/// Format: a counter name in the status report.
+pub(crate) const PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_manifests_asked";
+
+/// Counted most: the most [`PREVIOUS_MANIFESTS_ASKED`] one push's intake asked. Format: a counter name in the status
+/// report.
+pub(crate) const MOST_PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_manifests_asked_most";
+
 /// Counter: a push's file delta bases found in its cache of its own texts (A-767 C1, main's ruling (b2)). Format: a
 /// counter name in the status report.
 pub(crate) const BASE_HITS: &str = "vcs.hg.push_base_hits";
@@ -3392,6 +3419,13 @@ fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intake
   state.count(BASE_HITS, intaken.base_hits);
   state.count(BASE_REBUILDS, intaken.base_rebuilds);
   state.count(BASE_STORE_READS, intaken.base_store_reads);
+  state.count(LOG_TEXTS_ASKED, intaken.log_texts_asked);
+  state.count_max(MOST_LOG_TEXTS_ASKED, intaken.log_texts_asked);
+  state.count(PREVIOUS_MANIFESTS_ASKED, intaken.previous_manifests_asked);
+  state.count_max(
+    MOST_PREVIOUS_MANIFESTS_ASKED,
+    intaken.previous_manifests_asked,
+  );
   state.count_max(MOST_OWN_RUNS, intaken.most_own_runs);
   state.count_max(MOST_OWN_RUNS_IN_FLIGHT, intaken.most_own_runs_in_flight);
   state.count(TIERED_MERGES, intaken.tiered_merges);
@@ -3619,6 +3653,66 @@ pub(crate) fn land_in(
   }
 }
 
+/// `moved`'s work begun for [`works_whole`], as [`begun_work`] begins it: a changeset or manifest its layout found not
+/// at hand (its text let go once landed, goal 93 C1 (1) P5) read whole from the node's changeset store on a thread of
+/// its own and given to the layout in its object's place, then laid out again, at most [`LAYOUT_TEXTS`].
+#[cfg(test)]
+fn begun_whole(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: Option<&Forked>,
+  moved: &Move<'_>,
+  room: &Admission,
+) -> Result<tree::WorkBuild, Box<Refused>> {
+  let verified = Verified::default();
+  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
+  loop {
+    let mut layout_room = *room;
+    let begun = vcs_store::lent_state(state, |state| {
+      let held = held_over(state, repository, forked, &given)?;
+      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+      Some(tree::begin_work(
+        moved,
+        (&verified, &held),
+        (room.left(), pace),
+        &mut layout_room,
+      ))
+    })
+    .ok_or_else(|| abort(NO_STORE.to_vec()))?;
+    match begun {
+      Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node }))
+        if given.len() < LAYOUT_TEXTS && !given.iter().any(|(read, _)| *read == node) =>
+      {
+        let text = log_text_read_blocking(state, (repository, forked), (log, node))
+          .ok_or_else(|| abort(WORK_TEXT_UNREAD.to_vec()))?;
+        given.push((node, text));
+      }
+      other => return other.map_err(|refused| abort(refused_words(&refused))),
+    }
+  }
+}
+
+/// The whole text of the changeset or manifest `node` of `log`, let go once landed, read from the node's changeset store
+/// on a thread of its own (`test_store::answer_wants_blocking`) within the length its row records, for a test that holds
+/// the shard's state; none where the repository holds no such revision or the store gave no text.
+#[cfg(test)]
+fn log_text_read_blocking(
+  state: &mut ShardState,
+  (repository, forked): (RepositoryId, Option<&Forked>),
+  (log, node): (slates_hg::index::Log<'static>, Node),
+) -> Option<Vec<u8>> {
+  let disk = state.vcs_disk.clone()?;
+  let path = match log {
+    slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
+    _ => slates_hg::push::intake::MANIFEST_PATH,
+  };
+  let len = log_held(state, (repository, forked), log, &node)?.len;
+  let mut ask = slates_hg::push::held::TextAsk::new(path.to_vec(), node, len);
+  crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), &mut ask)
+    .then(|| ask.taken().map(|(_, _, text)| text))
+    .flatten()
+}
+
 /// The works `plan` names, built whole for a test that holds the shard's state through its push ([`land_in`],
 /// [`prepare_whole`], [`prepare_served`]): [`built_works`]' units at once over the push's fork (`forked`, else the
 /// store's index), a text not at hand read from the node's changeset store on a thread of its own
@@ -3647,25 +3741,13 @@ fn works_whole(
       base: base.as_ref(),
       head: &head,
     };
-    let mut layout_room = *room;
-    let begun = vcs_store::lent_state(state, |state| {
-      let held = held_over(state, repository, forked)?;
-      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-      Some(tree::begin_work(
-        &moved,
-        (&verified, &held),
-        (room.left(), pace),
-        &mut layout_room,
-      ))
-    })
-    .ok_or_else(|| abort(NO_STORE.to_vec()))?;
-    let mut building = begun.map_err(|refused| abort(refused_words(&refused)))?;
+    let mut building = begun_whole(state, repository, forked, &moved, room)?;
     loop {
       // Whole: every unit at once.
       building.pace().turn(u64::MAX);
       let advanced = vcs_store::lent_state(state, |state| {
         let engine = state.greens.get(&green)?;
-        let held = held_over(state, repository, forked)?;
+        let held = held_over(state, repository, forked, &[])?;
         Some(building.advance(&engine, (&verified, &held)))
       })
       .ok_or_else(|| abort(NOT_AVAILABLE.to_vec()))?;

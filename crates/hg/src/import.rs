@@ -915,7 +915,9 @@ impl Import {
     }
     let mut held = Held::default();
     let index = &mut self.imported.index;
+    let mut text_kept = None;
     let outcome = held.put(store, &text).and_then(|text_id| {
+      text_kept = Some(text_id);
       let planned = PlannedChangeset {
         node: entry.node,
         p1,
@@ -930,6 +932,15 @@ impl Import {
       append_changeset(index, store, rev, &planned)
     });
     held.give_back(store, outcome)?;
+    // A changeset's text is let go once the import lands (goal 93, C1 (1) P5).
+    if let (Some(emitter), Some(text_id)) = (self.emitter.as_mut(), text_kept) {
+      emitter.note_contents(crate::filerev::FileContents {
+        path: crate::push::intake::CHANGELOG_PATH.to_vec(),
+        node: entry.node,
+        bytes: text_id,
+        block: None,
+      });
+    }
     log.cached = Some((rev, text));
     self.cut_when_due(store, false)?;
     Ok(())
@@ -1010,16 +1021,29 @@ impl Import {
       append_revision(index, store, &reading, rev, &row)
     });
     held.give_back(store, outcome)?;
-    // A file revision's contents are let go once the segment holding its delta is durable (A-767 C1 step 2b).
-    if let (Log::File(path), Some(emitter), Some((bytes, block))) =
-      (reading.log, self.emitter.as_mut(), kept_as)
-    {
-      emitter.note_contents(crate::filerev::FileContents {
-        path: path.to_vec(),
-        node: entry.node,
-        bytes,
-        block,
-      });
+    // A file revision's contents are let go once the segment holding its delta is durable (A-767 C1 step 2b); a
+    // manifest's, the object its row names as the index kept it (whole or a delta), once the import lands (goal 93, C1
+    // (1) P5).
+    if let (Some(emitter), Some((bytes, block))) = (self.emitter.as_mut(), kept_as) {
+      match reading.log {
+        Log::File(path) => emitter.note_contents(crate::filerev::FileContents {
+          path: path.to_vec(),
+          node: entry.node,
+          bytes,
+          block,
+        }),
+        Log::Manifest => {
+          if let Some(row) = self.imported.index.revision(store, Log::Manifest, rev) {
+            emitter.note_contents(crate::filerev::FileContents {
+              path: crate::push::intake::MANIFEST_PATH.to_vec(),
+              node: entry.node,
+              bytes: row.bytes,
+              block: None,
+            });
+          }
+        }
+        Log::Changelog => {}
+      }
     }
     log.cached = Some((rev, text));
     self.cut_when_due(store, false)?;

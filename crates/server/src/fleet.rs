@@ -1900,7 +1900,7 @@ async fn serve_peer_records(
           // for it, apart from the content plane's holds, and answered once its image is published.
           slates_cluster::homes::HOME_STREAM => {
             crate::vcs_store::homes::serve_remote(
-              control,
+              (control, learned_host(peer_anchor, seed)),
               &request,
               crate::daemon::LIVENESS_BUDGET_NS,
             )
@@ -2626,6 +2626,15 @@ fn owed_state_log_parts(
   let mut heads = Vec::new();
   for (register, parts, acked) in state.state_logs.owed() {
     let placement = config.place(register);
+    // Written at the greater of the host's epoch and the epoch the log was adopted under, as `owed_record` writes a
+    // head: a successor's holders fenced the dead owner's logs at the takeover's epoch, and refused every part this
+    // node wrote at its own lower one `StaleEpoch`, so no push to a repository taken over ever committed (A-894's
+    // takeover test: the names log at 3, acknowledged by none, 19 refusals).
+    let epoch = state
+      .placed_heads
+      .get(&register)
+      .map_or(config.host_epoch, |head| head.epoch)
+      .max(config.host_epoch);
     for (sequence, value) in parts {
       let holding: Vec<HostId> = placement
         .candidates
@@ -2647,7 +2656,7 @@ fn owed_state_log_parts(
           owner: local,
           object: register,
           sequence: *sequence,
-          epoch: config.host_epoch,
+          epoch,
           generation: config.version,
           value: value.clone(),
         },
@@ -11883,8 +11892,9 @@ fn record_acks_in(
   // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
   // the last thing they waited for.
   crate::live_ship::resolve(state, object.0);
-  // A destroy is answered once its tombstone is placed (`live_ship::defer_destroy`).
-  crate::live_ship::resolve_destroys(state, object.0);
+  // A destroy is answered once its tombstone is placed, and a repository's creation once its record is (A-894;
+  // `live_ship::defer_until_placed`).
+  crate::live_ship::resolve_placed(state, object.0);
   // A live shipper waits for its holders' catalog to be placed before it ships (A-240).
   crate::live_ship::catalog_placed(state, object);
 }
