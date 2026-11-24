@@ -26635,6 +26635,47 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).
+- **The lane whole, measured (diag run 45315777446, 2026-11-24, a copy of CI's job at 947f0862d).** The TSan step took
+  20 min 38 s with no cache: the builds about 5 min 30 s, mem, rt, ipc and client 2 min 48 s (all green), the server's
+  12 min 20 s (its library 468 s). The canary's was the only ThreadSanitizer report. The server's daemon, recovery and
+  attach_forms suites were green, and its library had 8 reds, each the instrumentation's, none a race:
+  - `hook_driver`'s `a_hook_whose_child_holds_its_output_is_judged_by_its_exit_and_its_child_ended`: the lingering hook
+    was killed at its 1.04 s bound before its exit (`TimedOut`, signal 9, its child's pid written). ThreadSanitizer
+    sleeps a second at the exit of a process with a thread besides the exiting one (`atexit_sleep_ms`, 1,000 by
+    default: compiler-rt's `tsan_flags.inc`, `Finalize` in `tsan_rtl.cpp`), and the bound was learned from a 30 ms
+    constant. **Fixed:** the test learns from one real run of a hook that exits at once, as the product does.
+  - Four `vcs_http::daemon_edge` tests (a fresh repository's first push of hundreds of changesets, a clone of git/git's
+    many refs, a Mercurial push's known need, a push's texts' high water): "the answer ended inside a line"
+    (`WouldBlock`), the client's read given up at ten liveness windows before a byte came. **Fixed:** the patience is
+    scaled by the lane's declared slowdown (`SLATES_TEST_RESTART_SLOWDOWN`, read by `crate::test_lane`).
+  - Both A-859 tests (`vcs_http`'s and `vcs_ssh`'s, a client that reads late): none of the edge's 63 and 30 writes
+    found the socket full, the client's tenth of a liveness window over before the slowed edge had filled it.
+    `vcs_ssh`'s had also failed on plain Linux at a load of 35 to 70 on adacachy2, where no slowdown is declared, so a
+    scaled lateness would leave it. **Open, next:** the edges tell the exchange or command when a write first waits,
+    and status counts the writes waiting on a client now; the client reads once one waits (main 01a20182's ruling of
+    2026-11-23 20:08).
+  - `memory_gauges`'s `the_control_shards_memory_status_names_glibcs_bytes_where_glibc_runs`: no `malloc_*` row, since
+    the runtime's allocator replaces glibc's and glibc's figures read zero. **Fixed:** the test tells that build by
+    `cfg(slates_tsan)` and expects no row there.
+  - The step clock test: a probe read a 400 ns least gap between the clock's readings and steps of 300 pages against
+    the 450 asked. ThreadSanitizer intercepts `clock_gettime` (`sanitizer_common_interceptors.inc`), so the gap is the
+    interceptor's cost, not the clock's tick. **Fixed:** not run under `slates_tsan`; it runs one thread, so the lane
+    loses no race by it.
+  - t_a614a's probe: 9 turns over 453 ms at a 100 ms ceiling, 5 ceilings filled and 8 waits found; the bound as it
+    stands held, so the change counting waits found (4f995c6b0) was not landed. **Open:** watched in the lane.
+
+  Seven of diag run 45289949180's library reds were green here: the memory status's holders (intermittent, since fixed
+  by 8918cc8d0), two repository store restores (41bf83bf0, A-877), three let-go windows over the daemon's edge
+  (050ef43c2 in the tree) and the bounded sweep (about 120 s). The step's timeout is now 62 minutes, about three times
+  this pass, so a hang fails the lane in bounded time.
+
+  Main's next run (45318320246 at 1a734fc38, the library in 652 s) failed the same eight and one more,
+  `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node`: "120 of 120 files' windows let
+  go before; 81 brought back", file 81's bring-back false. Not a patience: the bring-backs run in one task on the
+  shard, whose 60 s wait held. `hg_push::bring_back` answers a bare false for each of four refusals (no such revision,
+  no text from the store, nothing taken, no room in the content store), each through `.ok()?`, so nothing says which.
+  **Open:** reproduced first, then a typed refusal passed on through `homes::bring_back_landed`, a counter for each
+  kind (main 01a20182's ruling of 2026-11-23 20:08, §2 item 9).
 
 ### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
 CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's
