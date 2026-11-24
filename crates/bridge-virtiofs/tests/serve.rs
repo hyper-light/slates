@@ -32,7 +32,8 @@ use slates_bridge_virtiofs::credit::AttachmentCredits;
 use slates_bridge_virtiofs::device::{DeviceConfig, Durability, FIRST_REQUEST_QUEUE, FsTag};
 use slates_bridge_virtiofs::memory::{GuestMemory, GuestMemoryError, GuestRange};
 use slates_bridge_virtiofs::serve::{
-  BridgeAccess, DeviceId, EndReason, ServeEnd, TOLD_ABANDONED, register, request_revoke, serve_loop,
+  AwayProbe, BridgeAccess, DeviceId, EndReason, ServeEnd, TOLD_ABANDONED, register, request_revoke,
+  serve_loop,
 };
 use slates_bridge_virtiofs::virtqueue::QueueLayout;
 use slates_db::catalog::Principal;
@@ -139,6 +140,13 @@ thread_local! {
   static OWNER_ASKED_AT: Cell<Option<u64>> = const { Cell::new(None) };
   /// When the guest of the guest-kill test hung up, for the loop's task to measure its end from.
   static HUNG_UP: Cell<Option<Instant>> = const { Cell::new(None) };
+  /// The dispatches whose probe answers that they met content not at hand, from the next on (the park's stand-in).
+  static AWAY_DISPATCHES: Cell<u32> = const { Cell::new(0) };
+  /// The bring-backs the loop asked of the test's access.
+  static BROUGHT_BACK: Cell<u32> = const { Cell::new(0) };
+  /// What a bring-back makes of file `f` when its brought content is held: the bytes the second dispatch reads, so
+  /// a reply holding them is the chain served again, never the first dispatch's.
+  static BROUGHT_BYTES: Cell<Option<u8>> = const { Cell::new(None) };
 }
 
 /// The stand-in FUSE mount's wait for its told point to reach a journal record, counted alive in `live` until it is
@@ -374,16 +382,51 @@ impl OwnedVolume {
   }
 }
 
+/// The test access's probe: the next [`AWAY_DISPATCHES`] dispatches met content not at hand, as a let-go window of a
+/// named text makes a daemon's.
+struct StandInProbe;
+
+impl AwayProbe for StandInProbe {
+  fn take_noted_away(&mut self) -> bool {
+    AWAY_DISPATCHES.with(|left| {
+      let away = left.get() > 0;
+      left.set(left.get().saturating_sub(1));
+      away
+    })
+  }
+}
+
 impl BridgeAccess for OwnedVolume {
   fn with_bridge<R>(
     &mut self,
-    f: impl FnOnce(&mut dyn Bridge, &mut Attachments) -> R,
+    f: impl FnOnce(&mut dyn Bridge, &mut Attachments, &mut dyn AwayProbe) -> R,
   ) -> Result<R, VfsError> {
     if let Some(id) = REVOKE_DURING_PASS.with(Cell::take) {
       request_revoke(id);
     }
     let mut bridge = VolumeBridge::new(vid(), &mut self.volume, &mut self.store);
-    Ok(f(&mut bridge, &mut self.registry))
+    Ok(f(&mut bridge, &mut self.registry, &mut StandInProbe))
+  }
+
+  type Brought = ();
+
+  type BringBack = std::future::Ready<()>;
+
+  fn bring_back(&mut self) -> std::future::Ready<()> {
+    BROUGHT_BACK.with(|brought| brought.set(brought.get() + 1));
+    std::future::ready(())
+  }
+
+  /// The content brought back: file `f` holds [`BROUGHT_BYTES`] where the test set them.
+  fn hold_brought(&mut self, (): ()) {
+    if let Some(byte) = BROUGHT_BYTES.with(Cell::take) {
+      let root = self.volume.root_inode(&self.store).unwrap();
+      let node = self.volume.lookup_no(&self.store, root, "f").unwrap().inode;
+      self
+        .volume
+        .write(&mut self.store, node, 0, &[byte; TOLD_BYTES])
+        .unwrap();
+    }
   }
 
   fn fenced(&mut self) -> Option<u64> {
@@ -1083,6 +1126,65 @@ fn a_guests_write_waits_for_a_held_fuse_mount_to_the_bound_while_a_later_read_co
     abandoned, 0,
     "no reply was still held at the end: the write's went out at the bound"
   );
+  let reclaimed = end.reclaimed.expect("the terminal step ran");
+  assert_eq!(reclaimed.credits_restored, (8, 1 << 20));
+  rt.shutdown().unwrap();
+}
+
+/// Shape: what the bring-back stand-in makes of file `f`: other bytes than [`FIRST`], so the reply tells the two
+/// dispatches apart.
+const BROUGHT: u8 = 0x2B;
+
+/// A-760 (b) 4d's park for a guest (main's order and ruling of 2026-11-24: a guest's read of a let-go text is kept,
+/// brought back and served again, never answered from a dispatch that met it). Do: over a volume holding file `f` of
+/// [`FIRST`], with the access's probe saying the first dispatch met content not at hand and its bring-back making `f`
+/// hold [`BROUGHT`], the guest reads `f`, then hangs up. Expect: one bring-back; the read's one used element carrying
+/// errno 0 and [`BROUGHT`]'s bytes, the second dispatch's answer; the loop's count of bring-backs 1; every credit given
+/// back. Before, the first dispatch's answer was published as it was: [`FIRST`]'s bytes, no bring-back.
+#[test]
+fn a_guests_read_that_met_content_not_at_hand_is_kept_brought_back_and_served_again() {
+  static LIVE: AtomicU64 = AtomicU64::new(0);
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<ServeEnd>();
+  let (guest_tx, guest_rx) = channel::<(i32, Vec<u8>, u32)>();
+  rt.spawn_on(shard, async move {
+    let (mut owned, node, _) = OwnedVolume::with_file(&LIVE);
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    AWAY_DISPATCHES.with(|left| left.set(1));
+    BROUGHT_BYTES.with(|bytes| bytes.set(Some(BROUGHT)));
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send(end);
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let rq = usize::from(FIRST_REQUEST_QUEUE);
+      let read = with_guest(|g| g.submit(rq, &read_request(1, node), REPLY_CAP, 1));
+      rustix::io::write(&kick_write, &[1u8]).unwrap();
+      notified(&call_read).await;
+      let (head, len) = with_guest(|g| g.reap(rq)).expect("the read's used element");
+      assert_eq!(head, read);
+      let reply = with_guest(|g| g.reply_of(rq, head, len));
+      let data = reply.get(OUT_HEADER..).unwrap_or(&[]).to_vec();
+      drop(kick_write);
+      let _ = guest_tx.send((reply_error(&reply), data, BROUGHT_BACK.with(Cell::get)));
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+  let (errno, data, brought) = guest_rx.recv_timeout(WAIT).expect("the guest finished");
+  assert_eq!(
+    (errno, data.as_slice(), brought),
+    (0, &[BROUGHT; TOLD_BYTES][..], 1),
+    "kept, brought back once and served again"
+  );
+  let end = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert_eq!(end.brought_back, 1);
   let reclaimed = end.reclaimed.expect("the terminal step ran");
   assert_eq!(reclaimed.credits_restored, (8, 1 << 20));
   rt.shutdown().unwrap();

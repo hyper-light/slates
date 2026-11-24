@@ -373,6 +373,8 @@ impl Future for RegisterWaker {
   }
 }
 
+pub use crate::device::AwayProbe;
+
 /// How the loop reaches the bridge for a pass: the daemon builds a transient `VolumeBridge` over
 /// the shard's state; a test lends an owned volume. Refused typed when the volume is gone
 /// (destroyed under a live device), which ends the loop.
@@ -380,10 +382,27 @@ pub trait BridgeAccess {
   /// Runs `f` with the bridge and the owner's attachment registry — the one every transport on the
   /// volume rides, so the owner's barriers see the device's requests (GAP-A9-4) — or refuses when
   /// there is no volume to bridge to.
+  /// `f` is handed the access's [`AwayProbe`] beside them: whether the dispatch it last made met content not at hand,
+  /// which the access states (main's ruling of 2026-11-24: one signature, so no access can skip the question).
   fn with_bridge<R>(
     &mut self,
-    f: impl FnOnce(&mut dyn Bridge, &mut Attachments) -> R,
+    f: impl FnOnce(&mut dyn Bridge, &mut Attachments, &mut dyn AwayProbe) -> R,
   ) -> Result<R, VfsError>;
+
+  /// What a kept chain's content brought back holds until the pass that serves the chain again has ended
+  /// ([`BridgeAccess::bring_back`], [`BridgeAccess::hold_brought`]).
+  type Brought;
+
+  /// A bring-back of what the last pass's kept chain met not at hand (A-760 (b) 4d): ready with what it holds once the
+  /// content is back, or once it could not be (then the chain's second dispatch meets it again and is answered). It
+  /// holds no borrow of the access.
+  type BringBack: Future<Output = Self::Brought> + 'static;
+
+  /// Brings back what the last pass's kept chain met not at hand.
+  fn bring_back(&mut self) -> Self::BringBack;
+
+  /// Holds what a bring-back brought until the next pass, which serves the kept chain again, has ended.
+  fn hold_brought(&mut self, brought: Self::Brought);
 
   /// The owner's barrier (§4.8, D-18; AUD-29-82): makes the volume's current state survive a daemon restart
   /// — the daemon publishes the shard's recovery image — and says whether the volume was captured. Run
@@ -504,6 +523,8 @@ pub struct ServeEnd {
   pub passes: u64,
   /// Intervals the loop held the guest's requests because the owner was fenced (AUD-29-83).
   pub fenced_waits: u64,
+  /// Bring-backs the loop awaited for a chain kept for content not at hand (A-760 (b) 4d's park).
+  pub brought_back: u64,
 }
 
 /// Runs service passes until the rings are idle, yielding between passes; `Some(reason)` when the loop must
@@ -559,6 +580,14 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
           return Some(end_of(refusal));
         }
         report_dax_counts(admitted, bridge, counters);
+        // A chain kept for content not at hand: brought back, then served again first by the next pass, what was
+        // brought held until that pass has ended (A-760 (b) 4d; main's ruling of 2026-11-24).
+        if admitted.holds_kept() {
+          counters.brought_back = counters.brought_back.saturating_add(1);
+          let brought = bridge.bring_back().await;
+          bridge.hold_brought(brought);
+          continue;
+        }
         if more {
           futures::yield_now().await;
         } else {
@@ -584,7 +613,7 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
   {
     let slice = bridge.copy_slice_bytes();
     let turned = bridge
-      .with_bridge(|b, registry| admitted.dax_turn(b, registry, slice))
+      .with_bridge(|b, registry, _| admitted.dax_turn(b, registry, slice))
       .map_err(ServeError::Authority)??;
     if turned.barrier_owed {
       // A request the step served changed what survives a restart, or its ingest wrote: publish before the guest
@@ -592,7 +621,7 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
       let captured = bridge.barrier();
       let durable = captured.then(|| bridge.durable_owed()).flatten();
       bridge
-        .with_bridge(|b, registry| admitted.complete_barrier(b, registry, (captured, durable)))
+        .with_bridge(|b, registry, _| admitted.complete_barrier(b, registry, (captured, durable)))
         .map_err(ServeError::Authority)??;
     }
     if turned.busy {
@@ -602,7 +631,7 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
     }
   }
   let pass = bridge
-    .with_bridge(|b, registry| admitted.service(b, registry))
+    .with_bridge(|b, registry, probe| admitted.service(b, registry, probe))
     .map_err(ServeError::Authority)??;
   counters.passes = counters.passes.saturating_add(1);
   if pass.barrier_owed {
@@ -611,7 +640,7 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
     let captured = bridge.barrier();
     let durable = captured.then(|| bridge.durable_owed()).flatten();
     bridge
-      .with_bridge(|b, registry| admitted.complete_barrier(b, registry, (captured, durable)))
+      .with_bridge(|b, registry, _| admitted.complete_barrier(b, registry, (captured, durable)))
       .map_err(ServeError::Authority)??;
   }
   // A guest's requests are client activity: the shard spins out its idle window after a pass, so the
@@ -707,7 +736,7 @@ async fn drive_dax_acks<S: VmmSeam, B: BridgeAccess>(
       }
       Ok(AckWoke::Ack) => {}
     }
-    match bridge.with_bridge(|_, registry| admitted.complete_dax_map(registry)) {
+    match bridge.with_bridge(|_, registry, _| admitted.complete_dax_map(registry)) {
       Ok(Ok(_)) => {}
       Ok(Err(e)) => {
         return AcksDriven {
@@ -725,7 +754,7 @@ async fn drive_dax_acks<S: VmmSeam, B: BridgeAccess>(
   }
   // Opportunistically settle any arrived unmap-acks without blocking, so the outstanding ring stays short.
   if admitted.dax_outstanding() {
-    match bridge.with_bridge(|_, registry| admitted.complete_dax_map(registry)) {
+    match bridge.with_bridge(|_, registry, _| admitted.complete_dax_map(registry)) {
       Ok(Ok(_)) | Err(_) => {}
       Ok(Err(e)) => {
         return AcksDriven {
@@ -747,7 +776,7 @@ async fn drive_end_ingest<S: VmmSeam, B: BridgeAccess>(
   bridge: &mut B,
 ) {
   if !bridge
-    .with_bridge(|b, _| admitted.begin_end_ingest(b))
+    .with_bridge(|b, _, _| admitted.begin_end_ingest(b))
     .unwrap_or(false)
   {
     return;
@@ -761,7 +790,7 @@ async fn drive_end_ingest<S: VmmSeam, B: BridgeAccess>(
       continue;
     }
     let slice = bridge.copy_slice_bytes();
-    match bridge.with_bridge(|b, registry| admitted.end_ingest_step(b, registry, slice)) {
+    match bridge.with_bridge(|b, registry, _| admitted.end_ingest_step(b, registry, slice)) {
       Ok(Ok(None)) => futures::yield_now().await,
       Ok(Ok(Some(wrote))) => {
         if wrote {
@@ -784,6 +813,8 @@ struct LoopCounters {
   wakes: u64,
   passes: u64,
   fenced_waits: u64,
+  /// Bring-backs the loop awaited for a chain kept for content not at hand.
+  brought_back: u64,
   /// The device's backed DAX counts as the loop last added them to the owner's status counters.
   dax_reported: crate::backed::BackedCounts,
 }
@@ -822,7 +853,7 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   if take_advance_requested(id) {
     // If the attachment's authority has just lapsed, the pass below meets the same lapse and ends the loop on it, so
     // the refusal here is folded into that pass, not lost.
-    let _advanced = bridge.with_bridge(|b, registry| admitted.view_advanced(b, registry));
+    let _advanced = bridge.with_bridge(|b, registry, _| admitted.view_advanced(b, registry));
     return serve_until_idle(id, admitted, bridge, counters).await;
   }
   let raw = match admitted.doorbell() {
@@ -902,7 +933,7 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
   drive_end_ingest(&mut admitted, &mut bridge).await;
   // The terminal step always runs to its end (AUD-29-70): through the bridge when the volume is there, else
   // through the registry alone — the volume's references went with it — and the store's backings alone.
-  let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
+  let reclaimed = match bridge.with_bridge(|b, registry, _| admitted.reclaim(b, registry)) {
     Ok(reclaimed) => reclaimed,
     Err(gone) => {
       let _released = bridge.with_backings(|backings| admitted.release_backings(backings));
@@ -919,6 +950,7 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
     wakes: counters.wakes,
     passes: counters.passes,
     fenced_waits: counters.fenced_waits,
+    brought_back: counters.brought_back,
   }
 }
 
