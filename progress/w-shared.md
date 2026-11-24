@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 11:20 PST 11-24: LANDED A-903, main 29f45e606: a successor writes its adopted state logs' parts at the adopted
+  epoch (was its host epoch; 19 StaleEpoch refusals a run, no push to a taken-over repository committed). Red/green in
+  A-894's takeover test (push to the successor). OPEN for main and w-git: a repository is reachable only at its
+  owner's edge (Repositories::locate is node-local): forward at the edge, or send the client to the owner. NEXT:
+  main's ruling on that; then the poll #[must_use] sweep.
+
 ## 10:45 PST 11-24: LANDED A-894, main 87a0b1b8c: a repository's creation answers once its record is placed at f + 1
   (63.8 ms at f = 1, debug), held on the destroy's hold made general (live_ship::defer_until_placed). Red: git_fleet's
   immediate check 0 of 2 holders. FOUND (GAPS OPEN): after a repository's takeover, a push is refused at both survivors
