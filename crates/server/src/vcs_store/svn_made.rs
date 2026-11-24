@@ -76,6 +76,15 @@ thread_local! {
   pub(crate) static KILL_BEFORE_MADE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+  /// A test's let-go of named texts' windows in a server-made commit's step, after its changeset landed and before its
+  /// held verdict applies (main's question of 2026-11-23: can a base let go between judge and apply make the green
+  /// other than judged?): the texts named, let go as a landing lets them go; it fires once, emptying itself.
+  pub(crate) static LET_GO_BEFORE_APPLY: std::cell::RefCell<Vec<[u8; 32]>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Counter: a revision the server made of a submitted version. Format: a counter name in the daemon's status report.
 pub(crate) const MADE: &str = "vcs.svn.revision_made";
 
@@ -242,6 +251,13 @@ async fn made_commit_landing(
     if KILL_BEFORE_MADE_COMMIT.with(|kill| kill.replace(false)) {
       killed.set(true);
       return Ok(None);
+    }
+    #[cfg(test)]
+    {
+      let texts = LET_GO_BEFORE_APPLY.with(|texts| std::mem::take(&mut *texts.borrow_mut()));
+      if !texts.is_empty() {
+        crate::vcs_store::name_holds::let_go_landed_texts(state, &texts);
+      }
     }
     let pending = waiting.take().ok_or(Uncommitted::NotHeld)?;
     Ok(crate::made_commit::commit_guarded(
