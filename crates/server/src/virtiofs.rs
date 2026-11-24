@@ -210,57 +210,78 @@ impl ShardBridge {
       } else {
         slates_bridge_core::DaxOffer::Withheld
       };
-      let ShardState {
-        store,
-        volumes,
-        attachments,
-        snapshot_views,
-        write_log,
-        content,
-        ..
-      } = s;
-      // Each write the guest is told succeeded is kept in the shard's write log before its used element is published,
-      // as a FUSE mount's and a Shards stream's are (A-63, A-410): a log with no room for it, or a span the content
-      // object refused, leaves it to the publication the device then runs before the reply (A-358's rule). Without a
-      // log (no anchor's content object) nothing outlives the daemon, and nothing is owed.
-      let mut log_write =
-        |inode: u64, offset: u64, bytes: &[u8]| match (write_log.as_mut(), content.as_mut()) {
-          (Some(log), Some(object)) => log
-            .append(object, (volume.bytes, inode), offset, bytes)
-            .is_ok(),
-          _ => true,
-        };
-      // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
-      let bridge = if presents_snapshot {
-        let view = snapshot_views.get_mut(&attachment)?;
-        VolumeBridge::attached(volume, &mut view.volume, store, handles, None)
-      } else {
-        let slot = volumes.get_mut(handle).ok()?;
-        VolumeBridge::attached(
-          volume,
-          &mut slot.volume,
+      // A mounted work's base held by name is read with its texts lent for the pass (A-760 (b) 4d), as a FUSE mount's
+      // turn reads it.
+      let lend = crate::mounted_work::reads_named(s, volume);
+      crate::vcs_store::svn_presenter::lent_if(s, lend, |s| {
+        // A mounted work whose base moved shows its new base (A-774 R4).
+        crate::mounted_work::refresh(s, volume);
+        let ShardState {
           store,
-          handles,
-          slot
-            .host
-            .as_mut()
-            .map(|host| host as &mut dyn slates_vfs::host::HostFs),
-        )
-      };
-      // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
-      let mut bridge = bridge
-        .offering_dax(offer)
-        .serving_a_guest()
-        .logging_writes(&mut log_write);
-      let mut scoped;
-      let served: &mut dyn Bridge = match scope {
-        Some(scope) => {
-          scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
-          &mut scoped
-        }
-        None => &mut bridge,
-      };
-      Some(f(served, attachments, &mut PassProbe { seen: 0 }))
+          volumes,
+          attachments,
+          snapshot_views,
+          write_log,
+          content,
+          greens,
+          merge,
+          vcs_stores,
+          ..
+        } = s;
+        // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774): the lend NFS's, FUSE's
+        // and WinFsp's turns make (`mounted_work::source`, `mounted_work::lend`).
+        let lent_green = crate::mounted_work::source(greens, &merge.mounted, volume);
+        let green_tree = lent_green.as_ref().map(|(green, version)| {
+          crate::green_tree::GreenTree::reading(
+            green,
+            *version,
+            crate::vcs_store::named_objects::plane(vcs_stores, &()),
+          )
+        });
+        let mut tree_lens = None;
+        // Each write the guest is told succeeded is kept in the shard's write log before its used element is published,
+        // as a FUSE mount's and a Shards stream's are (A-63, A-410): a log with no room for it, or a span the content
+        // object refused, leaves it to the publication the device then runs before the reply (A-358's rule). Without a
+        // log (no anchor's content object) nothing outlives the daemon, and nothing is owed.
+        let mut log_write =
+          |inode: u64, offset: u64, bytes: &[u8]| match (write_log.as_mut(), content.as_mut()) {
+            (Some(log), Some(object)) => log
+              .append(object, (volume.bytes, inode), offset, bytes)
+              .is_ok(),
+            _ => true,
+          };
+        // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
+        let bridge = if presents_snapshot {
+          let view = snapshot_views.get_mut(&attachment)?;
+          VolumeBridge::attached(volume, &mut view.volume, store, handles, None)
+        } else {
+          let slot = volumes.get_mut(handle).ok()?;
+          VolumeBridge::attached(
+            volume,
+            &mut slot.volume,
+            store,
+            handles,
+            slot
+              .host
+              .as_mut()
+              .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens)),
+          )
+        };
+        // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
+        let mut bridge = bridge
+          .offering_dax(offer)
+          .serving_a_guest()
+          .logging_writes(&mut log_write);
+        let mut scoped;
+        let served: &mut dyn Bridge = match scope {
+          Some(scope) => {
+            scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+            &mut scoped
+          }
+          None => &mut bridge,
+        };
+        Some(f(served, attachments, &mut PassProbe { seen: 0 }))
+      })
     })
     .flatten()
     .ok_or(VfsError::NotFound)
@@ -782,6 +803,8 @@ fn attach_handed(
   let db_volume = DbVolumeId {
     bytes: volume.bytes,
   };
+  // A work is served like any volume (A-774): its slot is made here, on its owner, at its first attach.
+  crate::mounted_work::ensure_slot(s, db_volume);
   if !s.by_id.contains_key(&db_volume) {
     return Err(Refusal::NotFound);
   }
@@ -1060,6 +1083,8 @@ fn open_view(
   volume: DbVolumeId,
   view: &GuestView,
 ) -> Result<ShardBridge, Refusal> {
+  // A work is served like any volume (A-774): its slot is made here, on its owner, at its device's attach.
+  crate::mounted_work::ensure_slot(s, volume);
   let scope = match (&view.subtree, view.snapshot) {
     (Some(_), Some(_)) => {
       return Err(Refusal::AttachmentUnsupported {
