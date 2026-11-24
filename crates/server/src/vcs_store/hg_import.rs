@@ -1113,10 +1113,8 @@ async fn built_works(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
           if !super::hg_view::answer_store_wants(&mut building, id).await {
             return None;
           }
-          let brought = crate::state::with_state(|state| {
-            super::lent_state(state, |state| brought_back(state, id, &mut building))
-          })
-          .flatten();
+          let brought =
+            crate::state::with_state(|state| brought_back(state, id, &mut building)).flatten();
           if brought.is_none() {
             return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
           }
@@ -1164,6 +1162,8 @@ fn done_held<T>(
 
 /// The text `building` was given for the file revision it waited for, brought back into the content store by the
 /// identities repository `id`'s done import's index names; none where nothing was given or the store refused it.
+/// Called outside any `lent_state`, since its `within_budget` grows the arena before it lends the chunks (refused
+/// `OutOfReach` inside one).
 fn brought_back(
   state: &mut ShardState,
   id: RepositoryId,
@@ -1257,8 +1257,7 @@ fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), Imp
           ) {
             return Err(unavailable());
           }
-          super::lent_state(state, |state| brought_back(state, id, &mut building))
-            .ok_or_else(unavailable)?;
+          brought_back(state, id, &mut building).ok_or_else(unavailable)?;
         }
         None => {}
         Some(Ok(built)) => {

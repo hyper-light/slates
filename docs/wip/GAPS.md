@@ -957,8 +957,9 @@
 >   it is durable on the changeset store its windows are let go (`hg_run::let_go_landed`, `let_go_object_landed` with
 >   `vcs_store::landed_pin`, as a landed git pack's), and once more when the entry commits, since the push's works
 >   bring back the texts they read between. Entries stay; a read brings a text back from the store, the works' own
->   included (`brought_back`, now within a lent budget and the chunk store's lend: its bring-back was refused
->   `OverBudget { room: 0 }` outside them). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
+>   included (`brought_back`, within a lent budget: its bring-back was refused `OverBudget { room: 0 }` with none; a
+>   `lent_state` wrapper put on it then hid the pool, and since 2026-11-23 room asked inside a lend is refused
+>   `OutOfReach`, docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md). Counted `vcs.hg.push_text_bytes_let_go`, `..._texts_pinned`. Held by
 >   `a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land` (120 files of 8 KiB: every window let go
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
@@ -966,7 +967,8 @@
 >   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
 >   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
 >   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
->   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   then put back within its lent room; refused by kind since 2026-11-23, `BringBackRefused`, each counted), counted
+>   `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
 >   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
 >   (`hg_run::Run::settle`) or an import lands, each file revision's windows a home holds (held for the region,
@@ -4707,8 +4709,24 @@
 > (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). Blame was of every file at every
 > sample, 155,904 commands over git-2000 (4,872 files × 16 samples × 2 legs). By main 01a20182's ruling it is now of
 > the files each sampled revision changed, or those of the nearest earlier change (`blamed_files`,
-> `files_changed_in`), the count printed at each sample. **Owed:** the sizing run (a diag lane on ubuntu-latest,
-> stock svn 1.15 built in the job), then git-2000's rerun on the big Studio, its bound derived from the per-verb lines.
+> `files_changed_in`), the count printed at each sample. **Sized (run 45330574435, diag 1a3f1079b, ubuntu-latest, 4
+> CPUs, load 1.2 to 2.3, stock svn 1.15.0 built in the job, git-2000.dump made in it):** the whole use test over HTTP
+> took 900.37 s, its verbs about 851 s of it, in seconds per leg:
+> - checkout 78.4 (stock 33.5, slates 37.6);
+> - update 126.4 (54.9, 58.6);
+> - switch 81.7 (36.2, 38.1);
+> - blame 393.0 (308.4, 72.8), most of it revision 1, whose 4,523 added files the rule blames, the later samples 1 to
+>   10 files each;
+> - svnsync 137.4 (67.3, 70.0);
+> - svnrdump's dump 9.1 (2.3, 6.6);
+> - the writing session 15.3 (0.6, 14.7);
+> - info, diff, revprops and log about 10 together.
+>
+> **The bound for git-2000's run is 1,800 s:** twice the slowest whole run measured (2 × 900.37 s on a 4-CPU runner).
+> Past twice that a run is stuck, not slow. It ended with 18 differences, server reds sent to w-svn by main: `info`
+> answered 500 on `/project/!svn/rvr/N/trunk/t` at all 17 samples, and svnrdump's dump differs in one deletion's order.
+> Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
+> w-svn. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -26797,8 +26815,16 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   go before; 81 brought back", file 81's bring-back false. Not a patience: the bring-backs run in one task on the
   shard, whose 60 s wait held. `hg_push::bring_back` answers a bare false for each of four refusals (no such revision,
   no text from the store, nothing taken, no room in the content store), each through `.ok()?`, so nothing says which.
-  **Open:** reproduced first, then a typed refusal passed on through `homes::bring_back_landed`, a counter for each
-  kind (main 01a20182's ruling of 2026-11-23 20:08, §2 item 9).
+  **Fixed (2026-11-23, w-tsan; main 01a20182's rulings of 21:25 and 21:30):** the content store's room, asked inside
+  `lent_state`, where the shard's chunk store, and with it the arena's pool, is the content store's for the step. The
+  step had only the arena's slack, which a publication's give-back (`Store::release_idle`) leaves at 407,277 bytes, so
+  the 49th file of 120 was refused `OverBudget { need: 8192, room: 5869 }`. Plainly 2 runs of 100 on adacachy2 at a load
+  of 47; with a publication pinned before the bring-backs 10 of 10 red, and 10 of 10 green with the room made outside
+  the lend. Six steps asked so (`bring_back`, `bring_back_log`, two `brought_back` sites in `hg_push`, two in
+  `hg_import`), all moved out. Room asked inside a lend is now refused by its own kind at its first put
+  (`ContentRefused::OutOfReach`, counted `vcs_store.room_out_of_reach`), and the bring-back's refusal is typed through
+  `homes::bring_back_landed` and `homes::read` (`BringBackRefused`, `LandedRefused`, `HomeReadRefused`), each kind
+  counted. docs/bugs/2026-11-23-a-bring-back-asked-for-room-inside-a-lend.md.
 
 ### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
 CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's
