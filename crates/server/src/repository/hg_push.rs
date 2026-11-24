@@ -1764,7 +1764,6 @@ async fn built_works(
   if let Err(outcome) = planned {
     return Some(Err(outcome));
   }
-  let verified = Verified::default();
   let mut built = BTreeMap::new();
   for key in &plan {
     if built.contains_key(key) {
@@ -1777,95 +1776,148 @@ async fn built_works(
       base: base.as_ref(),
       head: &head,
     };
-    let mut layout_texts = 0_u32;
-    let mut building = loop {
-      let mut layout_room = *room;
-      let begun = crate::state::with_state(|state| {
-        vcs_store::lent_state(state, |state| {
-          let held = held_over(state, repository, forked)?;
-          let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-          Some(tree::begin_work(
-            &moved,
-            (&verified, &held),
-            (room.left(), pace),
-            &mut layout_room,
-          ))
-        })
-      })
-      .flatten()?;
-      match begun {
-        Ok(building) => break building,
-        // A changeset or manifest the repository holds whose text was let go once landed (goal 93, C1 (1)): read from the
-        // node's changeset store, brought back over the push's fork, and the trees laid out again; each text once.
-        Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node }))
-          if layout_texts < LAYOUT_TEXTS =>
-        {
-          layout_texts = layout_texts.saturating_add(1);
-          let path = match log {
-            slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
-            _ => slates_hg::push::intake::MANIFEST_PATH,
-          };
-          if bring_back_log_on(
-            &mut ThisShard,
-            repository,
-            forked,
-            (log, path.to_vec()),
-            node,
-          )
-          .await
-          .is_err()
-          {
-            return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
-          }
-          let _ = crate::state::with_state(|state| state.count(WORK_LOG_TEXTS_READ, 1));
-        }
-        Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
-      }
+    let mut building = match begun_work(repository, forked, &moved, room).await? {
+      Ok(building) => building,
+      Err(outcome) => return Some(Err(outcome)),
     };
-    loop {
-      let advanced = crate::state::with_state(|state| {
-        let quantum = state.config.step_quantum_ns() / 2;
-        building
-          .pace()
-          .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
-        state.count(WORK_TURNS, 1);
-        vcs_store::lent_state(state, |state| {
-          let engine = state.greens.get(&green)?;
-          let held = held_over(state, repository, forked)?;
-          Some(building.advance(&engine, (&verified, &held)))
-        })
-      })
-      .flatten()?;
-      match advanced {
-        // The turn waited for a file revision the repository holds whose text is not at hand (A-767 C1: one an import
-        // let go): read from the node's changeset store between turns and brought back into the content store.
-        None if building.ask_waited(room.left()) => {
-          if !vcs_store::hg_view::answer_store_wants(&mut building, repository).await {
-            return None;
-          }
-          // Its window goes back into the shard's chunk store, lent to the content store within the room its bytes take
-          // (`brought_back`'s `within_budget`, which grows the arena first: never inside a `lent_state`).
-          let brought = crate::state::with_state(|state| {
-            brought_back(state, repository, forked, &mut building)
-          })
-          .flatten();
-          if brought.is_none() {
-            return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
-          }
-        }
-        None => slates_rt::futures::yield_now().await,
-        Some(Ok(work)) => {
-          let _ = crate::state::with_state(|state| state.count(WORKS_BUILT, 1));
-          built.insert(*key, work.increment);
-          break;
-        }
-        Some(Err(refused)) => {
-          return Some(Err(PushOutcome::refused(&abort(refused_words(&refused)))));
-        }
+    match work_built(repository, forked, green, &mut building, room).await? {
+      Ok(increment) => {
+        built.insert(*key, increment);
       }
+      Err(outcome) => return Some(Err(outcome)),
     }
   }
   Some(Ok((plan, built)))
+}
+
+/// `moved`'s work begun ([`built_works`]): its base's and its head's trees laid out in a turn of their own
+/// (`tree::begin_work`), a changeset or manifest the repository holds whose text was let go once landed read from the
+/// node's changeset store and the trees laid out again (goal 93, C1 (1)), each text once, at most [`LAYOUT_TEXTS`]. What
+/// refused it; none when the store went away.
+async fn begun_work(
+  repository: RepositoryId,
+  forked: Option<&Forked>,
+  moved: &Move<'_>,
+  room: &Admission,
+) -> Option<Result<tree::WorkBuild, PushOutcome>> {
+  let verified = Verified::default();
+  let mut layout_texts = 0_u32;
+  loop {
+    let mut layout_room = *room;
+    let begun = crate::state::with_state(|state| {
+      vcs_store::lent_state(state, |state| {
+        let held = held_over(state, repository, forked)?;
+        let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+        Some(tree::begin_work(
+          moved,
+          (&verified, &held),
+          (room.left(), pace),
+          &mut layout_room,
+        ))
+      })
+    })
+    .flatten()?;
+    match begun {
+      Ok(building) => return Some(Ok(building)),
+      Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node }))
+        if layout_texts < LAYOUT_TEXTS =>
+      {
+        layout_texts = layout_texts.saturating_add(1);
+        if !layout_text_read(repository, forked, (log, node)).await {
+          return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+        }
+      }
+      Err(refused) => return Some(Err(PushOutcome::refused(&abort(refused_words(&refused))))),
+    }
+  }
+}
+
+/// A changeset's or manifest's text a work's layout found not at hand (goal 93, C1 (1)): read from the node's changeset
+/// store and brought back over the push's fork, counted ([`WORK_LOG_TEXTS_READ`]). Whether it was.
+async fn layout_text_read(
+  repository: RepositoryId,
+  forked: Option<&Forked>,
+  (log, node): (slates_hg::index::Log<'static>, Node),
+) -> bool {
+  let path = match log {
+    slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
+    _ => slates_hg::push::intake::MANIFEST_PATH,
+  };
+  let read = bring_back_log_on(
+    &mut ThisShard,
+    repository,
+    forked,
+    (log, path.to_vec()),
+    node,
+  )
+  .await
+  .is_ok();
+  if read {
+    let _ = crate::state::with_state(|state| state.count(WORK_LOG_TEXTS_READ, 1));
+  }
+  read
+}
+
+/// `building`'s work built ([`built_works`]): its builder advanced a turn at a time over `green` under half the shard's
+/// step quantum, the push's revisions read through its fork, a file revision a turn waited for read from the node's
+/// changeset store between turns ([`waited_text_brought`]). Its increment, or what refused it; none when the store went
+/// away.
+async fn work_built(
+  repository: RepositoryId,
+  forked: Option<&Forked>,
+  green: DbVolumeId,
+  building: &mut tree::WorkBuild,
+  room: &Admission,
+) -> Option<Result<Increment, PushOutcome>> {
+  let verified = Verified::default();
+  loop {
+    let advanced = crate::state::with_state(|state| {
+      let quantum = state.config.step_quantum_ns() / 2;
+      building
+        .pace()
+        .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
+      state.count(WORK_TURNS, 1);
+      vcs_store::lent_state(state, |state| {
+        let engine = state.greens.get(&green)?;
+        let held = held_over(state, repository, forked)?;
+        Some(building.advance(&engine, (&verified, &held)))
+      })
+    })
+    .flatten()?;
+    match advanced {
+      None if building.ask_waited(room.left()) => {
+        if !waited_text_brought(repository, forked, building).await? {
+          return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+        }
+      }
+      None => slates_rt::futures::yield_now().await,
+      Some(Ok(work)) => {
+        let _ = crate::state::with_state(|state| state.count(WORKS_BUILT, 1));
+        return Some(Ok(work.increment));
+      }
+      Some(Err(refused)) => {
+        return Some(Err(PushOutcome::refused(&abort(refused_words(&refused)))));
+      }
+    }
+  }
+}
+
+/// The file revision a work's turn waited for, the repository's whose text is not at hand (A-767 C1: one an import let
+/// go), read from the node's changeset store between turns and brought back into the content store: its window goes back
+/// into the shard's chunk store, lent to the content store within the room its bytes take (`brought_back`'s
+/// `within_budget`, which grows the arena first: never inside a `lent_state`). Whether it was brought back; none where
+/// the store did not answer.
+async fn waited_text_brought(
+  repository: RepositoryId,
+  forked: Option<&Forked>,
+  building: &mut tree::WorkBuild,
+) -> Option<bool> {
+  if !vcs_store::hg_view::answer_store_wants(building, repository).await {
+    return None;
+  }
+  let brought =
+    crate::state::with_state(|state| brought_back(state, repository, forked, building)).flatten();
+  Some(brought.is_some())
 }
 
 /// [`held_ahead`], waiting for room where the content store cannot hold the increments for now (the content store giving

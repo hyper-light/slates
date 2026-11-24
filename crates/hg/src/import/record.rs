@@ -418,6 +418,12 @@ impl Source {
 pub enum Refused {
   /// The bytes end before what they declare.
   Truncated,
+  /// A text the replay reads was let go once landed and is asked of the node's changeset store (goal 93, C1 (1)):
+  /// never answered past [`Replay::step`], which turns it into an ask ([`Replay::store_wants`]) and takes the unit again
+  /// once given.
+  TextsWanted,
+  /// The node's changeset store gave none of the texts asked (goal 93, C1 (1)).
+  TextsUnread,
   /// A record replayed whole whose push named a file delta base landed before it, which only the node's changeset
   /// store holds and only a replay that waits between steps reads (A-767 C1; [`Progress::Store`]).
   StoreWanted,
@@ -537,6 +543,9 @@ pub struct Replayed {
   pub whole: bool,
   /// For a made changeset's record (A-731): the green's key, the version, and the changeset the server made of it.
   pub made: Option<(u64, u64, Node)>,
+  /// The changesets' and manifests' texts the replay asked of the node's changeset store, let go once landed (goal 93,
+  /// C1 (1)): what a recovery read back.
+  pub texts_asked: u64,
 }
 
 /// One revision a push's record holds ([`write_revisions`]): its node, parents, link (the null node for a changeset,
@@ -1395,7 +1404,12 @@ pub fn replay(
 ) -> Result<Replayed, Refused> {
   let mut replay = Replay::begin(bytes, index, store)?;
   loop {
-    match replay.step(bytes, store) {
+    // A whole replay waits on no store: a text let go once landed is refused, never awaited (goal 93, C1 (1)).
+    let stepped = match replay.step(bytes, store) {
+      Ok(true) if replay.asking() => Err(Refused::StoreWanted),
+      other => other,
+    };
+    match stepped {
       Ok(true) => {}
       Ok(false) => return replay.finish(index, store),
       Err(refused) => {
@@ -1444,6 +1458,12 @@ struct Revisions {
   base_by_node: bool,
   /// The manifest replayed last and its text: the next one's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
+  /// The texts asked of the node's changeset store, let go once landed, while asked ([`Replay::store_wants`]).
+  asked: Option<crate::push::held::TextsAsk>,
+  /// The changesets' texts the store gave, by node, each taken by its row's unit: as many as a unit's room held.
+  given_changesets: Vec<(Node, Vec<u8>)>,
+  /// The manifests' texts the store gave for the unit being replayed, given up once it is.
+  given_manifests: Vec<(Node, Vec<u8>)>,
 }
 
 /// A record replayed a unit at a time (A-732: a recovery of a large repository's record in one step spun its shard past
@@ -1649,7 +1669,41 @@ impl Replay {
   pub fn store_wants(&mut self) -> Option<&mut dyn crate::render::StoreWants> {
     match &mut self.kind {
       Kind::Changegroup(retaken) => Some(&mut retaken.intake),
-      Kind::Revisions(_) | Kind::Framing(_) => None,
+      Kind::Revisions(revisions) => revisions
+        .asked
+        .as_mut()
+        .filter(|asked| crate::render::StoreWants::wants(*asked).is_some())
+        .map(|asked| asked as &mut dyn crate::render::StoreWants),
+      Kind::Framing(_) => None,
+    }
+  }
+
+  /// Whether the replay waits on an ask of the node's changeset store ([`Replay::store_wants`] wanting something now).
+  pub fn asking(&mut self) -> bool {
+    self
+      .store_wants()
+      .is_some_and(|wants| wants.wants().is_some())
+  }
+
+  /// The ask the replay waits on, by its log's path and nodes, if any: the tests' stand-in for the store reads it.
+  #[cfg(test)]
+  pub(crate) fn asked_texts(&self) -> Option<(Vec<u8>, Vec<Node>)> {
+    match &self.kind {
+      Kind::Revisions(revisions) => revisions
+        .asked
+        .as_ref()
+        .map(|asked| (asked.path().to_vec(), asked.nodes().to_vec())),
+      _ => None,
+    }
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the replay's ask with `texts`, in the order asked.
+  #[cfg(test)]
+  pub(crate) fn answer_texts(&mut self, texts: Option<Vec<Vec<u8>>>) {
+    if let Kind::Revisions(revisions) = &mut self.kind
+      && let Some(asked) = revisions.asked.as_mut()
+    {
+      asked.answered(texts);
     }
   }
 
@@ -1734,8 +1788,10 @@ impl Retaken {
         self.intake.answer_from_fork(store);
         Ok(true)
       }
+      // The intake's ask stays pending: a replay that waits between units answers it ([`Replay::store_wants`]); a whole
+      // replay refuses it (`replay`).
       #[cfg(not(test))]
-      Progress::Store => Err(Refused::StoreWanted),
+      Progress::Store => Ok(true),
     }
   }
 
@@ -1808,6 +1864,7 @@ impl Retaken {
       markers: 0,
       whole: replaced.release(store).is_ok(),
       made,
+      texts_asked: intaken.log_texts_asked,
     })
   }
 }
@@ -1846,6 +1903,9 @@ impl Revisions {
       segment,
       base_by_node,
       last: None,
+      asked: None,
+      given_changesets: Vec::new(),
+      given_manifests: Vec::new(),
     })
   }
 
@@ -1854,12 +1914,129 @@ impl Revisions {
     if self.done {
       return Ok(false);
     }
+    // An ask the store has not answered yet: the unit waits ([`Replay::store_wants`]).
+    if self
+      .asked
+      .as_ref()
+      .is_some_and(|asked| crate::render::StoreWants::wants(asked).is_some())
+    {
+      return Ok(true);
+    }
+    if let Some(asked) = self.asked.take() {
+      let changesets = asked.path() == crate::push::intake::CHANGELOG_PATH;
+      let given = asked.taken().ok_or(Refused::TextsUnread)?;
+      if changesets {
+        self.given_changesets.extend(given);
+      } else {
+        self.given_manifests.extend(given);
+      }
+    }
     let mut reader = Reader {
       rest: bytes.get(self.at..).ok_or(Refused::Truncated)?,
     };
-    self.unit(&mut reader, bytes, store)?;
+    match self.unit(&mut reader, bytes, store) {
+      // A text let go once landed: asked, nothing taken; the unit is taken again once the store gives it.
+      Err(Refused::TextsWanted) => {
+        if self.asked.is_none() {
+          self.ask_changesets(bytes, store)?;
+        }
+        return Ok(true);
+      }
+      other => other?,
+    }
+    self.given_manifests.clear();
     self.at = bytes.len().saturating_sub(reader.rest.len());
     Ok(!self.done)
+  }
+
+  /// Asks the node's changeset store for the texts of the changelog group's revisions from this unit's, each let go once
+  /// landed and none given yet, as many as the room the record was written within holds (one at least; main's ruling
+  /// of 2026-11-24 03:17: one want for as many as a unit's room holds), read ahead from the record's bytes without
+  /// replaying them.
+  fn ask_changesets(&mut self, bytes: &[u8], store: &ContentStore) -> Result<(), Refused> {
+    let Some((CHANGELOG_TAG, _, left, _)) = self.group else {
+      return Err(Refused::TextsUnread);
+    };
+    let mut reader = Reader {
+      rest: bytes.get(self.at..).ok_or(Refused::Truncated)?,
+    };
+    let room = self.room.left();
+    let (mut nodes, mut most) = (Vec::new(), 0_u64);
+    for _ in 0..left {
+      let node = reader.node()?;
+      let _parents = (reader.node()?, reader.node()?);
+      let _flags = flags_of(&mut reader)?;
+      let len = reader.long()?;
+      let text = identity_of(&mut reader)?;
+      let held = self.fork.rev(store, Log::Changelog, &node).is_some()
+        || store.holds_whole(&text)
+        || self
+          .given_changesets
+          .iter()
+          .any(|(given, _)| *given == node);
+      if held {
+        continue;
+      }
+      if !nodes.is_empty() && most.saturating_add(len) > room {
+        break;
+      }
+      most = most.saturating_add(len);
+      nodes.push(node);
+    }
+    if nodes.is_empty() {
+      return Err(Refused::TextsUnread);
+    }
+    self.replayed.texts_asked = self
+      .replayed
+      .texts_asked
+      .saturating_add(to_u64(nodes.len()));
+    self.asked = Some(crate::push::held::TextsAsk::new(
+      crate::push::intake::CHANGELOG_PATH.to_vec(),
+      nodes,
+      most,
+    ));
+    Ok(())
+  }
+
+  /// Asks the node's changeset store for the manifests' texts a manifest kept again reads (its own, `own`, where it is
+  /// kept whole and its object was let go; its base's, by node, where its delta names one; and the one the fork holds
+  /// last, which the fork keeps it as a delta against), each not at hand and not given: asked, the unit refused
+  /// [`Refused::TextsWanted`] and taken again; none asked where every one is at hand.
+  fn manifests_ready(
+    &mut self,
+    store: &ContentStore,
+    base: Option<&Node>,
+    own: Option<(Node, u64)>,
+  ) -> Result<(), Refused> {
+    let log = Log::Manifest;
+    let given = |node: &Node, given: &[(Node, Vec<u8>)]| given.iter().any(|(n, _)| n == node);
+    let base_wanted = base
+      .and_then(|base| self.fork.rev(store, log, base))
+      .and_then(|on| crate::push::held::text_wanted((&self.fork, store), log, on));
+    let last_wanted = self
+      .fork
+      .len(store, log)
+      .checked_sub(1)
+      .and_then(|last| self.fork.revision(store, log, last))
+      .and_then(|row| {
+        let (len, at_hand) =
+          crate::push::held::log_text_at_hand((&self.fork, store), log, &row.node)?;
+        (!at_hand).then_some((row.node, len))
+      });
+    let wanted = [own, base_wanted, last_wanted]
+      .into_iter()
+      .flatten()
+      .find(|(node, _)| !given(node, &self.given_manifests));
+    let Some((node, most)) = wanted else {
+      return Ok(());
+    };
+    self.replayed.texts_asked = self.replayed.texts_asked.saturating_add(1);
+    self.asked = Some(crate::push::held::TextsAsk::new(
+      crate::push::intake::MANIFEST_PATH.to_vec(),
+      vec![node],
+      most,
+    ));
+    Err(Refused::TextsWanted)
   }
 
   /// The fork in the index's place, what was replayed answered.
@@ -2009,7 +2186,25 @@ impl Revisions {
       if held {
         return Ok(());
       }
-      let text = store.object_bytes(&text_id, len).ok_or_else(unheld)?;
+      let text = match store.object_bytes(&text_id, len) {
+        Some(text) => text,
+        // Let go once landed (goal 93, C1 (1)): the text the store gave, held to its identity, else asked.
+        None => match self
+          .given_changesets
+          .iter()
+          .position(|(given, _)| *given == node)
+        {
+          Some(at) => {
+            let (_, text) = self.given_changesets.swap_remove(at);
+            if slates_vcs::ContentId::of(&text) != text_id {
+              return Err(unheld());
+            }
+            text
+          }
+          None if store.len_of(&text_id).is_some() => return Err(Refused::TextsWanted),
+          None => return Err(unheld()),
+        },
+      };
       let read = Read {
         node,
         p1,
@@ -2051,7 +2246,26 @@ impl Revisions {
       bytes,
       block,
     };
-    let numbers = match self.stored_on(store, log, base) {
+    let keeping = self.stored_on(store, log, base);
+    let again = match keeping {
+      Keeping::AsStored(_, Some(below)) => below.saturating_add(delta_len) > len,
+      Keeping::AsStored(_, None) => false,
+      Keeping::Again => true,
+    };
+    if again && log == Log::Manifest {
+      let base = match base {
+        Base::Node(base) if base != NULL_NODE => Some(base),
+        _ => None,
+      };
+      // A manifest kept whole is appended by its own object's text, which the store may have let go too.
+      let own = base
+        .is_none()
+        .then_some((node, bytes, len))
+        .filter(|(_, bytes, _)| !store.holds_whole(bytes))
+        .map(|(node, _, len)| (node, len));
+      self.manifests_ready(store, base.as_ref(), own)?;
+    }
+    let numbers = match keeping {
       // Its chain rests on its base's as the fork keeps it now: past its text's length, the index would keep it whole
       // (`index::kept_as`'s bound), and so does the replay.
       Keeping::AsStored(_, Some(below)) if below.saturating_add(delta_len) > len => {
@@ -2104,12 +2318,16 @@ impl Revisions {
       return Err(unread);
     };
     if base == NULL_NODE {
-      return self.fork.append_revisions(store, log, &[row]);
+      return self.append_over_given(store, log, row);
     }
     let text = self
       .fork
       .rev(store, log, &base)
-      .and_then(|on| self.fork.revision_text(store, log, on))
+      .and_then(|on| {
+        self
+          .fork
+          .revision_text_over(store, log, on, &self.given_manifests)
+      })
       .zip(store.object_bytes(&row.bytes, delta_len))
       .and_then(|(on, delta)| crate::delta::apply(&on, &delta, &mut self.room).ok())
       .ok_or(unread)?;
@@ -2117,9 +2335,42 @@ impl Revisions {
       |refused| crate::index::Refused::Index(slates_vcs::IndexRefused::Content(refused));
     let put = store.put_object(&text).map_err(content)?;
     row.bytes = put;
-    let appended = self.fork.append_revisions(store, log, &[row]);
+    let appended = self.append_over_given(store, log, row);
     store.release(&put).map_err(content)?;
     appended
+  }
+
+  /// Appends `row` to `log` of the fork, which keeps a manifest as its own delta against the one it holds last, read from
+  /// the text the store gave for it where its object was let go once landed (goal 93, C1 (1)).
+  fn append_over_given(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    row: NewRevision,
+  ) -> Result<Vec<u32>, crate::index::Refused> {
+    let held_last = self
+      .fork
+      .len(store, log)
+      .checked_sub(1)
+      .and_then(|last| self.fork.revision(store, log, last))
+      .map(|row| row.node);
+    let previous = held_last.and_then(|held_last| {
+      self
+        .given_manifests
+        .iter()
+        .find(|(node, _)| *node == held_last)
+        .map(|(node, text)| (node, text.as_slice()))
+    });
+    // Its own text where the store gave it (a whole manifest whose object was let go).
+    let own: Vec<(Node, &[u8])> = self
+      .given_manifests
+      .iter()
+      .filter(|(node, _)| *node == row.node)
+      .map(|(node, text)| (*node, text.as_slice()))
+      .collect();
+    self
+      .fork
+      .append_revisions_after(store, log, &[row], (previous, &own))
   }
 
   /// A group read whole: counted, and the next group's head next.

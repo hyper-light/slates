@@ -1948,3 +1948,188 @@ fn a_pushs_segment_record_is_written_whole_over_let_go_logs() {
   while writer.step(&pushed, &store).unwrap() {}
   assert!(writer.finish().is_some(), "the record written whole");
 }
+
+/// A made changeset's push over `index`'s tip (`change` its one file), taken into a fork of it: the fork and what it
+/// brought.
+fn made_push(index: &mut HgIndex, store: &mut ContentStore, change: &[u8]) -> (HgIndex, Intaken) {
+  use crate::push::made::{Authored, CHANGEGROUP_VERSION, Change, changegroup, made};
+  let tip = {
+    let len = index.len(store, Log::Changelog);
+    index.changeset(store, len - 1).unwrap().node
+  };
+  let authored = Authored {
+    user: b"Client <c@example.com>",
+    seconds: 1,
+    branch: b"default",
+    message: change,
+  };
+  let changes = [Change {
+    path: change,
+    after: Some((change, crate::manifest::Flag::Regular)),
+    copied_from: None,
+  }];
+  let verified = made(
+    &crate::push::held::IndexHeld::new(index, store),
+    tip,
+    &changes,
+    &authored,
+    &mut room(),
+  )
+  .unwrap();
+  let payload = changegroup(&verified, &mut room()).unwrap();
+  let mut pushing =
+    Intake::begin((CHANGEGROUP_VERSION, &payload), index, store, &mut room()).unwrap();
+  let mut admission = room();
+  loop {
+    match pushing.step(&payload, store, &mut admission).unwrap() {
+      Stepped::Store => pushing.answer_from_fork(store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  finished(pushing)
+}
+
+/// `pushed`'s segment record (a push's, naming identities) of every revision `intaken` names.
+fn segment_record(pushed: &HgIndex, intaken: &Intaken, store: &ContentStore) -> Vec<u8> {
+  use crate::import::record::{Source, Writer};
+  let ranges: Vec<(Log<'_>, u32, u32)> = intaken
+    .logs
+    .iter()
+    .map(|(log, first)| (super::log_named(log), *first, u32::MAX))
+    .collect();
+  let mut writer = Writer::begin_segment(Source::Push, &ranges, 1 << 20, false).unwrap();
+  while writer.step(pushed, store).unwrap() {}
+  writer.finish().unwrap()
+}
+
+/// Every changeset's and manifest's text `indexes` hold, by (log path, node), saved, then every object their rows name
+/// let go: what was saved.
+fn saved_and_let_go(
+  indexes: &[&HgIndex],
+  store: &mut ContentStore,
+) -> std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>> {
+  let mut saved = std::collections::BTreeMap::new();
+  let mut objects = Vec::new();
+  for index in indexes {
+    for rev in 0..index.len(store, Log::Changelog) {
+      let row = index.changeset(store, rev).unwrap();
+      if let Some(text) = store.object_bytes(&row.text, row.len) {
+        saved.insert((super::CHANGELOG_PATH.to_vec(), row.node), text);
+      }
+      objects.push(row.text);
+    }
+    for rev in 0..index.len(store, Log::Manifest) {
+      let row = index.revision(store, Log::Manifest, rev).unwrap();
+      if let Some(text) = index.revision_text(store, Log::Manifest, rev) {
+        saved.insert((super::MANIFEST_PATH.to_vec(), row.node), text);
+      }
+      objects.push(row.bytes);
+    }
+  }
+  let let_go: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(let_go > 0, "objects let go");
+  saved
+}
+
+/// `record` replayed into `index` a step at a time, every ask answered from `saved`: what was replayed, and each ask's
+/// log path with how many texts it asked.
+fn replayed_answering(
+  record: &[u8],
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  saved: &std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
+) -> (crate::import::record::Replayed, Vec<(Vec<u8>, usize)>) {
+  use crate::import::record::Replay;
+  let mut replay = Replay::begin(record, index, store).unwrap();
+  let mut asks = Vec::new();
+  while replay.step(record, store).unwrap() {
+    if let Some((path, nodes)) = replay.asked_texts()
+      && replay.asking()
+    {
+      let texts = nodes
+        .iter()
+        .map(|node| saved.get(&(path.clone(), *node)).cloned())
+        .collect();
+      asks.push((path, nodes.len()));
+      replay.answer_texts(texts);
+    }
+  }
+  (replay.finish(index, store).unwrap(), asks)
+}
+
+/// Goal 93, C1 (1) (3)(a) (main's ruling of 2026-11-24 03:17: a replay reads the changesets' texts let go once landed
+/// from the changeset store, batched). Do: take the stock bundle into a repository and a made changeset's push into a
+/// fork of it; write the push's segment record (identities, base by node); let go every changeset's and manifest's
+/// object, the push's too, as a restart finds them after the let-go; replay the record over the repository, the
+/// store's asks answered from what was saved. Expect: the push's changeset replayed into the repository; texts asked
+/// (`Replayed::texts_asked`, the counter main's round reads). Red before: refused `Unheld`, the changeset's text read
+/// from the content store by its identity.
+#[test]
+fn a_replay_reads_a_changesets_text_let_go_from_the_changeset_store() {
+  let mut store = store();
+  let mut empty = HgIndex::new();
+  let (mut repository, _, _) = intake(&stock(), &mut empty, &mut store, &mut room()).unwrap();
+  let (pushed, intaken) = made_push(&mut repository, &mut store, b"one-more.txt");
+  let record = segment_record(&pushed, &intaken, &store);
+  let saved = saved_and_let_go(&[&repository, &pushed], &mut store);
+  let (replayed, asks) = replayed_answering(&record, &mut repository, &mut store, &saved);
+  assert!(replayed.texts_asked > 0, "texts asked of the store");
+  assert!(
+    asks.iter().any(|(path, _)| path == super::CHANGELOG_PATH),
+    "a changeset's text asked: {asks:?}"
+  );
+  assert!(
+    repository
+      .rev(&store, Log::Changelog, &intaken.changesets[0])
+      .is_some(),
+    "the push's changeset replayed"
+  );
+  let _ = pushed;
+}
+
+/// Goal 93, C1 (1) (3)(b): a replay over an index another push moved meanwhile keeps a manifest again against the one
+/// the index holds last, its base's text and that one's read from the changeset store. Do: take the stock bundle into
+/// a repository; take one made changeset's push into a fork and write its segment record; land another made changeset
+/// into the repository meanwhile; let go every changeset's and manifest's object; replay the first push's record over
+/// the moved repository, its asks answered from what was saved. Expect: the first push's changeset replayed, its
+/// manifest's text the one it was pushed with; texts asked. Red before: refused `Unread`, its manifest kept again over
+/// a base and a previous manifest let go.
+#[test]
+fn a_replay_over_a_moved_index_reads_its_manifests_let_go_from_the_changeset_store() {
+  let mut store = store();
+  let mut empty = HgIndex::new();
+  let (mut repository, _, _) = intake(&stock(), &mut empty, &mut store, &mut room()).unwrap();
+  let (pushed, intaken) = made_push(&mut repository, &mut store, b"first.txt");
+  let record = segment_record(&pushed, &intaken, &store);
+  let manifest = pushed.len(&store, Log::Manifest) - 1;
+  let expected = pushed
+    .revision_text(&store, Log::Manifest, manifest)
+    .unwrap();
+  let (mut moved, _) = made_push(&mut repository, &mut store, b"meanwhile.txt");
+  let saved = saved_and_let_go(&[&repository, &pushed, &moved], &mut store);
+  let (replayed, _) = replayed_answering(&record, &mut moved, &mut store, &saved);
+  assert!(replayed.texts_asked > 0, "texts asked of the store");
+  let rev = moved
+    .rev(
+      &store,
+      Log::Manifest,
+      &pushed
+        .revision(&store, Log::Manifest, manifest)
+        .unwrap()
+        .node,
+    )
+    .unwrap();
+  let manifests: Vec<(Node, Vec<u8>)> = saved
+    .iter()
+    .filter(|((path, _), _)| path == super::MANIFEST_PATH)
+    .map(|((_, node), text)| (*node, text.clone()))
+    .collect();
+  assert_eq!(
+    moved.revision_text_over(&store, Log::Manifest, rev, &manifests),
+    Some(expected)
+  );
+}
