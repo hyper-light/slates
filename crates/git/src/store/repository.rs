@@ -540,7 +540,14 @@ pub struct Repository {
   /// create's or a rewrite's search back at its admission meets as its base. Made by the commits alone, in the log's
   /// order, so a store made again from the log holds the same.
   peeled: BTreeMap<u64, (u64, usize)>,
-  /// What the chains, the head map and the peeled map charge the store.
+  /// For each commit some version's head names, by its position, each green with such a version and its newest one
+  /// (goal 93): what a push's search for the green holding a commit reads ([`Repository::holders`]), so what it costs
+  /// follows the greens holding that commit, never the repository's greens. Added to as each version commits; versions
+  /// are never taken out, so neither are its entries.
+  holders: BTreeMap<u64, BTreeMap<u64, usize>>,
+  /// The entries `holders` holds, green by green: what it charges the store.
+  holder_entries: usize,
+  /// What the chains, the head map, the peeled map and the holders' map charge the store.
   charged: u64,
   /// The version that brought each position, as runs: each run's first position to its end (exclusive), the green and
   /// that green's version (A-722: kept beside the rows, which no longer carry it, so a push can write its rows before it
@@ -596,6 +603,8 @@ impl Repository {
       chains: BTreeMap::new(),
       heads: BTreeMap::new(),
       peeled: BTreeMap::new(),
+      holders: BTreeMap::new(),
+      holder_entries: 0,
       charged: 0,
       landings: BTreeMap::new(),
       kinds: BTreeMap::new(),
@@ -760,6 +769,7 @@ impl Repository {
       self.chains.len(),
       self.heads.len(),
       self.peeled.len(),
+      self.holder_entries,
       self.kinds.len(),
       self.landings.len(),
     ]
@@ -1394,9 +1404,11 @@ impl Repository {
     let put: Vec<ContentId> = values.iter().flatten().copied().collect();
     let added = store.used().saturating_sub(before);
     let chains = self.chains_with(planned, &values);
-    // Each move notes at most one commit more in the peeled map: charged at that bound, the next charge exact.
+    // Each move notes at most one commit more in the peeled map and one green more in the holders' map: charged at
+    // that bound, the next charge exact.
     let peeled = self.peeled.len().saturating_add(moves.len());
-    let total = footprint(&self.chains, &chains, (&heads, peeled));
+    let holders = self.holder_entries.saturating_add(moves.len());
+    let total = footprint(&self.chains, &chains, (&heads, peeled, holders));
     let more = total.saturating_sub(self.charged);
     if let Err(refused) = store.charge(more) {
       give_back(store, &put)?;
@@ -1480,6 +1492,7 @@ impl Repository {
           .or_insert((movement.green, version));
       }
     }
+    self.note_holders(moves, &versions);
     // Each version committed with its value is a base a later derivation may search back to (`deriving`).
     for (movement, version) in moves.iter().zip(&versions) {
       let version = usize::try_from(*version).unwrap_or(usize::MAX);
@@ -1498,6 +1511,30 @@ impl Repository {
     // The push's objects read lately go with it, their charge given back (A-861).
     push.release_recent(store);
     Ok(versions)
+  }
+
+  /// Goal 93: each version `moves` committed (`versions`, in the same order) noted under its head in the holders' map,
+  /// the green with this version, its newest; a green new under a head counted in `holder_entries`, what the map
+  /// charges the store.
+  fn note_holders(&mut self, moves: &[Move], versions: &[u64]) {
+    for (movement, version) in moves.iter().zip(versions) {
+      let version = usize::try_from(*version).unwrap_or(usize::MAX);
+      let head = self
+        .chains
+        .get(&movement.green)
+        .and_then(|chain| chain.versions.get(version))
+        .and_then(|record| record.head);
+      if let Some(head) = head
+        && self
+          .holders
+          .entry(head)
+          .or_default()
+          .insert(movement.green, version)
+          .is_none()
+      {
+        self.holder_entries = self.holder_entries.saturating_add(1);
+      }
+    }
   }
 
   /// Every move's green is where it was when the move was admitted, and no green is moved twice.
@@ -1867,6 +1904,22 @@ impl Repository {
     self.chains.get(&green).and_then(Chain::head)
   }
 
+  /// The greens with a version whose head is the object `head`, each with its newest such version, in key order
+  /// (goal 93): one look-up of the index and one of the holders' map, whatever the number of greens. None where the
+  /// index holds no such object or no version names it.
+  pub fn holders(&self, store: &ContentStore, head: &ObjectId) -> Vec<(u64, usize)> {
+    self
+      .indexed(store, head)
+      .and_then(|(row, _)| self.holders.get(&row.position))
+      .map(|holders| {
+        holders
+          .iter()
+          .map(|(green, version)| (*green, *version))
+          .collect()
+      })
+      .unwrap_or_default()
+  }
+
   /// The head of `green`'s version `version`; `None` for a deleted ref.
   pub fn head(&self, store: &ContentStore, green: u64, version: usize) -> Option<ObjectId> {
     let position = self.chains.get(&green)?.versions.get(version)?.head?;
@@ -1977,6 +2030,8 @@ impl Repository {
       chains: self.chains.clone(),
       heads: self.heads.clone(),
       peeled: self.peeled.clone(),
+      holders: self.holders.clone(),
+      holder_entries: self.holder_entries,
       charged: self.charged,
       landings: self.landings.clone(),
       kinds: self.kinds.clone(),
@@ -2120,11 +2175,11 @@ fn move_head(
   }
 }
 
-/// What the chains and the head map charge once the planned chains replace theirs.
+/// What the chains, the head map, the peeled map and the holders' map charge once the planned chains replace theirs.
 fn footprint(
   current: &BTreeMap<u64, Chain>,
   planned: &BTreeMap<u64, Chain>,
-  (heads, peeled): (&BTreeMap<u64, BTreeSet<u64>>, usize),
+  (heads, peeled, holders): (&BTreeMap<u64, BTreeSet<u64>>, usize, usize),
 ) -> u64 {
   let chains = current
     .iter()
@@ -2140,7 +2195,12 @@ fn footprint(
   chains
     .saturating_add(bytes(entries, HEAD_BYTES))
     .saturating_add(bytes(peeled, PEELED_BYTES))
+    .saturating_add(bytes(holders, HOLDER_BYTES))
 }
+
+/// Derived: what one green of the holders' map charges the store: its key and its version, two words, the commit's
+/// position each map is under counted with them as the peeled map counts it.
+const HOLDER_BYTES: usize = size_of::<(u64, (u64, usize))>();
 
 /// Derived: what one entry of the peeled map charges the store: a commit's position, a green and a version, three
 /// words.
@@ -2300,7 +2360,7 @@ impl Repository {
     let total = footprint(
       &self.chains,
       &BTreeMap::new(),
-      (&self.heads, self.peeled.len()),
+      (&self.heads, self.peeled.len(), self.holder_entries),
     );
     if total > self.charged {
       store.charge(total.saturating_sub(self.charged))?;

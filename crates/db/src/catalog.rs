@@ -1486,6 +1486,17 @@ impl VolumeId {
     }
     u64::from_be_bytes(counter)
   }
+
+  /// The id's partition and counter as one word (bytes 8-15, big-endian): what tells ids minted on one node apart, so
+  /// what a store keying a repository's greens by a word keys them by (`slates_server::vcs_store::green_key`), and what
+  /// [`crate::repository::Repositories::member_keyed`] finds a member by.
+  pub fn serial(&self) -> u64 {
+    self
+      .bytes
+      .get(ID_PARTITION_BYTES.start..ID_COUNTER_BYTES.end)
+      .and_then(|serial| <[u8; size_of::<u64>()]>::try_from(serial).ok())
+      .map_or(0, u64::from_be_bytes)
+  }
 }
 
 /// Format: where a volume id's counter lies: its last six bytes, after the host's eight and the partition's two.

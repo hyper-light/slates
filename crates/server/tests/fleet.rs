@@ -806,14 +806,29 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
     .saturating_add(1)
 }
 
-/// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, then the departure confirmed ([`departure_confirmed_periods`]). The voter these tests stop is
+/// Derived: the coordinator periods the survivors take to learn a voter's departure: their detectors' detection of it
+/// ([`detection_periods`]), then the departure confirmed ([`departure_confirmed_periods`]). The voter these tests stop is
 /// the bootstrapper, which leads the council it created unless a priority transfer moved its leadership, and only a
 /// leader proposes the retirement: without the election the budget ran out with the retirement still owed at one CPU
 /// beside two busy loops (diag-g225-forming-fleet-reaches-2, 2026-11-18: 9 of 48 runs of the two tests waiting on it,
-/// every survivor still at the version of the stop or the leader still naming the stopped voter, 94 periods spent).
+/// every survivor still at the version of the stop or the leader still naming the stopped voter, 94 periods spent). The
+/// detection was a membership horizon until A-882, nine periods, where a survivor still judging the stopped voter by its
+/// pair's own retransmission timer takes 6 to 7 s to condemn it: these tests stop the voter as the fleet forms.
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
-  horizon_periods().saturating_add(departure_confirmed_periods(daemons))
+  detection_periods(daemons).saturating_add(departure_confirmed_periods(daemons))
+}
+
+/// Derived: the coordinator periods the survivors' detectors take to hold a stopped member dead: the largest detection
+/// term any of `daemons` states now (`Daemon::failover_detection_ns`, A-363's `D`: SWIM's count of its detector's periods
+/// at their measured tail, at least the bound its detector states while a pair is still judged by its own retransmission
+/// timer, A-882), in whole periods; a membership horizon where none of them answers.
+fn detection_periods(daemons: &[&Daemon]) -> u64 {
+  daemons
+    .iter()
+    .filter_map(|daemon| daemon.failover_detection_ns().ok().flatten())
+    .map(|detection_ns| detection_ns.div_ceil(HEARTBEAT_NS))
+    .max()
+    .unwrap_or_else(horizon_periods)
 }
 
 /// Derived: the coordinator periods from the survivors holding a voter dead to their learning its departure: the death
@@ -17986,6 +18001,11 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   // pair's own retransmission timer judges a's probes. Then, from the death held, the departure is confirmed and the
   // successor's round waits its promises whole from its last restart, at the failover delay the nodes read now.
   let survivors = [&daemons[1], &daemons[2]];
+  // Each survivor's detection term as the cut began (A-882): read for the record beside the detection it then took.
+  let detection_at_cut: Vec<Result<Option<u64>, ObserveError>> = survivors
+    .iter()
+    .map(|survivor| survivor.failover_detection_ns())
+    .collect();
   let held_dead = cut
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
       all_hold(
@@ -18022,9 +18042,9 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
     daemon.stop();
   }
   eprintln!(
-    "given up, then heard: cut {cut}, held dead {held_dead}, condemned by the survivors {condemnations:?}, given up \
-     {given_up}, answering again {answering}, healed {healed}, settled {settled}, judged afresh {judged_afresh}\nat the \
-     give-up:\n{}\nat the end:\n{}",
+    "given up, then heard: cut {cut}, detection terms at the cut {detection_at_cut:?}, held dead {held_dead}, condemned \
+     by the survivors {condemnations:?}, given up {given_up}, answering again {answering}, healed {healed}, settled \
+     {settled}, judged afresh {judged_afresh}\nat the give-up:\n{}\nat the end:\n{}",
     at_give_up.join("\n"),
     at_end.join("\n")
   );

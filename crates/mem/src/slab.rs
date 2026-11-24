@@ -54,6 +54,17 @@ pub struct Slab<T> {
 }
 
 impl<T> Slab<T> {
+  /// Derived: the slots of `T` one page of `page` bytes holds, as a segment: the largest power of two whose slots fit the
+  /// page (a segment's length is a power of two, [`Segmented::new`]), at least one. A slab grown a segment of this at a
+  /// time makes a page of memory each time it grows, whatever `T` is, so what it takes follows what it holds by a page.
+  pub fn slots_a_page(page: usize) -> usize {
+    let fit = page.checked_div(size_of::<Slot<T>>()).unwrap_or(0).max(1);
+    let below = usize::BITS
+      .saturating_sub(1)
+      .saturating_sub(fit.leading_zeros());
+    1usize.checked_shl(below).unwrap_or(1)
+  }
+
   /// A slab whose segments hold `segment_slots` slots and which never exceeds `max_slots`.
   pub fn new(segment_slots: usize, max_slots: usize) -> Self {
     Self::with_generation_base(segment_slots, max_slots, 0)
