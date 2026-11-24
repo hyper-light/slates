@@ -64,6 +64,11 @@ pub(crate) const TAGS_PATH: &[u8] = b".hgtags";
 pub struct TagsRead {
   /// The `.hgtags` file revisions, in the order read.
   files: Vec<Node>,
+  /// Each head's `.hgtags` revision in head order, or the manifest to read it from where the manifest's text is not at
+  /// hand (goal 93, C1 (1)): asked of the store first, the files read once those manifests are given.
+  heads: Vec<HeadTags>,
+  /// The manifests asked, in `heads`' order: what the first want of rows names, before the files.
+  manifests: Vec<Node>,
   /// What the next read asks of the store.
   want: Option<Want>,
   /// Each text, in `files`' order, once given.
@@ -74,33 +79,107 @@ pub struct TagsRead {
   refused: Option<Refusal>,
 }
 
+/// A head's `.hgtags` as a reading finds it ([`TagsRead::heads`]): its file revision, none, or its manifest to ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadTags {
+  /// The `.hgtags` revision its manifest names, or none.
+  File(Option<Node>),
+  /// Its manifest, whose text is not at hand: asked of the store.
+  Manifest(Node),
+}
+
 impl TagsRead {
-  /// Begins reading the `.hgtags` of `repo`'s heads, within `admission`'s room: what [`TagsRead::wants`] asks first.
+  /// Begins reading the `.hgtags` of `repo`'s heads, within `admission`'s room: what [`TagsRead::wants`] asks first (the
+  /// rows of the manifests whose texts are not at hand, else of the `.hgtags` revisions).
   pub fn begin(repo: &impl Repository, admission: &mut Admission) -> Result<TagsRead, Refusal> {
-    let heads = head_revs(repo, admission)?;
-    admission.charge_items::<Node>(heads.len().saturating_mul(2))?;
-    let mut seen: HashSet<Node> = HashSet::with_capacity(heads.len());
-    let mut files = Vec::with_capacity(heads.len());
-    for head in heads {
-      if let Some(file) = repo.tags_file(head, admission)?
-        && seen.insert(file)
-      {
-        files.push(file);
+    let revs = head_revs(repo, admission)?;
+    admission.charge_items::<Node>(revs.len().saturating_mul(3))?;
+    let mut heads = Vec::with_capacity(revs.len());
+    let mut manifests = Vec::new();
+    for head in revs {
+      match repo.manifest_not_at_hand(head) {
+        Some((manifest, _)) => {
+          manifests.push(manifest);
+          heads.push(HeadTags::Manifest(manifest));
+        }
+        None => heads.push(HeadTags::File(repo.tags_file(head, admission)?)),
       }
     }
-    let (want, texts) = if files.is_empty() {
-      (None, Some(Vec::new()))
-    } else {
-      let logs = vec![(TAGS_PATH.to_vec(), files.clone())];
-      (Some(Want::Rows { logs }), None)
-    };
-    Ok(TagsRead {
-      files,
-      want,
-      texts,
+    let mut read = TagsRead {
+      files: Vec::new(),
+      heads,
+      manifests,
+      want: None,
+      texts: None,
       most: admission.left(),
       refused: None,
-    })
+    };
+    if read.manifests.is_empty() {
+      read.ask_files();
+    } else {
+      let logs = vec![(
+        crate::push::intake::MANIFEST_PATH.to_vec(),
+        read.manifests.clone(),
+      )];
+      read.want = Some(Want::Rows { logs });
+    }
+    Ok(read)
+  }
+
+  /// The heads' `.hgtags` revisions, each once in head order: their rows asked, or nothing where there are none.
+  fn ask_files(&mut self) {
+    let mut seen: HashSet<Node> = HashSet::with_capacity(self.heads.len());
+    self.files = self
+      .heads
+      .iter()
+      .filter_map(|head| match head {
+        HeadTags::File(file) => *file,
+        HeadTags::Manifest(_) => None,
+      })
+      .filter(|file| seen.insert(*file))
+      .collect();
+    if self.files.is_empty() {
+      self.texts = Some(Vec::new());
+    } else {
+      let logs = vec![(TAGS_PATH.to_vec(), self.files.clone())];
+      self.want = Some(Want::Rows { logs });
+    }
+  }
+
+  /// Whether the manifests asked are still being read (their texts not given).
+  fn reading_manifests(&self) -> bool {
+    !self.manifests.is_empty()
+  }
+
+  /// The texts of the manifests asked: each head's `.hgtags` revision read from its manifest, then the files asked.
+  fn give_manifests(&mut self, texts: Vec<Vec<u8>>) {
+    if texts.len() != self.manifests.len() {
+      return self.fail(Refusal::Store {
+        what: "a manifest text the changeset store gave short",
+      });
+    }
+    let found: Vec<(Node, Option<Node>)> = self
+      .manifests
+      .iter()
+      .zip(&texts)
+      .map(|(manifest, text)| {
+        (
+          *manifest,
+          crate::manifest::find(text, TAGS_PATH).map(|entry| entry.node),
+        )
+      })
+      .collect();
+    for head in &mut self.heads {
+      if let HeadTags::Manifest(manifest) = *head {
+        let file = found
+          .iter()
+          .find(|(asked, _)| *asked == manifest)
+          .and_then(|(_, file)| *file);
+        *head = HeadTags::File(file);
+      }
+    }
+    self.manifests.clear();
+    self.ask_files();
   }
 
   /// The `.hgtags` of `store`'s heads read at once from what it answers now ([`Store::stored_now`], a whole answer's);
@@ -133,11 +212,17 @@ impl TagsRead {
     }
   }
 
-  /// The rows of the `.hgtags` revisions: their texts asked next, within the room; refused where one has none.
+  /// The rows of the manifests asked, or of the `.hgtags` revisions: their texts asked next, within the room; refused
+  /// where one has none.
   pub fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
     self.want = None;
     let log = rows.into_iter().next().unwrap_or_default();
-    let identities: Option<Vec<[u8; 32]>> = (log.len() == self.files.len())
+    let asked = if self.reading_manifests() {
+      self.manifests.len()
+    } else {
+      self.files.len()
+    };
+    let identities: Option<Vec<[u8; 32]>> = (log.len() == asked)
       .then(|| log.into_iter().map(|row| row.map(|row| row.text)).collect())
       .flatten();
     match identities {
@@ -148,14 +233,18 @@ impl TagsRead {
         });
       }
       None => self.fail(Refusal::Store {
-        what: "a .hgtags revision the changeset store keeps no row of",
+        what: "a .hgtags or manifest revision the changeset store keeps no row of",
       }),
     }
   }
 
-  /// The texts of the `.hgtags` revisions, each with its metadata block left out.
+  /// The texts of the manifests asked ([`TagsRead::give_manifests`]), or of the `.hgtags` revisions, each with its
+  /// metadata block left out.
   pub fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
     self.want = None;
+    if self.reading_manifests() {
+      return self.give_manifests(texts);
+    }
     if texts.len() != self.files.len() {
       return self.fail(Refusal::Store {
         what: "a .hgtags text the changeset store gave short",

@@ -1323,6 +1323,16 @@
 > - IN FLIGHT, the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
 >   pieces): the changelog's and the manifests' texts off the content store too, read through the store as file texts
 >   are.
+>   In five pieces (main's ruling of 2026-11-23 20:53: readers first, the let-go switched on last, P5; no manifest
+>   pinned, the learned cache alone). P1 BUILT (95a6be82f): `push::held::log_text_held`, `bring_back_log` (a manifest
+>   delta made again from its two texts, checked against its row's identity), `hg_push::bring_back` for the two logs'
+>   paths, `vcs.hg.landed_log_texts_brought_back`. P2 BUILT (serving): a fetch's changeset and manifest units ask a
+>   text not at hand of the changeset store under its log's path and take the same place again (`getbundle::LogTexts`,
+>   `Store::log_text_len`, `Store::manifest_entry`, `Walk::log_texts_asked`), and a lookup's `.hgtags` reading asks the
+>   heads' manifests first (`Repository::manifest_not_at_hand`); held by
+>   `a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store` (a clone and a pull) and
+>   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. Next: P3 (the push's work), P4 (the intake and
+>   the record), P5.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
