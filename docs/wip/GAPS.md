@@ -561,11 +561,19 @@
 > reversed and green with it on both runners (diag run 45260798132: the first create refused `{ available: 5722144768 }`
 > on windows-latest and the create during the remakes `{ available: 5713756160 }`, both admitted with the fix; the Node
 > SDK suites 8 of 8 on both; `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`). The
-> extents file runs on both Windows lanes now, its commit give-back test among them since A-879's fix. **Owed
-> (item 3b, main's ruling):** a create sent at once after a destroy meets the teardown, which holds the volume's
-> reservation past the destroy's answer, and is refused `BudgetExceeded` on every platform (diag run 45251289894:
-> `{ available: 1430536192 }`, the room less the destroyed volume's). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
-> depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
+> extents file runs on both Windows lanes now, its commit give-back test among them since A-879's fix. **Fixed
+> 2026-11-23 (A-884, item 3b, main's ruling): a create sent at once after a destroy met the teardown**, which held the
+> volume's reservation, inode allowance and records past the destroy's answer, and was refused `BudgetExceeded` on every
+> platform (diag run 45251289894: `{ available: 1430536192 }`, the room less the destroyed volume's). Now each of a
+> create's admissions counts the teardowns in flight on its shard as room on the way, and a create they would cover
+> parks until a teardown ends, bounded by their remaining slices at a step's budget. Red then green (diag run
+> 45325253708, all four runners): with no teardown counted the create was refused and the held teardown's create never
+> parked; with the deadline moved on without progress the bound test never ended (cut at 300 s); green, the create after
+> a destroy 5 of 5 rounds and the held teardown's create refused at its bound, 3 of 3, in 0.7 to 1.4 ms on macOS and
+> ubuntu and 2.0 s on windows-latest, the remakes' bound joining the window there
+> (`docs/bugs/2026-11-23-a-create-at-once-after-a-destroy-met-its-teardown.md`).
+> **Open (R2, found 2026-11-20 19:45):** the macOS give-back depends on the machine: recovery's
+> `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
 > fall of two bursts) both kept RAM, 591 and 340 MiB after the destroy (big Studio, branch agents/w-sizing-r2hold,
