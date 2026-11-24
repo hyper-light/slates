@@ -319,6 +319,12 @@ pub(crate) fn note_away(read: AwayRead) {
   });
 }
 
+/// How many reads the call running now has noted so far ([`away_scope`]); none outside one. A caller that asks after
+/// each of its steps (a virtio-fs device after each chain, `crate::virtiofs`) tells the step that met a let-go window.
+pub(crate) fn noted_in_scope() -> usize {
+  AWAY_READS.with(|reads| reads.borrow().as_ref().map_or(0, Vec::len))
+}
+
 /// Puts the caller's notes back however the scope ends.
 struct AwayRestore(Option<Option<Vec<AwayRead>>>);
 

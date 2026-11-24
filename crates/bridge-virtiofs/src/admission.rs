@@ -628,6 +628,7 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     &mut self,
     bridge: &mut dyn Bridge,
     registry: &Attachments,
+    probe: &mut dyn crate::device::AwayProbe,
   ) -> Result<Serviced, ServeError> {
     if self.state != AttachmentState::Live {
       return Err(ServeError::Revoked);
@@ -654,7 +655,14 @@ impl<S: VmmSeam> AdmittedDevice<S> {
         let memory = self.seam.memory().map_err(ServeError::Seam)?;
         let pass = self
           .device
-          .service_queue(queue, memory, bridge, &cx, batch, &mut self.ledger)
+          .service_queue(
+            queue,
+            memory,
+            bridge,
+            &cx,
+            batch,
+            (&mut self.ledger, &mut *probe),
+          )
           .map_err(ServeError::Device)?;
         total.served = total.served.saturating_add(pass.served);
         total.published = total.published.saturating_add(pass.published);
@@ -678,6 +686,12 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     }
     self.counters.passes = self.counters.passes.saturating_add(1);
     Ok(total)
+  }
+
+  /// Whether the device keeps a chain for content not at hand (`Device::holds_kept`): the loop brings the content back
+  /// and serves the chain again before anything else.
+  pub fn holds_kept(&self) -> bool {
+    self.device.holds_kept()
   }
 
   /// The attachment's view moved (§4.6 "revoke on advance"; a snapshot reader's `advance` kicks its device here): every

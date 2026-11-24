@@ -134,7 +134,35 @@ struct ShardBridge {
   /// Whether the device offers its guest a DAX window: its files are then offered per-inode DAX
   /// (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX`) while the shard's fill budget has room (A-163, A-168).
   dax: bool,
+  /// The reads the last pass noted not at hand: its kept chain's (the device keeps the first chain that noted any and
+  /// serves nothing after it in that pass), what [`BridgeAccess::bring_back`] brings back.
+  away: Vec<crate::vcs_store::named_objects::AwayRead>,
+  /// What the last bring-back brought, pinned until the pass that serves the kept chain again has ended.
+  brought: Vec<crate::vcs_store::named_objects::ReadPin>,
 }
+
+/// The probe a pass hands its device ([`slates_bridge_virtiofs::serve::AwayProbe`]): whether the chain just dispatched
+/// noted a read of a let-go window in the pass's scope (`named_objects::away_scope`).
+struct PassProbe {
+  /// The notes the pass's scope held at the last ask.
+  seen: usize,
+}
+
+impl slates_bridge_virtiofs::serve::AwayProbe for PassProbe {
+  fn take_noted_away(&mut self) -> bool {
+    let noted = crate::vcs_store::named_objects::noted_in_scope();
+    let met = noted > self.seen;
+    self.seen = noted;
+    met
+  }
+}
+
+/// Counter: a guest's chain kept because its dispatch met a let-go window, its content brought back before it was
+/// served again (A-760 (b) 4d's park for virtio-fs). Format: a counter name in the status report.
+const BROUGHT_BACK: &str = "virtiofs.brought_back";
+/// Counter: a bring-back the node's store or the content store refused: the kept chain's second dispatch meets the
+/// window again and is answered. Format: a counter name in the status report.
+const BRING_BACK_REFUSED: &str = "virtiofs.bring_back_refused";
 
 /// Closes device `attachment`'s snapshot view, if it has one, and removes its record, if it has one (its loop's
 /// end, or a refusal); a refused removal is counted.
@@ -152,10 +180,16 @@ fn close_device(attachment: u64) {
 /// Format: the refusal-ledger name of a guest record whose removal at the device's end was refused.
 const RECORD_END_REFUSED: &str = "virtiofs.record_end_refused";
 
-impl BridgeAccess for ShardBridge {
-  fn with_bridge<R>(
+impl ShardBridge {
+  /// [`BridgeAccess::with_bridge`]'s pass, inside its away scope: the bridge over the volume (its head, one directory
+  /// of it, or its snapshot view), the owner's attachments and the pass's probe handed to `f`.
+  fn with_bridge_scoped<R>(
     &mut self,
-    f: impl FnOnce(&mut dyn Bridge, &mut slates_bridge_core::Attachments) -> R,
+    f: impl FnOnce(
+      &mut dyn Bridge,
+      &mut slates_bridge_core::Attachments,
+      &mut dyn slates_bridge_virtiofs::serve::AwayProbe,
+    ) -> R,
   ) -> Result<R, VfsError> {
     let volume = self.volume;
     let (scope, attachment, presents_snapshot, dax) = (
@@ -226,10 +260,52 @@ impl BridgeAccess for ShardBridge {
         }
         None => &mut bridge,
       };
-      Some(f(served, attachments))
+      Some(f(served, attachments, &mut PassProbe { seen: 0 }))
     })
     .flatten()
     .ok_or(VfsError::NotFound)
+  }
+}
+
+impl BridgeAccess for ShardBridge {
+  fn with_bridge<R>(
+    &mut self,
+    f: impl FnOnce(
+      &mut dyn Bridge,
+      &mut slates_bridge_core::Attachments,
+      &mut dyn slates_bridge_virtiofs::serve::AwayProbe,
+    ) -> R,
+  ) -> Result<R, VfsError> {
+    // What a bring-back brought stays pinned through this pass, which serves the kept chain again, and goes after it.
+    let brought = std::mem::take(&mut self.brought);
+    let (served, away) = crate::vcs_store::named_objects::away_scope(|| self.with_bridge_scoped(f));
+    self.away = away;
+    drop(brought);
+    served
+  }
+
+  type Brought = Vec<crate::vcs_store::named_objects::ReadPin>;
+
+  type BringBack = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Vec<crate::vcs_store::named_objects::ReadPin>> + Send>,
+  >;
+
+  fn bring_back(&mut self) -> Self::BringBack {
+    let reads = std::mem::take(&mut self.away);
+    Box::pin(async move {
+      let _ = state::with_state(|s| s.count(BROUGHT_BACK, 1));
+      match crate::vcs_store::named_objects::bring_back_reads(&reads).await {
+        Ok(pins) => pins,
+        Err(_) => {
+          let _ = state::with_state(|s| s.count(BRING_BACK_REFUSED, 1));
+          Vec::new()
+        }
+      }
+    })
+  }
+
+  fn hold_brought(&mut self, brought: Self::Brought) {
+    self.brought = brought;
   }
 
   /// The §4.8 barrier the daemon's other transports run before a mutation's reply (NFS's stable
@@ -504,7 +580,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
       let outcome = refused;
       // The terminal step still runs to its end: nothing admitted outlives a refused loop (AUD-29-70) — through
       // the bridge, or the registry alone when the volume is gone; a sweep that could not run is counted.
-      let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
+      let reclaimed = match bridge.with_bridge(|b, registry, _| admitted.reclaim(b, registry)) {
         Ok(reclaimed) => reclaimed,
         Err(_) => bridge
           .with_registry(|registry| admitted.abandon(registry))
@@ -1014,6 +1090,8 @@ fn open_view(
     attachment,
     presents_snapshot: view.snapshot.is_some(),
     dax: false,
+    away: Vec::new(),
+    brought: Vec::new(),
   })
 }
 
