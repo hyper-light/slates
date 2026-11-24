@@ -565,3 +565,55 @@ fn a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart() {
   assert_eq!(read, None);
   owner.stop().unwrap();
 }
+
+/// Shape: how long the test waits for a stop before it calls the stop blind: far past the checkpoint of one row on a
+/// loaded machine, short of a test that hangs (the fleet test that met this joined for 75 minutes).
+const STOP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The owner's stop with a handle still held (main 01a20182's ruling of 2026-11-23: a blind join is a bug; the fleet's
+/// `GitFleet::stop_store` joined for 75 minutes, its sample in `StoreOwner::stop` waiting on a daemon's handle). Do: land
+/// a changeset through the owner, keep a handle, stop the owner on a plain thread, as the daemon does after its shards
+/// stop; then ask through the kept handle; start a new owner. Expect: the stop answers within [`STOP_PATIENCE`], Ok (its
+/// checkpoint written); the kept handle's request refused `Gone`; the new owner lists the changeset. Failing first: the
+/// stop joined an owner that ends only once every handle is gone, and never answered.
+#[test]
+fn a_stop_with_a_handle_still_held_ends_the_owner_and_the_handle_is_refused_gone() {
+  let dir = scratch("stop-held");
+  let owner = start(&dir);
+  let kept = owner.handle();
+  let handle = owner.handle();
+  let runtime = runtime();
+  runtime
+    .block_on(async move {
+      handle
+        .land(header(1), vec![(SectionKind::Record, b"heads".to_vec())])
+        .await
+        .unwrap();
+    })
+    .unwrap();
+  let (stopped, answered) = std::sync::mpsc::channel();
+  let stopper = std::thread::spawn(move || {
+    let _ = stopped.send(owner.stop().map_err(|error| error.to_string()));
+  });
+  let outcome = answered.recv_timeout(STOP_PATIENCE);
+  assert_eq!(
+    outcome,
+    Ok(Ok(())),
+    "the stop answered while a handle was held, its checkpoint written"
+  );
+  stopper.join().unwrap();
+  let refused = runtime
+    .block_on(async move { kept.changesets(11, 0, 10).await.map(|rows| rows.len()) })
+    .unwrap();
+  assert!(
+    matches!(refused, Err(slates_store::owner::OwnerError::Gone)),
+    "the kept handle's request after the stop: {refused:?}"
+  );
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let listed = runtime
+    .block_on(async move { handle.changesets(11, 0, 10).await.unwrap().len() })
+    .unwrap();
+  assert_eq!(listed, 1, "the changeset landed before the stop");
+  owner.stop().unwrap();
+}

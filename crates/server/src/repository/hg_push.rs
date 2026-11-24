@@ -1815,11 +1815,10 @@ async fn built_works(
           if !vcs_store::hg_view::answer_store_wants(&mut building, repository).await {
             return None;
           }
-          // Its window goes back into the shard's chunk store, lent to the content store for the step.
+          // Its window goes back into the shard's chunk store, lent to the content store within the room its bytes take
+          // (`brought_back`'s `within_budget`, which grows the arena first: never inside a `lent_state`).
           let brought = crate::state::with_state(|state| {
-            vcs_store::lent_state(state, |state| {
-              brought_back(state, repository, forked, &mut building)
-            })
+            brought_back(state, repository, forked, &mut building)
           })
           .flatten();
           if brought.is_none() {
@@ -1927,7 +1926,8 @@ pub(crate) const WORK_TEXTS_READ: &str = "vcs.hg.push_work_texts_read";
 
 /// The text `building` was given for the file revision it waited for, brought back into repository `id`'s content
 /// store by the identities the push's index (its fork's, else the store's) names: none where nothing was given or the
-/// store refused it (its budget, bytes not the revision's own).
+/// store refused it (its budget, bytes not the revision's own). Called outside any `lent_state`, since its
+/// [`vcs_store::within_budget`] grows the arena before it lends the chunks (refused `OutOfReach` inside one).
 fn brought_back(
   state: &mut ShardState,
   id: RepositoryId,
@@ -1951,49 +1951,117 @@ fn brought_back(
 /// status report.
 pub(crate) const LANDED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_texts_brought_back";
 
-/// Brings back the windows of the file revision `node` of `path` that repository `repository` holds (goal 93 item 2b(b);
-/// w-shared's seam 1, main's ruling of 2026-11-22 18:43): where any was let go once its segment landed
+/// Counter: a landed revision's bring-back refused, the repository holding no such revision on the shard
+/// ([`BringBackRefused::NotHeld`]). Format: a counter name in the status report.
+pub(crate) const BRING_BACK_NOT_HELD: &str = "vcs.hg.landed_bring_back_not_held";
+/// Counter: a landed revision's bring-back refused, the node's changeset store not answering the ask for its text
+/// ([`BringBackRefused::StoreUnanswered`]). Format: a counter name in the status report.
+pub(crate) const BRING_BACK_STORE_UNANSWERED: &str = "vcs.hg.landed_bring_back_store_unanswered";
+/// Counter: a landed revision's bring-back refused, the store keeping no such revision or giving no text
+/// ([`BringBackRefused::NoText`]). Format: a counter name in the status report.
+pub(crate) const BRING_BACK_NO_TEXT: &str = "vcs.hg.landed_bring_back_no_text";
+/// Counter: a landed revision's bring-back refused by the content store ([`BringBackRefused::Content`]). Format: a
+/// counter name in the status report.
+pub(crate) const BRING_BACK_CONTENT_REFUSED: &str = "vcs.hg.landed_bring_back_content_refused";
+/// Counter: a landed revision put back, yet not held whole after ([`BringBackRefused::NotWhole`]). Format: a counter
+/// name in the status report.
+pub(crate) const BRING_BACK_NOT_WHOLE: &str = "vcs.hg.landed_bring_back_not_whole";
+
+/// Why [`bring_back`] did not bring a landed revision's windows back whole (goal 93 item 2b(b)): each kind counted where
+/// it is refused ([`BringBackRefused::counter`]) and handed to the home's read that asked
+/// (`vcs_store::homes::LandedRefused::Revision`), never a bare false (§2 item 9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BringBackRefused {
+  /// The repository holds no such revision on this shard.
+  NotHeld,
+  /// The node's changeset store did not answer the ask for its text: its owner busy, gone or refusing
+  /// ([`hg_view::answer_store_wants`]).
+  StoreUnanswered,
+  /// The store answered, but kept no such revision or gave no text for it.
+  NoText,
+  /// The content store refused the text: its room, or bytes not the revision's own.
+  Content(slates_vcs::ContentRefused),
+  /// Put back, yet its object not held whole after.
+  NotWhole,
+}
+
+impl BringBackRefused {
+  /// This kind's counter in the status report.
+  pub(crate) const fn counter(self) -> &'static str {
+    match self {
+      BringBackRefused::NotHeld => BRING_BACK_NOT_HELD,
+      BringBackRefused::StoreUnanswered => BRING_BACK_STORE_UNANSWERED,
+      BringBackRefused::NoText => BRING_BACK_NO_TEXT,
+      BringBackRefused::Content(_) => BRING_BACK_CONTENT_REFUSED,
+      BringBackRefused::NotWhole => BRING_BACK_NOT_WHOLE,
+    }
+  }
+}
+
+/// Brings back the windows of the revision `node` that repository `repository` holds under `path` (goal 93 item 2b(b);
+/// w-shared's seam 1, main's ruling of 2026-11-22 18:43): a file's, or the changelog's or manifest log's by the path
+/// their kept texts are named with ([`bring_back_log`]). Where any window was let go once its segment landed
 /// ([`hg_run::let_go_windows`](super::hg_run::let_go_windows)), its whole text is read from the node's changeset store
 /// off the shard's step ([`hg_view::answer_store_wants`]), then put back by the identities the repository's index
-/// names, within the room its bytes take. True where its block and bytes are held whole after (brought back, or never
-/// let go); false where the repository holds no such revision here, the store gave no text, or the content store
-/// refused it.
-pub(crate) async fn bring_back(repository: RepositoryId, (path, node): (Vec<u8>, Node)) -> bool {
-  if let Some(log) = whole_log(&path) {
-    return bring_back_log(repository, (log, path), node).await;
-  }
-  let Some((len, whole)) =
-    crate::state::with_state(|state| held_whole(state, repository, (&path, &node))).flatten()
-  else {
-    return false;
+/// names, within the room its bytes take ([`file_put_back`]). Ok where it is held whole after (brought back, or never
+/// let go); otherwise the refusal, counted by its kind.
+pub(crate) async fn bring_back(
+  repository: RepositoryId,
+  (path, node): (Vec<u8>, Node),
+) -> Result<(), BringBackRefused> {
+  let brought = match whole_log(&path) {
+    Some(log) => bring_back_log(repository, (log, path), node).await,
+    None => bring_back_file(repository, (path, node)).await,
   };
+  if let Err(refused) = brought {
+    crate::state::with_state(|state| state.count(refused.counter(), 1));
+  }
+  brought
+}
+
+/// [`bring_back`] for a file's revision, its refusal not yet counted.
+async fn bring_back_file(
+  repository: RepositoryId,
+  (path, node): (Vec<u8>, Node),
+) -> Result<(), BringBackRefused> {
+  let (len, whole) =
+    crate::state::with_state(|state| held_whole(state, repository, (&path, &node)))
+      .flatten()
+      .ok_or(BringBackRefused::NotHeld)?;
   if whole {
-    return true;
+    return Ok(());
   }
-  let mut ask = slates_hg::push::held::TextAsk::new(path, node, len);
-  if !hg_view::answer_store_wants(&mut ask, repository).await {
-    return false;
+  let (path, node, text) = asked_text(repository, (path, node), len).await?;
+  crate::state::with_state(|state| file_put_back(state, repository, (&path, &node), &text))
+    .unwrap_or(Err(BringBackRefused::NotHeld))
+}
+
+/// Puts the text `text` of `path`'s revision `node` back into repository `repository`'s content store by the identities
+/// its index names, within the room its bytes take, counted once held whole. [`vcs_store::within_budget`] grows the
+/// shard's arena from its pool before it lends the chunks, so it runs outside any `lent_state`: inside one the room
+/// is out of reach (`ContentRefused::OutOfReach`). Before 2026-11-23 it ran inside one, with only the arena's slack, and
+/// once a publication had given the idle extents back the 49th of 120 bring-backs was refused `OverBudget` (w-tsan).
+fn file_put_back(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (path, node): (&[u8], &Node),
+  text: &[u8],
+) -> Result<(), BringBackRefused> {
+  let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
+  let (_, whole) = vcs_store::within_budget(state, lend, |stores| {
+    let (content, store) = stores
+      .mercurial(repository)
+      .ok_or(BringBackRefused::NotHeld)?;
+    slates_hg::push::held::bring_back_file((&store.index, content), (path, node), text)
+      .map_err(BringBackRefused::Content)?;
+    slates_hg::push::held::file_text_held((&store.index, content), (path, node))
+      .ok_or(BringBackRefused::NotHeld)
+  })?;
+  if !whole {
+    return Err(BringBackRefused::NotWhole);
   }
-  let Some((path, node, text)) = ask.taken() else {
-    return false;
-  };
-  crate::state::with_state(|state| {
-    let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
-    let back = vcs_store::lent_state(state, |state| {
-      vcs_store::within_budget(state, lend, |stores| {
-        let (content, store) = stores.mercurial(repository)?;
-        slates_hg::push::held::bring_back_file((&store.index, content), (&path, &node), &text)
-          .ok()?;
-        slates_hg::push::held::file_text_held((&store.index, content), (&path, &node))
-      })
-    });
-    let whole = back.is_some_and(|(_, whole)| whole);
-    if whole {
-      state.count(LANDED_TEXTS_BROUGHT_BACK, 1);
-    }
-    whole
-  })
-  .unwrap_or(false)
+  state.count(LANDED_TEXTS_BROUGHT_BACK, 1);
+  Ok(())
 }
 
 /// Counter: a changelog's or a manifest's revision brought back whole from the node's changeset store by its node, its
@@ -2016,74 +2084,74 @@ fn whole_log(path: &[u8]) -> Option<slates_hg::index::Log<'static>> {
 /// [`bring_back`] for the changelog's or the manifest log's revision `node` (goal 93, C1 (1)): where its object was let
 /// go, its text read from the node's changeset store under `path`, and for a manifest kept as a delta the text of the
 /// revision it is against too, the delta made again from the two and put back only as the very delta its row names
-/// ([`slates_hg::push::held::bring_back_log`]). True where its object is held whole after.
+/// ([`slates_hg::push::held::bring_back_log`]). Ok where its object is held whole after; its refusal not yet counted.
 async fn bring_back_log(
   repository: RepositoryId,
   (log, path): (slates_hg::index::Log<'static>, Vec<u8>),
   node: Node,
-) -> bool {
-  let Some(held) =
-    crate::state::with_state(|state| log_held(state, repository, log, &node)).flatten()
-  else {
-    return false;
-  };
+) -> Result<(), BringBackRefused> {
+  let held = crate::state::with_state(|state| log_held(state, repository, log, &node))
+    .flatten()
+    .ok_or(BringBackRefused::NotHeld)?;
   if held.whole {
-    return true;
+    return Ok(());
   }
-  let Some(text) = asked_text(repository, (path.clone(), node), held.len).await else {
-    return false;
-  };
+  let (path, _, text) = asked_text(repository, (path, node), held.len).await?;
   let against = match held.against {
     Some(against) => {
-      let Some(len) = crate::state::with_state(|state| log_held(state, repository, log, &against))
+      let len = crate::state::with_state(|state| log_held(state, repository, log, &against))
         .flatten()
-        .map(|held| held.len)
-      else {
-        return false;
-      };
-      let Some(text) = asked_text(repository, (path, against), len).await else {
-        return false;
-      };
+        .ok_or(BringBackRefused::NotHeld)?
+        .len;
+      let (_, _, text) = asked_text(repository, (path, against), len).await?;
       Some(text)
     }
     None => None,
   };
   crate::state::with_state(|state| {
-    let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
-    let whole = vcs_store::lent_state(state, |state| {
-      vcs_store::within_budget(state, lend, |stores| {
-        let (content, store) = stores.mercurial(repository)?;
-        slates_hg::push::held::bring_back_log(
-          (&store.index, content),
-          log,
-          &node,
-          (&text, against.as_deref()),
-        )
-        .ok()?;
-        slates_hg::push::held::log_text_held((&store.index, content), log, &node)
-      })
-    })
-    .is_some_and(|held| held.whole);
-    if whole {
-      state.count(LANDED_LOG_TEXTS_BROUGHT_BACK, 1);
-    }
-    whole
+    log_put_back(state, (repository, log, &node), (&text, against.as_deref()))
   })
-  .unwrap_or(false)
+  .unwrap_or(Err(BringBackRefused::NotHeld))
+}
+
+/// Puts the changelog's or the manifest log's revision `node` back into repository `repository`'s content store from its
+/// `text` (and for a delta the text it is `against`), within the room its bytes take, counted once held whole: outside
+/// any `lent_state`, as [`file_put_back`] puts a file's.
+fn log_put_back(
+  state: &mut ShardState,
+  (repository, log, node): (RepositoryId, slates_hg::index::Log<'static>, &Node),
+  (text, against): (&[u8], Option<&[u8]>),
+) -> Result<(), BringBackRefused> {
+  let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
+  let held = vcs_store::within_budget(state, lend, |stores| {
+    let (content, store) = stores
+      .mercurial(repository)
+      .ok_or(BringBackRefused::NotHeld)?;
+    slates_hg::push::held::bring_back_log((&store.index, content), log, node, (text, against))
+      .map_err(BringBackRefused::Content)?;
+    slates_hg::push::held::log_text_held((&store.index, content), log, node)
+      .ok_or(BringBackRefused::NotHeld)
+  })?;
+  if !held.whole {
+    return Err(BringBackRefused::NotWhole);
+  }
+  state.count(LANDED_LOG_TEXTS_BROUGHT_BACK, 1);
+  Ok(())
 }
 
 /// The whole text of the revision `node` kept under `path`, at most `most` bytes, read from the node's changeset store
-/// off the shard's step ([`hg_view::answer_store_wants`]); none where the store gave none.
+/// off the shard's step ([`hg_view::answer_store_wants`]), with the path and node it was asked by: refused where the
+/// store did not answer, or kept no such revision or gave no text.
 async fn asked_text(
   repository: RepositoryId,
   (path, node): (Vec<u8>, Node),
   most: u64,
-) -> Option<Vec<u8>> {
+) -> Result<(Vec<u8>, Node, Vec<u8>), BringBackRefused> {
   let mut ask = slates_hg::push::held::TextAsk::new(path, node, most);
   if !hg_view::answer_store_wants(&mut ask, repository).await {
-    return None;
+    return Err(BringBackRefused::StoreUnanswered);
   }
-  ask.taken().map(|(_, _, text)| text)
+  ask.taken().ok_or(BringBackRefused::NoText)
 }
 
 /// [`slates_hg::push::held::log_text_held`] in repository `id`, read with the shard's chunks lent.
@@ -3323,10 +3391,7 @@ fn works_whole(
           ) {
             return Err(unread());
           }
-          vcs_store::lent_state(state, |state| {
-            brought_back(state, repository, forked, &mut building)
-          })
-          .ok_or_else(unread)?;
+          brought_back(state, repository, forked, &mut building).ok_or_else(unread)?;
         }
         None => {}
         Some(Ok(work)) => {
