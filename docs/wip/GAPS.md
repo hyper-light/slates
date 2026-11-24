@@ -3741,7 +3741,15 @@
 > w-hg), svn 32 of 32 over both datasets. Windows x86_64 (jupiter, git 2.56 for Windows, hg 7.2 under uv, main
 > 95044a3): git 4 of 27 (the clone spins the edge's connection task, `vcs_http.rs:834`, and the restarted daemon its
 > start, `daemon.rs:1094`; each restart moves the edges to new ports, owed to w-reaper's held listener), hg 4 of 24
-> (pushes land; clones refused as on macOS), svn not run (no client there). Linux: not yet run.
+> (pushes land; clones refused as on macOS), svn not run (no client there). **Linux (2026-11-23, goal 93's "Linux
+> counts", closed):** x86_64 on GitHub's ubuntu-latest, release slates at main ab3e18b65, unloaded (4 CPUs, 16 GB, load
+> 1.1 to 1.6), git 2.56.1, svn 1.14.5, OpenSSH 10.2p1, run 45316568372 (diag 54e4a9a4c, every dataset fetched in the
+> job):
+> - git 27 of 27 over git/git cut at v1.0.0;
+> - svn 33 of 33 over git-2000.dump (made in the job by `git_to_svn_dump.py`) on the svn:// route, and 33 of 33 on HTTP.
+>
+> hg 24 of 24 over Mercurial's whole history, on ubuntu-latest x86_64 (glibc's default and tuned malloc) and on
+> ubuntu-24.04-arm, under twice the CPUs in busy loops (run 45303764098, arena-19).
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
 > verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
