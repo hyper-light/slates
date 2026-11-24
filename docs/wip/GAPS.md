@@ -4325,7 +4325,16 @@
 > submit's step saw head 1 and the new bytes). (b) BUILT (A-888, 2026-11-23): a submit dispatched outside a recorded
 > request (no answer waits on it) is refused `RecordedSubmitRequired` before its verdict, and the old path (the version
 > committed in its step, its revision landed after it) is gone; held by
-> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. (c) a Mercurial
+> `a_submit_to_a_subversion_green_outside_a_recorded_request_is_refused_and_moves_nothing`. Guard-then-apply BUILT
+> (A-890, 2026-11-23, main 20:51): a Subversion version no revision can be made of (a special file, a link with its own
+> properties, an undeclared copy, the records or the store's check refusing) is refused typed and recorded with nothing
+> applied, never committed alone (it had left the green past its records, every later revision not the next), and the
+> register entry is judged before the verdict applies (`made_commit::commit_guarded`, `MadeEntry::guard`,
+> `push::check_entry`), so the step is not refused after it applied anything; held by
+> `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` and
+> `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version` (each red before: accepted at version 1, no revision).
+> Owed to their owners (main's sweep): git's and Mercurial's made commits still commit a version alone when their
+> commit is unmade or their tool refuses, through `made_commit::commit`. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

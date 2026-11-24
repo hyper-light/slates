@@ -208,18 +208,27 @@ fn refused_recorded(state: &mut ShardState, body: RequestBody, sequence: u32) ->
   crate::verbs::run_recorded_for_test(state, (1, id), &owner(), body).and_then(refusal)
 }
 
-/// The durable head of `green` on `daemon`'s first shard once it reaches `version`, or where it stood at [`PATIENCE`].
+/// The durable head of `green` on `daemon`'s first shard once it reaches `version`, or where it stood at [`PATIENCE`]:
+/// read by a task on that shard between its turns, so the held verdicts' steps run meanwhile.
 fn head_reaching(daemon: &crate::Daemon, green: VolumeId, version: u64) -> u64 {
   let green = crate::verbs::to_db_volume(green);
-  let deadline = std::time::Instant::now() + PATIENCE;
-  loop {
-    let head =
-      crate::daemon::observe_first(daemon, move |state| state.db.partition().green_head(green));
-    if head >= version || std::time::Instant::now() >= deadline {
-      return head;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(1));
-  }
+  let patience = u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let deadline = slates_rt::futures::now_ns().saturating_add(patience);
+      loop {
+        let head = crate::state::with_state(|state| state.db.partition().green_head(green))
+          .unwrap_or_default();
+        if head >= version || slates_rt::futures::now_ns() >= deadline {
+          return head;
+        }
+        slates_rt::futures::yield_now().await;
+      }
+    },
+    // The task gives its answer at its own deadline, before the history's.
+    PATIENCE.saturating_mul(2),
+  )
 }
 
 /// A work over a new `tool` repository's root green named `name`, submitted as recorded requests from `sequence` on
