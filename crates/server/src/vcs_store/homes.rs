@@ -1731,18 +1731,15 @@ async fn caught_up(
 ) -> u64 {
   let began = slates_rt::futures::now_ns();
   let mut waited = false;
-  loop {
-    let Some((behind, seen)) = crate::state::with_state(|state| {
-      let local = state.fleet.host();
-      let members = state.fleet.members();
-      let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
-      let ranked = slates_db::identity_homes::homes(identity, members, f).contains(&local);
-      let behind =
-        !ranked && (carried > state.fleet.configuration().version || !members.contains(&sender));
-      (behind, state.fleet.installs())
-    }) else {
-      break;
-    };
+  while let Some((behind, seen)) = crate::state::with_state(|state| {
+    let local = state.fleet.host();
+    let members = state.fleet.members();
+    let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
+    let ranked = slates_db::identity_homes::homes(identity, members, f).contains(&local);
+    let behind =
+      !ranked && (carried > state.fleet.configuration().version || !members.contains(&sender));
+    (behind, state.fleet.installs())
+  }) {
     if !behind {
       if waited {
         let _ = crate::state::with_state(|state| state.count(INSTALL_WAIT_CAUGHT_UP, 1));
@@ -1827,41 +1824,13 @@ pub(crate) async fn serve_remote(
   request: &[u8],
   budget_ns: u64,
 ) -> Vec<u8> {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
-  if OTHER_VERSION.with(std::cell::Cell::get) {
-    return Vec::new();
-  }
-  let message = match HomeMessage::decode(request) {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let message = match decoded(request) {
     Ok(message) => message,
-    // Another version's message (a peer of another build): refused at once and typed, so its sender's homing fails at
-    // once rather than at its deadline (A-727 (d1a); a version-1 peer reads no version-2 answer, and fails as at once).
-    Err(slates_cluster::homes::HomeWireError::Version { .. }) => {
-      let _ = crate::state::with_state(|state| state.count(VERSION_REFUSED, 1));
-      return HomeMessage::Answer {
-        identity: [0; 32],
-        outcome: HomeOutcome::Refused(HomeRefusal::Version),
-      }
-      .encode();
-    }
-    Err(_) => return Vec::new(),
+    Err(answer) => return answer,
   };
-  // A put (or a put's first part) is judged only once this node is not behind its sender's configuration (A-902): the
-  // wait spends the message's budget, and what is left of it is the keep's.
-  let spent = match &message {
-    HomeMessage::Put {
-      identity,
-      configuration,
-      ..
-    }
-    | HomeMessage::PutPart {
-      identity,
-      configuration,
-      offset: 0,
-      ..
-    } => caught_up(identity, (sender, *configuration), budget_ns).await,
-    _ => 0,
-  };
-  let budget_ns = budget_ns.saturating_sub(spent);
+  // What is left of the message's budget once this node is not behind its sender's configuration is the keep's.
+  let budget_ns = budget_ns.saturating_sub(spent_catching_up(&message, sender, budget_ns).await);
   let Some((local, members, f, shards)) = crate::state::with_state(|state| {
     state.count(REMOTE_SERVED, 1);
     (
@@ -1897,24 +1866,16 @@ pub(crate) async fn serve_remote(
       offset,
       bytes,
       ..
-    } => {
-      let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
-      let outcome = match staged {
-        Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
-        Staged::Taken(received) => HomeOutcome::Taken { received },
-        Staged::Whole(bytes) => {
-          keep_put(
-            origin,
-            &shards,
-            (local, &members, f),
-            (identity, owners, bytes),
-            budget_ns,
-          )
-          .await
-        }
-      };
-      (identity, outcome)
-    }
+    } => (
+      identity,
+      part_answer(
+        (origin, &shards),
+        (local, &members, f),
+        (identity, owners, (total, offset)),
+        (bytes, budget_ns),
+      )
+      .await,
+    ),
     HomeMessage::ReadPart { identity, offset } => (
       identity,
       read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
@@ -1949,6 +1910,80 @@ pub(crate) async fn serve_remote(
     HomeMessage::Answer { .. } => return Vec::new(),
   };
   HomeMessage::Answer { identity, outcome }.encode()
+}
+
+/// A home message read from `request` ([`serve_remote`]), or what to answer at once instead: nothing for bytes no message
+/// reads as, or for any message while this member plays one of another version (a test's); another version's message (a
+/// peer of another build) refused at once and typed, so its sender's homing fails at once rather than at its deadline
+/// (A-727 (d1a); a version-1 peer reads no version-2 answer, and fails as at once).
+fn decoded(request: &[u8]) -> Result<slates_cluster::homes::HomeMessage, Vec<u8>> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal, HomeWireError};
+  if OTHER_VERSION.with(std::cell::Cell::get) {
+    return Err(Vec::new());
+  }
+  match HomeMessage::decode(request) {
+    Ok(message) => Ok(message),
+    Err(HomeWireError::Version { .. }) => {
+      let _ = crate::state::with_state(|state| state.count(VERSION_REFUSED, 1));
+      Err(
+        HomeMessage::Answer {
+          identity: [0; 32],
+          outcome: HomeOutcome::Refused(HomeRefusal::Version),
+        }
+        .encode(),
+      )
+    }
+    Err(_) => Err(Vec::new()),
+  }
+}
+
+/// The nanoseconds of a message's `budget_ns` spent waiting until this node is not behind the configuration its
+/// `sender` ranked by ([`caught_up`], A-902): a put or a put's first part waits; nothing else does.
+async fn spent_catching_up(
+  message: &slates_cluster::homes::HomeMessage,
+  sender: slates_db::HostId,
+  budget_ns: u64,
+) -> u64 {
+  use slates_cluster::homes::HomeMessage;
+  match message {
+    HomeMessage::Put {
+      identity,
+      configuration,
+      ..
+    }
+    | HomeMessage::PutPart {
+      identity,
+      configuration,
+      offset: 0,
+      ..
+    } => caught_up(identity, (sender, *configuration), budget_ns).await,
+    _ => 0,
+  }
+}
+
+/// [`serve_remote`]'s answer to a put's part (A-724 piece 8c): staged where it may be ([`stage_part`]), refused by kind
+/// where it may not, `Taken` with what is staged until the object is whole, then kept as a whole put is ([`keep_put`]).
+async fn part_answer(
+  (origin, shards): (u16, &[u16]),
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  (identity, owners, (total, offset)): ([u8; 32], Vec<HomeOwner>, (u64, u64)),
+  (bytes, budget_ns): (Vec<u8>, u64),
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::HomeOutcome;
+  match stage_part((local, members, f), (identity, total, offset), bytes) {
+    Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
+    Staged::Taken(received) => HomeOutcome::Taken { received },
+    Staged::Whole(bytes) => {
+      keep_put(
+        origin,
+        shards,
+        (local, members, f),
+        (identity, owners, bytes),
+        budget_ns,
+      )
+      .await
+    }
+  }
 }
 
 /// [`serve_remote`]'s answer to a resolution of `attempt`'s hold of `identity` (A-727 (d1a-3)): whether a record of its
@@ -3032,48 +3067,12 @@ async fn exchange(
   request: &[u8],
   budget: slates_cluster::CommitBudget,
 ) -> Vec<(slates_db::HostId, Vec<u8>)> {
-  use slates_cluster::homes::HOME_STREAM;
   let began = slates_rt::futures::now_ns();
   let spend = budget.max_deadline_ns();
   let mut left: Vec<slates_db::HostId> = hosts.to_vec();
   let mut answers = Vec::new();
   while !left.is_empty() {
-    let sessions =
-      crate::fleet::take_sessions("vcs_store.homes.exchange", |host| left.contains(&host));
-    let outgoing: Vec<_> = sessions
-      .into_iter()
-      .map(|(host, endpoint)| (host, request.to_vec(), endpoint))
-      .collect();
-    if !outgoing.is_empty() {
-      let (replied, _stragglers) = slates_cluster::broadcast(
-        outgoing,
-        HOME_STREAM,
-        slates_transport::connection::Priority::Bulk,
-        budget,
-      )
-      .await;
-      let mut returned = Vec::with_capacity(replied.len());
-      for (host, reply, endpoint) in replied {
-        left.retain(|waiting| *waiting != host);
-        // A reply this build cannot read (a peer of another version answers none it can) fails its exchange at once,
-        // counted: never a wait for the deadline (A-727 (d1a)).
-        if !matches!(
-          slates_cluster::homes::HomeMessage::decode(&reply.bytes),
-          Ok(slates_cluster::homes::HomeMessage::Answer {
-            outcome: slates_cluster::homes::HomeOutcome::Refused(
-              slates_cluster::homes::HomeRefusal::Version
-            ),
-            ..
-          }) | Err(_)
-        ) {
-          answers.push((host, reply.bytes));
-        } else {
-          let _ = crate::state::with_state(|state| state.count(REPLY_OTHER_VERSION, 1));
-        }
-        returned.push((host, endpoint));
-      }
-      crate::fleet::return_sessions(returned);
-    }
+    exchange_round(&mut left, request, budget, &mut answers).await;
     let spent = slates_rt::futures::now_ns().saturating_sub(began);
     if left.is_empty() || spent >= spend {
       break;
@@ -3091,6 +3090,53 @@ async fn exchange(
     log_unanswered(&left, began, Some(false));
   }
   answers
+}
+
+/// One round of [`exchange`]: `request` sent to each host of `left` whose record session is free now, within `budget`;
+/// each that replied leaves `left`, its reply kept in `answers` where this build can read it, and its session returned.
+/// A reply this build cannot read (a peer of another version answers none it can) fails its exchange at once, counted:
+/// never a wait for the deadline (A-727 (d1a)).
+async fn exchange_round(
+  left: &mut Vec<slates_db::HostId>,
+  request: &[u8],
+  budget: slates_cluster::CommitBudget,
+  answers: &mut Vec<(slates_db::HostId, Vec<u8>)>,
+) {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome, HomeRefusal};
+  let sessions =
+    crate::fleet::take_sessions("vcs_store.homes.exchange", |host| left.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  let outgoing: Vec<_> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.to_vec(), endpoint))
+    .collect();
+  let (replied, _stragglers) = slates_cluster::broadcast(
+    outgoing,
+    HOME_STREAM,
+    slates_transport::connection::Priority::Bulk,
+    budget,
+  )
+  .await;
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    left.retain(|waiting| *waiting != host);
+    let readable = !matches!(
+      HomeMessage::decode(&reply.bytes),
+      Ok(HomeMessage::Answer {
+        outcome: HomeOutcome::Refused(HomeRefusal::Version),
+        ..
+      }) | Err(_)
+    );
+    if readable {
+      answers.push((host, reply.bytes));
+    } else {
+      let _ = crate::state::with_state(|state| state.count(REPLY_OTHER_VERSION, 1));
+    }
+    returned.push((host, endpoint));
+  }
+  crate::fleet::return_sessions(returned);
 }
 
 /// Logs the hosts of an exchange that never answered, how long it ran, and why it stopped (gate 8: a homing short in about
@@ -3411,35 +3457,7 @@ async fn heal_one(
   let mut held: std::collections::BTreeSet<slates_db::HostId> = std::collections::BTreeSet::new();
   held.insert(local);
   if !others.is_empty() {
-    // Offered for every owner its hold has here (A-727 (d1a)), so a home it reaches holds it for the same reasons.
-    let owners = match home_of(shards, &identity) {
-      Some(home) => crate::xshard::call_in_shard_time(
-        origin,
-        home,
-        move |_| region_owners(&identity),
-        budget.max_deadline_ns(),
-      )
-      .await
-      .unwrap_or_default(),
-      None => Vec::new(),
-    };
-    // An ended attempt is never spread, only resolved (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 04:40): a
-    // home not yet resolved offering it to one that had moved it to the records joined it back after the last owed pass
-    // (the group runs' flake, 1 in 4), so the resolution's answer is the only way a hold changes owner. Judged here, on
-    // the control shard; a live attempt (a push in flight) is offered as before. An object whose every owner is an
-    // ended attempt waits here until its resolution moves it to the records or lets it go.
-    let offered: Vec<HomeOwner> = crate::state::with_state(|state| {
-      owners
-        .iter()
-        .copied()
-        .filter(|owner| !process_ended(state, owner))
-        .collect()
-    })
-    .unwrap_or_default();
-    if offered.len() < owners.len() {
-      crate::state::with_state(|state| state.count(HEAL_ENDED_WITHHELD, 1));
-    }
-    let owners = offered;
+    let owners = offered_owners(origin, shards, identity, budget).await;
     if owners.is_empty() {
       return;
     }
@@ -3448,17 +3466,63 @@ async fn heal_one(
     else {
       return;
     };
-    // An object past one message is offered a part at a time (A-724 piece 8c), as `home_in_region` sends it.
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES {
-      held.extend(put_in_parts(&others, (identity, &owners), &bytes, budget).await);
-      crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
-      release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
-      return;
-    }
-    held.extend(put_whole(&others, (identity, owners), bytes, budget).await);
+    held.extend(offer(&others, (identity, owners), bytes, budget).await);
     crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
   }
   release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
+}
+
+/// The owners [`heal_one`] offers the window `identity` for: every owner its hold has here (A-727 (d1a)), so a home it
+/// reaches holds it for the same reasons, except an ended attempt. An ended attempt is never spread, only resolved
+/// (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 04:40): a home not yet resolved offering it to one that had moved
+/// it to the records joined it back after the last owed pass (the group runs' flake, 1 in 4), so the resolution's answer
+/// is the only way a hold changes owner. Judged here, on the control shard; a live attempt (a push in flight) is offered
+/// as before. An object whose every owner is an ended attempt is offered for none, and waits until its resolution moves
+/// it to the records or lets it go.
+async fn offered_owners(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+) -> Vec<HomeOwner> {
+  let owners = match home_of(shards, &identity) {
+    Some(home) => crate::xshard::call_in_shard_time(
+      origin,
+      home,
+      move |_| region_owners(&identity),
+      budget.max_deadline_ns(),
+    )
+    .await
+    .unwrap_or_default(),
+    None => Vec::new(),
+  };
+  let offered: Vec<HomeOwner> = crate::state::with_state(|state| {
+    owners
+      .iter()
+      .copied()
+      .filter(|owner| !process_ended(state, owner))
+      .collect()
+  })
+  .unwrap_or_default();
+  if offered.len() < owners.len() {
+    crate::state::with_state(|state| state.count(HEAL_ENDED_WITHHELD, 1));
+  }
+  offered
+}
+
+/// Offers the window `identity`'s `bytes` to `others` for `owners` ([`heal_one`]): whole within one message, or a part at
+/// a time past it (A-724 piece 8c), as `home_in_region` sends it. The homes that kept it.
+async fn offer(
+  others: &[slates_db::HostId],
+  (identity, owners): (ContentId, Vec<HomeOwner>),
+  bytes: Vec<u8>,
+  budget: slates_cluster::CommitBudget,
+) -> Vec<slates_db::HostId> {
+  if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES {
+    put_in_parts(others, (identity, &owners), &bytes, budget).await
+  } else {
+    put_whole(others, (identity, owners), bytes, budget).await
+  }
 }
 
 /// Offers the window `identity` whole to `others` for `owners`, one message each over the sessions the fleet has free,
