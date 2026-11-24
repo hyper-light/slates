@@ -10,6 +10,21 @@
 use slates_merge::named::{Identity, ObjectMissing, Objects};
 use slates_vcs::{ContentId, ContentStore};
 
+use super::hg_named::ReadAt;
+
+/// Where a reader read a named file, as it knew it: the green, the path there and the version (a Mercurial green's
+/// named file is brought back by them, `hg_named`). None for a reader that reads an object by its identity alone.
+pub(crate) type Seen<'p> = Option<(slates_db::catalog::VolumeId, &'p str, u64)>;
+
+/// [`Seen`] kept with a read that met a let-go window.
+fn read_at(seen: Seen<'_>) -> Option<ReadAt> {
+  seen.map(|(green, path, version)| ReadAt {
+    green,
+    version,
+    path: path.to_owned(),
+  })
+}
+
 /// The engine's named objects over the content plane (module docs).
 #[derive(Clone, Copy)]
 pub(crate) struct PlaneObjects<'a> {
@@ -81,6 +96,7 @@ pub(crate) fn plane<'a>(
 pub(crate) fn whole_of(
   content: slates_merge::engine::ContentAt<'_>,
   plane: Option<&PlaneObjects<'_>>,
+  seen: Seen<'_>,
 ) -> Option<Vec<u8>> {
   match content {
     slates_merge::engine::ContentAt::Bytes(bytes) => Some(bytes.into_owned()),
@@ -88,7 +104,7 @@ pub(crate) fn whole_of(
       let plane = plane?;
       let mut bytes = vec![0u8; usize::try_from(identity.len).ok()?];
       if !bytes.is_empty() && plane.read(&identity, 0, &mut bytes).is_err() {
-        note_if_away(plane, identity, (0, identity.len));
+        note_if_away(plane, identity, (0, identity.len), seen);
         return None;
       }
       Some(bytes)
@@ -100,7 +116,7 @@ pub(crate) fn whole_of(
 /// or its object's range read through `plane` where the green holds the file by name alone (A-760 (b) 4d). Refused
 /// naming the file and its object where the plane cannot give them now.
 pub(crate) fn page_of<'a>(
-  path: &str,
+  (path, green_at): (&str, Option<(slates_db::catalog::VolumeId, u64)>),
   page: slates_merge::engine::ContentAt<'a>,
   (offset, want): (u64, u64),
   plane: Option<&PlaneObjects<'_>>,
@@ -118,7 +134,8 @@ pub(crate) fn page_of<'a>(
   if !bytes.is_empty() {
     let plane = plane.ok_or_else(unread)?;
     if plane.read(&identity, offset, &mut bytes).is_err() {
-      note_if_away(plane, identity, (offset, take));
+      let seen = green_at.map(|(green, version)| (green, path, version));
+      note_if_away(plane, identity, (offset, take), seen);
       return Err(unread());
     }
   }
@@ -137,6 +154,7 @@ pub(crate) fn read_file(
   whole_of(
     content.into(),
     plane(&state.vcs_stores, &state.store.content).as_ref(),
+    Some((green, path, engine.head())),
   )
 }
 
@@ -152,6 +170,7 @@ pub(crate) fn read_held(
   whole_of(
     content.into(),
     plane(&state.vcs_stores, &state.store.content).as_ref(),
+    None,
   )
 }
 
@@ -220,24 +239,9 @@ pub(crate) async fn bring_back_range(
   identity: Identity,
   (offset, len): (u64, u64),
 ) -> Result<ReadPin, super::read_through::ReadThroughRefused> {
-  use super::read_through::ReadThroughRefused;
   let began = slates_rt::futures::now_ns();
   let root = ContentId(identity.hash);
-  let windows = crate::state::with_state(|state| {
-    let content = state.vcs_stores.content()?;
-    let end = offset.saturating_add(len.max(1)).min(identity.len.max(1));
-    let mut windows = Vec::new();
-    let mut at = offset;
-    while at < end {
-      let (window, start, width) = content.window_holding(&root, identity.len, at)?;
-      windows.push((window, start));
-      at = start.saturating_add(width.max(1));
-    }
-    Some(windows)
-  })
-  .flatten()
-  .ok_or(ReadThroughRefused::NoStore)?;
-  let pin = ReadPin::of(windows.iter().map(|(window, _)| *window).collect());
+  let (pin, windows) = pin_range(identity, (offset, len))?;
   // A Subversion text is its repository's on the node's store (read by repository and identity); any other object is
   // its landed changeset's Payload, read by identity alone (`read_through`).
   let repository =
@@ -255,18 +259,50 @@ pub(crate) async fn bring_back_range(
       }
     }
   }
+  count_brought_back(1, began);
+  Ok(pin)
+}
+
+/// Counts `reads` brought back ([`READ_BROUGHT_BACK`]) and the wait since `began`.
+fn count_brought_back(reads: u64, began: u64) {
   let waited_ns = slates_rt::futures::now_ns().saturating_sub(began);
   let _ = crate::state::with_state(|state| {
-    state.count(READ_BROUGHT_BACK, 1);
+    state.count(READ_BROUGHT_BACK, reads);
     state.count(READ_BROUGHT_BACK_WAIT_NS, waited_ns);
   });
-  Ok(pin)
+}
+
+/// The windows of `identity` covering `[offset, offset + len)` (at least the one holding `offset`), each with where it
+/// begins, kept from a landed let-go until the pin drops: pinned before any wait, so none goes while another comes
+/// back.
+pub(crate) fn pin_range(
+  identity: Identity,
+  (offset, len): (u64, u64),
+) -> Result<(ReadPin, Vec<(ContentId, u64)>), super::read_through::ReadThroughRefused> {
+  use super::read_through::ReadThroughRefused;
+  let root = ContentId(identity.hash);
+  let windows = crate::state::with_state(|state| {
+    let content = state.vcs_stores.content()?;
+    let end = offset.saturating_add(len.max(1)).min(identity.len.max(1));
+    let mut windows = Vec::new();
+    let mut at = offset;
+    while at < end {
+      let (window, start, width) = content.window_holding(&root, identity.len, at)?;
+      windows.push((window, start));
+      at = start.saturating_add(width.max(1));
+    }
+    Some(windows)
+  })
+  .flatten()
+  .ok_or(ReadThroughRefused::NoStore)?;
+  let pin = ReadPin::of(windows.iter().map(|(window, _)| *window).collect());
+  Ok((pin, windows))
 }
 
 /// A read that met a window of a named text let go (A-760 (b) 4d; main's ruling (B): a landed text's windows go once
 /// durable): the object and the range the read wanted, which its async caller brings back ([`bring_back_reads`]) and
 /// serves the read again over, never answering the miss to its client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AwayRead {
   /// The object.
   pub(crate) identity: Identity,
@@ -274,6 +310,9 @@ pub(crate) struct AwayRead {
   pub(crate) offset: u64,
   /// How many bytes it wanted.
   pub(crate) len: u64,
+  /// Where the reader read it, where it knew ([`Seen`]): a Mercurial green's named file is brought back by it alone
+  /// (A-887, `hg_named`).
+  pub(crate) at: Option<ReadAt>,
 }
 
 // The reads that met a let-go window in the call running now on this shard's thread ([`away_scope`]): a sync call runs
@@ -289,6 +328,7 @@ pub(crate) fn note_if_away(
   plane: &PlaneObjects<'_>,
   identity: Identity,
   (offset, len): (u64, u64),
+  seen: Seen<'_>,
 ) {
   let root = ContentId(identity.hash);
   let end = offset.saturating_add(len.max(1)).min(identity.len.max(1));
@@ -302,6 +342,7 @@ pub(crate) fn note_if_away(
         identity,
         offset,
         len,
+        at: read_at(seen),
       });
       return;
     }
@@ -317,6 +358,12 @@ pub(crate) fn note_away(read: AwayRead) {
       reads.push(read);
     }
   });
+}
+
+/// How many reads the call running now has noted so far ([`away_scope`]); none outside one. A caller that asks after
+/// each of its steps (a virtio-fs device after each chain, `crate::virtiofs`) tells the step that met a let-go window.
+pub(crate) fn noted_in_scope() -> usize {
+  AWAY_READS.with(|reads| reads.borrow().as_ref().map_or(0, Vec::len))
 }
 
 /// Puts the caller's notes back however the scope ends.
@@ -341,7 +388,7 @@ pub(crate) fn away_scope<T>(f: impl FnOnce() -> T) -> (T, Vec<AwayRead>) {
     .with(|reads| reads.replace(restore.0.take().unwrap_or_default()))
     .unwrap_or_default();
   for read in &mine {
-    note_away(*read);
+    note_away(read.clone());
   }
   (answer, mine)
 }
@@ -372,14 +419,50 @@ impl ParkedReads {
   }
 }
 
-/// Brings back every window `reads` met let go, each read's range ([`bring_back_range`]), and keeps them all until the
-/// pins drop: what a parked call holds while it is served again. Refused as the first refused bring-back.
+/// Brings back every window `reads` met let go, each read's range, and keeps them all until the pins drop: what a parked
+/// call holds while it is served again. A Mercurial green's named file comes back by the revision its green's changeset
+/// names where it was read (A-887, `hg_named`), each green's and version's reads through one read of its manifest;
+/// any other object by its range ([`bring_back_range`]). Refused as the first refused bring-back.
 pub(crate) async fn bring_back_reads(
   reads: &[AwayRead],
 ) -> Result<Vec<ReadPin>, super::read_through::ReadThroughRefused> {
+  let began = slates_rt::futures::now_ns();
   let mut pins = Vec::with_capacity(reads.len());
+  // A Mercurial green's reads, by its repository, the green and the version read: each the paths and objects wanted.
+  type Wanted = Vec<(Identity, String)>;
+  let mut mercurial: Vec<((slates_db::catalog::RepositoryId, ReadAt), Wanted)> = Vec::new();
   for read in reads {
-    pins.push(bring_back_range(read.identity, (read.offset, read.len)).await?);
+    let repository = read.at.as_ref().and_then(|at| {
+      crate::state::with_state(|state| super::hg_named::repository_of(state, at.green)).flatten()
+    });
+    let (Some(repository), Some(at)) = (repository, read.at.as_ref()) else {
+      pins.push(bring_back_range(read.identity, (read.offset, read.len)).await?);
+      continue;
+    };
+    pins.push(pin_range(read.identity, (read.offset, read.len))?.0);
+    let wanted = (read.identity, at.path.clone());
+    let key = ReadAt {
+      path: String::new(),
+      ..at.clone()
+    };
+    match mercurial
+      .iter_mut()
+      .find(|((held_in, read_at), _)| *held_in == repository && *read_at == key)
+    {
+      Some((_, set)) if set.contains(&wanted) => {}
+      Some((_, set)) => set.push(wanted),
+      None => mercurial.push(((repository, key), vec![wanted])),
+    }
+  }
+  let mut brought = 0u64;
+  for ((repository, at), wanted) in &mercurial {
+    super::hg_named::bring_back(*repository, (at.green, at.version), wanted)
+      .await
+      .map_err(super::read_through::ReadThroughRefused::Mercurial)?;
+    brought = brought.saturating_add(u64::try_from(wanted.len()).unwrap_or(u64::MAX));
+  }
+  if brought > 0 {
+    count_brought_back(brought, began);
   }
   Ok(pins)
 }
@@ -457,12 +540,23 @@ pub(crate) async fn read_file_brought(
   green: slates_db::catalog::VolumeId,
   path: &str,
 ) -> Option<Vec<u8>> {
-  let named = crate::state::with_state(|state| match state.greens.get(&green)?.content(path)? {
-    slates_merge::engine::Content::Named(identity) => Some(identity),
-    slates_merge::engine::Content::Bytes(_) => None,
-  })?;
-  let _pin = match named {
-    Some(identity) => Some(bring_back_range(identity, (0, identity.len)).await.ok()?),
+  let named = crate::state::with_state(|state| {
+    let engine = state.greens.get(&green)?;
+    match engine.content(path)? {
+      slates_merge::engine::Content::Named(identity) => Some(Some((identity, engine.head()))),
+      slates_merge::engine::Content::Bytes(_) => Some(None),
+    }
+  })??;
+  let _pins = match named {
+    Some((identity, version)) => {
+      let read = AwayRead {
+        identity,
+        offset: 0,
+        len: identity.len,
+        at: read_at(Some((green, path, version))),
+      };
+      Some(bring_back_reads(&[read]).await.ok()?)
+    }
     None => None,
   };
   crate::state::with_state(|state| read_file(state, green, path))?
@@ -652,6 +746,7 @@ mod tests {
       let file = super::whole_of(
         slates_merge::engine::ContentAt::Named(object),
         super::plane(&state.vcs_stores, &state.store.content).as_ref(),
+        None,
       )
       .unwrap();
       let replayed = {

@@ -301,7 +301,7 @@ fn copy_named(
   let take = slice.min(total.saturating_sub(from));
   let plane = crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content);
   let page = crate::vcs_store::named_objects::page_of(
-    "",
+    ("", None),
     slates_merge::engine::ContentAt::Named(identity),
     (u64::try_from(from).ok()?, u64::try_from(take).ok()?),
     plane.as_ref(),
@@ -377,6 +377,7 @@ fn with_base<R>(
   if let Some(engine) = state.greens.get(&green) {
     return f(crate::work_files::Base {
       green: Some(&*engine),
+      green_id: Some(green),
       fetched: None,
       version,
       entries: None,
@@ -390,6 +391,7 @@ fn with_base<R>(
   {
     return f(crate::work_files::Base {
       green: Some(replica),
+      green_id: None,
       fetched: None,
       version,
       entries: None,
@@ -398,6 +400,7 @@ fn with_base<R>(
   }
   f(crate::work_files::Base {
     green: None,
+    green_id: None,
     fetched: crate::work_home::parked_fetched(state, work),
     version,
     entries: None,
@@ -868,6 +871,7 @@ impl RefineJob {
           let engine = s.greens.get(&green)?;
           let base = crate::work_files::Base {
             green: Some(&*engine),
+            green_id: Some(green),
             fetched: None,
             version: key.0,
             entries: None,

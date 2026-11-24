@@ -338,7 +338,7 @@ async fn parent_texts_at_hand(
     let read = crate::repository::hg_push::bring_back_log_on(
       &mut crate::vcs_http::git::ThisShard,
       repository,
-      None,
+      crate::repository::hg_push::Committed,
       (log, path.to_vec()),
       node,
     )

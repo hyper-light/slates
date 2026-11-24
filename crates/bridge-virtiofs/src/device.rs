@@ -226,6 +226,20 @@ pub struct DeviceCounters {
   pub init_seen: u64,
   /// `FUSE_DESTROY` requests observed.
   pub destroy_seen: u64,
+  /// Chains kept unpublished because their dispatch met content not at hand ([`AwayProbe`]), served again once it was
+  /// brought back: the park's non-vacuity counter.
+  pub kept_away: u64,
+  /// Kept chains whose second dispatch met content not at hand again, published with that dispatch's answer.
+  pub away_again: u64,
+}
+
+/// Whether the dispatch just made met content the shard does not hold at hand now (a let-go window of a named text,
+/// A-760 (b) 4d), so its answer is no answer: asked after each chain's dispatch, answered by the device's access from
+/// what that dispatch noted (`BridgeAccess::with_bridge` hands it over). Each access states it; one that can meet no
+/// such content answers `false` where it is written.
+pub trait AwayProbe {
+  /// Whether anything was noted not at hand since the last ask.
+  fn take_noted_away(&mut self) -> bool;
 }
 
 /// What one service pass did.
@@ -581,6 +595,9 @@ pub struct Device {
   setxattr_ext: bool,
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
+  /// A chain whose dispatch met content not at hand ([`AwayProbe`]), kept unpublished until it is brought back and the
+  /// chain served again: its queue and the chain. One a device.
+  kept: Option<(u16, DescriptorChain)>,
   counters: DeviceCounters,
   /// How the device places a file's backing into the guest's DAX window ([`crate::dax::DaxPlacer`]), installed once at
   /// admission ([`Device::install_dax_window`], or `Device::install_dax_message_placer` on Linux); `None` when the VMM offered
@@ -627,6 +644,7 @@ impl Device {
       setxattr_ext: false,
       fault: None,
       awaiting: None,
+      kept: None,
       counters: DeviceCounters::default(),
       #[cfg(unix)]
       dax_placer: None,
@@ -934,7 +952,7 @@ impl Device {
     bridge: &mut dyn Bridge,
     cx: &OpContext,
     batch: u32,
-    admission: &mut dyn ChainAdmission,
+    (admission, probe): (&mut dyn ChainAdmission, &mut dyn AwayProbe),
   ) -> Result<Serviced, DeviceError> {
     if let Some(fault) = &self.fault {
       return Err(fault.clone());
@@ -962,16 +980,33 @@ impl Device {
         barrier_owed: false,
       });
     }
+    if self.kept.as_ref().is_some_and(|(kept, _)| *kept != queue) {
+      // Nothing is served on another queue past a kept chain: it is served again first, once brought back.
+      return Ok(Serviced {
+        served: 0,
+        published: 0,
+        more_pending: true,
+        interrupt_wanted: false,
+        barrier_owed: false,
+      });
+    }
     let mut served: u32 = 0;
     let mut published: u32 = 0;
     while served < batch {
-      let Some(chain) = self.queue_at(index)?.peek(memory)? else {
-        break;
+      // A kept chain is served again first, charged and taken off its ring already.
+      let (chain, again) = match self.kept.take() {
+        Some((_, chain)) => (chain, true),
+        None => {
+          let Some(chain) = self.queue_at(index)?.peek(memory)? else {
+            break;
+          };
+          if let Err(refusal) = self.charge_copy(&chain, admission) {
+            return Err(self.record_fault(refusal));
+          }
+          self.queue_at(index)?.advance();
+          (chain, false)
+        }
       };
-      if let Err(refusal) = self.charge_copy(&chain, admission) {
-        return Err(self.record_fault(refusal));
-      }
-      self.queue_at(index)?.advance();
       let mark = self.journal_mark(bridge, cx);
       let written = match self.serve_chain(
         queue,
@@ -996,6 +1031,24 @@ impl Device {
         }
         Err(refusal) => return Err(self.record_fault(refusal)),
       };
+      // Its dispatch met content not at hand: its answer is none, so its used element is not published; it is kept, and
+      // served again once the content is brought back (A-760 (b) 4d; main's ruling of 2026-11-24). Once only: a second
+      // dispatch that met it again is published with its answer.
+      if probe.take_noted_away() {
+        if again {
+          self.counters.away_again = self.counters.away_again.saturating_add(1);
+        } else {
+          self.counters.kept_away = self.counters.kept_away.saturating_add(1);
+          self.kept = Some((queue, chain));
+          return Ok(Serviced {
+            served,
+            published,
+            more_pending: true,
+            interrupt_wanted: false,
+            barrier_owed: false,
+          });
+        }
+      }
       let owes = Self::journal_owed(mark, bridge, cx);
       if let Some(awaiting) =
         self.awaits_barrier((queue, &chain, written), owes, bridge.awaits_publication())
@@ -1042,6 +1095,11 @@ impl Device {
       interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
       barrier_owed: false,
     })
+  }
+
+  /// Whether a chain is kept for content not at hand ([`AwayProbe`]): the loop brings it back and serves again.
+  pub fn holds_kept(&self) -> bool {
+    self.kept.is_some()
   }
 
   /// The bytes the device's copy buffers keep between chains (their capacity): what its attachment's byte

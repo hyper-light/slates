@@ -103,14 +103,83 @@ pub(crate) const NAME_LENT_VERDICTS: &str = "merge.name_lend.verdicts";
 /// status report.
 pub(crate) const NAME_LEND_MISSED: &str = "merge.name_lend.missed";
 
-/// Lends green `green`'s engine each of `wanted`, read whole from the shard's content plane (A-760 (b) 4d): refused,
-/// nothing lent, naming the first the plane cannot give now.
+/// Where a verdict, a commit or a replay reads the named texts it is lent (A-887): its green, the paths its increment
+/// names (a copy's source among them) and the versions it reads them at. A text whose windows were let go is noted
+/// with the path and version it is the green's file at, found among these, by which a Mercurial green's text comes back
+/// (`hg_named`); found on the miss alone, a cold path.
+pub(crate) struct ReadIn<'a> {
+  /// The green.
+  pub(crate) green: slates_db::catalog::VolumeId,
+  /// The paths read.
+  pub(crate) paths: Vec<&'a str>,
+  /// The versions they are read at: the head, and the base the work was made over.
+  pub(crate) versions: [u64; 2],
+}
+
+impl<'a> ReadIn<'a> {
+  /// A work's verdict on `green`, over `inc`: the paths its operations name, at the green's head and the work's base.
+  pub(crate) fn verdict(
+    green: slates_db::catalog::VolumeId,
+    head: u64,
+    inc: &'a slates_merge::engine::Increment,
+  ) -> ReadIn<'a> {
+    ReadIn {
+      green,
+      paths: inc.doc.paths.paths().iter().map(String::as_str).collect(),
+      versions: [head, inc.base],
+    }
+  }
+
+  /// A commit or a replay on `green` of `applied`, read at `versions`: the paths each change names, a copy's source too.
+  pub(crate) fn applied(
+    green: slates_db::catalog::VolumeId,
+    versions: [u64; 2],
+    applied: &'a [slates_merge::chain_entry::Applied],
+  ) -> ReadIn<'a> {
+    use slates_merge::chain_entry::Applied;
+    let mut paths = Vec::with_capacity(applied.len());
+    for change in applied {
+      match change {
+        Applied::Spliced(path, _) | Applied::Created(path, _) => paths.push(path.as_str()),
+        Applied::Copied { dst, from, .. } => paths.extend([dst.as_str(), from.as_str()]),
+        _ => {}
+      }
+    }
+    ReadIn {
+      green,
+      paths,
+      versions,
+    }
+  }
+
+  /// The path and version at which the green holds `identity` as a file, among these.
+  fn site_of(
+    &self,
+    state: &crate::state::ShardState,
+    identity: slates_merge::named::Identity,
+  ) -> Option<(slates_db::catalog::VolumeId, &'a str, u64)> {
+    let engine = state.greens.get(&self.green)?;
+    self.versions.iter().find_map(|version| {
+      self.paths.iter().find_map(|path| {
+        matches!(
+          engine.content_ref_at(path, *version),
+          Some(slates_merge::engine::ContentAt::Named(named)) if named == identity
+        )
+        .then_some((self.green, *path, *version))
+      })
+    })
+  }
+}
+
+/// Lends the engine of `read_in`'s green each of `wanted`, read whole from the shard's content plane (A-760 (b) 4d):
+/// refused, nothing lent, naming the first the plane cannot give now.
 pub(crate) fn lend_from_plane(
   state: &mut crate::state::ShardState,
-  green: slates_db::catalog::VolumeId,
+  read_in: &ReadIn<'_>,
   wanted: &std::collections::BTreeSet<slates_merge::named::Identity>,
 ) -> Result<(), Unlendable> {
-  let read = read_from_plane(state, wanted)?;
+  let green = read_in.green;
+  let read = read_from_plane(state, wanted, Some(read_in))?;
   let Some(mut engine) = state.greens.get_mut(&green) else {
     return match wanted.first() {
       Some(identity) => Err(Unlendable::Missing(*identity)),
@@ -124,10 +193,11 @@ pub(crate) fn lend_from_plane(
 }
 
 /// Each of `wanted` read whole from the shard's content plane (A-760 (b) 4d), to lend an engine: refused naming the
-/// first the plane cannot give now.
+/// first the plane cannot give now, a let-go one noted where `read_in` reads it ([`ReadIn`]).
 pub(crate) fn read_from_plane(
   state: &crate::state::ShardState,
   wanted: &std::collections::BTreeSet<slates_merge::named::Identity>,
+  read_in: Option<&ReadIn<'_>>,
 ) -> Result<Vec<(slates_merge::named::Identity, Vec<u8>)>, Unlendable> {
   use slates_merge::named::Objects;
   let mut read = Vec::with_capacity(wanted.len());
@@ -156,7 +226,8 @@ pub(crate) fn read_from_plane(
       bytes.resize(len, 0);
       if len > 0 && objects.read(identity, 0, &mut bytes).is_err() {
         // Its windows let go: noted for the call's async frame, which parks it (`named_objects::away_scope`).
-        super::named_objects::note_if_away(&objects, *identity, (0, identity.len));
+        let seen = read_in.and_then(|read_in| read_in.site_of(state, *identity));
+        super::named_objects::note_if_away(&objects, *identity, (0, identity.len), seen);
         return Err(refused());
       }
       read.push((*identity, bytes));
@@ -185,7 +256,15 @@ pub(crate) fn commit_judged_lent(
   judged: slates_merge::engine::Judged,
 ) -> Option<(u64, Vec<slates_merge::chain_entry::Applied>)> {
   let unlent = state.greens.get(&green)?.commit_unlent(&judged);
-  if !unlent.is_empty() && lend_from_plane(state, green, &unlent).is_err() {
+  let at = judged.at();
+  if !unlent.is_empty()
+    && lend_from_plane(
+      state,
+      &ReadIn::applied(green, [at, at], judged.applied()),
+      &unlent,
+    )
+    .is_err()
+  {
     return None;
   }
   let mut engine = state.greens.get_mut(&green)?;
@@ -205,8 +284,17 @@ pub(crate) fn apply_recorded_lent(
     &[slates_merge::chain_entry::Applied],
   ),
 ) -> Option<u64> {
-  let unlent = state.greens.get(&green)?.recorded_unlent(inc, applied);
-  if !unlent.is_empty() && lend_from_plane(state, green, &unlent).is_err() {
+  let engine = state.greens.get(&green)?;
+  let (unlent, head) = (engine.recorded_unlent(inc, applied), engine.head());
+  drop(engine);
+  if !unlent.is_empty()
+    && lend_from_plane(
+      state,
+      &ReadIn::applied(green, [head, inc.base], applied),
+      &unlent,
+    )
+    .is_err()
+  {
     return None;
   }
   let mut engine = state.greens.get_mut(&green)?;

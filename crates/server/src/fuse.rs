@@ -1158,10 +1158,10 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
         .map(crate::vcs_store::svn_presenter::ViewTexts);
       // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
       let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
-      let green_tree = lent_green.as_ref().map(|(green, version)| {
+      let green_tree = lent_green.as_ref().map(|(green, at)| {
         crate::green_tree::GreenTree::reading(
           green,
-          *version,
+          *at,
           crate::vcs_store::named_objects::plane(vcs_stores, &()),
         )
       });

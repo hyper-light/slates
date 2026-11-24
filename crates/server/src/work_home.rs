@@ -816,6 +816,7 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
     .filter(|(path, base_len)| {
       let known = crate::work_files::Base {
         green: None,
+        green_id: None,
         fetched: None,
         version: sealed.base_version,
         entries: Some(&w.entries),
@@ -882,6 +883,7 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
   };
   let files_base = Base {
     green: None,
+    green_id: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
     entries: state.works.get(&sealed.work).map(|w| &w.entries),
@@ -946,6 +948,7 @@ fn sealed_with_edit(
   };
   let base = Base {
     green: None,
+    green_id: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
     entries: state.works.get(&sealed.work).map(|w| &w.entries),

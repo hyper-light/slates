@@ -3992,3 +3992,189 @@ fn a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram()
 /// Shape: the console lines kept as evidence for a workload that went missing in the guest.
 #[cfg(target_os = "linux")]
 const GUEST_EVIDENCE_LINES: usize = 60;
+
+/// The text the let-go guest test's dump commits at `trunk/a.txt`: a named text, its windows let go once its changeset
+/// is durable (A-760 (b) 4d, main's ruling (B)).
+const LET_GO_TEXT: &[u8] =
+  b"a Subversion text its windows let go, read by a guest through virtqueues\n";
+
+/// A format-2 dump whose revision 1 adds `trunk` and `trunk/a.txt` holding [`LET_GO_TEXT`].
+fn let_go_dump() -> Vec<u8> {
+  let props = |entries: &[(&str, &str)]| {
+    let mut section = String::new();
+    for (name, value) in entries {
+      section.push_str(&format!(
+        "K {}\n{name}\nV {}\n{value}\n",
+        name.len(),
+        value.len()
+      ));
+    }
+    section.push_str("PROPS-END\n");
+    section
+  };
+  let zero = props(&[("svn:date", "2026-11-24T00:00:00.000000Z")]);
+  let one = props(&[
+    ("svn:author", "alice"),
+    ("svn:date", "2026-11-24T00:00:01.000000Z"),
+    ("svn:log", "a text"),
+  ]);
+  let empty = "PROPS-END\n";
+  let text = String::from_utf8(LET_GO_TEXT.to_vec()).unwrap();
+  let mut dump =
+    String::from("SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000898\n\n");
+  dump.push_str(&format!(
+    "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+    zero.len()
+  ));
+  dump.push_str(&format!(
+    "Revision-number: 1\nProp-content-length: {0}\nContent-length: {0}\n\n{one}\n",
+    one.len()
+  ));
+  dump.push_str(&format!(
+    "Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: {0}\nContent-length: {0}\n\n{empty}\n\n",
+    empty.len()
+  ));
+  dump.push_str(&format!(
+    "Node-path: trunk/a.txt\nNode-kind: file\nNode-action: add\nProp-content-length: {}\nText-content-length: {}\n\
+     Content-length: {}\n\n{empty}{text}\n\n",
+    empty.len(),
+    text.len(),
+    empty.len() + text.len()
+  ));
+  dump.into_bytes()
+}
+
+/// A LOOKUP of `name` in `parent`, through the guest: the node it names.
+async fn guest_lookup(
+  (kick_write, call_read): (&std::os::fd::OwnedFd, &std::os::fd::OwnedFd),
+  unique: u64,
+  (parent, name): (u64, &str),
+) -> u64 {
+  let found = round_trip(kick_write, call_read, &lookup_message(unique, parent, name)).await;
+  assert_eq!(reply_error(&found), 0, "LOOKUP {name}");
+  u64_at(&found, OUT_HEADER_LEN)
+}
+
+/// A-898 (A-760 (b) 4d's park on virtio-fs; main's order of 2026-11-24 03:58): a guest's read of a let-go named text is
+/// kept, brought back and answered, never answered from the dispatch that met it. Do: on a daemon keeping a changeset
+/// store, create a Subversion repository and import a dump whose revision 1 adds `trunk/a.txt` (its landing lets the
+/// text's windows go); create a work over the repository's green; attach a guest device to the work and, through
+/// virtqueues, LOOKUP `trunk` and `a.txt`, OPEN it and READ it. Expect: the READ answered errno 0 with the text's
+/// bytes; the daemon's `virtiofs.brought_back` at least 1 (the read was kept and brought back); the loop ended on the
+/// guest's hangup.
+#[test]
+fn a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered() {
+  use slates_land::store_root::{StoreGrant, StoreRoot};
+  use slates_store::owner::StoreOwner;
+  use slates_store::store::Sizing;
+  let scratch = common::target::target_dir();
+  let store_dir = format!("{}/store", scratch.path);
+  // The store's directory inside the fixture's own, in the build output (`common::target`).
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(&store_dir).unwrap();
+  let store_dir = std::fs::canonicalize(&store_dir).unwrap();
+  let grant = StoreGrant {
+    repository: 0,
+    target: StoreRoot::identify(&store_dir).unwrap(),
+    issued_ns: 0,
+  };
+  let sizing = Sizing {
+    memory: 8 << 20,
+    disk: 1 << 30,
+    extent_bytes: 128 << 10,
+    fanout: 8,
+  };
+  let owner = StoreOwner::start(StoreRoot::open(&store_dir, &grant).unwrap(), sizing, 64).unwrap();
+  let profile = common::machine_profile();
+  let instance = format!("virtiofs-let-go-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  config.vcs_disk = Some(owner.handle());
+  let anchor = held_anchor(&instance, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut client = common::client::connect(&instance);
+  let green = client
+    .create_repository(&slates_client::RepositorySpec {
+      name: "letgo".to_owned(),
+      tool: slates_ipc::protocol::VcsTool::Subversion,
+      format: slates_ipc::protocol::ObjectFormat::Revisions,
+      default_branch: "trunk".to_owned(),
+      green: None,
+    })
+    .unwrap();
+  let dump = format!("{}/letgo.dump", scratch.path);
+  // The dump the daemon reads, in the fixture's own directory.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(&dump, let_go_dump()).unwrap();
+  client.import_repository("letgo", &dump).unwrap();
+  let (work, _) = client.create_work(green, "guest-reads").unwrap();
+  let brought_before = brought_back(&daemon);
+  let (outcome, (errno, bytes)) = run_guest(
+    &daemon,
+    work,
+    Principal::Uid {
+      host: slates_db::HostId(client.daemon_status().unwrap().anchor),
+      uid: my_uid(),
+    },
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let pipes = (&kick_write, &call_read);
+        let trunk = guest_lookup(pipes, 1, (1, "trunk")).await;
+        let file = guest_lookup(pipes, 2, (trunk, "a.txt")).await;
+        let mut open = 0u32.to_le_bytes().to_vec();
+        open.extend_from_slice(&0u32.to_le_bytes());
+        let opened = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Open.to_wire(), 3, file, &open),
+        )
+        .await;
+        assert_eq!(reply_error(&opened), 0, "OPEN");
+        let fh = u64_at(&opened, OUT_HEADER_LEN);
+        let mut read = fh.to_le_bytes().to_vec();
+        read.extend_from_slice(&0u64.to_le_bytes());
+        read.extend_from_slice(&u32::try_from(LET_GO_TEXT.len()).unwrap().to_le_bytes());
+        read.extend_from_slice(&[0u8; 20]);
+        let answered = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Read.to_wire(), 4, file, &read),
+        )
+        .await;
+        drop(kick_write);
+        (
+          reply_error(&answered),
+          answered.get(OUT_HEADER_LEN..).unwrap_or(&[]).to_vec(),
+        )
+      })
+    },
+  );
+  assert_eq!(
+    (errno, bytes.as_slice()),
+    (0, LET_GO_TEXT),
+    "the guest read the let-go text whole"
+  );
+  assert!(
+    brought_back(&daemon) > brought_before,
+    "the read was kept and its text brought back"
+  );
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert!(end.brought_back >= 1, "the loop awaited a bring-back");
+  drop(client);
+  daemon.stop();
+  drop(anchor);
+  owner.stop().unwrap();
+}
+
+/// The daemon's `virtiofs.brought_back`, summed over its shards.
+fn brought_back(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("virtiofs.brought_back")
+    .copied()
+    .unwrap_or(0)
+}

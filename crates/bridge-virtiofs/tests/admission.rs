@@ -275,7 +275,9 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
 
-  let first = admitted.service(&mut bridge, &registry).unwrap();
+  let first = admitted
+    .service(&mut bridge, &registry, &mut common::NeverAway)
+    .unwrap();
   assert_eq!((first.served, first.more_pending), (2, true));
   let ledger = admitted.ledger();
   assert_eq!(
@@ -287,9 +289,13 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
   assert_eq!(ledger.counters().released, 2);
   assert_eq!(admitted.seam().notified(), vec![FIRST_REQUEST_QUEUE]);
 
-  let second = admitted.service(&mut bridge, &registry).unwrap();
+  let second = admitted
+    .service(&mut bridge, &registry, &mut common::NeverAway)
+    .unwrap();
   assert_eq!((second.served, second.more_pending), (2, true));
-  let third = admitted.service(&mut bridge, &registry).unwrap();
+  let third = admitted
+    .service(&mut bridge, &registry, &mut common::NeverAway)
+    .unwrap();
   assert_eq!((third.served, third.more_pending), (1, false));
   assert_eq!(admitted.ledger().counters().charged, 5);
   assert_all_answered(&mut admitted, 5);
@@ -391,7 +397,9 @@ fn serve_one_pass(
   registry: &Attachments,
 ) -> (Serviced, usize) {
   let before = admitted.seam().notified().len();
-  let pass = admitted.service(bridge, registry).unwrap();
+  let pass = admitted
+    .service(bridge, registry, &mut common::NeverAway)
+    .unwrap();
   (pass, admitted.seam().notified().len() - before)
 }
 
@@ -471,7 +479,9 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
   let wanted = 40 + 16 + u64::from(REPLY_CAP);
-  let refused = admitted.service(&mut bridge, &registry).unwrap_err();
+  let refused = admitted
+    .service(&mut bridge, &registry, &mut common::NeverAway)
+    .unwrap_err();
   assert_eq!(
     refused,
     ServeError::Device(DeviceError::CreditRefused(CreditError::Exhausted {
@@ -497,7 +507,9 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
     "the refused chain's reply buffer was never touched"
   );
   assert_eq!(
-    admitted.service(&mut bridge, &registry).unwrap_err(),
+    admitted
+      .service(&mut bridge, &registry, &mut common::NeverAway)
+      .unwrap_err(),
     refused,
     "the fault persists until the driver reconfigures"
   );
@@ -553,7 +565,9 @@ fn owner_pass(
   bridge: &mut VolumeBridge<'_>,
   registry: &Attachments,
 ) -> u32 {
-  let pass = admitted.service(bridge, registry).unwrap();
+  let pass = admitted
+    .service(bridge, registry, &mut common::NeverAway)
+    .unwrap();
   if !pass.barrier_owed {
     return pass.served;
   }
@@ -635,7 +649,9 @@ fn assert_revoked_touches_nothing(
 ) {
   admitted.seam_mut().guest_mut().memory.record_accesses(true);
   assert_eq!(
-    admitted.service(bridge, registry).unwrap_err(),
+    admitted
+      .service(bridge, registry, &mut common::NeverAway)
+      .unwrap_err(),
     ServeError::Revoked
   );
   assert_eq!(
@@ -684,7 +700,9 @@ fn assert_reclaimed(
     "the sweep reclaimed the orphan the guest never forgot"
   );
   assert_eq!(
-    admitted.service(bridge, registry).unwrap_err(),
+    admitted
+      .service(bridge, registry, &mut common::NeverAway)
+      .unwrap_err(),
     ServeError::Revoked
   );
 }
@@ -901,7 +919,9 @@ fn served_through_the_loop(
         .unwrap();
     }
     if !turned.busy {
-      let pass = admitted.service(bridge, registry).unwrap();
+      let pass = admitted
+        .service(bridge, registry, &mut common::NeverAway)
+        .unwrap();
       if pass.barrier_owed {
         admitted
           .complete_barrier(bridge, registry, (true, None))

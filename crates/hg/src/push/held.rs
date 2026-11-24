@@ -81,6 +81,12 @@ impl Held for IndexHeld<'_> {
     self.revision_text(Log::File(path), node).map(Cow::Owned)
   }
 
+  /// The content store keeps each file revision's bytes as an object of their own, its metadata block apart (the
+  /// intake's `bytes_from`; A-767 C1).
+  fn stores_bytes(&self) -> bool {
+    true
+  }
+
   /// The row's own names (A-767 C1): its block's and its bytes' identities as the intake kept them, no text read.
   fn file_names(&self, path: &[u8], node: &Node) -> Option<FileNames> {
     let log = Log::File(path);
