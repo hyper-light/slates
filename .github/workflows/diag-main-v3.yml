@@ -1,9 +1,9 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 11:35 PST): gate 11 at a30ffbdb8, current main with A-902 (eaa1a3468), A-894 (c5911c0f3) and
-# A-903 (9b20a6f2a). Gate 10 (45450874392, d48863ddb) failed 31 of 31, every run "no survivor served the repository" at
-# v3_takeover.rs:542 after its whole wait (182 s release, 184 s debug); gate 9 (7d6874639) passed 37 of 40. Twenty release
-# then twenty debug runs, stopped after the first three if all three fail. Run only from diag-measurer-main-v3-*
-# branches, never main.
+# main 01a20182 (2026-11-24 12:35 PST): gate 12 at a551b0a88, current main with w-shared's A-907 (113c937b6: broadcast
+# stragglers settled by one fleet::settled_stragglers for homes' exchange_round, put_whole and credentials; Stragglers'
+# Drop hands unsettled sessions to an orphan hook; HOME_STREAM served on its own task). Gate 10 (d48863ddb, A-902 alone)
+# failed 31 of 31 "no survivor served the repository"; gate 9 (7d6874639) passed 37 of 40. Twenty release then twenty
+# debug runs, stopped after the first three if all three fail. Run only from diag-measurer-main-v3-* branches.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -13,13 +13,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 11 at a30ffbdb8)
+    name: v3_takeover (gate 12 at a551b0a88)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a30ffbdb87c5f2dd7c99b20913eaccbd9131989b
+          ref: a551b0a8822c9abed2e3307b221961c5c53be346
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -50,7 +50,7 @@ jobs:
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 11: $pass of $ran passed"
+          echo "== gate 12: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -60,5 +60,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate11
+          name: v3-gate12
           path: ${{ runner.temp }}/*.log
