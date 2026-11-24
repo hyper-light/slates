@@ -809,3 +809,88 @@ fn a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each() {
   assert_eq!(built.unwrap(), whole, "the work the one-call build makes");
   assert!(waits > 0, "the read-through ran");
 }
+
+/// A repository whose manifest texts are not at hand until fetched (goal 93, C1 (1): the manifests' texts let go once
+/// landed): it knows each manifest it holds, and gives a manifest's text only once its owner fetched it.
+struct ManifestsLetGo<'k> {
+  /// The repository whose texts it gives once fetched.
+  kept: &'k Kept,
+  /// The manifests fetched so far.
+  fetched: BTreeSet<Node>,
+}
+
+impl Held for ManifestsLetGo<'_> {
+  fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
+    self.kept.changeset_text(node)
+  }
+
+  fn manifest_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
+    if !self.fetched.contains(node) {
+      return None;
+    }
+    self.kept.manifest_text(node)
+  }
+
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self.kept.manifest_text(node).is_some()
+  }
+
+  fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
+    self.kept.file_text(path, node)
+  }
+}
+
+/// Goal 93, C1 (1) P3 (main's ruling of 2026-11-23 20:53: the manifests' texts off the content store, the push's work
+/// reading one not at hand through the changeset store). Do: land `default`'s line to revision 3 of the stock bundle;
+/// begin the work moving it to revision 7 over a repository that holds every revision but gives no manifest text until
+/// fetched, fetching each manifest the layout says is not at hand and beginning again; build the work. Expect: each
+/// refusal `NotAtHand` naming a manifest the repository holds, at most one for each tree's manifest; then the work the
+/// one-call build makes over the whole repository. Red before: refused `MissingManifest`, the push refused.
+#[test]
+fn a_work_over_manifests_not_at_hand_asks_for_each_and_lays_out_again() {
+  use crate::index::Log;
+  let verified = verify::verify(&stock_part(Version::V03), &Kept::default(), &mut room()).unwrap();
+  let mut kept = Kept::default();
+  kept.keep(&verified, |_| true);
+  let mut green = Green::new();
+  let third = log_node(3);
+  land(&mut green, None, &third, (&verified, &Kept::default()));
+  let head = log_node(7);
+  let moved = Move {
+    name: NAME,
+    base_version: green.head(),
+    base: Some(&third),
+    head: &head,
+  };
+  let nothing = Verified::default();
+  let whole = tree::work(&moved, &green, (&nothing, &kept), WORK_ROOM, &mut room()).unwrap();
+  let mut away = ManifestsLetGo {
+    kept: &kept,
+    fetched: BTreeSet::new(),
+  };
+  let mut asked = Vec::new();
+  let mut building = loop {
+    let pace = slates_merge::pace::Pace::unbounded();
+    match tree::begin_work(&moved, (&nothing, &away), (WORK_ROOM, pace), &mut room()) {
+      Ok(building) => break building,
+      Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node })) => {
+        assert_eq!(log, Log::Manifest);
+        assert!(kept.manifest_text(&node).is_some(), "a manifest it holds");
+        asked.push(node);
+        away.fetched.insert(node);
+      }
+      Err(other) => panic!("refused {other:?}"),
+    }
+    assert!(
+      asked.len() <= 2,
+      "one ask for each tree's manifest: {asked:?}"
+    );
+  };
+  assert_eq!(asked.len(), 2, "the base's and the head's manifests asked");
+  let built = loop {
+    if let Some(built) = building.advance(&green, (&nothing, &away)) {
+      break built;
+    }
+  };
+  assert_eq!(built.unwrap(), whole);
+}

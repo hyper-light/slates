@@ -1730,13 +1730,15 @@ mod tests {
     );
     assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
     let message = format!("f, version {serial}");
-    let submitted = ask(state, &owner(), crate::identities::authored(work, &message));
-    // A green's first submit builds its map in slices after it (A-664's live whole builds): driven to its end here.
-    crate::vcs_store::paths::whole_build::settle(state);
-    let ReplyBody::Submitted {
+    let submitted = crate::vcs_store::paths::tests::submit_as_taken(
+      state,
+      green,
+      crate::identities::authored(work, &message),
+    );
+    let Some(ReplyBody::Submitted {
       version: Some(version),
       ..
-    } = submitted
+    }) = submitted
     else {
       panic!("not accepted: {submitted:?}")
     };
@@ -2978,16 +2980,15 @@ mod tests {
       );
       assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
     }
-    let submitted = ask(
+    let submitted = crate::vcs_store::paths::tests::submit_as_taken(
       state,
-      &owner(),
+      green,
       crate::identities::authored(work, "many files"),
     );
-    crate::vcs_store::paths::whole_build::settle(state);
-    let ReplyBody::Submitted {
+    let Some(ReplyBody::Submitted {
       version: Some(version),
       ..
-    } = submitted
+    }) = submitted
     else {
       panic!("not accepted: {submitted:?}")
     };

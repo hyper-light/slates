@@ -11749,7 +11749,7 @@ pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> R
     applied,
     verification,
     computed,
-    authorship,
+    authorship: _,
   } = parts;
   // The wait goes first, in this transaction, so a version is never durable without it (A-252).
   if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
@@ -11794,10 +11794,9 @@ pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> R
   // only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
   // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
   let _ = crate::merge_service::settle_green_retention(state, green_id);
-  // A git repository's green keeps the version's map of paths to git's files and its git trees (A-664 part 3,
-  // `vcs_store::paths`), and the version becomes git's commit the server makes, recorded with the version in this
-  // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
-  crate::vcs_store::commits::after_submit(state, green_id, version, &authorship);
+  // A git repository's green commits a version only in its made commit's step, its map and commit made before it
+  // (`vcs_store::commits::make_deferred`); one committed otherwise is counted as the bug it is.
+  crate::vcs_store::commits::after_submit(state, green_id, version);
   Ok(())
 }
 

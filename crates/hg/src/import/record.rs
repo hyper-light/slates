@@ -1176,6 +1176,19 @@ fn unreadable(radix: &[u8], rev: u32) -> WriteRefused {
 /// Revision `rev` of `log` as the record holds it, its parents and link read back to their nodes; `None` where the
 /// index does not answer one of them.
 pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Kept> {
+  kept_over(index, store, log, rev, &[])
+}
+
+/// [`kept`] where the texts of some revisions of `log` are `given` by node (goal 93, C1 (1): a manifest kept as a delta
+/// whose chain rests on one let go once landed, its text read back from the node's changeset store), read in their
+/// objects' place ([`HgIndex::revision_text_over`]).
+pub(crate) fn kept_over(
+  index: &HgIndex,
+  store: &ContentStore,
+  log: Log<'_>,
+  rev: u32,
+  given: &[(Node, Vec<u8>)],
+) -> Option<Kept> {
   if log == Log::Changelog {
     let row = index.changeset(store, rev)?;
     let parent = |number: u32| changeset_node(index, store, number);
@@ -1202,7 +1215,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
   let rebuilt = if row.base == NONE {
     None
   } else {
-    Some(index.revision_text(store, log, rev)?)
+    Some(index.revision_text_over(store, log, rev, given)?)
   };
   Some(Kept {
     node: row.node,

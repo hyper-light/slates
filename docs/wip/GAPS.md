@@ -1652,7 +1652,10 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
 > until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
-> `vcs_store::owed`, made at its build's end from what the submit staged; a push mid-build moves the build to the newest
+> `vcs_store::owed`, made at its build's end from what the submit staged, WITHDRAWN 2026-11-24 by A-896: a git green's
+> submit is a recorded request alone, refused `RecordedSubmitRequired { tool: Git }` otherwise, its made commit's map put
+> over the held verdict's preview (whole past a copy) before one step commits both, and a replay refuses an owed
+> record `OwedCommit { key, version }`; a push mid-build moves the build to the newest
 > head at a slice's boundary, never restarting it, and a parked submit's wait bounded by the failover delay, BUILT
 > 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
