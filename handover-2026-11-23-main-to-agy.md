@@ -22,6 +22,19 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 04:39 on 11-24:
+- A-887 VERIFIED on the 57k push (r851): live at the push's end 115 MB, was ~170 MB; the greens' 56 MB is gone. RED: w-perf's
+  hg_push_restart over the 57k history (r854) was killed by the watchdog (a step ran 1,138 ms against the 1,000 ms
+  window, push or recovery); w-perf names and slices it.
+- Interop round 3 (a51883940) recorded in BENCHMARKS: svn at parity with stock; git 7.4-12x slower on whole-repository
+  transfers (its incremental fetch and shallow slow from run 2 on, each run a fresh daemon: w-git's, with a counters dump
+  w-interop adds to the harness); hg push 5.6x, stream 8.8x.
+- Gate 6 RUNNING (45395461722 at 77397a5f4): w-git fixed gate 5's cause (the side-band dropped from the request; Unlanded
+  now typed on band 3). The svn use round's git-2000 leg reruns (r865) after the Studio's kiln runner restart lost r817.
+- w-perf's bench verdict now judges p99 and p999 (7ff7c5276). w-perf next: the hg takeover re-adoption gap, git's half of
+  A-887, then AC-2.1. w-hg: P4b with a second-deferred-submit fix, then the commit-alone reds, then P5. w-shared:
+  (d1a-3) with the healer filter, then A-894. w-svn: A-774's virtio-fs line, then lend items.
+
 Updates at 04:01 on 11-24:
 - Push-0 ROOT CAUSE NAMED by gate 5 (run 45386968890, 6 of 7): the push's body arrived whole (385 bytes), but it met a
   repository created a moment before and not yet landed, and was refused Unlanded before side-band was in play, so the
