@@ -743,3 +743,7 @@
   Push::admit_placed_named, Named::ByReader; test r870_an_object_admitted_under_its_readers_name...). Push's remaining
   hashing is one SHA-1, one BLAKE3 (content identity, needed) and zlib inflate per object, one shard. WAITING: r935 git
   leg at 2dfda25d4+ (first-byte split vs r870's 102-111 s; new clone sample callers; push sample).
+- 09:50 queue (main agreed): (a) r935 clone sample -> git_derive's remaining frames (Tree::parse, put_derived blake3);
+  (b) clone-again's per-fetch gather (55 s first byte); (c) "intake off the owner" (§4.17.5 piece 5, owed; measure =
+  many concurrent pushes to one repo using every core); (d) GAPS: one push over several shards not in the design,
+  with r870 80.872 s / r940 / stock 10.797 s, for Ada, once r940 lands.
