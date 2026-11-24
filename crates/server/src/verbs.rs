@@ -3378,6 +3378,63 @@ const VERB_AWAY_AGAIN: &str = "verbs.away_again";
 /// unrecorded.
 const VERB_BRING_BACK_REFUSED: &str = "verbs.bring_back_refused";
 
+/// `reply` once [`run_recorded`]'s transaction commits ([`commit_settled`]), or the refusal its failure answers.
+fn settled_reply(state: &mut ShardState, reply: ReplyBody) -> ReplyBody {
+  match commit_settled(state) {
+    Ok(_) => reply,
+    Err(e) => {
+      // Nothing of the verb is durable and the partition has been rolled back to its durable state —
+      // the effects and the completion record gone together (`Db::commit`, AC-2.3; AUD-06). What the
+      // verb built outside the partition for a record that no longer exists is released with it, so a
+      // client retrying into a segment that cannot publish leaks nothing per attempt. The refusal is
+      // counted here (it is deliberately *not* recorded as a completion: a retry must re-execute).
+      let refusal = refusal_of_db(&e);
+      state.count(refusal_name(&refusal), 1);
+      reconcile_unpublished_effects(state);
+      refused(refusal)
+    }
+  }
+}
+
+/// [`dispatch`] for [`run_recorded`], parking a run that met a let-go window (A-760 (b) 4d): a read of a green holding
+/// files by name alone, or a submit (refused before any effect), refused for it is kept, parked unrecorded and run
+/// again once the windows are back ([`park_on_away`]); its transaction ends with nothing in it and the verb's span is
+/// put back (`outer`), and what the park answers now is the error. One run again that meets one again is counted, a
+/// bug, and answered as it ran.
+fn dispatch_parking(
+  state: &mut ShardState,
+  (origin, id, client_id, label): (u64, RequestId, u32, u32),
+  principal: &Principal,
+  (body, outer): (RequestBody, Option<slates_wire::observe::SpanContext>),
+) -> Result<ReplyBody, Box<Option<ReplyBody>>> {
+  let resuming = state.verb_resuming.contains(&(origin, id));
+  let parkable = (label == 0 || matches!(body, RequestBody::Submit { .. }))
+    && !resuming
+    && reads_named_green(state, &body);
+  let kept = parkable.then(|| body.clone());
+  let (reply, away) =
+    crate::vcs_store::named_objects::away_scope(|| dispatch(state, client_id, principal, body));
+  if let (Some(body), false, ReplyBody::Refused { .. }) = (kept, away.is_empty(), &reply) {
+    state.current_request = None;
+    let _ = commit_settled(state);
+    state.current_span = outer;
+    return Err(Box::new(park_on_away(
+      state,
+      (origin, id),
+      (client_id, principal, body),
+      away,
+    )));
+  }
+  if resuming && let Some(read) = away.first() {
+    state.count(VERB_AWAY_AGAIN, 1);
+    slates_machine::log_line!(
+      "slates-server: a request run again over its brought-back windows met {:?} let go again",
+      read.identity
+    );
+  }
+  Ok(reply)
+}
+
 /// Whether `body`'s volume reads a green holding a file by its content-plane object's name alone (A-760 (b) 4d): the
 /// green itself, or the green a work is based on.
 fn reads_named_green(state: &ShardState, body: &RequestBody) -> bool {
@@ -3535,27 +3592,15 @@ fn run_recorded(
     .volume()
     .and_then(|volume| crate::told::mark(state, to_db_volume(volume)));
   let live_volume = body.volume().map(to_db_volume);
-  // A read of a green holding files by name alone (or a submit, refused before any effect) that meets a let-go window
-  // is parked unrecorded and run again once the windows are back (A-760 (b) 4d): kept for that.
-  let parkable = (label == 0 || matches!(body, RequestBody::Submit { .. }))
-    && reads_named_green(state, &body)
-    && !state.verb_resuming.contains(&(origin, id));
-  let kept = parkable.then(|| body.clone());
-  let (reply, away) =
-    crate::vcs_store::named_objects::away_scope(|| dispatch(state, client_id, principal, body));
-  if let (Some(body), false, ReplyBody::Refused { .. }) = (kept, away.is_empty(), &reply) {
-    state.current_request = None;
-    let _ = commit_settled(state);
-    state.current_span = outer;
-    return park_on_away(state, (origin, id), (client_id, principal, body), away);
-  }
-  if !away.is_empty() && state.verb_resuming.contains(&(origin, id)) {
-    state.count(VERB_AWAY_AGAIN, 1);
-    slates_machine::log_line!(
-      "slates-server: a request run again over its brought-back windows met {:?} let go again",
-      away.first().map(|read| read.identity)
-    );
-  }
+  let reply = match dispatch_parking(
+    state,
+    (origin, id, client_id, label),
+    principal,
+    (body, outer),
+  ) {
+    Ok(reply) => reply,
+    Err(parked) => return *parked,
+  };
   state.current_request = None;
   let route = state.reply_route.take();
   // A verb that deferred its acceptance to a fleet commit (`submit` at `f > 0`; AUD-11) commits its
@@ -3574,20 +3619,7 @@ fn run_recorded(
     Chokepoint::LogAppend,
     state.clock.monotonic_ns(),
   );
-  let reply = match commit_settled(state) {
-    Ok(_) => reply,
-    Err(e) => {
-      // Nothing of the verb is durable and the partition has been rolled back to its durable state —
-      // the effects and the completion record gone together (`Db::commit`, AC-2.3; AUD-06). What the
-      // verb built outside the partition for a record that no longer exists is released with it, so a
-      // client retrying into a segment that cannot publish leaks nothing per attempt. The refusal is
-      // counted here (it is deliberately *not* recorded as a completion: a retry must re-execute).
-      let refusal = refusal_of_db(&e);
-      state.count(refusal_name(&refusal), 1);
-      reconcile_unpublished_effects(state);
-      refused(refusal)
-    }
-  };
+  let reply = settled_reply(state, reply);
   // What the committed verb owed the audit goes to the control shard now, after its transaction (A-265).
   crate::landing::send_owed_audit(state);
   let end_ns = state.clock.monotonic_ns();
@@ -20620,7 +20652,7 @@ fn lend_step(
       if from == 0 {
         lend.buffer.try_reserve_exact(whole).map_err(|_| missing)?;
       }
-      let to = from.saturating_add(slice.min(whole - from));
+      let to = from.saturating_add(slice.min(whole.saturating_sub(from)));
       lend.buffer.resize(to, 0);
       let into = lend.buffer.get_mut(from..to).ok_or(missing)?;
       objects

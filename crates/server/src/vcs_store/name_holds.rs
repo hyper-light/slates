@@ -51,7 +51,7 @@ pub(crate) fn freeing<T>(
   let dropped = slates_merge::engine::dropped_with_name_holds();
   let before = DROPPED_COUNTED.swap(dropped, std::sync::atomic::Ordering::Relaxed);
   if dropped > before {
-    state.count(NAME_HOLD_DROPPED_LIVE, dropped - before);
+    state.count(NAME_HOLD_DROPPED_LIVE, dropped.saturating_sub(before));
   }
   answer
 }

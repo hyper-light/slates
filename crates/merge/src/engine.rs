@@ -3065,19 +3065,15 @@ impl Green {
     // `dir` itself is the prefix less its slash: a lookup of its own, then the walk under it.
     let own = |held: bool| held.then(|| dir.to_owned());
     under.files.extend(
-      own(!dir.is_empty() && self.content.contains_key(dir)).and_then(|path| {
-        self
-          .content
-          .get(&path)
-          .map(|bytes| (path, bytes.len() as u64))
-      }),
+      own(!dir.is_empty() && self.content.contains_key(dir))
+        .and_then(|path| self.content.get(&path).map(|bytes| (path, bytes.len()))),
     );
     under.files.extend(
       self
         .content
         .prefix(&prefix)
         .filter(|(path, _)| at_or_under(path))
-        .map(|(path, bytes)| (path, bytes.len() as u64)),
+        .map(|(path, bytes)| (path, bytes.len())),
     );
     under
       .dirs
@@ -3127,7 +3123,7 @@ impl Green {
       files: self
         .content
         .iter()
-        .map(|(path, bytes)| (path, bytes.len() as u64))
+        .map(|(path, bytes)| (path, bytes.len()))
         .collect(),
       dirs: self.dirs.keys().collect(),
       modes: self
@@ -3674,7 +3670,7 @@ impl Green {
   /// Every dimension's entry at `path` at the head but hard links, added to `base` ([`Green::base_for`]).
   fn head_entries(&self, path: &str, base: &mut crate::increment::Base) {
     if let Some(bytes) = self.content.get(path) {
-      base.files.push((path.to_owned(), bytes.len() as u64));
+      base.files.push((path.to_owned(), bytes.len()));
     }
     if let Some(node) = self.specials.get(path) {
       base.specials.push((path.to_owned(), *node));
@@ -7600,7 +7596,7 @@ impl Green {
         Effect::SetContent(path, bytes, _, ContentSource::Copied(home, edits))
           if handed.contains(&path) =>
         {
-          let home_len = self.content.get(&home).map_or(0, |held| held.len() as u64);
+          let home_len = self.content.get(&home).map_or(0, |held| held.len());
           journal.extend(content_volume_ops(&home, &edits, home_len));
           changed.insert(path, Some(bytes.unwrap_or_default()));
         }
@@ -7618,7 +7614,7 @@ impl Green {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
-          let head_len = self.content.get(&path).map_or(0, |head| head.len() as u64);
+          let head_len = self.content.get(&path).map_or(0, |head| head.len());
           journal.extend(content_volume_ops(&path, &ops, head_len));
           changed.insert(path, Some(bytes.unwrap_or_default()));
         }

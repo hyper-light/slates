@@ -370,7 +370,6 @@ impl ParkedReads {
   pub(crate) fn release(&mut self, id: u64) {
     self.parked.remove(&id);
   }
-
 }
 
 /// Brings back every window `reads` met let go, each read's range ([`bring_back_range`]), and keeps them all until the

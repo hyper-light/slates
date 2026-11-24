@@ -1164,28 +1164,9 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     .volumes
     .get_mut(handle)
     .is_ok_and(|slot| slot.volume.wait_for_change(mount.seen, &mount.waker));
-  // A parked request whose windows are back is served again before any other (A-760 (b) 4d), once: its entry goes.
-  let reserved = match mount.parked.take() {
-    Some(parked) if parked.ready => {
-      s.winfsp_parked.release(parked.entry);
-      Some(parked.request)
-    }
-    still => {
-      mount.parked = still;
-      None
-    }
-  };
-  if mount.parked.is_some() {
-    return Turned::Parked;
-  }
-  let again = reserved.is_some();
-  let request = match reserved {
-    Some(request) => Some(request),
-    None => match mount.requests.as_ref().map(Receiver::try_recv) {
-      Some(Ok(request)) => Some(request),
-      Some(Err(TryRecvError::Empty)) => None,
-      Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
-    },
+  let (request, again) = match next_request(s, mount) {
+    Ok(next) => next,
+    Err(turned) => return turned,
   };
   if request.is_none() && !changed && !mount.owed {
     let retry_in = earliest(send_due_retries(s, mount), held_in);
@@ -1322,6 +1303,31 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     // The rest of a cut gather is owed now, and no round is out to wake the task when it returns (A-562).
     None if mount.owed && mount.round_out.is_none() && !mount.purge_out => Turned::Continued,
     None => retry_in.map_or(Turned::Idle, Turned::RetryIn),
+  }
+}
+
+/// The request this turn serves, and whether it is a parked one served again: the parked request whose windows are back
+/// before any other, once, its entry going (A-760 (b) 4d); else the next the dispatcher threads sent, if any. Refused
+/// with the turn's end: `Parked` while one waits for its windows, `Ended` once the channel is gone.
+fn next_request(
+  s: &mut ShardState,
+  mount: &mut WinFspMount,
+) -> Result<(Option<Request>, bool), Turned> {
+  match mount.parked.take() {
+    Some(parked) if parked.ready => {
+      s.winfsp_parked.release(parked.entry);
+      return Ok((Some(parked.request), true));
+    }
+    Some(waiting) => {
+      mount.parked = Some(waiting);
+      return Err(Turned::Parked);
+    }
+    None => {}
+  }
+  match mount.requests.as_ref().map(Receiver::try_recv) {
+    Some(Ok(request)) => Ok((Some(request), false)),
+    Some(Err(TryRecvError::Empty)) => Ok((None, false)),
+    Some(Err(TryRecvError::Disconnected)) | None => Err(Turned::Ended),
   }
 }
 

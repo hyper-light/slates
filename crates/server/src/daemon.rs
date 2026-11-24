@@ -9280,9 +9280,10 @@ mod tests {
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
           // RAM keeps no byte of it (A-760 (b) 4d, main's (B)): the recovered green's name keeps its entry, no window.
-          let kept = state.vcs_stores.content().is_some_and(|content| {
-            crate::vcs_store::name_holds::resident(content, identity, size)
-          });
+          let kept = state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| crate::vcs_store::name_holds::resident(content, identity, size));
           (recovered, refused, kept)
         })
         .ok()
