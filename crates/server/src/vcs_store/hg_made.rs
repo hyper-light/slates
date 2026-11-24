@@ -113,34 +113,6 @@ impl std::fmt::Debug for Unmade {
   }
 }
 
-/// Makes the changeset of `green`'s `version`, where `green` is a Mercurial repository's (module docs; A-767 C1): the
-/// repository's landing turn taken in the submit's own step where it is free, then the changeset made of the green as
-/// the version left it, landed on the node's changeset store and recorded by a task holding the turn
-/// ([`made_landing`]); counted.
-pub(crate) fn make(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  authorship: &Authorship,
-  copies: &[MadeCopy],
-) {
-  let Some(repository) = mercurial_repository_of(state, green) else {
-    return;
-  };
-  let turn = crate::repository::svn_commit::landing::Turn::take_now(state, repository);
-  let task = made_landing(
-    (repository, green, version),
-    (authorship.clone(), copies.to_vec()),
-    turn,
-  );
-  if slates_rt::futures::spawn(task)
-    .and_then(slates_rt::futures::detach)
-    .is_err()
-  {
-    unmade(state, &Unmade::Unlanded);
-  }
-}
-
 /// Counts and logs a version of which no changeset was made.
 fn unmade(state: &mut ShardState, why: &Unmade) {
   slates_machine::log_line!(
@@ -151,70 +123,6 @@ fn unmade(state: &mut ShardState, why: &Unmade) {
   if matches!(why, Unmade::Named(_)) {
     state.count(NAMED_UNREAD, 1);
   }
-}
-
-/// [`make`]'s task: the landing turn (`turn`, or awaited where the submit could not take it), then the changeset made
-/// of `green`'s `version`, landed and recorded in its own transaction; counted.
-async fn made_landing(
-  (repository, green, version): (RepositoryId, DbVolumeId, u64),
-  (authorship, copies): (Authorship, Vec<MadeCopy>),
-  turn: Option<crate::repository::svn_commit::landing::Turn>,
-) {
-  let turn = match turn {
-    Some(turn) => turn,
-    None => match crate::repository::svn_commit::landing::turn(repository).await {
-      Some(turn) => turn,
-      None => return,
-    },
-  };
-  let made = if parent_texts_at_hand(repository, (green, version)).await {
-    crate::state::with_state(|state| {
-      super::lent_state(state, |state| {
-        made_applied(state, green, version, (&authorship, &copies))
-      })
-    })
-  } else {
-    Some(Err(Unmade::ParentUnread))
-  };
-  let Some(made) = made else {
-    return;
-  };
-  let made = match made {
-    Ok(Some(made)) => made,
-    other => {
-      let _ = crate::state::with_state(move |state| {
-        if let Err(why) = &other {
-          unmade(state, why);
-        }
-        turn.give_back(state);
-      });
-      return;
-    }
-  };
-  let landed = landed(made).await;
-  let _ = crate::state::with_state(move |state| {
-    match landed {
-      Some(Ok((made, prepared))) => {
-        state.db.begin();
-        let committed = commit_made(state, &made, prepared);
-        let committed = match (committed, state.db.commit(&mut state.segment)) {
-          (Ok(()), Ok(_)) => Ok(()),
-          (Err(why), _) => Err(why),
-          (Ok(()), Err(error)) => {
-            crate::verbs::reconcile_unpublished_effects(state);
-            Err(Unmade::Entry(refusal_of_db(&error)))
-          }
-        };
-        match committed {
-          Ok(()) => state.count(MADE, 1),
-          Err(why) => unmade(state, &why),
-        }
-      }
-      Some(Err(why)) => unmade(state, &why),
-      None => {}
-    }
-    turn.give_back(state);
-  });
 }
 
 /// Makes the changeset of the version `pending` holds, of a Mercurial repository's green, from its verdict `judged`,
@@ -274,12 +182,20 @@ async fn made_commit_landing(
   };
   let made = match made {
     Ok(Some(made)) => made,
+    // No changeset made of it: refused typed and recorded, nothing of the accept applied (main's ruling of 2026-11-23
+    // 22:08: a version is never committed alone; A-891 `made_commit::refuse`).
     other => {
       let _ = crate::state::with_state(move |state| {
-        if let Err(why) = &other {
-          unmade(state, why);
-        }
-        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+        let refusal = match &other {
+          Err(why) => {
+            unmade(state, why);
+            why.refusal()
+          }
+          Ok(_) => Refusal::StoreRefused {
+            reason: "the version changes no file Mercurial tracks".to_owned(),
+          },
+        };
+        crate::made_commit::refuse(state, pending, refusal);
         turn.give_back(state);
       });
       return;
@@ -288,20 +204,33 @@ async fn made_commit_landing(
   let landed = landed(made).await;
   let _ = crate::state::with_state(move |state| {
     match landed {
+      // Guard then apply (A-891): the changeset's record judged before anything of the accept applies; refused, the
+      // submit is refused typed and recorded, nothing applied.
       Some(Ok((made, prepared))) => {
-        match crate::made_commit::commit(state, pending, |state| {
-          commit_made(state, &made, prepared)
-        }) {
-          Some(Ok(())) => state.count(MADE, 1),
-          Some(Err(why)) => unmade(state, &why),
-          None => {}
+        let committed = crate::made_commit::commit_guarded(
+          state,
+          pending,
+          |state| {
+            guard_made(state, &made, prepared).map_err(|why| {
+              unmade(state, &why);
+              why.refusal()
+            })
+          },
+          (
+            |state: &mut ShardState, guarded: GuardedHg| apply_made(state, &made, guarded),
+            |state: &mut ShardState, guarded: GuardedHg| give_back_fork(state, guarded.fork),
+          ),
+        );
+        if committed.is_some() {
+          state.count(MADE, 1);
         }
       }
-      // The store refused the changeset: nothing of the accept is applied or durable.
+      // The store refused the changeset: nothing of the accept is applied or durable, and its retry runs.
       Some(Err(Unmade::Unlanded)) => crate::made_commit::abandon(state, (pending.request(), green)),
+      // Its landing refused otherwise: refused typed and recorded, nothing applied.
       Some(Err(why)) => {
         unmade(state, &why);
-        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+        crate::made_commit::refuse(state, pending, why.refusal());
       }
       None => {}
     }
@@ -425,8 +354,12 @@ fn inputs(
   let Some(repository) = mercurial_repository_of(state, green) else {
     return Ok(None);
   };
+  #[cfg(test)]
+  let rebuilding = fault_at(Fault::Inputs);
+  #[cfg(not(test))]
+  let rebuilding = false;
   // A store being made again from its records is lent to nothing (A-732): no changeset is made over half its history.
-  if state.vcs_stores.rebuilding(repository) {
+  if rebuilding || state.vcs_stores.rebuilding(repository) {
     return Err(Unmade::NotHead);
   }
   let user = authorship
@@ -454,30 +387,6 @@ fn inputs(
     authored: (user, message, seconds),
     branch,
     room,
-  }))
-}
-
-/// The changeset of `green`'s `version` made of the green as the version left it (a bare dispatch's, [`make`]).
-fn made_applied(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  (authorship, copies): (&Authorship, &[MadeCopy]),
-) -> Result<Option<Made>, Unmade> {
-  let Some(inputs) = inputs(state, (green, version), authorship)? else {
-    return Ok(None);
-  };
-  let engine = state.greens.get(&green).ok_or(Unmade::NotHead)?;
-  let (content, store) = state
-    .vcs_stores
-    .mercurial_ref(inputs.repository)
-    .ok_or(Unmade::NotHead)?;
-  let verified = verified_of(&engine, (&store.index, content), &inputs, copies)?;
-  Ok(verified.map(|verified| Made {
-    repository: inputs.repository,
-    green,
-    version,
-    verified,
   }))
 }
 
@@ -551,6 +460,10 @@ async fn landed(
 
 /// [`landed`]'s first half: the changegroup taken into a fork and the changeset made, its sequence taken now.
 fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
+  #[cfg(test)]
+  if fault_at(Fault::Prepared) {
+    return Err(Unmade::Record);
+  }
   let room = crate::vcs_share::room(state, made.repository).bytes;
   let changegroup =
     slates_hg::push::made::changegroup(&made.verified, &mut slates_hg::Admission::new(room))
@@ -583,21 +496,42 @@ fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
   }
 }
 
-/// Records a landed made changeset in the caller's transaction (module docs): the register's entry naming its changeset
-/// by reference, judged then appended, then its fork put in the index's place and the made node noted; the fork given
-/// back where the entry is refused or a client's push made it stale meanwhile.
-fn commit_made(
+/// What a landed made changeset's guard took (`made_commit::commit_guarded`; main's ruling of 2026-11-24 04:59, A-891's
+/// Mercurial half): its fork, the register's entry naming its changeset by reference judged and the instant it was
+/// judged at, and its node; appended unrefused by [`apply_made`], or the fork given back.
+struct GuardedHg {
+  /// The fork, the made changeset's revisions over the index.
+  fork: HgIndex,
+  /// The register's entry, judged.
+  entry: Op,
+  /// When it was judged.
+  now: u64,
+  /// The made changeset's node.
+  node: Node,
+}
+
+/// A landed made changeset's guard (module docs; `made_commit::commit_guarded`): everything its record's commit can
+/// refuse judged before anything of the accept applies: its node, its fork not made stale by a client's push meanwhile,
+/// and the register's entry judged by the register's guard. Refused, the fork is given back and nothing applied.
+fn guard_made(
   state: &mut ShardState,
   made: &Made,
   (forked, reference): (crate::repository::hg_push::Forked, Vec<u8>),
-) -> Result<(), Unmade> {
-  let node = made
+) -> Result<GuardedHg, Unmade> {
+  let Some(node) = made
     .verified
     .changesets
     .first()
     .map(|changeset| changeset.node)
-    .ok_or(Unmade::Record)?;
-  if state.vcs_stores.generation_of(made.repository) != Some(forked.generation) {
+  else {
+    give_back_fork(state, forked.fork);
+    return Err(Unmade::Record);
+  };
+  #[cfg(test)]
+  let stale = fault_at(Fault::CommitMade);
+  #[cfg(not(test))]
+  let stale = false;
+  if stale || state.vcs_stores.generation_of(made.repository) != Some(forked.generation) {
     give_back_fork(state, forked.fork);
     return Err(Unmade::Stale);
   }
@@ -609,17 +543,37 @@ fn commit_made(
     },
   };
   let now = state.clock.monotonic_ns();
-  let appended = state
-    .db
-    .partition()
-    .check(&entry, now)
-    .and_then(|()| state.db.mutate(&mut state.segment, &entry, now).map(drop));
-  if let Err(error) = appended {
+  if let Err(error) = state.db.partition().check(&entry, now) {
     give_back_fork(state, forked.fork);
     return Err(Unmade::Entry(refusal_of_db(&error)));
   }
+  Ok(GuardedHg {
+    fork: forked.fork,
+    entry,
+    now,
+    node,
+  })
+}
+
+/// A guarded made changeset's apply ([`guard_made`]): the judged entry appended in the step's transaction, then the fork
+/// put in the index's place and the made node noted. Its guard judged the entry, so the append is not refused; were it,
+/// the store, ahead of the log, is made again from the log, logged and counted, as git's made commit does.
+fn apply_made(state: &mut ShardState, made: &Made, guarded: GuardedHg) {
   let (repository, green, version) = (made.repository, made.green, made.version);
-  let fork = forked.fork;
+  if let Err(error) = state
+    .db
+    .mutate(&mut state.segment, &guarded.entry, guarded.now)
+  {
+    slates_machine::log_line!(
+      "slates-server: partition {}: a made changeset's judged entry was refused at its append: {error:?}",
+      state.partition
+    );
+    give_back_fork(state, guarded.fork);
+    super::rebuild(state, repository);
+    state.count(UNMADE, 1);
+    return;
+  }
+  let (fork, node) = (guarded.fork, guarded.node);
   super::hg_view::walks_noted(state, &fork);
   let released = super::within_budget(state, 0, |stores| {
     let replaced = match stores.mercurial(repository) {
@@ -637,7 +591,20 @@ fn commit_made(
   if released.is_err() {
     state.count(super::RELEASE_REFUSED, 1);
   }
-  Ok(())
+}
+
+impl Unmade {
+  /// The typed refusal a submit is answered whose changeset could not be made (main's ruling of 2026-11-23 20:51, as
+  /// w-svn's `svn_made::Unmade::refusal` and git's): the register's own refusal as it is; the rest `StoreRefused` in
+  /// its words. A version is never committed without its changeset.
+  fn refusal(&self) -> Refusal {
+    match self {
+      Unmade::Entry(refusal) => refusal.clone(),
+      why => Refusal::StoreRefused {
+        reason: format!("no changeset could be made of the version: {why:?}"),
+      },
+    }
+  }
 }
 
 /// Gives a made changeset's fork back, counted where a hold did not go back.
@@ -808,6 +775,39 @@ fn branch_of(
         .and_then(|(name, _)| line_of(name).map(|(branch, _)| branch))
     })
     .unwrap_or_else(|| DEFAULT_BRANCH.to_vec())
+}
+
+/// Where a test makes a made changeset's landing fail, a path no test can drive otherwise (goal 93 correctness, main's
+/// ruling of 2026-11-23 22:08: a version committed with nothing behind it on the store): its preparation refused
+/// (`Record`, as a changegroup past its room is), its record refused at the commit (`Stale`, as a fork a client's push
+/// made stale is), or its inputs refused (`NotHead`, as a store being made again from its records refuses them).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+  /// [`inputs`] refuses.
+  Inputs,
+  /// [`prepared`] refuses.
+  Prepared,
+  /// [`commit_made`] refuses.
+  CommitMade,
+}
+
+#[cfg(test)]
+thread_local! {
+  /// The fault a test set on this shard's thread, taken by the first site it names.
+  pub(crate) static TEST_FAULT: core::cell::Cell<Option<Fault>> = const { core::cell::Cell::new(None) };
+}
+
+/// Whether a test set `fault` on this shard's thread; taken, so it fires once.
+#[cfg(test)]
+fn fault_at(fault: Fault) -> bool {
+  TEST_FAULT.with(|set| {
+    let fires = set.get() == Some(fault);
+    if fires {
+      set.set(None);
+    }
+    fires
+  })
 }
 
 #[cfg(test)]

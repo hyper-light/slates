@@ -11486,8 +11486,6 @@ fn accepted_answer(
     Option<slates_merge::engine::Judged>,
   ),
 ) -> ReplyBody {
-  let authorship = parts.authorship.clone();
-  let authorship = &authorship;
   // A Subversion repository's green whose submit took the repository's landing turn before its verdict
   // (`crate::made_commit`, main's landing order): the version, its revision's register entry and the answer are one
   // durable step after the revision's changeset lands on the node's store, by a task holding the turn. Nothing of
@@ -11511,9 +11509,6 @@ fn accepted_answer(
   if let Err(refusal) = commit_accepted(state, parts) {
     return refused(refusal);
   }
-  // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
-  // transaction (A-731, `vcs_store::hg_made`).
-  crate::vcs_store::hg_made::make(state, green_id, version, authorship, &copies);
   // The acceptance is published only once the version's merge record is **committed at the
   // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
   // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
