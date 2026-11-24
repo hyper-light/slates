@@ -3889,15 +3889,14 @@ fn record_completion_routed(
 /// Forwards a volume-bound request to its owner shard: a task there runs the verb on the
 /// owner's state and hands the reply back to this shard's queue (sharing by move both ways).
 /// Judges a request decoded at `now` against this shard's closed loop (§4.7; A-326). A request of the caller's own
-/// continues or ends the loop ([`loop_hold`]), its forward's hold set and its round's loop I/O marked. A client's
-/// acknowledgement, which it sends itself before a request every half ring of replies (§4.9), is the protocol's: it keeps
-/// a loop's clock running when it comes within F of the loop's last I/O and ends a loop it comes after a longer pause,
-/// but never lengthens a run or holds a shard. Skipped altogether, a debug build's acknowledgement ended the loop it
-/// sat in, the next create read more than F after the loop's last I/O (64 to 75 of a loop's 400 forwards unheld,
-/// against 20 to 31); counted as a request, it made a paced client's destroy the third request of a loop, which held
-/// its owner (closed_loop.rs, three runs each, the Mac Studio, 2026-11-18).
+/// continues or ends the loop ([`loop_hold`]), its forward's hold set and its round's loop I/O marked. A request that is
+/// no work of the caller's ([`holds_nothing`]) keeps a loop's clock running when it comes within F of the loop's last
+/// I/O and ends a loop it comes after a longer pause, but never lengthens a run or holds a shard. Skipped altogether, a
+/// debug build's acknowledgement ended the loop it sat in, the next create read more than F after the loop's last I/O
+/// (64 to 75 of a loop's 400 forwards unheld, against 20 to 31); counted as a request, it made a paced client's destroy
+/// the third request of a loop, which held its owner (closed_loop.rs, three runs each, the Mac Studio, 2026-11-18).
 fn judge_loop_request(state: &mut ShardState, body: &RequestBody, now: u64) {
-  if !matches!(body, RequestBody::Acknowledge { .. }) {
+  if !holds_nothing(body) {
     state.forward_hold_ns = loop_hold(state, now);
     state.loop_io = true;
   } else if now.saturating_sub(state.last_client_io_ns) <= crate::config::PROVISION_FLOOR_NS {
@@ -3905,6 +3904,22 @@ fn judge_loop_request(state: &mut ShardState, body: &RequestBody, now: u64) {
   } else {
     state.loop_run = 0;
   }
+}
+
+/// Whether a request is no work of its client's, so it holds no shard (§4.7; A-326's acknowledgement rule, A-901): a
+/// client's acknowledgement, which it sends itself before a request every half ring of replies (§4.9), or an observation
+/// of the daemon itself (§4.14's telemetry drain and status pages). Holds are bought for the verbs R9 and 84a hold to a
+/// bar, and no bar governs an observation's latency. Judged as the client's loop, `edit_merge_bench`'s telemetry drain
+/// after every sample held every shard it reached, about 7 of the bench's ~10 shard cores on jupiter, for no measured
+/// latency (A-897: with every hold off, 2.7-3.3 cores and the same failed runs).
+fn holds_nothing(body: &RequestBody) -> bool {
+  matches!(
+    body,
+    RequestBody::Acknowledge { .. }
+      | RequestBody::Telemetry { .. }
+      | RequestBody::DaemonStatus { .. }
+      | RequestBody::DaemonStatusNext { .. }
+  )
 }
 
 /// Judges a ring request read at `now` (§4.7; A-326) and returns the idle window a forward made for it holds its owner
