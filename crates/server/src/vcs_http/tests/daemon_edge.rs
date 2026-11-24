@@ -4339,6 +4339,134 @@ fn a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth() {
   }
 }
 
+/// Shape: the version of `main`'s green the barrier is told a push owes in
+/// [`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`]: one no record ever places.
+const NEVER_PLACED: u64 = 1 << 40;
+
+/// The push barrier's give-up (main 01a20182's ruling of 2026-11-23 18:55: an expired barrier answers git in its own
+/// words, a typed refusal it can act on, never a dropped connection). Do: start a store-backed daemon with its edge;
+/// push a create of `main` ([`large_create`]); tell the repository's barrier that an operation moved `main`'s green to a
+/// version no record ever places ([`NEVER_PLACED`], `StateLogs::note_greens`); then push a create of `other` at the same
+/// commit, asking a report. Expect: the first create `200` with `ok refs/heads/main`; the second `200` too, its report
+/// `unpack ok` and `ng refs/heads/other unable to commit` once the barrier's window passed with nothing moving, the push
+/// refused uncommitted counted. Red before: the barrier's give-up was answered with no report at all (a cut connection).
+#[test]
+fn a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(1 << 10);
+  let created = pushed(edge, &name, &request);
+  let owed_name = name.clone();
+  crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let repositories = state.db.partition().repositories();
+    let repository = repositories
+      .repository_named(&owed_name)
+      .expect("the repository")
+      .id;
+    let main = repositories.branch(repository, "main").expect("main");
+    let owed = slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to: 0,
+      identity: [0; 32],
+      spans: vec![slates_db::catalog::LogSpan {
+        log: slates_db::catalog::LogName::Green { green: main },
+        from: 0,
+        to: NEVER_PLACED,
+      }],
+      changes: Vec::new(),
+    };
+    state.state_logs.note_greens(&owed);
+  });
+  let mut other = Vec::new();
+  let line = format!("{ZERO} {commit} refs/heads/other\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut other).expect("the command");
+  pktline::write(Packet::Flush, &mut other).expect("the flush");
+  other.extend_from_slice(&stored_pack(&[]));
+  let answered = pushed(edge, &name, &other);
+  let uncommitted = counted_on(&daemon, REPOSITORY, crate::state_log::PUSH_UNCOMMITTED);
+  daemon.stop();
+  assert_eq!(created.0, 200);
+  assert!(
+    String::from_utf8_lossy(&created.1).contains("ok refs/heads/main"),
+    "{}",
+    String::from_utf8_lossy(&created.1)
+  );
+  assert_eq!(answered.0, 200);
+  let report = String::from_utf8_lossy(&answered.1).into_owned();
+  assert!(
+    report.contains("unpack ok") && report.contains("ng refs/heads/other unable to commit"),
+    "{report}"
+  );
+  assert_eq!(uncommitted, 1);
+}
+
+/// A v2 `ls-refs` request for every ref, peeled, as `git ls-remote` asks.
+fn ls_refs_all() -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=ls-refs\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [b"peel\n".as_slice(), b"symrefs\n", b"ref-prefix refs/\n"] {
+    pktline::write(Packet::Data(argument), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// Goal 93 (main 01a20182's r405: stock `git ls-remote` right after git/git's whole push waited 29 to 54 s in every
+/// run, where stock lists its 4,451 refs in under a second). Do: start a store-backed daemon with its edge; push a
+/// create of `main` at [`chained_create`]'s tip, a version neither derived nor encoded yet (neither is made ahead while
+/// no fetch is answered, A-856); list its refs over v2 `ls-refs`; then fetch `main`. Expect: the listing `200`, naming
+/// `main` at the tip, with the derivation's and the encoding's turns unmoved by it; and the fetch after it moving them,
+/// so the work the listing skipped is still done for the fetch that reads it. Red before: a listing waited for the
+/// repository's derivation, whole, and its encoding, as a fetch does.
+#[test]
+fn a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let chained = chained_create(CHAIN_FILE, CHAIN_SHALLOW);
+  let created = pushed(edge, &name, &chained.request);
+  let tip = chained.commits.last().expect("a tip").0;
+  let turns = || {
+    counted_on(&daemon, REPOSITORY, "vcs_store.git_derive.turns")
+      + counted_on(&daemon, REPOSITORY, "vcs_store.git_encode.turns")
+  };
+  let before = turns();
+  let listed = uploaded(edge, &name, &ls_refs_all());
+  let after_listing = turns();
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let after_fetch = turns();
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(listed.0, 200);
+  let main = format!("{tip} refs/heads/main");
+  assert!(
+    String::from_utf8_lossy(&listed.1).contains(&main),
+    "the listing names main at the tip: {}",
+    String::from_utf8_lossy(&listed.1)
+  );
+  assert_eq!(
+    after_listing, before,
+    "the listing waited for the derivation or the encoding"
+  );
+  assert_eq!(fetched.0, 200);
+  assert!(
+    after_fetch > after_listing,
+    "the fetch readied the store: {before} {after_listing} {after_fetch}"
+  );
+}
+
 /// The two clones of [`a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole`]: the one commit
 /// deep one (`shallow`) and the whole one (`fetched`) each `200`, each pack's objects the `pushed` bytes.
 fn assert_both_clones_whole(

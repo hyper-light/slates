@@ -1425,6 +1425,14 @@
 > windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
 > answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
 > r130's verbs with the lift on.
+> A ref listing waits for nothing a fetch reads BUILT (2026-11-23, w-git; main 01a20182's r405: stock `git ls-remote`
+> right after git/git's whole push took 29 to 54 s in every run, where stock lists its 4,451 refs in under a second).
+> Every upload-pack request but the advertisement derived the repository's unwalked versions whole and waited up to a
+> liveness window on its encoding (A-718's `encode`), a v2 `ls-refs` too; the SSH edge did it at each session's start.
+> Now only a request that may fetch waits (`vcs_http::git::upload::fetches`: every request before v2, and a v2 request
+> naming `fetch` or no command this crate reads; `slates_git::v2::request::command_of`), and SSH before its session's
+> first fetch (`a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding`: 4 turns during the listing before, 0
+> after, the fetch after it still readying the store). Owed: main's rerun of r405's push answer to refs listable.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -1683,7 +1691,14 @@
 > - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,
 >   and a holder's replica owes the same push at the base's identity, so a takeover adopts a green that owes it
 >   (`a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`).
->   OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
+>   BUILT, A-813's limit (A-886, w-git, 2026-11-23): a holder makes a replica that owes when a later version's record
+>   needs it, from a replica store of the repository its names-log parts make (held equal to the owner's store by an
+>   oracle), through the same door; a record waiting on it answers `ReplicaBuilding`, and a push's barrier waits for
+>   every green it moved (`v3_takeover` passes at f = 1, debug, macOS arm64, locally: both holders began and made a
+>   replica, 14.2 and 17.3 ms from begun to made, 877 and 1,468 turns, most waiting out the replica store's sliced
+>   replay; 3 versions waited; the takeover made its store again rather than adopting, its parts cut by `whole_parts`).
+>   Owed: main's release and debug gate; the build's time for git/git's history at f = 1.
+>   Was OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
 >   replica cannot judge it, so the record is refused (`merge.replica.owes`, counted) and waits for placement until a
 >   holder's replica is made. Before A-813 the owed version itself never placed. The fix: a holder makes its replica
 >   through the same door over its tool's objects, which needs the repository's store on holders (w-git, w-store).
@@ -1894,6 +1909,17 @@
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
+> Lost again at ae43b42ea (w-chaos, 2026-11-23, `v3_takeover` 7 of 7): the barrier waited for the names log alone, while
+> a push also moves its greens, whose versions stood at version 1 at both survivors while pushes 1 and 2 were answered, so
+> the successor's rebuild (`whole_parts`, a green's span judged by its head) kept push 0 only. Fixed (w-git, main
+> 01a20182's ruling): the barrier (`state_log::names_committed`, all three answer paths) also waits until every green the
+> repository's operations moved is placed at f + 1 through the version they took it to (`StateLogs::note_greens` as the
+> records are taken, `greens_placed` against `merge.placed`; `a_push_is_held_until_every_green_it_moved_is_placed_…`).
+> Its first gate (GitHub 45312465577) found the barrier right and what it waited for never placing: a holder's replica
+> owing its push could not judge the next version (A-813's limit), now built (A-886, below under A-812 (b)). The barrier
+> gives up only after a window with no progress, from the record plane's live pace, and answers `ng <ref> unable to
+> commit` (`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`). Owed: main's gate again, release and
+> debug.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
