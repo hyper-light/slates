@@ -11,6 +11,7 @@ use slates_ipc::protocol::{
   GitIdentity, ObjectFormat, Refusal, ReplyBody, RequestBody, ToolIdentities, VcsTool, VolumeId,
 };
 use slates_mem::Handle;
+use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 use slates_wire::request::{RequestId, Seen};
 
 use super::{READ, Resumed, record, set_on_channel, with_session};
@@ -208,17 +209,45 @@ fn refused_recorded(state: &mut ShardState, body: RequestBody, sequence: u32) ->
   crate::verbs::run_recorded_for_test(state, (1, id), &owner(), body).and_then(refusal)
 }
 
-/// The durable head of `green` on `daemon`'s first shard once it reaches `version`, or where it stood at [`PATIENCE`].
+/// Shape: how often [`head_reaching`] looks at a green's head while it waits for a version: every millisecond.
+const LOOK_EVERY_NS: u64 = 1_000_000;
+
+/// Shape: one shard on the test's thread, a few tasks and timers, whose wheel paces [`head_reaching`]'s looks (D-9: time
+/// goes through the timing wheel, never a thread's sleep).
+fn pacing_runtime() -> LocalRuntime {
+  LocalRuntime::new(&RuntimeConfig {
+    shards: 1,
+    tasks_per_shard: 8,
+    timers_per_shard: 8,
+    ring_entries: 8,
+    step_budget_ns: 1_000_000,
+    timer_tick_ns: 100_000,
+    batch: 8,
+    pin: false,
+    cores: Vec::new(),
+    page_bytes: 4096,
+    spin_ns: 0,
+    wake_tracking: None,
+  })
+  .expect("a local runtime")
+}
+
+/// The durable head of `green` on `daemon`'s first shard once it reaches `version`, or where it stood at [`PATIENCE`]:
+/// looked at every [`LOOK_EVERY_NS`], the pause between two looks a sleep on [`pacing_runtime`]'s wheel.
 fn head_reaching(daemon: &crate::Daemon, green: VolumeId, version: u64) -> u64 {
   let green = crate::verbs::to_db_volume(green);
   let deadline = std::time::Instant::now() + PATIENCE;
+  let runtime = pacing_runtime();
   loop {
     let head =
       crate::daemon::observe_first(daemon, move |state| state.db.partition().green_head(green));
     if head >= version || std::time::Instant::now() >= deadline {
       return head;
     }
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    runtime
+      .block_on(slates_rt::futures::sleep(LOOK_EVERY_NS))
+      .expect("the pause ran on the test's runtime")
+      .expect("the pause's timer");
   }
 }
 
