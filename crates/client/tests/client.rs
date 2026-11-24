@@ -3854,3 +3854,66 @@ fn a_hold_of_an_attachment_with_no_term_is_none_and_an_ended_hold_returns_its_re
     "the ended hold returned the refusal its renewals met: {ended:?}"
   );
 }
+
+/// Shape: the files the destroyed volume of [`a_create_at_once_after_a_destroy_waits_for_its_teardown`] holds, so its
+/// teardown takes many slices of a step: each file is an object the cooperative destroy releases, and a slice checks
+/// its clock every sixteen of them (`slates_vfs::volume`), stopping at half a step's budget.
+const TEARDOWN_FILES: usize = 16_384;
+/// Shape: the share of the shard's room the destroyed volume takes, in quarters: three, so a second volume of its size
+/// fits only once the first's reservation is given back.
+const DESTROYED_QUARTERS: u64 = 3;
+
+/// A-884 (item 3b, main 01a20182's ruling of 2026-11-23), on every platform. Do: on a one-shard daemon, learn the
+/// shard's room from a create past it; create a bounded volume of three quarters of it and write [`TEARDOWN_FILES`]
+/// empty files into it, so its teardown takes many slices; destroy it, and at once create a volume of the same size.
+/// Expect the create admitted, having waited for the teardown (`room.wait.parked`). Before, a destroy was answered once
+/// its record said so, and its teardown held the volume's reservation for the slices after, so a create sent at once
+/// met it and was refused `BudgetExceeded`, though its room was a teardown away.
+#[test]
+fn a_create_at_once_after_a_destroy_waits_for_its_teardown() {
+  let (daemon, mut client, _instance) = one_shard_daemon("teardown-wait");
+  let bounded = |name: &str, limit: u64| CreateSpec {
+    name: name.to_owned(),
+    size: SizeClass::Bounded { limit },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  };
+  let room = match client.create(&bounded("past-the-room", u64::MAX >> 1)) {
+    Err(ClientError::Refused(Refusal::BudgetExceeded { available })) => available,
+    other => panic!("a create past the shard's room is refused BudgetExceeded: {other:?}"),
+  };
+  let size = room / 4 * DESTROYED_QUARTERS;
+  let destroyed = client.create(&bounded("destroyed", size)).unwrap();
+  let attached = client.attach(destroyed, None, Intent::Write).unwrap();
+  for file in 0..TEARDOWN_FILES {
+    client
+      .fs_write(
+        (destroyed, attached.attachment),
+        &format!("f{file}"),
+        &[],
+        0o644,
+      )
+      .unwrap();
+  }
+  client.detach(attached.attachment).unwrap();
+  let answered = client.destroy(destroyed);
+  let again = client.create(&bounded("again", size));
+  let parked = daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("room.wait.parked")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  daemon.stop();
+  assert!(answered.is_ok(), "the destroy: {answered:?}");
+  assert!(
+    again.is_ok(),
+    "a create of {size} bytes at once after a destroy of as many ({room} bytes of room): {again:?}"
+  );
+  assert!(
+    parked > 0,
+    "the create waited for the destroyed volume's teardown (room.wait.parked {parked})"
+  );
+}

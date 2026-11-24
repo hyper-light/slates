@@ -465,6 +465,9 @@ pub struct Volume {
   pub(crate) idle_pending: std::collections::BTreeSet<InodeNo>,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
+  /// The objects the last slice of the destroy released ([`Volume::destroy_step`]): the pace its remaining slices are
+  /// judged by ([`Volume::destroy_slices_left`]); zero before any slice ran.
+  pub(crate) destroy_slice_objects: usize,
   /// The content identities this volume's referenced files hold, one entry per hold (A-645 P3 ruling 2,
   /// [`crate::referenced`]), and the counts of its referenced reads.
   pub(crate) referenced: ReferencedLedger,
@@ -852,6 +855,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      destroy_slice_objects: 0,
       referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
@@ -987,6 +991,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      destroy_slice_objects: 0,
       referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
@@ -1097,6 +1102,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      destroy_slice_objects: 0,
       referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
@@ -4159,16 +4165,19 @@ impl Volume {
     let started = self.clock.monotonic_ns();
     let mut released: usize = 0;
     let mut since_check: usize = 0;
+    let mut popped: usize = 0;
     loop {
       let Some(dead) = self.destroy_queue.pop() else {
         // The queue emptied in this slice: report its units; the next call says `Done`.
         if released > 0 {
+          self.destroy_slice_objects = popped;
           return Ok(DestroyProgress::Released(released));
         }
         self.state = VolumeState::Destroyed;
         self.bytes = ByEpoch::default();
         return Ok(DestroyProgress::Done);
       };
+      popped = popped.saturating_add(1);
       let shared = self
         .origin_epoch
         .is_some_and(|origin| dead.born() <= origin);
@@ -4186,7 +4195,22 @@ impl Volume {
         }
       }
     }
+    self.destroy_slice_objects = popped;
     Ok(DestroyProgress::Released(released))
+  }
+
+  /// How many more slices of [`Self::destroy_step`] this volume's teardown takes, at the pace of its last slice (the
+  /// objects it released; one before any slice ran, the least a slice releases): its queued objects over that pace,
+  /// and the call that says `Done`. Zero for a volume not being destroyed.
+  pub fn destroy_slices_left(&self) -> usize {
+    if self.state != VolumeState::Destroying {
+      return 0;
+    }
+    self
+      .destroy_queue
+      .len()
+      .div_ceil(self.destroy_slice_objects.max(1))
+      .saturating_add(1)
   }
 
   /// Objects still queued for a destroy in progress.
