@@ -227,6 +227,19 @@ pub(crate) fn owner() -> Principal {
   }
 }
 
+/// Makes git repository `name`, SHA-1, its default branch `main`, on `daemon`'s first shard as a client's creation is
+/// made, this thread waiting for its record ([`crate::test_store::create_on`]): its id. The shard is never held through
+/// the store's commit (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
+pub(crate) fn git_repository_on(daemon: &crate::Daemon, name: &str) -> RepositoryId {
+  crate::test_store::create_on(
+    daemon,
+    0,
+    &owner(),
+    (name, VcsTool::Git, WireFormat::Sha1, "main"),
+  )
+  .0
+}
+
 /// Makes git repository `name`, SHA-1, its default branch `main`, on the shard: its id.
 pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> RepositoryId {
   let reply = crate::test_store::create(

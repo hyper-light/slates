@@ -1478,12 +1478,13 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) {
       ),
       "the import did not end: {ended:?}"
     );
-    // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
-    assert_eq!(
-      crate::vcs_store::hg_import::land_imported(state, id),
-      Ok(())
-    );
   });
+  // A done import waits to land (A-687); landed from this thread, which waits, so the shard is never held through a
+  // segment's commit; landed, its index is the store's and the store is lent again.
+  assert_eq!(
+    crate::vcs_store::hg_import::land_imported_on(daemon, REPOSITORY, id),
+    Ok(())
+  );
 }
 
 /// The status and body of `GET /<name>?cmd=<command>` by the owner's bearer token, as stock hg asks a command.

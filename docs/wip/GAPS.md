@@ -818,8 +818,23 @@
 > moves).** `create_blocking`, `land_blocking` and `land_segments_blocking` wait in a `join` on the shard's own thread
 > while the store commits. An `fdatasync` longer than the 1000 ms window then ends the test binary with the watchdog's
 > exit 4 (w-tsan: 1 of 100 `daemon_edge` runs at load 47; reproduced 3 of 3 on adacachy2 with the store's `fdatasync`
-> delayed 1.5 s). `daemon_edge`'s creations moved to `create_on`, which waits on the test's thread; about 45 sites in
-> other files follow. Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
+> delayed 1.5 s). Each landing is one `fdatasync` of exposure, and every in-process test daemon runs its watchdog alone,
+> so one slow commit ends every test in the binary. The rule (main's ruling of 2026-11-24): the test's thread waits, never
+> the shard: a creation through `test_store::create_on`, a landing through `land_blocking` called between two
+> observations, an import's segments through `hg_import::land_imported_on`. Moved, each red under the 1.5 s `fdatasync`
+> and green after: `daemon_edge`'s creations and its import (076a4adb5 and the next change), the ssh serve test's
+> creation, `vcs_store::read_through`'s six tests, `vcs_store::upload`'s three landing tests and `hg_import`'s rebuild
+> test. Still held, by helper and caller count, each moved in its own change: `repository/hg_push/tests.rs` `new` (48),
+> `git_push/tests.rs` `git_repository` (37), `repository.rs` `ask` (31) and `create` (18), `vcs_store/paths/tests.rs`
+> `ask` (15), `vcs_store/tests.rs` `repository` (14), `appended` (10) and `push_unsettled` (1), `hg_import/tests.rs`
+> `created` (13) and its five direct `land_imported` histories, `repository/push/tests.rs` `repository` (12),
+> `hg_view/tests.rs` `created` (10) and `imported` (4), `lfs/tests.rs` `repository` (5), `identities/tests.rs` `ask`
+> (5) and `created` (2), `repository/import/tests.rs` `created` (5), `hg_made/tests.rs` `mercurial` (4),
+> `vcs_share/tests.rs` `hg_repository` (3), `vcs_ssh/tests/hg.rs` (3), `commits/tests.rs` `recorded_submit` (2),
+> `fleet.rs` `repository_and_branch` (2); the direct histories in `index_upkeep.rs` (2), `upload/tests.rs` (1) and
+> `repository.rs` (2); and the test helpers in product files (`hg_push.rs` `store_blocking`, `commits.rs`
+> `home_and_land_blocking` and `made_after_now`, `git_push/tests.rs` `carried_blocking`, `daemon.rs` `b1_crash` and two
+> histories). Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
 > `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
