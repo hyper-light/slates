@@ -111,6 +111,7 @@ jobs:
           cargo clippy --keep-going -p slates-db -p slates-server -p slates-client -p slates-ipc -p slates-api -p slates-cli --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
           echo "clippy exit $?"
           grep -a -A8 '^error' "$RUNNER_TEMP/clippy.log" | head -120
+          true
 
   windows:
     name: A-880 (${{ matrix.os }})
@@ -152,3 +153,4 @@ jobs:
           cargo clippy --keep-going -p slates-db -p slates-server -p slates-client -p slates-ipc -p slates-api -p slates-cli --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
           echo "clippy exit $?"
           grep -a -A8 '^error' "$RUNNER_TEMP/clippy.log" | head -120
+          true
