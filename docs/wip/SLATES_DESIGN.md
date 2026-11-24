@@ -23795,6 +23795,8 @@ Status: built 2026-11-06.
   (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
   still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
   own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
+  Since A-881 (2026-11-23) the rest waits for the shard's next idle point, not the next pass: the stop is the same, and a
+  shard under sustained load, which has no idle point, still pays nothing more.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -40060,6 +40062,22 @@ steps `return_dead_recovery` and `purge_write_log`, each timed by a clock it is 
   three steps' six. Green on the Mac Studio (kiln r154, debug, 0.76 s: 16 KiB pages, a 3,889 ns quantum); red with the
   steps timed by the wall clock again, which learned 21,239 bytes and then 82,598 from the steps' real wall time where
   the CPU said 16,384, 32,768 and 98,304. The recovery test's give-back case is filed for main.
+- **On Windows, a step timed by its cycles (w-win2 for main 01a20182, 2026-11-23).** The fold above waited for a step
+  whose clock showed CPU, and on Windows that took thousands of one-page steps of a few microseconds each, since
+  `GetThreadTimes` charges a thread a scheduler tick at a time. A pass cut short by any other task never reached one,
+  so the slice stayed a page, and an idle shard's give-back of its emptied write log, opened over the whole area a
+  predecessor may have written, never ended: both idle-sweep tests failed on both Windows runners (diag run 45238179939
+  on windows-latest: 332 one-page steps in the first pass, then one a pass). A step on Windows is now timed by the
+  thread's cycles at the rate the runtime measures once a process, before any shard runs
+  (`slates_machine::own_cpu::own_cpu_ns`, the clock the long-poll attribution reads, A-871), and by the thread clock
+  elsewhere, a pair of `#[cfg]` functions (`daemon::shard_thread_cpu_ns`). Measured and rejected: the cycles scaled by
+  the thread's own charged time, which taught nothing on a shard not yet charged a tick (diag run 45260798132: both
+  tests failed on windows-latest, each shard started with 0 µs of its CPU). With it the slice is learned within eight
+  steps (about 11 MB a 13 µs quantum on windows-latest, diag run 45275623386); what still kept windows-latest red was
+  the wait after an interrupted give-back, A-881. Held by the two idle-sweep tests, red with the fix reversed on both
+  runners before A-881 (diag run 45269168513), and since A-881 by `the_give_back_clock_reads_a_step_of_microseconds`,
+  which times steps of microseconds on that clock. Applied in the same change to: `crates/server/src/daemon.rs`, GAPS (A-491),
+  `docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.
 
 ### A-529 — A takeover's share is done only once the successor serves each volume it adopted from its own placement (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover", §4.10 "the healer"; the content release signal's first half; A-335, A-276, A-345)
 Applied in the same change to: GAPS (A-335's release entry), `crates/server/src/takeover.rs` (`share_done`,
@@ -62219,3 +62237,49 @@ GAPS (A-879, A-384's floor, and A-789's note on the extents file), `docs/cli.md`
   - A-251 (i)'s field and image text, A-309's admission rule.
   - GAPS.
   - docs/bugs/2026-11-23-a-move-named-its-host-not-its-retirement.md.
+
+### A-881 — An interrupted idle give-back resumes at the shard's next idle point, not a sweep's interval on (2026-11-23, w-win2 for main 01a20182, its ruling (c) of 2026-11-23 on item 2; A-226, A-715, A-491)
+
+- **What was there.** A pass's give-back (the free content, the dead recovery memory, the emptied write log) stops at
+  the first step across whose yield another task ran (A-226), and the rest waited for the next pass, which the sweep
+  armed a whole interval after the interrupted one ended (`idle_sweep::finish`). Anything that ran once an interval cut
+  that next pass short again at its first step. On CI's windows-latest the idle-sweep tests' look, once an interval,
+  landed on the same 15.6 ms scheduler tick as each pass: 60 passes of one step each (about 130 µs, about 8 MB), and 680
+  MB of a 1.43 GB walk still left at the 60-interval bound, where one uninterrupted pass walks it in 2.6 to 5.9 ms (diag
+  run 45275623386). windows-11-arm showed the same one-step passes and drifted out of the lock after a few. A client
+  polling once a second does the same in the field.
+- **The rule** (main's ruling (c)): a give-back is idle-time work, so after an interruption it waits for the shard's
+  next idle point, not a period. A-226's stop is unchanged: a give-back still ends at the first step across whose yield
+  another task ran, never interleaved with ready work. The interval paces only a fresh pass after one that owed it.
+  Under sustained load there is no idle point, so the give-back waits and costs nothing. Under a poller it resumes
+  right after each poll.
+- **The mechanism.** `purge_if_idle` says how it ended (`GiveBack::{Settled, Busy, Interrupted}`) and the pass says
+  how it ended (`PassEnd::{Settled, Owed, GiveBackLeft}`). A pass whose give-back was interrupted stays under way, so
+  nothing arms another meanwhile. It sets `give_back_waits_idle` and waits. The shard's idle work
+  (`ShardContext::set_idle_work`, its one slot, called when the shard finds nothing ready and its idle spin has run
+  out, before it parks) is `idle_sweep::idle_work`, registered at the shard's start. It wakes the sweep there to resume
+  the give-back (`resume_give_back`, counted as `content.give_back.resumed_at_idle`), and otherwise advances an armed
+  content-range sweep (A-744's `idle_slice`, which until now registered itself in the slot when armed). The pass ends
+  when its give-back settles or finds the shard busy. `sweep.passes_started` counts passes.
+- **A lost wake closed in the runtime (the same change).** The idle work borrows the shard's state, and a borrow's
+  hooks may wake a task; the shard's loop parked as soon as the idle work answered that it did nothing, with that task
+  ready on its own queue, to wait out the park's deadline or a kick (none, on a shard with no timer armed). Every park
+  now counts one begun with a task ready (`slates_rt` `Counters::parked_with_ready`), and the loop runs such a task
+  instead (`shard.rs`, `run`). Red without the change: `idle_work_that_wakes_a_task_leaves_it_to_run_not_to_wait_
+  out_a_park` (`crates/rt/tests/idle_work.rs`: the task did not run within 2 s). Every deadlines and idle-sweep test of
+  the daemon asserts the count stays 0 (main's ruling: the hazard answers for itself, not a rate).
+- **Why not the alternatives.** Pacing the test's looks off the interval would have hidden the field's starvation.
+  Ending a pass only when other work ran across two yields in a row would have changed A-226's rule and doubled the
+  sweep's intrusion under sustained load to buy back a timing coincidence.
+- **Evidence.** Diag run 45286588671: the drift-free test (`a_pass_cut_short_at_each_start_settles_in_that_pass_at_
+  the_shards_idle_points`, a poller the keeper wakes beside each pass) red with the resume off on windows-latest,
+  windows-11-arm and ubuntu; the idle sweep's tests 5 of 5 rounds on all three, about 10.5 s a round where
+  windows-latest's took 35 to 124 s and failed 2 of 5; macOS 4 of 4. The server's unit suite on both Windows runners
+  kept every test but A-877's two store tests. The lost wake (diag run 45309498515): red without the loop's change on
+  ubuntu and on macOS; green with it, every rt test binary on ubuntu and macOS, loom 6 of 6, and rt clippy for the two
+  Linux and two Windows targets; CI's Miri set on slates-rt clean (diag run 45310233924). `spin_kick`'s one failure on
+  macos-latest in that run is older than the change: 10 of 10 rounds with it, 9 of 10 without (diag run 45311228860).
+
+Applied in the same change to: A-226's record ("A give-back makes way"), GAPS (A-491's entry),
+`crates/rt/src/shard.rs`, `crates/rt/tests/idle_work.rs`, `crates/server/src/{daemon,idle_sweep,content_ranges,state,deadlines}.rs`,
+`docs/bugs/2026-11-23-a-windows-give-back-step-read-no-cpu-and-the-idle-sweep-never-settled.md`.
