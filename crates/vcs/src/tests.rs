@@ -12,7 +12,7 @@ use crate::arrival::{
 use crate::content::{ContentId, ContentRefused, ContentStore, Form, IDENTITY_BYTES};
 use crate::index::{
   AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, MergeStep,
-  NewRow, TAIL_SLOT_BYTES,
+  NewRow, TAIL_SLOT_BYTES, TIER_RATIO,
 };
 use crate::table::{RowRef, encode_body};
 
@@ -1024,6 +1024,63 @@ fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_bytes_whatever_
     (0, 0, 0),
     "own runs past the bytes bound (runs, bound, bytes) at worst; fewest bytes a seal wrote {fewest}"
   );
+  assert_eq!(read(&index, &store).len(), usize::try_from(at).unwrap());
+  index.release(&mut store).unwrap();
+}
+
+/// Shape: the rows of each seal of the deep-violation test, oldest first, each one table under its window: after the
+/// last, the newest run is under half the next (4 against 10) while the oldest is at most twice all the newer together
+/// (100 against 54).
+const DEEP_SEALS: [u64; 4] = [100, 40, 10, 4];
+
+/// The bytes of each run of `index`, oldest first (every run here is the index's own).
+fn run_bytes(index: &Index, store: &ContentStore) -> Vec<u64> {
+  index
+    .run_tables()
+    .iter()
+    .map(|tables| tables.iter().filter_map(|table| store.len_of(table)).sum())
+    .collect()
+}
+
+/// Whether every run of `bytes` (oldest first) holds more than [`TIER_RATIO`] times the bytes of all the runs newer than
+/// it together: the size-tiered rule's invariant, which its bound is derived from.
+fn tiered(bytes: &[u64]) -> bool {
+  let mut newer = 0u64;
+  bytes.iter().rev().enumerate().all(|(depth, run)| {
+    let held = depth == 0 || *run > newer * TIER_RATIO;
+    newer += run;
+    held
+  })
+}
+
+/// Goal 93 (B), r618 (main's ruling of 2026-11-23 21:14: 8 own runs at the 57k shape against a bound of 6): the
+/// size-tiered rule merged the newest runs while they reached half the next older, and stopped at the first older one
+/// past that, so a seal that grew every deeper run's newer bytes left a deeper run under its share unmerged. Do: seal
+/// [`DEEP_SEALS`]' rows a run each under a window that holds each in one table, merging what [`Index::tiered_due`] names
+/// after each seal to its end. Expect after each: every run holds more than twice the bytes of all newer runs together
+/// (the invariant), so the bound holds; every row read back at the end. Red before: after the fourth seal, nothing due,
+/// runs [100, 40, 10, 4] rows, the oldest at most twice the 54 newer.
+#[test]
+fn a_tiered_merge_restores_its_invariant_for_every_run_however_deep_the_seal_breaks_it() {
+  let mut store = ContentStore::new(1 << 24, 1 << 16).unwrap();
+  let mut index = Index::new();
+  let mut at = 0u64;
+  for rows in DEEP_SEALS {
+    for _ in 0..rows {
+      let key = scattered_key(at);
+      at += 1;
+      index
+        .insert(&mut store, row(&key, &[], &[0x5a; 20]))
+        .unwrap();
+    }
+    index.seal_all(&mut store).unwrap();
+    while let Some(runs) = index.tiered_due() {
+      let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
+      while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
+    }
+    let bytes = run_bytes(&index, &store);
+    assert!(tiered(&bytes), "runs of {bytes:?} bytes after {at} rows");
+  }
   assert_eq!(read(&index, &store).len(), usize::try_from(at).unwrap());
   index.release(&mut store).unwrap();
 }
