@@ -1,0 +1,61 @@
+name: diag-main-chaos
+# main 01a20182 (2026-11-24 10:07 PST): live_chaos's destroy flows at current main, after w-shared's A-894 (c5911c0f3:
+# the destroy's tombstone hold is now live_ship::defer_until_placed(PlacementOf::Tombstone | Repository), resolved where
+# placement acks fold), on the nightly lane's runners and commands, each flow alone with the nightly's cap; the flows count
+# fleet.destroy.awaited. Run only from diag-measurer-main-chaos-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-chaos-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  destroy-flows:
+    name: live_chaos destroy flows (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: The destroy flows, each on its own, capped
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          echo "nofile $(ulimit -n); cores $(nproc); load $(cat /proc/loadavg)"
+          mkdir -p target/chaos
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          slowest_pass_s=425
+          cap_s=$((slowest_pass_s * 4))
+          failed=0; ran=0
+          for flow in $("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p' | grep -i destroy); do
+            ran=$((ran + 1)); echo "=== ${flow}"
+            log="target/chaos/${flow//::/__}.log"
+            start=$(date +%s)
+            if ! timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "${log}" 2>&1; then
+              echo "::error title=${{ matrix.os }} ${flow}::FAILED (or past ${cap_s} s) after $(( $(date +%s) - start )) s"
+              tail -60 "${log}"; failed=$((failed + 1))
+            else
+              echo "::notice title=${{ matrix.os }} ${flow}::passed in $(( $(date +%s) - start )) s; $(grep -aoE 'fleet\.destroy\.awaited[^,; ]*' "${log}" | tail -1)"
+            fi
+          done
+          echo "destroy flows: ${ran} ran, ${failed} failed"
+          [ "${failed}" -eq 0 ]
+      - name: Upload the chaos logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-destroy-${{ matrix.os }}
+          path: target/chaos/
