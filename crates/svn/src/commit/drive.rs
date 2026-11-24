@@ -144,6 +144,8 @@ const REVISION_AUTHOR: &[u8] = b"svn:author";
 /// `SVN_ERR_FS_GENERAL`: a copy from another repository.
 /// Format: the filesystem category's start, 120,000 + 8 × 5,000 = 160,000 (`svn_error_codes.h` 581-582).
 const SVN_ERR_FS_GENERAL: u32 = 160_000;
+/// Format: `SVN_ERR_FS_CORRUPT`, the filesystem category's start plus 4 (`svn_error_codes.h`).
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 
 /// `SVN_ERR_FS_PATH_SYNTAX`: a path slates cannot hold.
 /// Format: the filesystem category's start plus 5 (`svn_error_codes.h`).
@@ -602,6 +604,12 @@ pub enum DriveRefusal {
   Unwritable,
   /// A read the authorization rules deny (`commit.c` `check_authz`).
   Unreadable,
+  /// A text delta's base the green answered no bytes of even once its owner was asked to bring it back ([`Due::Text`]),
+  /// as FSFS answers a representation it cannot read (`SVN_ERR_FS_CORRUPT`).
+  BaseUnavailable {
+    /// The base's identity.
+    identity: ContentIdentity,
+  },
 }
 
 impl DriveRefusal {
@@ -632,6 +640,7 @@ impl DriveRefusal {
       }
       Self::Unwritable => SVN_ERR_AUTHZ_UNWRITABLE,
       Self::Unreadable => SVN_ERR_AUTHZ_UNREADABLE,
+      Self::BaseUnavailable { .. } => SVN_ERR_FS_CORRUPT,
     }
   }
 }
@@ -1355,6 +1364,9 @@ pub struct Drive {
   /// The `textdelta-chunk` waiting for its base to be brought back ([`Due::Text`]): the file's token and the chunk,
   /// taken again on [`Drive::resume`].
   paused_chunk: Option<(Vec<u8>, Vec<u8>)>,
+  /// The last refusal the drive answered, described for its owner's log ([`Drive::take_refused`]): the client is told
+  /// Subversion's words alone.
+  refused: Option<String>,
 }
 
 impl Drive {
@@ -1388,7 +1400,14 @@ impl Drive {
       held: 0,
       replaced: BTreeMap::new(),
       paused_chunk: None,
+      refused: None,
     }
+  }
+
+  /// The last refusal the drive answered, described (its typed cause, or the errors a hook's or its owner's answer
+  /// refused with), once: what its owner logs, so no refusal goes unexplained.
+  pub fn take_refused(&mut self) -> Option<String> {
+    self.refused.take()
   }
 
   /// Takes one item the client sent during the drive, writing what `svnserve` writes for it. An item handed in while a
@@ -1454,6 +1473,7 @@ impl Drive {
     };
     self.phase = Phase::Driving;
     if let Err(errors) = answer {
+      self.refused = Some(format!("{pause:?} answered {errors:?}"));
       write_failure_errors(&errors, out)?;
       self.phase = Phase::Dropping;
       return Ok(Step::Refused);
@@ -1524,6 +1544,7 @@ impl Drive {
     };
     self.phase = Phase::Driving;
     if let Err(errors) = answer {
+      self.refused = Some(format!("{pause:?} answered {errors:?}"));
       self.phase = Phase::Done;
       return Edited::Refused(errors);
     }
@@ -1577,6 +1598,7 @@ impl Drive {
         Edited::Closed
       }
       Err(Stop::Refused(refusal)) => {
+        self.refused = Some(format!("{refusal:?}"));
         let errors = self.errors(&refusal);
         self.phase = Phase::Done;
         Edited::Refused(errors)
@@ -1700,6 +1722,10 @@ impl Drive {
       DriveRefusal::Room { .. } => {
         "The client request size exceeds the configured limit".to_owned()
       }
+      DriveRefusal::BaseUnavailable { identity } => {
+        let named: String = identity.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("The text {named} a delta is based on could not be read")
+      }
       other => default_message(other),
     }
   }
@@ -1715,6 +1741,7 @@ impl Drive {
 
   /// Writes a refusal's failure and turns to dropping (`editorp.c` 1149-1174).
   fn refuse(&mut self, refusal: &DriveRefusal, out: &mut Vec<u8>) -> Result<Step, ItemError> {
+    self.refused = Some(format!("{refusal:?}"));
     write_failure_errors(&self.errors(refusal), out)?;
     self.phase = Phase::Dropping;
     Ok(Step::Refused)
@@ -2208,9 +2235,13 @@ impl Drive {
       },
       None => Some(std::borrow::Cow::Borrowed(&[][..])),
     };
-    let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
-      IndexRefusal::Corrupt,
-    )))?;
+    let source = match (source, delta.source) {
+      (Some(source), _) => source,
+      (None, Some(identity)) => return Err(DriveRefusal::BaseUnavailable { identity }.into()),
+      (None, None) => {
+        return Err(DriveRefusal::Commit(CommitRefusal::Index(IndexRefusal::Corrupt)).into());
+      }
+    };
     let Some(Baton::File(File {
       delta: Some(delta), ..
     })) = self.tokens.get_mut(token)

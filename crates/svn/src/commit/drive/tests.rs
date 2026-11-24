@@ -800,7 +800,8 @@ fn a_resulting_text_whose_md5_is_not_the_clients_is_refused() {
 }
 
 /// A-617 (module documentation: the room). Do: open a delta on `a.txt` with a room of four bytes and send it eight.
-/// Expect: `E210009`, the work past its room, before the delta is read.
+/// Expect: `E210009`, the work past its room, before the delta is read; and the refusal described once for its owner's
+/// log (`Drive::take_refused`, main's finding of 2026-11-24: a refusal the client sees in a word went unexplained).
 #[test]
 fn a_work_past_its_room_is_refused() {
   let replay = replayed_until("edit-large");
@@ -831,6 +832,8 @@ fn a_work_past_its_room_is_refused() {
       "The client request size exceeds the configured limit".to_owned()
     ))
   );
+  assert_eq!(drive.take_refused().as_deref(), Some("Room { room: 4 }"));
+  assert_eq!(drive.take_refused(), None, "described once");
 }
 
 /// A-617 (module documentation: locks at each call; `tree.c` `fs_apply_textdelta`). Do: after bob locks `a.txt`, let
