@@ -14487,12 +14487,26 @@ fn continuity_body(file: usize) -> Vec<u8> {
 }
 
 /// A live-shipped volume named `name` on `client`'s node, shared with `fleet`, written [`CONTINUITY_FILES`] files: the
-/// volume and every write's reply.
+/// volume and every write's reply. The client keeps its write attachment ([`live_volume_written_attached`]).
 fn live_volume_written(
   client: &mut Client,
   fleet: &[Daemon],
   name: &str,
 ) -> (VolumeId, Vec<ReplyBody>) {
+  let (id, _attachment, written) = live_volume_written_attached(client, fleet, name);
+  (id, written)
+}
+
+/// [`live_volume_written`], with the write attachment `client` holds: the volume, the attachment and every write's
+/// reply. A test that next writes through another node without a takeover detaches it first. A client dropped without
+/// detaching keeps its seat and its attachments until its process exits on macOS and Windows, where a client's death is
+/// its process's exit (A-475, `crate::hangup`), so its write lease refuses every other writer `LeaseHeld` for as long as
+/// the test runs; Linux sees the drop at its control socket's close.
+fn live_volume_written_attached(
+  client: &mut Client,
+  fleet: &[Daemon],
+  name: &str,
+) -> (VolumeId, u64, Vec<ReplyBody>) {
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     panic!("the volume was created");
   };
@@ -14517,7 +14531,7 @@ fn live_volume_written(
       })
     })
     .collect();
-  (id, written)
+  (id, attachment, written)
 }
 
 /// Shape: the files [`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: its
@@ -15663,8 +15677,9 @@ fn written_through_counted(
 
 /// AUD-11, A-200, §4.8 "Lookup" (the regression of 1fc1da1fb, found 2026-11-23 by the two superseded-owner tests above):
 /// a write sent through a node that does not own its live-shipped volume is answered at its durability. Do: three nodes
-/// at `f = 1`; on a, a live-shipped volume written six files and shared with the fleet; then write through a client of
-/// b until a write is answered. Expect the last answer `FsDone`, none `Overloaded`, and the owner's exchange answered
+/// at `f = 1`; on a, a live-shipped volume written six files and shared with the fleet, its write attachment then let go
+/// ([`live_volume_written_attached`]: a dropped client keeps its lease on macOS and Windows, where every send met
+/// `LeaseHeld { epoch: 1 }` on CI's first Windows runs); then write through a client of b until a write is answered. Expect the last answer `FsDone`, none `Overloaded`, and the owner's exchange answered
 /// where its reply was held or recorded (a's counts). Before, the owner's exchange waited only for a deferred
 /// acceptance, so the write its live log held was refused `Overloaded` at once, every time, though it became durable,
 /// and a client that resent under a fresh id applied it again.
@@ -15673,17 +15688,22 @@ fn a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durab
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
   let mut client = Client::connect(daemons[0].instance());
-  let (id, written) = live_volume_written(&mut client, &daemons, "through-b");
+  let (id, attachment, written) = live_volume_written_attached(&mut client, &daemons, "through-b");
+  let detached = client.call(&RequestBody::DetachOf {
+    volume: id,
+    attachment,
+  });
   drop(client);
   let (through_b, moved) = written_through_counted(&daemons, (1, 0), id, "/through-b");
   for daemon in daemons {
     daemon.stop();
   }
   assert!(
-    written
-      .iter()
-      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
-    "every write on a was answered: {written:?}"
+    matches!(detached, ReplyBody::Detached)
+      && written
+        .iter()
+        .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered and its attachment let go: {written:?}, {detached:?}"
   );
   assert!(
     through_b
@@ -15707,7 +15727,8 @@ fn a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durab
 
 /// AUD-11, A-200 (main 01a20182's ruling of 2026-11-23 on the forwarded write's answer): a forwarded write whose reply
 /// was recorded before its exchange asked where it stands is answered that outcome, never `Overloaded`. Do: as
-/// [`a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability`], with a's exchange made to ask
+/// [`a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability`] (a's write attachment let go
+/// first), with a's exchange made to ask
 /// [`RECORDED_FIRST_DELAY_NS`] after the write deferred its reply (`Daemon::inject_forward_answer_delay`), long after a
 /// healthy fleet makes it durable. Expect the last answer `FsDone`, none `Overloaded`, and the owner's count of replies
 /// found recorded when their exchange asked moved: the case this test is for happened.
@@ -15716,7 +15737,12 @@ fn a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome()
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
   let mut client = Client::connect(daemons[0].instance());
-  let (id, written) = live_volume_written(&mut client, &daemons, "recorded-first");
+  let (id, attachment, written) =
+    live_volume_written_attached(&mut client, &daemons, "recorded-first");
+  let detached = client.call(&RequestBody::DetachOf {
+    volume: id,
+    attachment,
+  });
   drop(client);
   daemons[0]
     .inject_forward_answer_delay(Some(RECORDED_FIRST_DELAY_NS))
@@ -15726,10 +15752,11 @@ fn a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome()
     daemon.stop();
   }
   assert!(
-    written
-      .iter()
-      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
-    "every write on a was answered: {written:?}"
+    matches!(detached, ReplyBody::Detached)
+      && written
+        .iter()
+        .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered and its attachment let go: {written:?}, {detached:?}"
   );
   assert!(
     through_b
