@@ -1,0 +1,70 @@
+name: diag-main-winfleet
+# main 01a20182 (2026-11-24 05:03 PST): the Windows fleet step's limit, measured again. Main CI run 45385055058
+# (f0624c32b) cut both Windows fleet steps at their 31-minute limit with every test passing: x86_64 ran 218 of 244 tests
+# in 1,510.3 s. The limit was derived on 2026-11-09 from 110 tests (1.5 x 872.3 + 240 + 300 = 1,848 s); the suite has
+# since grown to 244 tests. This runs the step whole at 21b8b5311 on both runners, under a limit only a hang reaches, so
+# the formula gets its measured input again: each test's time, the whole, the slowest, and the build. Run only from
+# diag-measurer-main-winfleet-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-winfleet-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  fleet:
+    name: fleet whole (${{ matrix.runner }}, 21b8b5311)
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 21b8b5311bf550e6a0a5f3e5df2b0e45165372a9
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64, as main CI builds AWS-LC there)
+        if: matrix.runner == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the runner and the fleet test binary
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.runner == 'windows-latest' && '0' || '' }}
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          start=$(date +%s)
+          cargo build --locked -p xtask --bin each_test
+          cargo test --locked -p slates-server --test fleet --no-run
+          echo "build $(( $(date +%s) - start )) s"
+      - name: The fleet whole, one test at a time, each with a deadline (as main CI runs it)
+        shell: bash
+        timeout-minutes: 180
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.runner == 'windows-latest' && '0' || '' }}
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: |
+          set +e
+          start=$(date +%s)
+          cargo run --locked -p xtask --bin each_test -- --package slates-server --test fleet --per-test-secs 240 > "$RUNNER_TEMP/fleet.log" 2>&1
+          rc=$?
+          echo "each_test rc=$rc, step wall $(( $(date +%s) - start )) s"
+          grep -a 'each_test:' "$RUNNER_TEMP/fleet.log" | grep -av 'each_test: ok' | head -20 | cut -c1-240
+          grep -a 'each_test: ok' "$RUNNER_TEMP/fleet.log" | awk '{ n++; s += $(NF-2); if ($(NF-2) > m) m = $(NF-2) } END { printf "== fleet: %d ok, sum %.1f s, slowest %.1f s, mean %.2f s\n", n, s, m, (n ? s / n : 0) }'
+          echo "-- the ten slowest:"
+          grep -a 'each_test: ok' "$RUNNER_TEMP/fleet.log" | sort -k3 -n -r | head -10 | cut -c1-200
+          exit 0
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winfleet-${{ matrix.runner }}
+          path: ${{ runner.temp }}/fleet.log
