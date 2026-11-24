@@ -427,3 +427,146 @@ fn a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_i
   );
   assert!(after.3.is_some(), "the made changeset is the line's head");
 }
+
+/// Lets go the objects `repository`'s changelog and manifest rows name on this shard: how many let a window go.
+fn let_go_logs_here(state: &mut ShardState, repository: RepositoryId) -> usize {
+  crate::vcs_store::lent_state(state, |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let (content, store) = stores.mercurial(repository)?;
+      let index = &store.index;
+      let changesets = (0..index.len(content, Log::Changelog))
+        .map(|rev| index.changeset(content, rev).map(|row| row.text));
+      let manifests = (0..index.len(content, Log::Manifest)).map(|rev| {
+        index
+          .revision(content, Log::Manifest, rev)
+          .map(|row| row.bytes)
+      });
+      let identities = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
+      Some(
+        identities
+          .iter()
+          .filter(|identity| content.let_go_object(identity) > 0)
+          .count(),
+      )
+    })
+  })
+  .unwrap_or(0)
+}
+
+/// Goal 93, C1 (1) P4b (main's ruling of 2026-11-24 03:51: a made changeset reads its parent's texts let go once landed
+/// through the changeset store, made in one place). Do: on a running daemon holding a changeset store, submit a work to
+/// a Mercurial repository's green as a client's recorded request and await it; let go every object its changelog's and
+/// manifests' rows name; submit a second work to the green and await it. Expect: the second answered with the green's
+/// heads at 2 and its made changeset the line's head, its parent the first; the parent's texts read back from the
+/// store (`vcs.hg.made_parent_texts_read`). Red before: unmade `ParentUnknown`, its parent's texts let go.
+#[test]
+fn a_changeset_made_over_a_parent_let_go_reads_its_texts_from_the_store() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let first_id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let second_id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 2,
+  };
+  let (repository, green) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repository, green) = mercurial(state, "parent-let-go");
+    let work = hg_work(state, green, ("first-work", "a.txt", b"alpha\n"));
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, first_id),
+      &owner(),
+      crate::identities::authored(work, "first"),
+    );
+    (repository, green)
+  });
+  let first = answered(&daemon, green, first_id);
+  let (let_go, first_head) = crate::daemon::observe_first(&daemon, move |state| {
+    (let_go_logs_here(state, repository), head_of(state, green))
+  });
+  crate::daemon::observe_first(&daemon, move |state| {
+    let work = hg_work(state, green, ("second-work", "a.txt", b"beta\n"));
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, second_id),
+      &owner(),
+      crate::identities::authored(work, "second"),
+    );
+  });
+  let second = answered(&daemon, green, second_id);
+  let (parent, read) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      second_head_parent(state, repository, green),
+      state
+        .refusals
+        .get(super::PARENT_TEXTS_READ)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  daemon.stop();
+  assert!(first.0 && first.3.is_some(), "the first made: {first:?}");
+  assert!(let_go > 0, "objects let go");
+  assert!(second.0, "the second answered");
+  assert_eq!(
+    second.1, 2,
+    "the green's durable head at the second version"
+  );
+  assert_eq!(parent, first_head, "the second made over the first");
+  assert!(read > 0, "its parent's texts read back from the store");
+}
+
+/// The first parent of `green`'s line head changeset in `repository`, if any.
+fn second_head_parent(
+  state: &ShardState,
+  repository: RepositoryId,
+  green: DbVolumeId,
+) -> Option<Node> {
+  let head = head_of(state, green)?;
+  parent_of(state, repository, &head)
+}
+
+/// Goal 93 correctness (found making P4b's red, 2026-11-24): a held verdict's preview is a branch whose head is its
+/// version 1, the verdict over its version 0 (`Lineage::preview`), and the made changeset was read there at the green's
+/// own versions. Do: on a running daemon holding a changeset store, submit two works in turn to a Mercurial
+/// repository's green as a client's recorded requests, each awaited. Expect: both answered, the green's durable head at
+/// 2, the line's head made over the first's changeset. Red before: the second unmade `NotHead` (its preview's head 1
+/// against version 2), its version committed with nothing behind it on the store.
+#[test]
+fn a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ids = [1, 2].map(|sequence| slates_wire::request::RequestId {
+    client: 7,
+    sequence,
+  });
+  let (repository, green) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repository, green) = mercurial(state, "second-deferred");
+    let work = hg_work(state, green, ("first-deferred", "a.txt", b"alpha\n"));
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, ids[0]),
+      &owner(),
+      crate::identities::authored(work, "first"),
+    );
+    (repository, green)
+  });
+  let first = answered(&daemon, green, ids[0]);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let work = hg_work(state, green, ("second-deferred", "a.txt", b"beta\n"));
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, ids[1]),
+      &owner(),
+      crate::identities::authored(work, "second"),
+    );
+  });
+  let second = answered(&daemon, green, ids[1]);
+  let parent = crate::daemon::observe_first(&daemon, move |state| {
+    second_head_parent(state, repository, green)
+  });
+  daemon.stop();
+  assert!(first.0 && first.3.is_some(), "the first made: {first:?}");
+  assert_eq!((second.0, second.1), (true, 2), "the second answered at 2");
+  assert_eq!(parent, first.3, "the second made over the first");
+}

@@ -5334,28 +5334,9 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
         Opened::Units => {}
       }
     }
-    let outcome = match sectioned.as_mut() {
-      Some(changeset) => sectioned_unit(id, changeset, &mut replay).await,
-      None => record_unit(id, index, &mut replay).await,
-    };
-    match outcome {
-      Unit::More => {}
-      Unit::Replayed => {
-        sectioned = None;
-        let next = crate::state::with_state(|state| replayed(state, id, Ok(()))).unwrap_or(false);
-        if !next {
-          break;
-        }
-        index = index.saturating_add(1);
-      }
-      Unit::Refused(refused) => {
-        crate::state::with_state(|state| {
-          let _ = replayed(state, id, Err(refused));
-        })
-        .unwrap_or_default();
-        break;
-      }
-      Unit::Gone => break,
+    let outcome = next_unit(id, index, &mut sectioned, &mut replay).await;
+    if !unit_taken(id, outcome, (&mut sectioned, &mut index)) {
+      break;
     }
     slates_rt::futures::yield_now().await;
   }
@@ -5366,6 +5347,48 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
     release_aside(state, aside);
   })
   .unwrap_or_default();
+}
+
+/// [`replay_sliced`]'s next unit: of the changeset under way read from the changeset log, else of the register's record
+/// at `index`.
+async fn next_unit(
+  id: RepositoryId,
+  index: usize,
+  sectioned: &mut Option<Sectioned>,
+  replay: &mut Option<slates_hg::import::record::Replay>,
+) -> Unit {
+  match sectioned.as_mut() {
+    Some(changeset) => sectioned_unit(id, changeset, replay).await,
+    None => record_unit(id, index, replay).await,
+  }
+}
+
+/// What a unit's `outcome` leaves [`replay_sliced`] to do: whether the rebuild goes on, a record replayed moving it to
+/// the next (`index`), a refusal or a state gone ending it, either counted.
+fn unit_taken(
+  id: RepositoryId,
+  outcome: Unit,
+  (sectioned, index): (&mut Option<Sectioned>, &mut usize),
+) -> bool {
+  match outcome {
+    Unit::More => true,
+    Unit::Replayed => {
+      *sectioned = None;
+      let next = crate::state::with_state(|state| replayed(state, id, Ok(()))).unwrap_or(false);
+      if next {
+        *index = index.saturating_add(1);
+      }
+      next
+    }
+    Unit::Refused(refused) => {
+      crate::state::with_state(|state| {
+        let _ = replayed(state, id, Err(refused));
+      })
+      .unwrap_or_default();
+      false
+    }
+    Unit::Gone => false,
+  }
 }
 
 /// A changeset of the changeset log a rebuild is replaying (A-767 C4, C1).
