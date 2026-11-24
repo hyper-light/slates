@@ -592,7 +592,7 @@ fn first_revision() -> slates_svn::commit::revision::Revision {
 /// What the site reads of [`COMMITTED`] through the daemon's lender, from a task on its shard: whether the lender holds
 /// it and another repository; the PROPFIND of `/trunk` at depth 1; the text the GET of `/trunk/sub/b.txt` streams; the
 /// `log-report` of every revision.
-fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, Vec<u8>) {
+async fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, Vec<u8>) {
   let mut stores = ServedRecords;
   let held = (
     stores.holds(id),
@@ -626,13 +626,36 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
   let SiteAnswer::Report(mut report) = answer("REPORT", "/", None, LOG_EVERY) else {
     panic!("no report");
   };
-  let fetched = stores
+  let mut fetched_piece = None;
+  let fetched = match stores
     .lend(id, &owner, |lent| {
       slates_svn::reads::Repository::text(lent.repository, &text.identity, 0)
         .map(std::borrow::Cow::into_owned)
     })
     .flatten()
-    .expect("the text");
+  {
+    Some(bytes) => bytes,
+    None => {
+      fetched_piece = stores
+        .fetch(
+          id,
+          slates_svn::reads::Wanted {
+            text: text.identity,
+            offset: 0,
+          },
+        )
+        .await;
+      assert!(fetched_piece.is_some(), "the stored text's piece");
+      stores
+        .lend(id, &owner, |lent| {
+          slates_svn::reads::Repository::text(lent.repository, &text.identity, 0)
+            .map(std::borrow::Cow::into_owned)
+        })
+        .flatten()
+        .expect("the text after fetch")
+    }
+  };
+  drop(fetched_piece);
   let mut log = Vec::new();
   while stores
     .lend(id, &owner, |lent| {
@@ -665,7 +688,7 @@ fn the_daemons_lender_serves_a_repositorys_committed_records() {
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
-      let _ = sent.send(read_through_the_lender(id));
+      let _ = sent.send(read_through_the_lender(id).await);
     })
     .expect("the reading task");
     slates_rt::futures::detach(task).expect("detached");

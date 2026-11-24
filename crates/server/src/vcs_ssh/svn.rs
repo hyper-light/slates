@@ -68,8 +68,9 @@
 //! canonical URLs); the drop's ending above.
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
-use slates_svn::commit::drive::{Due, Green, HeldTexts, TextSink, Work};
+use slates_svn::commit::drive::{Due, Green, HeldTexts, NeedText, TextSink, Work};
 use slates_svn::commit::record::Record;
+use slates_svn::find::{Found as FoundUrl, find_repository};
 use slates_svn::handshake::{self, Access, Repository, Unserved as Refusal};
 use slates_svn::ra_svn::ItemError;
 use slates_svn::reads;
@@ -84,9 +85,10 @@ use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, Right};
-use crate::vcs_store::svn_view::FetchedPiece;
+use crate::vcs_store::svn_view::{BroughtText, FetchedPiece};
 use crate::vcs_svn::{
-  HookSite, Hooked, MERGEINFO, post_lock_hook, pre_lock_hooks, revision_property_hook, run_hook,
+  HookSite, Hooked, Located, Location, MERGEINFO, post_lock_hook, pre_lock_hooks,
+  revision_property_hook, run_hook,
 };
 
 /// Format: the refusal count of a command the connection answered "Unknown editor command" because slates does not
@@ -183,6 +185,18 @@ pub(crate) trait SvnStores {
     wanted: slates_svn::reads::Wanted,
   ) -> Option<FetchedPiece> {
     let _ = (id, wanted);
+    None
+  }
+  /// Brings back a landed base text `need` of repository `id` whole into this shard's content store for a commit's
+  /// text delta (`BroughtText::bring`); none where the store cannot give it or all texts stay in memory.
+  async fn bring(&mut self, id: RepositoryId, need: NeedText) -> Option<BroughtText> {
+    let _ = (id, need);
+    None
+  }
+  /// Locates which shard holds the repository named by `found` across the daemon's partitions (`vcs_svn::locate`);
+  /// `None` in single-shard test lenders that only look up in `SvnCommand::repositories`.
+  async fn locate(&mut self, found: &FoundUrl) -> Option<Location> {
+    let _ = found;
     None
   }
   /// Repository `id`'s landing turn, once no other landing holds it; none when its store is not held here.
@@ -329,6 +343,12 @@ pub(crate) struct SvnCommand<R, V> {
   /// The text piece a drive waited for and the session fetched (C2 stage B part 2), held while the drive reads on in it:
   /// given back when the drive waits for another, when the read's answer ends, or with the session.
   fetched: Option<FetchedPiece>,
+  /// A landed base text brought back whole while a commit applies delta windows against it: given back on drop, file
+  /// change, exit from edit, or shard migration.
+  brought: Option<BroughtText>,
+  /// A repository located on another shard, carried across `Next::Move` and opened immediately on arrival on the owner
+  /// shard.
+  pending_open: Option<(FoundUrl, Located)>,
   /// The principal the client's key proved, which the repository's policy judges.
   principal: Principal,
   /// Its name, the tunnel's user.
@@ -367,6 +387,8 @@ enum Received {
   Wrote,
   /// A drive waits for a text's piece read through the node's changeset store (C2 stage B part 2).
   Waiting(slates_svn::reads::Wanted),
+  /// A commit's text delta waits for its landed base text to be brought back whole.
+  NeedText(NeedText),
   /// The client answered the greeting with this URL.
   Opened {
     /// The URL.
@@ -421,6 +443,7 @@ impl Received {
       }
       Turn::Wrote => Received::Wrote,
       Turn::Waiting(wanted) => Received::Waiting(wanted),
+      Turn::NeedText(need) => Received::NeedText(need),
       Turn::Opened { open, consumed } => Received::Opened {
         url: open.url.to_vec(),
         consumed,
@@ -453,6 +476,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       repositories,
       stores,
       fetched: None,
+      brought: None,
+      pending_open: None,
       principal: principal.clone(),
       user: crate::lfs::owner_name(principal).into_bytes(),
       connection,
@@ -473,7 +498,12 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
   async fn stepped(&mut self, gone: ClientGone<'_>) -> Stepped {
     if let Some(status) = self.exit {
       self.fetched = None;
+      self.brought = None;
       return exited(status);
+    }
+    if let Some((found_url, located)) = self.pending_open.take() {
+      self.open_located(&found_url, &located);
+      return self.consumed(0);
     }
     let received = self.received();
     // The piece the last wait fetched stays held while the read goes on, since a call reads only a quantum of the
@@ -481,28 +511,27 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     if !self.connection.fetching() {
       self.fetched = None;
     }
+    if !matches!(self.connection.waiting(), Waiting::Edit) {
+      self.brought = None;
+    }
+    self.dispatch_received(received, gone).await
+  }
+
+  /// Dispatches one outcome of [`Self::received`] and returns the next step.
+  async fn dispatch_received(&mut self, received: Received, gone: ClientGone<'_>) -> Stepped {
     let consumed = match received {
       Received::NeedMore => return self.wait_or_end(),
       Received::Wrote => 0,
       Received::Waiting(wanted) => {
-        // The drive moved on from the piece held to another.
-        self.fetched = None;
-        let Some(id) = self.opened.as_ref().map(|record| record.id) else {
-          self.not_held();
-          return self.consumed(0);
-        };
-        // A piece the node's store cannot give ends the session: the drive would wait for it again.
-        match self.stores.fetch(id, wanted).await {
-          Some(piece) => self.fetched = Some(piece),
-          None => self.not_held(),
-        }
+        self.fetch_piece(wanted).await;
+        0
+      }
+      Received::NeedText(need) => {
+        self.bring_text(need).await;
         0
       }
       Received::Took(consumed) => consumed,
-      Received::Opened { url, consumed } => {
-        self.open(&url);
-        consumed
-      }
+      Received::Opened { url, consumed } => return self.handle_open(&url, consumed).await,
       Received::Challenge(consumed) => {
         let failed = self.connection.challenge_failed(&mut self.out);
         self.end_if_refused(failed);
@@ -542,6 +571,47 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         0
       }
     };
+    self.consumed(consumed)
+  }
+
+  /// Fetches one let-go read piece for the active repository, ending the session if absent.
+  async fn fetch_piece(&mut self, wanted: reads::Wanted) {
+    // The drive moved on from the piece held to another.
+    self.fetched = None;
+    let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+      self.not_held();
+      return;
+    };
+    // A piece the node's store cannot give ends the session: the drive would wait for it again.
+    match self.stores.fetch(id, wanted).await {
+      Some(piece) => self.fetched = Some(piece),
+      None => self.not_held(),
+    }
+  }
+
+  /// Brings back one let-go base text for an edit drive, ending the session if absent.
+  async fn bring_text(&mut self, need: NeedText) {
+    self.brought = None;
+    let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+      self.not_held();
+      return;
+    };
+    match self.stores.bring(id, need).await {
+      Some(brought) => self.brought = Some(brought),
+      None => self.not_held(),
+    }
+  }
+
+  /// Opens the repository at `url`, migrating the tunnel to its owning shard when it lives elsewhere.
+  async fn handle_open(&mut self, url: &[u8], consumed: usize) -> Stepped {
+    if let Some(shard) = self.open(url).await {
+      let taken = consumed.min(self.input.len());
+      self.input.drain(..taken);
+      return Stepped {
+        consumed: taken,
+        next: Next::Move(shard),
+      };
+    }
     self.consumed(consumed)
   }
 
@@ -604,14 +674,79 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     self.consumed(0)
   }
 
-  /// Answers the client's `url` (the module doc's session): the repository it names opened, or the URL refused.
-  fn open(&mut self, url: &[u8]) {
+  /// Answers the client's `url` (the module doc's session): locates the repository across shards when the lender
+  /// supports multi-shard lookup, returning `Some(shard)` to migrate the SSH connection to the owner shard when owned
+  /// elsewhere; otherwise opens it on this shard or refuses the URL.
+  async fn open(&mut self, url: &[u8]) -> Option<u16> {
+    let found_url = match find_repository(url) {
+      Ok(found_url) => found_url,
+      Err(refusal) => {
+        self.refuse_url(refusal);
+        return None;
+      }
+    };
+    if let Some(location) = self.stores.locate(&found_url).await {
+      match location {
+        Location::Found(located) => {
+          let here = crate::state::with_state(|state| state.shard);
+          if here != Some(located.shard) {
+            self.fetched = None;
+            self.brought = None;
+            let target = located.shard;
+            self.pending_open = Some((found_url, located));
+            return Some(target);
+          }
+          self.open_located(&found_url, &located);
+          return None;
+        }
+        Location::Nowhere => {
+          self.refuse_url(Refusal::NoRepository { url });
+          return None;
+        }
+        Location::Unanswered => {
+          self.not_held();
+          return None;
+        }
+      }
+    }
     let (record, root) = match found(&self.repositories, url) {
       Found::Repository { record, root } => (*record, root),
-      Found::BadUrl => return self.refuse_url(Refusal::BadUrl { url }),
-      Found::BadPath => return self.refuse_url(Refusal::BadPath),
-      Found::NoRepository => return self.refuse_url(Refusal::NoRepository { url }),
+      Found::BadUrl => {
+        self.refuse_url(Refusal::BadUrl { url });
+        return None;
+      }
+      Found::BadPath => {
+        self.refuse_url(Refusal::BadPath);
+        return None;
+      }
+      Found::NoRepository => {
+        self.refuse_url(Refusal::NoRepository { url });
+        return None;
+      }
     };
+    let root_url = url.get(..root).unwrap_or(url);
+    self.open_record(record, root_url);
+    None
+  }
+
+  /// Opens the repository `located` on its owner shard after `locate` (and any cross-shard migration).
+  fn open_located(&mut self, found_url: &FoundUrl, located: &Located) {
+    let Some(record) = self
+      .repositories
+      .find(&located.name)
+      .filter(|record| record.tool == VcsTool::Subversion)
+    else {
+      self.refuse_url(Refusal::NoRepository {
+        url: &found_url.url,
+      });
+      return;
+    };
+    let root_url = found_url.root_url(located.depth);
+    self.open_record(record, &root_url);
+  }
+
+  /// Checks policy and store presence on the owner shard and opens `record` with `root_url`.
+  fn open_record(&mut self, record: RepositoryRecord, root_url: &[u8]) {
     if !matches!(
       vcs_policy::reaches(&record, &self.principal, &TUNNEL_RIGHTS),
       Ok(true)
@@ -622,7 +757,6 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     if !self.stores.holds(record.id) {
       return self.not_held();
     }
-    let root_url = url.get(..root).unwrap_or(url);
     let Self {
       connection,
       stores,

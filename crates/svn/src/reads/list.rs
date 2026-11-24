@@ -585,3 +585,315 @@ fn end<R: Repository + ?Sized>(
   };
   Ok(Walk::Ended)
 }
+
+/// A `list-report` walk over HTTP (`reports/list.c`), streamed a slice at a time under the shard's budget, running the
+/// same `svn_repos_list` walk as [`ListStream`].
+#[derive(Debug)]
+pub struct DavList {
+  /// The canonical listed path.
+  path: String,
+  /// The requested revision (`None` for youngest).
+  requested_revision: Option<Revision>,
+  /// The settled revision once the walk begins.
+  revision: Revision,
+  /// The depth, or the negative code of one refused.
+  depth: Result<Depth, i8>,
+  /// Which dirent fields to include.
+  fields: DirentFields,
+  /// Optional glob patterns.
+  patterns: Patterns,
+  /// Where the walk stands.
+  walk: Walk,
+  /// Whether `<S:list-report ...>` has been written to the client.
+  begun: bool,
+  /// An encoded element held past the last slice's room, written first by the next.
+  held: Vec<u8>,
+}
+
+impl DavList {
+  /// A walk for `report`, its `S:path` joined to `target`, the repository path of the REPORT resource.
+  pub fn new(report: &crate::dav::listing::ListReport, target: &str) -> Self {
+    use crate::dav::request::SvnDepth;
+    let depth = match report.depth {
+      SvnDepth::Empty => Ok(Depth::Empty),
+      SvnDepth::Files => Ok(Depth::Files),
+      SvnDepth::Immediates => Ok(Depth::Immediates),
+      SvnDepth::Infinity => Ok(Depth::Infinity),
+      SvnDepth::Exclude => Err(DEPTH_EXCLUDE),
+      SvnDepth::Unknown => Err(DEPTH_UNKNOWN),
+    };
+    let fields = DirentFields {
+      kind: report.fields.kind,
+      size: report.fields.size,
+      has_properties: report.fields.has_props,
+      created: report.fields.created_rev,
+      time: report.fields.time,
+      author: report.fields.last_author,
+    };
+    let patterns = report.patterns.as_ref().map(|list| {
+      list
+        .iter()
+        .map(|pattern| pattern.as_bytes().to_vec())
+        .collect()
+    });
+    Self {
+      path: super::full_path_of(target, &report.path),
+      requested_revision: report.revision,
+      revision: 0,
+      depth,
+      fields,
+      patterns,
+      walk: Walk::Start,
+      begun: false,
+      held: Vec::new(),
+    }
+  }
+
+  /// Whether any bytes of the report's XML have already been written.
+  pub fn begun(&self) -> bool {
+    self.begun
+  }
+
+  /// Writes the next slice of `<S:item ...>` elements into `out` within `budget`.
+  pub fn resume<R: Repository + ?Sized>(
+    &mut self,
+    index: &crate::index::Index,
+    repository: &R,
+    rules: Option<&crate::authz::PrincipalRules>,
+    out: &mut Vec<u8>,
+    budget: crate::report::exchange::Budget,
+  ) -> super::log::dav::DavLogProgress {
+    use super::log::dav::DavLogProgress;
+    let room = budget.room.max(1);
+    let slice = crate::report::exchange::Slice::begin(budget.quantum);
+    let mut scratch = Vec::new();
+    let reads = Reads {
+      index,
+      repository,
+      base: super::ROOT,
+      uuid: "",
+      authz: rules,
+      authentication: super::Authentication::Settled,
+      out: &mut scratch,
+    };
+    let mut written = std::mem::take(&mut self.held);
+    let mut taken = !written.is_empty();
+    let mut visited = 0_usize;
+    loop {
+      if taken && slice.spent() {
+        self.begun |= !written.is_empty();
+        out.extend_from_slice(&written);
+        return DavLogProgress::More;
+      }
+      let walk = std::mem::replace(&mut self.walk, Walk::Ended);
+      if walk == Walk::Ended {
+        out.extend_from_slice(&written);
+        return DavLogProgress::Done;
+      }
+      let before = written.len();
+      let stepped = match walk {
+        Walk::Start => self.dav_begin(&reads, &mut written),
+        Walk::Levels(levels) => self.dav_visit(levels, &reads, &mut written),
+        Walk::Ended => Ok(Walk::Ended),
+      };
+      match stepped {
+        Ok(Walk::Ended) => {
+          written.extend_from_slice(crate::dav::listing::LIST_END.as_bytes());
+          self.walk = Walk::Ended;
+          self.begun = true;
+          out.extend_from_slice(&written);
+          return DavLogProgress::Done;
+        }
+        Ok(next_walk) => {
+          self.walk = next_walk;
+          visited = visited.saturating_add(1);
+          if written.len() > room && before > 0 {
+            self.held = written.split_off(before);
+            self.begun = true;
+            out.extend_from_slice(&written);
+            return DavLogProgress::More;
+          }
+          if written.len() >= room || (!slice.timed() && visited >= room) {
+            self.begun = true;
+            out.extend_from_slice(&written);
+            return DavLogProgress::More;
+          }
+          taken = true;
+        }
+        Err(failure) => {
+          self.walk = Walk::Ended;
+          return DavLogProgress::Refused {
+            code: failure.code,
+            message: failure.message,
+          };
+        }
+      }
+    }
+  }
+
+  /// First step of the DAV walk: checks authz, revision, depth and target existence before writing the XML header.
+  fn dav_begin<R: Repository + ?Sized>(
+    &mut self,
+    reads: &Reads<'_, R>,
+    out: &mut Vec<u8>,
+  ) -> Result<Walk, Failure> {
+    if !reads.readable(&self.path) {
+      return Err(Failure::unreadable_path());
+    }
+    let requested = self
+      .requested_revision
+      .map(|revision| i64::try_from(revision).unwrap_or(i64::MAX));
+    self.revision = reads.at_or_youngest(requested)?;
+    let depth = self.depth.map_err(|number| {
+      let message = format!("Invalid depth '{number}' in svn_repos_list");
+      Failure::new(SVN_ERR_REPOS_BAD_ARGS, message)
+    })?;
+    let node = reads.node(&self.path, self.revision)?.ok_or_else(|| {
+      Failure::new(
+        SVN_ERR_FS_NOT_FOUND,
+        format!("Path '{}' not found", self.path),
+      )
+    })?;
+    out.extend_from_slice(crate::dav::listing::LIST_START.as_bytes());
+    if self.patterns.as_ref().is_some_and(Vec::is_empty) {
+      return Ok(Walk::Ended);
+    }
+    if self.dav_matches(basename(&self.path)) {
+      self.dav_write_item(reads, &self.path, &node, out)?;
+    }
+    if node.kind() == NodeKind::File || depth == Depth::Empty {
+      return Ok(Walk::Ended);
+    }
+    Ok(Walk::Levels(vec![
+      self.dav_level(reads, &self.path, depth)?,
+    ]))
+  }
+
+  /// Visits one entry in the DAV walk.
+  fn dav_visit<R: Repository + ?Sized>(
+    &self,
+    mut levels: Vec<Level>,
+    reads: &Reads<'_, R>,
+    out: &mut Vec<u8>,
+  ) -> Result<Walk, Failure> {
+    let Some((path, entry)) = next_entry(&mut levels) else {
+      return if levels.is_empty() {
+        Ok(Walk::Ended)
+      } else {
+        Ok(Walk::Levels(levels))
+      };
+    };
+    if !reads.readable(&path) {
+      return Ok(Walk::Levels(levels));
+    }
+    if entry.matches {
+      let node = reads
+        .node(&path, self.revision)?
+        .ok_or_else(Failure::corrupt)?;
+      self.dav_write_item(reads, &path, &node, out)?;
+    }
+    if self.depth == Ok(Depth::Infinity) && entry.kind == NodeKind::Directory {
+      levels.push(self.dav_level(reads, &path, Depth::Infinity)?);
+    }
+    Ok(Walk::Levels(levels))
+  }
+
+  /// Collects one directory's filtered entries in byte order.
+  fn dav_level<R: Repository + ?Sized>(
+    &self,
+    reads: &Reads<'_, R>,
+    directory: &str,
+    depth: Depth,
+  ) -> Result<Level, Failure> {
+    let names = reads
+      .repository
+      .entries(directory, self.revision)
+      .ok_or_else(Failure::corrupt)?;
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+      let kind = reads
+        .node(&child_path(directory, &name), self.revision)?
+        .ok_or_else(Failure::corrupt)?
+        .kind();
+      let matches = self.dav_matches(&name);
+      let left_out = (kind == NodeKind::Directory && depth == Depth::Files)
+        || (kind == NodeKind::File && !matches);
+      if !left_out {
+        entries.push(ListEntry {
+          name,
+          kind,
+          matches,
+        });
+      }
+    }
+    entries.sort_by(|first, second| first.name.cmp(&second.name));
+    Ok(Level {
+      directory: directory.to_owned(),
+      entries,
+      next: 0,
+    })
+  }
+
+  /// Whether `name` matches any configured glob pattern.
+  fn dav_matches(&self, name: &str) -> bool {
+    self.patterns.as_ref().is_none_or(|patterns| {
+      let folded = fold(name);
+      patterns.iter().any(|pattern| fnmatch(pattern, &folded))
+    })
+  }
+
+  /// Encodes one `<S:item ...>` element into `out` (`reports/list.c` `list_receiver`).
+  fn dav_write_item<R: Repository + ?Sized>(
+    &self,
+    reads: &Reads<'_, R>,
+    path: &str,
+    node: &Node<'_>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Failure> {
+    let created = node.created_revision();
+    let date = if self.fields.time {
+      match reads.revision_property(created, DATE_PROPERTY) {
+        Some(raw) => {
+          let parsed = parse_time(c_string_of(raw)).ok_or_else(Failure::bogus_date)?;
+          Some(crate::lock::AprTime(parsed))
+        }
+        None => None,
+      }
+    } else {
+      None
+    };
+    let author = if self.fields.author {
+      reads
+        .revision_property(created, AUTHOR_PROPERTY)
+        .map(|raw| {
+          let text = String::from_utf8_lossy(c_string_of(raw));
+          crate::dav::xml::fuzzy_escape(&text).into_owned()
+        })
+    } else {
+      None
+    };
+    let item = crate::dav::listing::ListItem {
+      // `mod_dav_svn/reports/list.c` `list_receiver` writes the canonical FS path (`svn_repos_list`'s `path`,
+      // starting with `/`); `libsvn_client`'s `list_receiver` strips `baton->abs_path` via `svn_dirent_skip_ancestor`.
+      path: path.to_owned(),
+      kind: if self.fields.kind {
+        kind_word(node.kind())
+      } else {
+        UNKNOWN_KIND
+      },
+      size: (self.fields.size && node.kind() == NodeKind::File)
+        .then(|| node.text().map_or(0, |text| text.size)),
+      has_props: self
+        .fields
+        .has_properties
+        .then(|| reads.has_properties(node)),
+      created_rev: self.fields.created.then_some(created),
+      date,
+      author,
+    };
+    let encoded =
+      crate::dav::listing::list_item_element(&item).map_err(|_| Failure::bogus_date())?;
+    out.extend_from_slice(encoded.as_bytes());
+    Ok(())
+  }
+}

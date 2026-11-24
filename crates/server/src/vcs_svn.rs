@@ -85,7 +85,9 @@ use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
-use crate::vcs_store::svn_view::{FetchedPiece, SvnHold, hold_in, lend_held_in, lend_in};
+use crate::vcs_store::svn_view::{
+  BroughtText, FetchedPiece, SvnHold, hold_in, lend_held_in, lend_in,
+};
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -717,6 +719,9 @@ enum Next {
   /// A drive waits for a text's piece read through the node's changeset store (C2 stage B part 2): fetch it, then
   /// call again with the same input.
   Fetch(slates_svn::reads::Wanted),
+  /// A commit's text delta waits for its landed base text to be brought back whole: bring it into the content store,
+  /// then call again with the same input.
+  NeedText(slates_svn::commit::drive::NeedText),
   /// End the connection.
   End,
 }
@@ -745,6 +750,9 @@ struct Conversation {
   /// it: given back when the drive waits for another, when the read's answer ends, before the conversation moves to
   /// another shard, or with the conversation.
   fetched: Option<FetchedPiece>,
+  /// A landed base text brought back whole while a commit applies delta windows against it: given back when the edit
+  /// moves to another text, leaves the edit phase, migrates, or drops.
+  brought: Option<BroughtText>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -789,6 +797,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     commits: 0,
     held: None,
     fetched: None,
+    brought: None,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -819,9 +828,10 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
-        // A hold is given back on the shard that holds its records, and so is a fetched piece.
+        // A hold is given back on the shard that holds its records, and so is a fetched piece or brought base text.
         conversation.held = None;
         conversation.fetched = None;
+        conversation.brought = None;
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -855,6 +865,12 @@ async fn step(
   // drive's steps in it (goal 93); its answer ended, the piece goes.
   if !conversation.connection.fetching() {
     conversation.fetched = None;
+  }
+  if !matches!(
+    conversation.connection.waiting(),
+    slates_svn::serve::Waiting::Edit
+  ) {
+    conversation.brought = None;
   }
   if !out.is_empty() && !written_timed(stream, out).await {
     return Stepped::End;
@@ -904,6 +920,20 @@ async fn follow(
         return Stepped::End;
       };
       conversation.fetched = Some(piece);
+      return Stepped::Go;
+    }
+    Next::NeedText(need) => {
+      let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+        return Stepped::End;
+      };
+      conversation.brought = None;
+      let fetching = now_ns();
+      let brought = BroughtText::bring(repository, need).await;
+      count_since(FETCH_WAIT_NS, fetching);
+      let Some(brought) = brought else {
+        return Stepped::End;
+      };
+      conversation.brought = Some(brought);
       return Stepped::Go;
     }
     Next::End => return Stepped::End,
@@ -1123,6 +1153,7 @@ fn next_of(
     ) => Next::Consume(consumed),
     Ok(Turn::Wrote) => Next::Again,
     Ok(Turn::Waiting(wanted)) => Next::Fetch(wanted),
+    Ok(Turn::NeedText(need)) => Next::NeedText(need),
     Ok(Turn::Opened { open, consumed }) => match find_repository(open.url) {
       Ok(found) => Next::Locate { found, consumed },
       Err(unserved) => {

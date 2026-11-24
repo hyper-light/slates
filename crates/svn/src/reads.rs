@@ -2076,6 +2076,132 @@ mod segments;
 mod stream;
 
 pub use file_revs::DavFileRevs;
+pub use list::DavList;
+
+/// The youngest revision dated at or before `date` (`svn_repos_dated_revision`), shared by `svn://`'s `get-dated-rev`
+/// and HTTP's `dated-rev-report`.
+///
+/// # Errors
+/// Missing or unparseable `svn:date` on a revision visited by the binary search.
+pub fn dated_revision<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  date: crate::lock::AprTime,
+) -> Result<Revision, (u32, String)> {
+  let mut out = Vec::new();
+  let reads = Reads {
+    index,
+    repository,
+    base: ROOT,
+    uuid: "",
+    authz: None,
+    authentication: Authentication::Settled,
+    out: &mut out,
+  };
+  reads
+    .dated_revision(date.0)
+    .map_err(|failure| (failure.code, failure.message))
+}
+
+/// One location segment of a node's history: its repository path (`None` for a gap) and inclusive revision range.
+pub type LocationSegment = (Option<String>, Revision, Revision);
+
+/// One ancestor's inherited properties: its repository path and sorted property `(name, value)` pairs.
+pub type InheritedNodeProps = (String, Vec<(String, Vec<u8>)>);
+
+/// A Subversion read error: its numeric `SVN_ERR_*` code and message.
+pub type ReadError = (u32, String);
+
+/// The location segments of `path` at `peg` across `end..=start` (`svn_repos_node_location_segments`), shared by
+/// `svn://`'s `get-location-segments` and HTTP's `get-location-segments` report.
+///
+/// # Errors
+/// Out-of-order range, revision past youngest, unreadable path, or absent node.
+pub fn node_location_segments<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  rules: Option<&PrincipalRules>,
+  path: &str,
+  (peg, start, end): (Option<Revision>, Option<Revision>, Option<Revision>),
+) -> Result<Vec<LocationSegment>, ReadError> {
+  let mut out = Vec::new();
+  let reads = Reads {
+    index,
+    repository,
+    base: ROOT,
+    uuid: "",
+    authz: rules,
+    authentication: Authentication::Settled,
+    out: &mut out,
+  };
+  let signed = |revision: Revision| i64::try_from(revision).unwrap_or(i64::MAX);
+  let (peg, start, end) = reads
+    .segments_range_of(path, peg.map(signed), start.map(signed), end.map(signed))
+    .map_err(|failure| (failure.code, failure.message))?;
+  let mut found = Vec::new();
+  let mut next = Some((path.to_owned(), peg));
+  while let Some((place, revision)) = next.take().filter(|(_, revision)| *revision >= end) {
+    let turn = reads
+      .segment_turn(&place, revision, start, end)
+      .map_err(|failure| (failure.code, failure.message))?;
+    for segment in turn.sent {
+      found.push((segment.path, segment.start, segment.end));
+    }
+    next = turn.next;
+  }
+  Ok(found)
+}
+
+/// The readable ancestors of `path` holding properties at `revision` (the youngest when `None`), root first
+/// (`svn_repos_fs_get_inherited_props`), shared by `svn://`'s `get-iprops` and HTTP's `inherited-props-report`.
+///
+/// # Errors
+/// Unreadable target path, revision past youngest, or missing node.
+pub fn inherited_properties<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  rules: Option<&PrincipalRules>,
+  path: &str,
+  revision: Option<Revision>,
+) -> Result<Vec<InheritedNodeProps>, ReadError> {
+  let mut out = Vec::new();
+  let reads = Reads {
+    index,
+    repository,
+    base: ROOT,
+    uuid: "",
+    authz: rules,
+    authentication: Authentication::Settled,
+    out: &mut out,
+  };
+  if !reads.readable(path) {
+    let failure = Failure::unreadable_path();
+    return Err((failure.code, failure.message));
+  }
+  let requested = revision.map(|revision| i64::try_from(revision).unwrap_or(i64::MAX));
+  let revision = reads
+    .at_or_youngest(requested)
+    .map_err(|failure| (failure.code, failure.message))?;
+  reads
+    .present_for_iprops(path, revision)
+    .map_err(|failure| (failure.code, failure.message))?;
+  let ancestors = reads
+    .ancestors_properties(path, revision)
+    .map_err(|failure| (failure.code, failure.message))?;
+  Ok(
+    ancestors
+      .into_iter()
+      .map(|(ancestor, mut props)| {
+        props.sort_unstable();
+        let props = props
+          .into_iter()
+          .map(|(name, value)| (String::from_utf8_lossy(name).into_owned(), value.to_vec()))
+          .collect();
+        (ancestor.to_owned(), props)
+      })
+      .collect(),
+  )
+}
 
 /// Where the node at `path` in `peg` stood in each of `revisions`, as `svn_repos_trace_node_locations` traces it, read
 /// from `index` and `repository` with each path judged by `rules` (none: every path readable): the `get-locations`

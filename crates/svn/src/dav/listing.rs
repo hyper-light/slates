@@ -19,10 +19,6 @@ use crate::index::{Revision, is_canonical};
 use crate::lock::AprTime;
 use crate::svndiff::{Compression, Encoder, Version, Window};
 
-/// The XML declaration and `DEBUG_CR` every answer begins with.
-/// Format: `mod_dav.h` `DAV_XML_HEADER`, then `DEBUG_CR`, a line feed (httpd 2.4.66).
-const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
-
 /// Which entry fields a `list-report` sends (`SVN_DIRENT_*`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DirentFields {
@@ -70,7 +66,11 @@ pub struct FileRevsReport {
 
 /// Reads a `list-report`; a path is required ("Request was missing the path argument").
 pub fn list_report(body: &[u8], bounds: &Bounds) -> Result<ListReport, DavRefusal> {
-  let root = svn_root(body, bounds, "list-report")?;
+  list_from(&svn_root(body, bounds, "list-report")?)
+}
+
+/// Reads a `list-report` whose root is read already (`request::report`'s dispatch).
+pub(crate) fn list_from(root: &Element) -> Result<ListReport, DavRefusal> {
   let mut path = None;
   let mut report = ListReport {
     path: String::new(),
@@ -192,7 +192,7 @@ fn canonical(path: String) -> Result<String, DavRefusal> {
 /// One entry of a `list-report`'s answer; each field is sent when the request asked for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListItem {
-  /// The path, relative to the report's target.
+  /// The canonical repository path as `svn_repos_list` hands it to `list_receiver` (starting with `/`).
   pub path: String,
   /// `svn_node_kind_to_word`'s word; `unknown` when the kind was not asked for.
   pub kind: &'static str,
@@ -208,45 +208,58 @@ pub struct ListItem {
   pub author: Option<String>,
 }
 
+/// The start of a `list-report`'s answer (`list.c` `maybe_send_header`).
+/// Format: `mod_dav.h` `DAV_XML_HEADER`, `DEBUG_CR`, and `list.c`'s root element.
+pub(crate) const LIST_START: &str =
+  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:list-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n";
+
+/// The end of a `list-report`'s answer (`list.c`).
+/// Format: `dav_svn__list_report`'s closing element.
+pub(crate) const LIST_END: &str = "</S:list-report>\n";
+
+/// One `S:item` element of a `list-report`'s answer (`list.c` `list_receiver`).
+pub(crate) fn list_item_element(item: &ListItem) -> Result<String, DavRefusal> {
+  let size = item
+    .size
+    .map(|size| format!(" size=\"{size}\""))
+    .unwrap_or_default();
+  let props = item
+    .has_props
+    .map(|has| format!(" has-props=\"{has}\""))
+    .unwrap_or_default();
+  let created = item
+    .created_rev
+    .map(|revision| format!(" created-rev=\"{revision}\""))
+    .unwrap_or_default();
+  let date = match item.date {
+    Some(date) => format!(" date=\"{}\"", quote(&svn_time(date)?, false)),
+    None => String::new(),
+  };
+  let author = item
+    .author
+    .as_ref()
+    .map(|author| {
+      format!(
+        "<D:creator-displayname>{}</D:creator-displayname>",
+        quote(author, true)
+      )
+    })
+    .unwrap_or_default();
+  Ok(format!(
+    "<S:item node-kind=\"{}\"{size}{props}{created}{date}>{}{author}</S:item>\n",
+    item.kind,
+    quote(&item.path, false)
+  ))
+}
+
 /// A `list-report`'s answer (`list.c`).
 pub fn list(items: &[ListItem], room: usize) -> Result<Vec<u8>, DavRefusal> {
   let mut body = Body::new(room);
-  body.push(XML_HEADER)?;
-  body.push("<S:list-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n")?;
+  body.push(LIST_START)?;
   for item in items {
-    let size = item
-      .size
-      .map(|size| format!(" size=\"{size}\""))
-      .unwrap_or_default();
-    let props = item
-      .has_props
-      .map(|has| format!(" has-props=\"{has}\""))
-      .unwrap_or_default();
-    let created = item
-      .created_rev
-      .map(|revision| format!(" created-rev=\"{revision}\""))
-      .unwrap_or_default();
-    let date = match item.date {
-      Some(date) => format!(" date=\"{}\"", quote(&svn_time(date)?, false)),
-      None => String::new(),
-    };
-    let author = item
-      .author
-      .as_ref()
-      .map(|author| {
-        format!(
-          "<D:creator-displayname>{}</D:creator-displayname>",
-          quote(author, true)
-        )
-      })
-      .unwrap_or_default();
-    body.push(&format!(
-      "<S:item node-kind=\"{}\"{size}{props}{created}{date}>{}{author}</S:item>\n",
-      item.kind,
-      quote(&item.path, false)
-    ))?;
+    body.push(&list_item_element(item)?)?;
   }
-  body.push("</S:list-report>\n")?;
+  body.push(LIST_END)?;
   Ok(body.into_bytes())
 }
 

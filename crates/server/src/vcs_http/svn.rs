@@ -59,7 +59,7 @@
 use crate::repository::svn_commit::{Committed, Uncommitted};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_store::svn_texts::SvnView;
-use crate::vcs_store::svn_view::FetchedPiece;
+use crate::vcs_store::svn_view::{BroughtText, FetchedPiece};
 use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, run_hook};
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
@@ -70,11 +70,10 @@ use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential;
 use slates_rt::futures::yield_now;
 use slates_svn::authz::PrincipalRules;
-use slates_svn::commit::drive::Due;
-use slates_svn::commit::drive::{Setup, Work};
+use slates_svn::commit::drive::{Due, NeedText, Setup, Work};
 use slates_svn::dav::Bounds as XmlBounds;
 use slates_svn::dav::commit::{
-  self as commit, DavCommit, Hooks, MergeStep, Merged, PutStart, World as CommitWorld,
+  self as commit, DavCommit, Hooks, MergeStep, Merged, PutChunk, PutStart, World as CommitWorld,
 };
 use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
 use slates_svn::dav::response::MergeResponse;
@@ -264,6 +263,13 @@ pub(crate) trait SvnStores {
     wanted: slates_svn::reads::Wanted,
   ) -> Option<FetchedPiece> {
     let _ = (id, wanted);
+    None
+  }
+
+  /// Brings back a landed base text `need` of repository `id` whole into this shard's content store for an open PUT's
+  /// delta (`BroughtText::bring`); none where the store cannot give it or all texts stay in memory.
+  async fn bring(&mut self, id: RepositoryId, need: NeedText) -> Option<BroughtText> {
+    let _ = (id, need);
     None
   }
 
@@ -676,6 +682,8 @@ struct Streamed {
   path: String,
   /// Whether the file's delta is open.
   begun: bool,
+  /// A landed base text brought back whole while this PUT applies delta windows against it; given back on drop.
+  brought: Option<BroughtText>,
   /// The refusal met, which the PUT is answered with.
   refused: Option<HttpAnswer>,
 }
@@ -697,6 +705,7 @@ fn streamed_put(method: &str, path: &str) -> Option<Streamed> {
     activity,
     path: format!("/{}", rest.join("/")),
     begun: false,
+    brought: None,
     refused: None,
   })
 }
@@ -1479,15 +1488,41 @@ impl<S: SvnStores> SvnExchange<S> {
 
 impl<S: SvnStores> SvnExchange<S> {
   /// One run of a streamed PUT's body handed to its transaction's drive (the file begun at the first run, its `If`
-  /// tokens presented then), and held no longer; a run after a refusal is dropped.
-  fn stream(&mut self, run: &[u8]) {
+  /// tokens presented then), and held no longer; a run after a refusal is dropped. If the delta's base text was let go
+  /// to the node's changeset store, brings it back whole and retries the chunk once.
+  async fn stream(&mut self, run: &[u8]) {
     let Some(mut streamed) = self.streamed.take() else {
       return;
     };
-    if streamed.refused.is_none() {
-      let outcome = self.put_step(&streamed, Some(run));
-      streamed.begun = true;
-      streamed.refused = outcome.err();
+    let mut brought_once = false;
+    while streamed.refused.is_none() {
+      match self.put_step(&streamed, Some(run)) {
+        Ok(PutChunk::Taken) => {
+          streamed.begun = true;
+          break;
+        }
+        Ok(PutChunk::NeedText(need)) => {
+          streamed.begun = true;
+          if brought_once {
+            streamed.refused = Some(bare_status(HTTP_INTERNAL_SERVER_ERROR));
+            break;
+          }
+          brought_once = true;
+          streamed.brought = None;
+          match self.stores.bring(self.repository, need).await {
+            Some(brought) => streamed.brought = Some(brought),
+            None => {
+              streamed.refused = Some(bare_status(HTTP_SERVICE_UNAVAILABLE));
+              break;
+            }
+          }
+        }
+        Err(refused) => {
+          streamed.begun = true;
+          streamed.refused = Some(refused);
+          break;
+        }
+      }
     }
     self.streamed = Some(streamed);
   }
@@ -1498,7 +1533,7 @@ impl<S: SvnStores> SvnExchange<S> {
       return refused;
     }
     let started = if streamed.begun {
-      Ok(())
+      Ok(PutChunk::Taken)
     } else {
       self.put_step(&streamed, None)
     };
@@ -1526,7 +1561,7 @@ impl<S: SvnStores> SvnExchange<S> {
 
   /// One step of a streamed PUT on its transaction: the file begun where it is not yet, then `run` as the delta's next
   /// chunk where one is given.
-  fn put_step(&mut self, streamed: &Streamed, run: Option<&[u8]>) -> Result<(), HttpAnswer> {
+  fn put_step(&mut self, streamed: &Streamed, run: Option<&[u8]>) -> Result<PutChunk, HttpAnswer> {
     let name = self.streamed_transaction(streamed)?;
     let headers = self.commit_headers.clone();
     let hooks = self.hooks();
@@ -1546,7 +1581,9 @@ impl<S: SvnStores> SvnExchange<S> {
             };
             commit.begin_put(world, &hooks, path, &start)?;
           }
-          run.map_or(Ok(()), |run| commit.put_chunk(world, &hooks, run))
+          run.map_or(Ok(PutChunk::Taken), |run| {
+            commit.put_chunk(world, &hooks, run)
+          })
         });
     match stepped {
       Some(Some(stepped)) => stepped,
@@ -2070,7 +2107,7 @@ fn status_of(code: u16) -> Status {
 impl<S: SvnStores> Exchange for SvnExchange<S> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     if self.streamed.is_some() {
-      self.stream(run);
+      self.stream(run).await;
       return Ok(());
     }
     self

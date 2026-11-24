@@ -137,15 +137,18 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
   }
 
   /// The peg, start and end revisions as `serve.c` and `svn_repos_node_location_segments` settle and refuse them.
-  fn segments_range(
+  pub(super) fn segments_range_of(
     &self,
-    request: &SegmentsRequest,
+    path: &str,
+    peg: Option<i64>,
+    start: Option<i64>,
+    end: Option<i64>,
   ) -> Result<(Revision, Revision, Revision), Failure> {
     let youngest = i64::try_from(self.index.youngest()).map_err(|_| Failure::corrupt())?;
     let valid = |revision: Option<i64>| revision.filter(|&revision| revision >= 0);
-    let start = valid(request.start).unwrap_or(youngest);
-    let peg = valid(request.peg).unwrap_or(youngest);
-    let end = valid(request.end).unwrap_or(0);
+    let start = valid(start).unwrap_or(youngest);
+    let peg = valid(peg).unwrap_or(youngest);
+    let end = valid(end).unwrap_or(0);
     if end > start {
       return Err(Failure::new(
         SVN_ERR_FS_NO_SUCH_REVISION,
@@ -159,11 +162,19 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       ));
     }
     let peg = self.existing(peg)?;
-    if !self.readable(&request.path) {
+    if !self.readable(path) {
       return Err(Failure::unreadable_path());
     }
     let as_revision = |revision: i64| Revision::try_from(revision).map_err(|_| Failure::corrupt());
     Ok((peg, as_revision(start)?, as_revision(end)?))
+  }
+
+  /// The peg, start and end revisions for a parsed `get-location-segments` request.
+  fn segments_range(
+    &self,
+    request: &SegmentsRequest,
+  ) -> Result<(Revision, Revision, Revision), Failure> {
+    self.segments_range_of(&request.path, request.peg, request.start, request.end)
   }
 
   /// One turn of `svn_repos_node_location_segments`' loop at `path` in `revision`: the segment from the closest copy

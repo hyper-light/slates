@@ -75,15 +75,15 @@ use super::drive::uri_encode;
 use super::locking::{
   DAV_XML_CONTENT_TYPE, HttpAnswer, convert_status, error_answer, lockdiscovery,
 };
-use super::request::{self, PropertyName, PropfindRequest, Report as Asked, svn_time};
+use super::request::{self, PropertyName, PropfindRequest, Report as Asked, SvnDepth, svn_time};
 use super::response::{self, Body, BulkUpdates, Capability, Httpv2};
 use super::update::{UpdateWalk, Walked};
 use super::xml::{is_xml_safe, quote};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Index, Node, NodeKind, NodeRelation, PropertyList, Revision, Text};
-use crate::lock::{AprTime, LockTable};
-use crate::reads::{DavLog, DavLogProgress, Repository};
+use crate::lock::{AprTime, Depth as LockDepth, Lock, LockTable};
+use crate::reads::{DavList, DavLog, DavLogProgress, Repository};
 use crate::report::drive::history as copies;
 pub use crate::report::exchange::{Budget, Quantum};
 use std::fmt::Write;
@@ -168,6 +168,10 @@ const SVN_ERR_FS_NO_SUCH_REVISION: u32 = 160_006;
 /// Format: the filesystem category's start plus 4 (`svn_error_codes.h`).
 const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 
+/// `SVN_ERR_INCORRECT_PARAMS`: an unsupported depth on `get-locks-report`.
+/// Format: the miscellaneous category's start, 200,000, plus 4 (`svn_error_codes.h`).
+const SVN_ERR_INCORRECT_PARAMS: u32 = 200_004;
+
 /// `SVN_ERR_UNSUPPORTED_FEATURE`.
 /// Format: the miscellaneous category's start, 200,000, plus 7 (`svn_error_codes.h`).
 const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
@@ -205,11 +209,9 @@ const EPOCH_WEEKDAY: u64 = 4;
 /// Format: `apr_time_t` counts microseconds.
 const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
 
-/// The capabilities this site serves, which its OPTIONS answer lists: `log-revprops`, a `log-report`'s revision
-/// properties named or all of them, which a client asks for only where it is listed; and `mergeinfo`, the
-/// `mergeinfo-report` (A-726 part 2), which a client asks only where the repository's `SVN-Repository-MergeInfo` is `yes`.
-/// Format: `version.c` `get_vsn_options`' names (`svn_dav.h`), those whose report or form is served here.
-const SERVED_CAPABILITIES: [Capability; 2] = [Capability::LogRevprops, Capability::Mergeinfo];
+/// The capabilities this site serves, which its OPTIONS answer lists: every capability `mod_dav_svn` 1.15 advertises
+/// (`version.c` `get_vsn_options` and `get_option`), each backed by its served report or commit verb here.
+const SERVED_CAPABILITIES: [Capability; 14] = Capability::ALL;
 
 /// The status a `log-report` refused before its first byte is answered with, where `dav_svn__convert_err` maps the
 /// error to none of its own.
@@ -280,11 +282,14 @@ pub struct Report {
   walk: Walk,
 }
 
-/// The walk a REPORT's answer is: a `log-report`'s, a `file-revs-report`'s or an `update-report`'s.
+/// The walk a REPORT's answer is: a `log-report`'s, a `list-report`'s, a `file-revs-report`'s, a `replay-report`'s
+/// or an `update-report`'s.
 #[derive(Debug)]
 enum Walk {
   /// A `log-report`'s.
   Log(Box<DavLog>),
+  /// A `list-report`'s (`svn ls`; `reports/list.c`).
+  List(Box<DavList>),
   /// A `file-revs-report`'s (`svn blame`; A-726), boxed beside the update.
   FileRevs(Box<super::report_file_revs::FileRevsWalk>),
   /// A `replay-report`'s (`svnsync synchronize`; [`super::report_replay`]).
@@ -328,6 +333,19 @@ impl Report {
     let room = budget.room;
     let log = match &mut self.walk {
       Walk::Log(log) => log,
+      Walk::List(list) => {
+        let progress = list.resume(served.index, served.repository, served.rules, out, budget);
+        return match progress {
+          DavLogProgress::More => ReportProgress::More,
+          DavLogProgress::Waiting(wanted) => ReportProgress::Waiting(wanted),
+          DavLogProgress::Done => ReportProgress::Done,
+          DavLogProgress::Refused { .. } if list.begun() => ReportProgress::Broken,
+          DavLogProgress::Refused { code, message } => {
+            let status = convert_status(code, HTTP_INTERNAL_SERVER_ERROR);
+            ReportProgress::Refused(error_answer(status, true, code, &message))
+          }
+        };
+      }
       Walk::FileRevs(revisions) => return revisions.resume(served, out, budget),
       Walk::Replay(replay) => return replay.resume(served, out, budget),
       Walk::Update(walk) => {
@@ -742,9 +760,15 @@ fn report<R: Repository + ?Sized>(
   if let Asked::Replay(replay) = &asked {
     return replay_report(resource, replay, room);
   }
+  if let Asked::DatedRev(dated) = &asked {
+    return Answer::Whole(dated_rev_report(served, resource, dated.date, room));
+  }
   let Resource::Node(place) = resource else {
     return Answer::Whole(unserved_method("REPORT"));
   };
+  if let Asked::GetLocks(locks_req) = &asked {
+    return Answer::Whole(locks_report(served, place, locks_req.depth, room));
+  }
   match node_at(served, place) {
     Ok(Some(_)) => {}
     Ok(None) => return Answer::Whole(bare(HTTP_NOT_FOUND)),
@@ -768,13 +792,198 @@ fn report<R: Repository + ?Sized>(
       &locations,
       &place.path,
     )),
+    Asked::GetLocationSegments(segments) => Answer::Whole(location_segments_report(
+      served,
+      &segments,
+      &place.path,
+      room,
+    )),
+    Asked::GetDeletedRev(deleted) => {
+      Answer::Whole(deleted_rev_report(served, &deleted, &place.path, room))
+    }
+    Asked::InheritedProps(iprops) => {
+      Answer::Whole(inherited_props_report(served, &iprops, &place.path, room))
+    }
     Asked::FileRevs(revisions) => Answer::Report(Report {
       walk: Walk::FileRevs(Box::new(super::report_file_revs::FileRevsWalk::new(
         &revisions,
         &place.path,
       ))),
     }),
-    _ => Answer::Whole(unserved_method("REPORT")),
+    Asked::List(list) => Answer::Report(Report {
+      walk: Walk::List(Box::new(DavList::new(&list, &place.path))),
+    }),
+    Asked::Update(_) | Asked::Replay(_) | Asked::DatedRev(_) | Asked::GetLocks(_) => {
+      Answer::Whole(unserved_method("REPORT"))
+    }
+  }
+}
+
+/// An XML report's `200 OK` answer, or its refusal status when the body exceeds `room`.
+fn xml_report(body: Result<Vec<u8>, DavRefusal>) -> HttpAnswer {
+  match body {
+    Ok(body) => HttpAnswer {
+      status: HTTP_OK,
+      headers: vec![("Content-Type", String::from(DAV_XML_CONTENT_TYPE))],
+      body,
+    },
+    Err(refused) => refused_body(&refused),
+  }
+}
+
+/// A `dated-rev-report` (`reports/dated-rev.c`): accepted on `!svn/me`, `!svn/vcc/default`, or a node URL.
+fn dated_rev_report<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  resource: &Resource,
+  date: AprTime,
+  room: usize,
+) -> HttpAnswer {
+  if !matches!(resource, Resource::Me | Resource::Vcc | Resource::Node(_)) {
+    return unserved_method("REPORT");
+  }
+  match crate::reads::dated_revision(served.index, served.repository, date) {
+    Ok(revision) => xml_report(response::revision_report(
+      "dated-rev-report",
+      Some(revision),
+      room,
+    )),
+    Err((code, message)) => error_answer(
+      convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+      true,
+      code,
+      &message,
+    ),
+  }
+}
+
+/// A `get-locks-report` (`reports/get-locks.c`): locks at or beneath `place.path` readable by the principal.
+fn locks_report<R: ?Sized>(
+  served: &Served<'_, R>,
+  place: &Place,
+  depth: SvnDepth,
+  room: usize,
+) -> HttpAnswer {
+  let depth = match depth {
+    SvnDepth::Empty => LockDepth::Empty,
+    SvnDepth::Files => LockDepth::Files,
+    SvnDepth::Immediates => LockDepth::Immediates,
+    SvnDepth::Infinity | SvnDepth::Unknown => LockDepth::Infinity,
+    SvnDepth::Exclude => {
+      return error_answer(
+        HTTP_BAD_REQUEST,
+        true,
+        SVN_ERR_INCORRECT_PARAMS,
+        "Invalid 'depth' specified in get-locks-report request",
+      );
+    }
+  };
+  let mut found: Vec<Lock> = served
+    .locks
+    .get_locks(&place.path, depth, served.now)
+    .into_iter()
+    .filter(|lock| may_read(served.rules, &lock.path))
+    .cloned()
+    .collect();
+  found.sort_by(|left, right| left.path.cmp(&right.path));
+  xml_report(response::locks(&found, room))
+}
+
+/// A `get-deleted-rev-report` (`reports/deleted-rev.c`): the revision where `path` was deleted, or `-1`.
+fn deleted_rev_report<R: ?Sized>(
+  served: &Served<'_, R>,
+  report: &super::request::GetDeletedRevReport,
+  target: &str,
+  room: usize,
+) -> HttpAnswer {
+  let path = crate::reads::full_path_of(target, &report.path);
+  match copies::deleted_revision(
+    served.index,
+    &path,
+    report.peg_revision,
+    report.end_revision,
+  ) {
+    Ok(revision) => xml_report(response::revision_report(
+      "get-deleted-rev-report",
+      revision,
+      room,
+    )),
+    Err(refusal) => {
+      let code = refusal.subversion_code();
+      let message = match refusal {
+        crate::index::IndexRefusal::NoSuchRevision { revision } => {
+          format!("No such revision {revision}")
+        }
+        crate::index::IndexRefusal::NotFound { path, revision } => {
+          format!("File not found: revision {revision}, path '{path}'")
+        }
+        _ => String::from("The repository's index refused the request"),
+      };
+      error_answer(
+        convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+        true,
+        code,
+        &message,
+      )
+    }
+  }
+}
+
+/// A `get-location-segments` report (`reports/get-location-segments.c`).
+fn location_segments_report<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  report: &super::request::GetLocationSegmentsReport,
+  target: &str,
+  room: usize,
+) -> HttpAnswer {
+  let path = crate::reads::full_path_of(target, &report.path);
+  match crate::reads::node_location_segments(
+    served.index,
+    served.repository,
+    served.rules,
+    &path,
+    (report.peg_revision, report.start, report.end),
+  ) {
+    Ok(segments) => {
+      let items: Vec<response::Segment> = segments
+        .into_iter()
+        .map(|(path, start, end)| response::Segment { path, start, end })
+        .collect();
+      xml_report(response::location_segments(&items, room))
+    }
+    Err((code, message)) => {
+      error_answer(convert_status(code, HTTP_BAD_REQUEST), true, code, &message)
+    }
+  }
+}
+
+/// An `inherited-props-report` (`reports/inherited-props.c`).
+fn inherited_props_report<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  report: &super::request::InheritedPropsReport,
+  target: &str,
+  room: usize,
+) -> HttpAnswer {
+  let path = crate::reads::full_path_of(target, &report.path);
+  match crate::reads::inherited_properties(
+    served.index,
+    served.repository,
+    served.rules,
+    &path,
+    report.revision,
+  ) {
+    Ok(ancestors) => {
+      let items: Vec<response::InheritedItem> = ancestors
+        .into_iter()
+        .map(|(path, props)| response::InheritedItem { path, props })
+        .collect();
+      xml_report(response::inherited_props(&items, room))
+    }
+    Err((code, message)) => error_answer(
+      convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+      true,
+      code,
+      &message,
+    ),
   }
 }
 

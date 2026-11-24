@@ -577,6 +577,7 @@ enum Last {
   Dropped,
   Ended,
   Hook,
+  NeedText,
   Close,
 }
 
@@ -589,6 +590,7 @@ fn kind_of(step: &Step) -> Last {
     Step::Dropped => Last::Dropped,
     Step::Ended => Last::Ended,
     Step::Hook(_) => Last::Hook,
+    Step::NeedText(_) => Last::NeedText,
     Step::Close => Last::Close,
   }
 }
@@ -1923,4 +1925,163 @@ fn a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted() 
     "the text sealed whole"
   );
   assert_eq!(replay.texts.staged_count(), 0);
+}
+
+/// Encodes a single-file add or edit commit command stream with a Stored svndiff0 delta from `source` to `target`.
+fn single_file_edit_commands(open_prefix: &[u8], source: &[u8], target: &[u8]) -> Vec<u8> {
+  use crate::svndiff::{Compression, Encoder, Version, deltas};
+  let mut enc = Encoder::new(Version::Zero);
+  let mut diff = enc.header().to_vec();
+  let room = std::num::NonZeroUsize::new(1 << 16).unwrap();
+  for win in deltas(source, target, room).unwrap() {
+    enc.window(&win, Compression::Stored, &mut diff).unwrap();
+  }
+  let mut cmds = open_prefix.to_vec();
+  cmds.extend_from_slice(format!("( textdelta-chunk ( 2:c1 {}:", diff.len()).as_bytes());
+  cmds.extend_from_slice(&diff);
+  cmds.extend_from_slice(
+    b" ) ) ( textdelta-end ( 2:c1 ) ) ( close-file ( 2:c1 ( ) ) ) ( close-dir ( 2:d0 ) ) ( close-edit ( ) ) ",
+  );
+  cmds
+}
+
+/// C2 stage B part 2: editing a file whose landed base text was let go (`Green::text` returns `None`,
+/// `Green::text_fetchable` returns `true`). Do: apply an svndiff copy-from-source delta against an away base text,
+/// verify the drive pauses with `Step::NeedText` without duplicating pending bytes, bring the base text back into the
+/// green, retry the identical `textdelta-chunk` item, and close the edit. Expect: accepted work producing the exact
+/// patched target text.
+#[test]
+fn editing_an_away_base_text_pauses_with_need_text_then_succeeds_on_retry() {
+  use std::borrow::Cow;
+  use std::cell::Cell;
+
+  struct AwayGreen<'a> {
+    inner: &'a crate::migration::Repository,
+    missing_id: ContentIdentity,
+    base_bytes: Vec<u8>,
+    brought: Cell<bool>,
+  }
+
+  impl Green for AwayGreen<'_> {
+    fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
+      if *identity == self.missing_id {
+        return self
+          .brought
+          .get()
+          .then_some(Cow::Borrowed(self.base_bytes.as_slice()));
+      }
+      self.inner.text(identity)
+    }
+
+    fn text_fetchable(&self, identity: &ContentIdentity) -> bool {
+      *identity == self.missing_id
+    }
+
+    fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+      Green::properties(self.inner, identity)
+    }
+
+    fn name_text(&self, text: &[u8]) -> ContentIdentity {
+      self.inner.name_text(text)
+    }
+
+    fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
+      self.inner.name_properties(properties)
+    }
+  }
+
+  let base = b"hello world from landed revision one\n".to_vec();
+  let updated = b"hello world from landed revision two!\n".to_vec();
+  let mut replay = Replay::new();
+  let cmds1 = single_file_edit_commands(
+    b"( open-root ( ( 0 ) 2:d0 ) ) ( add-file ( 5:a.txt 2:d0 2:c1 ( ) ) ) ( apply-textdelta ( 2:c1 ( ) ) ) ",
+    &[],
+    &base,
+  );
+  let mut drive1 = Drive::new(alice_setup("/", Vec::new()));
+  let mut out = Vec::new();
+  let mut work1 = None;
+  for (item, _) in items(&cmds1) {
+    if let Step::Accepted(work) = replay.command(&mut drive1, &item, &mut out) {
+      work1 = Some(*work);
+    }
+  }
+  let base_id = *blake3::hash(&base).as_bytes();
+  let rev1 =
+    crate::commit::revision::Revision::of_work(work1.expect("r1 accepted"), AprTime(1_000_000))
+      .unwrap();
+  replay.repository.commit(rev1).unwrap();
+
+  let cmds2 = single_file_edit_commands(
+    b"( open-root ( ( 1 ) 2:d0 ) ) ( open-file ( 5:a.txt 2:d0 2:c1 ( 1 ) ) ) ( apply-textdelta ( 2:c1 ( ) ) ) ",
+    &base,
+    &updated,
+  );
+  let away = AwayGreen {
+    inner: &replay.repository,
+    missing_id: base_id,
+    base_bytes: base.clone(),
+    brought: Cell::new(false),
+  };
+  let texts2 = HeldTexts::new();
+  let mut drive2 = Drive::new(alice_setup("/", Vec::new()));
+  let mut needed_seen = 0_usize;
+  let mut accepted = None;
+  for (item, _) in items(&cmds2) {
+    loop {
+      let step = drive2
+        .command(
+          replay.repository.index(),
+          &away,
+          replay.repository.locks(),
+          &texts2,
+          &item,
+          &mut out,
+        )
+        .unwrap();
+      match step {
+        Step::Hook(_) => {
+          let resumed = drive2
+            .resume(
+              replay.repository.index(),
+              &away,
+              replay.repository.locks(),
+              &texts2,
+              Ok(()),
+              &mut out,
+            )
+            .unwrap();
+          if let Step::Accepted(work) = resumed {
+            accepted = Some(*work);
+          }
+          break;
+        }
+        Step::NeedText(need) => {
+          assert_eq!(
+            need,
+            NeedText {
+              identity: base_id,
+              len: u64::try_from(base.len()).unwrap()
+            }
+          );
+          needed_seen += 1;
+          away.brought.set(true);
+        }
+        Step::Accepted(work) => {
+          accepted = Some(*work);
+          break;
+        }
+        Step::Refused => panic!("unexpected refusal: {}", String::from_utf8_lossy(&out)),
+        _ => break,
+      }
+    }
+  }
+  assert_eq!(needed_seen, 1, "must pause once for away base text");
+  let work2 = accepted.expect("r2 accepted after bring-back");
+  let updated_id = *blake3::hash(&updated).as_bytes();
+  assert!(work2.texts.contains(&updated_id));
+  assert_eq!(
+    TextSink::sealed(&texts2, &updated_id).as_deref(),
+    Some(updated.as_slice())
+  );
 }

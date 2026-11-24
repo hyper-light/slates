@@ -490,6 +490,12 @@ impl TextSource for HeadTexts<'_> {
       && self.text_at(identity, offset).is_none()
   }
 
+  /// A stored text whose windows were let go to the node's changeset store and can be brought back whole for a commit's
+  /// text delta (`BroughtText::bring`, `bring_whole`).
+  fn text_fetchable(&self, identity: &ContentIdentity) -> bool {
+    self.pieces.is_some() && self.stored_len(identity).is_some()
+  }
+
   /// [`TextSource::text_at`] for a reader keeping `cache` across its steps: the green's and the content store's runs
   /// lent in place as `text_at` lends them; a text the records hold, lent in place from them.
   fn text_in<'a>(

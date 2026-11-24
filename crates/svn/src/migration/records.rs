@@ -941,6 +941,12 @@ pub trait TextSource {
   fn fetchable(&self, _identity: &ContentIdentity, _offset: u64) -> bool {
     false
   }
+
+  /// Whether a whole-text read of `identity` ([`TextSource::text`]) that answered none is a landed text the caller can
+  /// bring back asynchronously from the node's changeset store; false by default.
+  fn text_fetchable(&self, _identity: &ContentIdentity) -> bool {
+    false
+  }
 }
 
 /// The records as a text source: the text bytes they hold themselves, a property list's read as a text (module docs,
@@ -1085,6 +1091,10 @@ impl<T: TextSource + ?Sized> ReadSource for WithTexts<'_, T> {
 impl<T: TextSource + ?Sized> Green for WithTexts<'_, T> {
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     self.texts.text(identity)
+  }
+
+  fn text_fetchable(&self, identity: &ContentIdentity) -> bool {
+    self.texts.text_fetchable(identity)
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {

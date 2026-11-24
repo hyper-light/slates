@@ -34,11 +34,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::locking::{HttpAnswer, convert_status, error_answer};
 use super::xml::{Element, parse};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
-use crate::commit::drive::{Drive, Due, Edited, Green, Setup, TextSink, Work};
+use crate::commit::drive::{Drive, Due, Edited, Green, NeedText, Setup, TextSink, Work};
 use crate::commit::edit::{CopiedFrom, EditCommand};
 use crate::index::{Index, NodeKind, PropertyPairs, Revision};
 use crate::lock::LockTable;
 
+/// `SVN_ERR_FS_CORRUPT`: a base text the store lacks when applying a delta synchronously.
+/// Format: `svn_error_codes.h`.
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 /// `SVN_ERR_FS_NO_SUCH_TRANSACTION`: a request on a transaction that has ended.
 /// Format: `svn_error_codes.h`.
 const SVN_ERR_FS_NO_SUCH_TRANSACTION: u32 = 160_007;
@@ -90,6 +93,16 @@ const LOCK_TOKEN_SCHEME: &str = "opaquelocktoken:";
 /// The attribute naming a property value's encoding.
 /// Format: `dav_svn__encode_xml`'s `V:encoding` (`SVN_DAV_PROP_NS_DAV`).
 const ENCODING: &str = "encoding";
+
+/// What one call of [`DavCommit::put_chunk`] did: took the chunk, or paused for a landed base text to be brought back
+/// whole before the caller retries the same chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutChunk {
+  /// The chunk was applied to the open delta.
+  Taken,
+  /// The landed base text must be brought back into memory before retrying this chunk.
+  NeedText(NeedText),
+}
 
 /// What a commit's drive reads: the index, the green and the locks as they stand for this request.
 pub struct World<'a, G: ?Sized> {
@@ -679,8 +692,16 @@ impl DavCommit {
       version_name: put.version_name,
     };
     self.begin_put(world, hooks, path, &start)?;
-    self.put_chunk(world, hooks, put.body)?;
-    Ok(self.end_put(world, hooks))
+    match self.put_chunk(world, hooks, put.body)? {
+      PutChunk::Taken => Ok(self.end_put(world, hooks)),
+      PutChunk::NeedText(_) => {
+        self.over = true;
+        Err(refusal(
+          SVN_ERR_FS_CORRUPT,
+          "The base text is not held in memory",
+        ))
+      }
+    }
   }
 
   /// Begins a PUT of `path`'s text before its body's first run (§4.17.1 "A push's intake": a body is taken as it
@@ -734,7 +755,8 @@ impl DavCommit {
   }
 
   /// One run of the PUT's body, handed to the drive as the delta's next chunk and held no longer: the drive applies
-  /// each window as it completes.
+  /// each window as it completes, or asks for its landed base text to be brought back whole ([`PutChunk::NeedText`])
+  /// before the caller hands the same chunk in again.
   ///
   /// # Errors
   /// The answer to the PUT where the drive refused the chunk, or where no PUT was begun.
@@ -743,15 +765,22 @@ impl DavCommit {
     world: &World<'_, G>,
     hooks: Hooks<'_>,
     chunk: &[u8],
-  ) -> Result<(), HttpAnswer> {
+  ) -> Result<PutChunk, HttpAnswer> {
     let Some(file) = self.putting.as_ref().map(|putting| putting.file.clone()) else {
       return Err(unserved("A PUT's body with no PUT begun"));
     };
-    self.step(
+    match self.edit(
       world,
       hooks,
       &EditCommand::TextdeltaChunk { file: &file, chunk },
-    )
+    )? {
+      Edited::Taken => Ok(PutChunk::Taken),
+      Edited::NeedText(need) => Ok(PutChunk::NeedText(need)),
+      _ => {
+        self.over = true;
+        Err(no_such_transaction(self.drive.pending().transaction))
+      }
+    }
   }
 
   /// Ends the PUT begun last: its delta ended and its file closed with the result checksum; `201` for a file it added,

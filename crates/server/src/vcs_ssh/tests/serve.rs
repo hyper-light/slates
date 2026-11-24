@@ -321,6 +321,7 @@ fn served_by<S, M, C, R>(seats: usize, make: M, client: C) -> (R, Seen)
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
@@ -337,6 +338,7 @@ fn served_keyed<S, M, C, R>(
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
@@ -1277,4 +1279,105 @@ fn an_svnserve_tunnel_serves_a_stock_session_over_the_channel() {
     (seen.counts.commands_run, seen.counts.commands_refused),
     (1, 0)
   );
+}
+
+/// Multi-shard `svn+ssh://` compliance: `svnserve -t` learns the repository name only after the SSH channel carries
+/// the client's ra_svn greeting reply, so the running tunnel must migrate to the repository's owner shard rather than
+/// refusing repos owned by non-listener shards. Do: on a two-shard daemon whose SSH edge listens on `LISTENER`, enroll
+/// the owner's key and create a Subversion repository on each shard; connect over SSH for each, exec `svnserve -t`,
+/// send the greeting reply naming each repository plus `EXTERNAL` and `get-latest-rev`. Expect: both tunnels answer
+/// `( success ( 0 ) )` with exit-status 0 and empty stderr, and `LISTENER` moved one connection that `AWAY` received.
+#[test]
+fn an_svnserve_tunnel_moves_to_the_shard_that_holds_its_repository() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(SHARDS);
+  let bounds = Bounds::of_shard(TWO_SEATS, ROOM_BYTES, TICK_NS);
+  let kept = crate::daemon::observe_at(&daemon, AWAY, move |_state| {
+    keep_here(EdgeState::arrivals(bounds)).is_ok()
+  });
+  assert!(kept, "the other shard keeps an edge");
+  let address = crate::daemon::observe_at(&daemon, LISTENER, move |_state| {
+    let listener =
+      TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog()).ok()?;
+    let address = listener.local_addr().ok()?;
+    let state = keep_here(EdgeState::new(bounds, HOST_SEED)).ok()?;
+    let room = u64::try_from(ROOM_BYTES).unwrap_or(u64::MAX);
+    let task = slates_rt::futures::spawn(async move {
+      let _ = serve(listener, state, move || {
+        super::daemon_edge::daemon_site(room)
+      })
+      .await;
+    })
+    .ok()?;
+    slates_rt::futures::detach(task).ok()?;
+    Some(address)
+  })
+  .expect("the listener's shard serves the edge");
+  enroll_held_key(&daemon);
+  let svn_name_on = |partition: usize| -> String {
+    (0u32..)
+      .map(|serial| format!("svn-ssh-{serial}"))
+      .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == partition)
+      .expect("a name routes there")
+  };
+  let names = [svn_name_on(LISTENER), svn_name_on(AWAY)];
+  for (partition, name) in [(LISTENER, &names[0]), (AWAY, &names[1])] {
+    let name = name.clone();
+    let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+      crate::test_store::create(
+        state,
+        &owner(),
+        RequestBody::CreateRepository {
+          name,
+          tool: VcsTool::Subversion,
+          format: ObjectFormat::Revisions,
+          default_branch: "main".to_owned(),
+          green: None,
+        },
+      )
+    });
+    assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  }
+  let run_tunnel = |name: &str| -> Option<Transcript> {
+    let url = format!("svn+ssh://localhost/{name}");
+    let client = format!(
+      "( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) \
+       {}:{url} 10:testclient ( ) ) ( EXTERNAL ( 0: ) ) ( get-latest-rev ( ) ) ",
+      url.len(),
+    );
+    let mut peer = Peer::connect(address)?;
+    (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+    (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+    exec(&mut peer, b"svnserve -t").then_some(())?;
+    send_data(&mut peer, client.as_bytes());
+    send_eof(&mut peer);
+    Some(transcript(&mut peer))
+  };
+  let transcripts = [run_tunnel(&names[0]), run_tunnel(&names[1])];
+  let counts = [LISTENER, AWAY].map(|partition| {
+    let counts = counts_on(&daemon, partition);
+    (counts.accepted, counts.moved, counts.arrived)
+  });
+  daemon.stop();
+  for (idx, got) in transcripts.iter().enumerate() {
+    let got = got
+      .as_ref()
+      .unwrap_or_else(|| panic!("tunnel {idx} returned no transcript"));
+    assert_eq!(
+      got.status,
+      Some(0),
+      "stderr: {}",
+      String::from_utf8_lossy(&got.err)
+    );
+    assert!(
+      got.err.is_empty(),
+      "stderr: {}",
+      String::from_utf8_lossy(&got.err)
+    );
+    assert!(
+      got.out.ends_with(b"( success ( 0 ) ) "),
+      "unexpected tunnel {idx} output: {}",
+      String::from_utf8_lossy(&got.out)
+    );
+  }
+  assert_eq!(counts, [(2, 1, 0), (0, 0, 1)]);
 }

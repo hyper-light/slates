@@ -459,12 +459,19 @@ const POLICY: Policy<'static> = Policy {
   filesystem: REPOSITORY,
 };
 
+std::thread_local! {
+  /// Test-harness repositories on the calling shard thread, keyed by [`Lends::id`] so [`Lends`] is `Send`
+  /// across the `SshSite::Command: Send` bound without sharing mutable cells across threads.
+  static CREATED_REPOS: std::cell::RefCell<Vec<&'static Created>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Lends the store of [`REPOSITORY`] alone, at [`NOW`], and lands a work as the owner's step does on its records
 /// (`Repository::check_work` with the commit's locks, then `apply`), or refuses every work for want of room.
 #[derive(Clone, Copy)]
 struct Lends {
-  /// The repository, kept for the test's life.
-  created: &'static Created,
+  /// Index into [`CREATED_REPOS`] on the thread that created the repository.
+  id: usize,
   /// Whether every work is refused for want of room.
   full: bool,
 }
@@ -474,19 +481,28 @@ impl Lends {
   fn created() -> Lends {
     let uuid = Uuid::parse(UUID.as_bytes()).expect("the recordings' UUID");
     let records = Records::new(uuid, CREATED, RECORDS_ROOM).expect("revision 0's records");
-    Lends {
-      created: Box::leak(Box::new(Created {
-        current: Cell::new(Box::leak(Box::new(records))),
-        commits: Cell::new(0),
-        stored: StoredTexts::default(),
-      })),
-      full: false,
-    }
+    let created: &'static Created = Box::leak(Box::new(Created {
+      current: Cell::new(Box::leak(Box::new(records))),
+      commits: Cell::new(0),
+      stored: StoredTexts::default(),
+    }));
+    let id = CREATED_REPOS.with(|list| {
+      let mut list = list.borrow_mut();
+      let id = list.len();
+      list.push(created);
+      id
+    });
+    Lends { id, full: false }
+  }
+
+  /// The repository on this thread.
+  fn repo(self) -> &'static Created {
+    CREATED_REPOS.with(|list| list.borrow()[self.id])
   }
 
   /// The records' youngest revision now.
   fn youngest(self) -> Revision {
-    self.created.current.get().youngest()
+    self.repo().current.get().youngest()
   }
 }
 
@@ -554,7 +570,7 @@ impl SvnStores for Lends {
     if !self.holds(id) {
       return None;
     }
-    let created = self.created;
+    let created = self.repo();
     created.commits.set(created.commits.get() + 1);
     if self.full {
       return Some(Err(Unlanded::Budget { available: 0 }));
@@ -583,19 +599,20 @@ impl SvnStores for Lends {
     if !self.holds(id) {
       return None;
     }
-    let mut next = self.created.current.get().clone();
+    let created = self.repo();
+    let mut next = created.current.get().clone();
     // Its texts held apart, as the owner's landing puts them on the node's store (the KeptText move).
     let record = match record {
       slates_svn::commit::record::Record::Revision(mut revision) => {
         let taken = next.take_texts(&mut revision);
-        self.created.stored.borrow_mut().extend(taken);
+        created.stored.borrow_mut().extend(taken);
         slates_svn::commit::record::Record::Revision(revision)
       }
       other => other,
     };
     Some(match next.commit_record(record) {
       Ok(()) => {
-        self.created.current.set(Box::leak(Box::new(next)));
+        created.current.set(Box::leak(Box::new(next)));
         Ok(())
       }
       Err(refusal) => Err(Unlanded::Step(refusal)),
@@ -611,10 +628,11 @@ impl SvnStores for Lends {
     if !self.holds(id) {
       return None;
     }
-    let records = self.created.current.get();
+    let created = self.repo();
+    let records = created.current.get();
     Some(step(&Sources {
       index: records.index(),
-      repository: &View(records, &self.created.stored),
+      repository: &View(records, &created.stored),
       locks: records.locks(),
       now: NOW,
       policy: POLICY,
@@ -648,7 +666,7 @@ fn site<K>(keys: K, owner: Principal) -> (TunnelSite<K>, Lends) {
 pub(in crate::vcs_ssh) fn tunnel_site<K>(
   keys: K,
   owner: Principal,
-) -> impl SshSite<Keys = K> + 'static
+) -> impl SshSite<Keys = K, Command: Send + 'static> + 'static
 where
   K: KeyHolders<Principal = Principal> + Clone + 'static,
 {
@@ -726,6 +744,7 @@ fn drive<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       }
       Next::Input => hand_over(command, runs.next()),
       Next::More => {}
+      Next::Move(shard) => panic!("unexpected shard move to {shard}"),
     }
     let stepped = ready(command.step(ClientGone::never()))
       .expect("a tunnel ends as svnserve ends, never failed");
@@ -766,6 +785,7 @@ async fn drive_awaited<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       }
       Next::Input => hand_over(command, runs.next()),
       Next::More => {}
+      Next::Move(shard) => panic!("unexpected shard move to {shard}"),
     }
     let stepped = command
       .step(ClientGone::never())
@@ -918,7 +938,7 @@ fn a_stock_commit_lands_through_the_owners_step_as_svnserve_t_answered_it() {
   let stock = replaced(MKDIR_SERVER, RECORDED_AUTHOR, author.as_bytes());
   let answered = Answered::of(&as_slates_writes(&stock), "", 0);
   assert_eq!(ended, (answered, MKDIR_CLIENT.len()));
-  assert_eq!((lends.created.commits.get(), lends.youngest()), (1, 1));
+  assert_eq!((lends.repo().commits.get(), lends.youngest()), (1, 1));
 }
 
 /// A-698 (the step's refusal as `close-edit`'s failure; `editorp.c` 1149-1208). Do: through a lender whose step finds
@@ -939,7 +959,7 @@ fn a_work_the_owners_step_refuses_is_answered_as_close_edits_failure() {
   let consumed = MKDIR_CLIENT.len() + ABORT_EDIT.len();
   let answered = Answered::of(&[started, NO_ROOM.to_vec()].concat(), "", 0);
   assert_eq!(ended, (answered, consumed));
-  assert_eq!((lends.created.commits.get(), lends.youngest()), (1, 0));
+  assert_eq!((lends.repo().commits.get(), lends.youngest()), (1, 0));
 }
 
 /// A-688 (`find_repos`: the repository is the longest run of the URL's leading segments that names one). Do: run the
@@ -1255,6 +1275,7 @@ async fn drive_awaiting<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       }
       Next::Input => hand_over(command, runs.next()),
       Next::More => {}
+      Next::Move(shard) => panic!("unexpected shard move to {shard}"),
     }
     let stepped = command
       .step(ClientGone::never())

@@ -301,12 +301,28 @@ const SIXTY: i64 = 60;
 /// Format: `tree.c` `conflict_err`.
 const CONFLICT_AT: &str = "Conflict at";
 
+/// A stored base text the commit's drive needs whole before it can apply a text delta window (C2 stage B part 2:
+/// landed texts are kept on the node's changeset store and brought back on demand).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeedText {
+  /// The text's content identity.
+  pub identity: ContentIdentity,
+  /// Its length in bytes.
+  pub len: u64,
+}
+
 /// What the drive reads from the green beyond the index, and how the green names what the work makes (§4.17.4 item 1:
 /// texts and property lists are content, named by their identity).
 pub trait Green {
   /// The text held as `identity`, borrowed where the green holds it in one piece, owned where it must copy it; `None`
   /// when the green does not hold it.
   fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>>;
+
+  /// Whether the caller can bring `identity` back whole asynchronously when [`Green::text`] answered `None` (a landed
+  /// text whose windows were let go to the node's changeset store); false for a green holding every text in memory.
+  fn text_fetchable(&self, _identity: &ContentIdentity) -> bool {
+    false
+  }
 
   /// The property list held as `identity`, every property, in any order; `None` when the green does not hold it.
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>>;
@@ -710,6 +726,8 @@ pub enum Edited {
   Accepted(Box<Work>),
   /// A hook is due: answer it with [`Drive::resume_edit`].
   Hook(Due),
+  /// A text delta waits for its landed base text to be brought back whole: fetch it, then repeat the command.
+  NeedText(NeedText),
   /// Refused, with `svnserve`'s errors, outermost first: the drive is over.
   Refused(Vec<(u32, String)>),
   /// The drive was over already, or the command could not be read: nothing more is taken.
@@ -734,6 +752,8 @@ pub enum Step {
   /// The command waits for a hook `svnserve` runs inside it (A-661): run it, then hand its answer to
   /// [`Drive::resume`] before any other item. Nothing is written.
   Hook(Due),
+  /// A text delta waits for its landed base text to be brought back whole: fetch it, then hand the same item again.
+  NeedText(NeedText),
   /// An item `svnserve` refuses outside a command error: the connection ends, nothing written.
   Close,
 }
@@ -876,8 +896,8 @@ struct Delta {
   decoder: Decoder,
   /// The bytes received and not yet read.
   pending: Vec<u8>,
-  /// The text it applies to: its identity, or `None` for an empty one.
-  source: Option<ContentIdentity>,
+  /// The text it applies to: its identity and byte length, or `None` for an empty one.
+  source: Option<(ContentIdentity, u64)>,
   /// The new text in the caller's sink, a window appended as each is applied.
   staged: StagedText,
   /// The new text's bytes so far.
@@ -1535,6 +1555,7 @@ impl Drive {
         });
         Edited::Hook(due)
       }
+      Ok(Outcome::NeedText(need)) => Edited::NeedText(need),
       Err(Stop::Close) => {
         self.phase = Phase::Done;
         Edited::Closed
@@ -1589,6 +1610,7 @@ impl Drive {
         });
         Ok(Step::Hook(due))
       }
+      Ok(Outcome::NeedText(need)) => Ok(Step::NeedText(need)),
       Err(Stop::Close) => {
         self.phase = Phase::Done;
         Ok(Step::Close)
@@ -2127,7 +2149,7 @@ impl Drive {
     let delta = Delta {
       decoder: Decoder::new(),
       pending: Vec::new(),
-      source: node.text.map(|text| text.identity),
+      source: node.text.map(|text| (text.identity, text.size)),
       staged,
       size: 0,
       window: Vec::new(),
@@ -2159,16 +2181,22 @@ impl Drive {
     else {
       return Err(Stop::Close);
     };
-    let before = delta.pending.len();
-    delta.pending.extend_from_slice(chunk);
     let source = match delta.source {
-      Some(identity) if texts.contains(&identity) => world.texts.sealed(&identity),
-      Some(identity) => world.green.text(&identity),
+      Some((identity, _)) if texts.contains(&identity) => world.texts.sealed(&identity),
+      Some((identity, len)) => match world.green.text(&identity) {
+        Some(source) => Some(source),
+        None if world.green.text_fetchable(&identity) => {
+          return Ok(Outcome::NeedText(NeedText { identity, len }));
+        }
+        None => None,
+      },
       None => Some(std::borrow::Cow::Borrowed(&[][..])),
     };
     let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
       IndexRefusal::Corrupt,
     )))?;
+    let before = delta.pending.len();
+    delta.pending.extend_from_slice(chunk);
     read_windows(delta, &source, world.texts)?;
     let after = delta.pending.len();
     let held = held.saturating_sub(before).saturating_add(after);
@@ -2627,6 +2655,8 @@ enum Outcome {
   Accepted(Box<Work>),
   /// Waiting for a hook.
   Hook(Due),
+  /// Waiting for a landed base text to be brought back whole.
+  NeedText(NeedText),
 }
 
 /// A deletion's row.

@@ -104,6 +104,9 @@ pub(crate) enum Next {
   More,
   /// It needs more of its client's input before it steps again.
   Input,
+  /// Move the connection and this running command to runtime shard `shard` (e.g., `svnserve -t` once the client's URL
+  /// names a repository owned by another shard).
+  Move(u16),
   /// It exited with this status, once its output is sent.
   Exited(u32),
 }

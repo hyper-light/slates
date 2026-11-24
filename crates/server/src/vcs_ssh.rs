@@ -592,6 +592,7 @@ pub(crate) async fn serve<S, M>(
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
   state.with(|_| ()).ok_or(EdgeRefused::StateGone)?;
@@ -688,16 +689,25 @@ enum Why {
 }
 
 /// How a connection's loop left: it ended, or it moves to the shard its repository lives on (the module doc).
-enum Exit {
+enum Exit<C> {
   /// It ended.
   Ended(Why),
-  /// It moves to runtime shard `shard`, its `exec` not yet dispatched.
+  /// It moves to runtime shard `shard`, carrying either an undispatched `exec` or an already-running command
+  /// (`svnserve -t` once the client's URL names a repository on another shard).
   Moved {
     /// The shard.
     shard: u16,
-    /// The `exec`, dispatched there.
-    exec: Exec,
+    /// What resumes on the target shard.
+    work: MovingWork<C>,
   },
+}
+
+/// What a migrated SSH connection resumes on its repository's owner shard.
+enum MovingWork<C> {
+  /// An `exec` not yet dispatched.
+  Exec(Exec),
+  /// A running command (such as `svnserve -t`) that learned its target shard mid-session.
+  Running(Running<C>),
 }
 
 /// An `exec` a connection carries to the shard its repository lives on, where it is dispatched and answered.
@@ -765,6 +775,8 @@ impl<C: Command> Running<C> {
 enum Turn {
   /// It moved: output written to the channel, or the command asked again.
   Moved,
+  /// The running command asked to migrate this connection to runtime shard `shard`.
+  Move(u16),
   /// It waits on the client: for input, or for the channel's room.
   Client,
   /// Nothing runs.
@@ -860,7 +872,7 @@ impl<S: SshSite> Link<S> {
   }
 
   /// Runs the connection until it ends or moves to its repository's shard (the module doc's loop).
-  async fn run(&mut self) -> Exit {
+  async fn run(&mut self) -> Exit<S::Command> {
     loop {
       if let Some(exit) = self.pass().await {
         return exit;
@@ -870,7 +882,7 @@ impl<S: SshSite> Link<S> {
 
   /// One pass of the loop: pending output written, or the session's end, an event, unread bytes fed, or a turn and a
   /// read; how the connection left if it did, `None` to go round again.
-  async fn pass(&mut self) -> Option<Exit> {
+  async fn pass(&mut self) -> Option<Exit<S::Command>> {
     if let Some(rekeyed) = self.session.take_rekey() {
       // A-745 (main's order): every key exchange after the first is logged with what started it.
       slates_machine::log_line!(
@@ -911,9 +923,18 @@ impl<S: SshSite> Link<S> {
   }
 
   /// The loop's turn, then a read unless the connection moved; how it left if it did.
-  async fn turn_and_read(&mut self) -> Option<Exit> {
+  async fn turn_and_read(&mut self) -> Option<Exit<S::Command>> {
     match self.turn().await {
       Ok(Turn::Moved) => return None,
+      Ok(Turn::Move(shard)) => {
+        let Some(running) = self.running.take() else {
+          return Some(Exit::Ended(Why::Failed));
+        };
+        return Some(Exit::Moved {
+          shard,
+          work: MovingWork::Running(running),
+        });
+      }
       Ok(Turn::Client | Turn::Idle) => {}
       Err(why) => return Some(Exit::Ended(why)),
     }
@@ -1037,7 +1058,7 @@ impl<S: SshSite> Link<S> {
   }
 
   /// Takes one session event: the loop's exit when it ends the connection or moves it.
-  async fn on_event(&mut self, event: SessionEvent<Principal>) -> Option<Exit> {
+  async fn on_event(&mut self, event: SessionEvent<Principal>) -> Option<Exit<S::Command>> {
     match event {
       SessionEvent::Authenticated(authenticated) => {
         self.principal = Some(authenticated.principal);
@@ -1080,16 +1101,16 @@ impl<S: SshSite> Link<S> {
   /// The client's `exec`, where its repository lives (the module doc): on another shard, the connection moves there with
   /// the `exec` undecided; here, it is dispatched now. Only a connection whose key proved a principal moves: an `exec`
   /// without one is refused where it came.
-  fn located(&mut self, command: Asked, git_protocol: Option<Vec<u8>>) -> Option<Exit> {
+  fn located(&mut self, command: Asked, git_protocol: Option<Vec<u8>>) -> Option<Exit<S::Command>> {
     if self.principal.is_some()
       && let Located::Elsewhere(shard) = self.site.locate(&command)
     {
       return Some(Exit::Moved {
         shard,
-        exec: Exec {
+        work: MovingWork::Exec(Exec {
           command,
           git_protocol,
-        },
+        }),
       });
     }
     self.on_exec(&command, git_protocol.as_deref());
@@ -1179,6 +1200,10 @@ impl<S: SshSite> Link<S> {
     match next {
       Next::Exited(status) => Ok(self.exit(status)),
       Next::Input => Ok(Turn::Client),
+      Next::Move(shard) => {
+        running.next = Next::More;
+        Ok(Turn::Move(shard))
+      }
       Next::More => self.step().await,
     }
   }
@@ -1240,11 +1265,17 @@ impl<S: SshSite> Link<S> {
     self.unread.append(&mut kept.into_inner());
     match stepped {
       Ok(stepped) => {
-        if let Some(running) = self.running.as_mut() {
-          running.next = stepped.next;
-        }
         if stepped.consumed > 0 && self.session.consumed(stepped.consumed).is_err() {
           return Err(Why::Refused);
+        }
+        if let Next::Move(shard) = stepped.next {
+          if let Some(running) = self.running.as_mut() {
+            running.next = Next::More;
+          }
+          return Ok(Turn::Move(shard));
+        }
+        if let Some(running) = self.running.as_mut() {
+          running.next = stepped.next;
         }
       }
       Err(refused) => self.fail(refused),
@@ -1279,6 +1310,7 @@ async fn drive<S, M>(stream: TcpStream, make: M, seat: Seat, tracker: Tracker)
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
   let accepted_ns = now_ns();
@@ -1316,10 +1348,11 @@ where
 
 /// A connection's loop left as `exit` (the module doc): an end counted before its socket closes and its seat comes
 /// back; or a move to its repository's shard, counted here, its seat here given back before the connection leaves.
-fn leave<S, M>(link: Link<S>, seat: Seat, exit: Exit, make: M)
+fn leave<S, M>(link: Link<S>, seat: Seat, exit: Exit<S::Command>, make: M)
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
   match exit {
@@ -1328,7 +1361,7 @@ where
       drop(link);
       drop(seat);
     }
-    Exit::Moved { shard, exec } => {
+    Exit::Moved { shard, work } => {
       let Link {
         stream,
         unread,
@@ -1353,7 +1386,7 @@ where
           phase,
           principal,
           accepted_ns,
-          exec,
+          work,
           make,
         },
       );
@@ -1362,9 +1395,9 @@ where
 }
 
 /// A connection on its way to the shard its repository lives on (the module doc): its socket's handle, its session with
-/// the client's bytes it has not taken, its waits, its phase, its principal, when it was accepted, its `exec`
-/// undecided, and what makes its site there. Each part is plain data, so it moves whole.
-struct Moving<K: KeyHolders, M> {
+/// the client's bytes it has not taken, its waits, its phase, its principal, when it was accepted, what resumes on the
+/// target shard, and what makes its site there. Each part is plain data, so it moves whole.
+struct Moving<K: KeyHolders, C, M> {
   /// The socket's handle, its readiness armed on no shard between awaits.
   stream: OwnedStream,
   /// The session.
@@ -1379,8 +1412,8 @@ struct Moving<K: KeyHolders, M> {
   principal: Option<Principal>,
   /// When its listener accepted it.
   accepted_ns: u64,
-  /// The `exec` dispatched there.
-  exec: Exec,
+  /// What resumes on the target shard (`exec` or running command).
+  work: MovingWork<C>,
   /// What makes its site.
   make: M,
 }
@@ -1388,10 +1421,11 @@ struct Moving<K: KeyHolders, M> {
 /// Moves `moving` to runtime shard `shard`: one spawn on that shard's control channel carrying the connection, which
 /// there is seated and served ([`arrived`]). A spawn the channel refuses dropped the socket's handle with it, so the
 /// connection closed; it is counted, as the HTTP edge counts a refused move.
-fn migrate<S, M>(shard: u16, moving: Moving<S::Keys, M>)
+fn migrate<S, M>(shard: u16, moving: Moving<S::Keys, S::Command, M>)
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
   let arrive = slates_rt::task::SpawnRequest::new(
@@ -1409,10 +1443,11 @@ where
 
 /// A connection arrived on this shard ([`migrate`]): served by a task of this shard's, which adopts its socket, seats
 /// it ([`seat_arrival`]) and drives it on. Lost, and counted, on a shard keeping no edge state.
-fn arrived<S, M>(moving: Moving<S::Keys, M>)
+fn arrived<S, M>(moving: Moving<S::Keys, S::Command, M>)
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
   let Some(state) = here() else {
@@ -1431,13 +1466,14 @@ where
   }
 }
 
-/// Adopts the socket of a connection that moved here, seats it, dispatches its `exec` and serves it on: its task is the
-/// seat's, so a reap here cancels it. Lost, and counted, where the socket cannot be adopted; closed, and counted, where
-/// no seat can be had.
-async fn serve_arrival<S, M>(state: Kept<EdgeState>, moving: Moving<S::Keys, M>)
+/// Adopts the socket of a connection that moved here, seats it, resumes its work (`exec` or running command) and serves
+/// it on: its task is the seat's, so a reap here cancels it. Lost, and counted, where the socket cannot be adopted;
+/// closed, and counted, where no seat can be had.
+async fn serve_arrival<S, M>(state: Kept<EdgeState>, moving: Moving<S::Keys, S::Command, M>)
 where
   S: SshSite + 'static,
   S::Keys: Send + 'static,
+  S::Command: Send + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
   let Moving {
@@ -1448,7 +1484,7 @@ where
     phase,
     principal,
     accepted_ns,
-    exec,
+    work,
     make,
   } = moving;
   let Ok(stream) = TcpStream::from_owned(stream) else {
@@ -1472,7 +1508,10 @@ where
     running: None,
     accepted_ns,
   };
-  link.on_exec(&exec.command, exec.git_protocol.as_deref());
+  match work {
+    MovingWork::Exec(exec) => link.on_exec(&exec.command, exec.git_protocol.as_deref()),
+    MovingWork::Running(running) => link.running = Some(running),
+  }
   let exit = link.run().await;
   leave(link, seat, exit, make);
 }

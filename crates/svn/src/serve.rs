@@ -275,6 +275,9 @@ pub enum Turn<'a> {
   /// [`reads::Repository::fetchable`]): write the output, fetch the piece and make it readable to the repository,
   /// then call again with the same input.
   Waiting(reads::Wanted),
+  /// A commit's text delta waits for its landed base text to be brought back whole: fetch the text into the content
+  /// store, then call again with the same input.
+  NeedText(commit_drive::NeedText),
   /// The client answered the greeting, `consumed` bytes: the caller resolves its URL and calls
   /// [`Connection::open`] or [`Connection::refuse`].
   Opened {
@@ -1616,6 +1619,10 @@ impl Connection {
       Step::Hook(due) => {
         self.phase = Phase::Hooked(established, drive);
         Turn::Hook { due, consumed }
+      }
+      Step::NeedText(need) => {
+        self.phase = Phase::Committing(established, drive);
+        Turn::NeedText(need)
       }
       Step::Accepted(work) => {
         self.phase = Phase::Accepted(established);

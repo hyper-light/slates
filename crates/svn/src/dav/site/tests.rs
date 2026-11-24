@@ -166,8 +166,20 @@ fn an_options_answer_lists_the_httpv2_facts_and_no_capability_unserved() {
         "1,2",
         "version-control,checkout,working-resource",
         "merge,baseline,activity,version-controlled-collection",
+        "http://subversion.tigris.org/xmlns/dav/svn/depth",
         "http://subversion.tigris.org/xmlns/dav/svn/log-revprops",
-        "http://subversion.tigris.org/xmlns/dav/svn/mergeinfo"
+        "http://subversion.tigris.org/xmlns/dav/svn/atomic-revprops",
+        "http://subversion.tigris.org/xmlns/dav/svn/partial-replay",
+        "http://subversion.tigris.org/xmlns/dav/svn/inherited-props",
+        "http://subversion.tigris.org/xmlns/dav/svn/inline-props",
+        "http://subversion.tigris.org/xmlns/dav/svn/reverse-file-revs",
+        "http://subversion.tigris.org/xmlns/dav/svn/list",
+        "http://subversion.tigris.org/xmlns/dav/svn/mergeinfo",
+        "http://subversion.tigris.org/xmlns/dav/svn/replay-rev-resource",
+        "http://subversion.tigris.org/xmlns/dav/svn/ephemeral-txnprops",
+        "http://subversion.tigris.org/xmlns/dav/svn/svndiff1",
+        "http://subversion.tigris.org/xmlns/dav/svn/svndiff2",
+        "http://subversion.tigris.org/xmlns/dav/svn/put-result-checksum",
       ],
       vec!["6"],
       vec!["/repo"],
@@ -783,10 +795,10 @@ xmlns:C=\"svn:\">\n<C:error/>\n<m:human-readable errcode=\"160013\">\n{words}\n<
 fn a_report_is_refused_by_its_resource_its_name_and_its_limit() {
   let fixture = Fixture::new();
   let log: &[u8] = b"<S:log-report xmlns:S=\"svn:\"><S:path></S:path></S:log-report>";
-  let dated: &[u8] = include_bytes!("../fixtures/dated-rev-report.xml");
+  let unknown: &[u8] = b"<S:unknown-report xmlns:S=\"svn:\"/>";
   let negative: &[u8] =
     b"<S:log-report xmlns:S=\"svn:\"><S:limit>-1</S:limit><S:path></S:path></S:log-report>";
-  let unserved = fixture.anonymous("REPORT", "/trunk", None, dated);
+  let unserved = fixture.anonymous("REPORT", "/trunk", None, unknown);
   let statuses = [
     fixture
       .anonymous("REPORT", "/trunk/missing.txt", None, log)
@@ -800,6 +812,102 @@ fn a_report_is_refused_by_its_resource_its_name_and_its_limit() {
       text_of(&unserved).contains("The requested report is unknown")
     ),
     ([404, 501, 400], true)
+  );
+}
+
+/// Asserts a synchronous REPORT on `path` answers 200 and contains every expected XML substring.
+fn assert_report_contains(fixture: &Fixture, path: &str, body: &[u8], expected: &[&str]) {
+  let answer = fixture.anonymous("REPORT", path, None, body);
+  let text = text_of(&answer);
+  assert_eq!(answer.status, 200, "{text}");
+  for needle in expected {
+    assert!(text.contains(needle), "missing {needle:?} in {text}");
+  }
+}
+
+/// Full 1.15 DAV REPORT compliance: do send `dated-rev-report` (on `!svn/me`), `get-deleted-rev-report`,
+/// `get-location-segments`, `get-locks-report`, `inherited-props-report`, and `list-report` (streamed). Expect 200
+/// with the exact XML elements `mod_dav_svn` writes.
+#[test]
+fn all_six_newly_wired_dav_reports_answer_as_mod_dav_svn_does() {
+  let mut fixture = Fixture::new();
+  fixture
+    .locks
+    .apply(&LockEntry::Set(Lock {
+      path: "/trunk/a.txt".to_owned(),
+      token: LockToken::supplied("opaquelocktoken:6b4a5e2c-1d3f-4a7b-9c8e-0f1a2b3c4d5e").unwrap(),
+      owner: "alice".to_owned(),
+      comment: Some("working".to_owned()),
+      is_dav_comment: false,
+      created: AprTime(1_767_225_605_000_000),
+      expires: None,
+    }))
+    .unwrap();
+  assert_report_contains(
+    &fixture,
+    "/!svn/me",
+    include_bytes!("../fixtures/dated-rev-report.xml"),
+    &["<D:version-name>1</D:version-name>"],
+  );
+  assert_report_contains(
+    &fixture,
+    "/trunk",
+    b"<S:get-deleted-rev-report xmlns:S=\"svn:\"><S:path>dir/c.bin</S:path>\
+<S:peg-revision>1</S:peg-revision><S:end-revision>6</S:end-revision></S:get-deleted-rev-report>",
+    &["<D:version-name>4</D:version-name>"],
+  );
+  assert_report_contains(
+    &fixture,
+    "/trunk",
+    b"<S:get-location-segments xmlns:S=\"svn:\"><S:path>renamed.txt</S:path>\
+<S:peg-revision>5</S:peg-revision><S:start-revision>5</S:start-revision><S:end-revision>1</S:end-revision>\
+</S:get-location-segments>",
+    &[
+      "path=\"trunk/renamed.txt\" range-start=\"4\" range-end=\"5\"",
+      "path=\"trunk/new.txt\" range-start=\"2\" range-end=\"3\"",
+    ],
+  );
+  assert_report_contains(
+    &fixture,
+    "/trunk",
+    b"<S:get-locks-report xmlns:S=\"svn:\" depth=\"infinity\"/>",
+    &["<S:path>/trunk/a.txt</S:path>", "<S:owner >alice</S:owner>"],
+  );
+  assert_report_contains(
+    &fixture,
+    "/trunk",
+    b"<S:inherited-props-report xmlns:S=\"svn:\"><S:revision>6</S:revision>\
+<S:path>a.txt</S:path></S:inherited-props-report>",
+    &[
+      "<S:iprop-path>trunk</S:iprop-path>",
+      "<S:iprop-propname>svn:mergeinfo</S:iprop-propname>",
+    ],
+  );
+
+  let list_body: &[u8] = include_bytes!("../fixtures/list-report.xml");
+  let anonymous = rules_of(None);
+  let rules = Some(&anonymous);
+  let asked = fixture.ask(rules, "REPORT", ("/trunk", None), list_body);
+  let (headers, body, ended) = reported(&fixture, rules, asked, 32);
+  let list_text = String::from_utf8(body).unwrap();
+  assert_eq!(
+    (
+      headers,
+      ended,
+      list_text.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:list-report"),
+      list_text.contains(">/trunk/a.txt<D:creator-displayname>"),
+      list_text.contains("node-kind=\"dir\""),
+      list_text.ends_with("</S:list-report>\n"),
+    ),
+    (
+      vec![("Content-Type", String::from("text/xml; charset=\"utf-8\""))],
+      ReportProgress::Done,
+      true,
+      true,
+      true,
+      true,
+    ),
+    "{list_text}"
   );
 }
 

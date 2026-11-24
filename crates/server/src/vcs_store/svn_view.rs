@@ -169,6 +169,14 @@ impl SvnStores for ServedRecords {
     FetchedPiece::fetch(id, wanted).await
   }
 
+  async fn bring(
+    &mut self,
+    id: RepositoryId,
+    need: slates_svn::commit::drive::NeedText,
+  ) -> Option<BroughtText> {
+    BroughtText::bring(id, need).await
+  }
+
   async fn land(
     &mut self,
     id: RepositoryId,
@@ -368,6 +376,44 @@ impl Drop for FetchedPiece {
   }
 }
 
+/// A landed base text brought back whole into this shard's content store for a commit's text delta
+/// (`svn_texts::bring_whole`, C2 stage B part 2): held while the commit applies delta windows against it, and given
+/// back (hold released and windows marked away again via `name_holds::give_back_brought`) on drop, file change, end
+/// of edit, or shard migration. Bounded to one brought text per active connection and cancellation-safe.
+#[derive(Debug)]
+pub(crate) struct BroughtText {
+  /// The brought text's identity, until given back.
+  identity: Option<slates_svn::index::ContentIdentity>,
+}
+
+impl BroughtText {
+  /// Brings `need` of repository `id` back whole into this shard's content store, held until dropped; none where the
+  /// node's store could not give it.
+  pub(crate) async fn bring(
+    id: RepositoryId,
+    need: slates_svn::commit::drive::NeedText,
+  ) -> Option<Self> {
+    if super::svn_texts::bring_whole(id, need.identity, need.len).await {
+      Some(Self {
+        identity: Some(need.identity),
+      })
+    } else {
+      None
+    }
+  }
+}
+
+impl Drop for BroughtText {
+  fn drop(&mut self) {
+    if let Some(identity) = self.identity.take() {
+      crate::state::with_state(|state| {
+        super::name_holds::give_back_brought(state, &[identity]);
+      })
+      .unwrap_or_default();
+    }
+  }
+}
+
 /// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here or an import
 /// is under way ([`served`]).
 pub(crate) fn hold_in(state: &mut ShardState, id: RepositoryId) -> Option<SvnHold> {
@@ -502,6 +548,18 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     wanted: slates_svn::reads::Wanted,
   ) -> Option<FetchedPiece> {
     FetchedPiece::fetch(id, wanted).await
+  }
+
+  async fn bring(
+    &mut self,
+    id: RepositoryId,
+    need: slates_svn::commit::drive::NeedText,
+  ) -> Option<BroughtText> {
+    BroughtText::bring(id, need).await
+  }
+
+  async fn locate(&mut self, found: &slates_svn::find::Found) -> Option<crate::vcs_svn::Location> {
+    Some(crate::vcs_svn::locate(found).await)
   }
 
   async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn> {

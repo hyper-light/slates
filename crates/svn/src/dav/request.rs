@@ -307,6 +307,8 @@ pub enum Report {
   Replay(ReplayReport),
   /// `file-revs-report` (`svn blame`; A-726).
   FileRevs(super::listing::FileRevsReport),
+  /// `list-report` (`svn ls`; `reports/list.c`).
+  List(super::listing::ListReport),
 }
 
 /// Reads an OPTIONS body; no body asks for nothing.
@@ -429,6 +431,7 @@ pub fn report(body: &[u8], bounds: &Bounds) -> Result<Report, DavRefusal> {
     "inherited-props-report" => Ok(Report::InheritedProps(inherited_props(&root)?)),
     "replay-report" => replay(&root).map(Report::Replay),
     "file-revs-report" => super::listing::file_revs_from(&root).map(Report::FileRevs),
+    "list-report" => super::listing::list_from(&root).map(Report::List),
     _ => Err(unknown(&root)),
   }
 }

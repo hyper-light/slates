@@ -589,6 +589,7 @@ impl Channel {
           self.consumed += consumed;
           match next {
             Next::More => {}
+            Next::Move(shard) => panic!("unexpected shard move to {shard}"),
             Next::Input => return,
             Next::Exited(status) => {
               self.take(command);
