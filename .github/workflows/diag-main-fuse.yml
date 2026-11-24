@@ -1,0 +1,24 @@
+name: diag main fuse takeover
+# main 01a20182 (2026-11-23): is bridge-fuse's takeover_round red on main itself? w-svn's 4d diag (run 45315337284) read
+# 0 of 2 there: a zero budget's slices came out [1, 1, ...] where the test asserts [2, 1, ...]. Main's ubuntu lane has
+# stopped at clippy since 16e3cd261, so no main run has reached the test. One job at the pushed tree, the whole test file
+# with its output; a diagnostics branch, never merged.
+on:
+  push:
+    branches: ["diag-measurer-main-fuse-*"]
+
+jobs:
+  takeover-round:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: takeover_round at the pushed tree
+        run: cargo test --locked -p slates-bridge-fuse --test takeover_round -- --nocapture
