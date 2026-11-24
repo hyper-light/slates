@@ -716,42 +716,55 @@ async fn stage_owed(
     Vec<slates_svn::index::ContentIdentity>,
   ),
 ) -> Option<Result<(), Uncommitted>> {
-  let give_back = |texts: &[slates_svn::index::ContentIdentity]| {
-    crate::state::with_state(|state| svn_commit::release_texts(state, None, texts))
+  let mut batch = match batch_for((principal, id), staging, &revision).await? {
+    Ok(batch) => batch,
+    Err(refused) => {
+      crate::state::with_state(|state| svn_commit::release_texts(state, None, &texts))?;
+      return Some(Err(refused));
+    }
   };
+  match batch.stage(revision, texts).await? {
+    Ok(None) => {
+      *staging = Some(batch);
+      Some(Ok(()))
+    }
+    Ok(Some(deferred)) => staged_in_the_next((principal, id), staging, (batch, deferred)).await,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| batch.abandon(state));
+      Some(Err(refused))
+    }
+  }
+}
+
+/// The batch `revision` stages in: `staging`'s, landed first where the revision is due after it
+/// (`Staging::due_before`), or a new one where none is under way. Refused, nothing of the revision's is given back here.
+async fn batch_for(
+  (principal, id): (&Principal, RepositoryId),
+  staging: &mut Option<Staging>,
+  revision: &slates_svn::commit::revision::Revision,
+) -> Option<Result<Staging, Uncommitted>> {
   let due = staging.as_ref().and_then(|batch| {
-    crate::state::with_state(|state| batch.due_before(state, &revision)).flatten()
+    crate::state::with_state(|state| batch.due_before(state, revision)).flatten()
   });
   if let Some(cause) = due
     && let Some(batch) = staging.take()
     && let Err(refused) = batch.land(principal, cause).await?
   {
-    give_back(&texts)?;
     return Some(Err(refused));
   }
-  let mut batch = match staging.take() {
-    Some(batch) => batch,
-    None => match Staging::begin(id).await? {
-      Ok(batch) => batch,
-      Err(refused) => {
-        give_back(&texts)?;
-        return Some(Err(refused));
-      }
-    },
-  };
-  let deferred = match batch.stage(revision, texts).await? {
-    Ok(None) => {
-      *staging = Some(batch);
-      return Some(Ok(()));
-    }
-    Ok(Some(deferred)) => deferred,
-    Err(refused) => {
-      let _ = crate::state::with_state(|state| batch.abandon(state));
-      return Some(Err(refused));
-    }
-  };
-  // The batch has no room in the green's retention for the revision (goal 93, main's red of 2026-11-23): it lands, and
-  // the revision begins the next.
+  match staging.take() {
+    Some(batch) => Some(Ok(batch)),
+    None => Staging::begin(id).await,
+  }
+}
+
+/// Lands `batch`, which had no room for `deferred` (its green's retention, A-892, or its chains', A-895), and stages
+/// `deferred` in a batch begun after it. Refused, `deferred`'s texts are given back.
+async fn staged_in_the_next(
+  (principal, id): (&Principal, RepositoryId),
+  staging: &mut Option<Staging>,
+  (batch, deferred): (Staging, svn_commit::staging::Deferred),
+) -> Option<Result<(), Uncommitted>> {
   if let Err(refused) = batch.land(principal, deferred.cause()).await? {
     crate::state::with_state(|state| deferred.give_back(state))?;
     return Some(Err(refused));
