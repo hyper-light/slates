@@ -55801,7 +55801,8 @@ Applied in the same change to:
   sender's batched calls and the healer's loop at each configuration change.
 - **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM` to
   `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows (`fleet.members()`,
-  its quorum's f) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
+  its quorum's f; since A-902, once this node is not behind the configuration its sender ranked by, waited for within
+  the put's budget) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
   the window, and answered `Kept` only once that shard's image holding it is published (`published`, A-727's barrier);
   reads and let-goes by identity. Until A-727 a3 calls the barrier's hooks no image holds the content store, so a put
   from the region answers `Unanswered`, never a `Kept` the image could not back; a put so answered may have kept the
@@ -63132,3 +63133,46 @@ Applied in the same change to: `crates/client/examples/edit_merge_bench.rs` (and
 
 Applied in the same change to: §4.7 (a status), `crates/server/src/verbs.rs`, `crates/server/tests/closed_loop.rs`,
 GAPS (84a's owed line).
+
+### A-902 — A home behind its sender's configuration waits for its own install, within the put's budget, rather than refusing it (2026-11-24, w-shared for main 01a20182, its orders of 2026-11-24 06:01 and 09:10; one wait agreed in writing with w-git; gate 8 and gate 9; A-724 piece 6's door rule, A-727 (d1a)'s wire version rule)
+
+- **Why.** A fresh fleet's first push, right after its repository was made, was refused `Unlanded(HomedShort)`: two
+  of gate 8's runs and three of gate 9's 40 (run 45411079579 at 7d6874639). In every one a remote home answered
+  `Refused(NotAHome)` 0.83 to 1.89 ms into a homing budget of about 2 s. A home keeps an object only where its own
+  installed configuration ranks it among the object's homes. Both sides rank over `fleet.members()`, the members of the
+  last configuration that node installed, and at formation the home had not yet installed the configuration its
+  sender ranked by. Its refusal was final, so the homing fell short. A session not yet made was ruled out by reading:
+  `fleet::session_returned` waits for an install or a drop up to the budget, about 2 s, not 1 ms. Gate 9's logging
+  (w-git, 7d6874639) named `NotAHome` in all three.
+- **The change.** A put and a put's first part carry the configuration version the sender ranked the homes by
+  (`HomeMessage::Put` and `PutPart`'s `configuration`; home wire version 0x84, so an 0x83 member is refused typed at once
+  both ways by A-727 (d1a)'s rule). A home not ranked by its own configuration that is behind its sender waits, within
+  the message's budget, for its own next changing install, then ranks again (`vcs_store::homes::caught_up`). Behind
+  means the carried version is newer than its own installed one, or the sender is not among its members. The second
+  test covers a joiner: until it installs the region's configuration it holds its own council's, whose versions are
+  not the region's. An install wakes the wait (`FleetNode::await_install`, woken only by an install that changes the
+  version or the members, so a period's repeated install wakes nothing); there is no timer. A home ranked, or at the
+  sender's version with the sender among its members, is not behind: a true `NotAHome` or a stale sender is answered
+  at once. Past the budget the put is refused `NotAHome` as before, counted, so a home that never installs that
+  version (removed, cut off) costs its sender its budget once. The wait spends the message's budget; what is left of
+  it is the keep's. Nothing in `git_push` changes: a homing comes back kept, or short as before (w-git, in writing).
+  Counters: `vcs_store.homes.install_waits`, `install_wait_caught_up`, `install_wait_elapsed`.
+- **Rejected.** A-894's creation waiting for every home's configuration instead. That condition is region-wide
+  ("every member holds every other alive") and is wrong for a push into a fleet already formed, where a member still
+  installing the last change is the same case. The sender ranking again on a refusal naming a newer version was also
+  rejected: a second path, and gate 9 showed no stale sender. A-894 stays the record's own wait.
+- **Test** (macOS arm64, debug, 2026-11-24). `vcs_store::homes::tests::
+  a_home_behind_its_senders_configuration_waits_for_its_install_and_refuses_at_once_when_not_behind`. One node plays the
+  home under a configuration the test installs, ranking every window at another member:
+  - (a) a put carrying the next version, that version installed once the put waits: kept, counted caught up;
+  - (b) a put carrying a version never installed: refused `NotAHome` once its budget is spent, counted elapsed;
+  - (c) the node's own version: refused at once, no wait begun;
+  - (d) a sender the node's configuration does not name: waited for, refused past its budget.
+  Red before the change: (a) refused `NotAHome` at once; (a), (b) and (d) began no wait, (b) answered in 7,375 ns of
+  its 20 ms budget; (c) held.
+  Green: all four (2.25 s). Focused: `vcs_store::homes` 16 of 16, `slates-cluster` homes and fleet 15 of 15 (two
+  hand-built puts given the new field), `daemon::tests` 62, `git_push` 41.
+
+Applied in the same change to: §4.10 "Content homed by identity" (piece 6's served line), `crates/cluster/src/homes.rs`
+(wire 0x84), `crates/cluster/src/fleet.rs` (`installs`, `await_install`), `crates/server/src/vcs_store/homes.rs`,
+`crates/server/src/fleet.rs` (the sender's host passed to the home), GAPS.

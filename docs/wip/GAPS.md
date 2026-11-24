@@ -175,6 +175,12 @@
 > ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
 > resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
 > for it (`git_fleet`) until the creation does.
+> **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
+> home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
+> 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
+> behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
+> put's budget; red first in-process (`vcs_store::homes::tests::a_home_behind_its_senders_configuration_...`). OWED
+> (main): gate 10 at the landing, 0 of 40 to close.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
