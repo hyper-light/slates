@@ -37,6 +37,7 @@
 #   WORK    a scratch directory, made empty here and removed at the end
 #   RUNS    the runs of each server (default 3)
 #   BOUND   the seconds any one step may take before it is killed and recorded as such (default 1800)
+# SAMPLE=1 adds a profiling pass after the timed runs: one more slates push and clone, each sampled by macOS's `sample`.
 # SERVERS in the environment names the servers measured, in the order each run starts them (default "stock slates";
 # "stock" alone takes the stock baseline, and SLATES may then be "-"; "stock-http" adds git-http-backend under Apache).
 set -uo pipefail
@@ -75,6 +76,7 @@ timed() {
   local name=$1 start end status
   shift
   start=$(now)
+  LAST_START=$start
   if bounded "$@" > "$WORK/out.${name// /-}" 2> "$WORK/err.${name// /-}"; then status=ok; else status="failed($?)"; fi
   end=$(now)
   echo "$name $(perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$start" "$end") $status" | tee -a "$RESULTS"
@@ -106,27 +108,33 @@ stop_servers() {
   ANCHOR="" DAEMON="" STOCK=""
 }
 # KEEP_LOGS in the environment names a directory the servers' logs and each step's output are copied into at the end.
-trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/status.*.json "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
+trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/status.*.json "$WORK"/trace.* "$WORK"/sample-*.txt "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
 
 # The value of the first line of FILE matching the sed expression, or nothing.
 first() { sed -n "$2" "$1" | head -1; }
 
-# The counters w-git reads (`git_interop.rs` `counters_of`): whether a fetch meets the push's encode or derive still
-# behind, which slates' later runs of fetch and shallow (2.8-8.9 times their first, r811) may and run 1 may escape.
-COUNTERS="vcs_store.git_encode.encoded vcs_store.git_encode.turns vcs_store.git_encode.behind \
-vcs_store.git_encode.ahead_stopped vcs_store.git_derive.derived vcs_store.git_derive.turns"
+# The counters w-git reads (`git_interop.rs` `counters_of`), its list of 2026-11-24 04:55 (main 01a20182): the upload's
+# parts and reuse, the deflate states, the encode, and what was brought into memory, so a slates clone's 127 s against
+# stock's 10.7 (r811) and its later fetches' slowdown can be told apart by what the daemon did.
+COUNTERS=$(printf 'vcs_store.git_upload.%s ' parts_copied parts_by_entry entries_judged entries_copied headers_rewritten \
+  made_whole loose_whole loose_deltas loose_unsearched reused_whole reused_deltas reuse_refused reuse_no_entry \
+  reuse_unread reuse_crc_missed reuse_rebuilt backward_reads stops
+  printf 'vcs_store.git_deflate.%s ' states_made states_reused states_dropped
+  printf 'vcs_store.git_encode.%s ' begun encoded turns behind ahead_stopped reused_whole reused_deltas reuse_refused \
+    units_past_budget
+  printf 'vcs_store.git_resident.%s ' stopped_brought ahead_brought let_go_behind bring_back_past_patience)
 
-# After slates' step $1 of run $2: the daemon's `status --json` kept beside the logs (status.STEP-RUN.json), and a line
-# of COUNTERS, each summed over every shard's report of it as `counters_of` sums them. Read after the step's timing
-# ends, so it costs the step nothing.
-counters_after() {
-  local file="$WORK/status.$1-$2.json"
+# Slates' daemon at `$1` (before or after) step $2 of run $3: its `status --json` kept beside the logs
+# (status.WHEN-STEP-RUN.json), and a line of COUNTERS, each summed over every shard's report of it as `counters_of` sums
+# them. Read outside the step's timing, so it costs the step nothing.
+counters_at() {
+  local file="$WORK/status.$1-$2-$3.json"
   if ! "$SLATES" --instance "$INSTANCE" status --json > "$file" 2> /dev/null; then
-    echo "slates counters after $1 $2: status refused" | tee -a "$RESULTS"
+    echo "slates counters $1 $2 $3: status refused" | tee -a "$RESULTS"
     return 0
   fi
   # shellcheck disable=SC2086 # the counters' names are words
-  python3 -I - "$file" $COUNTERS << 'PY' | sed "s/^/slates counters after $1 $2: /" | tee -a "$RESULTS"
+  python3 -I - "$file" $COUNTERS << 'PY' | sed "s/^/slates counters $1 $2 $3: /" | tee -a "$RESULTS"
 import json, sys
 names = sys.argv[2:]
 sums = dict.fromkeys(names, 0)
@@ -142,6 +150,50 @@ def walk(node):
 walk(json.load(open(sys.argv[1])))
 print(" ".join(f"{name.split('vcs_store.git_')[-1]}={sums[name]}" for name in names))
 PY
+}
+
+# Slates' first bytes of step $1 of run $2, from its clone's packet trace $3 (`GIT_TRACE_PACKET`, which stops at the
+# pack's first bytes): the first packet received (the ref advertisement) and the pack's first bytes, each in seconds
+# after the step began (LAST_START), beside the step's total.
+first_bytes() {
+  python3 -I - "$3" "$LAST_START" << 'PY' | sed "s/^/slates first bytes of $1 $2: /" | tee -a "$RESULTS"
+import datetime, re, sys
+trace, start = sys.argv[1], float(sys.argv[2])
+day = datetime.datetime.fromtimestamp(start).date()
+def at(line):
+    hours, minutes, seconds = line.split(" ", 1)[0].split(":")
+    moment = datetime.datetime.combine(day, datetime.time(int(hours), int(minutes))).timestamp() + float(seconds)
+    return moment if moment >= start - 1 else moment + 86400
+first = pack = None
+try:
+    lines = open(trace, errors="replace")
+except OSError:
+    lines = []
+for line in lines:
+    if re.search(r"packet: +\S+<", line):
+        if first is None:
+            first = at(line)
+        if "PACK" in line:
+            pack = at(line)
+            break
+show = lambda moment: "none" if moment is None else f"{moment - start:.3f} s"
+print(f"first packet {show(first)}, first pack bytes {show(pack)}")
+PY
+}
+
+# Times clone step $1 of run $2 into $3, `git clone -q` taking the arguments after and the server's URL. For slates, the
+# daemon's counters before and after (`counters_at`) and its first bytes (`first_bytes`) too.
+clone_timed() {
+  local step=$1 run=$2 dest=$3 trace="$WORK/trace.$1-$2"
+  shift 3
+  if [ "$server" != slates ]; then
+    timed "$server $step $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q "$@" "$URL" "$dest"
+    return
+  fi
+  counters_at before "$step" "$run"
+  timed "$server $step $run" env "GIT_TRACE_PACKET=$trace" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q "$@" "$URL" "$dest"
+  counters_at after "$step" "$run"
+  first_bytes "$step" "$run" "$trace"
 }
 
 # Starts a fresh slates anchor for run $1 and makes the repository and a token: sets URL, AUTH, ANCHOR, DAEMON and
@@ -266,11 +318,11 @@ steps() {
   timed "$server push $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$SOURCE" push -q "$URL" 'refs/heads/*:refs/heads/*' \
     'refs/tags/*:refs/tags/*'
   [ "$server" = slates ] && echo "slates daemon rss after push: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
-  [ "$server" = slates ] && counters_after push "$run"
-  timed "$server clone $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$mirror"
+  [ "$server" = slates ] && counters_at after push "$run"
+  clone_timed clone "$run" "$mirror" --mirror
   [ "$run" = 1 ] && check "$mirror" "$server"
   # A second clone: what every clone after the first meets, once a server has kept what the first one made (A-718).
-  timed "$server clone-again $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$WORK/$server-again-$run"
+  clone_timed clone-again "$run" "$WORK/$server-again-$run" --mirror
   rm -rf "$WORK/$server-again-$run"
   g clone -q --bare "$SOURCE" "$scratch"
   blob=$(echo "one more commit, $server run $run" | g -C "$scratch" hash-object -w --stdin)
@@ -281,15 +333,15 @@ steps() {
   new=$(g -C "$scratch" commit-tree "$tree" -p HEAD -m "one more commit")
   timed "$server incremental-push $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$scratch" push -q "$URL" "$new:refs/heads/$DEFAULT"
   timed "$server incremental-fetch $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$mirror" fetch -q
-  [ "$server" = slates ] && counters_after incremental-fetch "$run"
+  [ "$server" = slates ] && counters_at after incremental-fetch "$run"
   if [ "$(g -C "$mirror" rev-parse "refs/heads/$DEFAULT" 2> /dev/null)" = "$new" ]; then
     echo "$server incremental check fetched" | tee -a "$RESULTS"
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
   timed "$server shallow $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --depth 1 "$URL" "$WORK/$server-shallow-$run"
-  [ "$server" = slates ] && counters_after shallow "$run"
-  timed "$server partial $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --filter=blob:none "$URL" "$WORK/$server-partial-$run"
+  [ "$server" = slates ] && counters_at after shallow "$run"
+  clone_timed partial "$run" "$WORK/$server-partial-$run" --bare --filter=blob:none
   [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   rm -rf "$mirror" "$scratch" "$WORK/$server-shallow-$run" "$WORK/$server-partial-$run"
 }
@@ -317,6 +369,39 @@ for run in $(seq 1 "$RUNS"); do
     esac
   done
 done
+
+# Runs `$@` (a slates push or clone, the profiling pass's) with the daemon sampled by macOS's `sample` for 30 s from
+# 10 s into it, the call tree kept as sample-$1.txt beside the logs, and the daemon's counters before and after it.
+sampled() {
+  local step=$1 running
+  shift
+  counters_at before "$step" profile
+  "$@" &
+  running=$!
+  sleep 10
+  if ! sample "$DAEMON" 30 -file "$WORK/sample-$step.txt" > /dev/null 2>&1; then
+    echo "profile: sample of the $step refused (macOS's sample, daemon pid $DAEMON)"
+  fi
+  wait "$running" || echo "profile: the $step itself failed ($?)"
+  counters_at after "$step" profile
+  echo "profile: the daemon's call tree over the $step in sample-$step.txt"
+}
+
+# The profiling pass (SAMPLE=1), apart from the timed runs so it cannot skew them: one more slates server, a push of the
+# repository, then a clone of it, each sampled (`sampled`). The push's sample is w-svn's check of A-900 (r244's push
+# profile spent ~10,000 samples in 30 s in memmove under ReceivePack::decide_step's lineage lend); the clone's is w-git's
+# (a slates clone's 127 s against stock's 10.7, r811).
+if [ "${SAMPLE:-}" = 1 ] && [[ " $SERVERS " == *" slates "* ]]; then
+  echo "== profile: one more slates push and clone, sampled (not among the timed runs)"
+  server=slates
+  if start_slates profile; then
+    sampled push "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$SOURCE" push -q "$URL" 'refs/heads/*:refs/heads/*' \
+      'refs/tags/*:refs/tags/*'
+    sampled clone "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$WORK/profile-mirror"
+  fi
+  stop_servers
+  rm -rf "$WORK/profile-mirror"
+fi
 
 echo "== results (seconds; every run shown)"
 FAILED_ROWS=""
