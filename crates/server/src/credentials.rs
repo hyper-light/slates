@@ -433,7 +433,7 @@ async fn to_region(
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
-  let (replied, _stragglers) = slates_cluster::broadcast(
+  let (replied, stragglers) = slates_cluster::broadcast(
     outgoing,
     CREDENTIAL_STREAM,
     slates_transport::connection::Priority::Bulk,
@@ -441,19 +441,27 @@ async fn to_region(
   )
   .await;
   let mut held = 0usize;
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
+  let mut count = |bytes: &[u8]| {
     if let Ok(CredentialMessage::Answer {
       id: answered,
       held: true,
-    }) = CredentialMessage::decode(&reply.bytes)
+    }) = CredentialMessage::decode(bytes)
       && answered == id
     {
       held = held.saturating_add(1);
     }
+  };
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    count(&reply.bytes);
     returned.push((host, endpoint));
   }
   crate::fleet::return_sessions(returned);
+  // A member slower than the round's stall answers late: its answer counts and its session goes back on its link
+  // (A-907); before, the stragglers were dropped and a slow member's link stayed lent for good.
+  for (_, bytes) in crate::fleet::settled_stragglers(stragglers).await {
+    count(&bytes);
+  }
   (held, total)
 }
 

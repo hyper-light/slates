@@ -63237,3 +63237,55 @@ Applied in the same change to: `crates/server/src/live_ship.rs`, `crates/server/
 
 Applied in the same change to: `crates/server/src/fleet.rs` (`owed_state_log_parts`), `crates/server/tests/fleet.rs`,
 GAPS.
+
+### A-907 — Every broadcast's stragglers end on their links: settled by their caller, or handed back when dropped; a home message is served on its own task (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 11:49; gate 10; fixes what A-902 exposed in A-724 piece 8c's exchange and the healer)
+
+- **Why.** Gate 10 (v3_takeover at d48863ddb, 31 of 31 runs): after the owner's death no survivor took the repository
+  over (`takeovers 0 volumes 0`, both survivors' edges 404). In every run one home waited out its budget for an
+  install (A-902: `install_waits 1`, `install_wait_elapsed 1`), and the other survivor counted
+  `fleet.takeover.pages_unsent` about 1,650 times: every takeover period, no session to the one member it asked.
+  - The healer offers windows under the coordinator's round budget (`fleet::follow_configuration`), which stops on a
+    stall of two periods. A home waiting for its install answered after that, so its session was a straggler.
+  - `vcs_store::homes::put_whole` (the healer), `homes::exchange_round` and `credentials`' exchange bound
+    `slates_cluster::broadcast`'s stragglers to `_stragglers` and dropped them. A dropped straggler's session never
+    went back to its link, so the link stayed lent for good (the 2026-11-08 bug `live_ship` settles against).
+  - With it went the council's appends and the takeover's pages to that member, so the install the home waited for
+    never came and no takeover completed. Before A-902 every home answered within milliseconds, so none straggled.
+- **The change.**
+  - One settle (`fleet::settled_stragglers`): the three callers await their stragglers within their dispatch's
+    deadline. A late answer counts as an answer and its session goes back to its link; an unanswered one's link,
+    still out on loan, is dropped to be dialed afresh.
+  - Structural, so the next `_stragglers` costs no session: `slates_cluster::Stragglers`' drop hands every reply still
+    in its channels to the process's orphan hook (`slates_cluster::on_orphaned_session`). A straggler that reports
+    after its stragglers were dropped finds no collector and hands its session to the same hook (`ReplyTx::send`, where
+    the failed send was swallowed). The daemon installs `fleet::orphaned_session`, which settles it on the control
+    shard. On another shard it drops only the link there, the session never carried across shards. With no hook (a
+    crate's own tests) the session is dropped, as before. A reply still in flight at a drop is caught at its send, so
+    `Drop` needs no host list and no link table.
+  - `HOME_STREAM` is served on its own task of the peer's serve loop (`forward_lane::ServedForwards`, as forwarded
+    verbs, live fetches and work routes are), so a home's waits (A-727's publication, A-902's install) hold no other
+    request of its peer.
+  - Still served one at a time per peer, inline: `RECORD_STREAM`, `CONFIG_STREAM`, `TAKEOVER_STREAM`,
+    `TAKEOVER_LEDGER_STREAM`, `MOVE_STREAM`, `CREDENTIAL_STREAM`, the content streams, `MERGE_RECORD_STREAM` and the
+    smaller kinds. A wait added to any of them holds the peer's configuration steps too.
+  - Counters: `fleet.stragglers.returned`, `fleet.stragglers.redialed`.
+- **Test** (macOS arm64, debug, 2026-11-24). `slates-server --test fleet
+  a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`:
+  - Setup: on a three-node `f = 1` fleet, push, then make b and c wait a quarter of the homing budget before
+    answering each home message (`Daemon::delay_home_answers`), past the round's stall.
+  - Owe a a heal walk and wait until it has run through and offered a window. Then answer at once again, and push a
+    commit on top of `main`.
+  - Red, with the settle and the hook switched off: the push refused `unable to commit`, a's exchange logging its home
+    "unanswered after 1,999 ms: no session or no reply" (3 runs). Green: `fleet.stragglers.returned` 2 and the push
+    lands, 3.9 s (2 of 2).
+  - Focused: `slates-cluster` lib (broadcast, stragglers, homes, live: 11) and `--test live`'s
+    `a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back`; `slates-server` lib `vcs_store::homes` and
+    `credentials` (29); fleet `t_a727` (5), `a894_`, `a907_`.
+- **Found, not changed (GAPS).** In the same harness a second push creating a new branch (a fresh history to
+  `refs/heads/after`) is refused `unable to commit`, with or without slow homes or a heal walk. Its barrier logged the
+  new branch's green at version 1 unplaced, `merge.inputs_unplaced` 4, and the names log acknowledged by none, while a
+  placed every names part (`fleet.ship.state_log.placed` 6) and no holder refused one.
+
+Applied in the same change to: `crates/cluster/src/lib.rs` (`Stragglers`' drop, `ReplyTx::send`,
+`on_orphaned_session`), `crates/server/src/fleet.rs` (`settled_stragglers`, `orphaned_session`, `HOME_STREAM` on its own
+task), `crates/server/src/vcs_store/homes.rs`, `crates/server/src/credentials.rs`, `crates/server/src/daemon.rs`, GAPS.

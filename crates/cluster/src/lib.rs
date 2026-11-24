@@ -366,13 +366,37 @@ pub(crate) struct ReplyTx {
 }
 
 impl ReplyTx {
-  /// Hands `reply` to the collector and wakes it. A collector that has gone (the receiver dropped) loses
-  /// nothing it still wanted.
+  /// Hands `reply` to the collector and wakes it. A collector that has gone (its [`Stragglers`] dropped unsettled) hands
+  /// the reply's session to the process's orphan hook instead ([`on_orphaned_session`], A-907), never to nobody: a
+  /// session dropped here left its link lent for good, and that peer was never sent to again (gate 10).
   pub(crate) fn send(&self, reply: Reply) {
-    let _ = self.tx.send(reply);
+    if let Err(std::sync::mpsc::SendError(reply)) = self.tx.send(reply) {
+      orphaned(reply);
+      return;
+    }
     if let Some(collector) = &self.collector {
       collector.wake_by_ref();
     }
+  }
+}
+
+/// What the process does with a dispatch's session whose collector had gone before it reported (A-907): the host, its
+/// reply (answered or not), and the session. Installed once by the daemon ([`on_orphaned_session`]), which puts the
+/// session back on its link, or has the link dialed afresh where nothing answered.
+pub type OrphanedSession = fn(HostId, TimedReply, Endpoint);
+
+/// The installed [`OrphanedSession`] hook: none until the daemon installs one (a crate's own tests, which keep no links).
+static ORPHANED_SESSION: std::sync::OnceLock<OrphanedSession> = std::sync::OnceLock::new();
+
+/// Installs the process's [`OrphanedSession`] hook (A-907), once; a second install changes nothing.
+pub fn on_orphaned_session(hook: OrphanedSession) {
+  let _ = ORPHANED_SESSION.set(hook);
+}
+
+/// Hands an orphaned reply's session to the installed hook; with none installed it is dropped, as before A-907.
+fn orphaned(Reply(host, reply, endpoint): Reply) {
+  if let Some(hook) = ORPHANED_SESSION.get() {
+    hook(host, reply, *endpoint);
   }
 }
 
@@ -403,6 +427,24 @@ pub struct Stragglers {
   /// The waits [`Stragglers::reported`] ended at a report's wake, and those it ended at a timer tick (a task the sends do
   /// not wake): the non-vacuity counts of the woken wait.
   waits: (u64, u64),
+}
+
+/// Stragglers dropped before they settled give every session they still hold to the orphan hook (A-907): the replies
+/// already in their channels now, and each straggler still in flight when it reports, its send then finding no collector
+/// ([`ReplyTx::send`]). So a caller that drops its stragglers costs its peers no session: before, `homes::exchange` and
+/// the healer bound theirs to `_stragglers`, and a home slower than the round's stall left its peer's link lent for
+/// good, the council's appends and the takeover's pages to it unsent (gate 10, 31 of 31 runs).
+impl Drop for Stragglers {
+  fn drop(&mut self) {
+    for pending in &mut self.replies {
+      let Some(replies) = pending.take() else {
+        continue;
+      };
+      while let Ok(reply) = replies.try_recv() {
+        orphaned(reply);
+      }
+    }
+  }
 }
 
 impl Stragglers {

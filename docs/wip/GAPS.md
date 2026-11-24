@@ -212,6 +212,16 @@
 > (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
 > for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
 > held and dropped could be answered at once, if a gate shows it.
+> **FIXED BY CHANGE, gate 12 owed (A-907, w-shared, 2026-11-24): gate 10 failed 31 of 31 at A-902.** A-902's slow
+> home outlasted the healer's round. The healer, the homes' exchange and credentials' exchange dropped their
+> stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
+> unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
+> served on its own task. Red first (`a907_...`).
+> **OPEN (w-shared, 2026-11-24): a second push creating a new branch is refused `unable to commit` in a three-node
+> `f = 1` fleet.** Found while writing A-907's test (`GitFleet`, a fresh history pushed to `refs/heads/after` after a first
+> push to `main`): its barrier saw the new branch's green at version 1 unplaced (`merge.inputs_unplaced` 4) and the names
+> log acknowledged by none, while the owner placed every names part (`fleet.ship.state_log.placed` 6) and no holder
+> refused one. A push on top of `main` lands. Cause not traced; for main to place.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
