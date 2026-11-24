@@ -204,7 +204,8 @@
 > 2. **The repository placed at its name's first-ranked member** at creation, a lookup ranking the name over the
 >    members. Joins and leaves move the rank, and after a takeover the successor is ranked by the id the edge lacks.
 > 3. **A location round by name** to every member. Main ruled it out (no location round).
-> **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
+> **CLOSED (A-902 with A-894, A-903 and A-907, w-shared, 2026-11-24; gate 12: 40 of 40, its NotAHome refusals gone):
+> a fresh fleet's first push refused `HomedShort` by a
 > home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
 > 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
 > behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
@@ -212,11 +213,22 @@
 > (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
 > for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
 > held and dropped could be answered at once, if a gate shows it.
-> **FIXED BY CHANGE, gate 12 owed (A-907, w-shared, 2026-11-24): gate 10 failed 31 of 31 at A-902.** A-902's slow
+> **CLOSED (A-907, w-shared, 2026-11-24; gate 12, 45482482443 at a551b0a88: 40 of 40, release 4.9-8.9 s and debug
+> 7.1-13.9 s a run, ubuntu-latest at load under 3): gate 10 failed 31 of 31 at A-902.** A-902's slow
 > home outlasted the healer's round. The healer, the homes' exchange and credentials' exchange dropped their
 > stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
 > unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
 > served on its own task. Red first (`a907_...`).
+> **OPEN, FOR ADA (w-shared, 2026-11-24; main 01a20182's ruling of 14:54): must a rolling upgrade keep NoLoss across a
+> merge-record format change?** A holder refuses a merge record of another format whole (`MergeRecordValue::decode_record`,
+> `RecordRefused::Version`, counted `merge.record.version_refused`; CLAUDE.md §2 item 7: no second decode path). After an
+> upgrade it therefore cannot rebuild a replica from the old-format records it holds (`merge_origin::rebuild_replica_through`
+> finds nothing), and the owner reships only versions not yet placed. Until each green's next version places at f + 1 in
+> the new format, its acknowledged versions are held only on the owner's own chain, and an owner lost for good in that
+> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 4: A-255, A-288,
+> A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
+> format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
+> Nothing is built on either answer.
 > **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
 > creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
 > (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
@@ -226,7 +238,10 @@
 > record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
 > `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
 > makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
-> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing).
+> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing). A-908, main's
+> ruling of 12:42: part 1 BUILT, the holder's replicas kept by the owner's own type (`crate::greens::Greens`), each
+> standing alone; part 2 owed: version 0's record names its membership, a holder founds and branches lineages,
+> adoption moves a lineage whole, and a branch is rebuilt by branching its source.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,

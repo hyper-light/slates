@@ -12385,15 +12385,23 @@ pub(crate) fn replica_rebase(
       Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
     },
   };
-  let Some(replica) = state.merge.replicas.get(&ObjectId(sealed.green.bytes)) else {
+  let Some(replica) = state
+    .merge
+    .replicas
+    .lend(&crate::merge_service::replica_key(ObjectId(
+      sealed.green.bytes,
+    )))
+  else {
     state.count(crate::work_home::REPLICA_BEHIND, 1);
     return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
   };
   if inc.base > replica.head() {
+    drop(replica);
     state.count(crate::work_home::REPLICA_BEHIND, 1);
     return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
   }
-  let answer = merge_answer(replica, (sealed.green, inc), true, sealed.merge.as_ref());
+  let answer = merge_answer(&replica, (sealed.green, inc), true, sealed.merge.as_ref());
+  drop(replica);
   state.count(REBASED_ON_REPLICA, 1);
   answer
 }
@@ -12415,7 +12423,9 @@ pub(crate) fn compose_on_replica(
   let Some(replica) = state
     .merge
     .replicas
-    .get(&ObjectId(sealed.green.bytes))
+    .lend(&crate::merge_service::replica_key(ObjectId(
+      sealed.green.bytes,
+    )))
     .filter(|replica| sealed.base_version <= replica.head())
   else {
     state.count(crate::work_home::REPLICA_BEHIND, 1);
@@ -12423,7 +12433,7 @@ pub(crate) fn compose_on_replica(
   };
   let base = replica.base_for(sealed.base_version, &sealed.journal);
   let files_base = crate::work_files::Base {
-    green: Some(replica),
+    green: Some(&replica),
     green_id: None,
     fetched: None,
     version: sealed.base_version,
@@ -12441,7 +12451,9 @@ pub(crate) fn compose_on_replica(
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
-  )?;
+  );
+  drop(replica);
+  let inc = inc?;
   state.count(COMPOSED_ON_REPLICA, 1);
   Ok(inc)
 }
@@ -12902,7 +12914,7 @@ fn admit_work(
 /// that holds it, which `work_home::answer_on_owner` has checked holds the work's base version.
 enum BaseEngine<'a> {
   Owned(crate::greens::GreenRef<'a>),
-  Replica(&'a slates_merge::engine::Green),
+  Replica(crate::greens::GreenRef<'a>),
 }
 
 impl std::ops::Deref for BaseEngine<'_> {
@@ -12927,7 +12939,7 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
   state
     .merge
     .replicas
-    .get(&ObjectId(green.bytes))
+    .lend(&crate::merge_service::replica_key(ObjectId(green.bytes)))
     .map(BaseEngine::Replica)
 }
 

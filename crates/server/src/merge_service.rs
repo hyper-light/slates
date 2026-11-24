@@ -56,6 +56,12 @@ use crate::verbs::{
   core_snapshot, find, forbidden, refused, rights_of, to_db_snapshot, to_db_volume, wire_id,
 };
 
+/// The key a holder's replica of `object` is kept under in [`MergeShardState::replicas`] (A-908): the green's volume id,
+/// the key the owner's greens use, so a replica is kept by the owner's type ([`crate::greens::Greens`]).
+pub(crate) fn replica_key(object: ObjectId) -> DbVolumeId {
+  DbVolumeId { bytes: object.0 }
+}
+
 /// The merge plane's per-shard state (§4.16): one field on [`ShardState`], so the join with the
 /// rest of the daemon is a single line there and a single line at init.
 #[derive(Default)]
@@ -85,7 +91,7 @@ pub struct MergeShardState {
   /// This holder's replica of each green it backs (§4.16 "Apply on holders"): the engine the
   /// holder recomputes every version into before accepting the record that names it. Empty on a
   /// laptop (no records arrive).
-  pub replicas: BTreeMap<ObjectId, Green>,
+  pub replicas: crate::greens::Greens,
   /// This holder's durable checkpoint of each green it backs (A-404): its replica's state at the newest committed
   /// version a record named, kept as a held piece (`content_holder`), so a rebuild after a restart starts there.
   /// Bounded by the greens it backs, one each, dropped with the green.
@@ -4796,8 +4802,13 @@ fn record_standing(
   version: u64,
   sender: HostId,
 ) -> Option<RecordStanding> {
-  let next = match state.merge.replicas.get(&object) {
-    Some(replica) => Some(replica.reached().saturating_add(1)),
+  let reached = state
+    .merge
+    .replicas
+    .lend(&crate::merge_service::replica_key(object))
+    .map(|replica| replica.reached());
+  let next = match reached {
+    Some(reached) => Some(reached.saturating_add(1)),
     // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
     // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
     // refused out of order here, for good.
@@ -4973,7 +4984,10 @@ pub(crate) fn accept_merge_record(
       state.count(reason, 1);
       if reason == RECOMPUTE_MISMATCH {
         state.merge.refused.insert(object);
-        state.merge.replicas.remove(&object);
+        state
+          .merge
+          .replicas
+          .remove(&crate::merge_service::replica_key(object));
         slates_machine::log_line!(
           "slates-server: merge record for green {} version {} from {:?}: the recomputed identity does not match the record; the green is refused on this holder",
           hex(&object.0),
@@ -5079,7 +5093,11 @@ fn recompute(
     let Some(bytes) = inputs else {
       return Err(INPUTS_UNHELD);
     };
-    let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
+    let mut replica = state
+      .merge
+      .replicas
+      .remove(&crate::merge_service::replica_key(object))
+      .ok_or(OUT_OF_ORDER)?;
     let started = slates_machine::clock::monotonic_ns();
     let applied = apply_inputs(&mut replica, bytes, value.version);
     count_phase(
@@ -5089,7 +5107,10 @@ fn recompute(
     );
     if let Err(reason) = applied {
       // Given back as it was: a later record or an adoption meets it again.
-      state.merge.replicas.insert(object, replica);
+      state
+        .merge
+        .replicas
+        .insert(crate::merge_service::replica_key(object), replica);
       // A replica owing its push is made from the repository's objects on this node, and the record judged once it is
       // (A-813's limit, `crate::replica_build`).
       if reason == REPLICA_OWES {
@@ -5104,13 +5125,25 @@ fn recompute(
   }
   // Version 0 of a green this holder already replicates: accepted only if it is the same origin.
   if value.version == 0
-    && let Some(existing) = state.merge.replicas.get_mut(&object)
+    && let Some(mut existing) = state
+      .merge
+      .replicas
+      .lend_mut(&crate::merge_service::replica_key(object))
     && existing.head_identity() != value.identity
   {
     return Err(OUT_OF_ORDER);
   }
-  if value.version == 0 && state.merge.replicas.contains_key(&object) {
-    replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
+  if value.version == 0
+    && state
+      .merge
+      .replicas
+      .contains_key(&crate::merge_service::replica_key(object))
+  {
+    replica = state
+      .merge
+      .replicas
+      .remove(&crate::merge_service::replica_key(object))
+      .ok_or(OUT_OF_ORDER)?;
   }
   // The version's provenance (A-321), as the record carries it: the replica a takeover adopts (A-333) answers it as the
   // owner judged it.
@@ -5122,7 +5155,10 @@ fn recompute(
   // Folded where the owner had folded when it made this record (A-385): nothing at or past the floor is lost, and no
   // later increment is based below it.
   fold_replica(state, &mut replica, value.folded_below);
-  state.merge.replicas.insert(object, replica);
+  state
+    .merge
+    .replicas
+    .insert(crate::merge_service::replica_key(object), replica);
   // A submit of a work on this holder node waits for its version here (A-697 part d).
   crate::work_home::replica_reached(state, object);
   Ok(())
@@ -5181,7 +5217,11 @@ pub(crate) fn fold_replica(state: &mut ShardState, replica: &mut Green, floor: u
 /// A holder's view of `object`'s replica, for a test.
 pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeState {
   HolderMergeState {
-    version: state.merge.replicas.get(&object).map(Green::reached),
+    version: state
+      .merge
+      .replicas
+      .lend(&crate::merge_service::replica_key(object))
+      .map(|replica| replica.reached()),
     refused: state.merge.refused.contains(&object),
   }
 }
