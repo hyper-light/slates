@@ -7721,8 +7721,18 @@
 >   `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (refused 1, then answered). Fleet
 >   leg: `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted`, the successor withholding its
 >   confirmation until its restart. Record: `docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md`.
->   **Still open (harness):** under load 55 to 73 on adacachy2 the scene's setup attach (`write_attachment`) and its
->   single-try reads (`continuity_read`) meet `Overloaded { shard: 1 }`, a retryable refusal neither retries.
+>   **Not the harness (w-chaos, 2026-11-23): the refusal never clears.** A diagnostic build named each site that
+>   refused and printed every node's counters at the scene's end (adacachy2, load 38 to 57, kiln r649). In 4 of 6 runs,
+>   3 of 3 of the A-885 leg and 1 of 3 of this test, every read was refused `Overloaded { shard: 1 }` for the whole of
+>   its 60 s window, 593 to 597 times, and in one run the write's attach was too. Both live coordinators ran 579 to 591
+>   periods a minute meanwhile. The successor's routing names it the volume's owner, but its owner shard holds no
+>   volume and no materialization is pending. So `await_materialization` ends at once and `resolve_and_forward` refuses
+>   again (`fleet.owner_location.owned_unmaterialized` 4,165 to 4,774 a run). Every run restored the volume from the
+>   image and resumed it. Only the failed runs then took it over again after the restart (`fleet.live.taken_over` 1,
+>   `fleet.live.rebuilds_begun` 1). A retry cannot turn these runs green, so round 1's retry was not landed. It also
+>   charged the client's own shard, which counts no periods on a two-shard node, and 3 of its 6 runs failed anyway, two
+>   at `FROZEN_CAP` (304 s) and one at its 900 s timeout. **Open (daemon):** the takeover a restarted successor runs on
+>   its own live volume leaves the owner shard without the volume while the routing names the node its owner.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
