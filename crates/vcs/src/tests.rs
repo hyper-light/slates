@@ -851,6 +851,13 @@ fn a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put() {
   index.release(&mut store).unwrap();
   assert_empty(&store);
 
+  assert_a_merge_refused_over_budget_gives_back_what_it_put(&before);
+}
+
+/// The last step of [`a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put`]: over a store whose budget
+/// leaves room for one merged table beside the runs, step a merge until it is refused. Expect: refused over budget, the
+/// store's contents and bytes as before it began, every row read back as `before`, and the store empty once released.
+fn assert_a_merge_refused_over_budget_gives_back_what_it_put(before: &[(Vec<u8>, Vec<u8>)]) {
   let runs_use = {
     let mut store = ContentStore::new(1 << 20, WINDOW).unwrap();
     let index = forty_rows_in_runs(&mut store);
