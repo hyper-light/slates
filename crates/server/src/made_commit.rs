@@ -154,9 +154,11 @@ pub(crate) fn take_turn(
   if !recorded {
     return match tool {
       Tool::Subversion => Taken::Unrecorded(VcsTool::Subversion),
-      // GAPS (main's sweep of 2026-11-23): git's and Mercurial's made commits outside a recorded request, their
-      // owners'.
-      Tool::Mercurial | Tool::Git => Taken::Unhooked,
+      // git's too (main 01a20182's ruling of 2026-11-24 01:36, A-888's git half): its commit is made only through the
+      // held verdict, never after a version committed alone.
+      Tool::Git => Taken::Unrecorded(VcsTool::Git),
+      // GAPS (main's sweep of 2026-11-23): Mercurial's made commits outside a recorded request, their owner's.
+      Tool::Mercurial => Taken::Unhooked,
     };
   }
   let turn = match state.made_commits.ready.remove(&repository) {

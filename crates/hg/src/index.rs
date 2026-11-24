@@ -1144,7 +1144,29 @@ impl HgIndex {
   /// revision's bytes. `None` where the index or the store does not hold it whole. The text handed out is its one
   /// allocation: a whole is read at its length, and a chain is rebuilt through the index's own buffers ([`TextBuffers`]).
   pub fn revision_text(&self, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Vec<u8>> {
+    self.revision_text_over(store, log, rev, &[])
+  }
+
+  /// [`HgIndex::revision_text`] where the texts of some revisions of `log` are `given` by node, each read in place of
+  /// its row's object (goal 93, C1 (1): a manifest's chain resting on one whose text was let go once landed, read back
+  /// from the node's changeset store): the chain is rebuilt from the nearest given text, its deltas above it applied.
+  pub fn revision_text_over(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    rev: u32,
+    given: &[(Node, Vec<u8>)],
+  ) -> Option<Vec<u8>> {
+    let given_text = |node: &Node| {
+      given
+        .iter()
+        .find(|(given, _)| given == node)
+        .map(|(_, text)| text.as_slice())
+    };
     let row = self.revision(store, log, rev)?;
+    if let Some(text) = given_text(&row.node) {
+      return Some(text.to_vec());
+    }
     if let Some(block) = row.block {
       return framed_text(store, (&block, &row.bytes), row.len);
     }
@@ -1153,8 +1175,13 @@ impl HgIndex {
     }
     let mut chain = vec![row];
     let mut at = row.base;
+    let mut over: Option<&[u8]> = None;
     // Each base is before its revision, so the walk takes at most `rev` steps.
     while let Some(link) = self.revision(store, log, at) {
+      if let Some(text) = given_text(&link.node) {
+        over = Some(text);
+        break;
+      }
       chain.push(link);
       if link.base == NONE {
         break;
@@ -1164,7 +1191,6 @@ impl HgIndex {
       }
       at = link.base;
     }
-    let whole = chain.pop()?;
     // Each delta is applied into the other of two text buffers and read into one reused delta buffer from the store's
     // windows (main's order of 2026-11-20, Ada's no-allocation rule): a chain costs the two longest texts and its
     // longest delta, never a text and a delta a link. A chain is up to its text's length of deltas, so a text a link
@@ -1174,7 +1200,13 @@ impl HgIndex {
     let mut held = self.buffers.try_borrow_mut().ok();
     let mut own = TextBuffers::default();
     let buffers = held.as_deref_mut().unwrap_or(&mut own);
-    let mut text = object_text(store, &whole.bytes, whole.len)?;
+    let mut text = match over {
+      Some(text) => text.to_vec(),
+      None => {
+        let whole = chain.pop()?;
+        object_text(store, &whole.bytes, whole.len)?
+      }
+    };
     let mut next = core::mem::take(&mut buffers.next);
     let mut room = crate::Admission::new(u64::MAX);
     let rebuilt = chain.iter().rev().try_for_each(|step| {

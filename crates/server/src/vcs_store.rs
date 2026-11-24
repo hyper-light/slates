@@ -331,9 +331,6 @@ pub(crate) struct VcsStores {
   /// Each git green's whole map built in slices after a push, between its slices ([`paths::whole_build`], A-664's live
   /// whole builds): one a green, so bounded by the partition's greens.
   whole_builds: paths::whole_build::Builds,
-  /// The git commits the server makes of versions already committed, landed and recorded a job at a time
-  /// ([`commits::MadeAfter`], C5 part 2b piece 3): bounded by the shard's client seats.
-  pub(crate) made_after: commits::MadeAfter,
   /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
   /// partition's repositories.
   index_upkeep: index_upkeep::Upkeep,
@@ -398,9 +395,6 @@ pub(crate) struct GitStore {
   /// of an index apart from the git objects', put there by its entry's append ([`admit_lfs`]) and by a recovery's
   /// replay of that entry's record ([`lfs_record`]), and given back with the store.
   pub(crate) lfs: LfsObjects,
-  /// The commits owed by submits whose maps are built whole after them (A-664's live whole builds, part 2, [`owed`]),
-  /// by the green's key: one a green, each settled as the made commit's move of its green to its version commits.
-  pub(crate) owed: BTreeMap<u64, owed::Owed>,
   /// The sequence of the changeset this repository landed last on the node's changeset log (A-767 C5): 0 its creation's
   /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
   /// register's records at recovery, so the next push after a crash lands at the last one named + 1.
@@ -421,7 +415,6 @@ impl GitStore {
       versions: BTreeMap::new(),
       charged: 0,
       lfs: LfsObjects::new(),
-      owed: BTreeMap::new(),
       landed: 0,
     }
   }
@@ -542,6 +535,14 @@ pub(crate) enum ReplayRefused {
   Pack(slates_git::unpack::Refusal),
   /// An owed commit's record's bytes (A-664's live whole builds, part 2).
   Owed(owed::OwedRefused),
+  /// An owed commit's record, read whole: a version of the green keyed `key` committed before its commit was made,
+  /// which no server writes since main 01a20182's ruling of 2026-11-24 01:36 ([`owed`]), so nothing makes it.
+  OwedCommit {
+    /// The green's key in the store.
+    key: u64,
+    /// The version the commit was owed of.
+    version: u64,
+  },
   /// A version-3 git record's names (A-724 piece 8c) not read: the store holds no content of their identity whole (not
   /// yet fetched from their region homes), or its rows are refused.
   Names(record_names::NamesRefused),
@@ -2056,7 +2057,7 @@ impl SealedPush {
   /// are still the names it would write (another push may have committed one of its objects since: refused, for the
   /// client's retry, never written inline). One bringing objects nobody homed and landed is refused `Unlanded`: no record
   /// carries a push's objects (C5 part 2b piece 3; a server-made commit lands as a client's push does,
-  /// `commits::make_deferred` and `commits::MadeAfter`).
+  /// `commits::make_deferred`).
   pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
     let (bytes, now) = self.names_now(stores)?;
     // A-850: each move's base, the version it was made at, as its admission found it, so a replay takes the same.
@@ -3026,14 +3027,6 @@ fn commit_moves(
   store.charged = store.charged.saturating_add(cost);
   for (key, version, _) in keyed {
     store.versions.entry(*key).or_default().push(*version);
-    // A made commit's move of its green to the version a commit was owed of settles it ([`owed`]).
-    if store
-      .owed
-      .get(key)
-      .is_some_and(|owed| owed.version <= *version)
-    {
-      store.owed.remove(key);
-    }
   }
   Ok(keep_values(content, store, moves))
 }
@@ -3125,17 +3118,15 @@ fn replay_git(
   store: &mut GitStore,
   bytes: &[u8],
 ) -> Result<u64, ReplayRefused> {
-  // An owed commit's record (A-664's live whole builds, part 2): owed again, unless a made commit settled it already.
+  // An owed commit's record (A-664's live whole builds, part 2), which no server since main 01a20182's ruling of
+  // 2026-11-24 01:36 writes: a git green's version commits with its made commit or not at all, so a log holding one has
+  // a version whose commit nothing will make. Refused typed, naming the green's key and the version ([`owed`]).
   if owed::is_owed(bytes) {
     let owed = owed::Owed::decode(bytes).map_err(ReplayRefused::Owed)?;
-    let settled = store
-      .versions(owed.key)
-      .last()
-      .is_some_and(|made| *made >= owed.version);
-    if !settled {
-      store.owed.insert(owed.key, owed);
-    }
-    return Ok(0);
+    return Err(ReplayRefused::OwedCommit {
+      key: owed.key,
+      version: owed.version,
+    });
   }
   let format = store.repository.format();
   let record = Record::decode(bytes, format).map_err(ReplayRefused::Record)?;
@@ -4677,7 +4668,6 @@ async fn remake_greens(
     }
     slices.unit_done().await;
   }
-  paths::whole_build::resume_owed(state, record.id);
 }
 
 /// Makes repository `id`'s store again from the log (module docs): what a commit whose entry was not made durable left
@@ -4718,7 +4708,7 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
 /// records replayed in one step held its shard past the watchdog's window and crash-looped the daemon, as Mercurial's did.
 /// Its store made empty now and lent to nothing ([`VcsStores::rebuild_turns`]), its records replayed a record a turn by
 /// a task ([`rebuild_turn`]), and once the last is in, each green's map made again in slices by its build
-/// (`paths::whole_build`), whose end makes any commit owed.
+/// (`paths::whole_build`).
 fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
   free(state, id);
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {

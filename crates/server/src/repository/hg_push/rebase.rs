@@ -166,14 +166,26 @@ pub(super) async fn rebase_sliced(
           .flatten()
           .map(Ok);
       }
-      // A re-base reads the fork's rows, never the changegroup's bytes nor the store.
-      Ok(Stepped::Wanted(_) | Stepped::Store) => {
+      // A manifest's text not at hand, let go once landed (goal 93, C1 (1)): read from the node's changeset store between
+      // slices, as the intake reads one, and the slice taken again.
+      Ok(Stepped::Store) => {
+        let rebase = rebasing.rebase.as_mut()?;
+        if !vcs_store::hg_view::answer_store_wants(rebase, repository).await {
+          return Some(Err(PushOutcome::refused(&abort(REBASE_UNREAD.to_vec()))));
+        }
+      }
+      // A re-base reads the fork's rows, never the changegroup's bytes.
+      Ok(Stepped::Wanted(_)) => {
         return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
       }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
     }
   }
 }
+
+/// Format: slates' words for a re-base whose manifest text, let go once landed, the node's changeset store did not give.
+const REBASE_UNREAD: &[u8] =
+  b"push refused: its re-base could not read a manifest from the changeset store";
 
 /// Format: slates' words for a re-base that asked for a changegroup's bytes, which none reads.
 const REBASE_WANTED: &[u8] = b"push refused: its re-base asked for bytes of its changegroup";

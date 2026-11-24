@@ -69,6 +69,12 @@ pub(crate) struct ImportBatch {
   room: u64,
   /// What the staged versions reserved of it.
   reserved: u64,
+  /// The bytes the batch's chain entries may take of the partition's green chains (`caps.green_chain_bytes`): their
+  /// room when the batch began and this green's own chain, which the landing's admission checkpoints where it must
+  /// (`push::append_versions`), taken when the batch began (A-895).
+  chain_room: usize,
+  /// What the staged versions' chain entries take of it.
+  entries: usize,
 }
 
 /// Why a revision's work could not be staged.
@@ -95,6 +101,17 @@ pub(crate) enum StageRefused {
     /// The room.
     room: u64,
   },
+  /// The work's chain entry would take the batch past its chains' room (`ImportBatch::chain_room`, A-895): the batch
+  /// lands first, and the work begins the next. Never refused to a batch with nothing staged, whose landing's append
+  /// refuses an entry past the room alone, typed (`TableAtCapacity { table: "green_chains" }`).
+  PastChainRoom {
+    /// What the staged versions' entries take.
+    entries: usize,
+    /// The work's entry.
+    entry: usize,
+    /// The room.
+    room: usize,
+  },
 }
 
 impl ImportBatch {
@@ -111,6 +128,13 @@ impl ImportBatch {
     let _ = crate::merge_service::settle_green_retention(state, green);
     let cap = u64::try_from(crate::merge_service::rejected_cache_budget(state)).unwrap_or(u64::MAX);
     let charged = state.green_retention.get(&green).copied().unwrap_or(0);
+    let partition = state.db.partition();
+    let own_chain = partition
+      .green_chain(green)
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add);
+    let chain_room = partition.green_chain_room().saturating_add(own_chain);
     let preview = state
       .greens
       .preview_at_head(&green)
@@ -122,6 +146,8 @@ impl ImportBatch {
       staged: Vec::new(),
       room: cap.saturating_sub(charged),
       reserved: 0,
+      chain_room,
+      entries: 0,
     })
   }
 
@@ -198,18 +224,28 @@ impl ImportBatch {
     // (A-760 (b) 4d), which the scratch member holds by name alone as the green does.
     let mut lent = Vec::new();
     let mut judged_again = false;
+    // A batch of none takes any work's entry, which its landing's append refuses typed where it is past the room alone.
+    let chain_left =
+      (!self.staged.is_empty()).then(|| self.chain_room.saturating_sub(self.entries));
     let judged = loop {
       let judged = state.greens.with_preview_mut(preview, |engine| {
         for (identity, bytes) in std::mem::take(&mut lent) {
           engine.lend(identity, bytes);
         }
-        let judged = judge_staged(engine, &mut work, (head, holders));
+        let judged = judge_staged(engine, &mut work, (head, holders), chain_left);
         engine.let_named_bytes_go();
         judged
       });
       let unlent = match judged {
-        Ok(Ok(staged)) => break Ok(staged),
-        Ok(Err(unlent)) => unlent,
+        Ok(Judging::Judged(staged)) => break Ok(staged),
+        Ok(Judging::PastChain { entry }) => {
+          return Err(StageRefused::PastChainRoom {
+            entries: self.entries,
+            entry,
+            room: self.chain_room,
+          });
+        }
+        Ok(Judging::Unlent(unlent)) => unlent,
         Err(refused) => break Err(refused),
       };
       if judged_again {
@@ -222,7 +258,8 @@ impl ImportBatch {
       judged_again = true;
     };
     work.base = head;
-    let (outcome, applied, identity, reserved) = judged.map_err(|_| StageRefused::Unavailable)?;
+    let (outcome, applied, identity, reserved, entry) =
+      judged.map_err(|_| StageRefused::Unavailable)?;
     let (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) = (&outcome, applied)
     else {
       return Err(StageRefused::NotAccepted(outcome));
@@ -230,6 +267,7 @@ impl ImportBatch {
     self.reserved = self
       .reserved
       .saturating_add(u64::try_from(reserved).unwrap_or(u64::MAX));
+    self.entries = self.entries.saturating_add(entry);
     self.staged.push(Staged {
       increment: work,
       applied,
@@ -305,8 +343,27 @@ impl Drop for ImportBatch {
 }
 
 /// What a staged work's verdict in the scratch member gives: its outcome, what its entry records, the member's head
-/// identity where holders take its record, and the history and change bytes reserved for it.
-type StagedVerdict = (Outcome, Option<Vec<Applied>>, Option<[u8; 32]>, usize);
+/// identity where holders take its record, the history and change bytes reserved for it, and its chain entry's bytes.
+type StagedVerdict = (
+  Outcome,
+  Option<Vec<Applied>>,
+  Option<[u8; 32]>,
+  usize,
+  usize,
+);
+
+/// What judging a staged work came to ([`judge_staged`]).
+enum Judging {
+  /// Judged into the scratch member.
+  Judged(StagedVerdict),
+  /// Accepted, its chain entry (`entry` bytes) past what the batch's chains may still take: nothing of it applied.
+  PastChain {
+    /// The entry's bytes.
+    entry: usize,
+  },
+  /// Refused naming every named text the verdict read that the member holds by name alone with none lent.
+  Unlent(std::collections::BTreeSet<slates_merge::named::Identity>),
+}
 
 /// The history and change bytes `work`, based at the batch's head `head` (in the green's numbering), would reserve in
 /// the scratch member `engine`, read as [`judge_staged`] reads it: moved into the member's numbering and back, `work`
@@ -331,7 +388,8 @@ fn judge_staged(
   engine: &mut Green,
   work: &mut Increment,
   (head, holders): (u64, bool),
-) -> Result<StagedVerdict, std::collections::BTreeSet<slates_merge::named::Identity>> {
+  chain_left: Option<usize>,
+) -> Judging {
   // The scratch member counts its versions from 0: the work's base, read there, and each copy's source version
   // (a Subversion copy names the head it copies from, w-svn's C2 stage C) moved into its numbering for the verdict.
   let offset = head.saturating_sub(engine.head());
@@ -341,7 +399,16 @@ fn judge_staged(
     .history_reservation(work)
     .saturating_add(engine.changes_reservation(work));
   // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
-  let (outcome, mut applied) = engine.submit_named(work);
+  // Judged and held first, so an accepted verdict's chain entry is sized before anything of it applies (A-895).
+  let judgment = engine.judge_named(work);
+  if let (Some(left), slates_merge::engine::Judgment::Accepted(held)) = (chain_left, &judgment) {
+    let entry = slates_merge::chain_entry::encoded_len(work, held.applied(), holders);
+    if entry > left {
+      in_numbering(work, |version| version.checked_add(offset));
+      return Judging::PastChain { entry };
+    }
+  }
+  let (outcome, mut applied) = engine.commit_judgment(judgment);
   let unlent = match outcome {
     Outcome::ContentUnread { identity }
       if !work.named.runs.iter().any(|run| run.identity == identity) =>
@@ -354,7 +421,7 @@ fn judge_staged(
   // Back into the green's numbering: the work's copies, and those its verdict records.
   in_numbering(work, |version| version.checked_add(offset));
   if let Some(unlent) = unlent {
-    return Err(unlent);
+    return Judging::Unlent(unlent);
   }
   if let Some(applied) = applied.as_mut() {
     for step in applied.iter_mut() {
@@ -363,5 +430,8 @@ fn judge_staged(
       }
     }
   }
-  Ok((outcome, applied, identity, reserved))
+  let entry = applied.as_deref().map_or(0, |applied| {
+    slates_merge::chain_entry::encoded_len(work, applied, holders)
+  });
+  Judging::Judged((outcome, applied, identity, reserved, entry))
 }

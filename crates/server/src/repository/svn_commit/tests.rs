@@ -2962,6 +2962,103 @@ fn a_work_over_a_subversion_green_reads_and_edits_a_named_text_its_windows_let_g
   });
 }
 
+/// Main's question of 2026-11-23 (the made commit's held verdict, A-805 with A-760 (b) 4d): can the base's windows let go
+/// between the verdict's judge and its apply make the green other than the verdict judged? Do: commit revision 1
+/// (`trunk/a.txt` "alpha\n"); over a work on the green insert "x" at offset 1 of `trunk/a.txt` and submit it as a client's
+/// recorded request, the base text's windows let go in the made commit's step, after its changeset landed and before its
+/// held verdict applies (`svn_made::LET_GO_BEFORE_APPLY`); where the step gave the accept up (counted
+/// `vcs.made.abandoned`, answered `Overloaded` unrecorded), send the same request again. Expect: revision 2 landed once,
+/// the green's file "axlpha\n", what the verdict judged, and the green's head 2; never another file.
+#[test]
+fn a_base_let_go_between_a_held_verdicts_judge_and_apply_never_makes_another_green() {
+  stored(|| async move {
+    use slates_ipc::protocol::{ReplyBody, RequestBody};
+    let (svn, green) = subversion("let-go-apply").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    let alpha = identity(b"alpha\n");
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("let-go-apply", "trunk/c.txt", b"c\n")));
+    let edited = on(|state| {
+      crate::vcs_store::paths::tests::ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: "trunk/a.txt".to_owned(),
+          at: 1,
+          delete_len: 0,
+          bytes: b"x".to_vec(),
+        },
+      )
+    });
+    assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+    let abandoned = |state: &ShardState| {
+      state
+        .refusals
+        .get(crate::made_commit::ABANDONED)
+        .copied()
+        .unwrap_or(0)
+    };
+    let abandoned_before = on(|state| abandoned(state));
+    crate::vcs_store::svn_made::LET_GO_BEFORE_APPLY.with(|texts| texts.borrow_mut().push(alpha));
+    let submit = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let send = move |state: &mut ShardState| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, submit),
+        &owner(),
+        crate::identities::authored(work, "edit a named text"),
+      )
+    };
+    let _ = on(send);
+    // The step either applied (revision 2) or gave the accept up; wait for one of them.
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+    let gave_up = loop {
+      let (youngest, given_up) =
+        on(|state| (kept(state, svn).0, abandoned(state) > abandoned_before));
+      if youngest == 2 {
+        break false;
+      }
+      if given_up {
+        break true;
+      }
+      assert!(
+        slates_rt::futures::now_ns() < deadline,
+        "the made commit never ended"
+      );
+      slates_rt::futures::yield_now().await;
+    };
+    eprintln!("held verdict over a base let go before its apply: given up {gave_up}");
+    if gave_up {
+      // Nothing of the accept applied or durable: the same request again runs the verb anew.
+      assert_eq!(
+        on(|state| (state.db.partition().green_head(green), kept(state, svn).0)),
+        (1, 1),
+        "nothing of the given-up accept stands"
+      );
+      let _ = on(send);
+    }
+    let submitted = answer_of(7, submit).await;
+    assert!(
+      !matches!(submitted, ReplyBody::Refused { .. }),
+      "{submitted:?}"
+    );
+    youngest_reaches(svn, 2).await;
+    let file = crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await;
+    assert_eq!(
+      (
+        file.as_deref(),
+        on(|state| state.db.partition().green_head(green))
+      ),
+      (Some(&b"axlpha\n"[..]), 2),
+      "the green the verdict judged (given up and run again: {gave_up})"
+    );
+  });
+}
+
 /// A-760 (b) 4d (main's order: a server test reading an svn file over a mount after its text left the green, through the
 /// refuse-and-bring-back, with its window let go). A mount's read reaches a green's file through one chain whatever
 /// its bridge (`GreenTree::read_at`, under NFS's, FUSE's and WinFsp's `Bridge::read`), so it is read here as a mount

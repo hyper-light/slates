@@ -1,23 +1,20 @@
-//! A made commit owed by a submit whose green's map is built whole after it (A-664's live whole builds, part 2; main's
-//! ruling of 2026-11-20: the effect and its completion record as one atom, CLAUDE.md §6's `run_recorded` pattern).
+//! A made commit owed by a submit whose green's map was built whole after it (A-664's live whole builds, part 2): a
+//! record no server writes since main 01a20182's ruling of 2026-11-24 01:36, kept so a log holding one is read and
+//! refused typed.
 //!
-//! **Why.** A version a work submits to a git repository's green becomes the commit the server makes over the version's
-//! trees (`super::commits`). Where the green keeps no map of the version before (its first submit, one past a copy),
-//! those trees are the whole head's, built in slices after the submit's step (`super::paths::whole_build`), so the
-//! commit is made after the version is durable. What makes it (its message, its git identity and its date, the owner's
-//! second at the submit) would otherwise live only in the submit's step, and a restart between the two would leave the
-//! version with no commit, ever.
+//! **Why it was.** A submit to a git repository's green outside a recorded request committed its version in its own
+//! step, and where the green kept no map of the version before (its first submit, one past a copy), its commit was made
+//! after the map's whole build. So the submit staged what makes the commit ([`Owed`]: the green's key and version, the
+//! message, the identity and the owner's second) in an entry of the repository's register holding it alone, and the
+//! build's end made the commit from it.
 //!
-//! **What.** The submit stages an owed commit ([`Owed`]) in its own transaction, as an entry of the repository's register
-//! holding it alone (`RepositoryEntry::objects`, the way a made commit's record rides one), after the version's record:
-//! the green's key and version, the message, the identity, and the second. The commit made at the build's end is made
-//! from it, never from the clock (`super::commits::made_owed`), so the commit a recovery makes is byte for byte the one
-//! the live store would have made. The made commit's record settles it: as its move of the green to that version commits
-//! (`super::commit_moves`, live and in a replay alike), the owed commit goes. A store made again from the log replays
-//! the owed record ([`super::replay_git`]); one no made commit settled is owed still, and its build starts again.
-//!
-//! **Bounds.** One owed a green: a submit to a green whose build runs is parked behind it (`super::paths::whole_build`),
-//! so no second is staged while one is owed; the store keeps them by the green's key.
+//! **Why it is gone.** A version committed before its commit is made is a version committed alone, which main's ruling
+//! forbids: a git green's submit is now a client's recorded request alone, refused `RecordedSubmitRequired` otherwise
+//! (`crate::made_commit::take_turn`), and its made commit's map, whole or stepped, is put over the held verdict's preview
+//! before its one step commits both (`super::commits::make_deferred`). Nothing makes an owed commit any longer, so a
+//! store made again from a log that holds one refuses it typed, naming the green's key and the version
+//! (`super::ReplayRefused::OwedCommit`, [`super::replay_git`]), rather than keep a version whose commit nothing will
+//! make.
 //!
 //! **The encoding**, little-endian as a push's record is (`super::record`): the magic "SGOC" and the version; the
 //! green's key, its version and the second, each a word of eight bytes; then the message, the identity's name and its
@@ -37,8 +34,9 @@ const WORD_BYTES: usize = size_of::<u32>();
 /// Format: the bytes of the key, the version, the second and each length.
 const LONG_BYTES: usize = size_of::<u64>();
 
-/// A commit owed by a submit (module docs).
+/// A commit owed by a submit (module docs). A daemon build reads its key and version alone, to name them.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Owed {
   /// The green's key in the store.
   pub(crate) key: u64,
@@ -75,7 +73,9 @@ pub(crate) fn is_owed(bytes: &[u8]) -> bool {
 }
 
 impl Owed {
-  /// The record's bytes (module docs, "The encoding").
+  /// The record's bytes (module docs, "The encoding"), as a server before main's ruling wrote them: a test's log holds
+  /// one.
+  #[cfg(test)]
   pub(crate) fn encode(&self) -> Vec<u8> {
     let texts = [&self.message, &self.name, &self.email];
     let len = texts

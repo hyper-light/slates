@@ -135,6 +135,14 @@ pub(crate) fn submitted_recorded(
   );
 }
 
+/// Shape: the client a test's recorded submits are made as ([`version_saying`]), apart from the clients tests name.
+const TEST_CLIENT: u32 = 9_001;
+
+thread_local! {
+  /// The next request sequence of [`TEST_CLIENT`] on this thread.
+  static TEST_SEQUENCE: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
 /// [`version`] submitted with `message`.
 pub(crate) fn version_saying(
   state: &mut ShardState,
@@ -168,23 +176,70 @@ pub(crate) fn version_saying(
     };
     assert!(!matches!(reply, ReplyBody::Refused { .. }), "{reply:?}");
   }
-  let submitted = ask(state, crate::identities::authored(work, message));
-  // A green's first submit owes its commit and builds its map in slices after it (A-664's live whole builds, part 2),
-  // by a task a test's step never runs: driven to its end here, so the test reads the store as the build leaves it.
-  super::whole_build::settle(state);
-  // The version's commit is made by a job of the shard's queue (C5 part 2b piece 3: landed on the node's store, then
-  // recorded), a task a test's step never runs: made here, so the test reads the store as the commit leaves it.
-  crate::vcs_store::commits::made_after_now(state);
-  let ReplyBody::Submitted {
+  let submitted = submit_as_taken(state, green, crate::identities::authored(work, message));
+  let Some(ReplyBody::Submitted {
     version: Some(version),
     ..
-  } = submitted
+  }) = submitted
   else {
     panic!("not accepted: {submitted:?}")
   };
   let destroyed = ask(state, RequestBody::Destroy { volume: work });
   assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
   version
+}
+
+/// `body`, a submit to `green`, as its green takes one: a git repository's as a client's recorded request alone (main
+/// 01a20182's ruling of 2026-11-24 01:36: no version committed before its commit is made, [`recorded_git_submit`]); any
+/// other's asked bare, a whole build its version's map waits for then driven to its end, so the test reads the store
+/// as the build leaves it. Its answer.
+pub(crate) fn submit_as_taken(
+  state: &mut ShardState,
+  green: VolumeId,
+  body: RequestBody,
+) -> Option<ReplyBody> {
+  if super::git_repository_of(state, crate::verbs::to_db_volume(green)).is_some() {
+    return recorded_git_submit(state, body);
+  }
+  let submitted = ask(state, body);
+  super::whole_build::settle(state);
+  Some(submitted)
+}
+
+/// `body`, a submit to a git green, run as request [`TEST_CLIENT`]'s next: what the submit waits on taken here, as the
+/// shard's tasks would take it, since a test's step runs none of them (its refinement, when the work
+/// rewrites a file whole, `refining::refined_now`; its made commit, `commits::made_landing_now`; the whole build its
+/// version's map waits on), and its answer read where the request recorded it.
+pub(crate) fn recorded_git_submit(state: &mut ShardState, body: RequestBody) -> Option<ReplyBody> {
+  let id = slates_wire::request::RequestId {
+    client: TEST_CLIENT,
+    sequence: TEST_SEQUENCE.with(|next| {
+      let sequence = next.get();
+      next.set(sequence.wrapping_add(1));
+      sequence
+    }),
+  };
+  crate::refining::HELD_FOR_TEST.with(|held| held.set(true));
+  crate::vcs_store::commits::MADE_HELD_FOR_TEST.with(|held| held.set(true));
+  let answered =
+    crate::verbs::run_recorded_for_test(state, (u64::from(TEST_CLIENT), id), &owner(), body);
+  crate::refining::refined_now(state);
+  crate::vcs_store::commits::made_landing_now(state);
+  crate::vcs_store::commits::MADE_HELD_FOR_TEST.with(|held| held.set(false));
+  crate::refining::HELD_FOR_TEST.with(|held| held.set(false));
+  super::whole_build::settle(state);
+  answered.or_else(|| {
+    match state
+      .db
+      .partition()
+      .completion(u64::from(TEST_CLIENT), id.client, id.sequence)
+    {
+      slates_wire::request::Seen::Completed(bytes) => {
+        <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
+      }
+      _ => None,
+    }
+  })
 }
 
 /// The map the store holds for `green`, when it is of `version`: its root and its files.
@@ -795,7 +850,7 @@ fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
       },
     );
     let ReplyBody::WorkCreated { id: work, .. } = made else {
-      return made;
+      return Some(made);
     };
     let copy = WorkOp::Copy {
       from: "/nothing".to_owned(),
@@ -804,11 +859,11 @@ fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
       replace: false,
     };
     ask(state, RequestBody::Declare { work, op: copy });
-    ask(state, crate::identities::authored(work, "copy nothing"))
+    recorded_git_submit(state, crate::identities::authored(work, "copy nothing"))
   });
   let expected = slates_ipc::protocol::Refusal::CopyRefused {
     path: "z".to_owned(),
     case: slates_ipc::protocol::CopyCase::SourceEmpty,
   };
-  assert_eq!(reply, ReplyBody::Refused { refusal: expected });
+  assert_eq!(reply, Some(ReplyBody::Refused { refusal: expected }));
 }

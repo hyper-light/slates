@@ -19,6 +19,10 @@
 //! (`verbs::compose_increment`). A verb whose work changed since (another journal length) finds none and owes one
 //! again.
 //!
+//! The job is a state machine, [`RefineJob`], whose [`RefineJob::turn`] takes one turn on the shard's state; its task
+//! calls it between yields and brings back what a turn's read met let go. A test that holds the shard calls the same
+//! turn through `refined_now`, and `tests` holds the two drivers equal on one recorded submit each.
+//!
 //! **Bounds.**
 //! - A copy slice is the shard's derived copy slice (its measured memcpy rate over half its quantum).
 //! - A refinement unit is `refine::WORK_PER_TICK` of work.
@@ -37,6 +41,9 @@ use slates_merge::increment::{PostStatePlan, VolumeOp};
 use slates_merge::ops_doc::OpsDoc;
 
 use crate::state::ShardState;
+
+#[cfg(test)]
+mod tests;
 
 /// Format: a refinement job started, the non-vacuity count of this module.
 pub(crate) const REFINE_STARTED: &str = "merge.refine.started";
@@ -181,6 +188,15 @@ pub(crate) fn start(
   owed: Owed,
 ) -> bool {
   if state.refining.running.get(&work) == Some(&owed.key) {
+    return true;
+  }
+  // A test that holds the shard takes the job's turns itself (`refined_now`).
+  #[cfg(test)]
+  if HELD_FOR_TEST.with(std::cell::Cell::get) {
+    let key = owed.key;
+    HELD_JOBS.with(|held| held.borrow_mut().push(RefineJob::new(work, green, owed)));
+    state.refining.running.insert(work, key);
+    state.count(REFINE_STARTED, 1);
     return true;
   }
   let job = job(work, green, owed);
@@ -398,17 +414,177 @@ type Job = (
   Key,
 );
 
-/// `work`'s refinement job for `owed` (module docs).
+/// `work`'s refinement job for `owed` (module docs): its task runs [`RefineJob::turn`] on the shard's state a turn at a
+/// time, yielding between turns, and brings back what a turn's read met let go before the turn is taken again. A test
+/// that holds the shard takes the same turns through [`refined_now`].
 fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
-  let Owed {
-    key,
-    doc,
-    plan,
-    pairs,
-  } = owed;
-  let task = async move {
-    let at = (work, green, key.0);
-    let mut copies: Vec<Copy> = pairs
+  let key = owed.key;
+  (Box::pin(task_of(RefineJob::new(work, green, owed))), key)
+}
+
+/// `job`'s task (module docs).
+async fn task_of(mut job: RefineJob) {
+  loop {
+    match crate::state::with_state(|s| job.turn(s)) {
+      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      // A read of a let-go window (A-760 (b) 4d) is never lost: its windows are brought back and kept, and the same
+      // slice copied again at once; a store that cannot give them back gives the job up, counted.
+      Some(Turned::BringBack(away)) => {
+        let brought = crate::vcs_store::named_objects::bring_back_reads(&away)
+          .await
+          .ok();
+        let _ = crate::state::with_state(|s| job.brought(s, brought));
+      }
+      Some(Turned::Done) | None => return,
+    }
+  }
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Set by a test that holds the shard: a job [`start`]s held for [`refined_now`], not spawned.
+  pub(crate) static HELD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// The jobs a test's shard holds for [`refined_now`] ([`HELD_FOR_TEST`]).
+  static HELD_JOBS: std::cell::RefCell<Vec<RefineJob>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every held job run to its end now, a turn at a time through [`RefineJob::turn`], as its task takes them: for a test
+/// that holds the shard, so the task cannot run. A test's shard keeps its landed packs, so no copy meets a let-go window;
+/// were one met, the job gives up, as one whose windows the store cannot give back does.
+#[cfg(test)]
+pub(crate) fn refined_now(state: &mut ShardState) {
+  while let Some(mut job) = HELD_JOBS.with(|held| held.borrow_mut().pop()) {
+    loop {
+      match job.turn(state) {
+        Turned::More => {}
+        Turned::BringBack(_) => job.brought(state, None),
+        Turned::Done => break,
+      }
+    }
+  }
+}
+
+/// What a turn of a job left ([`RefineJob::turn`]).
+pub(crate) enum Turned {
+  /// More turns are owed: the task yields first.
+  More,
+  /// A copy step met these let-go windows: brought back, then the same step taken again.
+  BringBack(Vec<crate::vcs_store::named_objects::AwayRead>),
+  /// The job ended: its result kept, or given up.
+  Done,
+}
+
+/// What a job's refinement gives back: the refined document and plan, the refiner's scratch, and the copies it read.
+type Refined = (
+  OpsDoc,
+  PostStatePlan,
+  slates_merge::refine::Refiner,
+  Vec<Copy>,
+);
+
+/// A refinement job between its turns (module docs), its stages in order: the copies a slice a turn, the refinement a
+/// pace turn a step, what it held given back a buffer a turn, and the parked submit's increment, verdict and encoding
+/// a bounded slice a turn (A-787 part 3). Each turn is one call over the shard's state ([`RefineJob::turn`]), so the
+/// task and a test's driver take the same turns.
+pub(crate) struct RefineJob {
+  work: DbVolumeId,
+  green: DbVolumeId,
+  key: Key,
+  stage: Stage,
+  turns: TurnCounts,
+  longest: u64,
+  /// The windows a copy step's read brought back, kept until that step is copied again (A-760 (b) 4d).
+  pins: Vec<crate::vcs_store::named_objects::ReadPin>,
+}
+
+/// Where a job stands ([`RefineJob`]).
+enum Stage {
+  /// Copying pair `index`'s `side`.
+  Copying {
+    copies: Vec<Copy>,
+    index: usize,
+    side: Side,
+    doc: OpsDoc,
+    plan: PostStatePlan,
+  },
+  /// The refinement, driven a pace turn a step.
+  Refining {
+    refining: core::pin::Pin<Box<dyn core::future::Future<Output = Refined>>>,
+    pace: slates_merge::pace::Pace,
+  },
+  /// What it held given back a buffer a turn.
+  Releasing {
+    doc: OpsDoc,
+    plan: PostStatePlan,
+    copies: std::vec::IntoIter<Copy>,
+    refiner: slates_merge::refine::Refiner,
+  },
+  /// The parked submit's increment, verdict and encoding.
+  Preparing {
+    doc: OpsDoc,
+    plan: PostStatePlan,
+    preparing: Preparing,
+  },
+  /// Its result to keep at its next turn.
+  Finishing {
+    refined: Option<(OpsDoc, PostStatePlan)>,
+    prepared: Option<Prepared>,
+  },
+  /// Ended.
+  Done,
+}
+
+/// Where a preparation stands ([`Stage::Preparing`]).
+enum Preparing {
+  /// Its evidence not yet read.
+  Begun,
+  /// The post-state laid from op `next` on.
+  Laying {
+    evidence: Vec<[u8; 32]>,
+    post: Vec<u8>,
+    next: usize,
+  },
+  /// The document's encoding next.
+  Encoding {
+    evidence: Vec<[u8; 32]>,
+    post: Vec<u8>,
+  },
+  /// The identity hashed from byte `hashed` of the document's encoding and the post-state.
+  Hashing {
+    evidence: Vec<[u8; 32]>,
+    post: Vec<u8>,
+    doc_bytes: Vec<u8>,
+    hasher: Box<blake3::Hasher>,
+    hashed: usize,
+  },
+  /// The increment made; checked whole against the one the submit's step composes (a debug build's oracle, A-821).
+  Checking {
+    evidence: Vec<[u8; 32]>,
+    increment: Box<slates_merge::engine::Increment>,
+  },
+  /// Its verdict next.
+  Computing {
+    evidence: Vec<[u8; 32]>,
+    increment: Box<slates_merge::engine::Increment>,
+  },
+  /// Its encoding next.
+  Encoded {
+    evidence: Vec<[u8; 32]>,
+    increment: Box<slates_merge::engine::Increment>,
+    computed: Box<slates_merge::engine::Computed>,
+  },
+}
+
+impl RefineJob {
+  /// `work`'s job for `owed`, at its first copy.
+  fn new(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> RefineJob {
+    let Owed {
+      key,
+      doc,
+      plan,
+      pairs,
+    } = owed;
+    let copies = pairs
       .into_iter()
       .map(|(base_path, path)| Copy {
         base_path,
@@ -417,139 +593,538 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
         post: Vec::new(),
       })
       .collect();
-    let mut turns = (0u64, [0u64; PAST_MULTIPLES.len()]);
-    let mut longest = 0u64;
-    // The windows a copy step's read brought back, kept until that step is copied again (A-760 (b) 4d).
-    let mut pins: Vec<crate::vcs_store::named_objects::ReadPin> = Vec::new();
-    // The copies, a slice a turn.
-    for index in 0..copies.len() {
-      for side in [Side::Base, Side::Post] {
-        loop {
-          let began = slates_rt::futures::now_ns();
-          let stepped = crate::state::with_state(|s| {
-            // Half the quantum's copying: the turn's budget, as a refinement turn's is.
-            let slice = s
-              .config
-              .copy_slice_bytes_within(s.config.step_quantum_ns() / 2);
-            let slice = usize::try_from(slice).unwrap_or(usize::MAX).max(1);
-            crate::vcs_store::named_objects::away_scope(|| {
-              copies
-                .get_mut(index)
-                .and_then(|copy| copy_step(s, at, (copy, side, slice)))
-            })
-          });
-          let (step, away) = stepped.unwrap_or((None, Vec::new()));
-          turn(&mut turns, &mut longest, began);
-          // A read of a let-go window (A-760 (b) 4d) is never lost: its windows are brought back, kept, and the same
-          // slice copied again, which meets none let go; a store that cannot give them back gives the job up, counted.
-          if step.is_none() && !away.is_empty() && pins.is_empty() {
-            match crate::vcs_store::named_objects::bring_back_reads(&away).await {
-              Ok(brought) => {
-                pins = brought;
-                let _ = crate::state::with_state(|s| s.count(COPY_BROUGHT_BACK, 1));
-                continue;
-              }
-              Err(_) => {
-                let _ = crate::state::with_state(|s| s.count(COPY_NOT_BROUGHT_BACK, 1));
-              }
-            }
-          } else if step.is_none() && !away.is_empty() {
-            let _ = crate::state::with_state(|s| s.count(COPY_AWAY_AGAIN, 1));
-          }
-          pins = Vec::new();
-          match step {
-            Some(true) => break,
-            Some(false) => slates_rt::futures::yield_now().await,
-            None => {
-              let _ =
-                crate::state::with_state(|s| finish(s, work, (key, None, None), (turns, longest)));
-              return;
-            }
-          }
-        }
-      }
+    RefineJob {
+      work,
+      green,
+      key,
+      stage: Stage::Copying {
+        copies,
+        index: 0,
+        side: Side::Base,
+        doc,
+        plan,
+      },
+      turns: (0, [0; PAST_MULTIPLES.len()]),
+      longest: 0,
+      pins: Vec::new(),
     }
-    // The refinement, a pace turn a step.
-    let refining = async move {
-      let (mut doc, mut plan) = (doc, plan);
-      let mut refiner = slates_merge::refine::Refiner::new();
-      let ticks = slates_merge::pace::Ticks;
-      let mut files = |base_path: &str, path: &str| {
-        copies
-          .iter()
-          .find(|copy| copy.base_path == base_path && copy.path == path)
-          .map(|copy| {
-            (
-              std::borrow::Cow::Borrowed(copy.base.as_slice()),
-              std::borrow::Cow::Borrowed(copy.post.as_slice()),
-            )
-          })
-      };
-      slates_merge::refine::refine_rewrites_paced(
-        &mut doc,
-        &mut plan,
-        &mut refiner,
-        (&mut files, &ticks),
-      )
-      .await;
-      // The scratch and the copies go back to the owner, to be given back a slice a turn.
-      (doc, plan, refiner, copies)
-    };
-    let mut refining = core::pin::pin!(refining);
-    let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-    let (doc, plan, mut refiner, copies) = loop {
-      let budget = crate::state::with_state(|s| s.config.step_quantum_ns() / 2).unwrap_or(1);
-      let began = slates_rt::futures::now_ns();
-      pace.turn(began.saturating_add(budget.max(1)));
-      let polled = pace.drive(refining.as_mut());
-      turn(&mut turns, &mut longest, began);
-      if let core::task::Poll::Ready(refined) = polled {
-        break refined;
-      }
-      slates_rt::futures::yield_now().await;
-    };
-    // What the job held, given back a buffer a turn: freed together, the copies and the scratch of a 2 MiB rewrite cost
-    // about a millisecond in one step (A-787 part 2).
-    let mut copies = copies.into_iter();
+  }
+
+  /// Takes the job's next turn over `state` (module docs): what it then owes. Steps that end within a turn go on in it,
+  /// as the task's one poll went on through them; a turn that ends yields, or brings back what its read met let go.
+  pub(crate) fn turn(&mut self, state: &mut ShardState) -> Turned {
     loop {
-      let began = slates_rt::futures::now_ns();
-      let done = match copies.next() {
-        Some(copy) => {
-          drop(copy);
-          false
+      match std::mem::replace(&mut self.stage, Stage::Done) {
+        Stage::Copying {
+          mut copies,
+          index,
+          side,
+          doc,
+          plan,
+        } => {
+          if index >= copies.len() {
+            self.stage = Stage::Refining {
+              refining: refining_of(doc, plan, copies),
+              pace: slates_merge::pace::Pace::new(slates_rt::futures::now_ns),
+            };
+            continue;
+          }
+          let began = slates_rt::futures::now_ns();
+          // Half the quantum's copying: the turn's budget, as a refinement turn's is.
+          let slice = state
+            .config
+            .copy_slice_bytes_within(state.config.step_quantum_ns() / 2);
+          let slice = usize::try_from(slice).unwrap_or(usize::MAX).max(1);
+          let at = (self.work, self.green, self.key.0);
+          let (step, away) = crate::vcs_store::named_objects::away_scope(|| {
+            copies
+              .get_mut(index)
+              .and_then(|copy| copy_step(state, at, (copy, side, slice)))
+          });
+          self.counted(state, began);
+          if step.is_none() && !away.is_empty() && self.pins.is_empty() {
+            self.stage = Stage::Copying {
+              copies,
+              index,
+              side,
+              doc,
+              plan,
+            };
+            return Turned::BringBack(away);
+          }
+          if step.is_none() && !away.is_empty() {
+            state.count(COPY_AWAY_AGAIN, 1);
+          }
+          self.pins = Vec::new();
+          match step {
+            Some(true) => {
+              let (index, side) = match side {
+                Side::Base => (index, Side::Post),
+                Side::Post => (index.saturating_add(1), Side::Base),
+              };
+              self.stage = Stage::Copying {
+                copies,
+                index,
+                side,
+                doc,
+                plan,
+              };
+            }
+            Some(false) => {
+              self.stage = Stage::Copying {
+                copies,
+                index,
+                side,
+                doc,
+                plan,
+              };
+              return Turned::More;
+            }
+            None => {
+              self.stage = Stage::Finishing {
+                refined: None,
+                prepared: None,
+              };
+            }
+          }
         }
-        None => refiner.release_step(),
-      };
-      turn(&mut turns, &mut longest, began);
-      if done {
-        break;
+        Stage::Refining { mut refining, pace } => {
+          let budget = state.config.step_quantum_ns() / 2;
+          let began = slates_rt::futures::now_ns();
+          pace.turn(began.saturating_add(budget.max(1)));
+          let polled = pace.drive(refining.as_mut());
+          self.counted(state, began);
+          match polled {
+            core::task::Poll::Ready((doc, plan, refiner, copies)) => {
+              self.stage = Stage::Releasing {
+                doc,
+                plan,
+                copies: copies.into_iter(),
+                refiner,
+              };
+            }
+            core::task::Poll::Pending => {
+              self.stage = Stage::Refining { refining, pace };
+              return Turned::More;
+            }
+          }
+        }
+        // What the job held, given back a buffer a turn: freed together, the copies and the scratch of a 2 MiB rewrite
+        // cost about a millisecond in one step (A-787 part 2).
+        Stage::Releasing {
+          doc,
+          plan,
+          mut copies,
+          mut refiner,
+        } => {
+          let began = slates_rt::futures::now_ns();
+          let done = match copies.next() {
+            Some(copy) => {
+              drop(copy);
+              false
+            }
+            None => refiner.release_step(),
+          };
+          self.counted(state, began);
+          if done {
+            self.stage = Stage::Preparing {
+              doc,
+              plan,
+              preparing: Preparing::Begun,
+            };
+            continue;
+          }
+          self.stage = Stage::Releasing {
+            doc,
+            plan,
+            copies,
+            refiner,
+          };
+          return Turned::More;
+        }
+        Stage::Preparing {
+          doc,
+          plan,
+          preparing,
+        } => match self.prepare_step(state, (&doc, &plan), preparing) {
+          Prepared_::Next(preparing, yielded) => {
+            self.stage = Stage::Preparing {
+              doc,
+              plan,
+              preparing,
+            };
+            if yielded {
+              return Turned::More;
+            }
+          }
+          Prepared_::Ended(prepared, yielded) => {
+            self.stage = Stage::Finishing {
+              refined: Some((doc, plan)),
+              prepared,
+            };
+            if yielded {
+              return Turned::More;
+            }
+          }
+        },
+        Stage::Finishing { refined, prepared } => {
+          finish(
+            state,
+            self.work,
+            (self.key, refined, prepared),
+            (self.turns, self.longest),
+          );
+          return Turned::Done;
+        }
+        Stage::Done => return Turned::Done,
       }
-      slates_rt::futures::yield_now().await;
     }
-    // The parked submit's increment, verdict and encoding, a bounded slice a turn (A-787 part 3).
-    let prepared = prepare(
-      (work, green, key),
-      (&doc, &plan),
-      (&mut turns, &mut longest),
-    )
-    .await;
-    let _ = crate::state::with_state(|s| {
-      finish(
-        s,
-        work,
-        (key, Some((doc, plan)), prepared),
-        (turns, longest),
-      )
-    });
-  };
-  (Box::pin(task), key)
+  }
+
+  /// What the task brought back for the copy step a turn stopped at ([`Turned::BringBack`]): kept, and the step taken
+  /// again; none brought, the job given up, counted.
+  pub(crate) fn brought(
+    &mut self,
+    state: &mut ShardState,
+    brought: Option<Vec<crate::vcs_store::named_objects::ReadPin>>,
+  ) {
+    match brought {
+      Some(pins) => {
+        self.pins = pins;
+        state.count(COPY_BROUGHT_BACK, 1);
+      }
+      None => {
+        state.count(COPY_NOT_BROUGHT_BACK, 1);
+        self.pins = Vec::new();
+        finish(
+          state,
+          self.work,
+          (self.key, None, None),
+          (self.turns, self.longest),
+        );
+        self.stage = Stage::Done;
+      }
+    }
+  }
+
+  /// Counts a job turn begun at `began` ([`turn`]).
+  fn counted(&mut self, state: &ShardState, began: u64) {
+    turn(
+      &mut self.turns,
+      &mut self.longest,
+      (began, state.config.step_quantum_ns()),
+    );
+  }
+
+  /// One step of the parked submit's preparation over `(doc, plan)`, the refinement's result (A-787 part 3): the
+  /// post-state a copy slice a turn (the shard's measured memcpy rate within its quantum), the identity a hash slice a
+  /// turn (its measured BLAKE3 rate), and the document's encoding, the verdict and the increment's encoding a turn each.
+  /// Whether the step was a bounded turn the task yields after, as each of the task's `prepare_turn` did; ended with
+  /// none where nothing waits for it or the work or the green changed, the submit then composing and judging in its step.
+  fn prepare_step(
+    &mut self,
+    state: &mut ShardState,
+    (doc, plan): (&OpsDoc, &PostStatePlan),
+    preparing: Preparing,
+  ) -> Prepared_ {
+    let (work, green, key) = (self.work, self.green, self.key);
+    let at = (work, green, key);
+    match preparing {
+      Preparing::Begun => {
+        let evidence = still_owed(state, at)
+          .and_then(|()| crate::verbs::parked_local_evidence(state.refining.parked.get(&work)?));
+        let size = crate::verbs::post_state_size(doc);
+        match (evidence, usize::try_from(size).ok()) {
+          (Some(evidence), Some(size)) => Prepared_::Next(
+            Preparing::Laying {
+              evidence,
+              post: vec![0u8; size],
+              next: 0,
+            },
+            false,
+          ),
+          _ => Prepared_::Ended(None, false),
+        }
+      }
+      Preparing::Laying {
+        evidence,
+        mut post,
+        next,
+      } => {
+        let ops = doc.ops.len();
+        if next >= ops {
+          return Prepared_::Next(Preparing::Encoding { evidence, post }, false);
+        }
+        let laid = self.prepare_turn(state, |s| {
+          still_owed(s, at)?;
+          let budget = s
+            .config
+            .copy_slice_bytes_within(s.config.step_quantum_ns())
+            .max(1);
+          let mut end = next;
+          let mut bytes = 0u64;
+          while end < ops && (end == next || bytes < budget) {
+            bytes = bytes.saturating_add(doc.ops.get(end).map_or(0, |op| op.len));
+            end = end.saturating_add(1);
+          }
+          let w = s.works.get(&work)?;
+          let engine = s.greens.get(&green)?;
+          let base = crate::work_files::Base {
+            green: Some(&*engine),
+            fetched: None,
+            version: key.0,
+            entries: None,
+            plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
+          };
+          // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
+          crate::verbs::lay_ops(
+            &mut post,
+            (doc, plan),
+            (&w.files, base),
+            &w.journal,
+            next..end,
+          )
+          .ok()?;
+          Some(end)
+        });
+        match laid {
+          Some(next) => Prepared_::Next(
+            Preparing::Laying {
+              evidence,
+              post,
+              next,
+            },
+            true,
+          ),
+          None => Prepared_::Ended(None, true),
+        }
+      }
+      Preparing::Encoding { evidence, post } => {
+        match self.prepare_turn(state, |s| {
+          still_owed(s, at)?;
+          Some(doc.encode())
+        }) {
+          Some(doc_bytes) => Prepared_::Next(
+            Preparing::Hashing {
+              evidence,
+              post,
+              doc_bytes,
+              hasher: Box::new(crate::verbs::identity_hasher(work, key.0)),
+              hashed: 0,
+            },
+            true,
+          ),
+          None => Prepared_::Ended(None, true),
+        }
+      }
+      Preparing::Hashing {
+        evidence,
+        post,
+        doc_bytes,
+        mut hasher,
+        hashed,
+      } => {
+        let whole = doc_bytes.len().saturating_add(post.len());
+        if hashed >= whole {
+          let id = *hasher.finalize().as_bytes();
+          drop(doc_bytes);
+          let increment = slates_merge::engine::Increment {
+            id,
+            base: key.0,
+            doc: doc.clone(),
+            post_state: post,
+            evidence: evidence.clone(),
+            named: Default::default(),
+          };
+          let increment = Box::new(increment);
+          return if cfg!(debug_assertions) {
+            Prepared_::Next(
+              Preparing::Checking {
+                evidence,
+                increment,
+              },
+              false,
+            )
+          } else {
+            Prepared_::Next(
+              Preparing::Computing {
+                evidence,
+                increment,
+              },
+              false,
+            )
+          };
+        }
+        let end = self.prepare_turn(state, |s| {
+          let slice = s
+            .config
+            .archive_slice_bytes_within(s.config.step_quantum_ns())
+            .max(1);
+          let end = hashed
+            .saturating_add(usize::try_from(slice).unwrap_or(usize::MAX))
+            .min(whole);
+          let doc_end = doc_bytes.len();
+          if hashed < doc_end {
+            hasher.update(doc_bytes.get(hashed..end.min(doc_end)).unwrap_or_default());
+          }
+          if end > doc_end {
+            let from = hashed.saturating_sub(doc_end);
+            hasher.update(
+              post
+                .get(from..end.saturating_sub(doc_end))
+                .unwrap_or_default(),
+            );
+          }
+          Some(end)
+        });
+        match end {
+          Some(hashed) => Prepared_::Next(
+            Preparing::Hashing {
+              evidence,
+              post,
+              doc_bytes,
+              hasher,
+              hashed,
+            },
+            true,
+          ),
+          None => Prepared_::Ended(None, true),
+        }
+      }
+      // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
+      // `compose_increment`), compared whole with the sliced one, in a turn of its own (A-821).
+      Preparing::Checking {
+        evidence,
+        increment,
+      } => {
+        let _ = self.prepare_turn(state, |s| {
+          let whole = crate::verbs::composed_whole(
+            s,
+            (work, green, key.0),
+            (doc.clone(), plan.clone()),
+            evidence.clone(),
+          )?;
+          s.count(PREPARED_CHECKED, 1);
+          if whole != *increment {
+            s.count(PREPARED_MISMATCH, 1);
+          }
+          Some(())
+        });
+        Prepared_::Next(
+          Preparing::Computing {
+            evidence,
+            increment,
+          },
+          true,
+        )
+      }
+      Preparing::Computing {
+        evidence,
+        increment,
+      } => {
+        match self.prepare_turn(state, |s| {
+          still_owed(s, at)?;
+          s.greens.get(&green)?.compute(&increment).ok()
+        }) {
+          Some(computed) => Prepared_::Next(
+            Preparing::Encoded {
+              evidence,
+              increment,
+              computed: Box::new(computed),
+            },
+            true,
+          ),
+          None => Prepared_::Ended(None, true),
+        }
+      }
+      Preparing::Encoded {
+        evidence,
+        increment,
+        computed,
+      } => {
+        match self.prepare_turn(state, |s| {
+          still_owed(s, at)?;
+          Some(increment.encode())
+        }) {
+          Some(encoded) => {
+            let id = increment.id;
+            Prepared_::Ended(
+              Some(Prepared {
+                evidence,
+                increment: Some(*increment),
+                id,
+                computed: Some(*computed),
+                encoded: Some(encoded),
+              }),
+              true,
+            )
+          }
+          None => Prepared_::Ended(None, true),
+        }
+      }
+    }
+  }
+
+  /// One bounded turn of a preparation: runs `step` on the shard's state and counts the turn and the slice; the task
+  /// yields after it ([`Prepared_`]).
+  fn prepare_turn<T>(
+    &mut self,
+    state: &mut ShardState,
+    step: impl FnOnce(&mut ShardState) -> Option<T>,
+  ) -> Option<T> {
+    let began = slates_rt::futures::now_ns();
+    let done = step(state);
+    state.count(PREPARE_SLICES, 1);
+    self.counted(state, began);
+    done
+  }
 }
 
-/// Counts a job turn begun at `began`: `turns` the turns and those past each multiple of the shard's whole step quantum,
-/// `longest` the longest, nanoseconds.
-fn turn(turns: &mut TurnCounts, longest: &mut u64, began: u64) {
+/// What a preparation's step left ([`RefineJob::prepare_step`]): its next stage, or its end (what it prepared, or none);
+/// each with whether it was a bounded turn the task yields after.
+enum Prepared_ {
+  Next(Preparing, bool),
+  Ended(Option<Prepared>, bool),
+}
+
+/// The refinement of `doc` and `plan` over `copies` (`slates_merge::refine::refine_rewrites_paced`), as one future that
+/// owns them and gives them back with the refiner's scratch ([`Refined`]), driven a pace turn a step.
+fn refining_of(
+  doc: OpsDoc,
+  plan: PostStatePlan,
+  copies: Vec<Copy>,
+) -> core::pin::Pin<Box<dyn core::future::Future<Output = Refined>>> {
+  Box::pin(async move {
+    let (mut doc, mut plan) = (doc, plan);
+    let mut refiner = slates_merge::refine::Refiner::new();
+    let ticks = slates_merge::pace::Ticks;
+    let mut files = |base_path: &str, path: &str| {
+      copies
+        .iter()
+        .find(|copy| copy.base_path == base_path && copy.path == path)
+        .map(|copy| {
+          (
+            std::borrow::Cow::Borrowed(copy.base.as_slice()),
+            std::borrow::Cow::Borrowed(copy.post.as_slice()),
+          )
+        })
+    };
+    slates_merge::refine::refine_rewrites_paced(
+      &mut doc,
+      &mut plan,
+      &mut refiner,
+      (&mut files, &ticks),
+    )
+    .await;
+    // The scratch and the copies go back to the owner, to be given back a slice a turn.
+    (doc, plan, refiner, copies)
+  })
+}
+
+/// Counts a job turn begun at `began`, the shard's step quantum `quantum`: `turns` the turns and those past each
+/// multiple of the quantum, `longest` the longest, nanoseconds.
+fn turn(turns: &mut TurnCounts, longest: &mut u64, (began, quantum): (u64, u64)) {
   let took = slates_rt::futures::now_ns().saturating_sub(began);
-  let quantum = crate::state::with_state(|s| s.config.step_quantum_ns()).unwrap_or(u64::MAX);
   turns.0 = turns.0.saturating_add(1);
   for (count, multiple) in turns.1.iter_mut().zip(PAST_MULTIPLES) {
     *count = count.saturating_add(u64::from(took > quantum.saturating_mul(multiple)));
@@ -619,96 +1194,11 @@ pub(crate) const PREPARED_MISMATCH: &str = "merge.refine.prepared_mismatch";
 /// daemon's status report.
 pub(crate) const PREPARED_TAKEN: &str = "merge.submit.prepared_taken";
 
-/// One bounded turn of a prepare: runs `step` on the shard's state, counts the turn and the slice, and yields.
-async fn prepare_turn<T>(
-  (turns, longest): (&mut TurnCounts, &mut u64),
-  step: impl FnOnce(&mut ShardState) -> Option<T>,
-) -> Option<T> {
-  let began = slates_rt::futures::now_ns();
-  let done = crate::state::with_state(|s| {
-    let done = step(s);
-    s.count(PREPARE_SLICES, 1);
-    done
-  })
-  .flatten();
-  turn(turns, longest, began);
-  slates_rt::futures::yield_now().await;
-  done
-}
-
 /// What the work still is and what the green holds for a prepare's turn: `None` once the work changed (another key),
 /// the green is not on this shard, or no local submit waits for the refinement.
 fn still_owed(s: &ShardState, (work, green, key): (DbVolumeId, DbVolumeId, Key)) -> Option<()> {
   let w = s.works.get(&work)?;
   ((w.base_version, w.journal.len()) == key && s.greens.contains_key(&green)).then_some(())
-}
-
-/// Prepares the parked submit's increment, verdict and encoding over `(doc, plan)`, the refinement's result, a bounded
-/// slice a turn ([`Prepared`]): the post-state a copy slice a turn (the shard's measured memcpy rate within its
-/// quantum), the identity a hash slice a turn (its measured BLAKE3 rate), and the document's encoding, the verdict and
-/// the increment's encoding a turn each. `None`, nothing kept, where nothing waits for it or the work or the green
-/// changed: the submit then composes and judges in its step as before.
-async fn prepare(
-  (work, green, key): (DbVolumeId, DbVolumeId, Key),
-  (doc, plan): (&OpsDoc, &PostStatePlan),
-  (turns, longest): (&mut TurnCounts, &mut u64),
-) -> Option<Prepared> {
-  let at = (work, green, key);
-  let evidence = crate::state::with_state(|s| {
-    still_owed(s, at)?;
-    crate::verbs::parked_local_evidence(s.refining.parked.get(&work)?)
-  })
-  .flatten()?;
-  let post = laid_post_state(at, (doc, plan), (&mut *turns, &mut *longest)).await?;
-  let doc_bytes = prepare_turn((&mut *turns, &mut *longest), |s| {
-    still_owed(s, at)?;
-    Some(doc.encode())
-  })
-  .await?;
-  let id = hashed_identity(at, (&doc_bytes, &post), (&mut *turns, &mut *longest)).await?;
-  drop(doc_bytes);
-  let increment = slates_merge::engine::Increment {
-    id,
-    base: key.0,
-    doc: doc.clone(),
-    post_state: post,
-    evidence: evidence.clone(),
-    named: Default::default(),
-  };
-  // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
-  // `compose_increment`), compared whole with the sliced one, in a turn of its own (A-821).
-  #[cfg(debug_assertions)]
-  let _ = prepare_turn((&mut *turns, &mut *longest), |s| {
-    let whole = crate::verbs::composed_whole(
-      s,
-      (work, green, key.0),
-      (doc.clone(), plan.clone()),
-      evidence.clone(),
-    )?;
-    s.count(PREPARED_CHECKED, 1);
-    if whole != increment {
-      s.count(PREPARED_MISMATCH, 1);
-    }
-    Some(())
-  })
-  .await;
-  let computed = prepare_turn((&mut *turns, &mut *longest), |s| {
-    still_owed(s, at)?;
-    s.greens.get(&green)?.compute(&increment).ok()
-  })
-  .await?;
-  let encoded = prepare_turn((&mut *turns, &mut *longest), |s| {
-    still_owed(s, at)?;
-    Some(increment.encode())
-  })
-  .await?;
-  Some(Prepared {
-    evidence,
-    increment: Some(increment),
-    id,
-    computed: Some(computed),
-    encoded: Some(encoded),
-  })
 }
 
 /// The prepared part of `work`'s submit `take` reads (A-787 part 3), counted when taken.
@@ -775,95 +1265,4 @@ pub(crate) fn take_computed(
       .then(|| prepared.computed.take())
       .flatten()
   })
-}
-
-/// The increment's post-state laid over `(doc, plan)` a copy slice a turn ([`prepare`]): the ops whose bytes fit the
-/// shard's copy slice within its quantum (its measured memcpy rate), at least one a turn.
-async fn laid_post_state(
-  at: (DbVolumeId, DbVolumeId, Key),
-  (doc, plan): (&OpsDoc, &PostStatePlan),
-  (turns, longest): (&mut TurnCounts, &mut u64),
-) -> Option<Vec<u8>> {
-  let (work, green, key) = at;
-  let size = usize::try_from(crate::verbs::post_state_size(doc)).ok()?;
-  let mut post = vec![0u8; size];
-  let ops = doc.ops.len();
-  let mut next = 0usize;
-  while next < ops {
-    next = prepare_turn((&mut *turns, &mut *longest), |s| {
-      still_owed(s, at)?;
-      let budget = s
-        .config
-        .copy_slice_bytes_within(s.config.step_quantum_ns())
-        .max(1);
-      let mut end = next;
-      let mut bytes = 0u64;
-      while end < ops && (end == next || bytes < budget) {
-        bytes = bytes.saturating_add(doc.ops.get(end).map_or(0, |op| op.len));
-        end = end.saturating_add(1);
-      }
-      let w = s.works.get(&work)?;
-      let engine = s.greens.get(&green)?;
-      let base = crate::work_files::Base {
-        green: Some(&*engine),
-        green_id: Some(green),
-        fetched: None,
-        version: key.0,
-        entries: None,
-        plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
-      };
-      // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
-      crate::verbs::lay_ops(
-        &mut post,
-        (doc, plan),
-        (&w.files, base),
-        &w.journal,
-        next..end,
-      )
-      .ok()?;
-      Some(end)
-    })
-    .await?;
-  }
-  Some(post)
-}
-
-/// The increment's identity hashed a hash slice a turn ([`prepare`]): the work and its base, then the encoded document
-/// and the post-state, as `verbs::compose_increment` hashes them, each turn the shard's hash slice within its quantum
-/// (its measured BLAKE3 rate).
-async fn hashed_identity(
-  at: (DbVolumeId, DbVolumeId, Key),
-  (doc_bytes, post): (&[u8], &[u8]),
-  (turns, longest): (&mut TurnCounts, &mut u64),
-) -> Option<[u8; 32]> {
-  let (work, _, key) = at;
-  let mut hasher = crate::verbs::identity_hasher(work, key.0);
-  let whole = doc_bytes.len().saturating_add(post.len());
-  let mut hashed = 0usize;
-  while hashed < whole {
-    hashed = prepare_turn((&mut *turns, &mut *longest), |s| {
-      let slice = s
-        .config
-        .archive_slice_bytes_within(s.config.step_quantum_ns())
-        .max(1);
-      let end = hashed
-        .saturating_add(usize::try_from(slice).unwrap_or(usize::MAX))
-        .min(whole);
-      let doc_end = doc_bytes.len();
-      if hashed < doc_end {
-        hasher.update(doc_bytes.get(hashed..end.min(doc_end)).unwrap_or_default());
-      }
-      if end > doc_end {
-        let from = hashed.saturating_sub(doc_end);
-        hasher.update(
-          post
-            .get(from..end.saturating_sub(doc_end))
-            .unwrap_or_default(),
-        );
-      }
-      Some(end)
-    })
-    .await?;
-  }
-  Some(*hasher.finalize().as_bytes())
 }

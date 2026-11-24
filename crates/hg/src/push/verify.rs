@@ -82,6 +82,17 @@ pub trait Held {
   fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>>;
   /// The text of the manifest `node`, if the manifest log holds it.
   fn manifest_text(&self, node: &Node) -> Option<Cow<'_, [u8]>>;
+  /// Whether the changelog holds the changeset `node`, its text at hand or not (goal 93, C1 (1): the changelog's texts
+  /// let go once landed): a reader finding no text of one it holds waits while its owner reads it from the node's
+  /// changeset store ([`crate::push::tree::LayoutRefusal::NotAtHand`]). By default, where it gives its text.
+  fn holds_changeset(&self, node: &Node) -> bool {
+    self.changeset_text(node).is_some()
+  }
+  /// Whether the manifest log holds the manifest `node`, its text at hand or not, as [`Held::holds_changeset`] tells a
+  /// changeset.
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self.manifest_text(node).is_some()
+  }
   /// The text (its metadata block, then its bytes) of the revision `node` of `path`'s file log, if it holds it.
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>>;
   /// The names of the revision `node` of `path`'s file log, if it holds it: its metadata block's and its bytes'

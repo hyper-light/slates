@@ -1661,7 +1661,10 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
 > until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
-> `vcs_store::owed`, made at its build's end from what the submit staged; a push mid-build moves the build to the newest
+> `vcs_store::owed`, made at its build's end from what the submit staged, WITHDRAWN 2026-11-24 by A-896: a git green's
+> submit is a recorded request alone, refused `RecordedSubmitRequired { tool: Git }` otherwise, its made commit's map put
+> over the held verdict's preview (whole past a copy) before one step commits both, and a replay refuses an owed
+> record `OwedCommit { key, version }`; a push mid-build moves the build to the newest
 > head at a slice's boundary, never restarting it, and a parked submit's wait bounded by the failover delay, BUILT
 > 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
@@ -4681,6 +4684,15 @@
 > `GreenReplay::step`). Owed: git-2000 re-measured on the merged tree (main's run), which closes P7's finding (2) or
 > not. Still one step a batch: `append_versions`' loop before the record (each version's increment held, its entry
 > encoded; w-rewrite-ops'), and `follow`, the fold and the texts' release after the last slice.
+> **A held verdict's base let go between its judge and its apply never makes another green; it costs a run (2026-11-24,
+> w-svn; main's question of 2026-11-23).** The made commit's step applies the verdict as its chain entry records it
+> (`Green::apply_recorded`, named bytes lent by identity from the content plane, `name_holds::apply_recorded_lent`); a
+> base window let go meanwhile cannot be lent in the synchronous step, so the step gives the accept up with nothing
+> applied (`made_commit::abandon`, `Overloaded` unrecorded) and the retry judges, lands and applies anew. Held by
+> `a_base_let_go_between_a_held_verdicts_judge_and_apply_never_makes_another_green` (the base let go in the step through
+> `svn_made::LET_GO_BEFORE_APPLY`: given up, then revision 2 once, the file the verdict judged, head 2). Owed, on the
+> speed list: bring the apply's unlent objects back in the task before its step (the turn is held), so a let-go costs a
+> fetch, not a whole run and a changeset landed again at its sequence.
 > **The use test's dump comparison reads a directory's deletions as a set (2026-11-24, w-svn; main's interop red of
 > 2026-11-23, run 45330574435).** `svnrdump dump 0:HEAD` differed at line 1,608,541 only in the order of one revision's
 > deletions in `trunk/templates/`. Stock's own order is no fixed rule: its dump editor queues a directory's deletions in
@@ -4707,10 +4719,14 @@
 > naming it, both numbers and what landed. Held by
 > `t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_time` (red: refused at the first batch's
 > landing) and `t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_and_both_numbers`. Owed: the
-> Studio's interop round 3 (main's run); and the batch's chain entries, held to the same cap in the `green_chains`
-> table: under a 16 KiB cap a batch of two revisions adding 400 paths was refused `TableAtCapacity { table:
-> "green_chains" }` at its landing, so a batch must also flush before its entries outgrow the chain's room (found
-> 2026-11-24 writing A-892's red; far from the Studio's cap at git-2000's sizes).
+> Studio's interop round 3 (main's run). The batch's chain entries, held to the same cap in the `green_chains` table
+> (under a 16 KiB cap a batch of two revisions adding 400 paths was refused `TableAtCapacity { table: "green_chains"
+> }` at its landing; found writing A-892's red), BUILT (A-895, 2026-11-24): the batch takes its chains' room when it
+> begins, each verdict is judged and held, its entry sized exactly, and a revision that would take the batch past the
+> room is deferred whole (`Flush::Chain`); a lone entry past it keeps the append's typed refusal. An import reports its
+> batches by cause (`Loaded::batches`, logged at its end). Held by
+> `t_c2c_an_import_past_the_chains_room_lands_a_batch_within_it_at_a_time` (two revisions of 190 new paths; red with the
+> check out: refused at the landing). The 400-path revision's entry is past the room alone and is refused typed.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").

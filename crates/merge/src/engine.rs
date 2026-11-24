@@ -6471,8 +6471,9 @@ impl Green {
   }
 
   /// A judgment committed at once where it accepted, as a submit's outcome, with what the chain records of a new
-  /// version (`None` beside every other outcome).
-  fn commit_judgment(
+  /// version (`None` beside every other outcome): [`Green::submit_named`]'s second half, for a caller that sizes the
+  /// accepted verdict's entry between the two (an import's batch, held to its chains' room; A-895).
+  pub fn commit_judgment(
     &mut self,
     judgment: Judgment,
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {

@@ -660,17 +660,16 @@ pub(crate) fn cut_ended() -> usize {
 
 /// The pre-images homes kept since this was last asked, the counts started again.
 pub(crate) fn take_cut_counts() -> slates_vcs::preimage::PreimageCounts {
-  let mut counts = CUT_REGION.with(|cut| {
+  let region = CUT_REGION.with(|cut| {
     cut
       .try_borrow_mut()
       .map_or_else(|_| Default::default(), |mut cut| cut.take_counts())
   });
-  counts += CUT_LANDED.with(|cut| {
+  region.and(CUT_LANDED.with(|cut| {
     cut
       .try_borrow_mut()
       .map_or_else(|_| Default::default(), |mut cut| cut.take_counts())
-  });
-  counts
+  }))
 }
 
 /// [`region_held_in`] as at the cut (F2): the holds now with their pre-images laid over them, read until their bytes

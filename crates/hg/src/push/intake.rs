@@ -136,6 +136,9 @@ pub struct Intaken {
   /// [`Intaken::most_own_runs`]'s bound (the run a seal wrote, until the merge it made due ends; Derived in
   /// [`slates_vcs::Index::tiered_due`]).
   pub most_own_runs_in_flight: u64,
+  /// The changelog's and the manifests' texts the intake asked of the node's changeset store, their windows let go once
+  /// landed (goal 93, C1 (1)): a delta's base, or the manifest a new one is kept as a delta against.
+  pub log_texts_asked: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -464,6 +467,10 @@ struct Taker {
   cache: BaseCache,
   /// A file delta's base asked of the store, and its answer.
   asked: Option<StoreAsk>,
+  /// The changelog's and the manifest log's texts the store gave for the unit being taken (goal 93, C1 (1): those
+  /// logs' texts let go once landed): its delta's base and, for a manifest, the one before it that its row is kept as a
+  /// delta against; two at most, given up once the unit is taken whole ([`Taker::log_texts_ready`]).
+  logs_given: Vec<(Node, Vec<u8>)>,
   /// A revision longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
   /// The merge of the fork's newest runs the size-tiered rule named, a table a step until it ends
@@ -847,6 +854,18 @@ enum Based {
   Store,
 }
 
+/// The log a text asked of the store is kept under (a file's path, or [`CHANGELOG_PATH`] or [`MANIFEST_PATH`]), as a
+/// refusal names it.
+fn log_of_path(path: &[u8]) -> LogOf {
+  if path == CHANGELOG_PATH {
+    LogOf::Changelog
+  } else if path == MANIFEST_PATH {
+    LogOf::Manifests
+  } else {
+    LogOf::File(path.to_vec())
+  }
+}
+
 impl crate::render::StoreWants for Intake {
   fn wants(&self) -> Option<&crate::render::Want> {
     self
@@ -875,7 +894,7 @@ impl crate::render::StoreWants for Intake {
       None => {
         asked.want = None;
         asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
-          log: LogOf::File(asked.path.clone()),
+          log: log_of_path(&asked.path),
           node: asked.node,
           base: asked.node,
         }));
@@ -897,7 +916,7 @@ impl crate::render::StoreWants for Intake {
     asked.text = texts.into_iter().next();
     if asked.text.is_none() {
       asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
-        log: LogOf::File(asked.path.clone()),
+        log: log_of_path(&asked.path),
         node: asked.node,
         base: asked.node,
       }));
@@ -931,6 +950,37 @@ impl Intake {
   /// Answers the store's want from the fork's own texts, as a test's stand-in for the node's changeset store (the tests
   /// keep no store): the base the step asked for, read back from the fork's content store.
   #[cfg(test)]
+  /// The text a step asked of the store, by its log's path and its node, if any: the tests' stand-in for the node's
+  /// changeset store reads it.
+  #[cfg(test)]
+  pub(crate) fn asked_text(&self) -> Option<(Vec<u8>, Node)> {
+    self
+      .taker
+      .asked
+      .as_ref()
+      .map(|asked| (asked.path.clone(), asked.node))
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the text asked with `text`, none where it keeps none.
+  #[cfg(test)]
+  pub(crate) fn answer_text(&mut self, text: Option<Vec<u8>>) {
+    let Some(asked) = self.taker.asked.as_mut() else {
+      return;
+    };
+    asked.want = None;
+    match text {
+      Some(text) => asked.text = Some(text),
+      None => {
+        asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
+          log: log_of_path(&asked.path),
+          node: asked.node,
+          base: asked.node,
+        }));
+      }
+    }
+  }
+
+  #[cfg(test)]
   pub(crate) fn answer_from_fork(&mut self, store: &ContentStore) {
     let Some(asked) = self.taker.asked.as_mut() else {
       return;
@@ -941,7 +991,7 @@ impl Intake {
       Some(text) => asked.text = Some(text.into_owned()),
       None => {
         asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
-          log: LogOf::File(asked.path.clone()),
+          log: log_of_path(&asked.path),
           node: asked.node,
           base: asked.node,
         }));
@@ -1006,6 +1056,7 @@ impl Intake {
         positions: BTreeMap::new(),
         cache: BaseCache::within(room),
         asked: None,
+        logs_given: Vec::new(),
         pending: None,
         merging: None,
         cutting: None,
@@ -1168,6 +1219,9 @@ impl Taker {
       Stage::Manifests(at) => Stage::Manifests(at.saturating_add(1)),
       other => other,
     };
+    if let Some(stepped) = self.log_texts_ready(log, &revision, store)? {
+      return Ok(stepped);
+    }
     // A revision longer than a window is taken over the steps after this one ([`Pending`]), which move the stage on.
     if self.take(
       log,
@@ -1177,8 +1231,82 @@ impl Taker {
       (after, None),
     )? {
       self.stage = after;
+      self.logs_given.clear();
     }
     Ok(Stepped::More)
+  }
+
+  /// Whether the texts a changelog's or a manifest's revision's step reads are at hand (goal 93, C1 (1): those logs'
+  /// texts let go once landed, main's ruling of 2026-11-23 20:53): its delta's base, and for a manifest the one the fork
+  /// holds last, which its row is kept as a delta against (`HgIndex::append_revisions_after`). One the fork holds whose
+  /// text is not at hand is asked of the node's changeset store ([`StoreAsk`] under its log's path) and the step taken
+  /// again once given, nothing taken meanwhile: `Store`; the text given is kept for the unit ([`Taker::logs_given`]).
+  /// None where the step may go on. Refused where the store gave nothing for the one asked.
+  fn log_texts_ready(
+    &mut self,
+    log: Log<'_>,
+    revision: &Revision<'_>,
+    store: &ContentStore,
+  ) -> Result<Option<Stepped>, Refused> {
+    let path = match log {
+      Log::Changelog => CHANGELOG_PATH,
+      Log::Manifest => MANIFEST_PATH,
+      Log::File(_) => return Ok(None),
+    };
+    if let Some(asked) = self.asked.take() {
+      if asked.path != path {
+        self.asked = Some(asked);
+      } else if let Some(refused) = asked.refused {
+        return Err(refused);
+      } else if let Some(text) = asked.text {
+        self.logs_given.push((asked.node, text));
+      } else {
+        self.asked = Some(asked);
+        return Ok(Some(Stepped::Store));
+      }
+    }
+    if self.fork.rev(store, log, &revision.node).is_some() {
+      return Ok(None);
+    }
+    let previous = match log {
+      Log::Manifest => self
+        .fork
+        .len(store, log)
+        .checked_sub(1)
+        .and_then(|rev| self.fork.revision(store, log, rev))
+        .map(|row| row.node),
+      _ => None,
+    };
+    let wanted = [Some(revision.base), previous]
+      .into_iter()
+      .flatten()
+      .filter(|node| *node != NULL_NODE)
+      .filter(|node| !self.has_text(node))
+      .find_map(|node| {
+        let (len, at_hand) = crate::push::held::log_text_at_hand((&self.fork, store), log, &node)?;
+        (!at_hand).then_some((node, len))
+      });
+    let Some((node, most)) = wanted else {
+      return Ok(None);
+    };
+    self.asked = Some(StoreAsk {
+      path: path.to_vec(),
+      node,
+      want: Some(crate::render::Want::Rows {
+        logs: vec![(path.to_vec(), vec![node])],
+      }),
+      most,
+      text: None,
+      refused: None,
+    });
+    self.intaken.log_texts_asked = self.intaken.log_texts_asked.saturating_add(1);
+    Ok(Some(Stepped::Store))
+  }
+
+  /// Whether the text of `node` is the one kept last or one the store gave for the unit ([`Taker::logs_given`]).
+  fn has_text(&self, node: &Node) -> bool {
+    self.last.as_ref().is_some_and(|(last, _)| last == node)
+      || self.logs_given.iter().any(|(given, _)| given == node)
   }
 
   /// One step of the file groups: a group opened (its path read, audited and kept, charged to `admission`), then its
@@ -1603,6 +1731,7 @@ impl Taker {
       self.positions.insert(node, position);
     }
     self.stage = after;
+    self.logs_given.clear();
     Ok(Stepped::More)
   }
 
@@ -1639,9 +1768,20 @@ impl Taker {
       link: revision.link,
       text,
     };
-    let previous = self
-      .last
-      .as_ref()
+    // The manifest the fork holds last, which this one's row is kept as a delta against: the text kept last, else one
+    // the store gave for the unit (`Taker::log_texts_ready`).
+    let held_last = match log {
+      Log::Manifest => self
+        .fork
+        .len(store, log)
+        .checked_sub(1)
+        .and_then(|rev| self.fork.revision(store, log, rev))
+        .map(|row| row.node),
+      _ => None,
+    };
+    let previous = held_last
+      .and_then(|held_last| self.logs_given.iter().find(|(node, _)| *node == held_last))
+      .or(self.last.as_ref())
       .map(|(node, text)| (node, text.as_slice()));
     keep_one(
       &mut self.fork,
@@ -1856,6 +1996,13 @@ impl Taker {
     {
       return Some(Cow::Borrowed(text.as_slice()));
     }
+    if let Some((_, text)) = self
+      .logs_given
+      .iter()
+      .find(|(node, _)| *node == revision.base)
+    {
+      return Some(Cow::Borrowed(text.as_slice()));
+    }
     if let Log::File(_) = log
       && let Some(text) = self.cache.held.get(&revision.base)
     {
@@ -2024,6 +2171,39 @@ pub struct Rebase {
   logged: bool,
   /// What the push brings over the index as it is now.
   intaken: Intaken,
+  /// A manifest's text not at hand, asked of the node's changeset store ([`Rebase::texts_ready`]).
+  asked: Option<crate::push::held::TextAsk>,
+  /// The manifests' texts the store gave for the row being re-appended: the one its chain rests on and the one the fork
+  /// holds last, two at most, given up once the row is appended (goal 93, C1 (1); main's ruling of 2026-11-24 02:55:
+  /// one way to read a text not at hand, everywhere).
+  given: Vec<(Node, Vec<u8>)>,
+}
+
+impl crate::render::StoreWants for Rebase {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self
+      .asked
+      .as_ref()
+      .and_then(crate::render::StoreWants::wants)
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_rows(rows);
+    }
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_chunks(chunks);
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_texts(texts);
+    }
+  }
 }
 
 impl Rebase {
@@ -2055,6 +2235,8 @@ impl Rebase {
       at: (0, 0),
       logged: false,
       intaken,
+      asked: None,
+      given: Vec::new(),
     })
   }
 
@@ -2071,9 +2253,83 @@ impl Rebase {
       self.logged = false;
       return Ok(Stepped::More);
     }
+    if let Some(stepped) = self.texts_ready(log, rev, store)? {
+      return Ok(stepped);
+    }
     self.again(log, &named, rev, store)?;
+    self.given.clear();
     self.at = (at, rev.saturating_add(1));
     Ok(Stepped::More)
+  }
+
+  /// The ask of the node's changeset store the re-base waits on, by its path and node, if any: the tests' stand-in for
+  /// the store reads it.
+  #[cfg(test)]
+  pub(crate) fn asked_text(&self) -> Option<(Vec<u8>, Node)> {
+    self.asked.as_ref().map(|asked| {
+      let (path, node) = asked.asked();
+      (path.to_vec(), node)
+    })
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the ask with `text`, none where it keeps none.
+  #[cfg(test)]
+  pub(crate) fn answer_text(&mut self, text: Option<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.answered(text);
+    }
+  }
+
+  /// Whether the manifests' texts re-appending the stale fork's manifest `rev` reads are at hand (goal 93, C1 (1)): the
+  /// one its chain rests on whose object was let go ([`crate::push::held::text_wanted`]), and the one the fork holds
+  /// last, which the fork keeps it as a delta against. One not at hand is asked of the node's changeset store and the
+  /// step taken again once given, nothing re-appended meanwhile: `Store`. None where the step may go on; refused where
+  /// the store gave no text for the one asked.
+  fn texts_ready(
+    &mut self,
+    log: Log<'_>,
+    rev: u32,
+    store: &ContentStore,
+  ) -> Result<Option<Stepped>, Unindexed> {
+    if log != Log::Manifest {
+      return Ok(None);
+    }
+    if let Some(asked) = self.asked.take() {
+      if crate::render::StoreWants::wants(&asked).is_some() {
+        self.asked = Some(asked);
+        return Ok(Some(Stepped::Store));
+      }
+      let (node, text) = asked
+        .taken()
+        .map(|(_, node, text)| (node, text))
+        .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+      self.given.push((node, text));
+    }
+    let rests_on = crate::push::held::text_wanted((&self.stale, store), log, rev);
+    let held_last = self
+      .fork
+      .len(store, log)
+      .checked_sub(1)
+      .and_then(|last| self.fork.revision(store, log, last))
+      .and_then(|row| {
+        let (len, at_hand) =
+          crate::push::held::log_text_at_hand((&self.fork, store), log, &row.node)?;
+        (!at_hand).then_some((row.node, len))
+      });
+    let wanted = [rests_on, held_last]
+      .into_iter()
+      .flatten()
+      .find(|(node, _)| !self.given.iter().any(|(given, _)| given == node));
+    let Some((node, most)) = wanted else {
+      return Ok(None);
+    };
+    self.asked = Some(crate::push::held::TextAsk::new(
+      MANIFEST_PATH.to_vec(),
+      node,
+      most,
+    ));
+    self.intaken.log_texts_asked = self.intaken.log_texts_asked.saturating_add(1);
+    Ok(Some(Stepped::Store))
   }
 
   /// The fork of the index as it is now, holding the push, and what it brings over that index; the stale fork given
@@ -2106,7 +2362,7 @@ impl Rebase {
     rev: u32,
     store: &mut ContentStore,
   ) -> Result<(), Unindexed> {
-    let kept = crate::import::record::kept(&self.stale, store, log, rev).ok_or(
+    let kept = crate::import::record::kept_over(&self.stale, store, log, rev, &self.given).ok_or(
       Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE }),
     )?;
     let node = kept.node;
@@ -2156,7 +2412,7 @@ impl Rebase {
       } else {
         let text = self
           .stale
-          .revision_text(store, log, rev)
+          .revision_text_over(store, log, rev, &self.given)
           .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
         Some(store.put_object(&text)?)
       };
@@ -2170,7 +2426,24 @@ impl Rebase {
         bytes: rebuilt.unwrap_or(row.bytes),
         block: row.block,
       };
-      let appended = self.fork.append_revisions(store, log, &[again]);
+      // The fork keeps it as its own delta against the manifest it holds last, whose text the store may have given.
+      let held_last = self
+        .fork
+        .len(store, log)
+        .checked_sub(1)
+        .and_then(|last| self.fork.revision(store, log, last))
+        .map(|row| row.node);
+      let previous = held_last.and_then(|held_last| {
+        self
+          .given
+          .iter()
+          .find(|(node, _)| *node == held_last)
+          .map(|(node, text)| (node, text.as_slice()))
+      });
+      let appended = self
+        .fork
+        .append_revisions_after(store, log, &[again], (previous, &[]))
+        .map(drop);
       if let Some(put) = rebuilt {
         store.release(&put)?;
       }

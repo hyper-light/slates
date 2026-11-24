@@ -526,7 +526,7 @@ pub(crate) enum OverPreviewStep {
   /// slice a turn (`whole_build::PreviewChange`).
   Change(Head, BTreeSet<String>),
   /// Built from the preview's whole head, a slice a turn too: the version a root's first, so the whole is the version's
-  /// own change.
+  /// own change; or its change names a copy, which stands for the tree it brought (A-586, A-626 part 4).
   Whole,
   /// The map of the head before is built first, in slices (`whole_build`), then the change stepped.
   HeadFirst,
@@ -554,8 +554,13 @@ pub(crate) fn over_preview_step(
       over.version.saturating_sub(offset),
     )
   };
-  if let Some((before, named)) = before.and_then(|before| Some((before, named_over(before)?))) {
-    return Some(OverPreviewStep::Change(before, named));
+  if let Some(before) = before {
+    // A copy named in the change stands for the tree it brought (A-586), so the version's map is built from the
+    // preview's whole head, as [`advance`] builds a committed version's (A-626 part 4).
+    return Some(match named_over(before) {
+      Some(named) => OverPreviewStep::Change(before, named),
+      None => OverPreviewStep::Whole,
+    });
   }
   Some(if over.version <= 1 {
     OverPreviewStep::Whole
