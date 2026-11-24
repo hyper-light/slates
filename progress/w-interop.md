@@ -623,3 +623,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   histories, git fetch and shallow fast on run 1 then slow (w-git). LANDED 9f3c3ad80, 2026-11-24: the git harness keeps
   status --json after each slates push, fetch and shallow, and prints w-git's encode and derive counters. Waiting:
   r865 (git-2000 svn use leg, rerun after the runner restart) and main's git-leg run at 9f3c3ad80.
+- LANDED 21b8b5311, 2026-11-24: the git harness keeps status before and after every slates clone, with w-git's full
+  counter list, records each clone's first packet and first pack bytes, and with SAMPLE=1 profiles one more slates push
+  and clone (macOS sample, 30 s from 10 s in) apart from the timed runs. This is for w-git's clone and w-svn's A-900
+  check. Waiting: main's git leg at 21b8b5311, and r865.
