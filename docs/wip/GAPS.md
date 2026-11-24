@@ -1219,8 +1219,11 @@
 >   brings back through its fork what was let go before its entry commits; a replay reads no run its apply names whole,
 >   and recovery rebuilds a green whose replay reads a named base after the stores whose index resolves it. Reds green:
 >   the naming, a mount's read, an in-place edit, a second work naming the same bytes, two restarts. Owed: main's rerun
->   of the 57k lifetimes sampler (the greens' bytes the gate); a takeover's re-adoption of a Mercurial green brings back
->   no named base (`green_adopt::readopt_with` runs svn's live pre-pass alone); git as its own piece.
+>   of the 57k lifetimes sampler (the greens' bytes the gate; VERIFIED r851, 2026-11-24: live under the mapped floor
+>   at the push's end 114,954,401 B against r583's ~170 MB, the greens' heap copies gone); git as its own piece. A
+>   takeover's re-adoption brings back the named bases a Mercurial green's replay reads, by the plan a recovery runs
+>   (`hg_named::bring_back_named_live`, 2026-11-24; red `a_readopted_green_brings_back_the_named_base_its_chain_splices_first`:
+>   not re-adopted, the edit's replay fencing `ContentMissing`).
 > - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
 >   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
 >   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no

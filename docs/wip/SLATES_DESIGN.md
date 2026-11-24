@@ -62650,7 +62650,9 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   needs an index and the branches made from them (`verbs::rebuilt_after_stores`, counted
   `merge.recovery.greens_after_stores`), in the same recovery. Their works wait as a work over a green awaiting
   adoption does (`work_home.unbuilt`), replayed through the green once it is in, before any client is admitted. The
-  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). Rejected: recovering
+  texts brought are let go again once the green is replayed (`name_holds::let_go_landed_texts`). A takeover's
+  re-adoption runs the same plan on its live shard before it replays (`hg_named::bring_back_named_live` beside
+  `svn_texts::bring_back_named_live` in `green_adopt::readopt_with`; one planner, `hg_named::to_bring`). Rejected: recovering
   one repository's store before its greens (a store's replay reads greens: an import's bookmarks, a cycle), and a
   second resolver over the node's store without the index.
 - **Counters.** `repository.push.files_named` (named rather than made); `vcs.hg.pushed_texts_brought_back` (a named
