@@ -109,7 +109,7 @@ proptest! {
     let given_up = checkpoint.clone().into_encoded();
     prop_assert_eq!(given_up.capacity(), given_up.len());
     prop_assert_eq!(given_up, checkpoint.encode());
-    let mut restored = Green::restore(origin_of(&origin_rows), &mut checkpoint.clone()).unwrap();
+    let mut restored = Green::restore(origin_of(&origin_rows), &checkpoint);
     prop_assert_eq!(restored.head(), at);
     for version in 0..=head {
       let kept = if version <= at { green.signature(version) } else { None };
@@ -168,14 +168,14 @@ proptest! {
     let head = green.head();
     let at = u64::from(pick) % (head + 1);
     let checkpoint = green.checkpoint(at).expect("a checkpoint at or below the head");
-    let mut whole = Green::restore(origin_of(&origin_rows), &mut checkpoint.clone()).unwrap();
+    let mut whole = Green::restore(origin_of(&origin_rows), &checkpoint);
     let mut load = slates_merge::engine::OriginLoad::new(origin_of(&origin_rows));
     let seeded = loop {
       if let Some(seeded) = load.step(share) {
         break seeded;
       }
     };
-    let mut in_shares = seeded.with_checkpoint(&mut checkpoint.clone()).unwrap();
+    let mut in_shares = seeded.with_checkpoint(&checkpoint);
     for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
       let committed = matches!(whole.submit(increment), Outcome::Accepted { version: v } | Outcome::Identical { version: v } if v == *version);
       prop_assert!(committed, "accepted as version {}, changing something or (A-782) nothing", version);

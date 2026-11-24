@@ -2176,6 +2176,12 @@ impl Dispatched {
   pub fn needs_barrier(&self) -> bool {
     crate::bridge::needs_barrier(self.opcode, self.error)
   }
+
+  /// The request as the kernel sent it, its reply never sent: what an owner keeps to dispatch again
+  /// ([`dispatch_kept`]) once what it waited on is back (A-760 (b) 4d: a read of a let-go window, parked).
+  pub fn into_request(self) -> Vec<u8> {
+    self.request
+  }
 }
 
 /// What one non-blocking turn of [`dispatch_ready`] found.
@@ -2241,6 +2247,34 @@ pub fn dispatch_ready(
     };
   };
   let request = channel.take_request();
+  dispatch_admitted(
+    channel,
+    bridge,
+    attachments,
+    attachment,
+    state,
+    slice_bytes,
+    (cx, request),
+  )
+}
+
+/// [`dispatch_ready`] for `request`, read by an earlier turn and kept unanswered by its owner (A-760 (b) 4d: parked on a
+/// read of a let-go window until it is back): admitted and dispatched again as if read now, its reply left in `state`.
+pub fn dispatch_kept(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+  state: &mut ServeState,
+  slice_bytes: u64,
+  request: Vec<u8>,
+) -> Result<Turn, ChannelError> {
+  let Ok(cx) = attachments.begin(attachment) else {
+    return match refuse_revoked(channel, state, &request)? {
+      Revoked::Ended => Ok(Turn::Ended),
+      Revoked::Dropping => Ok(Turn::Refused),
+    };
+  };
   dispatch_admitted(
     channel,
     bridge,

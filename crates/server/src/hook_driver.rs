@@ -714,7 +714,7 @@ mod tests {
   use super::{Ended, Launch, run};
   use crate::daemon::LIVENESS_BUDGET_NS;
   use crate::vcs_hooks::{
-    EnvValue, ExitStatus, HookInput, HookPoint, HookTimes, Learns, Lesson, Outcome, PendingView,
+    EnvValue, ExitStatus, HookInput, HookPoint, HookTimes, Lesson, Outcome, PendingView,
     StartRefused, View,
   };
 
@@ -728,8 +728,6 @@ mod tests {
   const SLEEP_SECONDS: u64 = 30;
   /// Shape: how many bytes of a hook's words the tests keep.
   const CAP: usize = 1 << 16;
-  /// Shape: a hook run as a quick check takes it, 30 ms.
-  const QUICK_NS: u64 = 30_000_000;
   /// Shape: how long a test lets a run take before giving up on it: ten liveness windows.
   const TEST_BOUND_NS: u64 = 10 * LIVENESS_BUDGET_NS;
   /// Shape: when a test's client leaves: a fifth of a liveness window.
@@ -916,13 +914,43 @@ mod tests {
     got.recv().expect("the run answered")
   }
 
-  /// A hook's times after eight quick runs finished: a bound a little past a liveness window.
+  /// A hook's times after eight quick runs finished, each as long as [`quick_run`]'s: a bound a liveness window past a
+  /// hook that exits at once.
   fn learned() -> HookTimes {
+    let quick = quick_run();
     let mut times = HookTimes::default();
     for _ in 0..8 {
-      times.finished(QUICK_NS);
+      quick.teach(&mut times);
     }
     times
+  }
+
+  /// What one real run of a hook that exits at once teaches, run once a process: how long this build's re-invoked test
+  /// binary takes from its spawn to its exit, as the product learns it. A constant stood here, 30 ms, and
+  /// ThreadSanitizer's lane outran it: its runtime sleeps a second at the exit of any process with a thread besides the
+  /// exiting one (`atexit_sleep_ms`, 1,000 by default: compiler-rt's `tsan_flags.inc`, and `Finalize` in
+  /// `tsan_rtl.cpp`), and libtest's main thread waits beside the role's. So the lingering hook, its child spawned and
+  /// its words written, was killed at the 1.04 s bound before its exit (diag run 45315777446, 2026-11-24).
+  fn quick_run() -> Lesson {
+    static QUICK_RUN: std::sync::OnceLock<Lesson> = std::sync::OnceLock::new();
+    *QUICK_RUN.get_or_init(|| {
+      let (outcome, lesson, _) = drive(
+        None,
+        input(HookPoint::GitPostReceive, "accept", &[], Vec::new()),
+        None,
+        None,
+      )
+      .expect("the quick run ended");
+      assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+      let mut taught = HookTimes::default();
+      lesson.teach(&mut taught);
+      assert_eq!(
+        taught.finished_runs(),
+        1,
+        "the quick run finished: {lesson:?}"
+      );
+      lesson
+    })
   }
 
   /// A hook's words, as text.

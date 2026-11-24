@@ -263,6 +263,13 @@ pub(crate) fn source<'a>(
   Some((greens.get(&pin.green)?, pin.version))
 }
 
+/// Whether `volume` is a mounted work whose green holds a file by its content-plane object's name alone (A-760 (b) 4d):
+/// a request to its mount reads such a file through the content store, its chunks lent for the request.
+pub(crate) fn reads_named(state: &ShardState, volume: DbVolumeId) -> bool {
+  source(&state.greens, &state.merge.mounted, volume)
+    .is_some_and(|(green, _)| green.named_blocks() > 0)
+}
+
 /// Declares into `work` what its mount changed (the module doc). Nothing to do for a work with no mount. A refusal of
 /// any declaration is the submit's: what was declared before it stays declared (each is recorded as its verb records
 /// it), and a retry compares again and declares the rest.
@@ -334,12 +341,18 @@ fn read_mounted(
     volumes,
     greens,
     merge,
+    vcs_stores,
     ..
   } = state;
   let lent = source(greens, &merge.mounted, id);
-  let tree = lent
-    .as_ref()
-    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  // A base held by name is read through the content plane, its chunks lent by the caller (A-760 (b) 4d).
+  let tree = lent.as_ref().map(|(green, version)| {
+    crate::green_tree::GreenTree::reading(
+      green,
+      *version,
+      crate::vcs_store::named_objects::plane(vcs_stores, &()),
+    )
+  });
   let slot = volumes.get_mut(handle).map_err(|_| VfsError::StaleHandle)?;
   let mut lens = None;
   let Some(host) = slot.host.as_mut() else {
@@ -387,7 +400,12 @@ fn declare_entry(
   path: &str,
 ) -> Result<(), Refusal> {
   let path = crate::merge_service::canonical_path(path);
-  match read_mounted(state, (id, handle), path).map_err(|e| refusal_of_vfs(&e))? {
+  // A base held by name is read through the content store, its chunks lent for the read (A-760 (b) 4d).
+  let lend = reads_named(state, id);
+  let mounted = crate::vcs_store::svn_presenter::lent_if(state, lend, |state| {
+    read_mounted(state, (id, handle), path)
+  });
+  match mounted.map_err(|e| refusal_of_vfs(&e))? {
     Mounted::Dir => {
       if work_has_dir(state, id, path) {
         return Ok(());
@@ -609,6 +627,18 @@ fn load_tree(state: &mut ShardState, id: DbVolumeId) -> Result<(), VfsError> {
 }
 
 /// The green tree green view `id` reads: the green, lent from `greens`, at the head its view was made at.
+/// Whether the volume at `handle` is a green's landing view whose green holds a file by its content-plane object's name
+/// alone (A-760 (b) 4d): a step of its landing reads such a file through the content store, its chunks lent.
+pub(crate) fn view_reads_named(
+  state: &ShardState,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+) -> bool {
+  state.volumes.get(handle).is_ok_and(|slot| {
+    view_source(&state.greens, &state.merge.green_views, slot.id)
+      .is_some_and(|(green, _)| green.named_blocks() > 0)
+  })
+}
+
 pub(crate) fn view_source<'a>(
   greens: &'a crate::greens::Greens,
   views: &GreenViews,

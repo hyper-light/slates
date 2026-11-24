@@ -362,14 +362,9 @@ impl Green {
 
   /// A named file of a checkpoint set (A-869): its bytes, the whole of `identity`'s object, taken without a copy and
   /// its block named for it, the identity's entry moved with it; no history.
-  pub(super) fn place_named_file(
-    &mut self,
-    path: &str,
-    bytes: Vec<u8>,
-    identity: crate::named::Identity,
-  ) {
+  pub(super) fn place_named_file(&mut self, path: &str, identity: crate::named::Identity) {
     self.take_file_entry(path);
-    self.content.insert_named(path, bytes, Some(identity));
+    self.content.insert_named(path, identity);
     if let Some(digest) = self.content.digest_of(path) {
       self.identity.add(&file_entry(path, digest));
     }

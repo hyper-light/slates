@@ -513,11 +513,16 @@ impl RecordedBatch {
       // again from the content store, which holds them until the batch's landing ends (`svn_commit::staging`). One read
       // in place of the copy the post-state was; adopting the scratch member's files is w-svn's piece (c).
       let read = crate::repository::svn_commit::read_named(state, &mut step.increment).is_ok();
-      let applied = state
-        .greens
-        .get_mut(&self.green)
-        .filter(|_| read)
-        .map(|mut engine| engine.apply_recorded(&mut step.increment, &step.applied));
+      // The named texts its apply reads that the green holds by name alone lent it first (A-760 (b) 4d).
+      let applied = if read {
+        crate::vcs_store::name_holds::apply_recorded_lent(
+          state,
+          self.green,
+          (&mut step.increment, &step.applied),
+        )
+      } else {
+        None
+      };
       if applied != Some(version) {
         // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
         state.count(BATCH_APPLY_REFUSED, 1);
@@ -1259,6 +1264,35 @@ enum Verdict {
 /// Format: a counter name in the status report.
 pub(crate) const READ_CLONED_BYTES: &str = "repository.push.read_cloned_bytes";
 
+/// `work`'s verdict on `green` (`Green::judge_named`), judged again once lent from the content plane every named text
+/// its first judge read unlent (A-760 (b) 4d: a copied or spliced base held by name alone), let go once committed
+/// ([`commit`]). A text the plane cannot give now leaves the first refusal; one read unlent again is counted, a bug.
+fn judged_lent(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  work: &mut Increment,
+) -> Option<Judgment> {
+  use crate::vcs_store::name_holds;
+  let base_unlent = |judgment: &Judgment, work: &Increment| {
+    matches!(judgment, Judgment::ContentUnread { identity }
+      if !work.named.runs.iter().any(|run| run.identity == *identity))
+  };
+  let first = state.greens.get_mut(&green)?.judge_named(work);
+  if !base_unlent(&first, work) {
+    return Some(first);
+  }
+  let wanted = state.greens.get_mut(&green)?.unlent_reads(work);
+  if name_holds::lend_from_plane(state, green, &wanted).is_err() {
+    return Some(first);
+  }
+  state.count(name_holds::NAME_LENT_VERDICTS, 1);
+  let again = state.greens.get_mut(&green)?.judge_named(work);
+  if base_unlent(&again, work) {
+    state.count(name_holds::NAME_LEND_MISSED, 1);
+  }
+  Some(again)
+}
+
 /// Each work's verdict, held (`Green::judge_named`: a work naming its content gives its read runs' buffers to the
 /// verdict, which the commit makes its files with no copy, A-760), in the order of the steps (none for a step with no
 /// work); or every work refused. Before, `Green::judge` cloned every read buffer into the verdict (goal 93, main
@@ -1275,10 +1309,7 @@ fn judge(
       verdicts.push(None);
       continue;
     };
-    let judgment = state
-      .greens
-      .get_mut(&green)
-      .map(|mut engine| engine.judge_named(work));
+    let judgment = judged_lent(state, green, work);
     // An accepted verdict takes the runs' buffers: any the work still holds were cloned. A refused one takes none, and
     // they go with the work.
     let kept = (0..work.named.runs.len())
@@ -1490,12 +1521,10 @@ fn commit(
   for (step, verdict) in steps.iter().zip(verdicts) {
     let made = match (step.work(), verdict) {
       (Some((green, _)), Some(Verdict::Held(judged))) => {
-        let done = state
-          .greens
-          .get_mut(&green)
-          .map(|mut engine| engine.commit_judged(*judged));
+        // The named texts its commit reads lent it first (A-760 (b) 4d), let go after.
+        let done = crate::vcs_store::name_holds::commit_judged_lent(state, green, *judged);
         match done {
-          Some(Ok((version, applied))) => Some((version, applied, false)),
+          Some((version, applied)) => Some((version, applied, false)),
           // Confirmed above in this same step; counted should it ever be met.
           _ => {
             state.count(PUSH_COMMIT_REFUSED, 1);
