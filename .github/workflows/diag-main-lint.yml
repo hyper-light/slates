@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 3 (main 01a20182, 2026-11-24 11:33 PST): run 2 found two sites the first three hid (fleet.rs's Unix-only getuid on
+# Windows, daemon_edge.rs's log_rows type); main's next commit takes both.
 # Run 2 (main 01a20182, 2026-11-24 11:20 PST): the wall again at c45aff536 with main's e7f18e4d1, which takes the three
 # sites run 1 (45463272613) named under it: content.rs's empty-window test, homes.rs's serve_remote, hg_push's re-adopt test.
 # main 01a20182 (2026-11-24 10:47 PST): the lint wall at current main (d9cabf2cc) after the nine sites main CI 45450619947 named
