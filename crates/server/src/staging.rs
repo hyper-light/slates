@@ -342,8 +342,28 @@ pub(crate) fn after_borrow(state: &mut crate::state::ShardState) {
   }
 }
 
-/// Counter: open staging buffers released because their attachment ended (A-880, [`after_borrow`]): the non-vacuity
-/// count of a buffer bound to its attachment.
+/// Releases buffer `token` when it is an open buffer whose attachment has ended (A-880), as every verb that uses a buffer
+/// asks before it does: a put or a take served after that end finds the buffer gone, whether in a later borrow or in the
+/// same one. A serve round runs several requests in one borrow, so [`after_borrow`] alone left the buffer to a verb the
+/// round served after the end and before the borrow closed.
+pub(crate) fn release_if_orphaned(state: &mut crate::state::ShardState, token: u64) {
+  let crate::state::ShardState {
+    staging, db, store, ..
+  } = state;
+  let Some(&attachment) = staging.open.get(&token) else {
+    return;
+  };
+  if db.partition().attachment(attachment).is_some() {
+    return;
+  }
+  if let Some(buffer) = staging.remove(token) {
+    store.metadata.release(buffer.credit);
+    state.count(RELEASED_WITH_ATTACHMENT, 1);
+  }
+}
+
+/// Counter: open staging buffers released because their attachment ended (A-880, [`after_borrow`],
+/// [`release_if_orphaned`]): the non-vacuity count of a buffer bound to its attachment.
 pub(crate) const RELEASED_WITH_ATTACHMENT: &str = "staging.released_with_attachment";
 
 /// Reserves `incoming` more bytes for an open buffer (A-880), from the budget and from the allocator, both or neither:

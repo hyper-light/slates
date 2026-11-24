@@ -1,8 +1,12 @@
 name: diag-w-win2
 
-# w-win2 for main 01a20182 (2026-11-23), A-880, run 18b: run 18's one Windows failure read whole. On both Windows
-# runners `an_open_staging_buffer_goes_with_its_attachment` failed at its NotFound check (client.rs:3974) and run 18's
-# filter dropped the message; here the test runs alone, unfiltered, three rounds, with the daemon's counters printed.
+# w-win2 for main 01a20182 (2026-11-23), A-880, run 18b: run 18's one failure, read whole and fixed. On both Windows
+# runners `an_open_staging_buffer_goes_with_its_attachment` failed at its NotFound check (client.rs:3974), and run 18's
+# filter dropped the message. The hypothesis: a serve round runs several requests in one state borrow, so the put after
+# the detach was served before the borrow's end released the buffer. The fix: every put and take of an open buffer
+# checks its attachment first (`staging::release_if_orphaned`). Here, on both Windows runners: the test unfiltered with
+# that check removed (three rounds, the red), then with it (five rounds), then the library's streamed writes and holds;
+# on ubuntu and macOS the library's streamed writes and holds with it.
 
 on:
   push:
@@ -12,14 +16,14 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  detach:
-    name: A-880's detach test (${{ matrix.os }})
+  windows:
+    name: A-880's check at use (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -28,14 +32,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-      - name: "The detach test alone, unfiltered, three rounds"
+      - name: "Red: the detach test with no check at use, unfiltered, three rounds"
         timeout-minutes: 60
         run: |
+          git apply .github/diag-w-win2/a880-red-at-use.patch
+          failed=0
           for round in 1 2 3; do
             set +e
-            RUST_BACKTRACE=1 cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact an_open_staging_buffer_goes_with_its_attachment > "$RUNNER_TEMP/detach-$round.log" 2>&1
+            cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact an_open_staging_buffer_goes_with_its_attachment > "$RUNNER_TEMP/red-$round.log" 2>&1
             code=$?
             set -e
-            echo "== round $round exit $code"
-            grep -av 'descriptor_limit\|^\s*Compiling\|^\s*Running\|^warning: aws-lc' "$RUNNER_TEMP/detach-$round.log" | tail -40
+            echo "== red round $round exit $code"
+            grep -av 'descriptor_limit\|^\s*Compiling\|^\s*Running\|^warning\|^\s*Finished\|^\s*Downloaded\|^\s*Downloading' "$RUNNER_TEMP/red-$round.log" | tail -25
+            if [ "$code" -ne 0 ]; then failed=$((failed+1)); fi
           done
+          git apply -R .github/diag-w-win2/a880-red-at-use.patch
+          echo "red rounds failed: $failed of 3"
+      - name: "Green: the detach test with the check at use, five rounds"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          for round in 1 2 3 4 5; do
+            set +e
+            cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact an_open_staging_buffer_goes_with_its_attachment > "$RUNNER_TEMP/green-$round.log" 2>&1
+            code=$?
+            set -e
+            echo "== green round $round exit $code"
+            if [ "$code" -ne 0 ]; then grep -av 'descriptor_limit\|^\s*Compiling\|^\s*Running\|^warning' "$RUNNER_TEMP/green-$round.log" | tail -30; exit $code; fi
+          done
+      - name: "Green: the library's streamed writes and holds"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          cargo test -p slates-client --test client -- --test-threads=1 a_write_from_a_reader an_open_staging_buffer a_streamed_write a_hold 2>&1 | grep -a '^test \|test result\|panicked' -A3 | grep -av descriptor_limit
+
+  unix:
+    name: A-880's check at use (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: "Green: the library's streamed writes and holds"
+        timeout-minutes: 60
+        run: |
+          cargo test -p slates-client --test client -- --test-threads=1 a_write_from_a_reader an_open_staging_buffer a_streamed_write a_hold 2>&1 | grep -a '^test \|test result\|panicked' -A3 | grep -av descriptor_limit

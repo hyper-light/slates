@@ -9291,6 +9291,8 @@ fn stage_put(
     Ok(id) => id,
     Err(refusal) => return refused(refusal),
   };
+  // An open buffer whose attachment ended is gone, whenever the end came (A-880).
+  crate::staging::release_if_orphaned(state, token);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
   let expires = now.saturating_add(state.failover_ns);
@@ -9318,6 +9320,8 @@ fn fs_write_staged(
   token: u64,
   mode: u32,
 ) -> ReplyBody {
+  // An open buffer whose attachment ended is gone, whenever the end came (A-880).
+  crate::staging::release_if_orphaned(state, token);
   let bytes = match state.staging.take(
     (to_db_volume(volume), principal, token),
     &mut state.store.metadata,
