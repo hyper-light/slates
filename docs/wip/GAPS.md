@@ -945,7 +945,12 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   Decision 3's rewrite admission BUILT (2026-11-23, w-hg): a new head may take a line it does not descend from (an
+>   amend's or a rebase's successor) after every line it does, only where every changeset the move drops from the
+>   line's history is a draft a held or pushed marker obsoletes, its public history kept (`classify::rewrites`,
+>   `rewrite_admitted`); else it makes a line, as before. Held by
+>   `a_rewrite_moves_its_line_only_when_it_drops_obsolete_drafts_alone` (red: the amend's `b'` made `default:1`, the
+>   obsolete `b` keeping `default:0`). Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
 >   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
 >   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
 >   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
@@ -2962,6 +2967,14 @@
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
 > A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+>
+> **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
+> command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
+> session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits
+> while the git tree or its daemon's processes gain CPU, or the daemon's fetch, encoding, derivation or landing counters
+> move, and fails once none has for `process_wait::STALL` (`exit_progressing`; `Judged::progressing`, no CPU budget;
+> `a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at`). A hang fails within that window; no
+> ratio to stock's speed is a bound. Owed: hg's, svn's and git_correctness's waits the same way.
 >
 > **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
 > (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
