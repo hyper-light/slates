@@ -1,0 +1,81 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), A-884 (item 3b): a create sent at once after a destroy waits for the destroyed
+# volume's teardown, whichever admission it met, bounded by the teardown's remaining slices at the step budget. On
+# ubuntu, macOS and both Windows runners: the red (no teardown's room counted as on the way, as before) and the green
+# of the create-after-destroy test, room_wait's unit test, and clippy of the touched crates. On Windows also the
+# extents file, whose remake-window test waits in the same list.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  teardown:
+    name: A-884 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: "Red: no teardown's room counted as on the way"
+        timeout-minutes: 60
+        run: |
+          git apply .github/diag-w-win2/a884-red.patch
+          set +e
+          cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact a_create_at_once_after_a_destroy_waits_for_its_teardown > "$RUNNER_TEMP/red.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a884-red.patch
+          grep -a 'test result\|panicked\|BudgetExceeded\|room.wait' "$RUNNER_TEMP/red.log" | cut -c1-240 | head -12
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the create after a destroy passed with no teardown counted"; exit 1; fi
+      - name: "Green: the create after a destroy, five rounds"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          for round in 1 2 3 4 5; do
+            set +e
+            cargo test -p slates-client --test client -- --test-threads=1 --nocapture --exact a_create_at_once_after_a_destroy_waits_for_its_teardown > "$RUNNER_TEMP/green-$round.log" 2>&1
+            code=$?
+            set -e
+            echo "round $round: $(grep -a 'test result\|panicked' "$RUNNER_TEMP/green-$round.log" | cut -c1-200 | tr '\n' ' ')"
+            if [ "$code" -ne 0 ]; then grep -a -B2 -A6 'panicked' "$RUNNER_TEMP/green-$round.log" | head -20; exit $code; fi
+          done
+      - name: "room_wait's unit test"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          cargo test -p slates-server --lib room_wait:: 2>&1 | grep -a '^test \|test result\|panicked'
+      - name: "The extents file (Windows: its remake-window test waits in the same list)"
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        timeout-minutes: 40
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          set +e
+          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture > "$RUNNER_TEMP/extents.log" 2>&1
+          code=$?
+          grep -a '^test \|test result\|panicked' "$RUNNER_TEMP/extents.log" | cut -c1-200 | head -20
+          exit $code
+      - name: "Clippy of the touched crates, every error printed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          cargo clippy --keep-going -p slates-vfs -p slates-server -p slates-client --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
+          echo "clippy exit $?"
+          grep -a -A8 '^error' "$RUNNER_TEMP/clippy.log" | head -120

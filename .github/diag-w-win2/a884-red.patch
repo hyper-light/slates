@@ -1,0 +1,13 @@
+--- a/crates/server/src/room_wait.rs
++++ b/crates/server/src/room_wait.rs
+@@ -151,6 +151,10 @@
+ /// The room of kind `room` the teardowns in flight on this shard give back when they end: each destroying volume's
+ /// credits of that kind, as `verbs::release_slot_credits` releases them.
+ fn teardown_room(state: &ShardState, room: Room) -> u64 {
++  // DIAG RED (never merged): no teardown's room is counted as on the way, as before A-884.
++  if room == room {
++    return 0;
++  }
+   destroying(state).fold(0u64, |sum, slot| {
+     let credits = match room {
+       Room::Bytes => slot
