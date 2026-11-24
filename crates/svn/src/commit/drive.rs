@@ -756,6 +756,14 @@ pub enum Due {
     /// The transaction's name.
     transaction: String,
   },
+  /// A text delta's base the green holds no bytes of now (A-760 (b) 4d: a landed text's windows are let go once its
+  /// changeset is durable, main's ruling (B)): its owner brings it back whole from the node's store and resumes the
+  /// drive, which takes the `textdelta-chunk` that met it again ([`Drive::resume`]); a resume that refuses, or a base
+  /// still missing after it, refuses the commit naming it. No `svnserve` waits here: FSFS reads every base from disk.
+  Text {
+    /// The base's identity.
+    identity: ContentIdentity,
+  },
 }
 
 /// What a hook reads of the transaction its command waits on ([`Drive::pending`], A-661): what FSFS's read-only view of
@@ -845,6 +853,17 @@ enum Pause {
   OpenRoot,
   /// `close-edit`, for pre-commit.
   CloseEdit,
+  /// A `textdelta-chunk` whose base was brought back ([`Due::Text`]): the chunk kept, taken again.
+  Chunk,
+}
+
+/// The command `due` pauses.
+fn pause_of(due: &Due) -> Pause {
+  match due {
+    Due::StartCommit { .. } => Pause::OpenRoot,
+    Due::PreCommit { .. } => Pause::CloseEdit,
+    Due::Text { .. } => Pause::Chunk,
+  }
 }
 
 /// What `open-root` makes once start-commit passed: the root directory's token, and the revision the client holds it
@@ -1333,6 +1352,9 @@ pub struct Drive {
   held: usize,
   /// The kinds of the nodes the drive deleted and then replaced, by path, for a deletion of the replacement.
   replaced: BTreeMap<String, NodeKind>,
+  /// The `textdelta-chunk` waiting for its base to be brought back ([`Due::Text`]): the file's token and the chunk,
+  /// taken again on [`Drive::resume`].
+  paused_chunk: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Drive {
@@ -1365,6 +1387,7 @@ impl Drive {
       property_lists: BTreeMap::new(),
       held: 0,
       replaced: BTreeMap::new(),
+      paused_chunk: None,
     }
   }
 
@@ -1435,15 +1458,15 @@ impl Drive {
       self.phase = Phase::Dropping;
       return Ok(Step::Refused);
     }
-    let outcome = match pause {
-      Pause::OpenRoot => self.make_root(),
-      Pause::CloseEdit => self.judge(&World {
+    let outcome = self.resumed(
+      pause,
+      &World {
         index,
         green,
         locks,
         texts,
-      }),
-    };
+      },
+    );
     self.answer(outcome, out)
   }
 
@@ -1504,16 +1527,33 @@ impl Drive {
       self.phase = Phase::Done;
       return Edited::Refused(errors);
     }
-    let outcome = match pause {
-      Pause::OpenRoot => self.make_root(),
-      Pause::CloseEdit => self.judge(&World {
+    let outcome = self.resumed(
+      pause,
+      &World {
         index,
         green,
         locks,
         texts,
-      }),
-    };
+      },
+    );
     self.edited(outcome)
+  }
+
+  /// The paused command taken again once its wait was answered `Ok`: `open-root`'s transaction made, `close-edit`'s
+  /// verdict judged, or the `textdelta-chunk` whose base was brought back applied (a base still missing refused).
+  fn resumed<G: Green + ?Sized>(
+    &mut self,
+    pause: Pause,
+    world: &World<'_, G>,
+  ) -> Result<Outcome, Stop> {
+    match pause {
+      Pause::OpenRoot => self.make_root(),
+      Pause::CloseEdit => self.judge(world),
+      Pause::Chunk => match self.paused_chunk.take() {
+        Some((token, chunk)) => self.textdelta_chunk(world, &token, &chunk, false),
+        None => Err(Stop::Close),
+      },
+    }
   }
 
   /// What a command's outcome made, typed ([`Drive::edit`]).
@@ -1529,10 +1569,7 @@ impl Drive {
         Edited::Accepted(work)
       }
       Ok(Outcome::Hook(due)) => {
-        self.phase = Phase::Waiting(match due {
-          Due::StartCommit { .. } => Pause::OpenRoot,
-          Due::PreCommit { .. } => Pause::CloseEdit,
-        });
+        self.phase = Phase::Waiting(pause_of(&due));
         Edited::Hook(due)
       }
       Err(Stop::Close) => {
@@ -1583,10 +1620,7 @@ impl Drive {
         Ok(Step::Accepted(work))
       }
       Ok(Outcome::Hook(due)) => {
-        self.phase = Phase::Waiting(match due {
-          Due::StartCommit { .. } => Pause::OpenRoot,
-          Due::PreCommit { .. } => Pause::CloseEdit,
-        });
+        self.phase = Phase::Waiting(pause_of(&due));
         Ok(Step::Hook(due))
       }
       Err(Stop::Close) => {
@@ -1772,7 +1806,7 @@ impl Drive {
         file,
         base_checksum,
       } => self.apply_textdelta(world, file, base_checksum),
-      EditCommand::TextdeltaChunk { file, chunk } => self.textdelta_chunk(world, file, chunk),
+      EditCommand::TextdeltaChunk { file, chunk } => self.textdelta_chunk(world, file, chunk, true),
       EditCommand::TextdeltaEnd { file } => self.textdelta_end(world, file),
       EditCommand::ChangeFileProp { file, name, value } => {
         let path = self.file(file)?.path.clone();
@@ -2140,19 +2174,43 @@ impl Drive {
     Ok(Outcome::Taken)
   }
 
-  /// `textdelta-chunk` (`editorp.c` 788-805): the chunk read on, every whole window applied to the file's text.
+  /// `textdelta-chunk` (`editorp.c` 788-805): the chunk read on, every whole window applied to the file's text. A
+  /// base the green holds no bytes of now pauses the drive for it ([`Due::Text`]) where `may_wait`, nothing of the
+  /// chunk taken, and is refused `Corrupt` where it is still missing once brought back.
   fn textdelta_chunk<G: Green + ?Sized>(
     &mut self,
     world: &World<'_, G>,
     token: &[u8],
     chunk: &[u8],
+    may_wait: bool,
   ) -> Result<Outcome, Stop> {
     let held = self.held;
     let room = self.setup.room;
     if held.saturating_add(chunk.len()) > room {
       return Err(DriveRefusal::Room { room }.into());
     }
-    let texts = &self.texts;
+    let Some(Baton::File(File {
+      delta: Some(delta), ..
+    })) = self.tokens.get(token)
+    else {
+      return Err(Stop::Close);
+    };
+    // The base first, before anything of the chunk is taken, so a chunk that waits for it is taken whole again.
+    let source = match delta.source {
+      Some(identity) if self.texts.contains(&identity) => world.texts.sealed(&identity),
+      Some(identity) => match world.green.text(&identity) {
+        Some(bytes) => Some(bytes),
+        None if may_wait => {
+          self.paused_chunk = Some((token.to_vec(), chunk.to_vec()));
+          return Ok(Outcome::Hook(Due::Text { identity }));
+        }
+        None => None,
+      },
+      None => Some(std::borrow::Cow::Borrowed(&[][..])),
+    };
+    let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
+      IndexRefusal::Corrupt,
+    )))?;
     let Some(Baton::File(File {
       delta: Some(delta), ..
     })) = self.tokens.get_mut(token)
@@ -2161,14 +2219,6 @@ impl Drive {
     };
     let before = delta.pending.len();
     delta.pending.extend_from_slice(chunk);
-    let source = match delta.source {
-      Some(identity) if texts.contains(&identity) => world.texts.sealed(&identity),
-      Some(identity) => world.green.text(&identity),
-      None => Some(std::borrow::Cow::Borrowed(&[][..])),
-    };
-    let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
-      IndexRefusal::Corrupt,
-    )))?;
     read_windows(delta, &source, world.texts)?;
     let after = delta.pending.len();
     let held = held.saturating_sub(before).saturating_add(after);
