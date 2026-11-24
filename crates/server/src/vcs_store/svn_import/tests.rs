@@ -518,6 +518,7 @@ fn check_host_refusal_and_answers() {
     revisions: 3,
     youngest: 3,
     turns: 2,
+    batches: super::Batches::default(),
   };
   let answers = [Some(Ok(finished)), None].map(|outcome| svn_reply_of(PATH, ROOM, outcome));
   let abandoned = ReplyBody::Refused {
@@ -794,6 +795,12 @@ fn t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_ti
 /// A format-2 dump whose revision 1 adds `files` files `f0`.. of about `size` bytes and whose revision 2 rewrites every
 /// one of them whole: one revision of `files` paths.
 fn one_wide_rewrite(files: usize, size: usize) -> Vec<u8> {
+  wide_revisions(files, size, (2, false))
+}
+
+/// A format-2 dump of `revisions` revisions of `files` files of about `size` bytes each: revision 1 adds `f0`.. and
+/// each later one rewrites them whole, or, where `apart`, every revision adds files of its own (`r<n>-f<i>`).
+fn wide_revisions(files: usize, size: usize, (revisions, apart): (usize, bool)) -> Vec<u8> {
   let props = |entries: &[(&str, &str)]| {
     let mut section = String::new();
     for (name, value) in entries {
@@ -813,7 +820,7 @@ fn one_wide_rewrite(files: usize, size: usize) -> Vec<u8> {
     "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
     zero.len()
   ));
-  for number in 1..=2usize {
+  for number in 1..=revisions {
     let date = format!("2026-11-24T00:00:00.{number:06}Z");
     let log = format!("r{number}");
     let section = props(&[
@@ -828,19 +835,25 @@ fn one_wide_rewrite(files: usize, size: usize) -> Vec<u8> {
     for file in 0..files {
       let line = format!("{number}:{file:05}\n");
       let text: String = line.repeat(size / line.len());
-      let (action, empty) = if number == 1 {
+      let adds = number == 1 || apart;
+      let (action, empty) = if adds {
         ("add", "PROPS-END\n")
       } else {
         ("change", "")
       };
-      let props_header = if number == 1 {
+      let props_header = if adds {
         format!("Prop-content-length: {}\n", empty.len())
       } else {
         String::new()
       };
       dump.push_str(&format!(
-        "Node-path: f{file}\nNode-kind: file\nNode-action: {action}\n{props_header}Text-content-length: {}\n\
+        "Node-path: {}\nNode-kind: file\nNode-action: {action}\n{props_header}Text-content-length: {}\n\
          Content-length: {}\n\n{empty}{text}\n\n",
+        if apart {
+          format!("r{number}-f{file}")
+        } else {
+          format!("f{file}")
+        },
         text.len(),
         empty.len() + text.len()
       ));
@@ -893,6 +906,43 @@ fn t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_an
         landed: 0,
       }
     }
+  );
+}
+
+/// Shape: the new files each of the chain test's revisions adds: a revision's chain entry (about 47 bytes a path)
+/// within [`TINY_GREEN_CAP`], two revisions' past it, while their reservations (about 40 bytes a path) stay within it,
+/// so the chains' room is the bound met first. (400 paths make an entry of 18,778 bytes, past the room alone.)
+const CHAIN_FILES: usize = 190;
+
+/// Shape: the chain test's revisions, each adding [`CHAIN_FILES`] files of its own.
+const CHAIN_REVISIONS: usize = 2;
+
+/// Goal 93 (main's order of 2026-11-24 02:25, item 2): a batch's chain entries meet the green chains' cap
+/// (`caps.green_chain_bytes`, the partition's merge budget) at its landing. Do: under a cap of [`TINY_GREEN_CAP`],
+/// import [`wide_revisions`] of [`CHAIN_REVISIONS`] revisions each adding [`CHAIN_FILES`] small files of its own.
+/// Expect: the import whole, its batches each within the chains' room, one landed for it (the import's report,
+/// `Loaded::batches`). Without the bound, refused `TableAtCapacity { table: "green_chains" }` at the batch's landing.
+#[test]
+fn t_c2c_an_import_past_the_chains_room_lands_a_batch_within_it_at_a_time() {
+  let loaded = crate::repository::svn_commit::tests::stored_configured(
+    || async move {
+      let (svn, _green) = subversion("chained").await;
+      let (loaded, _turns) = imported(
+        svn,
+        wide_revisions(CHAIN_FILES, 16, (CHAIN_REVISIONS, true)),
+      )
+      .await;
+      loaded.map(|loaded| (loaded.youngest, loaded.batches.chain))
+    },
+    |config| config.caps.green_chain_bytes = TINY_GREEN_CAP,
+  );
+  let Ok((youngest, chain)) = loaded else {
+    panic!("not imported whole: {loaded:?}");
+  };
+  assert_eq!(youngest, u64::try_from(CHAIN_REVISIONS).unwrap_or(u64::MAX));
+  assert!(
+    chain > 0,
+    "a batch landed for its chains' room, in the import's report"
   );
 }
 

@@ -62789,3 +62789,33 @@ Applied in the same change to: GAPS (C2 stage C), `crates/ipc/src/protocol.rs`, 
 
 Applied in the same change to: GAPS (the svn HTTP edge), `crates/svn/src/dav/site.rs` and its tests,
 `crates/server/src/vcs_http/svn.rs`.
+
+### A-895 — An import batch is bounded by its chains' room: each verdict is held and its entry sized before it applies (2026-11-24, w-svn for main 01a20182, its rulings of 2026-11-24 02:25 and 02:46; goal 93; amends A-892; A-822, A-635)
+
+- **What was there.** A batch's landing appends every staged version's chain entry with the register's parts as one
+  record (`push::append_versions`), judged by the register's guard against the partition's green chains' cap
+  (`caps.green_chain_bytes`); the admission checkpoints the batch's green where the cap refuses, then judges again. A
+  batch was bounded by the shard's memory (A-822) and its green's retention (A-892), never by its entries: under a 16
+  KiB cap two revisions each adding 190 paths, each entry within the room and their reservations within the retention
+  room, together past the chains' room, were refused `TableAtCapacity { table: "green_chains" }` at their batch's
+  landing and the import ended there. (A-892's note named two revisions of 400 paths: one such revision's entry, 18,778
+  bytes, is past the room alone, which the append refuses typed, as it should.)
+- **The rule.** A batch takes its chains' room when it begins: what the chains may still grow by, and its green's own
+  chain, which the landing's checkpoint can fold (`ImportBatch::chain_room`). `ImportBatch::stage` judges a work and
+  holds the verdict (`Green::judge_named`), sizes its chain entry exactly as the batch's record will write it
+  (`chain_entry::encoded_len`, the entry `push::recorded_entry` encodes), and where the batch holds versions already
+  and the entry would take it past its room, refuses `StageRefused::PastChainRoom` with nothing applied: the import
+  hands the revision to the next batch whole, as A-892 hands one past the retention room, and lands this one
+  (`Flush::Chain`, counted `repository.svn_import.flushed_chain`). Otherwise the held verdict commits
+  (`Green::commit_judgment`, public now). A lone revision whose entry alone is past the room keeps the append's typed
+  `TableAtCapacity { table: "green_chains" }`: no new refusal.
+- **An import says why it took its batches.** `Loaded::batches` counts its batches by cause (admission, sections,
+  retention, chain, end), and the import logs them at its end (main's ruling of 2026-11-24 02:46).
+- **Evidence.** `t_c2c_an_import_past_the_chains_room_lands_a_batch_within_it_at_a_time` (16 KiB cap, two revisions of
+  190 new paths each): with the chain check taken out it is refused `Uncommitted { refusal: Append(Entry(TableAtCapacity
+  { table: "green_chains" })), revision: 0, landed: 0 }` (macOS, debug, 2026-11-24); with it, imported whole at revision
+  2, its report "batches landed for ... retention 0, chain 1, end 1". The focused counts are in the commit.
+
+Applied in the same change to: GAPS (C2 stage C, A-892's owed line), `crates/merge/src/{engine,chain_entry}.rs`,
+`crates/server/src/import_batch.rs`, `crates/server/src/repository/svn_commit/staging.rs`,
+`crates/server/src/vcs_store/svn_import.rs` and its tests.
