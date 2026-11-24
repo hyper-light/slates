@@ -19,7 +19,7 @@ use slates_db::register::{
 };
 
 use hyper_datagram::{ExporterSecret, Role, SECRET_BYTES};
-use hyper_swim::detector::Judge;
+use hyper_swim::detector::{Judge, PeerReport};
 use hyper_swim::membership::Liveness;
 
 /// Shape: the members of the simulated fleet.
@@ -594,41 +594,20 @@ type HeldAtKill = (
 #[test]
 fn a_young_members_detection_term_covers_a_detection_its_timer_judges() {
   let mut fleet = Network::new();
-  let young = fleet.run_until(HORIZON_NS, |fleet| {
-    [1, 2].iter().all(|me| {
-      let member = &fleet.members[me];
-      member.detection(fleet.now_ns).is_some()
-        && timer_judges(member, 3)
-        && member
-          .detector()
-          .report(hyper_swim::HostId(3))
-          .is_some_and(|report| report.last_answer_ns.is_some())
-    })
-  });
+  let young = fleet.run_until(HORIZON_NS, young_toward_member_3);
   assert!(
     young,
     "members 1 and 2 timed an answered period, and member 3 answered each, while each judged member 3 by its timer"
   );
   let killed_at = fleet.now_ns;
-  let held: Vec<HeldAtKill> = [1, 2]
-    .iter()
-    .map(|me| {
-      let member = &fleet.members[me];
-      (
-        *me,
-        member.detection(killed_at).unwrap().ns,
-        member.detector().detection_bound(killed_at),
-        member.detector().least_detection_bound(killed_at),
-      )
-    })
-    .collect();
+  let held = held_by_the_survivors(&fleet, killed_at);
   fleet.killed.push(3);
   let condemned = fleet.run_until(killed_at + HORIZON_NS, |fleet| {
     [1, 2]
       .iter()
       .all(|me| matches!(fleet.liveness(*me, 3), Some(Liveness::Dead) | None))
   });
-  let reports: Vec<_> = [1, 2]
+  let reports: Vec<Option<PeerReport>> = [1, 2]
     .iter()
     .map(|me| fleet.members[me].detector().report(hyper_swim::HostId(3)))
     .collect();
@@ -648,7 +627,55 @@ fn a_young_members_detection_term_covers_a_detection_its_timer_judges() {
     fleet.now_ns
   );
   assert!(condemned, "both survivors hold member 3 dead");
-  for (me, term_ns, _, stated) in &held {
+  assert_condemned_within_the_terms_held(&held, &reports);
+  let judged = fleet.run_until(fleet.now_ns + HORIZON_NS, |fleet| {
+    !timer_judges(&fleet.members[&1], 2) && !timer_judges(&fleet.members[&2], 1)
+  });
+  let after_death = held_by_the_survivors(&fleet, fleet.now_ns);
+  println!(
+    "once the survivors judge each other by an estimator ({judged}, at {} ns): (member, term ns, detection_bound, \
+     least_detection_bound) {after_death:?}",
+    fleet.now_ns
+  );
+  assert!(judged, "an estimator came to judge each survivor's pair");
+  assert_fell_back_from_the_timers_bound(&after_death, &held);
+}
+
+/// Whether members 1 and 2 have each timed an answered period, and member 3 has answered each, while each still judges
+/// member 3 by the pair's own retransmission timer: the young fleet the kill is to meet.
+fn young_toward_member_3(fleet: &Network) -> bool {
+  [1, 2].iter().all(|me| {
+    let member = &fleet.members[me];
+    member.detection(fleet.now_ns).is_some()
+      && timer_judges(member, 3)
+      && member
+        .detector()
+        .report(hyper_swim::HostId(3))
+        .is_some_and(|report| report.last_answer_ns.is_some())
+  })
+}
+
+/// What members 1 and 2 each hold at `now_ns` ([`HeldAtKill`]).
+fn held_by_the_survivors(fleet: &Network, now_ns: u64) -> Vec<HeldAtKill> {
+  [1, 2]
+    .iter()
+    .map(|me| {
+      let member = &fleet.members[me];
+      (
+        *me,
+        member.detection(now_ns).unwrap().ns,
+        member.detector().detection_bound(now_ns),
+        member.detector().least_detection_bound(now_ns),
+      )
+    })
+    .collect()
+}
+
+/// Asserts each survivor's detection term at the kill (`held`) was at least the bound its detector stated then, that a
+/// survivor's own probes condemned member 3 (`reports`, in `held`'s order), and that each that did so condemned it
+/// within the term it held at the kill.
+fn assert_condemned_within_the_terms_held(held: &[HeldAtKill], reports: &[Option<PeerReport>]) {
+  for (me, term_ns, _, stated) in held {
     assert!(
       stated.is_some_and(|stated| u128::from(*term_ns) >= stated.as_nanos()),
       "member {me}'s detection term {term_ns} ns is at least the bound its detector stated, {stated:?}"
@@ -656,7 +683,7 @@ fn a_young_members_detection_term_covers_a_detection_its_timer_judges() {
   }
   let own: Vec<(u64, u64, std::time::Duration)> = held
     .iter()
-    .zip(&reports)
+    .zip(reports)
     .filter_map(|((me, term_ns, _, _), report)| {
       let report = (*report)?;
       (report.condemnations > 0).then_some((*me, *term_ns, report.condemned_after?))
@@ -672,28 +699,12 @@ fn a_young_members_detection_term_covers_a_detection_its_timer_judges() {
       "member {me} condemned member 3 {after:?} after its last answer, within the detection term it held, {term_ns} ns"
     );
   }
-  let judged = fleet.run_until(fleet.now_ns + HORIZON_NS, |fleet| {
-    !timer_judges(&fleet.members[&1], 2) && !timer_judges(&fleet.members[&2], 1)
-  });
-  let after_death: Vec<HeldAtKill> = [1, 2]
-    .iter()
-    .map(|me| {
-      let member = &fleet.members[me];
-      (
-        *me,
-        member.detection(fleet.now_ns).unwrap().ns,
-        member.detector().detection_bound(fleet.now_ns),
-        member.detector().least_detection_bound(fleet.now_ns),
-      )
-    })
-    .collect();
-  println!(
-    "once the survivors judge each other by an estimator ({judged}, at {} ns): (member, term ns, detection_bound, \
-     least_detection_bound) {after_death:?}",
-    fleet.now_ns
-  );
-  assert!(judged, "an estimator came to judge each survivor's pair");
-  for ((me, term_ns, _, _), (_, young_term_ns, _, _)) in after_death.iter().zip(&held) {
+}
+
+/// Asserts each survivor's detection term once no pair is on its timer (`after_death`) fell back below the one it held
+/// while young (`held`, in the same order).
+fn assert_fell_back_from_the_timers_bound(after_death: &[HeldAtKill], held: &[HeldAtKill]) {
+  for ((me, term_ns, _, _), (_, young_term_ns, _, _)) in after_death.iter().zip(held) {
     assert!(
       term_ns < young_term_ns,
       "member {me}'s detection term fell back from the timer's bound once no pair was on its timer: {term_ns} ns, \
