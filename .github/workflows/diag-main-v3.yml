@@ -1,10 +1,9 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 05:35 PST): gate 8 for the push-0/1 failure, at ee9571813 (w-git's instrumentation of every
-# branch that can answer a homing short, agreed with w-shared; no behaviour change). Gate 7 (45398593779, 3d65116a6)
-# named the refusal, Unlanded(HomedShort) after a pack homing came back Err(Unanswered) 0.9 ms after the body, in 1 of
-# 20 runs. Twenty release then twenty debug runs (about 87% to meet a 1-in-20 failure), each log grepped for the new
-# lines: "fell short", "publication for generation", "ticket of generation", and the Unlanded line. Run only from
-# diag-measurer-main-v3-* branches, never main.
+# main 01a20182 (2026-11-24 06:12 PST): gate 9 for the push-0/1 failure, at 7d6874639 (w-git's line for each non-Kept
+# answer of a home's put, and for a region exchange that ended with hosts unanswered; agreed with w-shared; no behaviour
+# change). Gate 8 (45405128575, ee9571813) failed 2 of 40: push 0 right after creation, a remote home's answer other than
+# kept within about 1 ms of a 2 s budget. Twenty release then twenty debug runs, each log grepped for the new lines.
+# Run only from diag-measurer-main-v3-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -14,13 +13,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 8 at ee9571813)
+    name: v3_takeover (gate 9 at 7d6874639)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ee95718132a3879a0ecaf7d3fa1bd1173b10522a
+          ref: 7d6874639df859f7eeeef4f20f1d3082c02d8b50
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -48,15 +47,15 @@ jobs:
             echo "debug $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
-          echo "== gate 8: $pass of 40 passed"
+          echo "== gate 9: $pass of 40 passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
-            grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation' "$f" | head -6 | cut -c1-400
+            grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with' "$f" | head -8 | cut -c1-400
           done
           exit 0
       - name: Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate8
+          name: v3-gate9
           path: ${{ runner.temp }}/*.log
