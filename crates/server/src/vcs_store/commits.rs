@@ -34,17 +34,20 @@
 //! store committed next, the entry appended last; a store whose entry the log then refuses is made again from the log
 //! (`super::rebuild`), with the version's commit not made.
 //!
-//! **Not made, and counted** ([`UNMADE`]): a version whose trees are not kept (its step of the map was refused), an
-//! identity git would not write as it is, a commit git's strict fsck refuses (a NUL in the message), a store's refusal
-//! (the budget), the register's refusal. The version stands, since its own record is in the transaction already; the
-//! green's ref stays at the commit before; nothing new is held.
+//! **Not made, and counted** ([`UNMADE`]): a version whose trees are not kept (its step of the map was refused), a
+//! store's refusal (the budget), the register's refusal. A deferred submit's version is then not committed: nothing of
+//! its accept is applied or durable, and it is answered so its retry runs (main 01a20182's ruling of 2026-11-23 22:08,
+//! w-svn's A-888: a version is never committed alone, its green ahead of the store). What git refuses in any commit, a
+//! message holding a NUL (`nulInCommit`), is refused before the verdict (`identities::refused_for_its_commit`), and
+//! an identity git would not write is refused where it is set.
 //!
 //! **Counters.** [`MADE`] (the path's non-vacuity count), [`UNMADE`].
 //!
 //! **Owed** (GAPS, A-664): the holders' commits (A-636's fleet half: the merge record carrying the message, the identity
 //! and the time, so every holder makes the same commit; a register entry's objects reach no holder today); a submit
-//! refused before its verdict when git cannot hold its post-state or its message; Mercurial's changesets and
-//! Subversion's revisions by the same rule.
+//! refused before its verdict when git cannot hold its post-state (its message is, since 2026-11-23); the store's and the
+//! register's refusals of a made commit judged before its step's apply (`made_commit::commit_held`'s guard, w-svn's
+//! A-888 piece 2); Mercurial's changesets and Subversion's revisions by the same rule.
 
 use std::collections::BTreeSet;
 
@@ -696,8 +699,7 @@ pub(crate) fn make_deferred(
 enum Before {
   /// Its changeset landed: the sealed push, its record version 5 once written.
   Landed(Box<SealedPush>),
-  /// Its commit not made (counted [`UNMADE`]): the version stands alone, as a version no commit was made of does
-  /// (module docs).
+  /// Its commit not made (counted [`UNMADE`]): nothing of the accept may be durable, as for [`Before::Unlanded`].
   Unmade,
   /// Its changeset refused by the node's store or the region: nothing of the accept may be durable.
   Unlanded,
@@ -743,9 +745,14 @@ async fn made_landing(
         // Committed, the push holds nothing and this gives back nothing; refused, it gives back what it held.
         sealed.abandon(state);
       }
+      // Its commit not made: nothing of the accept is applied or durable, and the submit is answered so its retry runs
+      // (main 01a20182's ruling of 2026-11-23 22:08: a version is never committed alone; A-888). What git refuses in
+      // every commit is refused before the verdict (`identities::refused_for_its_commit`), so what reaches here passes
+      // (the map's room, the store's budget).
       Before::Unmade => {
         state.count(UNMADE, 1);
-        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+        super::paths::forget_preview_head(state, green, version);
+        crate::made_commit::give_up(state, pending);
       }
       Before::Unlanded | Before::Gone => {
         super::paths::forget_preview_head(state, green, version);

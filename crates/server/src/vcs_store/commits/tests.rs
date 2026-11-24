@@ -13,7 +13,7 @@ use slates_git::object_name::{Kind, ObjectFormat, ObjectId};
 use slates_git::objects::tree::{Mode, Tree};
 use slates_git::unpack::{self, NoIndex};
 use slates_git::upload::Asked;
-use slates_ipc::protocol::WorkOp;
+use slates_ipc::protocol::{ReplyBody, RequestBody, WorkOp};
 use slates_vfs::clock::{Clock, HostClock};
 
 use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_MAP_BUDGET};
@@ -375,32 +375,70 @@ fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
   assert_eq!(topic.files, expected);
 }
 
-/// A-664 part 3 (its commit; module docs, "Not made, and counted"). Do: submit a version whose message holds a NUL,
-/// which git's strict fsck refuses in a commit (`nulInCommit`); then submit a second version with a plain message, and
-/// clone. Expect: the first version accepted, its commit not made and counted, the repository's store holding no version
-/// of the green and its register only the commit the submit owed (A-664's live whole builds, part 2: staged before its
-/// map was built, settled by the next made commit); the second's commit made as the repository's first, with no parent,
-/// its tree holding both versions' files.
+/// A-664 part 3's message rule, refused before its verdict (main 01a20182's ruling of 2026-11-23 22:08: a version is never
+/// committed alone, its commit not made; w-svn's A-888). Do: submit a version whose message holds a NUL, which git's
+/// strict fsck refuses in a commit (`nulInCommit`); then submit a second version with a plain message, and clone. Expect:
+/// the first refused `BadRequest` before its verdict, the green's durable head still 0, no version of the green in the
+/// store and nothing counted unmade; the second's commit made as the repository's first, its tree holding its own file
+/// alone. Red before: the first was accepted, its version committed with no commit (the green past its store), counted
+/// unmade.
 #[test]
-fn t_a664_p3_a_commit_git_refuses_is_not_made_and_its_successor_holds_both() {
-  let (unmade, clone, made) =
+fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() {
+  let (refused, clone, made) =
     crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
       let (repository, green) = git_repository(state, "refused");
-      version_saying(state, (green, 1), vec![create("/f", b"one")], "one\0two");
+      let made = crate::vcs_store::paths::tests::ask(
+        state,
+        RequestBody::CreateWork {
+          green,
+          name: "work-1".to_owned(),
+        },
+      );
+      let ReplyBody::WorkCreated { id: work, .. } = made else {
+        panic!("no work: {made:?}")
+      };
+      let edited = crate::vcs_store::paths::tests::ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: "/f".to_owned(),
+          at: 0,
+          delete_len: 0,
+          bytes: b"one".to_vec(),
+        },
+      );
+      assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+      let submitted =
+        crate::vcs_store::paths::tests::ask(state, crate::identities::authored(work, "one\0two"));
+      // As `version_saying` drives them: the whole build a first submit owes, then the commit's queued job.
+      crate::vcs_store::paths::whole_build::settle(state);
+      crate::vcs_store::commits::made_after_now(state);
       let key = green_key(to_db_volume(green));
       let held = state
         .vcs_stores
         .git_ref(repository)
         .map(|(_, git)| git.versions(key).len());
-      let unmade = (counts(state), held, records(state, repository).len());
+      let head = state.db.partition().green_head(to_db_volume(green));
+      let refused = (
+        matches!(
+          submitted,
+          ReplyBody::Refused {
+            refusal: slates_ipc::protocol::Refusal::BadRequest { .. },
+            ..
+          }
+        ),
+        head,
+        held,
+        counts(state),
+      );
       version(state, green, 2, vec![create("/g", b"two")]);
-      (unmade, cloned(state, repository, "main"), counts(state))
+      (refused, cloned(state, repository, "main"), counts(state))
     });
-  assert_eq!(unmade, ((0, 1), Some(0), 1));
+  assert_eq!(refused, (true, 0, Some(0), (0, 0)));
   assert_eq!(parents_of(&clone.text), Vec::<ObjectId>::new());
-  let expected = listing(&[("f", Mode::File, b"one"), ("g", Mode::File, b"two")]);
+  let expected = listing(&[("g", Mode::File, b"two")]);
   assert_eq!(clone.files, expected);
-  assert_eq!(made, (1, 1));
+  assert_eq!(made, (1, 0));
 }
 
 /// A work's `mv` of `from` to `to`.
