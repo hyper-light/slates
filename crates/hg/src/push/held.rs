@@ -197,6 +197,92 @@ impl crate::render::StoreWants for TextAsk {
   }
 }
 
+/// The texts of revisions of one log asked of the node's changeset store at once, by node (goal 93, C1 (1); main's ruling
+/// of 2026-11-24 03:17: a replay reads the changesets' texts let go once landed, as many as a unit's room holds in one
+/// want): their rows under the log's path, then their texts within `most` bytes. Taken, each node with its text, in
+/// the order asked; none where the store kept a row of none of them or gave fewer texts.
+pub struct TextsAsk {
+  /// The log's path in the store.
+  path: Vec<u8>,
+  /// The revisions asked, by node.
+  nodes: Vec<Node>,
+  /// What is asked next.
+  want: Option<crate::render::Want>,
+  /// The most bytes the texts may hold together.
+  most: u64,
+  /// The texts, once given.
+  texts: Option<Vec<Vec<u8>>>,
+}
+
+impl TextsAsk {
+  /// The ask of the texts of `nodes` kept under `path`, within `most` bytes: their rows first.
+  pub fn new(path: Vec<u8>, nodes: Vec<Node>, most: u64) -> Self {
+    TextsAsk {
+      want: Some(crate::render::Want::Rows {
+        logs: vec![(path.clone(), nodes.clone())],
+      }),
+      path,
+      nodes,
+      most,
+      texts: None,
+    }
+  }
+
+  /// The log's path asked under.
+  pub fn path(&self) -> &[u8] {
+    &self.path
+  }
+
+  /// The nodes asked.
+  pub fn nodes(&self) -> &[Node] {
+    &self.nodes
+  }
+
+  /// The tests' stand-in for the node's changeset store answering the ask at once with `texts`, in the order asked.
+  #[cfg(test)]
+  pub(crate) fn answered(&mut self, texts: Option<Vec<Vec<u8>>>) {
+    self.want = None;
+    self.texts = texts;
+  }
+
+  /// Each node asked with its text, in the order asked; none where the store gave fewer.
+  pub fn taken(self) -> Option<Vec<(Node, Vec<u8>)>> {
+    let texts = self.texts?;
+    (texts.len() == self.nodes.len()).then(|| self.nodes.into_iter().zip(texts).collect())
+  }
+}
+
+impl crate::render::StoreWants for TextsAsk {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.want.as_ref()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    let identities: Option<Vec<[u8; 32]>> = rows
+      .into_iter()
+      .next()
+      .filter(|log| log.len() == self.nodes.len())
+      .and_then(|log| log.into_iter().map(|row| row.map(|row| row.text)).collect());
+    self.want = identities.map(|texts| crate::render::Want::Texts {
+      texts,
+      most: self.most,
+    });
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    self.want = None;
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.want = None;
+    self.texts = Some(texts);
+  }
+
+  fn texts_past(&mut self) {
+    self.want = None;
+  }
+}
+
 /// The length of the text of the revision `node` of `path`'s file log that `index` holds, and whether `store` holds its
 /// metadata block and its bytes whole ([`ContentStore::holds_whole`]): what a home reads before it brings a let-go
 /// revision back (goal 93 item 2b(b)). None where the index holds no such revision.

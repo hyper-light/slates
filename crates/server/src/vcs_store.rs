@@ -3509,7 +3509,7 @@ async fn replay_hg_sliced(
 ) -> Option<Result<(), ReplayRefused>> {
   let begun = hg_record_step(state, id, index, None, slices.budget_ns())?;
   let mut replay = match begun {
-    Ok(HgStep::Begun(replay)) => replay,
+    Ok(HgStep::Begun(replay) | HgStep::Asked(replay)) => replay,
     Ok(HgStep::Stepped(..)) => return Some(Ok(())),
     Err(refused) => return Some(Err(refused)),
   };
@@ -3518,6 +3518,18 @@ async fn replay_hg_sliced(
       Ok(HgStep::Stepped(Some(more))) => {
         replay = more;
         slices.unit_done().await;
+      }
+      Ok(HgStep::Asked(mut more)) => {
+        let Some(disk) = state.vcs_disk.clone() else {
+          let _ = with_released(state, more);
+          return Some(Err(ReplayRefused::Unlanded));
+        };
+        let Some(asked) = replay_answered(&disk, id, &mut more).await else {
+          let _ = with_released(state, more);
+          return Some(Err(ReplayRefused::Unlanded));
+        };
+        state.count(HG_REPLAY_TEXTS_ASKED, asked);
+        replay = more;
       }
       Ok(HgStep::Stepped(None) | HgStep::Begun(_)) => return Some(Ok(())),
       Err(refused) => return Some(Err(refused)),
@@ -3532,6 +3544,34 @@ enum HgStep {
   Begun(slates_hg::import::record::Replay),
   /// A unit replayed: the replay while more follow.
   Stepped(Option<slates_hg::import::record::Replay>),
+  /// The replay asks the node's changeset store for texts let go once landed (goal 93, C1 (1)): answered between units
+  /// ([`replay_answered`]), then stepped again.
+  Asked(slates_hg::import::record::Replay),
+}
+
+/// Counter: the changesets' and manifests' texts a Mercurial replay asked of the node's changeset store, let go once
+/// landed (goal 93, C1 (1); main's ruling of 2026-11-24 03:17): what a recovery read back, the number main's restart round
+/// reads. Format: a counter name in the status report.
+pub(crate) const HG_REPLAY_TEXTS_ASKED: &str = "vcs_store.hg_replay_texts_asked";
+
+/// Answers `replay`'s ask of the node's changeset store (`Replay::store_wants`) over `disk`: the texts it asked, counted
+/// by its first want (their rows); none where the store did not answer.
+async fn replay_answered(
+  disk: &slates_store::owner::StoreHandle,
+  id: RepositoryId,
+  replay: &mut slates_hg::import::record::Replay,
+) -> Option<u64> {
+  let repository = u128::from_be_bytes(id.bytes);
+  let wants = replay.store_wants()?;
+  let asked = match wants.wants() {
+    Some(slates_hg::render::Want::Rows { logs }) => logs.iter().fold(0_u64, |asked, (_, nodes)| {
+      asked.saturating_add(u64::try_from(nodes.len()).unwrap_or(u64::MAX))
+    }),
+    _ => 0,
+  };
+  hg_view::answer_wants_over(disk, repository, wants)
+    .await
+    .then_some(asked)
 }
 
 /// [`replay_hg_sliced`]'s one unit over the shard's state (its type's docs): the record's steps taken under one lend
@@ -4016,10 +4056,14 @@ fn hg_step_in(
     return begun.map(HgStep::Begun).map_err(ReplayRefused::Mercurial);
   };
   let mut stepped = replay.step(bytes, content);
-  while matches!(stepped, Ok(true)) && slates_rt::futures::now_ns() < deadline_ns {
+  while matches!(stepped, Ok(true))
+    && slates_rt::futures::now_ns() < deadline_ns
+    && !replay.asking()
+  {
     stepped = replay.step(bytes, content);
   }
   match stepped {
+    Ok(true) if replay.asking() => Ok(HgStep::Asked(replay)),
     Ok(true) => Ok(HgStep::Stepped(Some(replay))),
     Ok(false) => {
       let replayed = replay
@@ -4510,11 +4554,22 @@ async fn replay_hg_run(
       u64::try_from(bytes.len()).unwrap_or(u64::MAX),
     );
     let mut replay = None;
-    while let HgStep::Begun(begun) | HgStep::Stepped(Some(begun)) =
-      hg_segment_step(state, id, &bytes, replay.take(), slices.budget_ns())?
-    {
-      replay = Some(begun);
-      slices.unit_done().await;
+    loop {
+      match hg_segment_step(state, id, &bytes, replay.take(), slices.budget_ns())? {
+        HgStep::Begun(begun) | HgStep::Stepped(Some(begun)) => {
+          replay = Some(begun);
+          slices.unit_done().await;
+        }
+        HgStep::Asked(mut more) => {
+          let Some(asked) = replay_answered(&disk, id, &mut more).await else {
+            let _ = with_released(state, more);
+            return Err(ReplayRefused::Unlanded);
+          };
+          state.count(HG_REPLAY_TEXTS_ASKED, asked);
+          replay = Some(more);
+        }
+        HgStep::Stepped(None) => break,
+      }
     }
   }
   if let Some(last) = run.last() {
@@ -4549,6 +4604,20 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
       });
       match stepped {
         Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => replay = Some(begun),
+        Some(Ok(HgStep::Asked(mut more))) => match replay_answered(&disk, id, &mut more).await {
+          Some(asked) => {
+            crate::state::with_state(|state| state.count(HG_REPLAY_TEXTS_ASKED, asked))
+              .unwrap_or_default();
+            replay = Some(more);
+          }
+          None => {
+            crate::state::with_state(|state| {
+              let _ = with_released(state, more);
+            })
+            .unwrap_or_default();
+            return Unit::Refused(ReplayRefused::Unlanded);
+          }
+        },
         Some(Ok(HgStep::Stepped(None))) => break,
         Some(Err(refused)) => return Unit::Refused(refused),
         None => return Unit::Gone,
@@ -5267,7 +5336,7 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
     }
     let outcome = match sectioned.as_mut() {
       Some(changeset) => sectioned_unit(id, changeset, &mut replay).await,
-      None => record_unit(id, index, &mut replay),
+      None => record_unit(id, index, &mut replay).await,
     };
     match outcome {
       Unit::More => {}
@@ -5390,8 +5459,9 @@ async fn sectioned_unit(
   }
 }
 
-/// One unit of a register-held record's replay in a rebuild ([`hg_record_step`]).
-fn record_unit(
+/// One unit of a register-held record's replay in a rebuild ([`hg_record_step`]), an ask of the node's changeset store
+/// answered after it ([`replay_answered`]).
+async fn record_unit(
   id: RepositoryId,
   index: usize,
   replay: &mut Option<slates_hg::import::record::Replay>,
@@ -5404,6 +5474,30 @@ fn record_unit(
     Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => {
       *replay = Some(begun);
       Unit::More
+    }
+    Some(Ok(HgStep::Asked(mut more))) => {
+      let Some(disk) = crate::state::with_state(|state| state.vcs_disk.clone()).flatten() else {
+        crate::state::with_state(|state| {
+          let _ = with_released(state, more);
+        })
+        .unwrap_or_default();
+        return Unit::Refused(ReplayRefused::Unlanded);
+      };
+      match replay_answered(&disk, id, &mut more).await {
+        Some(asked) => {
+          crate::state::with_state(|state| state.count(HG_REPLAY_TEXTS_ASKED, asked))
+            .unwrap_or_default();
+          *replay = Some(more);
+          Unit::More
+        }
+        None => {
+          crate::state::with_state(|state| {
+            let _ = with_released(state, more);
+          })
+          .unwrap_or_default();
+          Unit::Refused(ReplayRefused::Unlanded)
+        }
+      }
     }
     Some(Ok(HgStep::Stepped(None))) => Unit::Replayed,
     Some(Err(refused)) => Unit::Refused(refused),

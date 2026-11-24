@@ -118,8 +118,14 @@ fn serve(
   cx: &OpContext,
   batch: u32,
 ) -> Result<slates_bridge_virtiofs::device::Serviced, DeviceError> {
-  let mut pass =
-    device.service_queue(queue, &mut driver.memory, bridge, cx, batch, &mut Unlimited)?;
+  let mut pass = device.service_queue(
+    queue,
+    &mut driver.memory,
+    bridge,
+    cx,
+    batch,
+    (&mut Unlimited, &mut common::NeverAway),
+  )?;
   if pass.barrier_owed {
     device.complete_awaiting(&mut driver.memory, bridge, cx, (true, None), &mut Unlimited)?;
     pass.served += 1;
@@ -708,7 +714,7 @@ fn a_reply_the_guest_cannot_take_gives_back_what_it_granted() {
         &mut bridge,
         &cx,
         BATCH,
-        &mut Unlimited,
+        (&mut Unlimited, &mut common::NeverAway),
       )
       .unwrap_err();
     assert!(matches!(refused, DeviceError::Memory(_)), "{refused:?}");
@@ -757,7 +763,7 @@ fn a_mutations_used_element_waits_for_the_owners_barrier() {
       &mut bridge,
       &cx,
       BATCH,
-      &mut Unlimited,
+      (&mut Unlimited, &mut common::NeverAway),
     )
     .unwrap();
   assert!(pass.barrier_owed);
@@ -841,7 +847,7 @@ fn a_mutations_used_element_waits_for_the_owners_barrier() {
       &mut bridge,
       &cx,
       BATCH,
-      &mut Unlimited,
+      (&mut Unlimited, &mut common::NeverAway),
     )
     .unwrap();
   assert!(!pass.barrier_owed, "a write waits for no barrier");
@@ -1157,7 +1163,14 @@ fn exchange_charged(
   let queue = FIRST_REQUEST_QUEUE;
   let head = driver.submit(usize::from(queue), &request, reply_room, 1);
   let pass = device
-    .service_queue(queue, &mut driver.memory, bridge, &cx, BATCH, ledger)
+    .service_queue(
+      queue,
+      &mut driver.memory,
+      bridge,
+      &cx,
+      BATCH,
+      (ledger, &mut common::NeverAway),
+    )
     .unwrap_or_else(|e| panic!("{opcode:?} served: {e}"));
   if pass.barrier_owed {
     device
@@ -1810,7 +1823,7 @@ mod backed {
               &mut bridge,
               &self.cx,
               BATCH,
-              &mut Unlimited,
+              (&mut Unlimited, &mut common::NeverAway),
             )
             .unwrap();
           if pass.barrier_owed {

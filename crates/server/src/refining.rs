@@ -747,7 +747,7 @@ impl RefineJob {
           plan,
           preparing,
         } => match self.prepare_step(state, (&doc, &plan), preparing) {
-          Prepared_::Next(preparing, yielded) => {
+          PrepareStepped::Next(preparing, yielded) => {
             self.stage = Stage::Preparing {
               doc,
               plan,
@@ -757,10 +757,10 @@ impl RefineJob {
               return Turned::More;
             }
           }
-          Prepared_::Ended(prepared, yielded) => {
+          PrepareStepped::Ended(prepared, yielded) => {
             self.stage = Stage::Finishing {
               refined: Some((doc, plan)),
-              prepared,
+              prepared: prepared.map(|prepared| *prepared),
             };
             if yielded {
               return Turned::More;
@@ -826,7 +826,7 @@ impl RefineJob {
     state: &mut ShardState,
     (doc, plan): (&OpsDoc, &PostStatePlan),
     preparing: Preparing,
-  ) -> Prepared_ {
+  ) -> PrepareStepped {
     let (work, green, key) = (self.work, self.green, self.key);
     let at = (work, green, key);
     match preparing {
@@ -835,7 +835,7 @@ impl RefineJob {
           .and_then(|()| crate::verbs::parked_local_evidence(state.refining.parked.get(&work)?));
         let size = crate::verbs::post_state_size(doc);
         match (evidence, usize::try_from(size).ok()) {
-          (Some(evidence), Some(size)) => Prepared_::Next(
+          (Some(evidence), Some(size)) => PrepareStepped::Next(
             Preparing::Laying {
               evidence,
               post: vec![0u8; size],
@@ -843,7 +843,7 @@ impl RefineJob {
             },
             false,
           ),
-          _ => Prepared_::Ended(None, false),
+          _ => PrepareStepped::Ended(None, false),
         }
       }
       Preparing::Laying {
@@ -853,7 +853,7 @@ impl RefineJob {
       } => {
         let ops = doc.ops.len();
         if next >= ops {
-          return Prepared_::Next(Preparing::Encoding { evidence, post }, false);
+          return PrepareStepped::Next(Preparing::Encoding { evidence, post }, false);
         }
         let laid = self.prepare_turn(state, |s| {
           still_owed(s, at)?;
@@ -889,7 +889,7 @@ impl RefineJob {
           Some(end)
         });
         match laid {
-          Some(next) => Prepared_::Next(
+          Some(next) => PrepareStepped::Next(
             Preparing::Laying {
               evidence,
               post,
@@ -897,7 +897,7 @@ impl RefineJob {
             },
             true,
           ),
-          None => Prepared_::Ended(None, true),
+          None => PrepareStepped::Ended(None, true),
         }
       }
       Preparing::Encoding { evidence, post } => {
@@ -905,7 +905,7 @@ impl RefineJob {
           still_owed(s, at)?;
           Some(doc.encode())
         }) {
-          Some(doc_bytes) => Prepared_::Next(
+          Some(doc_bytes) => PrepareStepped::Next(
             Preparing::Hashing {
               evidence,
               post,
@@ -915,7 +915,7 @@ impl RefineJob {
             },
             true,
           ),
-          None => Prepared_::Ended(None, true),
+          None => PrepareStepped::Ended(None, true),
         }
       }
       Preparing::Hashing {
@@ -939,7 +939,7 @@ impl RefineJob {
           };
           let increment = Box::new(increment);
           return if cfg!(debug_assertions) {
-            Prepared_::Next(
+            PrepareStepped::Next(
               Preparing::Checking {
                 evidence,
                 increment,
@@ -947,7 +947,7 @@ impl RefineJob {
               false,
             )
           } else {
-            Prepared_::Next(
+            PrepareStepped::Next(
               Preparing::Computing {
                 evidence,
                 increment,
@@ -979,7 +979,7 @@ impl RefineJob {
           Some(end)
         });
         match end {
-          Some(hashed) => Prepared_::Next(
+          Some(hashed) => PrepareStepped::Next(
             Preparing::Hashing {
               evidence,
               post,
@@ -989,7 +989,7 @@ impl RefineJob {
             },
             true,
           ),
-          None => Prepared_::Ended(None, true),
+          None => PrepareStepped::Ended(None, true),
         }
       }
       // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
@@ -1011,7 +1011,7 @@ impl RefineJob {
           }
           Some(())
         });
-        Prepared_::Next(
+        PrepareStepped::Next(
           Preparing::Computing {
             evidence,
             increment,
@@ -1027,7 +1027,7 @@ impl RefineJob {
           still_owed(s, at)?;
           s.greens.get(&green)?.compute(&increment).ok()
         }) {
-          Some(computed) => Prepared_::Next(
+          Some(computed) => PrepareStepped::Next(
             Preparing::Encoded {
               evidence,
               increment,
@@ -1035,7 +1035,7 @@ impl RefineJob {
             },
             true,
           ),
-          None => Prepared_::Ended(None, true),
+          None => PrepareStepped::Ended(None, true),
         }
       }
       Preparing::Encoded {
@@ -1049,25 +1049,25 @@ impl RefineJob {
         }) {
           Some(encoded) => {
             let id = increment.id;
-            Prepared_::Ended(
-              Some(Prepared {
+            PrepareStepped::Ended(
+              Some(Box::new(Prepared {
                 evidence,
                 increment: Some(*increment),
                 id,
                 computed: Some(*computed),
                 encoded: Some(encoded),
-              }),
+              })),
               true,
             )
           }
-          None => Prepared_::Ended(None, true),
+          None => PrepareStepped::Ended(None, true),
         }
       }
     }
   }
 
   /// One bounded turn of a preparation: runs `step` on the shard's state and counts the turn and the slice; the task
-  /// yields after it ([`Prepared_`]).
+  /// yields after it ([`PrepareStepped`]).
   fn prepare_turn<T>(
     &mut self,
     state: &mut ShardState,
@@ -1082,10 +1082,11 @@ impl RefineJob {
 }
 
 /// What a preparation's step left ([`RefineJob::prepare_step`]): its next stage, or its end (what it prepared, or none);
-/// each with whether it was a bounded turn the task yields after.
-enum Prepared_ {
+/// each with whether it was a bounded turn the task yields after. What it prepared is boxed: it holds the increment, its
+/// verdict and its encoding inline, many times a stage's size, and every step's answer would carry that room.
+enum PrepareStepped {
   Next(Preparing, bool),
-  Ended(Option<Prepared>, bool),
+  Ended(Option<Box<Prepared>>, bool),
 }
 
 /// The refinement of `doc` and `plan` over `copies` (`slates_merge::refine::refine_rewrites_paced`), as one future that

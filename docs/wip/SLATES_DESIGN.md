@@ -62960,3 +62960,30 @@ named above.
 Applied in the same change to: GAPS (C2 stage C, A-892's owed line), `crates/merge/src/{engine,chain_entry}.rs`,
 `crates/server/src/import_batch.rs`, `crates/server/src/repository/svn_commit/staging.rs`,
 `crates/server/src/vcs_store/svn_import.rs` and its tests.
+
+### A-898 — A virtio-fs guest's read that met a let-go window is kept, brought back and served again (2026-11-24, w-svn for main 01a20182, its order of 2026-11-24 02:25 and rulings of 03:35 and 03:41; goal 93's completeness; A-760 (b) 4d)
+
+- **What was there.** A-760 (b) 4d lets a named text's windows go once its changeset is durable and brings a read of
+  one back: NFS parks the call (`nfs::serve_local_parked`), FUSE keeps the request (`dispatch_kept`), WinFsp keeps
+  it (`Request::kept`), and a verb parks (`verbs::park_on_away`), each served again over the windows brought back and
+  pinned. A virtio-fs device served its chains in one synchronous pass and published each reply: a guest's read of a
+  work over a Subversion green that met a let-go window was answered from that dispatch.
+- **The rule.** `BridgeAccess::with_bridge` hands its pass an `AwayProbe` beside the bridge and the attachments, one
+  signature, so every access states whether a dispatch met content not at hand (the server from the pass's
+  `away_scope` notes, `named_objects::noted_in_scope`; a test access from its hook; no silent default, main's ruling of
+  03:41). After each chain the device asks; one that met it is kept unpublished (`Device::kept`, one a device, its
+  credits charged once) and nothing more is served on any queue that pass. The loop then awaits
+  `BridgeAccess::bring_back` (the server's: `bring_back_reads` over the pass's notes, a `Send` future, counted
+  `virtiofs.brought_back`, a refusal `virtiofs.bring_back_refused`), holds what it brought (`hold_brought`: the server
+  keeps the `ReadPin`s until the next pass has ended), and serves the kept chain again first, published or held as any
+  chain. A second dispatch that meets content not at hand again is answered with that dispatch's answer (counted
+  `away_again`), so a bring-back that could not bring cannot loop. Counted on the device (`kept_away`) and the loop
+  (`ServeEnd::brought_back`).
+- **Evidence.** `a_guests_read_that_met_content_not_at_hand_is_kept_brought_back_and_served_again`
+  (`crates/bridge-virtiofs/tests/serve.rs`; the test access's probe says the first dispatch met content not at hand,
+  and its bring-back rewrites the file): with the keep taken out the guest read the first dispatch's bytes (0x11) with
+  no bring-back; with it, the second dispatch's (0x2B), one bring-back, every credit given back (macOS, 2026-11-24).
+  Owed: a guest over a work on a Subversion green on Linux (main's run of `crates/server/tests/virtiofs.rs`).
+
+Applied in the same change to: GAPS (goal 93's entries), `crates/bridge-virtiofs/src/{device,admission,serve}.rs` and
+its serve tests, `crates/server/src/virtiofs.rs`, `crates/server/src/vcs_store/named_objects.rs`.

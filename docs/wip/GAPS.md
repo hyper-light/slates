@@ -1532,6 +1532,15 @@
 > `vcs_http.git.push_refused_after_body`; one wording for both edges (`git_push::words`, the SSH site's). Red 2 of 2 on
 > 94ff89fe5 (`vcs_http::git::receive::tests`, the body's end failed, nothing answered), green 2 of 2. Owed: a refusal
 > while the body is still read still cuts the connection, as git's `http-backend` does when receive-pack dies mid-body.
+> Gate 4's push 0 (run 45363070862, `v3_takeover`'s first debug run, 2026-11-24): stock git's push to a repository
+> created a moment before was answered `200` and an empty chunked body, git saying "unexpected disconnect while reading
+> sideband packet", the edge counting it completed and logging nothing. The receive exchange answers a request whose
+> bytes never reached it so: read as cut short before its first command (`Truncated` at 0), its refusal had no
+> side-band and no command to give words to, so nothing was written. GUARDED (w-git, 2026-11-24): such a reply is failed,
+> counted `vcs_http.git.push_ended_empty` and logged with the bytes read, and every refusal after the body is logged with
+> its cause (`a_push_whose_request_never_arrived_is_failed_never_answered_with_an_empty_body`, red then green; the probe
+> of a flush alone still answered with nothing). OPEN: why the 385 bytes git sent never reached the exchange; gate 5's
+> log line names the bytes read.
 > Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
@@ -4701,6 +4710,16 @@
 > (`tables/apr_hash.c` `apr_hash_make`), so two stock runs may differ. `svn_interop`'s dump comparison sorts each run of
 > one directory's pure deletions (`sibling_deletes_in_order`, a record's body skipped by its `Content-length`); held by
 > `a_dumps_order_of_a_directorys_deletions_is_no_part_of_an_answer`. Not a server change.
+> **A guest's read of a let-go named text parks on virtio-fs too, BUILT (A-898, 2026-11-24, w-svn; main's order and
+> rulings of 2026-11-24 02:25, 03:35, 03:41).** A-760 (b) 4d parks a read that meets a let-go window of a named text
+> on NFS (`nfs::serve_local_parked`), FUSE (`bridge_fuse::channel::dispatch_kept`), WinFsp (`Request::kept`) and the
+> verbs (`verbs::park_on_away`); a virtio-fs guest's was answered from the dispatch that met it. Now the device keeps
+> that chain unpublished (one a device), its loop awaits the access's bring-back and serves it again first, what was
+> brought pinned until that pass ends; a second miss is answered. The device learns of the miss through the probe
+> every access states in `BridgeAccess::with_bridge` (the server's from the pass's `away_scope` notes). Held by
+> `a_guests_read_that_met_content_not_at_hand_is_kept_brought_back_and_served_again` (red with the keep taken out: the
+> first dispatch's bytes, no bring-back). Owed: a guest over a work on a Subversion green, Linux (main's run of
+> `crates/server/tests/virtiofs.rs`).
 > **A depth-1 PROPFIND streams its children; a server error names its cause, BUILT (A-893, 2026-11-24, w-svn; main's
 > interop red of 2026-11-23, run 45330574435).** `svn info -R` over HTTP of git-2000 answered `500` at
 > `!svn/rvr/N/trunk/t` at all 17 sampled revisions: a collection's depth-1 multistatus was written into one body bounded
