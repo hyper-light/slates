@@ -3129,13 +3129,14 @@ fn a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again() {
 /// The Subversion twin of `hg_push::tests::a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt`
 /// (main 01a20182's ruling of 2026-11-24 09:46: the refusal is tool-neutral, so its tests hold every tool). Do: make a
 /// Subversion repository and land revision 1 through a client's recorded submit; leave the repository awaiting its
-/// rebuild (`test_store::awaiting_rebuild`); over a work on its green add `/trunk/b.txt` and submit it as a client's
-/// recorded request. Expect: refused `Overloaded`, counted `merge.made.unbuilt`, the green's head unmoved. Failing
-/// first: a version committed with no revision made of it. (The resend after a successor's rebuild is not held here: a
-/// Subversion store made again from its records by `takeover::rebuild_repository` on one node is refused `Unlanded`, the
-/// store's rebuild A-636 part 2c-2 owes; reported to main, 2026-11-24.)
+/// rebuild, its store gone as a successor holds none (`test_store::awaiting_rebuild`); over a work on its green add `/trunk/b.txt` and submit it as a client's
+/// recorded request; then rebuild the repository as its successor does (`test_store::rebuild_after_takeover`, its
+/// records read back from the node's store by the rebuild's task) and resend the submit under the same id. Expect: the
+/// first refused `Overloaded`, counted `merge.made.unbuilt`, the green's head unmoved; the resend accepted, revision 2
+/// made of it. Failing first: a version committed with no revision made of it.
 #[test]
-fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refused() {
+fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt()
+ {
   stored(|| async move {
     let (svn, green) = subversion("pending-svn").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
@@ -3146,7 +3147,10 @@ fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refus
     on(|state| crate::vcs_store::paths::tests::submitted_recorded(state, ipc_green, 1, first));
     youngest_reaches(svn, 1).await;
     let head = on(|state| state.db.partition().green_head(green));
-    let _record = on(|state| crate::test_store::awaiting_rebuild(state, svn, false));
+    let adopted = on(|state| {
+      let parts = state.db.take_state_log_records();
+      (crate::test_store::awaiting_rebuild(state, svn, true), parts)
+    });
     let work = on(|state| {
       made_work(
         state,
@@ -3158,14 +3162,17 @@ fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refus
       client: 7,
       sequence: 2,
     };
-    let refused = on(|state| {
-      crate::verbs::run_recorded_for_test(
-        state,
-        (7, submit),
-        &owner(),
-        crate::identities::authored(work, "pending"),
-      )
-    });
+    let send = || {
+      on(|state| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, submit),
+          &owner(),
+          crate::identities::authored(work, "pending"),
+        )
+      })
+    };
+    let refused = send();
     let unbuilt = on(|state| {
       state
         .refusals
@@ -3185,5 +3192,15 @@ fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refus
     );
     assert_eq!(unbuilt, 1, "counted merge.made.unbuilt");
     assert!(unmoved, "nothing committed while it awaited");
+    on(|state| crate::test_store::rebuild_after_takeover(state, adopted));
+    crate::vcs_store::rebuilt(svn).await;
+    assert_eq!(on(|state| kept(state, svn).0), 1, "rebuilt to revision 1");
+    let _ = send();
+    youngest_reaches(svn, 2).await;
+    assert_ne!(
+      on(|state| state.db.partition().green_head(green)),
+      head,
+      "the resend committed"
+    );
   });
 }
