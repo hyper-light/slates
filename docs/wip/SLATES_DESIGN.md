@@ -61911,6 +61911,11 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   and version 2's reader first refused it, so every window of a granule or more was lost at a restart. Windows' 4 KiB
   granule showed it, and a 16 KiB granule hid it (`docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-
   chunk-the-seal-trimmed.md`). Only a window's slot is held to its chunk's bytes, and only a shared slab asks again.
+- **A window's record** (2026-11-23, main's (3) of goal 93) keeps what the window alone names: its identity, its
+  length, its slot's offset and its slab's key, 56 bytes. The slab keeps the placement its windows share: the chunk,
+  the block's length, the bytes used and the birth epoch. A window's placement is made from the two when it is read or
+  imaged (`ChunkWindows::placed_of`). Measured with a count of a test thread's live heap (`tests/window_records_heap.rs`):
+  250 bytes a window on the record that repeated the placement, 150 on this one.
 - **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
 - **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
   - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows

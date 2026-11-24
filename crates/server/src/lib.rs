@@ -156,6 +156,14 @@ mod owner_location;
 mod staging;
 #[cfg(test)]
 pub(crate) mod test_store;
+
+/// The repository content store's window storage over a shard's chunk store (A-727 a2, A-877), its placeholder page
+/// `page`: what a shard's `ContentStore` keeps its windows in. Public for `tests/window_records_heap.rs`, which counts
+/// the heap bytes its records keep under an allocator of its own (goal 93); no product caller makes one this way.
+#[doc(hidden)]
+pub fn chunk_window_storage(page: usize) -> Box<dyn slates_vcs::WindowStorage> {
+  Box::new(vcs_store::arena_windows::ChunkWindows::new(page))
+}
 mod work_charge;
 pub mod work_files;
 mod work_log;
