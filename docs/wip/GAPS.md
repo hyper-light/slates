@@ -174,7 +174,17 @@
 > holder's fleet test, its rebuild held until a pass kept every hold, then resolved by the rebuild's event alone. An
 > ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
 > resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
-> for it (`git_fleet`) until the creation does. OWED (fleet memory, one item
+> for it (`git_fleet`) until the creation does.
+> **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
+> disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
+> agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
+> the failing runs of the healer flake), `Daemon::repository_takeover`'s fifth flag (the repository in
+> `partition().repositories()`, observed on each of `Daemon::shards` and OR'd) read false on both survivors at the end,
+> while a period watch on the rebuilder (`call_within` to `state.shards[partition]`, the shard `fleet`'s
+> `rebuild_adopted_repositories` rebuilt it on, the same accessor) read it held for 3,980 to 3,985 consecutive periods,
+> its counters rebuilt 1, unrebuilt 0. The flag was dropped from the view; the disagreement may be a real inconsistency
+> between the observed shard and the routed one, not a bad flag: start from comparing `Daemon::shards` with
+> `state.shards` and the shard `verbs::owner_of` routes a repository id to. OWED (fleet memory, one item
 > for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
 > in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
 > should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
