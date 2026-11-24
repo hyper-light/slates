@@ -22,6 +22,14 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 03:02 on 11-24:
+- NEW SUBAGENT w-84a-win (in main's session; worktree ~/slates-work/w-84a-win): 84a's Windows every-run tail. A shard
+  idle window derived from the measured park-cost tail (one formula on every platform, under IDLE_SPIN_CEILING), a
+  client spin for its reply, and the bench printing the OS wake floor and its CPU. Design note to main first, red first,
+  lands itself, A/B on jupiter. Removed from w-perf's queue. If main's session ends, its worktree keeps the work.
+- 84a's stop hook judges every single run under 1 ms. Per round, all three platforms are met at current main; single
+  runs still cross on Windows (OS wake tail) and on Linux under heavy external load. The hook's text is Ada's to replace.
+
 Updates at 03:00 on 11-24:
 - 84a Windows tail, second measurement (r820, jupiter): a 2 ms idle window before parking (DIAG override, scratch
   a06a2a062) against the default 50 us cut slow samples 21 -> 11 and rounds with a single run over 1 ms 5/7 -> 1/7; the
