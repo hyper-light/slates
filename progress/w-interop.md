@@ -588,3 +588,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   rows (instance_listing). Why pgrep missed is not known; the next miss will say. Owed to main: the conformance lane on
   ubuntu, and clippy for xtask and cli's tests.
 - QUEUED (main's r110): A-645 (a) and A-681 svn runs on the big Studio.
+- LANDED c40775ea2 (red c5e705502), 2026-11-23: svn use-test harness faults from main's r202. info -R entries are
+  compared in text order (stock lists them in APR's freshly seeded hash order), and tree_of holds a symbolic link as
+  "link TARGET" (git-2000's IsADirectory). GAPS: A-645 (a) by use (r202; the long-history test closed by A-877
+  c1da780ec per main's bisect r378, green 3/3 in r351), and both matrices 66/66. Owed to main: rerun (d) over HTTP.
