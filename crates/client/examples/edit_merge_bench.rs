@@ -43,7 +43,7 @@
 )]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_client::{Client, ClientError, Deadlines, ReadAt, Rebased, Submitted, VolumeId};
@@ -86,6 +86,14 @@ const PERMILLE: u64 = 1000;
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// Format: the offset of the second, disjoint edit range in a file: its second half.
 const SECOND_RANGE: u64 = (FILE_BYTES / 2) as u64;
+/// Shape: the wakes the noise floor's probe times under each load ([`wake_floor`]): as many as a form's timed requests
+/// over its runs, an edit and a submit a sample, so the floor's share over the required bound is read at the bench's own
+/// count.
+const FLOOR_WAKES: usize = RUNS * SAMPLES * 2;
+/// Format: parts per million, the unit the floor's share over the required bound is printed in.
+const PER_MILLION: u64 = 1_000_000;
+/// Format: nanoseconds per microsecond, the unit the `cpu` line prints in.
+const NS_PER_US: u64 = 1_000;
 
 fn ns(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
@@ -523,6 +531,103 @@ fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
   out
 }
 
+/// The operating system's own wake of a blocked thread under `load`, with nothing of slates in it: the noise floor of
+/// every sample that waits on a park (the pattern of `destroy_rows` in `crates/vfs/examples/vfs_bench.rs`, which
+/// measures its scheduling jitter before it judges). Two threads of this process ping-pong [`FLOOR_WAKES`] times through
+/// `std::thread::park`; before each wake the waker idles R9's floor, the least idle window a shard parks after, so the
+/// waiter has parked as a shard does, and the waiter times its wake from the waker's stamp. Main's AutoResetEvent
+/// ping-pong on jupiter (2026-11-24) is the out-of-process form: 36 of 200,000 such wakes over 1 ms after 50 µs idle,
+/// 224 after 500 µs.
+fn wake_floor(load: &str) {
+  let epoch = Instant::now();
+  let gap = Duration::from_nanos(slates_server::config::PROVISION_FLOOR_NS);
+  let sent = AtomicU64::new(0);
+  let turn = AtomicU64::new(0);
+  let taken = AtomicU64::new(0);
+  let waker = std::thread::current();
+  let wakes = u64::try_from(FLOOR_WAKES).unwrap_or(u64::MAX);
+  let latencies = std::thread::scope(|scope| {
+    let waiter = scope.spawn(|| {
+      let mut latencies = Vec::with_capacity(FLOOR_WAKES);
+      for wake in 1..=wakes {
+        while turn.load(Ordering::Acquire) < wake {
+          std::thread::park();
+        }
+        latencies.push(ns(epoch.elapsed()).saturating_sub(sent.load(Ordering::Acquire)));
+        taken.store(wake, Ordering::Release);
+        waker.unpark();
+      }
+      latencies
+    });
+    for wake in 1..=wakes {
+      let idle_until = Instant::now() + gap;
+      while Instant::now() < idle_until {
+        std::hint::spin_loop();
+      }
+      sent.store(ns(epoch.elapsed()), Ordering::Release);
+      turn.store(wake, Ordering::Release);
+      waiter.thread().unpark();
+      while taken.load(Ordering::Acquire) < wake {
+        std::thread::park();
+      }
+    }
+    waiter.join().unwrap()
+  });
+  let over = latencies
+    .iter()
+    .filter(|latency| **latency > GOAL_REQUIRED_NS)
+    .count();
+  let over = u64::try_from(over).unwrap_or(u64::MAX);
+  let shown: Vec<String> = percentiles(latencies)
+    .into_iter()
+    .map(|(name, value)| format!("{name} {value} ns"))
+    .collect();
+  println!(
+    "floor\t{load}: {FLOOR_WAKES} wakes of a thread parked {} ns, the OS's own: {}; {over} over the required 1 ms ({} per million)",
+    gap.as_nanos(),
+    shown.join(", "),
+    over.saturating_mul(PER_MILLION) / wakes.max(1)
+  );
+}
+
+/// What this process's slates threads have run so far and when: the daemon's shards, each read from its own thread
+/// clock (`Daemon::shard_cpu_ns`), and the client, the bench's main thread (`slates_rt::registry::calling_thread_cpu`).
+/// The loaded form's spinners are in neither, so the difference over a form is what slates spent on it.
+#[derive(Clone, Copy)]
+struct Spent {
+  shards_ns: u64,
+  client_ns: u64,
+  at: Instant,
+}
+
+impl Spent {
+  fn now(daemon: &Daemon) -> Spent {
+    Spent {
+      shards_ns: daemon.shard_cpu_ns().iter().map(|(_, spent)| *spent).sum(),
+      client_ns: slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+      at: Instant::now(),
+    }
+  }
+
+  /// The CPU spent since `self` and the wall time it took, as the `cpu` line prints them for `samples` timed samples.
+  fn print_since(self, key: &str, daemon: &Daemon, samples: u64) {
+    let now = Spent::now(daemon);
+    let shards = now.shards_ns.saturating_sub(self.shards_ns);
+    let client = now.client_ns.saturating_sub(self.client_ns);
+    let wall = ns(now.at - self.at).max(1);
+    let samples = samples.max(1);
+    println!(
+      "cpu\tmerge.{key}: shards {} us, client {} us of CPU over {} us of wall ({} cores per thousand); per sample shards {} ns, client {} ns",
+      shards / NS_PER_US,
+      client / NS_PER_US,
+      wall / NS_PER_US,
+      shards.saturating_add(client).saturating_mul(PERMILLE) / wall,
+      shards / samples,
+      client / samples
+    );
+  }
+}
+
 /// One form on one green shape: per part, per percentile, the per-run values.
 /// One request's server-side time, from its spans (§4.14): the ring span on the shard that read its slot (read to
 /// reply written), the shard ops of its verb on the shards that ran it, and the merge verdict inside a submit.
@@ -921,11 +1026,13 @@ impl Selection {
   }
 }
 
-/// Runs every selected form over every selected shape, under `load`.
-fn sweep(instance: &str, load: &str, selection: &Selection) {
+/// Runs every selected form over every selected shape, under `load`, each form's CPU read from `daemon`'s shards and the
+/// client's thread ([`Spent`]).
+fn sweep(daemon: &Daemon, instance: &str, load: &str, selection: &Selection) {
   for files in &selection.shapes {
     for form in selection.forms.iter().copied() {
       let key = format!("{}_f{files}_{load}", form.key());
+      let spent = Spent::now(daemon);
       let rows = match measure(instance, (form, *files, load), selection.shards) {
         Ok(rows) => rows,
         Err(refused) => {
@@ -933,6 +1040,7 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
           continue;
         }
       };
+      spent.print_since(&key, daemon, rows["samples"].iter().sum());
       print_rows(&key, &rows);
       let p99 = median_of(&rows, "total_p99");
       let verdict = against_goal(p99);
@@ -942,11 +1050,13 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
         LOADED_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
       }
       println!(
-        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}",
+        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}; every run's p99 {:?} ns and p999 {:?} ns",
         rows["samples"],
         median_of(&rows, "total_p50"),
         median_of(&rows, "total_p999"),
         median_of(&rows, "total_max"),
+        rows["total_p99"],
+        rows["total_p999"],
       );
     }
   }
@@ -982,7 +1092,10 @@ fn main() {
   let mut selection = Selection::parse();
   selection.shards = shards;
   if selection.quiet {
-    sweep(&instance, "quiet", &selection);
+    if !selection.forms.is_empty() {
+      wake_floor("quiet");
+    }
+    sweep(&daemon, &instance, "quiet", &selection);
     growth_sweep(&instance, &selection);
   }
   if selection.loaded {
@@ -999,21 +1112,27 @@ fn main() {
           }
         });
       }
-      sweep(&instance, "loaded", &selection);
+      if !selection.forms.is_empty() {
+        wake_floor("loaded");
+      }
+      sweep(&daemon, &instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);
     });
   }
   // Each shard's pulse as the runtime holds it (§4.14): its longest step tells a request held behind a long task from
-  // one whose shard was woken late; its overrun says how late its timed waits ran.
+  // one whose shard was woken late; its overrun says how late its timed waits ran; its idle window and the idle turn a
+  // request meets say how long it spun before it parked and whether a hold paid (A-387).
   for pulse in daemon.shard_pulses() {
     println!(
-      "pulse\tshard {}: steps {}, waits {}, longest step {} ns, scheduler overrun {} ns, wake cost {} ns, kicks skipped {}",
+      "pulse\tshard {}: steps {}, waits {}, longest step {} ns, scheduler overrun {} ns, wake cost {} ns, idle window {} ns, held turn {} ns, kicks skipped {}",
       pulse.shard,
       pulse.steps,
       pulse.waits,
       pulse.longest_step_ns,
       pulse.scheduler_overrun_ns,
       pulse.wake_cost_ns,
+      pulse.idle_window_ns,
+      pulse.held_turn_ns,
       pulse.kicks_skipped
     );
   }

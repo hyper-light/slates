@@ -25,6 +25,9 @@ slates-mem = { workspace = true }
 
 [dev-dependencies]
 slates-server = { workspace = true }
+# `edit_merge_bench` reads its client thread's own CPU clock (`registry::calling_thread_cpu`), so the CPU a form costs is
+# slates' alone, with the loaded form's spinners out of it (A-897).
+slates-rt = { workspace = true }
 # The edit-and-submit oracle's generated histories (A-225), persisted through the reviewed-seed wrapper.
 proptest = { workspace = true }
 slates-test-seeds = { workspace = true }
