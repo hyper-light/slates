@@ -22,6 +22,18 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 04:01 on 11-24:
+- Push-0 ROOT CAUSE NAMED by gate 5 (run 45386968890, 6 of 7): the push's body arrived whole (385 bytes), but it met a
+  repository created a moment before and not yet landed, and was refused Unlanded before side-band was in play, so the
+  client got nothing. w-git: report every refusal in git's protocol (unpack/ng). The creation race: w-shared's A-894 (the
+  creation waits for its record at f+1) may fix it at the source; the two agree one wait before building. Gate 6 runs on
+  that fix the same way (worktree main-v3diag, branch diag-measurer-main-v3-*).
+- Main's own daemon tests t_goal93_* (daemon.rs:8630, :8959, :9115) went red under w-git's Option A (bare git submits
+  refused); w-git moves them to recorded_git_submit.
+- Lint wall in slates-server: one red left, vcs_store.rs:5322 replay_sliced (w-hg, in P4b's landing). Workspace-wide
+  clippy still to run once the server is clean.
+- w-svn's A-898 (virtio-fs guest park) landed; it writes the Linux guest case in crates/server/tests/virtiofs.rs for main.
+
 Updates at 03:32 on 11-24:
 - Main CI: the Ubuntu disk fix works (run 45373311018: 88G free before, 113G after, of 145G), but clippy had broken again
   from the day's landings (agents don't run it). Main landed f0624c32b (vcs, hg, server fixes); four errors are with their
