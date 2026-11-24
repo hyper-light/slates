@@ -58789,6 +58789,8 @@ on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-lin
     on `crate::lease_wait`'s pattern). It runs again as each remake ends, told across shards while any waits. Its
     deadline is one remake's bound, its two exchanges at the learned answer bound, for each remake in flight when it
     parked. A create that would not fit even then is refused at once with the room there is.
+    **Since A-884 (2026-11-23, every platform)** a teardown in flight is room on the way too, at each of a create's
+    admissions (bytes, versions, metadata), and its remaining slices at a step's budget join the deadline.
   - Held by `a_create_the_moment_the_daemon_serves_is_admitted_on_windows` and
     `a_create_during_the_released_extents_remakes_waits_for_them_on_windows`, on a real one-shard anchor; red with the
     fix reversed and green with it on both runners (diag run 45260798132, the first create refused `BudgetExceeded { available: 5722144768 }` on windows-latest (5,720,506,368 on windows-11-arm) and the create during the remakes refused `{ available: 5713756160 }` (5,712,117,760) with the fix reversed, both admitted with it, and the Node SDK suites 8 of 8 on both). Applied in the same change to:
@@ -62334,3 +62336,42 @@ Applied in the same change to: A-879's record and its bug record (the piece it o
 `docs/cli.md`, `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`,
 `crates/server/src/{staging,verbs,fs_verbs,state}.rs`, `crates/db/src/partition.rs`, `crates/client/src/client.rs`,
 `crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`, `crates/client/tests/client.rs`, `crates/cli/tests/cli.rs`.
+
+### A-884 — A create sent at once after a destroy waits for the destroyed volume's teardown, whichever admission it met (2026-11-23, w-win2 for main 01a20182, its ruling of 2026-11-23, item 3b; §4.2, A-789)
+
+- **What was there.** A destroy is answered once its record says the volume is destroying; its teardown then frees the
+  volume's objects a slice a round of the shard's serve loop (`verbs::step_destroys`), and only the teardown's end gives
+  the volume's credits back (`verbs::release_slot_credits`): its byte reservation, its inode allowance and its records.
+  A create sent the moment the destroy was answered met them held and was refused `BudgetExceeded`, on every platform
+  (diag run 45251289894: `{ available: 1430536192 }`, the room less the destroyed volume's). The room wait of A-789
+  counted only the remakes of the pool's extents as room on the way, and only at the byte admission.
+- **The rule** (main's ruling): such a create waits for the teardowns in flight, bounded by their remaining slices at
+  the step budget. A create that would not fit even once they end is refused at once with the room there is.
+- **How.** Each of a bounded create's three admissions (bytes, versions, metadata: `room_wait::Room`) counts as room on
+  the way the credits of every volume its shard is destroying, as `release_slot_credits` will give them back
+  (`teardown_room`), and the bytes count the remakes too, as before. A create they would cover parks on A-789's pattern
+  and runs again when a teardown ends (`room_wait::teardown_ended`, from `step_destroys` once the credits are back). Its
+  deadline adds the teardowns' remaining slices at a step's budget apiece (`teardown_window_ns`) to the remakes' bound.
+  A volume's teardown counts its remaining slices at its last slice's pace (`Volume::destroy_slices_left`: its queued
+  objects over the objects that slice released, one before any slice ran, and the call that says `Done`); one not begun
+  yet counts its live inodes, each at least one object, since the destroy verb only records the volume as destroying and
+  its next destroy round builds the queue. The deadline moves on while the teardowns go on: a create run again after its
+  shard's teardown slices released objects since it parked (`room_wait::teardown_sliced`, from `step_destroys`) takes
+  the window from now, never sooner than the one it had. So a create waits at most the teardowns and one window, and is
+  refused once a whole window passes with nothing released. Released objects, not slices left, are the progress:
+  building a teardown's queue counts objects its live inodes did not (directory blocks among them), so the first
+  estimate of slices left can rise as the teardown begins, and run 21 on macOS refused a create its teardown was still
+  serving that way. A teardown on one shard gives room back on that shard alone, so nothing is told across shards.
+- **Evidence.** Diag run 45325253708 (2026-11-23, debug builds on ab3e18b65), on ubuntu, macOS and both Windows runners.
+  Red A, no teardown counted as room on the way: the create at once after a destroy refused `BudgetExceeded` (macOS `{
+  available: 1250033664 }` for 3,750,100,992 bytes of 5,000,134,656) and the held teardown's create never parked, on all
+  four. Red B, the deadline moved on with no progress: the bound test never ended, cut at 300 s (ubuntu, exit 124).
+  Green: the create after a destroy 5 of 5 rounds and the bound test 3 of 3 on all four; the held teardown's create
+  refused at its bound (parked, then expired once) after 0.7 to 1.4 ms on macOS and ubuntu and 2.0 s on windows-latest,
+  where the remakes' bound joins the window, and the same size admitted once the hold lifted; room_wait's unit test on
+  all four; the Windows extents file, its remake-window test among them, on both runners; clippy clean in A-884's files.
+  On this Mac (2026-11-23): the create at once after a destroy answered after 3.66 ms, parked once and resumed once.
+
+Applied in the same change to: A-789's record (its room wait), GAPS (item 3b's entry under A-789),
+`docs/bugs/2026-11-23-a-create-at-once-after-a-destroy-met-its-teardown.md`, `crates/vfs/src/volume.rs`,
+`crates/server/src/{room_wait,verbs,daemon,state}.rs`, `crates/client/tests/client.rs`.
