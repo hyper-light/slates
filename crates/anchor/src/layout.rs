@@ -25,10 +25,12 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// region a want word a partition after its owner words (A-853, 2026-11-21), 19 a green's head identity hashes each
 /// file's path, length and plain BLAKE3, not its bytes (A-873, A-760 (b) piece 4a, 2026-11-23): every identity a
 /// segment of 18 records (chain entries, checkpoints' head checks, merge records, the ledger) was made under the other
-/// rule, and would fence the green it names as diverged, so the segment is refused at adoption. An older segment is
-/// refused, never misread.
+/// rule, and would fence the green it names as diverged, so the segment is refused at adoption, 20 the pool region a
+/// generation word after the want words, moved at every claim and release of an extent (A-906, 2026-11-24: a shard reads
+/// it to know its last count of the pool's free room still holds, where every lend scanned every owner word). An older
+/// segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 19;
+pub const LAYOUT_VERSION: u32 = 20;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -38,6 +40,29 @@ pub const POOL_WORD_BYTES: usize = 8;
 /// A-848 a run doubling from one unit, then the rest's binary parts: about two per bit of its length in units, cut
 /// off at this many). Extent `partition × this + part`.
 pub const POOL_EXTENTS_PER_PARTITION: usize = 64;
+/// Format: the line a hot word of the segment has to itself (A-906; CLAUDE.md §3, "hot atomics are cache-line
+/// padded"): 128 bytes, the widest cache line slates runs on (Apple silicon's), so a word every lend reads shares its
+/// line with nothing written.
+pub const HOT_LINE_BYTES: usize = 128;
+
+/// Format: the pool region's owner and want words for `partitions` partitions: [`POOL_EXTENTS_PER_PARTITION`] owner words
+/// and one want word a partition (A-98, A-853).
+pub fn pool_owner_and_want_words(partitions: u16) -> u64 {
+  u64::from(partitions).saturating_mul(
+    u64::try_from(POOL_EXTENTS_PER_PARTITION)
+      .unwrap_or(u64::MAX)
+      .saturating_add(1),
+  )
+}
+
+/// Format: the pool generation word's offset in the pool region (A-906): the first [`HOT_LINE_BYTES`] boundary past the
+/// owner and want words, so its line holds nothing else (the region begins on a page).
+pub fn pool_generation_offset(partitions: u16) -> u64 {
+  pool_owner_and_want_words(partitions)
+    .saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX))
+    .next_multiple_of(u64::try_from(HOT_LINE_BYTES).unwrap_or(u64::MAX))
+}
+
 /// Format: the snapshot slots a partition holds (the committed one and the one being written).
 const SNAPSHOT_SLOTS: usize = 2;
 /// Format: the node-wide consensus publications (regional and root).
@@ -402,15 +427,11 @@ impl Geometry {
   }
 
   /// The pool region's bytes (A-98): [`POOL_EXTENTS_PER_PARTITION`] owner words a partition, then one want word a
-  /// partition (A-853: the room a partition was refused, posted for the others to give back toward).
+  /// partition (A-853: the room a partition was refused, posted for the others to give back toward), then the pool's
+  /// generation word on a line of its own (A-906: moved at every claim and release, read at every lend).
   fn pool_bytes(&self) -> u64 {
-    u64::from(self.partitions)
-      .saturating_mul(
-        u64::try_from(POOL_EXTENTS_PER_PARTITION)
-          .unwrap_or(u64::MAX)
-          .saturating_add(1),
-      )
-      .saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX))
+    pool_generation_offset(self.partitions)
+      .saturating_add(u64::try_from(HOT_LINE_BYTES).unwrap_or(u64::MAX))
   }
 
   /// The region of `kind`, by arithmetic over the layout, or `None` for a kind this geometry has no region of. The
