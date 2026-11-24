@@ -4023,6 +4023,17 @@
 >
 > hg 24 of 24 over Mercurial's whole history, on ubuntu-latest x86_64 (glibc's default and tuned malloc) and on
 > ubuntu-24.04-arm, under twice the CPUs in busy loops (run 45303764098, arena-19).
+>
+> **Later rounds (2026-11-24):**
+> - **Linux git, run 3** (45445378898, at c53777733): 27 of 27 again.
+> - **Linux svn, runs 3 and 4** (45445378898 at c53777733; 45477825824 at 4664f8d26, svn legs only): **26 of 33 on
+>   both routes**, the same seven rows each time, against run 1's 33 of 33.
+>   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
+>   - delete, revert and status failed after them, on the edit left behind.
+>   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
+>     4d), and nothing brought it back. The fix is w-svn's, in progress; run 5 follows it.
+> - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
+>   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
 > verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
