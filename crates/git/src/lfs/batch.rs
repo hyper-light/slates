@@ -1,5 +1,5 @@
 //! The batch API and the basic transfer adapter (A-610; git-lfs v3.8.1 `docs/api/batch.md` and `basic-transfers.md`
-//! [B]; the client's `tq/api.go` and `tq/transfer.go` [C]).
+//! \[B\]; the client's `tq/api.go` and `tq/transfer.go` \[C\]).
 //!
 //! **A request** ([`read_request`]) names an `operation`, `download` or `upload`; optionally the transfer adapters the
 //! client has (`transfers`; "If omitted, the `basic` transfer adapter MUST be assumed"), the ref the objects belong to

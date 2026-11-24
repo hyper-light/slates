@@ -4,11 +4,11 @@
 //!
 //! **One kind for imports and pushes** (main's ruling, 2026-11-19): the record holds revisions to append to a
 //! repository's index, in groups, each one log's revisions in the order they were appended, and the markers after them.
-//! An import's record ([`write`], [`Source::Import`]) is every revision its index holds: the changelog's group, the
-//! manifest log's, then each file log's in its path's order. A push's whole-text record ([`write_revisions`], the
-//! tests' and a made changeset's; a live push writes its changegroup, below) is the
-//! revisions it brought that the repository lacked, in the order its landing appended them (`push::commit`), so a
-//! recovery appends them where the live push did. [`replay`] is the one entry point for both.
+//! An import's record ([`write`](fn@write), [`Source::Import`]) is every revision its index holds: the changelog's
+//! group, the manifest log's, then each file log's in its path's order. A push's whole-text record ([`write_revisions`],
+//! the tests' and a made changeset's; a live push writes its changegroup, below) is the revisions it brought that the
+//! repository lacked, in the order its landing appended them (`push::commit`), so a recovery appends them where the live
+//! push did. [`replay`] is the one entry point for both.
 //!
 //! **What a revision holds.** Its node, its parents' nodes, a manifest's or file revision's link (the node of the
 //! changeset that brought it), 7.2's index flags and its whole text as 7.2 stores it (a file revision's metadata block
@@ -593,9 +593,9 @@ pub fn write(index: &HgIndex, store: &ContentStore, room: u64) -> Result<Vec<u8>
 }
 
 /// An import's record written a revision at a time (A-732: written whole at the landing, a large repository's record
-/// held its shard past the watchdog's window): [`write`]'s bytes, cut into steps its owner advances within its step
-/// budget. A step writes one log's group head with its first revision, or one revision, or the markers last. The
-/// record grows as it is written, each part's room reserved before it is put, refused typed where it cannot be.
+/// held its shard past the watchdog's window): [`write`](fn@write)'s bytes, cut into steps its owner advances within
+/// its step budget. A step writes one log's group head with its first revision, or one revision, or the markers last.
+/// The record grows as it is written, each part's room reserved before it is put, refused typed where it cannot be.
 pub struct Writer {
   /// The logs, each its log's tag, a file log's path, and the number of the first revision the record holds of it: an
   /// import's, the changelog, the manifest log, then each file log in its path's order, each from its first; a push's,

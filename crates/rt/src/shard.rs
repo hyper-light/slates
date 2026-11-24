@@ -744,7 +744,8 @@ impl ShardContext {
   /// Whether anyone else waits on this shard now (A-783; asked once a paced step's quantum, never once a unit): an
   /// inbound ring's word, a ready poller (woken, since asking may consume its signal, as the idle spin does), the
   /// driver's pending or harvested completions (a non-blocking poll, as a busy run's harvest), a due timer, a ready
-  /// task, or a task of the step's batch not yet polled. Counted ([`ShardCounters::waiting_asked`], [`ShardCounters::waiting_found`]).
+  /// task, or a task of the step's batch not yet polled. Counted ([`Counters::waiting_asked`],
+  /// [`Counters::waiting_found`]).
   pub fn others_waiting(&self) -> bool {
     let now = self.now_ns();
     let mut waiting = self.has_inbound();

@@ -809,9 +809,9 @@ impl StoreHandle {
   }
 
   /// For each log of `logs` (a path and the versions its tool names, Mercurial's nodes), each version in `repository`
-  /// as it landed ([`Store::text_by_tool`]), in order, none for one no landed changeset named. One batch for many logs,
-  /// so a stream asks by its room, never once a log (r20 on hg-src: about 12,000 asks, the serving shard idle half the
-  /// stream); bounded by what the asker's room holds.
+  /// as it landed ([`Store::texts_by_tools`]), in order, none for one no landed changeset named. One batch for many
+  /// logs, so a stream asks by its room, never once a log (r20 on hg-src: about 12,000 asks, the serving shard idle half
+  /// the stream); bounded by what the asker's room holds.
   pub async fn texts_by_tool(
     &self,
     repository: u128,

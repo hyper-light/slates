@@ -2,7 +2,7 @@
 //! stream, so that a successor daemon can hand the device a fresh stream for the same attachment after this daemon dies
 //! (`slates_bridge_fuse::shards_resync` holds the wire, the conditions Shards' coordinator set, and their evidence).
 //!
-//! **At the attach** ([`establish`]): a message pair (`slates_ipc::stream::message_pair`: sequenced packets on Linux,
+//! **At the attach** (`establish`): a message pair (`slates_ipc::stream::message_pair`: sequenced packets on Linux,
 //! a stream of fixed-length messages on macOS, A-339); the attachment's resync token, 128 bits from the daemon's secure
 //! random, never its NFS mount capability; the `Attached` message written on the daemon's end before the device has its
 //! own, so it is the first thing the device reads. The daemon's end then goes to the anchor as a held descriptor, keyed
@@ -13,25 +13,25 @@
 //! refused, closes its end at once: the device reads `Attached` and then the channel's end, and knows its share ends
 //! with this daemon (Shards' option (a)).
 //!
-//! **The daemon keeps its own copy of its end while the anchor holds one** ([`Resync::end`], A-339). XNU flushes a Unix
+//! **The daemon keeps its own copy of its end while the anchor holds one** (`Resync::end`, A-339). XNU flushes a Unix
 //! socket whose every reference rides a message in flight whenever its collector of such descriptors runs (`unp_gc`,
 //! which any Unix socket's close in the system can start): its collector walks only descriptors that are themselves in
 //! flight, so a socket waiting in the receive buffer of one never sent (the anchor's end of its channel) is never found
 //! reachable. Flushed, the end would read its own end of file for good, and its owner could never again tell the device's
 //! close from it. An end sent to the anchor and closed at once is all in flight until the anchor's receive, so the
-//! daemon keeps its copy until the attachment's end or [`give_up`], and closes it then with the anchor's: the device
+//! daemon keeps its copy until the attachment's end or `give_up`, and closes it then with the anchor's: the device
 //! reads the channel's end only when both are gone. Linux's collector takes only unreachable cycles (measured not to
 //! flush a handed end, A-161's record); the copy is kept there too, so the two platforms run one rule.
 //!
 //! **While the stream lives**: the owner view the guest's root names (A-281) is told to the anchor as the hold's new
-//! session ([`tell_owners`]); a stream whose guest maps a file with DAX keeps its resync while the anchor holds each
+//! session (`tell_session`); a stream whose guest maps a file with DAX keeps its resync while the anchor holds each
 //! object it hands the device and the shard's range table records the ranges answered (A-365, `crate::shards::dax_hold`),
 //! since the guest's stores through a map live in an object only the device maps once this daemon is gone, and gives it
-//! up ([`give_up`]) where either is refused; and the attachment's end releases the hold ([`give_up`] again), so the
-//! device reads the channel's end. Each refusal on the way gives the resync up rather than leave a hold that would carry a wrong view: a share
-//! that cannot be resynced ends at a daemon's death, as before.
+//! up (`give_up`) where either is refused; and the attachment's end releases the hold (`give_up` again), so the
+//! device reads the channel's end. Each refusal on the way gives the resync up rather than leave a hold that would
+//! carry a wrong view: a share that cannot be resynced ends at a daemon's death, as before.
 //!
-//! **After a death** ([`send_resync`]): recovery keeps a Shards attachment whose resync end the anchor held, and the
+//! **After a death** (`send_resync`): recovery keeps a Shards attachment whose resync end the anchor held, and the
 //! successor serves it on a fresh stream as the same attachment (its owner view from the hold's session, no `INIT`, no
 //! restore), then hands the device the fresh stream's end over the held channel in a `Resync` naming the same token.
 //! The successor keeps its own copy of that end until the device shows it holds its own (its first bytes on the
@@ -42,8 +42,8 @@
 //! taken back and their guest's unsynced stores ingested before it serves anything (A-365).
 //!
 //! **Windows** (A-427) keeps the same token, owner view and form, and one thing more: the process that holds the
-//! stream ([`Holder`]), since a successor there duplicates the fresh end into a process rather than sending it on the
-//! channel (A-418's wire). The session's bytes there are [`handle_session_bytes`], and the channel's I/O is the child
+//! stream (`Holder`), since a successor there duplicates the fresh end into a process rather than sending it on the
+//! channel (A-418's wire). The session's bytes there are `handle_session_bytes`'s, and the channel's I/O is the child
 //! module `resync_handle` of `crate::shards`. A successor's half on Windows is not here yet (GAPS).
 
 #[cfg(unix)]
