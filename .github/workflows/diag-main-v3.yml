@@ -1,9 +1,10 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 06:12 PST): gate 9 for the push-0/1 failure, at 7d6874639 (w-git's line for each non-Kept
-# answer of a home's put, and for a region exchange that ended with hosts unanswered; agreed with w-shared; no behaviour
-# change). Gate 8 (45405128575, ee9571813) failed 2 of 40: push 0 right after creation, a remote home's answer other than
-# kept within about 1 ms of a 2 s budget. Twenty release then twenty debug runs, each log grepped for the new lines.
-# Run only from diag-measurer-main-v3-* branches, never main.
+# main 01a20182 (2026-11-24 09:39 PST): gate 10 for the push-0/1 failure, at d48863ddb (w-shared's A-902: a Put and a
+# PutPart's first part carry the sender's configuration version; a home not ranked by its own configuration and behind
+# its sender waits within the budget for its next changing install, counted vcs_store.homes.install_waits / caught_up /
+# elapsed). Gate 9 (45411079579) failed 3 of 40, each Refused(NotAHome) about 1 ms in. 0 of 40 closes it. Twenty release
+# then twenty debug runs; each log grepped for the answer lines and the new counters. Run only from
+# diag-measurer-main-v3-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -13,13 +14,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 9 at 7d6874639)
+    name: v3_takeover (gate 10 at d48863ddb)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 7d6874639df859f7eeeef4f20f1d3082c02d8b50
+          ref: d48863ddb3d330618e13050451d6703b7c243462
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -47,15 +48,15 @@ jobs:
             echo "debug $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
-          echo "== gate 9: $pass of 40 passed"
+          echo "== gate 10: $pass of 40 passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
-            grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with' "$f" | head -8 | cut -c1-400
+            grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
           done
           exit 0
       - name: Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate9
+          name: v3-gate10
           path: ${{ runner.temp }}/*.log
