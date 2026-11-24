@@ -8434,7 +8434,11 @@ mod tests {
     assert!(records.len() > 1, "a record for each window: {records:?}");
     assert_eq!(gone, records.len(), "every recorded window let go");
     assert_eq!(restored, records, "each record taken back as it was");
-    assert!(read == Some(bytes), "the pack read whole after the restart");
+    assert!(
+      read.as_ref() == Ok(&bytes),
+      "the pack read whole after the restart: {:?}",
+      read.err()
+    );
   }
 
   /// Goal 93 item 2b(b), Mercurial's half of the seam (w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43: an hg
