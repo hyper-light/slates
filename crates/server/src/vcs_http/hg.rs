@@ -302,19 +302,26 @@ impl CompressionLearner {
 
   /// Chooses the offered engine and level minimizing expected wall-clock time per uncompressed byte.
   fn choose(&self, media: Media, engines: &[Engine]) -> Compression {
+    let pacing = self.link_bytes >= LINK_LEARNED_FROM && self.link_ns > 0;
     if media == Media::V1 {
-      let level = if self.link_bytes >= LINK_LEARNED_FROM && self.link_ns > 0 {
-        FASTEST_COMPRESSING_LEVEL
-      } else {
-        0
-      };
+      let zlib_unmeasured = self
+        .engines
+        .get(engine_slot(Engine::Zlib))
+        .is_some_and(|stats| stats.in_bytes == 0);
+      let compress = pacing
+        && (zlib_unmeasured
+          || self.compare_cost(Engine::Zlib, Engine::Uncompressed) == core::cmp::Ordering::Less);
       return Compression {
         engine: Engine::Zlib,
-        level,
+        level: if compress {
+          FASTEST_COMPRESSING_LEVEL
+        } else {
+          0
+        },
       };
     }
     // Until link backpressure is observed past a socket buffer, avoid burning CPU on compression.
-    if self.link_bytes < LINK_LEARNED_FROM || self.link_ns == 0 {
+    if !pacing {
       let engine = engines
         .iter()
         .copied()
@@ -326,25 +333,35 @@ impl CompressionLearner {
         level: unpaced_level(engine),
       };
     }
-    // Once the link paces writes, probe any unmeasured fast compressed engine (zstd, then zlib) to measure
-    // its real speed and ratio on this machine and workload, then pick the minimum total-time winner.
-    for probe in [Engine::Zstd, Engine::Zlib] {
-      if engines.contains(&probe)
-        && self
-          .engines
-          .get(engine_slot(probe))
-          .is_some_and(|stats| stats.in_bytes == 0)
-      {
-        return Compression {
-          engine: probe,
-          level: paced_level(probe),
-        };
-      }
+    // Once the link paces writes, probe only the client's preferred fast compressed engine (zstd
+    // when offered, else zlib) if unmeasured so we never burn a bulk stream probing legacy zlib
+    // when zstd is already offered and measured.
+    if let Some(probe) = [Engine::Zstd, Engine::Zlib]
+      .into_iter()
+      .find(|engine| engines.contains(engine))
+      && self
+        .engines
+        .get(engine_slot(probe))
+        .is_some_and(|stats| stats.in_bytes == 0)
+    {
+      return Compression {
+        engine: probe,
+        level: paced_level(probe),
+      };
     }
+    // Compare only measured codecs and uncompressed so an unprobed codec never beats a measured winner.
     let best = engines
       .iter()
       .copied()
+      .filter(|&engine| {
+        engine == Engine::Uncompressed
+          || self
+            .engines
+            .get(engine_slot(engine))
+            .is_some_and(|stats| stats.in_bytes > 0)
+      })
       .min_by(|&a, &b| self.compare_cost(a, b))
+      .or_else(|| engines.first().copied())
       .unwrap_or(Engine::Zlib);
     Compression {
       engine: best,
@@ -929,12 +946,15 @@ impl<S: HgStores> Exchange for HgExchange<S> {
 
 impl<S: HgStores> HgExchange<S> {
   /// One turn of a streamed answer (A-745, §4.17.1 "A fetch's answer"): the repository's view lent for the turn alone,
-  /// steps taken within the room the lender names until one shard quantum elapses (so accept loops and sibling tasks
-  /// are never starved behind multi-millisecond bursts), the answer ends, or the answer asks the changeset store; a
-  /// step past the turn's room after others ends the turn, and is taken again by the next within a room of its own.
+  /// steps taken within the room the lender names until one shard quantum elapses while other tasks wait (so accept
+  /// loops and sibling requests are never starved), or until one derived content window of reply bytes is ready when
+  /// the shard is otherwise idle (avoiding hundreds of thousands of 64-byte revlog-entry turns on single-client stream
+  /// clones), the answer ends, or the answer asks the changeset store; a step past the turn's room after others ends
+  /// the turn, and is taken again by the next within a room of its own.
   fn turn(&mut self, streamed: &mut hg_http::Streamed, out: &mut Vec<u8>) -> Result<bool, Failed> {
     let id = self.repository.id;
     let (room, quantum) = self.stores.fetch_turn(id).unwrap_or((self.request_room, 0));
+    let ceiling = slates_rt::futures::step_ceiling_ns().unwrap_or(quantum);
     let mut admission = Admission::new(room);
     let start = slates_rt::futures::now_ns();
     let generation = self
@@ -956,7 +976,15 @@ impl<S: HgStores> HgExchange<S> {
             }
             Ok(true) => {
               taken = true;
-              if quantum == 0 || slates_rt::futures::now_ns().saturating_sub(start) >= quantum {
+              if quantum == 0 {
+                break Ok(true);
+              }
+              let elapsed = slates_rt::futures::now_ns().saturating_sub(start);
+              if elapsed >= quantum
+                && (slates_rt::futures::others_waiting()
+                  || out.len().saturating_sub(before_out) >= slates_http::MAX_LINE
+                  || elapsed >= ceiling)
+              {
                 break Ok(true);
               }
             }

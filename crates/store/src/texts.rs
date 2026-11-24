@@ -1122,6 +1122,146 @@ impl Store {
     Ok(found)
   }
 
+  /// Point-reads one tool id row of `path` in `repository`, counting one engine read.
+  fn tool_get(
+    &mut self,
+    repository: u128,
+    hash: &Identity,
+    tool_id: &[u8],
+    value: &mut Vec<u8>,
+  ) -> Result<Option<(Identity, TextRow)>, StoreError> {
+    value.clear();
+    self.tool_read();
+    if !self
+      .rows_mut()
+      .get(&tool_key(repository, hash, tool_id), value)?
+    {
+      return Ok(None);
+    }
+    decode_tool_value(value).map(Some)
+  }
+
+  /// Applies a scanned page of `I` rows under `prefix` into `results`, returning `(hits, first_hit)`.
+  fn apply_tool_page(
+    out: &mantle_engine::rows::Rows,
+    prefix: &[u8],
+    index_by_id: &std::collections::HashMap<&[u8], usize>,
+    first_id: &[u8],
+    results: &mut [Option<(Identity, TextRow)>],
+  ) -> Result<(usize, bool), StoreError> {
+    let mut hits = 0usize;
+    let mut first_hit = false;
+    for (key, value) in out.iter() {
+      let Some(tool_id) = key.strip_prefix(prefix) else {
+        continue;
+      };
+      if let Some(&slot) = index_by_id.get(tool_id)
+        && let Some(entry) = results.get_mut(slot)
+        && entry.is_none()
+      {
+        *entry = Some(decode_tool_value(value)?);
+        hits = hits.saturating_add(1);
+        if tool_id == first_id {
+          first_hit = true;
+        }
+      }
+    }
+    Ok((hits, first_hit))
+  }
+
+  /// Point-reads every remaining unmatched tool id in `sorted` at or after `from_id`.
+  fn point_read_remaining_tools(
+    &mut self,
+    repository: u128,
+    hash: &Identity,
+    sorted: &[(&[u8], usize)],
+    from_id: &[u8],
+    results: &mut [Option<(Identity, TextRow)>],
+  ) -> Result<(), StoreError> {
+    let mut value = Vec::with_capacity(IDENTITY + TEXT_VALUE_BYTES);
+    let start_idx = sorted.partition_point(|&(id, _)| id < from_id);
+    for &(tool_id, slot) in sorted.get(start_idx..).unwrap_or_default() {
+      if results.get(slot).is_some_and(Option::is_none)
+        && let Some(found) = self.tool_get(repository, hash, tool_id, &mut value)?
+        && let Some(entry) = results.get_mut(slot)
+      {
+        *entry = Some(found);
+      }
+    }
+    Ok(())
+  }
+
+  /// Scans `[min_id, max_id]` starting with one probe page of `unique` rows; dense asks finish in
+  /// sequential scans, while sparse asks switch to O(remaining) point lookups immediately after an
+  /// empty hit probe.
+  fn scan_or_point_tools(
+    &mut self,
+    repository: u128,
+    hash: &Identity,
+    index_by_id: &std::collections::HashMap<&[u8], usize>,
+    results: &mut [Option<(Identity, TextRow)>],
+  ) -> Result<(), StoreError> {
+    let unique = index_by_id.len();
+    let mut sorted: Vec<(&[u8], usize)> =
+      index_by_id.iter().map(|(&id, &slot)| (id, slot)).collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let prefix = tool_key(repository, hash, &[]);
+    let first_id = sorted.first().map_or(&[][..], |&(id, _)| id);
+    let last_id = sorted.last().map_or(&[][..], |&(id, _)| id);
+    let end = prefix_end(&tool_key(repository, hash, last_id));
+    let mut from = tool_key(repository, hash, first_id);
+    let mut next = Vec::new();
+    let mut out = mantle_engine::rows::Rows::default();
+    let mut matched = 0usize;
+    let mut page_limit = unique;
+    let mut first_page = true;
+    loop {
+      out.clear();
+      self.tool_read();
+      let more = self
+        .rows_mut()
+        .scan(&from, end.as_deref(), page_limit, &mut out, &mut next)?;
+      let (hits, first_hit) = Self::apply_tool_page(&out, &prefix, index_by_id, first_id, results)?;
+      matched = matched.saturating_add(hits);
+      if !more || matched == unique {
+        return Ok(());
+      }
+      let remaining = unique.saturating_sub(matched);
+      let drop_first = usize::from(first_page && first_hit);
+      first_page = false;
+      let effective_hits = hits.saturating_sub(drop_first);
+      let effective_scanned = out.len().saturating_sub(drop_first);
+      if remaining == 1 || effective_hits == 0 {
+        let next_id = next.strip_prefix(prefix.as_slice()).unwrap_or(&[]);
+        return self.point_read_remaining_tools(repository, hash, &sorted, next_id, results);
+      }
+      page_limit = remaining
+        .saturating_mul(effective_scanned)
+        .checked_div(effective_hits)
+        .unwrap_or(remaining)
+        .max(remaining);
+      core::mem::swap(&mut from, &mut next);
+    }
+  }
+
+  /// Copies matched entries into duplicate request slots when `tool_ids` contained repeats.
+  fn fill_duplicate_tools(
+    tool_ids: &[Vec<u8>],
+    index_by_id: &std::collections::HashMap<&[u8], usize>,
+    results: &mut [Option<(Identity, TextRow)>],
+  ) {
+    for idx in 0..tool_ids.len() {
+      if results.get(idx).is_some_and(Option::is_none)
+        && let Some(tool_id) = tool_ids.get(idx)
+        && let Some(&first) = index_by_id.get(tool_id.as_slice())
+        && let Some(found) = results.get(first).copied().flatten()
+        && let Some(slot) = results.get_mut(idx)
+      {
+        *slot = Some(found);
+      }
+    }
+  }
+
   /// The versions of `path` in repository `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as
   /// they landed: each one's text identity and its own row (its base a version of the same path, its place its own
   /// edit's); none for one no landed changeset named.
@@ -1137,12 +1277,7 @@ impl Store {
     if tool_ids.is_empty() {
       return Ok(Vec::new());
     }
-    // The path's tool id rows share their key's prefix, so they are read in one scan of it, a page as large as the
-    // ask, keeping the ones asked: a stream asks for a log's every version, one random lookup each before (r27 on
-    // hg-src: about 230,000 a stream, 1.35 s of its 3.7 s waiting on the store).
     let hash = *blake3::hash(path).as_bytes();
-    let start = tool_key(repository, &hash, &[]);
-    let end = prefix_end(&start);
     let mut index_by_id: std::collections::HashMap<&[u8], usize> =
       std::collections::HashMap::with_capacity(tool_ids.len());
     for (idx, tool_id) in tool_ids.iter().enumerate() {
@@ -1150,48 +1285,17 @@ impl Store {
     }
     let unique = index_by_id.len();
     let mut results: Vec<Option<(Identity, TextRow)>> = vec![None; tool_ids.len()];
-    let mut matched = 0usize;
-    let mut from = start.clone();
-    let mut next = Vec::new();
-    let mut out = mantle_engine::rows::Rows::default();
-    loop {
-      out.clear();
-      self.tool_read();
-      let more = self.rows_mut().scan(
-        &from,
-        end.as_deref(),
-        tool_ids.len().max(1),
-        &mut out,
-        &mut next,
-      )?;
-      for (key, value) in out.iter() {
-        let Some(tool_id) = key.strip_prefix(start.as_slice()) else {
-          continue;
-        };
-        if let Some(&slot) = index_by_id.get(tool_id)
-          && let Some(entry) = results.get_mut(slot)
-          && entry.is_none()
-        {
-          *entry = Some(decode_tool_value(value)?);
-          matched = matched.saturating_add(1);
-        }
+    if unique == 1 {
+      if let Some(only) = tool_ids.first() {
+        let mut value = Vec::with_capacity(IDENTITY + TEXT_VALUE_BYTES);
+        let found = self.tool_get(repository, &hash, only, &mut value)?;
+        results.fill(found);
       }
-      if !more || matched == unique {
-        break;
-      }
-      core::mem::swap(&mut from, &mut next);
+      return Ok(results);
     }
+    self.scan_or_point_tools(repository, &hash, &index_by_id, &mut results)?;
     if unique < tool_ids.len() {
-      for idx in 0..tool_ids.len() {
-        if results.get(idx).is_some_and(Option::is_none)
-          && let Some(tool_id) = tool_ids.get(idx)
-          && let Some(&first) = index_by_id.get(tool_id.as_slice())
-          && let Some(found) = results.get(first).copied().flatten()
-          && let Some(slot) = results.get_mut(idx)
-        {
-          *slot = Some(found);
-        }
-      }
+      Self::fill_duplicate_tools(tool_ids, &index_by_id, &mut results);
     }
     Ok(results)
   }

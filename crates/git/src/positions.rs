@@ -54,7 +54,17 @@ impl PartialEq for Positions {
     match (&self.form, &other.form) {
       (Form::Runs(mine), Form::Runs(theirs)) => mine == theirs,
       (Form::List(mine), Form::List(theirs)) => mine == theirs,
-      _ => self.iter().eq(other.iter()),
+      (
+        Form::Bits {
+          start: s1,
+          words: w1,
+        },
+        Form::Bits {
+          start: s2,
+          words: w2,
+        },
+      ) => bits_eq((*s1, w1), (*s2, w2)),
+      _ => self.runs_iter().eq(other.runs_iter()),
     }
   }
 }
@@ -123,17 +133,29 @@ impl Positions {
   /// Puts the set in its cheapest form (module docs): the runs, the list or the bit table, whichever costs fewest bytes,
   /// runs before the list and the list before the table where two tie.
   fn settle(&mut self) {
-    let (mut runs, mut count) = (0_u64, 0_u64);
-    let (mut first, mut last) = (None, None);
-    for (start, end) in self.runs_iter() {
-      runs = runs.saturating_add(1);
-      count = count.saturating_add(end.saturating_sub(start));
-      first.get_or_insert(start);
-      last = Some(end.saturating_sub(1));
-    }
-    let (Some(first), Some(last)) = (first, last) else {
-      self.form = Form::Runs(Vec::new());
-      return;
+    let (runs, count, first, last, bits_trim) = match &self.form {
+      Form::Bits { start, words } => match bits_stats(*start, words) {
+        Some((r, c, f, l, fw, lw)) => (r, c, f, l, Some((fw, lw))),
+        None => {
+          self.form = Form::Runs(Vec::new());
+          return;
+        }
+      },
+      _ => {
+        let (mut runs, mut count) = (0_u64, 0_u64);
+        let (mut first, mut last) = (None, None);
+        for (start, end) in self.runs_iter() {
+          runs = runs.saturating_add(1);
+          count = count.saturating_add(end.saturating_sub(start));
+          first.get_or_insert(start);
+          last = Some(end.saturating_sub(1));
+        }
+        let (Some(first), Some(last)) = (first, last) else {
+          self.form = Form::Runs(Vec::new());
+          return;
+        };
+        (runs, count, first, last, None)
+      }
     };
     let span_words = (last / WORD_BITS)
       .saturating_sub(first / WORD_BITS)
@@ -146,6 +168,18 @@ impl Positions {
     let cheapest = (0..costs.len())
       .min_by_key(|at| costs.get(*at).copied().unwrap_or(u64::MAX))
       .unwrap_or(0);
+    if cheapest == 2
+      && let (Form::Bits { start, words }, Some((fw, lw))) = (&mut self.form, bits_trim)
+    {
+      if lw < words.len() {
+        words.truncate(lw);
+      }
+      if fw > 0 {
+        words.drain(..fw);
+        *start = start.saturating_add(crate::to_u64(fw).saturating_mul(WORD_BITS));
+      }
+      return;
+    }
     let form = match (cheapest, &self.form) {
       (0, Form::Runs(_)) | (1, Form::List(_)) | (2, Form::Bits { .. }) => return,
       (0, _) => Form::Runs(self.runs_iter().collect()),
@@ -153,15 +187,7 @@ impl Positions {
       _ => {
         let start = first.saturating_sub(first % WORD_BITS);
         let mut words = vec![0_u64; usize::try_from(span_words).unwrap_or(0)];
-        for position in self.iter() {
-          let offset = position.saturating_sub(start);
-          if let Some(word) = usize::try_from(offset / WORD_BITS)
-            .ok()
-            .and_then(|at| words.get_mut(at))
-          {
-            *word |= 1u64 << (offset % WORD_BITS);
-          }
-        }
+        fill_bits_from_runs(start, &mut words, self.runs_iter());
         Form::Bits { start, words }
       }
     };
@@ -183,8 +209,22 @@ impl Positions {
     }
   }
 
-  /// The union of this set and `other`: the two sets' runs merged in one pass over both.
+  /// The union of this set and `other`: word-wise bitwise OR when both are bit tables, else the
+  /// two sets' runs merged in one pass over both.
   pub fn union(&self, other: &Positions) -> Positions {
+    if let (
+      Form::Bits {
+        start: s1,
+        words: w1,
+      },
+      Form::Bits {
+        start: s2,
+        words: w2,
+      },
+    ) = (&self.form, &other.form)
+    {
+      return bits_union((*s1, w1), (*s2, w2));
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let (mut mine, mut theirs) = (self.runs_iter().peekable(), other.runs_iter().peekable());
     loop {
@@ -320,30 +360,35 @@ impl Positions {
   }
 
   /// The set's runs, ascending, whatever its form.
-  fn runs_iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-    let kept = match &self.form {
-      Form::Runs(runs) => Some(runs.iter().copied()),
-      _ => None,
-    };
-    let positions = match &self.form {
-      Form::Runs(_) => None,
-      _ => Some(self.iter()),
-    };
-    let mut positions = positions.into_iter().flatten().peekable();
-    let made = core::iter::from_fn(move || {
-      let start = positions.next()?;
-      let mut end = start.saturating_add(1);
-      while positions.next_if_eq(&end).is_some() {
-        end = end.saturating_add(1);
-      }
-      Some((start, end))
-    });
-    kept.into_iter().flatten().chain(made)
+  fn runs_iter(&self) -> RunsIter<'_> {
+    match &self.form {
+      Form::Runs(runs) => RunsIter::Runs(runs.iter()),
+      Form::List(list) => RunsIter::List { list, at: 0 },
+      Form::Bits { start, words } => RunsIter::Bits(BitsRunsIter {
+        start: *start,
+        words,
+        word_idx: 0,
+        bit_idx: 0,
+      }),
+    }
   }
 
-  /// The positions both this set and `other` hold (A-639): each run of one met with the runs of the other it overlaps,
-  /// in one pass over both. Two runs out never touch, since a gap of either set lies between them.
+  /// The positions both this set and `other` hold (A-639): word-wise bitwise AND when both are bit
+  /// tables, else each run of one met with the runs of the other it overlaps in one pass over both.
   pub fn intersection(&self, other: &Positions) -> Positions {
+    if let (
+      Form::Bits {
+        start: s1,
+        words: w1,
+      },
+      Form::Bits {
+        start: s2,
+        words: w2,
+      },
+    ) = (&self.form, &other.form)
+    {
+      return bits_intersection((*s1, w1), (*s2, w2));
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let (mut mine, mut theirs) = (self.runs_iter().peekable(), other.runs_iter().peekable());
     while let (Some(&(start, end)), Some(&(from, to))) = (mine.peek(), theirs.peek()) {
@@ -360,9 +405,22 @@ impl Positions {
     Positions::of_runs(runs)
   }
 
-  /// The positions this set holds and `other` does not (A-639): each run cut by the runs of `other` it overlaps, in one
-  /// pass over both.
+  /// The positions this set holds and `other` does not (A-639): word-wise bitwise AND-NOT when
+  /// both are bit tables, else each run cut by the runs of `other` it overlaps in one pass.
   pub fn difference(&self, other: &Positions) -> Positions {
+    if let (
+      Form::Bits {
+        start: s1,
+        words: w1,
+      },
+      Form::Bits {
+        start: s2,
+        words: w2,
+      },
+    ) = (&self.form, &other.form)
+    {
+      return bits_difference((*s1, w1), (*s2, w2));
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut cuts = other.runs_iter().peekable();
     for (start, end) in self.runs_iter() {
@@ -388,8 +446,22 @@ impl Positions {
     Positions::of_runs(runs)
   }
 
-  /// Whether `other` holds every position this set holds (A-639).
+  /// Whether `other` holds every position this set holds (A-639), zero-allocation when both are
+  /// bit tables.
   pub fn is_subset(&self, other: &Positions) -> bool {
+    if let (
+      Form::Bits {
+        start: s1,
+        words: w1,
+      },
+      Form::Bits {
+        start: s2,
+        words: w2,
+      },
+    ) = (&self.form, &other.form)
+    {
+      return bits_is_subset((*s1, w1), (*s2, w2));
+    }
     self.difference(other).is_empty()
   }
 
@@ -554,6 +626,284 @@ fn bits_of(start: u64, words: &[u64]) -> impl Iterator<Item = u64> + '_ {
       Some(base.saturating_add(low))
     })
   })
+}
+
+/// Ascending run iterator over any [`Form`] without per-bit combinator nesting.
+enum RunsIter<'a> {
+  Runs(core::slice::Iter<'a, (u64, u64)>),
+  List { list: &'a [u64], at: usize },
+  Bits(BitsRunsIter<'a>),
+}
+
+impl Iterator for RunsIter<'_> {
+  type Item = (u64, u64);
+
+  fn next(&mut self) -> Option<(u64, u64)> {
+    match self {
+      RunsIter::Runs(iter) => iter.next().copied(),
+      RunsIter::List { list, at } => {
+        let &start = list.get(*at)?;
+        let mut end = start.saturating_add(1);
+        *at = at.saturating_add(1);
+        while list.get(*at).copied() == Some(end) {
+          end = end.saturating_add(1);
+          *at = at.saturating_add(1);
+        }
+        Some((start, end))
+      }
+      RunsIter::Bits(iter) => iter.next(),
+    }
+  }
+}
+
+/// Word-level ascending run iterator over `Form::Bits`: skips zero words and `u64::MAX` runs in
+/// one instruction per 64 positions.
+struct BitsRunsIter<'a> {
+  start: u64,
+  words: &'a [u64],
+  word_idx: usize,
+  bit_idx: u32,
+}
+
+impl Iterator for BitsRunsIter<'_> {
+  type Item = (u64, u64);
+
+  fn next(&mut self) -> Option<(u64, u64)> {
+    while let Some(&raw) = self.words.get(self.word_idx) {
+      let word = raw & (u64::MAX << self.bit_idx);
+      if word == 0 {
+        self.word_idx = self.word_idx.saturating_add(1);
+        self.bit_idx = 0;
+        continue;
+      }
+      let tz = word.trailing_zeros();
+      let word_base = self
+        .start
+        .saturating_add(crate::to_u64(self.word_idx).saturating_mul(WORD_BITS));
+      let run_start = word_base.saturating_add(u64::from(tz));
+      let ones = (!(word >> tz)).trailing_zeros();
+      let end_bit = tz.saturating_add(ones);
+      if end_bit < u64::BITS {
+        self.bit_idx = end_bit;
+        return Some((run_start, word_base.saturating_add(u64::from(end_bit))));
+      }
+      self.word_idx = self.word_idx.saturating_add(1);
+      while self.words.get(self.word_idx) == Some(&u64::MAX) {
+        self.word_idx = self.word_idx.saturating_add(1);
+      }
+      let next_word = self.words.get(self.word_idx).copied().unwrap_or(0);
+      let tail = next_word.trailing_ones();
+      self.bit_idx = if self.word_idx < self.words.len() {
+        tail
+      } else {
+        0
+      };
+      let end_base = self
+        .start
+        .saturating_add(crate::to_u64(self.word_idx).saturating_mul(WORD_BITS));
+      return Some((run_start, end_base.saturating_add(u64::from(tail))));
+    }
+    None
+  }
+}
+
+/// Computes `(runs, count, first, last, first_word, last_word_excl)` for a bit table in one
+/// linear word pass using `w & !((w << 1) | prev_msb)` for exact run transitions.
+fn bits_stats(start: u64, words: &[u64]) -> Option<(u64, u64, u64, u64, usize, usize)> {
+  let first_word = words.iter().position(|&w| w != 0)?;
+  let last_word = words.iter().rposition(|&w| w != 0)?;
+  let first_bits = words.get(first_word).copied().unwrap_or(0);
+  let last_bits = words.get(last_word).copied().unwrap_or(0);
+  let first = start
+    .saturating_add(crate::to_u64(first_word).saturating_mul(WORD_BITS))
+    .saturating_add(u64::from(first_bits.trailing_zeros()));
+  let last_offset = u64::BITS
+    .saturating_sub(1)
+    .saturating_sub(last_bits.leading_zeros());
+  let last = start
+    .saturating_add(crate::to_u64(last_word).saturating_mul(WORD_BITS))
+    .saturating_add(u64::from(last_offset));
+  let mut runs = 0_u64;
+  let mut count = 0_u64;
+  let mut prev_msb = 0_u64;
+  let shift_msb = u64::BITS.saturating_sub(1);
+  for &word in words.get(first_word..=last_word).unwrap_or_default() {
+    count = count.saturating_add(u64::from(word.count_ones()));
+    let starts = word & !((word << 1) | prev_msb);
+    runs = runs.saturating_add(u64::from(starts.count_ones()));
+    prev_msb = word >> shift_msb;
+  }
+  Some((
+    runs,
+    count,
+    first,
+    last,
+    first_word,
+    last_word.saturating_add(1),
+  ))
+}
+
+/// Sets every bit in `runs` into `words` anchored at `start`, filling whole words with `u64::MAX`.
+fn fill_bits_from_runs(start: u64, words: &mut [u64], runs: impl Iterator<Item = (u64, u64)>) {
+  for (run_start, run_end) in runs {
+    if run_end <= run_start {
+      continue;
+    }
+    let lo = run_start.saturating_sub(start);
+    let hi = run_end.saturating_sub(start).saturating_sub(1);
+    let Ok(w_lo) = usize::try_from(lo / WORD_BITS) else {
+      continue;
+    };
+    let Ok(w_hi) = usize::try_from(hi / WORD_BITS) else {
+      continue;
+    };
+    let b_lo = (lo % WORD_BITS) as u32;
+    let b_hi = (hi % WORD_BITS) as u32;
+    let lo_mask = u64::MAX << b_lo;
+    let hi_mask = u64::MAX >> (u64::BITS.saturating_sub(1).saturating_sub(b_hi));
+    if w_lo == w_hi {
+      if let Some(word) = words.get_mut(w_lo) {
+        *word |= lo_mask & hi_mask;
+      }
+      continue;
+    }
+    if let Some(word) = words.get_mut(w_lo) {
+      *word |= lo_mask;
+    }
+    if let Some(mid) = words.get_mut(w_lo.saturating_add(1)..w_hi) {
+      mid.fill(u64::MAX);
+    }
+    if let Some(word) = words.get_mut(w_hi) {
+      *word |= hi_mask;
+    }
+  }
+}
+
+/// Trims leading and trailing zero words from `(start, words)` without allocating.
+fn trim_bits(start: u64, words: &[u64]) -> (u64, &[u64]) {
+  let Some(first) = words.iter().position(|&w| w != 0) else {
+    return (0, &[]);
+  };
+  let last = words.iter().rposition(|&w| w != 0).unwrap_or(first);
+  let trimmed = words.get(first..=last).unwrap_or_default();
+  let new_start = start.saturating_add(crate::to_u64(first).saturating_mul(WORD_BITS));
+  (new_start, trimmed)
+}
+
+/// Word-wise equality of two bit tables.
+fn bits_eq((s1, w1): (u64, &[u64]), (s2, w2): (u64, &[u64])) -> bool {
+  trim_bits(s1, w1) == trim_bits(s2, w2)
+}
+
+/// Word-wise union of two bit tables.
+fn bits_union((s1, w1): (u64, &[u64]), (s2, w2): (u64, &[u64])) -> Positions {
+  let (s1, w1) = trim_bits(s1, w1);
+  let (s2, w2) = trim_bits(s2, w2);
+  if w1.is_empty() {
+    return Positions::of_bits(s2, w2.to_vec());
+  }
+  if w2.is_empty() {
+    return Positions::of_bits(s1, w1.to_vec());
+  }
+  let low = s1.min(s2);
+  let off1 = usize::try_from(s1.saturating_sub(low) / WORD_BITS).unwrap_or(0);
+  let off2 = usize::try_from(s2.saturating_sub(low) / WORD_BITS).unwrap_or(0);
+  let len = off1
+    .saturating_add(w1.len())
+    .max(off2.saturating_add(w2.len()));
+  let mut out = vec![0_u64; len];
+  if let Some(dst) = out.get_mut(off1..off1.saturating_add(w1.len())) {
+    dst.copy_from_slice(w1);
+  }
+  if let Some(dst) = out.get_mut(off2..off2.saturating_add(w2.len())) {
+    for (d, &s) in dst.iter_mut().zip(w2) {
+      *d |= s;
+    }
+  }
+  Positions::of_bits(low, out)
+}
+
+/// Word-wise intersection of two bit tables.
+fn bits_intersection((s1, w1): (u64, &[u64]), (s2, w2): (u64, &[u64])) -> Positions {
+  let (s1, w1) = trim_bits(s1, w1);
+  let (s2, w2) = trim_bits(s2, w2);
+  if w1.is_empty() || w2.is_empty() {
+    return Positions::new();
+  }
+  let w1_start = s1 / WORD_BITS;
+  let w2_start = s2 / WORD_BITS;
+  let w1_end = w1_start.saturating_add(crate::to_u64(w1.len()));
+  let w2_end = w2_start.saturating_add(crate::to_u64(w2.len()));
+  let ov_start = w1_start.max(w2_start);
+  let ov_end = w1_end.min(w2_end);
+  if ov_start >= ov_end {
+    return Positions::new();
+  }
+  let len = usize::try_from(ov_end.saturating_sub(ov_start)).unwrap_or(0);
+  let i1 = usize::try_from(ov_start.saturating_sub(w1_start)).unwrap_or(0);
+  let i2 = usize::try_from(ov_start.saturating_sub(w2_start)).unwrap_or(0);
+  let s1_slice = w1.get(i1..i1.saturating_add(len)).unwrap_or_default();
+  let s2_slice = w2.get(i2..i2.saturating_add(len)).unwrap_or_default();
+  let out: Vec<u64> = s1_slice
+    .iter()
+    .zip(s2_slice)
+    .map(|(&a, &b)| a & b)
+    .collect();
+  Positions::of_bits(ov_start.saturating_mul(WORD_BITS), out)
+}
+
+/// Word-wise difference `a \ b` of two bit tables.
+fn bits_difference((s1, w1): (u64, &[u64]), (s2, w2): (u64, &[u64])) -> Positions {
+  let (s1, w1) = trim_bits(s1, w1);
+  if w1.is_empty() {
+    return Positions::new();
+  }
+  let (s2, w2) = trim_bits(s2, w2);
+  let mut out = w1.to_vec();
+  if w2.is_empty() {
+    return Positions::of_bits(s1, out);
+  }
+  let w1_start = s1 / WORD_BITS;
+  let w2_start = s2 / WORD_BITS;
+  let w1_end = w1_start.saturating_add(crate::to_u64(w1.len()));
+  let w2_end = w2_start.saturating_add(crate::to_u64(w2.len()));
+  let ov_start = w1_start.max(w2_start);
+  let ov_end = w1_end.min(w2_end);
+  if ov_start < ov_end {
+    let len = usize::try_from(ov_end.saturating_sub(ov_start)).unwrap_or(0);
+    let i1 = usize::try_from(ov_start.saturating_sub(w1_start)).unwrap_or(0);
+    let i2 = usize::try_from(ov_start.saturating_sub(w2_start)).unwrap_or(0);
+    let dst = out.get_mut(i1..i1.saturating_add(len)).unwrap_or_default();
+    let src = w2.get(i2..i2.saturating_add(len)).unwrap_or_default();
+    for (d, &s) in dst.iter_mut().zip(src) {
+      *d &= !s;
+    }
+  }
+  Positions::of_bits(s1, out)
+}
+
+/// Zero-allocation word-wise subset test `a ⊆ b` for two bit tables.
+fn bits_is_subset((s1, w1): (u64, &[u64]), (s2, w2): (u64, &[u64])) -> bool {
+  let (s1, w1) = trim_bits(s1, w1);
+  if w1.is_empty() {
+    return true;
+  }
+  let (s2, w2) = trim_bits(s2, w2);
+  if w2.is_empty() {
+    return false;
+  }
+  let w1_start = s1 / WORD_BITS;
+  let w2_start = s2 / WORD_BITS;
+  let w1_end = w1_start.saturating_add(crate::to_u64(w1.len()));
+  let w2_end = w2_start.saturating_add(crate::to_u64(w2.len()));
+  if w1_start < w2_start || w1_end > w2_end {
+    return false;
+  }
+  let off = usize::try_from(w1_start.saturating_sub(w2_start)).unwrap_or(0);
+  let target = w2
+    .get(off..off.saturating_add(w1.len()))
+    .unwrap_or_default();
+  w1.iter().zip(target).all(|(&a, &b)| (a & !b) == 0)
 }
 
 #[cfg(test)]

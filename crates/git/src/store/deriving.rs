@@ -192,6 +192,7 @@ impl Repository {
     quantum: Quantum<'_>,
   ) -> Result<Derived, StoreRefused> {
     let deadline = quantum.clock.now_ns().saturating_add(quantum.ns);
+    let mut units = 0_u32;
     loop {
       if deriving.now.is_none() && deriving.waiting.is_empty() {
         return Ok(Derived::Done);
@@ -203,7 +204,11 @@ impl Repository {
           sets,
         });
       }
-      if quantum.clock.now_ns() >= deadline {
+      units = units.wrapping_add(1);
+      // Sample the monotonic clock once per machine-word batch of units (`u64::BITS` = 64) when
+      // a non-zero quantum is given, avoiding per-object clock calls on fast indexed walk steps.
+      if (quantum.ns == 0 || units.is_multiple_of(u64::BITS)) && quantum.clock.now_ns() >= deadline
+      {
         return Ok(Derived::More);
       }
     }

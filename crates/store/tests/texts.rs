@@ -628,3 +628,102 @@ fn a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it() {
   assert_eq!(seen.4, vec![None, None], "p's versions forgotten");
   assert_eq!(seen.5, vec![Some((id(x), 2))], "q's version intact");
 }
+
+/// Regression (Wave 6F): asking for one or a few tool ids in a large log must use O(asked) point
+/// lookups instead of scanning the entire path prefix a few rows per scan. Do: land 400 versions
+/// of `f`, then ask for one late tool id and for three scattered tool ids (including one absent).
+/// Expect: exact matching identities and `tool_reads()` bounded by the asked count, not the log's
+/// length.
+#[test]
+fn sparse_tool_id_lookups_do_not_scan_the_whole_log() {
+  let dir = scratch("sparse-by-tools");
+  let mut store = open(&dir);
+  let staging = Staging::new(0);
+  let count = 400_u32;
+  let mut payload = Vec::new();
+  let mut entries = Vec::with_capacity(count as usize);
+  let mut ids = Vec::with_capacity(count as usize);
+  for i in 0..count {
+    let text = format!("revision payload {i:04}\n").into_bytes();
+    let offset = payload.len() as u64;
+    payload.extend_from_slice(&text);
+    let mut tool_id = [0_u8; 20];
+    tool_id[..4].copy_from_slice(&i.to_be_bytes());
+    let text_id = *blake3::hash(&text).as_bytes();
+    ids.push((tool_id.to_vec(), text_id));
+    entries.push(TextEntry {
+      path: b"f".to_vec(),
+      tool_id: tool_id.to_vec(),
+      text: text_id,
+      len: text.len() as u64,
+      base: None,
+      place: Place {
+        payload: [0; 32],
+        offset,
+        len: text.len() as u64,
+      },
+    });
+  }
+  let payload_id = *blake3::hash(&payload).as_bytes();
+  for entry in &mut entries {
+    entry.place.payload = payload_id;
+  }
+  let section = texts::encode(&entries);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 1,
+        sequence: 1,
+        judged_over: 0,
+        grant: 1,
+        work: 1,
+        time_ns: 1,
+        sections: 0,
+      },
+      &[
+        (SectionKind::Payload, Contents::Bytes(&payload)),
+        (SectionKind::Texts, Contents::Bytes(&section)),
+      ],
+      &staging,
+    )
+    .unwrap();
+
+  let before_one = store.tool_reads();
+  let target = &ids[350];
+  let got_one = store
+    .texts_by_tools(1, b"f", core::slice::from_ref(&target.0))
+    .unwrap();
+  assert_eq!(got_one.len(), 1);
+  assert_eq!(got_one[0].map(|(id, _)| id), Some(target.1));
+  let reads_one = store.tool_reads() - before_one;
+  assert_eq!(
+    reads_one, 1,
+    "single tool id lookup must take 1 engine read, took {reads_one}"
+  );
+
+  let before_three = store.tool_reads();
+  let missing = vec![0xFF; 20];
+  let asked = vec![
+    ids[380].0.clone(),
+    missing,
+    ids[10].0.clone(),
+    ids[200].0.clone(),
+  ];
+  let got_three = store.texts_by_tools(1, b"f", &asked).unwrap();
+  let got_ids: Vec<Option<[u8; 32]>> = got_three
+    .into_iter()
+    .map(|row| row.map(|(id, _)| id))
+    .collect();
+  assert_eq!(
+    got_ids,
+    vec![Some(ids[380].1), None, Some(ids[10].1), Some(ids[200].1)]
+  );
+  let reads_three = store.tool_reads() - before_three;
+  assert!(
+    reads_three <= asked.len() as u64,
+    "sparse 4-id lookup must take at most {} engine reads, took {reads_three}",
+    asked.len()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}

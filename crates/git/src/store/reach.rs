@@ -120,18 +120,16 @@ pub(crate) struct Shape {
 
 impl Shape {
   /// The shape for a store of `window`; `None` for a window too short for a leaf of two positions
-  /// or an inner node of two children.
+  /// or an inner node of two children. Uses Roaring's canonical `MAX_BLOCK` (65,536 positions,
+  /// 8 KiB max bitmap) whenever `window` holds it so large repositories store ~15× fewer leaf
+  /// chunks per ref.
   pub(crate) fn of(window: usize) -> Option<Shape> {
     let fanout = fanout_for(window)?.min(WORD_FANOUT);
     let leaf_head = encode_derived(&[], &[LEAF_BITMAP])?.len();
     let max_bitmap_bits = u64::try_from(window.checked_sub(leaf_head)?)
       .ok()?
       .checked_mul(SLOT_BITS)?;
-    let block = fanout
-      .checked_mul(fanout)?
-      .min(max_bitmap_bits)
-      .min(MAX_BLOCK)
-      & !1;
+    let block = max_bitmap_bits.min(MAX_BLOCK) & !1;
     Shape::recorded(block, fanout)
   }
 
@@ -298,11 +296,18 @@ impl Sets {
     shape: Shape,
   ) -> Result<ContentId, ContentRefused> {
     let reached = put_tree(store, shape, &self.reached)?;
-    let brought = match put_tree(store, shape, &self.brought) {
-      Ok(brought) => brought,
-      Err(refused) => {
-        let_go(store, reached.as_slice())?;
-        return Err(refused);
+    let brought = if self.brought == self.reached {
+      if let Some(root) = reached {
+        store.hold(&root)?;
+      }
+      reached
+    } else {
+      match put_tree(store, shape, &self.brought) {
+        Ok(brought) => brought,
+        Err(refused) => {
+          let_go(store, reached.as_slice())?;
+          return Err(refused);
+        }
       }
     };
     let mut present = 0;
@@ -424,17 +429,64 @@ impl Builder<'_> {
     let blocks = self.shape.blocks(below).ok_or_else(exhausted)?;
     let mut names = Vec::new();
     let mut bitmap = vec![0_u8; self.shape.bitmap_len().ok_or_else(exhausted)?];
-    for (slot, pieces) in children(runs, start, span).ok_or_else(exhausted)? {
-      let child_first = slot
-        .checked_mul(blocks)
-        .and_then(|offset| first.checked_add(offset))
-        .ok_or_else(exhausted)?;
-      if let Some(child) = self.node(below, child_first, &pieces)? {
-        names.push(child);
-        set_bit(&mut bitmap, slot).ok_or_else(exhausted)?;
+    // `runs` is strictly ascending and within `[start, end)`: slice each child slot linearly in
+    // one pass with one reused buffer instead of inserting into a `BTreeMap`.
+    let mut slot_runs: Vec<(u64, u64)> = Vec::new();
+    let mut active_slot: Option<u64> = None;
+    for &(run_start, run_end) in runs {
+      let mut from = run_start;
+      while from < run_end {
+        let slot = from
+          .checked_sub(start)
+          .and_then(|d| d.checked_div(span))
+          .ok_or_else(exhausted)?;
+        if let Some(prev) = active_slot
+          && prev != slot
+        {
+          self.push_child(
+            (below, first, blocks, prev),
+            &slot_runs,
+            (&mut names, &mut bitmap),
+          )?;
+          slot_runs.clear();
+        }
+        active_slot = Some(slot);
+        let bound = slot
+          .checked_add(1)
+          .and_then(|next| next.checked_mul(span))
+          .and_then(|off| off.checked_add(start))
+          .ok_or_else(exhausted)?;
+        let to = run_end.min(bound);
+        slot_runs.push((from, to));
+        from = to;
       }
     }
+    if let Some(last_slot) = active_slot {
+      self.push_child(
+        (below, first, blocks, last_slot),
+        &slot_runs,
+        (&mut names, &mut bitmap),
+      )?;
+    }
     self.inner(level, &names, bitmap).map(Some)
+  }
+
+  /// Builds child `slot` at level `below` from `slot_runs` and records it in `names` and `bitmap`.
+  fn push_child(
+    &mut self,
+    (below, first, blocks, slot): (u32, u64, u64, u64),
+    slot_runs: &[(u64, u64)],
+    (names, bitmap): (&mut Vec<ContentId>, &mut [u8]),
+  ) -> Result<(), ContentRefused> {
+    let child_first = slot
+      .checked_mul(blocks)
+      .and_then(|offset| first.checked_add(offset))
+      .ok_or_else(exhausted)?;
+    if let Some(child) = self.node(below, child_first, slot_runs)? {
+      names.push(child);
+      set_bit(bitmap, slot).ok_or_else(exhausted)?;
+    }
+    Ok(())
   }
 
   /// A leaf of the block from `start`: picks the strictly smallest canonical Roaring container
@@ -517,22 +569,6 @@ impl Builder<'_> {
     released?;
     Ok(root)
   }
-}
-
-/// `runs`, within a node's range from `start`, cut at its children's bounds, `span` positions each, by slot.
-fn children(runs: &[(u64, u64)], start: u64, span: u64) -> Option<BTreeMap<u64, Vec<(u64, u64)>>> {
-  let mut children: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
-  for &(run_start, run_end) in runs {
-    let mut from = run_start;
-    while from < run_end {
-      let slot = from.checked_sub(start)?.checked_div(span)?;
-      let bound = slot.checked_add(1)?.checked_mul(span)?.checked_add(start)?;
-      let to = run_end.min(bound);
-      children.entry(slot).or_default().push((from, to));
-      from = to;
-    }
-  }
-  Some(children)
 }
 
 /// Where child slot `slot` sits in a bitmap: its byte, and its bit's mask there.
@@ -680,7 +716,8 @@ fn encode_array_leaf(
   Ok(payload)
 }
 
-/// Encodes `runs` relative to `start` as a `LEAF_BITMAP` payload (`bmp_len` bit bytes).
+/// Encodes `runs` relative to `start` as a `LEAF_BITMAP` payload (`bmp_len` bit bytes), filling
+/// full bytes directly instead of setting individual bits.
 fn encode_bitmap_leaf(
   start: u64,
   runs: &[(u64, u64)],
@@ -691,12 +728,32 @@ fn encode_bitmap_leaf(
     *first = LEAF_BITMAP;
   }
   let bits = payload.get_mut(1..).ok_or_else(exhausted)?;
+  let max_shift = u8::BITS.saturating_sub(1);
   for &(run_start, run_end) in runs {
     let rel_start = run_start.checked_sub(start).ok_or_else(exhausted)?;
-    let rel_end = run_end.checked_sub(start).ok_or_else(exhausted)?;
-    for rel in rel_start..rel_end {
-      set_bit(bits, rel).ok_or_else(exhausted)?;
+    let rel_last = run_end
+      .checked_sub(1)
+      .and_then(|last| last.checked_sub(start))
+      .ok_or_else(exhausted)?;
+    let byte_lo = usize::try_from(rel_start.checked_div(SLOT_BITS).ok_or_else(exhausted)?)
+      .map_err(|_| exhausted())?;
+    let byte_hi = usize::try_from(rel_last.checked_div(SLOT_BITS).ok_or_else(exhausted)?)
+      .map_err(|_| exhausted())?;
+    let bit_lo = u32::try_from(rel_start.checked_rem(SLOT_BITS).ok_or_else(exhausted)?)
+      .map_err(|_| exhausted())?;
+    let bit_hi = u32::try_from(rel_last.checked_rem(SLOT_BITS).ok_or_else(exhausted)?)
+      .map_err(|_| exhausted())?;
+    let lo_mask = u8::MAX << bit_lo;
+    let hi_mask = u8::MAX >> max_shift.saturating_sub(bit_hi);
+    if byte_lo == byte_hi {
+      *bits.get_mut(byte_lo).ok_or_else(exhausted)? |= lo_mask & hi_mask;
+      continue;
     }
+    *bits.get_mut(byte_lo).ok_or_else(exhausted)? |= lo_mask;
+    if let Some(mid) = bits.get_mut(byte_lo.saturating_add(1)..byte_hi) {
+      mid.fill(u8::MAX);
+    }
+    *bits.get_mut(byte_hi).ok_or_else(exhausted)? |= hi_mask;
   }
   Ok(payload)
 }
@@ -867,9 +924,8 @@ fn array_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
   Some(runs)
 }
 
-/// Decodes and validates a `LEAF_BITMAP` payload (`block.div_ceil(8)` bytes, non-empty, zero
-/// padding bits at or past `block`).
-fn bitmap_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
+/// Checks that `bytes` has exact length for `block` bits with zero padding bits past `block`.
+fn check_bitmap_padding(bytes: &[u8], block: u64) -> Option<()> {
   if bytes.len() != bitmap_bytes(block)? {
     return None;
   }
@@ -880,33 +936,69 @@ fn bitmap_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
   {
     return None;
   }
+  Some(())
+}
+
+/// Appends set-bit runs of one 8-byte little-endian word at bit offset `base`.
+fn append_bitmap_chunk(
+  runs: &mut Vec<(u64, u64)>,
+  base: u64,
+  chunk: [u8; WORD_BYTES],
+) -> Option<()> {
+  let word = u64::from_le_bytes(chunk);
+  if word == 0 {
+    return Some(());
+  }
+  if word == u64::MAX {
+    append_run(runs, base, base.checked_add(u64::from(u64::BITS))?);
+    return Some(());
+  }
+  append_word_runs(runs, base, word)
+}
+
+/// Decodes and validates a `LEAF_BITMAP` payload (`block.div_ceil(8)` bytes, non-empty, zero
+/// padding bits at or past `block`), scanning whole `u64` words at a time.
+fn bitmap_leaf_runs(bytes: &[u8], block: u64) -> Option<Vec<(u64, u64)>> {
+  check_bitmap_padding(bytes, block)?;
   let mut runs: Vec<(u64, u64)> = Vec::new();
-  for (byte_idx, &byte) in bytes.iter().enumerate() {
-    if byte == 0 {
-      continue;
+  let (chunks, tail) = bytes.as_chunks::<WORD_BYTES>();
+  let word_bits = u64::from(u64::BITS);
+  for (chunk_idx, &chunk) in chunks.iter().enumerate() {
+    let base = u64::try_from(chunk_idx).ok()?.checked_mul(word_bits)?;
+    append_bitmap_chunk(&mut runs, base, chunk)?;
+  }
+  let tail_base = u64::try_from(chunks.len()).ok()?.checked_mul(word_bits)?;
+  for (offset, &byte) in tail.iter().enumerate() {
+    if byte != 0 {
+      let base = tail_base.checked_add(u64::try_from(offset).ok()?.checked_mul(SLOT_BITS)?)?;
+      append_word_runs(&mut runs, base, u64::from(byte))?;
     }
-    let base = u64::try_from(byte_idx).ok()?.checked_mul(SLOT_BITS)?;
-    append_byte_runs(&mut runs, base, byte)?;
   }
   (!runs.is_empty()).then_some(runs)
 }
 
-/// Appends the set-bit runs of `byte` at bit offset `base` to `runs`, joining adjacent runs.
-fn append_byte_runs(runs: &mut Vec<(u64, u64)>, base: u64, mut byte: u8) -> Option<()> {
-  while byte != 0 {
-    let tz = u64::from(byte.trailing_zeros());
-    let shifted = byte >> tz;
+/// Appends `[start, end)` to `runs`, coalescing with the previous run when adjacent.
+fn append_run(runs: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+  match runs.last_mut() {
+    Some(last) if last.1 == start => last.1 = end,
+    _ => runs.push((start, end)),
+  }
+}
+
+/// Appends the set-bit runs of `word` at bit offset `base` to `runs`, joining adjacent runs.
+fn append_word_runs(runs: &mut Vec<(u64, u64)>, base: u64, mut word: u64) -> Option<()> {
+  while word != 0 {
+    let tz = u64::from(word.trailing_zeros());
+    let shifted = word >> tz;
     let ones = u64::from((!shifted).trailing_zeros());
     let start = base.checked_add(tz)?;
     let end = start.checked_add(ones)?;
-    match runs.last_mut() {
-      Some(last) if last.1 == start => last.1 = end,
-      _ => runs.push((start, end)),
-    }
-    byte = shifted
+    append_run(runs, start, end);
+    let advance = u32::try_from(tz.saturating_add(ones)).ok()?;
+    word = shifted
       .checked_shr(u32::try_from(ones).ok()?)
       .unwrap_or(0)
-      .checked_shl(u32::try_from(tz.saturating_add(ones)).ok()?)
+      .checked_shl(advance)
       .unwrap_or(0);
   }
   Some(())
