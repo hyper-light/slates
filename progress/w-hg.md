@@ -637,3 +637,11 @@ Waiting: main's route; arena-7 and arena-8.
 - Open, waiting on main: manifest-chain reach. A push's first manifest is a delta against the repository's tip, so a stale re-base or the record writer may rebuild through let-go texts. Before P5.
 - Then: P5 (switch on the let-go, main's red, asks per push counted), then C1 (2), the intake keeping no whole text.
 - Then: stream 9.2x and push 5.8x slower than stock; pending-last 51% of intake time.
+
+## 2026-11-24 ~04:00: the reach, (3) and the built_works split landed
+- a313f83d9: a stale re-base asks for let-go manifest texts. Guard: a push's segment record reads no text.
+- b82590ddf: a replay asks for let-go changeset texts, batched by the record's room, and for manifest texts (own, base, previous). The four server drivers answer HgStep::Asked. Counter vcs_store.hg_replay_texts_asked, for main's restart round.
+- 011e8e80e: built_works split (lint, cognitive complexity 14 of 10).
+- Not mine, reported: t_goal93_a_recovery_keeps_a_landed_pack_while_the_landed_let_go_is_held (git) fails here 4 of 4.
+- Next: P5. Switch on the let-go for changelog and manifest windows after a push commits or an import segment lands. Main's red: ContentStore::used, clone and pull verify. Count asks per push, with the parent manifest's read-back named apart. GAPS entry off IN FLIGHT.
+- Held: ~/.cache/w-hg-made-reds.patch, waiting on w-svn's commit_held guard.
