@@ -400,6 +400,14 @@ fn write_and_read(instance: &str, id: &str) {
     assert_eq!(code, 0, "read {path}: {err}");
     assert!(read == *bytes, "{path} reads back as written");
   }
+  a_write_under_another_attachment_is_refused(instance, id);
+  let (code, _, err) = run(instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
+}
+
+/// The last step of [`write_and_read`]: a write under an attachment the caller does not hold is refused (exit 1) with
+/// nothing written, its stderr naming the hold it could not make before it read its input (A-879).
+fn a_write_under_another_attachment_is_refused(instance: &str, id: &str) {
   let (code, _, err) = run_with_stdin(instance, &["write", id, "999999", "stray.txt"], b"stray");
   assert_eq!(
     code, 1,
@@ -413,8 +421,6 @@ fn write_and_read(instance: &str, id: &str) {
   );
   let (code, _, _) = run_with_stdin(instance, &["read", id, "stray.txt"], b"");
   assert_ne!(code, 0, "nothing was written");
-  let (code, _, err) = run(instance, &["detach", &attachment]);
-  assert_eq!(code, 0, "detach: {err}");
 }
 
 /// attach for writing, the volume's status, detach.
@@ -1416,13 +1422,31 @@ fn a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it() {
   drop(anchor);
 }
 
-/// Shape: how long `a_cli_attachment_outlives_the_process_that_made_it` waits between its verbs: past the reaper's
-/// silence (one liveness budget) and its next sweep (one more), which ended a CLI attachment before A-230 (GAPS
-/// 2026-10-23 and 2026-10-27, measured 3 of 3 with a 2.5 s pause).
-const PAST_THE_REAPER: Duration = Duration::from_millis(2_500);
+/// The failover delay `instance`'s daemon reports (`slates status`, `fleet_failover: total_ns=`), nanoseconds: the term a
+/// fresh CLI attachment has, rounded up to the daemon's heartbeat period (A-230, `fleet::failover_in_periods`).
+fn failover_delay_ns(instance: &str) -> u64 {
+  let (code, status, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  status
+    .lines()
+    .find_map(|line| line.strip_prefix("fleet_failover: "))
+    .and_then(|fields| {
+      fields
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("total_ns=")?.parse::<u64>().ok())
+    })
+    .expect("the daemon reports its failover delay")
+}
 
-/// A-230 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; wait past the reaper's sweep;
-/// `slates write` a file under the attachment from a later process; wait again; `slates detach` it. Expect: the write
+/// Shape: the share of a CLI attachment's term `a_cli_attachment_outlives_the_process_that_made_it` waits between its
+/// verbs: half of it, past the reaper's answer to the attaching process's hangup (which ended a CLI attachment before
+/// A-230) and inside the term on any machine, where a fixed 2.5 s pause bet on a term of about 3 s (A-384: about a
+/// second on a laptop, four to five in a quiet fleet).
+const PAUSE_SHARE_OF_TERM: u32 = 2;
+
+/// A-230 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; wait half the attachment's term
+/// ([`PAUSE_SHARE_OF_TERM`]), past the reaper's answer to the attaching process; `slates write` a file under the
+/// attachment from a later process; wait again; `slates detach` it. Expect: the write
 /// and the detach succeed: a CLI attachment outlives the process that made it, for its term, renewed by each verb that
 /// names it. Before A-230 the reaper ended it with its client, about a second after `attach` exited, and the write was
 /// refused `NotFound`.
@@ -1437,18 +1461,19 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   let instance = format!("cli-term-{}", std::process::id());
   let anchor = start_anchor(&instance);
   let id = created_volume(&instance, "termed");
+  let pause = Duration::from_nanos(failover_delay_ns(&instance)) / PAUSE_SHARE_OF_TERM;
   let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
   assert_eq!(code, 0, "attach: {err}");
   let attachment = value_of(&out, "attachment");
   #[allow(clippy::disallowed_methods)] // a test waiting out the reaper it checks
-  std::thread::sleep(PAST_THE_REAPER);
+  std::thread::sleep(pause);
   let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "kept.txt"], b"kept");
   assert_eq!(
     code, 0,
     "a write under the attachment after its process exited: {err}"
   );
   #[allow(clippy::disallowed_methods)] // the same wait again, after the renewal
-  std::thread::sleep(PAST_THE_REAPER);
+  std::thread::sleep(pause);
   let (code, _, err) = run(&instance, &["detach", &attachment]);
   assert_eq!(code, 0, "detach: {err}");
   drop(anchor);
@@ -1477,17 +1502,7 @@ fn a_write_whose_input_outlasts_its_attachments_term_holds_it() {
   let instance = format!("cli-late-input-{}", std::process::id());
   let anchor = start_anchor(&instance);
   let id = created_volume(&instance, "late-input");
-  let (code, status, err) = run(&instance, &["status"]);
-  assert_eq!(code, 0, "status: {err}");
-  let failover_ns = status
-    .lines()
-    .find_map(|line| line.strip_prefix("fleet_failover: "))
-    .and_then(|fields| {
-      fields
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("total_ns=")?.parse::<u64>().ok())
-    })
-    .expect("the daemon reports its failover delay");
+  let failover_ns = failover_delay_ns(&instance);
   let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
   assert_eq!(code, 0, "attach: {err}");
   let attachment = value_of(&out, "attachment");

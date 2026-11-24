@@ -1,0 +1,66 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), A-879, run 15: A-384's floor (a CLI attachment's term never below the longest
+# silence its holder has shown, plus a liveness window, capped at the failover delay), which A-879's macOS CLI flows
+# needed: an attach, a pause and a held write lapsed before a detach. On ubuntu and macOS: the floor test red with the
+# floor reverted, then every attachment-term test (the held test's named terms printed), the library's holds, and the
+# CLI's term, hold and write flows, the term test pausing half the failover delay the daemon reports.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  floor:
+    name: A-384's floor (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: "A-384's floor, red: the burst test with the floor reverted"
+        timeout-minutes: 45
+        run: |
+          git apply .github/diag-w-win2/floor-red.patch
+          set +e
+          cargo test -p slates-server --test attachment_term -- --test-threads=1 --nocapture a_burst_of_uses_does_not_shorten > "$RUNNER_TEMP/floor-red.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/floor-red.patch
+          grep -a 'test result\|panicked\|burst.s terms\|AttachmentExpired\|every term' "$RUNNER_TEMP/floor-red.log" | head -12
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the burst test passed without the floor"; exit 1; fi
+      - name: "A-384's floor, green: every attachment-term test, the held test's terms printed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          set +e
+          cargo test -p slates-server --test attachment_term -- --test-threads=1 --nocapture > "$RUNNER_TEMP/floor-green.log" 2>&1
+          code=$?
+          grep -a '^test \|test result\|panicked\|burst.s terms\|terms the renewals named' "$RUNNER_TEMP/floor-green.log" | sed 's/slates daemon: descriptor_limit.*$//' | head -20
+          exit $code
+      - name: "The library's holds"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          cargo test -p slates-client --test client -- --test-threads=1 a_hold 2>&1 | grep -a '^test \|test result\|panicked'
+      - name: "The CLI's term, hold and write flows"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          set +e
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact a_write_whose_input_outlasts_its_attachments_term_holds_it a_cli_attachment_outlives_the_process_that_made_it attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor > "$RUNNER_TEMP/cli.log" 2>&1
+          code=$?
+          grep -a '^test \|test result\|panicked\|AttachmentExpired' "$RUNNER_TEMP/cli.log" | cut -c1-200 | head -20
+          exit $code

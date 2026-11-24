@@ -1,0 +1,11 @@
+--- a/crates/server/src/verbs.rs
++++ b/crates/server/src/verbs.rs
+@@ -14792,7 +14792,7 @@
+       pace
+         .gaps
+         .tail_ns()
+-        .map(|tail| tail.max(pace.longest_gap_ns))
++        .map(|tail| tail.max(0))
+     })
+     .map_or(ceiling, |gap| {
+       gap
