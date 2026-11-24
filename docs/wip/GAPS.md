@@ -7657,8 +7657,15 @@
 >   adoption made that copy its own, owner itself and no move. So the volume was never promised and was given up ("the
 >   takeover of the creator's objects gave up 2 of them"), and every write was held until the SLO. A-883's version check
 >   refused no copy in those runs. CI's ae43b42ea run, before A-883, logged the same give-up on Windows x64.
->   **Open, reported to main:** a copy the successor has since written (its adoption placed) should no longer fall by its
->   move, or a restarted round should count its own adoption.
+>   **FIXED 2026-11-23 (w-chaos; A-885, main's ruling (b): a restarted round counts its own adoption).** The adoption
+>   records the move it is (`Acceptor::adopt`, `MovedFrom { departed, retirement }`), so the rerun lists and answers it
+>   as the successor's own promise, re-adopts the volume at its epoch and gives nothing up. A round never promises again
+>   what it adopted. Deterministic red:
+>   `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (refused 1, then answered). Fleet
+>   leg: `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted`, the successor withholding its
+>   confirmation until its restart. Record: `docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md`.
+>   **Still open (harness):** under load 55 to 73 on adacachy2 the scene's setup attach (`write_attachment`) and its
+>   single-try reads (`continuity_read`) meet `Overloaded { shard: 1 }`, a retryable refusal neither retries.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).

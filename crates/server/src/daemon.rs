@@ -11276,6 +11276,86 @@ mod tests {
     );
   }
 
+  /// A takeover round run again after its successor restarted warm (main 01a20182's ruling of 2026-11-23; the cause of
+  /// GAPS' load flake `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`, read in a diagnostic build):
+  /// a successor that adopted an object and restarted before it confirmed its share runs the departed owner's round
+  /// again, and its adoption is its own promise of the object there. Do: make this node the successor of a held object of
+  /// a retired member; adopt it here as the round does (`takeover::adopted_acceptor`, its record accepted here as the
+  /// commit accepts it first); write the held image, drop the acceptors and routing, and restore them (the warm
+  /// restart); then answer the rerun's question by name of this node itself (`answer_own_copies_by_name`). Expect the
+  /// adopted record answered and nothing refused. Before, the adopted copy recorded no move, so the rerun refused it by
+  /// name as this node's own, waited for that promise, and gave the object up.
+  #[test]
+  fn a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again() {
+    use slates_db::register::{HostEpoch, HostPrepare, MovedFrom, ObjectId};
+    let (refused, answered, adopted_at) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      // An object of the retired member whose successor among the two survivors is this node.
+      let (object, departed) = (1..=u8::MAX)
+        .find_map(|byte| {
+          let object = ObjectId([byte; 16]);
+          state.holder_records.clear();
+          let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+          (successor == local).then_some((object, departed))
+        })
+        .unwrap();
+      let adopted = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.highest_accepted(object))
+        .unwrap();
+      let from = state
+        .council
+        .configuration()
+        .retirement_version(departed)
+        .map(|retired_at| MovedFrom {
+          owner: departed,
+          retired_at,
+        });
+      let (mut acceptor, _, _, record, _) =
+        crate::takeover::adopted_acceptor(state, object, adopted, (HostEpoch(2), from), local);
+      acceptor.accept(&record).unwrap();
+      state.holder_records.insert(object, acceptor);
+      let image = crate::content_holder::held_image(state);
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let regional = state.council.configuration().clone();
+      let prepare = HostPrepare {
+        departed,
+        owner: local,
+        epoch: HostEpoch(3),
+        generation: regional.version,
+        after: None,
+        named: vec![object],
+      };
+      let answer = slates_db::takeover::answer_by_name(
+        local,
+        &prepare,
+        &regional,
+        &mut state.holder_records,
+        usize::MAX,
+      );
+      let answered: Vec<(ObjectId, u64)> = answer
+        .promise
+        .entries
+        .iter()
+        .map(|(object, highest)| (*object, highest.sequence))
+        .collect();
+      (answer.refused, answered, (object, record.sequence))
+    });
+    assert_eq!(
+      (refused, answered),
+      (0, vec![adopted_at]),
+      "the rerun's question by name is answered with this node's adoption, never refused as its own"
+    );
+  }
+
   /// A-251 (b), the moved case across a warm restart: the held image keeps the retired owner a copy's authority moved
   /// from, so after the restore, which routes the copy to the successor as a live owner, the successor's page still
   /// lists it. Do: retire the owner of a record this node holds; run the authority reconcile; write the held image, drop
