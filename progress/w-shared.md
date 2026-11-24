@@ -1,5 +1,10 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 09:55 PST 11-24: LANDED A-902, main d48863ddb: a home behind its sender's configuration waits for its own install
+  within the put's budget (gate 9: NotAHome 0.83-1.89 ms into 2 s, 3 of 40). Home wire 0x84; agreed in writing with
+  w-git. Red in-process (a) refused at once, (b)/(d) no wait; green 2.25 s. OWED (main): gate 10 at d48863ddb, 0 of 40.
+  NEXT: A-894 (claimed; a repository's creation answers once its record is at f+1), then the poll #[must_use] sweep.
+
 ## 06:25 PST 11-24: LANDED the Windows fleet hang fix, main 866374d85: a_captured_clone_moved_to_another_node_is_found_there_by_its_name
   now snapshots its clone, so the carry is made and asserted (red with the assertion alone after 4,027 periods; green
   4.29 s, was 407 s on the Mac and killed at 240 s on Windows). OWED, for main to schedule, as a separate piece after A-894:
