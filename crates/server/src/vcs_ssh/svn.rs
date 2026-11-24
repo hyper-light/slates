@@ -479,6 +479,28 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     })
   }
 
+  /// What a step settles before it answers its call ([`Self::stepped`]): the piece the last wait fetched stays held while
+  /// the read goes on, since a call reads only a quantum of the drive's steps in it (goal 93), and goes once its answer
+  /// ended; a refusal the commit's drive answered is named in the daemon's log (the client is told Subversion's words
+  /// alone); and the bases a commit brought back, its own, are given back once none is under way (landed, refused or
+  /// aborted).
+  fn settle_before_step(&mut self) {
+    if !self.connection.fetching() {
+      self.fetched = None;
+    }
+    if let Some(refused) = self.connection.take_drive_refused() {
+      slates_machine::log_line!(
+        "slates-server: a Subversion commit's drive refused over SSH: {refused}"
+      );
+    }
+    if matches!(
+      self.connection.waiting(),
+      slates_svn::serve::Waiting::Command | slates_svn::serve::Waiting::Ended
+    ) {
+      self.brought.give_back();
+    }
+  }
+
   /// One step (the module doc): the connection's call over the input held, the tunnel's answer to what it asks, and the
   /// bytes it took given back.
   async fn stepped(&mut self, gone: ClientGone<'_>) -> Stepped {
@@ -487,24 +509,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       return exited(status);
     }
     let received = self.received();
-    // The piece the last wait fetched stays held while the read goes on, since a call reads only a quantum of the
-    // drive's steps in it (goal 93); its answer ended, the piece goes.
-    if !self.connection.fetching() {
-      self.fetched = None;
-    }
-    // A refusal the commit's drive answered, named in the daemon's log: the client is told Subversion's words alone.
-    if let Some(refused) = self.connection.take_drive_refused() {
-      slates_machine::log_line!(
-        "slates-server: a Subversion commit's drive refused over SSH: {refused}"
-      );
-    }
-    // The bases a commit brought back are its own: given back once none is under way (landed, refused or aborted).
-    if matches!(
-      self.connection.waiting(),
-      slates_svn::serve::Waiting::Command | slates_svn::serve::Waiting::Ended
-    ) {
-      self.brought.give_back();
-    }
+    self.settle_before_step();
     let consumed = match received {
       Received::NeedMore => return self.wait_or_end(),
       Received::Wrote => 0,
