@@ -1,0 +1,59 @@
+name: diag main a890 windows
+# main 01a20182 (2026-11-23): w-chaos's A-890 (c5de37b3b + 46e1d3efb, on main 8462ef25a): a restarted successor settles what it
+# adopted instead of fencing itself. CI's native Windows job at f9a5539b5 failed
+# a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over (the write answered, every read back [false; 7]). This runs
+# that test five rounds on each Windows runner, with the fleet step's own environment from ci.yml. A diagnostics branch,
+# never merged.
+on:
+  push:
+    branches: ["diag-measurer-main-a890-*"]
+
+jobs:
+  successor-write:
+    name: successor write on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    defaults:
+      run:
+        shell: bash
+    env:
+      SLATES_FLEET_TRACE: "1"
+      SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+      SLATES_TEST_RESTART_SLOWDOWN: "10"
+      SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the fleet tests
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The successor write test, five rounds
+        run: |
+          T=a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over
+          pass=0
+          for n in 1 2 3 4 5; do
+            set +e
+            cargo test --locked -p slates-server --test fleet -- --exact "$T" --test-threads=1 --nocapture > "$RUNNER_TEMP/run-$n.log" 2>&1
+            rc=$?
+            set -e
+            echo "round $n rc=$rc $(grep -a '^test result' "$RUNNER_TEMP/run-$n.log" | tail -1 | cut -c1-80)"
+            if [ $rc -eq 0 ]; then pass=$((pass + 1)); else grep -a -A6 'panicked at' "$RUNNER_TEMP/run-$n.log" | head -10 | cut -c1-400; fi
+          done
+          echo "== ${{ matrix.os }}: $pass of 5"
+          [ $pass -eq 5 ]
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: a890-successor-write-${{ matrix.os }}
+          path: ${{ runner.temp }}/run-*.log
+          if-no-files-found: warn
