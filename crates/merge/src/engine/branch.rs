@@ -512,9 +512,23 @@ pub struct Lineage {
   out: Option<LineageGreen>,
   /// Keys every branch set back.
   reverted: u64,
-  /// The engine of the member a [`Lent`] has out (`out`), held here while the guard reads it; an empty engine
-  /// otherwise.
-  lent: Green,
+  /// An empty engine, made once with the lineage and never moved: what a [`Lent`] whose seat is gone (none, in a
+  /// correct use) reads, so its guard answers without a panic.
+  vacant: Green,
+  /// What the lineage's lends cost (main's order of 2026-11-23, the push profile's lend items): engines moved out of
+  /// their seats by value, lends made in place, and engines dropped making a lend.
+  lends: LendCounts,
+}
+
+/// What a [`Lineage`]'s lends cost ([`Lineage::lend_counts`]): the non-vacuity counters of a lend made in place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LendCounts {
+  /// Engines moved out of their seats by value ([`Lineage::take`] and the lends made through it).
+  pub taken: u64,
+  /// Lends made in place: the arenas swapped into the seated engine, nothing moved.
+  pub borrowed: u64,
+  /// Engines dropped making a lend (the empty engine a lend's slot held).
+  pub dropped: u64,
 }
 
 /// A retired green's holds on its lineage's nodes, given back a node a step ([`Lineage::release_step`]), so a release
@@ -533,10 +547,12 @@ impl Release {
   }
 }
 
-/// A member's engine lent out of its lineage with the arenas in it, for as long as the guard lives (A-575): it reads
-/// and writes as a green standing alone does, and goes back to its seat, the arenas with it, when the guard is dropped.
-/// While it is out every other lend of the lineage is refused [`LineageRefused::Busy`]. `L` is how the lineage is
-/// borrowed: `&mut Lineage`, or a `RefMut` of one a shard keeps in a cell.
+/// A member's engine lent with the lineage's arenas in it, for as long as the guard lives (A-575): it reads and writes
+/// as a green standing alone does. Lent in place (main's order of 2026-11-23, the push profile's lend items): the
+/// arenas are swapped into the engine where it sits and swapped back when the guard is dropped, so no engine is moved
+/// by value and none is made or dropped for a lend ([`LendCounts`]). While it is lent every other lend of the lineage
+/// is refused [`LineageRefused::Busy`]. `L` is how the lineage is borrowed: `&mut Lineage`, or a `RefMut` of one a
+/// shard keeps in a cell.
 pub struct Lent<L: DerefMut<Target = Lineage>> {
   lineage: L,
   handle: LineageGreen,
@@ -545,10 +561,9 @@ pub struct Lent<L: DerefMut<Target = Lineage>> {
 impl<L: DerefMut<Target = Lineage>> Lent<L> {
   /// `handle`'s engine, lent out of `lineage`.
   pub fn new(mut lineage: L, handle: LineageGreen) -> Result<Lent<L>, LineageRefused> {
-    // The member's engine moves into the lineage's slot for the one member out, where the guard reads it: the guard is
-    // the lineage and a handle, nothing boxed or made for it (goal 93: a boxed guard and a default engine a lend were
-    // the push's 86% of churn, `hg_push_heap`).
-    lineage.lent = lineage.take(handle)?;
+    // The guard is the lineage and a handle, nothing boxed or made for it (goal 93: a boxed guard and a default engine
+    // a lend were the push's 86% of churn, `hg_push_heap`), and the engine stays in its seat.
+    lineage.lend_in_place(handle)?;
     Ok(Lent { lineage, handle })
   }
 }
@@ -557,21 +572,19 @@ impl<L: DerefMut<Target = Lineage>> Deref for Lent<L> {
   type Target = Green;
 
   fn deref(&self) -> &Green {
-    &self.lineage.lent
+    self.lineage.seated(self.handle)
   }
 }
 
 impl<L: DerefMut<Target = Lineage>> DerefMut for Lent<L> {
   fn deref_mut(&mut self) -> &mut Green {
-    &mut self.lineage.lent
+    self.lineage.seated_mut(self.handle)
   }
 }
 
 impl<L: DerefMut<Target = Lineage>> Drop for Lent<L> {
   fn drop(&mut self) {
-    // An empty engine left in the slot allocates nothing (its set hash makes its lanes at its first change).
-    let green = std::mem::take(&mut self.lineage.lent);
-    self.lineage.restore(self.handle, green);
+    self.lineage.return_in_place(self.handle);
   }
 }
 
@@ -582,6 +595,64 @@ impl Lineage {
     green.swap_arenas(&mut lineage.arenas);
     let first = lineage.seat(green);
     (lineage, first)
+  }
+
+  /// What the lineage's lends have cost so far ([`LendCounts`]).
+  pub fn lend_counts(&self) -> LendCounts {
+    self.lends
+  }
+
+  /// Lends `handle`'s engine where it sits ([`Lent`]): the arenas swapped into it. Refused `Busy` while another member
+  /// is out or lent, `Stale` for a handle whose seat holds no engine of it.
+  fn lend_in_place(&mut self, handle: LineageGreen) -> Result<(), LineageRefused> {
+    if self.out.is_some() {
+      return Err(LineageRefused::Busy);
+    }
+    let Lineage { seats, arenas, .. } = self;
+    let green = seats
+      .get_mut(handle.seat)
+      .filter(|place| place.generation == handle.generation)
+      .and_then(|place| place.green.as_mut())
+      .ok_or(LineageRefused::Stale)?;
+    green.swap_arenas(arenas);
+    self.out = Some(handle);
+    self.lends.borrowed = self.lends.borrowed.saturating_add(1);
+    Ok(())
+  }
+
+  /// Ends a lend in place: the arenas swapped back out of `handle`'s engine.
+  fn return_in_place(&mut self, handle: LineageGreen) {
+    let Lineage {
+      seats, arenas, out, ..
+    } = self;
+    if let Some(green) = seats
+      .get_mut(handle.seat)
+      .filter(|place| place.generation == handle.generation)
+      .and_then(|place| place.green.as_mut())
+    {
+      green.swap_arenas(arenas);
+    }
+    *out = None;
+  }
+
+  /// The engine lent in place for `handle`, or the vacant engine where its seat holds none (not in a correct use).
+  fn seated(&self, handle: LineageGreen) -> &Green {
+    self
+      .seats
+      .get(handle.seat)
+      .filter(|place| place.generation == handle.generation)
+      .and_then(|place| place.green.as_ref())
+      .unwrap_or(&self.vacant)
+  }
+
+  /// [`Lineage::seated`], to write.
+  fn seated_mut(&mut self, handle: LineageGreen) -> &mut Green {
+    let Lineage { seats, vacant, .. } = self;
+    seats
+      .get_mut(handle.seat)
+      .filter(|place| place.generation == handle.generation)
+      .and_then(|place| place.green.as_mut())
+      .unwrap_or(vacant)
   }
 
   /// A new member with nothing in it, at version 0: it shares nothing until it changes.
@@ -630,6 +701,7 @@ impl Lineage {
     let mut green = self.unseat(handle)?;
     green.swap_arenas(&mut self.arenas);
     self.out = Some(handle);
+    self.lends.taken = self.lends.taken.saturating_add(1);
     Ok(green)
   }
 

@@ -1360,8 +1360,18 @@
 >   `Store::log_text_len`, `Store::manifest_entry`, `Walk::log_texts_asked`), and a lookup's `.hgtags` reading asks the
 >   heads' manifests first (`Repository::manifest_not_at_hand`); held by
 >   `a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store` (a clone and a pull) and
->   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. Next: P3 (the push's work), P4 (the intake and
->   the record), P5.
+>   `a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store`. P3 BUILT (5de28ccb2): a push's work lays its
+>   trees out again once a changeset or manifest `NotAtHand` is brought back (`LAYOUT_TEXTS`,
+>   `vcs.hg.push_work_log_texts_read`). P4 BUILT (63e25a1ca): the intake asks its delta base and previous manifest
+>   through `Stepped::Store`. The reach BUILT: a stale re-base (a313f83d9) and a replay (b82590ddf; changeset texts
+>   batched by the record's room, `vcs_store.hg_replay_texts_asked`) ask likewise; a push's segment record reads no
+>   text (a guard). P4b BUILT: a made changeset brings its parent's texts back before it is made, in one place
+>   (`hg_made::parent_texts_at_hand`, `vcs.hg.made_parent_texts_read`; the deferred path makes in its landing task).
+>   Found and closed with it: a Mercurial green's second deferred submit was unmade `NotHead` and its version committed
+>   with nothing behind it, the held verdict's preview (a branch whose head is its version 1, `Lineage::preview`) read at
+>   the green's own versions; every made-changeset test submitted once, which hid it
+>   (`a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset`). Next: the commit-alone reds with w-svn's
+>   `commit_held` guard (A-891), then P5.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
@@ -1542,8 +1552,14 @@
 > side-band and no command to give words to, so nothing was written. GUARDED (w-git, 2026-11-24): such a reply is failed,
 > counted `vcs_http.git.push_ended_empty` and logged with the bytes read, and every refusal after the body is logged with
 > its cause (`a_push_whose_request_never_arrived_is_failed_never_answered_with_an_empty_body`, red then green; the probe
-> of a flush alone still answered with nothing). OPEN: why the 385 bytes git sent never reached the exchange; gate 5's
-> log line names the bytes read.
+> of a flush alone still answered with nothing). Gate 5 (run 45386968890) named it: the body arrived whole (385 bytes),
+> the push was refused `Unlanded` while it was answered, and the log said "side-band false" though git asked it: the
+> session lets its request go once the push is checked and taken, and side-band was read from it. FIXED (w-git,
+> 2026-11-24): the push keeps what its request asked (`ReceivePack::side_band`), so such a refusal goes on band 3
+> (`a_push_refused_while_answered_is_still_answered_on_band_three`, red at the shard fenced for the third lend after
+> the body: "side-band false", failed empty; green after); and `Unlanded` names where it fell short
+> (`git_push::Unlanded`: names not put, homing untaken, pack not held, homed short of f + 1, no landing, landing
+> untaken, store refused), in the log and in the client's words. OPEN: which of them gate 6 names, and its fix.
 > Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
@@ -4401,8 +4417,14 @@
 > `push::check_entry`), so the step is not refused after it applied anything; held by
 > `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` and
 > `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version` (each red before: accepted at version 1, no revision).
-> Owed to their owners (main's sweep): git's and Mercurial's made commits still commit a version alone when their
-> commit is unmade or their tool refuses, through `made_commit::commit`. (c) a Mercurial
+> Git's half BUILT (w-git, 2026-11-23 and 24): a git made commit goes only through `made_commit::commit_guarded`
+> (`commits::guard_made`: the record written, the register's entry judged, the store committed, before anything
+> applies), `refuse` (its commit not made: refused typed and recorded, nothing applied), `give_up` and `abandon` (its
+> changeset not landed: retryable); held by `t_a888_git_a_made_commit_not_made_refuses_its_submit_with_nothing_applied`
+> and `t_a888_git_a_made_commits_refused_entry_refuses_its_submit_with_nothing_applied` (red first at 22a88984b), and a
+> bare git submit is refused `RecordedSubmitRequired` since A-896. Owed to its owner (main's sweep): Mercurial's made
+> changesets still commit a version alone when their changeset is unmade or refused, through `made_commit::commit`
+> (`vcs_store::hg_made`, w-hg). (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
@@ -4722,7 +4744,10 @@
 > every access states in `BridgeAccess::with_bridge` (the server's from the pass's `away_scope` notes). Held by
 > `a_guests_read_that_met_content_not_at_hand_is_kept_brought_back_and_served_again` (red with the keep taken out: the
 > first dispatch's bytes, no bring-back). Owed: a guest over a work on a Subversion green, Linux (main's run of
-> `crates/server/tests/virtiofs.rs`).
+> `crates/server/tests/virtiofs.rs`). Reached since A-899 (2026-11-24): a virtio-fs device serves a work (its
+> attach makes the slot, its pass lends the green's tree), held by
+> `a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered` (before, the guest's first LOOKUP over a work
+> was never answered).
 > **A depth-1 PROPFIND streams its children; a server error names its cause, BUILT (A-893, 2026-11-24, w-svn; main's
 > interop red of 2026-11-23, run 45330574435).** `svn info -R` over HTTP of git-2000 answered `500` at
 > `!svn/rvr/N/trunk/t` at all 17 sampled revisions: a collection's depth-1 multistatus was written into one body bounded
@@ -15528,7 +15553,7 @@ or executable regression was performed by this docs change.
 | GAP-A9-11 | Separate frame classes do not bound CPU, device, arena or full-object transfer costs; resumable helper is not bounded end-to-end ingest. | §4.2/§4.9: all-resource QoS, bounded quanta/credits, verified named and unknown-length transfer, cancellation and release. | AC-0.10/T-0.10; AC-7.7/T-7.8; Phases 0/7/8. |
 | GAP-A9-12 | Closed registry, distinct identities with type-enforced causation, and typed loss/absence markers built and proven by use single-node (`e18619a`); open: cross-node trace propagation and the fleet/archive emitters (§4.8/§4.10 integration). (Was: signal names/absence and request-vs-trace causation not enforced end to end; nine spans were called seven.) | §4.14: closed registry, absence/freshness semantics, distinct identities and telemetry loss markers. | AC-0.11/T-0.11; Phase 0 foundation with surface/fleet integration. |
 | GAP-A9-13 | **Built single-node (2026-09-14, `docs/wip/clean-digest.md`):** verified current digest only (`Overlay::digest`, the `Digest` verb on the wire/CLI/MCP); invalidated before any mutation (`copy_up`, `base_forget`, listing refresh); bounded cache discovery (`Store.digests`, `digest_capacity`, typed counted `DigestCacheFull`); watcher hints backed by revalidation, overflow drops all. Owed: cooperative slicing of the hash, sealed-content digests, SDK exposure. (Was: clean-file digest export and bounded cache discovery not implemented; stale source knowledge must not imply clean content.) | §4.15: verified current digest only; invalidate before mutation; watcher hints backed by revalidation. | AC-1.17/T-1.21; Phase 1 core and bridge integration. |
-| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). A mount follows its work's base once it moves (2026-11-20, A-774 R4; a file the mount changed stays its own, so another work's later change to it is undone by the mount's next save of it). A save through a mount is refined into the edits it made (2026-11-20, A-774 part 5 with A-776). A mount's unsubmitted writes survive a restart (2026-11-20, A-774 part 4: the slot rebuilt from its image). A mount reads its green's pinned version where it lies (2026-11-20, A-774 part 2: 8 mounts over 64 MiB add 1.5 MB, 548 MB before; `tests/mounted_work_cow.rs`). Remain: a work over a green on another shard mounts nothing, a green landed again into a directory holding its earlier landing conflicts on every changed file (part 3 lands its head without a copy, but the plan holds no witness of the earlier landing; incremental landing owed), the landing view's tree is loaded in one step (slicing owed), a work with declared changes is refused a mount, only the NFS, FUSE and WinFsp bridges lend the green to a mount's base (virtio-fs and the file verbs refuse typed), the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). A work's first edit holds what it wrote as pieces over the base, never the file (A-790, 2026-11-20: 8 one-byte edits of a 64 MiB file add 32 KiB, were 201 MB). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
+| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). A mount follows its work's base once it moves (2026-11-20, A-774 R4; a file the mount changed stays its own, so another work's later change to it is undone by the mount's next save of it). A save through a mount is refined into the edits it made (2026-11-20, A-774 part 5 with A-776). A mount's unsubmitted writes survive a restart (2026-11-20, A-774 part 4: the slot rebuilt from its image). A mount reads its green's pinned version where it lies (2026-11-20, A-774 part 2: 8 mounts over 64 MiB add 1.5 MB, 548 MB before; `tests/mounted_work_cow.rs`). Remain: a work over a green on another shard mounts nothing, a green landed again into a directory holding its earlier landing conflicts on every changed file (part 3 lands its head without a copy, but the plan holds no witness of the earlier landing; incremental landing owed), the landing view's tree is loaded in one step (slicing owed), a work with declared changes is refused a mount, the NFS, FUSE, WinFsp and (since A-899, 2026-11-24) virtio-fs bridges lend the green to a mount's base (the file verbs refuse typed), the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). A work's first edit holds what it wrote as pieces over the base, never the file (A-790, 2026-11-20: 8 one-byte edits of a 64 MiB file add 32 KiB, were 201 MB). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
 | GAP-A9-15 | Evidence surface built (2026-09-14, `docs/wip/conformance.md`): a typed record per transport × suite rendered as a doc-truth matrix, with `cargo xtask conformance` driving the real binary over a real mount and a CI `conformance` lane; on macOS NFS fsx and fsstress pass, the workloads differ by two declared NFS limits (AppleDouble sidecars, SQLite WAL) and pjdfstest ran unprivileged (3,348/3,331/2,007) with its failures categorized, none reviewed as expected; Linux runs as a LIMITED root-NFS adapter, Windows/virtio-fs/OCI and the pressure/failure suites are typed skips. Historical overstatement is closed by construction; the transport guarantees themselves remain open. (Was: native/guest POSIX, strict RAM residency and grant-only disk effects lack complete transport-specific evidence; historical stages overstate coverage.) | §4.6, Part 6 and EQUIVALENCE.md: explicit semantics/boundaries; report skipped lanes and limited adapters honestly. | AC-9.7/T-9.1 plus original conformance/workload gates; Phase 9, prerequisite gates run in their owning phase. |
 
 **Additional decisions/evidence owed.** Phase 4 must establish the supported VMM/device seam,

@@ -62992,3 +62992,45 @@ Applied in the same change to: GAPS (C2 stage C, A-892's owed line), `crates/mer
 
 Applied in the same change to: GAPS (goal 93's entries), `crates/bridge-virtiofs/src/{device,admission,serve}.rs` and
 its serve tests, `crates/server/src/virtiofs.rs`, `crates/server/src/vcs_store/named_objects.rs`.
+
+### A-899 — A virtio-fs device serves a work: its attach makes the work's slot and its pass lends the green's tree, as the other bridges do (2026-11-24, w-svn for main 01a20182, its order of 2026-11-24 04:16; goal 93's completeness; closes A-774's virtio-fs line; A-898)
+
+- **What was there.** A work mounts like any volume (A-774): its first mount makes its slot, an overlay whose base is
+  the work's green at its pin (`mounted_work::ensure_slot`), and each NFS, FUSE or WinFsp turn lends that slot's tree
+  host the green's tree (`mounted_work::source`, `mounted_work::lend`, refreshed by `mounted_work::refresh`, the texts
+  lent where the base is held by name). A virtio-fs device did neither: its pass found no slot for a work under
+  `ShardState::by_id`, so every pass was refused `NotFound` and a guest's first request over a work was never
+  answered (A-774's owed line: "virtio-fs and the file verbs refuse a mounted work's base reads typed"). A-898's park
+  was therefore reachable on virtio-fs by no Subversion text.
+- **The rule.** A device's attach makes the work's slot on its owner (`virtiofs::open_view` and the handed attach,
+  through `mounted_work::ensure_slot`, as NFS's first look does), and each pass lends the slot's tree host the green's
+  tree with the same calls a FUSE turn makes (`mounted_work::refresh`, `source`, `GreenTree::reading` over the named
+  objects' plane, `lend`), inside `svn_presenter::lent_if` where the base is held by name. One lend, called from both
+  bridges. The file verbs still refuse a mounted work's base reads typed.
+- **Evidence.** `a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered`
+  (`crates/server/tests/virtiofs.rs`, over the in-process seam, so on every Unix host): a store-keeping daemon, a
+  Subversion repository imported from a one-revision dump (its landing lets the text's windows go), a work over its
+  green, a guest LOOKUP `trunk` and `a.txt`, OPEN and READ. Before, the guest's first LOOKUP was never answered (every
+  pass `NotFound`); after, the READ answered with the text's bytes, `virtiofs.brought_back` moved and the loop awaited a
+  bring-back (A-898's park reached), on macOS, 2026-11-24. Owed: the same on Linux (main's run).
+
+Applied in the same change to: GAPS (GAP-A9-14's row), `crates/server/src/{virtiofs,mounted_work}.rs`,
+`crates/server/tests/virtiofs.rs`.
+
+### A-900 — A lineage member is lent in place: no engine moved by value, none made or dropped for a lend (2026-11-24, w-svn for main 01a20182, its order of 2026-11-23 and approval of 2026-11-24 04:42; goal 93's speed list; amends A-575's `Lent`)
+
+- **What was there.** A lend of a lineage's member (`Lent`, A-575) took the member's engine out of its seat by value
+  into the lineage's slot for the one member out, with the arenas swapped into it, and its drop put it back by value
+  after taking an empty engine into the slot (`mem::take`). Every lend, a read-only one too (`Greens::is_owing`,
+  `repository::branch_version`), moved a `Green` twice and made and dropped an empty one: w-git's push profile counted
+  about 10,000 memmove samples in 30 s there.
+- **The rule.** A lend is made in place: `Lent::new` swaps the lineage's arenas into the seated engine and marks it out,
+  the guard reads and writes it where it sits, and its drop swaps the arenas back. No engine is moved by value, and
+  none is made or dropped for a lend. `Lineage::take` and `put_back`, which move an engine out by value, stay for a
+  replay that holds one across slices. `Lineage::lend_counts` counts engines taken by value, lends made in place and
+  engines dropped making a lend, the non-vacuity counters of the rule.
+- **Evidence.** `a_lend_moves_no_engine_and_drops_none` (`crates/merge/src/engine/branch/tests.rs`): one lend counted
+  `(taken, dropped, borrowed) = (1, 1, 0)` before, `(0, 0, 1)` after (macOS, debug, 2026-11-24); the merge crate's
+  tests and the server's lend-heavy filters pass (counts in the commit). Owed: main's push profile again.
+
+Applied in the same change to: `crates/merge/src/engine/branch.rs` and its tests.

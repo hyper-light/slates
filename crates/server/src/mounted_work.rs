@@ -31,10 +31,11 @@
 //! again and untouched entries show the new base.
 //!
 //! **What is owed (GAPS, A-774).** A file the mount changed stays its own after a refresh, so a later save of it is
-//! declared against the work's new bytes, which undoes another work's change made to that file meanwhile. A work holding declared changes when first mounted is refused. A
-//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS, FUSE and WinFsp
-//! bridges lend the tree; virtio-fs and the file verbs refuse a mounted work's base reads typed. A green on another shard than its work's mounts
-//! nothing yet.
+//! declared against the work's new bytes, which undoes another work's change made to that file meanwhile. A work
+//! holding declared changes when first mounted is refused. A directory renamed through the mount is refused at the
+//! submit, as is a special file. The NFS, FUSE, WinFsp and virtio-fs bridges lend the tree (virtio-fs since A-899: its
+//! attach makes the slot, its pass lends the tree); the file verbs refuse a mounted work's base reads typed. A green on
+//! another shard than its work's mounts nothing yet.
 
 use slates_db::catalog::{Role, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{NamePolicy, Refusal, ReplyBody, SizeClass, VolumeId, WorkOp};

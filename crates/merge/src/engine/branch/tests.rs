@@ -1308,3 +1308,25 @@ fn a_held_verdict_previewed_reads_as_its_commit_while_its_green_shows_nothing_of
   );
   assert_eq!(lineage.len(), 1, "nothing made by the refused preview");
 }
+
+/// Main's order of 2026-11-23 (the push profile: a lend moved the member's engine out of its seat and back, ~10k
+/// memmove samples in 30 s, and made and dropped an empty engine each time). Do: lend a lineage's member once and read
+/// it. Expect: the lend made in place: no engine taken out by value, none dropped, one borrowed; the read as before.
+#[test]
+fn a_lend_moves_no_engine_and_drops_none() {
+  let mut origin = Origin::default();
+  origin.files.push(("a".to_owned(), b"0123".to_vec()));
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  let before = lineage.lend_counts();
+  assert_eq!(read_member(&mut lineage, root, "a"), Some(b"0123".to_vec()));
+  let after = lineage.lend_counts();
+  assert_eq!(
+    (
+      after.taken - before.taken,
+      after.dropped - before.dropped,
+      after.borrowed - before.borrowed
+    ),
+    (0, 0, 1),
+    "one lend, made in place"
+  );
+}

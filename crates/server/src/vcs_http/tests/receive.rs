@@ -25,6 +25,8 @@ const NOT_SERVED: &[u8] = b"git-receive-pack is not served yet";
 thread_local! {
   /// How many of [`FencedOnce`]'s next lends are refused, on the shard's thread the exchange runs on.
   static REFUSALS_DUE: Cell<u32> = const { Cell::new(0) };
+  /// How many of [`FencedOnce`]'s next lends are made before [`REFUSALS_DUE`] refuses any.
+  static LENDS_BEFORE_FENCE: Cell<u32> = const { Cell::new(0) };
 }
 
 /// The daemon's lender ([`ThisShard`]), but for the lends [`REFUSALS_DUE`] names, refused as a fenced shard's are.
@@ -33,6 +35,14 @@ struct FencedOnce;
 
 impl ShardLender for FencedOnce {
   fn lend<R>(&mut self, step: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+    let lent_first = LENDS_BEFORE_FENCE.with(|before| {
+      let left = before.get();
+      before.set(left.saturating_sub(1));
+      left > 0
+    });
+    if lent_first {
+      return ThisShard.lend(step);
+    }
     let refused = REFUSALS_DUE.with(|due| {
       let left = due.get();
       due.set(left.saturating_sub(1));
@@ -91,6 +101,11 @@ struct Pushed {
 /// the site's receive exchange on a stored daemon's shard, its shard fenced for the next `fenced` lends once the body
 /// is taken: what the push saw.
 fn pushed_through(name: &'static str, request: Vec<u8>, fenced: u32) -> Pushed {
+  pushed_fenced_after(name, request, (0, fenced))
+}
+
+/// [`pushed_through`], the shard fenced for `fenced` lends once `lent` more lends after the body was taken were made.
+fn pushed_fenced_after(name: &'static str, request: Vec<u8>, (lent, fenced): (u32, u32)) -> Pushed {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (sent, answered) = std::sync::mpsc::channel();
   observe_first(&daemon, move |_| {
@@ -120,6 +135,7 @@ fn pushed_through(name: &'static str, request: Vec<u8>, fenced: u32) -> Pushed {
       if !request.is_empty() {
         exchange.body(&request).await.expect("the body taken");
       }
+      LENDS_BEFORE_FENCE.with(|before| before.set(lent));
       REFUSALS_DUE.with(|due| due.set(fenced));
       let ended = exchange.body_end(ClientGone::never()).await.is_ok();
       let mut answer = Vec::new();
@@ -243,5 +259,33 @@ fn a_probe_of_a_flush_alone_is_still_answered_with_nothing_and_ends_cleanly() {
       pushed.ended_empty
     ),
     (true, Vec::new(), true, 0, 0)
+  );
+}
+
+/// Main 01a20182's gate 5 (run 45386968890, `v3_takeover`'s first release run, 2026-11-24 04:00): a push asking
+/// side-band-64k was refused `Unlanded` while it was answered, and the log said "side-band false": the session lets its
+/// request go once the push is checked and taken, and the side-band asked was read from it, so the refusal had no band
+/// to go on and the reply was failed empty. Do: push a history asking side-band-64k through the site's receive exchange,
+/// the shard fenced for the one lend after the push was checked and taken (the third after its body). Expect: the reply git's band 3 with the
+/// refusal's words, ended cleanly; counted refused after its body, never ended empty.
+#[test]
+fn a_push_refused_while_answered_is_still_answered_on_band_three() {
+  let (request, _) = long_history(HISTORY);
+  let pushed = pushed_fenced_after("answered-fenced", request, (3, 1));
+  let mut words = vec![3];
+  words.extend_from_slice(NOT_SERVED);
+  assert_eq!(
+    (
+      String::from_utf8_lossy(&pushed.answer).into_owned(),
+      pushed.completed,
+      pushed.refused_after_body,
+      pushed.ended_empty
+    ),
+    (
+      String::from_utf8_lossy(&line(&words)).into_owned(),
+      true,
+      1,
+      0
+    )
   );
 }

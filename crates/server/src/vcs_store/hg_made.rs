@@ -90,6 +90,9 @@ enum Unmade {
   Stale,
   /// A file of the change is held by its content-plane object alone, which an hg green never holds (A-760 (b) 4b).
   Named(super::named_objects::NamedUnread),
+  /// The parent changeset's or its manifest's text, let go once landed, could not be read back from the node's
+  /// changeset store (goal 93, C1 (1)).
+  ParentUnread,
 }
 
 /// Written out rather than derived, as a derived `Debug` is all that reads the refusals and dead-code analysis ignores
@@ -105,6 +108,7 @@ impl std::fmt::Debug for Unmade {
       Unmade::Unlanded => formatter.write_str("Unlanded"),
       Unmade::Stale => formatter.write_str("Stale"),
       Unmade::Named(unread) => formatter.debug_tuple("Named").field(unread).finish(),
+      Unmade::ParentUnread => formatter.write_str("ParentUnread"),
     }
   }
 }
@@ -163,11 +167,15 @@ async fn made_landing(
       None => return,
     },
   };
-  let made = crate::state::with_state(|state| {
-    super::lent_state(state, |state| {
-      made_applied(state, green, version, (&authorship, &copies))
+  let made = if parent_texts_at_hand(repository, (green, version)).await {
+    crate::state::with_state(|state| {
+      super::lent_state(state, |state| {
+        made_applied(state, green, version, (&authorship, &copies))
+      })
     })
-  });
+  } else {
+    Some(Err(Unmade::ParentUnread))
+  };
   let Some(made) = made else {
     return;
   };
@@ -219,17 +227,9 @@ pub(crate) fn make_deferred(
   pending: crate::made_commit::Pending,
   (copies, judged): (Vec<MadeCopy>, slates_merge::engine::Judged),
 ) {
-  let (green, version) = pending.version();
-  let made = super::lent_state(state, |state| {
-    made_held(
-      state,
-      (green, version),
-      (pending.authorship(), &copies),
-      judged,
-    )
-  });
+  let green = pending.version().0;
   let request = pending.request();
-  let task = made_commit_landing(turn, pending, made);
+  let task = made_commit_landing(turn, pending, (copies, judged));
   if slates_rt::futures::spawn(task)
     .and_then(slates_rt::futures::detach)
     .is_err()
@@ -246,9 +246,32 @@ pub(crate) fn make_deferred(
 async fn made_commit_landing(
   turn: crate::repository::svn_commit::landing::Turn,
   pending: crate::made_commit::Pending,
-  made: Result<Option<Made>, Unmade>,
+  (copies, judged): (Vec<MadeCopy>, slates_merge::engine::Judged),
 ) {
-  let (green, _) = pending.version();
+  let (green, version) = pending.version();
+  // Made here, holding the landing turn, the verdict held and not applied (main's ruling of 2026-11-24 03:51, (i): one
+  // place makes): the parent's texts let go once landed read back first (goal 93, C1 (1)).
+  let repository =
+    crate::state::with_state(|state| mercurial_repository_of(state, green)).flatten();
+  let at_hand = match repository {
+    Some(repository) => parent_texts_at_hand(repository, (green, version)).await,
+    None => true,
+  };
+  let made = if at_hand {
+    crate::state::with_state(|state| {
+      super::lent_state(state, |state| {
+        made_held(
+          state,
+          (green, version),
+          (pending.authorship(), &copies),
+          judged,
+        )
+      })
+    })
+    .unwrap_or(Err(Unmade::NotHead))
+  } else {
+    Err(Unmade::ParentUnread)
+  };
   let made = match made {
     Ok(Some(made)) => made,
     other => {
@@ -284,6 +307,83 @@ async fn made_commit_landing(
     }
     turn.give_back(state);
   });
+}
+
+/// Derived: the parent's texts a made changeset reads (goal 93, C1 (1)): the parent changeset's and the manifest it
+/// names.
+const PARENT_TEXTS: usize = 2;
+
+/// Counter: a made changeset's parent text read back from the node's changeset store, let go once landed (goal 93, C1
+/// (1)). Format: a counter name in the status report.
+pub(crate) const PARENT_TEXTS_READ: &str = "vcs.hg.made_parent_texts_read";
+
+/// Whether the parent's texts a changeset made of `green`'s `version` in `repository` reads are at hand, each let go
+/// once landed brought back from the node's changeset store first (goal 93, C1 (1); main's ruling of 2026-11-24 03:51):
+/// the parent changeset's, then the manifest it names, at most [`PARENT_TEXTS`]. True where none is needed.
+async fn parent_texts_at_hand(
+  repository: RepositoryId,
+  (green, version): (DbVolumeId, u64),
+) -> bool {
+  for _ in 0..PARENT_TEXTS {
+    let wanted =
+      crate::state::with_state(|state| parent_text_wanted(state, repository, (green, version)))
+        .flatten();
+    let Some((log, node)) = wanted else {
+      return true;
+    };
+    let path = match log {
+      slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
+      _ => slates_hg::push::intake::MANIFEST_PATH,
+    };
+    let read = crate::repository::hg_push::bring_back_log_on(
+      &mut crate::vcs_http::git::ThisShard,
+      repository,
+      crate::repository::hg_push::Committed,
+      (log, path.to_vec()),
+      node,
+    )
+    .await;
+    if read.is_err() {
+      return false;
+    }
+    let _ = crate::state::with_state(|state| state.count(PARENT_TEXTS_READ, 1));
+  }
+  crate::state::with_state(|state| parent_text_wanted(state, repository, (green, version)))
+    .flatten()
+    .is_none()
+}
+
+/// The first of the parent's texts a changeset made of `green`'s `version` reads that is not at hand: the parent
+/// changeset's, else the manifest it names; none where both are, or the parent is the null node.
+fn parent_text_wanted(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (green, version): (DbVolumeId, u64),
+) -> Option<(slates_hg::index::Log<'static>, Node)> {
+  use slates_hg::index::Log;
+  let before = version.checked_sub(1)?;
+  let parent = made_at(state, green, before).or_else(|| named_head(state, green))?;
+  if parent == slates_hg::NULL_NODE {
+    return None;
+  }
+  super::lent_state(state, |state| {
+    super::within_budget(state, 0, |stores| {
+      let (content, store) = stores.mercurial(repository)?;
+      let index = &store.index;
+      let at_hand = |log, node: &Node| {
+        slates_hg::push::held::log_text_at_hand((index, content), log, node).map(|(_, at)| at)
+      };
+      if !at_hand(Log::Changelog, &parent)? {
+        return Some((Log::Changelog, parent));
+      }
+      let rev = index.rev(content, Log::Changelog, &parent)?;
+      let manifest = index.changeset(content, rev)?.manifest;
+      if manifest == slates_hg::NULL_NODE || at_hand(Log::Manifest, &manifest)? {
+        return None;
+      }
+      Some((Log::Manifest, manifest))
+    })
+  })
 }
 
 /// What a made changeset carries to its landing (module docs): its repository, its green and version, and the revisions
@@ -392,6 +492,14 @@ fn made_held(
   let Some(inputs) = inputs(state, (green, version), authorship)? else {
     return Ok(None);
   };
+  let repository = inputs.repository;
+  // The preview is a branch whose head is its version 1, the verdict committed over its version 0 (`Lineage::preview`):
+  // the change is read there, between those, whatever the green's own versions (goal 93 correctness: read at the
+  // green's, a second version's preview was refused NotHead, its version committed alone).
+  let previewed = Inputs {
+    versions: (0, 1),
+    ..inputs
+  };
   let ShardState {
     greens, vcs_stores, ..
   } = &mut *state;
@@ -401,14 +509,14 @@ fn made_held(
   let verified = greens
     .with_preview(&preview, |engine| {
       let (content, store) = vcs_stores
-        .mercurial_ref(inputs.repository)
+        .mercurial_ref(repository)
         .ok_or(Unmade::NotHead)?;
-      verified_of(engine, (&store.index, content), &inputs, copies)
+      verified_of(engine, (&store.index, content), &previewed, copies)
     })
     .unwrap_or(Err(Unmade::NotHead));
   greens.retire_preview(preview);
   Ok(verified?.map(|verified| Made {
-    repository: inputs.repository,
+    repository,
     green,
     version,
     verified,
