@@ -806,14 +806,29 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
     .saturating_add(1)
 }
 
-/// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, then the departure confirmed ([`departure_confirmed_periods`]). The voter these tests stop is
+/// Derived: the coordinator periods the survivors take to learn a voter's departure: their detectors' detection of it
+/// ([`detection_periods`]), then the departure confirmed ([`departure_confirmed_periods`]). The voter these tests stop is
 /// the bootstrapper, which leads the council it created unless a priority transfer moved its leadership, and only a
 /// leader proposes the retirement: without the election the budget ran out with the retirement still owed at one CPU
 /// beside two busy loops (diag-g225-forming-fleet-reaches-2, 2026-11-18: 9 of 48 runs of the two tests waiting on it,
-/// every survivor still at the version of the stop or the leader still naming the stopped voter, 94 periods spent).
+/// every survivor still at the version of the stop or the leader still naming the stopped voter, 94 periods spent). The
+/// detection was a membership horizon until A-882, nine periods, where a survivor still judging the stopped voter by its
+/// pair's own retransmission timer takes 6 to 7 s to condemn it: these tests stop the voter as the fleet forms.
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
-  horizon_periods().saturating_add(departure_confirmed_periods(daemons))
+  detection_periods(daemons).saturating_add(departure_confirmed_periods(daemons))
+}
+
+/// Derived: the coordinator periods the survivors' detectors take to hold a stopped member dead: the largest detection
+/// term any of `daemons` states now (`Daemon::failover_detection_ns`, A-363's `D`: SWIM's count of its detector's periods
+/// at their measured tail, at least the bound its detector states while a pair is still judged by its own retransmission
+/// timer, A-882), in whole periods; a membership horizon where none of them answers.
+fn detection_periods(daemons: &[&Daemon]) -> u64 {
+  daemons
+    .iter()
+    .filter_map(|daemon| daemon.failover_detection_ns().ok().flatten())
+    .map(|detection_ns| detection_ns.div_ceil(HEARTBEAT_NS))
+    .max()
+    .unwrap_or_else(horizon_periods)
 }
 
 /// Derived: the coordinator periods from the survivors holding a voter dead to their learning its departure: the death
@@ -15610,6 +15625,132 @@ fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
   }
 }
 
+/// Format: the owner's count of forwarded requests whose exchange attached to the reply its live log held
+/// (`live_ship::await_forwarded`).
+const FORWARD_ATTACHED_TO_LIVE: &str = "fleet.live.forward_attached";
+/// Format: the owner's count of forwarded requests whose deferred reply was recorded before their exchange asked
+/// (`verbs::await_deferred_completion`).
+const FORWARD_DEFERRED_COMPLETED: &str = "fleet.forward.deferred_completed";
+
+/// Shape: how long the owner's exchange waits before asking where a forwarded write's deferred reply stands, in the
+/// test whose write must be recorded first: half a liveness window, so the forward's origin, which waits one window plus
+/// its path's tail, still hears the answer. A healthy loopback fleet makes a write durable in milliseconds
+/// (2026-11-23, adacachy2: about 13,900 forwarded writes made durable in 30 s by one owner).
+const RECORDED_FIRST_DELAY_NS: u64 = LIVENESS_BUDGET_NS / 2;
+
+/// Writes through node `through` of `daemons` into `id` as [`written_through`] does, and reads owner `owner`'s counts of
+/// the two ways a deferred forwarded reply is answered before and after: the replies, and how much each count moved,
+/// attached to the live log's hold first.
+fn written_through_counted(
+  daemons: &[Daemon],
+  (through, owner): (usize, usize),
+  id: VolumeId,
+  path: &str,
+) -> (Vec<ReplyBody>, [u64; 2]) {
+  let counted = |daemon: &Daemon| {
+    let counters = summed_counters(daemon);
+    [FORWARD_ATTACHED_TO_LIVE, FORWARD_DEFERRED_COMPLETED]
+      .map(|name| counters.get(name).copied().unwrap_or(0))
+  };
+  let before = counted(&daemons[owner]);
+  let replies = written_through(daemons, through, id, path);
+  let after = counted(&daemons[owner]);
+  (
+    replies,
+    [0, 1].map(|at| after[at].saturating_sub(before[at])),
+  )
+}
+
+/// AUD-11, A-200, §4.8 "Lookup" (the regression of 1fc1da1fb, found 2026-11-23 by the two superseded-owner tests above):
+/// a write sent through a node that does not own its live-shipped volume is answered at its durability. Do: three nodes
+/// at `f = 1`; on a, a live-shipped volume written six files and shared with the fleet; then write through a client of
+/// b until a write is answered. Expect the last answer `FsDone`, none `Overloaded`, and the owner's exchange answered
+/// where its reply was held or recorded (a's counts). Before, the owner's exchange waited only for a deferred
+/// acceptance, so the write its live log held was refused `Overloaded` at once, every time, though it became durable,
+/// and a client that resent under a fresh id applied it again.
+#[test]
+fn a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "through-b");
+  drop(client);
+  let (through_b, moved) = written_through_counted(&daemons, (1, 0), id, "/through-b");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    through_b
+      .last()
+      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. }))
+      && !through_b.iter().any(|reply| {
+        matches!(
+          reply,
+          ReplyBody::Refused {
+            refusal: Refusal::Overloaded { .. }
+          }
+        )
+      }),
+    "a write through b was answered at durability, never Overloaded: {through_b:?}"
+  );
+  assert!(
+    moved.iter().sum::<u64>() > 0,
+    "the owner answered the forward where its reply was held or recorded (attached, completed: {moved:?})"
+  );
+}
+
+/// AUD-11, A-200 (main 01a20182's ruling of 2026-11-23 on the forwarded write's answer): a forwarded write whose reply
+/// was recorded before its exchange asked where it stands is answered that outcome, never `Overloaded`. Do: as
+/// [`a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability`], with a's exchange made to ask
+/// [`RECORDED_FIRST_DELAY_NS`] after the write deferred its reply (`Daemon::inject_forward_answer_delay`), long after a
+/// healthy fleet makes it durable. Expect the last answer `FsDone`, none `Overloaded`, and the owner's count of replies
+/// found recorded when their exchange asked moved: the case this test is for happened.
+#[test]
+fn a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "recorded-first");
+  drop(client);
+  daemons[0]
+    .inject_forward_answer_delay(Some(RECORDED_FIRST_DELAY_NS))
+    .unwrap();
+  let (through_b, moved) = written_through_counted(&daemons, (1, 0), id, "/recorded-first");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    through_b
+      .last()
+      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. }))
+      && !through_b.iter().any(|reply| {
+        matches!(
+          reply,
+          ReplyBody::Refused {
+            refusal: Refusal::Overloaded { .. }
+          }
+        )
+      }),
+    "a write through b was answered its recorded outcome, never Overloaded: {through_b:?}"
+  );
+  assert!(
+    moved[1] > 0,
+    "a's exchange found the write's reply recorded when it asked (attached, completed: {moved:?})"
+  );
+}
+
 /// Derived: the coordinator periods a takeover round waits on a learned object's promises before it gives the object
 /// up (`takeover`'s promise-wait bound, A-304): the failover delay's worth of the fleet's periods, the longest any of
 /// `daemons` estimates now (A-363), at least one.
@@ -15904,6 +16045,204 @@ fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retir
     settled,
     "every node holds one configuration naming a, b and c, all voting and meshed, once the adopter hears again: {}",
     at_end.join("; ")
+  );
+}
+
+/// A move names its retirement, across processes (A-883; the chaos nemesis's settle failure of 2026-11-23, seeds
+/// 14946995733817154046 and 8173581894251929445; §4.8 "Promotion and takeover", A-251): a host admitted again under its id
+/// keeps it, so when it retires a second time no copy moved at its first retirement falls to that retirement's successor
+/// again. Before A-883 the successor listed its own live volume in the second round, by the owner the copies had been
+/// moved from, and took it over again at a higher fence; where its holders disagreed it gave the volume up instead, and
+/// the retirement was never confirmed. Do: three nodes at `f = 1`; on a, a live-shipped volume written six files and
+/// shared with the fleet; cut a off on the probe plane until the survivor the volume ranks first has taken it over, heal,
+/// and wait for one configuration of all three; note who ships the volume at the highest fence and at which; then make
+/// a deaf to the others until the survivors retire it ([`deaf_until_its_takeover_resolves`]), heal, wait for one
+/// configuration again, and write through the successor. Expect the same node shipping the volume at the same fence
+/// before the write and after it, the write answered and never refused `StaleEpoch` (a's second retirement fenced
+/// nothing of the successor's volume), no node counting a live takeover or a given-up object while a was deaf (a owned
+/// nothing then), and the fleet on one configuration naming all three after each fault. With the retirement ignored,
+/// the second round's promises fenced the volume's holders above the successor's own epoch, and its writes were refused
+/// `StaleEpoch { current: 3 }` until it took its own volume over again.
+#[test]
+fn a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time() {
+  let _serial = serialize_fleet_tests();
+  let seen = retired_twice();
+  eprintln!(
+    "retired twice: the first takeover {} by node {}, a re-admitted {}; shipping at the highest fence (node, fence, \
+     durable) {:?}; a deaf {} retired {} healed {}, live takeovers and given-up objects per node {:?} -> {:?}; settled \
+     {}; then {:?}; a write through the successor {:?}, then {:?}\nafter the first takeover:\n{}\nat a's second \
+     retirement:\n{}\nat the end:\n{}",
+    seen.taken,
+    seen.adopter,
+    seen.readmitted,
+    seen.before,
+    seen.spell.deafened,
+    seen.spell.retired,
+    seen.spell.healed,
+    seen.spell.outcomes.0,
+    seen.spell.outcomes.1,
+    seen.settled,
+    seen.after,
+    seen.through_owner,
+    seen.after_the_write,
+    seen.after_first.join("\n"),
+    seen.spell.at_retirement.join("\n"),
+    seen.at_end.join("\n")
+  );
+  judge_retired_twice_scene(&seen);
+  judge_retired_twice_volume(&seen);
+}
+
+/// What [`retired_twice`] saw.
+struct RetiredTwice {
+  written: Vec<ReplyBody>,
+  adopter: usize,
+  taken: bool,
+  readmitted: bool,
+  before: Option<(usize, u64, Option<u64>)>,
+  after_first: Vec<String>,
+  spell: DeafSpell,
+  settled: bool,
+  after: Option<(usize, u64, Option<u64>)>,
+  through_owner: Vec<ReplyBody>,
+  after_the_write: Option<(usize, u64, Option<u64>)>,
+  at_end: Vec<String>,
+}
+
+/// [`a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time`]'s scene: three nodes at
+/// `f = 1`; on a, a live-shipped volume written six files and shared with the fleet; a cut off on the probe plane until
+/// the survivor the volume ranks first has taken it over, healed, and one configuration of all three waited for; the
+/// node shipping the volume at the highest fence noted; a made deaf until the survivors retire it a second time
+/// ([`deaf_until_its_takeover_resolves`]), healed, one configuration waited for again; a write through the successor.
+fn retired_twice() -> RetiredTwice {
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "retired-twice");
+  drop(client);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let adopter = if successor == hosts[1] { 1 } else { 2 };
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
+  let readmitted = taken
+    && poll_for_live_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let before = shipping_at_the_highest_fence(&daemons, id);
+  let after_first: Vec<String> = daemons.iter().map(configuration_view).collect();
+  let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, 0);
+  let settled = spell.healed
+    && poll_for_live_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let after = shipping_at_the_highest_fence(&daemons, id);
+  let through_owner = written_through(&daemons, adopter, id, "/after-the-second-retirement");
+  let after_the_write = shipping_at_the_highest_fence(&daemons, id);
+  let at_end: Vec<String> = daemons
+    .iter()
+    .map(|daemon| {
+      format!(
+        "{}; live {:?}",
+        configuration_view(daemon),
+        live_lines(daemon, id)
+      )
+    })
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  RetiredTwice {
+    written,
+    adopter,
+    taken,
+    readmitted,
+    before,
+    after_first,
+    spell,
+    settled,
+    after,
+    through_owner,
+    after_the_write,
+    at_end,
+  }
+}
+
+/// Judges [`retired_twice`]'s scene: every step of it happened, and the fleet settled on one configuration after each
+/// fault.
+fn judge_retired_twice_scene(seen: &RetiredTwice) {
+  assert!(
+    seen
+      .written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {:?}",
+    seen.written
+  );
+  assert!(
+    seen.taken && seen.readmitted,
+    "the adopter took the volume over and a was re-admitted: {}",
+    seen.after_first.join("; ")
+  );
+  assert!(
+    seen.spell.deafened && seen.spell.retired && seen.spell.healed,
+    "a was made deaf, retired a second time and healed: {}",
+    seen.spell.at_retirement.join("; ")
+  );
+  assert!(
+    seen.settled,
+    "every node holds one configuration naming a, b and c, all voting and meshed, once a hears again: {}",
+    seen.at_end.join("; ")
+  );
+}
+
+/// Judges what [`retired_twice`]'s second retirement did to the successor's volume: nothing. No node took a volume over
+/// or gave an object up while a was deaf, the successor ships the volume at the fence it had before (and after its
+/// write), and its write is answered, never refused `StaleEpoch`.
+fn judge_retired_twice_volume(seen: &RetiredTwice) {
+  let owner_and_fence =
+    |shipping: Option<(usize, u64, Option<u64>)>| shipping.map(|(owner, fence, _)| (owner, fence));
+  assert!(
+    seen
+      .before
+      .is_some_and(|(owner, _, _)| owner == seen.adopter),
+    "node {} ships the volume at the highest fence after the first takeover: {:?}",
+    seen.adopter,
+    seen.before
+  );
+  assert_eq!(
+    seen.spell.outcomes.1, seen.spell.outcomes.0,
+    "no node took a volume over or gave an object up at a's second retirement: a owned nothing then"
+  );
+  for shipping in [seen.after, seen.after_the_write] {
+    assert_eq!(
+      owner_and_fence(shipping),
+      owner_and_fence(seen.before),
+      "the successor ships its volume at the same fence: a's second retirement took nothing of it over"
+    );
+  }
+  let stale = seen.through_owner.iter().any(|reply| {
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::StaleEpoch { .. }
+      }
+    )
+  });
+  assert!(
+    !stale
+      && seen
+        .through_owner
+        .last()
+        .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "a write through the successor was answered, never refused StaleEpoch: a's second retirement fenced nothing of \
+     its volume: {:?}",
+    seen.through_owner
   );
 }
 
@@ -17860,6 +18199,11 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   // pair's own retransmission timer judges a's probes. Then, from the death held, the departure is confirmed and the
   // successor's round waits its promises whole from its last restart, at the failover delay the nodes read now.
   let survivors = [&daemons[1], &daemons[2]];
+  // Each survivor's detection term as the cut began (A-882): read for the record beside the detection it then took.
+  let detection_at_cut: Vec<Result<Option<u64>, ObserveError>> = survivors
+    .iter()
+    .map(|survivor| survivor.failover_detection_ns())
+    .collect();
   let held_dead = cut
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
       all_hold(
@@ -17896,9 +18240,9 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
     daemon.stop();
   }
   eprintln!(
-    "given up, then heard: cut {cut}, held dead {held_dead}, condemned by the survivors {condemnations:?}, given up \
-     {given_up}, answering again {answering}, healed {healed}, settled {settled}, judged afresh {judged_afresh}\nat the \
-     give-up:\n{}\nat the end:\n{}",
+    "given up, then heard: cut {cut}, detection terms at the cut {detection_at_cut:?}, held dead {held_dead}, condemned \
+     by the survivors {condemnations:?}, given up {given_up}, answering again {answering}, healed {healed}, settled \
+     {settled}, judged afresh {judged_afresh}\nat the give-up:\n{}\nat the end:\n{}",
     at_give_up.join("\n"),
     at_end.join("\n")
   );
@@ -23474,8 +23818,10 @@ fn a_version_crossing_in_several_shipments_is_archived_once() {
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
 /// commit past the owner's liveness budget, so B's client is answered with a refusal retryable under the same id:
-/// `Overloaded` when A's deferred answer reaches B (this Mac), `OwnerUnreachable` when B's forward gives up on A first
-/// (CI's Linux runners, run 42348339167). Do: the client acknowledges everything it may; the holder's fault is lifted
+/// `DurabilityPending`, the submit's outcome in doubt, when A's deferred answer reaches B, `OwnerUnreachable` when B's
+/// forward gives up on A first (CI's Linux runners, run 42348339167). Until 2026-11-23 A answered `Overloaded`, which
+/// says the submit never ran (main's ruling that day: `Overloaded` only where a request was never admitted). Do: the
+/// client acknowledges everything it may; the holder's fault is lifted
 /// and the version commits; the client sends the submit again under its id (`begin_again`). Expect: the first answer
 /// one of those two; the resend
 /// answered `Submitted { version: Some(1) }` from the completion the commit recorded. Before: the acknowledgement
@@ -23713,8 +24059,8 @@ fn resent_answer(
   }
 }
 
-/// The forwarded resend's assertions: refused `Overloaded` first, then, after the acknowledgement and the commit,
-/// answered with version 1 under its own id.
+/// The forwarded resend's assertions: refused in doubt (`DurabilityPending`) or by its origin (`OwnerUnreachable`) first,
+/// then, after the acknowledgement and the commit, answered with version 1 under its own id.
 fn assert_resent_under_its_id(run: &ForwardedResend) {
   let setup = [
     ("the holder's fault installs and lifts", run.faulted),
@@ -23738,9 +24084,9 @@ fn assert_resent_under_its_id(run: &ForwardedResend) {
   assert!(
     matches!(
       &run.first,
-      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+      Some(Err(refusal)) if refusal.starts_with("DurabilityPending") || refusal.starts_with("OwnerUnreachable")
     ),
-    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {:?}",
+    "the forwarded submit's acceptance outlived a budget, answered in doubt and retryable under its id: {:?}",
     run.first
   );
   assert!(
@@ -23819,9 +24165,9 @@ fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound(
   assert!(
     matches!(
       &first,
-      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+      Some(Err(refusal)) if refusal.starts_with("DurabilityPending") || refusal.starts_with("OwnerUnreachable")
     ),
-    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {first:?}"
+    "the forwarded submit's acceptance outlived a budget, answered in doubt and retryable under its id: {first:?}"
   );
   assert_eq!(
     (edits.served, edits.refused.as_deref()),
@@ -30514,7 +30860,8 @@ fn library_shard_count(client: &mut slates_client::Client, kind: &str) -> u64 {
 const RESEND_RETRY_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS);
 
 /// Sends the client's last request again under its id, as a client does, while the answer is a refusal retryable under
-/// that id (the forward still naming the dead owner: `OwnerUnreachable`; a shard at its bound: `Overloaded`), for
+/// that id (the forward still naming the dead owner: `OwnerUnreachable`; a shard at its bound: `Overloaded`; the owner's
+/// deferred answer in doubt: `DurabilityPending`), for
 /// [`RESEND_RETRY_FOR`], paced by a liveness budget's tenth: the last answer.
 fn resend_while_refused_retryable(
   client: &mut Client,
@@ -30526,7 +30873,9 @@ fn resend_while_refused_retryable(
     let retryable = matches!(
       answer,
       Ok(ReplyBody::Refused {
-        refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. }
+        refusal: Refusal::OwnerUnreachable { .. }
+          | Refusal::Overloaded { .. }
+          | Refusal::DurabilityPending { .. }
       })
     );
     if !retryable || began.elapsed() >= RESEND_RETRY_FOR {

@@ -1150,6 +1150,11 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): how long this node, as a forwarded verb's owner, waits after the verb
+  /// ran and deferred its reply before its exchange asks where the reply stands, as an exchange whose owner shard was
+  /// busy does, so a test sees a reply recorded before its exchange asked (`verbs::await_deferred_completion`). `None`
+  /// in production (`Daemon::inject_forward_answer_delay`).
+  pub injected_forward_answer_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): how long this node, as a content holder, holds each acknowledgement
   /// of a placement before it leaves, after the hold already took the content, so the owner's round stops collecting at
   /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.
@@ -1968,14 +1973,18 @@ impl PendingTombstone {
   }
 }
 
-/// A CLI attachment's pace (A-384): when it was last used, and the running estimate of the gaps between its uses
-/// (RFC 6298's estimator, as the failover estimate's terms are), so its term is its holder's own.
+/// A CLI attachment's pace (A-384): when it was last used, the running estimate of the gaps between its uses (RFC 6298's
+/// estimator, as the failover estimate's terms are), and the longest of them, so its term is its holder's own and never
+/// shorter than a silence its holder has already shown (`verbs::attachment_term`).
 #[derive(Debug, Default)]
 pub struct AttachmentPace {
   /// The shard's clock at its last use, or at its making.
   pub last_use_ns: u64,
   /// The gaps between its uses.
   pub gaps: slates_cluster::failover::RunningDuration,
+  /// The longest gap between two of its uses since its pace began (its making, or the shard's start): the silence its
+  /// holder has shown it keeps. A burst of uses lowers the running estimate, never this (A-384's floor, 2026-11-23).
+  pub longest_gap_ns: u64,
 }
 
 impl AttachmentPace {
@@ -1984,6 +1993,7 @@ impl AttachmentPace {
     AttachmentPace {
       last_use_ns: now_ns,
       gaps: slates_cluster::failover::RunningDuration::new(),
+      longest_gap_ns: 0,
     }
   }
 
@@ -1991,6 +2001,7 @@ impl AttachmentPace {
   pub fn used(&mut self, now_ns: u64) {
     if let Some(gap) = now_ns.checked_sub(self.last_use_ns) {
       self.gaps.on_sample(gap);
+      self.longest_gap_ns = self.longest_gap_ns.max(gap);
     }
     self.last_use_ns = now_ns;
   }

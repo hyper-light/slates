@@ -1078,19 +1078,13 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
   };
   let mut used = slates_db::register::HOST_PROMISE_HEADER_BYTES;
   let mut last = prepare.after;
-  let retired: BTreeSet<HostId> = state
-    .council
-    .configuration()
-    .retired
-    .keys()
-    .copied()
-    .collect();
+  let retired = retirement_versions(state);
   for object in objects {
     let Some(acceptor) = state.holder_records.get_mut(&object) else {
       continue;
     };
-    let from_retired = retired.contains(&acceptor.owner());
-    match promise_object(acceptor, object, prepare, from_retired) {
+    let retired_at = retired.get(&acceptor.owner()).copied();
+    match promise_object(acceptor, object, prepare, retired_at) {
       Ok(Some(highest)) => {
         let size = HostPromise::entry_bytes(&highest);
         if !promise.entries.is_empty() && used.saturating_add(size) > budget {
@@ -1384,6 +1378,19 @@ fn initial_epoch(
     })
 }
 
+/// The retirements the council's configuration keeps, each host's with the version that retired it
+/// ([`RegionalConfiguration::retirement_version`]): what a promise's install records with a copy it moves from a retired
+/// owner (A-883), read once for a page's or a round's walk of the copies.
+fn retirement_versions(state: &ShardState) -> BTreeMap<HostId, u64> {
+  state
+    .council
+    .configuration()
+    .retired
+    .iter()
+    .map(|(host, retirement)| (*host, retirement.version))
+    .collect()
+}
+
 /// Promises this node's own copies of `departed`'s objects that fall to it, as a holder answers a page: the
 /// highest record of each is learned from this node itself, and a fence above the epoch sends the round higher.
 fn promise_local_copies(
@@ -1404,19 +1411,13 @@ fn promise_local_copies(
   };
   let mut learned = Vec::new();
   let mut fenced = None;
-  let retired: BTreeSet<HostId> = state
-    .council
-    .configuration()
-    .retired
-    .keys()
-    .copied()
-    .collect();
+  let retired = retirement_versions(state);
   for object in objects {
     let Some(acceptor) = state.holder_records.get_mut(&object) else {
       continue;
     };
-    let from_retired = retired.contains(&acceptor.owner());
-    match promise_object(acceptor, object, &prepare, from_retired) {
+    let retired_at = retired.get(&acceptor.owner()).copied();
+    match promise_object(acceptor, object, &prepare, retired_at) {
       Ok(Some(highest)) => learned.push((object, highest)),
       Ok(None) => {}
       Err(RegisterError::StaleEpoch { current }) => {
@@ -3122,7 +3123,7 @@ mod tests {
       after: None,
       named: Vec::new(),
     };
-    let refusal = promise_object(&mut acceptor, object, &prepare, false).unwrap_err();
+    let refusal = promise_object(&mut acceptor, object, &prepare, None).unwrap_err();
     let mut promise = HostPromise {
       holder: RegisterHost(2),
       departed: host,
@@ -3179,10 +3180,7 @@ mod tests {
       named: Vec::new(),
     };
     let mut empty = Acceptor::new(RegisterHost(2), authority);
-    assert_eq!(
-      promise_object(&mut empty, object, &prepare, false),
-      Ok(None)
-    );
+    assert_eq!(promise_object(&mut empty, object, &prepare, None), Ok(None));
     let mut holding = Acceptor::new(RegisterHost(2), authority);
     holding
       .accept(&Record {
@@ -3195,7 +3193,7 @@ mod tests {
       })
       .unwrap();
     assert!(matches!(
-      promise_object(&mut holding, object, &prepare, false),
+      promise_object(&mut holding, object, &prepare, None),
       Ok(Some(_))
     ));
   }
@@ -3352,14 +3350,7 @@ mod tests {
     install_council(state);
     let local = state.fleet.host();
     let regional = state.council.configuration().clone();
-    let retired: std::collections::BTreeSet<HostId> = regional.retired.keys().copied().collect();
-    crate::fleet::install_on_copy(
-      state,
-      local,
-      (&regional, &retired),
-      regional.version,
-      object,
-    );
+    crate::fleet::install_on_copy(state, local, &regional, regional.version, object);
   }
 
   /// A-485 (A-291's move, §4.8 "Authority scope"; A-398's install walk): a holder's copy of a moved volume follows the

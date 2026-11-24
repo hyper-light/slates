@@ -1369,7 +1369,7 @@ fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
   let mut records = Vec::new();
   let mut recorded = |taking: &mut Intake, store: &ContentStore| {
     while let Some(segment) = taking.take_segment() {
-      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+      records.push(whole_record(&taking, &segment, 1 << 20, store));
     }
   };
   loop {
@@ -1547,7 +1547,7 @@ fn segment_records_over(
   let mut records = Vec::new();
   let mut recorded = |taking: &mut Intake, store: &ContentStore| {
     while let Some(segment) = taking.take_segment() {
-      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+      records.push(whole_record(&taking, &segment, 1 << 20, store));
     }
   };
   loop {
@@ -1640,4 +1640,64 @@ fn a_stale_forks_re_base_and_its_segments_replay_make_the_same_index() {
   for held in [rebased, replayed, index] {
     held.release(&mut store).unwrap();
   }
+}
+
+/// Goal 93 (main's ruling of 2026-11-23 16:29: attribute a push's long steps by the kind of unit each takes;
+/// `crates/hg/examples/intake_steps.rs` reads it). Do: take stock 7.2's bundle a step at a time, reading before each
+/// step the kind of unit it takes. Expect the kinds in the intake's order, each a run with no kind coming back once
+/// left: the changelog, the manifests, the files, the manifests' presence, the files', then done; and every step's kind
+/// one of those (no merge: the stock bundle seals nothing in the tests' window).
+#[test]
+fn each_step_names_the_kind_of_unit_it_takes_in_the_intakes_order() {
+  let part = stock();
+  let (mut index, mut store) = (HgIndex::new(), store());
+  let mut admission = room();
+  let mut intake = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  let mut kinds: Vec<&'static str> = Vec::new();
+  loop {
+    let unit = intake.unit();
+    if kinds.last() != Some(&unit) {
+      kinds.push(unit);
+    }
+    match intake
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap()
+    {
+      Stepped::Store => intake.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  kinds.push(intake.unit());
+  assert_eq!(
+    kinds,
+    [
+      "changelog",
+      "manifest",
+      "file",
+      "manifests-present",
+      "files-present",
+      "done"
+    ]
+  );
+  let (fork, _) = finished(intake);
+  fork.release(&mut store).unwrap();
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }

@@ -15,7 +15,7 @@
 use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::{HgIndex, Log};
 use slates_hg::manifest::{self, Entry, Flag};
-use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::push::intake::{Intake, PushSegment, Stepped};
 use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, NULL_NODE, Node, node};
@@ -27,10 +27,12 @@ use slates_vcs::{ContentRefused, ContentStore, StoredWindow, WindowStorage};
 #[global_allocator]
 static ALLOCATOR: LargeMapped = LargeMapped;
 
-/// Held by each test while it reads the heap's figures: the figures are the process's, so two tests reading at once
-/// would read each other's allocations.
-// D-8 test harness: a lock held in turn by its two owners, `a_pushs_churn_per_changeset_is_its_file_alone` and
-// `a_views_manifest_read_is_one_text`, poison recovered.
+/// Held by each test while it runs: the heap's figures are the process's, so a test that allocates while another reads
+/// them is counted as the reader's (the long push's test, run without it, failed the cached base's in 4 of 6 runs).
+// D-8 test harness: a lock held in turn by its owners, every test of this binary
+// (`a_pushs_churn_per_changeset_is_its_file_alone`, `a_views_manifest_read_is_one_text`,
+// `a_cached_file_base_is_read_where_it_lies` and `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows`),
+// poison recovered.
 #[allow(clippy::disallowed_types)]
 static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -316,7 +318,7 @@ fn churned(payload: &[u8]) -> u64 {
       intake.cut_rest();
     }
     while let Some(segment) = intake.take_segment() {
-      let _record = intake.segment_record(&segment, u64::MAX, &store).unwrap();
+      let _record = whole_record(&intake, &segment, u64::MAX, &store);
     }
     match stepped {
       Stepped::More => {}
@@ -619,6 +621,9 @@ const LONG_EDITS: usize = 1_500;
 /// counter, so the bound is not met by sealing nothing). Red before: no merge, the fork's own runs one a seal.
 #[test]
 fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
   let (payload, _) = history(50, 64, LONG_EDITS);
   let mut store = ContentStore::new(u64::MAX, 4 << 10).unwrap();
   let mut index = HgIndex::new();
@@ -659,4 +664,16 @@ fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
     "the fork held {} runs of its own, past the bound {bound} at {rows} rows",
     intaken.most_own_runs
   );
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }

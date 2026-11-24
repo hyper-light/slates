@@ -675,8 +675,10 @@ const SEGMENT_BYTES: u64 = 128 * 1024;
 /// of segment changesets. Do: on a running daemon holding a changeset store, push six changesets each adding a 128 KiB
 /// file (a payload of about 768 KiB, cut at [`SEGMENT_BYTES`]); make the repository's store again from its log (the sliced
 /// `vcs_store::rebuild`) and read it once the task ends. Expect every changeset held again; the push landed as more than
-/// one segment and its run replayed segment by segment; and no byte of its payload read back, its rows appended by
-/// identity. Before (b1) the push's one changeset replayed from its payload a piece at a time, a want a piece.
+/// one segment and its run replayed segment by segment; no byte of its payload read back, its rows appended by
+/// identity; and each segment's record written over paced turns, at least one a segment (goal 93, r499: a whole record
+/// in one shard step ran 316 ms; red before, no record turn counted). Before (b1) the push's one changeset replayed
+/// from its payload a piece at a time, a want a piece.
 #[test]
 fn a_landed_push_replays_as_its_run_of_segments_reading_no_payload() {
   let commits: Vec<Commit> = LARGE
@@ -710,15 +712,17 @@ fn a_landed_push_replays_as_its_run_of_segments_reading_no_payload() {
     }
   };
   let counted = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
-  let (changesets, landed, replayed, wants) = crate::daemon::observe_first(&daemon, move |state| {
-    let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
-    (
-      store.index.len(content, Log::Changelog),
-      counted(state, super::super::hg_run::SEGMENTS_LANDED),
-      counted(state, crate::vcs_store::HG_REPLAY_SEGMENTS),
-      counted(state, crate::vcs_store::HG_REPLAY_WANTS),
-    )
-  });
+  let (changesets, landed, replayed, wants, record_turns) =
+    crate::daemon::observe_first(&daemon, move |state| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
+      (
+        store.index.len(content, Log::Changelog),
+        counted(state, super::super::hg_run::SEGMENTS_LANDED),
+        counted(state, crate::vcs_store::HG_REPLAY_SEGMENTS),
+        counted(state, crate::vcs_store::HG_REPLAY_WANTS),
+        counted(state, super::SEGMENT_RECORD_TURNS),
+      )
+    });
   daemon.stop();
   println!(
     "(b1) replay: a {payload}-byte payload landed as {landed} segments, {replayed} replayed, {wants} payload fills"
@@ -728,6 +732,11 @@ fn a_landed_push_replays_as_its_run_of_segments_reading_no_payload() {
   assert!(landed > 1, "the push landed as {landed} segments");
   assert_eq!(replayed, landed, "its run replayed segment by segment");
   assert_eq!(wants, 0, "no byte of its payload read back");
+  // Goal 93 (r499: a segment's whole record in one shard step ran 316 ms): every record written a paced turn at a time.
+  assert!(
+    record_turns >= landed,
+    "{record_turns} record turns for {landed} segments: a record written in one call"
+  );
 }
 
 fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {

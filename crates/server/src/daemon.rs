@@ -3780,6 +3780,16 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node, as a forwarded verb's owner, wait `delay_ns` after the verb ran and deferred its
+  /// reply before its exchange asks where the reply stands (`None` restores asking at once), as an exchange whose owner
+  /// shard was busy does: a reply that is recorded meanwhile must be the answer. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_forward_answer_delay(&self, delay_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_forward_answer_delay_ns = delay_ns;
+    })
+  }
+
   /// Test support: makes this node, as a content holder, hold each acknowledgement of a placement `delay_ns` before it
   /// leaves (`None` restores immediate answers). The hold has already taken the content, so an owner whose round stops
   /// collecting at its hedge delay first receives the acknowledgement as a straggler's, as it does from a holder whose
@@ -3815,6 +3825,17 @@ impl Daemon {
   /// make is its typed refusal.
   pub fn failover_ns(&self) -> Result<u64, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.failover_ns)
+  }
+
+  /// The detection term of this node's failover estimate now, nanoseconds (A-363's `D`, A-882): SWIM's count of its
+  /// detector's periods at their measured tail, at least the bound its detector states while a pair is still judged by
+  /// its own retransmission timer; the anchor's supervision where no peer's detector judges the node; `None` before
+  /// either. A one-shot control-shard question; an observation the daemon could not make is its typed refusal. Exposed so
+  /// a fleet test sizes a wait on a member's detection by the detection its survivors state, not by a fixed window.
+  pub fn failover_detection_ns(&self) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      s.failover.estimate().detection.map(|term| term.ns)
+    })
   }
 
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
@@ -5171,6 +5192,7 @@ async fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_forward_answer_delay_ns: None,
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
@@ -11066,6 +11088,7 @@ mod tests {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
       crate::fleet::reconcile_held_authority(state);
+      let retired_at = state.council.configuration().retirement_version(departed);
       let moved_from = state.holder_records.get(&object).and_then(|acceptor| {
         (acceptor.owner() == successor)
           .then(|| acceptor.moved_from())
@@ -11090,12 +11113,16 @@ mod tests {
         .get("fleet.takeover.listed_by_moved_from")
         .copied()
         .unwrap_or(0);
-      (moved_from.map(|from| from == departed), page, counted)
+      (
+        moved_from.map(|from| (from.owner, Some(from.retired_at)) == (departed, retired_at)),
+        page,
+        counted,
+      )
     });
     assert_eq!(
       moved_from,
       Some(true),
-      "the install moved the copy from the retired owner"
+      "the install moved the copy from the retired owner, naming its retirement (A-883)"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(
@@ -11116,15 +11143,23 @@ mod tests {
   /// (the move); build the delta's held pieces (`held_changes`) and fold them over the checkpoint's as recovery does;
   /// drop the acceptors, routing and lineage and restore them from the folded pieces; answer the successor's page.
   /// Expect: no move at the checkpoint, the register's piece carried by the delta, the restored acceptor naming the
-  /// retired owner it moved from, and the page listing the copy. A move whose mark the tracked map missed would leave
+  /// retired owner it moved from and the retirement that moved it (A-883), and the page listing the copy. A move whose mark the tracked map missed would leave
   /// the checkpoint's piece in place, and the restored copy would name no move and go unlisted.
   #[test]
   fn a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([47; 16]);
-    let (before_move, in_delta, restored_from, departed, page) = audit_on_shard(move |state| {
+    let (before_move, in_delta, restored_from, moved, page) = audit_on_shard(move |state| {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let moved = slates_db::register::MovedFrom {
+        owner: departed,
+        retired_at: state
+          .council
+          .configuration()
+          .retirement_version(departed)
+          .unwrap(),
+      };
       let before_move = state
         .holder_records
         .get(&object)
@@ -11180,7 +11215,7 @@ mod tests {
         named: Vec::new(),
       };
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
-      (before_move, in_delta, restored_from, departed, page)
+      (before_move, in_delta, restored_from, moved, page)
     });
     assert_eq!(
       before_move, None,
@@ -11189,8 +11224,8 @@ mod tests {
     assert!(in_delta > 0, "the delta carried the moved register's piece");
     assert_eq!(
       restored_from,
-      Some(departed),
-      "the checkpoint and its delta kept the owner the copy moved from"
+      Some(moved),
+      "the checkpoint and its delta kept the owner the copy moved from and its retirement"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(
@@ -11208,14 +11243,23 @@ mod tests {
   /// from, so after the restore, which routes the copy to the successor as a live owner, the successor's page still
   /// lists it. Do: retire the owner of a record this node holds; run the authority reconcile; write the held image, drop
   /// the acceptors, routing and lineage, and restore them from the image; answer the successor's page. Expect: the
-  /// restored acceptor names the retired owner it moved from, and the page lists the copy.
+  /// restored acceptor names the retired owner it moved from and the retirement that moved it (A-883), and the page
+  /// lists the copy.
   #[test]
   fn a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([43; 16]);
-    let (restored_from, departed, page) = audit_on_shard(move |state| {
+    let (restored_from, moved, page) = audit_on_shard(move |state| {
       let local = state.fleet.host();
       let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let moved = slates_db::register::MovedFrom {
+        owner: departed,
+        retired_at: state
+          .council
+          .configuration()
+          .retirement_version(departed)
+          .unwrap(),
+      };
       crate::fleet::reconcile_held_authority(state);
       let image = crate::content_holder::held_image(state);
       state.holder_records.clear();
@@ -11243,12 +11287,12 @@ mod tests {
         named: Vec::new(),
       };
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
-      (restored_from, departed, page)
+      (restored_from, moved, page)
     });
     assert_eq!(
       restored_from,
-      Some(departed),
-      "the image kept the owner the copy moved from"
+      Some(moved),
+      "the image kept the owner the copy moved from and its retirement"
     );
     let page = HostPromise::decode(&page).expect("the page answers");
     assert_eq!(

@@ -18873,3 +18873,39 @@ Every run: oracle failures 0, refusals 0, lost 0.
   look-up's least stays 1 ns. That is noise beside the standard channel each claim comes with. A Miri-only shape would
   be a mode switch, and it would have Miri certify code that does not ship. Re-read the cost on a quiet box with the
   command above.
+
+## A repository window's record: the placement once in its slab (goal 93, main 01a20182's (3); w-perf; 2026-11-23)
+
+- **Why asked.** w-perf's push of Mercurial's history (57,035 changesets, `crates/server/tests/hg_push_lifetimes.rs`,
+  2026-11-23) left 22,107,816 bytes live under `ChunkWindows::put`'s map for 114,200 windows, 194 bytes a window, beside
+  the content store's own entries (25,802,289 bytes for about 253,000, near their floor). Each window's record repeated
+  its whole placement: its extent, region, offset, block length, bytes used and birth epoch.
+- **Command.** `cargo test -p slates-server --test window_records_heap -- --nocapture` (debug, the MacBook, 2026-11-23,
+  load average about 60 to 85, not quiesced; the figure is a count of the test thread's own live heap bytes under that
+  binary's allocator, so load moves its time, not its bytes). It puts and names a first window, since the chunk store
+  makes its table of chunk records at its first chunk (558,784 bytes for 4,096 records, 136 a record, which a shard's
+  store holds from its start), then 4,000 windows of arena-15's mean length, 1,151 bytes, at a 16 KiB granule, the
+  windows changed since the last publication still held (the next publication clears them). Read first in the library's
+  tests with those changes cleared, before the count moved to its own binary (it changed what the library's other
+  tests measure of their timing; see the gauge test in GAPS).
+
+| record | bytes for 4,000, changes held | a window | changes cleared (library) |
+|---|---|---|---|
+| main's, the placement in every record (120 bytes with its key) | 1,002,952 | 250 | 231 |
+| the window's own (identity, length, slot, slab key: 56 bytes) | 602,816 | 150 | 131 |
+| a plain `BTreeMap<u64, [u8; 56]>` of 4,000 handles in order, for scale | | | 122 |
+
+- **Projection, not measured:** 7 to 10 MB less of the 57k push's 22.1 MB. The push measured 194 bytes a window where
+  this test reads 231 for the same record, so the saving is 114,200 windows times 63 bytes (194 less 131) at least, 7.2
+  MB, and the test's ratio (131 of 231) at most, 9.6 MB. The push's own rerun reads it (owed with w-hg's cuts').
+- **Bound.** 3 × 64 bytes a window (`RECORD_BYTES_A_WINDOW`): an entry of 64 bytes, a B-tree's leaves at least 5 of 11
+  full and handles put in order, its inner nodes about a sixth more.
+- **Found beside it, then fixed (main's (1)).** The chunk store's record table grows a segment at a time, to its
+  derived bound (`max_chunks`, reserve over granule), but its segment was `min(max_chunks, page)` records: a page's byte
+  count taken as a record count, with no derivation. So a shard's first chunk made 16,384 records at once on a 16 KiB
+  page and 4,096 on a 4 KiB page (557 KB). Now a segment is the records a page holds (`Slab::slots_a_page`, the largest
+  power of two of slots that fits), and the tag table takes its segment the same way (it divided by the run's pointer,
+  not its slot, 24 KiB a segment at a 16 KiB page). `cargo test -p slates-vfs --test chunk_records_heap -- --nocapture`
+  (debug, the MacBook, 2026-11-23): a store's first chunk kept 2,228,320 bytes of heap at a 16 KiB page, now 8,800.
+  The table now grows a page at a time, every 64 chunks at a 16 KiB page, and nothing reserves its segments ahead
+  (`Slab::reserve_segments`); main's AC-0.4 provisioning A/B reads whether that moves the seal path.

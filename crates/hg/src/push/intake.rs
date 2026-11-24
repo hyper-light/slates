@@ -570,16 +570,16 @@ pub struct PushSegment {
   pub contents: Vec<FileContents>,
 }
 
-/// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
-/// identity from `fork`, the intake's fork or the fork it finished as, `room` the room the intake began within; what a
-/// replay appends after the rows the segments before it appended, no text rebuilt. Refused where a row cannot be read
-/// or written.
-pub fn segment_record(
-  fork: &HgIndex,
+/// The writer of the `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept
+/// revisions in it read by identity from the intake's fork a step at a time ([`Intake::record_step`]), `room` the room
+/// the intake began within; what a replay appends after the rows the segments before it appended, no text rebuilt.
+/// Written a step at a time because a segment's whole record in one call was one shard step: 316 ms in a release build
+/// on the big Studio over Mercurial's own push (r499, goal 93), past the slice rule. Refused where its logs cannot be
+/// held.
+fn segment_writer(
   segment: &PushSegment,
   room: u64,
-  store: &ContentStore,
-) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+) -> Result<crate::import::record::Writer, crate::import::record::WriteRefused> {
   use crate::import::record::{Source, WriteRefused, Writer};
   let mut ranges = Vec::new();
   ranges
@@ -591,9 +591,7 @@ pub fn segment_record(
       .iter()
       .map(|(log, first, end)| (log_named(log), *first, *end)),
   );
-  let mut writer = Writer::begin_segment(Source::Push, &ranges, room, false)?;
-  while writer.step(fork, store)? {}
-  writer.finish().ok_or(WriteRefused::Allocation)
+  Writer::begin_segment(Source::Push, &ranges, room, false)
 }
 
 /// A revision longer than the content store's window taken over as many steps as it has windows (A-767 C1, the push
@@ -1027,14 +1025,24 @@ impl Intake {
     self.taker.cutting.as_mut()?.ready.pop_front()
   }
 
-  /// The `Record` of `segment`, cut from this intake (main's ruling (b1)): [`segment_record`] over its fork.
-  pub fn segment_record(
+  /// The writer of the `Record` of `segment`, cut from this intake (main's ruling (b1); [`segment_writer`]): stepped by
+  /// [`Intake::record_step`] over its fork, a turn's steps at a time, then finished (`Writer::finish`).
+  pub fn record_writer(
     &self,
     segment: &PushSegment,
     room: u64,
+  ) -> Result<crate::import::record::Writer, crate::import::record::WriteRefused> {
+    segment_writer(segment, room)
+  }
+
+  /// One step of `writer`, a segment's record, over this intake's fork: whether more steps follow. Refused where a row
+  /// cannot be read or written.
+  pub fn record_step(
+    &self,
+    writer: &mut crate::import::record::Writer,
     store: &ContentStore,
-  ) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
-    segment_record(&self.taker.fork, segment, room, store)
+  ) -> Result<bool, crate::import::record::WriteRefused> {
+    writer.step(&self.taker.fork, store)
   }
 
   /// Cuts the segment being cut whatever its length: the push's last, once every unit is taken.
@@ -1084,6 +1092,33 @@ impl Intake {
       Stage::ManifestsPresent(at) => taker.manifest_present(at, store),
       Stage::FilesPresent => taker.files_present(store),
       Stage::Done => Ok(Stepped::Done),
+    }
+  }
+
+  /// Whether a merge of the fork's runs is under way ([`Taker::merge_step`]): the next step cuts one of its tables. What
+  /// a caller timing its steps reads to tell a merge's cost from a revision's.
+  pub fn merging(&self) -> bool {
+    self.taker.merging.is_some()
+  }
+
+  /// The kind of unit the next step takes, as [`Intake::step`] chooses it: `pending` (a revision longer than a window,
+  /// a window more), `merge` (a table of the fork's merge), else the stage's (`changelog`, `manifest`, `file`,
+  /// `manifests-present`, `files-present`, `done`). What a caller timing its steps reads to tell which unit a long one
+  /// took.
+  pub fn unit(&self) -> &'static str {
+    if self.taker.pending.is_some() {
+      return "pending";
+    }
+    if self.taker.merging.is_some() {
+      return "merge";
+    }
+    match self.taker.stage {
+      Stage::Changelog(_) => "changelog",
+      Stage::Manifests(_) => "manifest",
+      Stage::Files { .. } => "file",
+      Stage::ManifestsPresent(_) => "manifests-present",
+      Stage::FilesPresent => "files-present",
+      Stage::Done => "done",
     }
   }
 
