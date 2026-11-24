@@ -149,6 +149,11 @@ impl Walked {
   }
 }
 
+/// The changelog's and the manifests' texts by (log path, node), as the tests' changeset store answers them
+/// ([`Indexed::answering_log_texts`]).
+#[cfg(test)]
+pub(crate) type LogTexts = std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>;
+
 /// A repository's served view over its index (module docs).
 #[derive(Debug)]
 pub struct Indexed<'a> {
@@ -180,10 +185,7 @@ pub struct Indexed<'a> {
   /// The changelog's and the manifests' texts the tests' changeset store answers with, by (log path, node), saved
   /// before their windows were let go ([`Indexed::answering_log_texts`]); and how many it answered.
   #[cfg(test)]
-  log_texts: (
-    std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
-    Cell<u64>,
-  ),
+  log_texts: (LogTexts, Cell<u64>),
 }
 
 impl<'a> Indexed<'a> {
@@ -242,10 +244,7 @@ impl<'a> Indexed<'a> {
   /// The view answering as [`Indexed::answering_from_its_texts`] does, the changelog's and the manifests' texts from
   /// `texts`, by (log path, node), saved before their windows were let go (goal 93, C1 (1)).
   #[cfg(test)]
-  pub(crate) fn answering_log_texts(
-    mut self,
-    texts: std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>,
-  ) -> Self {
+  pub(crate) fn answering_log_texts(mut self, texts: LogTexts) -> Self {
     self.log_texts.0 = texts;
     self.answering_from_its_texts()
   }

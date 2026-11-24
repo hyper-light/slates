@@ -699,11 +699,11 @@ impl VmmSeam for SimVmm {
 }
 
 /// The probe of an access whose volume holds no named text a dispatch could meet let go: no dispatch met content not
-/// at hand (`slates_bridge_virtiofs::serve::AwayProbe`). Stated at each call that serves a pass, so a test that needs
+/// at hand (`slates_bridge_virtiofs::device::AwayProbe`). Stated at each call that serves a pass, so a test that needs
 /// another says so (`serve.rs`'s stand-in).
 pub struct NeverAway;
 
-impl slates_bridge_virtiofs::serve::AwayProbe for NeverAway {
+impl slates_bridge_virtiofs::device::AwayProbe for NeverAway {
   fn take_noted_away(&mut self) -> bool {
     false
   }
