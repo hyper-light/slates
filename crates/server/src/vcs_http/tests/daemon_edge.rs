@@ -5364,6 +5364,78 @@ fn a_landed_changelog_and_manifest_revision_let_go_is_brought_back_by_its_log_an
   );
 }
 
+/// Shape: the line the let-go work test pushes: all but its last changeset first, then its last alone.
+const LET_GO_LINE: usize = 7;
+
+/// Goal 93, C1 (1) P3 (main's ruling of 2026-11-23 20:53: the changelog's and the manifests' texts off the content
+/// store, a push's work reading one not at hand through the changeset store). Do: start a two-shard daemon over
+/// loopback TLS; push a line of [`LET_GO_LINE`] changesets but its last; let go every object the repository's changelog
+/// and manifest rows name; push the last changeset alone, its work's base the line's head, whose changeset and manifest
+/// were let go. Expect both pushes `200`; objects let go; the second push's work read texts from the changeset store
+/// (`vcs.hg.push_work_log_texts_read`) and the line's head the last changeset after. Red before: the second push
+/// refused in its reply, `Index(Unread { rev: 5 })`: its intake could not read the previous manifest it deltas
+/// against (P4), and past that its work's layout would find no manifest (P3).
+#[test]
+fn a_push_whose_works_base_was_let_go_reads_it_from_the_changeset_store() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let edge = (port, &certificate);
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let paths: &'static [String] = Box::leak(
+    (0..LET_GO_LINE)
+      .map(|at| format!("line-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = (0..LET_GO_LINE)
+    .map(|at| {
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        paths[at].as_bytes(),
+        at.checked_sub(1),
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let first: Vec<usize> = (0..LET_GO_LINE - 1).collect();
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &first));
+  let named = name.clone();
+  let repository = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&named)
+      .map(|record| record.id)
+  })
+  .expect("the repository's record");
+  let let_go = let_go_logs(&daemon, repository);
+  let last = hg_unbundle(edge, &name, &history_bundle(&made, &[LET_GO_LINE - 1]));
+  let read = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::WORK_LOG_TEXTS_READ,
+  );
+  let heads = hg_command(edge, &name, "heads");
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert!(let_go > 0, "objects let go");
+  assert_eq!(last.0, 200, "{}", String::from_utf8_lossy(&last.2));
+  assert!(
+    !String::from_utf8_lossy(&last.2).contains("ERROR:ABORT"),
+    "the last push accepted: {}",
+    String::from_utf8_lossy(&last.2)
+  );
+  assert!(read > 0, "the work read its base from the changeset store");
+  let tip = crate::verbs::hex_of(&made[LET_GO_LINE - 1].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
+}
+
 /// Lets go every object `repository`'s changelog and manifest rows name on its shard: how many let any window go.
 fn let_go_logs(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) -> usize {
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {

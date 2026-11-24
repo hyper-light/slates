@@ -236,6 +236,32 @@ pub fn log_text_held(
   }
 }
 
+/// The length of the text of the changelog's or the manifest log's revision `node` that `index` holds, and whether its
+/// text is at hand: the object its row names held whole, and for a manifest kept as a delta every object of its chain
+/// (A-729), so [`HgIndex::revision_text`] would read it (goal 93, C1 (1): what the push's intake checks before a step
+/// that reads it). None where the index holds no such revision, or `log` is a file log.
+pub fn log_text_at_hand(
+  (index, store): (&HgIndex, &ContentStore),
+  log: Log<'_>,
+  node: &Node,
+) -> Option<(u64, bool)> {
+  let held = log_text_held((index, store), log, node)?;
+  if log == Log::Changelog || !held.whole {
+    return Some((held.len, held.whole));
+  }
+  let mut at = index.rev(store, log, node)?;
+  let mut row = index.revision(store, log, at)?;
+  // Each base is before its revision, so the walk takes at most `at` steps.
+  while row.base != crate::index::NONE && row.base < at {
+    at = row.base;
+    row = index.revision(store, log, at)?;
+    if !store.holds_whole(&row.bytes) {
+      return Some((held.len, false));
+    }
+  }
+  Some((held.len, true))
+}
+
 /// A changelog's or a manifest log's revision as [`log_text_held`] reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogTextHeld {

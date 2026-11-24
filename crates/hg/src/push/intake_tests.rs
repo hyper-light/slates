@@ -1701,3 +1701,91 @@ fn whole_record(
   while intake.record_step(&mut writer, store).unwrap() {}
   writer.finish().unwrap()
 }
+
+/// Goal 93, C1 (1) P4 (main's ruling of 2026-11-23 20:53: the changelog's and the manifests' texts off the content
+/// store, the push's intake reading one not at hand through the changeset store). Do: take stock 7.2's bundle into a
+/// repository; make a changeset over its tip (`push::made`, its revisions whole against the null base, as a client's
+/// push of one changeset); save every changeset's and manifest's text; let go every object those rows name; take the
+/// made changegroup into a fork of the repository through the intake, its asks of a log's text answered from what was
+/// saved (a file's from the fork). Expect: objects let go; the intake done, the made changeset in its fork; the
+/// manifest it is kept as a delta against asked of the store (`Intaken::log_texts_asked`). Red before: refused
+/// `Unread`, the previous manifest read from the content store (the edge red's `Index(Unread { rev: 5 })`).
+#[test]
+fn a_pushs_intake_reads_a_manifest_let_go_from_the_changeset_store() {
+  use crate::push::made::{Authored, CHANGEGROUP_VERSION, Change, changegroup, made};
+  use std::collections::BTreeMap;
+  let mut store = store();
+  let mut empty = HgIndex::new();
+  let (mut repository, _, _) = intake(&stock(), &mut empty, &mut store, &mut room()).unwrap();
+  let tip = {
+    let len = repository.len(&store, Log::Changelog);
+    repository.changeset(&store, len - 1).unwrap().node
+  };
+  let authored = Authored {
+    user: b"Client <c@example.com>",
+    seconds: 1,
+    branch: b"default",
+    message: b"one more",
+  };
+  let change = [Change {
+    path: b"one-more.txt",
+    after: Some((b"one more\n", crate::manifest::Flag::Regular)),
+    copied_from: None,
+  }];
+  let verified = made(
+    &crate::push::held::IndexHeld::new(&repository, &store),
+    tip,
+    &change,
+    &authored,
+    &mut room(),
+  )
+  .unwrap();
+  let payload = changegroup(&verified, &mut room()).unwrap();
+  let mut saved: BTreeMap<(Vec<u8>, Node), Vec<u8>> = BTreeMap::new();
+  let mut objects = Vec::new();
+  for rev in 0..repository.len(&store, Log::Changelog) {
+    let row = repository.changeset(&store, rev).unwrap();
+    let text = store.object_bytes(&row.text, row.len).unwrap();
+    saved.insert((super::CHANGELOG_PATH.to_vec(), row.node), text);
+    objects.push(row.text);
+  }
+  for rev in 0..repository.len(&store, Log::Manifest) {
+    let row = repository.revision(&store, Log::Manifest, rev).unwrap();
+    let text = repository
+      .revision_text(&store, Log::Manifest, rev)
+      .unwrap();
+    saved.insert((super::MANIFEST_PATH.to_vec(), row.node), text);
+    objects.push(row.bytes);
+  }
+  let let_go: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(let_go > 0, "objects let go");
+  let mut intake = Intake::begin(
+    (CHANGEGROUP_VERSION, &payload),
+    &mut repository,
+    &mut store,
+    &mut room(),
+  )
+  .unwrap();
+  let mut admission = room();
+  loop {
+    match intake.step(&payload, &mut store, &mut admission).unwrap() {
+      Stepped::Store => match intake.asked_text() {
+        Some(asked) if saved.contains_key(&asked) => intake.answer_text(saved.get(&asked).cloned()),
+        _ => intake.answer_from_fork(&store),
+      },
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  let (mut fork, intaken) = finished(intake);
+  let made_node = verified.changesets[0].node;
+  assert!(
+    fork.rev(&store, Log::Changelog, &made_node).is_some(),
+    "the made changeset taken"
+  );
+  assert!(intaken.log_texts_asked > 0, "a manifest asked of the store");
+  let _ = fork.rows();
+}
