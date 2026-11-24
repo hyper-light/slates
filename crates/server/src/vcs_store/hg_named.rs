@@ -361,6 +361,8 @@ struct Planning {
   changeset: Option<Node>,
   /// The bases to bring back, by the changeset that resolves them.
   plan: Vec<(Node, Vec<(Identity, String)>)>,
+  /// Each base planned, by its changeset: so each is planned once, found in log time.
+  planned: std::collections::BTreeSet<(Node, Identity, String)>,
 }
 
 impl Planning {
@@ -370,6 +372,7 @@ impl Planning {
       named: std::collections::BTreeMap::new(),
       changeset: None,
       plan: Vec::new(),
+      planned: std::collections::BTreeSet::new(),
     };
     let Some((_, checkpointed)) = state.db.partition().green_checkpoint(green) else {
       return planning;
@@ -450,9 +453,12 @@ impl Planning {
     let Some(changeset) = self.changeset.filter(|_| !held) else {
       return;
     };
+    if !self.planned.insert((changeset, identity, path.to_owned())) {
+      return;
+    }
     let entry = (identity, path.to_owned());
+    // The changesets a chain names are its pushes', a few; the files under each, many.
     match self.plan.iter_mut().find(|(at, _)| *at == changeset) {
-      Some((_, set)) if set.contains(&entry) => {}
       Some((_, set)) => set.push(entry),
       None => self.plan.push((changeset, vec![entry])),
     }

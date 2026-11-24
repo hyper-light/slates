@@ -1331,3 +1331,70 @@ fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
   );
   eprintln!("name oracle census: {:?}", census.into_inner());
 }
+
+/// Bound: the most a replay's choice of runs may take over [`REPLAY_RUNS`] whole files. Derived: the shard's liveness
+/// window, 1 s (`slates_server::daemon::LIVENESS_BUDGET_NS`), within which the watchdog finds a recovery's step stuck;
+/// the choice is one step of a recovery's replay of one entry.
+const REPLAY_CHOICE_NS: u128 = 1_000_000_000;
+/// Shape: the whole files a push of a history's tree names in one entry, a few thousand (Mercurial's tip holds about
+/// that many).
+const REPLAY_RUNS: usize = 2_000;
+
+/// A push's chain entry: `files` files created, each made whole of a run of its own, its object whole.
+fn pushed_whole(files: usize) -> (Increment, Vec<crate::chain_entry::Applied>) {
+  let len = 100u64;
+  let mut work = Increment {
+    id: [0; 32],
+    base: 0,
+    doc: crate::ops_doc::OpsDoc::new(),
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: crate::named::Named::default(),
+  };
+  let mut applied = Vec::with_capacity(files);
+  for at in 0..files {
+    let file = u64::try_from(at).unwrap();
+    work.named.runs.push(NamedRun {
+      identity: Identity {
+        hash: *blake3::hash(&file.to_le_bytes()).as_bytes(),
+        len,
+      },
+      offset: 0,
+      len,
+    });
+    let op = crate::ops_doc::Op {
+      kind: crate::ops_doc::OpKind::Overwrite,
+      flags: 0,
+      path: 0,
+      at: 0,
+      len,
+      src: file * len,
+    };
+    applied.push(crate::chain_entry::Applied::Created(
+      format!("f{at}"),
+      vec![op],
+    ));
+  }
+  (work, applied)
+}
+
+/// A-887 (main 01a20182's red of 2026-11-24 04:40: the 57k restart ended by the watchdog, shard 0 spinning 1,138 ms of
+/// CPU in its start's recovery). Do: choose which runs a replay reads (`Increment::replay_reads`) and which files it
+/// names whole (`Increment::named_whole_files`) for a push's entry of [`REPLAY_RUNS`] files, each whole of a run of its
+/// own. Expect: no run read, every file named, within [`REPLAY_CHOICE_NS`]. Failing first: the choice compared each run
+/// with every change and each change's place in every pair named, cubic in the files: 10.1 s at 1,000 runs, 480 s at
+/// 4,000 (debug, the MacBook).
+#[test]
+fn a_replays_choice_of_runs_is_linear_in_a_pushs_files() {
+  let (work, applied) = pushed_whole(REPLAY_RUNS);
+  let began = std::time::Instant::now();
+  let reads = work.replay_reads(&applied);
+  let named = work.named_whole_files(&applied);
+  let took = began.elapsed().as_nanos();
+  assert_eq!(reads.iter().filter(|read| **read).count(), 0, "no run read");
+  assert_eq!(named.len(), REPLAY_RUNS, "every file named");
+  assert!(
+    took <= REPLAY_CHOICE_NS,
+    "{took} ns past {REPLAY_CHOICE_NS} for {REPLAY_RUNS} files"
+  );
+}

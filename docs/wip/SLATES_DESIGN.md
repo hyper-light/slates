@@ -58087,7 +58087,10 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   base and from any), its object whole, and read by no other change nor by a payload of the document (an attribute's,
   a node's, a link's value). The replay reads those (`read_step_among`), the apply waits on those alone
   (`unread_among`), and a recovery's pre-pass brings back no other (`svn_texts::named_lacking`). The post-state places
-  each run by its declared length (`named::Post`), so a run never read moves no later run's address. Red:
+  each run by its declared length (`named::Post`), so a run never read moves no later run's address. The choice is n log
+  n in the entry's operations (a whole operation's run found by halving the runs' ascending spans, each run's other
+  readers marked in one pass): first written cubic, it ran past a shard's liveness window on a push of a history's
+  tree (docs/bugs/2026-11-24-a-replays-choice-of-named-runs-was-cubic-in-a-pushs-files.md). Red:
   `repository::hg_push::tests::a_restart_replays_a_push_naming_its_files_without_reading_their_texts` (the green fenced
   `ContentMissing { version: 1 }`, the push's runs read from a content store that had let them go).
 
