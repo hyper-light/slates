@@ -18,6 +18,8 @@
 use std::hash::{DefaultHasher, Hasher};
 use std::mem::size_of;
 
+use crate::index::TIER_BASE;
+
 /// Shape: the bits of a filter's word.
 const WORD_BITS: u64 = u64::BITS as u64;
 
@@ -77,14 +79,17 @@ pub(crate) struct KeyFilter {
 
 impl KeyFilter {
   /// Derived: a filter for `rows` keys in a store of `budget` bytes. Each row takes a byte of the budget at least, so
-  /// an index holds at most `budget` rows and its own runs number at most ⌊log₃ budget⌋ + 1 (the size-tiered bound
-  /// with a seal of one row at fewest); a lookup walks [`OWN_AND_SHARED`] times that, `R`. A key sets `k = ⌈log₂(2R)⌉`
+  /// an index's tables hold at most `budget` bytes and its own runs number at most ⌊log₃ budget⌋ + 1 (the size-tiered
+  /// bound, base [`TIER_BASE`], with a seal of one byte at fewest); a lookup walks [`OWN_AND_SHARED`] times that, `R`. A key sets `k = ⌈log₂(2R)⌉`
   /// bits ([`FALSE_RESOLVES_PER_MISS_INVERSE`] = 2), and the filter takes `k · log₂ e` bits a key, rounded up to whole
   /// words, so a miss passes a run with probability `2^-k ≤ 1/(2R)` and resolves under half a table over all `R`.
   /// For the 64 GiB budget of the intake harness: `R` = 46, `k` = 7, 10.1 bits a key. A size past the machine's
   /// words is no filter: it says yes to every key.
   pub(crate) fn sized(rows: u64, budget: u64) -> KeyFilter {
-    let own = budget.checked_ilog(3).unwrap_or(0).saturating_add(1);
+    let own = budget
+      .checked_ilog(TIER_BASE)
+      .unwrap_or(0)
+      .saturating_add(1);
     let walked = u64::from(own).saturating_mul(OWN_AND_SHARED);
     let Some(probes) = walked
       .saturating_mul(FALSE_RESOLVES_PER_MISS_INVERSE)

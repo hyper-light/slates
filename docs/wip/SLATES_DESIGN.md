@@ -6288,6 +6288,18 @@ reconnaissance because the touched partitions are named up front).
    cadence; a volume with policy `live-shipped` additionally ships its op log to f+1 of its
    candidates and is acknowledged at f+1.
 
+**An operation over several registers is acknowledged once every part is at f+1 (A-886).** A repository's push moves
+its names log and each green it moves, every one its own register. A push is answered only once each is held at f+1:
+the names log through its position, and each green's merge record through the version the push took it to
+(`state_log::names_committed`; until A-886 the names log alone, and a successor holding a push's names but not its
+greens' versions rebuilt the repository without it). The barrier waits on progress, not a clock: it gives up only
+after a whole window in which none of what it waits for moved (the versions placed, the holders' replica builds'
+turns done, the names log's acknowledgements), the window three passes of the record plane's pace over the shard as
+measured between its last two plus the plane's exchange budget, never under the commit's own deadline. Given up, each
+command the push applied is reported `ng <ref> unable to commit` in the client's own report (`git_push::UNCOMMITTED`),
+a typed answer it can act on and retry, never a dropped connection. At f = 0 every part is placed at its append and the
+barrier passes at once (R8).
+
 > **Status (2026-11-04, a commit returns at its quorum).** Every quorum dispatch (record commits, ledger promotions,
 > group rounds, content puts) is collected by a loop that is woken by each reply, not only by its poll: a dispatch
 > task sends its reply and wakes the collector (`ReplyTx`, `DispatchWait::keep_waiting` in `crates/cluster/src/lib.rs`).
@@ -11803,6 +11815,14 @@ the inputs were cut, so inputs that repeat a chunk's bytes (one chunk named at s
 they are; what the recomputation holds of them, the gathered bytes and the increment decoded from them, is charged to
 the holder's shard's budget before a byte is reserved and released once it has recomputed, and a record whose inputs
 the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose inputs are not yet held (A-383).
+A holder whose replica owes its push (a created ref's, P2) cannot judge a version after the owed one, so it makes the
+replica through the same door its owner makes the green (A-886): the owed push built over a replica store of the
+repository, its names-log parts replayed by the owner's own replay (`vcs_store::replica`, held equal to the owner's
+store by an oracle at every push and after a takeover adopts it), lazily when the first later version's record finds
+the replica owing, a turn at a time (`crate::replica_build`). While it builds, such a record is answered
+`ReplicaBuilding { object, sequence, slices_done }` on the shipment's own channel (`ContentMessage`, kind 10), the
+build's turns done so far, which only rise: the owner keeps the latest a holder, and a push's barrier reads it rising
+as progress. A takeover adopts the replica store as it stands, so it is warm.
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -29974,6 +29994,12 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
     - where they disagreed (a holder whose copy came after the move refuses it by name), the object was never promised
       and was given up, and the retirement was never confirmed, so the fleet never settled (the chaos nemesis, seeds
       14946995733817154046 and 8173581894251929445).
+  - **An adoption records its move (A-885, 2026-11-23).** A takeover's adoption makes the copy the successor's with
+    `Acceptor::adopt`, recording `MovedFrom { departed, retirement }` whatever the copy served before. A round lives
+    in its successor's memory, so a successor restarted warm before it confirmed its share runs the round again; its
+    adopted copy then falls there by that move, and the rerun counts the adoption as the successor's own promise
+    (re-adopting the object at the rerun's epoch) instead of refusing it by name and giving the object up. A round never
+    promises again what it adopted.
   - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
@@ -58790,6 +58816,8 @@ on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-lin
     on `crate::lease_wait`'s pattern). It runs again as each remake ends, told across shards while any waits. Its
     deadline is one remake's bound, its two exchanges at the learned answer bound, for each remake in flight when it
     parked. A create that would not fit even then is refused at once with the room there is.
+    **Since A-884 (2026-11-23, every platform)** a teardown in flight is room on the way too, at each of a create's
+    admissions (bytes, versions, metadata), and its remaining slices at a step's budget join the deadline.
   - Held by `a_create_the_moment_the_daemon_serves_is_admitted_on_windows` and
     `a_create_during_the_released_extents_remakes_waits_for_them_on_windows`, on a real one-shard anchor; red with the
     fix reversed and green with it on both runners (diag run 45260798132, the first create refused `BudgetExceeded { available: 5722144768 }` on windows-latest (5,720,506,368 on windows-11-arm) and the create during the remakes refused `{ available: 5713756160 }` (5,712,117,760) with the fix reversed, both admitted with it, and the Node SDK suites 8 of 8 on both). Applied in the same change to:
@@ -62335,6 +62363,112 @@ Applied in the same change to: A-879's record and its bug record (the piece it o
 `docs/cli.md`, `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`,
 `crates/server/src/{staging,verbs,fs_verbs,state}.rs`, `crates/db/src/partition.rs`, `crates/client/src/client.rs`,
 `crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`, `crates/client/tests/client.rs`, `crates/cli/tests/cli.rs`.
+
+### A-884 — A create sent at once after a destroy waits for the destroyed volume's teardown, whichever admission it met (2026-11-23, w-win2 for main 01a20182, its ruling of 2026-11-23, item 3b; §4.2, A-789)
+
+- **What was there.** A destroy is answered once its record says the volume is destroying; its teardown then frees the
+  volume's objects a slice a round of the shard's serve loop (`verbs::step_destroys`), and only the teardown's end gives
+  the volume's credits back (`verbs::release_slot_credits`): its byte reservation, its inode allowance and its records.
+  A create sent the moment the destroy was answered met them held and was refused `BudgetExceeded`, on every platform
+  (diag run 45251289894: `{ available: 1430536192 }`, the room less the destroyed volume's). The room wait of A-789
+  counted only the remakes of the pool's extents as room on the way, and only at the byte admission.
+- **The rule** (main's ruling): such a create waits for the teardowns in flight, bounded by their remaining slices at
+  the step budget. A create that would not fit even once they end is refused at once with the room there is.
+- **How.** Each of a bounded create's three admissions (bytes, versions, metadata: `room_wait::Room`) counts as room on
+  the way the credits of every volume its shard is destroying, as `release_slot_credits` will give them back
+  (`teardown_room`), and the bytes count the remakes too, as before. A create they would cover parks on A-789's pattern
+  and runs again when a teardown ends (`room_wait::teardown_ended`, from `step_destroys` once the credits are back). Its
+  deadline adds the teardowns' remaining slices at a step's budget apiece (`teardown_window_ns`) to the remakes' bound.
+  A volume's teardown counts its remaining slices at its last slice's pace (`Volume::destroy_slices_left`: its queued
+  objects over the objects that slice released, one before any slice ran, and the call that says `Done`); one not begun
+  yet counts its live inodes, each at least one object, since the destroy verb only records the volume as destroying and
+  its next destroy round builds the queue. The deadline moves on while the teardowns go on: a create run again after its
+  shard's teardown slices released objects since it parked (`room_wait::teardown_sliced`, from `step_destroys`) takes
+  the window from now, never sooner than the one it had. So a create waits at most the teardowns and one window, and is
+  refused once a whole window passes with nothing released. Released objects, not slices left, are the progress:
+  building a teardown's queue counts objects its live inodes did not (directory blocks among them), so the first
+  estimate of slices left can rise as the teardown begins, and run 21 on macOS refused a create its teardown was still
+  serving that way. A teardown on one shard gives room back on that shard alone, so nothing is told across shards.
+- **Evidence.** Diag run 45325253708 (2026-11-23, debug builds on ab3e18b65), on ubuntu, macOS and both Windows runners.
+  Red A, no teardown counted as room on the way: the create at once after a destroy refused `BudgetExceeded` (macOS `{
+  available: 1250033664 }` for 3,750,100,992 bytes of 5,000,134,656) and the held teardown's create never parked, on all
+  four. Red B, the deadline moved on with no progress: the bound test never ended, cut at 300 s (ubuntu, exit 124).
+  Green: the create after a destroy 5 of 5 rounds and the bound test 3 of 3 on all four; the held teardown's create
+  refused at its bound (parked, then expired once) after 0.7 to 1.4 ms on macOS and ubuntu and 2.0 s on windows-latest,
+  where the remakes' bound joins the window, and the same size admitted once the hold lifted; room_wait's unit test on
+  all four; the Windows extents file, its remake-window test among them, on both runners; clippy clean in A-884's files.
+  On this Mac (2026-11-23): the create at once after a destroy answered after 3.66 ms, parked once and resumed once.
+
+Applied in the same change to: A-789's record (its room wait), GAPS (item 3b's entry under A-789),
+`docs/bugs/2026-11-23-a-create-at-once-after-a-destroy-met-its-teardown.md`, `crates/vfs/src/volume.rs`,
+`crates/server/src/{room_wait,verbs,daemon,state}.rs`, `crates/client/tests/client.rs`.
+
+### A-885 — An adoption records its move, so a takeover round run again after a warm restart counts its own adoption (2026-11-23, w-chaos for main 01a20182, its ruling (1) (b) of 2026-11-23; amends A-251 (i); A-883, A-344)
+
+- **Why.** A takeover round lives in its successor's memory (`ShardState::host_takeovers`), so a successor restarted
+  warm before it confirmed its share runs the departed owner's round again from nothing. That rerun learned the
+  adopted volume from the third node's copy, which still falls in the round by its move, then asked itself by name
+  and refused: its own copy, made at the adoption, recorded no move, and A-251 keeps the asker's own objects out of
+  another host's round. The cohort's quorum needs both survivors, so the volume was never promised, was given up at
+  the failover SLO, and every write was held there. This was GAPS' load flake
+  `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`: 2 of 8 runs at load 50 in a diagnostic build,
+  and CI's ae43b42ea run on Windows x64.
+- **The rule (main's ruling (b): a restarted round counts its own adoption).** "A takeover round re-run after a crash
+  must reach the same end as the run it replaces."
+  - A takeover's adoption records the move it is (`takeover::adopted_acceptor`, `Acceptor::adopt`): the departed
+    owner's object moved to its successor at that retirement. The record is persisted with the acceptor.
+  - A rerun therefore lists the adopted copy as the successor's own promise (`promise_local_copies`) and answers it by
+    name. The volume is ready with the other survivor's promise and adopted again at the rerun's epoch. Nothing is
+    given up.
+  - A round never promises again what it adopted (`promise_local_copies` leaves its `adopted` set out), so a round
+    started over above its epoch never fences an adoption its successor writes under.
+  - A moved volume's adoption (A-291) records no move. A later retirement of the same host never counts this one
+    (A-883).
+- **Why the rerun's second adoption is harmless (main's ruling of 2026-11-23).**
+  - The rerun adopts the object again at its own epoch, one above the first run's, and fences its holders there.
+  - That is not A-883's spurious self-takeover coming back. There, a live owner's own object was taken over again by
+    another host's later round, with its requests in flight.
+  - Here, the warm restart has already ended every request in flight from the first run. So the extra fence costs
+    nothing a client can see beyond the restart itself, and the successor's next writes go out under the new epoch.
+- **Rejected (main's ruling):** clearing a copy's move once its successor has written it (A-484's ownership rule).
+  That widens what a move means for every copy, and still misses a restart that comes before any write.
+- **Tests** (adacachy2):
+  - `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (`crates/server/src/daemon.rs`):
+    adopt as the round does, restart warm from the held image, and ask the rerun's question by name. Red with the move
+    not recorded (refused 1, nothing answered); green (the adopted record answered, nothing refused).
+  - `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted` (`crates/server/tests/fleet.rs`):
+    the successor withholds its confirmation until its restart. Green 2 of 2 runs whose setup completed: the write
+    answered, every file read, the registers re-adopted at the rerun's epoch, nothing given up.
+- **Applied in the same change to:**
+  - `crates/db/src/register.rs`: `Acceptor::adopt`.
+  - `crates/server/src/takeover.rs`: `adopted_acceptor`, `commit_adopted`, `commit_adopted_at`, `adopt_at`,
+    `promise_local_copies`.
+  - `crates/server/src/daemon.rs` and `crates/server/tests/fleet.rs`: the tests, `restarted_successor_owing`.
+  - A-251 (i)'s text.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md.
+
+### A-886 — A holder makes a replica that owes its push from the repository's records, and a push is answered once every part it moved is at f+1 (2026-11-23, w-git; main 01a20182's rulings of 2026-11-23 17:27, 18:55, 20:00 and 20:28; A-724 piece 8c, A-812, A-813, A-884)
+
+w-chaos's `v3_takeover` lost acknowledged pushes 1 and 2 of 3 at f = 1, 7 of 7 runs: the push barrier waited for the
+names log alone, while each push also moved `main`'s green, whose versions 2 and 3 never placed. The holders' counters
+named why (`merge.replica.owes` about 1,173 a holder): `main`'s version 1 was a deferred push (P2), the holders'
+replicas owed it, and a replica that owes cannot judge the increment after it (A-813's open limit). Now:
+1. The barrier waits for every green the push's operations moved, through the version they took it to, beside the
+   names log (`StateLogs::note_greens`, `greens_placed`), giving up only after a window with no progress, from the
+   record plane's live pace (`state_log::Waited`, `barrier_window_ns`), and then reporting `ng <ref> unable to commit`.
+2. A holder whose replica owes makes it when a later version needs it: a replica store of the repository from the
+   names-log parts it holds (`vcs_store::replica`; every replay reads its records through `vcs_store::object_record`,
+   the partition's or these), then the owed push's build over it (`replica_build`); a takeover adopts the store.
+3. A record waiting on that build is answered `ReplicaBuilding { object, sequence, slices_done }` (work done, never
+   work left, which can rise as a build finds more, A-884), which the owner keeps a holder and the barrier reads.
+Rejected: a holder accepting a version after an owed one unjudged (it breaks "every holder recomputes before
+accepting"), and materializing eagerly at f > 0 (a mode switch, R8).
+
+Applied in the same change to: §4.8 (an operation over several registers); §4.16 (Apply on holders); `slates-cluster`
+(`ContentMessage::ReplicaBuilding`, its golden vector and refusals); `slates-server` (`state_log`, `vcs_store`,
+`vcs_store::replica`, `replica_build`, `merge_service`, `fleet::serve_merge_shipment`, `takeover::rebuild_repository`,
+`git_push::uncommitted_report`, the HTTP and SSH receive drivers); GAPS (A-812 (b)).
 
 ### A-888 — A submit to a Subversion repository's green outside a recorded request is refused `RecordedSubmitRequired`; the path that committed a version and landed its revision after it is gone (2026-11-23, w-svn for main 01a20182, its rulings of 2026-11-23 20:32 and 20:40: the store is the truth, with no second path; goal 93's C2; A-805, A-804, A-664)
 

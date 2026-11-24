@@ -50,15 +50,12 @@ use std::time::{Duration, Instant};
 
 use crate::Failure;
 
-/// The export leg (AUD-29-75's kernel leg), a child module so it reuses the lane's machinery.
 #[path = "kind_export.rs"]
 mod export;
 
-/// The direct leg (the DAX matrix's Kubernetes socket-route cells), a child module for the same reason.
 #[path = "kind_direct.rs"]
 mod direct;
 
-/// The live leg (live-shipped writes under the WAN profiles, with the register invariants), a child module likewise.
 #[path = "kind_live.rs"]
 mod live;
 

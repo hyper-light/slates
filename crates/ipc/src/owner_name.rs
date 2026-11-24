@@ -1,7 +1,9 @@
-//! The owner's token on macOS (§4.7, A-176; GAPS "macOS takes a live owner's rendezvous over"): a Mach bootstrap name
-//! that launchd gives to its first registrant and takes back when that registrant's port dies, so at most one live
+//! The owner's token on macOS (§4.7, A-176, A-178; GAPS "macOS takes a live owner's rendezvous over"): a Mach bootstrap
+//! name that launchd gives to its first registrant and takes back when that registrant's port dies, so at most one live
 //! process owns an instance's rendezvous, as the named Event token makes it on Windows (`rendezvous.rs` `Owner`) and the
-//! abstract address on Linux.
+//! abstract address on Linux. It is registered once in its owner's life, and its port carries only a claim's hand-off
+//! of a client's region (`mach_claim.rs`, A-233), never a verb's request or reply, which cross the rings: so D-10's
+//! refusal of Mach messages as the request transport does not reach it.
 //!
 //! **Why a bootstrap name.** The rendezvous's bootstrap object is a POSIX shared-memory object: its name lives until it
 //! is unlinked, and no lock can be taken on it (measured 2026-10-26 on macOS 26: `flock` on its descriptor answers

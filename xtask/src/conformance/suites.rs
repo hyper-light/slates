@@ -145,11 +145,8 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       bounds,
     )?);
   }
-  let (alive, live_note) = session.alive_and_shipped();
-  if !alive {
-    notes.push("the daemon stopped answering, or a live-shipped run did not ship".to_owned());
-  }
-  notes.extend(live_note);
+  let after = session.after_run();
+  notes.extend(after.notes);
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
@@ -175,7 +172,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     expected_failure_list: Some(digest),
     notes,
-    ok: judgement.acceptable() && alive,
+    ok: judgement.acceptable() && after.ok,
   })
 }
 
@@ -347,22 +344,13 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     output.as_bytes(),
   )?;
   let verdict = judge_fsstress(success, &output);
-  let (alive, live_note) = session.alive_and_shipped();
-  let ok = verdict.ok && alive;
-  let mut notes = vec![
-    built.built.note,
-    format!("the daemon answered `volume list` after the run: {alive}"),
-  ];
+  let after = session.after_run();
+  let ok = verdict.ok && after.ok;
+  let mut notes = vec![built.built.note];
   if !verdict.ok {
     notes.push(format!("fsstress output tail: {}", verdict.detail));
   }
-  if !alive {
-    notes.push(format!(
-      "the daemon stopped answering during the run; anchor log tail:\n{}",
-      session.anchor_log_tail()
-    ));
-  }
-  notes.extend(live_note);
+  notes.extend(after.notes);
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
@@ -765,13 +753,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     }
     parsed.push(parse_file(&relative, &output, &runner));
   }
-  let (alive, live_note) = session.alive_and_shipped();
-  let daemon_note = (!alive).then(|| {
-    format!(
-      "the daemon stopped answering during the run; anchor log tail:\n{}",
-      session.anchor_log_tail()
-    )
-  });
+  let after = session.after_run();
   let size_note = session.size_note.clone();
   drop(session);
   let command = format!(
@@ -788,8 +770,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   );
   let mut notes = vec![tree.note];
   notes.extend(probe);
-  notes.extend(daemon_note);
-  notes.extend(live_note);
+  notes.extend(after.notes);
   notes.extend(size_note);
   judged_pjdfstest(
     run,
@@ -798,7 +779,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       runner,
       files: files.len(),
       timed_out,
-      alive,
+      after_ok: after.ok,
       command,
       notes,
     },
@@ -953,8 +934,9 @@ pub(crate) struct Ran {
   pub(crate) files: usize,
   /// The files that passed their bound.
   pub(crate) timed_out: Vec<String>,
-  /// Whether the daemon answered after the run.
-  pub(crate) alive: bool,
+  /// Whether the daemon answered after the run and, for a live-shipped session, the run shipped
+  /// ([`super::slates::AfterRun`]).
+  pub(crate) after_ok: bool,
   /// The record's command.
   pub(crate) command: String,
   /// The run's own notes (the build, the daemon, the volume's size).
@@ -972,7 +954,7 @@ pub(crate) fn judged_pjdfstest(
     runner,
     files,
     timed_out,
-    alive,
+    after_ok,
     command,
     mut notes,
   } = ran;
@@ -985,7 +967,8 @@ pub(crate) fn judged_pjdfstest(
   for id in &judgement.listed_now_passing {
     println!("pjdfstest: listed but now passing {id}");
   }
-  let ok = judgement.acceptable() && tally.incomplete.is_empty() && timed_out.is_empty() && alive;
+  let ok =
+    judgement.acceptable() && tally.incomplete.is_empty() && timed_out.is_empty() && after_ok;
   notes.insert(1.min(notes.len()), judgement.describe());
   if tally.failed > 0 {
     notes.push(shape_note(&tally.cases));

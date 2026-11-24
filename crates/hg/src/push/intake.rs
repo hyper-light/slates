@@ -129,9 +129,13 @@ pub struct Intaken {
   pub spread: u64,
   /// The fork's runs merged by the size-tiered rule as the push sealed them ([`Taker::merge_step`]).
   pub tiered_merges: u64,
-  /// The most runs only the fork held after any step: what a lookup of a new row walked past its parent's runs, held
-  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its rows.
+  /// The most runs only the fork held where no merge was due: what a lookup of a new row walked past its parent's runs,
+  /// held within [`slates_vcs::Index::tiered_due`]'s logarithm of its own tables' bytes.
   pub most_own_runs: u64,
+  /// The most runs only the fork held after any step, a merge due or under way: at most one past
+  /// [`Intaken::most_own_runs`]'s bound (the run a seal wrote, until the merge it made due ends; Derived in
+  /// [`slates_vcs::Index::tiered_due`]).
+  pub most_own_runs_in_flight: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -1348,7 +1352,7 @@ impl Taker {
   /// ([`slates_vcs::Index::tiered_due`]), or its begin, between revisions; none where none is due. Every append seals
   /// the fork's tail when due (`HgIndex::insert`), each seal a run, and a lookup walks every run: unmerged, a push's
   /// runs grew a seal at a time and each new row's lookup with them (arena-14: shard 0 spun past 1 s in a segment step).
-  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step (each step puts
+  /// Merged so, the fork's own runs stay within the rule's logarithm of its own bytes, a table's work a step (each step puts
   /// one table or gives one back). A push refused or given back drops its merge with the fork, whose release gives back
   /// what the merge put.
   fn merge_step(&mut self, store: &mut ContentStore) -> Result<Option<Stepped>, Refused> {
@@ -1371,8 +1375,10 @@ impl Taker {
       return Ok(Some(Stepped::More));
     }
     let own = to_u64(self.fork.rows().own_runs());
-    self.intaken.most_own_runs = self.intaken.most_own_runs.max(own);
+    self.intaken.most_own_runs_in_flight = self.intaken.most_own_runs_in_flight.max(own);
     let Some(runs) = self.fork.rows().tiered_due() else {
+      // No merge due: the runs are at the rule's invariant, where its bound holds.
+      self.intaken.most_own_runs = self.intaken.most_own_runs.max(own);
       return Ok(None);
     };
     let begun = self

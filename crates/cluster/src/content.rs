@@ -120,6 +120,8 @@ const KIND_STAGED: u8 = 7;
 const KIND_FETCH_CHUNK: u8 = 8;
 /// Format: the kind byte of a fetched chunk.
 const KIND_PIECE: u8 = 9;
+/// Format: the kind byte of a holder's answer to a merge record that waits on its replica's build (A-813's limit).
+const KIND_REPLICA_BUILDING: u8 = 10;
 /// Format: the width of a BLAKE3 identity on the wire.
 const HASH_BYTES: usize = 32;
 /// Format: the width of an object id on the wire.
@@ -205,6 +207,18 @@ pub enum ContentMessage {
     manifest: [u8; 32],
     /// The chunk.
     chunk: Chunk,
+  },
+  /// A holder's answer to a merge record it cannot judge yet because its replica of the green owes its push and is
+  /// being made (A-813's limit; main 01a20182's ruling of 2026-11-23 20:28): the record waits, and the build's turns
+  /// done so far tell its owner it progresses. Work done, never work left, which can rise as a build finds more to do
+  /// (w-win2's A-884) and read as none. Sent only while a record waits on a build, so never at `f = 0`.
+  ReplicaBuilding {
+    /// The green whose record waits.
+    object: ObjectId,
+    /// The version the record is of.
+    sequence: u64,
+    /// The turns the replica's build has done, rising while it runs.
+    slices_done: u64,
   },
 }
 
@@ -496,6 +510,16 @@ impl ContentMessage {
         out.extend_from_slice(manifest);
         put_chunk(&mut out, chunk);
       }
+      ContentMessage::ReplicaBuilding {
+        object,
+        sequence,
+        slices_done,
+      } => {
+        out.push(KIND_REPLICA_BUILDING);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(&slices_done.to_le_bytes());
+      }
     }
     out
   }
@@ -551,6 +575,11 @@ impl ContentMessage {
         object: reader.object()?,
         manifest: reader.hash()?,
         chunk: reader.chunk()?,
+      },
+      KIND_REPLICA_BUILDING => ContentMessage::ReplicaBuilding {
+        object: reader.object()?,
+        sequence: reader.u64()?,
+        slices_done: reader.u64()?,
       },
       kind => return Err(ContentError::UnknownKind { kind }),
     };
@@ -4013,7 +4042,42 @@ mod tests {
         manifest: hash(1),
         chunk: Archive::raw_chunk(b"a piece".to_vec()),
       },
+      ContentMessage::ReplicaBuilding {
+        object: OBJECT,
+        sequence: SEQUENCE,
+        slices_done: 3,
+      },
     ]
+  }
+
+  /// Golden vector (§4.9): a replica build's progress answer's bytes are fixed (kind, object, sequence, the turns done),
+  /// so an owner reads every holder's alike; and a decoder that predates a kind refuses it typed, as this one refuses a
+  /// kind past its own (`oversized_counts_unknown_kinds_and_trailing_bytes_are_refused`), never a panic.
+  #[test]
+  fn a_replica_build_answer_has_a_golden_encoding() {
+    let bytes = ContentMessage::ReplicaBuilding {
+      object: ObjectId([0xAA; 16]),
+      sequence: 0x0304,
+      slices_done: 0x0506,
+    }
+    .encode();
+    let mut expected = vec![KIND_REPLICA_BUILDING];
+    expected.extend_from_slice(&[0xAA; 16]);
+    expected.extend_from_slice(&0x0304u64.to_le_bytes());
+    expected.extend_from_slice(&0x0506u64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(
+      ContentMessage::decode(&[KIND_REPLICA_BUILDING.saturating_add(1)]),
+      Err(ContentError::UnknownKind {
+        kind: KIND_REPLICA_BUILDING.saturating_add(1)
+      })
+    );
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert_eq!(
+      ContentMessage::decode(&trailing),
+      Err(ContentError::BadLength)
+    );
   }
 
   #[test]

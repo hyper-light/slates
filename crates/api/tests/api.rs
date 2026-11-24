@@ -32,14 +32,14 @@ use slates_api::{
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// A software SSH signer (A-321), shared with the daemon's own signed-work tests; not every helper is used here.
+// A software SSH signer (A-321), shared with the daemon's own signed-work tests; not every helper is used here.
 #[path = "../../server/tests/common/signer.rs"]
 #[allow(dead_code)]
 mod signer;
 
-/// The daemon's own test VMM (§4.6, G-vhost): a guest driver over real virtqueues and the vhost-user front end that
-/// speaks for it, shared with the server's virtio-fs suite and the CLI's live-shipping flow; not every helper is used
-/// here. Linux only, as the vhost-user form is.
+// The daemon's own test VMM (§4.6, G-vhost): a guest driver over real virtqueues and the vhost-user front end that
+// speaks for it, shared with the server's virtio-fs suite and the CLI's live-shipping flow; not every helper is used
+// here. Linux only, as the vhost-user form is.
 #[cfg(target_os = "linux")]
 #[path = "../../server/tests/common/guest.rs"]
 #[allow(dead_code)]

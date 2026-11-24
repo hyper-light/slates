@@ -561,11 +561,19 @@
 > reversed and green with it on both runners (diag run 45260798132: the first create refused `{ available: 5722144768 }`
 > on windows-latest and the create during the remakes `{ available: 5713756160 }`, both admitted with the fix; the Node
 > SDK suites 8 of 8 on both; `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`). The
-> extents file runs on both Windows lanes now, its commit give-back test among them since A-879's fix. **Owed
-> (item 3b, main's ruling):** a create sent at once after a destroy meets the teardown, which holds the volume's
-> reservation past the destroy's answer, and is refused `BudgetExceeded` on every platform (diag run 45251289894:
-> `{ available: 1430536192 }`, the room less the destroyed volume's). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
-> depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
+> extents file runs on both Windows lanes now, its commit give-back test among them since A-879's fix. **Fixed
+> 2026-11-23 (A-884, item 3b, main's ruling): a create sent at once after a destroy met the teardown**, which held the
+> volume's reservation, inode allowance and records past the destroy's answer, and was refused `BudgetExceeded` on every
+> platform (diag run 45251289894: `{ available: 1430536192 }`, the room less the destroyed volume's). Now each of a
+> create's admissions counts the teardowns in flight on its shard as room on the way, and a create they would cover
+> parks until a teardown ends, bounded by their remaining slices at a step's budget. Red then green (diag run
+> 45325253708, all four runners): with no teardown counted the create was refused and the held teardown's create never
+> parked; with the deadline moved on without progress the bound test never ended (cut at 300 s); green, the create after
+> a destroy 5 of 5 rounds and the held teardown's create refused at its bound, 3 of 3, in 0.7 to 1.4 ms on macOS and
+> ubuntu and 2.0 s on windows-latest, the remakes' bound joining the window there
+> (`docs/bugs/2026-11-23-a-create-at-once-after-a-destroy-met-its-teardown.md`).
+> **Open (R2, found 2026-11-20 19:45):** the macOS give-back depends on the machine: recovery's
+> `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
 > fall of two bursts) both kept RAM, 591 and 340 MiB after the destroy (big Studio, branch agents/w-sizing-r2hold,
@@ -800,6 +808,12 @@
 > test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
 > recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
 > `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
+> **A synchronous history's landing held its shard past the watchdog's window (2026-11-24, w-ci; OPEN until every site
+> moves).** `create_blocking`, `land_blocking` and `land_segments_blocking` wait in a `join` on the shard's own thread
+> while the store commits. An `fdatasync` longer than the 1000 ms window then ends the test binary with the watchdog's
+> exit 4 (w-tsan: 1 of 100 `daemon_edge` runs at load 47; reproduced 3 of 3 on adacachy2 with the store's `fdatasync`
+> delayed 1.5 s). `daemon_edge`'s creations moved to `create_on`, which waits on the test's thread; about 45 sites in
+> other files follow. Record: `docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md`.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
 > `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
@@ -1093,8 +1107,14 @@
 >   never merged, so each new row's lookup walked them all and a segment step grew with the push (arena-14: shard 0 past
 >   1 s in `hg_push::segment`, the daemon killed). Now every append seals when due through one insert
 >   (`HgIndex::insert`, import's own seal gone), and the fork's runs are merged by a size-tiered rule as it goes
->   (`slates_vcs::Index::tiered_due`: the newest merged while their rows together are at least half the next older's;
->   Derived: at most ⌊log₃(own rows ÷ the fewest a seal writes)⌋ + 1 own runs), a table a step between revisions
+>   (`slates_vcs::Index::tiered_due`: the newest merged through the deepest own run at most twice the bytes of all newer
+>   own runs together, since r618 held 8 where the bound is 6 when the rule stopped at the first older run past its share
+>   (`a_tiered_merge_restores_its_invariant_for_every_run_however_deep_the_seal_breaks_it`); Derived: where no merge is
+>   due, at most ⌊log₃(own bytes ÷ the fewest bytes a seal writes)⌋ + 1 own runs, one more until a due merge ends
+>   (`vcs.hg.push_most_own_runs`, `_in_flight`); weighed in bytes since
+>   goal 93 (B), as a seal is due by bytes: in rows, r499 held 8 own runs where the row bound computed 6, and
+>   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_bytes_whatever_its_rows_sizes` held 8 where the
+>   bytes bound is 5, each phase of larger rows keeping a stack of its own), a table a step between revisions
 >   (`Taker::merge_step`, `Intaken::tiered_merges`, `most_own_runs`). Held by
 >   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows` (slates-vcs, 2,000 rows: red 2 runs past the
 >   bound after 2 seals) and push_heap's
@@ -1152,6 +1172,15 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
+>   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
+>   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no
+>   debt and no hold). The pool's claim returned at the first extent it claimed and could not hand out, so the arena's
+>   growth came up short and gave back what it took, refusing the admission whole. Now a refused map is counted, the
+>   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
+>   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
+>   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
+>   makes each extent's object afresh at a claim after a release), should refusals remain.
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
@@ -1396,6 +1425,14 @@
 > windows are (`t_…a_shallow_clone_of_a_chained_file_let_go_is_whole_at_each_depth`, depths 1 and 8, the fetch
 > answering without waiting for the encoding as git/git's did: red before, git's abort words). Owed: main's rerun of
 > r130's verbs with the lift on.
+> A ref listing waits for nothing a fetch reads BUILT (2026-11-23, w-git; main 01a20182's r405: stock `git ls-remote`
+> right after git/git's whole push took 29 to 54 s in every run, where stock lists its 4,451 refs in under a second).
+> Every upload-pack request but the advertisement derived the repository's unwalked versions whole and waited up to a
+> liveness window on its encoding (A-718's `encode`), a v2 `ls-refs` too; the SSH edge did it at each session's start.
+> Now only a request that may fetch waits (`vcs_http::git::upload::fetches`: every request before v2, and a v2 request
+> naming `fetch` or no command this crate reads; `slates_git::v2::request::command_of`), and SSH before its session's
+> first fetch (`a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding`: 4 turns during the listing before, 0
+> after, the fetch after it still readying the store). Owed: main's rerun of r405's push answer to refs listable.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -1654,7 +1691,14 @@
 > - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,
 >   and a holder's replica owes the same push at the base's identity, so a takeover adopts a green that owes it
 >   (`a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`).
->   OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
+>   BUILT, A-813's limit (A-886, w-git, 2026-11-23): a holder makes a replica that owes when a later version's record
+>   needs it, from a replica store of the repository its names-log parts make (held equal to the owner's store by an
+>   oracle), through the same door; a record waiting on it answers `ReplicaBuilding`, and a push's barrier waits for
+>   every green it moved (`v3_takeover` passes at f = 1, debug, macOS arm64, locally: both holders began and made a
+>   replica, 14.2 and 17.3 ms from begun to made, 877 and 1,468 turns, most waiting out the replica store's sliced
+>   replay; 3 versions waited; the takeover made its store again rather than adopting, its parts cut by `whole_parts`).
+>   Owed: main's release and debug gate; the build's time for git/git's history at f = 1.
+>   Was OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
 >   replica cannot judge it, so the record is refused (`merge.replica.owes`, counted) and waits for placement until a
 >   holder's replica is made. Before A-813 the owed version itself never placed. The fix: a holder makes its replica
 >   through the same door over its tool's objects, which needs the repository's store on holders (w-git, w-store).
@@ -1865,6 +1909,17 @@
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
+> Lost again at ae43b42ea (w-chaos, 2026-11-23, `v3_takeover` 7 of 7): the barrier waited for the names log alone, while
+> a push also moves its greens, whose versions stood at version 1 at both survivors while pushes 1 and 2 were answered, so
+> the successor's rebuild (`whole_parts`, a green's span judged by its head) kept push 0 only. Fixed (w-git, main
+> 01a20182's ruling): the barrier (`state_log::names_committed`, all three answer paths) also waits until every green the
+> repository's operations moved is placed at f + 1 through the version they took it to (`StateLogs::note_greens` as the
+> records are taken, `greens_placed` against `merge.placed`; `a_push_is_held_until_every_green_it_moved_is_placed_…`).
+> Its first gate (GitHub 45312465577) found the barrier right and what it waited for never placing: a holder's replica
+> owing its push could not judge the next version (A-813's limit), now built (A-886, below under A-812 (b)). The barrier
+> gives up only after a window with no progress, from the record plane's live pace, and answers `ng <ref> unable to
+> commit` (`a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off`). Owed: main's gate again, release and
+> debug.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -4621,8 +4676,15 @@
 > - `info`'s entries compared in stock svn's hash order, which APR seeds afresh each run;
 > - a working copy's symbolic link read through as a file (`IsADirectory` over git-2000).
 >
-> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Owed:** main's rerun of the
-> use test over HTTP with reads.dump and git-2000.dump.
+> See `docs/bugs/2026-11-23-the-svn-use-test-compared-hash-order-and-read-through-links.md`. **Rerun (main's r546, at
+> c40775ea2):** reads.dump passed, 0 differences over all 14 verbs. git-2000.dump was killed at its 5,400 s bound, the
+> test thread sleeping in the harness's poll between `svn` children. Each stock command's wait is now a blocking wait
+> on its exit, not a stretched poll, and each verb prints its time and each leg's share as it goes
+> (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). Blame was of every file at every
+> sample, 155,904 commands over git-2000 (4,872 files × 16 samples × 2 legs). By main 01a20182's ruling it is now of
+> the files each sampled revision changed, or those of the nearest earlier change (`blamed_files`,
+> `files_changed_in`), the count printed at each sample. **Owed:** the sizing run (a diag lane on ubuntu-latest,
+> stock svn 1.15 built in the job), then git-2000's rerun on the big Studio, its bound derived from the per-verb lines.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -7652,8 +7714,15 @@
 >   adoption made that copy its own, owner itself and no move. So the volume was never promised and was given up ("the
 >   takeover of the creator's objects gave up 2 of them"), and every write was held until the SLO. A-883's version check
 >   refused no copy in those runs. CI's ae43b42ea run, before A-883, logged the same give-up on Windows x64.
->   **Open, reported to main:** a copy the successor has since written (its adoption placed) should no longer fall by its
->   move, or a restarted round should count its own adoption.
+>   **FIXED 2026-11-23 (w-chaos; A-885, main's ruling (b): a restarted round counts its own adoption).** The adoption
+>   records the move it is (`Acceptor::adopt`, `MovedFrom { departed, retirement }`), so the rerun lists and answers it
+>   as the successor's own promise, re-adopts the volume at its epoch and gives nothing up. A round never promises again
+>   what it adopted. Deterministic red:
+>   `a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again` (refused 1, then answered). Fleet
+>   leg: `a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted`, the successor withholding its
+>   confirmation until its restart. Record: `docs/bugs/2026-11-23-a-successor-restarted-warm-gave-up-the-volume-it-had-adopted.md`.
+>   **Still open (harness):** under load 55 to 73 on adacachy2 the scene's setup attach (`write_attachment`) and its
+>   single-try reads (`continuity_read`) meet `Overloaded { shard: 1 }`, a retryable refusal neither retries.
 > - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
 >   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
 >   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
@@ -10468,9 +10537,18 @@
 > `docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`.
 > - Not a defect: the candidates' `durable=none` in the record. Every held copy reports no durable position, and the
 >   harness reads only the candidates' heads.
-> - **Open (the harness's):** a live run's record says "the daemon answered `volume list` after the run: false" and "the
->   daemon stopped answering during the run" whenever the log did not catch up, because `Session::alive_and_shipped`
->   returns the two answers as one flag. The daemon answered `status` throughout.
+> - **Closed (the harness's, 2026-11-24, w-ci):** a live run's record said "the daemon answered `volume list` after the
+>   run: false" and "the daemon stopped answering during the run" whenever the log did not catch up, because
+>   `Session::alive_and_shipped` returned the two answers as one flag; the daemon answered `status` throughout. Every
+>   suite's record now takes both from `Session::after_run`, which notes each on its own; the live note keeps each
+>   node's whole `live` status line (holders, fence, recorded holders), and the container lane keeps fsstress's output in
+>   its scratch, as the host lane does. Test: `a_record_says_whether_the_daemon_stopped_or_the_fleet_did_not_ship`.
+> - **Open (w-ci, 2026-11-24): the lane still fails after the fix, with one candidate left behind.** Run 45318320246 at
+>   1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s fleet wait the
+>   owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at 2149. The same
+>   shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083). The
+>   live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job steps),
+>   so it is no regression of that window; the cause is being looked for.
 > - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
 >   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
 

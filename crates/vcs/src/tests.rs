@@ -12,7 +12,7 @@ use crate::arrival::{
 use crate::content::{ContentId, ContentRefused, ContentStore, Form, IDENTITY_BYTES};
 use crate::index::{
   AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, MergeStep,
-  NewRow, TAIL_SLOT_BYTES,
+  NewRow, TAIL_SLOT_BYTES, TIER_RATIO,
 };
 use crate::table::{RowRef, encode_body};
 
@@ -851,6 +851,13 @@ fn a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put() {
   index.release(&mut store).unwrap();
   assert_empty(&store);
 
+  assert_a_merge_refused_over_budget_gives_back_what_it_put(&before);
+}
+
+/// The last step of [`a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put`]: over a store whose budget
+/// leaves room for one merged table beside the runs, step a merge until it is refused. Expect: refused over budget, the
+/// store's contents and bytes as before it began, every row read back as `before`, and the store empty once released.
+fn assert_a_merge_refused_over_budget_gives_back_what_it_put(before: &[(Vec<u8>, Vec<u8>)]) {
   let runs_use = {
     let mut store = ContentStore::new(1 << 20, WINDOW).unwrap();
     let index = forty_rows_in_runs(&mut store);
@@ -891,6 +898,25 @@ fn scattered_key(at: u64) -> [u8; 8] {
   (mixed ^ (mixed >> 31)).to_be_bytes()
 }
 
+/// An index of [`FILTERED_ROWS`] scattered keys ([`scattered_key`]), sealed when due and merged as the size-tiered rule
+/// names after each seal, then sealed whole: several runs, as a push's fork leaves them.
+fn scattered_rows_in_runs(store: &mut ContentStore) -> Index {
+  let mut index = Index::new();
+  for at in 0..FILTERED_ROWS {
+    let key = scattered_key(at);
+    index.insert(store, row(&key, &[], b"payload")).unwrap();
+    if index.seal_due(store) {
+      index.seal(store).unwrap();
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(store, runs).unwrap().unwrap();
+        while index.merge_step(store, &mut merge).unwrap() == MergeStep::More {}
+      }
+    }
+  }
+  index.seal_all(store).unwrap();
+  index
+}
+
 /// Shape: the rows the resolves test appends, and the absent keys it looks up.
 const FILTERED_ROWS: u64 = 600;
 /// Shape: see [`FILTERED_ROWS`].
@@ -906,21 +932,7 @@ const ABSENT_LOOKUPS: u64 = 2_000;
 #[test]
 fn a_lookup_of_a_key_no_run_holds_resolves_almost_no_table() {
   let mut store = store();
-  let mut index = Index::new();
-  for at in 0..FILTERED_ROWS {
-    let key = scattered_key(at);
-    index
-      .insert(&mut store, row(&key, &[], b"payload"))
-      .unwrap();
-    if index.seal_due(&store) {
-      index.seal(&mut store).unwrap();
-      while let Some(runs) = index.tiered_due() {
-        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
-        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
-      }
-    }
-  }
-  index.seal_all(&mut store).unwrap();
+  let index = scattered_rows_in_runs(&mut store);
   let runs = index.run_tables().len();
   assert!(runs >= 3, "runs to walk: {runs}");
   let before = index.counters();
@@ -948,6 +960,129 @@ fn a_lookup_of_a_key_no_run_holds_resolves_almost_no_table() {
   );
   index.release(&mut store).unwrap();
   assert_empty(&store);
+}
+
+/// The bytes of the tables of every run of `index`.
+fn table_bytes(index: &Index, store: &ContentStore) -> u64 {
+  index
+    .run_tables()
+    .iter()
+    .flatten()
+    .filter_map(|table| store.len_of(table))
+    .sum()
+}
+
+/// Shape: the mixed-size tiered test's window, larger than the tests' so a table holds rows of many sizes.
+const MIXED_WINDOW: usize = 4_096;
+/// Shape: the payloads of its phases, each phase's rows larger, so a table holds about 170, 68, 18 and 3 of them.
+const MIXED_PAYLOADS: [usize; 4] = [4, 40, 200, 1_200];
+/// Shape: the windows of rows each phase appends.
+const MIXED_PHASE_WINDOWS: usize = 20;
+
+/// Goal 93 (B), main's ruling of 2026-11-23 (r499: 8 own runs where the row bound computed 6): a seal is due by bytes,
+/// a window of them, so a seal of large rows writes few rows and one of small rows many, and a size-tiered rule stated
+/// in rows holds the runs to no bound in bytes: a later phase of larger rows never has the rows to merge into the
+/// runs of smaller rows before it, so each phase keeps a stack of its own. Do: append scattered keys in phases of
+/// [`MIXED_PHASE_WINDOWS`] windows each, every phase's payloads larger ([`MIXED_PAYLOADS`]), sealing when due and
+/// merging whatever [`Index::tiered_due`] names to its end, noting the fewest bytes a seal wrote. Expect after every
+/// seal: the own runs within ⌊log₃(their tables' bytes ÷ the fewest bytes a seal wrote)⌋ + 1; every row read back.
+#[test]
+fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_bytes_whatever_its_rows_sizes() {
+  let mut store = ContentStore::new(1 << 26, MIXED_WINDOW).unwrap();
+  let mut index = Index::new();
+  let mut fewest = u64::MAX;
+  let mut worst = (0_usize, 0_usize, 0_u64);
+  let mut at = 0_u64;
+  for payload in MIXED_PAYLOADS {
+    let payload = vec![0x5a; payload];
+    let mut phase_bytes = 0_usize;
+    while phase_bytes < MIXED_PHASE_WINDOWS * MIXED_WINDOW {
+      let key = scattered_key(at);
+      at += 1;
+      phase_bytes += key.len() + payload.len();
+      index.insert(&mut store, row(&key, &[], &payload)).unwrap();
+      if !index.seal_due(&store) {
+        continue;
+      }
+      let before = table_bytes(&index, &store);
+      index.seal(&mut store).unwrap();
+      fewest = fewest.min((table_bytes(&index, &store) - before).max(1));
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
+        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
+      }
+      let bytes = table_bytes(&index, &store);
+      let tiers = (bytes / fewest).checked_ilog(3).unwrap_or(0);
+      let bound = usize::try_from(tiers).unwrap() + 1;
+      if index.own_runs() > bound {
+        worst = worst.max((index.own_runs(), bound, bytes));
+      }
+    }
+  }
+  assert_eq!(
+    worst,
+    (0, 0, 0),
+    "own runs past the bytes bound (runs, bound, bytes) at worst; fewest bytes a seal wrote {fewest}"
+  );
+  assert_eq!(read(&index, &store).len(), usize::try_from(at).unwrap());
+  index.release(&mut store).unwrap();
+}
+
+/// Shape: the rows of each seal of the deep-violation test, oldest first, each one table under its window: after the
+/// last, the newest run is under half the next (4 against 10) while the oldest is at most twice all the newer together
+/// (100 against 54).
+const DEEP_SEALS: [u64; 4] = [100, 40, 10, 4];
+
+/// The bytes of each run of `index`, oldest first (every run here is the index's own).
+fn run_bytes(index: &Index, store: &ContentStore) -> Vec<u64> {
+  index
+    .run_tables()
+    .iter()
+    .map(|tables| tables.iter().filter_map(|table| store.len_of(table)).sum())
+    .collect()
+}
+
+/// Whether every run of `bytes` (oldest first) holds more than [`TIER_RATIO`] times the bytes of all the runs newer than
+/// it together: the size-tiered rule's invariant, which its bound is derived from.
+fn tiered(bytes: &[u64]) -> bool {
+  let mut newer = 0u64;
+  bytes.iter().rev().enumerate().all(|(depth, run)| {
+    let held = depth == 0 || *run > newer * TIER_RATIO;
+    newer += run;
+    held
+  })
+}
+
+/// Goal 93 (B), r618 (main's ruling of 2026-11-23 21:14: 8 own runs at the 57k shape against a bound of 6): the
+/// size-tiered rule merged the newest runs while they reached half the next older, and stopped at the first older one
+/// past that, so a seal that grew every deeper run's newer bytes left a deeper run under its share unmerged. Do: seal
+/// [`DEEP_SEALS`]' rows a run each under a window that holds each in one table, merging what [`Index::tiered_due`] names
+/// after each seal to its end. Expect after each: every run holds more than twice the bytes of all newer runs together
+/// (the invariant), so the bound holds; every row read back at the end. Red before: after the fourth seal, nothing due,
+/// runs [100, 40, 10, 4] rows, the oldest at most twice the 54 newer.
+#[test]
+fn a_tiered_merge_restores_its_invariant_for_every_run_however_deep_the_seal_breaks_it() {
+  let mut store = ContentStore::new(1 << 24, 1 << 16).unwrap();
+  let mut index = Index::new();
+  let mut at = 0u64;
+  for rows in DEEP_SEALS {
+    for _ in 0..rows {
+      let key = scattered_key(at);
+      at += 1;
+      index
+        .insert(&mut store, row(&key, &[], &[0x5a; 20]))
+        .unwrap();
+    }
+    index.seal_all(&mut store).unwrap();
+    while let Some(runs) = index.tiered_due() {
+      let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
+      while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
+    }
+    let bytes = run_bytes(&index, &store);
+    assert!(tiered(&bytes), "runs of {bytes:?} bytes after {at} rows");
+  }
+  assert_eq!(read(&index, &store).len(), usize::try_from(at).unwrap());
+  index.release(&mut store).unwrap();
 }
 
 /// The first byte of the key of each row `index` reads from `start`.

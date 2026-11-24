@@ -51,8 +51,8 @@ use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::{ClusterError, CommitBudget, broadcast, commit_record};
 use slates_db::register::{
   Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, LedgerPrepare,
-  LedgerPromise, Lineage, ObjectId, Placement, Record, RegionalConfiguration, RegisterClass,
-  RegisterError, encode_refusal,
+  LedgerPromise, Lineage, MovedFrom, ObjectId, Placement, Record, RegionalConfiguration,
+  RegisterClass, RegisterError, encode_refusal,
 };
 use slates_db::takeover::{
   CountingRule, Heard, LedgerAnswered, Readiness, answer_by_name, answer_ledger, copy_falls_to,
@@ -1392,7 +1392,11 @@ fn retirement_versions(state: &ShardState) -> BTreeMap<HostId, u64> {
 }
 
 /// Promises this node's own copies of `departed`'s objects that fall to it, as a holder answers a page: the
-/// highest record of each is learned from this node itself, and a fence above the epoch sends the round higher.
+/// highest record of each is learned from this node itself, and a fence above the epoch sends the round higher. An
+/// object this round adopted is its result and is never promised again, so a round started over above its epoch does not
+/// fence the adoption this node writes under. A copy this node adopted in an earlier run of the round, one the node
+/// restarted warm since, falls here by the move its adoption recorded ([`adopted_acceptor`]) and is promised as any
+/// copy is: its adoption is this node's own promise of the object (main 01a20182's ruling of 2026-11-23).
 fn promise_local_copies(
   state: &mut ShardState,
   departed: HostId,
@@ -1400,7 +1404,10 @@ fn promise_local_copies(
   epoch: HostEpoch,
   generation: u64,
 ) {
-  let objects = copies_falling_to(state, departed, local, None);
+  let mut objects = copies_falling_to(state, departed, local, None);
+  if let Some(take) = state.host_takeovers.get(&departed) {
+    objects.retain(|object| !take.adopted.contains(object));
+  }
   let prepare = HostPrepare {
     departed,
     owner: local,
@@ -2045,7 +2052,7 @@ pub(crate) async fn adopt_at(
   budget: CommitBudget,
 ) -> (Option<Dispatch>, bool) {
   let Some((dispatch, record, placement)) =
-    commit_adopted_at(object, adopted, epoch, local, budget).await
+    commit_adopted_at(object, adopted, (epoch, None), local, budget).await
   else {
     return (None, false);
   };
@@ -2073,56 +2080,94 @@ async fn commit_adopted(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
-  let epoch =
-    state::with_state(|s| s.host_takeovers.get(&departed).map(|take| take.epoch)).flatten()?;
-  commit_adopted_at(object, adopted, epoch, local, budget).await
+  let (epoch, from) = state::with_state(|s| {
+    let epoch = s.host_takeovers.get(&departed).map(|take| take.epoch)?;
+    let from = s
+      .council
+      .configuration()
+      .retirement_version(departed)
+      .map(|retired_at| MovedFrom {
+        owner: departed,
+        retired_at,
+      });
+    Some((epoch, from))
+  })
+  .flatten()?;
+  commit_adopted_at(object, adopted, (epoch, from), local, budget).await
+}
+
+/// The acceptor an adoption of `object` commits through on this node, `local`, and what it commits: the copy this node
+/// holds (or a fresh one) under its own authority at the configuration's generation, the object's placement, the
+/// quorum, the record (the adopted value at `epoch`), and whether this node held another value at its position (A-373).
+/// A takeover's adoption (`from`, the retirement it adopts from) is recorded with the copy as the move it is
+/// ([`Acceptor::adopt`]), so a round run again after this node restarts warm counts the adoption as this node's own
+/// promise of the object (main 01a20182's ruling of 2026-11-23): before, a copy made at the adoption recorded no move,
+/// and the rerun refused it by name as this node's own, waited for the promise, and gave the object up. A moved
+/// volume's adoption (A-291) names none.
+pub(crate) fn adopted_acceptor(
+  s: &mut ShardState,
+  object: ObjectId,
+  adopted: Accepted,
+  (epoch, from): (HostEpoch, Option<MovedFrom>),
+  local: HostId,
+) -> (
+  Acceptor,
+  Placement,
+  slates_db::register::Quorum,
+  Record,
+  bool,
+) {
+  let config = s.fleet.configuration();
+  let generation = config.version;
+  let quorum = config.quorum;
+  let shape = Placement {
+    acked: Vec::new(),
+    ..config.place(object)
+  };
+  let mut acceptor = s.holder_records.remove(&object).unwrap_or_else(|| {
+    Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: local,
+      },
+    )
+  });
+  let authority = Authority {
+    generation,
+    owner: local,
+  };
+  let _ = match from {
+    Some(from) => acceptor.adopt(authority, from),
+    None => acceptor.install_authority(authority),
+  };
+  // This node holds another value at the adopted position, a lower epoch's that never committed (A-373).
+  let replaces = acceptor
+    .value_at(object, adopted.sequence)
+    .is_some_and(|held| held != adopted.value.as_slice());
+  let record = Record {
+    owner: local,
+    object,
+    sequence: adopted.sequence,
+    epoch,
+    generation,
+    value: adopted.value,
+  };
+  (acceptor, shape, quorum, record, replaces)
 }
 
 /// [`commit_adopted`] at `epoch`, the round's: a takeover's round names its own, and a moved volume's adoption (A-291,
-/// `crate::moves`) the epoch of its round over the move's cohort, which no takeover round is kept for.
+/// `crate::moves`) the epoch of its round over the move's cohort, which no takeover round is kept for. `from`, a
+/// takeover's: the retirement the object is adopted from, recorded with the adopted copy ([`adopted_acceptor`]).
 async fn commit_adopted_at(
   object: ObjectId,
   adopted: Accepted,
-  epoch: HostEpoch,
+  (epoch, from): (HostEpoch, Option<MovedFrom>),
   local: HostId,
   budget: CommitBudget,
 ) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
-  let (mut acceptor, shape, quorum, record, replaces) = state::with_state(|s| {
-    let config = s.fleet.configuration();
-    let generation = config.version;
-    let quorum = config.quorum;
-    let shape = Placement {
-      acked: Vec::new(),
-      ..config.place(object)
-    };
-    let mut acceptor = s.holder_records.remove(&object).unwrap_or_else(|| {
-      Acceptor::new(
-        local,
-        Authority {
-          generation,
-          owner: local,
-        },
-      )
-    });
-    let _ = acceptor.install_authority(Authority {
-      generation,
-      owner: local,
-    });
-    // This node holds another value at the adopted position, a lower epoch's that never committed (A-373).
-    let replaces = acceptor
-      .value_at(object, adopted.sequence)
-      .is_some_and(|held| held != adopted.value.as_slice());
-    let record = Record {
-      owner: local,
-      object,
-      sequence: adopted.sequence,
-      epoch,
-      generation,
-      value: adopted.value,
-    };
-    Some((acceptor, shape, quorum, record, replaces))
-  })
-  .flatten()?;
+  let (mut acceptor, shape, quorum, record, replaces) =
+    state::with_state(|s| adopted_acceptor(s, object, adopted, (epoch, from), local))?;
   let holders = take_sessions("fleet.lent_to.adopt", |host| {
     host != local && shape.candidates.contains(&host)
   });
@@ -2594,7 +2639,7 @@ pub(crate) fn repositories_ready(state: &ShardState) -> Vec<ReadyRepository> {
 }
 
 /// Every part of `repository`'s four state logs this node's acceptors hold, by log and then position.
-fn held_parts(
+pub(crate) fn held_parts(
   state: &ShardState,
   repository: slates_db::catalog::RepositoryId,
 ) -> Vec<slates_db::catalog::StateLogRecord> {
@@ -2665,7 +2710,11 @@ pub(crate) fn rebuild_repository(
   // Its store made from the log a step a turn, lent to nothing until it is whole, then each green's map made again in
   // slices (A-732 and its git and Subversion sibling): a large repository's adoption held in one step would spin the
   // successor's shard past the watchdog, the crash loop on another path.
-  crate::vcs_store::rebuild(state, record.id);
+  // A replica store this node made of it as a holder (`vcs_store::replica`) stands where it was made from the records
+  // the partition now holds: the takeover is warm.
+  if !crate::vcs_store::replica::adopt(state, record.id) {
+    crate::vcs_store::rebuild(state, record.id);
+  }
   state.count(TAKEOVER_REPOSITORY_REBUILT, 1);
   true
 }

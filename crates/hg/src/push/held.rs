@@ -177,6 +177,103 @@ pub fn file_text_held(
   Some((row.len, whole))
 }
 
+/// What a reader of the changelog's or the manifest log's revision `node` needs to bring it back once its windows were
+/// let go (goal 93, C1 (1): these logs' texts off the content store, read through the node's changeset store): its
+/// text's length, whether `store` holds the object its row names whole, and for a manifest kept as a delta the node of
+/// the revision the delta is against, whose text the delta is made from ([`bring_back_log`]). None where the index holds
+/// no such revision, or `log` is a file log ([`file_text_held`]).
+pub fn log_text_held(
+  (index, store): (&HgIndex, &ContentStore),
+  log: Log<'_>,
+  node: &Node,
+) -> Option<LogTextHeld> {
+  let rev = index.rev(store, log, node)?;
+  match log {
+    Log::Changelog => {
+      let row = index
+        .changeset(store, rev)
+        .filter(|row| row.node == *node)?;
+      Some(LogTextHeld {
+        len: row.len,
+        whole: store.holds_whole(&row.text),
+        against: None,
+      })
+    }
+    Log::Manifest => {
+      let row = index
+        .revision(store, log, rev)
+        .filter(|row| row.node == *node)?;
+      let against = if row.base == crate::index::NONE {
+        None
+      } else {
+        Some(index.revision(store, log, row.base)?.node)
+      };
+      Some(LogTextHeld {
+        len: row.len,
+        whole: store.holds_whole(&row.bytes),
+        against,
+      })
+    }
+    Log::File(_) => None,
+  }
+}
+
+/// A changelog's or a manifest log's revision as [`log_text_held`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogTextHeld {
+  /// Its text's length.
+  pub len: u64,
+  /// Whether the store holds the object its row names whole.
+  pub whole: bool,
+  /// For a manifest kept as a delta, the node of the revision it is a delta against.
+  pub against: Option<Node>,
+}
+
+/// Brings back into `store` the changelog's or the manifest log's revision `node` that `index` holds, from `text`, its
+/// whole text as its reader read it from the node's changeset store (goal 93, C1 (1)): a changeset's text, or a
+/// manifest's whole text, by the identity its row names; a manifest kept as a delta made again from `against`, the text
+/// of the revision it is against ([`LogTextHeld::against`]), as the index made it (`kept_as`: line deltas,
+/// deterministic), and put back only where it is the very delta the row names.
+///
+/// # Errors
+/// `NotHeld` where the index holds no such revision, `log` is a file log, a delta's `against` text is missing, or the
+/// text (or the delta made from it) is not the row's own; the store's refusal (its budget) as a put's.
+pub fn bring_back_log(
+  (index, store): (&HgIndex, &mut ContentStore),
+  log: Log<'_>,
+  node: &Node,
+  (text, against): (&[u8], Option<&[u8]>),
+) -> Result<(), slates_vcs::ContentRefused> {
+  let rev = index
+    .rev(store, log, node)
+    .ok_or(slates_vcs::ContentRefused::NotHeld)?;
+  match log {
+    Log::Changelog => {
+      let row = index
+        .changeset(store, rev)
+        .filter(|row| row.node == *node)
+        .ok_or(slates_vcs::ContentRefused::NotHeld)?;
+      let identity = row.text;
+      store.bring_back_object(&identity, text).map(drop)
+    }
+    Log::Manifest => {
+      let row = index
+        .revision(store, log, rev)
+        .filter(|row| row.node == *node)
+        .ok_or(slates_vcs::ContentRefused::NotHeld)?;
+      if row.base == crate::index::NONE {
+        return store.bring_back_object(&row.bytes, text).map(drop);
+      }
+      let against = against.ok_or(slates_vcs::ContentRefused::NotHeld)?;
+      let mut delta = Vec::new();
+      crate::delta::encode_lines(against, text, &mut delta)
+        .map_err(|_| slates_vcs::ContentRefused::NotHeld)?;
+      store.bring_back_object(&row.bytes, &delta).map(drop)
+    }
+    Log::File(_) => Err(slates_vcs::ContentRefused::NotHeld),
+  }
+}
+
 /// Brings back into `store` the text of the revision `node` of `path`'s file log that `index` holds, from `text`, the
 /// whole text its reader read from the node's changeset store (A-767 C1: a push's work reading a text an import let go):
 /// its metadata block and its bytes, each by the identity its row names, each window let go brought back.

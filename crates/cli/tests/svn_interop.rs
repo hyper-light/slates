@@ -222,6 +222,9 @@ struct Svn {
   /// The environment every command runs with beside `LC_ALL` (a route's own switches: HTTP v1's,
   /// [`HTTP_V1_SWITCH`]); none for most routes.
   env: Vec<(String, String)>,
+  /// The wall time this session's commands have taken ([`Svn::run`], and the tools charged to it by [`Svn::charged`]),
+  /// so the use test can print each verb's time a leg (main's r546: a round cut at its bound had said nothing).
+  spent: std::cell::Cell<Duration>,
 }
 
 impl Svn {
@@ -239,7 +242,19 @@ impl Svn {
       session: session.to_owned(),
       options,
       env: Vec::new(),
+      spent: std::cell::Cell::new(Duration::ZERO),
     }
+  }
+
+  /// Runs `step` (a stock tool's command on this session's behalf: `svnrdump`, `svnsync`, `svnadmin`), its wall time
+  /// added to the session's [`Svn::spent`].
+  fn charged<T>(&self, step: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let answer = step();
+    self
+      .spent
+      .set(self.spent.get().saturating_add(started.elapsed()));
+    answer
   }
 
   /// The path of the session's working copy `name`.
@@ -260,9 +275,13 @@ impl Svn {
       .stderr(Stdio::piped())
       .spawn()
       .unwrap();
+    let started = Instant::now();
     let out = read_on_a_thread(child.stdout.take().unwrap());
     let err = read_on_a_thread(child.stderr.take().unwrap());
-    let code = exit_within(&mut child, &format!("svn {args:?} in {dir}"));
+    let code = exited_within(child, PATIENCE, &format!("svn {args:?} in {dir}"));
+    self
+      .spent
+      .set(self.spent.get().saturating_add(started.elapsed()));
     (code, out.join().unwrap(), err.join().unwrap())
   }
 
@@ -283,27 +302,54 @@ fn read_on_a_thread(mut from: impl Read + Send + 'static) -> std::thread::JoinHa
   })
 }
 
-/// Waits for `child` to end within [`PATIENCE`], killing it and failing the test past that: its exit code, -1 where a
-/// signal ended it.
-fn exit_within(child: &mut Child, what: &str) -> i32 {
-  let started = Instant::now();
-  loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      return status.code().unwrap_or(-1);
+/// Waits for `child` to end within `bound`, killing it and failing the test past that: its exit code, -1 where a signal
+/// ended it. The wait blocks on the child's own exit, on a thread that owns it, and this thread waits on that thread's
+/// word with the bound, so the command costs what it takes: until 2026-11-23 the harness polled every [`POLL`], a timed
+/// sleep a host's timer policy stretches (launchd's, 10 ms to about 76 ms), paid by every one of a round's thousands of
+/// commands (main's r546, killed at 5,400 s; [`a_commands_wait_takes_no_timed_pause`]).
+fn exited_within(child: Child, bound: Duration, what: &str) -> i32 {
+  let pid = child.id();
+  let (told, word) = std::sync::mpsc::channel();
+  let waiter = std::thread::spawn(move || {
+    let mut child = child;
+    let _ = told.send(child.wait());
+  });
+  match word.recv_timeout(bound) {
+    Ok(status) => {
+      let _ = waiter.join();
+      status.unwrap().code().unwrap_or(-1)
     }
-    if started.elapsed() > PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{what} ran past {PATIENCE:?} and was killed");
+    Err(_) => {
+      // Still unreaped (its waiter has not returned), so the pid is still this child's.
+      killed(pid);
+      let _ = waiter.join();
+      panic!("{what} ran past {bound:?} and was killed");
     }
-    pause();
   }
 }
 
+/// Kills process `pid`, a child of this process that its waiter has not reaped.
+fn killed(pid: u32) {
+  #[cfg(unix)]
+  let _ = Command::new("kill")
+    .args(["-KILL", &pid.to_string()])
+    .status();
+  #[cfg(windows)]
+  let _ = Command::new("taskkill")
+    .args(["/F", "/PID", &pid.to_string()])
+    .status();
+}
+
 fn pause() {
+  PAUSES.with(|pauses| pauses.set(pauses.get().saturating_add(1)));
   // The harness paces its polls; shipped code parks on its driver (D-9).
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(POLL);
+}
+
+thread_local! {
+  /// Counter: this thread's [`pause`]s, for [`a_commands_wait_takes_no_timed_pause`]'s non-vacuity.
+  static PAUSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Writes `text` as working copy `copy`'s [`FILE`]: the test writes the file stock `svn` commits, inside the scratch
@@ -2827,18 +2873,7 @@ fn tool_with(
     .unwrap();
   let out = read_on_a_thread(child.stdout.take().unwrap());
   let err = read_on_a_thread(child.stderr.take().unwrap());
-  let started = Instant::now();
-  let code = loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      break status.code().unwrap_or(-1);
-    }
-    if started.elapsed() > USE_PATIENCE {
-      let _ = child.kill();
-      let _ = child.wait();
-      panic!("{program} {args:?} in {dir} ran past {USE_PATIENCE:?}");
-    }
-    pause();
-  };
+  let code = exited_within(child, USE_PATIENCE, &format!("{program} {args:?} in {dir}"));
   (code, out.join().unwrap(), err.join().unwrap())
 }
 
@@ -2972,6 +3007,42 @@ fn info_entries_in_order(text: &str) -> String {
   }
   entries.sort();
   head + &entries.concat() + &tail
+}
+
+/// The files a blame at revision `at` reads (main 01a20182's ruling of 2026-11-23): those revision `at` added or
+/// modified, as `leg`'s `svn log -v -r AT` names them, that `copy` (a working copy of the repository's root at `at`)
+/// holds; where `at` changed no file the copy holds, those of the nearest earlier revision that did. The paths beneath
+/// the copy, and the revision they were taken from. Read from one leg (the control), so both legs blame the same files.
+fn blamed_files(leg: &UseLeg, scratch: &str, at: u64, copy: &str) -> (Vec<String>, u64) {
+  for revision in (1..=at).rev() {
+    let rev = revision.to_string();
+    let log = leg.answer(scratch, &["log", "-v", "--xml", "-r", &rev, "{url}"]);
+    let files: Vec<String> = files_changed_in(&log)
+      .into_iter()
+      .filter(|path| std::path::Path::new(copy).join(path).is_file())
+      .collect();
+    if !files.is_empty() {
+      return (files, revision);
+    }
+  }
+  (Vec::new(), 0)
+}
+
+/// The files `log`, an `svn log -v --xml` answer made plain (each `<path ...>` tag one line, [`UseLeg::plain`]), names
+/// as added, modified or replaced, by their repository paths without the leading `/`; a deletion and a directory are left
+/// out.
+fn files_changed_in(log: &str) -> Vec<String> {
+  log
+    .lines()
+    .filter(|line| line.contains("<path ") && line.contains("kind=\"file\""))
+    .filter(|line| !line.contains("action=\"D\""))
+    .filter_map(|line| {
+      let start = line.find('>')?.checked_add(1)?;
+      let end = line.find("</path>")?;
+      line.get(start..end)
+    })
+    .map(|path| path.trim_start_matches('/').to_owned())
+    .collect()
 }
 
 /// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out. A symbolic link is held
@@ -3206,11 +3277,11 @@ fn use_verb_compared(
       words(&["proplist", "--revprop", "-v", "--xml", "-r", at, "{url}"])
     }),
     "dump" => {
-      let [a, b] = legs.map(|leg| rdump_of(leg, scratch));
+      let [a, b] = legs.map(|leg| leg.svn.charged(|| rdump_of(leg, scratch)));
       compare(failed, "svnrdump dump", "0:HEAD", &a, &b);
     }
     "svnsync" => {
-      let [a, b] = legs.map(|leg| mirror_dump_of(leg, (scratch, root)));
+      let [a, b] = legs.map(|leg| leg.svn.charged(|| mirror_dump_of(leg, (scratch, root))));
       compare(failed, "svnsync", "0:HEAD", &a, &b);
     }
     "commit" | "copy" | "merge" | "propset" => {}
@@ -3218,7 +3289,43 @@ fn use_verb_compared(
   }
 }
 
-/// `verb` (checkout, update, switch or blame) at each of `sampled` as a working copy on both legs, compared.
+/// Runs one verb's comparison, `run`, printing as it starts and as it ends: its wall time, each leg's share of it (the
+/// time its commands took, [`Svn::spent`]) and the differences found so far, so a round cut at its bound shows how far
+/// it got and which server was slow (main's r546, killed at 5,400 s, had printed nothing past its daemon's start).
+fn timed_verb<T>(
+  verb: &str,
+  legs: [&UseLeg; 2],
+  failed: &mut Vec<String>,
+  run: impl FnOnce(&mut Vec<String>) -> T,
+) -> T {
+  eprintln!("svn use: {verb}: started");
+  let before = legs.map(|leg| leg.svn.spent.get());
+  let started = Instant::now();
+  let answer = run(failed);
+  let [a, b] = [0, 1].map(|at| {
+    legs
+      .get(at)
+      .zip(before.get(at))
+      .map_or(Duration::ZERO, |(leg, then)| {
+        leg.svn.spent.get().saturating_sub(*then)
+      })
+  });
+  eprintln!(
+    "svn use: {verb}: {:.1} s ({} {:.1} s, {} {:.1} s); {} differences so far",
+    started.elapsed().as_secs_f64(),
+    legs[0].name,
+    a.as_secs_f64(),
+    legs[1].name,
+    b.as_secs_f64(),
+    failed.len()
+  );
+  answer
+}
+
+/// `verb` (checkout, update, switch or blame) at each of `sampled` as a working copy on both legs, compared. Blame is of
+/// the files the sampled revision changed ([`blamed_files`]), not of every file: main 01a20182's ruling of 2026-11-23
+/// (r546), since every file at every sample was 155,904 whole-history fetches over git-2000 and checked the same
+/// attributions again and again, where a file the revision changed is where its newest attribution can go wrong.
 #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
 fn working_copies_compared(
   verb: &str,
@@ -3257,7 +3364,12 @@ fn working_copies_compared(
         }
       }
       held_by.push(if verb == "blame" {
-        let files: Vec<String> = tree_of(&copy).into_keys().collect();
+        let (files, from) = blamed_files(legs[0], scratch, *at, &copy);
+        eprintln!(
+          "svn use: blame r{at} on {}: {} files, those r{from} changed",
+          leg.name,
+          files.len()
+        );
         files
           .iter()
           .map(|file| leg.answer(&copy, &["blame", "-v", "-r", &rev, file]))
@@ -3461,7 +3573,8 @@ fn use_slates_leg(
 /// import the same revisions into a slates repository (`slates repository import`) served on the route
 /// `SLATES_SVN_USE_ROUTE` names (`svn`, the default: the svn:// listener; `http`: the HTTP edge as HTTPv2; `http-v1`: the
 /// same, its client told to speak HTTPv1 ([`HTTP_V1_SWITCH`]); `ssh`: the SSH edge as svn+ssh, by an enrolled key); then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
-/// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`), and the writing verbs
+/// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`; blame of the files each
+/// sampled revision changed, [`blamed_files`]), and the writing verbs
 /// (commit, copy, merge, propset of a revision property) as the same edits on both, then their logs. Expect every
 /// answer byte for byte alike once each server's URL is made plain ([`USE_URL`]; a written revision's author and date,
 /// which the servers stamp, left out): log -v, info, a checkout's files and properties, `update -r`, `switch`, blame,
@@ -3543,7 +3656,9 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
   let mut ran = Vec::new();
   for verb in &verbs {
     ran.push(verb.clone());
-    use_verb_compared(verb, legs, (&scratch.path, &root), &sampled, &mut failed);
+    timed_verb(verb, legs, &mut failed, |failed| {
+      use_verb_compared(verb, legs, (&scratch.path, &root), &sampled, failed);
+    });
   }
   // The writing verbs, as one session of edits on each server, then each written revision's log, the servers' own
   // stamps (author, date) left out.
@@ -3552,8 +3667,11 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     .filter(|verb| verbs.iter().any(|named| named == verb))
     .collect();
   if !writes.is_empty() {
-    let logs = legs.map(|leg| use_writes_logged(leg, &scratch.path, &writes));
-    compare(&mut failed, &writes.join("+"), "HEAD", &logs[0], &logs[1]);
+    let named = writes.join("+");
+    let logs = timed_verb(&named, legs, &mut failed, |_| {
+      legs.map(|leg| use_writes_logged(leg, &scratch.path, &writes))
+    });
+    compare(&mut failed, &named, "HEAD", &logs[0], &logs[1]);
   }
   println!(
     "svn correctness by use: {} revisions, sampled {:?}; verbs {ran:?}; {} differences between {} and {}",
@@ -3564,6 +3682,20 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     slates_leg.name
   );
   assert!(failed.is_empty(), "differences:\n{}", failed.join("\n"));
+}
+
+/// Main 01a20182's order (r546, 2026-11-23: the use test over HTTP with git-2000.dump killed at its 5,400 s bound, the
+/// test thread found sleeping in the harness's poll between short-lived `svn` children, the daemon at 32 s of CPU in 28
+/// minutes). A stock command's wait must not be a timed sleep: on a host whose timer policy stretches a sleep (launchd's
+/// stretches 10 ms to about 76 ms), every command pays it. Do: run `sh -c 'sleep 0.1'`, longer than the poll, through
+/// [`tool`], counting this thread's [`pause`]s. Expect it to end with status 0 and no pause taken.
+#[cfg(unix)]
+#[test]
+fn a_commands_wait_takes_no_timed_pause() {
+  let before = PAUSES.with(std::cell::Cell::get);
+  let (code, _, err) = tool("sh", ".", &["-c", "sleep 0.1"]);
+  let paused = PAUSES.with(std::cell::Cell::get).saturating_sub(before);
+  assert_eq!((code, paused), (0, 0), "{err}");
 }
 
 /// The comparison's own rule ([`canonical_tags`]). Do: put the two attribute orders the first run of
@@ -3675,6 +3807,25 @@ fn an_infos_entry_order_is_no_part_of_an_answer() {
   assert_ne!(
     info_entries_in_order(&stock),
     info_entries_in_order(&changed)
+  );
+}
+
+/// The blame rule's reading of a revision's changes ([`files_changed_in`], main 01a20182's ruling of 2026-11-23). Do: read
+/// a plain `svn log -v --xml` answer naming a modified file, an added file, a deleted file, a replaced file and a changed
+/// directory. Expect the three files still there after the revision, by their paths without the leading `/`, in the
+/// log's order.
+#[test]
+fn a_revisions_changed_files_are_read_from_its_log() {
+  let log = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<logentry revision=\"7\">\n<author>t</author>\n<paths>\n\
+<path action=\"M\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/a.c</path>\n\
+<path action=\"A\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/dir/new.h</path>\n\
+<path action=\"D\" kind=\"file\" prop-mods=\"false\" text-mods=\"false\">/trunk/gone.c</path>\n\
+<path action=\"R\" kind=\"file\" prop-mods=\"false\" text-mods=\"true\">/trunk/again.c</path>\n\
+<path action=\"M\" kind=\"dir\" prop-mods=\"true\" text-mods=\"false\">/trunk/dir</path>\n\
+</paths>\n<msg>m</msg>\n</logentry>\n</log>\n";
+  assert_eq!(
+    files_changed_in(log),
+    ["trunk/a.c", "trunk/dir/new.h", "trunk/again.c"]
   );
 }
 

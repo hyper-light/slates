@@ -286,11 +286,17 @@ impl LiveFleet {
           .chain(self.other_instances.iter().map(String::as_str))
           .map(|instance| format!("{instance} {:?}", live_counters(binary, instance)))
           .collect();
+        let candidates: Vec<&str> = held
+          .iter()
+          .map(|line| LiveLine::shown(line.as_ref()))
+          .collect();
         let note = format!(
           "live-shipped (A-200) on an f = {FLEET_F} fleet, the owner and {} candidate anchors, mounted through node {}: \
-           the owner's log {shipping:?}, the candidates holding {held:?}; {}",
+           the owner's log `{}`, the candidates' logs `{}`; {}",
           self.others.len(),
           FLEET_NODES.first().copied().unwrap_or_default(),
+          LiveLine::shown(shipping.as_ref()),
+          candidates.join("`, `"),
           if shipped {
             "durable at its head and held by both candidates"
           } else {
@@ -327,12 +333,24 @@ fn live_counters(binary: &SlatesBinary, instance: &str) -> std::collections::BTr
   counts
 }
 
-/// A `live` status line's head, durable and owed fields.
+/// A `live` status line's head, durable and owed fields, and the whole line, which the record keeps: its holders,
+/// fence and recorded holders say why a candidate is behind.
 #[derive(Debug)]
 struct LiveLine {
   head: String,
   durable: String,
   owed: String,
+  line: String,
+}
+
+impl LiveLine {
+  /// The whole line a node reported, or why there is none.
+  fn shown(line: Option<&LiveLine>) -> &str {
+    line.map_or(
+      "none: no answer to `status`, or no `live` line for the volume",
+      |line| line.line.as_str(),
+    )
+  }
 }
 
 /// `instance`'s `live <role> <volume>` status line, as `crates/cli/tests/live_fleet.rs` reads it.
@@ -354,6 +372,7 @@ fn live_line(binary: &SlatesBinary, instance: &str, role: &str, volume: &str) ->
       head: field("head")?,
       durable: field("durable")?,
       owed: field("owed")?,
+      line: line.trim().to_owned(),
     })
   })
 }

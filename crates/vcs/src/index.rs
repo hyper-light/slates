@@ -67,6 +67,16 @@ use crate::table::{
 /// slots.
 pub const TAIL_SLOT_BYTES: usize = size_of::<(Box<[u8]>, Box<[u8]>)>();
 
+/// Derived: the size-tiered rule's one decision ([`Index::tiered_due`]): the newest runs are merged through the deepest
+/// run whose bytes are at most this many times all the newer runs' together. So each run holds more than this many
+/// times the bytes of all the runs newer than it together, the bytes to a run grow more than [`TIER_BASE`] = this + 1 fold a run, and
+/// an index's own runs number at most ⌊log_{TIER_BASE}(own bytes ÷ the fewest bytes a seal writes)⌋ + 1. Change it and
+/// the base, the bound and the key filters' size ([`crate::filter`]) follow.
+pub const TIER_RATIO: u64 = 2;
+
+/// Derived: the base of the size-tiered bound's logarithm, [`TIER_RATIO`] + 1 (three).
+pub const TIER_BASE: u64 = TIER_RATIO.saturating_add(1);
+
 /// Shape: what one table of a run costs the budget beside the store beyond its first key's bytes: its fence's record.
 /// Derived from the type.
 pub const FENCE_SLOT_BYTES: usize = size_of::<Fence>();
@@ -166,13 +176,15 @@ struct Fence {
   rows: u64,
 }
 
-/// A run (module docs): its tables in key order, their rows, what their fences and its key filter charged the store,
+/// A run (module docs): its tables in key order, their rows and their bytes (what the size-tiered rule weighs,
+/// [`Index::tiered_due`]), what their fences and its key filter charged the store,
 /// whether another index may hold its tables too (set at a fork or when a table's bytes were stored already; read again
 /// from the store's counts before each merge), and its key filter ([`crate::filter`]; none in a fork's copy).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Run {
   fences: Vec<Fence>,
   rows: u64,
+  bytes: u64,
   charged: u64,
   shared: bool,
   filter: KeyFilter,
@@ -184,6 +196,7 @@ impl Run {
     Run {
       fences: self.fences.clone(),
       rows: self.rows,
+      bytes: self.bytes,
       charged: self.charged.saturating_sub(self.filter.bytes()),
       shared: true,
       filter: KeyFilter::default(),
@@ -318,6 +331,8 @@ struct MergeWork {
   fences: Vec<Fence>,
   /// Their rows.
   rows: u64,
+  /// Their bytes.
+  bytes: u64,
   /// Their fences' charge.
   charged: u64,
   /// Of them, the tables found held already.
@@ -575,6 +590,9 @@ fn cut_rows(cuts: &[Cut]) -> u64 {
 /// The run `cuts` make once `stored` put them.
 fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64, filter: KeyFilter) -> Run {
   let rows = cut_rows(&cuts);
+  let bytes = cuts.iter().fold(0_u64, |bytes, cut| {
+    bytes.saturating_add(u64::try_from(cut.bytes.len()).unwrap_or(u64::MAX))
+  });
   let shared = stored.iter().any(|put| !put.fresh);
   let fences = cuts
     .into_iter()
@@ -588,6 +606,7 @@ fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64, filter: KeyFilter) ->
   Run {
     fences,
     rows,
+    bytes,
     charged,
     shared,
     filter,
@@ -899,6 +918,7 @@ impl Index {
       self.runs.push(Run {
         fences: Vec::new(),
         rows: 0,
+        bytes: 0,
         charged: filter_bytes,
         shared: false,
         filter,
@@ -913,6 +933,9 @@ impl Index {
         rows,
       });
       run.rows = run.rows.saturating_add(rows);
+      run.bytes = run
+        .bytes
+        .saturating_add(u64::try_from(table.cut.bytes.len()).unwrap_or(u64::MAX));
       run.charged = run.charged.saturating_add(fence);
       run.shared |= !put.fresh;
     }
@@ -1079,27 +1102,46 @@ impl Index {
 
   /// The merge the size-tiered rule says is due now (goal 93: a push's fork seals as it appends and never had its runs
   /// merged, so each new row's lookup walked every run it sealed; arena-14's segment steps grew past the watchdog): the
-  /// number of the newest runs only this index holds to merge, the newest taken while their rows together are at least
-  /// half the next older one's; `None` below two. Asked after every seal and merged to its end each time, it keeps each
-  /// run holding more than twice the rows of all the runs newer than it together, so the rows to a run grow more than
-  /// threefold a run.
+  /// number of the newest runs only this index holds to merge, through the deepest own run whose tables' bytes are at
+  /// most [`TIER_RATIO`] times the bytes of all the own runs newer than it together; `None` where there is none. The
+  /// rule's invariant is that every own run holds more than that many times the bytes of all newer own runs together,
+  /// and a seal adds bytes to the newer runs of every run below it, so it can break the invariant at any depth (r618:
+  /// the rule once stopped at the first older run past its share, and held 8 own runs where the bound is 6; runs of
+  /// 100, 40 and 10 rows and a seal of 4 left the oldest at most twice the 54 newer, nothing due). Merging the newest
+  /// through the deepest such run changes no deeper run's newer bytes, so one merge restores the invariant for the whole
+  /// stack. Asked after every seal and merged to its end each time, the bytes to a run grow more than [`TIER_BASE`] fold
+  /// a run. Weighed in bytes, not rows (goal 93 (B); r499 held 8 own runs where a bound in rows computed 6): a seal is
+  /// due by bytes, a window of them, so a seal of large rows writes few rows, and a rule in rows let each phase of larger
+  /// rows keep a stack of its own beside the runs of smaller rows before it.
   ///
-  /// Derived: an index's own runs number at most ⌊log₃(its own rows ÷ the fewest rows a seal writes)⌋ + 1, so a
-  /// lookup walks that many of them at most beside the runs it shares (its parent's, merged by the parent's own rule).
-  /// Read from the runs as they are marked (a shared run is passed over), with no look at the store: cheap after any
-  /// seal. Beside [`Index::compaction_due`]'s rent-or-buy, which weighs measured lookups an index answers for long.
+  /// Derived ([`TIER_RATIO`], [`TIER_BASE`]): where no merge is due, an index's own runs number at most ⌊log₃(their
+  /// tables' bytes ÷ the fewest bytes a seal writes)⌋ + 1 ([`Index::own_bytes`]); between a seal and the end of the
+  /// merge it makes due, one more (the run it sealed). A seal writes a window's bytes of rows at most, and about a window
+  /// when its rows are small beside the window; a table cut before a row near a window long is short, so the fewest is
+  /// the data's, not fixed. A lookup walks that many of them at most beside the runs it shares (its parent's, merged by
+  /// the parent's own rule). Read from the runs as they are marked (a shared run is passed over), with no look at the
+  /// store: cheap after any seal. Beside [`Index::compaction_due`]'s rent-or-buy, which weighs measured lookups an index
+  /// answers for long.
   pub fn tiered_due(&self) -> Option<usize> {
-    let mut own = self.runs.iter().rev().filter(|run| !run.shared);
-    let mut merged = own.next()?.rows;
-    let mut runs = 1_usize;
-    for older in own {
-      if merged.saturating_mul(2) < older.rows {
-        break;
+    let mut newer = 0_u64;
+    let mut due = None;
+    for (depth, run) in self.runs.iter().rev().filter(|run| !run.shared).enumerate() {
+      if depth > 0 && run.bytes <= newer.saturating_mul(TIER_RATIO) {
+        due = Some(depth.saturating_add(1));
       }
-      merged = merged.saturating_add(older.rows);
-      runs = runs.saturating_add(1);
+      newer = newer.saturating_add(run.bytes);
     }
-    (runs >= 2).then_some(runs)
+    due
+  }
+
+  /// The bytes of the tables of the runs only this index holds: what the size-tiered rule's bound is stated over
+  /// ([`Index::tiered_due`]).
+  pub fn own_bytes(&self) -> u64 {
+    self
+      .runs
+      .iter()
+      .filter(|run| !run.shared)
+      .fold(0_u64, |bytes, run| bytes.saturating_add(run.bytes))
   }
 
   /// How many runs only this index holds: the runs [`Index::tiered_due`] and [`Index::compaction_due`] may merge.
@@ -1273,6 +1315,9 @@ impl Index {
       rows: cut.rows,
     });
     work.rows = work.rows.saturating_add(cut.rows);
+    work.bytes = work
+      .bytes
+      .saturating_add(u64::try_from(cut.bytes.len()).unwrap_or(u64::MAX));
     work.charged = work.charged.saturating_add(fence);
     work.deduplicated = work.deduplicated.saturating_add(u64::from(!put.fresh));
     merge.after = last;
@@ -1300,6 +1345,7 @@ impl Index {
     let run = Run {
       fences: work.fences,
       rows: work.rows,
+      bytes: work.bytes,
       charged: work.charged,
       shared: work.deduplicated > 0,
       filter: work.filter,

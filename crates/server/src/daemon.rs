@@ -3710,6 +3710,16 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: every shard runs no teardown slice while `held` (A-884), so a destroyed volume's teardown stays
+  /// where it is and a create waiting for its room meets its bound. `Ok` once set everywhere, else the first shard's
+  /// typed refusal.
+  pub fn inject_teardown_hold(&self, held: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.teardowns_held = held)?;
+    }
+    Ok(())
+  }
+
   /// The memory-pressure hold now on each shard's byte budget (§4.2), in shard order — the capacity
   /// each withholds from new admission. Zero when the host is not under pressure (or has no sampler).
   /// An observation a shard could not answer is its typed refusal.
@@ -5142,6 +5152,7 @@ async fn init_shard(
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
     materializations: crate::green_ready::Materializations::default(),
+    replica_builds: crate::replica_build::ReplicaBuilds::default(),
     hg_tags: crate::vcs_store::hg_tags::HgTags::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
@@ -5233,6 +5244,7 @@ async fn init_shard(
     stop_watch: None,
     stop_watch_install,
     nfs_purges_refused: false,
+    teardowns_held: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
     delegation_lapse_at: None,
@@ -5288,6 +5300,7 @@ async fn init_shard(
     fenced_greens: std::collections::BTreeMap::new(),
     vcs_disk: config.vcs_disk.clone(),
     family_reserved_through: 0,
+    vcs_replica_records: crate::vcs_store::ReplicaRecords::new(),
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),
@@ -11262,6 +11275,86 @@ mod tests {
         .collect::<Vec<_>>(),
       vec![object],
       "the restored copy is listed: {page:?}"
+    );
+  }
+
+  /// A takeover round run again after its successor restarted warm (main 01a20182's ruling of 2026-11-23; the cause of
+  /// GAPS' load flake `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`, read in a diagnostic build):
+  /// a successor that adopted an object and restarted before it confirmed its share runs the departed owner's round
+  /// again, and its adoption is its own promise of the object there. Do: make this node the successor of a held object of
+  /// a retired member; adopt it here as the round does (`takeover::adopted_acceptor`, its record accepted here as the
+  /// commit accepts it first); write the held image, drop the acceptors and routing, and restore them (the warm
+  /// restart); then answer the rerun's question by name of this node itself (`answer_own_copies_by_name`). Expect the
+  /// adopted record answered and nothing refused. Before, the adopted copy recorded no move, so the rerun refused it by
+  /// name as this node's own, waited for that promise, and gave the object up.
+  #[test]
+  fn a_successor_restarted_warm_promises_what_it_adopted_when_its_round_runs_again() {
+    use slates_db::register::{HostEpoch, HostPrepare, MovedFrom, ObjectId};
+    let (refused, answered, adopted_at) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      // An object of the retired member whose successor among the two survivors is this node.
+      let (object, departed) = (1..=u8::MAX)
+        .find_map(|byte| {
+          let object = ObjectId([byte; 16]);
+          state.holder_records.clear();
+          let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+          (successor == local).then_some((object, departed))
+        })
+        .unwrap();
+      let adopted = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.highest_accepted(object))
+        .unwrap();
+      let from = state
+        .council
+        .configuration()
+        .retirement_version(departed)
+        .map(|retired_at| MovedFrom {
+          owner: departed,
+          retired_at,
+        });
+      let (mut acceptor, _, _, record, _) =
+        crate::takeover::adopted_acceptor(state, object, adopted, (HostEpoch(2), from), local);
+      acceptor.accept(&record).unwrap();
+      state.holder_records.insert(object, acceptor);
+      let image = crate::content_holder::held_image(state);
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let regional = state.council.configuration().clone();
+      let prepare = HostPrepare {
+        departed,
+        owner: local,
+        epoch: HostEpoch(3),
+        generation: regional.version,
+        after: None,
+        named: vec![object],
+      };
+      let answer = slates_db::takeover::answer_by_name(
+        local,
+        &prepare,
+        &regional,
+        &mut state.holder_records,
+        usize::MAX,
+      );
+      let answered: Vec<(ObjectId, u64)> = answer
+        .promise
+        .entries
+        .iter()
+        .map(|(object, highest)| (*object, highest.sequence))
+        .collect();
+      (answer.refused, answered, (object, record.sequence))
+    });
+    assert_eq!(
+      (refused, answered),
+      (0, vec![adopted_at]),
+      "the rerun's question by name is answered with this node's adoption, never refused as its own"
     );
   }
 
