@@ -606,3 +606,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   stretched 20 ms poll), and each verb prints its time and each leg's share. r546's git-2000 round had been killed at
   5,400 s with nothing printed. Owed to main: the sizing run (every verb but blame, then blame at one sample), then
   git-2000's rerun with its bound stated. Blame is 155,904 commands at 16 samples.
+- LANDED b16224d1d: blame reads the files each sampled revision changed (main's ruling). READY 1a3f1079b
+  (diag-measurer-w-interop-svn-sizing): the svn use test over HTTP with git-2000.dump on ubuntu-latest, stock svn 1.15.0
+  built in the job. It sizes the bound.
+- LANDED a51b627f5, 2026-11-23: r592's slates git and svn legs failed every step because the harness's anchor had no
+  --vcs-store. Now a failed step or a setup-refused server fails the harness and the round loudly, and hg's empty
+  optional rows are gone. Owed to main: rerun the round.
