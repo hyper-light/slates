@@ -36300,7 +36300,7 @@ fn git_fleet(name: &str) -> GitFleet {
   let token = format!("{name}-token-{}", std::process::id());
   let principal = Principal::Uid {
     host: client.daemon_status().unwrap().anchor,
-    uid: rustix::process::getuid().as_raw(),
+    uid: this_account(),
   };
   let material = CredentialMaterial::HttpToken {
     id: slates_server::credentials::token_id(token.as_bytes()),

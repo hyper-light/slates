@@ -5789,16 +5789,16 @@ fn let_go_logs(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) ->
   .expect("the repository's rows")
 }
 
-/// Each changelog and manifest revision of `repository` as its shard holds it: its node, its parents' nodes, and its
-/// text read from the content store (none where not held).
-fn log_rows(
-  daemon: &Daemon,
-  repository: slates_db::catalog::RepositoryId,
-) -> Vec<(
+/// One changelog or manifest revision as [`log_rows`] reads it: its node, its parents' nodes, and its text read from the
+/// content store (none where not held).
+type LogRow = (
   slates_hg::Node,
   (slates_hg::Node, slates_hg::Node),
   Option<Vec<u8>>,
-)> {
+);
+
+/// Each changelog and manifest revision of `repository` as its shard holds it ([`LogRow`]).
+fn log_rows(daemon: &Daemon, repository: slates_db::catalog::RepositoryId) -> Vec<LogRow> {
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
     crate::vcs_store::lent_state(state, |state| {
       crate::vcs_store::within_budget(state, 0, |stores| {
