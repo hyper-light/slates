@@ -22,6 +22,20 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 10:58 on 11-24:
+- NEEDS ADA, a naming-model decision (A-904, GAPS): any node other than a repository's owner answers "repository not found"
+  (always so; after a takeover a client can't find the successor), and names are unique per node only (two nodes could each
+  create "project"; untested). Main's 10:54 ruling to forward over the fleet session rested on a wrong premise (owner_of_name
+  is node-local; the configuration routes ids, not names), now withdrawn. w-shared's options: (1) name homes, a per-name
+  record (name -> id) at f+1 homes by the name's hash, claimed at creation (region-unique names), like A-724's content
+  homing [recommended]; (2) place the repository at the name's first-ranked member (breaks on membership changes); (3) a
+  location round. It sits beside §2 item 12 / D-14 ("no global catalog or index"), so the call is Ada's. Nothing built.
+- Closed today: the 57k hg restart (53e09728f, r942 green), the svn use round on git-2000 (0 differences, r938), push 0
+  (A-902 for NotAHome, A-903 for the successor's epoch), the Windows fleet hang (a test), the must_use sweep, A-894.
+- In flight: w-git on the clone (197b0bc4f landed; next Kept::len, then the content pool's one-word free count, then
+  derive), w-shared on intake off the owner, w-perf on (a) the taken-over green's typed refusal, w-hg on P5, w-svn on
+  per-revision slicing. Gate 10 (A-902, 40 runs) ran past its usual time; it's read at the GitHub limit's reset.
+
 Updates at 09:31 on 11-24:
 - Goal 84a measured at current main on every platform:
   - macOS: met. Big Studio bare metal, r931 at 259b0db84. Every one of 30 runs is under 1 ms at p99 and p999, loaded
