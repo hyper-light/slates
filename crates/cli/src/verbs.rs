@@ -1675,39 +1675,23 @@ fn emit_write(
   Ok(())
 }
 
-/// Writes stdin's bytes as `path`'s whole new content: the file's size. stdin is read up to the largest metadata ledger
-/// any shard reports, past which no shard can stage it (`crate::staging` in the daemon reserves a staged write there),
-/// so the command holds at most that much and refuses more, naming it.
+/// Writes stdin's bytes as `path`'s whole new content: the file's size. The input is streamed to the daemon a page at a
+/// time as it is read (`Client::fs_write_from`, A-880), so the command holds two pages of it at most whatever its
+/// length, and an input past what the owner shard can stage is refused by the daemon's typed `BudgetExceeded`. Until
+/// A-880 the command read the whole input first, up to the largest metadata ledger any shard reported, a second whole
+/// copy beside the daemon's staging buffer, and refused more as a `BadRequest`.
 fn write_stdin(
   client: &mut Client,
   (volume, attachment): (slates_client::VolumeId, u64),
   path: &str,
   mode: u32,
 ) -> Result<u64, ClientError> {
-  use std::io::Read;
-  let bound = client
-    .daemon_status()?
-    .shards
-    .iter()
-    .map(|shard| shard.metadata_bytes)
-    .max()
-    .unwrap_or(0);
-  let mut bytes = Vec::new();
-  let read = std::io::stdin()
-    .lock()
-    .take(bound.saturating_add(1))
-    .read_to_end(&mut bytes);
-  if let Err(e) = read {
-    return Err(ClientError::Refused(slates_client::Refusal::BadRequest {
-      reason: format!("reading stdin: {e}"),
-    }));
-  }
-  if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > bound {
-    return Err(ClientError::Refused(slates_client::Refusal::BadRequest {
-      reason: format!("stdin holds more than any shard can stage ({bound} bytes)"),
-    }));
-  }
-  client.fs_write((volume, attachment), path, &bytes, mode)
+  client.fs_write_from(
+    (volume, attachment),
+    path,
+    &mut std::io::stdin().lock(),
+    mode,
+  )
 }
 
 /// Acknowledges an outcome-only verb: a JSON `{ "ok": true }` under `--json`, else the text `message`.

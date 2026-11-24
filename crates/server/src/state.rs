@@ -1668,6 +1668,8 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     crate::base_hints::after_borrow(state);
     // A write, free or allocation the idle sweep owes a pass arms it (A-715).
     crate::idle_sweep::after_borrow(state);
+    // An open staging buffer goes with its attachment, however the borrow ended it (A-880).
+    crate::staging::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
   })

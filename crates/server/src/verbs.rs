@@ -269,23 +269,37 @@ pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
 /// or the operation headroom. The `available > 0` guard is why an earlier once-gate saw nothing: an
 /// intentional-too-big refusal consumed it. Evidence a boot profile does not carry, for the flaky
 /// macOS-runner refusal (2026-09-16). Counted once (a genuinely-full running daemon must not spam).
+///
+/// A refusal of what its own `available` covers (`requested <= available`) is as pathological, and logged once on a
+/// gate of its own (main 01a20182's r509, 2026-11-23: provision_bench's 64-client sweep refused 1 MiB creates
+/// `BudgetExceeded { available: 33945026560 }` on the big Studio, with no breakdown, since the gate was refuse-all's
+/// alone). Its breakdown adds the pool's side: what the arena could claim, the pressure debt and hold a growth takes on,
+/// the growths that found the pool's room enough and claimed less ([`slates_mem::ChunkArena::room_lost`]), and the
+/// claims the pool refused.
 fn report_first_budget_refusal(
   state: &crate::state::ShardState,
   dimension: &str,
   requested: u64,
   available: u64,
 ) {
-  if available != 0 {
+  static REFUSE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  static COVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  let (gate, kind) = if available == 0 {
+    (&REFUSE_ALL, "refuse-all")
+  } else if requested <= available {
+    (&COVERED, "refused what its available covers")
+  } else {
+    return;
+  };
+  if gate.swap(true, std::sync::atomic::Ordering::Relaxed) {
     return;
   }
-  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-  if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-    return;
-  }
+  let arena = state.store.content.arena();
   slates_machine::log_line!(
-    "slates-server: {dimension} budget refuse-all (first occurrence): requested={requested} \
+    "slates-server: {dimension} budget {kind} (first occurrence): requested={requested} available={available} \
      config[reserve_per_shard={} shards={} max_inodes={} max_chunks={} metadata_class={}] \
-     bytes[capacity={} committed={} retained={} headroom={} replicated={}] \
+     bytes[capacity={} committed={} retained={} headroom={} replicated={} hold={} debt={}] \
+     pool[claimable={} pending={} room_lost={} refused={}] \
      versions[capacity={} committed={} retained={} headroom={}] held[stages={} charged={}]",
     state.config.reserve_per_shard,
     state.config.runtime.shards,
@@ -297,6 +311,12 @@ fn report_first_budget_refusal(
     state.store.budget.retained(),
     state.store.budget.headroom(),
     state.store.budget.replicated(),
+    state.store.budget.hold(),
+    state.store.budget.debt(),
+    arena.claimable(),
+    state.store.pending_room(),
+    arena.room_lost(),
+    arena.source_refusals(),
     state.store.versions.capacity(),
     state.store.versions.committed(),
     state.store.versions.retained(),
@@ -6021,6 +6041,9 @@ fn dispatch_inner(
       cursor,
     } => crate::listing::read_dir(state, principal, (volume, &path, at), cursor),
     RequestBody::StageBegin { work, len } => stage_begin(state, principal, work, len),
+    RequestBody::StageOpen { volume, attachment } => {
+      stage_open(state, principal, volume, attachment)
+    }
     RequestBody::StagePut {
       work,
       token,
@@ -9234,6 +9257,48 @@ fn stage_begin(
   }
 }
 
+/// `StageOpen` (`crate::staging`, A-880): a buffer of no stated length for an `FsWriteStaged` under the caller's write
+/// `attachment` of a plain `volume`, living as long as the attachment. Checked as the write it stages is: the volume as
+/// `StageBegin` checks it and as the file verbs do (a plain volume), the attachment as a write through it
+/// (`fs_verbs::writer_attachment`, which renews a CLI attachment as any use does).
+fn stage_open(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  attachment: u64,
+) -> ReplyBody {
+  let volume_id = match staging_volume(state, principal, volume) {
+    Ok(id) => id,
+    Err(refusal) => return refused(refusal),
+  };
+  // A file write's buffer, so a plain volume's, refused as the file verbs refuse any other (`fs_verbs::serve`).
+  if let Err(refusal) = crate::fs_verbs::plain(state, volume) {
+    return refused(refusal);
+  }
+  if let Err(refusal) =
+    crate::fs_verbs::writer_attachment(state, principal, (volume, attachment), "stage")
+  {
+    return refused(refusal);
+  }
+  let now = state.clock.monotonic_ns();
+  state.staging.expire(now, &mut state.store.metadata);
+  match state.staging.open(
+    (volume_id, principal),
+    attachment,
+    state.partition,
+    &mut state.store.metadata,
+  ) {
+    Ok(token) => {
+      state.count(STAGES_OPENED, 1);
+      ReplyBody::Staged { token }
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Counter: open staging buffers begun (A-880, `StageOpen`): the non-vacuity count of a write streamed in pages.
+pub const STAGES_OPENED: &str = "staging.opened";
+
 /// `StagePut` (`crate::staging`): the next bytes of a staging buffer.
 fn stage_put(
   state: &mut ShardState,
@@ -9249,10 +9314,12 @@ fn stage_put(
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
   let expires = now.saturating_add(state.failover_ns);
-  match state
-    .staging
-    .put((work_id, principal, token), offset, bytes, expires)
-  {
+  match state.staging.put(
+    (work_id, principal, token),
+    offset,
+    bytes,
+    (expires, &mut state.store.metadata),
+  ) {
     Ok(filled) => {
       crate::deadlines::noted(state, expires);
       ReplyBody::StagePutDone { filled }

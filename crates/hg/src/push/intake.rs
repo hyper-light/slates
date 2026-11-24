@@ -1348,8 +1348,9 @@ impl Taker {
   /// ([`slates_vcs::Index::tiered_due`]), or its begin, between revisions; none where none is due. Every append seals
   /// the fork's tail when due (`HgIndex::insert`), each seal a run, and a lookup walks every run: unmerged, a push's
   /// runs grew a seal at a time and each new row's lookup with them (arena-14: shard 0 spun past 1 s in a segment step).
-  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step. A push refused
-  /// or given back drops its merge with the fork: nothing changes until the merge's last step.
+  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step (each step puts
+  /// one table or gives one back). A push refused or given back drops its merge with the fork, whose release gives back
+  /// what the merge put.
   fn merge_step(&mut self, store: &mut ContentStore) -> Result<Option<Stepped>, Refused> {
     let as_refused = |refused: IndexRefused| {
       Refused::Unindexed(Unindexed::Index(crate::index::Refused::Index(refused)))
@@ -1374,7 +1375,12 @@ impl Taker {
     let Some(runs) = self.fork.rows().tiered_due() else {
       return Ok(None);
     };
-    Ok(self.fork.rows().merge_begin(store, runs).map(|merge| {
+    let begun = self
+      .fork
+      .rows()
+      .merge_begin(store, runs)
+      .map_err(as_refused)?;
+    Ok(begun.map(|merge| {
       self.merging = Some(merge);
       Stepped::More
     }))

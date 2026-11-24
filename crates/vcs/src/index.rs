@@ -16,16 +16,25 @@
 //! is answered `Identical` when its row is the same and refused `RowDiffers` when it is not.
 //!
 //! **Merging.** A merge ([`Index::compact`]) reads the rows of the newest `j` runs only this index holds, in key order,
-//! and cuts them into one run; which `j`, and when, is the learned rule of [`crate::rule`]: the index counts, for each
+//! and cuts them into one run, a step at a time ([`Index::merge_step`]): each step cuts and puts one table, the step
+//! after the last swaps the merged run in for the runs it merged, and each step after that gives back one of their
+//! tables (goal 93: a last step that put every table and gave back every run took 89.7 ms in r499, past the slice;
+//! main's ruling of 2026-11-23 18:41). Which `j`, and when, is the learned rule of [`crate::rule`]: the index counts, for each
 //! lookup, how many runs it visited and how many of those it alone holds, and the caller reports the times it
 //! measured. Runs a fork shares are never merged, since merging them would copy rows the fork still shares; a run is
 //! read again as this index's own once no other index holds its tables (a fork released). Report the lookups' time
 //! before a seal or a merge: lookups not yet timed when the runs change are dropped, since they were counted against
 //! runs that are gone.
 //!
-//! **A fork** seals its parent's whole tail, holds each of the parent's tables once more, copies the runs' fences and
-//! starts with an empty tail: it writes no table and copies no row ([`IndexCounters`] are the non-vacuity counters the
-//! tests read).
+//! **Key filters.** Each run keeps a filter of its keys ([`crate::filter`]), written with its tables by the seal or
+//! merge that writes them and charged with its fences, so a lookup passes over a run whose filter says no without
+//! resolving its table through the store (goal 93, r536: under load a push's lookups, its duplicate checks nearly all
+//! misses, spent their time resolving a table a run). A key's hash is taken once a lookup.
+//!
+//! **A fork** seals its parent's whole tail, holds each of the parent's tables once more, copies the runs' fences (not
+//! their key filters, so a fork costs its fences and no copy of rows' worth; its lookups resolve the runs it shares as
+//! before) and starts with an empty tail: it writes no table and copies no row ([`IndexCounters`] are the non-vacuity
+//! counters the tests read).
 //!
 //! **Holds** (the crate's docs, "What holds what"). Each tail row holds the contents it names once. A table stored new
 //! takes over its rows' holds, and a table whose bytes were stored already (another index wrote the same rows) gives
@@ -33,10 +42,12 @@
 //!
 //! **Bounds.** Every table is at most a window, and a row too long for a table of its own is refused
 //! ([`IndexRefused::RowPastWindow`]). A tail row is charged to the store's budget for its key, its body and its slot
-//! ([`TAIL_SLOT_BYTES`]), a run's fences for their keys and their slots ([`FENCE_SLOT_BYTES`]), and a table's bytes are
+//! ([`TAIL_SLOT_BYTES`]), a run's fences for their keys and their slots ([`FENCE_SLOT_BYTES`]) and its key filter for
+//! its words, and a table's bytes are
 //! content in the same budget. An insert past the budget is refused with nothing changed; a batch
 //! ([`Index::insert_all`]) is checked whole, its order, its rows and its room, before any of it is applied; a seal's
-//! and a merge's tables are admitted as one step ([`ContentStore::put_tables`]).
+//! tables are admitted as one step ([`ContentStore::put_tables`]), and a merge's a table a step, a refusal giving back
+//! what the merge had put.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -45,6 +56,7 @@ use std::mem::{size_of, take};
 use std::ops::Bound;
 
 use crate::content::{ContentId, ContentRefused, ContentStore, Stored};
+use crate::filter::{KeyFilter, KeyHash};
 use crate::rule::Compaction;
 use crate::table::{
   RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, encode_body, row_bytes,
@@ -138,6 +150,12 @@ pub struct IndexCounters {
   /// The runs those lookups visited, a miss every run (goal 93: a push's fork seals as it appends, so its lookups walk
   /// runs where they met one tail; arena-19 put the reland at 24-35% of push-all outside the intake).
   pub runs_visited: u64,
+  /// The tables those lookups resolved through the store, a run each at most (goal 93, r536: under load a push's
+  /// lookups spent their time in `ContentStore::get` and the shared object's atomics behind it, a resolve a run).
+  pub resolves: u64,
+  /// The runs those lookups passed over on their key filter's word, resolving nothing: the filter's non-vacuity
+  /// counter.
+  pub filter_rejections: u64,
 }
 
 /// One table of a run: its identity, its first key (the fence a lookup searches) and its rows.
@@ -148,18 +166,30 @@ struct Fence {
   rows: u64,
 }
 
-/// A run (module docs): its tables in key order, their rows, what their fences charged the store, and whether another
-/// index may hold its tables too (set at a fork or when a table's bytes were stored already; read again from the
-/// store's counts before each merge).
+/// A run (module docs): its tables in key order, their rows, what their fences and its key filter charged the store,
+/// whether another index may hold its tables too (set at a fork or when a table's bytes were stored already; read again
+/// from the store's counts before each merge), and its key filter ([`crate::filter`]; none in a fork's copy).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Run {
   fences: Vec<Fence>,
   rows: u64,
   charged: u64,
   shared: bool,
+  filter: KeyFilter,
 }
 
 impl Run {
+  /// A fork's copy of this run: its fences, charged for them alone, and no key filter (module docs, "A fork").
+  fn fork_copy(&self) -> Run {
+    Run {
+      fences: self.fences.clone(),
+      rows: self.rows,
+      charged: self.charged.saturating_sub(self.filter.bytes()),
+      shared: true,
+      filter: KeyFilter::default(),
+    }
+  }
+
   /// The table that may hold `key`: the last whose first key is not after it.
   fn fence_for(&self, key: &[u8]) -> Option<&Fence> {
     let after = self
@@ -212,6 +242,8 @@ struct Visit {
   visits: u64,
   compactable: u64,
   runs: u64,
+  resolves: u64,
+  rejected: u64,
 }
 
 impl Visit {
@@ -240,29 +272,61 @@ struct Cut {
   rows: u64,
 }
 
-/// A merge under way ([`Index::merge_begin`]), made a table at a time ([`Index::merge_step`]): the runs it merges, each by
-/// its tables' identities (so a fork that comes to share one, or a run gone, is seen), the last key it cut, and the
-/// tables cut so far, held until the merged run is admitted whole.
+/// A merge under way ([`Index::merge_begin`]), made a table at a time ([`Index::merge_step`]): which of the index's
+/// merges it is, the runs it merges, each by its tables' identities (so a fork that comes to share one, or a run gone,
+/// is seen), the last key it cut, the tables cut so far and the store's window when it began. What it has put the index
+/// holds ([`MergeWork`]), so a merge dropped part-way leaks nothing.
 #[derive(Debug)]
 pub struct Merge {
+  begun: u64,
   runs: Vec<Vec<ContentId>>,
   after: Option<Box<[u8]>>,
-  cuts: Vec<Cut>,
+  tables_cut: usize,
+  window: usize,
+  filter_bytes: u64,
 }
 
 impl Merge {
   /// The tables cut so far: the merge's progress.
   pub fn tables_cut(&self) -> usize {
-    self.cuts.len()
+    self.tables_cut
   }
 
-  /// The bytes of the tables cut so far: what its last step puts into the content store ([`Index::merge_step`]), and
-  /// so all the room a step is lent (a step before it cuts a table into memory and puts nothing).
-  pub fn cut_bytes(&self) -> u64 {
-    self.cuts.iter().fold(0_u64, |total, cut| {
-      total.saturating_add(u64::try_from(cut.bytes.len()).unwrap_or(u64::MAX))
-    })
+  /// Derived: the most one step puts into the content store ([`Index::merge_step`]), so the room a step is lent: one
+  /// table of at most the window and its fence's charge (its first key, a row's at most a window, and the fence's slot),
+  /// and the merged run's key filter, charged with its first table.
+  pub fn step_room(&self) -> u64 {
+    let table = u64::try_from(self.window).unwrap_or(u64::MAX);
+    let slot = u64::try_from(FENCE_SLOT_BYTES).unwrap_or(u64::MAX);
+    table
+      .saturating_mul(2)
+      .saturating_add(slot)
+      .saturating_add(self.filter_bytes)
   }
+}
+
+/// What a merge under way holds between its steps (goal 93, main's ruling of 2026-11-23 18:41: no step puts more than
+/// one table): the merged run's tables put so far, each held, its rows' holds taken when it was stored new and its fence
+/// charged; and once that run is admitted in place of the runs it merged, their tables left to give back a step each
+/// and the merged rows to answer. Given back whole when the merge is given up or refused, when another is begun, and
+/// with the index ([`Index::release`]).
+#[derive(Debug, Default)]
+struct MergeWork {
+  /// Which merge this is ([`Merge::begun`]).
+  begun: u64,
+  /// The merged run's tables put so far.
+  fences: Vec<Fence>,
+  /// Their rows.
+  rows: u64,
+  /// Their fences' charge.
+  charged: u64,
+  /// Of them, the tables found held already.
+  deduplicated: u64,
+  /// The merged run's key filter, sized for the rows of the runs it merges ([`crate::filter`]), charged with its first
+  /// table and noting each table's keys as it is put.
+  filter: KeyFilter,
+  /// Once the merged run is admitted: its rows, and the merged runs' tables left to give back.
+  admitted: Option<(u64, Vec<ContentId>)>,
 }
 
 /// What one step of a merge did.
@@ -270,9 +334,10 @@ impl Merge {
 pub enum MergeStep {
   /// A table cut; more follow.
   More,
-  /// The merged run admitted in place of the runs it merged: its rows.
+  /// The merged run admitted in place of the runs it merged and their tables given back: its rows.
   Done(u64),
-  /// Given up, nothing changed: its runs are no longer all this index's own.
+  /// Given up, its runs unchanged and what it had put given back: its runs are no longer all this index's own, or
+  /// another merge of the index was begun since.
   GivenUp,
 }
 
@@ -292,6 +357,10 @@ pub struct Index {
   lookups: Cell<u64>,
   /// The runs those lookups visited ([`IndexCounters::runs_visited`]).
   runs_visited: Cell<u64>,
+  /// The tables those lookups resolved ([`IndexCounters::resolves`]).
+  resolves: Cell<u64>,
+  /// The runs those lookups passed over on their filters ([`IndexCounters::filter_rejections`]).
+  filter_rejections: Cell<u64>,
   /// `depths[p]`: the lookups since then that visited `p` runs only this index holds.
   depths: RefCell<Vec<u64>>,
   /// Rows inserted since the caller last reported its inserts' time.
@@ -308,6 +377,10 @@ pub struct Index {
   /// A seal of the whole tail under way a table at a time ([`Index::seal_step`], A-722 part 4): the runs only this index
   /// held before its run, the last of `runs`, was begun.
   sealing: Option<usize>,
+  /// What the merge under way holds between its steps ([`Index::merge_step`]).
+  merge_work: MergeWork,
+  /// Merges begun, for the index's life: what tells a [`Merge`] whether it is still the index's merge under way.
+  merges_begun: u64,
 }
 
 /// Why a parent did not adopt a fork ([`Index::adopt`]), the fork handed back whole.
@@ -371,17 +444,13 @@ fn release_rows<'a>(
   first.map_err(IndexRefused::from)
 }
 
-/// Takes the holds `rows` take of their contents.
+/// Takes the holds `rows` take of their contents, all or none ([`hold_all`]).
 fn hold_rows<'a>(
   store: &mut ContentStore,
   rows: impl Iterator<Item = RowRef<'a>>,
 ) -> Result<(), IndexRefused> {
-  for row in rows {
-    for content in row.contents() {
-      store.hold(&content)?;
-    }
-  }
-  Ok(())
+  let contents: Vec<ContentId> = rows.flat_map(|row| row.contents()).collect();
+  hold_all(store, &contents)
 }
 
 /// The holds a table's rows take, read from its bytes: taken (`hold`) or given back.
@@ -504,7 +573,7 @@ fn cut_rows(cuts: &[Cut]) -> u64 {
 }
 
 /// The run `cuts` make once `stored` put them.
-fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64) -> Run {
+fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64, filter: KeyFilter) -> Run {
   let rows = cut_rows(&cuts);
   let shared = stored.iter().any(|put| !put.fresh);
   let fences = cuts
@@ -521,6 +590,26 @@ fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64) -> Run {
     rows,
     charged,
     shared,
+    filter,
+  }
+}
+
+/// The hashes of the keys of the table of `bytes`, taken before the table changes anything, so its run's key filter
+/// ([`KeyFilter::add`]) notes every key or the step is refused with nothing changed: a filter missing a key would say no
+/// to a row its run holds.
+fn table_hashes(bytes: &[u8]) -> Result<Vec<KeyHash>, IndexRefused> {
+  Ok(
+    TableView::open_known(bytes)?
+      .iter()
+      .map(|row| KeyHash::of(row.key()))
+      .collect(),
+  )
+}
+
+/// Notes `hashes` in `filter`.
+fn note_all(filter: &mut KeyFilter, hashes: &[KeyHash]) {
+  for hash in hashes {
+    filter.add(hash);
   }
 }
 
@@ -569,6 +658,12 @@ impl Index {
     self
       .runs_visited
       .set(self.runs_visited.get().saturating_add(visit.runs));
+    self
+      .resolves
+      .set(self.resolves.get().saturating_add(visit.resolves));
+    self
+      .filter_rejections
+      .set(self.filter_rejections.get().saturating_add(visit.rejected));
     if let Ok(mut depths) = self.depths.try_borrow_mut() {
       let at = usize::try_from(visit.compactable).unwrap_or(usize::MAX);
       if depths.len() <= at {
@@ -595,10 +690,19 @@ impl Index {
         return RowRef::new(stored, body);
       }
     }
+    if self.runs.is_empty() {
+      return None;
+    }
+    let hash = KeyHash::of(key);
     self.runs.iter().rev().find_map(|run| {
       visit.visit(!run.shared);
       visit.runs = visit.runs.saturating_add(1);
+      if !run.filter.may_hold(&hash) {
+        visit.rejected = visit.rejected.saturating_add(1);
+        return None;
+      }
       let fence = run.fence_for(key)?;
+      visit.resolves = visit.resolves.saturating_add(1);
       view(store, &fence.table)?.get(key)
     })
   }
@@ -762,7 +866,22 @@ impl Index {
       .checked_add(FENCE_SLOT_BYTES)
       .and_then(|bytes| u64::try_from(bytes).ok())
       .ok_or(TableRefused::TooLarge)?;
-    let stored = store.put_tables(&[table.cut.bytes.as_slice()], table.discharged, fence)?;
+    // The run's key filter, sized for the whole tail's rows, is charged with its first table (rows the tail takes in
+    // meanwhile only raise its rate of a wrong yes, never make it say no to a key the run holds).
+    let mut filter = match self.sealing {
+      Some(_) => None,
+      None => Some(KeyFilter::sized(
+        u64::try_from(self.tail.len()).unwrap_or(u64::MAX),
+        store.budget(),
+      )),
+    };
+    let filter_bytes = filter.as_ref().map_or(0, KeyFilter::bytes);
+    let hashes = table_hashes(&table.cut.bytes)?;
+    let stored = store.put_tables(
+      &[table.cut.bytes.as_slice()],
+      table.discharged,
+      fence.saturating_add(filter_bytes),
+    )?;
     let put = stored.first().ok_or(IndexRefused::LayerMissing)?;
     let given_back = if put.fresh {
       Ok(())
@@ -775,17 +894,19 @@ impl Index {
     };
     self.tail_charged = self.tail_charged.saturating_sub(table.discharged);
     self.tail_bytes = self.tail_bytes.saturating_sub(table.bytes);
-    if self.sealing.is_none() {
+    if let Some(filter) = filter.take() {
       self.sealing = Some(self.compactable());
       self.runs.push(Run {
         fences: Vec::new(),
         rows: 0,
-        charged: 0,
+        charged: filter_bytes,
         shared: false,
+        filter,
       });
     }
     let rows = table.cut.rows;
     if let Some(run) = self.runs.last_mut() {
+      note_all(&mut run.filter, &hashes);
       run.fences.push(Fence {
         table: put.identity,
         first: table.cut.first,
@@ -867,7 +988,11 @@ impl Index {
       bytes = bytes.saturating_add(row_bytes(key, body).ok_or(TableRefused::TooLarge)?);
     }
     let kept_from: Option<Box<[u8]>> = self.tail.keys().nth(sealed).cloned();
-    let fences = fences_charge(&cuts)?;
+    let mut filter = KeyFilter::sized(cut_rows(&cuts), store.budget());
+    for cut in &cuts {
+      note_all(&mut filter, &table_hashes(&cut.bytes)?);
+    }
+    let fences = fences_charge(&cuts)?.saturating_add(filter.bytes());
     let tables: Vec<&[u8]> = cuts.iter().map(|cut| cut.bytes.as_slice()).collect();
     let stored = store.put_tables(&tables, discharged, fences)?;
     let mut given_back = Ok(());
@@ -882,16 +1007,22 @@ impl Index {
     };
     self.tail_charged = self.tail_charged.saturating_sub(discharged);
     self.tail_bytes = self.tail_bytes.saturating_sub(bytes);
-    let rows = self.add_run(cuts, &stored, fences);
+    let rows = self.add_run(cuts, &stored, fences, filter);
     self.counters.seals = self.counters.seals.saturating_add(1);
     given_back.map(|()| rows)
   }
 
-  /// Records a run a seal or a merge wrote, on top; its rows.
-  fn add_run(&mut self, cuts: Vec<Cut>, stored: &[Stored], charged: u64) -> u64 {
+  /// Records a run a seal wrote, its key filter `filter`, on top; its rows.
+  fn add_run(&mut self, cuts: Vec<Cut>, stored: &[Stored], charged: u64, filter: KeyFilter) -> u64 {
     let tables = u64::try_from(cuts.len()).unwrap_or(u64::MAX);
     let deduplicated = stored.iter().filter(|put| !put.fresh).count();
-    let run = run_of(cuts, stored, charged);
+    let run = run_of(cuts, stored, charged, filter);
+    self.admit_run(run, tables, u64::try_from(deduplicated).unwrap_or(u64::MAX))
+  }
+
+  /// Records `run`, of `tables` tables of which `deduplicated` were found held already, on top: a seal's or a merge's;
+  /// its rows.
+  fn admit_run(&mut self, run: Run, tables: u64, deduplicated: u64) -> u64 {
     let rows = run.rows;
     let compactable = self.compactable();
     let own = !run.shared;
@@ -905,7 +1036,7 @@ impl Index {
     self.counters.tables_deduplicated = self
       .counters
       .tables_deduplicated
-      .saturating_add(u64::try_from(deduplicated).unwrap_or(u64::MAX));
+      .saturating_add(deduplicated);
     rows
   }
 
@@ -989,11 +1120,11 @@ impl Index {
   }
 
   /// Merges the newest `runs` runs only this index holds into one run (module docs), at once: [`Index::merge_begin`] and
-  /// every [`Index::merge_step`] to its end; the rows written. Fewer than two such runs merge nothing. The merged run's
-  /// tables are admitted as one step and take their rows' holds before the merged runs give theirs back: refused,
-  /// nothing changed.
+  /// every [`Index::merge_step`] to its end; the rows written. Fewer than two such runs merge nothing. Each merged table
+  /// takes its rows' holds before the merged runs give theirs back: refused, what the merge put is given back and the
+  /// runs are as they were.
   pub fn compact(&mut self, store: &mut ContentStore, runs: usize) -> Result<u64, IndexRefused> {
-    let Some(mut merge) = self.merge_begin(store, runs) else {
+    let Some(mut merge) = self.merge_begin(store, runs)? else {
       return Ok(0);
     };
     loop {
@@ -1007,8 +1138,14 @@ impl Index {
 
   /// Plans a merge of the newest `runs` runs only this index holds (module docs, "Merging"), made a table at a time by
   /// [`Index::merge_step`], so its work fits a step's budget however large the runs are; `None` for fewer than two such
-  /// runs. Nothing changes until its last step: lookups read the runs it merges meanwhile.
-  pub fn merge_begin(&mut self, store: &ContentStore, runs: usize) -> Option<Merge> {
+  /// runs. Lookups read the runs it merges until the step that swaps its run in. A merge left part-way before (its
+  /// caller dropped it) is given back first; refused, the give-back's refusal.
+  pub fn merge_begin(
+    &mut self,
+    store: &mut ContentStore,
+    runs: usize,
+  ) -> Result<Option<Merge>, IndexRefused> {
+    self.merge_given_back(store)?;
     self.relearn(store);
     let merging: Vec<Vec<ContentId>> = self
       .runs
@@ -1018,26 +1155,77 @@ impl Index {
       .take(runs)
       .map(|run| run.fences.iter().map(|fence| fence.table).collect())
       .collect();
-    (merging.len() >= 2).then_some(Merge {
+    if merging.len() < 2 {
+      return Ok(None);
+    }
+    let rows = self
+      .runs
+      .iter()
+      .rev()
+      .filter(|run| !run.shared)
+      .take(merging.len())
+      .fold(0_u64, |rows, run| rows.saturating_add(run.rows));
+    let filter = KeyFilter::sized(rows, store.budget());
+    self.merges_begun = self.merges_begun.saturating_add(1);
+    let filter_bytes = filter.bytes();
+    self.merge_work = MergeWork {
+      begun: self.merges_begun,
+      filter,
+      ..MergeWork::default()
+    };
+    Ok(Some(Merge {
+      begun: self.merges_begun,
       runs: merging,
       after: None,
-      cuts: Vec::new(),
-    })
+      tables_cut: 0,
+      window: store.window(),
+      filter_bytes,
+    }))
   }
 
-  /// One step of `merge`: the next table of its merged run cut from the rows of the runs it merges past the last key it
-  /// cut; once no row is left, the merged run admitted in their place, as [`Index::compact`] admits it. A merge whose
-  /// runs are no longer all this index's own (a fork shares one, or one is gone) is given up, nothing changed.
+  /// One step of `merge` (module docs, "Merging"): the next table of its merged run cut from the rows of the runs it
+  /// merges past the last key it cut and put into the store; once no row is left, the merged run swapped in for the runs
+  /// it merged; then one of their tables given back a step, the last answering `Done`. A merge whose runs are no longer
+  /// all this index's own (a fork shares one, or one is gone), or that is no longer the index's merge under way, is given
+  /// up, its runs unchanged and what it put given back. Refused, the merge is given up likewise and the refusal
+  /// answered (a refusal giving a table back answered first).
   pub fn merge_step(
     &mut self,
     store: &mut ContentStore,
     merge: &mut Merge,
   ) -> Result<MergeStep, IndexRefused> {
+    if merge.begun != self.merge_work.begun {
+      return Ok(MergeStep::GivenUp);
+    }
+    if self.merge_work.admitted.is_some() {
+      return self.merge_give_back_step(store);
+    }
     self.relearn(store);
     let Some(merging) = self.merging_positions(merge) else {
+      self.merge_given_back(store)?;
       return Ok(MergeStep::GivenUp);
     };
-    let window = store.window();
+    match self.merge_cut_step(store, merge, &merging) {
+      Ok(true) => Ok(MergeStep::More),
+      Ok(false) => {
+        self.merge_swap(store, &merging)?;
+        Ok(MergeStep::More)
+      }
+      Err(refused) => {
+        self.merge_given_back(store)?;
+        Err(refused)
+      }
+    }
+  }
+
+  /// The next table of `merge`'s run, cut from the rows of the runs at `merging` past the last key it cut and put: held,
+  /// its rows' holds taken when stored new, its fence charged. Whether one was cut (none: no row is left).
+  fn merge_cut_step(
+    &mut self,
+    store: &mut ContentStore,
+    merge: &mut Merge,
+    merging: &[usize],
+  ) -> Result<bool, IndexRefused> {
     let (cut, last) = {
       let mut sources: Vec<Source<'_>> = Vec::with_capacity(merging.len());
       for run in merging.iter().filter_map(|at| self.runs.get(*at)) {
@@ -1054,28 +1242,74 @@ impl Index {
         };
         sources.push(rows.peekable());
       }
-      one_table(Merged { sources }, window)?
+      one_table(Merged { sources }, store.window())?
     };
-    if let Some(cut) = cut {
-      merge.cuts.push(cut);
-      merge.after = last;
-      return Ok(MergeStep::More);
+    let Some(cut) = cut else {
+      return Ok(false);
+    };
+    let hashes = table_hashes(&cut.bytes)?;
+    // The merged run's key filter is charged with its first table.
+    let filter_bytes = if self.merge_work.fences.is_empty() {
+      self.merge_work.filter.bytes()
+    } else {
+      0
+    };
+    let fence = fences_charge(std::slice::from_ref(&cut))?.saturating_add(filter_bytes);
+    let stored = store.put_tables(&[cut.bytes.as_slice()], 0, fence)?;
+    let put = stored.first().ok_or(IndexRefused::LayerMissing)?;
+    if put.fresh
+      && let Err(refused) = table_rows_held(store, &cut.bytes, true)
+    {
+      // Its rows' holds were not taken, so only the table's own hold and its fence's charge are given back.
+      give_back(store, &[put.identity])?;
+      store.discharge(fence)?;
+      return Err(refused);
     }
-    let cuts = take(&mut merge.cuts);
-    self.merge_fits(store, &merging)?;
-    let fences = fences_charge(&cuts)?;
-    let tables: Vec<&[u8]> = cuts.iter().map(|cut| cut.bytes.as_slice()).collect();
-    let stored = store.put_tables(&tables, 0, fences)?;
-    let mut given_back = Ok(());
-    for (cut, put) in cuts.iter().zip(&stored) {
-      if put.fresh {
-        given_back = given_back.and(table_rows_held(store, &cut.bytes, true));
-      }
-    }
-    for run in self.take_runs(&merging) {
-      given_back = given_back.and(release_run(store, &run));
-    }
-    let rows = self.add_run(cuts, &stored, fences);
+    let work = &mut self.merge_work;
+    note_all(&mut work.filter, &hashes);
+    work.fences.push(Fence {
+      table: put.identity,
+      first: cut.first,
+      rows: cut.rows,
+    });
+    work.rows = work.rows.saturating_add(cut.rows);
+    work.charged = work.charged.saturating_add(fence);
+    work.deduplicated = work.deduplicated.saturating_add(u64::from(!put.fresh));
+    merge.after = last;
+    merge.tables_cut = merge.tables_cut.saturating_add(1);
+    Ok(true)
+  }
+
+  /// Swaps the merged run, its tables all put, in for the runs at `merging`: their fences' charge given back now and
+  /// their tables kept to give back a step each ([`Index::merge_give_back_step`]).
+  fn merge_swap(
+    &mut self,
+    store: &mut ContentStore,
+    merging: &[usize],
+  ) -> Result<(), IndexRefused> {
+    let work = take(&mut self.merge_work);
+    let taken = self.take_runs(merging);
+    let charged = taken
+      .iter()
+      .fold(0_u64, |charged, run| charged.saturating_add(run.charged));
+    let tables: Vec<ContentId> = taken
+      .iter()
+      .flat_map(|run| run.fences.iter().map(|fence| fence.table))
+      .collect();
+    let built = u64::try_from(work.fences.len()).unwrap_or(u64::MAX);
+    let run = Run {
+      fences: work.fences,
+      rows: work.rows,
+      charged: work.charged,
+      shared: work.deduplicated > 0,
+      filter: work.filter,
+    };
+    let rows = self.admit_run(run, built, work.deduplicated);
+    self.merge_work = MergeWork {
+      begun: work.begun,
+      admitted: Some((rows, tables)),
+      ..MergeWork::default()
+    };
     self.counters.compactions = self.counters.compactions.saturating_add(1);
     self.counters.runs_merged = self
       .counters
@@ -1083,7 +1317,42 @@ impl Index {
       .saturating_add(u64::try_from(merging.len()).unwrap_or(u64::MAX));
     self.compacted_rows = rows;
     self.restart();
-    given_back.map(|()| MergeStep::Done(rows))
+    store.discharge(charged).map_err(IndexRefused::from)
+  }
+
+  /// Gives back one table of the runs a merge swapped out, the last answering `Done` with the merged rows.
+  fn merge_give_back_step(&mut self, store: &mut ContentStore) -> Result<MergeStep, IndexRefused> {
+    let Some((rows, tables)) = self.merge_work.admitted.as_mut() else {
+      return Ok(MergeStep::GivenUp);
+    };
+    let rows = *rows;
+    let Some(table) = tables.pop() else {
+      self.merge_work = MergeWork::default();
+      return Ok(MergeStep::Done(rows));
+    };
+    let given_back = release_table(store, &table);
+    if tables.is_empty() {
+      self.merge_work = MergeWork::default();
+      return given_back.map(|()| MergeStep::Done(rows));
+    }
+    given_back.map(|()| MergeStep::More)
+  }
+
+  /// Gives back whatever the merge under way holds ([`MergeWork`]): the tables it put, their rows' holds and their
+  /// fences' charge; or, its run swapped in, the merged runs' tables left. It goes on past a refusal and answers the
+  /// first.
+  fn merge_given_back(&mut self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+    let work = take(&mut self.merge_work);
+    let mut first = store.discharge(work.charged).map_err(IndexRefused::from);
+    for fence in &work.fences {
+      first = first.and(release_table(store, &fence.table));
+    }
+    if let Some((_, tables)) = &work.admitted {
+      for table in tables {
+        first = first.and(release_table(store, table));
+      }
+    }
+    first
   }
 
   /// Where `merge`'s runs are among this index's, each still its own: none when one is gone or shared.
@@ -1105,24 +1374,6 @@ impl Index {
       .collect()
   }
 
-  /// Refuses a merge whose runs' tables alone could not fit the room, before any of their rows is read: the merged run
-  /// holds the same rows, so this is what its tables come to, and the exact check is the store's.
-  fn merge_fits(&self, store: &ContentStore, merging: &[usize]) -> Result<(), IndexRefused> {
-    let mut need: u64 = 0;
-    for run in merging.iter().filter_map(|at| self.runs.get(*at)) {
-      for fence in &run.fences {
-        let bytes = store.get(&fence.table).ok_or(IndexRefused::LayerMissing)?;
-        let bytes = u64::try_from(bytes.len()).map_err(|_| TableRefused::TooLarge)?;
-        need = need.checked_add(bytes).ok_or(TableRefused::TooLarge)?;
-      }
-    }
-    let room = store.room();
-    if need > room {
-      return Err(ContentRefused::OverBudget { need, room }.into());
-    }
-    Ok(())
-  }
-
   /// Takes the runs at `positions` out of the index, keeping the rest in order.
   fn take_runs(&mut self, positions: &[usize]) -> Vec<Run> {
     let mut taken = Vec::with_capacity(positions.len());
@@ -1141,8 +1392,8 @@ impl Index {
   /// tell, and nothing else changed.
   pub fn fork(&mut self, store: &mut ContentStore) -> Result<Index, IndexRefused> {
     self.seal_rows(store, false)?;
-    let fences = self
-      .runs
+    let copies: Vec<Run> = self.runs.iter().map(Run::fork_copy).collect();
+    let fences = copies
       .iter()
       .try_fold(0_u64, |charged, run| charged.checked_add(run.charged))
       .ok_or(TableRefused::TooLarge)?;
@@ -1157,7 +1408,7 @@ impl Index {
     }
     self.restart();
     Ok(Index {
-      runs: self.runs.clone(),
+      runs: copies,
       rule: self.rule.clone(),
       forked: Some((self.runs.len(), self.keys_added)),
       ..Index::default()
@@ -1168,10 +1419,9 @@ impl Index {
   /// tables (the rows' bytes, a frame and a fence a table, held beside the tail they replace until it is given back) and
   /// every run's fences copied.
   pub fn fork_room(&self) -> u64 {
-    let fences = self
-      .runs
-      .iter()
-      .fold(0_u64, |charged, run| charged.saturating_add(run.charged));
+    let fences = self.runs.iter().fold(0_u64, |charged, run| {
+      charged.saturating_add(run.charged.saturating_sub(run.filter.bytes()))
+    });
     let tail = self
       .tail_bytes
       .saturating_add(TABLE_FRAME_BYTES)
@@ -1200,6 +1450,10 @@ impl Index {
     };
     if keys_added != self.keys_added || inherited > fork.runs.len() {
       return Err(AdoptRefused::Stale(Box::new(fork)));
+    }
+    // A merge of the fork's own left part-way is given back: the fork's runs are what is adopted.
+    if let Err(refused) = fork.merge_given_back(store) {
+      return Err(AdoptRefused::Refused(refused, Box::new(fork)));
     }
     if let Err(refused) = fork.seal_rows(store, false) {
       return Err(AdoptRefused::Refused(refused, Box::new(fork)));
@@ -1230,7 +1484,7 @@ impl Index {
     for run in &self.runs {
       first = first.and(release_run(store, run));
     }
-    first
+    first.and(self.merge_given_back(store))
   }
 
   /// Every row, in key order.
@@ -1317,6 +1571,8 @@ impl Index {
     IndexCounters {
       lookups: self.lookups.get(),
       runs_visited: self.runs_visited.get(),
+      resolves: self.resolves.get(),
+      filter_rejections: self.filter_rejections.get(),
       ..self.counters
     }
   }

@@ -233,8 +233,12 @@ mod tests {
       .collect()
   }
 
-  /// Shape: how long a checkpoint taken in turns may take to end on a loaded runner.
-  const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+  /// Derived: how long a checkpoint taken in turns may take to end, sixty liveness budgets (a minute at the derived
+  /// budget). It does a turn each time its shard cycles through its ready tasks; a loaded runner stretches a cycle
+  /// toward the liveness budget, past which the watchdog would call the shard stuck, and the checkpoint of one page's
+  /// file is a few turns, so sixty such cycles bound it with room.
+  const CHECKPOINT_WAIT: std::time::Duration =
+    std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS.saturating_mul(60));
 
   /// A one-shard daemon's memory status, with and without memory, once the checkpoint of a green with one file accepted
   /// has ended: its hold paused before its first chunk through the submit's step when `paused`, so the checkpoint is
