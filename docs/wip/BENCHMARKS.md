@@ -19140,3 +19140,55 @@ Shapes to note:
 - **git's clone-again on slates:** run 1 took 120.3 s, like a first clone, and runs 2 to 5 took 80.8 to 82.8 s. Stock's
   clone-again equals its clone throughout.
 - Round 2's outliers did not recur: this round's runs agree within a few percent wherever load did not move.
+## Slates against stock git: round 4, the git leg alone with A-900 in, first bytes measured (goal 93 perf; main 01a20182's r870, 2026-11-24)
+
+The git leg of round 3, alone, at 21b8b5311 (A-900 in, and the harness's counters, first bytes and sampled pass, all
+read outside each step's timing). Stock is `git daemon` alone this round. Five runs interleaved, stock first, with
+`SAMPLE=1`.
+
+- **Machine:** the big Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4). Load 2.19 at the start and 1.83 at the
+  end; the round was quiet throughout.
+- **Dataset and versions:** git/git bare at f7de81456940 (8 branches, 1,019 tags, 206,375 commits, 424,912 objects
+  pushed); git 2.50.1 (Apple Git-155); slates 0.1.0, release.
+- **Command:** `SAMPLE=1 SERVERS="stock slates" KEEP_LOGS=… crates/cli/bench/git_scale.sh SLATES git-git.git WORK 5`.
+  The record, logs, status files, packet traces and both call trees are in `~/.cache/main-rounds/git-leg-2/` on the
+  Studio.
+- **Checks:** refs (1,027) and objects (424,912) identical on both servers; each incremental fetch held its commit.
+
+Seconds, wall clock at the client, every run shown:
+
+| git | git daemon 1-5 | best | slates 1-5 | best | slates against stock |
+|---|---|---|---|---|---|
+| push, every branch and tag | 11.024 10.812 10.821 10.797 10.834 | 10.797 | 82.436 81.593 81.778 80.988 80.872 | 80.872 | 7.49× slower |
+| clone `--mirror` | 10.587 10.551 10.540 10.580 10.588 | 10.540 | 133.029 129.051 128.571 122.352 124.379 | 122.352 | 11.61× slower |
+| clone again | 10.602 10.597 10.638 10.536 10.593 | 10.536 | 121.106 80.729 81.061 80.719 81.012 | 80.719 | 7.66× slower |
+| one-commit push | 0.136 0.133 0.149 0.133 0.132 | 0.132 | 0.078 0.075 0.078 0.079 0.081 | 0.075 | 1.76× faster |
+| fetch of it | 0.145 0.146 0.144 0.141 0.140 | 0.140 | 0.134 1.181 1.213 1.210 1.183 | 0.134 | 1.04× faster (run 1 only) |
+| clone `--depth 1` | 0.931 0.932 0.936 0.920 0.928 | 0.920 | 1.346 3.753 3.755 3.667 3.628 | 1.346 | 1.46× slower (run 1 only) |
+| clone `--filter=blob:none` | 6.291 6.239 6.266 6.213 6.214 | 6.213 | 73.431 78.542 83.559 76.606 78.754 | 73.431 | 11.82× slower |
+
+Slates' first bytes, in seconds after each clone began, runs 1 to 5 (from the client's packet trace; the first packet is
+the ref advertisement, the first pack bytes where git stops tracing):
+
+| slates step | first packet | first pack bytes | its total |
+|---|---|---|---|
+| clone `--mirror` | 0.072 0.079 0.080 0.081 0.078 | 111.332 108.399 107.645 102.369 104.188 | 133.029 129.051 128.571 122.352 124.379 |
+| clone again | 0.029 0.029 0.030 0.029 0.029 | 87.980 54.899 54.981 55.270 55.149 | 121.106 80.729 81.061 80.719 81.012 |
+| clone `--filter=blob:none` | 0.029 0.030 0.030 0.029 0.030 | 63.028 67.869 72.801 66.214 68.276 | 73.431 78.542 83.559 76.606 78.754 |
+
+What it says:
+- **A slates clone spends most of its time before it sends the pack's first byte.** The ref advertisement is
+  answered at once (0.03 to 0.08 s). The first pack bytes come 102 to 111 s into a 122 to 133 s clone, about 84% of
+  it. The pack's transfer then takes 21 to 25 s, about twice stock's whole clone.
+- **The same holds for partial clone and clone-again.** A partial clone's first pack bytes come at 63 to 73 s of 73 to
+  84 s. Clone-again's come at about 55 s of about 81 in runs 2 to 5. Its run 1 took 88 s of 121, like a first clone,
+  as in round 3.
+- **Against round 3 (a51883940), A-900 moved little:** push 80.9 s against 81.9, clone 122.4 against 127.3,
+  clone-again 80.7 against 80.8, partial 73.4 against 72.1, every one within 4%.
+- **Fetch and shallow kept round 3's shape:** run 1 matches stock (0.134 s against 0.140; 1.346 against 0.920), runs 2
+  to 5 are slower (about 1.2 s and 3.7 s). That is w-git's item.
+- **The sampled pass (`SAMPLE=1`), outside the timed runs:** both call trees came back (`sample-push.txt`,
+  `sample-clone.txt`), w-svn's check of A-900 and w-git's of the clone. The profiled clone's counters went from zero to
+  `upload.parts_copied=34`, `parts_by_entry=315`, `entries_judged=46,260`, `entries_copied=28,501`,
+  `headers_rewritten=9,567` and `made_whole=8,192`. Its whole counter line, and every timed clone's before and after,
+  are in the record.
