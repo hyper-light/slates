@@ -778,8 +778,15 @@ mod tests {
   /// modelled step that truly costs 1.5 µs and 3 ns a page, each read on a clock rounded down to that tick at both ends,
   /// with half a microsecond of budget left a step and a vector page of 16,384 pages the most. Expect the steps to average
   /// at least nine tenths of the pages their fixed cost buys (1.5 µs ÷ 3 ns = 500). Red on the shard's clock, whose 1,000 ns tick gave
-  /// 333; a tick of a few tens of nanoseconds judges a page truly.
+  /// 333; a tick of a few tens of nanoseconds judges a page truly. Not in ThreadSanitizer's lane: its runtime intercepts
+  /// `clock_gettime` (compiler-rt's `sanitizer_common_interceptors.inc`), so a reading there costs hundreds of
+  /// nanoseconds and the measured tick is that cost, not the clock's (400 ns in diag run 45315777446, 2026-11-24, the
+  /// steps averaging 300 pages of the 450 asked). The test runs one thread, so the lane loses no race by it.
   #[test]
+  #[cfg_attr(
+    slates_tsan,
+    ignore = "ThreadSanitizer intercepts clock_gettime, so its readings of the step clock are 400 ns apart at the least (diag run 45315777446); the test judges the clock's own tick and runs one thread"
+  )]
   fn a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes() {
     const MOST: usize = 16_384;
     const STEPS: u64 = 20_000;

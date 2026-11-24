@@ -3385,6 +3385,151 @@ pub(crate) fn run_recorded_for_test(
 }
 
 /// `body` back to run now, or parked until what it owes is made (its reply then, if any).
+/// Format: client requests parked on a read of a named text's let-go window while it came back from the node's store,
+/// then run again (A-760 (b) 4d; main's ruling (B)).
+const VERB_PARKED_ON_AWAY: &str = "verbs.parked_on_away";
+/// Format: requests refused a park because the shard's table was at its bound, or no task could bring their windows
+/// back: answered `Overloaded`, unrecorded, so a retry runs again.
+const VERB_PARK_REFUSED: &str = "verbs.park_refused";
+/// Format: a request run again over the windows it was parked on that met a let-go window again: a bug, answered as it
+/// ran and logged naming the object, never parked again.
+const VERB_AWAY_AGAIN: &str = "verbs.away_again";
+/// Format: a parked request whose windows the node's store did not give back: answered `ContentUnavailable`,
+/// unrecorded.
+const VERB_BRING_BACK_REFUSED: &str = "verbs.bring_back_refused";
+
+/// `reply` once [`run_recorded`]'s transaction commits ([`commit_settled`]), or the refusal its failure answers.
+fn settled_reply(state: &mut ShardState, reply: ReplyBody) -> ReplyBody {
+  match commit_settled(state) {
+    Ok(_) => reply,
+    Err(e) => {
+      // Nothing of the verb is durable and the partition has been rolled back to its durable state —
+      // the effects and the completion record gone together (`Db::commit`, AC-2.3; AUD-06). What the
+      // verb built outside the partition for a record that no longer exists is released with it, so a
+      // client retrying into a segment that cannot publish leaks nothing per attempt. The refusal is
+      // counted here (it is deliberately *not* recorded as a completion: a retry must re-execute).
+      let refusal = refusal_of_db(&e);
+      state.count(refusal_name(&refusal), 1);
+      reconcile_unpublished_effects(state);
+      refused(refusal)
+    }
+  }
+}
+
+/// [`dispatch`] for [`run_recorded`], parking a run that met a let-go window (A-760 (b) 4d): a read of a green holding
+/// files by name alone, or a submit (refused before any effect), refused for it is kept, parked unrecorded and run
+/// again once the windows are back ([`park_on_away`]); its transaction ends with nothing in it and the verb's span is
+/// put back (`outer`), and what the park answers now is the error. One run again that meets one again is counted, a
+/// bug, and answered as it ran.
+fn dispatch_parking(
+  state: &mut ShardState,
+  (origin, id, client_id, label): (u64, RequestId, u32, u32),
+  principal: &Principal,
+  (body, outer): (RequestBody, Option<slates_wire::observe::SpanContext>),
+) -> Result<ReplyBody, Box<Option<ReplyBody>>> {
+  let resuming = state.verb_resuming.contains(&(origin, id));
+  let parkable = (label == 0 || matches!(body, RequestBody::Submit { .. }))
+    && !resuming
+    && reads_named_green(state, &body);
+  let kept = parkable.then(|| body.clone());
+  let (reply, away) =
+    crate::vcs_store::named_objects::away_scope(|| dispatch(state, client_id, principal, body));
+  if let (Some(body), false, ReplyBody::Refused { .. }) = (kept, away.is_empty(), &reply) {
+    state.current_request = None;
+    let _ = commit_settled(state);
+    state.current_span = outer;
+    return Err(Box::new(park_on_away(
+      state,
+      (origin, id),
+      (client_id, principal, body),
+      away,
+    )));
+  }
+  if resuming && let Some(read) = away.first() {
+    state.count(VERB_AWAY_AGAIN, 1);
+    slates_machine::log_line!(
+      "slates-server: a request run again over its brought-back windows met {:?} let go again",
+      read.identity
+    );
+  }
+  Ok(reply)
+}
+
+/// Whether `body`'s volume reads a green holding a file by its content-plane object's name alone (A-760 (b) 4d): the
+/// green itself, or the green a work is based on.
+fn reads_named_green(state: &ShardState, body: &RequestBody) -> bool {
+  let Some(volume) = body.volume().map(to_db_volume) else {
+    return false;
+  };
+  let green = match state.works.get(&volume) {
+    Some(work) => work.green,
+    None => volume,
+  };
+  state
+    .greens
+    .get(&green)
+    .is_some_and(|engine| engine.named_blocks() > 0)
+}
+
+/// Parks request `(origin, id)`, whose run met reads of let-go windows (`away`; A-760 (b) 4d), unrecorded: a task brings
+/// the windows back and runs it again over them, kept until it is answered ([`crate::vcs_store::named_objects::ReadPin`]),
+/// which by construction meets none let go. Refused `Overloaded` at the shard's bound (its clients' slots, as the other
+/// parked requests are) or with no task to run, unrecorded, so a retry runs again.
+fn park_on_away(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  (client_id, principal, body): (u32, &Principal, RequestBody),
+  away: Vec<crate::vcs_store::named_objects::AwayRead>,
+) -> Option<ReplyBody> {
+  let shard = state.shard;
+  let bound = state
+    .config
+    .clients_per_shard
+    .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(1));
+  let Some(entry) = state.verb_parked.park(away.clone(), bound) else {
+    state.count(VERB_PARK_REFUSED, 1);
+    return Some(refused(Refusal::Overloaded { shard }));
+  };
+  let route = state.reply_route.take();
+  let parked = parked_request(
+    (origin, id),
+    route,
+    (client_id, principal.clone(), body),
+    state,
+  );
+  let task = async move {
+    let brought = crate::vcs_store::named_objects::bring_back_reads(&away).await;
+    let _ = crate::state::with_state(move |state| {
+      state.verb_parked.release(entry);
+      match brought {
+        Ok(_pins) => {
+          state.verb_resuming.insert((origin, id));
+          resume_all(state, vec![parked]);
+          state.verb_resuming.remove(&(origin, id));
+        }
+        Err(refused) => {
+          state.count(VERB_BRING_BACK_REFUSED, 1);
+          slates_machine::log_line!(
+            "slates-server: a request parked on {:?} was not brought back: {refused:?}",
+            away.first().map(|read| read.identity)
+          );
+          let _handed = answer_refused(state, parked, Refusal::ContentUnavailable);
+        }
+      }
+    });
+  };
+  let started = slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .is_ok();
+  if !started {
+    state.verb_parked.release(entry);
+    state.count(VERB_PARK_REFUSED, 1);
+    return Some(refused(Refusal::Overloaded { shard }));
+  }
+  state.count(VERB_PARKED_ON_AWAY, 1);
+  None
+}
+
 fn parked_or_body(
   state: &mut ShardState,
   (origin, id): (u64, RequestId),
@@ -3467,7 +3612,15 @@ fn run_recorded(
     .volume()
     .and_then(|volume| crate::told::mark(state, to_db_volume(volume)));
   let live_volume = body.volume().map(to_db_volume);
-  let reply = dispatch(state, client_id, principal, body);
+  let reply = match dispatch_parking(
+    state,
+    (origin, id, client_id, label),
+    principal,
+    (body, outer),
+  ) {
+    Ok(reply) => reply,
+    Err(parked) => return *parked,
+  };
   state.current_request = None;
   let route = state.reply_route.take();
   // A verb that deferred its acceptance to a fleet commit (`submit` at `f > 0`; AUD-11) commits its
@@ -3486,20 +3639,7 @@ fn run_recorded(
     Chokepoint::LogAppend,
     state.clock.monotonic_ns(),
   );
-  let reply = match commit_settled(state) {
-    Ok(_) => reply,
-    Err(e) => {
-      // Nothing of the verb is durable and the partition has been rolled back to its durable state —
-      // the effects and the completion record gone together (`Db::commit`, AC-2.3; AUD-06). What the
-      // verb built outside the partition for a record that no longer exists is released with it, so a
-      // client retrying into a segment that cannot publish leaks nothing per attempt. The refusal is
-      // counted here (it is deliberately *not* recorded as a completion: a retry must re-execute).
-      let refusal = refusal_of_db(&e);
-      state.count(refusal_name(&refusal), 1);
-      reconcile_unpublished_effects(state);
-      refused(refusal)
-    }
-  };
+  let reply = settled_reply(state, reply);
   // What the committed verb owed the audit goes to the control shard now, after its transaction (A-265).
   crate::landing::send_owed_audit(state);
   let end_ns = state.clock.monotonic_ns();
@@ -6041,6 +6181,9 @@ fn dispatch_inner(
       cursor,
     } => crate::listing::read_dir(state, principal, (volume, &path, at), cursor),
     RequestBody::StageBegin { work, len } => stage_begin(state, principal, work, len),
+    RequestBody::StageOpen { volume, attachment } => {
+      stage_open(state, principal, volume, attachment)
+    }
     RequestBody::StagePut {
       work,
       token,
@@ -9254,6 +9397,48 @@ fn stage_begin(
   }
 }
 
+/// `StageOpen` (`crate::staging`, A-880): a buffer of no stated length for an `FsWriteStaged` under the caller's write
+/// `attachment` of a plain `volume`, living as long as the attachment. Checked as the write it stages is: the volume as
+/// `StageBegin` checks it and as the file verbs do (a plain volume), the attachment as a write through it
+/// (`fs_verbs::writer_attachment`, which renews a CLI attachment as any use does).
+fn stage_open(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  attachment: u64,
+) -> ReplyBody {
+  let volume_id = match staging_volume(state, principal, volume) {
+    Ok(id) => id,
+    Err(refusal) => return refused(refusal),
+  };
+  // A file write's buffer, so a plain volume's, refused as the file verbs refuse any other (`fs_verbs::serve`).
+  if let Err(refusal) = crate::fs_verbs::plain(state, volume) {
+    return refused(refusal);
+  }
+  if let Err(refusal) =
+    crate::fs_verbs::writer_attachment(state, principal, (volume, attachment), "stage")
+  {
+    return refused(refusal);
+  }
+  let now = state.clock.monotonic_ns();
+  state.staging.expire(now, &mut state.store.metadata);
+  match state.staging.open(
+    (volume_id, principal),
+    attachment,
+    state.partition,
+    &mut state.store.metadata,
+  ) {
+    Ok(token) => {
+      state.count(STAGES_OPENED, 1);
+      ReplyBody::Staged { token }
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Counter: open staging buffers begun (A-880, `StageOpen`): the non-vacuity count of a write streamed in pages.
+pub const STAGES_OPENED: &str = "staging.opened";
+
 /// `StagePut` (`crate::staging`): the next bytes of a staging buffer.
 fn stage_put(
   state: &mut ShardState,
@@ -9269,10 +9454,12 @@ fn stage_put(
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
   let expires = now.saturating_add(state.failover_ns);
-  match state
-    .staging
-    .put((work_id, principal, token), offset, bytes, expires)
-  {
+  match state.staging.put(
+    (work_id, principal, token),
+    offset,
+    bytes,
+    (expires, &mut state.store.metadata),
+  ) {
     Ok(filled) => {
       crate::deadlines::noted(state, expires);
       ReplyBody::StagePutDone { filled }
@@ -9500,6 +9687,7 @@ fn edit(
       fetched: home.fetched.as_ref(),
       version: w.base_version,
       entries: Some(&w.entries),
+      plane: crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content),
     };
     crate::work_log::apply_edit(
       (&mut w.files, &mut w.journal),
@@ -9737,6 +9925,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       fetched: home.fetched.as_ref(),
       version: w.base_version,
       entries: Some(&w.entries),
+      plane: crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content),
     };
     crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op)
   };
@@ -9955,6 +10144,7 @@ fn build_increment(
     fetched: None,
     version: base_version,
     entries: None,
+    plane: crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content),
   };
   let kept = crate::refining::kept(state, sealed.work, (base_version, sealed.journal.len()));
   let inc = compose_increment(
@@ -10044,6 +10234,7 @@ pub(crate) fn composed_whole(
     fetched: None,
     version: base_version,
     entries: None,
+    plane: crate::vcs_store::named_objects::plane(&state.vcs_stores, &state.store.content),
   };
   compose_increment(
     (work, base_version),
@@ -10819,11 +11010,45 @@ pub(crate) fn settle_submit(
   reply
 }
 
+/// The green's verdict on `inc` ([`verdict_once`]), judged again once lent from the content plane every named text its
+/// first judge read unlent (A-760 (b) 4d: a base held by name alone is read through the plane, as runs are), the texts
+/// let go after. One lend makes the second judge read nothing unlent, since `Green::unlent_reads` names every text the
+/// verdict reads; a second refusal is counted, a bug. A text the plane cannot give now leaves the first refusal.
+fn verdict_of(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  sealed: &crate::work_home::SealedWork,
+  (inc, hold): (&slates_merge::engine::Increment, bool),
+) -> Option<Result<(Judged, Option<slates_merge::engine::Judged>), String>> {
+  use crate::vcs_store::name_holds;
+  let base_unlent = |judged: &Result<(Judged, Option<slates_merge::engine::Judged>), String>| {
+    matches!(judged,
+      Ok(((slates_merge::engine::Outcome::ContentUnread { identity }, _), _))
+        if !inc.named.runs.iter().any(|run| run.identity == *identity))
+  };
+  let first = verdict_once(state, green_id, sealed, (inc, hold))?;
+  if !base_unlent(&first) {
+    name_holds::let_go_lent(state, green_id);
+    return Some(first);
+  }
+  let wanted = state.greens.get_mut(&green_id)?.unlent_reads(inc);
+  if name_holds::lend_from_plane(state, green_id, &wanted).is_err() {
+    return Some(first);
+  }
+  state.count(name_holds::NAME_LENT_VERDICTS, 1);
+  let again = verdict_once(state, green_id, sealed, (inc, hold))?;
+  if base_unlent(&again) {
+    state.count(name_holds::NAME_LEND_MISSED, 1);
+  }
+  name_holds::let_go_lent(state, green_id);
+  Some(again)
+}
+
 /// The green's verdict on `inc`: a holder's computed verdict taken by position (A-697 part c), or one judged here; the
 /// reason where a computed verdict does not read back or is not taken. `None` for a green this shard does not hold.
 /// Where `hold` (a server-made commit's submit holding its landing turn, `crate::made_commit`), an accepted verdict is
 /// held, not applied (A-805): its outcome and what it records come with it, and the green shows nothing of it.
-fn verdict_of(
+fn verdict_once(
   state: &mut ShardState,
   green_id: DbVolumeId,
   sealed: &crate::work_home::SealedWork,
@@ -10911,14 +11136,20 @@ fn held_outcome(
 /// (`Green::apply_recorded`, the replay a recovery runs). Whether it committed as its version; false, nothing applied,
 /// where the green moved since or is not here.
 pub(crate) fn apply_accepted(state: &mut ShardState, parts: &mut AcceptedParts) -> bool {
-  let Some(mut engine) = state.greens.get_mut(&parts.green) else {
-    return false;
-  };
-  if engine.head().checked_add(1) != Some(parts.version) {
+  let at_head = state
+    .greens
+    .get(&parts.green)
+    .is_some_and(|engine| engine.head().checked_add(1) == Some(parts.version));
+  if !at_head {
     return false;
   }
+  // The named texts its apply reads that the green holds by name alone lent it first, let go after (A-760 (b) 4d).
   let applied = parts.applied.as_deref().unwrap_or_default();
-  engine.apply_recorded(&mut parts.increment, applied) == parts.version
+  crate::vcs_store::name_holds::apply_recorded_lent(
+    state,
+    parts.green,
+    (&mut parts.increment, applied),
+  ) == Some(parts.version)
 }
 
 /// A green's verdict on an increment and what it applied ([`slates_merge::engine`]'s `submit_resolved`).
@@ -11226,11 +11457,9 @@ fn accepted_answer(
       Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
       // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
       None => {
-        let committed = state
-          .greens
-          .get_mut(&green_id)
-          .map(|mut engine| engine.commit_judged(judged).is_ok());
-        if committed != Some(true) {
+        let committed =
+          crate::vcs_store::name_holds::commit_judged_lent(state, green_id, judged).is_some();
+        if !committed {
           return refused(Refusal::Overloaded { shard: state.shard });
         }
       }
@@ -12128,6 +12357,7 @@ pub(crate) fn compose_on_replica(
     fetched: None,
     version: sealed.base_version,
     entries: None,
+    plane: None,
   };
   let kept = crate::refining::kept(
     state,
@@ -12327,6 +12557,7 @@ fn apply_replacement(
     fetched: None,
     version: head,
     entries: None,
+    plane: None,
   };
   let unknown = || Refusal::UnknownBase {
     green: VolumeId::default(),
@@ -15794,10 +16025,11 @@ fn remake_greens_ahead(state: &mut ShardState) {
   }
 }
 
-/// Makes `record`'s green again from its durable checkpoint and chain ([`remake_greens_ahead`]), the named texts they name
-/// that the content plane does not hold whole kept from the engine it replaces first ([`kept_for_remake`]).
+/// Makes `record`'s green again from its durable checkpoint and chain ([`remake_greens_ahead`]). The checkpoint's named
+/// texts are restored by name, read by nothing; the texts the chain's entries name stay in the content plane while the
+/// engine it replaces is let go, since its holds are given back only at the next drain (A-760 (b) 4d), after the
+/// new engine's are taken.
 fn remake_green(state: &mut ShardState, record: &VolumeRecord) {
-  let kept = kept_for_remake(state, record.id);
   let member = state
     .db
     .partition()
@@ -15828,7 +16060,7 @@ fn remake_green(state: &mut ShardState, record: &VolumeRecord) {
       state.greens.remove(&record.id);
     }
   }
-  let replayed = replay_green_keeping(state, record.id, kept);
+  let replayed = replay_green(state, record.id);
   match &member {
     Some(member) => install_member_root(state, record, member, replayed),
     None => install_green(state, record, replayed),
@@ -19831,7 +20063,7 @@ async fn rebuild_record(
         Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
         None => rebuild_green_sliced(state, record, slices).await,
       };
-      crate::repository::svn_commit::release_texts(state, None, &brought);
+      crate::vcs_store::name_holds::give_back_brought(state, &brought);
       for version in versions {
         crate::merge_service::enqueue_recovered_record(state, record.id, version);
         slices.unit_done().await;
@@ -20368,34 +20600,20 @@ pub(crate) fn replayed_green_for_test(
   replay_green(state, id).ok().map(|replayed| replayed.0)
 }
 
-#[cfg(test)]
+/// Replays green `id`'s durable origin and chain into a fresh engine in one call, its named texts read from the content
+/// plane ([`replay_objects`]).
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
 ) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
-  replay_green_keeping(state, id, Vec::new())
-}
-
-/// Green `id` replayed from its durable chain into a fresh engine, as a recovery replays it (the tests' `replay_green`
-/// keeps nothing), its named texts read from the content plane, then from `kept` (sorted by identity, each an object's
-/// whole bytes: [`remake_green`]'s).
-fn replay_green_keeping(
-  state: &ShardState,
-  id: DbVolumeId,
-  kept: Vec<(slates_merge::named::Identity, Vec<u8>)>,
-) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
   let mut replay = GreenReplay::begin(state, id)?;
-  replay.kept = kept;
   while !replay.step(state)? {}
   replay.finish(state)
 }
 
 /// Where a replay reads named texts (A-760, A-869): the shard's content plane, read with the shard's chunk store in
-/// place of a lent one (a replay holds the shard read-only), then `kept`.
-fn replay_objects<'a>(
-  state: &'a ShardState,
-  kept: &'a [(slates_merge::named::Identity, Vec<u8>)],
-) -> crate::vcs_store::named_objects::ReplayObjects<'a> {
+/// place of a lent one (a replay holds the shard read-only).
+fn replay_objects(state: &ShardState) -> crate::vcs_store::named_objects::ReplayObjects<'_> {
   crate::vcs_store::named_objects::ReplayObjects {
     plane: state
       .vcs_stores
@@ -20404,33 +20622,7 @@ fn replay_objects<'a>(
         store,
         kept_in: &state.store.content,
       }),
-    kept,
   }
-}
-
-/// The named texts green `id`'s durable checkpoint and chain name that the content plane does not hold whole, copied from
-/// its engine, which holds each it still names in a block named for it (A-866): what a refused publication's remake
-/// replays with ([`remake_green`]), read before the engine is let go. The checkpoint and the chain name texts that are
-/// durable on the node's store (A-865), but the remake runs inside the refused step and cannot wait on that store, as a
-/// recovery's pre-pass does (`svn_texts::bring_back_named`); a text neither the plane nor the engine holds still fences
-/// the green `ContentMissing`, typed.
-fn kept_for_remake(
-  state: &ShardState,
-  id: DbVolumeId,
-) -> Vec<(slates_merge::named::Identity, Vec<u8>)> {
-  let wanted: std::collections::BTreeSet<slates_merge::named::Identity> =
-    crate::vcs_store::svn_texts::named_lacking(state, id)
-      .into_iter()
-      .map(|(hash, len)| slates_merge::named::Identity { hash, len })
-      .collect();
-  if wanted.is_empty() {
-    return Vec::new();
-  }
-  state
-    .greens
-    .get(&id)
-    .map(|engine| engine.bytes_named(&wanted))
-    .unwrap_or_default()
 }
 
 /// Replays green `id`'s durable origin and chain into a fresh engine in a recovery's slices ([`GreenReplay`]): the slice
@@ -20475,9 +20667,6 @@ pub(crate) struct GreenReplay {
   phase: GreenReplayPhase,
   /// The shares its origin was seeded in: more than one shows the seeding was sliced.
   load_steps: u64,
-  /// Named texts kept for the replay where the content plane does not hold them whole, sorted by identity
-  /// ([`crate::vcs_store::named_objects::ReplayObjects`]): a refused publication's remake's ([`remake_green`]).
-  kept: Vec<(slates_merge::named::Identity, Vec<u8>)>,
 }
 
 /// Where a [`GreenReplay`] is.
@@ -20488,13 +20677,6 @@ enum GreenReplayPhase {
   Decode(Box<slates_merge::origin::DecodeCursor>),
   /// Seeding the engine from the origin a share a step. Boxed: it holds the engine being seeded.
   Load(Box<slates_merge::engine::OriginLoad>),
-  /// Reading the files the green's checkpoint names from the content plane, a copy slice a step (A-869), before the
-  /// seeded engine is restored at it: the engine, the checkpoint being read, and its version.
-  Restoring {
-    seeded: Box<slates_merge::engine::Green>,
-    checkpoint: Box<slates_merge::checkpoint::Checkpoint>,
-    held: u64,
-  },
   /// Replaying the chain: the engine so far, the version its checkpoint holds (0 with none), the index of the next
   /// entry, the versions rebuilt so far, and the head and identity the checkpoint recorded (A-257).
   Chain {
@@ -20505,7 +20687,68 @@ enum GreenReplayPhase {
     head_check: Option<(u64, [u8; 32])>,
     /// The next entry while its named runs are read from the content plane, a copy slice a step (A-760).
     reading: Option<Box<slates_merge::chain_entry::ChainEntry>>,
+    /// The named texts the next entry's apply reads that the green holds by name alone, read from the content plane a
+    /// copy slice a step and lent the green (A-760 (b) 4d), once its runs are read.
+    lending: Option<Box<Lending>>,
   },
+}
+
+/// The texts a replayed entry's apply reads that its green holds by name alone (`Green::recorded_unlent`), being read
+/// from the content plane to lend it: those left, the last being read into `buffer` (A-760 (b) 4d).
+#[derive(Default)]
+struct Lending {
+  left: Vec<slates_merge::named::Identity>,
+  buffer: Vec<u8>,
+}
+
+/// One copy slice more of the texts `entry`'s apply reads that `green` holds unlent, read from the content plane and
+/// lent it once whole ([`Lending`]): whether every one is lent. A text the plane lacks fences the green
+/// `ContentMissing`; the recovery's pre-pass brings back what the content store lacks first
+/// (`svn_texts::bring_back_named`).
+fn lend_step(
+  state: &ShardState,
+  green: &mut slates_merge::engine::Green,
+  (entry, version): (&slates_merge::chain_entry::ChainEntry, u64),
+  lending: &mut Option<Box<Lending>>,
+) -> Result<bool, crate::merge_service::GreenFence> {
+  use slates_merge::named::Objects;
+  let missing = crate::merge_service::GreenFence::ContentMissing { version };
+  let lend = lending.get_or_insert_with(|| {
+    Box::new(Lending {
+      left: green
+        .recorded_unlent(&entry.increment, &entry.applied)
+        .into_iter()
+        .collect(),
+      buffer: Vec::new(),
+    })
+  });
+  let slice = usize::try_from(state.config.copy_slice_bytes().max(1)).unwrap_or(usize::MAX);
+  let objects = replay_objects(state);
+  while let Some(identity) = lend.left.last().copied() {
+    let whole = usize::try_from(identity.len).map_err(|_| missing)?;
+    let from = lend.buffer.len();
+    if from < whole {
+      if from == 0 {
+        lend.buffer.try_reserve_exact(whole).map_err(|_| missing)?;
+      }
+      let to = from.saturating_add(slice.min(whole.saturating_sub(from)));
+      lend.buffer.resize(to, 0);
+      let into = lend.buffer.get_mut(from..to).ok_or(missing)?;
+      objects
+        .read(&identity, u64::try_from(from).unwrap_or(u64::MAX), into)
+        .map_err(|_| missing)?;
+      if to < whole {
+        return Ok(false);
+      }
+    }
+    let bytes = std::mem::take(&mut lend.buffer);
+    if green.lend(identity, bytes) == 0 {
+      return Err(missing);
+    }
+    lend.left.pop();
+  }
+  *lending = None;
+  Ok(true)
 }
 
 impl GreenReplay {
@@ -20531,7 +20774,6 @@ impl GreenReplay {
       id,
       phase,
       load_steps: 0,
-      kept: Vec::new(),
     })
   }
 
@@ -20552,7 +20794,6 @@ impl GreenReplay {
       id,
       phase: chain_phase_or_back(state, id, seeded)?,
       load_steps: 0,
-      kept: Vec::new(),
     })
   }
 
@@ -20560,9 +20801,7 @@ impl GreenReplay {
   /// to its lineage (A-575).
   fn into_engine(self) -> Option<Box<slates_merge::engine::Green>> {
     match self.phase {
-      GreenReplayPhase::Chain { green, .. } | GreenReplayPhase::Restoring { seeded: green, .. } => {
-        Some(green)
-      }
+      GreenReplayPhase::Chain { green, .. } => Some(green),
       GreenReplayPhase::Origin(_) | GreenReplayPhase::Decode(_) | GreenReplayPhase::Load(_) => None,
     }
   }
@@ -20601,35 +20840,6 @@ impl GreenReplay {
           None => return Ok(false),
         }
       }
-      GreenReplayPhase::Restoring {
-        seeded,
-        checkpoint,
-        held,
-      } => {
-        let held = *held;
-        let objects = replay_objects(state, &self.kept);
-        let read = checkpoint
-          .read_step(&objects, state.config.copy_slice_bytes().max(1))
-          .map_err(|_| GreenFence::ContentMissing { version: held })?;
-        if !read {
-          return Ok(false);
-        }
-        let seeded = std::mem::take(seeded);
-        let mut checkpoint = std::mem::take(checkpoint);
-        match restored_phase(state, id, seeded, (&mut checkpoint, held)) {
-          Ok(phase) => self.phase = phase,
-          // The engine stays with the replay, so a lineage member's refused replay gives it back (A-575).
-          Err((fence, seeded)) => {
-            self.phase = GreenReplayPhase::Restoring {
-              seeded,
-              checkpoint,
-              held,
-            };
-            return Err(fence);
-          }
-        }
-        return Ok(false);
-      }
       GreenReplayPhase::Chain {
         green,
         held,
@@ -20637,12 +20847,13 @@ impl GreenReplay {
         replayed,
         head_check,
         reading,
+        lending,
       } => {
         return replay_chain_entry(
-          (state, &self.kept),
+          state,
           (id, green),
           (*held, *head_check),
-          (next, reading),
+          (next, reading, lending),
           replayed,
         );
       }
@@ -20699,10 +20910,7 @@ impl GreenReplay {
         green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
         Ok((*green, replayed))
       }
-      GreenReplayPhase::Origin(_)
-      | GreenReplayPhase::Decode(_)
-      | GreenReplayPhase::Load(_)
-      | GreenReplayPhase::Restoring { .. } => {
+      GreenReplayPhase::Origin(_) | GreenReplayPhase::Decode(_) | GreenReplayPhase::Load(_) => {
         Err(crate::merge_service::GreenFence::OriginUnavailable)
       }
     }
@@ -20712,12 +20920,13 @@ impl GreenReplay {
 /// Applies green `id`'s next chain entry as its own version (A-257), keeping the version's merge record as its owner enqueued
 /// it, with the head identity the green has at that version; true once no entry is left.
 fn replay_chain_entry(
-  (state, kept): (&ShardState, &[(slates_merge::named::Identity, Vec<u8>)]),
+  state: &ShardState,
   (id, green): (DbVolumeId, &mut slates_merge::engine::Green),
   (held, head_check): (u64, Option<(u64, [u8; 32])>),
-  (next, reading): (
+  (next, reading, lending): (
     &mut usize,
     &mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
+    &mut Option<Box<Lending>>,
   ),
   replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
 ) -> Result<bool, crate::merge_service::GreenFence> {
@@ -20778,7 +20987,7 @@ fn replay_chain_entry(
   // An entry naming its content (A-760) reads it from the content plane first, a copy slice a step, so no step reads
   // a large text whole: the step ends with the entry kept for the next.
   if entry.increment.unread().is_some() {
-    let objects = replay_objects(state, kept);
+    let objects = replay_objects(state);
     let read = entry
       .increment
       .read_step(&objects, state.config.copy_slice_bytes().max(1))
@@ -20788,8 +20997,15 @@ fn replay_chain_entry(
       return Ok(false);
     }
   }
+  // The texts its apply reads that the green holds by name alone (A-760 (b) 4d) are lent it first, a copy slice a step.
+  if !lend_step(state, green, (&entry, version), lending)? {
+    *reading = Some(entry);
+    return Ok(false);
+  }
   let mut entry = *entry;
   let accepted = green.apply_recorded(&mut entry.increment, &entry.applied);
+  // Lent for the apply, let go once it is committed.
+  green.let_named_bytes_go();
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
   }
@@ -20867,51 +21083,24 @@ fn chain_phase_or_back(
           Box::new(seeded),
         ));
       };
-      let Some(mut checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
+      let Some(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
         .ok()
         .filter(|checkpoint| checkpoint.version == held)
       else {
         return Err((GreenFence::CheckpointCorrupt, Box::new(seeded)));
       };
-      // The files it names (A-869) are read from the content plane first, a copy slice a step, so no step reads a
-      // large text whole ([`GreenReplayPhase::Restoring`]).
-      if checkpoint.unread().is_some() {
-        return Ok(GreenReplayPhase::Restoring {
-          seeded: Box::new(seeded),
-          checkpoint: Box::new(checkpoint),
-          held,
-        });
-      }
-      restored_phase(state, id, Box::new(seeded), (&mut checkpoint, held))
+      // The files it names (A-869) are restored by name alone, read by nothing (A-760 (b) 4d).
+      let head_check = checkpoint.head_check;
+      chain_from(
+        state,
+        id,
+        seeded.with_checkpoint(&checkpoint),
+        (held, head_check),
+      )
     }
     // With no checkpoint the chain begins after the green's floor: 0, or the version its takeover adopted it at, whose
     // engine the boot rebuilt from this node's ledger (A-333).
     None => chain_from(state, id, seeded, (partition.green_floor(id), None)),
-  }
-}
-
-/// The chain's replay of green `id` over `seeded` restored at `checkpoint`, of version `held`, whose named files are
-/// read (A-869): the engine handed back with the fence when it cannot begin.
-fn restored_phase(
-  state: &ShardState,
-  id: DbVolumeId,
-  seeded: Box<slates_merge::engine::Green>,
-  (checkpoint, held): (&mut slates_merge::checkpoint::Checkpoint, u64),
-) -> Result<
-  GreenReplayPhase,
-  (
-    crate::merge_service::GreenFence,
-    Box<slates_merge::engine::Green>,
-  ),
-> {
-  use crate::merge_service::GreenFence;
-  let head_check = checkpoint.head_check;
-  match seeded.with_checkpoint(checkpoint) {
-    Ok(green) => chain_from(state, id, green, (held, head_check)),
-    Err(unrestored) => Err((
-      GreenFence::ContentMissing { version: held },
-      unrestored.green,
-    )),
   }
 }
 
@@ -20960,6 +21149,7 @@ fn chain_from(
     replayed,
     head_check,
     reading: None,
+    lending: None,
   })
 }
 
@@ -21064,7 +21254,6 @@ pub(crate) fn begin_readoption(
       id,
       phase,
       load_steps: 0,
-      kept: Vec::new(),
     }));
   }
   true

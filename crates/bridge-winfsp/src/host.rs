@@ -263,6 +263,7 @@ const CLEANUP_CHANGED: u32 = 0x01 | 0x02 | 0x10 | 0x40 | 0x80;
 
 /// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
 /// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
+#[derive(Clone)]
 enum Op<T> {
   /// One durable kernel-name update after a successful rename response was saved, before it reaches the driver.
   RenameName {
@@ -501,6 +502,29 @@ pub struct Request {
 }
 
 impl Request {
+  /// A copy of this request answering on the same reply channel, kept by an owner that may serve it again in its place
+  /// (A-760 (b) 4d: a request whose serve met a read of a let-go window is parked unanswered until the window is back,
+  /// its dispatcher thread waiting on the reply all along).
+  pub fn kept(&self) -> Request {
+    Request {
+      op: self.op.clone(),
+      reply: self.reply.clone(),
+      hint: self.hint,
+      replayed: self.replayed,
+    }
+  }
+
+  /// Answers this request `STATUS_UNEXPECTED_IO_ERROR` without serving it: a parked request whose windows the node's
+  /// store did not give back (A-760 (b) 4d). `false` when its dispatcher thread is gone.
+  pub fn refuse_io(self) -> bool {
+    self
+      .reply
+      .send(crate::reply::Stamped::now(Reply::Err(
+        crate::status_unexpected_io_error(),
+      )))
+      .is_ok()
+  }
+
   /// Serves on the owner shard. Kernel contexts are resolved here, never on a foreign dispatcher thread. Opens are
   /// recorded before their contexts are returned; only a successful close retires a token.
   pub fn serve(

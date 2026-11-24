@@ -1479,6 +1479,127 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   drop(anchor);
 }
 
+/// Shape: the bytes of the large streamed write: far above a CLI process's own resident size (11.7 MB for a 4-byte write
+/// on macOS, 2026-11-23), so an input held whole shows plainly. Before A-880 this write held its command at 549 MB.
+const LARGE_WRITE_BYTES: usize = 128 << 20;
+
+/// Shape: the share of its input the large write's command may keep resident at its peak: a quarter, far above the
+/// command's own size and two pages of a request's bulk chunk, far below the input.
+const LARGE_WRITE_PEAK_SHARE: u64 = 4;
+
+/// Shape: the bytes the large write's feeder writes to the command's stdin at a time.
+const FEED_BYTES: usize = 64 << 10;
+
+/// Runs the command with `total` bytes of a pattern fed to its stdin as it reads them, and reaps it with `wait4`: its
+/// exit code, its stdout, its stderr and its peak resident size in bytes (`ru_maxrss`, kibibytes on Linux and bytes on
+/// macOS), the peak of this one process rather than of every child the test has reaped.
+fn run_fed_with_peak(instance: &str, args: &[&str], total: usize) -> (i32, String, String, u64) {
+  use std::io::{Read, Write};
+  // Reaped by `wait4` below, the one wait that also reads this process's own peak resident size; `Child::wait` reads
+  // none, and a second wait after `wait4` would find no child.
+  #[allow(clippy::zombie_processes)]
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stdin = child.stdin.take().unwrap();
+  let feeder = std::thread::spawn(move || {
+    let piece: Vec<u8> = (0..FEED_BYTES)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let mut left = total;
+    while left > 0 {
+      let take = left.min(piece.len());
+      if stdin.write_all(&piece[..take]).is_err() {
+        return;
+      }
+      left -= take;
+    }
+  });
+  let mut stdout = child.stdout.take().unwrap();
+  let mut stderr = child.stderr.take().unwrap();
+  let out = std::thread::spawn(move || {
+    let mut text = String::new();
+    let _ = stdout.read_to_string(&mut text);
+    text
+  });
+  let err = std::thread::spawn(move || {
+    let mut text = String::new();
+    let _ = stderr.read_to_string(&mut text);
+    text
+  });
+  let pid = libc::pid_t::try_from(child.id()).unwrap();
+  let mut status: libc::c_int = 0;
+  // SAFETY: an all-zero `rusage` is a valid value of the plain C struct; `wait4` overwrites it.
+  let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+  // SAFETY: `pid` is this test's own child, which nothing else reaps (`child` is never waited on), and `status` and
+  // `usage` are this frame's, written by the call.
+  let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+  assert_eq!(reaped, pid, "the command reaped");
+  feeder.join().unwrap();
+  let code = if libc::WIFEXITED(status) {
+    libc::WEXITSTATUS(status)
+  } else {
+    -1
+  };
+  let peak = u64::try_from(usage.ru_maxrss).unwrap();
+  #[cfg(target_os = "linux")]
+  let peak = peak * 1024;
+  (code, out.join().unwrap(), err.join().unwrap(), peak)
+}
+
+/// A-880 (§4.12; docs/cli.md's flow). Do: `slates attach --write` a volume, then feed [`LARGE_WRITE_BYTES`] into
+/// `slates write` under it as fast as it reads them, and reap the command for its peak resident size. Expect the write
+/// to succeed with every byte, and the command's peak under a [`LARGE_WRITE_PEAK_SHARE`]th of its input: it held a page
+/// of the input at a time, streamed into an open staging buffer. Before A-880 it read the whole input first and copied
+/// it twice more to frame one request (549 MB resident for this 128 MiB on macOS, 2026-11-23).
+#[test]
+fn a_large_write_keeps_a_page_of_its_input_resident_not_the_input() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the large streamed write: set SLATES_TEST_CLI=1 to run it (a real anchor and daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-large-write-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "large-write", "--bounded", "512MiB"],
+  );
+  assert_eq!(code, 0, "create: {err}");
+  let id = value_of(&out, "id");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "attach: {err}");
+  let attachment = value_of(&out, "attachment");
+  let (code, out, err, peak) = run_fed_with_peak(
+    &instance,
+    &["write", &id, &attachment, "large.bin"],
+    LARGE_WRITE_BYTES,
+  );
+  drop(anchor);
+  eprintln!(
+    "a {} MiB write peaked at {} KiB resident",
+    LARGE_WRITE_BYTES >> 20,
+    peak >> 10
+  );
+  assert_eq!(code, 0, "the large write: {err}");
+  assert!(
+    out.contains(&format!("wrote {LARGE_WRITE_BYTES} bytes")),
+    "every byte written: {out}"
+  );
+  let input = u64::try_from(LARGE_WRITE_BYTES).unwrap();
+  assert!(
+    peak < input / LARGE_WRITE_PEAK_SHARE,
+    "the command held a page of its input, not the input: {peak} bytes resident at its peak for {input}"
+  );
+}
+
 /// Shape: how many failover delays the late-input test's stdin arrives after its command starts: two, past a fresh CLI
 /// attachment's term, which is the failover delay the daemon reports rounded up to its heartbeat period (A-230,
 /// `fleet::failover_in_periods`).

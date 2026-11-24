@@ -93,7 +93,8 @@ red, and CI skipped it.
 - The write's input is held whole in the CLI, up to the largest shard's metadata ledger, next to the daemon's staging
   buffer holding a second copy. Main ruled that the next piece is a stage opened without a length, reserved put by put
   within the ledger and bound to the attachment, with a peak-RSS red. The CLI's refusals of an oversize input and of a
-  failed stdin read are still `BadRequest` strings. That piece removes both together with the buffer.
+  failed stdin read are still `BadRequest` strings. That piece removes both together with the buffer. It is A-880,
+  built the same day.
 - A staging buffer expires one failover delay after its last put, as an attachment's term does, and no hold renews it.
   The length-less stage is bound to its attachment, so the same hold keeps both alive.
 - This change's CLI flow on the Mac found that a burst of uses, now every held write, drove a CLI attachment's term

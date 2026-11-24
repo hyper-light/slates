@@ -424,13 +424,28 @@ fn held_bytes<'g>(
     .and_then(|content| content.bytes().ok())
 }
 
+impl HeadTexts<'_> {
+  /// The length of text `identity` where it is read from the content store: a text the records keep stored, or one the
+  /// green holds by its object's name alone (A-760 (b) 4c: a text a batch staged and has not landed yet, which the
+  /// records do not name stored, is read from the content store all the same).
+  fn stored_len(&self, identity: &ContentIdentity) -> Option<u64> {
+    self
+      .records
+      .stored_len(identity)
+      .or_else(|| match self.green?.held(identity)? {
+        slates_merge::engine::Content::Named(object) => Some(object.len),
+        slates_merge::engine::Content::Bytes(_) => None,
+      })
+  }
+}
+
 impl TextSource for HeadTexts<'_> {
   /// The head's text from the green; any other from where the records keep it (module docs, "Reading").
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     if let Some(bytes) = self.green.and_then(|green| held_bytes(green, identity)) {
       return Some(Cow::Borrowed(bytes));
     }
-    match self.records.stored_len(identity) {
+    match self.stored_len(identity) {
       Some(len) => {
         let store = self.store?;
         let id = slates_vcs::ContentId(*identity);
@@ -449,7 +464,7 @@ impl TextSource for HeadTexts<'_> {
         .get(usize::try_from(offset).ok()?..)
         .map(Cow::Borrowed);
     }
-    match self.records.stored_len(identity) {
+    match self.stored_len(identity) {
       Some(len) => {
         if offset >= len {
           return (offset == len).then_some(Cow::Borrowed(&[]));
@@ -483,7 +498,7 @@ impl TextSource for HeadTexts<'_> {
     offset: u64,
     cache: &'a mut slates_svn::reads::WindowCache,
   ) -> Option<Cow<'a, [u8]>> {
-    let kept_by_records = self.records.stored_len(identity).is_none()
+    let kept_by_records = self.stored_len(identity).is_none()
       && self
         .green
         .and_then(|green| held_bytes(green, identity))
@@ -501,7 +516,7 @@ impl TextSource for HeadTexts<'_> {
     if let Some(bytes) = self.green.and_then(|green| held_bytes(green, identity)) {
       return Some(reading.copy_step(bytes));
     }
-    let Some(len) = self.records.stored_len(identity) else {
+    let Some(len) = self.stored_len(identity) else {
       return TextSource::read_step(self.records, identity, reading);
     };
     let read = reading.read();

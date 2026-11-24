@@ -455,60 +455,14 @@ fn a_named_files_section_is_refused_typed_when_hostile() {
   );
 }
 
-/// A plane of objects by identity for the read tests, counting the largest read.
-#[derive(Default)]
-struct Plane {
-  objects: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
-  largest: std::cell::Cell<usize>,
-}
-
-impl crate::named::Objects for Plane {
-  fn read(
-    &self,
-    identity: &crate::named::Identity,
-    at: u64,
-    into: &mut [u8],
-  ) -> Result<(), crate::named::ObjectMissing> {
-    self.largest.set(self.largest.get().max(into.len()));
-    let missing = crate::named::ObjectMissing {
-      identity: *identity,
-    };
-    let bytes = self.objects.get(&identity.hash).ok_or(missing)?;
-    let at = usize::try_from(at).map_err(|_| missing)?;
-    into.copy_from_slice(bytes.get(at..at + into.len()).ok_or(missing)?);
-    Ok(())
-  }
-}
-
-/// A-869, a restore's read (Ada's sizing rule: no step reads more than its slice). Do: read a checkpoint naming three
-/// files, of 0, 10 and 100 bytes, 7 bytes a step from a plane holding them, after a first try at a plane holding none.
-/// Expect: the try refused `ObjectMissing`, keeping nothing; then every file read in order, no read past 7 bytes, the
-/// steps those the bytes take (a file a step at least); and the files taken with their bytes, once, then unread again.
-/// The plane holding each of `texts` under its BLAKE3 identity.
-fn plane_of(texts: &[&[u8]]) -> Plane {
-  let mut plane = Plane::default();
-  for bytes in texts {
-    plane
-      .objects
-      .insert(*blake3::hash(bytes).as_bytes(), bytes.to_vec());
-  }
-  plane
-}
-
-/// Reads `checkpoint`'s named files from `plane`, `slice` bytes a step, until they are read: the steps taken, the last
-/// one (which finds nothing left) included.
-fn steps_to_read(checkpoint: &mut Checkpoint, plane: &Plane, slice: u64) -> usize {
-  let mut steps = 1;
-  while !checkpoint.read_step(plane, slice).unwrap() {
-    steps += 1;
-  }
-  steps
-}
-
+/// A-760 (b) 4d, a restore reads nothing. Do: restore a green from a checkpoint naming three files, of 0, 10 and 100
+/// bytes, with no content plane at all. Expect: each file is its object's name alone, its length and identity entry
+/// read off the name, no byte held by a named block, and, once its owner tracks its holds, one taken of each object.
 #[test]
-fn a_checkpoints_named_files_are_read_a_slice_a_step() {
+fn a_checkpoints_named_files_are_restored_by_name_alone() {
   let texts: [&[u8]; 3] = [b"", b"ten bytes!", &[7; 100]];
-  let mut checkpoint = Checkpoint {
+  let checkpoint = Checkpoint {
+    version: 1,
     named: texts
       .iter()
       .enumerate()
@@ -516,39 +470,35 @@ fn a_checkpoints_named_files_are_read_a_slice_a_step() {
       .collect(),
     ..Checkpoint::default()
   };
-  let empty = Plane::default();
+  let mut green = crate::engine::Green::restore(crate::origin::Origin::default(), &checkpoint);
+  for (at, bytes) in texts.iter().enumerate() {
+    let path = format!("f{at}");
+    let identity = checkpoint.named[at].identity;
+    assert_eq!(
+      green.content(&path),
+      Some(crate::engine::Content::Named(identity)),
+      "{path} by name"
+    );
+    assert_eq!(green.content_len_at(&path, 1), Some(bytes.len()));
+  }
+  assert_eq!(green.named_bytes_held(), 0, "no named block holds bytes");
   assert!(
-    checkpoint.read_step(&empty, 7).is_ok(),
-    "an empty object reads from any plane"
+    green.take_name_holds().is_empty(),
+    "untracked, none recorded"
   );
+  let mut holds = green.track_name_holds();
+  holds.sort_by_key(|hold| format!("{hold:?}"));
+  let mut taken: Vec<_> = checkpoint
+    .named
+    .iter()
+    .map(|file| crate::engine::NameHold::Take(file.identity))
+    .collect();
+  taken.sort_by_key(|hold| format!("{hold:?}"));
+  assert_eq!(holds, taken, "one hold of each object");
+  assert!(green.track_name_holds().is_empty(), "drained once");
   assert_eq!(
-    checkpoint
-      .read_step(&empty, 7)
-      .map_err(|missing| missing.identity),
-    Err(checkpoint.named[1].identity)
+    green.give_back_name_holds().len(),
+    3,
+    "each given back before the drop"
   );
-  assert_eq!(
-    checkpoint.unread().map(|file| file.key.as_str()),
-    Some("f1")
-  );
-  let plane = plane_of(&texts);
-  assert_eq!(
-    steps_to_read(&mut checkpoint, &plane, 7),
-    2 + 15,
-    "f1's 10 bytes in 2 steps, f2's 100 in 15"
-  );
-  assert!(
-    plane.largest.get() <= 7,
-    "{} bytes in one read",
-    plane.largest.get()
-  );
-  let taken = checkpoint.take_named().unwrap();
-  let bytes: Vec<&[u8]> = taken.iter().map(|(_, bytes)| bytes.as_slice()).collect();
-  assert_eq!(bytes, texts.to_vec());
-  // Taken, the files are unread again: a second restore reads them again rather than take nothing.
-  assert_eq!(
-    checkpoint.unread().map(|file| file.key.as_str()),
-    Some("f0")
-  );
-  assert!(checkpoint.take_named().is_none(), "taken once");
 }

@@ -293,7 +293,7 @@ mod tests {
       }
       origin.files = model.iter().map(|(path, bytes)| (path.clone(), bytes.clone())).collect();
       let green = Green::with_origin(origin.clone());
-      let base = Base { green: Some(&green), fetched: None, version: 0, entries: None };
+      let base = Base { green: Some(&green), fetched: None, version: 0, entries: None, plane: None };
       let mut files = WorkFiles::default();
       let mut journal: Vec<VolumeOp> = Vec::new();
       let mut charged = 0u64;
