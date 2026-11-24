@@ -173,14 +173,21 @@
 > told to every member by `HomeMessage::Rebuilt`, home wire version 0x83, until each answers); red first, the unreachable
 > holder's fleet test, its rebuild held until a pass kept every hold, then resolved by the rebuild's event alone. An
 > ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
-> resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
-> for it (`git_fleet`) until the creation does.
+> resolved). BUILT (A-894, 2026-11-24): a repository's creation answers once its record is placed at f + 1 (its reply
+> held on the destroy's hold, made general: `live_ship::defer_until_placed`), so `git_fleet` no longer waits for it.
+> **OPEN (A-894, w-shared, 2026-11-24): after a repository's takeover, a push to it is refused at both survivors.** In
+> `a894_...served_by_a_survivor` (three daemons at f = 1, the owner killed as its creation answered), the successor
+> rebuilt it and its edge listed it (`git ls-remote`), but a push was refused `unable to commit` there (the push
+> barrier). The other survivor's edge answered "repository not found": it holds the record as a register, not in its
+> partition. Untested before: no fleet test pushed after a repository's takeover. For main to place.
 > **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
 > home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
 > 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
 > behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
 > put's budget; red first in-process (`vcs_store::homes::tests::a_home_behind_its_senders_configuration_...`). OWED
-> (main): gate 10 at the landing, 0 of 40 to close.
+> (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
+> for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
+> held and dropped could be answered at once, if a gate shows it.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
