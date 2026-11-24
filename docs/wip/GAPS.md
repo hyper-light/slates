@@ -204,7 +204,8 @@
 > 2. **The repository placed at its name's first-ranked member** at creation, a lookup ranking the name over the
 >    members. Joins and leaves move the rank, and after a takeover the successor is ranked by the id the edge lacks.
 > 3. **A location round by name** to every member. Main ruled it out (no location round).
-> **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
+> **CLOSED (A-902 with A-894, A-903 and A-907, w-shared, 2026-11-24; gate 12: 40 of 40, its NotAHome refusals gone):
+> a fresh fleet's first push refused `HomedShort` by a
 > home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
 > 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
 > behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
@@ -212,7 +213,8 @@
 > (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
 > for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
 > held and dropped could be answered at once, if a gate shows it.
-> **FIXED BY CHANGE, gate 12 owed (A-907, w-shared, 2026-11-24): gate 10 failed 31 of 31 at A-902.** A-902's slow
+> **CLOSED (A-907, w-shared, 2026-11-24; gate 12, 45482482443 at a551b0a88: 40 of 40, release 4.9-8.9 s and debug
+> 7.1-13.9 s a run, ubuntu-latest at load under 3): gate 10 failed 31 of 31 at A-902.** A-902's slow
 > home outlasted the healer's round. The healer, the homes' exchange and credentials' exchange dropped their
 > stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
 > unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
@@ -226,7 +228,10 @@
 > record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
 > `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
 > makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
-> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing).
+> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing). A-908, main's
+> ruling of 12:42: part 1 BUILT, the holder's replicas kept by the owner's own type (`crate::greens::Greens`), each
+> standing alone; part 2 owed: version 0's record names its membership, a holder founds and branches lineages,
+> adoption moves a lineage whole, and a branch is rebuilt by branching its source.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1470,6 +1475,17 @@
 >   `landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify` (an import and a push
 >   in two: every changelog and manifest object let go before and after a clone and a pull, each changegroup verified
 >   by the push's own verifier; red: 10 and 14 held). Owed: stock 7.2's clone, pull and verify (main's `hg_interop`).
+>   Found by main's `hg_interop` round at a30ffbdb8 and closed: a fetch's changelog and manifest texts read whole from
+>   the changeset store (to send a changeset, or diff a manifest against the client's) were counted as file revisions
+>   sent whole (`vcs_store.hg_pull_whole_texts`: 3 for a one-changeset pull, its changeset, its manifest and the parent
+>   manifest), though the pull sent the stored delta; now counted apart (`StoreWants::reads_logs`,
+>   `vcs_store.hg_pull_log_texts`). Held by P5's red above (red: 3 whole, 0 log texts).
+>   Also found there and closed: `branch create --from v1` hung (`stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_
+>   from_the_tag`). The verb parked on its `.hgtags` read ran again and judged the read held by its files, which a read
+>   begun over heads whose manifests are let go does not know yet, so it parked again, for ever. A held read is now judged
+>   by the heads it began over (`TagsRead::same_heads`). Held by
+>   `a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made` (red: refused
+>   `ContentUnavailable`).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
@@ -4031,7 +4047,10 @@
 >   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
 >   - delete, revert and status failed after them, on the edit left behind.
 >   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
->     4d), and nothing brought it back. The fix is w-svn's, in progress; run 5 follows it.
+>     4d), and nothing brought it back.
+>   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
+>     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
+>     its chunk again, on all three edges, counted.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
@@ -13731,6 +13750,22 @@ its slack, since for a page grain the congruent address is the reservation's bas
 population by its **median**, which a handful of merges cannot move and a grain changed from the page to the
 huge page would move all sixty-four of. **A sum cannot tell a merge from a regression; an order statistic
 can.**
+
+### 8a-tsan-sweep. One sweep held the TSan lane for hours, and one Subversion test fails under it (2026-11-24, open)
+
+Main's TSan step (62 minutes, three times diag 45315777446's 20 min 38 s) timed out on main run 45461883678 at
+62.6 minutes. Diag 45411303175 (7d6874639, ubuntu-latest, its step held to 300 minutes) took 234 minutes. Its log's
+timestamps put 3 h 26 min of that in one test, `content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`
+(14:34 to 18:00), where the rest of the server's library took 16 min 15 s. The sweep runs on one shard, so it has no
+second thread for ThreadSanitizer to watch, while every byte it holds to is read through the shared object's atomics
+(A-171), each intercepted. The lane now leaves it out (`SERVER_SKIPPED` in `xtask/src/tsan.rs`, with that reason;
+it runs in every other lane), and the step's limit is three times the measured pass without it: 31 min 41 s,
+95 minutes.
+
+Open (w-svn): the same diag's one failure in 1,306 library tests,
+`daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (daemon.rs:9662,
+`seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
+fixed or explained.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

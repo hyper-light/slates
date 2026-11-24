@@ -429,6 +429,11 @@ impl Answering {
     self.walk.as_ref()?.wants()
   }
 
+  /// Whether [`Answering::wants`] reads a changeset's or a manifest's text whole ([`Walk::reads_logs`]).
+  pub fn reads_logs(&self) -> bool {
+    self.walk.as_ref().is_some_and(Walk::reads_logs)
+  }
+
   /// The changeset store's answer to [`Answering::wants`].
   pub fn give(&mut self, given: Given) {
     if let Some(walk) = &mut self.walk {
@@ -1095,6 +1100,12 @@ impl Walk {
       Some(pull) => pull.want.as_ref(),
       None => self.files.want.as_ref(),
     }
+  }
+
+  /// Whether [`Walk::wants`] is a changeset's or a manifest's text asked whole ([`LogTexts`], goal 93 C1 (1) P5): a text
+  /// the walk reads to send a changeset or diff a manifest, never a file revision it sends whole.
+  pub fn reads_logs(&self) -> bool {
+    self.logs.want.is_some()
   }
 
   /// Whether every text a unit asked (`LogTexts`) is answered now, by a store that answers at once (a whole answer's,

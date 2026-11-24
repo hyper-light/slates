@@ -11837,6 +11837,10 @@ the replica owing, a turn at a time (`crate::replica_build`). While it builds, s
 `ReplicaBuilding { object, sequence, slices_done }` on the shipment's own channel (`ContentMessage`, kind 10), the
 build's turns done so far, which only rise: the owner keeps the latest a holder, and a push's barrier reads it rising
 as progress. A takeover adopts the replica store as it stands, so it is warm.
+A holder keeps its replicas by the owner's own type, `crate::greens::Greens`, each keyed by its green's id
+(`merge_service::replica_key`; A-908 part 1). A replica is read and written through its guards, as the owner reads a
+green. Part 1 is that change alone: every replica still stands alone. Part 2 makes a repository's greens one lineage on
+the holder too, so a branch's replica is made as the owner makes the branch (A-908, in flight).
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed

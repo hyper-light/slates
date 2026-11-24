@@ -3272,7 +3272,10 @@ impl Daemon {
       return Ok(served);
     }
     self.observe(self.shards.first().copied(), move |s| {
-      s.merge.replicas.get(&object).map(history)
+      s.merge
+        .replicas
+        .lend(&crate::merge_service::replica_key(object))
+        .map(|engine| history(&engine))
     })
   }
 

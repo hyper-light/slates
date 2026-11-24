@@ -36768,6 +36768,11 @@ fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_
   );
 }
 
+/// Shape: the pushes [`a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`] makes at most until a
+/// holds a window for the region: each push homes two windows at two of the three nodes, so a is a home of neither one
+/// time in nine, and of none after this many more pushes one time in 3^16, about 43 million.
+const PUSHES_FOR_A_HOME: usize = 8;
+
 /// Shape: the share of a push's homing budget each home waits before it answers in
 /// [`a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`]: a quarter, past the coordinator's round
 /// stall (two periods), which bounds the healer's offers, and inside that round's whole span, so the answer comes late
@@ -36788,17 +36793,39 @@ fn a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session() {
   let _serial = serialize_fleet_tests();
   let fleet = git_fleet("slow-home");
   let first = fleet.push(0, ("first.txt", b"windows for the healer to offer\n"));
+  // a's healer offers only windows a holds, so the test needs one: a push's windows are homed by their identities, and
+  // a is a home of neither of them one run in nine, its healer then rightly offering nothing.
+  let mut more = 0;
+  while fleet.daemons[0]
+    .region_holds()
+    .unwrap_or_default()
+    .is_empty()
+    && more < PUSHES_FOR_A_HOME
+  {
+    let file = format!("more-{more}.txt");
+    fleet
+      .push_on_top(0, (&file, b"another window for a to hold\n"))
+      .unwrap();
+    more += 1;
+  }
   let delay_ns = fleet.daemons[0].homing_budget_ns() / SLOW_HOME_SHARE;
   for daemon in &fleet.daemons[1..] {
     daemon.delay_home_answers(delay_ns).unwrap();
   }
   fleet.daemons[0].owe_heal_walk().unwrap();
   let sender: Vec<&Daemon> = fleet.daemons[..1].iter().collect();
-  // The walk is done once it has run through and offered a window: a walk that ran before the windows were held here
-  // offers none, and a later one is owed by the next period's turn.
+  // Waited for until a walk has run through having offered a window. A walk that ran before the windows were where it
+  // reads them offers none and owes nothing after it, so it is owed again.
   let offered_of = || move_counter(&fleet.daemons[0], "vcs_store.homes.heal_offered");
   let walked = poll_until(&sender, PLACEMENT_DEADLINE, || {
-    Ok(fleet.daemons[0].heal_walk_done()? && offered_of()? >= 1)
+    if !fleet.daemons[0].heal_walk_done()? {
+      return Ok(false);
+    }
+    if offered_of()? >= 1 {
+      return Ok(true);
+    }
+    fleet.daemons[0].owe_heal_walk()?;
+    Ok(false)
   });
   let offered = offered_of().unwrap_or(0);
   for daemon in &fleet.daemons[1..] {

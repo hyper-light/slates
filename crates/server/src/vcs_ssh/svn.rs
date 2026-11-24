@@ -84,7 +84,7 @@ use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, Right};
-use crate::vcs_store::svn_view::FetchedPiece;
+use crate::vcs_store::svn_view::{BroughtBases, FetchedPiece};
 use crate::vcs_svn::{
   HookSite, Hooked, MERGEINFO, post_lock_hook, pre_lock_hooks, revision_property_hook, run_hook,
 };
@@ -336,6 +336,9 @@ pub(crate) struct SvnCommand<R, V> {
   /// The text piece a drive waited for and the session fetched (C2 stage B part 2), held while the drive reads on in it:
   /// given back when the drive waits for another, when the read's answer ends, or with the session.
   fetched: Option<FetchedPiece>,
+  /// The bases its commit's drive waited for and the session brought back (`Due::Text`), held for the commit's life:
+  /// given back once no commit is under way, or with the session.
+  brought: BroughtBases,
   /// The principal the client's key proved, which the repository's policy judges.
   principal: Principal,
   /// Its name, the tunnel's user.
@@ -460,6 +463,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       repositories,
       stores,
       fetched: None,
+      brought: BroughtBases::default(),
       principal: principal.clone(),
       user: crate::lfs::owner_name(principal).into_bytes(),
       connection,
@@ -487,6 +491,19 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     // drive's steps in it (goal 93); its answer ended, the piece goes.
     if !self.connection.fetching() {
       self.fetched = None;
+    }
+    // A refusal the commit's drive answered, named in the daemon's log: the client is told Subversion's words alone.
+    if let Some(refused) = self.connection.take_drive_refused() {
+      slates_machine::log_line!(
+        "slates-server: a Subversion commit's drive refused over SSH: {refused}"
+      );
+    }
+    // The bases a commit brought back are its own: given back once none is under way (landed, refused or aborted).
+    if matches!(
+      self.connection.waiting(),
+      slates_svn::serve::Waiting::Command | slates_svn::serve::Waiting::Ended
+    ) {
+      self.brought.give_back();
     }
     let consumed = match received {
       Received::NeedMore => return self.wait_or_end(),
@@ -921,6 +938,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         )
         .await
       }
+      // A delta's base let go (A-760 (b) 4d): brought back whole for the drive, which takes its chunk again.
+      Due::Text { identity } => crate::vcs_svn::HookAnswer {
+        verdict: Some(self.brought.bring(id, *identity).await),
+        ..crate::vcs_svn::HookAnswer::default()
+      },
     };
     // No verdict: the client left during the run (the module doc's hooks).
     let Some(answer) = ran.verdict else {

@@ -434,6 +434,84 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
   });
 }
 
+/// Goal 93, C1 (1) P5 (main's hg_interop round at a30ffbdb8: `stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_from_
+/// the_tag` hung, its `branch create --from v1` parked again and again). Do: push a changeset to a Mercurial repository and
+/// branch `mark` from `default` at it; push two more, the second adding `.hgtags` with `v1` at the first; let go every
+/// object the repository's changelog and manifest rows name, as a landing does since P5; branch `from-v1` from `v1`
+/// through the verb's door. Expect the branch made at the first changeset, its tags read from the changeset store once.
+/// Red before: the door's read, answered, did not answer the verb that ran again over it: a read begun over heads whose
+/// manifests are not at hand knows no `.hgtags` revision yet, so it never matched the read held (`TagsRead::same_files`),
+/// and the verb was refused (in the daemon, parked again, for ever).
+#[test]
+fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made() {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let first = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b\n", Some(0), "default"),
+    ]);
+    let tags = format!("{} v1\n", crate::verbs::hex_of(&first[0].node));
+    let tags: &'static [u8] = Box::leak(tags.into_bytes().into_boxed_slice());
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b\n", Some(0), "default"),
+      ("Added tags", ".hgtags", tags, Some(1), "default"),
+    ]);
+    let branch = |state: &mut ShardState, name: &str, from: &str| {
+      crate::vcs_store::hg_tags::dispatch_blocking(
+        state,
+        &owner(),
+        RequestBody::CreateBranch {
+          repository: "hg".to_owned(),
+          name: name.to_owned(),
+          from: from.to_owned(),
+          version: None,
+        },
+      )
+    };
+    pushed(state, hg, &made, &[0]);
+    let (mark, _) = branch(state, "mark", "default");
+    assert!(matches!(mark, ReplyBody::GreenCreated { .. }), "{mark:?}");
+    pushed(state, hg, &made, &[1, 2]);
+    let let_go = crate::vcs_store::lent_state(state, |state| {
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let (content, store) = stores.mercurial(hg)?;
+        let index = &store.index;
+        let changesets = (0..index.len(content, slates_hg::index::Log::Changelog))
+          .map(|rev| index.changeset(content, rev).map(|row| row.text));
+        let manifests = (0..index.len(content, slates_hg::index::Log::Manifest)).map(|rev| {
+          index
+            .revision(content, slates_hg::index::Log::Manifest, rev)
+            .map(|row| row.bytes)
+        });
+        let objects = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
+        Some(
+          objects
+            .iter()
+            .filter(|object| content.let_go_object(object) > 0)
+            .count(),
+        )
+      })
+    });
+    assert!(
+      let_go.is_some_and(|count| count > 0),
+      "objects let go: {let_go:?}"
+    );
+    let (from_v1, read) = branch(state, "from-v1", "v1");
+    assert!(
+      matches!(from_v1, ReplyBody::GreenCreated { .. }),
+      "{from_v1:?}"
+    );
+    assert!(read, "the tags read from the changeset store");
+    let marks = bookmarks_of(state, hg);
+    let at = marks
+      .iter()
+      .find(|(held, _)| held.as_slice() == b"from-v1")
+      .map(|(_, node)| *node);
+    assert_eq!(at, Some(made[0].node), "{marks:?}");
+  });
+}
+
 /// Whether repository `id`'s view advertises a stream clone (`stream`/`streamreqs` in its capabilities), lent now and
 /// lent over a held generation: both, which must agree.
 fn streams_of(state: &mut ShardState, id: RepositoryId) -> (bool, bool) {

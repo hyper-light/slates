@@ -152,6 +152,13 @@ impl SvnStores for ServedRecords {
         };
         step(&mut commit, &world)
       })?;
+      // A refusal the drive answered, named in the daemon's log: the client is told Subversion's words alone.
+      if let Some(refused) = commit.take_refused() {
+        slates_machine::log_line!(
+          "slates-server: partition {}: a Subversion HTTP commit's drive refused: {refused}",
+          state.partition
+        );
+      }
       let now_ns = state.clock.monotonic_ns();
       state
         .vcs_stores
@@ -366,6 +373,120 @@ impl Drop for FetchedPiece {
       crate::state::with_state(|state| super::svn_texts::let_go(state, wanted)).unwrap_or_default();
     }
   }
+}
+
+/// Counter: a text delta's base a commit's drive waited for ([`Due::Text`]) that its edge brought back whole from the
+/// node's store, its landed windows let go (A-760 (b) 4d): the Linux svn matrix's commit-edit, refused `Corrupt` before.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const BASES_BROUGHT: &str = "vcs_svn.commit.bases_brought";
+
+/// Counter: a commit drive's waits for a base ([`Due::Text`]), brought back or refused: one round a base, so an edit
+/// across many files pays a round each. Format: a counter name in the daemon's status report.
+pub(crate) const BASE_WAITS: &str = "vcs_svn.commit.base_waits";
+
+/// Counter: the nanoseconds commit drives waited for their bases to be brought back. Format: a counter name in the
+/// daemon's status report.
+pub(crate) const BASE_WAIT_NS: &str = "vcs_svn.commit.base_wait_ns";
+
+/// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (`svn_error_codes.h`): a base past the shard's room,
+/// as the commit step answers its room (`repository::svn_commit`'s `Budget`).
+const SVN_ERR_FS_GENERAL: u32 = 160_000;
+
+/// Format: `SVN_ERR_FS_CORRUPT`, the filesystem category's start plus 4 (`svn_error_codes.h`): a base the node's store
+/// could not give whole.
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
+
+/// The text delta bases one commit's drive waited for ([`Due::Text`]) and its edge brought back whole into the content
+/// store, one hold each, charged to the shard's content budget: held for the commit's life, since every later chunk of
+/// the delta reads its base again, and given back when the commit ends, or by its drop, on the shard that holds them, so
+/// a connection dropped mid-commit leaks nothing (as [`FetchedPiece`] is). One commit's bases at most.
+#[derive(Debug, Default)]
+pub(crate) struct BroughtBases {
+  /// The texts brought back, one hold each.
+  texts: Vec<[u8; 32]>,
+}
+
+impl BroughtBases {
+  /// Brings base `identity` of repository `id` back whole for a drive that waits for it: `Ok` to resume it, or the
+  /// errors it is refused with, naming the text: past the shard's room (the room's refusal, nothing brought), or one the
+  /// records name no length of or the node's store could not give whole. Counted, with the wait's time.
+  pub(crate) async fn bring(
+    &mut self,
+    id: RepositoryId,
+    identity: [u8; 32],
+  ) -> Result<(), Vec<(u32, String)>> {
+    let began = slates_rt::futures::now_ns();
+    let named = hex_of(&identity);
+    let sized = crate::state::with_state(|state| {
+      state.count(BASE_WAITS, 1);
+      let len = state
+        .vcs_stores
+        .subversion_records(id)
+        .and_then(|records| records.stored_len(&identity))?;
+      Some((len, state.store.admittable()))
+    })
+    .flatten();
+    let answer = match sized {
+      None => Err(vec![(
+        SVN_ERR_FS_CORRUPT,
+        format!("The text {named} a delta is based on is not stored in the repository"),
+      )]),
+      Some((len, available)) if len > available => Err(vec![(
+        SVN_ERR_FS_GENERAL,
+        format!(
+          "No room for the commit: the text {named} a delta is based on is {len} bytes, {available} bytes available"
+        ),
+      )]),
+      Some((len, _)) => {
+        if super::svn_texts::bring_whole(id, identity, len).await {
+          self.texts.push(identity);
+          Ok(())
+        } else {
+          Err(vec![(
+            SVN_ERR_FS_CORRUPT,
+            format!(
+              "The text {named} a delta is based on could not be brought back from the node's store"
+            ),
+          )])
+        }
+      }
+    };
+    let waited = slates_rt::futures::now_ns().saturating_sub(began);
+    let brought = u64::from(answer.is_ok());
+    let _ = crate::state::with_state(|state| {
+      state.count(BASES_BROUGHT, brought);
+      state.count(BASE_WAIT_NS, waited);
+    });
+    answer
+  }
+
+  /// Gives back every base brought: the commit ended.
+  pub(crate) fn give_back(&mut self) {
+    if self.texts.is_empty() {
+      return;
+    }
+    let texts = std::mem::take(&mut self.texts);
+    let _ = crate::state::with_state(|state| {
+      crate::vcs_store::name_holds::give_back_brought(state, &texts);
+    });
+  }
+}
+
+impl Drop for BroughtBases {
+  fn drop(&mut self) {
+    self.give_back();
+  }
+}
+
+/// A text's identity in hex, as a refusal names it.
+fn hex_of(identity: &[u8; 32]) -> String {
+  identity
+    .iter()
+    .fold(String::with_capacity(64), |mut out, byte| {
+      use core::fmt::Write as _;
+      let _ = write!(out, "{byte:02x}");
+      out
+    })
 }
 
 /// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here or an import
