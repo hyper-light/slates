@@ -260,6 +260,10 @@ pub struct RecordDialReport {
   pub calls: u64,
 }
 
+/// Test support (A-727 (d1a-3), [`Daemon::region_holds`]): a region hold, its object's identity with the owners it is
+/// held for.
+pub type RegionHold = ([u8; 32], Vec<slates_cluster::homes::HomeOwner>);
+
 /// The daemon.
 pub struct Daemon {
   /// Where [`Self::wait_for_stop`] hands the control shard its watch, taken in at the next heartbeat.
@@ -1622,9 +1626,7 @@ impl Daemon {
 
   /// Test support (A-727 (d1a-3)): every hold this node's shards keep for the region, each object's identity with its
   /// owners. A one-shot observation of each shard; the typed refusal when one could not answer.
-  pub fn region_holds(
-    &self,
-  ) -> Result<Vec<([u8; 32], Vec<slates_cluster::homes::HomeOwner>)>, ObserveError> {
+  pub fn region_holds(&self) -> Result<Vec<RegionHold>, ObserveError> {
     let mut holds = Vec::new();
     for shard in self.shards.clone() {
       holds.extend(self.observe(Some(shard), |_| {
