@@ -10540,12 +10540,20 @@
 >   suite's record now takes both from `Session::after_run`, which notes each on its own; the live note keeps each
 >   node's whole `live` status line (holders, fence, recorded holders), and the container lane keeps fsstress's output in
 >   its scratch, as the host lane does. Test: `a_record_says_whether_the_daemon_stopped_or_the_fleet_did_not_ship`.
-> - **Open (w-ci, 2026-11-24): the lane still fails after the fix, with one candidate left behind.** Run 45318320246 at
->   1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s fleet wait the
->   owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at 2149. The same
->   shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083). The
->   live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job steps),
->   so it is no regression of that window; the cause is being looked for.
+> - **Closed (w-ci, 2026-11-24, A-889): the lane still failed after the fix, with one candidate left behind.** Run
+>   45318320246 at 1a734fc38, which holds 21861059f: `oci-linux` fsstress passed its own verdict, and after the 40 s
+>   fleet wait the owner's log was durable at its head 2195 with nothing owed, candidate b at 2195 and candidate c at
+>   2149. The same shape before the fix: 1891 of 2216 and 1830 of 2245 (run 45235122249), 1848 of 2172 (45217887083).
+>   The live-shipped fsstress step failed in 37 of 55 main runs from 2026-11-21 06:34 to 2026-11-24 03:16 (CI's job
+>   steps), so it was no regression of that window. Only the FUSE lanes failed (`native-linux-fuse`, and `oci-linux`
+>   over the daemon's FUSE mount). The cause, read from a diagnostic build on adacachy2 pinned to 4 CPUs: the kernel's
+>   `FORGET` of a file unlinked while open came after the run's last publication, reclaimed the orphan with no barrier,
+>   and left the owner's volume unpublished for good; the candidate behind the retained tail was owed an install image,
+>   which the record period made only for a volume with nothing unpublished. The period now publishes such a volume and
+>   the image follows (`live_ship::published_for_image`, counted `fleet.live.image_published`). The lane on adacachy2,
+>   pinned to 4 CPUs: 2 of 12 runs failed before; 0 of 30 after, the period's publication made in 6 of them. Test:
+>   `a_holder_behind_the_tail_is_installed_after_a_forget_left_the_volume_unpublished`. Record:
+>   `docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md`.
 > - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
 >   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
 
