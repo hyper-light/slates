@@ -664,6 +664,14 @@ const NAMED_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 /// (A-887's in-place edit of a named file): the submit's answer, and how many requests parked on a let-go window meanwhile
 /// (`verbs.parked_on_away`), and the work.
 async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64, slates_ipc::protocol::VolumeId) {
+  edited_named_as(green, ("edit-named", 1)).await
+}
+
+/// [`edited_named`] by a work named `name`, its submit request `sequence` of client 7.
+async fn edited_named_as(
+  green: DbVolumeId,
+  (name, sequence): (&str, u32),
+) -> (ReplyBody, u64, slates_ipc::protocol::VolumeId) {
   use crate::repository::svn_commit::tests::on;
   let parked = || {
     on(|state| {
@@ -679,7 +687,7 @@ async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64, slates_ipc::protoco
       state,
       RequestBody::CreateWork {
         green: slates_ipc::protocol::VolumeId { bytes: green.bytes },
-        name: "edit-named".to_owned(),
+        name: name.to_owned(),
       },
     )
   });
@@ -702,7 +710,7 @@ async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64, slates_ipc::protoco
   let before = parked();
   let submit = slates_wire::request::RequestId {
     client: 7,
-    sequence: 1,
+    sequence,
   };
   let _ = on(|state| {
     crate::verbs::run_recorded_for_test(
@@ -714,6 +722,91 @@ async fn edited_named(green: DbVolumeId) -> (ReplyBody, u64, slates_ipc::protoco
   });
   let submitted = recorded_answer(7, submit).await;
   (submitted, parked().saturating_sub(before), work)
+}
+
+/// A-887's owed gap (main 01a20182's order of 2026-11-24 04:40: a takeover's re-adoption of a Mercurial green brings back
+/// the named bases its replay reads, by the planner a recovery runs). Do: on a store-backed daemon, rebuild the fixtures'
+/// repository as one push, its root green holding `b` by its object's name; edit `b` in place over a work and submit it
+/// (`edited_named`); let `b`'s base go again and leave the green as a restart leaves an adopted one (its engine gone,
+/// awaiting its re-adoption through version 0), as `a_readopted_green_brings_back_the_texts_its_checkpoint_names_first`
+/// leaves a Subversion one; re-adopt it over a fresh engine (`green_adopt::readopt_with`); then read `b` through its
+/// name. Expect: re-adopted, the base brought back by the planner (`vcs.hg.named_recovery_brought_back` 1); `b` `bx\n`.
+/// Failing first: not re-adopted, the replay of the edit fencing the green `ContentMissing`, the splice's base unread
+/// (`readopt_with` ran Subversion's pre-pass alone). (A further edit over the re-adopted green is refused `NotHead` by
+/// `hg_made` since 946484875, its changeset not made: reported to main, 2026-11-24, not A-887's.)
+#[test]
+fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (green, base) = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "named-readopt");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let base = match state.greens.get(&hg.root).unwrap().content("b") {
+      Some(slates_merge::engine::Content::Named(identity)) => identity.hash,
+      other => panic!("`b` not named: {other:?}"),
+    };
+    (hg.root, base)
+  });
+  let (submitted, _, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { edited_named(green).await },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    !matches!(submitted, ReplyBody::Refused { .. }),
+    "{submitted:?}"
+  );
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &[base]);
+    assert!(
+      state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| !content.holds_whole(&slates_vcs::ContentId(base))),
+      "the base let go again"
+    );
+    if let Some((lineage, Ok(mut release))) = state.greens.retire(&green) {
+      while state
+        .greens
+        .release_step(lineage, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
+    state.greens.remove(&green);
+    state.merge.awaiting_adoption.insert(
+      green,
+      crate::green_adopt::AwaitingAdoption {
+        through: 0,
+        identity: None,
+        replay: None,
+      },
+    );
+  });
+  let (readopted, brought, read) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      let readopted =
+        crate::green_adopt::readopt_with(shard, shard, green, slates_merge::engine::Green::new())
+          .await;
+      let brought = crate::repository::svn_commit::tests::on(|state| {
+        state
+          .refusals
+          .get(crate::vcs_store::hg_named::RECOVERY_BROUGHT_BACK)
+          .copied()
+          .unwrap_or(0)
+      });
+      if readopted != Some(true) {
+        return (readopted, brought, None);
+      }
+      let read = crate::vcs_store::named_objects::read_file_brought(green, "b").await;
+      (readopted, brought, read)
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(readopted, Some(true), "re-adopted");
+  assert_eq!(brought, 1, "the splice's base brought back first");
+  assert_eq!(read.as_deref(), Some(&b"bx\n"[..]), "the edited file");
 }
 
 /// A daemon over `instance`'s segment and `store`, the anchor's, with a Mercurial repository rebuilt from the fixtures by

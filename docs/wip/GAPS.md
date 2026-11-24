@@ -377,6 +377,23 @@
 >   `the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long` (`slates-rt`: a 5 ms kernel sleep `Blocked`, a 5 ms
 >   spin `Long`; red `NoClock` with main's account) at 291 ns a read, taken only at a long poll's end and while armed.
 >   Owed: a round on jupiter that names its long polls' holders.
+>   **Every single run: not met on jupiter, and not slates' to meet (A-897, w-84a-win for main 01a20182, 2026-11-24;
+>   BENCHMARKS "84a on Windows bare metal: whose time a slow sample is").** The bar is every run's p99 and p999 under
+>   1 ms, so a run of 1,000 samples may hold one sample over it. At main, 1 of 96 loaded runs and 15 of 114 quiet runs
+>   held two or more (143 interleaved invocations, six rounds). The quiet rate is 3-7e-4 samples over 1 ms a sample,
+>   λ 0.3-0.7 a run, so 4-15% of runs fail; holding every run of 72 needs λ ≤ 0.05. The OS's own floor sits around that
+>   rate: main's AutoResetEvent ping-pong (`pingpong.ps1`) woke a blocked thread 1-12 ms late at 2e-4 to 1e-3 a wake.
+>   `edit_merge_bench` now splits each sample over 1 ms on one clock (its `slow` lines). Of 239 such samples the client's
+>   own thread held 177: its send path, µs of code stalled 1-29 ms, in 97, and its take in 80. The seat's pickup held 29
+>   and the service 33. No arm moved the rate: a 2 ms shard idle window (direction (a)), a client spin for its reply
+>   (direction (b)), the seat holding for its own loop, A-326's holds off, the client's thread at ABOVE_NORMAL, HIGHEST
+>   or TIME_CRITICAL for the whole run, or fixed to one of four CPUs. Inferred, not measured: hypervisor- or DPC-class
+>   preemption of whichever thread is on the path. The evidence is the client stalling 3-12 ms at TIME_CRITICAL, DPC and
+>   interrupt time of 1.6-2.7% on every CPU, and the hypervisor present (WHP). No product latency change lands; the bar
+>   on this machine is Ada's to restate. A measured waste, found on the way: the bench's per-sample telemetry drain
+>   touches every shard, and A-326's holds keep each one spinning, about 7 of the bench's ~10 shard cores, for no
+>   measured latency (holds off: 2.7-3.3 cores, failed runs unchanged). Owed: an observation holds no shard (main's
+>   ruling, its own amendment).
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -1233,8 +1250,11 @@
 >   brings back through its fork what was let go before its entry commits; a replay reads no run its apply names whole,
 >   and recovery rebuilds a green whose replay reads a named base after the stores whose index resolves it. Reds green:
 >   the naming, a mount's read, an in-place edit, a second work naming the same bytes, two restarts. Owed: main's rerun
->   of the 57k lifetimes sampler (the greens' bytes the gate); a takeover's re-adoption of a Mercurial green brings back
->   no named base (`green_adopt::readopt_with` runs svn's live pre-pass alone); git as its own piece.
+>   of the 57k lifetimes sampler (the greens' bytes the gate; VERIFIED r851, 2026-11-24: live under the mapped floor
+>   at the push's end 114,954,401 B against r583's ~170 MB, the greens' heap copies gone); git as its own piece. A
+>   takeover's re-adoption brings back the named bases a Mercurial green's replay reads, by the plan a recovery runs
+>   (`hg_named::bring_back_named_live`, 2026-11-24; red `a_readopted_green_brings_back_the_named_base_its_chain_splices_first`:
+>   not re-adopted, the edit's replay fencing `ContentMissing`).
 > - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
 >   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
 >   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no

@@ -1878,16 +1878,16 @@ async fn built_works(
           let Ok(node) = Node::try_from(object.key.as_bytes()) else {
             continue;
           };
-          let revision = (object.identity, object.path.into_bytes(), node);
-          if !named.contains(&revision) {
-            named.push(revision);
-          }
+          named.push((object.identity, object.path.into_bytes(), node));
         }
         built.insert(*key, increment);
       }
       Err(outcome) => return Some(Err(outcome)),
     }
   }
+  // Each once, in n log n: a push of a history's tree names thousands of files, a scan for each was quadratic.
+  named.sort_unstable();
+  named.dedup();
   Some(Ok((plan, (built, named))))
 }
 

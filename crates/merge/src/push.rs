@@ -1668,13 +1668,14 @@ impl Hashing {
       .into_iter()
       .map(|(at, identity, _)| (at, identity));
     reads.named = name_runs(&mut increment, runs.collect());
-    named.retain(|object| {
-      increment
-        .named
-        .runs
-        .iter()
-        .any(|run| run.identity == object.identity)
-    });
+    // The objects its runs name, found in log time: a push of a history's tree names thousands of files.
+    let runs: std::collections::BTreeSet<crate::named::Identity> = increment
+      .named
+      .runs
+      .iter()
+      .map(|run| run.identity)
+      .collect();
+    named.retain(|object| runs.contains(&object.identity));
     Built {
       increment,
       reads,

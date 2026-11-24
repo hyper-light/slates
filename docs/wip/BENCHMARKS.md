@@ -17721,6 +17721,84 @@ held a fixed shard was not separated (DPC time on the busiest CPUs was 7.8-10.9%
 second machine-wide). The runtime's long polls on Windows carry no attribution (`NoClock`): its attribution has no
 per-thread clock there, a gap of its own.
 
+## 84a on Windows bare metal: whose time a slow sample is, and the arms that did not move it (A-897; w-84a-win for main 01a20182; 2026-11-24)
+
+**The bar.** Every run's p99 and p999 of a full edit and merge under 1 ms, loaded and quiet (`--loaded-only` and
+`--quiet-only`, `--spinners-per-core 2 --files 10 --form accept --form conflict`). A run holds 1,000 samples, so it may
+hold one sample over 1 ms. A run **fails** when its p999 is over 1 ms.
+
+**Machine and launch.** jupiter, as in the section above (AMD Ryzen AI Max+ 395, 16 cores and 32 threads, Windows 11
+build 26200, Balanced plan, 16 of 32 logical CPUs parked by the OS throughout; 15 shards). Every invocation was started
+at Normal through WMI's `Win32_Process.Create`, outside kiln's agent job, by
+`C:\Users\corph\.cache\w-84a-win\{launch2.ps1,round.sh,ab.sh}`.
+
+**How the arms were run.** One prototype binary per round (main eb60e1c3e, this change's bench lines, main's DIAG split
+of a slow sample from `main01a20182/84a-win-diag`, and DIAG environment switches, never main), so every arm in a round
+ran the same code and only its switch differed. Arms were interleaved within each round in balanced orders. D is main.
+Shard CPU is the shards' and the client thread's CPU over the accept form's wall time (the bench's `cpu` line), as a
+range over the arm's invocations.
+
+| arm | what it changes | rounds | inv. L/Q | failed runs L | failed runs Q | cores, accept form |
+|---|---|---|---|---|---|---|
+| D | nothing (main) | 1-6 | 16/19 | 1/96 | 15/114 | 3.1-11.0 L, 4.4-13.1 Q |
+| W | every shard's idle window 2 ms (direction (a)) | 1, 2 | 8/5 | 0/48 vs D 1/48 | 6/30 vs D 6/30 | 13.7-14.9 |
+| C | the client spins 1 ms for each reply (direction (b)) | 1 | 4/2 | 2/24 vs D 0/24 | 1/12 vs D 3/12 | 10.1-13.2 |
+| WC | W and C | 1 | 4/2 | 5/24 vs D 0/24 | 0/12 vs D 3/12 | 14.0-15.6 |
+| S | the client's own shard holds for its loop as A-326's owners do | 2, 3 | 6/6 | 0/36 vs D 1/36 | 7/36 vs D 5/36 | 4.9-12.8 |
+| S2 | S, and the client spins 200 µs | 2 | 4/3 | 0/24 vs D 1/24 | 2/18 vs D 3/18 | 7.1-12.4 |
+| R | the client's thread one level above normal for the whole run | 3, 4 | 5/7 | 1/30 vs D 0/30 | 2/42 vs D 3/42 | 4.4-12.5 |
+| SR | S and R | 3 | 2/3 | 0/12 vs D 0/12 | 3/18 vs D 2/18 | 9.8-12.8 |
+| NH | A-326's closed-loop holds off | 4 | 3/4 | 0/18 vs D 0/18 | 1/24 vs D 1/24 | 2.7-3.3 |
+| NHC | NH, and the client spins 1 ms | 4 | 3/4 | 3/18 vs D 0/18 | 1/24 vs D 1/24 | 3.6-4.7 |
+| H | the client's thread at HIGHEST for the whole run | 5 | 3/4 | 0/18 vs D 0/18 | 3/24 vs D 4/24 | 9.5-12.3 |
+| T | the client's thread at TIME_CRITICAL (15) for the whole run | 5 | 3/4 | 2/18 vs D 0/18 | 5/24 vs D 4/24 | 4.6-12.9 |
+| NHT | NH and T | 5 | 3/4 | 0/18 vs D 0/18 | 1/24 vs D 4/24 | 2.7-3.4 |
+| P1, P2, P8, P14 | the client's thread fixed to logical CPU 1, 2, 8 or 14 | 6 | 0/3 each | none run loaded | 1/18 each vs D 2/18 | 6.0-12.7 |
+
+143 invocations in all: 24, 28, 20, 28, 28 and 15 a round.
+
+**Whose time a slow sample is.** Rounds 3-6 split each sample over 1 ms on one clock: the client's send (its call to
+its request landing in the command ring), the seat's pickup (landing to its shard reading it), the service (the
+`ring.request` span), and the client's take (its reply landing to the call returning). Of 239 such samples, by their
+largest part:
+
+| largest part | samples |
+|---|---|
+| the client's send: µs of its own code, stalled 1-29 ms | 97 |
+| the client's take: its wake, or a stall right after it | 80 |
+| the seat's pickup, 0.85-12 ms | 29 |
+| the service, or spread over several parts | 33 |
+
+So the client's own thread held 177 of 239. Main's DIAG split had read "before pickup" as the shard's. The ring stamps
+(A-559) show most of it was the client's send path. The stalls cluster near 3.5-4 ms and 7.3-7.9 ms.
+
+**The rate against the floor.** At main the quiet rate is 3-7e-4 samples over 1 ms a sample, λ 0.3-0.7 a run, so 4-15% of
+runs hold two or more. Measured: 15 of 114 quiet runs failed, and 1 of 96 loaded runs. Holding every run of 72 needs
+λ ≤ 0.05. The operating system's own floor sits around that rate. Main's AutoResetEvent ping-pong
+(`C:\Users\corph\.cache\main-84a-win\pingpong.ps1`, 200,000 wakes) woke a blocked thread 1-12 ms late at 1.8e-4 a wake
+after 50 µs idle and 1.1e-3 after 500 µs. The bench's own `floor` line (6,000 std parks after 50 µs, quiet) counted
+0-5 over 1 ms.
+
+**Why no arm moved it (inferred, not measured).** The client's thread stalls 3-12 ms in its send path even at
+TIME_CRITICAL, where only real-time-class threads and deferred procedure calls or interrupts preempt it. It stalls on
+every logical CPU it was fixed to. DPC and interrupt time ran 1.6-2.7% on every CPU during the runs
+(`\Processor(*)\% DPC Time`, `% Interrupt Time`, sampled each second). The hypervisor is present (WHP). Hypervisor- or
+DPC-class preemption of whichever thread is on the path fits all of it. Whatever the source, slates does not cause it
+and cannot schedule around it.
+
+**Verdict (main's ruling, 2026-11-24 05:35).** No product latency change lands. Direction (a) (W) ties D and costs
+4-5 more shard cores. Direction (b) (C, WC, NHC) helps quiet and hurts loaded: a client spinning for its replies uses
+up its quantum and is then round-robined behind the load in its own normal-level code. Raising, fixing or freeing the
+client's thread does not remove its stalls. The bar on this machine is Ada's to restate.
+
+**A measured waste found on the way.** The bench's per-sample telemetry drain forwards a request to every shard, and
+each forward carries A-326's closed-loop hold. Every shard stays held, about 7 of the bench's ~10 shard cores. Holds
+off (NH), the shards spent 2.7-3.3 cores, and the failed runs were D's in the same round. An observation holding no
+shard is its own change (main's ruling).
+
+**Landed with this record.** `edit_merge_bench` prints the `floor` line before each sweep, a `cpu` line per form, every
+run's p99 and p999 on the `goal` line, and a `slow` line per sample over the required bound with its split.
+
 ## 84a on Linux bare metal: the shards in the round-robin real-time class where granted, accepted; the client's whole-wait raise not taken (A-872; main 01a20182's A/Bs, w-perf's arms; 2026-11-23)
 
 **Machine.** adacachy2: x86_64, 32 CPUs, CachyOS on kernel 7.3.3 (`CONFIG_PREEMPT=y`, full preemption, `HZ=1000`).

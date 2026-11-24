@@ -1658,6 +1658,7 @@ dependencies = [
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-seal",
  "slates-server",
  "slates-test-seeds",

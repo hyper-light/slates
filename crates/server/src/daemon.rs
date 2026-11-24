@@ -6830,6 +6830,19 @@ async fn boot_before_claims(listener: &mut Listener, control: u16, shards: &[Sha
   true
 }
 
+/// Marks in the anchor's segment that this daemon serves (`slates_anchor::layout::SUP_SERVING`), now in the heartbeat's
+/// host domain, over a mapping of its own; nothing where the segment cannot be mapped or holds no supervision block.
+fn mark_serving(handoff: &Handoff, len: usize, identity: &Identity) {
+  let Ok(segment) = AnchorSegment::attach(handoff, len, identity) else {
+    return;
+  };
+  if let Ok(supervision) = segment.supervision() {
+    supervision.mark_serving(slates_vfs::clock::Clock::monotonic_ns(
+      &mut slates_vfs::clock::HostClock::new(),
+    ));
+  }
+}
+
 /// The control shard's loop: the rendezvous, the heartbeat, and a client handed to its shard
 /// as a spawned task (sharing by move). Every client region is named under `region_names`
 /// ([`region_name_key`]).
@@ -6883,6 +6896,13 @@ async fn control_loop(
   // daemon served at once, so a create the moment it served was refused.
   #[cfg(windows)]
   crate::content_extents::hold_before_serving(&config).await;
+  // The start is done, every shard's recovery included: this loop runs on the control shard, which runs nothing until
+  // its own start ends, and the boot above asked every other shard, each answering only once its start ended. An exit
+  // from here on is a daemon that recovered, which the anchor's restart bound does not count; one before is a failed
+  // start (`slates_anchor::layout::SUP_SERVING`, A-311). Until 2026-11-24 the daemon's role marked it as soon as
+  // `Daemon::start` returned, before any shard's start ended: a start that spun past its window on every restart was
+  // never counted (r865, 1,189 restarts in 44 minutes).
+  mark_serving(&handoff, len, &identity);
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the

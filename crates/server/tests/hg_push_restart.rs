@@ -85,6 +85,11 @@ fn a_restart_after_a_push_brings_back_none_of_its_texts() {
     .output()
     .expect("hg ran");
   let push_took = began.elapsed();
+  // Printed before the restart, so a run the restart ends still says where the push got (main's r854).
+  println!(
+    "hg_push_restart: source {source}: pushed in {push_took:?}, exit {:?}",
+    pushed.status.code()
+  );
   assert!(
     pushed.status.code().is_some_and(|code| code <= 1),
     "push: {}\n{}",
@@ -114,7 +119,7 @@ fn a_restart_after_a_push_brings_back_none_of_its_texts() {
   let source_tip = tip(&source);
   served.stop();
   println!(
-    "hg_push_restart: source {source}: pushed in {push_took:?}, restarted in {restart_took:?}; tip served {served_tip}, source {source_tip}"
+    "hg_push_restart: restarted in {restart_took:?}; tip served {served_tip}, source {source_tip}"
   );
   for name in COUNTERS {
     println!(
