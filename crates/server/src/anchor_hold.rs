@@ -3,7 +3,7 @@
 //! copy it hands a client and each Shards stream's DAX object it hands a device, and what the anchor handed back at this
 //! daemon's start. With it a daemon's death leaves its
 //! mounts, its kernel clients' connections and its clients' writable copies alive; the next daemon takes them back
-//! (`crate::fuse::adopt_held`, `crate::nfs::adopt_held`, `crate::direct_map::adopt_inherited`).
+//! (`crate::fuse::adopt_held`, `crate::nfs::adopt_held`, `crate::shards::dax_hold::adopt_inherited`).
 //!
 //! The channel is adopted once at start ([`adopt`]) into a process-lifetime cell: every shard sends on it, and the
 //! channel keeps each send whole whichever thread makes it (`slates_anchor::held`). The descriptors handed back are

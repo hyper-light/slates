@@ -851,6 +851,13 @@ fn a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put() {
   index.release(&mut store).unwrap();
   assert_empty(&store);
 
+  assert_a_merge_refused_over_budget_gives_back_what_it_put(&before);
+}
+
+/// The last step of [`a_merge_given_up_refused_or_dropped_part_way_gives_back_what_it_put`]: over a store whose budget
+/// leaves room for one merged table beside the runs, step a merge until it is refused. Expect: refused over budget, the
+/// store's contents and bytes as before it began, every row read back as `before`, and the store empty once released.
+fn assert_a_merge_refused_over_budget_gives_back_what_it_put(before: &[(Vec<u8>, Vec<u8>)]) {
   let runs_use = {
     let mut store = ContentStore::new(1 << 20, WINDOW).unwrap();
     let index = forty_rows_in_runs(&mut store);
@@ -891,6 +898,25 @@ fn scattered_key(at: u64) -> [u8; 8] {
   (mixed ^ (mixed >> 31)).to_be_bytes()
 }
 
+/// An index of [`FILTERED_ROWS`] scattered keys ([`scattered_key`]), sealed when due and merged as the size-tiered rule
+/// names after each seal, then sealed whole: several runs, as a push's fork leaves them.
+fn scattered_rows_in_runs(store: &mut ContentStore) -> Index {
+  let mut index = Index::new();
+  for at in 0..FILTERED_ROWS {
+    let key = scattered_key(at);
+    index.insert(store, row(&key, &[], b"payload")).unwrap();
+    if index.seal_due(store) {
+      index.seal(store).unwrap();
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(store, runs).unwrap().unwrap();
+        while index.merge_step(store, &mut merge).unwrap() == MergeStep::More {}
+      }
+    }
+  }
+  index.seal_all(store).unwrap();
+  index
+}
+
 /// Shape: the rows the resolves test appends, and the absent keys it looks up.
 const FILTERED_ROWS: u64 = 600;
 /// Shape: see [`FILTERED_ROWS`].
@@ -906,21 +932,7 @@ const ABSENT_LOOKUPS: u64 = 2_000;
 #[test]
 fn a_lookup_of_a_key_no_run_holds_resolves_almost_no_table() {
   let mut store = store();
-  let mut index = Index::new();
-  for at in 0..FILTERED_ROWS {
-    let key = scattered_key(at);
-    index
-      .insert(&mut store, row(&key, &[], b"payload"))
-      .unwrap();
-    if index.seal_due(&store) {
-      index.seal(&mut store).unwrap();
-      while let Some(runs) = index.tiered_due() {
-        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
-        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
-      }
-    }
-  }
-  index.seal_all(&mut store).unwrap();
+  let index = scattered_rows_in_runs(&mut store);
   let runs = index.run_tables().len();
   assert!(runs >= 3, "runs to walk: {runs}");
   let before = index.counters();

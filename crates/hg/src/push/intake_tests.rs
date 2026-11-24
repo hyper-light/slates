@@ -1369,7 +1369,7 @@ fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
   let mut records = Vec::new();
   let mut recorded = |taking: &mut Intake, store: &ContentStore| {
     while let Some(segment) = taking.take_segment() {
-      records.push(whole_record(&taking, &segment, 1 << 20, store));
+      records.push(whole_record(taking, &segment, 1 << 20, store));
     }
   };
   loop {
@@ -1547,7 +1547,7 @@ fn segment_records_over(
   let mut records = Vec::new();
   let mut recorded = |taking: &mut Intake, store: &ContentStore| {
     while let Some(segment) = taking.take_segment() {
-      records.push(whole_record(&taking, &segment, 1 << 20, store));
+      records.push(whole_record(taking, &segment, 1 << 20, store));
     }
   };
   loop {

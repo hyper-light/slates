@@ -3931,6 +3931,25 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
     "the long push's tip unknown: {}",
     String::from_utf8_lossy(&unknown.1)
   );
+  assert_the_long_push_re_based_and_landed(
+    &long,
+    rebased,
+    lookups,
+    &after,
+    [crate::verbs::hex_of(&long_tip), small_tip],
+  );
+}
+
+/// The long push of [`a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named`] once let go on: `long`
+/// answered `200`, its fork re-based once over the small push's entry and its index lookups counted (`rebased`,
+/// `lookups`), and the repository's heads after it (`after`) naming both `tips`.
+fn assert_the_long_push_re_based_and_landed(
+  long: &(u16, String, Vec<u8>),
+  rebased: u64,
+  lookups: u64,
+  after: &(u16, Vec<u8>),
+  tips: [String; 2],
+) {
   assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
   assert_eq!(
     rebased, 1,
@@ -3941,7 +3960,7 @@ fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
     "a settled push counts its fork's index lookups (goal 93, arena-20's counters)"
   );
   let after = String::from_utf8_lossy(&after.1).into_owned();
-  for tip in [crate::verbs::hex_of(&long_tip), small_tip] {
+  for tip in tips {
     assert!(after.contains(&tip), "{after}");
   }
 }
@@ -4194,7 +4213,6 @@ pub(crate) fn chained_create(bytes: usize, depth: usize) -> Chained {
       &mut at,
     );
   }
-  drop(put);
   writer.finish().expect("the trailer");
   let tip = commits.last().expect("a commit").0;
   let mut request = Vec::new();

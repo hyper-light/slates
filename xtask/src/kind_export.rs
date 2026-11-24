@@ -1,7 +1,8 @@
 //! `cargo xtask kind export` — AUD-29-75's kernel leg (§4.6 "Kubernetes publication without privilege"):
 //! kubelet itself mounts a slates volume into a pod as an `nfs` PersistentVolume, over the daemon's RFC 9289
 //! RPC-with-TLS export, with no privilege anywhere in slates. Ada authorized its CI tooling on 2026-10-01: the
-//! node image with Debian's ktls-utils, the runner's `modprobe tls`, and this step.
+//! node image with Debian's ktls-utils, the runner's `modprobe tls`, and this step. The leg is a child module of
+//! `kind.rs`, so it reuses the lane's machinery.
 //!
 //! The run, each step a command on the record:
 //!

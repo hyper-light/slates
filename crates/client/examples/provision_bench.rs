@@ -184,6 +184,9 @@ struct Sample {
   total: u64,
   daemon: u64,
   parked: bool,
+  /// The client part's two halves by the exchange's stamps: from its sending to its request's landing, and from its
+  /// reply's landing to its taking; none where a stamp is missing.
+  halves: Option<(u64, u64)>,
 }
 
 /// Creates the daemon refused, typed, over the whole bench: each is reported and counted, and the bench fails at its end,
@@ -202,6 +205,9 @@ fn sample(
   own_shard: Option<usize>,
 ) -> Vec<Sample> {
   let mut client = connect(instance);
+  if tag.ends_with("-0-0") {
+    println!("  provision.{tag} client thread: {}", scheduling::thread());
+  }
   // Where the client's own shard is asked for (of `own_shard` shards), each name is one its shard owns: the client's
   // shard is its id's residue over the shards (the daemon's accept), a name's owner its hash's (`owner_of_name`).
   let seat = own_shard.map(|shards| {
@@ -259,10 +265,20 @@ fn sample(
       taken_ns,
     };
     let daemon = harness_part(&exchange).map_or(total, |harness| total.saturating_sub(harness));
+    let halves = exchange
+      .request_landed_ns
+      .zip(exchange.reply_landed_ns)
+      .and_then(|(request, reply)| {
+        Some((
+          request.checked_sub(exchange.sent_ns)?,
+          exchange.taken_ns.checked_sub(reply)?,
+        ))
+      });
     samples.push(Sample {
       total,
       daemon,
       parked: client.park_ratio().0 > parks_before,
+      halves,
     });
     client.destroy(id).unwrap();
   }
@@ -291,6 +307,27 @@ fn print_tail(key: &str, run: usize, samples: &[Sample]) {
   let client = median(tail.iter().map(|s| s.total - s.daemon).collect());
   let parked = tail.iter().filter(|s| s.parked).count();
   let all_parked = samples.iter().filter(|s| s.parked).count();
+  // The client part's halves, the tail's parked creates apart from its unparked ones: an unparked create that took its
+  // reply late was off its core while it spun (descheduled), not parked (GAPS' open AC-2.1 entry).
+  let halves = |want_parked: bool| {
+    let picked: Vec<(u64, u64)> = tail
+      .iter()
+      .filter(|s| s.parked == want_parked)
+      .filter_map(|s| s.halves)
+      .collect();
+    if picked.is_empty() {
+      return "none".to_owned();
+    }
+    let count = picked.len();
+    let before = median(picked.iter().map(|h| h.0).collect());
+    let after = median(picked.iter().map(|h| h.1).collect());
+    format!("{count}: sent to landed {before} ns, reply landed to taken {after} ns at the median")
+  };
+  println!(
+    "  provision.{key} run {run} tail halves: parked {}; unparked {}",
+    halves(true),
+    halves(false)
+  );
   println!(
     "  provision.{key} run {run} tail: {} creates at or past p99 {p99} ns: daemon part {daemon} ns, client part {client} ns at the median, {parked} parked (all creates: {all_parked} of {} parked, daemon part p50 {} ns)",
     tail.len(),
@@ -546,6 +583,58 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   ok
 }
 
+/// T-2.6's spinning sweep over [`CLIENT_COUNTS`] clients, each level's CPU, parks and rows printed: the single client's
+/// p99 held to [`PROVISION_FLOOR_NS`] (AC-2.1), and each level that `cores` past the `shards` can run ratcheted. The
+/// single client's p99, and whether it failed the floor.
+fn spinning_sweep(daemon: &Daemon, instance: &str, shards: u16, cores: usize) -> (u64, bool) {
+  // A client thread spins for its reply while the shards spin serving; a run with more of
+  // those than the machine has cores past the shards measures the scheduler oversubscribing,
+  // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
+  // is measured on the reference machine, whose cores hold the concurrency).
+  let runnable = cores.saturating_sub(usize::from(shards)).max(1);
+  let mut failed = false;
+  let mut quiet_spinning = 0;
+  for clients in CLIENT_COUNTS {
+    let key = format!("spinning_{clients}");
+    let before = daemon.shard_pulses();
+    let (rows, cpu) = form(instance, &key, (*clients, SPINNING_SAMPLES, None), None);
+    print_cpu(&key, shards, &cpu);
+    print_parks(
+      &key,
+      &before,
+      &daemon.shard_pulses(),
+      RUNS * clients * SPINNING_SAMPLES,
+    );
+    // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
+    // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
+    // recorded so the ratchet catches regressions, but only the single-client p99 is held to
+    // the 50 µs floor here (a concurrency level's tail is contention on shared owner shards,
+    // reported and ratcheted, not floored).
+    let ratchet_gated = *clients <= runnable;
+    print_rows_gated(&key, &rows, ratchet_gated);
+    let p99 = p99_median(&rows);
+    let floor_gated = *clients == 1;
+    if floor_gated {
+      quiet_spinning = p99;
+      let ok = p99 <= PROVISION_FLOOR_NS;
+      failed |= !ok;
+      println!(
+        "ac-2.1: {clients} client spinning ({cores} cores, {shards} shards), provisioning p99 {p99} ns vs floor {PROVISION_FLOOR_NS} ns: {}",
+        if ok { "ok" } else { "FAIL" }
+      );
+    } else if ratchet_gated {
+      println!(
+        "ac-2.1: {clients} clients spinning, p99 {p99} ns (T-2.6 histogram; recorded and ratcheted, not floored)"
+      );
+    } else {
+      println!(
+        "ac-2.1: {clients} clients oversubscribes {runnable} runnable core(s); p99 {p99} ns reported, not gated here"
+      );
+    }
+  }
+  (quiet_spinning, failed)
+}
+
 fn main() {
   if std::env::args().any(|argument| argument == SPIN_ARGUMENT) {
     spin();
@@ -589,6 +678,11 @@ fn main() {
     daemon.config().region.spin_ns,
     daemon.config().runtime.spin_ns
   );
+  println!(
+    "  provision.scheduling: process {}; main thread {}",
+    scheduling::process(),
+    scheduling::thread()
+  );
   // At rest: no client yet, and the bootstrap's own window spun out first, so the row reads an idle daemon.
   wait_out(Duration::from_nanos(daemon.config().runtime.spin_ns));
   let (cpu_before, started) = (cpu_now_ns(), Instant::now());
@@ -598,52 +692,8 @@ fn main() {
     cores_permille(cpu_now_ns().saturating_sub(cpu_before), started.elapsed()),
     started.elapsed().as_millis()
   );
-  // A client thread spins for its reply while the shards spin serving; a run with more of
-  // those than the machine has cores past the shards measures the scheduler oversubscribing,
-  // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
-  // is measured on the reference machine, whose cores hold the concurrency).
-  let cores = profile.facts.cpus_at_once();
-  let runnable = cores.saturating_sub(usize::from(shards)).max(1);
-  let mut failed = false;
-  let mut quiet_spinning = 0;
-  for clients in CLIENT_COUNTS {
-    let key = format!("spinning_{clients}");
-    let before = daemon.shard_pulses();
-    let (rows, cpu) = form(&instance, &key, (*clients, SPINNING_SAMPLES, None), None);
-    print_cpu(&key, shards, &cpu);
-    print_parks(
-      &key,
-      &before,
-      &daemon.shard_pulses(),
-      RUNS * clients * SPINNING_SAMPLES,
-    );
-    // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
-    // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
-    // recorded so the ratchet catches regressions, but only the single-client p99 is held to
-    // the 50 µs floor here (a concurrency level's tail is contention on shared owner shards,
-    // reported and ratcheted, not floored).
-    let ratchet_gated = *clients <= runnable;
-    print_rows_gated(&key, &rows, ratchet_gated);
-    let p99 = p99_median(&rows);
-    let floor_gated = *clients == 1;
-    if floor_gated {
-      quiet_spinning = p99;
-      let ok = p99 <= PROVISION_FLOOR_NS;
-      failed |= !ok;
-      println!(
-        "ac-2.1: {clients} client spinning ({cores} cores, {shards} shards), provisioning p99 {p99} ns vs floor {PROVISION_FLOOR_NS} ns: {}",
-        if ok { "ok" } else { "FAIL" }
-      );
-    } else if ratchet_gated {
-      println!(
-        "ac-2.1: {clients} clients spinning, p99 {p99} ns (T-2.6 histogram; recorded and ratcheted, not floored)"
-      );
-    } else {
-      println!(
-        "ac-2.1: {clients} clients oversubscribes {runnable} runnable core(s); p99 {p99} ns reported, not gated here"
-      );
-    }
-  }
+  let (quiet_spinning, mut failed) =
+    spinning_sweep(&daemon, &instance, shards, profile.facts.cpus_at_once());
   // The single spinning client again, each name one its own shard owns: no create crosses to another shard, so its
   // rows beside `spinning_1`'s split the cross-shard hop and its wakes from the rest (informational, never gated;
   // GAPS' open AC-2.1 entry at many shards on macOS, main 01a20182's order of 2026-11-23).
@@ -717,5 +767,108 @@ fn main() {
   }
   if failed || refused > 0 {
     std::process::exit(1);
+  }
+}
+
+/// The scheduling the OS gives this process and its threads (main 01a20182's control of 2026-11-23: on the Studio every
+/// bench runs as a child of kiln's runner, a launchd job, whose policy may set the QoS its threads get, and so which
+/// cores; under such a job a 10 ms timed wait returned about 76 ms late at the median,
+/// docs/bugs/2026-10-26-the-async-sdk-tests-noise-was-another-waits-timer-delay.md).
+#[cfg(target_os = "macos")]
+mod scheduling {
+  /// Format: `task_policy_get`'s flavor for the task's role (`TASK_CATEGORY_POLICY`, `<mach/task_policy.h>`).
+  const TASK_CATEGORY_POLICY: u32 = 1;
+  /// Format: `TASK_CATEGORY_POLICY_COUNT`, the policy's length in `integer_t`s: one, its role.
+  const TASK_CATEGORY_POLICY_COUNT: u32 = 1;
+
+  unsafe extern "C" {
+    fn task_policy_get(
+      task: libc::mach_port_t,
+      flavor: u32,
+      policy_info: *mut i32,
+      count: *mut u32,
+      get_default: *mut u32,
+    ) -> i32;
+  }
+
+  /// A QoS class by its name in `<sys/qos.h>`.
+  fn qos_name(class: libc::qos_class_t) -> &'static str {
+    match class {
+      libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE => "user-interactive",
+      libc::qos_class_t::QOS_CLASS_USER_INITIATED => "user-initiated",
+      libc::qos_class_t::QOS_CLASS_DEFAULT => "default",
+      libc::qos_class_t::QOS_CLASS_UTILITY => "utility",
+      libc::qos_class_t::QOS_CLASS_BACKGROUND => "background",
+      libc::qos_class_t::QOS_CLASS_UNSPECIFIED => "unspecified",
+    }
+  }
+
+  /// The calling thread's QoS class and its relative priority.
+  pub(super) fn thread() -> String {
+    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+    let mut relative = 0;
+    // SAFETY: the calling thread's own handle, and two locals the call writes.
+    let rc =
+      unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative) };
+    if rc != 0 {
+      return format!("qos unread (rc {rc})");
+    }
+    format!("qos {} (relative priority {relative})", qos_name(class))
+  }
+
+  /// The task's darwin role (`task_role_t`, `<mach/task_policy.h>`) by name, as its launcher left it.
+  pub(super) fn process() -> String {
+    let mut role = 0i32;
+    let mut count = TASK_CATEGORY_POLICY_COUNT;
+    let mut get_default = 0u32;
+    // SAFETY: this task's own port, a one-integer policy buffer and its count, and the default flag, all locals the call
+    // writes within the count it is given.
+    #[allow(
+      deprecated,
+      reason = "libc's mach_task_self works; the mach2 crate it points to is no dependency of this workspace"
+    )]
+    let rc = unsafe {
+      task_policy_get(
+        libc::mach_task_self(),
+        TASK_CATEGORY_POLICY,
+        &mut role,
+        &mut count,
+        &mut get_default,
+      )
+    };
+    if rc != 0 {
+      return format!("darwin role unread (kern_return {rc})");
+    }
+    let name = match role {
+      0 => "unspecified",
+      1 => "foreground",
+      2 => "background",
+      3 => "control",
+      4 => "graphics server",
+      5 => "throttle",
+      6 => "non-UI",
+      7 => "default",
+      8 => "darwin background",
+      _ => "unknown",
+    };
+    format!(
+      "darwin role {role} ({name}){}",
+      if get_default != 0 {
+        ", the default"
+      } else {
+        ""
+      }
+    )
+  }
+}
+
+/// [`scheduling`] off macOS: nothing it reads exists there.
+#[cfg(not(target_os = "macos"))]
+mod scheduling {
+  pub(super) fn thread() -> String {
+    "not read off macOS".to_owned()
+  }
+  pub(super) fn process() -> String {
+    "not read off macOS".to_owned()
   }
 }
