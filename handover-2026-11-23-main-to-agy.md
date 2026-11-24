@@ -22,6 +22,29 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 11:38 on 11-24:
+- REGRESSION, owned: gate 10 (45450874392, v3_takeover at d48863ddb = A-902) failed 31 of 31, "no survivor served the
+  repository" (both survivors 404, takeovers 0, pages_unsent ~1,650); gate 9 was 37/40. w-shared's cause: A-902's home
+  wait (~1 s) outlasts the sender's broadcast stall window (~200 ms); homes.rs exchange_round and put_whole drop the
+  returned Stragglers, so the session to that home stays lent for good and council and takeover pages never reach it;
+  serve_peer_records also serves HOME_STREAM inline with CONFIG and TAKEOVER. Fix ordered ahead of A-905 as A-907:
+  settle all three drop sites (with credentials.rs:436), HOME_STREAM on its own task, structural if Drop allows, red
+  first. Gate 11 (45470507096 at a30ffbdb8) runs to confirm the cause holds at current main; gate 12 runs at the fix.
+  Logs: ~/.cache/main-rounds/gate10/ on this Mac. "Push 0 closed" in the 10:58 block below is withdrawn until gate 12.
+- Lint wall: main fixed five sites in place, not yet landed (worktree ~/slates-work/main-ci-disk, detached): e7f18e4d1
+  (content.rs empty-window test, homes.rs serve_remote, hg_push re-adopt test) and c5c3fcc9b (fleet.rs Unix-only getuid
+  on Windows, daemon_edge.rs log_rows type). Lint diag 3 (branch diag-measurer-main-lint-3) and r950 on the Studio
+  (focused tests and macOS clippy) decide the landing.
+- r940, git leg at 0ebf10cf4: push 69.0 s (r935 81.6, the double SHA-1 gone); clone 148.1 s (r935 117.8), the stream
+  after the first pack byte grew from about 20 s to about 44 s, with top frames ContentStore::len_of and
+  ContentPool::available. Both are being fixed: 197b0bc4f, and w-git's A-906 (the pool's generation word, in progress).
+  The next git leg runs once A-906 lands.
+- r951 on the Studio: w-hg's P5 owed round (stock hg 7.2 over every hg_interop test, then the 57k push and restart) at
+  a30ffbdb8.
+- Disk: ENOSPC on this Mac about 11:10-11:30 (w-git's rustc crashed, w-svn's link failed). w-perf deleted its own
+  3.6 GB target and main removed four of its own worktrees; 12 GiB free at 11:33.
+- Numbers: A-906 is w-git's (pool generation word); w-shared takes A-907 for the gate 10 fix.
+
 Updates at 10:58 on 11-24:
 - NEEDS ADA, a naming-model decision (A-904, GAPS): any node other than a repository's owner answers "repository not found"
   (always so; after a takeover a client can't find the successor), and names are unique per node only (two nodes could each
