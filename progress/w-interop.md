@@ -612,3 +612,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - LANDED a51b627f5, 2026-11-23: r592's slates git and svn legs failed every step because the harness's anchor had no
   --vcs-store. Now a failed step or a setup-refused server fails the harness and the round loudly, and hg's empty
   optional rows are gone. Owed to main: rerun the round.
+- LANDED b0d738c6f: blame skips files added without a source (the r1 import). LANDED 489d3f19d: git-2000 use test's
+  bound is 1,800 s (sizing run 45330574435, 900.37 s).
+- LANDED f6ef1b034, 2026-11-24: round 2 of the order-of-magnitude record in BENCHMARKS (r655). git is 7.6-14.2x and hg
+  up to 9.2x slower than stock on whole-history transfers; svn is blocked by slates' import BudgetExceeded (w-svn). The
+  harness now checks git objects against what the push sends, prints no line for a step a server doesn't run, samples
+  `hg -R serve`, and leaves no stray git-daemon. Owed: round 3 after w-svn's import fix.
