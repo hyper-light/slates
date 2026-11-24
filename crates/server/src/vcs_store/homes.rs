@@ -1824,7 +1824,10 @@ pub(crate) async fn serve_remote(
   request: &[u8],
   budget_ns: u64,
 ) -> Vec<u8> {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let delay_ns = ANSWER_DELAY_NS.with(std::cell::Cell::get);
+  if delay_ns > 0 {
+    let _ = slates_rt::futures::sleep(delay_ns).await;
+  }
   let message = match decoded(request) {
     Ok(message) => message,
     Err(answer) => return answer,
@@ -1842,7 +1845,23 @@ pub(crate) async fn serve_remote(
   }) else {
     return Vec::new();
   };
-  let (identity, outcome) = match message {
+  outcome_of(message, (origin, &shards), (local, &members, f), budget_ns)
+    .await
+    .map_or_else(Vec::new, |(identity, outcome)| {
+      slates_cluster::homes::HomeMessage::Answer { identity, outcome }.encode()
+    })
+}
+
+/// [`serve_remote`]'s outcome for a decoded `message` and the identity it answers for, served on shard `origin` with what
+/// this node knows of the region; `None` for an answer, which nothing answers.
+async fn outcome_of(
+  message: slates_cluster::homes::HomeMessage,
+  (origin, shards): (u16, &[u16]),
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  budget_ns: u64,
+) -> Option<([u8; 32], slates_cluster::homes::HomeOutcome)> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let answered = match message {
     HomeMessage::Put {
       identity,
       owners,
@@ -1852,8 +1871,8 @@ pub(crate) async fn serve_remote(
       identity,
       keep_put(
         origin,
-        &shards,
-        (local, &members, f),
+        shards,
+        (local, members, f),
         (identity, owners, bytes),
         budget_ns,
       )
@@ -1869,8 +1888,8 @@ pub(crate) async fn serve_remote(
     } => (
       identity,
       part_answer(
-        (origin, &shards),
-        (local, &members, f),
+        (origin, shards),
+        (local, members, f),
         (identity, owners, (total, offset)),
         (bytes, budget_ns),
       )
@@ -1878,27 +1897,24 @@ pub(crate) async fn serve_remote(
     ),
     HomeMessage::ReadPart { identity, offset } => (
       identity,
-      read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
+      read_part(origin, shards, ContentId(identity), offset, budget_ns).await,
     ),
-    HomeMessage::Read { identity } => {
-      let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
-        Ok(bytes) => HomeOutcome::Bytes(bytes),
-        Err(refused) => HomeOutcome::Refused(refused.wire()),
-      };
-      (identity, outcome)
-    }
+    HomeMessage::Read { identity } => (
+      identity,
+      read_answer(origin, shards, identity, budget_ns).await,
+    ),
     HomeMessage::LetGo { identity, owner } => (
       identity,
-      let_go_answer(origin, &shards, (identity, owner), budget_ns).await,
+      let_go_answer(origin, shards, (identity, owner), budget_ns).await,
     ),
     HomeMessage::Moved { identity, from, to } => (
       identity,
-      moved_answer(origin, &shards, (identity, (from, to)), budget_ns).await,
+      moved_answer(origin, shards, (identity, (from, to)), budget_ns).await,
     ),
     // Answered by the shard holding the attempt's repository, from its records (A-727 (d1a-3)).
     HomeMessage::Resolve { identity, attempt } => (
       identity,
-      resolve_answer(origin, &shards, (identity, attempt), budget_ns).await,
+      resolve_answer(origin, shards, (identity, attempt), budget_ns).await,
     ),
     // A repository rebuilt on its successor (A-727 (d1a-3), main 01a20182's ruling of 2026-11-24 01:36): the answer a
     // resolution asks for exists now, so a pass is owed here, on this control shard; owing it twice is harmless.
@@ -1907,9 +1923,23 @@ pub(crate) async fn serve_remote(
       let _ = crate::state::with_state(|state| state.count(REBUILT_HEARD, 1));
       ([0; 32], HomeOutcome::Owed)
     }
-    HomeMessage::Answer { .. } => return Vec::new(),
+    HomeMessage::Answer { .. } => return None,
   };
-  HomeMessage::Answer { identity, outcome }.encode()
+  Some(answered)
+}
+
+/// [`serve_remote`]'s answer to a read: the bytes this node's home holds, or the refusal typed for the wire.
+async fn read_answer(
+  origin: u16,
+  shards: &[u16],
+  identity: [u8; 32],
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::HomeOutcome;
+  match read(origin, shards, ContentId(identity), budget_ns).await {
+    Ok(bytes) => HomeOutcome::Bytes(bytes),
+    Err(refused) => HomeOutcome::Refused(refused.wire()),
+  }
 }
 
 /// A home message read from `request` ([`serve_remote`]), or what to answer at once instead: nothing for bytes no message
@@ -2122,6 +2152,15 @@ std::thread_local! {
   /// Test support (A-727 (d1a-3)): whether this node answers every resolution unresolved, as a repository's holder this
   /// node cannot reach does ([`hold_resolutions`]).
   static RESOLUTIONS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Test support (A-907): how long this node waits before it serves each home message from the region
+  /// ([`delay_answers`]): a home slower than its sender's round, as one waiting for its own install is (A-902).
+  static ANSWER_DELAY_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test support (A-907): this node waits `delay_ns` before it serves each home message from the region while `delay_ns`
+/// is not 0, so it answers after its sender's round has stalled, as a home waiting for its own install does (A-902).
+pub(crate) fn delay_answers(delay_ns: u64) {
+  ANSWER_DELAY_NS.with(|delay| delay.set(delay_ns));
 }
 
 /// Test support (A-727 (d1a-3)): this node's resolutions all answer unresolved while `held`, as when the repository's
@@ -3112,31 +3151,39 @@ async fn exchange_round(
     .into_iter()
     .map(|(host, endpoint)| (host, request.to_vec(), endpoint))
     .collect();
-  let (replied, _stragglers) = slates_cluster::broadcast(
+  let (replied, stragglers) = slates_cluster::broadcast(
     outgoing,
     HOME_STREAM,
     slates_transport::connection::Priority::Bulk,
     budget,
   )
   .await;
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
+  let mut take = |host: slates_db::HostId, bytes: Vec<u8>| {
     left.retain(|waiting| *waiting != host);
     let readable = !matches!(
-      HomeMessage::decode(&reply.bytes),
+      HomeMessage::decode(&bytes),
       Ok(HomeMessage::Answer {
         outcome: HomeOutcome::Refused(HomeRefusal::Version),
         ..
       }) | Err(_)
     );
     if readable {
-      answers.push((host, reply.bytes));
+      answers.push((host, bytes));
     } else {
       let _ = crate::state::with_state(|state| state.count(REPLY_OTHER_VERSION, 1));
     }
+  };
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    take(host, reply.bytes);
     returned.push((host, endpoint));
   }
   crate::fleet::return_sessions(returned);
+  // A home slower than the round's stall (one waiting for its own install, A-902) answers late: its answer counts, and
+  // its session goes back on its link (A-907). An unanswered one's link is dialed afresh and the host stays left.
+  for (host, bytes) in crate::fleet::settled_stragglers(stragglers).await {
+    take(host, bytes);
+  }
 }
 
 /// Logs the hosts of an exchange that never answered, how long it ran, and why it stopped (gate 8: a homing short in about
@@ -3550,7 +3597,7 @@ async fn put_whole(
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
-  let (replied, _stragglers) = slates_cluster::broadcast(
+  let (replied, stragglers) = slates_cluster::broadcast(
     outgoing,
     HOME_STREAM,
     slates_transport::connection::Priority::Bulk,
@@ -3558,19 +3605,26 @@ async fn put_whole(
   )
   .await;
   let mut kept = Vec::new();
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
+  let mut take = |host: slates_db::HostId, bytes: &[u8]| {
     if let Ok(HomeMessage::Answer {
       identity: answered,
       outcome: HomeOutcome::Kept { .. },
-    }) = HomeMessage::decode(&reply.bytes)
+    }) = HomeMessage::decode(bytes)
       && answered == identity.0
     {
       kept.push(host);
     }
+  };
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    take(host, &reply.bytes);
     returned.push((host, endpoint));
   }
   crate::fleet::return_sessions(returned);
+  // A late home's answer counts and its session goes back on its link (A-907).
+  for (host, bytes) in crate::fleet::settled_stragglers(stragglers).await {
+    take(host, &bytes);
+  }
   kept
 }
 

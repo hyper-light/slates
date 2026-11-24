@@ -212,6 +212,21 @@
 > (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
 > for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
 > held and dropped could be answered at once, if a gate shows it.
+> **FIXED BY CHANGE, gate 12 owed (A-907, w-shared, 2026-11-24): gate 10 failed 31 of 31 at A-902.** A-902's slow
+> home outlasted the healer's round. The healer, the homes' exchange and credentials' exchange dropped their
+> stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
+> unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
+> served on its own task. Red first (`a907_...`).
+> **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
+> creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
+> (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
+> both count `merge.recompute_mismatch` and refuse the new green at version 0 ("the recomputed identity does not match the
+> record"). A branch's green is made at a version of its source (`Lineage::branch`, A-575), so its version 0 is the
+> source's state there, while a holder recomputes every version 0 as an empty green (`merge_service::recompute`) and the
+> record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
+> `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
+> makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
+> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing).
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1455,6 +1470,17 @@
 >   `landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify` (an import and a push
 >   in two: every changelog and manifest object let go before and after a clone and a pull, each changegroup verified
 >   by the push's own verifier; red: 10 and 14 held). Owed: stock 7.2's clone, pull and verify (main's `hg_interop`).
+>   Found by main's `hg_interop` round at a30ffbdb8 and closed: a fetch's changelog and manifest texts read whole from
+>   the changeset store (to send a changeset, or diff a manifest against the client's) were counted as file revisions
+>   sent whole (`vcs_store.hg_pull_whole_texts`: 3 for a one-changeset pull, its changeset, its manifest and the parent
+>   manifest), though the pull sent the stored delta; now counted apart (`StoreWants::reads_logs`,
+>   `vcs_store.hg_pull_log_texts`). Held by P5's red above (red: 3 whole, 0 log texts).
+>   Also found there and closed: `branch create --from v1` hung (`stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_
+>   from_the_tag`). The verb parked on its `.hgtags` read ran again and judged the read held by its files, which a read
+>   begun over heads whose manifests are let go does not know yet, so it parked again, for ever. A held read is now judged
+>   by the heads it began over (`TagsRead::same_heads`). Held by
+>   `a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made` (red: refused
+>   `ContentUnavailable`).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
@@ -4008,6 +4034,17 @@
 >
 > hg 24 of 24 over Mercurial's whole history, on ubuntu-latest x86_64 (glibc's default and tuned malloc) and on
 > ubuntu-24.04-arm, under twice the CPUs in busy loops (run 45303764098, arena-19).
+>
+> **Later rounds (2026-11-24):**
+> - **Linux git, run 3** (45445378898, at c53777733): 27 of 27 again.
+> - **Linux svn, runs 3 and 4** (45445378898 at c53777733; 45477825824 at 4664f8d26, svn legs only): **26 of 33 on
+>   both routes**, the same seven rows each time, against run 1's 33 of 33.
+>   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
+>   - delete, revert and status failed after them, on the edit left behind.
+>   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
+>     4d), and nothing brought it back. The fix is w-svn's, in progress; run 5 follows it.
+> - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
+>   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
 > verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
@@ -4538,11 +4575,15 @@
 > joined here yet) is refused `Overloaded`, retryable, counted `merge.made.unbuilt` and logged once a repository
 > (`made_commit::Taken::Unbuilt`; w-perf, 2026-11-24, main's (a) of 09:46): before, it was taken for no repository's
 > green and committed with no commit, revision or changeset made of it. Reds for each tool, each committing bare with
-> the fix out; Mercurial's and git's resend after the rebuild lands. Owed by A-636 part 2c-2 ("the store's objects
-> rebuilt by content identity"), w-perf's next piece: a rebuilt store holds none of its objects, so after a successor's
-> rebuild a Mercurial made changeset lacks its parent's texts (the red keeps them), and a Subversion store made again
-> from its records on one node is refused `Unlanded`, its resend `NotNext`
-> (`svn_commit::tests::a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refused`'s doc). (c) a Mercurial
+> the fix out; each tool's resend after the rebuild lands, its store gone as a successor holds none. A-636 part 2c-2's
+> "the store's objects rebuilt by content identity" BUILT for Mercurial (w-perf, 2026-11-24, main's ruling of 12:25,
+> w-hg's review): a record's replay asks the node's changeset store for a changeset's text, a manifest's or a file
+> revision's whole text whose identity the content store never knew, as for one let go once landed, batched by the
+> record's room, each held to its node (`node::compute`) before it is kept, counted `vcs_store.hg_replay_unknown_asked`
+> (`slates_hg` `a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store`; the hg twin with its store
+> gone). Subversion owed nothing: its rebuild's task reads its records back (the earlier `Unlanded` was a test's
+> one-step settle). Owed (w-hg's review): what a successor's replay puts back stays held, marked landed by nothing, so
+> nothing lets it go, as P5 lets a landed push's go; to be let go once the rebuild ends, as `hg_run`'s let-go does. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

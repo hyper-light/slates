@@ -2022,8 +2022,11 @@ impl ContentStore {
       {
         pending.extend(
           list
-            .chunks_exact(IDENTITY_BYTES)
-            .filter_map(ContentId::from_slice),
+            .as_chunks::<IDENTITY_BYTES>()
+            .0
+            .iter()
+            .copied()
+            .map(ContentId),
         );
       }
     }
@@ -3627,18 +3630,24 @@ mod tests {
     assert_eq!(alone.let_go(&single), Err(LetGoRefused::Empty));
     assert_eq!(alone.let_go_object(&single), 0);
     for held in [&store, &alone] {
-      assert!(!held.is_away(&id), "the empty window held");
-      assert_eq!(held.len_of(&id), Some(0));
-      assert_eq!(held.bytes_of(&id).as_deref(), Some(&b""[..]));
-      let aways: Vec<(ContentId, u64)> = held.aways().collect();
-      assert!(aways.is_empty(), "nothing let go to carry: {aways:?}");
-      let mut after = ContentStore::new(1 << 20, 4096).unwrap();
-      assert_eq!(
-        after.restore_away(aways),
-        0,
-        "nothing refused at the restart"
-      );
+      assert_the_empty_window_is_held(held, &id);
     }
+  }
+
+  /// The empty window as a store that kept it shows it: held, never away, read as no bytes, and nothing let go for a
+  /// restart's image to carry, so a fresh store refuses nothing.
+  fn assert_the_empty_window_is_held(held: &ContentStore, id: &ContentId) {
+    assert!(!held.is_away(id), "the empty window held");
+    assert_eq!(held.len_of(id), Some(0));
+    assert_eq!(held.bytes_of(id).as_deref(), Some(&b""[..]));
+    let aways: Vec<(ContentId, u64)> = held.aways().collect();
+    assert!(aways.is_empty(), "nothing let go to carry: {aways:?}");
+    let mut after = ContentStore::new(1 << 20, 4096).unwrap();
+    assert_eq!(
+      after.restore_away(aways),
+      0,
+      "nothing refused at the restart"
+    );
   }
 
   /// A-724 piece 4. Do: let go a landed window, then put the same bytes again (a new push bringing them). Expect: the put

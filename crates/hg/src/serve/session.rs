@@ -349,6 +349,10 @@ impl crate::render::StoreWants for Producing {
   fn reads_tags(&self) -> bool {
     matches!(self, Producing::Lookup(_))
   }
+
+  fn reads_logs(&self) -> bool {
+    matches!(self, Producing::Bundle(answering) if answering.reads_logs())
+  }
 }
 
 /// A `lookup` of `key` over `transport` whose name reaches the tags: its answer begun reading the heads' `.hgtags`
