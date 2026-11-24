@@ -85,11 +85,23 @@ const CLOCK_RATE_TOLERANCE_PPM: u64 = 500;
 /// Format: parts per million.
 const MILLION: u64 = 1_000_000;
 
-/// Derived: the **membership horizon** — the longest a peer can go unanswered before this node's detector
-/// declares it dead: the probe deadline plus the suspicion window ([`SUSPICION_PERIODS`] periods), each
-/// period dilated to the Lifeguard local-health cap ([`LOCAL_HEALTH_CAP`] + 1). A holder that has not
-/// answered an owner for this long is retiring it; an owner unanswered for this long is being retired. The
-/// holder side of the lease ([`AnswersGiven::promotion_open`]).
+/// Derived: the **membership horizon**, 0.9 s at the 100 ms heartbeat: the probe deadline plus the suspicion
+/// window ([`SUSPICION_PERIODS`] periods), each period dilated to the Lifeguard local-health cap
+/// ([`LOCAL_HEALTH_CAP`] + 1). It is the window the lease's two sides reason with: a holder that has not answered
+/// an owner alive for this long may answer a promotion of its objects ([`AnswersGiven::promotion_open`]), and an
+/// owner none of whose holders has answered it within its lease bound, this less the clock tolerance
+/// ([`lease_bound_ns`]), stops serving their latest state. Both sides judge answers given and taken, so the
+/// lease's safety rests on no detection. It is also the detection budget the member plane asks of its detector
+/// (`MemberPlane::new`), which floors each period at the budget's share of SWIM's count.
+///
+/// It is not a bound on detection. The detector keeps the budget only while an estimator, a pair's own or the
+/// member's pooled one, judges every pair it probes. What it guarantees is a condemnation within the bound it
+/// states (hyper-swim's `detection_bound` and the wait it measures for another member's answer, recorded as
+/// `condemned_within`). While a pair is still judged by its own retransmission timer, as in a member's first
+/// seconds before its pool has a verdict, the least it can keep is its `least_detection_bound`: 21 s for a forming
+/// three-node fleet on the simulated network, where a peer took 6.0 s to condemn; on adacachy2's loopback fleets
+/// peers so judged took 7.2 to 15.3 s (A-882). That bound reaches the waits through the failover delay's detection
+/// term (A-363, A-882), not through this horizon.
 pub fn horizon_ns() -> u64 {
   HEARTBEAT_NS
     .saturating_mul(u64::from(LOCAL_HEALTH_CAP.saturating_add(1)))

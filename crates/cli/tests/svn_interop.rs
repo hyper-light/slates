@@ -2942,7 +2942,41 @@ fn canonical_tags(text: &str) -> String {
   out
 }
 
-/// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out.
+/// `text`, an `svn info -R --xml` answer made plain ([`UseLeg::plain`], so each `<entry ...>` tag is one line), with its
+/// entries in text order and everything around them as answered: stock `svn` lists a directory's children in the order
+/// its hash of them iterates (`libsvn_client/info.c` `push_dir_info` walks `svn_ra_get_dir2`'s hash unsorted), and APR
+/// seeds every hash afresh (`apr_hash_make`, from the clock and the table's address), so the order is no part of an
+/// answer. Found by main's round r202 (2026-11-23, reads.dump over HTTP): seven `info` differences, each the same
+/// entries in another order.
+fn info_entries_in_order(text: &str) -> String {
+  let mut head = String::new();
+  let mut entries: Vec<String> = Vec::new();
+  let mut tail = String::new();
+  for line in text.split_inclusive('\n') {
+    if line.starts_with("<entry") {
+      entries.push(String::new());
+    }
+    match entries.last_mut() {
+      Some(entry) if tail.is_empty() => {
+        entry.push_str(line);
+        if line.trim_end() == "</info>" {
+          // The closing tag is no part of the last entry.
+          let kept = entry.len().saturating_sub(line.len());
+          entry.truncate(kept);
+          tail.push_str(line);
+        }
+      }
+      Some(_) => tail.push_str(line),
+      None => head.push_str(line),
+    }
+  }
+  entries.sort();
+  head + &entries.concat() + &tail
+}
+
+/// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out. A symbolic link is held
+/// as `link TARGET`, the text Subversion keeps for a link (`svn:special`), never read through: a link may name a
+/// directory, and r202's git-2000 round read one as a file ([`a_working_copys_symbolic_links_are_held_as_links`]).
 #[allow(clippy::disallowed_methods)] // test code: reads the working copies stock `svn` wrote
 fn tree_of(copy: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
   let mut files = std::collections::BTreeMap::new();
@@ -2954,16 +2988,23 @@ fn tree_of(copy: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
       if entry.file_name() == ".svn" {
         continue;
       }
-      if entry.file_type().unwrap().is_dir() {
+      let kind = entry.file_type().unwrap();
+      if kind.is_dir() {
         stack.push(path);
-      } else {
-        let relative = path
-          .strip_prefix(copy)
-          .unwrap()
-          .to_string_lossy()
-          .into_owned();
-        files.insert(relative, std::fs::read(&path).unwrap());
+        continue;
       }
+      let relative = path
+        .strip_prefix(copy)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      let bytes = if kind.is_symlink() {
+        let target = std::fs::read_link(&path).unwrap();
+        format!("link {}", target.to_string_lossy()).into_bytes()
+      } else {
+        std::fs::read(&path).unwrap()
+      };
+      files.insert(relative, bytes);
     }
   }
   files
@@ -3138,9 +3179,16 @@ fn use_verb_compared(
       let [a, b] = legs.map(|leg| leg.answer(scratch, &args));
       compare(failed, verb, "0:HEAD", &a, &b);
     }
-    "info" => at_each(failed, &|at| {
-      words(&["info", "-R", "--xml", &format!("{{url}}@{at}")])
-    }),
+    "info" => {
+      // A recursive info lists each directory's children in the client's hash order, seeded afresh each run
+      // ([`info_entries_in_order`]).
+      for at in sampled {
+        let target = format!("{{url}}@{at}");
+        let args = ["info", "-R", "--xml", target.as_str()];
+        let [a, b] = legs.map(|leg| info_entries_in_order(&leg.answer(scratch, &args)));
+        compare(failed, verb, &format!("r{at}"), &a, &b);
+      }
+    }
     "checkout" | "update" | "switch" | "blame" => {
       working_copies_compared(verb, legs, scratch, sampled, failed);
     }
@@ -3584,6 +3632,81 @@ fn a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from() {
     over_tunnel, over_file,
     "the mirror over {} (left) and over {} (right)",
     tunnel.name, local.name
+  );
+}
+
+/// The comparison's rule for a recursive info ([`info_entries_in_order`]). Do: put r202's two answers to `svn info -R
+/// --xml` at revision 1 (the root, then `branches`, `tags` and `trunk` in two orders, each directory's entry whole)
+/// through it, and an answer whose `tags` entry names another revision. Expect the first two one text, what precedes
+/// the entries and the closing tag kept, and the third still different from them.
+#[test]
+fn an_infos_entry_order_is_no_part_of_an_answer() {
+  let entry = |path: &str, revision: u32| {
+    format!(
+      "<entry kind=\"dir\" path=\"{path}\" revision=\"{revision}\">\n<url><repository>/{path}</url>\n</entry>\n"
+    )
+  };
+  let head = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<info>\n";
+  let root = "<entry kind=\"dir\" path=\"<repository>\" revision=\"1\">\n<url><repository></url>\n</entry>\n";
+  let stock = format!(
+    "{head}{root}{}{}{}</info>\n",
+    entry("trunk", 1),
+    entry("branches", 1),
+    entry("tags", 1)
+  );
+  let slates = format!(
+    "{head}{root}{}{}{}</info>\n",
+    entry("tags", 1),
+    entry("trunk", 1),
+    entry("branches", 1)
+  );
+  assert_eq!(
+    info_entries_in_order(&stock),
+    info_entries_in_order(&slates)
+  );
+  assert!(info_entries_in_order(&stock).starts_with(head));
+  assert!(info_entries_in_order(&stock).ends_with("</info>\n"));
+  let changed = format!(
+    "{head}{root}{}{}{}</info>\n",
+    entry("tags", 2),
+    entry("trunk", 1),
+    entry("branches", 1)
+  );
+  assert_ne!(
+    info_entries_in_order(&stock),
+    info_entries_in_order(&changed)
+  );
+}
+
+/// The comparison's reading of a working copy ([`tree_of`]): a symbolic link is held as the link it is, never read
+/// through. Found by main's round r202 (2026-11-23, git-2000 over HTTP): git/git's history holds symbolic links, which
+/// stock `svn` checks out as links (`svn:special`), and one naming a directory was read as a file (`IsADirectory`, the
+/// harness's panic at `tree_of`). Do: in a scratch directory, make a directory, a file in it, a link to the directory
+/// and a link to the file, and read the tree. Expect the file once under its own path and each link as its target,
+/// with nothing read through either.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn a_working_copys_symbolic_links_are_held_as_links() {
+  let scratch = Scratch::new("tree-links");
+  made_directory(&format!("{}/dir", scratch.path));
+  std::fs::write(format!("{}/dir/file", scratch.path), "bytes\n").unwrap();
+  std::os::unix::fs::symlink("dir", format!("{}/to-dir", scratch.path)).unwrap();
+  std::os::unix::fs::symlink("dir/file", format!("{}/to-file", scratch.path)).unwrap();
+  let tree = tree_of(&scratch.path);
+  let paths: Vec<&str> = tree.keys().map(String::as_str).collect();
+  assert_eq!(paths, ["dir/file", "to-dir", "to-file"]);
+  assert_eq!(
+    tree.get("dir/file").map(Vec::as_slice),
+    Some(&b"bytes\n"[..])
+  );
+  assert_eq!(
+    tree.get("to-dir").map(Vec::as_slice),
+    Some(&b"link dir"[..])
+  );
+  assert_eq!(
+    tree.get("to-file").map(Vec::as_slice),
+    Some(&b"link dir/file"[..])
   );
 }
 

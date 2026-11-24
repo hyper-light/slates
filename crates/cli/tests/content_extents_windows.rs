@@ -22,8 +22,17 @@ const SHARDS: &str = "2";
 /// Shape: verbs in a row the daemon must answer before a test starts: the anchor may restart a daemon once at its start
 /// (its first heartbeat lapsing), and a verb in that window answers exit 3.
 const STABLE_STREAK: u32 = 5;
-/// Shape: the bound on the anchor's start and the daemon's settling, past any healthy start.
-const START_BOUND: Duration = Duration::from_secs(120);
+/// Derived: the bound on the anchor's start and the daemon's settling, past any healthy start: [`START_BUDGETS`]
+/// observation budgets (`slates_machine::budgets::observe_budget_ns`, the longest any party goes unobserved before its
+/// observer's question ends with a deadline), for the anchor's start, the daemon's recovery and its one startup restart.
+const START_BOUND: Duration =
+  Duration::from_nanos(START_BUDGETS * slates_machine::budgets::observe_budget_ns());
+/// Shape: the observation budgets in [`START_BOUND`]: twelve, the 120 s it was at today's 10 s budget.
+const START_BUDGETS: u64 = 12;
+/// Derived: how long a test waits for `slates write` to say its hold is taken ([`write_over_held`]): two observation
+/// budgets (`slates_machine::budgets::observe_budget_ns`), one for the write's start and connect and one for its hold's
+/// first renewal, each a question its asker ends within one budget.
+const HOLD_WAIT: Duration = Duration::from_nanos(2 * slates_machine::budgets::observe_budget_ns());
 /// Format: the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`), the instance name after it.
 const SERVING_LINE: &str = "slates daemon: instance ";
 
@@ -58,13 +67,19 @@ fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>,
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  child.stdin.take().unwrap().write_all(input).unwrap();
-  let output = child.wait_with_output().unwrap();
-  (
-    output.status.code().unwrap_or(-1),
-    output.stdout,
-    String::from_utf8_lossy(&output.stderr).into_owned(),
-  )
+  // Fed beside the wait, and a feed the command cut short by ending first is part of its outcome, not the test's panic:
+  // a held write that fails ends before it reads (A-879), and its stderr says why.
+  let mut stdin = child.stdin.take().unwrap();
+  let (fed, output) = std::thread::scope(|scope| {
+    let feeder = scope.spawn(move || stdin.write_all(input));
+    let output = child.wait_with_output().unwrap();
+    (feeder.join().unwrap(), output)
+  });
+  let mut err = String::from_utf8_lossy(&output.stderr).into_owned();
+  if let Err(error) = fed {
+    err.push_str(&format!("\n(the input was not all read: {error})"));
+  }
+  (output.status.code().unwrap_or(-1), output.stdout, err)
 }
 
 /// The value of the `key: value` line in `text`.
@@ -168,7 +183,7 @@ fn spawn_anchor(instance: &str, shards: &str) -> AnchorProcess {
   anchor
 }
 
-/// Shape: the bound on one test's whole run under its anchor, past any healthy run: a start ([`START_BOUND`]) and as
+/// Derived: the bound on one test's whole run under its anchor, past any healthy run: a start ([`START_BOUND`]) and as
 /// long again for its verbs.
 const TEST_BOUND: Duration = Duration::from_secs(2 * START_BOUND.as_secs());
 
@@ -326,13 +341,127 @@ fn terminate(pid: u32) {
 }
 
 /// A volume of `bounded` bytes made through the CLI and attached for writing: its id and the attachment.
-fn writable_volume(instance: &str, name: &str, bounded: &str) -> (String, String) {
+/// A volume's write attachment held from the moment it is made by a `slates attach --hold` process (A-879), until the
+/// write that names it has taken its own hold ([`write_over_held`]): no moment passes with nothing renewing the
+/// attachment, however slowly the runner starts the write. A CLI attachment lapses about a second after its last use
+/// here, and a write that began later met it lapsed ("could not be held ... AttachmentExpired", diag run 45289962818).
+struct HeldAttachment {
+  holder: Child,
+  id: String,
+  attachment: String,
+}
+
+/// Creates volume `name` of `bounded` bytes on `instance` and attaches it for writing with `slates attach --hold`,
+/// whose stdout names the attachment; both of its outputs are drained as they come, so it never blocks or meets a
+/// closed pipe, its stderr echoed.
+fn held_writable_volume(instance: &str, name: &str, bounded: &str) -> HeldAttachment {
   let (code, out, err) = run(instance, &["volume", "create", name, "--bounded", bounded]);
   assert_eq!(code, 0, "create {name}: {err}");
   let id = value_of(&out, "id");
-  let (code, out, err) = run(instance, &["attach", &id, "--write"]);
-  assert_eq!(code, 0, "attach {name}: {err}");
-  (id, value_of(&out, "attachment"))
+  let mut holder = slates()
+    .args(["--instance", instance, "attach", &id, "--write", "--hold"])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(holder.stderr.take().unwrap());
+  std::thread::spawn(move || {
+    let mut line = String::new();
+    while stderr.read_line(&mut line).is_ok_and(|read| read > 0) {
+      eprint!("{line}");
+      line.clear();
+    }
+  });
+  let (lines, said) = std::sync::mpsc::channel::<String>();
+  let mut stdout = std::io::BufReader::new(holder.stdout.take().unwrap());
+  std::thread::spawn(move || {
+    let mut line = String::new();
+    while stdout.read_line(&mut line).is_ok_and(|read| read > 0) {
+      let _ = lines.send(std::mem::take(&mut line));
+    }
+  });
+  let attachment = loop {
+    let line = said.recv_timeout(START_BOUND).unwrap_or_else(|_| {
+      panic!("attach --hold for {name} named no attachment within {START_BOUND:?}")
+    });
+    if let Some(attachment) = line.trim_end().strip_prefix("attachment: ") {
+      break attachment.to_owned();
+    }
+  };
+  HeldAttachment {
+    holder,
+    id,
+    attachment,
+  }
+}
+
+/// The line `slates write` gives once its own hold of attachment `attachment` is taken, before it reads any input.
+fn write_hold_line(attachment: &str) -> String {
+  format!("slates write: holding attachment {attachment} ")
+}
+
+/// Writes `input` to `path` under `held`'s attachment: the write starts, `held`'s holder is ended once the write's
+/// stderr says its own hold is taken (or the write has ended without one, or [`HOLD_WAIT`] passed), and only then is
+/// the input fed, so the
+/// staging rests on the write's hold alone. The exit code, the stdout and the whole stderr, a feed the write cut short
+/// part of it.
+fn write_over_held(
+  instance: &str,
+  held: HeldAttachment,
+  path: &str,
+  input: &[u8],
+) -> (i32, Vec<u8>, String) {
+  use std::io::{Read, Write};
+  let HeldAttachment {
+    mut holder,
+    id,
+    attachment,
+  } = held;
+  let mut child = slates()
+    .args(["--instance", instance, "write", &id, &attachment, path])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let (lines, seen) = std::sync::mpsc::channel::<String>();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let reader = std::thread::spawn(move || {
+    let mut line = String::new();
+    while stderr.read_line(&mut line).is_ok_and(|read| read > 0) {
+      let _ = lines.send(std::mem::take(&mut line));
+    }
+  });
+  let hold_line = write_hold_line(&attachment);
+  let mut err = String::new();
+  while let Ok(line) = seen.recv_timeout(HOLD_WAIT) {
+    // Anywhere in the line: a log line may carry a prefix of its own.
+    let held_now = line.contains(&hold_line);
+    err.push_str(&line);
+    if held_now {
+      break;
+    }
+  }
+  // The write holds the attachment now, or has ended without a hold, or never said: either way the holder goes.
+  let _ = holder.kill();
+  let _ = holder.wait();
+  let mut stdin = child.stdin.take().unwrap();
+  let mut stdout = child.stdout.take().unwrap();
+  let (fed, out) = std::thread::scope(|scope| {
+    let feeder = scope.spawn(move || stdin.write_all(input));
+    let mut out = Vec::new();
+    let _ = stdout.read_to_end(&mut out);
+    (feeder.join().unwrap(), out)
+  });
+  let status = child.wait().unwrap();
+  let _ = reader.join();
+  for line in seen.try_iter() {
+    err.push_str(&line);
+  }
+  if let Err(error) = fed {
+    err.push_str(&format!("\n(the input was not all read: {error})"));
+  }
+  (status.code().unwrap_or(-1), out, err)
 }
 
 /// MEMORY SIZING, R2 on Windows (main's ruling of 2026-11-20 18:40: every platform gives a burst's memory back; A-789's
@@ -352,12 +481,16 @@ fn a_freed_content_extent_gives_its_commit_back_on_windows() {
   }
   let instance = format!("cli-extent-commit-{}", std::process::id());
   let anchor = start_anchor(&instance);
-  let before = commit_charge();
-  let (id, attachment) = writable_volume(&instance, "burst", "512MiB");
+  // Made before the attachment is, and the attachment held from its making until the write holds it
+  // ([`held_writable_volume`]): the burst takes seconds to make in a debug build, and an attachment made before it,
+  // with nothing renewing it, lapsed before its write began (A-879's named refusal, diag run 45289962818).
   let burst: Vec<u8> = (0..BURST)
     .map(|at| u8::try_from(at % 251).unwrap())
     .collect();
-  let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "burst.bin"], &burst);
+  let before = commit_charge();
+  let held = held_writable_volume(&instance, "burst", "512MiB");
+  let (id, attachment) = (held.id.clone(), held.attachment.clone());
+  let (code, _, err) = write_over_held(&instance, held, "burst.bin", &burst);
   assert_eq!(code, 0, "write: {err}");
   drop(burst);
   let with_burst = commit_charge();
@@ -411,11 +544,13 @@ fn a_content_extent_outlives_a_killed_daemon_on_windows() {
   }
   let instance = format!("cli-extent-restart-{}", std::process::id());
   let anchor = start_anchor(&instance);
-  let (id, attachment) = writable_volume(&instance, "kept", "64MiB");
+  // Made before the attachment is, and the attachment held until the write holds it (the commit test's lesson).
   let bytes: Vec<u8> = (0..FILE)
     .map(|at| u8::try_from((at * 7 + at / 4096) % 251).unwrap())
     .collect();
-  let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "kept.bin"], &bytes);
+  let held = held_writable_volume(&instance, "kept", "64MiB");
+  let id = held.id.clone();
+  let (code, _, err) = write_over_held(&instance, held, "kept.bin", &bytes);
   assert_eq!(code, 0, "write: {err}");
   let killed = status_pid(&instance).expect("the instance's daemon answers");
   terminate(killed);

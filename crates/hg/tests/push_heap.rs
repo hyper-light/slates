@@ -15,7 +15,7 @@
 use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::{HgIndex, Log};
 use slates_hg::manifest::{self, Entry, Flag};
-use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::push::intake::{Intake, PushSegment, Stepped};
 use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, NULL_NODE, Node, node};
@@ -318,7 +318,7 @@ fn churned(payload: &[u8]) -> u64 {
       intake.cut_rest();
     }
     while let Some(segment) = intake.take_segment() {
-      let _record = intake.segment_record(&segment, u64::MAX, &store).unwrap();
+      let _record = whole_record(&intake, &segment, u64::MAX, &store);
     }
     match stepped {
       Stepped::More => {}
@@ -664,4 +664,16 @@ fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
     "the fork held {} runs of its own, past the bound {bound} at {rows} rows",
     intaken.most_own_runs
   );
+}
+
+/// `segment`'s record, written by `intake` a step at a time to its end (as the daemon writes it, a turn's steps at a time).
+fn whole_record(
+  intake: &Intake,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Vec<u8> {
+  let mut writer = intake.record_writer(segment, room).unwrap();
+  while intake.record_step(&mut writer, store).unwrap() {}
+  writer.finish().unwrap()
 }

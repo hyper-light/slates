@@ -1130,8 +1130,10 @@ pub enum RequestBody {
   /// library's and the SDKs' attachment objects send while they live, so an attachment its holder keeps never lapses
   /// for want of another verb naming it. Does nothing else. Served on the attachment's owner shard and answered
   /// `Renewed` with the term now in force and when to renew again; refused as any use of the attachment is
-  /// (`AttachmentExpired` once its term lapsed), and `BadRequest` for an attachment with no term (a mount's renews
-  /// through its own activity). Appended.
+  /// (`AttachmentExpired` once its term lapsed). An attachment with no term (a mount's, which lives by its own activity;
+  /// an SDK client's, which lives with its client) is answered `NoTerm`, nothing renewed: a state, not a fault, which a
+  /// process naming an attachment another made reads to learn whether to hold it (A-879; `BadRequest` until
+  /// 2026-11-23). Appended.
   Renew {
     /// The attachment.
     attachment: u64,
@@ -5981,6 +5983,12 @@ pub enum ReplyBody {
     /// Operations of the declaration past what this reply holds.
     declaration_elided: u32,
   },
+  /// The attachment `Renew` named has no term (A-879): its life is its own activity or its maker's (a mount's, an SDK
+  /// client's, a guest's), not a holder's renewals, so nothing was renewed and nothing need hold it. An answer, not a
+  /// refusal: `slates write` renews the attachment it names before it reads its input and holds the attachment exactly
+  /// when the answer is `Renewed`. Until 2026-11-23 this was a `BadRequest`, an uncategorized refusal standing for a
+  /// valid state. Appended.
+  NoTerm,
 }
 
 /// Where a session log walk stands (A-773): a line's key. A work's line is keyed by the work alone, a waiting landing's

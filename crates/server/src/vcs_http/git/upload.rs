@@ -147,7 +147,8 @@ pub(crate) trait StoreLender {
 }
 
 /// A window an answer's read-through brought back (A-864 piece 3): its pack, where it ends there, and its identity, let
-/// go again once the answer's cursor has passed it.
+/// go again once the answer's cursor has passed it; or, for a window a read stopped at, once the cursor has moved off the
+/// object that read was for (`pinned`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Brought {
   /// The pack.
@@ -156,10 +157,17 @@ pub(crate) struct Brought {
   pub(crate) end: u64,
   /// The window.
   pub(crate) window: slates_vcs::ContentId,
+  /// For a window a read stopped at, where the stream read next when it stopped: the object under way, whose read may
+  /// need the window wherever it lies in the pack (a delta's base, earlier in it). Held while the stream still reads
+  /// there (goal 93, r130's shallow clone: a base brought back and let go behind the cursor in one turn was met again
+  /// and the answer refused `Unreadable`).
+  pub(crate) pinned: Option<slates_git::store::packed::Waited>,
 }
 
-/// The windows an answer brought back and has not let go (A-864 piece 3): at most a turn's look-ahead and the window it
-/// stopped at, the cursor passing each.
+/// The windows an answer brought back and has not let go (A-864 piece 3): a turn's look-ahead, and the windows the
+/// object under way stopped at (`Brought::pinned`), the cursor passing each. The pinned windows are at most those one
+/// object's read lies in: its delta chain's entries, at most the deepest chain a push carried, each at most the largest
+/// object and so its bytes' windows and one more.
 pub(crate) type Resident = Vec<Brought>;
 
 /// Where an answer's pack reads next and the let-go window its last turn stopped at (A-864 piece 2,

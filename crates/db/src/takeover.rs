@@ -152,20 +152,21 @@ pub fn readiness(
 /// Promises `object` to the successor `prepare` names: installs its authority under the round's generation and runs the
 /// prepare through the object's acceptor, raising its fence to the round's epoch. The highest record held, `None` when
 /// the acceptor holds nothing of it, or the refusal (a fence already above the epoch, or a generation newer than the
-/// round's). A page's listing and a by-name answer promise alike. `from_retired`: whether the copy's current owner is a
-/// retired host, so the install records it as the owner the authority moved from ([`Acceptor::move_authority`]).
+/// round's). A page's listing and a by-name answer promise alike. `retired_at`: the version of the retirement the
+/// configuration keeps of the copy's current owner, `None` for a live one, so the install records the owner the
+/// authority moved from with that retirement ([`Acceptor::move_authority`], A-883).
 pub fn promise_object(
   acceptor: &mut Acceptor,
   object: ObjectId,
   prepare: &HostPrepare,
-  from_retired: bool,
+  retired_at: Option<u64>,
 ) -> Result<Option<Accepted>, RegisterError> {
   acceptor.move_authority(
     Authority {
       generation: prepare.generation,
       owner: prepare.owner,
     },
-    from_retired,
+    retired_at,
   )?;
   let promise = acceptor.prepare(&Prepare {
     owner: prepare.owner,
@@ -210,10 +211,13 @@ pub fn falls_to(
 
 /// Whether a holder's copy of `object`, kept by `acceptor`, falls to `asker` in `departed`'s takeover (A-251 (b), shape
 /// (i) as one rule): the line of its authority's owner ends there ([`falls_to`]), or the line of the owner an install
-/// moved that authority from does ([`Acceptor::moved_from`]). The second case is the common one: an install moves a
-/// retired owner's copies to its successor (`reconcile_held_authority`), and a holder restored warm then routes the copy
-/// to the successor as a live owner, so neither routing nor the authority alone names the retired host. Routing plays no
-/// part. The asker's own objects never fall here: no install moved them from the round's line.
+/// moved that authority from does ([`Acceptor::moved_from`]), while the retirement that made the move is the one the
+/// configuration keeps of that owner (A-883). The second case is the common one: an install moves a retired owner's
+/// copies to its successor (`reconcile_held_authority`), and a holder restored warm then routes the copy to the
+/// successor as a live owner, so neither routing nor the authority alone names the retired host. Routing plays no part.
+/// The asker's own objects never fall here: no install of this retirement moved them from the round's line. A move made
+/// at an earlier retirement of the same host, which was admitted again under its id, says nothing of this one: counted,
+/// it gave the asker its own live object to take over again (2026-11-23, the chaos nemesis's settle failure).
 pub fn copy_falls_to(
   regional: &RegionalConfiguration,
   acceptor: &Acceptor,
@@ -222,9 +226,10 @@ pub fn copy_falls_to(
   asker: HostId,
 ) -> bool {
   falls_to(regional, acceptor.owner(), object, departed, asker)
-    || acceptor
-      .moved_from()
-      .is_some_and(|from| falls_to(regional, from, object, departed, asker))
+    || acceptor.moved_from().is_some_and(|moved| {
+      regional.retirement_version(moved.owner) == Some(moved.retired_at)
+        && falls_to(regional, moved.owner, object, departed, asker)
+    })
 }
 
 /// A holder's answer to a by-name question, and what it could not answer.
@@ -290,8 +295,8 @@ pub fn answer_by_name(
       answer.refused = answer.refused.saturating_add(1);
       continue;
     }
-    let from_retired = regional.retired.contains_key(&acceptor.owner());
-    match promise_object(acceptor, *object, prepare, from_retired) {
+    let retired_at = regional.retirement_version(acceptor.owner());
+    match promise_object(acceptor, *object, prepare, retired_at) {
       Ok(Some(highest)) => {
         let size = HostPromise::entry_bytes(&highest);
         if used.saturating_add(size) > budget && answered(&answer.promise) {
@@ -378,7 +383,7 @@ pub fn answer_move(
       answer.promise.nothing.push(*object);
       continue;
     };
-    match promise_object(acceptor, *object, prepare, false) {
+    match promise_object(acceptor, *object, prepare, None) {
       Ok(Some(highest)) => {
         let size = HostPromise::entry_bytes(&highest);
         if used.saturating_add(size) > budget && answered(&answer.promise) {
@@ -444,7 +449,7 @@ pub fn answer_ledger(
   ) {
     return None;
   }
-  let from_retired = regional.retired.contains_key(&acceptor.owner());
+  let retired_at = regional.retirement_version(acceptor.owner());
   let page = HostPrepare {
     departed: prepare.departed,
     owner: prepare.owner,
@@ -453,7 +458,7 @@ pub fn answer_ledger(
     after: None,
     named: Vec::new(),
   };
-  match promise_object(acceptor, prepare.object, &page, from_retired) {
+  match promise_object(acceptor, prepare.object, &page, retired_at) {
     Ok(_) => {}
     Err(RegisterError::StaleEpoch { current }) => {
       promise.fenced = Some(HostEpoch(current));
@@ -573,7 +578,7 @@ pub fn ledger_positions(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::register::HostEpoch;
+  use crate::register::{HostEpoch, MovedFrom};
 
   fn record(sequence: u64) -> Accepted {
     Accepted {
@@ -1073,14 +1078,16 @@ mod tests {
     assert_eq!(answer.refused, 1, "an adopted move owes no round");
   }
 
-  /// A-251's persisted field, as the supervisor bounded it: an install records the owner it moved the authority from only
-  /// when that owner is retired, one owner overwritten by the next such move, never a list. Do: move a copy from a
-  /// retired host to its successor, then from that successor (retired too) to the next; then install a new live owner
-  /// with an ordinary install. Expect: the first owner, then the second, kept through the ordinary install.
+  /// A-251's persisted field, as the supervisor bounded it, with the retirement it names (A-883): an install records the
+  /// owner it moved the authority from, and that owner's retirement, only when that owner is retired, one record
+  /// overwritten by the next such move, never a list. Do: move a copy from a retired host to its successor, then from
+  /// that successor (retired too) to the next; then install a new live owner with an ordinary install. Expect: the first
+  /// owner and its retirement, then the second and its, kept through the ordinary install.
   #[test]
   fn an_acceptor_keeps_only_the_last_retired_owner_its_authority_moved_from() {
     let generation = 3;
     let (first, second, third, live) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let (first_retired_at, second_retired_at) = (5, 8);
     let mut copy = acceptor(HostId(9), first, generation, None);
     assert_eq!(copy.moved_from(), None);
     copy
@@ -1089,32 +1096,44 @@ mod tests {
           generation,
           owner: second,
         },
-        true,
+        Some(first_retired_at),
       )
       .unwrap();
-    assert_eq!(copy.moved_from(), Some(first));
+    let from_first = MovedFrom {
+      owner: first,
+      retired_at: first_retired_at,
+    };
+    assert_eq!(copy.moved_from(), Some(from_first));
     copy
       .move_authority(
         Authority {
           generation,
           owner: third,
         },
-        true,
+        Some(second_retired_at),
       )
       .unwrap();
-    assert_eq!(copy.moved_from(), Some(second), "overwritten, one owner");
+    let from_second = MovedFrom {
+      owner: second,
+      retired_at: second_retired_at,
+    };
+    assert_eq!(
+      copy.moved_from(),
+      Some(from_second),
+      "overwritten, one record"
+    );
     copy
       .move_authority(
         Authority {
           generation,
           owner: live,
         },
-        false,
+        None,
       )
       .unwrap();
     assert_eq!(
       copy.moved_from(),
-      Some(second),
+      Some(from_second),
       "a move from a live owner records nothing"
     );
     copy
@@ -1125,7 +1144,7 @@ mod tests {
       .unwrap();
     assert_eq!(
       copy.moved_from(),
-      Some(second),
+      Some(from_second),
       "nor does an ordinary install"
     );
   }
@@ -1146,7 +1165,7 @@ mod tests {
           generation,
           owner: asker,
         },
-        true,
+        regional.retirement_version(departed),
       )
       .unwrap();
     let bytes = slates_wire::Wire::to_bytes(&copy.to_persisted());
@@ -1154,7 +1173,14 @@ mod tests {
       slates_wire::Wire::from_bytes(&bytes).unwrap();
     let rebuilt = Acceptor::from_persisted(HostId(5), decoded);
     assert_eq!(rebuilt.authority(), copy.authority());
-    assert_eq!(rebuilt.moved_from(), Some(departed));
+    assert_eq!(
+      rebuilt.moved_from(),
+      Some(MovedFrom {
+        owner: departed,
+        retired_at: regional.version,
+      }),
+      "the owner and the retirement that moved it"
+    );
     assert_eq!(rebuilt.persisted(), copy.persisted());
     assert_eq!(
       copy_falls_to(&regional, &rebuilt, theirs[0], departed, asker),
@@ -1189,10 +1215,10 @@ mod tests {
           generation,
           owner: asker,
         },
-        true,
+        regional.retirement_version(departed),
       )
       .unwrap();
-    assert_eq!(moved.moved_from(), Some(departed));
+    assert_eq!(moved.moved_from().map(|moved| moved.owner), Some(departed));
     assert!(
       !falls_to(&regional, moved.owner(), theirs[0], departed, asker),
       "its authority alone no longer says"
@@ -1206,6 +1232,101 @@ mod tests {
       !copy_falls_to(&regional, &askers, own, departed, asker),
       "the asker's own object"
     );
+  }
+
+  /// A move names its retirement (A-883; the chaos nemesis's settle failure of 2026-11-23, seeds 14946995733817154046
+  /// and 8173581894251929445): a host whose retirement completed may be admitted again under the same id and retire
+  /// again, and a copy an install moved from it at the first retirement falls to its successor in that round and in none
+  /// of the later ones, though the configuration ranks the same successor for the object in each: counted there, it is
+  /// the successor's own live object taken over again. The copy is rebuilt from its persisted state between the move and
+  /// the rounds (a warm restart), so the retirement survives recovery. Do: retire host 1 and move a holder's copy of one of
+  /// its objects to the successor; rebuild the copy from its encoding; every survivor confirms, so the retirement
+  /// completes; admit host 1 again and retire it a second time. Expect: the copy, and its rebuilt twin, fall to the
+  /// successor in the first round and not in the second.
+  #[test]
+  fn a_copy_moved_at_a_hosts_earlier_retirement_falls_in_none_of_its_later_rounds() {
+    use slates_wire::Wire;
+    let departed = HostId(1);
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      BTreeMap::new(),
+      scatter,
+      false,
+    );
+    regional.take_over(departed, scatter).unwrap();
+    let first: Vec<(ObjectId, Option<HostId>)> = (0..64)
+      .map(|local| {
+        let object = ObjectId::new(departed, local);
+        (object, regional.successor(departed, object))
+      })
+      .collect();
+    let first_retirement = regional.clone();
+    let survivors = regional.retired[&departed].survivors.clone();
+    for survivor in survivors {
+      regional.confirm(departed, survivor);
+    }
+    assert!(
+      !regional.retired.contains_key(&departed),
+      "every survivor confirmed, so the retirement completed"
+    );
+    assert!(
+      regional.admit(departed, None, scatter),
+      "host 1 is admitted again under its id"
+    );
+    regional.take_over(departed, scatter).unwrap();
+    assert_ne!(
+      regional.retirement_version(departed),
+      first_retirement.retirement_version(departed),
+      "a second retirement of the same host"
+    );
+    // An object the second retirement ranks for the same successor as the first: the only case in which the earlier
+    // move could make the copy fall to that successor again.
+    let (object, asker) = first
+      .iter()
+      .find_map(|(object, successor)| {
+        successor
+          .filter(|successor| regional.successor(departed, *object) == Some(*successor))
+          .map(|successor| (*object, successor))
+      })
+      .unwrap();
+    let holder = first_retirement
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != asker)
+      .unwrap();
+    let generation = first_retirement.version;
+    let mut moved = acceptor(holder, departed, generation, Some((object, 1)));
+    moved
+      .move_authority(
+        Authority {
+          generation,
+          owner: asker,
+        },
+        first_retirement.retirement_version(departed),
+      )
+      .unwrap();
+    let rebuilt = Acceptor::from_persisted(
+      holder,
+      crate::register::PersistedAcceptor::from_bytes(&moved.to_persisted().to_bytes()).unwrap(),
+    );
+    assert_eq!(
+      rebuilt.moved_from(),
+      moved.moved_from(),
+      "the retirement survives recovery"
+    );
+    for copy in [&moved, &rebuilt] {
+      assert!(
+        copy_falls_to(&first_retirement, copy, object, departed, asker),
+        "the copy falls to the successor in the round of the retirement that moved it"
+      );
+      assert!(
+        !copy_falls_to(&regional, copy, object, departed, asker),
+        "a move made at host 1's first retirement says nothing of its second"
+      );
+    }
   }
 
   /// A-251 (b), the holder's side, with no routing at all (the warm-restarted holder's case): asked by name, a holder
@@ -1287,7 +1408,7 @@ mod tests {
           epoch: HostEpoch(6),
           ..prepare.clone()
         },
-        false
+        None
       )
       .is_err(),
       "the copy's fence was raised to the asker's epoch"
@@ -1330,7 +1451,7 @@ mod tests {
         epoch: HostEpoch(9),
         ..prepare.clone()
       },
-      true,
+      regional.retirement_version(departed),
     )
     .unwrap();
     let mut acceptors = BTreeMap::from([(theirs[0], fenced)]);

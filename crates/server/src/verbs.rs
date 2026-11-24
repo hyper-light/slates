@@ -14774,14 +14774,28 @@ pub(crate) fn consumer_of(
 /// --hold`, the library's and the SDKs' attachment objects, which renew at the cadence the `Renewed` reply names,
 /// [`renewal_cadence`]) is judged by its own pace, and one with no pace measured yet (just made, or recovered by a restart, or used by verbs
 /// alone a term apart) has the failover delay.
+///
+/// Never below the longest silence the holder has shown ([`crate::state::AttachmentPace::longest_gap_ns`]) and a
+/// liveness window, still capped at the failover delay (A-384's floor, main 01a20182's ruling of 2026-11-23). A burst
+/// of uses, a holder's or any verbs' a few milliseconds apart, drove the estimator's tail to the burst's gaps and the
+/// term toward a liveness window, so a holder that had just shown a silence of seconds lapsed sooner than it: an attach,
+/// a 2.5 s pause and a write, whose hold renewed and whose verbs followed within milliseconds, lapsed before a detach
+/// 2.5 s later where the failover delay was about 3 s (A-879's CLI flows on the Mac, 2026-11-23). A holder renewing at
+/// its cadence shows no longer silence than that cadence, so its term still settles near four thirds of a window and
+/// it still lapses at its own pace.
 pub(crate) fn attachment_term(state: &ShardState, attachment: u64) -> u64 {
   let ceiling = state.failover_ns.max(1);
   state
     .attachment_paces
     .get(&attachment)
-    .and_then(|pace| pace.gaps.tail_ns())
-    .map_or(ceiling, |tail| {
-      tail
+    .and_then(|pace| {
+      pace
+        .gaps
+        .tail_ns()
+        .map(|tail| tail.max(pace.longest_gap_ns))
+    })
+    .map_or(ceiling, |gap| {
+      gap
         .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
         .min(ceiling)
     })
@@ -14797,8 +14811,10 @@ pub(crate) fn termed_expiry(state: &mut ShardState) -> u64 {
 /// The `Renew` verb (A-384): a holder's renewal of its CLI attachment's term, and nothing else. Renewed by
 /// [`use_attachment`] as any verb naming it is, and answered the term now in force and the cadence the holder renews at
 /// ([`renewal_cadence`]). Refused as any use is (`AttachmentExpired` past its term, `NotFound` for no such attachment);
-/// another principal's is `Forbidden`, its use having renewed nothing; and an attachment with no term (a mount's,
-/// which renews through its own activity) is a bad request.
+/// another principal's is `Forbidden`, its use having renewed nothing. An attachment with no term (a mount's, which
+/// lives by its own activity; an SDK client's, which lives with its client) is answered `NoTerm`, a state rather than a
+/// fault, so a process naming an attachment another made learns from the answer whether to hold it (A-879). Until
+/// 2026-11-23 it was a `BadRequest`, an uncategorized refusal for a valid state.
 fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
   if let Err(refusal) = use_attachment(state, principal, attachment) {
     return refused(refusal);
@@ -14813,11 +14829,7 @@ fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> Repl
     expires_ns: current,
   } = record.consumer
   else {
-    return refused(Refusal::BadRequest {
-      reason:
-        "only a CLI attachment has a term to renew; a mount's renews through its own activity"
-          .to_owned(),
-    });
+    return ReplyBody::NoTerm;
   };
   // A renewal asked for is made: its holder's next is a third of the term away, so the expiry is a whole term from now,
   // whatever an ordinary use's half-term rule left it at (`use_attachment`).

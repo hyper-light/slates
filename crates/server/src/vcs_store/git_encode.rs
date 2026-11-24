@@ -538,7 +538,19 @@ async fn encode_ahead(id: RepositoryId) {
 /// A fetch's encoding (A-718 continued): repository `id`'s encoding turned a turn at a time, yielding between, for at most
 /// [`FETCH_WAIT_NS`]; past it the fetch answers, and a task finishes the encoding behind it ([`encode_behind`]).
 pub(crate) async fn encode_for_fetch(id: RepositoryId) {
+  #[cfg(test)]
+  if NO_FETCH_WAIT.with(core::cell::Cell::get) {
+    return;
+  }
   encode_within(id, FETCH_WAIT_NS).await;
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Whether a fetch on this shard answers without waiting for its repository's encoding (a test's shard, set through
+  /// `crate::daemon::observe_at`): its stream then sends what is unencoded through its loose stage, as a fetch of a
+  /// history too long to encode within [`FETCH_WAIT_NS`] does (git/git's r130).
+  pub(crate) static NO_FETCH_WAIT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
