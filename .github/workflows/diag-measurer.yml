@@ -1,0 +1,85 @@
+name: diag measurer
+# w-interop (2026-11-23, main 01a20182's order, goal 93 "the Linux counts"): stock git and svn against a release slates
+# on ubuntu-latest, unloaded, each row's PASS/FAIL and seconds, so the per-platform interop counts (GAPS, "Stock-client
+# interop per platform") carry Linux beside macOS and Windows. The hg matrix's Linux rows are arena-19's (run
+# 45303764098: 24 of 24 on ubuntu-latest and ubuntu-24.04-arm), so it is not run again here. Every dataset is fetched
+# inside the job: git/git by clone (the git matrix's cut at v1.0.0; the svn matrix's git-2000.dump made from it by its
+# recorded recipe, crates/cli/bench/git_to_svn_dump.py). Runs only from `diag-measurer-*` branches, never main.
+# Run 2 (main 01a20182, 2026-11-24 05:35 PST): the same matrices at 8466f48b3 (current main). Run 1 (45316568372, at
+# 54e4a9a4c) passed the svn matrix 33 of 33 with git-2000's import in 7 s; the big Studio's svn use round at 77397a5f4
+# then crash-looped on that import (one import poll of 1,189 ms; every restart's start spun). This shows whether Linux
+# meets it too, and every row's state at current main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  interop-linux:
+    name: ${{ matrix.matrix }} matrix (ubuntu-latest${{ matrix.route && format(', route {0}', matrix.route) || '' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { matrix: git, route: "" }
+          - { matrix: svn, route: svn }
+          - { matrix: svn, route: http }
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Stock clients
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q subversion openssh-client
+          git --version; svn --version --quiet; ssh -V 2>&1
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: git/git, by clone (retried, so a cut transfer is fetched again)
+        run: |
+          S=$RUNNER_TEMP/git-src
+          for i in 1 2 3; do git clone -q --bare https://github.com/git/git.git $S && break; rm -rf $S; sleep 10; done
+          git -C $S rev-parse v1.0.0^{commit} master
+      - name: git-2000.dump by its recorded recipe
+        if: ${{ matrix.matrix == 'svn' }}
+        run: |
+          start=$(date +%s)
+          python3 -I crates/cli/bench/git_to_svn_dump.py "$RUNNER_TEMP/git-src" master 2000 > "$RUNNER_TEMP/git-2000.dump"
+          echo "git-2000.dump: $(stat -c %s "$RUNNER_TEMP/git-2000.dump") bytes in $(( $(date +%s) - start )) s"
+      - name: The matrix
+        run: |
+          echo "nproc $(nproc); load before $(cat /proc/loadavg); $(free -m | sed -n 2p)"
+          set +e
+          if [ "${{ matrix.matrix }}" = git ]; then
+            PUSH_REFS='v1.0.0^{commit}:refs/heads/master' STEP_LIMIT=2400 \
+              ci/interop/git-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/git-src" "$RUNNER_TEMP/matrix" 2>&1 \
+              | tee "$RUNNER_TEMP/matrix.out"
+          else
+            ROUTE=${{ matrix.route }} STEP_LIMIT=2400 \
+              ci/interop/svn-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/git-2000.dump" "$RUNNER_TEMP/matrix" 2>&1 \
+              | tee "$RUNNER_TEMP/matrix.out"
+          fi
+          rc=${PIPESTATUS[0]}
+          echo "load after $(cat /proc/loadavg)"
+          echo "== rows"; grep -E '^(PASS|FAIL) ' "$RUNNER_TEMP/matrix.out" | sort -u -k2,2 | cut -c1-200
+          echo "== summary"; grep -E 'summary|passed' "$RUNNER_TEMP/matrix.out" | tail -2
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-linux-${{ matrix.matrix }}-${{ matrix.route || 'all' }}
+          path: |
+            ${{ runner.temp }}/matrix.out
+            ${{ runner.temp }}/matrix/anchor.log
+            ${{ runner.temp }}/matrix/logs
+          if-no-files-found: warn
