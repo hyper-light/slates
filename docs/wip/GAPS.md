@@ -1101,8 +1101,11 @@
 >   never merged, so each new row's lookup walked them all and a segment step grew with the push (arena-14: shard 0 past
 >   1 s in `hg_push::segment`, the daemon killed). Now every append seals when due through one insert
 >   (`HgIndex::insert`, import's own seal gone), and the fork's runs are merged by a size-tiered rule as it goes
->   (`slates_vcs::Index::tiered_due`: the newest merged while their rows together are at least half the next older's;
->   Derived: at most ⌊log₃(own rows ÷ the fewest a seal writes)⌋ + 1 own runs), a table a step between revisions
+>   (`slates_vcs::Index::tiered_due`: the newest merged while their tables' bytes together are at least half the next
+>   older's; Derived: at most ⌊log₃(own bytes ÷ the fewest bytes a seal writes)⌋ + 1 own runs; weighed in bytes since
+>   goal 93 (B), as a seal is due by bytes: in rows, r499 held 8 own runs where the row bound computed 6, and
+>   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_bytes_whatever_its_rows_sizes` held 8 where the
+>   bytes bound is 5, each phase of larger rows keeping a stack of its own), a table a step between revisions
 >   (`Taker::merge_step`, `Intaken::tiered_merges`, `most_own_runs`). Held by
 >   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows` (slates-vcs, 2,000 rows: red 2 runs past the
 >   bound after 2 seals) and push_heap's
