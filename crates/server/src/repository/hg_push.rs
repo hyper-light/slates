@@ -2651,10 +2651,24 @@ fn record_turn(
 
 /// `take_sliced`'s settle: the intake finished into its fork, its delta bases counted. None where the store went away.
 fn settled(taking: Taking) -> Option<Forked> {
-  let forked = taking.finish()?;
-  let _ = crate::state::with_state(|state| count_bases(state, &forked.intaken));
+  let mut forked = taking.finish()?;
+  let lookups = forked.fork.rows().counters();
+  let _ = crate::state::with_state(|state| {
+    count_bases(state, &forked.intaken);
+    state.count(INDEX_LOOKUPS, lookups.lookups);
+    state.count(INDEX_RUNS_VISITED, lookups.runs_visited);
+  });
   Some(forked)
 }
+
+/// Counter: the lookups a push's fork made of its rows over the push, its intake's checks and keeps alike (goal 93:
+/// arena-19 put the index seal's reland at 24-35% of push-all under a loaded lane, none on a quiet Studio, r517).
+/// Format: a counter name in the status report.
+pub(crate) const INDEX_LOOKUPS: &str = "vcs.hg.push_index_lookups";
+
+/// Counter: the runs those lookups visited, a miss every run ([`INDEX_LOOKUPS`]): runs a lookup is the one over the
+/// other. Format: a counter name in the status report.
+pub(crate) const INDEX_RUNS_VISITED: &str = "vcs.hg.push_index_runs_visited";
 
 /// Counter: a push admitted its known need up front at its begin, past the room it was first given (main 01a20182's
 /// ruling (a) of 2026-11-22 04:23). Format: a counter name in the status report.
