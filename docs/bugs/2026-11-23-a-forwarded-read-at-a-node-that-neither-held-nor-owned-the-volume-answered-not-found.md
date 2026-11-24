@@ -91,6 +91,14 @@ in the same change as the forwarded-write fix; see
 docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md, which names the suites
 a change here must run.
 
+## Found later: the write policy's verbs (2026-11-23, main's ruling)
+
+`landing::policy_record` answered a volume with no record `NotFound` itself, so the policy's read and setting at a node
+that knows the volume is elsewhere said it did not exist, while a landing's verbs at that node answered `NotOwnerHere`.
+It now meets `verbs::absent`, one rule for every slotless verb. `crates/cli/tests/fs_server.rs`'s ask landing expects
+`NotOwnerHere` for both. Red on main: the policy was answered `NotFound` in 97 µs. Green: both are `NotOwnerHere` in
+240 µs and 156 µs, so the caller gets the refusal at once and no retry budget is spent.
+
 ## Siblings (every entry point that can answer "absent" from a node that is not the owner)
 
 | Entry point | Before | Now |

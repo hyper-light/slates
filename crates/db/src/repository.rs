@@ -89,6 +89,12 @@ pub struct Repositories {
   members: BTreeMap<VolumeId, MemberRecord>,
   /// Each lineage's members in the order they joined, the order a recovery rebuilds them in (A-575).
   lineages: BTreeMap<RepositoryId, Vec<VolumeId>>,
+  /// Derived: each member by its lineage and its id's serial (`VolumeId::serial`, the key a repository's store keys its
+  /// greens by), with the rank it joined at: what [`Repositories::member_keyed`] answers with no walk of the lineage.
+  keyed: BTreeMap<(RepositoryId, u64), (VolumeId, u64)>,
+  /// Derived: the rank the next member to join takes. Ranks only rise, so within a lineage they keep the order its
+  /// members joined, as the lineage's own order does, and a recovery, which joins them again in that order, keeps it.
+  joins: u64,
   /// Each repository's own state, in logs of its own (A-603, A-642).
   registers: BTreeMap<RepositoryId, Register>,
   /// The atomic records kept (A-642), by key: the first log a record moved and the position it took it to; each with how
@@ -451,6 +457,13 @@ impl Repositories {
       .into_iter()
       .flatten()
       .filter_map(|green| self.members.get(green))
+  }
+
+  /// The member of `repository`'s lineage whose id's serial is `serial` (`VolumeId::serial`), with the rank it joined
+  /// at: lower for a member that joined earlier, so members sorted by it are in the order [`Repositories::members_of`]
+  /// gives them. One look-up, whatever the lineage's length (goal 93: a push asked it once a decision, by a walk).
+  pub fn member_keyed(&self, repository: RepositoryId, serial: u64) -> Option<(VolumeId, u64)> {
+    self.keyed.get(&(repository, serial)).copied()
   }
 
   /// Every lineage that has a member, in id order.
@@ -1230,6 +1243,11 @@ impl Repositories {
       .or_default()
       .push(record.green);
     self.members.insert(record.green, record.clone());
+    self.keyed.insert(
+      (record.repository, record.green.serial()),
+      (record.green, self.joins),
+    );
+    self.joins = self.joins.saturating_add(1);
   }
 
   /// A destroyed green leaves the namespace that bound it (§4.17.1: deleting a branch's green deletes the branch), and
@@ -1252,6 +1270,14 @@ impl Repositories {
     }
     if let Some(member) = self.members.remove(&green) {
       changed.insert(member.repository);
+      let key = (member.repository, green.serial());
+      if self
+        .keyed
+        .get(&key)
+        .is_some_and(|(keyed, _)| *keyed == green)
+      {
+        self.keyed.remove(&key);
+      }
       if let Some(order) = self.lineages.get_mut(&member.repository) {
         order.retain(|joined| *joined != green);
         if order.is_empty() {

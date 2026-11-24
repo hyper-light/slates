@@ -1326,6 +1326,18 @@
 > socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
 > HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
 > before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
+> Push hot path BUILT (2026-11-23, w-git; main 01a20182's order from git/git's push profile): a create's search for the
+> green holding its commit (`git_push::ShardGreens::holding`) lent every member green (`Greens::is_owing`, a take and
+> restore of the lineage) and read each one's versions through its head rows, once a decision: O(decisions x greens).
+> Now the git store keeps, for each commit a version's head names, each green with such a version and its newest one
+> (`Repository::holders`, charged with the chains), and the repository index finds a member by its key and the rank it
+> joined at (`Repositories::member_keyed`), so the search asks only the greens holding the commit, in the same order
+> (`t_goal93_a_pushs_search_…_is_flat_in_the_repositorys_greens`: 60 greens examined with 4 held and 156 with 16
+> before, the same in both after, `git_push.holding.examined`). `keyed`'s walk of the lineage went with it. Owed: a lend
+> that only reads a green's own fields (`is_owing`, `branch_version`) borrowing it rather than taking it out of its
+> lineage, and the empty engine each lend makes and drops (`Lent::new`), with w-svn's lend work; the commit's clone of
+> the whole head map and its footprint's walk of every chain (`Repository::plan`, `footprint`), O(greens) a push;
+> main's git/git push before and after on the Studio.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -2958,6 +2970,14 @@
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
 > A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+>
+> **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
+> command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
+> session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits
+> while the git tree or its daemon's processes gain CPU, or the daemon's fetch, encoding, derivation or landing counters
+> move, and fails once none has for `process_wait::STALL` (`exit_progressing`; `Judged::progressing`, no CPU budget;
+> `a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at`). A hang fails within that window; no
+> ratio to stock's speed is a bound. Owed: hg's, svn's and git_correctness's waits the same way.
 >
 > **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
 > (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
@@ -7521,6 +7541,16 @@
 > interval at a time before). A FUSE helper's exit, mount and unmount alike, is awaited by its exit watch since 2026-11-20 (family three: polled
 > a heartbeat tick at a time before; a watch the kernel refuses refuses the mount, typed). Owed from that sweep: the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
+
+> **Open (test, 2026-11-23, w-chaos): two tests failed only under a whole-suite sweep on adacachy2.** That was r322,
+> the forwarded-write fix's sweep. They ran serially among 237 fleet tests and 38 live_fleet flows, while kiln's
+> placement saw 0 to 3 of 32 cores idle. Each passed 2 of 2 alone with the fix, and 1 of 1 on main.
+> - `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over` (fleet): its write was held past the failover
+>   SLO on each of its three sends, the last `DurabilityPending { held_ns: 3,246,047,745 }`. The SLO is a product
+>   deadline (A-354). The test's bet is `CONTINUITY_WRITES`, three sends, one for each outcome it allows.
+> - `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` (live_fleet): one write took 1.539 s with a
+>   candidate stopped, 6.2 times its bound `STOPPED_WAIT` (a quarter of the liveness budget, 250 ms). The bound is the
+>   test's timing bet, placed between the two regimes it was derived from (3–5 ms and 489–783 ms).
 
 > **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
 > a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,

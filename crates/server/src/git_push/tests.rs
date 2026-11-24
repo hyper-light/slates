@@ -881,6 +881,75 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
   assert_eq!(refused, (Vec::new(), 0));
 }
 
+/// Shape: the greens the smaller repository of
+/// [`t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_repositorys_greens`] holds before its push.
+const HELD_FEW: usize = 4;
+
+/// Shape: the greens the larger repository holds: four times [`HELD_FEW`], so work linear in the greens shows as four
+/// times as much.
+const HELD_MANY: usize = 4 * HELD_FEW;
+
+/// Shape: the creates the one push makes, each at a commit no green holds yet.
+const CREATES_UNHELD: usize = 4;
+
+/// The greens a push's search for the green holding a commit examined (`HOLDING_EXAMINED`), in a repository holding
+/// `held` greens at the fixtures' first commit, over one push creating [`CREATES_UNHELD`] branches at its second commit,
+/// which no green holds; and each create's outcome.
+fn examined_over(state: &mut ShardState, name: &str, held: usize) -> (u64, Vec<Vec<u8>>) {
+  let repository = git_repository(state, name);
+  let create = pack_of(scenario!("create").request);
+  for k in 0..held {
+    let branch = if k == 0 {
+      "main".to_owned()
+    } else {
+      format!("held{k}")
+    };
+    let named = format!("refs/heads/{branch}");
+    let created = [("", FIRST, named.as_bytes())];
+    let received = pushed(state, repository, &request(&created, CAPABILITIES, create));
+    assert_eq!(reasons(&received), [b"ok".to_vec()], "{branch}");
+  }
+  let names: Vec<Vec<u8>> = (0..CREATES_UNHELD)
+    .map(|k| format!("refs/heads/unheld{k}").into_bytes())
+    .collect();
+  let commands: Vec<(&str, &str, &[u8])> = names
+    .iter()
+    .map(|name| ("", SECOND, name.as_slice()))
+    .collect();
+  let update = pack_of(scenario!("update").request);
+  let before = state
+    .refusals
+    .get(super::HOLDING_EXAMINED)
+    .copied()
+    .unwrap_or(0);
+  let received = pushed(state, repository, &request(&commands, CAPABILITIES, update));
+  let after = state
+    .refusals
+    .get(super::HOLDING_EXAMINED)
+    .copied()
+    .unwrap_or(0);
+  (after - before, reasons(&received))
+}
+
+/// Goal 93 (main 01a20182's order: git/git's push spent its time in `ShardGreens::holding`, which lent every member
+/// green and read every one's versions for each decision). Do: in one repository holding [`HELD_FEW`] greens at the
+/// first commit and another holding [`HELD_MANY`], push [`CREATES_UNHELD`] creates at the second commit, which no green
+/// holds, so each create asks which green holds its commit and finds none. Expect: every create `ok`, and the greens
+/// the search examined the same in both repositories: what a create's search costs follows the greens holding its
+/// commit, never the repository's greens. Red before the change: the search examined every member green for each create,
+/// four times as many in the larger repository.
+#[test]
+fn t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_repositorys_greens() {
+  let (few, many) = crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let few = examined_over(state, "few", HELD_FEW);
+    let many = examined_over(state, "many", HELD_MANY);
+    (few, many)
+  });
+  let created = vec![b"ok".to_vec(); CREATES_UNHELD];
+  assert_eq!((&few.1, &many.1), (&created, &created));
+  assert_eq!(few.0, many.0, "the search followed the repository's greens");
+}
+
 /// Shape: the files of each tree [`t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`] pushes:
 /// enough that each create's work is a large part of [`SMALL_CHAIN_BUDGET`].
 const ROOMY_FILES: usize = 64;
