@@ -305,7 +305,15 @@ impl core::future::Future for PublishedHere {
         crate::state::with_state(|state| state.count(HOME_PUBLISHED, 1));
       } else if !published_here(generation) {
         // The shard's publication was refused (its image lost, or no room): answered not durable at once, typed, rather
-        // than left to wait for a publication that may never come.
+        // than left to wait for a publication that may never come. Counted and logged (gate 7's fast short homing).
+        let _ = crate::state::with_state(|state| {
+          state.count(HOME_PUBLISH_REFUSED, 1);
+          slates_machine::log_line!(
+            "slates-server: partition {}: a home's publication for generation {generation} was refused: answered not \
+             durable at once",
+            state.partition
+          );
+        });
         return core::task::Poll::Ready(false);
       }
     }
@@ -316,6 +324,11 @@ impl core::future::Future for PublishedHere {
       let stranded = !published_here(generation) && !state.image_encoder.owed();
       if stranded {
         state.count(HOME_TICKET_STRANDED, 1);
+        slates_machine::log_line!(
+          "slates-server: partition {}: a home's ticket of generation {generation} is stranded: not published and no \
+           image owed",
+          state.partition
+        );
       }
       stranded
     });
@@ -339,6 +352,9 @@ impl core::future::Future for PublishedHere {
 /// Counter: a ticket's wait that found its image unpublished and no publication owed (F2): nothing would publish it, so it
 /// was answered not durable at once. A bug signal, asserted none by the image oracle. Format: a counter name.
 pub(crate) const HOME_TICKET_STRANDED: &str = "vcs_store.homes.ticket_stranded";
+/// Counter: a home's wait for its window's publication answered not durable at once because the shard's publication was
+/// refused (its image lost, or no room). Format: a counter name.
+pub(crate) const HOME_PUBLISH_REFUSED: &str = "vcs_store.homes.publish_refused";
 
 /// Counter: publications a home's wait for its ticket made itself (A-724 piece 8c), nothing else having published since
 /// the window was kept. Format: a counter name.
@@ -2098,19 +2114,21 @@ pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
 /// (an object of any length a home keeps whole, cut at its own windows; one region message carries at most
 /// `slates_archive::format::MAX_CHUNK_BYTES` until an object past that is sent in parts).
 /// This node, one of the object's homes, keeps `bytes`: 1 once its image holding them is durable within `budget_ns`,
-/// else 0.
+/// else 0 with why it was not (for [`home_in_region`]'s log of a short homing).
 async fn kept_here(
   origin: u16,
   shards: &[u16],
   (bytes, owner): (&[u8], HomeOwner),
   budget_ns: u64,
-) -> Result<usize, HomeRefused> {
+) -> Result<(usize, Option<super::durable::BarrierRefused>), HomeRefused> {
   let (_, ticket) =
     keep_region_at_home(origin, shards, (bytes.to_vec(), vec![owner]), budget_ns).await?;
-  let durable = super::durable::content_durable(origin, ticket, budget_ns)
-    .await
-    .is_ok();
-  Ok(usize::from(durable))
+  Ok(
+    match super::durable::content_durable(origin, ticket, budget_ns).await {
+      Ok(()) => (1, None),
+      Err(refused) => (0, Some(refused)),
+    },
+  )
 }
 
 pub(crate) async fn home_in_region(
@@ -2135,11 +2153,21 @@ pub(crate) async fn home_in_region(
   let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
   let budget_ns = budget.max_deadline_ns();
   let mut kept = 0usize;
+  let mut here = None;
   let began = slates_rt::futures::now_ns();
   if homes.contains(&local) {
     match kept_here(origin, shards, (&bytes, owner), budget_ns).await {
-      Ok(here) => kept = here,
+      Ok((durable, refused)) => {
+        kept = durable;
+        here = Some(refused);
+      }
       Err(refused) => {
+        slates_machine::log_line!(
+          "slates-server: a homing of {identity:?} fell short at once: this node, one of its {} homes, refused its keep \
+           in {} ns: {refused:?}",
+          homes.len(),
+          slates_rt::futures::now_ns().saturating_sub(began)
+        );
         return Homed {
           outcome: Err(refused),
           bytes,
@@ -2157,18 +2185,21 @@ pub(crate) async fn home_in_region(
   // on any other shard none is found and every homing there fell short (the three-node A/B, 2026-11-20).
   let began = slates_rt::futures::now_ns();
   let mut bytes = bytes;
+  let mut remote_kept = None;
+  let asked_others = others.len();
   if !others.is_empty() {
     let control = shards.first().copied().unwrap_or(origin);
     // The bytes go to the control shard's task and come back with its count, so a caller that moves them on (a push's
     // pack into the changeset store, A-767 C5) makes no copy; a task that never answered took them with it.
-    let (remote, back) = crate::xshard::task_in_shard_time(
+    let answered = crate::xshard::task_in_shard_time(
       origin,
       control,
       move || put_remote(others, identity, (vec![owner], bytes), budget),
       budget_ns,
     )
-    .await
-    .unwrap_or_default();
+    .await;
+    remote_kept = answered.as_ref().map(|(remote, _)| *remote);
+    let (remote, back) = answered.unwrap_or_default();
     kept = kept.saturating_add(remote);
     bytes = back;
   }
@@ -2178,6 +2209,26 @@ pub(crate) async fn home_in_region(
     state.count(HOMING_REGION_NS, region_ns);
   });
   let homed = kept >= homes.len() && !homes.is_empty();
+  if !homed {
+    // Which branch fell short and how long each took (main 01a20182's gate 7: a pack's homing came back short 0.9 ms
+    // after the push's body, never waiting its budget; w-shared agreed this line, 2026-11-24).
+    slates_machine::log_line!(
+      "slates-server: a homing of {identity:?} fell short: {kept} of {} homes kept it; this node {} in {local_ns} ns; \
+       {} of {asked_others} other homes in {region_ns} ns (the control shard's task {}); budget {budget_ns} ns",
+      homes.len(),
+      match here {
+        None => "not one of its homes".to_owned(),
+        Some(None) => "kept it durable".to_owned(),
+        Some(Some(refused)) => format!("kept it, not durable: {refused:?}"),
+      },
+      remote_kept.unwrap_or(0),
+      if remote_kept.is_some() || asked_others == 0 {
+        "answered"
+      } else {
+        "never ran"
+      }
+    );
+  }
   crate::state::with_state(|state| {
     state.count(if homed { HOMED_IN_REGION } else { HOMED_SHORT }, 1)
   });
