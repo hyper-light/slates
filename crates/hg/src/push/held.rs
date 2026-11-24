@@ -59,6 +59,24 @@ impl Held for IndexHeld<'_> {
     self.revision_text(Log::Manifest, node).map(Cow::Owned)
   }
 
+  /// The changelog's row, no text read (goal 93, C1 (1)).
+  fn holds_changeset(&self, node: &Node) -> bool {
+    self
+      .index
+      .rev(self.store, Log::Changelog, node)
+      .and_then(|rev| self.index.changeset(self.store, rev))
+      .is_some_and(|row| row.node == *node)
+  }
+
+  /// The manifest log's row, no text read (goal 93, C1 (1)).
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self
+      .index
+      .rev(self.store, Log::Manifest, node)
+      .and_then(|rev| self.index.revision(self.store, Log::Manifest, rev))
+      .is_some_and(|row| row.node == *node)
+  }
+
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
     self.revision_text(Log::File(path), node).map(Cow::Owned)
   }

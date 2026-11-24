@@ -77,6 +77,14 @@ pub enum LayoutRefusal {
   },
   /// A directory's name A-618's key cannot hold: never met, every name being thirty-two bytes.
   Unnamed,
+  /// A changeset or manifest the repository holds whose text is not at hand (goal 93, C1 (1): those logs' texts let go
+  /// once landed): its owner reads it from the node's changeset store, brings it back and lays the tree out again.
+  NotAtHand {
+    /// Its log: the changelog or the manifest log.
+    log: crate::index::Log<'static>,
+    /// Its node.
+    node: Node,
+  },
   /// More than the request's admission had left.
   PastAdmission(PastAdmission),
 }
@@ -136,10 +144,16 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
   ) -> Result<ObjectKey, LayoutRefusal> {
     let text = match self.verified.changeset(changeset) {
       Some(arrived) => Cow::Borrowed(arrived.text.as_slice()),
-      None => self
-        .held
-        .changeset_text(changeset)
-        .ok_or(LayoutRefusal::MissingChangeset { node: *changeset })?,
+      None => match self.held.changeset_text(changeset) {
+        Some(text) => text,
+        None if self.held.holds_changeset(changeset) => {
+          return Err(LayoutRefusal::NotAtHand {
+            log: crate::index::Log::Changelog,
+            node: *changeset,
+          });
+        }
+        None => return Err(LayoutRefusal::MissingChangeset { node: *changeset }),
+      },
     };
     let manifest = changeset::decode(&text)
       .and_then(|read| read.manifest_node())
@@ -158,8 +172,16 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
   ) -> Result<ObjectKey, LayoutRefusal> {
     let verified = self.verified;
     let held = self.held;
-    let text =
-      manifest_text(verified, held, node).ok_or(LayoutRefusal::MissingManifest { node: *node })?;
+    let text = match manifest_text(verified, held, node) {
+      Some(text) => text,
+      None if held.holds_manifest(node) => {
+        return Err(LayoutRefusal::NotAtHand {
+          log: crate::index::Log::Manifest,
+          node: *node,
+        });
+      }
+      None => return Err(LayoutRefusal::MissingManifest { node: *node }),
+    };
     let entries =
       manifest::decode(&text).map_err(|fault| LayoutRefusal::Manifest { node: *node, fault })?;
     let mut stack = vec![Open {
