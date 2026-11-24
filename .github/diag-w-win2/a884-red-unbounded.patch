@@ -1,0 +1,12 @@
+--- a/crates/server/src/room_wait.rs
++++ b/crates/server/src/room_wait.rs
+@@ -272,7 +272,8 @@
+     remake_window_ns().saturating_add(teardown_window_ns(state, teardown_slices_left(state)));
+   let deadline_ns = match state.room_waiters.resuming {
+     // The teardowns went on since it parked: the bound is their remaining slices from now, never sooner (A-884).
+-    Some(resuming) if released > resuming.released_at_park => {
++    // DIAG RED (never merged): the deadline moves on whether or not the teardowns released anything.
++    Some(resuming) if released >= resuming.released_at_park => {
+       now.saturating_add(window_ns).max(resuming.deadline_ns)
+     }
+     Some(resuming) => resuming.deadline_ns,
