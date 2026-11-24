@@ -7,8 +7,9 @@
 // Each test binary uses part of the harness.
 #![allow(dead_code)]
 
-/// The suites' wait judgment, for a test of these harnesses' VMs (`guest_image`'s and `pmem`'s launchers name
-/// `vm::process_wait::...`): a module of the harness, not re-exports, so a binary that uses none of it has nothing unused.
+// The suites' wait judgment, for a test of these harnesses' VMs (`guest_image`'s and `pmem`'s launchers name
+// `vm::process_wait::...`): a module of the harness, not re-exports, so a binary that uses none of it has nothing
+// unused.
 #[path = "../support/process_wait.rs"]
 pub(crate) mod process_wait;
 

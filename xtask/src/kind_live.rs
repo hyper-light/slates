@@ -2,7 +2,8 @@
 //! goal of 2026-11-04: replicas of the filesystem server, replicated per write, chaos-tested under injected latency,
 //! jitter and loss). The process flows on one machine (`crates/cli/tests/live_chaos.rs`) stop and kill processes; netem
 //! needs `NET_ADMIN`, which this project never takes on a developer's machine, so the shaped paths are measured here,
-//! where the lane's init container already applies them (`values-netem.yaml`, lane-only).
+//! where the lane's init container already applies them (`values-netem.yaml`, lane-only). The leg is a child module of
+//! `kind.rs`, so it reuses the lane's machinery.
 //!
 //! The run, each step a command on the record, on a cluster of its own (`slates-live`, from `deploy/kind/cluster.yaml`):
 //!

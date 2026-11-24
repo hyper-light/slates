@@ -174,7 +174,7 @@ pub(crate) struct Block(usize);
 /// (b), [`Blocks::name`]), and the plain BLAKE3 of its bytes ([`Blocks::digest`], A-873): what the green's identity
 /// entry for a file holds in place of its bytes. A named block holds no bytes (A-760 (b) 4d): its object holds them in
 /// the owner's content plane, held there for as long as the block stands ([`NameHold`]); its bytes are lent to it only
-/// for a judge that reads them ([`Blocks::hydrate`]), and let go after ([`Blocks::let_named_bytes_go`]). The digest is
+/// for a judge that reads them ([`Blocks::lend`]), and let go after ([`Blocks::let_named_bytes_go`]). The digest is
 /// `None` only once a staged text's piece is appended, until it is read again.
 #[derive(Debug)]
 struct Slot {

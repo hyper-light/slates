@@ -29,12 +29,6 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
-/// The client-side completion bridge that gives an async SDK event loop a descriptor it can adopt as
-/// a stream (§4.7, D-19). macOS and Windows pass no completion fd (Mach and named sockets are refused,
-/// D-10), so a thread makes a client-local descriptor readable when an armed reply lands — a self-pipe
-/// on macOS, a loopback socket on Windows. Linux passes the rendezvous eventfd, which Python's asyncio
-/// polls directly with no bridge; the Linux arm exists only for an SDK that adopts the fd (Node's
-/// `net.Socket` refuses an eventfd), converting the eventfd's readability to a pollable self-pipe.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod completion;
 #[cfg(unix)]
@@ -50,10 +44,6 @@ pub mod handle_route;
 #[cfg(target_os = "linux")]
 pub mod issuer_route;
 pub mod looks;
-/// The owner's token on macOS (A-176, A-178): a Mach bootstrap name that ends with its holder, so one live process
-/// owns an instance's rendezvous, as Windows's named Event token and Linux's abstract address make it there. A
-/// registration made once per owner's life; no message crosses it, so D-10's refusal of Mach messages as the request
-/// transport does not reach it.
 #[cfg(target_os = "macos")]
 mod mach_claim;
 #[cfg(target_os = "macos")]
@@ -61,8 +51,6 @@ mod mach_semaphore;
 #[cfg(target_os = "macos")]
 mod owner_name;
 pub mod park;
-/// A Unix socket peer's credentials on Linux, read soundly (`SO_PEERCRED`; a peer whose process the reader cannot see
-/// has pid 0, which rustix 1.1's `UCred` cannot hold).
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod protocol;
