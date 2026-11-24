@@ -888,7 +888,9 @@ impl WorkFiles {
             named => crate::vcs_store::named_objects::whole_of(
               named,
               base.plane.as_ref(),
-              base.green_id.map(|green| (green, path.as_str(), base.version)),
+              base
+                .green_id
+                .map(|green| (green, path.as_str(), base.version)),
             )
             .map(Cow::Owned)
             .ok_or(BaseGone)?,

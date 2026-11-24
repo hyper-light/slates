@@ -871,6 +871,7 @@ impl RefineJob {
           let engine = s.greens.get(&green)?;
           let base = crate::work_files::Base {
             green: Some(&*engine),
+            green_id: Some(green),
             fetched: None,
             version: key.0,
             entries: None,

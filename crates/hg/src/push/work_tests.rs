@@ -848,6 +848,11 @@ impl Held for ManifestsLetGo<'_> {
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
     self.kept.file_text(path, node)
   }
+
+  /// As the repository it gives texts of (A-887).
+  fn stores_bytes(&self) -> bool {
+    self.kept.stores_bytes()
+  }
 }
 
 /// Goal 93, C1 (1) P3 (main's ruling of 2026-11-23 20:53: the manifests' texts off the content store, the push's work

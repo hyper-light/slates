@@ -795,10 +795,13 @@ fn a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited() {
   let anchor = anchor_of(&instance);
   let (daemon, green) = named_restart_daemon(&instance, &anchor, &store);
   let base = crate::daemon::observe_first(&daemon, move |state| {
-    let named = state.greens.get(&green).and_then(|engine| match engine.content("b")? {
-      slates_merge::engine::Content::Named(identity) => Some(identity.hash),
-      slates_merge::engine::Content::Bytes(_) => None,
-    });
+    let named = state
+      .greens
+      .get(&green)
+      .and_then(|engine| match engine.content("b")? {
+        slates_merge::engine::Content::Named(identity) => Some(identity.hash),
+        slates_merge::engine::Content::Bytes(_) => None,
+      });
     named.expect("`b` named by the push")
   });
   let (submitted, _, work) = crate::test_store::run_on_first(

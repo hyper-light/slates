@@ -11064,7 +11064,13 @@ fn verdict_of(
   }
   let wanted = state.greens.get_mut(&green_id)?.unlent_reads(inc);
   let head = state.greens.get(&green_id)?.head();
-  if name_holds::lend_from_plane(state, &name_holds::ReadIn::verdict(green_id, head, inc), &wanted).is_err() {
+  if name_holds::lend_from_plane(
+    state,
+    &name_holds::ReadIn::verdict(green_id, head, inc),
+    &wanted,
+  )
+  .is_err()
+  {
     return Some(first);
   }
   state.count(name_holds::NAME_LENT_VERDICTS, 1);
@@ -20022,7 +20028,9 @@ fn rebuilt_after_stores(state: &mut ShardState, record: &VolumeRecord) -> bool {
     .repositories()
     .member(record.id)
     .is_some_and(|member| match member.origin {
-      slates_db::catalog::MemberOrigin::Branch { from, .. } => state.merge.after_stores.contains(&from),
+      slates_db::catalog::MemberOrigin::Branch { from, .. } => {
+        state.merge.after_stores.contains(&from)
+      }
       slates_db::catalog::MemberOrigin::Root => false,
     });
   // The content store made first, as a first repository makes it (`svn_texts::to_bring`): what it holds whole from the
@@ -20054,17 +20062,7 @@ async fn rebuild_reconciled(
   (slices, rebuilt): (&mut crate::recovery_slices::RecoverySlices, &mut Rebuilt),
   max_prefix: &mut u16,
 ) {
-  if rebuild_record(
-    state,
-    record,
-    images,
-    claims,
-    slices,
-    rebuilt,
-    max_prefix,
-  )
-  .await
-  {
+  if rebuild_record(state, record, images, claims, slices, rebuilt, max_prefix).await {
     let (snapshots, attachments) = reconcile_lost(state, record);
     rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
     rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);

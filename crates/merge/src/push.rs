@@ -1663,7 +1663,10 @@ impl Hashing {
         })
       })
       .collect();
-    let runs = self.named.into_iter().map(|(at, identity, _)| (at, identity));
+    let runs = self
+      .named
+      .into_iter()
+      .map(|(at, identity, _)| (at, identity));
     reads.named = name_runs(&mut increment, runs.collect());
     named.retain(|object| {
       increment

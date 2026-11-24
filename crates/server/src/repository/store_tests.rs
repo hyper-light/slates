@@ -546,7 +546,9 @@ pub(crate) fn daemon_over(
 }
 
 /// The anchor's segment and content object for `instance`, sized as the anchor sizes them, and its rendezvous.
-pub(crate) fn anchor_of(instance: &str) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
+pub(crate) fn anchor_of(
+  instance: &str,
+) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
   let profile = crate::daemon::test_profile();
   let config = crate::DaemonConfig::derive(&profile, instance, Some(1));
   let segment = slates_anchor::AnchorSegment::create(
