@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 13 (main 01a20182, 2026-11-24 15:00 PST): run 12 found the svn SSH step at 12; main's commit settles its bookkeeping
+# in settle_before_step.
 # Run 12 (main 01a20182, 2026-11-24 14:52 PST): main itself at 9272195a6 (A-908 part 1, A-907's test fix, the svn log and
 # E160004 fixes, the TSan lane, since run 11 at e7c265c6c).
 # Run 11 (main 01a20182, 2026-11-24 13:25 PST): run 10 passed the server library and found push_on_top's assertions
