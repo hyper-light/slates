@@ -22,6 +22,16 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 01:57 on 11-24:
+- 84a Linux at 55650fef1, run under adacachy2's own load (about 3 runnable threads a core, not the defined 2; r809):
+  loaded p99 under 1 ms in all 16 values (at most 605 us); loaded p999 under 1 ms in 14 of 16, over in two accept rounds
+  (1,165 and 1,076 us). The defined-condition round r793 still waits for a quiet box (until ~04:33).
+- edit_merge_bench's verdict line (line 837) judges p99 only, never p999, though 84a's bar is p99/p999: read p999 from
+  the numbers, not the verdict. Sent to w-perf to fix, red first.
+- Interop speed round 3 RUNNING on the big Studio (r811, studio-interop-speed-5.sh, record
+  ~/.cache/main-rounds/interop-speed-r3) at current main with w-svn's A-892 import fix (a51883940). Send each leg's rows
+  to its owner and to w-interop for BENCHMARKS.
+
 Updates at 01:53 on 11-24:
 - CORRECTION, 84a: the goal's instrument is edit_merge_bench's own verdict (each invocation judged by its three runs'
   median). At current main 55650fef1 it reads "within the required 1 ms" in 20 of 20 verdicts on macOS (loaded p99
