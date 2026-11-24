@@ -1,0 +1,78 @@
+name: diag measurer
+# w-interop (2026-11-23, main 01a20182's order after r546): the sizing run of the svn use test over HTTP with git-2000.dump.
+# The big Studio is booked, so this runs on ubuntu-latest: stock Subversion 1.15.0 built from Apache's source in the job
+# (Ubuntu ships 1.14, and the use test holds slates to the 1.15 line), git-2000.dump made in the job by its recorded
+# recipe (crates/cli/bench/git_to_svn_dump.py over a git/git clone), then the whole use test over HTTP, release,
+# --nocapture, every verb printing its time and each leg's share as it goes. Its per-verb lines size the round's bound.
+# Runs only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  SVN_VERSION: 1.15.0
+
+jobs:
+  svn-use-http-git-2000:
+    name: svn use test over HTTP, git-2000.dump (ubuntu-latest, stock svn 1.15.0 built here)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Stock Subversion 1.15.0 from Apache's source, its SHA-512 checked
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential libapr1-dev libaprutil1-dev libsqlite3-dev zlib1g-dev liblz4-dev \
+            libutf8proc-dev libserf-dev openssh-client
+          cd "$RUNNER_TEMP"
+          base=https://archive.apache.org/dist/subversion/subversion-$SVN_VERSION.tar.bz2
+          curl -sfLO "$base" && curl -sfLO "$base.sha512"
+          echo "$(cut -d' ' -f1 subversion-$SVN_VERSION.tar.bz2.sha512)  subversion-$SVN_VERSION.tar.bz2" | sha512sum -c -
+          tar xjf subversion-$SVN_VERSION.tar.bz2
+          cd subversion-$SVN_VERSION
+          ./configure -q --prefix="$RUNNER_TEMP/svn" --with-serf --with-lz4 --with-utf8proc --without-berkeley-db \
+            --disable-javahl > "$RUNNER_TEMP/svn-configure.log" 2>&1 || { tail -40 "$RUNNER_TEMP/svn-configure.log"; exit 1; }
+          make -s -j"$(nproc)" > "$RUNNER_TEMP/svn-make.log" 2>&1 || { tail -40 "$RUNNER_TEMP/svn-make.log"; exit 1; }
+          make -s install > /dev/null
+          echo "$RUNNER_TEMP/svn/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/svn/lib" >> "$GITHUB_ENV"
+      - name: The tools the use test runs
+        run: for t in svn svnadmin svnserve svnrdump svnsync; do echo "$t $($t --version --quiet)"; done
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates && cargo test --release --locked -p slates-cli --test svn_interop --no-run
+      - name: git/git, by clone (retried), and git-2000.dump by its recorded recipe
+        run: |
+          S=$RUNNER_TEMP/git-src
+          for i in 1 2 3; do git clone -q --bare https://github.com/git/git.git $S && break; rm -rf $S; sleep 10; done
+          start=$(date +%s)
+          python3 -I crates/cli/bench/git_to_svn_dump.py "$S" master 2000 > "$RUNNER_TEMP/git-2000.dump"
+          echo "git-2000.dump: $(stat -c %s "$RUNNER_TEMP/git-2000.dump") bytes in $(( $(date +%s) - start )) s"
+      - name: The use test over HTTP, every verb, git-2000.dump (bounded at 3 h for this sizing run)
+        timeout-minutes: 180
+        run: |
+          echo "nproc $(nproc); load before $(cat /proc/loadavg); $(free -m | sed -n 2p)"
+          set +e
+          SLATES_SVN_USE_ROUTE=http SLATES_SVN_USE_DUMP="$RUNNER_TEMP/git-2000.dump" \
+            cargo test --release --locked -p slates-cli --test svn_interop -- --ignored \
+            a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve --nocapture 2>&1 | tee "$RUNNER_TEMP/use.out"
+          rc=${PIPESTATUS[0]}
+          echo "load after $(cat /proc/loadavg)"
+          echo "== per verb"; grep -E '^svn use: ' "$RUNNER_TEMP/use.out" | grep -v ': started$' | cut -c1-300
+          exit $rc
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: svn-use-http-git-2000
+          path: ${{ runner.temp }}/use.out
+          if-no-files-found: warn
