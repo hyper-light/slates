@@ -3208,6 +3208,150 @@ fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_th
   drop(anchor);
 }
 
+/// The anchor's failed-start bound (A-311; main 01a20182's red of 2026-11-24 05:29: r865's svn round restarted its daemon
+/// 1,189 times in 44 minutes, each logged "recovered: it has served as long as its start took (102 ms)" while shard 0's
+/// start had never ended, so the bound never counted one failed start). A daemon serves once every shard's start has
+/// ended, recovery included: its serving word (`slates_anchor::layout::SUP_SERVING`) says so, and the anchor counts an
+/// exit before it as a failed start. Do: start a daemon whose second shard spends two liveness windows on the CPU in its
+/// start; read its serving word while that start runs, then wait for it. Expect: unmarked while the shard starts, then
+/// marked, no sooner than the held start took. Failing first: unmarked until the daemon's role marked it, as soon as
+/// `Daemon::start` returned and before any shard's start had ended (an in-process daemon here, which no role marks: never).
+#[test]
+fn a_daemon_serves_only_once_every_shards_start_has_ended() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-serving-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Busy,
+      for_ns: HELD_START_NS,
+    });
+  let anchor = held_anchor("serving", &profile, &config);
+  let began = std::time::Instant::now();
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let serving = || daemon.segment().supervision().unwrap().serving_since();
+  let while_starting = serving();
+  // Its serving word, waited for: past the held start by the same again, which a start that never ends exceeds.
+  let deadline = Duration::from_nanos(HELD_START_NS.saturating_mul(4));
+  let mut marked_after = None;
+  while began.elapsed() < deadline {
+    if serving().is_some() {
+      marked_after = Some(began.elapsed());
+      break;
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  daemon.stop();
+  drop(anchor);
+  assert_eq!(while_starting, None, "unmarked while a shard starts");
+  let marked_after = marked_after.expect("marked serving once every shard's start ended");
+  assert!(
+    marked_after >= Duration::from_nanos(HELD_START_NS),
+    "marked after {marked_after:?}, before the held start's {HELD_START_NS} ns"
+  );
+}
+
+/// The role [`a_shard_start_that_never_ends_is_a_failed_start_and_its_loop_backs_off`] runs as each supervised daemon's
+/// process: a daemon whose second shard's start spins in one poll far past its window, which then waits for its anchor to
+/// end it. A role its anchor never ends aborts at [`NEVER_ENDED`], failing the test by its missing restarts.
+const NEVER_SERVES_ROLE: &str = "a_shard_start_that_never_ends_role";
+/// Shape: how long the role's held start spins, and how long the role waits for its anchor: past the test's whole watch.
+const NEVER_ENDED: Duration = Duration::from_nanos(60 * slates_server::daemon::LIVENESS_BUDGET_NS);
+/// Shape: how long the test watches the supervision at most: two failed starts, each spun past the watchdog's window
+/// (its CPU window held to this build's speed, a few liveness windows in a debug build) and killed a liveness window
+/// after its beat stops, then the backoff of at least the second one's life, then its restart.
+const NEVER_SERVES_WATCH: Duration =
+  Duration::from_nanos(50 * slates_server::daemon::LIVENESS_BUDGET_NS);
+
+/// The anchor's failed-start bound, end to end (A-311; main 01a20182's order of 2026-11-24 06:05 on r865: 1,189 restarts
+/// in 44 minutes, each read as recovered, since the daemon said "serving" before its shards' starts ended). Do: supervise
+/// a daemon whose second shard's start spins in one poll past its window on every start, the test playing an anchor
+/// that kills a daemon whose beat lapsed, until the backed-off restart after a crash loop. Expect: the first exit a failed
+/// start restarted at once (`failed_in_a_row` 1); the second a `CrashLoop` with a backoff; the restart after it no sooner
+/// than its backoff; no exit ever read as a recovered daemon's. Red with the bug put back (the daemon marked serving as
+/// `Daemon::start` returned): every exit read as recovered, `failed_in_a_row` 0, restarted at once, never a crash loop.
+#[test]
+fn a_shard_start_that_never_ends_is_a_failed_start_and_its_loop_backs_off() {
+  let watched = common::supervised::watch_restarts(
+    NEVER_SERVES_ROLE,
+    ("never-serves", TEST_SHARDS),
+    NEVER_SERVES_WATCH,
+    |watched| {
+      let crash_at = watched.ends.iter().find_map(|(at, step)| {
+        matches!(step, slates_anchor::supervise::Step::CrashLoop { .. }).then_some(*at)
+      });
+      crash_at.is_some_and(|at| watched.starts.iter().any(|start| *start > at))
+    },
+  );
+  let ends: Vec<String> = watched
+    .ends
+    .iter()
+    .map(|(at, step)| format!("{at} ns: {step:?}"))
+    .collect();
+  println!("ends: {ends:?}; starts: {:?}", watched.starts);
+  assert!(
+    !watched.ends.iter().any(|(_, step)| matches!(
+      step,
+      slates_anchor::supervise::Step::Restarted {
+        failed_in_a_row: 0,
+        ..
+      }
+    )),
+    "an exit read as a recovered daemon's: {ends:?}"
+  );
+  assert!(
+    matches!(
+      watched.ends.first(),
+      Some((
+        _,
+        slates_anchor::supervise::Step::Restarted {
+          failed_in_a_row: 1,
+          ..
+        }
+      ))
+    ),
+    "the first exit a failed start, restarted at once: {ends:?}"
+  );
+  let Some((crash_at, slates_anchor::supervise::Step::CrashLoop { retry_in_ns, .. })) =
+    watched.ends.get(1)
+  else {
+    panic!("the second exit a crash loop: {ends:?}");
+  };
+  let next = watched
+    .starts
+    .iter()
+    .find(|start| **start > *crash_at)
+    .expect("restarted after its backoff, within the watch");
+  assert!(
+    *retry_in_ns > 0 && *next >= crash_at.saturating_add(*retry_in_ns),
+    "restarted at {next} ns, before the crash loop at {crash_at} ns plus its {retry_in_ns} ns backoff"
+  );
+}
+
+/// The role [`a_shard_start_that_never_ends_is_a_failed_start_and_its_loop_backs_off`] runs (`NEVER_SERVES_ROLE`).
+#[test]
+#[ignore = "a role: run by a_shard_start_that_never_ends_is_a_failed_start_and_its_loop_backs_off"]
+fn a_shard_start_that_never_ends_role() {
+  let Some((_daemon, _)) = common::supervised::daemon_with(NEVER_SERVES_ROLE, |config| {
+    config.with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Spinning,
+      for_ns: u64::try_from(NEVER_ENDED.as_nanos()).unwrap_or(u64::MAX),
+    })
+  }) else {
+    return;
+  };
+  // Lives until its anchor ends it; past the test's whole watch, it ends itself without a stop its spinning shard would
+  // never answer.
+  let began = Instant::now();
+  while began.elapsed() < NEVER_ENDED {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS));
+  }
+  std::process::abort();
+}
+
 /// Boot (GAPS 2026-10-05): do start a daemon whose second shard sleeps through two liveness windows in its start, using
 /// no CPU, as a stuck shard does; expect the daemon to stop beating within the client's start wait (so the anchor, which
 /// restarts a daemon whose heartbeat lapses, restarts it) instead of beating on while it can never serve.

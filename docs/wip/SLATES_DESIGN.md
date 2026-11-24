@@ -5624,6 +5624,17 @@ idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is 
 > destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
 > `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
 
+> **Status (2026-11-24, A-901: an observation holds no shard).** A request that is no work of its client's keeps a
+> closed loop's clock as A-326's acknowledgement does: within F of the shard's last client I/O it continues the loop,
+> after a longer pause it ends it. It never lengthens a run or holds a shard. Two kinds: a client's acknowledgement
+> (§4.9), and the daemon's observations of itself, §4.14's telemetry drain and status pages (`verbs::holds_nothing`).
+> Holds are bought for the verbs R9 and 84a hold to a bar, and no bar governs an observation's latency. Judged as the
+> loop's, `edit_merge_bench`'s telemetry drain after every sample held every shard it reached, about 7 of the bench's
+> ~10 shard cores on jupiter, for no measured latency (A-897: with every hold off, 2.7–3.3 cores and the same failed
+> runs). Test: `crates/server/tests/closed_loop.rs`
+> (`an_observation_holds_no_shard_while_a_closed_loop_still_does`: 200 rounds draining three shards asked 390 holds
+> before and none after, and a closed loop run after them still asks its owners for holds).
+
 > **Status (2026-11-18, A-361: Windows' own window, and every idle spin under the watchdog's).** Windows wakes a thread
 > blocked on an event, a semaphore or an address a priority level up, and a thread dequeued from an I/O completion port
 > at its own level, which is how a parked shard waited. Beside two spinners a logical CPU at the shard's level, on CI's
@@ -57971,7 +57982,11 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
   a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
   captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
-  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after. Since 2026-11-24 the test snapshots
+  the clone before sharing it and asserts the carry it waits for. A clone's head is its origin's until its first
+  snapshot, so nothing was carried. The wait was unasserted, so it ran out its whole budget and the test passed late:
+  407 s on a Mac (4.29 s now). Windows CI's 240 s per-test deadline killed it first, a red on every Windows run of main. The red
+  with the assertion alone failed on the Mac at the carry.
 
 ### A-754 — The Linux issuer surface: the anchor prints an issuer route and its secret, and a separate process that presents the secret is handed the segment (2026-11-20, w-reaper, main's ruling; §4.13 "Grants", A-299; closes the Linux issuer surface owed since 2026-09-13)
 
@@ -63067,3 +63082,53 @@ Applied in the same change to: GAPS (GAP-A9-14's row), `crates/server/src/{virti
   tests and the server's lend-heavy filters pass (counts in the commit). Owed: main's push profile again.
 
 Applied in the same change to: `crates/merge/src/engine/branch.rs` and its tests.
+
+### A-897 — 84a's every-run bar on Windows bare metal is held back by stalls of the path's own threads, which no scheduling change on slates' side removes; the bench names whose time each slow sample is (2026-11-24, w-84a-win for main 01a20182, its rulings of 2026-11-24 04:55 and 05:35; goal 84a; A-871, A-799, A-326, A-559)
+
+- **Why.** A-871 held jupiter's p99 and p999 under 1 ms as each invocation's median of three runs, but single runs
+  still crossed it. The bar is every run (a run of 1,000 samples may hold one sample over 1 ms). Two directions were to
+  be built: (a) a shard's idle window priced on its measured wake tail, rent or buy, and (b) a client spinning for its
+  reply within a window derived from the service time.
+- **Measured instead of built** (BENCHMARKS "84a on Windows bare metal: whose time a slow sample is"; 143 invocations
+  at Normal outside kiln's job, six rounds, every arm against main in the same round). Main failed 1 of 96 loaded runs
+  and 15 of 114 quiet runs, a quiet rate of 3-7e-4 samples over 1 ms a sample. Split on one clock with the slots'
+  stamps (A-559), 177 of 239 slow samples were the client's own thread (its send path stalled 1-29 ms, or its take), and
+  29 were the seat's pickup. No arm moved the rate:
+  - (a) as a 2 ms window tied main, at 4-5 more shard cores.
+  - (b) helped quiet and hurt loaded (with (a): 5 of 24 loaded runs failed against 0). A client spinning for its
+    replies uses up its quantum, and is then round-robined behind the load in its own normal-level code.
+  - Neither did the client's shard holding for its loop, A-326's holds off, the client's thread at ABOVE_NORMAL,
+    HIGHEST or TIME_CRITICAL, or fixed to one of four CPUs.
+  The client stalls 3-12 ms even at TIME_CRITICAL, DPC and interrupt time ran 1.6-2.7% on every CPU, and the hypervisor
+  is present: hypervisor- or DPC-class preemption, inferred, not measured. The operating system's own floor
+  (`pingpong.ps1`: a blocked thread woken 1-12 ms late at 2e-4 to 1e-3 a wake) sits around slates' rate.
+- **The change.** No scheduling change: §4.3's idle window and §4.7's reply wait stand as A-223, A-326 and A-799 left
+  them. `crates/client/examples/edit_merge_bench.rs` carries each judgment's context. A `floor` line before each sweep
+  times the operating system's own wake of a parked thread under the sweep's load. A `cpu` line per form gives the
+  CPU of the shards and of the client thread. The `goal` line lists every run's p99 and p999 beside w-perf's verdict.
+  A `slow` line per sample over the bound splits its edit and its submit into the client's send, the seat's pickup,
+  the service and the client's take, which add up to the call.
+- **Found on the way.** The bench's per-sample telemetry drain touches every shard, and A-326's holds keep each one
+  spinning: about 7 of its ~10 shard cores, for no measured latency (holds off: 2.7-3.3 cores, failed runs unchanged).
+  That observations hold no shard is its own amendment (main's ruling).
+
+Applied in the same change to: `crates/client/examples/edit_merge_bench.rs` (and its unit test of the split),
+`crates/client/Cargo.toml` (`slates-rt` for the client thread's clock), BENCHMARKS, GAPS (84a).
+
+### A-901 — An observation keeps a closed loop's clock and holds no shard (2026-11-24, w-84a-win for main 01a20182, its ruling of 2026-11-24 05:35; A-897's measured waste; amends A-326's acknowledgement rule)
+
+- **Why.** A-326 judges every request a client's ring brings, except its acknowledgement, as its closed loop's, and a
+  forward made for one carries a hold for its owner. `edit_merge_bench` drains every shard's telemetry after every
+  sample, so its drain was a loop over every shard, and A-326 held all of them: about 7 of the bench's ~10 shard cores
+  on jupiter. With every hold off the same rounds measured 2.7-3.3 shard cores and the same failed runs (A-897). The
+  CPU bought no latency, and no bar governs an observation's.
+- **The change.** `verbs::holds_nothing` names the requests that are no work of their client's: an acknowledgement,
+  `Telemetry`, `DaemonStatus` and `DaemonStatusNext`. Each keeps a loop's clock as an acknowledgement did, and none
+  lengthens a run or sets a forward's hold.
+- **Test** (macOS arm64, debug, 2026-11-24). Red first: `an_observation_holds_no_shard_while_a_closed_loop_still_does`
+  (`crates/server/tests/closed_loop.rs`). 200 rounds draining a three-shard daemon's telemetry asked 390 holds (1 kept,
+  389 declined) before the change and none after. A closed loop of creates and destroys run after the drain still asked
+  its owners for holds, so the count can see one. A-326's own test passes unchanged.
+
+Applied in the same change to: §4.7 (a status), `crates/server/src/verbs.rs`, `crates/server/tests/closed_loop.rs`,
+GAPS (84a's owed line).

@@ -1410,6 +1410,9 @@ pub enum BootFaultKind {
   Busy,
   /// The start sleeps for the whole time, using no CPU, as a stuck shard does.
   Stuck,
+  /// The start runs on the CPU for the whole time in one poll, never yielding, as a recovery step past its window does
+  /// (r865, 2026-11-24): the watchdog finds the shard spinning and withholds the beat.
+  Spinning,
 }
 
 /// The NFSv4 listener's table bounds (§4.6 A-35): what its sessions, clients and opens may hold.
