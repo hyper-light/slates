@@ -709,3 +709,9 @@
 - NEXT: gate 4 empty receive-pack-result body (run 45363070862, debug-1.log 251-343 on main's Mac): red on a freshly
   created repository's first push; body must carry a report or typed refusal; edge refuses to complete an empty body,
   counted+logged. Then hash to main for gate 5. Then the clone speed item (derive+encode behind the push).
+- LANDED 0741deb0a (0037b3d6c): gate-4 guard: receive reply ending empty (non-probe) is failed, counted
+  vcs_http.git.push_ended_empty, logged with bytes read; cut() logs cause. Red/green
+  a_push_whose_request_never_arrived_is_failed_never_answered_with_an_empty_body; probe test kept. Main's clippy lines
+  on 7d95662b5 fixed (PrepareStepped boxed; drift test split). OPEN: why git's 385 bytes never reached the exchange
+  (gate 5 log names bytes read). Hash sent to main for gate 5.
+- NEXT: clone speed item (derive+encode behind the push, off fetch's path); clone 149 s vs stock 11 s first.
