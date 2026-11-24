@@ -4955,7 +4955,11 @@
 > Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
 > w-svn. Since then (main's ruling) blame leaves out a file added without a source, whose blame names its one revision
 > on every line, so revision 1's import is blamed no more; a later sample that changes such a file blames its whole
-> history. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
+> history. **Done (main 01a20182's round on the big Studio, 2026-11-24, a0c46b705):** green, 0 differences across
+> every verb over HTTPv2 with git-2000, its verbs about 1,359 s within the 1,800 s bound. Slates is at parity or
+> faster on reads (checkout, update and switch within 13%; diff, info, log and revprops 2.6 to 14 times faster) and
+> slower on the dump (3.0×), the writing session (2.1×, down from 24×) and svnsync (1.27×, noisy). See BENCHMARKS,
+> "The svn use test over HTTP with git-2000". The dump and the writing session are w-svn's.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon

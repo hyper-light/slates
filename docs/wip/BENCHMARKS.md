@@ -19192,3 +19192,37 @@ What it says:
   `upload.parts_copied=34`, `parts_by_entry=315`, `entries_judged=46,260`, `entries_copied=28,501`,
   `headers_rewritten=9,567` and `made_whole=8,192`. Its whole counter line, and every timed clone's before and after,
   are in the record.
+
+## The svn use test over HTTP with git-2000: green, every verb timed against stock svnserve (goal 93; main 01a20182's round, 2026-11-24, a0c46b705)
+
+`a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve` over HTTPv2 (`SLATES_SVN_USE_ROUTE=http`) with
+git-2000.dump, release, stock Subversion 1.15.0, on the big Studio (Apple M3 Ultra) at a0c46b705. It found **0
+differences** across log, info, checkout, update, switch, blame (17 sampled revisions, the files each changed with a
+history; `blamed_files`), diff, revprops, svnrdump's dump, svnsync, and the writing session (commit, copy, merge,
+propset). Its verbs took about 1,359 s, within the round's 1,800 s bound (GAPS, sized from run 45330574435).
+
+Seconds per leg, from the test's own per-verb lines (each leg's share of the verb; one run, so no best):
+
+| verb | stock svnserve | slates over HTTPv2 | slates against stock |
+|---|---|---|---|
+| log | 0.4 | 0.1 | 4.0× faster |
+| info | 6.6 | 2.5 | 2.6× faster |
+| checkout | 62.6 | 55.7 | 1.12× faster |
+| update | 99.6 | 95.2 | 1.05× faster |
+| switch | 86.6 | 76.6 | 1.13× faster |
+| blame | 85.6 | 63.2 | 1.35× faster |
+| diff | 8.3 | 1.8 | 4.6× faster |
+| revprops | 4.2 | 0.3 | 14.0× faster |
+| svnrdump's dump | 2.5 | 7.6 | 3.0× slower |
+| svnsync | 299.2 | 379.8 | 1.27× slower (noisy: it overlapped another round on the box) |
+| commit + copy + merge + propset | 6.8 | 14.2 | 2.1× slower |
+
+What it says:
+- **Correct over HTTPv2 on a real 2,000-revision history**, with every verb answered as stock svnserve answers it.
+- **Reads are at parity or faster.** Checkout, update and switch are within about 13% of stock. Diff, info, log and
+  revprops are 2.6 to 14 times faster.
+- **Slower than stock on three verbs:** the dump (3.0×), the writing session (2.1×) and svnsync (1.27×, noisy).
+  Against the sizing run on a 4-CPU Linux runner (run 45330574435, before w-svn's fixes), the writing session fell from
+  24× to 2.1×, and the dump stays about 3×: both w-svn's.
+- **svnsync's row overlapped another round on the box,** so its times are not comparable with the rest of the table.
+
