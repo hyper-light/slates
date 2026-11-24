@@ -490,6 +490,56 @@ pub fn position_id(format: ObjectFormat, payload: &[u8]) -> Option<ObjectId> {
 mod tests {
   use super::*;
 
+  fn assert_commit_row_partials(packed: Option<PackedRow>, parents: Vec<u64>) {
+    let row = ObjectRow {
+      kind: Kind::Commit,
+      len: 321,
+      position: 99,
+      pack: packed,
+      commit: Some(CommitRow {
+        tree: 55,
+        date: 1_700_000_000,
+        generation: 12,
+        parents: parents.clone(),
+      }),
+      tag_target: None,
+    };
+    let encoded = encode(&row);
+    assert_eq!(decode(&encoded), Some(row));
+    assert_eq!(decode_position(&encoded), Some(99));
+    assert_eq!(decode_len(&encoded), Some(321));
+    assert_eq!(
+      decode_commit_header(&encoded),
+      Some((55, 1_700_000_000, 12))
+    );
+    assert_eq!(
+      decode_commit_parents(&encoded)
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>(),
+      parents
+    );
+    assert_eq!(decode_tag_target(&encoded), None);
+  }
+
+  fn assert_tag_row_partials(packed: Option<PackedRow>) {
+    let tag = ObjectRow {
+      kind: Kind::Tag,
+      len: 140,
+      position: 101,
+      pack: packed,
+      commit: None,
+      tag_target: Some(99),
+    };
+    let encoded_tag = encode(&tag);
+    assert_eq!(decode(&encoded_tag), Some(tag));
+    assert_eq!(decode_position(&encoded_tag), Some(101));
+    assert_eq!(decode_len(&encoded_tag), Some(140));
+    assert_eq!(decode_commit_header(&encoded_tag), None);
+    assert_eq!(decode_commit_parents(&encoded_tag), None);
+    assert_eq!(decode_tag_target(&encoded_tag), Some(Some(99)));
+  }
+
   /// A-614. Do: encode commit (0, 1, 2, and 4 octopus parents), blob, and annotated tag rows both
   /// whole and in-pack, then read them with the zero-allocation partial decoders. Expect: every
   /// partial decoder agrees identically with full `decode`.
@@ -503,52 +553,9 @@ mod tests {
     });
     for packed in [None, pack] {
       for parents in [vec![], vec![7], vec![7, 9], vec![1, 2, 3, 4]] {
-        let row = ObjectRow {
-          kind: Kind::Commit,
-          len: 321,
-          position: 99,
-          pack: packed,
-          commit: Some(CommitRow {
-            tree: 55,
-            date: 1_700_000_000,
-            generation: 12,
-            parents: parents.clone(),
-          }),
-          tag_target: None,
-        };
-        let encoded = encode(&row);
-        assert_eq!(decode(&encoded), Some(row));
-        assert_eq!(decode_position(&encoded), Some(99));
-        assert_eq!(decode_len(&encoded), Some(321));
-        assert_eq!(
-          decode_commit_header(&encoded),
-          Some((55, 1_700_000_000, 12))
-        );
-        assert_eq!(
-          decode_commit_parents(&encoded)
-            .unwrap()
-            .into_iter()
-            .collect::<Vec<_>>(),
-          parents
-        );
-        assert_eq!(decode_tag_target(&encoded), None);
+        assert_commit_row_partials(packed, parents);
       }
-
-      let tag = ObjectRow {
-        kind: Kind::Tag,
-        len: 140,
-        position: 101,
-        pack: packed,
-        commit: None,
-        tag_target: Some(99),
-      };
-      let encoded_tag = encode(&tag);
-      assert_eq!(decode(&encoded_tag), Some(tag));
-      assert_eq!(decode_position(&encoded_tag), Some(101));
-      assert_eq!(decode_len(&encoded_tag), Some(140));
-      assert_eq!(decode_commit_header(&encoded_tag), None);
-      assert_eq!(decode_commit_parents(&encoded_tag), None);
-      assert_eq!(decode_tag_target(&encoded_tag), Some(Some(99)));
+      assert_tag_row_partials(packed);
     }
   }
 }

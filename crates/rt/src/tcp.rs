@@ -560,6 +560,7 @@ mod round_trip_tests {
   #[test]
   #[cfg(unix)]
   #[cfg_attr(miri, ignore = "Miri's isolation has no sockets; plain lanes run it")]
+  #[allow(clippy::disallowed_methods)] // Test-only sleep waiting for loopback RST packets to reach the kernel listen queue.
   fn accept_skips_aborted_peer_and_serves_next_connection() {
     use std::io::Write;
     use std::time::Duration;

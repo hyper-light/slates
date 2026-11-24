@@ -209,6 +209,7 @@ fn refused_recorded(state: &mut ShardState, body: RequestBody, sequence: u32) ->
 }
 
 /// The durable head of `green` on `daemon`'s first shard once it reaches `version`, or where it stood at [`PATIENCE`].
+#[allow(clippy::disallowed_methods)] // Test polling helper waiting on a background shard's durable head.
 fn head_reaching(daemon: &crate::Daemon, green: VolumeId, version: u64) -> u64 {
   let green = crate::verbs::to_db_volume(green);
   let deadline = std::time::Instant::now() + PATIENCE;
