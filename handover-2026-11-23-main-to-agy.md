@@ -22,6 +22,13 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
+Updates at 02:01 on 11-24:
+- 84a CONFIRMED AT CURRENT MAIN 55650fef1 on all three bare-metal platforms, by the bench's reported p99/p999 (each
+  invocation's three runs' median; p999 read from the numbers, since the verdict line judges p99 only): macOS p99 <= 158
+  us, p999 <= 172 us; Windows p99 <= 194 us, p999 <= 345 us; Linux p99 <= 473 us, p999 <= 973 us (adacachy2, a user
+  scope at CPUWeight 10000 over kiln's weight-1 agent runs, r810). Linux's margin is thin, and single runs on Windows
+  (the OS wake tail) and Linux (the fair-class client) crossed 1 ms: w-perf's hardening after A-887.
+
 Updates at 01:57 on 11-24:
 - 84a Linux at 55650fef1, run under adacachy2's own load (about 3 runnable threads a core, not the defined 2; r809):
   loaded p99 under 1 ms in all 16 values (at most 605 us); loaded p999 under 1 ms in 14 of 16, over in two accept rounds
