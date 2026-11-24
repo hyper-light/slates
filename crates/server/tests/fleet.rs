@@ -7024,15 +7024,18 @@ fn a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its
 /// partition holds (A-236); a move releases the old owner's alias, and the new owner must hold one of its own, or a
 /// `MNT` of the name (routed to the name's partition, `nfs::routed`) finds nothing there and the kernel's mount is
 /// refused `NOENT` (kiln's live-move test, 2026-11-19: four runs of five). Three daemons at `f = 1`. Do: on a, overlay
-/// the captured tree, capture its base, and clone it under a name whose partition is not the clone's; share it with b and
-/// move it there until the move is done. Expect: b serves the clone, and b resolves its name to it as a mount does
-/// (`Daemon::mount_capability`), a's alias gone with its copy.
+/// the captured tree, capture its base, and clone it under a name whose partition is not the clone's; snapshot the clone,
+/// so its head carries the capture, share it with b, wait until a has recorded the carry, and move it there until the
+/// move is done. Expect: b serves the clone, and b resolves its name to it as a mount does
+/// (`Daemon::mount_capability`), a's alias gone with its copy. Before the clone was snapshotted here, nothing was
+/// carried and the unasserted wait for the carry ran out its whole budget (407 s on a Mac; Windows CI's 240 s per-test
+/// deadline killed it first).
 #[test]
 fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
   let _serial = serialize_fleet_tests();
   let members = three_members_sharded(4);
   let base = captured_tree_dir();
-  let (served, resolved, answers, described) = {
+  let (carried, served, resolved, answers, described) = {
     let fleet: Vec<&Daemon> = members.daemons.iter().collect();
     let mut client_a = Client::connect(&members.instances[0]);
     let ReplyBody::Created { id: overlay } = client_a.call(&RequestBody::Create {
@@ -7068,8 +7071,14 @@ fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
     let ReplyBody::Cloned { id: clone } = cloned else {
       panic!("clone {name} of the captured snapshot: {cloned:?}");
     };
+    // A clone's head is its origin's until its first snapshot, and only a head of its own carries the capture (A-503).
+    let snapshotted = client_a.call(&RequestBody::Snapshot { volume: clone });
+    assert!(
+      matches!(snapshotted, ReplyBody::Snapshotted { .. }),
+      "a snapshot of the clone: {snapshotted:?}"
+    );
     share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
-    poll_until(&fleet, SERVE_DEADLINE, || {
+    let carried = poll_until(&fleet, SERVE_DEADLINE, || {
       Ok(move_counter(&members.daemons[0], CARRY_RECORDED)? >= 1)
     });
     let (moved, answers) = move_until_done(&fleet, &mut client_a, clone, members.hosts[1]);
@@ -7081,11 +7090,15 @@ fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
       resolved = Some(members.daemons[1].mount_capability(&name));
       Ok(matches!(resolved, Some(Ok(Some(_)))))
     });
-    (served, resolved, answers, describe(&fleet))
+    (carried, served, resolved, answers, describe(&fleet))
   };
   for daemon in members.daemons {
     daemon.stop();
   }
+  assert!(
+    carried,
+    "the clone's head carried its capture before the move; {described}"
+  );
   assert!(served, "b serves the moved clone; {described}");
   assert!(
     matches!(resolved, Some(Ok(Some(_)))),
