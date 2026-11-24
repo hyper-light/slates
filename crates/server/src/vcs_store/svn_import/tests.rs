@@ -980,8 +980,10 @@ fn t_c2c_a_large_batch_is_applied_a_slice_at_a_time() {
 
 /// Shape: the files the one-wide-revision import adds, each [`WIDE_TEXT_BYTES`]: git-2000's first revision's width and
 /// more. A replay's read plan was cubic in them (A-887 part 3's `Increment::replay_reads`): 3,000 held the shard past
-/// its window in the batch's first apply.
-const WIDE_REVISION_FILES: usize = 3000;
+/// its window in the batch's first apply. The staging step's judge and commit were quadratic in them (each file's run
+/// found by a walk of every run, each file's run counted against every other's, each place searched among every
+/// whole's): 6,000 held the shard 1,511 ms in that one step.
+const WIDE_REVISION_FILES: usize = 6000;
 
 /// Shape: each wide file's bytes, a source file's (about 1 KiB): a text the content store names (A-760).
 const WIDE_TEXT_BYTES: usize = 1024;
@@ -991,7 +993,9 @@ const WIDE_TEXT_BYTES: usize = 1024;
 /// whole, and the shard's longest step (its registry's counted `longest_step_ns`) under its watchdog window. Red at
 /// 77397a5f4: the batch's first apply planned its replay's reads over every run, change and whole named (A-887 part 3's
 /// cubic `Increment::replay_reads`) in one poll, and the watchdog ended the process (3,480 ms against its 3,480 ms
-/// window); green since 5606962eb made the plan n log n.
+/// window); green since 5606962eb made the plan n log n. Red again at 6,000 files at a0c46b705: the staging step's
+/// judge and commit (`Green::sole_runs`, `alone`, the wholes' and names' searches) took 1,511 ms against the 1,000 ms
+/// window (debug); 592 ms once each is a lookup.
 #[test]
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
   let (loaded, longest_ns, window_ns) = stored(|| async move {
