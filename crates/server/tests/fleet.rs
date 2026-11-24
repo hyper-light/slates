@@ -158,6 +158,33 @@ fn shard_steps(shard: u16) -> u64 {
   slates_rt::registry::with_entry(shard, |entry| entry.pulse.steps()).unwrap_or(0)
 }
 
+/// Every fleet coordinator registered in this process, with the periods it has counted: each shard slot whose pulse has
+/// counted a period, which only a daemon's control shard does (`Daemon::fleet_progress`), named by its slot's holder so
+/// that a slot a later daemon takes is never read as the same coordinator.
+fn coordinators() -> Vec<(slates_rt::registry::SlotHolder, u64)> {
+  (0..slates_rt::registry::MAX_SHARDS)
+    .filter_map(|slot| u16::try_from(slot).ok())
+    .filter_map(|shard| {
+      let holder = slates_rt::registry::holder_of(shard)?;
+      let periods = slates_rt::registry::with_entry(shard, |entry| entry.pulse.progress())?;
+      (periods > 0).then_some((holder, periods))
+    })
+    .collect()
+}
+
+/// The periods the slowest of `began`'s coordinators has run since it was read there, counting only those whose slot
+/// still has the same holder; `None` once none of them is registered.
+fn slowest_since(began: &[(slates_rt::registry::SlotHolder, u64)]) -> Option<u64> {
+  began
+    .iter()
+    .filter(|(holder, _)| slates_rt::registry::holder_of(holder.shard()) == Some(*holder))
+    .filter_map(|(holder, then)| {
+      slates_rt::registry::with_entry(holder.shard(), |entry| entry.pulse.progress())
+        .map(|now| now.saturating_sub(*then))
+    })
+    .min()
+}
+
 /// The TLS server name every fleet node presents (a single fleet's shared name; the certificate pins who).
 const NAME: &str = "slates-fleet";
 /// Shape: how long to let the fleet form — the loops establish their sessions and exchange several probes,
@@ -11446,6 +11473,41 @@ impl Client {
     self.send_at(self.sequence, body)
   }
 
+  /// [`call`](Self::call), sent again under a fresh id while it is refused `Overloaded`, which says the request was never
+  /// admitted, so it may be sent again (§4.7; after a materialization ends, the refusal that follows meets the made
+  /// volume on the retry, `verbs::await_materialization`). The retries are charged in the fleet's own time, as
+  /// [`poll_until`] charges a wait by its slowest daemon. They stop once the slowest fleet coordinator in this process has
+  /// run a liveness window of its periods since the first refusal ([`liveness_periods`]), or once that one ran none for
+  /// [`FROZEN_CAP`], the only wall bound. Its own daemon's coordinator is among them, so the window is never shorter than
+  /// that daemon's own. The client cannot name that coordinator: its region names only the shard it is pinned to, and that
+  /// shard counts no periods unless it is the control shard. The last reply, refused or not.
+  fn call_admitted(&mut self, body: &RequestBody) -> ReplyBody {
+    let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+    let mut charge: Option<(Vec<(slates_rt::registry::SlotHolder, u64)>, u64, Instant)> = None;
+    loop {
+      let reply = self.call(body);
+      if !matches!(
+        reply,
+        ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      ) {
+        return reply;
+      }
+      let (began, seen, advanced) =
+        charge.get_or_insert_with(|| (coordinators(), 0, Instant::now()));
+      let ran = slowest_since(began).unwrap_or(0);
+      if ran != *seen {
+        *seen = ran;
+        *advanced = Instant::now();
+      }
+      if ran >= liveness_periods() || advanced.elapsed() >= FROZEN_CAP {
+        return reply;
+      }
+      let _ = pace.recv_timeout(UNAVAILABLE_PACE);
+    }
+  }
+
   /// Acknowledges every reply received so far once half a ring of them is owed, as `slates_client` does (its
   /// `ack_every`), before the next new request. Only the latest id is ever retried ([`call_retry`](Self::call_retry)),
   /// and only before another new request, so no retry meets an acknowledged record. A reply other than
@@ -13280,9 +13342,10 @@ const LIVE_BATCHED: &str = "fleet.live.batched";
 /// Format: a holder's count of live entries it took into its copy (`live_ship::LIVE_HELD`), alone or in a batch.
 const LIVE_HELD: &str = "fleet.live.held";
 
-/// A write attachment of `volume` through `client`.
+/// A write attachment of `volume` through `client`, the attach sent again while refused `Overloaded`
+/// ([`Client::call_admitted`]).
 fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
-  match client.call(&RequestBody::Attach {
+  match client.call_admitted(&RequestBody::Attach {
     volume,
     snapshot: None,
     intent: Intent::Write,
@@ -14537,9 +14600,6 @@ fn live_volume_written_attached(
 /// Shape: the files [`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: its
 /// log holds a payload a publication, and a burst's writes may share one, so the log's length is read, not assumed.
 const LIVE_TURN_FILES: usize = 24;
-/// Format: a node's count of the copies its takeover rounds listed by the owner their authority moved from
-/// (`takeover::copies_falling_to`, A-251): after a successor's warm restart, its own adoptions among them.
-const LISTED_BY_MOVED_FROM: &str = "fleet.takeover.listed_by_moved_from";
 /// Format: the successor's count of the owner-shard turns its live rebuilds took (`fleet::make_live_in_turns`).
 const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
 /// Format: the successor's count of the payloads its live rebuilds applied, in all their turns.
@@ -20325,12 +20385,45 @@ fn continuity_write_answered(instance: &str, volume: VolumeId, file: usize) -> V
   replies
 }
 
-/// Whether each of the continuity files `0..files` reads back through `instance` as written.
+/// Format: a counter of the objects a takeover round found already adopted on its node by their persisted adoption and
+/// settled when it began (`takeover::adopted_in_its_round`), never taken over again.
+const TAKEOVER_SETTLED: &str = "fleet.takeover.settled";
+
+/// What a restarted successor's rerun cost its volume, read off the live nodes: the live holds refused at a stale epoch,
+/// summed over `daemons`, and the verbs the successor (`daemons[index]`) refused because its routing named it the owner of
+/// a volume its owner shard did not hold (`fleet.owner_location.owned_unmaterialized`). A rerun that fenced its own
+/// adoption showed both (2026-11-23, 4 of 6 runs on adacachy2: a holder refused the successor's log once, and the successor
+/// refused 4,165 to 4,774 reads). A stale refusal alone can also be the third node's correct takeover under load.
+fn self_fence_counts(daemons: &[Daemon], index: usize) -> (u64, u64) {
+  let stale = daemons
+    .iter()
+    .map(|daemon| {
+      summed_counters(daemon)
+        .get("fleet.live.hold_refused.stale_epoch")
+        .copied()
+        .unwrap_or(0)
+    })
+    .sum();
+  let unmade = summed_counters(&daemons[index])
+    .get("fleet.owner_location.owned_unmaterialized")
+    .copied()
+    .unwrap_or(0);
+  (stale, unmade)
+}
+
+/// Whether each of the continuity files `0..files` reads back through `instance` as written, each read sent again while
+/// refused `Overloaded` ([`Client::call_admitted`]).
 fn continuity_read(instance: &str, volume: VolumeId, files: usize) -> Vec<bool> {
   let mut reader = Client::connect(instance);
   (0..files)
     .map(|file| {
-      let reply = read_at_head(&mut reader, volume, &format!("/continuity-{file}"));
+      let reply = reader.call_admitted(&RequestBody::ReadRange {
+        volume,
+        path: format!("/continuity-{file}"),
+        at: ReadAt::Head,
+        offset: 0,
+        max: u64::MAX,
+      });
       matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect()
@@ -20501,12 +20594,18 @@ fn a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over() {
     .cloned()
     .expect("at least one write was sent");
   let read = continuity_read(&instance, scene.volume, CONTINUITY_FILES + 1);
+  let (stale, unmade) = self_fence_counts(&scene.daemons, scene.index);
   for daemon in scene.daemons {
     daemon.stop();
   }
   eprintln!(
-    "a write after the successor's warm restart: taken {}, served {}, written {replies:?}, read {read:?}",
+    "a write after the successor's warm restart: taken {}, served {}, written {replies:?}, read {read:?}; stale holds \
+     refused {stale}, verbs refused as owned but unmade {unmade}",
     scene.taken, scene.served
+  );
+  assert_eq!(
+    unmade, 0,
+    "the restarted successor never refused a verb as owner of a volume its owner shard did not hold"
   );
   assert!(
     scene
@@ -20560,16 +20659,17 @@ fn a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted() {
       .find(|(counted, _)| *counted == name)
       .map_or(0, |(_, count)| *count)
   };
-  let (listed, given_up) = (
-    counted(LISTED_BY_MOVED_FROM),
+  let (settled, given_up) = (
+    counted(TAKEOVER_SETTLED),
     counted("fleet.takeover.given_up"),
   );
+  let (stale, unmade) = self_fence_counts(&scene.daemons, scene.index);
   for daemon in scene.daemons {
     daemon.stop();
   }
   eprintln!(
     "a successor restarted owing its share: taken {}, served {}; written {replies:?}, read {read:?}; its takeover \
-     counts since the restart {takeover:?}",
+     counts since the restart {takeover:?}; stale holds refused {stale}, verbs refused as owned but unmade {unmade}",
     scene.taken, scene.served
   );
   assert!(
@@ -20583,8 +20683,12 @@ fn a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted() {
     "the write after the restart was answered ({after:?}) and every file reads back ({read:?})"
   );
   assert!(
-    given_up == 0 && listed > 0,
-    "the rerun listed the successor's adoption by its move ({listed}) and gave nothing up ({given_up})"
+    given_up == 0 && settled > 0,
+    "the rerun settled the successor's adoption by its persisted marker ({settled}) and gave nothing up ({given_up})"
+  );
+  assert_eq!(
+    unmade, 0,
+    "the restarted successor never refused a verb as owner of a volume its owner shard did not hold"
   );
 }
 

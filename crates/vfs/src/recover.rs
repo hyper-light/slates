@@ -108,9 +108,13 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// (`slates_db::register::MovedFrom`), so a warm restart keeps which retirement a move belongs to: a host admitted again
 /// under its id retires again, and a move made at its first retirement says nothing of its next. No reader of 33's
 /// layout is kept: it is refused by its version (CLAUDE.md §2.7).
+/// 35 (A-890, 2026-11-23) each held register also carries the retirement its node adopted the object in as that
+/// retirement's successor (`slates_db::register::Acceptor::adopted`), so a successor restarted warm settles its own
+/// adoption in the round it runs again instead of taking the object over again. No reader of 34's layout is kept: it is
+/// refused by its version (CLAUDE.md §2.7).
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 34;
+pub const IMAGE_VERSION: u16 = 35;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
