@@ -22,7 +22,7 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 23:30: w-git 96921, w-hg 8084, w-svn 87108, w-perf 93193, w-shared 56627, w-interop 9734.
 
-Updates at 00:52 on 11-24:
+Updates at 00:51 on 11-24:
 - 84a at current main 55650fef1. macOS (r791, Studio): every run under 1 ms (24 loaded runs: p99 at most 216 us, p999 at
   most 542 us). Windows (r792, jupiter): every run's p99 under 1 ms, but p999 crossed 1 ms in 3 of 24 loaded accept runs
   (2.0-3.7 ms) and 3 of 12 quiet runs (1.0-3.3 ms). A rare ~3.7 ms client-daemon round-trip stall, in edit (L7) or submit
