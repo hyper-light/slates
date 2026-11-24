@@ -1,5 +1,12 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~16:30 PST
+- LANDED 15e739357: every Mercurial replay lets go what it brought back from the changeset store (successor's unknown
+  texts, restart's let-go ones) through hg_run::let_go_committed; counter vcs_store.hg_brought_back_let_go equals the
+  asks. Reds (successor 0/6, restart 0/3 with the let-go out). GAPS: git keeps its pack as a live commit; svn nothing.
+- Note to main: a restart asks only if the image published after the push's let-go.
+- Free for the next piece.
+
 ## 2026-11-24 ~15:00 PST
 - (b) LANDED 60b4de519 (A-636 part 2c-2, hg): a record replay asks the changeset store for texts/rows whose identities
   the content store never knew (batched by room, node::compute checked); counter vcs_store.hg_replay_unknown_asked.
