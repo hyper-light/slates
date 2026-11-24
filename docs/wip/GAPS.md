@@ -1101,8 +1101,11 @@
 >   never merged, so each new row's lookup walked them all and a segment step grew with the push (arena-14: shard 0 past
 >   1 s in `hg_push::segment`, the daemon killed). Now every append seals when due through one insert
 >   (`HgIndex::insert`, import's own seal gone), and the fork's runs are merged by a size-tiered rule as it goes
->   (`slates_vcs::Index::tiered_due`: the newest merged while their tables' bytes together are at least half the next
->   older's; Derived: at most ⌊log₃(own bytes ÷ the fewest bytes a seal writes)⌋ + 1 own runs; weighed in bytes since
+>   (`slates_vcs::Index::tiered_due`: the newest merged through the deepest own run at most twice the bytes of all newer
+>   own runs together, since r618 held 8 where the bound is 6 when the rule stopped at the first older run past its share
+>   (`a_tiered_merge_restores_its_invariant_for_every_run_however_deep_the_seal_breaks_it`); Derived: where no merge is
+>   due, at most ⌊log₃(own bytes ÷ the fewest bytes a seal writes)⌋ + 1 own runs, one more until a due merge ends
+>   (`vcs.hg.push_most_own_runs`, `_in_flight`); weighed in bytes since
 >   goal 93 (B), as a seal is due by bytes: in rows, r499 held 8 own runs where the row bound computed 6, and
 >   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_bytes_whatever_its_rows_sizes` held 8 where the
 >   bytes bound is 5, each phase of larger rows keeping a stack of its own), a table a step between revisions
@@ -1163,6 +1166,15 @@
 >   the cause, as first thought. The test now runs on a daemon, waits until no checkpoint is under way, and reads the
 >   status, twice: once with the hold paused through the submit's step (`hold_pause_at`), which pins the checkpoint in
 >   turns, and once as the budget falls.
+> - A create refused `BudgetExceeded` with the pool's room free, its claim ended by one extent the OS would not map.
+>   FIXED (w-perf, 2026-11-23, main's r578 at 80fbd5249: the big Studio's provision_bench refused 67 and 44 creates of
+>   1 MiB in the 64-client sweep, `available: 33945026560`; the daemon's once-line read `room_lost=1 refused=5` with no
+>   debt and no hold). The pool's claim returned at the first extent it claimed and could not hand out, so the arena's
+>   growth came up short and gave back what it took, refusing the admission whole. Now a refused map is counted, the
+>   extent given back, and the next candidate tried (`content_pool::ContentPool::claim`, and its hold path). Red:
+>   `content_pool::tests::an_extent_the_os_will_not_map_passes_the_claim_to_the_next` (`room_lost` 1, now 0). Owed:
+>   main's rerun of provision_bench, its refusal count the gate; and which OS refusal the Studio met (macOS opens and
+>   makes each extent's object afresh at a claim after a release), should refusals remain.
 > - **Open (test, 2026-11-23, found by w-perf): an audit observation's patience is the liveness budget.** In a landing
 >   round of the fix above, at a load average of 60 to 85 on the MacBook, `memory_gauges.rs:249`'s
 >   `crate::daemon::observe_first` failed its expect: the observation returned an error, not the test's assertion. The
@@ -4633,8 +4645,11 @@
 > c40775ea2):** reads.dump passed, 0 differences over all 14 verbs. git-2000.dump was killed at its 5,400 s bound, the
 > test thread sleeping in the harness's poll between `svn` children. Each stock command's wait is now a blocking wait
 > on its exit, not a stretched poll, and each verb prints its time and each leg's share as it goes
-> (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). **Owed:** git-2000's rerun, its
-> bound sized from those times; its `blame` verb alone is 155,904 commands (4,872 files × 16 samples × 2 legs).
+> (`docs/bugs/2026-11-23-the-svn-use-tests-commands-each-paid-a-stretched-poll.md`). Blame was of every file at every
+> sample, 155,904 commands over git-2000 (4,872 files × 16 samples × 2 legs). By main 01a20182's ruling it is now of
+> the files each sampled revision changed, or those of the nearest earlier change (`blamed_files`,
+> `files_changed_in`), the count printed at each sample. **Owed:** the sizing run (a diag lane on ubuntu-latest,
+> stock svn 1.15 built in the job), then git-2000's rerun on the big Studio, its bound derived from the per-verb lines.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon

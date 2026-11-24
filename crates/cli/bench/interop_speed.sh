@@ -89,12 +89,15 @@ sampler >> "$WORK/samples.txt" &
 SAMPLER=$!
 trap 'kill "$SAMPLER" 2> /dev/null' EXIT
 
+FAILED_TOOLS=""
 run() {
-  local tool=$1
+  local tool=$1 status
   shift
   say "== $tool, load before: $(load)"
-  KEEP_LOGS="$WORK/logs/$tool" "$@" 2>&1 | tee -a "$OUT" | grep -E '^== results|^(push|clone|incremental|shallow|partial|stream|checkout|log|commit|update|import)' || true
-  say "== $tool, load after: $(load)"
+  KEEP_LOGS="$WORK/logs/$tool" "$@" 2>&1 | tee -a "$OUT" | grep -E '^== results|^FAILED|^(push|clone|incremental|shallow|partial|stream|checkout|log|commit|update|import)'
+  status=${PIPESTATUS[0]}
+  [ "$status" = 0 ] || FAILED_TOOLS="$FAILED_TOOLS $tool"
+  say "== $tool, exit $status, load after: $(load)"
 }
 run git env SERVERS="stock stock-http slates" bash "$HERE/git_scale.sh" "$SLATES" "$GIT_SOURCE" "$WORK/git" "$RUNS" "$BOUND"
 run hg env SERVERS="stock slates" SLATES="$SLATES" bash "$HERE/hg_scale.sh" "$HG" "$HG_SOURCE" "$WORK/hg" "$RUNS" "$BOUND"
@@ -106,3 +109,9 @@ awk '{ for (i = 3; i <= NF; i++) { split($i, kv, "="); split(kv[2], v, ","); if 
   END { for (k in rss) printf "%-14s peak %6.0f MiB  cpu %6.0f s\n", k, rss[k] / 1024, cpu[k] }' "$WORK/samples.txt" | sort | tee -a "$OUT"
 say "== load, sampled every ${SAMPLE} s: $(awk '{ split($2, l, "[=,]"); if (l[2] > max) max = l[2] } END { print "highest 1-minute " max }' "$WORK/samples.txt"); at the end: $(load)"
 say "record: $OUT; samples: $WORK/samples.txt; logs: $WORK/logs"
+# A harness with a step every run of which failed fails the round, loudly (main's r592: every slates git and svn step
+# failed, and the round ended as if it had a record).
+if [ -n "$FAILED_TOOLS" ]; then
+  say "FAILED: the harness of$FAILED_TOOLS had a step every run of which failed; see its table above"
+  exit 1
+fi

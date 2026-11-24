@@ -67,9 +67,9 @@ use crate::table::{
 /// slots.
 pub const TAIL_SLOT_BYTES: usize = size_of::<(Box<[u8]>, Box<[u8]>)>();
 
-/// Derived: the size-tiered rule's one decision ([`Index::tiered_due`]): the newest runs are merged while their tables'
-/// bytes together, doubled by this, reach the next older run's. So each run holds more than this many times the bytes
-/// of all the runs newer than it together, the bytes to a run grow more than [`TIER_BASE`] = this + 1 fold a run, and
+/// Derived: the size-tiered rule's one decision ([`Index::tiered_due`]): the newest runs are merged through the deepest
+/// run whose bytes are at most this many times all the newer runs' together. So each run holds more than this many
+/// times the bytes of all the runs newer than it together, the bytes to a run grow more than [`TIER_BASE`] = this + 1 fold a run, and
 /// an index's own runs number at most ⌊log_{TIER_BASE}(own bytes ÷ the fewest bytes a seal writes)⌋ + 1. Change it and
 /// the base, the bound and the key filters' size ([`crate::filter`]) follow.
 pub const TIER_RATIO: u64 = 2;
@@ -1102,32 +1102,36 @@ impl Index {
 
   /// The merge the size-tiered rule says is due now (goal 93: a push's fork seals as it appends and never had its runs
   /// merged, so each new row's lookup walked every run it sealed; arena-14's segment steps grew past the watchdog): the
-  /// number of the newest runs only this index holds to merge, the newest taken while their tables' bytes together are
-  /// at least the next older one's over [`TIER_RATIO`] (half); `None` below two. Asked after every seal and merged to its end each time, it
-  /// keeps each run holding more than twice the bytes of all the runs newer than it together, so the bytes to a run grow
-  /// more than threefold a run. Weighed in bytes, not rows (goal 93 (B); r499 held 8 own runs where a bound in rows
-  /// computed 6): a seal is due by bytes, a window of them, so a seal of large rows writes few rows, and a rule in rows
-  /// let each phase of larger rows keep a stack of its own beside the runs of smaller rows before it.
+  /// number of the newest runs only this index holds to merge, through the deepest own run whose tables' bytes are at
+  /// most [`TIER_RATIO`] times the bytes of all the own runs newer than it together; `None` where there is none. The
+  /// rule's invariant is that every own run holds more than that many times the bytes of all newer own runs together,
+  /// and a seal adds bytes to the newer runs of every run below it, so it can break the invariant at any depth (r618:
+  /// the rule once stopped at the first older run past its share, and held 8 own runs where the bound is 6; runs of
+  /// 100, 40 and 10 rows and a seal of 4 left the oldest at most twice the 54 newer, nothing due). Merging the newest
+  /// through the deepest such run changes no deeper run's newer bytes, so one merge restores the invariant for the whole
+  /// stack. Asked after every seal and merged to its end each time, the bytes to a run grow more than [`TIER_BASE`] fold
+  /// a run. Weighed in bytes, not rows (goal 93 (B); r499 held 8 own runs where a bound in rows computed 6): a seal is
+  /// due by bytes, a window of them, so a seal of large rows writes few rows, and a rule in rows let each phase of larger
+  /// rows keep a stack of its own beside the runs of smaller rows before it.
   ///
-  /// Derived ([`TIER_RATIO`], [`TIER_BASE`]): an index's own runs number at most ⌊log₃(their tables' bytes ÷ the
-  /// fewest bytes a seal writes)⌋ + 1
-  /// ([`Index::own_bytes`]). A seal writes a window's bytes of rows at most, and about a window when its rows are small
-  /// beside the window; a table cut before a row near a window long is short, so the fewest is the data's, not fixed.
-  /// A lookup walks that many of them at most beside the runs it shares (its parent's, merged by the parent's own rule).
-  /// Read from the runs as they are marked (a shared run is passed over), with no look at the store: cheap after any
-  /// seal. Beside [`Index::compaction_due`]'s rent-or-buy, which weighs measured lookups an index answers for long.
+  /// Derived ([`TIER_RATIO`], [`TIER_BASE`]): where no merge is due, an index's own runs number at most ⌊log₃(their
+  /// tables' bytes ÷ the fewest bytes a seal writes)⌋ + 1 ([`Index::own_bytes`]); between a seal and the end of the
+  /// merge it makes due, one more (the run it sealed). A seal writes a window's bytes of rows at most, and about a window
+  /// when its rows are small beside the window; a table cut before a row near a window long is short, so the fewest is
+  /// the data's, not fixed. A lookup walks that many of them at most beside the runs it shares (its parent's, merged by
+  /// the parent's own rule). Read from the runs as they are marked (a shared run is passed over), with no look at the
+  /// store: cheap after any seal. Beside [`Index::compaction_due`]'s rent-or-buy, which weighs measured lookups an index
+  /// answers for long.
   pub fn tiered_due(&self) -> Option<usize> {
-    let mut own = self.runs.iter().rev().filter(|run| !run.shared);
-    let mut merged = own.next()?.bytes;
-    let mut runs = 1_usize;
-    for older in own {
-      if merged.saturating_mul(TIER_RATIO) < older.bytes {
-        break;
+    let mut newer = 0_u64;
+    let mut due = None;
+    for (depth, run) in self.runs.iter().rev().filter(|run| !run.shared).enumerate() {
+      if depth > 0 && run.bytes <= newer.saturating_mul(TIER_RATIO) {
+        due = Some(depth.saturating_add(1));
       }
-      merged = merged.saturating_add(older.bytes);
-      runs = runs.saturating_add(1);
+      newer = newer.saturating_add(run.bytes);
     }
-    (runs >= 2).then_some(runs)
+    due
   }
 
   /// The bytes of the tables of the runs only this index holds: what the size-tiered rule's bound is stated over
