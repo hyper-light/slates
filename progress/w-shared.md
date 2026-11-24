@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 10:45 PST 11-24: LANDED A-894, main 87a0b1b8c: a repository's creation answers once its record is placed at f + 1
+  (63.8 ms at f = 1, debug), held on the destroy's hold made general (live_ship::defer_until_placed). Red: git_fleet's
+  immediate check 0 of 2 holders. FOUND (GAPS OPEN): after a repository's takeover, a push is refused at both survivors
+  ("not found" at the non-successor's edge, "unable to commit" at the successor). NEXT (scheduled by main): the poll
+  #[must_use] sweep. Gate 10 (A-902) result pending from main.
+
 ## 09:55 PST 11-24: LANDED A-902, main d48863ddb: a home behind its sender's configuration waits for its own install
   within the put's budget (gate 9: NotAHome 0.83-1.89 ms into 2 s, 3 of 40). Home wire 0x84; agreed in writing with
   w-git. Red in-process (a) refused at once, (b)/(d) no wait; green 2.25 s. OWED (main): gate 10 at d48863ddb, 0 of 40.
