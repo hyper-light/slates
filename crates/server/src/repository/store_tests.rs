@@ -594,19 +594,35 @@ fn read_back(
   bytes: &[u8],
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
   let identity = *blake3::hash(bytes).as_bytes();
-  crate::daemon::observe_first(daemon, move |state| {
-    // Read as a session reads it: through the green, then the content store, then the records (`svn_view::lend_in`).
-    let held = crate::vcs_store::svn_view::lend_in(state, repository, |lent| {
-      slates_svn::reads::Repository::text(lent.repository, &identity, 0)
-        .map(std::borrow::Cow::into_owned)
-    })
-    .flatten();
-    let green = super::svn_commit::green_of(state, repository).ok();
-    let file = green
-      .and_then(|green| state.greens.get(&green))
-      .and_then(|engine| engine.content_bytes("trunk/a.txt").map(<[u8]>::to_vec));
-    (held, file)
-  })
+  let named = slates_merge::named::Identity {
+    hash: identity,
+    len: u64::try_from(bytes.len()).unwrap(),
+  };
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      // Its windows brought back first where they were let go, as a parked read brings them (A-760 (b) 4d).
+      let _pin = crate::vcs_store::named_objects::bring_back_range(named, (0, named.len))
+        .await
+        .ok();
+      crate::state::with_state(|state| {
+        // Read as a session reads it: through the green, then the content store, then the records
+        // (`svn_view::lend_in`).
+        let held = crate::vcs_store::svn_view::lend_in(state, repository, |lent| {
+          slates_svn::reads::Repository::text(lent.repository, &identity, 0)
+            .map(std::borrow::Cow::into_owned)
+        })
+        .flatten();
+        let green = super::svn_commit::green_of(state, repository).ok();
+        let file = green.and_then(|green| {
+          crate::vcs_store::named_objects::read_file(state, green, "trunk/a.txt")
+        });
+        (held, file)
+      })
+      .unwrap()
+    },
+    std::time::Duration::from_secs(60),
+  )
 }
 
 /// Revision 1's changeset carries the text it put (C2 stage B): its payload `alpha\n`, the `Texts` entry naming it there,
@@ -1227,11 +1243,7 @@ fn a_subversion_copy_from_a_stored_revision_reads_a_window_that_was_let_go() {
         .map(|landed| landed.revision);
       let copied = crate::state::with_state(|state| {
         let green = super::svn_commit::green_of(state, repository).ok()?;
-        state
-          .greens
-          .get(&green)?
-          .content_bytes("copy/a.txt")
-          .map(<[u8]>::to_vec)
+        crate::vcs_store::named_objects::read_file(state, green, "copy/a.txt")
       })
       .flatten();
       (released, durable, committed, copied)
@@ -1345,8 +1357,9 @@ fn restart_with_two_named_texts(release_window: bool) {
             assert!(content.holds_whole(&identity));
             if release {
               assert!(content.mark_landed(&identity));
+              // Whatever holds it: the staging's put, and any green's name for it (A-760 (b) 4c).
               assert_eq!(
-                content.let_go(&identity),
+                content.let_go_landed(&identity, None),
                 Ok(u64::try_from(expected.len()).unwrap())
               );
             }
@@ -1422,12 +1435,12 @@ fn a_subversion_restart_replays_a_named_text_with_one_released_window() {
 /// The re-adoption's bring-back (main 01a20182's ruling of 2026-11-23, the sibling of the remake fix cf1529f1d): a
 /// takeover's re-adoption replays the green's own checkpoint and chain onto the engine it is handed, and since A-869 the
 /// checkpoint names its texts. Do: on a daemon holding a store, land revision 1 adding `/trunk/a.txt`, whose checkpoint
-/// names its text; leave the text the node's store's alone (the content store holds none of it) and the green as a
+/// names its text; leave the text the node's store's alone (the content store holds none of its bytes) and the green as a
 /// restart leaves an adopted one (its engine gone, awaiting its re-adoption through version 0); re-adopt it over a
 /// seeded engine (`green_adopt::readopt_with`, as the existing readoption test hands `Green::new()`); then commit
 /// revision 2. Expect: re-adopted, the file the text's bytes, the next commit revision 2. Failing first: the replay
 /// fenced the green `ContentMissing` (no pre-pass), so it was not re-adopted. End to end this stays unreachable until
-/// A-727 (d): an svn takeover fails today at the holder's replica build (`merge.replica.checkpoint_unread`).
+/// A-727 (d): an svn takeover fails today at the holder's replica build (its recomputed versions' named runs unread).
 #[test]
 fn a_readopted_green_brings_back_the_texts_its_checkpoint_names_first() {
   use slates_svn::index::Action;
@@ -1445,13 +1458,11 @@ fn a_readopted_green_brings_back_the_texts_its_checkpoint_names_first() {
   let identity = slates_vcs::ContentId(*blake3::hash(text).as_bytes());
   let green = crate::daemon::observe_first(&daemon, move |state| {
     let green = super::svn_commit::green_of(state, repository).unwrap();
+    // The node's store's alone: every window let go, landed (A-760 (b) 4d; the green's name keeps the entry, as every
+    // named file's does).
     crate::vcs_store::within_budget(state, 0, |stores| {
       if let Some(content) = stores.content_mut() {
-        while content.contains(&identity) {
-          if content.release(&identity).is_err() {
-            break;
-          }
-        }
+        let _ = content.let_go_object_landed(&identity, &|_| None);
       }
     });
     if let Some((lineage, Ok(mut release))) = state.greens.retire(&green) {
@@ -1479,13 +1490,8 @@ fn a_readopted_green_brings_back_the_texts_its_checkpoint_names_first() {
       let readopted =
         crate::green_adopt::readopt_with(shard, shard, green, slates_merge::engine::Green::new())
           .await;
-      let served = crate::state::with_state(|state| {
-        state
-          .greens
-          .get(&green)
-          .and_then(|engine| engine.content_bytes("trunk/a.txt").map(<[u8]>::to_vec))
-      })
-      .flatten();
+      // Read through the green's name for it, its windows brought back from the node's store (A-760 (b) 4d).
+      let served = crate::vcs_store::named_objects::read_file_brought(green, "trunk/a.txt").await;
       (readopted, served)
     },
     std::time::Duration::from_secs(60),

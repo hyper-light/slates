@@ -579,3 +579,25 @@ async fn waiter(repository: RepositoryId) {
     }
   });
 }
+
+#[cfg(test)]
+mod teardown_tests {
+  /// Main's order of 2026-11-23 (CLAUDE.md section 2 item 6: no product panic in a destructor). A shard's state stays
+  /// installed until its thread ends (`state::install`; nothing takes it), so a daemon's stop drops it in the thread's
+  /// local storage teardown, and a landing turn it holds gives itself back from its `Drop` (`landing::Turn`) through
+  /// `state::with_state_counted`. Do: on a stored daemon, take a Subversion repository's landing turn and leave it held
+  /// in the shard's state (a waiting task's ready turn), then stop the daemon. Expect: the daemon stops. Failing first:
+  /// the turn's give-back read the state's thread-local during its own destruction, which panicked in a destructor
+  /// ("cannot access a Thread Local Storage value during or after destruction"), aborting the process.
+  #[test]
+  fn a_daemon_stopped_with_a_landing_turn_held_ends_without_a_panic() {
+    use crate::repository::svn_commit::tests::{on, stored, subversion};
+    stored(|| async move {
+      let (svn, _) = subversion("held-turn").await;
+      on(|state| {
+        let turn = super::Turn::take_now(state, svn).expect("the repository's turn free");
+        state.made_commits.ready.insert(svn, turn);
+      });
+    });
+  }
+}

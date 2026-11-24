@@ -346,7 +346,9 @@ fn with_export<R>(
   let view = crate::vcs_store::svn_presenter::view_of(&s.svn_views, volume);
   let view_green =
     view.and_then(|repository| crate::repository::svn_commit::green_of(s, repository).ok());
-  crate::vcs_store::svn_presenter::lent_if(s, view.is_some(), move |s| {
+  // So is a mounted work's base held by name (A-760 (b) 4d).
+  let lend = view.is_some() || crate::mounted_work::reads_named(s, volume);
+  crate::vcs_store::svn_presenter::lent_if(s, lend, move |s| {
     with_export_lent(s, volume, who, (rights, capability), (view, view_green), f)
   })
 }
@@ -405,9 +407,13 @@ fn with_export_lent<R>(
     .map(crate::vcs_store::svn_presenter::ViewTexts);
   // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
   let lent_green = crate::mounted_work::source(greens, &merge.mounted, volume);
-  let green_tree = lent_green
-    .as_ref()
-    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let green_tree = lent_green.as_ref().map(|(green, version)| {
+    crate::green_tree::GreenTree::reading(
+      green,
+      *version,
+      crate::vcs_store::named_objects::plane(vcs_stores, &()),
+    )
+  });
   let mut tree_lens = None;
   let mut handles = new_handle_store();
   let served = {
@@ -1307,7 +1313,8 @@ async fn serve_remote(
     origin,
     owner,
     move || async move {
-      let ((served, owed), _) = serve_local_seen(requester, xid, program, procedure, &args, port);
+      let ((served, owed), _) =
+        serve_local_parked(requester, xid, program, procedure, &args, port).await;
       let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
@@ -1609,6 +1616,83 @@ fn serve_local_seen(
   )
 }
 
+/// Counter: NFS calls parked on a read of a named text's let-go window while it came back from the node's store, then
+/// served again (A-760 (b) 4d; main's ruling (B)). Format: a counter name.
+const PARKED_ON_AWAY: &str = "nfs.parked_on_away";
+/// Counter: NFS calls refused a park because the parked table was at its bound: answered the transport's I/O error.
+/// Format: a counter name.
+const PARK_REFUSED: &str = "nfs.park_refused";
+/// Counter: a call served again over the windows it was parked on that met a let-go window again: a bug, answered the
+/// transport's I/O error and logged naming the object, never parked again. Format: a counter name.
+const AWAY_AGAIN: &str = "nfs.away_again";
+/// Counter: a parked call whose windows the node's store did not give back: answered the transport's I/O error.
+/// Format: a counter name.
+const BRING_BACK_REFUSED: &str = "nfs.bring_back_refused";
+
+/// A parked call's entry in the shard's table ([`ParkedReads`](crate::vcs_store::named_objects::ParkedReads)), released
+/// at the call's terminal step, answered or cancelled (its future dropped).
+struct Parked(u64);
+
+impl Drop for Parked {
+  fn drop(&mut self) {
+    let id = self.0;
+    let _ = state::with_state(|s| s.nfs_parked.release(id));
+  }
+}
+
+/// Serves one call locally ([`serve_local_seen`]), parking it where a read met a named text's let-go window (A-760 (b)
+/// 4d): the windows its reads wanted brought back from the node's store and kept until it is answered, then served
+/// again, which by construction meets none let go. The miss's answer stays here, never the client's. A second miss is a
+/// bug, counted and logged; a full table, or a bring-back the store refuses, is answered as served (the transport's
+/// I/O error), counted. One entry per parked call, bounded by the connections the listener holds.
+async fn serve_local_parked(
+  requester: Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> (Answered, Option<u64>) {
+  use crate::vcs_store::named_objects::{away_scope, bring_back_reads};
+  let mut held: Option<(Parked, Vec<crate::vcs_store::named_objects::ReadPin>)> = None;
+  loop {
+    let (served, away) =
+      away_scope(|| serve_local_seen(requester.clone(), xid, program, procedure, args, port));
+    let Some(first) = away.first().copied() else {
+      return served;
+    };
+    if held.is_some() {
+      let _ = state::with_state_counted(|s| s.count(AWAY_AGAIN, 1));
+      slates_machine::log_line!(
+        "slates-server: an NFS call served again over its brought-back windows met {:?} let go again",
+        first.identity
+      );
+      return served;
+    }
+    let parked = state::with_state(|s| {
+      let bound = s.config.held_connection_bound();
+      s.nfs_parked.park(away.clone(), bound)
+    })
+    .flatten();
+    let Some(parked) = parked.map(Parked) else {
+      let _ = state::with_state_counted(|s| s.count(PARK_REFUSED, 1));
+      return served;
+    };
+    let _ = state::with_state_counted(|s| s.count(PARKED_ON_AWAY, 1));
+    match bring_back_reads(&away).await {
+      Ok(pins) => held = Some((parked, pins)),
+      Err(refused) => {
+        let _ = state::with_state_counted(|s| s.count(BRING_BACK_REFUSED, 1));
+        slates_machine::log_line!(
+          "slates-server: an NFS call parked on {:?} was not brought back: {refused:?}",
+          first.identity
+        );
+        return served;
+      }
+    }
+  }
+}
+
 /// Counter: NFSv3 calls the recall gate refused that were held for the delegation's return rather than answered
 /// `NFS3ERR_JUKEBOX` (A-79), one per wait.
 const V3_HELD: &str = "nfs.v3.held_for_recall";
@@ -1634,7 +1718,7 @@ async fn serve_local_held(
   let mut deadline: Option<u64> = None;
   loop {
     let ((served, owed), seen) =
-      serve_local_seen(requester.clone(), xid, program, procedure, args, port);
+      serve_local_parked(requester.clone(), xid, program, procedure, args, port).await;
     let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.

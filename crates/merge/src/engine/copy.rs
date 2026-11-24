@@ -241,15 +241,27 @@ impl<'a> SourceAt<'a> {
     Some((rel, self.fix.is_none_or(|fix| grafted_in(fix, rel))))
   }
 
-  /// The file's bytes at `path`.
-  pub(super) fn content(&self, path: &str) -> Option<&'a [u8]> {
+  /// The file at `path`: its bytes, or the object it is held by alone (A-760 (b) 4d).
+  pub(super) fn content(&self, path: &str) -> Option<super::Content<'a>> {
     let Some(fix) = self.fix else {
       return self.green.content.get(path);
     };
     let (rel, grafted) = self.place(path)?;
     match fix.files.get(rel) {
-      Some(bytes) => bytes.as_deref(),
+      Some(bytes) => bytes.as_deref().map(super::Content::Bytes),
       None => self.green.content.get(path).filter(|_| grafted),
+    }
+  }
+
+  /// The file's bytes at `path`: none for an absent file, and for an unlent named one, whose read is noted
+  /// (`crate::unlent`), so the verdict reading it is refused.
+  pub(super) fn bytes(&self, path: &str) -> Option<&'a [u8]> {
+    match self.content(path)? {
+      super::Content::Bytes(bytes) => Some(bytes),
+      super::Content::Named(identity) => {
+        crate::unlent::note(identity);
+        None
+      }
     }
   }
 
@@ -1035,7 +1047,8 @@ impl Green {
     if let Some(mode) = self.modes.get(target) {
       linked.push(Effect::Mode(copied.clone(), *mode));
     }
-    let bytes = self.content.get(target).map(<[u8]>::to_vec);
+    // Subversion has no hard links, so no named file is ever a link's node; were one, its unlent read is noted.
+    let bytes = self.head_bytes(target).map(<[u8]>::to_vec);
     let source = ContentSource::Copied(target.to_owned(), Vec::new());
     linked.push(Effect::SetContent(copied, bytes, Vec::new(), source));
   }
@@ -1114,8 +1127,11 @@ impl Green {
     }
     let rel = relative(path, source).unwrap_or_default().to_owned();
     let grafted = grafted_in(fix, &rel);
-    let then = self.content_ref_at_bytes(path, version);
-    if then.as_deref() != self.content.get(path).filter(|_| grafted) {
+    // Told apart by their digests, so a named file is read only where it differs; a fix carries bytes, so an unlent
+    // named text it carries is noted and the verdict refused (`crate::unlent`).
+    let now = self.content.get(path).filter(|_| grafted);
+    if self.digest_at(path, version) != now.as_ref().map(super::Content::digest) {
+      let then = self.bytes_at(path, version);
       fix
         .files
         .insert(rel.clone(), then.map(std::borrow::Cow::into_owned));
@@ -1369,7 +1385,14 @@ impl Green {
     let Some(source) = brought.content(from) else {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     };
-    let bytes = apply(source, ops, post_state);
+    // A named source the ops replace whole is made over with its length alone (a Subversion copy's text is whole); any
+    // other unlent one reads as none, noted: the verdict is refused, never judged over it.
+    let bytes = match source {
+      super::Content::Named(identity) if !super::keeps_base(identity.len, ops) => {
+        super::apply_over((&[], identity.len), ops, post_state)
+      }
+      _ => apply(brought.bytes(from).unwrap_or_default(), ops, post_state),
+    };
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
@@ -1449,9 +1472,7 @@ impl Green {
           0
         } else {
           let (brought, from) = self.copied_source((r, fixes), path);
-          brought
-            .content(&from)
-            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+          brought.content(&from).map_or(0, |content| content.len())
         };
         !super::fits_base(ops, base_len, post_len)
       })
@@ -1882,8 +1903,8 @@ impl Green {
   fn entry_at(&self, key: &IdentityKey, from: &str, version: u64) -> Option<Entry> {
     match key {
       IdentityKey::File(path) => self
-        .content_ref_at_bytes(from, version)
-        .map(|bytes| file_entry_of(path, &bytes)),
+        .digest_at(from, version)
+        .map(|digest| super::file_entry(path, digest)),
       IdentityKey::Special(path) => self
         .special_at(from, version)
         .map(|node| special_entry(path, &node)),

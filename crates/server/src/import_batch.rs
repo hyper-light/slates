@@ -150,29 +150,33 @@ impl ImportBatch {
     }
     let preview = self.preview.as_ref().ok_or(StageRefused::Unavailable)?;
     let holders = crate::merge_service::record_goes_to_holders(state, self.green);
-    let judged = state.greens.with_preview_mut(preview, |engine| {
-      // The scratch member counts its versions from 0: the work's base, read there, and each copy's source version
-      // (a Subversion copy names the head it copies from, w-svn's C2 stage C) moved into its numbering for the verdict.
-      let offset = head.saturating_sub(engine.head());
-      work.base = engine.head();
-      in_numbering(&mut work, |version| version.checked_sub(offset));
-      let reserved = engine
-        .history_reservation(&work)
-        .saturating_add(engine.changes_reservation(&work));
-      // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
-      let (outcome, mut applied) = engine.submit_named(&mut work);
-      let identity = holders.then(|| engine.head_identity());
-      // Back into the green's numbering: the work's copies, and those its verdict records.
-      in_numbering(&mut work, |version| version.checked_add(offset));
-      if let Some(applied) = applied.as_mut() {
-        for step in applied.iter_mut() {
-          if let Applied::CopyTree { version, .. } = step {
-            *version = version.saturating_add(offset);
-          }
+    // Judged once; judged again once lent from the content plane every named text a copy or a splice read unlent
+    // (A-760 (b) 4d), which the scratch member holds by name alone as the green does.
+    let mut lent = Vec::new();
+    let mut judged_again = false;
+    let judged = loop {
+      let judged = state.greens.with_preview_mut(preview, |engine| {
+        for (identity, bytes) in std::mem::take(&mut lent) {
+          engine.lend(identity, bytes);
         }
+        let judged = judge_staged(engine, &mut work, (head, holders));
+        engine.let_named_bytes_go();
+        judged
+      });
+      let unlent = match judged {
+        Ok(Ok(staged)) => break Ok(staged),
+        Ok(Err(unlent)) => unlent,
+        Err(refused) => break Err(refused),
+      };
+      if judged_again {
+        state.count(crate::vcs_store::name_holds::NAME_LEND_MISSED, 1);
+        return Err(StageRefused::Unavailable);
       }
-      (outcome, applied, identity, reserved)
-    });
+      lent = crate::vcs_store::name_holds::read_from_plane(state, &unlent)
+        .map_err(|_| StageRefused::Unavailable)?;
+      state.count(crate::vcs_store::name_holds::NAME_LENT_VERDICTS, 1);
+      judged_again = true;
+    };
     work.base = head;
     let (outcome, applied, identity, reserved) = judged.map_err(|_| StageRefused::Unavailable)?;
     let (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) = (&outcome, applied)
@@ -251,4 +255,50 @@ impl Drop for ImportBatch {
       let _ = crate::state::with_state_counted(|state| state.greens.retire_preview(preview));
     }
   }
+}
+
+/// What a staged work's verdict in the scratch member gives: its outcome, what its entry records, the member's head
+/// identity where holders take its record, and the history and change bytes reserved for it.
+type StagedVerdict = (Outcome, Option<Vec<Applied>>, Option<[u8; 32]>, usize);
+
+/// `work` judged into the scratch member `engine` at the batch's head `head` (in the green's numbering), moved into the
+/// member's numbering for the verdict and back: refused naming every named text the verdict read that the member holds
+/// by name alone with none lent ([`Green::unlent_reads`], A-760 (b) 4d), nothing judged.
+fn judge_staged(
+  engine: &mut Green,
+  work: &mut Increment,
+  (head, holders): (u64, bool),
+) -> Result<StagedVerdict, std::collections::BTreeSet<slates_merge::named::Identity>> {
+  // The scratch member counts its versions from 0: the work's base, read there, and each copy's source version
+  // (a Subversion copy names the head it copies from, w-svn's C2 stage C) moved into its numbering for the verdict.
+  let offset = head.saturating_sub(engine.head());
+  work.base = engine.head();
+  in_numbering(work, |version| version.checked_sub(offset));
+  let reserved = engine
+    .history_reservation(work)
+    .saturating_add(engine.changes_reservation(work));
+  // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
+  let (outcome, mut applied) = engine.submit_named(work);
+  let unlent = match outcome {
+    Outcome::ContentUnread { identity }
+      if !work.named.runs.iter().any(|run| run.identity == identity) =>
+    {
+      Some(engine.unlent_reads(work))
+    }
+    _ => None,
+  };
+  let identity = holders.then(|| engine.head_identity());
+  // Back into the green's numbering: the work's copies, and those its verdict records.
+  in_numbering(work, |version| version.checked_add(offset));
+  if let Some(unlent) = unlent {
+    return Err(unlent);
+  }
+  if let Some(applied) = applied.as_mut() {
+    for step in applied.iter_mut() {
+      if let Applied::CopyTree { version, .. } = step {
+        *version = version.saturating_add(offset);
+      }
+    }
+  }
+  Ok((outcome, applied, identity, reserved))
 }

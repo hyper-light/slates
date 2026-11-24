@@ -581,12 +581,19 @@ fn a_stored_text_let_go(
             for piece in committed.chunks(window) {
               let window = slates_vcs::ContentId::of(piece);
               assert!(content.mark_landed(&window), "a window of the text");
-              content.let_go(&window).unwrap();
+              // Let go whatever holds it (the green's name holds the text, A-760 (b) 4c), or gone already (main's (B)).
+              let gone = content.let_go_landed(&window, None);
+              assert!(
+                matches!(gone, Ok(_) | Err(slates_vcs::LetGoRefused::Away)),
+                "{gone:?}"
+              );
             }
           });
         });
       }
-      // Every hold RAM has on the text let go: the green's held table's and the content store's.
+      // Every byte RAM has of the text let go: the green's held table's hold given back, and every window of it let go,
+      // landed (A-760 (b) 4d). The green's file names it alone, its hold keeping the content store's entry, so a reader
+      // brings its bytes back from the node's store.
       crate::state::with_state(|state| {
         if let Some(mut engine) = state.greens.get_mut(&green) {
           while engine.held(&text.identity).is_some() {
@@ -595,12 +602,7 @@ fn a_stored_text_let_go(
         }
         crate::vcs_store::within_budget(state, 0, |stores| {
           if let Some(content) = stores.content_mut() {
-            let content_id = slates_vcs::ContentId(text.identity);
-            while !away && content.contains(&content_id) {
-              if content.release(&content_id).is_err() {
-                break;
-              }
-            }
+            let _ = content.let_go_object_landed(&slates_vcs::ContentId(text.identity), &|_| None);
           }
         });
       });

@@ -2416,6 +2416,21 @@ impl Acceptor {
     Ok(())
   }
 
+  /// Installs `authority`, this node's own as a takeover's successor adopting the object, and records the adoption as
+  /// the move it is (§4.8 phase two; main 01a20182's ruling of 2026-11-23 on the warm-restarted successor): the departed
+  /// owner's object moved to its successor at the retirement `from` names, whatever authority this acceptor served
+  /// before (the departed's, its own after an install, or none, a fresh acceptor). So the adopted copy falls in that
+  /// retirement's round for its adopter ([`crate::takeover::copy_falls_to`]), and a round run again after the adopter
+  /// restarted warm counts the adoption as the adopter's own promise of the object, never refusing it by name: the
+  /// rerun reaches the end of the run it replaces. Before, an adopted copy kept whatever move it had, none for a copy
+  /// made at the adoption, and the rerun refused it by name as the adopter's own object, waited for that promise and
+  /// gave the object up. A later retirement of the same host never counts it (A-883).
+  pub fn adopt(&mut self, authority: Authority, from: MovedFrom) -> Result<(), RegisterError> {
+    self.install_authority(authority)?;
+    self.moved_from = Some(from);
+    Ok(())
+  }
+
   /// Answers a new owner's phase-one [`Prepare`] (§4.8 "Promotion and takeover"): raises this holder's
   /// fence for the object's host to the prepare's epoch and reports the highest record it holds for the
   /// object, so the new owner can adopt the newest across a quorum before it serves. The checks mirror
