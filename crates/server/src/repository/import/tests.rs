@@ -386,8 +386,8 @@ const ONE_CALL_ROOM: u64 = 1 << 24;
 const ONE_CALL_WINDOW: usize = 1 << 12;
 
 /// What a Mercurial repository serves (A-687; §4.17.3 "The repository's index", decisions 2 and 3): its index's rows,
-/// every changeset's text read back through the index, the register's phase roots, and each bookmark's name with its
-/// green's head changeset and head identity.
+/// every changeset's text read back through the index (through the changeset store where it was let go once landed), the
+/// register's phase roots, and each bookmark's name with its green's head changeset and head identity.
 #[derive(Debug, PartialEq, Eq)]
 struct Served {
   /// The index's rows, each its key and body.
@@ -421,6 +421,7 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
       (name, head, engine.head_identity())
     })
     .collect();
+  let disk = state.vcs_disk.clone().expect("a changeset store");
   let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
   let (content, store) = lent.stores.mercurial(id).expect("the store");
   let content: &ContentStore = content;
@@ -434,7 +435,19 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
   let texts = (0..index.len(content, Log::Changelog))
     .map(|rev| {
       let row = index.changeset(content, rev).expect("a changeset");
-      content.object_bytes(&row.text, row.len).expect("its text")
+      // Let go once the import landed (goal 93, C1 (1) P5): read back through the changeset store, as a reader does.
+      content.object_bytes(&row.text, row.len).unwrap_or_else(|| {
+        let mut ask = slates_hg::push::held::TextAsk::new(
+          slates_hg::push::intake::CHANGELOG_PATH.to_vec(),
+          row.node,
+          row.len,
+        );
+        assert!(
+          crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(id.bytes), &mut ask),
+          "the changeset store answered"
+        );
+        ask.taken().map(|(_, _, text)| text).expect("its text")
+      })
     })
     .collect();
   Served {
