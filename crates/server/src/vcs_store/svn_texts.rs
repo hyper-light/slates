@@ -666,23 +666,55 @@ pub(crate) fn follow(
   released: &[FileText],
   held: &[FileText],
 ) {
-  set_room(state, green);
+  let mut at = 0;
+  follow_some(state, green, (released, held), (&mut at, u64::MAX));
+}
+
+/// [`follow`] a slice at a time (goal 93: an import's landing followed 9,000 paths in one step): from `at`, a place
+/// among `released` then `held`, until the shard's clock passes `deadline_ns`, at least one; `at` moved past those
+/// followed. Whether every one is followed. The held room is set at the first.
+pub(crate) fn follow_some(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  (released, held): (&[FileText], &[FileText]),
+  (at, deadline_ns): (&mut usize, u64),
+) -> bool {
+  if *at == 0 {
+    set_room(state, green);
+  }
+  let total = released.len().saturating_add(held.len());
   let (mut refused, mut holds) = (0u64, 0u64);
   if let Some(mut engine) = state.greens.get_mut(&green) {
-    for (identity, _) in released {
-      if engine.release_held(identity).is_err() {
-        refused = refused.saturating_add(1);
+    while *at < total {
+      let place = *at;
+      *at = place.saturating_add(1);
+      match place.checked_sub(released.len()) {
+        None => {
+          if let Some((identity, _)) = released.get(place)
+            && engine.release_held(identity).is_err()
+          {
+            refused = refused.saturating_add(1);
+          }
+        }
+        Some(place) => {
+          if let Some((identity, path)) = held.get(place) {
+            match engine.hold_path(*identity, path) {
+              Ok(()) => holds = holds.saturating_add(1),
+              Err(_) => refused = refused.saturating_add(1),
+            }
+          }
+        }
+      }
+      if slates_rt::futures::now_ns() >= deadline_ns {
+        break;
       }
     }
-    for (identity, path) in held {
-      match engine.hold_path(*identity, path) {
-        Ok(()) => holds = holds.saturating_add(1),
-        Err(_) => refused = refused.saturating_add(1),
-      }
-    }
+  } else {
+    *at = total;
   }
   state.count(HELD, holds);
   state.count(REFUSED, refused);
+  *at >= total
 }
 
 /// Holds every file of repository `id`'s head in its green, in byte order, where the green holds none (module docs: a
