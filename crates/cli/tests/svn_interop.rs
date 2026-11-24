@@ -301,9 +301,15 @@ fn exit_within(child: &mut Child, what: &str) -> i32 {
 }
 
 fn pause() {
+  PAUSES.with(|pauses| pauses.set(pauses.get().saturating_add(1)));
   // The harness paces its polls; shipped code parks on its driver (D-9).
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(POLL);
+}
+
+thread_local! {
+  /// Counter: this thread's [`pause`]s, for [`a_commands_wait_takes_no_timed_pause`]'s non-vacuity.
+  static PAUSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Writes `text` as working copy `copy`'s [`FILE`]: the test writes the file stock `svn` commits, inside the scratch
@@ -3564,6 +3570,20 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     slates_leg.name
   );
   assert!(failed.is_empty(), "differences:\n{}", failed.join("\n"));
+}
+
+/// Main 01a20182's order (r546, 2026-11-23: the use test over HTTP with git-2000.dump killed at its 5,400 s bound, the
+/// test thread found sleeping in the harness's poll between short-lived `svn` children, the daemon at 32 s of CPU in 28
+/// minutes). A stock command's wait must not be a timed sleep: on a host whose timer policy stretches a sleep (launchd's
+/// stretches 10 ms to about 76 ms), every command pays it. Do: run `sh -c 'sleep 0.1'`, longer than the poll, through
+/// [`tool`], counting this thread's [`pause`]s. Expect it to end with status 0 and no pause taken.
+#[cfg(unix)]
+#[test]
+fn a_commands_wait_takes_no_timed_pause() {
+  let before = PAUSES.with(std::cell::Cell::get);
+  let (code, _, err) = tool("sh", ".", &["-c", "sleep 0.1"]);
+  let paused = PAUSES.with(std::cell::Cell::get).saturating_sub(before);
+  assert_eq!((code, paused), (0, 0), "{err}");
 }
 
 /// The comparison's own rule ([`canonical_tags`]). Do: put the two attribute orders the first run of
