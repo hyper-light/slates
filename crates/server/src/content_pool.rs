@@ -650,26 +650,48 @@ impl ExtentSource for ContentPool {
 
   fn available(&self) -> usize {
     let hold_open = self.hold_open;
-    self
-      .candidates()
-      .filter(|id| claimable_now(*id))
-      .filter(|id| match self.segment.pool_owner(usize::from(*id)) {
-        Ok(None) => true,
-        Ok(Some(POOL_HOLD_OWNER)) => hold_open,
-        _ => false,
-      })
-      .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
-      .sum()
+    let mut total = 0usize;
+    for slice in 0..usize::from(self.partitions) {
+      let base = slice.saturating_mul(POOL_EXTENTS_PER_PARTITION);
+      for (part, &(_, len)) in self.parts.iter().enumerate() {
+        let id = base.saturating_add(part);
+        let Ok(id_u16) = u16::try_from(id) else {
+          continue;
+        };
+        if !claimable_now(id_u16) {
+          continue;
+        }
+        let free = match self.segment.pool_owner(id) {
+          Ok(None) => true,
+          Ok(Some(POOL_HOLD_OWNER)) => hold_open,
+          _ => false,
+        };
+        if free {
+          total = total.saturating_add(len);
+        }
+      }
+    }
+    total
   }
 
   #[cfg(windows)]
   fn pending(&self) -> usize {
-    self
-      .candidates()
-      .filter(|id| crate::content_extents::remaking(*id))
-      .filter(|id| matches!(self.segment.pool_owner(usize::from(*id)), Ok(None)))
-      .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
-      .sum()
+    let mut total = 0usize;
+    for slice in 0..usize::from(self.partitions) {
+      let base = slice.saturating_mul(POOL_EXTENTS_PER_PARTITION);
+      for (part, &(_, len)) in self.parts.iter().enumerate() {
+        let id = base.saturating_add(part);
+        let Ok(id_u16) = u16::try_from(id) else {
+          continue;
+        };
+        if crate::content_extents::remaking(id_u16)
+          && matches!(self.segment.pool_owner(id), Ok(None))
+        {
+          total = total.saturating_add(len);
+        }
+      }
+    }
+    total
   }
 }
 

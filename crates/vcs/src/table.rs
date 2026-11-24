@@ -171,6 +171,27 @@ pub struct TableView<'a> {
   rows: usize,
 }
 
+/// Lexicographical key comparison, reading eight-byte big-endian words inline before falling back
+/// to byte comparison so short hash-prefixed keys never bounce through `memcmp`.
+#[inline]
+pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
+  let mut left = a;
+  let mut right = b;
+  while let (Some((la, lr)), Some((ra, rr))) = (
+    left.split_first_chunk::<WORD_BYTES>(),
+    right.split_first_chunk::<WORD_BYTES>(),
+  ) {
+    let lw = u64::from_be_bytes(*la);
+    let rw = u64::from_be_bytes(*ra);
+    if lw != rw {
+      return lw.cmp(&rw);
+    }
+    left = lr;
+    right = rr;
+  }
+  left.cmp(right)
+}
+
 impl<'a> TableView<'a> {
   /// Opens bytes from anywhere: the frame, every entry and the keys' order are checked (module docs).
   pub fn open(bytes: &'a [u8]) -> Result<TableView<'a>, TableRefused> {
@@ -274,14 +295,27 @@ impl<'a> TableView<'a> {
     TableView::split(self.entry(at)?)
   }
 
+  /// Key of row `at`, reading only `offset[at]` and its key header without parsing the body.
+  fn key_at(&self, at: usize) -> Option<&'a [u8]> {
+    let start = usize::try_from(self.offset(at)?).ok()?;
+    let rest = self.entries.get(start..)?;
+    let length = rest.get(..KEY_LENGTH_BYTES)?;
+    let key_len = usize::try_from(u32::from_le_bytes(
+      <[u8; KEY_LENGTH_BYTES]>::try_from(length).ok()?,
+    ))
+    .ok()?;
+    let key_end = KEY_LENGTH_BYTES.checked_add(key_len)?;
+    rest.get(KEY_LENGTH_BYTES..key_end)
+  }
+
   /// The row whose key is `key`, by binary search.
   pub fn get(&self, key: &[u8]) -> Option<RowRef<'a>> {
     let (mut low, mut high) = (0, self.rows);
     while low < high {
       let middle = low.midpoint(high);
-      let row = self.row(middle)?;
-      match row.key().cmp(key) {
-        Ordering::Equal => return Some(row),
+      let row_key = self.key_at(middle)?;
+      match compare_keys(row_key, key) {
+        Ordering::Equal => return self.row(middle),
         Ordering::Less => low = middle.checked_add(1)?,
         Ordering::Greater => high = middle,
       }
@@ -301,8 +335,10 @@ impl<'a> TableView<'a> {
     let (mut low, mut high) = (0, self.rows);
     while low < high {
       let middle = low.midpoint(high);
-      match self.row(middle) {
-        Some(row) if row.key() < start => low = middle.saturating_add(1),
+      match self.key_at(middle) {
+        Some(row_key) if compare_keys(row_key, start) == Ordering::Less => {
+          low = middle.saturating_add(1);
+        }
         _ => high = middle,
       }
     }

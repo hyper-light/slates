@@ -50,12 +50,46 @@
 //! admitted as one step before a byte of them is kept. A lowered budget refuses new bytes until releases bring the
 //! store under it, and never drops what is held.
 //!
-//! The map is ordered (`BTreeMap`) so that every walk of it is deterministic.
+//! Lookups (`entries`, `objects`, `rooted`) are O(1) hash maps keyed directly by the first eight
+//! bytes of each cryptographic BLAKE3 [`ContentId`]; the three paged-image families (`lists`,
+//! `names`, `aways`) keep ordered [`BTreeSet`] indexes so every image page (`lists_in`, `names_in`,
+//! `aways_in`) and walk (`lists`, `names`, `aways`) is deterministic and bounded by the page.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasher, Hasher};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
+
+/// Zero-overhead hasher for [`ContentId`]: every content identity is already a 256-bit
+/// cryptographic BLAKE3 digest, so its first eight bytes are uniform and collision-resistant
+/// without re-hashing.
+#[derive(Default)]
+struct ContentIdHasher(u64);
+
+impl Hasher for ContentIdHasher {
+  fn finish(&self) -> u64 {
+    self.0
+  }
+
+  fn write(&mut self, bytes: &[u8]) {
+    if let Some(head) = bytes.first_chunk::<{ size_of::<u64>() }>() {
+      self.0 = u64::from_ne_bytes(*head);
+    }
+  }
+}
+
+/// Builder for [`ContentIdHasher`].
+#[derive(Clone, Copy, Debug, Default)]
+struct ContentIdBuildHasher;
+
+impl BuildHasher for ContentIdBuildHasher {
+  type Hasher = ContentIdHasher;
+
+  fn build_hasher(&self) -> ContentIdHasher {
+    ContentIdHasher::default()
+  }
+}
 
 /// Format: a content identity's bytes, BLAKE3's output length.
 pub const IDENTITY_BYTES: usize = blake3::OUT_LEN;
@@ -419,12 +453,18 @@ impl Writing {
 /// The content store (module docs).
 #[derive(Debug)]
 pub struct ContentStore {
-  entries: BTreeMap<ContentId, Held>,
+  entries: HashMap<ContentId, Held, ContentIdBuildHasher>,
   /// The identity rule (main's ruling, 2026-11-20; R8): each object longer than a window by its identity, the BLAKE3 of
   /// its bytes, to the root of the tree this store cut it into, a node-local detail; and back.
-  objects: BTreeMap<ContentId, ContentId>,
+  objects: HashMap<ContentId, ContentId, ContentIdBuildHasher>,
   /// [`ContentStore::objects`] inverted: a root to the identity of the object it roots.
-  rooted: BTreeMap<ContentId, ContentId>,
+  rooted: HashMap<ContentId, ContentId, ContentIdBuildHasher>,
+  /// Ordered index of `Form::List` entries for O(log L + page) deterministic `lists_in` / `lists`.
+  lists: BTreeSet<ContentId>,
+  /// Ordered index of multi-window object identities (`objects` keys) for `names_in` / `names`.
+  names: BTreeSet<ContentId>,
+  /// Ordered index of let-go (`Kept::Away`) windows for O(log A + page) `aways_in` / `aways`.
+  aways: BTreeSet<ContentId>,
   /// The lists kept or freed since its owner last took the changes (A-727 slice a3b: the shard image carries them).
   lists_changed: BTreeSet<ContentId>,
   /// The objects named or unnamed since its owner last took the changes (A-727 slice a3b).
@@ -624,9 +664,12 @@ impl ContentStore {
       .ok_or_else(too_small)?;
     let window = NonZeroUsize::new(window).ok_or_else(too_small)?;
     Ok(ContentStore {
-      entries: BTreeMap::new(),
-      objects: BTreeMap::new(),
-      rooted: BTreeMap::new(),
+      entries: HashMap::with_hasher(ContentIdBuildHasher),
+      objects: HashMap::with_hasher(ContentIdBuildHasher),
+      rooted: HashMap::with_hasher(ContentIdBuildHasher),
+      lists: BTreeSet::new(),
+      names: BTreeSet::new(),
+      aways: BTreeSet::new(),
       lists_changed: BTreeSet::new(),
       names_changed: BTreeSet::new(),
       away_changed: BTreeSet::new(),
@@ -756,6 +799,7 @@ impl ContentStore {
     self.counters.stored = self.counters.stored.saturating_add(1);
     if form == Form::List {
       self.counters.lists = self.counters.lists.saturating_add(1);
+      self.lists.insert(identity);
       self.lists_changed.insert(identity);
     }
     Ok(())
@@ -779,13 +823,18 @@ impl ContentStore {
   fn named_object(&mut self, identity: ContentId, root: ContentId) -> ContentId {
     if identity != root && self.objects.insert(identity, root).is_none() {
       self.rooted.insert(root, identity);
+      self.names.insert(identity);
       self.names_changed.insert(identity);
     }
     identity
   }
 
   /// The node an identity names in this store: an object's root for an object longer than a window, else itself.
+  #[inline]
   fn resolve(&self, identity: &ContentId) -> ContentId {
+    if self.objects.is_empty() {
+      return *identity;
+    }
     *self.objects.get(identity).unwrap_or(identity)
   }
 
@@ -1198,14 +1247,17 @@ impl ContentStore {
       return Err(ContentRefused::NotHeld);
     };
     if matches!(freed.kept, Kept::Away { .. }) {
+      self.aways.remove(identity);
       self.away_changed.insert(*identity);
     }
     // A freed root takes its object's name with it (module docs, "The identity rule").
     if let Some(named) = self.rooted.remove(identity) {
       self.objects.remove(&named);
+      self.names.remove(&named);
       self.names_changed.insert(named);
     }
     if freed.form == Form::List {
+      self.lists.remove(identity);
       self.lists_changed.insert(*identity);
     }
     let len = width(freed.len())?;
@@ -1364,6 +1416,7 @@ impl ContentStore {
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Away { len };
     }
+    self.aways.insert(identity);
     self.away_changed.insert(identity);
     self.storage.release(window);
     let freed = u64::try_from(len).unwrap_or(u64::MAX);
@@ -1394,6 +1447,7 @@ impl ContentStore {
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Stored { window, len };
     }
+    self.aways.remove(&identity);
     self.away_changed.insert(identity);
     self.content_bytes = self.content_bytes.saturating_add(need);
     self.counters.brought_back = self.counters.brought_back.saturating_add(1);
@@ -1592,26 +1646,28 @@ impl ContentStore {
   /// [`ContentStore::lists`] whose identities' first eight bytes lie in `lo..=hi` (A-870: one page of the shard image).
   pub fn lists_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, &[u8])> + '_ {
     self
-      .entries
+      .lists
       .range(Self::identities_in(lo, hi))
-      .filter(|(_, held)| held.form == Form::List)
-      .filter_map(|(identity, held)| Some((*identity, held.here()?)))
+      .filter_map(|identity| {
+        let held = self.entries.get(identity)?;
+        Some((*identity, held.here()?))
+      })
   }
 
   /// [`ContentStore::names`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
   pub fn names_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, ContentId)> + '_ {
     self
-      .objects
+      .names
       .range(Self::identities_in(lo, hi))
-      .map(|(identity, root)| (*identity, *root))
+      .filter_map(|identity| Some((*identity, *self.objects.get(identity)?)))
   }
 
   /// [`ContentStore::aways`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
   pub fn aways_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, u64)> + '_ {
     self
-      .entries
+      .aways
       .range(Self::identities_in(lo, hi))
-      .filter_map(|(identity, held)| match held.kept {
+      .filter_map(|identity| match self.entries.get(identity)?.kept {
         Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
         _ => None,
       })
@@ -1620,19 +1676,18 @@ impl ContentStore {
   /// The lists the store keeps, each with its bytes (A-727 slice a3b): what the shard image carries whole beside the
   /// windows, so an object longer than a window is whole again after a restart before any record is replayed.
   pub fn lists(&self) -> impl Iterator<Item = (ContentId, &[u8])> + '_ {
-    self
-      .entries
-      .iter()
-      .filter(|(_, held)| held.form == Form::List)
-      .filter_map(|(identity, held)| Some((*identity, held.here()?)))
+    self.lists.iter().filter_map(|identity| {
+      let held = self.entries.get(identity)?;
+      Some((*identity, held.here()?))
+    })
   }
 
   /// Each object longer than a window, by its identity, with the root this store cut it into (A-727 slice a3b).
   pub fn names(&self) -> impl Iterator<Item = (ContentId, ContentId)> + '_ {
     self
-      .objects
+      .names
       .iter()
-      .map(|(identity, root)| (*identity, *root))
+      .filter_map(|identity| Some((*identity, *self.objects.get(identity)?)))
   }
 
   /// The lists and names kept or let go since the owner last took them ([`ContentStore::clear_changes`]): each list
@@ -1669,9 +1724,9 @@ impl ContentStore {
   /// whole, so a restart keeps each as let go (A-767 C1 step 2b, main's ruling (a) of 2026-11-22 02:52).
   pub fn aways(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
     self
-      .entries
+      .aways
       .iter()
-      .filter_map(|(identity, held)| match held.kept {
+      .filter_map(|identity| match self.entries.get(identity)?.kept {
         Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
         _ => None,
       })
@@ -1718,6 +1773,7 @@ impl ContentStore {
           last_read: core::cell::Cell::new(0),
         },
       );
+      self.aways.insert(identity);
     }
     refused
   }
@@ -1756,6 +1812,7 @@ impl ContentStore {
           last_read: core::cell::Cell::new(0),
         },
       );
+      self.lists.insert(identity);
       kept.push(identity);
     }
     // Each list holds the nodes it names, once for each time it names them, as it did before the restart.
@@ -1784,6 +1841,7 @@ impl ContentStore {
       if self.entries.contains_key(&root) && !self.objects.contains_key(&identity) {
         self.objects.insert(identity, root);
         self.rooted.insert(root, identity);
+        self.names.insert(identity);
       } else {
         refused = refused.saturating_add(1);
       }
@@ -2795,12 +2853,14 @@ mod tests {
     );
   }
 
-  /// Every identity `store` holds, with its holders and its form.
+  /// Every identity `store` holds, with its holders and its form, in deterministic identity order.
   fn held(store: &ContentStore) -> Vec<(ContentId, u64, Option<Form>)> {
-    store
+    let mut rows: Vec<(ContentId, u64, Option<Form>)> = store
       .identities()
       .map(|identity| (*identity, store.holders(identity), store.form(identity)))
-      .collect()
+      .collect();
+    rows.sort_by_key(|(identity, _, _)| *identity);
+    rows
   }
 
   /// A-727 slice c (an object put a window at a time: §4.17.1 "A push's intake", rule 1). Do: for objects of 0, 1, a

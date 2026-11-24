@@ -48,14 +48,59 @@
 //! utility). Keys are the caller's uniform hashes: the first eight bytes of a BLAKE3 content identity are, and nothing
 //! here hashes again. Arithmetic on the counts is in `f64`, where nothing panics; every slot and size is checked.
 
-use std::collections::BTreeMap;
+use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasher, Hasher};
 
 /// Format: the bins a curve keeps: one for each bit length a distance in windows can have, 0 to 64.
 const BINS: usize = 65;
 
-/// Format: the bytes each sampled key costs a curve: its entry in the key map (the key, its slot and its size, with
-/// the map's own node share taken as one more entry, a B-tree's node holding at most twice its least), and the two
-/// slots it may span (the slot's key and the Fenwick tree's sum).
+/// Shape: reciprocal of the 64-bit hash space (`2^-64`), used to compute the SHARDS sampling rate
+/// `T / 2^64` without invoking `f64::exp2` on every read.
+const INV_U64_SPACE: f64 = 1.0 / ((1_u128 << u64::BITS) as f64);
+
+/// Identity hasher for [`Curve`]'s keys, which are already the first eight bytes of a cryptographic
+/// BLAKE3 content identity (module docs: "nothing here hashes again").
+#[derive(Default)]
+struct UniformKeyHasher(u64);
+
+impl Hasher for UniformKeyHasher {
+  fn finish(&self) -> u64 {
+    self.0
+  }
+
+  fn write(&mut self, bytes: &[u8]) {
+    if let Some(head) = bytes.first_chunk::<{ core::mem::size_of::<u64>() }>() {
+      self.0 = u64::from_ne_bytes(*head);
+    }
+  }
+
+  fn write_u64(&mut self, value: u64) {
+    self.0 = value;
+  }
+}
+
+/// Builder for [`UniformKeyHasher`].
+#[derive(Clone, Copy, Debug, Default)]
+struct UniformKeyBuildHasher;
+
+impl BuildHasher for UniformKeyBuildHasher {
+  type Hasher = UniformKeyHasher;
+
+  fn build_hasher(&self) -> UniformKeyHasher {
+    UniformKeyHasher::default()
+  }
+}
+
+/// Sampling rate `threshold / 2^64` and its reciprocal (0 when `threshold == 0`).
+fn rate_pair(threshold: u64) -> (f64, f64) {
+  let rate = (threshold as f64) * INV_U64_SPACE;
+  let inv = if rate > 0.0 { 1.0 / rate } else { 0.0 };
+  (rate, inv)
+}
+
+/// Format: the bytes each sampled key costs a curve: its entry in the key hash table (key, slot and
+/// size, plus load-factor overhead taken as one more entry) and its entry in the max-heap, plus the
+/// two slots it may span (the slot's key and the Fenwick tree's sum).
 const BYTES_PER_KEY: usize = core::mem::size_of::<u64>()
   .saturating_mul(6)
   .saturating_add(
@@ -70,16 +115,28 @@ pub fn keys_within(bytes: usize) -> usize {
 }
 
 /// One repository's miss-ratio curve (module docs).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Curve {
   /// The most sampled keys kept.
   capacity: usize,
   /// The window distances are counted in, in bytes (at least one).
   granule: u64,
+  /// When `granule` is a power of two, its bit shift so bin rounding avoids integer division.
+  granule_shift: Option<u32>,
   /// The sampling threshold: a key below it is sampled.
   threshold: u64,
-  /// Each sampled key's slot and bytes.
-  keys: BTreeMap<u64, (usize, u64)>,
+  /// Precomputed sampling rate `threshold / 2^64`, updated only when `threshold` moves.
+  rate: f64,
+  /// Precomputed reciprocal `1.0 / rate`, updated only when `threshold` moves.
+  inv_rate: f64,
+  /// Each sampled key's slot and bytes (O(1) hash lookup over uniform BLAKE3 key prefixes).
+  keys: HashMap<u64, (usize, u64), UniformKeyBuildHasher>,
+  /// Max-heap of live sampled keys so `shrink` evicts the largest key in O(log capacity). Because
+  /// `shrink` sets `threshold = key` and keys `>= threshold` are never re-admitted, every live key
+  /// is pushed once and popped at most once.
+  largest: BinaryHeap<u64>,
+  /// Total bytes of every live sampled key (kept in sync with `sums` so reads avoid a Fenwick total walk).
+  total_bytes: u64,
   /// Each slot's key, while live.
   slot_keys: Vec<Option<u64>>,
   /// The Fenwick tree over the slots' bytes (one-based in its own arithmetic, stored from zero).
@@ -96,16 +153,40 @@ pub struct Curve {
   expected: f64,
 }
 
+impl PartialEq for Curve {
+  fn eq(&self, other: &Self) -> bool {
+    self.capacity == other.capacity
+      && self.granule == other.granule
+      && self.threshold == other.threshold
+      && self.keys == other.keys
+      && self.total_bytes == other.total_bytes
+      && self.slot_keys == other.slot_keys
+      && self.sums == other.sums
+      && self.next_slot == other.next_slot
+      && self.bins == other.bins
+      && self.cold == other.cold
+      && self.sampled == other.sampled
+      && self.expected == other.expected
+  }
+}
+
 impl Curve {
   /// A curve keeping at most `capacity` sampled keys (at least one), counting distances in windows of `granule` bytes
   /// (at least one), sampling every key until its capacity binds.
   pub fn new(capacity: usize, granule: u64) -> Curve {
     let capacity = capacity.max(1);
+    let granule = granule.max(1);
+    let (rate, inv_rate) = rate_pair(u64::MAX);
     Curve {
       capacity,
-      granule: granule.max(1),
+      granule,
+      granule_shift: granule.is_power_of_two().then(|| granule.trailing_zeros()),
       threshold: u64::MAX,
-      keys: BTreeMap::new(),
+      rate,
+      inv_rate,
+      keys: HashMap::with_hasher(UniformKeyBuildHasher),
+      largest: BinaryHeap::new(),
+      total_bytes: 0,
       slot_keys: Vec::new(),
       sums: Vec::new(),
       next_slot: 0,
@@ -127,26 +208,34 @@ impl Curve {
 
   /// The sampling rate now: the fraction of keys sampled.
   pub fn sampling_rate(&self) -> f64 {
-    self.threshold as f64 / f64::from(u64::BITS).exp2()
+    self.rate
   }
 
   /// One read of the object whose uniform hash is `key` and whose length is `bytes`.
   pub fn read(&mut self, key: u64, bytes: u64) {
-    self.expected += self.sampling_rate();
+    self.expected += self.rate;
     if key >= self.threshold {
       return;
     }
     self.sampled += 1.0;
-    match self.keys.get(&key).copied() {
-      Some((slot, held)) => {
-        let after = self.total().saturating_sub(self.prefix(slot));
-        self.count(after, held);
-        self.add(slot, held, false);
-        self.slot_keys.get_mut(slot).map(|entry| entry.take());
+    if let Some(&(slot, held)) = self.keys.get(&key) {
+      // Back-to-back read of the most recently read key: reuse distance after it is zero, and
+      // leaving it in place leaves every other key's prefix sum unchanged without advancing slots.
+      if slot.saturating_add(1) == self.next_slot && held == bytes {
+        self.count(0, held);
+        return;
       }
-      None => self.cold += 1.0,
+      let after = self.total_bytes.saturating_sub(self.prefix(slot));
+      self.count(after, held);
+      self.add(slot, held, false);
+      if let Some(entry) = self.slot_keys.get_mut(slot) {
+        *entry = None;
+      }
+      self.place_existing(key, bytes);
+      return;
     }
-    self.place(key, bytes);
+    self.cold += 1.0;
+    self.place_new(key, bytes);
     while self.keys.len() > self.capacity {
       self.shrink();
     }
@@ -235,13 +324,24 @@ impl Curve {
   /// three-window object at `R = 0.073` was counted 38 windows away from itself, and the curve's misses at 2,000 keys
   /// overstated by 0.07 on average); in windows rounded up, binned by its bit length.
   fn count(&mut self, after: u64, held: u64) {
-    let rate = self.sampling_rate();
-    let scaled = if rate > 0.0 {
-      crate::share::whole_units((crate::share::amount_of(after) / rate).ceil()).saturating_add(held)
+    let scaled = if after == 0 {
+      held
+    } else if self.rate > 0.0 {
+      crate::share::whole_units((crate::share::amount_of(after) * self.inv_rate).ceil())
+        .saturating_add(held)
     } else {
       u64::MAX
     };
-    let windows = scaled.div_ceil(self.granule).max(1);
+    let windows = match self.granule_shift {
+      Some(shift) => {
+        if scaled == 0 {
+          1
+        } else {
+          ((scaled.saturating_sub(1)) >> shift).saturating_add(1)
+        }
+      }
+      None => scaled.div_ceil(self.granule).max(1),
+    };
     let bin = usize::try_from(u64::BITS.saturating_sub(windows.leading_zeros()))
       .unwrap_or(BINS.saturating_sub(1));
     if let Some(slot) = self.bins.get_mut(bin) {
@@ -249,8 +349,24 @@ impl Curve {
     }
   }
 
-  /// Puts `key` at the next slot with `bytes`, renumbering the slots first when none is left.
-  fn place(&mut self, key: u64, bytes: u64) {
+  /// Moves already-tracked `key` to the next slot with `bytes`, renumbering first when no slot is left.
+  fn place_existing(&mut self, key: u64, bytes: u64) {
+    if self.next_slot >= self.slot_keys.len() {
+      self.renumber();
+    }
+    let slot = self.next_slot;
+    if let Some(entry) = self.slot_keys.get_mut(slot) {
+      *entry = Some(key);
+    }
+    self.add(slot, bytes, true);
+    if let Some(entry) = self.keys.get_mut(&key) {
+      *entry = (slot, bytes);
+    }
+    self.next_slot = slot.saturating_add(1);
+  }
+
+  /// Inserts newly sampled `key` at the next slot with `bytes`, renumbering first when no slot is left.
+  fn place_new(&mut self, key: u64, bytes: u64) {
     if self.next_slot >= self.slot_keys.len() {
       self.renumber();
     }
@@ -260,22 +376,31 @@ impl Curve {
     }
     self.add(slot, bytes, true);
     self.keys.insert(key, (slot, bytes));
+    self.largest.push(key);
     self.next_slot = slot.saturating_add(1);
   }
 
   /// Drops the sampled key with the largest hash and lowers the threshold to it, scaling the counts by the rate's fall
   /// (module docs).
   fn shrink(&mut self) {
-    let Some((key, (slot, bytes))) = self.keys.pop_last() else {
-      return;
+    let popped = loop {
+      let Some(key) = self.largest.pop() else {
+        return;
+      };
+      if let Some((slot, bytes)) = self.keys.remove(&key) {
+        break (key, slot, bytes);
+      }
     };
+    let (key, slot, bytes) = popped;
     self.add(slot, bytes, false);
     if let Some(entry) = self.slot_keys.get_mut(slot) {
       *entry = None;
     }
-    let before = self.sampling_rate();
+    let before = self.rate;
     self.threshold = key;
-    let after = self.sampling_rate();
+    let (after, inv) = rate_pair(key);
+    self.rate = after;
+    self.inv_rate = inv;
     if before > 0.0 {
       self.scale(after / before);
     }
@@ -306,6 +431,7 @@ impl Curve {
     self.slot_keys.resize(slots, None);
     self.sums.clear();
     self.sums.resize(slots, 0);
+    self.total_bytes = 0;
     self.next_slot = 0;
     for key in live {
       let bytes = self.keys.get(&key).map_or(0, |(_, bytes)| *bytes);
@@ -314,13 +440,20 @@ impl Curve {
         *entry = Some(key);
       }
       self.add(slot, bytes, true);
-      self.keys.insert(key, (slot, bytes));
+      if let Some(entry) = self.keys.get_mut(&key) {
+        *entry = (slot, bytes);
+      }
       self.next_slot = slot.saturating_add(1);
     }
   }
 
   /// Adds (or takes away) `bytes` at `slot` in the Fenwick tree.
   fn add(&mut self, slot: usize, bytes: u64, adding: bool) {
+    self.total_bytes = if adding {
+      self.total_bytes.saturating_add(bytes)
+    } else {
+      self.total_bytes.saturating_sub(bytes)
+    };
     let mut at = slot.saturating_add(1);
     while let Some(sum) = self.sums.get_mut(at.wrapping_sub(1)) {
       *sum = if adding {
@@ -348,10 +481,7 @@ impl Curve {
 
   /// The bytes of every live sampled key.
   fn total(&self) -> u64 {
-    match self.sums.len() {
-      0 => 0,
-      len => self.prefix(len.saturating_sub(1)),
-    }
+    self.total_bytes
   }
 }
 

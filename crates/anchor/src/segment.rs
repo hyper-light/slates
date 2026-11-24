@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use slates_machine::facts::Identity;
-use slates_mem::{Handoff, SparseObject, Width, WordRun, Words};
+use slates_mem::{Handoff, RunId, SparseObject, Width, WordRun, Words};
 
 use crate::error::AnchorError;
 use crate::layout::{
@@ -154,6 +154,10 @@ fn segment_words(geometry: &Geometry) -> Words {
 pub struct AnchorSegment {
   object: SparseObject,
   geometry: Geometry,
+  /// Resolved handle to the content pool's declared word run (owner words followed by want words):
+  /// resolved once at create/attach so hot availability and claim paths index it in O(1) without
+  /// re-computing region offsets or searching the declared layout.
+  pool_run: RunId,
   /// The content object the supervisor creates and holds so a shard's volume storage lives in
   /// anchor-owned RAM (§4.8): `Some` on the process that created it (the supervisor keeps it alive
   /// across daemon restarts), `None` on a process that only attached the metadata object — that
@@ -163,6 +167,26 @@ pub struct AnchorSegment {
   /// ([`AnchorSegment::adopt_content`]): the creator's extents go with it when it drops (macOS, where each extent is an
   /// object of its own).
   content_created: bool,
+}
+
+/// Resolves the segment's declared content-pool word run (`RegionKind::Pool`, owner words followed by
+/// want words) once so `pool_word` and `want_word` reach any word in constant time.
+fn resolve_pool_run(object: &SparseObject, geometry: &Geometry) -> Result<RunId, AnchorError> {
+  let spec = geometry
+    .region(RegionKind::Pool)
+    .ok_or(AnchorError::Geometry {
+      reason: "no pool region",
+    })?;
+  let at = usize::try_from(spec.offset).map_err(|_| AnchorError::Geometry {
+    reason: "pool region offset overflows",
+  })?;
+  let count = usize::from(geometry.partitions)
+    .saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION.saturating_add(1));
+  object
+    .resolve(&WordRun::strided(at, size_of::<u64>(), count, Width::U64))
+    .map_err(|_| AnchorError::Geometry {
+      reason: "pool word run not declared",
+    })
 }
 
 impl Drop for AnchorSegment {
@@ -434,9 +458,11 @@ impl AnchorSegment {
     object
       .atomic_u64(AT_GENERATION)?
       .store(2, Ordering::Release);
+    let pool_run = resolve_pool_run(&object, &geometry)?;
     let segment = AnchorSegment {
       object,
       geometry,
+      pool_run,
       content: None,
       content_created: false,
     };
@@ -559,9 +585,11 @@ impl AnchorSegment {
     // Declared rather than opened again, since every open maps the whole object and on macOS marks it whole (84a: two
     // opens an attach, 2.4-5.3 ms each on a debug build).
     let object = object.declare(segment_words(&geometry))?;
+    let pool_run = resolve_pool_run(&object, &geometry)?;
     Ok(AnchorSegment {
       object,
       geometry,
+      pool_run,
       content: None,
       content_created: false,
     })
@@ -1155,12 +1183,7 @@ impl AnchorSegment {
         reason: "a pool extent past the pool",
       });
     }
-    let at = extent
-      .checked_mul(crate::layout::POOL_WORD_BYTES)
-      .ok_or(AnchorError::Geometry {
-        reason: "a pool word offset overflows",
-      })?;
-    self.word_at(self.spec(RegionKind::Pool)?, at)
+    Ok(self.object.run_u64(self.pool_run, extent)?)
   }
 
   /// The partition that holds pool extent `extent`, or `None` while it is free (A-98).
@@ -1205,14 +1228,13 @@ impl AnchorSegment {
         reason: "a pool want past the partitions",
       });
     }
-    let at = self
+    let index = self
       .pool_extents()
       .checked_add(usize::from(partition))
-      .and_then(|word| word.checked_mul(crate::layout::POOL_WORD_BYTES))
       .ok_or(AnchorError::Geometry {
         reason: "a pool want offset overflows",
       })?;
-    self.word_at(self.spec(RegionKind::Pool)?, at)
+    Ok(self.object.run_u64(self.pool_run, index)?)
   }
 
   /// Posts the room `partition` was refused, `bytes` (0 withdraws it), and returns whether it was not posted before

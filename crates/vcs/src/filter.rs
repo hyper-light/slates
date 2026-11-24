@@ -40,6 +40,22 @@ const OWN_AND_SHARED: u64 = 2;
 /// Derived: a miss's false resolves over every run it may walk, at most one over this (so under one, main's ruling).
 const FALSE_RESOLVES_PER_MISS_INVERSE: u64 = 2;
 
+/// Format: golden-ratio Weyl increment `⌊2^64 / φ⌋` and Stafford Variant 13 SplitMix64 mixing
+/// multipliers (Steele, Lea, and Flood 2014, "Fast Splittable Pseudorandom Number Generators",
+/// OOPSLA 2014, Fig. 4) used to derive the independent second double-hashing word from one SipHash
+/// evaluation.
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Format: first Stafford Variant 13 avalanche multiplier (Steele, Lea, and Flood 2014, Fig. 4).
+const SPLITMIX_MUL_1: u64 = 0xBF58_476D_1CE4_E5B9;
+/// Format: second Stafford Variant 13 avalanche multiplier (Steele, Lea, and Flood 2014, Fig. 4).
+const SPLITMIX_MUL_2: u64 = 0x94D0_49BB_1331_11EB;
+/// Format: SplitMix64 first shift width (Steele, Lea, and Flood 2014, Fig. 4).
+const SPLITMIX_SHIFT_1: u32 = 30;
+/// Format: SplitMix64 second shift width (Steele, Lea, and Flood 2014, Fig. 4).
+const SPLITMIX_SHIFT_2: u32 = 27;
+/// Format: SplitMix64 final shift width (Steele, Lea, and Flood 2014, Fig. 4).
+const SPLITMIX_SHIFT_3: u32 = 31;
+
 /// A key's hash, taken once a lookup and probed into every run's filter ([`KeyFilter::may_hold`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KeyHash {
@@ -48,25 +64,34 @@ pub(crate) struct KeyHash {
 }
 
 impl KeyHash {
-  /// The hash of `key`: two words of SipHash, the second forced odd so its probes step through every bit of a filter
-  /// whose length is a power of two and through many of any other.
+  /// The hash of `key`: one SipHash word and an independent SplitMix64-mixed second word forced
+  /// odd for double hashing (Kirsch and Mitzenmacher 2006).
   pub(crate) fn of(key: &[u8]) -> KeyHash {
     let mut hasher = DefaultHasher::new();
     hasher.write(key);
     let first = hasher.finish();
-    hasher.write_u8(0);
+    let mut second = first.wrapping_add(SPLITMIX_GAMMA);
+    second = (second ^ (second >> SPLITMIX_SHIFT_1)).wrapping_mul(SPLITMIX_MUL_1);
+    second = (second ^ (second >> SPLITMIX_SHIFT_2)).wrapping_mul(SPLITMIX_MUL_2);
+    second ^= second >> SPLITMIX_SHIFT_3;
     KeyHash {
       first,
-      step: hasher.finish() | 1,
+      step: second | 1,
     }
   }
 
-  /// The `probe`-th bit of a filter of `bits` bits.
+  /// The `probe`-th bit of a filter of `bits` bits, mapped uniformly onto `[0, bits)` via fast
+  /// multiply-high range reduction (Lemire 2019, "Fast Random Integer Generation in an Interval",
+  /// ACM TOMS 45(1)) to avoid a 64-bit integer division per probe.
   fn bit(&self, probe: u32, bits: u64) -> Option<u64> {
-    self
+    if bits == 0 {
+      return None;
+    }
+    let mixed = self
       .first
-      .wrapping_add(u64::from(probe).wrapping_mul(self.step))
-      .checked_rem(bits)
+      .wrapping_add(u64::from(probe).wrapping_mul(self.step));
+    let wide = u128::from(mixed).wrapping_mul(u128::from(bits));
+    u64::try_from(wide >> u64::BITS).ok()
   }
 }
 
@@ -109,6 +134,11 @@ impl KeyFilter {
       words: vec![0; words].into_boxed_slice(),
       probes,
     }
+  }
+
+  /// Whether this filter is empty (says yes to every key without probing).
+  pub(crate) fn is_empty(&self) -> bool {
+    self.words.is_empty() || self.probes == 0
   }
 
   /// The bytes the filter charges the store.

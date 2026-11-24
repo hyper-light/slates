@@ -59,7 +59,8 @@ use crate::content::{ContentId, ContentRefused, ContentStore, Stored};
 use crate::filter::{KeyFilter, KeyHash};
 use crate::rule::Compaction;
 use crate::table::{
-  RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, encode_body, row_bytes,
+  RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, compare_keys, encode_body,
+  row_bytes,
 };
 
 /// Shape: what one tail row costs the budget beyond its key's and its body's bytes: its boxed key and boxed body, the
@@ -205,9 +206,9 @@ impl Run {
 
   /// The table that may hold `key`: the last whose first key is not after it.
   fn fence_for(&self, key: &[u8]) -> Option<&Fence> {
-    let after = self
-      .fences
-      .partition_point(|fence| fence.first.as_ref() <= key);
+    let after = self.fences.partition_point(|fence| {
+      compare_keys(fence.first.as_ref(), key) != std::cmp::Ordering::Greater
+    });
     self.fences.get(after.checked_sub(1)?)
   }
 
@@ -712,13 +713,16 @@ impl Index {
     if self.runs.is_empty() {
       return None;
     }
-    let hash = KeyHash::of(key);
+    let mut hash: Option<KeyHash> = None;
     self.runs.iter().rev().find_map(|run| {
       visit.visit(!run.shared);
       visit.runs = visit.runs.saturating_add(1);
-      if !run.filter.may_hold(&hash) {
-        visit.rejected = visit.rejected.saturating_add(1);
-        return None;
+      if !run.filter.is_empty() {
+        let key_hash = *hash.get_or_insert_with(|| KeyHash::of(key));
+        if !run.filter.may_hold(&key_hash) {
+          visit.rejected = visit.rejected.saturating_add(1);
+          return None;
+        }
       }
       let fence = run.fence_for(key)?;
       visit.resolves = visit.resolves.saturating_add(1);
