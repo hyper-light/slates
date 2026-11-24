@@ -1476,6 +1476,19 @@ pub enum RequestBody {
     /// The repository.
     repository: String,
   },
+  /// Open a staging buffer of no stated length on a plain volume's owner for an `FsWriteStaged` under the caller's write
+  /// attachment `attachment` of `volume` (A-880): each `StagePut` reserves its own bytes from the owner's metadata budget
+  /// as it extends the buffer, refused `BudgetExceeded` past it, so a writer that learns its input's length only at its
+  /// end (`slates write` reading a pipe) holds one page of the input at a time. The buffer lives as long as the
+  /// attachment, released when the attachment ends or when applied, never at a deadline. Answered `Staged`; refused as
+  /// `StageBegin` is for the volume, and as a write through the attachment is for the attachment. Never recorded.
+  /// Appended.
+  StageOpen {
+    /// The volume.
+    volume: VolumeId,
+    /// The caller's write attachment of the volume, which the buffer lives with.
+    attachment: u64,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2538,6 +2551,7 @@ impl RequestBody {
       | RequestBody::ReadDir { volume, .. }
       | RequestBody::StageBegin { work: volume, .. }
       | RequestBody::StagePut { work: volume, .. }
+      | RequestBody::StageOpen { volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
       | RequestBody::EditSubmit { work: volume, .. }
       | RequestBody::EditSubmitHeld { work: volume, .. }
@@ -2668,8 +2682,8 @@ impl RequestBody {
   /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
   /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
   /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
-  /// strands a charged buffer that expires within a lease. So does a work's floor move (`MoveWorkFloor`), monotone and
-  /// idempotent at the owner.
+  /// strands a charged buffer that expires within a lease, a retried open one whose record's charge goes when its
+  /// attachment ends (A-880). So does a work's floor move (`MoveWorkFloor`), monotone and idempotent at the owner.
   pub fn forwards_as_read(&self) -> bool {
     matches!(
       self,
@@ -2686,6 +2700,7 @@ impl RequestBody {
         | RequestBody::ReadDir { .. }
         | RequestBody::StageBegin { .. }
         | RequestBody::StagePut { .. }
+        | RequestBody::StageOpen { .. }
         // A floor's move is monotone and idempotent (A-697 part b), so a resent forward changes nothing.
         | RequestBody::MoveWorkFloor { .. }
     )
