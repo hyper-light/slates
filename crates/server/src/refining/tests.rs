@@ -113,16 +113,109 @@ fn kept_of(state: &ShardState, work: VolumeId) -> Kept {
     .and_then(|done| done.refined.clone())
 }
 
-/// The counters a job moves whatever its timing: started, gave up, prepared, its check, a mismatch.
-fn counted(state: &ShardState) -> [u64; 5] {
-  [
-    super::REFINE_STARTED,
-    super::REFINE_GAVE_UP,
-    super::PREPARED,
-    super::PREPARED_CHECKED,
-    super::PREPARED_MISMATCH,
-  ]
-  .map(|name| state.refusals.get(name).copied().unwrap_or(0))
+/// The counters a job moves whatever its timing (started, gave up, prepared, its check, a mismatch), and the turns jobs
+/// took in all.
+type Counts = ([u64; 5], u64);
+
+/// The shard's [`Counts`] now.
+fn counted(state: &ShardState) -> Counts {
+  let of = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (
+    [
+      super::REFINE_STARTED,
+      super::REFINE_GAVE_UP,
+      super::PREPARED,
+      super::PREPARED_CHECKED,
+      super::PREPARED_MISMATCH,
+    ]
+    .map(of),
+    of(super::REFINE_TURNS),
+  )
+}
+
+/// What one driver of a recorded submit's refinement left: what the submit was answered at once (none: parked), its
+/// completion before the job ran and after, the counters after, and the work's kept refinement.
+struct Driven {
+  parked: Option<ReplyBody>,
+  before_job: Option<ReplyBody>,
+  answer: Option<ReplyBody>,
+  counts: Counts,
+  kept: Kept,
+}
+
+/// A green whose `/f` is [`original`], seeded through a recorded submit, and two works on it re-indenting `/f` whole.
+fn two_rewrites(state: &mut ShardState) -> (VolumeId, VolumeId) {
+  let made = ask(
+    state,
+    RequestBody::CreateGreen {
+      name: "refined".to_owned(),
+      require_evidence: false,
+      base: None,
+    },
+  );
+  let ReplyBody::GreenCreated { id: green } = made else {
+    panic!("no green: {made:?}")
+  };
+  let seed = work_writing(state, (green, "seed"), (0, original()));
+  let seeded = submit(state, seed, 1).1;
+  assert!(
+    matches!(
+      seeded,
+      Some(ReplyBody::Submitted {
+        version: Some(_),
+        ..
+      })
+    ),
+    "{seeded:?}"
+  );
+  let whole = u64::try_from(original().len()).expect("a length");
+  (
+    work_writing(state, (green, "by-task"), (whole, reindented())),
+    work_writing(state, (green, "by-turns"), (whole, reindented())),
+  )
+}
+
+/// `work` submitted as request `sequence`, its refinement run by the shard's own task, awaited until it is answered.
+async fn by_task(work: VolumeId, sequence: u32) -> Driven {
+  let (id, parked) = on(|state| submit(state, work, sequence));
+  let before_job = on(|state| completed(state, id));
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+  while on(|state| completed(state, id)).is_none() && slates_rt::futures::now_ns() < deadline {
+    slates_rt::futures::yield_now().await;
+  }
+  on(|state| Driven {
+    parked,
+    before_job,
+    answer: completed(state, id),
+    counts: counted(state),
+    kept: kept_of(state, work),
+  })
+}
+
+/// `work` submitted as request `sequence` under a held shard, its refinement's turns taken through `refined_now`.
+fn by_turns(state: &mut ShardState, work: VolumeId, sequence: u32) -> Driven {
+  super::HELD_FOR_TEST.with(|held| held.set(true));
+  let (id, parked) = submit(state, work, sequence);
+  let before_job = completed(state, id);
+  super::refined_now(state);
+  super::HELD_FOR_TEST.with(|held| held.set(false));
+  Driven {
+    parked,
+    before_job,
+    answer: completed(state, id),
+    counts: counted(state),
+    kept: kept_of(state, work),
+  }
+}
+
+/// What `driven` moved of the counters since `before`: each job-moved counter's delta, and the turns'.
+fn moved(before: Counts, driven: &Driven) -> ([u64; 5], u64) {
+  let mut deltas = [0; 5];
+  for ((delta, after), earlier) in deltas.iter_mut().zip(driven.counts.0).zip(before.0) {
+    *delta = after.saturating_sub(earlier);
+  }
+  (deltas, driven.counts.1.saturating_sub(before.1))
 }
 
 /// A-787 part 2 (the job's drivers; main's ruling of 2026-11-24 02:17). Do: make two works on one green, each
@@ -136,160 +229,58 @@ fn counted(state: &ShardState) -> [u64; 5] {
 fn t_a787_a_recorded_submits_refinement_by_its_task_and_by_refined_now_agree() {
   let (store, daemon) = crate::test_store::audit_daemon_stored();
   let history = || async move {
-    let green = on(|state| {
-      let made = ask(
-        state,
-        RequestBody::CreateGreen {
-          name: "refined".to_owned(),
-          require_evidence: false,
-          base: None,
-        },
-      );
-      let ReplyBody::GreenCreated { id } = made else {
-        panic!("no green: {made:?}")
-      };
-      id
-    });
-    let seeded = on(|state| {
-      let seed = work_writing(state, (green, "seed"), (0, original()));
-      submit(state, seed, 1).1
-    });
-    assert!(
-      matches!(
-        seeded,
-        Some(ReplyBody::Submitted {
-          version: Some(_),
-          ..
-        })
-      ),
-      "{seeded:?}"
-    );
-    let whole = u64::try_from(original().len()).expect("a length");
-    let (by_task, by_turns) = on(|state| {
-      (
-        work_writing(state, (green, "by-task"), (whole, reindented())),
-        work_writing(state, (green, "by-turns"), (whole, reindented())),
-      )
-    });
-
-    // The shard's own task.
-    let (before, turns_before) = on(|state| {
-      (
-        counted(state),
-        state.refusals.get(super::REFINE_TURNS).copied(),
-      )
-    });
-    let (task_id, parked) = on(|state| submit(state, by_task, 2));
-    assert!(
-      parked.is_none(),
-      "the submit parks on its refinement: {parked:?}"
-    );
-    let deadline = slates_rt::futures::now_ns()
-      .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
-    let task_answer = loop {
-      if let Some(answer) = on(|state| completed(state, task_id)) {
-        break answer;
-      }
-      assert!(
-        slates_rt::futures::now_ns() < deadline,
-        "the task's submit was never answered"
-      );
-      slates_rt::futures::yield_now().await;
-    };
-    let (task_counted, task_turns, task_kept) = on(|state| {
-      (
-        counted(state),
-        state.refusals.get(super::REFINE_TURNS).copied(),
-        kept_of(state, by_task),
-      )
-    });
-
-    // The held shard's turns.
-    let held = on(|state| {
-      super::HELD_FOR_TEST.with(|held| held.set(true));
-      let (id, parked) = submit(state, by_turns, 3);
-      let unanswered = completed(state, id);
-      super::refined_now(state);
-      super::HELD_FOR_TEST.with(|held| held.set(false));
-      (
-        parked,
-        unanswered,
-        completed(state, id),
-        counted(state),
-        state.refusals.get(super::REFINE_TURNS).copied(),
-        kept_of(state, by_turns),
-      )
-    });
-    let (held_parked, held_unanswered, held_answer, held_counted, held_turns, held_kept) = held;
-    (
-      (before, turns_before),
-      (task_answer, task_counted, task_turns, task_kept),
-      (
-        held_parked,
-        held_unanswered,
-        held_answer,
-        held_counted,
-        held_turns,
-        held_kept,
-      ),
-    )
+    let (task_work, turns_work) = on(two_rewrites);
+    let before = on(|state| counted(state));
+    let task = by_task(task_work, 2).await;
+    let held = on(|state| by_turns(state, turns_work, 3));
+    (moved(before, &task), moved(task.counts, &held), task, held)
   };
-  let (
-    (before, turns_before),
-    (task_answer, task_counted, task_turns, task_kept),
-    (held_parked, held_unanswered, held_answer, held_counted, held_turns, held_kept),
-  ) = crate::test_store::run_on_first(&daemon, history, PATIENCE);
+  let (task_moved, held_moved, task, held) =
+    crate::test_store::run_on_first(&daemon, history, PATIENCE);
   daemon.stop();
   drop(store);
-
+  for driven in [&task, &held] {
+    assert!(
+      driven.parked.is_none(),
+      "parked on its refinement: {:?}",
+      driven.parked
+    );
+    assert!(
+      driven.before_job.is_none(),
+      "answered before its job: {:?}",
+      driven.before_job
+    );
+  }
   assert!(
     matches!(
-      task_answer,
-      ReplyBody::Submitted {
+      task.answer,
+      Some(ReplyBody::Submitted {
         version: Some(_),
         ..
-      }
+      })
     ),
-    "{task_answer:?}"
+    "{:?}",
+    task.answer
   );
   assert!(
-    held_parked.is_none(),
-    "the held submit parks on its refinement: {held_parked:?}"
-  );
-  assert!(
-    held_unanswered.is_none(),
-    "answered before its job ran: {held_unanswered:?}"
-  );
-  assert!(
-    held_answer.is_some(),
+    held.answer.is_some(),
     "the held submit was answered once its job ended"
   );
-  assert!(task_kept.is_some(), "the task kept a refinement");
-  assert_eq!(task_kept, held_kept, "the two drivers refined alike");
-  let by_task: Vec<u64> = task_counted
-    .iter()
-    .zip(before)
-    .map(|(after, before)| after.saturating_sub(before))
-    .collect();
-  let by_turns: Vec<u64> = held_counted
-    .iter()
-    .zip(task_counted)
-    .map(|(after, before)| after.saturating_sub(before))
-    .collect();
+  assert!(task.kept.is_some(), "the task kept a refinement");
+  assert_eq!(task.kept, held.kept, "the two drivers refined alike");
   assert_eq!(
-    by_task,
-    vec![1, 0, 1, 1, 0],
+    task_moved.0,
+    [1, 0, 1, 1, 0],
     "the task's job: started, prepared, checked"
   );
-  assert_eq!(by_turns, by_task, "the held job moved the task's counters");
-  let task_took = task_turns
-    .unwrap_or(0)
-    .saturating_sub(turns_before.unwrap_or(0));
-  let held_took = held_turns
-    .unwrap_or(0)
-    .saturating_sub(task_turns.unwrap_or(0));
+  assert_eq!(
+    held_moved.0, task_moved.0,
+    "the held job moved the task's counters"
+  );
   assert!(
-    task_took > 1 && held_took > 1,
-    "both took turns: {task_took} and {held_took}"
+    task_moved.1 > 1 && held_moved.1 > 1,
+    "both took turns: {} and {}",
+    task_moved.1,
+    held_moved.1
   );
 }
