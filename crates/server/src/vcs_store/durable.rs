@@ -303,6 +303,10 @@ mod tests {
             counted(crate::content_holder::IMAGE_PAGES_SPLIT),
             counted(crate::content_holder::IMAGE_CUTS),
             state.image_encoder.progress(),
+            (
+              counted(crate::content_holder::IMAGE_ENCODED_BYTES),
+              counted(crate::content_holder::IMAGE_SPLIT_DISCARDED_BYTES),
+            ),
           )
         });
         let dirtied = (
@@ -320,8 +324,8 @@ mod tests {
     assert_eq!(
       outcome,
       Ok(()),
-      "the ticket answered durable within the budget (publications skipped, turns, pages split, cuts and the encoder \
-       meanwhile: {counts:?}; backlog {backlog}, the dirtier's rounds in the wait {rounds}, the fewest kept in one \
+      "the ticket answered durable within the budget (publications skipped, turns, pages split, cuts, the encoder, and the \
+       bytes spent and split reads dropped, meanwhile: {counts:?}; backlog {backlog}, the dirtier's rounds in the wait {rounds}, the fewest kept in one \
        {fewest})"
     );
     assert!(
