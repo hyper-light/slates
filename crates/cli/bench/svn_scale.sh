@@ -10,7 +10,8 @@
 # The servers, a fresh one for every run, in SERVERS' order:
 # - stock: `svnserve -d` over svn:// on loopback over the repository the run loaded, anonymous write allowed
 #   (`anon-access = write`), as a stock server that takes commits without accounts is configured;
-# - slates: `slates anchor --vcs-svn 127.0.0.1:0` from the release build, a Subversion repository made by `slates
+# - slates: `slates anchor --vcs-svn 127.0.0.1:0 --vcs-store WORK/store-N` from the release build (a Subversion
+#   repository's records are kept on the node's changeset store, which it needs since C2), a Subversion repository made by `slates
 #   repository create --tool svn` and filled by `slates repository import` of the dump (timed as "import", every run),
 #   and a token from `slates credential token` (run with the anchor's issuer surface), its id and the token the user and
 #   password svn signs in with (CRAM-MD5).
@@ -129,7 +130,8 @@ first() { sed -n "$2" "$1" | head -1; }
 # AUTH, ANCHOR, DAEMON.
 start_slates() {
   local instance="w-perf-svn-$$-$1" log="$WORK/anchor-$1.log" exports minted streak=0 port
-  "$SLATES" --instance "$instance" anchor --vcs-svn 127.0.0.1:0 > /dev/null 2> "$log" &
+  mkdir -p "$WORK/store-$1"
+  "$SLATES" --instance "$instance" anchor --vcs-svn 127.0.0.1:0 --vcs-store "$WORK/store-$1" > /dev/null 2> "$log" &
   ANCHOR=$!
   for _ in $(seq 1 1200); do
     if grep -q "^slates daemon: instance $instance serving on" "$log" \
@@ -147,7 +149,8 @@ start_slates() {
     sleep 0.1
   done
   "$SLATES" --instance "$instance" bootstrap root > /dev/null
-  "$SLATES" --instance "$instance" repository create project --tool svn > /dev/null
+  "$SLATES" --instance "$instance" repository create project --tool svn > /dev/null \
+    || { echo "slates run $1: repository create refused" | tee -a "$RESULTS"; return 1; }
   timed "slates import $1" "$SLATES" --instance "$instance" repository import project "$DUMP"
   echo "slates daemon rss after import: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   # shellcheck disable=SC2086 # the surface's NAME=VALUE pairs are words
@@ -223,12 +226,26 @@ for run in $(seq 1 "$RUNS"); do
 done
 
 echo "== results (seconds; every run shown)"
+FAILED_ROWS=""
 for step in load import checkout log commit update "update-$UPDATE_SPAN"; do
+  grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
   printf '%-18s %-6s' "$step" "$server"
   grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
-    $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  best %s", (best == "" ? "-" : best) }'
+    $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  %s", (best == "" ? "FAILED" : "best " best) }'
   echo
+  if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
+# A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
+# could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round
+# exited 0). A server that timed no step at all (its setup refused) fails it too, though it left no row to mark.
+for server in $SERVERS; do
+  grep -qE "^$server [^ ]+ [0-9]+ [0-9.]+ " "$RESULTS" || FAILED_ROWS="$FAILED_ROWS $server:every-step"
+done
+if [ -n "$FAILED_ROWS" ]; then
+  echo "FAILED: every run failed for$FAILED_ROWS"
+  exit 1
+fi
+
