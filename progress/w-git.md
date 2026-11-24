@@ -686,3 +686,11 @@
   guard-then-apply, A-888) -> speed (interop round a51b627f5 big Studio, stock daemon/http-backend/slates: push
   11.5/13.1/87.8 s, clone 10.9/10.6/149.4 s, partial 6.2/6.6/73.3 s, incremental fetch 4 of 5 runs ~2.2 s; RSS 1.3 GiB
   after push, 2.9 GiB end): clone first, then partial, then push; with pack shape vs stock, (iii), B1/B2.
+- 2026-11-24 ~02:10: LANDED: edge failure logging b98233544; made-commit NUL guard 32fc2c982 (dc7980f98); gate-4
+  instrumentation d0c12a8e2 (d801b78d2; gate 4 = GitHub 45363070862 running); guarded made commits 22a88984b
+  (7925ce564: commit_guarded, Before::Unmade refused typed). IN PROGRESS (uncommitted, ~/.cache/w-git-optionA-wip.patch):
+  Option A (main 01:36): bare git submits refused RecordedSubmitRequired (take_turn), test driver made_landing_now
+  (MADE_HELD_FOR_TEST), version_saying recorded; ~20 tests fail: recorded submits park on refine jobs (sync tests can't
+  run them). Asked main: (a) async harness vs (b) sync refine driver (recommended). Owed records: replay refuses typed
+  (main 01:51). Production check: no bare git submit in slates prod; kiln's vendored source not found locally (asked).
+  W-GIT-DIAG eprintlns in paths/tests.rs version_saying + commits::held_count: REMOVE before commit.
