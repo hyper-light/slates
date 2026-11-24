@@ -2769,8 +2769,10 @@
 > `a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory` and
 > `a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it` pass (r202, 2e375de89).
 > `a_hooks_first_view_of_a_long_history_is_waited_for_while_it_is_laid_out` passes 3 of 3 alone (r351, 23850ce74), red
-> 3 of 3 at 2e375de89 (r269, the import refused `BudgetExceeded { available: 0 }`); main's bisect of the 79 commits
-> between (r378) names the fix. The svn matrix's revprop rows pass with the store (r202, 66 of 66 over svn:// and
+> 3 of 3 at 2e375de89 (r269, the import refused `BudgetExceeded { available: 0 }`). **A-877 (c1da780ec) closed it:**
+> main's bisect of the 79 commits between (r378, 7 steps, the test alone on the big Studio) names c1da780ec the first
+> fixed commit ("repository windows shorter than a granule share one-granule slabs"). Before it, each of the first
+> revision's 4,872 tiny texts held a granule of its own, and the owner shard's admittable room ran out within seconds. The svn matrix's revprop rows pass with the store (r202, 66 of 66 over svn:// and
 > HTTP). Owed: a revision property change's own signal, since each hook refreshes
 > every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
 > repository. Owed before: P3 (the presenter under
