@@ -29959,16 +29959,28 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
   - **The field, as bounded.** `Acceptor::moved_from` is set only by an install that moves the authority away from a
     retired owner (`Acceptor::move_authority`, from a takeover's page or answer and from the authority reconcile). It
     holds one owner, overwritten by the next such move, never a list.
+  - **A move names its retirement (amended by A-883, 2026-11-23).** The record is the retired owner and the version of
+    the retirement whose install made the move (`slates_db::register::MovedFrom`,
+    `RegionalConfiguration::retirement_version`), and `copy_falls_to` counts it only while the configuration keeps that
+    same retirement of that owner. A host whose retirement completed may be admitted again under its id and retire
+    again, and a move made at its first retirement says nothing of its next, as A-309's completion record says nothing
+    of the member an id names after its admission. Counted by the host alone, a copy moved at the first retirement fell
+    in every later round of that host, and "the asker's own objects never fall here" broke two ways:
+    - where every holder's copy carried the stale move, the successor took its own live object over again at a higher
+      epoch, fencing its own log;
+    - where they disagreed (a holder whose copy came after the move refuses it by name), the object was never promised
+      and was given up, and the retirement was never confirmed, so the fleet never settled (the chaos nemesis, seeds
+      14946995733817154046 and 8173581894251929445).
   - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
     byte. The layout without the field is refused as truncated, never read as "moved from none".
   - **The image.** The held image's register is its object and this encoding (`HeldRegister`), so a warm restart keeps
-    an earlier move. The layout changed, so the image version is 25 and the delta version 8: a delta carries the held
-    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7); A-275 (image 26, delta 9) and
-    raft-7's A-270 (image 27, delta 10) take the numbers after, in landing order. An image or delta of another version
-    is refused by its version. A missing field is never read as none: that would be the compatibility shim §2.7
-    forbids.
+    an earlier move, and since A-883 the retirement that made it (image version 34, delta version 12). The layout
+    changed, so the image version is 25 and the delta version 8: a delta carries the held image whole. Both follow
+    conformance-14 (A-262, image 23 and 24, delta 6 and 7); A-275 (image 26, delta 9) and raft-7's A-270 (image 27,
+    delta 10) take the numbers after, in landing order. An image or delta of another version is refused by its
+    version. A missing field is never read as none: that would be the compatibility shim §2.7 forbids.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.
@@ -32326,7 +32338,9 @@ model below; each red before its fix):
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
   never a loss. An id admitted again loses its old record (`admit`): it says nothing of the member it names now, and
-  kept it would let a later, uncompleted takeover of the id read as completed.
+  kept it would let a later, uncompleted takeover of the id read as completed. The same holds of a holder's record of
+  a move (A-883): a move names the retirement that made it, never the host alone, so a copy moved at one retirement of
+  an id is listed in no later round of that id.
 - **A move on an unresolved line is allowed** (`RegionalConfiguration::moves`). Records are bounded, so the line of
   every volume whose creator's takeover completed long ago reads unresolved once its record goes; refusing it, as
   A-272 did, would leave such a volume unmovable for good. The configuration names no owner there and holds no claim
@@ -62158,3 +62172,50 @@ GAPS (A-879, A-384's floor, and A-789's note on the extents file), `docs/cli.md`
     `detection_periods`, the readmission test's record of each survivor's term at the cut).
   - §4.4's status, A-363's entry, GAPS, and
     `docs/bugs/2026-11-23-the-failover-delay-left-out-a-detection-the-detectors-timer-judged.md`.
+
+### A-883 — A move names its retirement, not its host (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the chaos nemesis's settle failure; amends A-251 (i); A-309, A-409)
+
+- **Why.** A takeover's install moves a retired owner's copies to the owner's successor, and the holder records the
+  owner a copy came from (`Acceptor::moved_from`, A-251), so the successor's round still lists the copy once routing
+  names the successor as a live owner. The record named the host alone. A host whose retirement completed may be
+  admitted again under the same id and retire again. A copy moved at its first retirement then fell in every later
+  round of that host, and the asker's own objects, which never fall in another host's round, did:
+  - where every holder's copy carried the stale move, the successor took its own live volume over again at a higher
+    epoch, fencing its own log (diagnostic run 11 of 14 on adacachy2, seed 14946995733817154046: epoch 3 seq 8 adopted
+    again as epoch 4 seq 8);
+  - where they disagreed, a holder whose copy came after the move refused the object by name, the object was given up
+    at the failover SLO, the share was never confirmed and the fleet never settled (CI, seeds 14946995733817154046 and
+    8173581894251929445: 371 copies listed by the moved-from owner, 233 by-name refusals, 246 unpromised, 3 given up).
+- **The rule.** A move records the retired owner and the version of the retirement whose install made it
+  (`slates_db::register::MovedFrom`, `RegionalConfiguration::retirement_version`, as `DepartedOwner::since_version`
+  names the lease gate's retirement). `copy_falls_to` counts the move only while the configuration keeps that same
+  retirement of that owner. A-309's completion record is dropped at an admission for the same reason: a record of an
+  earlier takeover of an id says nothing of the member it names now.
+- **Rejected.** Clearing the move at the install that admits the host again: a lagging holder can install from the
+  first retirement straight to the second without seeing the admission, and keeps the stale move.
+- **Format.** `PersistedAcceptor`'s last field is the record, the owner and the retirement's version. The image is
+  version 34 and the delta 12. No reader of the old layouts is kept: an older image or delta is refused by its version,
+  and a register whose record is the owner alone is refused as truncated (§2.7).
+- **Tests** (adacachy2):
+  - `a_copy_moved_at_a_hosts_earlier_retirement_falls_in_none_of_its_later_rounds` (`crates/db/src/takeover.rs`,
+    through the real configuration, on the copy and its twin rebuilt from its encoding): red with the version ignored,
+    green with it.
+  - `a_volume_taken_from_a_host_is_not_taken_over_again_when_the_host_retires_a_second_time`
+    (`crates/server/tests/fleet.rs`, three daemons): red with the version ignored, green with it.
+  - The register nemesis (`crates/db/src/register_nemesis.rs`): each takeover's install is a move from a retired
+    owner, the owner hosts taking turns as a re-admitted id does, and every holder back from a restart, through the
+    encoding, must name the move it named before; its restarts across a move are counted.
+  - The daemon's three moved-copy tests, the register's persisted-state and hostile-input tests, and the lineage
+    model's copy of the rule, each held to the record and its retirement.
+- **Applied in the same change to:**
+  - `crates/db/src/register.rs`: `MovedFrom`, `Acceptor::move_authority`, `Acceptor::moved_from`, `PersistedAcceptor`,
+    `RegionalConfiguration::retirement_version`, the persisted-state tests.
+  - `crates/db/src/takeover.rs`: `copy_falls_to`, `promise_object`, `answer_by_name`, the ledger's answer, the tests.
+  - `crates/db/src/register_nemesis.rs` and `crates/db/tests/lineage_model.rs`.
+  - `crates/server/src/fleet.rs` (`reconcile_held_copy`, `install_on_copy`, the install walk), `takeover.rs` (the page's
+    and the round's promises, `retirement_versions`) and `daemon.rs` (the moved-copy tests).
+  - `crates/server/tests/fleet.rs`.
+  - `crates/vfs/src/recover.rs` (image 34) and `checkpoint_log.rs` (delta 12).
+  - A-251 (i)'s field and image text, A-309's admission rule.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-move-named-its-host-not-its-retirement.md.
