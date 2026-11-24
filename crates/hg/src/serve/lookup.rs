@@ -62,6 +62,9 @@ pub(crate) const TAGS_PATH: &[u8] = b".hgtags";
 /// (7.2's `filectx.data()`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagsRead {
+  /// The heads' changeset nodes it began over, in head order: what tells a read made earlier still answers
+  /// ([`TagsRead::same_heads`]), known before any text is (goal 93, C1 (1) P5: a head's manifest may be let go).
+  head_nodes: Vec<Node>,
   /// The `.hgtags` file revisions, in the order read.
   files: Vec<Node>,
   /// Each head's `.hgtags` revision in head order, or the manifest to read it from where the manifest's text is not at
@@ -96,6 +99,10 @@ impl TagsRead {
     admission.charge_items::<Node>(revs.len().saturating_mul(3))?;
     let mut heads = Vec::with_capacity(revs.len());
     let mut manifests = Vec::new();
+    let head_nodes = revs
+      .iter()
+      .map(|rev| repo.node(*rev).ok_or(Refusal::Graph { rev: *rev }))
+      .collect::<Result<Vec<_>, _>>()?;
     for head in revs {
       match repo.manifest_not_at_hand(head) {
         Some((manifest, _)) => {
@@ -106,6 +113,7 @@ impl TagsRead {
       }
     }
     let mut read = TagsRead {
+      head_nodes,
       files: Vec::new(),
       heads,
       manifests,
@@ -317,10 +325,12 @@ impl crate::render::StoreWants for TagsRead {
 }
 
 impl TagsRead {
-  /// Whether `self` read the same `.hgtags` revisions `other` begins to: the heads' tags unchanged between them, so a
-  /// read made earlier answers a lookup now.
-  pub fn same_files(&self, other: &TagsRead) -> bool {
-    self.files == other.files
+  /// Whether `self` was read over the heads `other` begins over: the same heads name the same `.hgtags` revisions, so a
+  /// read made earlier answers a lookup now. Judged by the heads, never by the files: a read begun where a head's
+  /// manifest is not at hand knows no file yet (goal 93, C1 (1) P5; judged by the files, a verb parked on the read ran
+  /// again, found it unlike its new one, and parked again, for ever: main's hg_interop round at a30ffbdb8).
+  pub fn same_heads(&self, other: &TagsRead) -> bool {
+    self.head_nodes == other.head_nodes
   }
 }
 

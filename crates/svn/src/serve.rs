@@ -669,6 +669,9 @@ pub struct Connection {
   url: Vec<u8>,
   /// What the caller's answer to the URL settled, until the session is established.
   resolved: Option<Resolved>,
+  /// The last refusal a commit's drive answered, described, until its caller takes it for its log
+  /// ([`Connection::take_drive_refused`]).
+  drive_refused: Option<String>,
 }
 
 impl Connection {
@@ -683,6 +686,7 @@ impl Connection {
       limits,
       url: Vec::new(),
       resolved: None,
+      drive_refused: None,
     })
   }
 
@@ -925,6 +929,13 @@ impl Connection {
       }
     };
     self.begin_commit(established, command, start, false, &sources.policy, out)
+  }
+
+  /// The last refusal a commit's drive answered, described (its typed cause, or the errors a hook or the caller refused
+  /// with), once: the client is told Subversion's words alone, so the caller logs this (main's finding of 2026-11-24,
+  /// the Linux matrix's bare "Corrupt").
+  pub fn take_drive_refused(&mut self) -> Option<String> {
+    self.drive_refused.take()
   }
 
   /// The transaction a due hook runs over (A-661): its name, base, revision properties, rows and
@@ -1600,10 +1611,13 @@ impl Connection {
   fn stepped<'a>(
     &mut self,
     established: Box<Established>,
-    drive: Box<Drive>,
+    mut drive: Box<Drive>,
     step: Step,
     consumed: usize,
   ) -> Result<Turn<'a>, Refused> {
+    if let Some(refused) = drive.take_refused() {
+      self.drive_refused = Some(refused);
+    }
     Ok(match step {
       Step::Taken | Step::Refused | Step::Dropped => {
         self.phase = Phase::Committing(established, drive);

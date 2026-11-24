@@ -1470,6 +1470,17 @@
 >   `landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify` (an import and a push
 >   in two: every changelog and manifest object let go before and after a clone and a pull, each changegroup verified
 >   by the push's own verifier; red: 10 and 14 held). Owed: stock 7.2's clone, pull and verify (main's `hg_interop`).
+>   Found by main's `hg_interop` round at a30ffbdb8 and closed: a fetch's changelog and manifest texts read whole from
+>   the changeset store (to send a changeset, or diff a manifest against the client's) were counted as file revisions
+>   sent whole (`vcs_store.hg_pull_whole_texts`: 3 for a one-changeset pull, its changeset, its manifest and the parent
+>   manifest), though the pull sent the stored delta; now counted apart (`StoreWants::reads_logs`,
+>   `vcs_store.hg_pull_log_texts`). Held by P5's red above (red: 3 whole, 0 log texts).
+>   Also found there and closed: `branch create --from v1` hung (`stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_
+>   from_the_tag`). The verb parked on its `.hgtags` read ran again and judged the read held by its files, which a read
+>   begun over heads whose manifests are let go does not know yet, so it parked again, for ever. A held read is now judged
+>   by the heads it began over (`TagsRead::same_heads`). Held by
+>   `a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made` (red: refused
+>   `ContentUnavailable`).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
@@ -4023,6 +4034,20 @@
 >
 > hg 24 of 24 over Mercurial's whole history, on ubuntu-latest x86_64 (glibc's default and tuned malloc) and on
 > ubuntu-24.04-arm, under twice the CPUs in busy loops (run 45303764098, arena-19).
+>
+> **Later rounds (2026-11-24):**
+> - **Linux git, run 3** (45445378898, at c53777733): 27 of 27 again.
+> - **Linux svn, runs 3 and 4** (45445378898 at c53777733; 45477825824 at 4664f8d26, svn legs only): **26 of 33 on
+>   both routes**, the same seven rows each time, against run 1's 33 of 33.
+>   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
+>   - delete, revert and status failed after them, on the edit left behind.
+>   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
+>     4d), and nothing brought it back.
+>   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
+>     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
+>     its chunk again, on all three edges, counted.
+> - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
+>   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
 > verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
@@ -13726,6 +13751,22 @@ its slack, since for a page grain the congruent address is the reservation's bas
 population by its **median**, which a handful of merges cannot move and a grain changed from the page to the
 huge page would move all sixty-four of. **A sum cannot tell a merge from a regression; an order statistic
 can.**
+
+### 8a-tsan-sweep. One sweep held the TSan lane for hours, and one Subversion test fails under it (2026-11-24, open)
+
+Main's TSan step (62 minutes, three times diag 45315777446's 20 min 38 s) timed out on main run 45461883678 at
+62.6 minutes. Diag 45411303175 (7d6874639, ubuntu-latest, its step held to 300 minutes) took 234 minutes. Its log's
+timestamps put 3 h 26 min of that in one test, `content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`
+(14:34 to 18:00), where the rest of the server's library took 16 min 15 s. The sweep runs on one shard, so it has no
+second thread for ThreadSanitizer to watch, while every byte it holds to is read through the shared object's atomics
+(A-171), each intercepted. The lane now leaves it out (`SERVER_SKIPPED` in `xtask/src/tsan.rs`, with that reason;
+it runs in every other lane), and the step's limit is three times the measured pass without it: 31 min 41 s,
+95 minutes.
+
+Open (w-svn): the same diag's one failure in 1,306 library tests,
+`daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (daemon.rs:9662,
+`seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
+fixed or explained.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

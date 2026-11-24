@@ -244,6 +244,10 @@ impl crate::render::StoreWants for Streamed {
   fn reads_tags(&self) -> bool {
     self.answering.reads_tags()
   }
+
+  fn reads_logs(&self) -> bool {
+    self.answering.reads_logs()
+  }
 }
 
 impl Streamed {
