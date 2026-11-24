@@ -4042,7 +4042,10 @@
 >   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
 >   - delete, revert and status failed after them, on the edit left behind.
 >   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
->     4d), and nothing brought it back. The fix is w-svn's, in progress; run 5 follows it.
+>     4d), and nothing brought it back.
+>   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
+>     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
+>     its chunk again, on all three edges, counted.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
