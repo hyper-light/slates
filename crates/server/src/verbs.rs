@@ -7687,9 +7687,10 @@ pub(crate) fn admit_over(
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        // Room the remakes of the pool's extents in flight would make is waited for (`crate::room_wait`, A-789), so
-        // only a refusal that waits for nothing is the shard's first to report.
-        if !crate::room_wait::note_refusal(state, limit) {
+        // Room the work in flight would make is waited for (`crate::room_wait`): the remakes of the pool's extents
+        // (A-789) and the teardowns of the volumes this shard destroys (A-884), so only a refusal that waits for
+        // nothing is the shard's first to report.
+        if !crate::room_wait::note_refusal(state, crate::room_wait::Room::Bytes, limit, available) {
           report_first_budget_refusal(state, "bytes", limit, available);
         }
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
@@ -7723,7 +7724,11 @@ pub(crate) fn admit_over(
   let version_credit = match taken {
     Ok(c) => Some(c),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-      report_first_budget_refusal(state, "versions", wanted, available);
+      // A teardown in flight gives its volume's inode allowance back as it ends (A-884): waited for, as bytes are.
+      if !crate::room_wait::note_refusal(state, crate::room_wait::Room::Versions, wanted, available)
+      {
+        report_first_budget_refusal(state, "versions", wanted, available);
+      }
       return Err(Box::new(give_back(
         state,
         reservation,
@@ -7750,6 +7755,13 @@ pub(crate) fn admit_over(
   let metadata_credit = match reserve_metadata(state, journal_bytes) {
     Ok(credit) => Some(credit),
     Err(refusal) => {
+      // A teardown in flight gives its volume's records back as it ends (A-884): waited for, as bytes are. Whether it
+      // waits is the dispatch's to act on (`room_wait::park_if_owed`); this path reports no first refusal.
+      if let Refusal::BudgetExceeded { available } = refusal {
+        let page = usize::try_from(state.config.geometry.page).unwrap_or(1);
+        let wanted = Volume::metadata_footprint(journal_bytes, page);
+        crate::room_wait::note_refusal(state, crate::room_wait::Room::Metadata, wanted, available);
+      }
       return Err(Box::new(give_back(
         state,
         reservation,
@@ -16119,6 +16131,10 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     / PERMILLE;
   let releasing = step_releases(state, budget.max(1));
   let mut any = step_relinquished(state, budget);
+  // Test support: a held teardown runs no slice (`Daemon::inject_teardown_hold`, A-884).
+  if state.teardowns_held {
+    return any || releasing;
+  }
   let destroying: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -16137,13 +16153,20 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       any = true;
       continue;
     }
-    let done = match state.volumes.get_mut(handle) {
-      Ok(slot) => matches!(
-        slot.volume.destroy_step(&mut state.store, budget.max(1)),
-        Ok(DestroyProgress::Done) | Err(_)
-      ),
-      Err(_) => true,
+    let (done, released) = match state.volumes.get_mut(handle) {
+      Ok(slot) => {
+        let before = slot.volume.destroy_pending();
+        let stepped = slot.volume.destroy_step(&mut state.store, budget.max(1));
+        let released = before.saturating_sub(slot.volume.destroy_pending());
+        (
+          matches!(stepped, Ok(DestroyProgress::Done) | Err(_)),
+          released,
+        )
+      }
+      Err(_) => (true, 0),
     };
+    // A create parked for this teardown's room learns it went on (A-884).
+    crate::room_wait::teardown_sliced(state, u64::try_from(released).unwrap_or(u64::MAX));
     // A slice ran; the round goes on while it has more (the serve loop keeps stepping).
     any |= !done;
     if done {
@@ -16181,6 +16204,8 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       state.by_id.remove(&id);
       crate::live_ship::forget(state, id);
       retire_local_tombstones(state);
+      // A create parked for the room this teardown held runs again now that it is back (A-884).
+      crate::room_wait::teardown_ended(state);
     }
   }
   any || releasing

@@ -18,6 +18,8 @@
 use std::hash::{DefaultHasher, Hasher};
 use std::mem::size_of;
 
+use crate::index::TIER_BASE;
+
 /// Shape: the bits of a filter's word.
 const WORD_BITS: u64 = u64::BITS as u64;
 
@@ -37,11 +39,6 @@ const OWN_AND_SHARED: u64 = 2;
 
 /// Derived: a miss's false resolves over every run it may walk, at most one over this (so under one, main's ruling).
 const FALSE_RESOLVES_PER_MISS_INVERSE: u64 = 2;
-
-/// Derived: how the rows to an index's own run grow, one run to the next older: the size-tiered rule keeps each run
-/// holding more than twice the rows of all the runs newer than it together (`Index::tiered_due`), so the rows to a run
-/// grow more than 1 + 2 = 3 fold a run, and an index of `n` rows has at most ⌊log₃ n⌋ + 1 own runs.
-const TIERED_GROWTH: u64 = 3;
 
 /// A key's hash, taken once a lookup and probed into every run's filter ([`KeyFilter::may_hold`]).
 #[derive(Clone, Copy, Debug)]
@@ -82,15 +79,15 @@ pub(crate) struct KeyFilter {
 
 impl KeyFilter {
   /// Derived: a filter for `rows` keys in a store of `budget` bytes. Each row takes a byte of the budget at least, so
-  /// an index holds at most `budget` rows and its own runs number at most ⌊log₃ budget⌋ + 1 (the size-tiered bound
-  /// with a seal of one row at fewest); a lookup walks [`OWN_AND_SHARED`] times that, `R`. A key sets `k = ⌈log₂(2R)⌉`
+  /// an index's tables hold at most `budget` bytes and its own runs number at most ⌊log₃ budget⌋ + 1 (the size-tiered
+  /// bound, base [`TIER_BASE`], with a seal of one byte at fewest); a lookup walks [`OWN_AND_SHARED`] times that, `R`. A key sets `k = ⌈log₂(2R)⌉`
   /// bits ([`FALSE_RESOLVES_PER_MISS_INVERSE`] = 2), and the filter takes `k · log₂ e` bits a key, rounded up to whole
   /// words, so a miss passes a run with probability `2^-k ≤ 1/(2R)` and resolves under half a table over all `R`.
   /// For the 64 GiB budget of the intake harness: `R` = 46, `k` = 7, 10.1 bits a key. A size past the machine's
   /// words is no filter: it says yes to every key.
   pub(crate) fn sized(rows: u64, budget: u64) -> KeyFilter {
     let own = budget
-      .checked_ilog(TIERED_GROWTH)
+      .checked_ilog(TIER_BASE)
       .unwrap_or(0)
       .saturating_add(1);
     let walked = u64::from(own).saturating_mul(OWN_AND_SHARED);
