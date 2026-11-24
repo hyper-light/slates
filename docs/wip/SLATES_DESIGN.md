@@ -62659,3 +62659,39 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
 Applied in the same change to: GAPS (C2's made commits), `crates/server/src/{made_commit,verbs}.rs`,
 `crates/server/src/repository/{svn_commit,push}.rs`, `crates/server/src/vcs_store/svn_made.rs`, and the tests named
 above.
+
+### A-892 — An import batch is bounded by its green's retention room as well as the shard's memory (2026-11-24, w-svn for main 01a20182, its rulings of 2026-11-24 00:09 and 00:49; goal 93, the Studio's interop round 2; amends A-822's batch rule; A-814, A-835)
+
+- **What was there.** A Subversion import lands its revisions a batch at a time (A-822), the batch flushed when the next
+  revision's memory would not be admitted (`Staging::due_before`) or its changeset is full. Its landing secures every
+  staged version's history and change-index reservation at once against the green's retention cap
+  (`push::append_versions`, `verbs::secure_retention`; the cap is `caps.green_chain_bytes`, the derived merge byte bound
+  a green's history and chain are held to). Nothing bounded the batch by that cap. On the Studio's 23 shards (main
+  a51b627f5, round 2) git-2000.dump's first batch secured 422,803,669 bytes against a cap of 373,475,417 with nothing
+  charged, and the import was refused `BudgetExceeded { available: 373475417 }` in all five runs; a 4-CPU runner's
+  larger shards imported it.
+- **The rule.** A batch takes its room when it begins: the green's cap less what it holds once its history is folded as
+  far as its readers let it (`ImportBatch::begin` settles first, as the landing's securing does). `ImportBatch::stage`
+  measures a work's reservation in the scratch member before its verdict, as the verdict would (`reservation_of`), and a
+  work that would take the batch past its room is refused `StageRefused::PastRoom` with nothing judged; the import's
+  staging hands the revision, its texts put and their holds kept, to the next batch (`staging::Deferred`), the
+  revision's records not yet applied, and lands this one (`Flush::Retention`, counted
+  `repository.svn_import.flushed_retention`). A revision past the room alone, in a batch of none, is refused
+  `Uncommitted::PastRetention`, on the wire `ImportFault::RetentionPastRoom { revision, reserved, room, landed }`
+  (appended, tag 11; the API's contract 64): nothing of it staged, the repository at `landed`.
+- **A budget log names what it knows.** The record step logs every `BudgetExceeded` reply once, where its request is
+  unknown; it logged `requested=0` and so classed the refusal as one its available covered (main's question of
+  2026-11-24). `report_first_budget_refusal` takes the request as an `Option`: unknown is logged `unknown`, and only a
+  refusal with nothing available is logged there.
+- **Evidence.** Red first on main 891de2741 (macOS, debug): under a green cap of 256 KiB,
+  `t_c2c_an_import_past_the_greens_retention_cap_lands_a_batch_within_it_at_a_time` (200 rewrites of an 8 KiB file) was
+  refused `Uncommitted { refusal: Append(Entry(BudgetExceeded { available: 262144 })), revision: 0, landed: 0 }`. Green
+  after: the import whole at revision 200, landed in batches (`flushed_retention` moved);
+  `t_c2c_a_revision_past_the_greens_retention_room_alone_is_refused_naming_it_and_both_numbers` (under a 16 KiB cap, one
+  revision adding 1,000 paths) refused at revision 1, reserved past the room, none landed, the wire fault as named; the
+  fault's golden vector in `crates/ipc/tests/wire_order.rs`. Owed: the Studio's round 3 (main's).
+
+Applied in the same change to: GAPS (C2 stage C), `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.{rs,txt}`,
+`crates/api/src/lib.rs`, `crates/server/src/{import_batch,verbs}.rs`,
+`crates/server/src/repository/{import,svn_commit}.rs`, `crates/server/src/repository/svn_commit/staging.rs`,
+`crates/server/src/vcs_store/svn_import.rs`, and the tests named above.

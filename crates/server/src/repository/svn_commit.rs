@@ -160,6 +160,14 @@ pub(crate) enum Uncommitted {
   /// The node's changeset store refused the record's changeset, or the daemon holds none (C2, A-767 C6): nothing of it
   /// is in the register.
   Unstored,
+  /// An imported revision whose history and change index alone would reserve more of its green's retention than the
+  /// green may hold (its cap less what it holds once folded; `ImportBatch::room`): nothing of it staged.
+  PastRetention {
+    /// What it would reserve.
+    reserved: u64,
+    /// The room.
+    room: u64,
+  },
 }
 
 /// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (160,000): the error a refusal of the step's own that
@@ -215,6 +223,10 @@ impl Uncommitted {
       Uncommitted::Unstored => (
         SVN_ERR_FS_GENERAL,
         "The repository's store did not take the commit".to_owned(),
+      ),
+      Uncommitted::PastRetention { reserved, room } => (
+        SVN_ERR_FS_GENERAL,
+        format!("The revision's history would hold {reserved} bytes of its green's {room}"),
       ),
     };
     Answered::Refused { code, message }
