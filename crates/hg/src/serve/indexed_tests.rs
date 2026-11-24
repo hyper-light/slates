@@ -2189,7 +2189,7 @@ fn clone_and_pull(
 fn log_texts_and_objects(
   index: &HgIndex,
   store: &ContentStore,
-) -> (BTreeMap<(Vec<u8>, Node), Vec<u8>>, Vec<ContentId>) {
+) -> (super::LogTexts, Vec<ContentId>) {
   let (mut texts, mut objects) = (BTreeMap::new(), Vec::new());
   for rev in 0..index.len(store, Log::Changelog) {
     let row = index.changeset(store, rev).unwrap();

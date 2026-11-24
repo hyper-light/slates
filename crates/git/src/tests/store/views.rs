@@ -664,6 +664,7 @@ fn the_first_push_reads_every_object_once(
     trees: 3,
     blobs: 4,
     skipped: 0,
+    named: 0,
   };
   assert_eq!(built.reads, reads);
   assert!(
@@ -693,6 +694,7 @@ fn the_second_push_reads_only_what_changed(
     trees: 4,
     blobs: 1,
     skipped: 1,
+    named: 0,
   };
   assert_eq!(built.reads, reads);
   let outcome = green.submit(&built.increment);
