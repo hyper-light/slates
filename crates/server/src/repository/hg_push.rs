@@ -1546,52 +1546,23 @@ async fn landed_after_builds(
         return Some(outcome);
       }
     };
-    match committing.ready(repository, &mut forked).await? {
-      Ok(true) => {}
-      Ok(false) => {
-        // Re-based: its works built again over the index as it is now.
-        crate::state::with_state(|state| crate::held_ahead::give_back(state, &ahead))?;
-        continue;
-      }
-      Err(outcome) => {
-        crate::state::with_state(|state| crate::held_ahead::give_back(state, &ahead))?;
+    // Its named texts held whole for the landing's judge, through its end (A-887).
+    let _pins = match readied(repository, (&mut committing, &mut forked), &named, &ahead).await? {
+      Readied::Land(pins) => pins,
+      Readied::Again => continue,
+      Readied::Refused(outcome) => {
         give_back(forked);
         return Some(outcome);
-      }
-    }
-    // Its named texts held whole for the landing's judge, through its end (A-887).
-    let _pins = match bring_back_named(repository, forked.as_ref(), &named).await {
-      Ok(pins) => pins,
-      Err(_) => {
-        crate::state::with_state(|state| crate::held_ahead::give_back(state, &ahead))?;
-        give_back(forked);
-        return Some(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec())));
       }
     };
     let landing_step = slates_rt::futures::doing("hg_push::landing");
     let tried = crate::state::with_state(|state| {
-      let tried = landing(
+      land_built(
         state,
-        repository,
-        (principal, name),
-        unbundle,
-        forked.take(),
-        (
-          &mut Works::Built {
-            built: &mut built,
-            missed: false,
-            ahead: &ahead,
-            uses: &mut uses_of(&plan),
-          },
-          room,
-        ),
-      );
-      // What the landing's entry did not name is given back, whatever it answered.
-      crate::held_ahead::give_back(state, &ahead);
-      if matches!(tried, Landing::Done(_)) {
-        committing.landed(state);
-      }
-      tried
+        (repository, (principal, name), unbundle),
+        (forked.take(), &mut built, &plan, &ahead),
+        (room, &mut committing),
+      )
     });
     drop(landing_step);
     match tried? {
@@ -1608,6 +1579,73 @@ async fn landed_after_builds(
       }
     }
   }
+}
+
+/// Where a push stands once its works are built and held ahead ([`readied`]).
+enum Readied {
+  /// It lands now, its named texts held whole by these pins until the landing ends (A-887).
+  Land(Vec<vcs_store::named_objects::ReadPin>),
+  /// Its fork was re-based: its works are built again over the index as it is now.
+  Again,
+  /// It is refused so.
+  Refused(PushOutcome),
+}
+
+/// A push's landing turn taken ([`Committing::ready`]) and the named texts its works name brought back through its fork
+/// ([`bring_back_named`]): it lands, it is built again, or it is refused, what it held ahead given back but for the
+/// first. None where the store went away.
+async fn readied(
+  repository: RepositoryId,
+  (committing, forked): (&mut Committing, &mut Option<Forked>),
+  named: &[NamedRevision],
+  ahead: &[crate::held_ahead::HeldAhead],
+) -> Option<Readied> {
+  let readied = match committing.ready(repository, forked).await? {
+    Ok(true) => match bring_back_named(repository, forked.as_ref(), named).await {
+      Ok(pins) => return Some(Readied::Land(pins)),
+      Err(_) => Readied::Refused(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))),
+    },
+    Ok(false) => Readied::Again,
+    Err(outcome) => Readied::Refused(outcome),
+  };
+  crate::state::with_state(|state| crate::held_ahead::give_back(state, ahead))?;
+  Some(readied)
+}
+
+/// A push's landing, its one step, over its works built ([`landing`]): what its entry did not name given back whatever
+/// it answered, and its turn noted landed where it landed.
+fn land_built(
+  state: &mut ShardState,
+  (repository, (principal, name), unbundle): (RepositoryId, (&Principal, [u8; 32]), &Unbundle),
+  (forked, built, plan, ahead): (
+    Option<Forked>,
+    &mut BTreeMap<WorkKey, Increment>,
+    &[WorkKey],
+    &[crate::held_ahead::HeldAhead],
+  ),
+  (room, committing): (&mut Admission, &mut Committing),
+) -> Landing {
+  let tried = landing(
+    state,
+    repository,
+    (principal, name),
+    unbundle,
+    forked,
+    (
+      &mut Works::Built {
+        built,
+        missed: false,
+        ahead,
+        uses: &mut uses_of(plan),
+      },
+      room,
+    ),
+  );
+  crate::held_ahead::give_back(state, ahead);
+  if matches!(tried, Landing::Done(_)) {
+    committing.landed(state);
+  }
+  tried
 }
 
 /// A push's entry's commit under its repository's landing turn (main 01a20182's rulings of 2026-11-22 07:32 and 12:00):

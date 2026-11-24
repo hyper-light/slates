@@ -19867,21 +19867,8 @@ pub(crate) async fn rebuild_recovered(
   // Each repository's tool store made again, every entry's objects replayed through its admission and commit in log
   // order, a record a unit (A-662).
   crate::vcs_store::recover(state, slices).await;
-  // The greens whose replay reads a named base a repository's store resolves, rebuilt now the stores are (A-887): the
-  // same rebuild, in the order recovery took them.
-  let mut prefix = max_prefix;
-  for record in &after_stores {
-    rebuild_reconciled(
-      state,
-      record,
-      (&std::collections::BTreeMap::new(), None),
-      (slices, &mut rebuilt),
-      &mut prefix,
-    )
-    .await;
-  }
-  state.merge.after_stores.clear();
-  state.next_prefix = state.next_prefix.max(prefix);
+  // The greens whose replay reads a named base a repository's store resolves, rebuilt now the stores are (A-887).
+  rebuild_after_stores(state, &after_stores, (slices, &mut rebuilt), max_prefix).await;
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
   slices.unit_done().await;
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
@@ -20003,6 +19990,29 @@ async fn rebuild_records(
     .await;
   }
   (max_prefix, after_stores)
+}
+
+/// Rebuilds `after_stores`, the greens recovery left for after the repositories' stores ([`rebuilt_after_stores`]), by
+/// the same rebuild, in the order it took them, and ends the order's notes: their works then wait no more.
+async fn rebuild_after_stores(
+  state: &mut ShardState,
+  after_stores: &[VolumeRecord],
+  (slices, rebuilt): (&mut crate::recovery_slices::RecoverySlices, &mut Rebuilt),
+  max_prefix: u16,
+) {
+  let mut prefix = max_prefix;
+  for record in after_stores {
+    rebuild_reconciled(
+      state,
+      record,
+      (&std::collections::BTreeMap::new(), None),
+      (slices, rebuilt),
+      &mut prefix,
+    )
+    .await;
+  }
+  state.merge.after_stores.clear();
+  state.next_prefix = state.next_prefix.max(prefix);
 }
 
 /// Counted: the content store refused to be made when recovery ordered a Mercurial green ([`rebuilt_after_stores`]).
@@ -20168,6 +20178,44 @@ fn rebuild_mounted_slot(
   }
 }
 
+/// A green's record rebuilt from its own origin and chain, or as the member of its repository it joined as (A-575), the
+/// named texts its replay reads brought back first and let go after (A-760's pre-pass, A-887's), and every merge record
+/// its chain holds enqueued for its holders again.
+async fn rebuild_green_record(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  // A restarted owner owes its holders every merge record its chain holds that they may not: the pending records
+  // lived in memory, so a version appended before the restart and not yet committed at `f + 1` was never shipped
+  // again (the bug record of 2026-11-07). Re-enqueued, each is placed from the current configuration; a holder that
+  // already holds a version acknowledges it again at no cost.
+  // A repository's member is rebuilt the way it joined, in the order it joined (A-575); a lone green from its own
+  // origin and chain.
+  let member = state
+    .db
+    .partition()
+    .repositories()
+    .member(record.id)
+    .cloned();
+  // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
+  // once it is replayed.
+  let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
+  // A Mercurial green's named bases its replay reads, by the revisions its checkpoint's and chain's changesets name
+  // (A-887), let go again once it is replayed: a landed text's bytes are the node's store's.
+  let brought_hg = crate::vcs_store::hg_named::bring_back_named(state, record.id, slices).await;
+  let versions = match member {
+    Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
+    None => rebuild_green_sliced(state, record, slices).await,
+  };
+  crate::vcs_store::name_holds::give_back_brought(state, &brought);
+  crate::vcs_store::name_holds::let_go_landed_texts(state, &brought_hg);
+  for version in versions {
+    crate::merge_service::enqueue_recovered_record(state, record.id, version);
+    slices.unit_done().await;
+  }
+}
+
 /// Rebuilds one recorded volume by its role; false when a plain volume could not be (refused and logged, never
 /// presented empty), which leaves it out of the reconciliation.
 async fn rebuild_record(
@@ -20186,34 +20234,7 @@ async fn rebuild_record(
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
     }
     Role::Green { .. } => {
-      // A restarted owner owes its holders every merge record its chain holds that they may not: the pending records
-      // lived in memory, so a version appended before the restart and not yet committed at `f + 1` was never shipped
-      // again (the bug record of 2026-11-07). Re-enqueued, each is placed from the current configuration; a holder that
-      // already holds a version acknowledges it again at no cost.
-      // A repository's member is rebuilt the way it joined, in the order it joined (A-575); a lone green from its own
-      // origin and chain.
-      let member = state
-        .db
-        .partition()
-        .repositories()
-        .member(record.id)
-        .cloned();
-      // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
-      // once it is replayed.
-      let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
-      // A Mercurial green's named bases its replay reads, by the revisions its checkpoint's and chain's changesets name
-      // (A-887), let go again once it is replayed: a landed text's bytes are the node's store's.
-      let brought_hg = crate::vcs_store::hg_named::bring_back_named(state, record.id, slices).await;
-      let versions = match member {
-        Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
-        None => rebuild_green_sliced(state, record, slices).await,
-      };
-      crate::vcs_store::name_holds::give_back_brought(state, &brought);
-      crate::vcs_store::name_holds::let_go_landed_texts(state, &brought_hg);
-      for version in versions {
-        crate::merge_service::enqueue_recovered_record(state, record.id, version);
-        slices.unit_done().await;
-      }
+      rebuild_green_record(state, record, slices).await;
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
     }
     Role::Work { green, .. } => {
