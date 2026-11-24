@@ -261,8 +261,13 @@ echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
 for server in $SERVERS; do
   grep -qE "^$server [^ ]+ [0-9]+ [0-9.]+ " "$RESULTS" || FAILED_ROWS="$FAILED_ROWS $server:every-step"
 done
-if [ -n "$FAILED_ROWS" ]; then
-  echo "FAILED: every run failed for$FAILED_ROWS"
+# A check that found the served data unlike the source (refs, objects, changesets, tree or log DIFFER; an incremental
+# change MISSED) fails the harness too: a check that only prints could let a dropped ref pass (main 01a20182, after
+# r655 narrowed git's object check to what the push sends).
+CHECKS_FAILED=$(grep -E '^[^ ]+ (incremental )?check .*(DIFFER|MISSED)' "$RESULTS" | sort -u | tr '\n' ';')
+if [ -n "$FAILED_ROWS" ] || [ -n "$CHECKS_FAILED" ]; then
+  [ -n "$FAILED_ROWS" ] && echo "FAILED: every run failed for$FAILED_ROWS"
+  [ -n "$CHECKS_FAILED" ] && echo "FAILED: a check found the served data unlike the source: $CHECKS_FAILED"
   exit 1
 fi
 

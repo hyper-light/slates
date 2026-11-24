@@ -55,3 +55,9 @@ w-svn's. It also showed four faults of the harness:
 - **`git daemon` outlived its run.** git starts `git-daemon` as a child, and the harness killed only its wrapper; r655's
   samples held a stray daemon from the git leg onward, using no CPU. The harness now starts `git-daemon` itself under
   `env`, so the kill reaches it: on the MacBook no daemon is left after a run.
+- **A check that found the served data unlike the source only printed** (main's question after round 2): a dropped
+  ref read `check refs DIFFER` and the harness still exited 0, and a source with no branch or tag would have compared
+  two empty sets as identical. Every check line reading `DIFFER` or `MISSED` (refs, objects, changesets, tree, log, an
+  incremental change) now fails all three harnesses, naming the lines, and the git harness refuses a source with
+  nothing to push. On the MacBook an empty bare repository exits 1, "has no branch or tag to push", and the 3-commit
+  repository still exits 0 with every check identical.

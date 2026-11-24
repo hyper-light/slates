@@ -87,6 +87,8 @@ rss_of() { ps -o rss= -p "$1" 2> /dev/null | awk '{ printf "%.0f", $1 / 1024 }' 
 DEFAULT=$(g -C "$SOURCE" symbolic-ref --short HEAD)
 echo "dataset: $SOURCE at $(g -C "$SOURCE" rev-parse HEAD) ($DEFAULT); $(g -C "$SOURCE" for-each-ref refs/heads | wc -l | tr -d ' ') branches, $(g -C "$SOURCE" for-each-ref refs/tags | wc -l | tr -d ' ') tags, $(g -C "$SOURCE" rev-list --all --count) commits"
 g -C "$SOURCE" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort > "$WORK/source.refs"
+# The refs the first push sends, which every clone's refs must equal: none would make that check vacuous.
+[ -s "$WORK/source.refs" ] || { echo "FAILED: $SOURCE has no branch or tag to push"; exit 1; }
 # What the first push sends: the objects reachable from the branches and tags, not every ref of the source (a clone of
 # git/git also has refs no push here sends, and r655's check read 436,736 objects "missing" on every server, stock too).
 g -C "$SOURCE" rev-list --objects --branches --tags | cut -d' ' -f1 | sort > "$WORK/source.objects"
@@ -299,8 +301,13 @@ echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
 for server in $SERVERS; do
   grep -qE "^$server [^ ]+ [0-9]+ [0-9.]+ " "$RESULTS" || FAILED_ROWS="$FAILED_ROWS $server:every-step"
 done
-if [ -n "$FAILED_ROWS" ]; then
-  echo "FAILED: every run failed for$FAILED_ROWS"
+# A check that found the served data unlike the source (refs, objects, changesets, tree or log DIFFER; an incremental
+# change MISSED) fails the harness too: a check that only prints could let a dropped ref pass (main 01a20182, after
+# r655 narrowed git's object check to what the push sends).
+CHECKS_FAILED=$(grep -E '^[^ ]+ (incremental )?check .*(DIFFER|MISSED)' "$RESULTS" | sort -u | tr '\n' ';')
+if [ -n "$FAILED_ROWS" ] || [ -n "$CHECKS_FAILED" ]; then
+  [ -n "$FAILED_ROWS" ] && echo "FAILED: every run failed for$FAILED_ROWS"
+  [ -n "$CHECKS_FAILED" ] && echo "FAILED: a check found the served data unlike the source: $CHECKS_FAILED"
   exit 1
 fi
 
