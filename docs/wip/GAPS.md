@@ -1691,7 +1691,26 @@
 > (`a_push_refused_while_answered_is_still_answered_on_band_three`, red at the shard fenced for the third lend after
 > the body: "side-band false", failed empty; green after); and `Unlanded` names where it fell short
 > (`git_push::Unlanded`: names not put, homing untaken, pack not held, homed short of f + 1, no landing, landing
-> untaken, store refused), in the log and in the client's words. OPEN: which of them gate 6 names, and its fix.
+> untaken, store refused), in the log and in the client's words. NAMED (gates 7 to 9): `HomedShort`, a remote home
+> answering `Refused(NotAHome)` 0.83-1.89 ms in, right after formation, its installed configuration behind the sender's;
+> FIXED by w-shared's A-902 (d48863ddb: the put carries the sender's configuration version, and a home behind it waits
+> for its own install within the put's budget).
+>
+> A git push of many new refs makes every new green in its landing's one step, OWED (w-git, 2026-11-24, main's order of
+> 15:06): git/git's whole history creates about 1,027 refs, mostly tags, each a Create whose make, secure, judge, hold
+> and commit run in the step that appends the entry, the cost w-hg measured for Mercurial's heads (452 heads held a
+> shard 3.5 s, watchdog exit). The way is w-hg's prepared-creates seam in `repository/push.rs` (agreed in writing
+> 2026-11-24: `prepare_create`, `PreparedCreates` handed to `push_planned`, prepared in slices under the landing turn
+> before the step, ids reserved ahead): git's driver hands its Creates in as Mercurial's does, once that lands.
+>
+> One push's reading spread over several shards, NOT IN THE DESIGN (for Ada; w-git, 2026-11-24, main's order of 09:50):
+> stock git's `index-pack` resolves one pack's deltas over threads; slates reads one push on one shard. §4.17.1 item 2
+> ("one repository's greens serialize on its owner shard") and §4.17.5 "Giant repositories" ("An intake's decoding,
+> hashing and checks run on the shard its connection arrived at ... so one hot repository uses every core") spread many
+> pushes, never one. Measured on the big Studio over git/git, best of 5 (main's git legs): r870 at 21b8b5311, slates
+> 80.872 s against stock 10.797 s; r940 at 0ebf10cf4 (one SHA-1 an object, not two), slates 69.016 s against 10.815 s,
+> its time one SHA-1, one BLAKE3 and zlib an object on one shard. Intake off the owner (§4.17.5 piece 5) is A-905,
+> w-shared's, and moves a push's reading off the owner, not across shards.
 > Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
