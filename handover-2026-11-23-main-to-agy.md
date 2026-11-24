@@ -22,6 +22,24 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 09:31 on 11-24:
+- Goal 84a measured at current main on every platform:
+  - macOS: met. Big Studio bare metal, r931 at 259b0db84. Every one of 30 runs is under 1 ms at p99 and p999, loaded
+    and quiet; the worst loaded p999 is 579 µs.
+  - Windows: met on GitHub's windows-latest and windows-11-arm (diag 45446126735 at afa579483). Every run's p99 and p999
+    is under 1 ms; the worst p999 is 469 µs. On jupiter's bare metal the every-run bar sits below the machine's own wake
+    floor (A-897), which is Ada's to rule on.
+  - Linux: quiet met on both ubuntu runners. Loaded is not met: p99 2.4-6.0 ms at whole milliseconds. The runners
+    grant no real-time priority (NoPriorityGranted, RLIMIT_RTPRIO 0), and the OS's own wake floor under the same load
+    is fine (p999 19 µs). So slates' per-sample CPU (shards 175-300 µs) is time-sliced behind the spinners. w-perf takes
+    it after its re-adoption piece (a).
+- Gate 9 named push 0's cause, Refused(NotAHome) from a remote home whose configuration is still settling (3 of 3).
+  w-shared builds A-902, the single wait, agreed with w-git.
+- w-git landed 2dfda25d4 (bit tables combined a word at a time). The git leg reruns at it as r935, after the load falls.
+- Landed: w-perf afa579483, d22209019 and cf8ecbde5 (re-adoption items 1 and 2a), w-svn 0c1cc4707 (the 3,000-file
+  import red). The svn import spin is closed (the cubic replay). w-perf has (a) next: a taken-over Mercurial green
+  refuses a made commit typed until the store moves with a takeover.
+
 Updates at 08:58 on 11-24:
 - Main and the fleet were paused by a usage limit from 06:27 to 08:51. The in-process subagent w-84a-win was stopped
   during it, after A-897 and A-901 had landed; its jupiter A/Bs for A-901 were not run (main's macOS half was: neutral).
