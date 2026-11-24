@@ -1150,6 +1150,11 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): how long this node, as a forwarded verb's owner, waits after the verb
+  /// ran and deferred its reply before its exchange asks where the reply stands, as an exchange whose owner shard was
+  /// busy does, so a test sees a reply recorded before its exchange asked (`verbs::await_deferred_completion`). `None`
+  /// in production (`Daemon::inject_forward_answer_delay`).
+  pub injected_forward_answer_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): how long this node, as a content holder, holds each acknowledgement
   /// of a placement before it leaves, after the hold already took the content, so the owner's round stops collecting at
   /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.

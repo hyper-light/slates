@@ -34,6 +34,8 @@ pub(crate) struct Judged {
   since: Instant,
   /// The CPU the tree gained over the looks since the wait began (a successor's from its first reading).
   spent: Duration,
+  /// Whether the wait fails once the trees spent [`CPU_BUDGET`] ([`Judged::progressing`] waits on progress alone).
+  budgeted: bool,
 }
 
 /// What a look at a waited-on tree came to.
@@ -65,6 +67,18 @@ impl Judged {
       mark,
       since: Instant::now(),
       spent: Duration::ZERO,
+      budgeted: true,
+    }
+  }
+
+  /// A wait on the trees under `roots` judged by their progress alone, with no [`CPU_BUDGET`]: for a step whose work
+  /// grows with its data (a stock git command over a whole repository), which a correct but slow run must never fail
+  /// (main 01a20182's ruling of 2026-11-23: a bound by speed fails a slow correct run). It fails once the trees are
+  /// gone or have gained no CPU for [`STALL`].
+  pub(crate) fn progressing(roots: Vec<u32>) -> Judged {
+    Judged {
+      budgeted: false,
+      ..Judged::of_all(roots)
     }
   }
 
@@ -91,7 +105,12 @@ impl Judged {
     if let (Some(then), Some(now)) = (self.mark, now) {
       self.spent = self.spent.saturating_add(now.saturating_sub(then));
     }
-    let judged = verdict(self.mark, now, self.since.elapsed(), self.spent);
+    let spent = if self.budgeted {
+      self.spent
+    } else {
+      Duration::ZERO
+    };
+    let judged = verdict(self.mark, now, self.since.elapsed(), spent);
     if judged == (Verdict::Waiting { progressed: true }) {
       self.mark = now;
       self.since = Instant::now();
@@ -579,6 +598,39 @@ fn a_tree_is_waited_on_while_it_gains_cpu_and_given_up_stalled_gone_or_spent() {
     Verdict::SpentItsBudget,
     "a tree that spent the wait's CPU budget without the answer is given up"
   );
+}
+
+/// Shape: the CPU [`a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at`] spends between
+/// its looks: enough for the process clock to see it gain some.
+#[cfg(test)]
+const BURN: Duration = Duration::from_millis(50);
+
+/// Spends about [`BURN`] of this thread's CPU.
+#[cfg(test)]
+fn burn() {
+  let began = Instant::now();
+  let mut spun = 0u64;
+  while began.elapsed() < BURN {
+    spun = std::hint::black_box(spun.wrapping_add(1));
+  }
+}
+
+/// A wait judged by its progress alone (main 01a20182's ruling of 2026-11-23: a stock git command over a whole
+/// repository is judged by progress, never by a budget a correct but slow run can pass). Do: judge this test's own
+/// process, gaining CPU, through two waits that have each spent [`CPU_BUDGET`] already: one made by
+/// [`Judged::progressing`], one by [`Judged::of`]. Expect the first still waited on and the second given up as having
+/// spent its budget: a tree that keeps working is never failed by its CPU under the first.
+#[test]
+fn a_wait_by_progress_alone_outlasts_the_cpu_budget_a_budgeted_wait_gives_up_at() {
+  let me = std::process::id();
+  let mut progressing = Judged::progressing(vec![me]);
+  progressing.spent = CPU_BUDGET;
+  burn();
+  assert_eq!(progressing.judge(), Verdict::Waiting { progressed: true });
+  let mut budgeted = Judged::of(me);
+  budgeted.spent = CPU_BUDGET;
+  burn();
+  assert_eq!(budgeted.judge(), Verdict::SpentItsBudget);
 }
 
 /// The mount-table wait (main's ruling of 2026-11-20: a wait on the kernel waits on the kernel's own event, within a
