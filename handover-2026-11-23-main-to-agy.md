@@ -22,6 +22,29 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 05:24 on 11-24:
+- Push-0/1's cause, narrowed: gate 7 (45398593779, 3d65116a6) passed 19 of 20. In the failure, push 1's pack homing came
+  back Err(Unanswered) 0.9 ms after the body was sent (13:08:46.350264 sent, 13:08:46.351179 refused on band 3 "not kept
+  by enough homes in the region yet: retry"). So a branch in homes.rs gives up at once; it is not a slow home. w-git is
+  adding a log line and counter on each of the four candidate branches, with w-shared's written agreement and no
+  behaviour change. Gate 8 runs at that commit to name the branch, then the fix. Logs in
+  ~/.cache/main-01a20182/ci/gate7/art/.
+- Main CI at 21b8b5311 (45398791868) failed the lint wall everywhere. Main fixed four reds in place in main-ci-disk:
+  slates-git's lib tests did not compile since A-887 part 1 added Reads::named at 00:27, an hg test-only type, a
+  Windows-only virtio-fs test path (serve::AwayProbe is unix-gated; the trait lives in device), and a svn_interop
+  complexity split. The workspace wall is clean on macOS and the virtio-fs crate by xwin. Lesson: main's wall checks
+  had linted only slates-server's tests; lint the workspace with --all-targets and cross-lint Windows by xwin.
+- Main CI TSan lane: the watchdog killed the server lib test process. room_needed served a whole fetch in one shard
+  step, which w-git fixed in f7c70b076. t_a614a's TSan failure is still unread; the 21b8b5311 run's TSan lane will show it.
+- Windows fleet step: both Windows lanes hit their 31-minute limit with every test passing (218 of 244 ran in
+  1,510 s on x86_64). The limit was derived from 110 tests on 11-09. Diag 45399658803 measures the whole suite on both
+  runners at 21b8b5311. Then main re-derives the limit with the same formula (1.5 x whole + 240 + 300 s) in ci.yml
+  and docs/wip/ci-matrix.md.
+- Landed: w-git f7c70b076 (TSan); A-891's git half was already built (t_a888_git tests, GAPS ba61d4890). w-hg is landing
+  the Mercurial half and removes made_commit::commit, which has no callers left; w-git agreed in writing.
+- Studio: r870 (git leg at 21b8b5311, SAMPLE=1) waits behind r865 (svn git-2000 round, running since 04:39).
+- Disk: the 11-24 dips on this Mac were kiln's ~/.cache/kiln-reaudit-* (124 GiB), not slates'. Free went 12 -> 62 GiB.
+
 Updates at 04:59 on 11-24:
 - Gate 6 (45395461722, 77397a5f4) passed 7 of 7 with no Unlanded line, so push 0's cause is still unnamed (gate 5 met it
   once in 7). Gate 7 runs 10 release and 10 debug at 3d65116a6 (run 45398593779, branch diag-measurer-main-v3-gate7),
