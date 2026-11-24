@@ -950,6 +950,72 @@ fn a_lookup_of_a_key_no_run_holds_resolves_almost_no_table() {
   assert_empty(&store);
 }
 
+/// The bytes of the tables of every run of `index`.
+fn table_bytes(index: &Index, store: &ContentStore) -> u64 {
+  index
+    .run_tables()
+    .iter()
+    .flatten()
+    .filter_map(|table| store.len_of(table))
+    .sum()
+}
+
+/// Shape: the mixed-size tiered test's window, larger than the tests' so a table holds rows of many sizes.
+const MIXED_WINDOW: usize = 4_096;
+/// Shape: the payloads of its phases, each phase's rows larger, so a table holds about 170, 68, 18 and 3 of them.
+const MIXED_PAYLOADS: [usize; 4] = [4, 40, 200, 1_200];
+/// Shape: the windows of rows each phase appends.
+const MIXED_PHASE_WINDOWS: usize = 20;
+
+/// Goal 93 (B), main's ruling of 2026-11-23 (r499: 8 own runs where the row bound computed 6): a seal is due by bytes,
+/// a window of them, so a seal of large rows writes few rows and one of small rows many, and a size-tiered rule stated
+/// in rows holds the runs to no bound in bytes: a later phase of larger rows never has the rows to merge into the
+/// runs of smaller rows before it, so each phase keeps a stack of its own. Do: append scattered keys in phases of
+/// [`MIXED_PHASE_WINDOWS`] windows each, every phase's payloads larger ([`MIXED_PAYLOADS`]), sealing when due and
+/// merging whatever [`Index::tiered_due`] names to its end, noting the fewest bytes a seal wrote. Expect after every
+/// seal: the own runs within ⌊log₃(their tables' bytes ÷ the fewest bytes a seal wrote)⌋ + 1; every row read back.
+#[test]
+fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_bytes_whatever_its_rows_sizes() {
+  let mut store = ContentStore::new(1 << 26, MIXED_WINDOW).unwrap();
+  let mut index = Index::new();
+  let mut fewest = u64::MAX;
+  let mut worst = (0_usize, 0_usize, 0_u64);
+  let mut at = 0_u64;
+  for payload in MIXED_PAYLOADS {
+    let payload = vec![0x5a; payload];
+    let mut phase_bytes = 0_usize;
+    while phase_bytes < MIXED_PHASE_WINDOWS * MIXED_WINDOW {
+      let key = scattered_key(at);
+      at += 1;
+      phase_bytes += key.len() + payload.len();
+      index.insert(&mut store, row(&key, &[], &payload)).unwrap();
+      if !index.seal_due(&store) {
+        continue;
+      }
+      let before = table_bytes(&index, &store);
+      index.seal(&mut store).unwrap();
+      fewest = fewest.min((table_bytes(&index, &store) - before).max(1));
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(&mut store, runs).unwrap().unwrap();
+        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
+      }
+      let bytes = table_bytes(&index, &store);
+      let tiers = (bytes / fewest).checked_ilog(3).unwrap_or(0);
+      let bound = usize::try_from(tiers).unwrap() + 1;
+      if index.own_runs() > bound {
+        worst = worst.max((index.own_runs(), bound, bytes));
+      }
+    }
+  }
+  assert_eq!(
+    worst,
+    (0, 0, 0),
+    "own runs past the bytes bound (runs, bound, bytes) at worst; fewest bytes a seal wrote {fewest}"
+  );
+  assert_eq!(read(&index, &store).len(), usize::try_from(at).unwrap());
+  index.release(&mut store).unwrap();
+}
+
 /// The first byte of the key of each row `index` reads from `start`.
 fn keys_from(index: &Index, store: &ContentStore, start: &[u8]) -> Vec<u8> {
   index

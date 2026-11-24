@@ -130,7 +130,7 @@ pub struct Intaken {
   /// The fork's runs merged by the size-tiered rule as the push sealed them ([`Taker::merge_step`]).
   pub tiered_merges: u64,
   /// The most runs only the fork held after any step: what a lookup of a new row walked past its parent's runs, held
-  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its rows.
+  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its own tables' bytes.
   pub most_own_runs: u64,
 }
 
@@ -1348,7 +1348,7 @@ impl Taker {
   /// ([`slates_vcs::Index::tiered_due`]), or its begin, between revisions; none where none is due. Every append seals
   /// the fork's tail when due (`HgIndex::insert`), each seal a run, and a lookup walks every run: unmerged, a push's
   /// runs grew a seal at a time and each new row's lookup with them (arena-14: shard 0 spun past 1 s in a segment step).
-  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step (each step puts
+  /// Merged so, the fork's own runs stay within the rule's logarithm of its own bytes, a table's work a step (each step puts
   /// one table or gives one back). A push refused or given back drops its merge with the fork, whose release gives back
   /// what the merge put.
   fn merge_step(&mut self, store: &mut ContentStore) -> Result<Option<Stepped>, Refused> {

@@ -2916,7 +2916,8 @@ pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
 
 /// Counter: the most runs only a push's fork held after any of its steps (goal 93, the index seal's reland), the most of
 /// every push's: what a lookup of a new row walked past its parent's runs, within `slates_vcs::Index::tiered_due`'s
-/// bound of ⌊log₃(the fork's own rows ÷ the fewest a seal writes)⌋ + 1. Format: a counter name in the status report.
+/// bound of ⌊log₃(the fork's own tables' bytes ÷ the fewest a seal writes)⌋ + 1. Format: a counter name in the status
+/// report.
 pub(crate) const MOST_OWN_RUNS: &str = "vcs.hg.push_most_own_runs";
 
 /// Counter: a push's fork's runs merged by the size-tiered rule as it sealed them (goal 93, the index seal's reland),

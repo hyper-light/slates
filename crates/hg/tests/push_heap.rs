@@ -647,6 +647,9 @@ fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
   };
   let rows = fork.rows().rows();
   // In integers: f64's log₃ of a power of three can fall just short of it (243 gives 4.999999999999999).
+  // The rule weighs bytes (⌊log₃(own bytes ÷ the fewest bytes a seal writes)⌋ + 1), but the fewest bytes a seal
+  // writes is the data's: a small row cut before a row near a window long makes a short table. A seal writes a row at
+  // least, so the bound in rows is the one that holds for any data, looser than the bytes bound.
   let bound = u64::from(rows.checked_ilog(3).unwrap_or(0)) + 1;
   println!(
     "push_heap: {rows} rows, {} seals, {} tiered merges, the most own runs {} (bound {bound})",
