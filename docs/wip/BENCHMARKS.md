@@ -19192,3 +19192,86 @@ What it says:
   `upload.parts_copied=34`, `parts_by_entry=315`, `entries_judged=46,260`, `entries_copied=28,501`,
   `headers_rewritten=9,567` and `made_whole=8,192`. Its whole counter line, and every timed clone's before and after,
   are in the record.
+
+## Slates against stock git: rounds 5 and 6, the git leg alone at 2dfda25d4 and 0ebf10cf4 (goal 93 perf; main 01a20182's r935 and r940, 2026-11-24)
+
+Round 4's harness and arguments (`git_scale.sh`, `SERVERS="stock slates"`, five runs interleaved, stock first) on the
+big Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4) over git/git at f7de81456940 (1,027 refs, 424,912 objects
+pushed). Refs and objects were identical on both servers in both rounds, and each incremental fetch held its commit.
+Records, counters, packet traces and call trees: `~/.cache/main-rounds/git-leg-3/` (r935) and `git-leg-4/` (r940) on the
+Studio.
+
+- **r935, at 2dfda25d4, ended 10:07:59 local.** It began as an earlier round's load was falling (1-, 5- and 15-minute
+  averages 2.19, 8.92 and 21.97), and runs 3 and 4 of both servers rose with it: stock push 11.59 and 11.58 s against
+  10.83, slates clone-again 129.3 s in run 3. Load 1.94 at the end.
+- **r940, at 0ebf10cf4, 10:42 to 11:20 local, load 1.9 to 3.3:** quiet throughout.
+
+Seconds, wall clock at the client, every run shown:
+
+| git | r935 git daemon 1-5 | best | r935 slates 1-5 | best | × | r940 git daemon 1-5 | best | r940 slates 1-5 | best | × |
+|---|---|---|---|---|---|---|---|---|---|---|
+| push | 10.984 10.870 11.588 11.578 10.828 | 10.828 | 81.921 83.450 88.976 88.933 81.590 | 81.590 | 7.54 slower | 10.982 10.875 11.039 10.851 10.815 | 10.815 | 69.383 70.488 69.684 69.413 69.016 | 69.016 | 6.38 slower |
+| clone `--mirror` | 10.608 10.661 10.978 10.955 10.577 | 10.577 | 118.416 134.423 149.512 126.841 117.838 | 117.838 | 11.14 slower | 10.630 10.611 10.607 10.602 10.615 | 10.602 | 148.596 179.951 157.787 153.501 148.103 | 148.103 | 13.97 slower |
+| clone again | 10.633 10.698 10.988 10.957 10.566 | 10.566 | 103.707 76.823 129.250 69.958 69.562 | 69.562 | 6.58 slower | 10.588 10.640 10.620 10.607 10.602 | 10.588 | 64.057 64.807 65.049 64.269 64.007 | 64.007 | 6.05 slower |
+| one-commit push | 0.133 0.137 0.154 0.146 0.132 | 0.132 | 0.068 0.078 0.079 0.072 0.067 | 0.067 | 1.97 faster | 0.133 0.132 0.133 0.132 0.131 | 0.131 | 0.090 0.091 0.092 0.095 0.069 | 0.069 | 1.90 faster |
+| fetch of it | 0.143 0.150 0.152 0.151 0.142 | 0.142 | 0.135 1.218 0.140 1.195 1.178 | 0.135 | 1.05 faster | 0.139 0.146 0.143 0.143 0.142 | 0.139 | 0.133 0.133 0.130 0.130 0.136 | 0.130 | 1.07 faster |
+| clone `--depth 1` | 0.919 0.934 0.984 0.974 0.923 | 0.919 | 1.337 3.953 1.471 3.760 3.677 | 1.337 | 1.45 slower | 0.924 0.953 0.934 0.926 0.921 | 0.921 | 1.337 1.361 1.334 1.340 1.334 | 1.334 | 1.45 slower |
+| clone `--filter=blob:none` | 6.232 6.240 6.580 6.510 6.225 | 6.225 | 65.118 81.537 74.380 72.130 69.570 | 65.118 | 10.46 slower | 6.216 6.207 6.287 6.224 6.232 | 6.207 | 68.304 66.028 67.343 66.927 68.185 | 66.028 | 10.64 slower |
+
+Slates' first pack bytes, in seconds after each step began, runs 1 to 5 (the first packet, the ref advertisement, came
+at 0.03 to 0.08 s throughout):
+
+| slates step | r935 first pack bytes | r940 first pack bytes |
+|---|---|---|
+| clone `--mirror` | 100.274 115.435 126.533 106.977 99.938 | 104.204 112.506 106.558 105.865 104.565 |
+| clone again | 85.815 61.051 99.489 54.003 54.703 | 52.949 53.292 53.868 53.108 52.899 |
+| clone `--filter=blob:none` | 60.365 76.096 69.216 66.974 64.642 | 63.601 61.103 62.657 62.217 63.493 |
+
+What moved, and why (from the commits between the rounds' builds):
+- **r870 (round 4) to r935:** 21b8b5311..2dfda25d4 changed no git path but general work: a replay's choice of named
+  runs made n log n (5606962eb), and bit tables read as runs (9d362b188). r935's rows are round 4's within its noise.
+- **Push, 81.6 s in r935 to 69.0 s in r940 (6.4× stock, from 7.5×):** w-git's b4f3a74f6 (merged at 0ebf10cf4). An object
+  the pack's reader named is admitted under that name, not SHA-1'd a second time.
+- **Clone, 117.8 s to 148.1 s (14.0× stock, from 11.1×), with the time before the pack unchanged:** the first pack bytes
+  still come at 104 to 112 s, but the stream after them grew from about 18 s (r935: 117.8 − 99.9) to about 44 s (r940:
+  148.1 − 104.6). r940's call tree has `ContentStore::len_of` and `ContentPool::available` on top during it, which
+  w-git's 197b0bc4f and A-906 address. The one git change between the builds was b4f3a74f6.
+- **Fetch and shallow clone are fast in every run at r940:** 0.130 to 0.136 s and 1.334 to 1.361 s across all five
+  runs. Rounds 3 and 4 had runs 2 to 5 at about 1.2 s and 3.7 s; r935 alternated, runs 1 and 3 fast and 2, 4 and 5 slow.
+  The fix falls within 21b8b5311..0ebf10cf4; which commit made it is w-git's to say.
+- **Clone-again is steady at r940** (64.0 to 65.0 s, its first pack bytes at 52.9 to 53.9 s, run 1 included), where earlier
+  rounds' run 1 was slow like a first clone.
+
+## The svn use test over HTTP with git-2000: green, every verb timed against stock svnserve (goal 93; main 01a20182's round, 2026-11-24, a0c46b705)
+
+`a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve` over HTTPv2 (`SLATES_SVN_USE_ROUTE=http`) with
+git-2000.dump, release, stock Subversion 1.15.0, on the big Studio (Apple M3 Ultra) at a0c46b705. It found **0
+differences** across log, info, checkout, update, switch, blame (17 sampled revisions, the files each changed with a
+history; `blamed_files`), diff, revprops, svnrdump's dump, svnsync, and the writing session (commit, copy, merge,
+propset). Its verbs took about 1,359 s, within the round's 1,800 s bound (GAPS, sized from run 45330574435).
+
+Seconds per leg, from the test's own per-verb lines (each leg's share of the verb; one run, so no best):
+
+| verb | stock svnserve | slates over HTTPv2 | slates against stock |
+|---|---|---|---|
+| log | 0.4 | 0.1 | 4.0× faster |
+| info | 6.6 | 2.5 | 2.6× faster |
+| checkout | 62.6 | 55.7 | 1.12× faster |
+| update | 99.6 | 95.2 | 1.05× faster |
+| switch | 86.6 | 76.6 | 1.13× faster |
+| blame | 85.6 | 63.2 | 1.35× faster |
+| diff | 8.3 | 1.8 | 4.6× faster |
+| revprops | 4.2 | 0.3 | 14.0× faster |
+| svnrdump's dump | 2.5 | 7.6 | 3.0× slower |
+| svnsync | 299.2 | 379.8 | 1.27× slower (noisy: it overlapped another round on the box) |
+| commit + copy + merge + propset | 6.8 | 14.2 | 2.1× slower |
+
+What it says:
+- **Correct over HTTPv2 on a real 2,000-revision history**, with every verb answered as stock svnserve answers it.
+- **Reads are at parity or faster.** Checkout, update and switch are within about 13% of stock. Diff, info, log and
+  revprops are 2.6 to 14 times faster.
+- **Slower than stock on three verbs:** the dump (3.0×), the writing session (2.1×) and svnsync (1.27×, noisy).
+  Against the sizing run on a 4-CPU Linux runner (run 45330574435, before w-svn's fixes), the writing session fell from
+  24× to 2.1×, and the dump stays about 3×: both w-svn's.
+- **svnsync's row overlapped another round on the box,** so its times are not comparable with the rest of the table.
+

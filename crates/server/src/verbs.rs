@@ -3657,7 +3657,18 @@ fn run_recorded(
   if let Some(destroy_target) = destroy_target
     && !matches!(reply, ReplyBody::Refused { .. })
   {
-    crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+    let (volume, sequence) = destroy_target;
+    crate::live_ship::defer_until_placed(
+      state,
+      (
+        crate::live_ship::PlacementOf::Tombstone,
+        volume.bytes,
+        sequence,
+      ),
+      (origin, id),
+      route,
+      reply,
+    );
     return None;
   }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {

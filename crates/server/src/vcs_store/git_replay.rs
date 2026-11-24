@@ -456,7 +456,7 @@ impl GitReplay {
         content,
         store,
         (&mut self.push, &mut self.remade),
-        (incoming, Some(object.offset)),
+        (incoming, Some(object.offset), super::Named::ByReader),
       )
       .map_err(ReplayRefused::Git)?;
       self

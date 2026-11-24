@@ -62,6 +62,21 @@ const REMAKE_EXCHANGES: u64 = 2;
 /// The process's extents, one slot per id the layout can name ([`install`]).
 static SLOTS: OnceLock<Box<[Slot]>> = OnceLock::new();
 
+/// How many times an extent's readiness moved in this process (made, held, taken for a remake, its remake ended): the
+/// pool's count of its free room taken at one value still holds while this reads the same (A-906; with the segment's
+/// pool generation, `crate::content_pool`'s cache key). Moved only as a slot's state does, so a rare word.
+static READINESS_MOVED: AtomicU64 = AtomicU64::new(0);
+
+/// How many times an extent's readiness moved in this process ([`READINESS_MOVED`]).
+pub(crate) fn readiness_moved() -> u64 {
+  READINESS_MOVED.load(Ordering::Acquire)
+}
+
+/// Notes that an extent's readiness moved ([`READINESS_MOVED`]).
+fn moved() {
+  READINESS_MOVED.fetch_add(1, Ordering::AcqRel);
+}
+
 /// Counter: extents the anchor would not hold or let go, or the OS would not make: each stays unready (never claimed)
 /// until the next try, and a section the anchor still holds goes with the anchor.
 pub(crate) const EXTENT_REFUSED: &str = "content.extent.refused";
@@ -121,6 +136,7 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
           .handle
           .store(value_of(extent.section), Ordering::Release);
         slot.held.store(true, Ordering::Release);
+        moved();
       }
       // An id the layout has no slot for, or one handed twice: its section closes here.
       _ => drop(extent.section),
@@ -138,7 +154,10 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
       continue;
     }
     match slates_mem::make_extent_section(len) {
-      Ok(section) => slot.handle.store(value_of(section), Ordering::Release),
+      Ok(section) => {
+        slot.handle.store(value_of(section), Ordering::Release);
+        moved();
+      }
       Err(_) => refused = refused.saturating_add(1),
     }
   }
@@ -204,6 +223,7 @@ pub(crate) fn take_for_remake(id: u16) -> Option<OwnedHandle> {
   slot.held.store(false, Ordering::Release);
   slot.remaking.store(true, Ordering::Release);
   let value = slot.handle.swap(0, Ordering::AcqRel);
+  moved();
   owned(value)
 }
 
@@ -212,6 +232,7 @@ pub(crate) fn take_for_remake(id: u16) -> Option<OwnedHandle> {
 pub(crate) fn end_remake(id: u16) {
   if let Some(slot) = SLOTS.get().and_then(|slots| slots.get(usize::from(id))) {
     slot.remaking.store(false, Ordering::Release);
+    moved();
   }
 }
 
@@ -334,7 +355,10 @@ async fn hold(id: u16) {
     return;
   }
   match crate::anchor_hold::hold_extent(hold_id(id), value, record(id)).await {
-    Ok(()) => slot.held.store(true, Ordering::Release),
+    Ok(()) => {
+      slot.held.store(true, Ordering::Release);
+      moved();
+    }
     Err(_) => {
       let _ = crate::state::with_state_counted(|s| s.count(EXTENT_REFUSED, 1));
     }

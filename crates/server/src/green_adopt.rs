@@ -539,9 +539,10 @@ async fn readopt_one(control: u16, owner: u16, id: DbVolumeId, through: u64) -> 
 /// store does not hold whole are brought back from the node's changeset store, as a recovery's pre-pass brings them
 /// (`svn_texts::bring_back_named_live`; A-869), so the replay reads every name through the plane; their holds are given
 /// back once the green is installed or fenced. A Mercurial green's named bases its replay reads come back the same way,
-/// by the plan a recovery runs (`hg_named::bring_back_named_live`, A-887), and are let go again after. End to end this stays unreachable for a Subversion green until A-727
-/// (d): the engine handed is the holder's replica, which reads no named content, so an svn takeover fails today at
-/// the replica's build, whose recomputed versions' named runs it does not read.
+/// by the plan a recovery runs (`hg_named::bring_back_named_live`, A-887), and are let go again after. End to end this
+/// stays unreachable for a Subversion green until A-727 (d): the engine handed is the holder's replica, which reads no
+/// named content, so an svn takeover fails today at the replica's build, whose recomputed versions' named runs it does
+/// not read.
 pub(crate) async fn readopt_with(
   control: u16,
   owner: u16,
@@ -571,8 +572,15 @@ pub(crate) async fn readopt_with(
     Some(false) => Some(false),
     None => None,
   };
-  // The branches that waited for it, rebuilt over it now it stands, and theirs over them in turn; fenced with it where
-  // it did not stand (main's item (2) of 2026-11-24 08:52).
+  after_readoption(control, owner, id, readopted).await;
+  give_back_readoption_texts(control, owner, (brought, brought_hg)).await;
+  readopted
+}
+
+/// The branches that waited for green `id`, rebuilt over it on `owner` now it stands (`readopted` true), and theirs over
+/// them in turn; fenced with it where it did not stand (main's item (2) of 2026-11-24 08:52); nothing where the owner did
+/// not answer.
+async fn after_readoption(control: u16, owner: u16, id: DbVolumeId, readopted: Option<bool>) {
   match readopted {
     Some(true) => rebuild_waiting_branches(control, owner, id).await,
     Some(false) => {
@@ -586,6 +594,15 @@ pub(crate) async fn readopt_with(
     }
     None => {}
   }
+}
+
+/// Gives back on `owner` what a re-adoption brought back for its replay: the Subversion texts' holds (`brought`), and
+/// the Mercurial bases (`brought_hg`) let go again, since a landed text's bytes are the node's store's.
+async fn give_back_readoption_texts(
+  control: u16,
+  owner: u16,
+  (brought, brought_hg): (Vec<[u8; 32]>, Vec<[u8; 32]>),
+) {
   if !brought.is_empty() {
     let _ = crate::xshard::call_in_shard_time(
       control,
@@ -605,7 +622,6 @@ pub(crate) async fn readopt_with(
     )
     .await;
   }
-  readopted
 }
 
 /// Rebuilds over `source`, re-adopted on `owner`, each branch member that waited for it, then those that waited on each in

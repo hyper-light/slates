@@ -527,6 +527,11 @@ fn land_then_record(
           .to_owned(),
     });
   };
+  // Its answer may be held for its record's placement (A-894): seated among the shard's held replies before anything
+  // lands, or refused `Overloaded` with nothing changed.
+  if let Err(refusal) = crate::live_ship::take_placement_seat(state, request) {
+    return refused(refusal);
+  }
   let (header, parts, svn_created) = match creation_changeset(
     state,
     (&disk, principal),
@@ -534,7 +539,10 @@ fn land_then_record(
     (repository, minted),
   ) {
     Ok(changeset) => changeset,
-    Err(reply) => return *reply,
+    Err(reply) => {
+      crate::live_ship::release_seat(state, request);
+      return *reply;
+    }
   };
   let principal = principal.clone();
   let asked = (name.to_owned(), default_branch.to_owned());
@@ -564,15 +572,32 @@ fn land_then_record(
         );
         refusal_of_owner(state, &error)
       });
-      let reply = recorded_after_landing(
+      let (reply, held) = recorded_after_landing(
         state,
         &principal,
         (&asked.0, tool, format, &asked.1),
         (adopted, (repository, minted)),
         (landed, Some(request), svn_created),
       );
-      (reply, state.shard)
-    });
+      // Answered once its record is at f + 1 (A-894): its completion and its reply follow the placement.
+      if let Some(sequence) = held {
+        crate::live_ship::defer_until_placed(
+          state,
+          (
+            crate::live_ship::PlacementOf::Repository,
+            repository.bytes,
+            sequence,
+          ),
+          request,
+          Some(route),
+          reply,
+        );
+        return None;
+      }
+      crate::live_ship::release_seat(state, request);
+      Some((reply, state.shard))
+    })
+    .flatten();
     if let Some((reply, here)) = answered {
       crate::told::deliver_to(route, reply, here);
     }
@@ -584,6 +609,7 @@ fn land_then_record(
       ReplyBody::Acknowledged
     }
     Err(_) => {
+      crate::live_ship::release_seat(state, request);
       state.count(CREATION_UNRUN, 1);
       refused(Refusal::Overloaded { shard: state.shard })
     }
@@ -689,28 +715,39 @@ type CreationLanded = (
 
 /// A landed creation recorded (A-767 item 7, the second step): in one transaction the repository, its root and, for a
 /// client's `request`, its completion, a Subversion repository's from its creation record `svn_created` (C2); a
-/// creation the store did not land answered its refusal ([`refusal_of_owner`]), nothing recorded of it.
+/// creation the store did not land answered its refusal ([`refusal_of_owner`]), nothing recorded of it. A client's
+/// creation whose record must be placed at `f + 1` before it answers (A-894, `live_ship::repository_target`) records no
+/// completion here: the sequence its answer waits for is given back with the reply, and its completion is recorded at
+/// the placement (`live_ship::defer_until_placed`), so a retry meanwhile joins the wait and never reads an answer no
+/// quorum holds.
 fn recorded_after_landing(
   state: &mut ShardState,
   principal: &Principal,
   asked: (&str, VcsTool, ObjectFormat, &str),
   ids: (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
   (landed, request, svn_created): CreationLanded,
-) -> ReplyBody {
+) -> (ReplyBody, Option<u64>) {
+  let repository = (ids.1).0;
   state.db.begin();
   let reply = match landed {
     Ok(()) => record_created(state, principal, asked, ids, svn_created),
     Err(refusal) => refused(refusal),
   };
-  let reply = match request {
-    Some((origin, id)) => crate::verbs::record_completion(state, origin, id, reply),
-    None => reply,
+  let held = match (&reply, request) {
+    (ReplyBody::GreenCreated { .. }, Some(_)) => {
+      crate::live_ship::repository_target(state, repository)
+    }
+    _ => None,
+  };
+  let reply = match (request, held) {
+    (Some((origin, id)), None) => crate::verbs::record_completion(state, origin, id, reply),
+    _ => reply,
   };
   match state.db.commit(&mut state.segment) {
-    Ok(_) => reply,
+    Ok(_) => (reply, held),
     Err(error) => {
       crate::verbs::reconcile_unpublished_effects(state);
-      refused(refusal_of_db(&error))
+      (refused(refusal_of_db(&error)), None)
     }
   }
 }
@@ -750,6 +787,7 @@ pub(crate) fn create_blocking(
     (adopted, ids),
     (landed, None, svn_created),
   )
+  .0
 }
 
 /// Format: a repository's creation record in its store (A-767): one line each of a marker, the name, the default

@@ -2276,7 +2276,7 @@ impl GitPush {
           content,
           store,
           (&mut self.push, &mut self.record),
-          (incoming, Some(object.offset)),
+          (incoming, Some(object.offset), Named::ByReader),
         )?;
         self
           .push
@@ -2317,7 +2317,7 @@ impl GitPush {
           content,
           store,
           (&mut self.push, &mut self.record),
-          (*incoming, Some(base.saturating_add(offset))),
+          (*incoming, Some(base.saturating_add(offset)), Named::Here),
         )?;
       }
       Ok(())
@@ -2476,7 +2476,18 @@ fn abandon_push(state: &mut ShardState, push: Push) {
   settle(state);
 }
 
-/// Admits one object into `push`: named by git's rule and checked against the id its source claims (A-614). An object
+/// Who named an object [`admit_object`] admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Named {
+  /// The pack's reader, by git's rule from the bytes handed over, in the repository's format: its claimed id is that
+  /// name, so it is not hashed again (gate r870: every pushed object was SHA-1'd twice).
+  ByReader,
+  /// Another source: the object is named here and checked against the id it claims.
+  Here,
+}
+
+/// Admits one object into `push`: named by git's rule and checked against the id its source claims (A-614), or, named
+/// by the pack's reader from these bytes ([`Named::ByReader`]), taken under that name. An object
 /// arriving under a claimed id the repository indexes already is passed over, since the store reads an indexed object
 /// from its index before any push (A-638's order). Every object new to the push is noted for the record by the root its
 /// quarantine holds it under, whether or not the repository holds it now: which of them the record holds is decided
@@ -2487,7 +2498,7 @@ fn admit_object(
   content: &mut ContentStore,
   store: &GitStore,
   (push, record): (&mut Push, &mut RecordWriter),
-  (incoming, offset): (Incoming<'_>, Option<u64>),
+  (incoming, offset, named): (Incoming<'_>, Option<u64>, Named),
 ) -> Result<(), GitRefused> {
   if let Some(claimed) = incoming.claimed
     && store.repository.object(content, &claimed).is_some()
@@ -2501,9 +2512,15 @@ fn admit_object(
   let naming = store.repository.naming();
   // An object of the push's own pack is held where it lies there (`slates_git::store::Push::admit_placed`); one no pack
   // brought (the server's own commits, a replay's) in the content store.
-  let (id, admitted) = match offset {
-    Some(offset) => push.admit_placed::<_, Infallible>(content, &naming, (incoming, offset)),
-    None => push.admit::<_, Infallible>(content, &naming, incoming),
+  let (id, admitted) = match (offset, named, incoming.claimed) {
+    // Named by the pack's reader from these bytes: not hashed again (`Push::admit_placed_named`).
+    (Some(offset), Named::ByReader, Some(id)) => {
+      push.admit_placed_named::<Infallible>(content, (incoming, offset), id)
+    }
+    (Some(offset), _, _) => {
+      push.admit_placed::<_, Infallible>(content, &naming, (incoming, offset))
+    }
+    (None, _, _) => push.admit::<_, Infallible>(content, &naming, incoming),
   }
   .map_err(GitRefused::Object)?;
   if admitted == Admitted::New {
@@ -3271,7 +3288,7 @@ fn replay_pack(
       content,
       store,
       (&mut *push, &mut *remade),
-      (incoming, Some(object.offset)),
+      (incoming, Some(object.offset), Named::ByReader),
     )
     .map_err(ReplayRefused::Git)?;
   }

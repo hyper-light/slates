@@ -2885,10 +2885,9 @@ struct UseLeg {
 }
 
 impl UseLeg {
-  /// `text` with this leg's URL replaced by [`USE_URL`] and each XML tag's attributes in one order
-  /// ([`canonical_tags`]).
+  /// `text` with this leg's URL made plain ([`plain_answer`]).
   fn plain(&self, text: &str) -> String {
-    canonical_tags(&text.replace(&self.url, USE_URL))
+    plain_answer(text, &self.url)
   }
 
   /// `svn args` against this leg (each `{url}` in `args` its URL), in `dir`: its standard output with the URL made
@@ -2905,6 +2904,18 @@ impl UseLeg {
     } else {
       format!("exit {code}: {}", self.plain(&err))
     }
+  }
+}
+
+/// `text`, a leg's answer, with its URL `url` replaced by [`USE_URL`] and, where it is an XML document, each tag's
+/// attributes in one order ([`canonical_tags`]); any other answer as it was.
+fn plain_answer(text: &str, url: &str) -> String {
+  let text = text.replace(url, USE_URL);
+  // `svn --xml` writes its declaration first. A diff, a file's text or a blame is no XML, and a `<` in it is no tag.
+  if text.starts_with("<?xml") {
+    canonical_tags(&text)
+  } else {
+    text
   }
 }
 
@@ -3861,6 +3872,24 @@ fn an_xml_tags_attribute_order_is_no_part_of_an_answer() {
     canonical_tags("x <e b=\"two words\" a=\"1\"/> y"),
     "x <e a=\"1\" b=\"two words\"/> y"
   );
+}
+
+/// Main's round at 39a1dcd4a (2026-11-24, git-2000 over HTTP: "diff r251: line 362"). Do: put one `svn diff`'s two
+/// per-path blocks through the comparison's rules ([`plain_answer`], then [`canonical_diff`]) in each order a server may
+/// drive them, the first block's C text holding a `<` (`i <ARRAY_SIZE(values)`) and the second's a `>` (`buf->len`).
+/// Expect one text for both orders, every line as `svn` wrote it. Before, every answer's text was read as XML: the `<`
+/// opened a "tag" that ran to the next `>`, across the block boundary in each server's order, and its words were sorted
+/// onto one line, so stock's drive (t-hashmap.c, then t-strcmp-offset.c) and slates' (t-hashmap.c, then t-strbuf.c)
+/// differed though each file's block was byte for byte the same.
+#[test]
+fn a_diffs_text_is_compared_as_written_whatever_its_blocks_order() {
+  let hashmap = "Index: trunk/t-hashmap.c\n===\n-\tfor (size_t i = 0; i <ARRAY_SIZE(values); i++)\n-\t\tcheck(\"add works\");\n";
+  let strbuf = "Index: trunk/t-strbuf.c\n===\n-\tif (!check(!!buf->buf))\n-\t\treturn 0;\n";
+  let url = "svn://127.0.0.1:1/repository";
+  let one = canonical_diff(&plain_answer(&format!("{hashmap}{strbuf}"), url));
+  let other = canonical_diff(&plain_answer(&format!("{strbuf}{hashmap}"), url));
+  assert_eq!(one, other);
+  assert_eq!(one, format!("{hashmap}{strbuf}"), "every line as written");
 }
 
 /// The comparison's rule for an `svnsync` mirror ([`mirror_dump_of`]). Do: mirror one stock repository (the reads

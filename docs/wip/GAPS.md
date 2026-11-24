@@ -173,8 +173,45 @@
 > told to every member by `HomeMessage::Rebuilt`, home wire version 0x83, until each answers); red first, the unreachable
 > holder's fleet test, its rebuild held until a pass kept every hold, then resolved by the rebuild's event alone. An
 > ended attempt is never spread by the healer, only resolved (red first: a resolved home joined it back from one not yet
-> resolved). OWED (A-894): a repository's creation answers before its record reaches f + 1, so the fleet harness waits
-> for it (`git_fleet`) until the creation does.
+> resolved). BUILT (A-894, 2026-11-24): a repository's creation answers once its record is placed at f + 1 (its reply
+> held on the destroy's hold, made general: `live_ship::defer_until_placed`), so `git_fleet` no longer waits for it.
+> **FIXED (A-903, w-shared, 2026-11-24): after a repository's takeover, a push to its successor was refused `unable to
+> commit`.** The successor wrote its adopted state logs' parts at its own host epoch, below the takeover's fence, and
+> the other survivor refused each `StaleEpoch`; now at the adopted epoch (A-894's takeover test pushes to it, red first).
+> **OPEN, FOR ADA (A-904, w-shared; main 01a20182's rulings of 2026-11-24 10:54 and 10:56): a repository is reachable
+> only at its owner's edge, and its name is not region-unique.** D-14 promises that lookups route by id to the current
+> owner, and the edges locate a repository by its name's route (A-651 part 4), so reach through any member's edge is
+> owed. Main ruled the mechanism: (a), the edge forwards the whole exchange to the owner over the fleet session, for
+> HTTP and SSH alike. w-git and w-shared agreed the edge's seam: `Located::Remote(host)`, asked only after today's local
+> locate misses, `Answer::Forward { host }` for HTTP with the exchange proved at the owner, and the SSH channel forwarded
+> after the session's key proof. What is missing is a resolver from a name to its owner:
+> - `verbs::owner_of_name` routes a name to a shard of one node, and the configuration routes ids (`RegionalConfiguration::
+>   owner_of`: creator, moved, lineage), never names.
+> - A repository is created on whichever node the client reached (A-575), so an edge holding only a name cannot find the
+>   repository's owner, or its id, without something new.
+> - From reading, unproven by test: a name is unique only within one node's partition, so two nodes can each create
+>   `project`.
+> Measured symptom (A-894's takeover test, three daemons at f = 1, its owner killed): the survivor that is not the
+> successor answers a clone and a push "repository not found"; that red is kept, not landed, until a resolver exists.
+> The resolver changes the naming model and sits beside §2 item 12 and D-14's "no global catalog or index", so it is
+> Ada's to rule. Options:
+> 1. **Name homes** (recommended, w-shared). A repository's name is a small record (name → repository id) kept at the
+>    name's f + 1 homes, ranked over the members by the name's hash, as A-724 homes content by identity, and carried
+>    across membership changes by the same healer. Creation claims the name at its homes first, which makes names
+>    region-unique. An edge whose local locate misses asks one home for the id (one directed exchange, cacheable), then
+>    reads the owner from the configuration (`owner_of`, takeovers included). This routes by hash to known homes; it is
+>    neither a broadcast nor a central catalog, but it is a per-name record.
+> 2. **The repository placed at its name's first-ranked member** at creation, a lookup ranking the name over the
+>    members. Joins and leaves move the rank, and after a takeover the successor is ranked by the id the edge lacks.
+> 3. **A location round by name** to every member. Main ruled it out (no location round).
+> **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
+> home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
+> 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
+> behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
+> put's budget; red first in-process (`vcs_store::homes::tests::a_home_behind_its_senders_configuration_...`). OWED
+> (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
+> for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
+> held and dropped could be answered at once, if a gate shows it.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1362,7 +1399,8 @@
 > escaped one said 29 for 25 bytes). Swept: the served view and the index frame a block with its markers against the
 > row's length (`indexed.rs`, `index.rs` `framed_text`), and the intake and the work's own texts split through
 > `filerev::split`; this was the one count off.
-> **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). IN FLIGHT.**
+> **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). BUILT
+> (P5, 2026-11-24): an import's and a push's changelog and manifest texts leave the content store once landed.**
 > - 2a BUILT (2026-11-22, w-hg): the read-through. `slates_merge::push::Unavailable::NotYet`, a blob the store holds
 >   but has not at hand: the sliced build (`Building`) takes the unit that read it again once its owner fetched it
 >   (`Building::waiting`); the posting's file reads are taken again, a one-call `build` is refused with it. Mercurial's
@@ -1382,7 +1420,7 @@
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
-> - IN FLIGHT, the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
+> - BUILT (P5), the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
 >   pieces): the changelog's and the manifests' texts off the content store too, read through the store as file texts
 >   are.
 >   In five pieces (main's ruling of 2026-11-23 20:53: readers first, the let-go switched on last, P5; no manifest
@@ -1404,7 +1442,27 @@
 >   with nothing behind it, the held verdict's preview (a branch whose head is its version 1, `Lineage::preview`) read at
 >   the green's own versions; every made-changeset test submitted once, which hid it
 >   (`a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset`). Next: the commit-alone reds with w-svn's
->   `commit_held` guard (A-891), then P5.
+>   `commit_held` guard (A-891), then P5. P5 BUILT (2026-11-24, w-hg): the let-go switched on. The import notes each
+>   changeset's text and manifest's row object under `CHANGELOG_PATH` and `MANIFEST_PATH`, the intake keeps every
+>   log's contents for its segment, and `hg_run` lets them go once the push commits or the import lands, never before.
+>   A reader finding one not at hand reads its whole text from the node's changeset store and is given it in its
+>   object's place (`IndexHeld::with_given`, `HgIndex::revision_text_over`), so no delta chain is brought back link by
+>   link: a work's layout (`hg_push::log_text_read`, `vcs.hg.push_work_log_texts_read`), a made changeset's parent
+>   (`hg_made::parent_texts_read`, `vcs.hg.made_parent_texts_read`) and a named file's resolution
+>   (`hg_named::resolve_at`, `vcs.hg.named_log_texts_read`); a bring-back of a deep chain had looped `NotAtHand`. A
+>   push's asks are counted, the parent manifest's read-back apart (`vcs.hg.push_log_texts_asked`,
+>   `vcs.hg.push_previous_manifests_asked`, each with its most for one push). Held by
+>   `landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a_pull_verify` (an import and a push
+>   in two: every changelog and manifest object let go before and after a clone and a pull, each changegroup verified
+>   by the push's own verifier; red: 10 and 14 held). Owed: stock 7.2's clone, pull and verify (main's `hg_interop`).
+> Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
+> restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
+> so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
+> delta), which an empty file revision's let-go had marked away with a length of 0: that freed nothing, and an image
+> carries no window let go of no length (`ContentStore::restore_away`), so the restart lost it. The content store now
+> refuses to let the empty window go (`LetGoRefused::Empty`), on both paths a landed text is let go; held by
+> `the_empty_window_is_never_let_go_so_a_restart_never_loses_it` (red: let go of 0 bytes) and the 5,000-revision push and
+> restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
@@ -4918,7 +4976,11 @@
 > Slates is well over stock in the writing session (14.7 s against 0.6 s) and the dump (6.6 s against 2.3 s), also for
 > w-svn. Since then (main's ruling) blame leaves out a file added without a source, whose blame names its one revision
 > on every line, so revision 1's import is blamed no more; a later sample that changes such a file blames its whole
-> history. **Owed:** the git-2000 run on the big Studio within 1,800 s, after w-svn's reds.
+> history. **Done (main 01a20182's round on the big Studio, 2026-11-24, a0c46b705):** green, 0 differences across
+> every verb over HTTPv2 with git-2000, its verbs about 1,359 s within the 1,800 s bound. Slates is at parity or
+> faster on reads (checkout, update and switch within 13%; diff, info, log and revprops 2.6 to 14 times faster) and
+> slower on the dump (3.0×), the writing session (2.1×, down from 24×) and svnsync (1.27×, noisy). See BENCHMARKS,
+> "The svn use test over HTTP with git-2000". The dump and the writing session are w-svn's.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon

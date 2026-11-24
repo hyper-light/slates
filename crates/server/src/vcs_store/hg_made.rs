@@ -161,24 +161,23 @@ async fn made_commit_landing(
   // place makes): the parent's texts let go once landed read back first (goal 93, C1 (1)).
   let repository =
     crate::state::with_state(|state| mercurial_repository_of(state, green)).flatten();
-  let at_hand = match repository {
-    Some(repository) => parent_texts_at_hand(repository, (green, version)).await,
-    None => true,
+  let given = match repository {
+    Some(repository) => parent_texts_read(repository, (green, version)).await,
+    None => Some(Vec::new()),
   };
-  let made = if at_hand {
-    crate::state::with_state(|state| {
+  let made = match given {
+    Some(given) => crate::state::with_state(|state| {
       super::lent_state(state, |state| {
         made_held(
           state,
           (green, version),
           (pending.authorship(), &copies),
-          judged,
+          (judged, &given),
         )
       })
     })
-    .unwrap_or(Err(Unmade::NotHead))
-  } else {
-    Err(Unmade::ParentUnread)
+    .unwrap_or(Err(Unmade::NotHead)),
+    None => Err(Unmade::ParentUnread),
   };
   let made = match made {
     Ok(Some(made)) => made,
@@ -246,48 +245,44 @@ const PARENT_TEXTS: usize = 2;
 /// (1)). Format: a counter name in the status report.
 pub(crate) const PARENT_TEXTS_READ: &str = "vcs.hg.made_parent_texts_read";
 
-/// Whether the parent's texts a changeset made of `green`'s `version` in `repository` reads are at hand, each let go
-/// once landed brought back from the node's changeset store first (goal 93, C1 (1); main's ruling of 2026-11-24 03:51):
-/// the parent changeset's, then the manifest it names, at most [`PARENT_TEXTS`]. True where none is needed.
-async fn parent_texts_at_hand(
+/// The parent's texts a changeset made of `green`'s `version` in `repository` reads that were let go once landed, each
+/// read whole from the node's changeset store to be given to the making in its object's place (goal 93, C1 (1); main's
+/// ruling of 2026-11-24 03:51): the parent changeset's, then the manifest it names, at most [`PARENT_TEXTS`]. Empty
+/// where none was let go; none where one could not be read.
+async fn parent_texts_read(
   repository: RepositoryId,
   (green, version): (DbVolumeId, u64),
-) -> bool {
-  for _ in 0..PARENT_TEXTS {
-    let wanted =
-      crate::state::with_state(|state| parent_text_wanted(state, repository, (green, version)))
-        .flatten();
+) -> Option<Vec<(Node, Vec<u8>)>> {
+  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
+  loop {
+    let wanted = crate::state::with_state(|state| {
+      parent_text_wanted(state, repository, (green, version), &given)
+    })
+    .flatten();
     let Some((log, node)) = wanted else {
-      return true;
+      return Some(given);
     };
-    let path = match log {
-      slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
-      _ => slates_hg::push::intake::MANIFEST_PATH,
-    };
-    let read = crate::repository::hg_push::bring_back_log_on(
-      &mut crate::vcs_http::git::ThisShard,
-      repository,
-      crate::repository::hg_push::Committed,
-      (log, path.to_vec()),
-      node,
-    )
-    .await;
-    if read.is_err() {
-      return false;
+    if given.len() >= PARENT_TEXTS {
+      return None;
     }
+    let text = crate::repository::hg_push::log_text_read(
+      &mut crate::vcs_http::git::ThisShard,
+      (repository, crate::repository::hg_push::Committed),
+      (log, node),
+    )
+    .await?;
     let _ = crate::state::with_state(|state| state.count(PARENT_TEXTS_READ, 1));
+    given.push((node, text));
   }
-  crate::state::with_state(|state| parent_text_wanted(state, repository, (green, version)))
-    .flatten()
-    .is_none()
 }
 
-/// The first of the parent's texts a changeset made of `green`'s `version` reads that is not at hand: the parent
-/// changeset's, else the manifest it names; none where both are, or the parent is the null node.
+/// The first of the parent's texts a changeset made of `green`'s `version` reads that is neither at hand nor `given`:
+/// the parent changeset's, else the manifest it names; none where both are, or the parent is the null node.
 fn parent_text_wanted(
   state: &mut ShardState,
   repository: RepositoryId,
   (green, version): (DbVolumeId, u64),
+  given: &[(Node, Vec<u8>)],
 ) -> Option<(slates_hg::index::Log<'static>, Node)> {
   use slates_hg::index::Log;
   let before = version.checked_sub(1)?;
@@ -300,6 +295,9 @@ fn parent_text_wanted(
       let (content, store) = stores.mercurial(repository)?;
       let index = &store.index;
       let at_hand = |log, node: &Node| {
+        if given.iter().any(|(read, _)| read == node) {
+          return Some(true);
+        }
         slates_hg::push::held::log_text_at_hand((index, content), log, node).map(|(_, at)| at)
       };
       if !at_hand(Log::Changelog, &parent)? {
@@ -391,12 +389,12 @@ fn inputs(
 }
 
 /// The changeset of `green`'s `version` made from the verdict `judged`, held and not applied: read from a preview of it
-/// (`Greens::preview`), retired in this step.
+/// (`Greens::preview`), retired in this step; the parent's texts `given` by node read in their let-go objects' place.
 fn made_held(
   state: &mut ShardState,
   (green, version): (DbVolumeId, u64),
   (authorship, copies): (&Authorship, &[MadeCopy]),
-  judged: slates_merge::engine::Judged,
+  (judged, given): (slates_merge::engine::Judged, &[(Node, Vec<u8>)]),
 ) -> Result<Option<Made>, Unmade> {
   let Some(inputs) = inputs(state, (green, version), authorship)? else {
     return Ok(None);
@@ -420,7 +418,7 @@ fn made_held(
       let (content, store) = vcs_stores
         .mercurial_ref(repository)
         .ok_or(Unmade::NotHead)?;
-      verified_of(engine, (&store.index, content), &previewed, copies)
+      verified_of(engine, (&store.index, content, given), &previewed, copies)
     })
     .unwrap_or(Err(Unmade::NotHead));
   greens.retire_preview(preview);
@@ -663,10 +661,11 @@ pub(crate) fn mercurial_repository_of(
 }
 
 /// The revisions the server makes of `engine`'s change from the version before to the version over the parent
-/// (module docs; `inputs`), read against `index`; none where the change touches no tracked file.
+/// (module docs; `inputs`), read against `index`, the parent's texts `given` by node in their let-go objects' place; none
+/// where the change touches no tracked file.
 fn verified_of(
   engine: &Green,
-  (index, content): (&HgIndex, &slates_vcs::ContentStore),
+  (index, content, given): (&HgIndex, &slates_vcs::ContentStore, &[(Node, Vec<u8>)]),
   inputs: &Inputs,
   copies: &[MadeCopy],
 ) -> Result<Option<Verified>, Unmade> {
@@ -690,7 +689,7 @@ fn verified_of(
   };
   let mut room = slates_hg::Admission::new(inputs.room);
   match made_of(
-    &IndexHeld::new(index, content),
+    &IndexHeld::with_given(index, content, given),
     inputs.parent,
     &changes,
     &authored,

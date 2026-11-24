@@ -292,6 +292,12 @@ pub(super) struct Kept {
   /// budget, read for every kept part each time a repository's holding is weighed (main 01a20182's r100: git/git's work
   /// clone spent 85% of its shard counting them again, a set's runs walked whole each turn of its encoding ahead).
   pub(super) runs: usize,
+  /// The bytes the store holds under its content, its whole tree of windows and lists (`ContentStore::tree_bytes`), read
+  /// once as it is kept, since a kept part's content never changes: what weighing a repository's kept fragments reads
+  /// ([`Repository::kept_fragments`]). It read `len_of` from the store's map for every kept part on every weighing (gate
+  /// r935: 2,270 of a clone's 24,971 samples), and that was the root node's length alone, so a fragment kept as a tree
+  /// was weighed at a few dozen bytes (main 01a20182's ruling of 2026-11-24 10:56).
+  pub(super) held: u64,
 }
 
 /// A version's two fragments, or a base pack's two parts: commits, trees and tags, then blobs.
@@ -2253,6 +2259,7 @@ fn keep(((bytes, placed), content): (fragment::Encoded, ContentId)) -> Result<Ke
     offsets: to_u64(offsets),
     order,
     runs,
+    held: 0,
   })
 }
 
@@ -2280,7 +2287,12 @@ fn keep_both(
 ) -> Result<Fragments, StoreRefused> {
   let roots = [objects.1, blobs.1];
   match (keep(objects), keep(blobs)) {
-    (Ok(objects), Ok(blobs)) => Ok(Fragments { objects, blobs }),
+    (Ok(mut objects), Ok(mut blobs)) => {
+      for kept in [&mut objects, &mut blobs] {
+        kept.held = store.tree_bytes(&kept.content);
+      }
+      Ok(Fragments { objects, blobs })
+    }
     (Err(refused), _) | (_, Err(refused)) => {
       for root in roots {
         store.release(&root)?;
@@ -2415,7 +2427,7 @@ impl Repository {
   /// Every version whose fragments are kept, by green and then version, with the bytes dropping
   /// them gives back: their content and what their entries are charged (A-724 piece 4): what a repository over its memory share may drop, since a version
   /// whose fragments are gone is encoded again by the next fetch (A-718), as after a recovery.
-  pub fn kept_fragments(&self, store: &ContentStore) -> Vec<((u64, usize), u64)> {
+  pub fn kept_fragments(&self) -> Vec<((u64, usize), u64)> {
     self
       .chains
       .iter()
@@ -2429,7 +2441,7 @@ impl Repository {
             let bytes = [&fragments.objects, &fragments.blobs]
               .into_iter()
               .map(|kept| {
-                let content = store.len_of(&kept.content).unwrap_or(0);
+                let content = kept.held;
                 let runs = kept.runs;
                 content
                   .saturating_add(bytes(
