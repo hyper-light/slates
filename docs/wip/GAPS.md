@@ -26564,6 +26564,12 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
 - **A flaky bench assertion.** `crates/ipc/examples/ipc_bench.rs`'s parked row asserts "every trip woke the client"; it
   aborted 1 run in 12 under load on adacachy2 (2026-11-23, BENCHMARKS' A/B of the switch-count reads). Its spinning row
   had failed every run since A-799 (85b88770e): **fixed**, it names its spin.
+- **A test that ran past 90 minutes under TSan.** Once the server library ran whole under TSan (the r16 push driven a
+  step a poll), `content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes` never
+  ended in diag run 45289949180 or main run 45294047051 (both cancelled), holding the lane's job and main's CI group:
+  its one-shard daemon, sized by its host, planned millions of pages, and its bound is a request a page.
+  **Fixed:** its daemon is bounded at a gibibyte (`audit_daemon_within`), 393,231 pages planned against 48,334,716 on
+  adacachy2, the sweep 24 to 71 ms against 33.7 s plain.
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).

@@ -942,9 +942,16 @@ mod tests {
     sweeps
   }
 
+  /// Shape: the host memory bound the bounded sweep's daemon derives its sizes from: a gibibyte, a small container's,
+  /// so its plan is the same few hundred thousand pages on any host. A one-shard daemon sized by its host planned
+  /// 48,334,716 pages on adacachy2 (126 GiB; the sweep took 33.7 s in a debug build) against 393,231 bounded so (24 to
+  /// 71 ms), and under ThreadSanitizer, on CI's 16 GiB runner, the test ran past 90 minutes without ending (diag run
+  /// 45289949180, main run 45294047051, 2026-11-23), holding the lane's job toward GitHub's six-hour limit.
+  const SWEPT_MEMORY: u64 = 1 << 30;
+
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
-    let daemon = crate::daemon::audit_daemon();
+    let daemon = crate::daemon::audit_daemon_within(SWEPT_MEMORY);
     let (bound, arena_len, planned) = crate::daemon::observe_first(&daemon, |state| {
       let page = state.config.page.max(1);
       let targets = targets(state).0;

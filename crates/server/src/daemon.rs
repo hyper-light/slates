@@ -7334,7 +7334,8 @@ pub fn log_descriptor_raise(who: &str, raise: slates_machine::facts::DescriptorR
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_daemon_of_configured,
-  audit_on_shard, audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
+  audit_daemon_within, audit_on_shard, audit_on_shard_configured, hold_busy, observe_at,
+  observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -7533,6 +7534,22 @@ mod tests {
     );
     let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     configure(&mut config);
+    audit_daemon_with(&profile, config, instance)
+  }
+
+  /// [`audit_daemon`] on a host whose memory is bounded at `memory` bytes (its limit, as a container's is): every size
+  /// the daemon derives from the host's memory (its shard's slice, its tables, its segment's log and snapshot slots)
+  /// derived from that bound, for a test whose work walks what those sizes span; the test stops it.
+  pub(crate) fn audit_daemon_within(memory: u64) -> super::Daemon {
+    let mut profile = test_profile();
+    profile.facts.memory.limit = Some(memory);
+    static NEXT_WITHIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-within-{}-{}",
+      std::process::id(),
+      NEXT_WITHIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     audit_daemon_with(&profile, config, instance)
   }
 
