@@ -345,6 +345,11 @@ pub struct Partition {
   /// The earliest term entered in [`Partition::termed_by_expiry`] since the shard's deadline keeper last asked
   /// ([`Partition::take_noted_term`]), as `lease_noted` is for leases (A-536).
   term_noted: Option<u64>,
+  /// How many attachments the partition has ended since it was made, wrapping: a detach, a term's lapse, a reap and a
+  /// destroy's dependents all end one through [`Partition::remove_attachment`]. It tells a holder of state bound to an
+  /// attachment (an open staging buffer, A-880) that one ended, without a walk of the table. Not recorded: a restored
+  /// partition counts from zero, so it is compared, never summed.
+  attachments_ended: u64,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
   /// The completions a green's successor adopted from the green's merge records (A-255), each with the work whose submit
   /// it completes (A-288), by key `(origin, client, sequence)`: held while the client's window retains the completion,
@@ -519,6 +524,7 @@ impl Partition {
       lease_noted: None,
       termed_by_expiry: BTreeSet::new(),
       term_noted: None,
+      attachments_ended: 0,
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
@@ -1148,6 +1154,7 @@ impl Partition {
       .ok_or(DbError::NotFound)?;
     let record = self.attachments.remove(handle)?;
     self.unindex_term(&record);
+    self.attachments_ended = self.attachments_ended.wrapping_add(1);
     Ok(())
   }
 
@@ -1199,6 +1206,12 @@ impl Partition {
   /// bounded by its cap; asked once at boot, so a fresh counter never re-mints a recovered id).
   pub fn highest_attachment(&self) -> Option<u64> {
     self.attachments.iter().map(|(_, a)| a.id).max()
+  }
+
+  /// How many attachments the partition has ended since it was made, wrapping (A-880): a count that moved says one
+  /// ended, whichever path ended it.
+  pub fn attachments_ended(&self) -> u64 {
+    self.attachments_ended
   }
 
   /// An attachment.
