@@ -645,3 +645,10 @@ Waiting: main's route; arena-7 and arena-8.
 - Not mine, reported: t_goal93_a_recovery_keeps_a_landed_pack_while_the_landed_let_go_is_held (git) fails here 4 of 4.
 - Next: P5. Switch on the let-go for changelog and manifest windows after a push commits or an import segment lands. Main's red: ContentStore::used, clone and pull verify. Count asks per push, with the parent manifest's read-back named apart. GAPS entry off IN FLIGHT.
 - Held: ~/.cache/w-hg-made-reds.patch, waiting on w-svn's commit_held guard.
+
+## 2026-11-24 ~05:30: P4b and A-891's Mercurial half landed
+- 866bfc1dd: P4b. A made changeset brings its parent's texts back before it is made. Fixed with it: a green's second deferred submit was unmade NotHead (the preview read at the green's own version numbers).
+- 946484875: hg_made guard-then-apply via commit_guarded and refuse. The bare path is removed (an unrecorded Mercurial submit is refused RecordedSubmitRequired). made_commit::commit removed, agreed with w-git. Sweep listed in the commit.
+- The held reds patch is consumed (~/.cache/w-hg-made-reds.patch no longer needed).
+- Next: P5. Let go changelog and manifest windows after commit or landing. Main's red: ContentStore::used, plus clone and pull verifying clean against stock 7.2. Asks per push counted. GAPS off IN FLIGHT.
+- Then: stream (8.8x) and push (5.6x) speed.
