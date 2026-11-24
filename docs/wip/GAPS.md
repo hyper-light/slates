@@ -4414,8 +4414,14 @@
 > `push::check_entry`), so the step is not refused after it applied anything; held by
 > `a_special_file_refuses_its_submit_and_the_repository_takes_the_next` and
 > `a_made_entry_its_guard_refuses_leaves_nothing_of_the_version` (each red before: accepted at version 1, no revision).
-> Owed to their owners (main's sweep): git's and Mercurial's made commits still commit a version alone when their
-> commit is unmade or their tool refuses, through `made_commit::commit`. (c) a Mercurial
+> Git's half BUILT (w-git, 2026-11-23 and 24): a git made commit goes only through `made_commit::commit_guarded`
+> (`commits::guard_made`: the record written, the register's entry judged, the store committed, before anything
+> applies), `refuse` (its commit not made: refused typed and recorded, nothing applied), `give_up` and `abandon` (its
+> changeset not landed: retryable); held by `t_a888_git_a_made_commit_not_made_refuses_its_submit_with_nothing_applied`
+> and `t_a888_git_a_made_commits_refused_entry_refuses_its_submit_with_nothing_applied` (red first at 22a88984b), and a
+> bare git submit is refused `RecordedSubmitRequired` since A-896. Owed to its owner (main's sweep): Mercurial's made
+> changesets still commit a version alone when their changeset is unmade or refused, through `made_commit::commit`
+> (`vcs_store::hg_made`, w-hg). (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
