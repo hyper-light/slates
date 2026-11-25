@@ -1,5 +1,14 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~14:30 PST
+- LANDED 3f61d5429: A-923's entry names the replay path that read hg's named files back with old aways refused.
+- LANDED f954135af: the owner's text cache in memory status (store.text_cache_{reserved_bytes,bound_bytes,walks,
+  walk_bytes}); a read left part-way holds the bound as a walk.
+- LANDED 6b3864cf9: the clone's scan churn: the store keeps its scan buffers, texts_by_tools a merge join into its
+  answer (2,000 versions: 1,406,209 -> 305,865 B). Mantle unchanged.
+- LANDED 42b3f2a85: lint run 51's splits (Encoder::turn, family_entries).
+- WAITING (main's next 57k run): the walks rule (b), the reader's handle ends its walk on drop, if the gauges show
+  walks x texts ~ 32 MB; the tail-page append rule if encoded_bytes.aways ~ publications x tail size.
 ## 2026-11-25 ~12:30 PST
 - LANDED 69f2875ae: P7 closed in GAPS on main's after arm (settled resident free within the keep in all three rounds).
 - LANDED c1ded2c5a: A-923, the Aways family keyed by let-go number (push of 20 let-goes: 47,887 -> 3,701 B
