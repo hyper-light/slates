@@ -1032,11 +1032,7 @@ fn a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows() {
   let mut store = store();
   let (fork, first, first_asks) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
   assert_eq!(
-    (
-      first.kept,
-      first.base_store_reads,
-      first_asks
-    ),
+    (first.kept, first.base_store_reads, first_asks),
     (12, 0, 0),
     "every base read from the fork's rows: four changesets, manifests and file revisions kept"
   );

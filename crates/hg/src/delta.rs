@@ -183,6 +183,10 @@ pub fn apply_into(
 pub trait BaseRead {
   /// The base's length.
   fn len(&self) -> u64;
+  /// Whether the base has no bytes: a delta over it can only insert.
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
   /// Appends the base's bytes `at..at + n` to `out`: none where the reader does not hold them now (a window let go),
   /// `out` then as it was.
   fn read_into(&mut self, at: u64, n: usize, out: &mut Vec<u8>) -> Option<()>;
