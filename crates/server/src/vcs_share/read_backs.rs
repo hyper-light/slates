@@ -15,16 +15,18 @@
 //! repository whose git store holds that pack ([`git_holding_pack`]: a scan of this shard's git stores' packs, so
 //! `O(repositories × packs)` on the shard, run only on a bring-back, which has already waited on the node's store); a
 //! home's window, its landed note's (a Mercurial revision's repository, or a pack's as above). A window no store here
-//! claims is no repository's cache: counted, and let go at the next division it is old enough for, no reader pinning it
+//! claims is no repository's cache: counted, and let go at the next division no reader pinning it
 //! ([`let_go_unattributed`]).
 //!
-//! **What it holds.** Each attributed window, by repository, with its bytes and the division it was noted under; each
-//! unattributed window, with its division, until it goes. A window let go, or gone, leaves it at the next let-go here.
-//! One table a shard, on the shard's thread, as the read pins are (`named_objects::read_pinned`).
+//! **What it holds.** Each attributed window, by repository, with its bytes; each unattributed window until it goes. A
+//! window let go, or gone, leaves it at the next let-go here. One table a shard, on the shard's thread, as the read pins
+//! are (`named_objects::read_pinned`).
 //!
-//! **Never under a read.** Only a named read pins what it brought back; a git or a home's read brings a window back and
-//! reads it after, a step later. So a let-go here takes only a window noted before the division before this one: every
-//! read-back stays at least a whole cadence, and no let-go lands between a bring-back and its read.
+//! **Under a read** (main 01a20182's ruling of 2026-11-25, from the readers' code). A reader that reads once holds what
+//! it brought back until it has read it: a named read (`named_objects::ReadPin`), a home's read (one task, its object's
+//! windows pinned, `homes::read`). A git reader (a fetch, a derivation, a green's or a replica's build) reads again
+//! after a let-go and brings the window back again: a let-go here between its bring-back and its read costs it a second
+//! fetch, never its answer.
 //!
 //! **When it lets go.** At the division (`grants::current_at` when it divides: the learning cadence, no timer of its
 //! own; a read asks it too, [`brought_back`], so a shard that only reads divides at its cadence): every repository's
@@ -39,7 +41,7 @@
 //! home holds here stays, as every landed let-go leaves it (`vcs_store::let_go_read`).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::catalog::RepositoryId;
 use slates_vcs::ContentId;
@@ -71,11 +73,10 @@ pub(crate) const UNATTRIBUTED: &str = "vcs_share.read_backs_unattributed";
 pub(crate) const UNATTRIBUTED_LET_GO: &str = "vcs_share.read_backs_unattributed_let_go";
 
 thread_local! {
-  /// This shard's attributed read-backs (module docs): by repository, each window's bytes and the division it was noted
-  /// under.
-  static READ_BACKS: RefCell<BTreeMap<RepositoryId, BTreeMap<ContentId, (u64, u64)>>> = const { RefCell::new(BTreeMap::new()) };
-  /// This shard's unattributed read-backs, each with the division it was noted under.
-  static UNATTRIBUTED_BACKS: RefCell<BTreeMap<ContentId, u64>> = const { RefCell::new(BTreeMap::new()) };
+  /// This shard's attributed read-backs (module docs): by repository, each window's bytes.
+  static READ_BACKS: RefCell<BTreeMap<RepositoryId, BTreeMap<ContentId, u64>>> = const { RefCell::new(BTreeMap::new()) };
+  /// This shard's unattributed read-backs, each let go at the next division no reader pins it.
+  static UNATTRIBUTED_BACKS: RefCell<BTreeSet<ContentId>> = const { RefCell::new(BTreeSet::new()) };
 }
 
 /// What holds a brought-back window's object, as its bring-back names it ([`brought_back`]).
@@ -104,16 +105,9 @@ pub(crate) fn brought_back(state: &mut ShardState, window: ContentId, len: u64, 
     }
     None => {
       state.count(UNATTRIBUTED, 1);
-      let generation = state.vcs_grants.generation;
-      UNATTRIBUTED_BACKS.with(|backs| backs.borrow_mut().insert(window, generation));
+      UNATTRIBUTED_BACKS.with(|backs| backs.borrow_mut().insert(window));
     }
   }
-}
-
-/// Whether a read-back noted under division `noted` may go now, the grants at `generation`: noted before the division
-/// before this one (module docs, "Never under a read"), so a whole cadence has passed since its read.
-fn old_enough(noted: u64, generation: u64) -> bool {
-  noted.saturating_add(1) < generation
 }
 
 /// The repository whose store holds `window`'s object, as `holder` names it (module docs), and the counter of its kind.
@@ -144,14 +138,13 @@ pub(crate) fn git_holding_pack(state: &ShardState, pack: &ContentId) -> Option<R
 /// Notes `window` (`len` bytes) against repository `reader`'s grant, letting go at once where that takes it past its
 /// bound ([`bound`]).
 fn noted(state: &mut ShardState, reader: RepositoryId, window: ContentId, len: u64) {
-  let generation = state.vcs_grants.generation;
   let held = READ_BACKS.with(|backs| {
     let mut backs = backs.borrow_mut();
     let windows = backs.entry(reader).or_default();
-    windows.insert(window, (len, generation));
+    windows.insert(window, len);
     windows
       .values()
-      .fold(0u64, |held, (len, _)| held.saturating_add(*len))
+      .fold(0u64, |held, len| held.saturating_add(*len))
   });
   if held > bound(state, reader) {
     state.count(PAST_BOUND, 1);
@@ -178,18 +171,11 @@ pub(crate) fn let_go_past_grants(state: &mut ShardState) {
   let_go_unattributed(state);
 }
 
-/// Lets go every unattributed read-back old enough ([`old_enough`]) that no reader pins (`vcs_store::let_go_read`),
-/// forgetting each one let go or refused.
+/// Lets go every unattributed read-back no reader pins (`vcs_store::let_go_read`), forgetting each one let go or
+/// refused.
 fn let_go_unattributed(state: &mut ShardState) {
-  let generation = state.vcs_grants.generation;
-  let windows: Vec<ContentId> = UNATTRIBUTED_BACKS.with(|backs| {
-    backs
-      .borrow()
-      .iter()
-      .filter(|(_, noted)| old_enough(**noted, generation))
-      .map(|(window, _)| *window)
-      .collect()
-  });
+  let windows: Vec<ContentId> =
+    UNATTRIBUTED_BACKS.with(|backs| backs.borrow().iter().copied().collect());
   for window in windows {
     if crate::vcs_store::named_objects::read_pinned(&window) {
       continue;
@@ -202,8 +188,8 @@ fn let_go_unattributed(state: &mut ShardState) {
 }
 
 /// Lets go repository `id`'s coldest read-backs, by last read, until what it holds of them is within its grant (none
-/// where it has none), passing over a window a reader pins or one too young ([`old_enough`]; `vcs_store::let_go_read`'s
-/// rules for the rest); then forgets every window it holds no more. The bytes freed.
+/// where it has none), passing over a window a reader pins (`vcs_store::let_go_read`'s rules for the rest); then forgets
+/// every window it holds no more. The bytes freed.
 fn let_go_past(state: &mut ShardState, id: RepositoryId) -> u64 {
   let grant = state.vcs_grants.of(id).unwrap_or(0);
   let Some(windows) = READ_BACKS.with(|backs| backs.borrow().get(&id).cloned()) else {
@@ -212,32 +198,21 @@ fn let_go_past(state: &mut ShardState, id: RepositoryId) -> u64 {
   let Some(content) = state.vcs_stores.content() else {
     return 0;
   };
-  let generation = state.vcs_grants.generation;
-  // Resident, pinned or young or not: such a window counts against the grant though it cannot go yet.
-  let mut resident: Vec<(u64, ContentId, u64, bool)> = windows
+  // Resident, pinned or not: a pinned window counts against the grant though it cannot go.
+  let mut resident: Vec<(u64, ContentId, u64)> = windows
     .iter()
     .filter(|(window, _)| content.contains(window) && !content.is_away(window))
-    .map(|(window, (len, noted))| {
-      (
-        content.last_read(window).unwrap_or(0),
-        *window,
-        *len,
-        old_enough(*noted, generation),
-      )
-    })
+    .map(|(window, len)| (content.last_read(window).unwrap_or(0), *window, *len))
     .collect();
   let held = resident
     .iter()
-    .fold(0u64, |held, (_, _, len, _)| held.saturating_add(*len));
+    .fold(0u64, |held, (_, _, len)| held.saturating_add(*len));
   let mut over = held.saturating_sub(grant);
   resident.sort_unstable_by_key(|(read, ..)| *read);
   let (mut freed, mut let_go, mut kept) = (0u64, 0u64, 0u64);
-  for (_, window, _, old) in &resident {
+  for (_, window, _) in &resident {
     if over == 0 {
       break;
-    }
-    if !old {
-      continue;
     }
     if crate::vcs_store::named_objects::read_pinned(window) {
       kept = kept.saturating_add(1);
@@ -270,6 +245,43 @@ fn forget_away(state: &ShardState, id: RepositoryId) {
       }
     }
   });
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's cold trigger forced once at its point in a home's read, between the bring-back and the read
+  /// (`homes::read_brought_back`): every repository's grant taken as nothing, then every read-back let go
+  /// ([`let_go_past_grants`]); it clears itself as it fires.
+  pub(crate) static FORCE_COLD_TRIGGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's let-go forced once of the window a git read just brought back, before the reader reads it
+  /// (`read_through::bring_back_window`): what a division landing between a bring-back and its read does to a reader
+  /// that holds no pin; it clears itself as it fires.
+  pub(crate) static FORCE_LET_GO_AFTER_BRING_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The let-go [`FORCE_LET_GO_AFTER_BRING_BACK`] forces of `window`, at its point: where set, it clears itself and lets
+/// the window go (`vcs_store::let_go_read`).
+#[cfg(test)]
+pub(crate) fn let_go_after_bring_back_where_forced(state: &mut ShardState, window: &ContentId) {
+  if FORCE_LET_GO_AFTER_BRING_BACK.with(|force| force.replace(false)) {
+    let _ = crate::vcs_store::let_go_read(state, window);
+  }
+}
+
+/// The cold trigger [`FORCE_COLD_TRIGGER`] forces, at its point: where set, it clears itself and lets go every read-back
+/// no reader pins, as a division granting nothing would.
+#[cfg(test)]
+pub(crate) fn cold_trigger_where_forced(state: &mut ShardState) {
+  if FORCE_COLD_TRIGGER.with(|force| force.replace(false)) {
+    let mut nothing = crate::vcs_share::grants::Grants::default();
+    nothing.generation = state.vcs_grants.generation.saturating_add(1);
+    state.vcs_grants = nothing;
+    let_go_past_grants(state);
+  }
 }
 
 #[cfg(test)]
@@ -311,8 +323,7 @@ mod tests {
         .vcs_stores
         .content()
         .is_some_and(|content| !content.is_away(&window));
-      // Two divisions on: a whole cadence old, the read that brought it back long done.
-      state.vcs_grants.generation = state.vcs_grants.generation.saturating_add(2);
+      // The division: the read that brought it back done, no reader pinning it.
       super::let_go_past_grants(state);
       let away = state
         .vcs_stores
@@ -368,6 +379,98 @@ mod tests {
         held.len(),
         held.len(),
         took.as_nanos() / u128::try_from(held.len().max(1)).unwrap_or(1)
+      );
+    });
+  }
+
+  /// Main 01a20182's ruling of 2026-11-25 (a home's read reads once: a let-go between its bring-back and its read
+  /// refused it, `NotWhole` or `NotHeld`, which a timing rule only hid). Do: on a store-backed daemon, keep a two-window
+  /// object for the region, land its bytes on the node's store and let both windows go; force the cold trigger to run
+  /// between the home's bring-back and its read (`FORCE_COLD_TRIGGER`: every grant nothing, every read-back no reader
+  /// pins let go); read the object from its home. Expect: the read answers the object's bytes whole, its windows pinned
+  /// through the trigger (counted kept, none of them let go). Failing first (the windows unpinned): refused, the trigger
+  /// letting them go before the read.
+  #[test]
+  fn a_homes_read_holds_its_windows_from_their_bring_back_to_its_read() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let (read, expected) = crate::test_store::run_on_first(
+      &daemon,
+      || async {
+        let (object, expected, disk) = crate::state::with_state(|state| {
+          let window = state.store.content.chunk_bytes();
+          state.vcs_stores.content_made(window).unwrap();
+          let bytes = vec![b'x'; window * 2];
+          let (object, _) = crate::vcs_store::homes::keep_for_region(
+            state,
+            &bytes,
+            &[crate::vcs_store::homes::TEST_OWNER],
+          )
+          .unwrap();
+          (object, bytes, state.vcs_disk.clone().unwrap())
+        })
+        .unwrap();
+        let header = slates_store::log::Header {
+          tool: slates_store::log::Tool::Git,
+          repository: 3,
+          sequence: 0,
+          judged_over: 0,
+          grant: 0,
+          work: 0,
+          time_ns: slates_rt::futures::now_ns(),
+          sections: 0,
+        };
+        let parts = vec![(slates_store::log::SectionKind::Payload, expected.clone())];
+        assert!(disk.land(header, parts).await.is_ok());
+        let (here, budget) = crate::state::with_state(|state| {
+          let here = state.shard;
+          crate::vcs_store::let_go_landed_pack_among(state, &object, &[here]);
+          assert!(!state.vcs_stores.content().unwrap().holds_whole(&object));
+          (here, crate::fleet::live_budget().max_deadline_ns())
+        })
+        .unwrap();
+        super::FORCE_COLD_TRIGGER.with(|force| force.set(true));
+        let read = crate::vcs_store::homes::read(here, &[here], object, budget).await;
+        (read.map(|got| got == expected), expected.len())
+      },
+      std::time::Duration::from_secs(60),
+    );
+    daemon.stop();
+    assert!(expected > 0);
+    assert_eq!(read, Ok(true), "read whole through the forced trigger");
+  }
+
+  /// Main 01a20182's datum of 2026-11-25 (w-interop's round 2: the daemon at 5,987 MiB in the hg leg, the clone reading
+  /// every landed text back, none let go): a Mercurial revision's window a home brings back is its repository's
+  /// read-back. Do: note a window landed for a Mercurial revision of a repository (`homes::Landed::Hg`), put it, and
+  /// note it brought back by a home (`Holder::Landed`). Expect: counted attributed to Mercurial
+  /// (`vcs_share.read_backs_attributed_hg`), none unattributed.
+  #[test]
+  fn a_homes_mercurial_window_is_attributed_to_its_revisions_repository() {
+    crate::test_store::audit_on_stored_shard("read-backs-hg", |state| {
+      let (repository, _) =
+        crate::vcs_store::tests::repository(state, "hg-read-back", VcsTool::Mercurial);
+      let window = crate::vcs_store::within_budget(state, 1 << 16, |stores| {
+        stores
+          .content_mut()
+          .expect("a content store")
+          .put(&[3u8; 1_000])
+          .expect("put")
+      });
+      crate::vcs_store::homes::note_landed(
+        window,
+        crate::vcs_store::homes::Landed::Hg(crate::vcs_store::homes::HgLanded {
+          repository,
+          path: b"README".to_vec(),
+          node: [1; 20],
+        }),
+      );
+      brought_back(state, window, 1_000, Holder::Landed);
+      assert_eq!(
+        (
+          count(state, super::ATTRIBUTED_HG),
+          count(state, UNATTRIBUTED)
+        ),
+        (1, 0)
       );
     });
   }

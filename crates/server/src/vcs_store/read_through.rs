@@ -218,6 +218,8 @@ pub(crate) async fn bring_back_window(
         brought,
         crate::vcs_share::read_backs::Holder::Pack(pack),
       );
+      #[cfg(test)]
+      crate::vcs_share::read_backs::let_go_after_bring_back_where_forced(state, &window);
     }
     put.map(|brought| (brought > 0).then_some((window, brought)))
   })
