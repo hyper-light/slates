@@ -771,3 +771,11 @@
   slates' server ~75 ms of 0.95 s; the rest is the client's 1,027-ref work + HTTP helper. NOW: A-911's miss counter
   (vcs_store.git_upload.position_cache_conflicts; red 0 -> green 292 of 383 lookups conflicts), landing; then main's
   A/B: set-associative vs wider window.
+- 11-25 ~02:30: LANDED 15b4f1061 (position_cache_conflicts; later documented an upper bound, a8ca56a4f with GAPS'
+  intakes_live line), f9090c7d8 = 86b057be4 (walk takes one tree entry a unit: unit_entries_most red 60 -> 1,
+  tree_parse_bytes_most counted; frame held/released after t_a752 PackTooLarge; positions: one-sided union settled +
+  span settled, seed in positions.proptest-regressions; git_derive.turns only counts real turns), 2dd25afe6
+  (vcs_store.git_derive.ns). A/B arms built: B agents/w-git-a911-assoc 11128da63, C agents/w-git-a911-wide 0c8e7d496.
+  Answered: git has no hg 57k-push let-go shape (LANDED_LET_GO false; landed_let_go_may waits intakes_live).
+  PARKED agents/w-git-derive-behind 0552aca75 (derive a push's versions behind it; red/green done; t_a724 replay diff
+  in a reach value open). WAITING: main's A/B verdict, the 57k read of tree_parse_bytes_most/long steps, git_derive.ns.
