@@ -200,7 +200,11 @@ where
   let repository = u128::from_be_bytes(id.bytes);
   while let Some(want) = wants.wants().cloned() {
     let asked_at = slates_rt::futures::now_ns();
-    let disk = lender.lend(|state| state.vcs_disk.clone()).flatten();
+    let Some((disk, step)) =
+      lender.lend(|state| (state.vcs_disk.clone(), text_bytes_a_step(state)))
+    else {
+      return false;
+    };
     let Some(disk) = disk else {
       // A daemon holding no store keeps no revision: a rows' want is answered none, any other refused.
       let Want::Rows { logs } = want else {
@@ -216,7 +220,7 @@ where
     };
     // Read before the answer, which ends the want it names.
     let logs = wants.reads_logs();
-    let Some((whole, requests)) = answer_one(&disk, repository, want, wants).await else {
+    let Some((whole, asks)) = answer_one(&disk, repository, (want, step), wants).await else {
       return false;
     };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
@@ -224,7 +228,8 @@ where
     let _ = lender.lend(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
-      state.count(TEXT_REQUESTS, requests);
+      state.count(TEXT_REQUESTS, asks.requests);
+      state.count_max(TEXT_COPIED_MOST_BYTES, asks.most_copied);
       if tags {
         state.count(LOOKUP_STORE_ASKS, 1);
       } else if bases {
@@ -244,34 +249,45 @@ where
 /// counter name in the status report.
 pub(crate) const TEXT_REQUESTS: &str = "vcs_store.hg_text_requests";
 
+/// Counter: the most bytes one request of a fetch's texts copied on the store's owner (goal 93, main's ruling of
+/// 2026-11-25): held to a step's copy budget ([`text_bytes_a_step`]), a text past it copied in slices. Format: a counter
+/// name in the status report.
+pub(crate) const TEXT_COPIED_MOST_BYTES: &str = "vcs_store.hg_text_copied_most_bytes";
+
 /// Counter: the asks a push's intake (or its replay) made of the node's changeset store for a file delta's base landed
 /// before the push (A-767 C1, main's ruling (b2); `slates_hg::push::intake::Stepped::Store`), each a want of rows or of
 /// texts. Format: a counter name in the status report.
 pub(crate) const INTAKE_BASE_ASKS: &str = "vcs_store.hg_intake_base_asks";
 
 /// [`answer_store_wants`] over `disk` alone, touching no shard state (a recovery's replay holds the state across its
-/// waits): whether every want was answered.
+/// waits): whether every want was answered. A want of texts is copied in one request of the owner, as before the step
+/// rule (goal 93, main's ruling of 2026-11-25, owed here: a replay's base asks, sized by its own room, are swept onto
+/// [`text_bytes_a_step`] once its callers can name their shard's step).
 pub(crate) async fn answer_wants_over(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
   wants: &mut dyn slates_hg::render::StoreWants,
 ) -> bool {
   while let Some(want) = wants.wants().cloned() {
-    if answer_one(disk, repository, want, wants).await.is_none() {
+    if answer_one(disk, repository, (want, u64::MAX), wants)
+      .await
+      .is_none()
+    {
       return false;
     }
   }
   true
 }
 
-/// Answers one `want` of `repository` from `disk` into `wants`: the whole texts it gave (zero for any other want), or
-/// none where the store refused or was gone.
+/// Answers one `want` of `repository` from `disk` into `wants`, the owner copying at most `step` bytes a request: the
+/// whole texts it gave (zero for any other want) and what it asked of the owner, or none where the store refused or
+/// was gone.
 async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
-  want: slates_hg::render::Want,
+  (want, step): (slates_hg::render::Want, u64),
   wants: &mut W,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, TextAsks)> {
   use slates_hg::render::{StoredPlace, StoredRevision, Want};
   match want {
     Want::Rows { logs } => {
@@ -306,7 +322,7 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
           })
           .collect(),
       );
-      Some((0, 0))
+      Some((0, TextAsks::default()))
     }
     Want::Chunks { places } => {
       let asked = places
@@ -319,19 +335,21 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
         .collect();
       let chunks = disk.places(asked).await.ok()?;
       wants.give_chunks(chunks);
-      Some((0, 0))
+      Some((0, TextAsks::default()))
     }
-    Want::Texts { texts, most } => match texts_made(disk, repository, &texts, most).await? {
-      (MadeTexts::Past, requests) => {
-        wants.texts_past();
-        Some((0, requests))
+    Want::Texts { texts, most } => {
+      match texts_made(disk, repository, &texts, (most, step)).await? {
+        (MadeTexts::Past, asks) => {
+          wants.texts_past();
+          Some((0, asks))
+        }
+        (MadeTexts::Made(made), asks) => {
+          let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
+          wants.give_texts(made);
+          Some((whole, asks))
+        }
       }
-      (MadeTexts::Made(made), requests) => {
-        let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
-        wants.give_texts(made);
-        Some((whole, requests))
-      }
-    },
+    }
   }
 }
 
@@ -344,23 +362,89 @@ pub(crate) enum MadeTexts {
   Past,
 }
 
-/// The full texts `texts` (each by its identity) of `repository`, made by the store's owner from their chains and read
-/// a piece at a time to their end (`StoreHandle::text`, empty at a text's end; A-767 C1: a pull's revision sent whole,
-/// a lookup's `.hgtags`), together at most `most` bytes: past them the reading stops, so a hostile or huge text is
-/// never held whole ([`MadeTexts::Past`]). None where the store keeps no such text.
+/// What a [`texts_made`] read asked of the store's owner: its requests, and the most bytes one of them copied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TextAsks {
+  /// The requests made of the owner.
+  pub(crate) requests: u64,
+  /// The most bytes one request's answer copied.
+  pub(crate) most_copied: u64,
+}
+
+impl TextAsks {
+  /// One request more, whose answer copied `bytes`.
+  fn asked(&mut self, bytes: u64) {
+    self.requests = self.requests.saturating_add(1);
+    self.most_copied = self.most_copied.max(bytes);
+  }
+}
+
+/// The full texts `texts` (each by its identity) of `repository`, made by the store's owner from their chains (A-767
+/// C1: a fetch's let-go changelog and manifest texts, a pull's revision sent whole, a lookup's `.hgtags`), together at
+/// most `most` bytes: past them the reading stops, so a hostile or huge text is never held whole ([`MadeTexts::Past`]).
+/// The owner copies at most `step` bytes a request (a step's copy budget, [`text_bytes_a_step`]; goal 93, main's ruling
+/// of 2026-11-25). None where the store keeps no such text. What it asked, beside them.
 pub(crate) async fn texts_made(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
   texts: &[[u8; 32]],
-  most: u64,
-) -> Option<(MadeTexts, u64)> {
-  // One request of the store's owner for the batch (goal 93: a request a text and a piece before, over 100,000 trips to
-  // the owner for hg's 57k clone), counted ([`TEXT_REQUESTS`]).
-  match disk.texts(repository, texts.to_vec(), most).await.ok()? {
-    slates_store::owner::MadeTexts::Made(made) => Some((MadeTexts::Made(made), 1)),
-    slates_store::owner::MadeTexts::Past => Some((MadeTexts::Past, 1)),
-    slates_store::owner::MadeTexts::Missing => None,
+  (most, step): (u64, u64),
+) -> Option<(MadeTexts, TextAsks)> {
+  let step = step.max(1);
+  let mut asks = TextAsks::default();
+  if most <= step {
+    // The want within one step (a fetch's batch, `LogTexts::ask_batch`, holds a step's bytes): one request of the
+    // store's owner for all of it (goal 93: a request a text and a piece before, over 100,000 trips to the owner for hg's
+    // 57k clone), counted ([`TEXT_REQUESTS`]).
+    let made = match disk.texts(repository, texts.to_vec(), most).await.ok()? {
+      slates_store::owner::MadeTexts::Made(made) => made,
+      slates_store::owner::MadeTexts::Past => {
+        asks.asked(0);
+        return Some((MadeTexts::Past, asks));
+      }
+      slates_store::owner::MadeTexts::Missing => return None,
+    };
+    let copied = made
+      .iter()
+      .map(|text| u64::try_from(text.len()).unwrap_or(u64::MAX))
+      .fold(0, u64::saturating_add);
+    asks.asked(copied);
+    return Some((MadeTexts::Made(made), asks));
   }
+  // Past a step: each text copied a step's slice a request, to its end (an empty slice, or one short of the step).
+  let mut made = Vec::new();
+  made.try_reserve_exact(texts.len()).ok()?;
+  let mut total = 0_u64;
+  for identity in texts {
+    let mut text = Vec::new();
+    loop {
+      let at = u64::try_from(text.len()).ok()?;
+      let slice = disk
+        .text_slice(repository, *identity, (at, step))
+        .await
+        .ok()??;
+      let len = u64::try_from(slice.len()).ok()?;
+      asks.asked(len);
+      total = total.saturating_add(len);
+      if total > most {
+        return Some((MadeTexts::Past, asks));
+      }
+      text.extend_from_slice(&slice);
+      if len < step {
+        break;
+      }
+    }
+    made.push(text);
+  }
+  Some((MadeTexts::Made(made), asks))
+}
+
+/// The most bytes of texts one want of a fetch over the shard's view asks the store's owner to make and copy at once
+/// (`slates_hg::serve::getbundle::Store::text_bytes_a_step`; goal 93, main's ruling of 2026-11-25): the copy budget of
+/// one step on the calling shard, `copy_slice_bytes` (the machine's measured memcpy rate over the copy share of its
+/// step quantum; 94,797 B on main's bench), one byte at least.
+fn text_bytes_a_step(state: &ShardState) -> u64 {
+  state.config.copy_slice_bytes().max(1)
 }
 
 /// [`held`], for the tests.
@@ -473,7 +557,7 @@ pub(crate) fn lend_held_in<R>(
   let made = super::lent_state(state, |state| {
     let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
     let read = generation.register.state();
-    let view = Indexed::new(index, content, read, room).ok()?;
+    let view = Indexed::new(index, content, read, (text_bytes_a_step(state), room)).ok()?;
     Some(step(&view, room))
   });
   if made.is_none() {
@@ -552,7 +636,13 @@ pub(crate) fn with_view<R>(
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
   let register = register_of(shard, id, room).ok()?;
   let read = register.state();
-  let view = Indexed::new(&store.index, content, read, room).ok()?;
+  let view = Indexed::new(
+    &store.index,
+    content,
+    read,
+    (text_bytes_a_step(shard), room),
+  )
+  .ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
 }
 
@@ -569,7 +659,13 @@ pub(crate) fn with_view_over<R>(
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
   let register = register_of(shard, id, room).ok()?;
   let read = register.state();
-  let view = Indexed::new(&store.index, content, read, room).ok()?;
+  let view = Indexed::new(
+    &store.index,
+    content,
+    read,
+    (text_bytes_a_step(shard), room),
+  )
+  .ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);
   Some(step(&view, held, content, room))
 }

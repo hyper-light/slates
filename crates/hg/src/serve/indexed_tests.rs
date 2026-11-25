@@ -29,6 +29,9 @@ use proptest::prelude::*;
 
 /// The window the tests' stores are made with: room for a few rows a table, and longer than every fixture's text.
 const WINDOW: usize = 1 << 12;
+/// Shape: a fetch's texts asked a want with no step bound but the room's, past every fixture's texts
+/// ([`Store::text_bytes_a_step`]); the step's own test sets one.
+const UNSTEPPED: u64 = u64::MAX;
 
 /// A store with room for every history the tests make, many times over.
 fn store() -> ContentStore {
@@ -218,7 +221,13 @@ fn check_answers(name: &str, view: &Indexed<'_>) {
 fn the_states_repositories_are_served_as_7_2_serves_them() {
   for name in ["states", "states-store"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (UNSTEPPED, &mut room()),
+    )
+    .unwrap();
     check_served(name, &view, &imported, &store);
     check_left_out(name, &view, &imported, &store);
     check_answers(name, &view);
@@ -251,7 +260,13 @@ fn bookmark_lines<'a>(marks: impl Iterator<Item = (&'a [u8], Node)>) -> Vec<Stri
 fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
   let name = "divergent";
   let (imported, store) = imported(name);
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   assert_eq!(
     bookmark_lines(view.bookmarks()),
     listed("divergent-bookmarks.txt")
@@ -282,7 +297,13 @@ fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
 fn a_hidden_draft_root_is_listed_as_7_2_lists_it() {
   let name = "amended-root";
   let (imported, store) = imported(name);
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   check_served(name, &view, &imported, &store);
   check_left_out(name, &view, &imported, &store);
   check_answers(name, &view);
@@ -322,9 +343,14 @@ fn texts_of(
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_in_place() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   assert_eq!(
     view.lends(),
     Lends {
@@ -459,7 +485,7 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     publishing: true,
     markers: &[],
   };
-  let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
+  let view = Indexed::new(&index, &store, no_state, (UNSTEPPED, &mut room())).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
   assert_eq!(
     short,
@@ -774,7 +800,7 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     publishing,
     markers: &[],
   };
-  Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
+  Indexed::new(&built.index, &built.store, state, (UNSTEPPED, &mut room())).unwrap()
 }
 
 /// A history from per-revision choices: a first parent among the three before it (or none), a second now and then, a
@@ -1006,7 +1032,7 @@ fn a_root_the_changelog_lacks_is_dropped_and_counted() {
     roots: &roots,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   check_served("states", &view, &imported, &store);
   assert_eq!(view.census().dropped_roots, 1);
 }
@@ -1055,7 +1081,7 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     publishing: false,
     markers: &[],
   };
-  let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
+  let refused = Indexed::new(&built.index, &built.store, state, (UNSTEPPED, &mut room())).err();
   assert_eq!(
     refused,
     Some(Refusal::Store {
@@ -1074,7 +1100,7 @@ fn a_view_past_its_room_is_refused() {
       &imported.index,
       &store,
       state_of(&imported),
-      &mut Admission::new(room),
+      (UNSTEPPED, &mut Admission::new(room)),
     )
     .map(|_| ())
   };
@@ -1208,7 +1234,13 @@ fn whole_texts<'s>(
 fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   use super::super::stream::stream_out;
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   let mut answer = Vec::new();
   stream_out(
     &view,
@@ -1229,7 +1261,7 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
     roots: &public,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let mut answer = Vec::new();
   stream_out(
     &view,
@@ -1279,9 +1311,14 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   let mut walked = 0;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-      .unwrap()
-      .answering_from_its_texts();
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (UNSTEPPED, &mut room()),
+    )
+    .unwrap()
+    .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1316,7 +1353,7 @@ fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
       roots: &public,
       ..state_of(&imported)
     };
-    let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
     let mut whole = Vec::new();
     stream_out(
       &view,
@@ -1381,9 +1418,14 @@ fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
   let mut deltas = 0usize;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-      .unwrap()
-      .answering_from_its_texts();
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (UNSTEPPED, &mut room()),
+    )
+    .unwrap()
+    .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1518,7 +1560,7 @@ fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
     roots: &public,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let mut whole = Vec::new();
   stream_out(
     &view,
@@ -1703,9 +1745,14 @@ fn a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_roun
   use super::super::lookup::{TagsRead, lookup};
   use crate::render::Want;
   let (imported, store) = imported("hidden-tag");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
   let mut asks = Vec::new();
   while let Some(want) = tags.wants().cloned() {
@@ -1740,7 +1787,13 @@ fn a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_roun
 fn a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup() {
   use super::super::lookup::{TagsRead, lookup};
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   let tags = TagsRead::begin(&view, &mut room()).unwrap();
   assert_eq!(tags.wants(), None);
   let mut out = Vec::new();
@@ -1759,10 +1812,21 @@ fn a_batch_of_lookups_reads_the_tags_once() {
   use super::super::session::{Batch, BatchStep, Transport};
   use crate::render::StoreWants;
   let (imported, store) = imported("hidden-tag");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
-  let answering = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
+  let answering = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   let mut batch = Batch::begin(b"lookup key=seen;lookup key=nope", &mut room()).unwrap();
   let mut waits = 0;
   let mut asks = 0;
@@ -1850,9 +1914,14 @@ fn a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step() {
 #[test]
 fn a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   let lent = |view: &Indexed<'_>| {
     let lends = view.lends();
     lends.in_place + lends.copied
@@ -2172,9 +2241,14 @@ fn clone_and_pull(
   store: &ContentStore,
   saved: BTreeMap<(Vec<u8>, Node), Vec<u8>>,
 ) -> (Sent, Sent, u64) {
-  let view = Indexed::new(&imported.index, store, state_of(imported), &mut room())
-    .unwrap()
-    .answering_log_texts(saved);
+  let view = Indexed::new(
+    &imported.index,
+    store,
+    state_of(imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_log_texts(saved);
   let clone = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
   let common = hex(&view.node(0).unwrap());
   let pulled = pull::outgoing(&view, b"", common.as_bytes(), &mut room()).unwrap();
@@ -2235,6 +2309,58 @@ fn a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store() 
   assert!(answered > 0, "texts answered by the changeset store");
 }
 
+/// Goal 93 (main's ruling of 2026-11-25: a fetch's batch of let-go changelog and manifest texts sized by what one step
+/// copies, not by the fetch's room; at hg's 57k clone a room's batch held gigabytes of texts at once, the system
+/// allocator keeping 5.25 GB of them after). Do: over `divergent` (every changeset served, so a clone is walked by its
+/// links as a clone of hg's own history is), save every changeset's and manifest's text and let go every object those
+/// rows name; clone through a view whose fetch asks at most `step` bytes of texts a want, `step` twice the longest such
+/// text, walked a step at a time, the tests' store answering from what was saved; and clone again with no step but the
+/// room's. Expect: the same changegroup both times; with the step, every want of texts holding at most `step` bytes, or
+/// one text alone, and more than one want made. Red before: one want of a whole log's texts, as many as the room held.
+#[test]
+fn a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes() {
+  let (imported, mut store) = imported("divergent");
+  let (saved, objects) = log_texts_and_objects(&imported.index, &store);
+  let longest = saved.values().map(Vec::len).max().unwrap() as u64;
+  let step = 2 * longest;
+  let freed: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(freed > 0, "the log texts let go");
+  let clone_within = |step: u64| {
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (step, &mut room()),
+    )
+    .unwrap()
+    .answering_log_texts(saved.clone());
+    let clone = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
+    let mut walk =
+      super::super::getbundle::Walk::begin(&view, &clone, Version::V03, &mut room()).unwrap();
+    let mut out = Vec::new();
+    while walk.step(&view, &mut room(), &mut out).unwrap() {}
+    (out, view.texts_asked())
+  };
+  let (unstepped, whole) = clone_within(UNSTEPPED);
+  let (stepped, asked) = clone_within(step);
+  assert_eq!(stepped, unstepped, "the same changegroup within the step");
+  let total: u64 = saved.values().map(|text| text.len() as u64).sum();
+  println!(
+    "indexed: {} log texts, {total} B, longest {longest} B, step {step} B: wants {asked:?} (the room's {whole:?})",
+    saved.len()
+  );
+  assert!(asked.len() > 1, "more than one want of texts: {asked:?}");
+  assert!(
+    asked
+      .iter()
+      .all(|(texts, bytes)| *bytes <= step || *texts == 1),
+    "every want of texts within {step} B or one text alone: {asked:?}"
+  );
+}
+
 /// Goal 93, C1 (1) P2 (lookup's half). Do: over `hidden-tag` (a visible head whose `.hgtags` tags the root `seen`), save
 /// every changeset's and manifest's text; let go every object those rows name; read the heads' `.hgtags` through a view
 /// whose changeset store answers those logs' texts from what was saved, and look up `seen`. Expect: objects let go; the
@@ -2252,9 +2378,14 @@ fn a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store() {
     .map(|object| store.let_go_object(object))
     .sum();
   assert!(let_go > 0, "objects let go");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_log_texts(saved);
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_log_texts(saved);
   let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
   let mut asks = Vec::new();
   while let Some(want) = tags.wants().cloned() {

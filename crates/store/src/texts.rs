@@ -530,13 +530,13 @@ impl TextCache {
       .or_else(|| (self.last_made == Some(*identity)).then_some(self.base.as_slice()))
   }
 
-  /// Records a read lending `identity` (`len` bytes) from `offset`, as the owner serves it a piece
-  /// ([`crate::store::PIECE_BYTES`]) at a time: its walk in flight until a piece reaches the end, the bound derived again,
-  /// the text moved to the newest chunk where it lies in an older one (so the least lately read go first), and the chunks
-  /// past the bound given back.
-  fn read(&mut self, identity: Identity, len: u64, offset: u64) {
+  /// Records a read lending `identity` (`len` bytes) from `offset` as far as `reach` bytes, as the owner serves it a
+  /// piece ([`crate::store::PIECE_BYTES`]) or a slice ([`Store::text_slice`]) at a time, or whole: its walk in flight
+  /// until a read reaches the end, the bound derived again, the text moved to the newest chunk where it lies in an older
+  /// one (so the least lately read go first), and the chunks past the bound given back.
+  fn read(&mut self, identity: Identity, len: u64, (offset, reach): (u64, u64)) {
     if self.reads > 0 {
-      let finished = offset.saturating_add(to_u64(crate::store::PIECE_BYTES)) >= len;
+      let finished = offset.saturating_add(reach) >= len;
       if finished {
         if let Some(walked) = self.walks.remove(&identity) {
           self.walk_bytes = self.walk_bytes.saturating_sub(walked);
@@ -1077,7 +1077,11 @@ impl Store {
       .lent(text)
       .map(<[u8]>::len)
       .ok_or(StoreError::BadRow)?;
-    cache.read(*text, to_u64(len), offset);
+    cache.read(
+      *text,
+      to_u64(len),
+      (offset, to_u64(crate::store::PIECE_BYTES)),
+    );
     // Held, or in the buffer the chain was made into where the bound could not hold it.
     let Some(whole) = cache.lent(text) else {
       return Err(StoreError::BadRow);
@@ -1112,9 +1116,44 @@ impl Store {
         .map(<[u8]>::len)
         .ok_or(StoreError::BadRow)?,
     );
-    // Read from its end: the walk, if any piece began one, ends here, and none begins.
-    cache.read(*text, len, len);
+    // Read whole, its reach its length: the walk, if any piece began one, ends here, and none begins.
+    cache.read(*text, len, (0, len));
     cache.lent(text).map(Some).ok_or(StoreError::BadRow)
+  }
+
+  /// At most `most` bytes of the text `text` of repository `repository` from `offset`, as [`Store::text_at`] makes and
+  /// lends it, for a caller that copies a text in slices of a step's bytes (goal 93, main's ruling of 2026-11-25: a
+  /// fetch's texts copied by the owner at most a step's copy budget a request, a text past it in slices across
+  /// requests). The read reaches `most` bytes, so its walk ends at the slice that reaches the text's end, whatever the
+  /// slice's length against a piece. Empty at the text's end; none past it, or for a text no landed changeset kept.
+  ///
+  /// # Errors
+  /// As [`Store::text_at`].
+  pub fn text_slice<'c>(
+    &mut self,
+    staging: &Staging,
+    repository: u128,
+    (text, offset, most): (&Identity, u64, u64),
+    cache: &'c mut TextCache,
+  ) -> Result<Option<&'c [u8]>, StoreError> {
+    if cache.get(text).is_none() && !self.make(staging, repository, text, cache)? {
+      return Ok(None);
+    }
+    let len = to_u64(
+      cache
+        .lent(text)
+        .map(<[u8]>::len)
+        .ok_or(StoreError::BadRow)?,
+    );
+    cache.read(*text, len, (offset, most));
+    let Some(whole) = cache.lent(text) else {
+      return Err(StoreError::BadRow);
+    };
+    let start = usize::try_from(offset).map_err(|_| StoreError::BadRow)?;
+    let end = start
+      .saturating_add(usize::try_from(most).unwrap_or(usize::MAX))
+      .min(whole.len());
+    Ok(whole.get(start..end.max(start)))
   }
 
   /// A path's history in repository `repository`: each changeset that kept a version of `path` from sequence `from` on,

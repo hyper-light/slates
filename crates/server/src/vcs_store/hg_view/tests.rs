@@ -629,6 +629,64 @@ fn the_store_makes_a_pushed_mercurial_text_whole() {
   });
 }
 
+/// Shape: the step's copy budget the sliced read is held to: far under its text's bytes.
+const SMALL_STEP: u64 = 1 << 10;
+/// Shape: the lines of the text read in slices, about 40 bytes each: a dozen steps of [`SMALL_STEP`].
+const LONG_TEXT_LINES: usize = 300;
+
+/// Goal 93 (main's ruling of 2026-11-25: a fetch's texts copied by the store's owner at most a step's copy budget a
+/// request, a text past it in slices across requests; at hg's 57k clone one request copied a whole batch of the
+/// fetch's room). Do: push a changeset adding a file of [`LONG_TEXT_LINES`] lines, and ask the node's store for its text
+/// whole within a step of [`SMALL_STEP`] bytes (`hg_view::texts_made`). Expect the text as pushed; no request copying
+/// more than the step; as many requests as its slices. Red before: one request copying the whole text.
+#[test]
+fn a_text_past_a_step_is_copied_a_step_a_request() {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let long: &'static [u8] = Box::leak(
+      (0..LONG_TEXT_LINES)
+        .flat_map(|line| format!("line {line} of a text several steps long\n").into_bytes())
+        .collect::<Vec<u8>>()
+        .into_boxed_slice(),
+    );
+    let made =
+      crate::repository::hg_push::tests::history_of(&[("base", "long", long, None, "default")]);
+    pushed(state, hg, &made, &[0]);
+    let identity = *blake3::hash(long).as_bytes();
+    let disk = state.vcs_disk.clone().expect("a store");
+    let repository = u128::from_be_bytes(hg.bytes);
+    let (made, asks) = std::thread::scope(|scope| {
+      scope
+        .spawn(move || {
+          crate::test_store::waiting_runtime()
+            .block_on(async move {
+              super::texts_made(&disk, repository, &[identity], (u64::MAX, SMALL_STEP)).await
+            })
+            .ok()
+            .flatten()
+        })
+        .join()
+        .unwrap()
+    })
+    .expect("the text made");
+    let slices = (long.len() as u64).div_ceil(SMALL_STEP);
+    println!(
+      "hg_view: a text of {} B within a step of {SMALL_STEP} B: {asks:?} ({slices} slices)",
+      long.len()
+    );
+    match made {
+      super::MadeTexts::Made(made) => assert_eq!(made, vec![long.to_vec()], "the text as pushed"),
+      super::MadeTexts::Past => panic!("refused past its room"),
+    }
+    assert!(
+      asks.most_copied <= SMALL_STEP,
+      "a request copied {} B, past the step's {SMALL_STEP}",
+      asks.most_copied
+    );
+    assert!(asks.requests >= slices, "a request a slice: {asks:?}");
+  });
+}
+
 /// What a revision's text must be, as its writer kept it: a changeset's or a manifest's text whole; a file revision's
 /// by the identities its row names (its bytes' BLAKE3 and its metadata block's), since a landed file's text leaves the
 /// content store once its writer lands it (goal 93 item 2b(b)) and its row's names are what the writer kept.
