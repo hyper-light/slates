@@ -887,7 +887,7 @@ fn source_reached(state: &ShardState, from: DbVolumeId, version: u64) -> bool {
 /// holder accepted; a missing one is rebuilt, or, where its own source is missing too, the nearest missing ancestor whose
 /// source is here (or a root) is rebuilt instead, a level an ask, never by recursion, the walk bounded by the
 /// memberships this holder knows. Whether `from` is at `version` now.
-fn make_source(state: &mut ShardState, from: DbVolumeId, version: u64) -> bool {
+pub(crate) fn make_source(state: &mut ShardState, from: DbVolumeId, version: u64) -> bool {
   use slates_db::catalog::MemberOrigin;
   if state.merge.replicas.contains_key(&from) {
     return matches!(
@@ -2432,6 +2432,110 @@ mod tests {
         },
       ),
     ]
+  }
+
+  /// A branch's version 0 record as its owner, this node, ships it (A-913): authorized by this node's own configuration.
+  fn branch_version_zero(state: &ShardState, branch: ObjectId, identity: [u8; 32]) -> Record {
+    let owner = state.fleet.host();
+    let value = MergeRecordValue {
+      version: 0,
+      increment: [0; 32],
+      base: 0,
+      inputs: None,
+      identity,
+      evidence: Vec::new(),
+      name: "green".to_owned(),
+      require_evidence: false,
+      owner: slates_db::catalog::Principal::Uid {
+        host: owner,
+        uid: 0,
+      },
+      completion: None,
+      signature: None,
+      folded_below: 0,
+      checkpoint_floor: 0,
+    };
+    Record {
+      owner,
+      object: branch,
+      sequence: 0,
+      epoch: slates_db::HostEpoch(1),
+      generation: state.fleet.configuration().version,
+      value: value.to_record_bytes(),
+    }
+  }
+
+  /// A-913 (A-912's sibling, main 01a20182's ruling of 2026-11-24): a branch's version 0 arriving at a holder that holds
+  /// its source's records but no replica of it (a warm restart keeps the records, not the replicas) makes the source
+  /// first, as a rebuild of the branch does (A-908 part 4). Do: give a holder the root's records (versions 0 and 1), its
+  /// increment and the names-log part joining the root and a branch made at its version 1, no replicas, and offer the
+  /// branch's version 0 record as its owner ships it, a turn at a time ([`one_unit_slices`]), until it is acknowledged or
+  /// as many offers as the lineage's members and one were made. Expect it acknowledged, the root rebuilt as the
+  /// lineage's root and the branch its member. Red before: the record path branched only from a replica already there,
+  /// so the root was never rebuilt and every offer was answered out of order (A-912's push test: a branch created while a
+  /// member died refused at its barrier, 3 of 25 runs, b's source "at None" from +0.5 s to +4.4 s).
+  #[test]
+  fn a913_a_branchs_record_on_a_holder_without_its_source_makes_the_source_and_is_acknowledged() {
+    let (first, second) = (
+      creating("main-1", b"one", 1, 0),
+      creating("branch-1", b"two", 2, 0),
+    );
+    let (roots, branches) = lineage_identities(&first, &second);
+    let (root, branch) = (family(1, 2), family(2, 3));
+    let daemon = one_unit_slices();
+    crate::daemon::observe_first(&daemon, move |state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family(1, 1).0,
+      };
+      note_joins(state, repository, &branch_joins(root, branch));
+      let first_inputs = hold_encoded(state, root, &first.encode());
+      accept_records(
+        state,
+        root,
+        &[(0, None, roots[0]), (1, Some(first_inputs), roots[1])],
+      );
+    });
+    let mut offers = Vec::new();
+    for _ in 0..3 {
+      let acknowledged = crate::daemon::observe_first(&daemon, move |state| {
+        let record = branch_version_zero(state, branch, branches[0]);
+        let local = state.fleet.host();
+        let reply = crate::merge_service::accept_merge_record(state, local, local, &record);
+        slates_db::register::Ack::decode(&reply).is_ok()
+      });
+      offers.push(acknowledged);
+      if acknowledged {
+        break;
+      }
+      let began = std::time::Instant::now();
+      while !crate::daemon::observe_first(&daemon, |state| state.merge.seeding.is_empty())
+        && began.elapsed() < REBUILD_WAIT
+      {
+        std::thread::yield_now();
+      }
+    }
+    let lineages = crate::daemon::observe_first(&daemon, move |state| {
+      [root, branch].map(|green| {
+        state
+          .merge
+          .replicas
+          .lineage_of(&crate::merge_service::replica_key(green))
+      })
+    });
+    daemon.stop();
+    assert_eq!(
+      offers.last(),
+      Some(&true),
+      "the branch's version 0 acknowledged within its offers: {offers:?}"
+    );
+    let repository = slates_db::catalog::RepositoryId {
+      bytes: family(1, 1).0,
+    };
+    assert_eq!(
+      lineages,
+      [Some(repository); 2],
+      "the root rebuilt as the lineage's root, the branch its member"
+    );
   }
 
   /// A-908 part 4: a branch of a branch whose sources are both missing is rebuilt a level an ask, never by recursion. Do:

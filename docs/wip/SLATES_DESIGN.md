@@ -11873,6 +11873,8 @@ A holder restarted warm keeps its records, not its replicas, and rebuilds a repl
 its source's replica and advanced from the records held. A source not rebuilt yet is rebuilt first, or the nearest
 missing ancestor whose own source is there, a level an ask (never by recursion), and the branch waits meanwhile
 (`merge.replica.branch_source_behind`). A green seeded from origin inputs stands alone, there as on a record's arrival.
+A branch's version 0 arriving as a record makes a missing source the same way (A-913, counted
+`merge.replica.branch_source_made`), so a restarted holder serves a branch created after its restart.
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -63602,3 +63604,29 @@ Applied in the same change to: the A-724 entry's piece 6 region half (the invari
 lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,
 `crates/server/src/{fleet,state,daemon,git_push}.rs`, `crates/server/src/vcs_store/homes.rs` and its tests,
 `crates/server/tests/fleet.rs`, GAPS.
+
+### A-913 — A branch's record on a holder with no replica of its source makes the source first, so a branch created while a member dies is placed (2026-11-24, w-shared for main 01a20182, its ruling (a) on A-912; A-912's sibling; amends A-908 part 4)
+
+- **Why.** In A-912's push test (three branches created while c dies, b restarted warm before), a created branch was
+  refused `unable to commit` at its record barrier, 3 of 25 instrumented runs (macOS arm64, debug). Measured: in the 22
+  others every new green's versions 0 and 1 placed 0.18 to 1.1 s after enqueue, within the barrier's 2 s window; in the
+  3, the branch was enqueued 0.32 to 0.67 s after c stopped and its version 0 shipped to b and c every coordinator
+  period for 2 s, acknowledged only by its owner. b, the only live holder, logged "branch … waits: source … at None":
+  it held the source's records but no replica of it (a warm restart keeps records, not replicas) from +0.5 s until +4.4
+  to 5.2 s, when another record of the source happened to rebuild it, well past the barrier giving up at +2.35 to 2.78
+  s. A-908 part 4 makes a missing source on a branch's rebuild (`merge_origin::make_source`); the record path,
+  `merge_service::make_origin_replica`, branched only from a replica already there.
+- **The change.** `make_origin_replica` makes a source it has no replica of before branching, by the same
+  `make_source` (the source rebuilt from its records, or the nearest missing ancestor whose own source is here, a level
+  an ask, never by recursion), counted `merge.replica.branch_source_made`; the branch is tried at once after, and waits
+  `OUT_OF_ORDER` (its sender ships it again) while the source's build runs, as before.
+- **Tests** (macOS arm64, debug, 2026-11-24).
+  - `merge_origin::tests::a913_a_branchs_record_on_a_holder_without_its_source_makes_the_source_and_is_acknowledged`:
+    a holder with the root's records and the join, no replicas, offered the branch's version 0 through the record path
+    (`accept_merge_record`) a turn at a time, one unit a slice. Red before: `[false, false, false]`, never acknowledged.
+    Green: acknowledged, the root rebuilt as the lineage's root, the branch its member.
+  - Fleet `a912_a_push_while_a_holders_takeover_moves_the_configuration_is_accepted` asserts no created branch is
+    refused at its barrier (red before: 3 of 25). Asserting every created branch lands showed A-912's homing window
+    short under load (5 of 10 at about 48 on 18 cores, at the homing): A-912's follow-up, owed (GAPS).
+- **Applied in the same change to** §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin}.rs`,
+  `crates/server/tests/fleet.rs`, GAPS.

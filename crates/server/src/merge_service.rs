@@ -5217,8 +5217,10 @@ fn recompute(
 /// repository's lineage as this holder's names logs record it ([`membership`]):
 /// - a lineage's root founds the lineage here, an empty green (`crate::greens::Greens::found`, the owner's);
 /// - a branch is branched from its source's replica at the version it was made at (`crate::greens::Greens::branch`, the
-///   owner's: lent, nothing copied), refused [`OUT_OF_ORDER`] (counted [`BRANCH_SOURCE_BEHIND`]) while the source's
-///   replica is missing or has not reached that version, a source that owes its push made first (A-886's door);
+///   owner's: lent, nothing copied), a source with no replica here made first from its records (A-913,
+///   `crate::merge_origin::make_source`, counted [`BRANCH_SOURCE_MADE`]), refused [`OUT_OF_ORDER`] (counted
+///   [`BRANCH_SOURCE_BEHIND`]) while the source's replica is missing or has not reached that version, a source that owes
+///   its push made first (A-886's door);
 /// - a green of a repository's family whose membership no names-log part held here records yet waits, [`OUT_OF_ORDER`]
 ///   (counted [`MEMBER_UNKNOWN`]): its join is a part of the names log, which the owner owes every holder of the green
 ///   (one placement: a family's greens and its names log share their line key), so it comes; the record stays with its
@@ -5241,6 +5243,13 @@ fn make_origin_replica(state: &mut ShardState, object: ObjectId) -> Result<(), &
         state.count(MEMBER_FOUNDED, 1);
       }
       MemberOrigin::Branch { from, version } => {
+        // A source with no replica here (a warm restart keeps the records, not the replicas) is made first, as a branch's
+        // rebuild makes it (A-913, `crate::merge_origin::make_source`): before, nothing here made it, and the branch waited
+        // until some other record of the source happened to (a branch created while a member died refused at its barrier).
+        if !state.merge.replicas.contains_key(&from) {
+          state.count(BRANCH_SOURCE_MADE, 1);
+          let _ = crate::merge_origin::make_source(state, from, version);
+        }
         if state.merge.replicas.branch(&from, version, key).is_err() {
           state.count(BRANCH_SOURCE_BEHIND, 1);
           // A source whose replica owes its push (a created ref's, P2) is made first, through the door its owner made it
@@ -5275,6 +5284,9 @@ pub(crate) const MEMBER_FOUNDED: &str = "merge.replica.member_founded";
 /// Counter: a branch whose replica was branched from its source's on this holder, lent and nothing copied (A-908).
 /// Format: a counter name in the daemon's status report.
 pub(crate) const MEMBER_BRANCHED: &str = "merge.replica.member_branched";
+/// Counter: a branch's version 0 that found no replica of its source here and made it first, a rebuild from the source's
+/// records (A-913). Format: a counter name in the daemon's status report.
+pub(crate) const BRANCH_SOURCE_MADE: &str = "merge.replica.branch_source_made";
 /// Counter: a branch's version 0 refused out of order because its source's replica here is missing or behind the
 /// version it was made at (A-908): retried by its sender.
 /// Format: a counter name in the daemon's status report.
