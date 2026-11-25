@@ -3811,8 +3811,11 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     counted(crate::repository::hg_run::TURN_WAITS),
     parked.is_finished(),
   );
-  give_back_turn(&daemon);
+  // Read before the release begins: the push waits from before it was seen to past the release, while the release's own
+  // round trip back to this thread (`give_back_turn`) may end after the push was woken (TSan diag 3, run 45527257702:
+  // read after it, the parked interval came out 0.56 ms past the push's wait under the lane's slowdown).
   let held_after_park = seen_parked.elapsed();
+  give_back_turn(&daemon);
   let parked = parked.join().expect("the parked push answered");
   let waited_ns = counted(crate::repository::hg_run::TURN_WAITED_NS);
   let heads = hg_command((port, &certificate), &first, "heads");
