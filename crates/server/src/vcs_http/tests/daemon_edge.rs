@@ -2153,7 +2153,7 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
 
 /// Goal 93, main's ruling (b) (content kept once, on arrival, as stock's revlog chunks). Do: through a two-shard daemon's
 /// edge, push one changeset whose file is twice a request's room and compresses (every byte odd); stream-clone it; clone
-/// it. Expect: the push's segment made into chunks as it landed, each step compressing at most the shard's copy slice;
+/// it. Expect: the push's segment made into chunks as it landed, no step compressing past the copy slice it was given;
 /// the stream sending the file's chunk byte for byte with nothing compressed again (its count and send passes' zstd at
 /// zero); the clone's changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the
 /// decoded bytes at least the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at
@@ -2163,7 +2163,7 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
   let (identity, certificate) = identity();
   let (daemon, instance) = daemon_named(Some(identity));
   let config = crate::DaemonConfig::derive(&crate::daemon::test_profile(), &instance, Some(SHARDS));
-  let (room, slice) = (super::bounds_of(&config).room, config.copy_slice_bytes());
+  let room = super::bounds_of(&config).room;
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   create_empty_hg(&daemon, &name);
@@ -2185,6 +2185,11 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
       &daemon,
       REPOSITORY,
       crate::repository::hg_push::COMPRESS_BYTES_MOST,
+    ),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_push::COMPRESS_PAST_BUDGET_MOST,
     ),
   );
   let request = format!(
@@ -2215,8 +2220,8 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     "the push's file made into a chunk: {chunked:?}"
   );
   assert!(
-    chunked.1 > 0 && chunked.1 <= slice,
-    "a step's compression within the copy slice {slice}: {chunked:?}"
+    chunked.1 > 0 && chunked.2 == 0,
+    "steps of compression, none past the copy slice it was given: {chunked:?}"
   );
   let mut chunk = Vec::new();
   slates_hg::revlog_chunk::chunk(large, slates_hg::revlog_chunk::Pass::Send, &mut chunk)

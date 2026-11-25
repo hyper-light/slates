@@ -3188,6 +3188,9 @@ pub(crate) const SEGMENT_CHUNK_TURNS: &str = "vcs.hg.segment_chunk_turns";
 /// Counter: the most plain bytes one step of that chunking compressed, kept as a maximum: held to the shard's copy slice
 /// (main's ruling (b), its condition (1)). Format: a counter name in the status report.
 pub(crate) const COMPRESS_BYTES_MOST: &str = "vcs.hg.segment_compress_bytes_most";
+/// Counter: the most bytes one step of that chunking compressed past the copy slice it was given, kept as a maximum:
+/// zero but where a step's first unit is a short text longer than its slice. Format: a counter name in the status report.
+pub(crate) const COMPRESS_PAST_BUDGET_MOST: &str = "vcs.hg.segment_compress_past_budget_most";
 /// Counter: the plain bytes of the deltas made into chunks. Format: a counter name in the status report.
 pub(crate) const COMPRESS_PLAIN_BYTES: &str = "vcs.hg.segment_compress_plain_bytes";
 /// Counter: the bytes their chunks took: against [`COMPRESS_PLAIN_BYTES`], what keeping them as chunks saves. Format: a
@@ -3231,6 +3234,7 @@ fn chunk_turn(
   let (plain, stored) = chunked.bytes();
   state.count(SEGMENT_CHUNK_TURNS, 1);
   state.count_max(COMPRESS_BYTES_MOST, chunked.most_step());
+  state.count_max(COMPRESS_PAST_BUDGET_MOST, chunked.most_past());
   state.count(COMPRESS_PLAIN_BYTES, plain.saturating_sub(plain_before));
   state.count(COMPRESS_STORED_BYTES, stored.saturating_sub(stored_before));
   state.count(COMPRESS_NS, ended.saturating_sub(began));

@@ -45,6 +45,9 @@ pub struct Chunked {
   most_step: u64,
   /// The plain bytes laid so far.
   plain: u64,
+  /// The most bytes one step compressed past the budget it was given (none: a step's first unit is all a step must
+  /// take, and a frame's piece is held to the budget).
+  most_past: u64,
 }
 
 impl core::fmt::Debug for Chunked {
@@ -76,6 +79,7 @@ impl Chunked {
       places,
       most_step: 0,
       plain: 0,
+      most_past: 0,
     })
   }
 
@@ -97,6 +101,10 @@ impl Chunked {
       };
       let plain = place_of(kept, slice)?;
       if plain.len() < SHORTEST_COMPRESSED {
+        // Laid whole or left for the next step: a step never takes more than it is given, past its first unit.
+        if plain.len() > left && stepped > 0 {
+          break;
+        }
         self.lay(plain, None);
         left = left.saturating_sub(plain.len().max(1));
         stepped = stepped.saturating_add(plain.len());
@@ -108,6 +116,7 @@ impl Chunked {
       stepped = stepped.saturating_add(take);
     }
     self.most_step = self.most_step.max(to_u64(stepped));
+    self.most_past = self.most_past.max(to_u64(stepped).saturating_sub(budget));
     Ok(self.at < texts.len())
   }
 
@@ -119,6 +128,12 @@ impl Chunked {
   /// The most plain bytes one step compressed.
   pub fn most_step(&self) -> u64 {
     self.most_step
+  }
+
+  /// The most bytes one step compressed past the budget it was given: zero but where a step's first unit is a short text
+  /// longer than its budget.
+  pub fn most_past(&self) -> u64 {
+    self.most_past
   }
 
   /// The plain bytes compressed so far and the bytes their chunks took.
