@@ -64044,5 +64044,6 @@ GAPS.
   the commit's end (`commit_finish` 6.6 ms with the batch's keep, 12.9-13.6 ms in all), and the records' step 29-30 ms;
   the record check (101-105 ms) and the build (51-53 ms) unchanged. Oracle: over generated works, a verdict committed
   a unit a step equals the verdict committed whole (`a_verdict_committed_a_unit_a_step_is_the_verdict_committed_whole`,
-  1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds 150 ms, not 500: every staging
-  step waits a hold, and the first batch's 151 steps took it past its patience; 150 ms is still 20 times a flush.
+  1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds the shard's flush measured by
+  an import alone first, not 500 ms: every staging step waits a hold, and the first batch's 151 steps took it past its
+  patience (61 s at 150 ms; 3.5-5.3 s at a flush, its await 0.45-1.1 s against `F` 5.6-9.8 ms).
