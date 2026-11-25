@@ -706,3 +706,4 @@ Waiting: main's route; arena-7 and arena-8.
 - Store-wait split instrumented (not landed; patch ~/.cache/w-hg-scratch/store-wait/): owner requests timed (behind/wake/serve/disk/back), in-process 2,000-cs clone: wake 85.5% (~1.2 ms a request). Proposed owner spin-before-park bounded by measured inter-arrival; asked main to land instrumentation first and read 57k split.
 - Reviewed w-interop's 5114fd09e (codec + stream): OK; note `sized` grows with repository until (b).
 - (b) can start: codec at main 70fa2080f (revlog_chunk::chunk/decode).
+- Landed main 0351b043c: store-wait instrumentation (9699452d1): vcs_store.hg_owner_{requests,total,behind,wake,serve,disk,back,most}_ns; ignored measurement hg_clone_store_wait. Waiting: main's 57k split to choose spin vs pipelining; then (b).
