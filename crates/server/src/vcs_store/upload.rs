@@ -1115,6 +1115,16 @@ pub(crate) const TREE_DELTAS_MOST: &str = "vcs_store.git_upload.tree_deltas_most
 /// Counter: the deltas a fetch's tree reads applied, summed: against the walk's trees opened, a tree's mean chain read.
 /// Format: a counter name.
 pub(crate) const TREE_DELTAS: &str = "vcs_store.git_upload.tree_deltas";
+/// Counter: a fetch's tree reads that found the tree, or an entry of its chain, kept by its fork's read cache
+/// (`slates_git::store::PositionCounts::read_cache_hits`; main 01a20182's reading of 2026-11-25: on git/git the cache cut
+/// chain rebuilds by 2.1 % where a one-directory fixture cut 85 %). Format: a counter name.
+pub(crate) const READ_CACHE_HITS: &str = "vcs_store.git_upload.read_cache_hits";
+/// Counter: the times a fetch's walk widened its read cache before a tree's read. Format: a counter name.
+pub(crate) const READ_CACHE_WIDENED: &str = "vcs_store.git_upload.read_cache_widened";
+/// Counter: the times a fetch's admission refused its read cache the room a tree's read asked. Format: a counter name.
+pub(crate) const READ_CACHE_REFUSED: &str = "vcs_store.git_upload.read_cache_refused";
+/// Counted most: the most bytes a fetch's read cache was allowed to keep. Format: a counter name.
+pub(crate) const READ_CACHE_BUDGET_MOST: &str = "vcs_store.git_upload.read_cache_budget_most";
 /// Counter: fetches whose cache of positions was refused the room its walk's work asked, each then as slow as with no
 /// cache (A-911: a cache costs time, never an answer). Format: a counter name.
 pub(crate) const POSITION_CACHE_UNROOMED: &str = "vcs_store.git_upload.position_cache_unroomed";
@@ -1215,12 +1225,16 @@ impl ShardPacks {
     state.count_max(UNIT_ENTRIES_MOST, self.chose.entries_most);
     state.count_max(TREE_PARSE_BYTES_MOST, self.chose.tree_bytes_most);
     state.count_max(TREE_DELTAS_MOST, self.chose.tree_deltas_most);
+    state.count_max(READ_CACHE_BUDGET_MOST, self.chose.read_cache_budget_most);
     for (name, by) in [
       (POSITION_LOOKUPS, self.chose.lookups),
       (POSITION_CACHE_HITS, self.chose.hits),
       (POSITION_CACHE_CONFLICTS, self.chose.conflicts),
       (POSITION_CACHE_UNROOMED, self.chose.unroomed),
       (TREE_DELTAS, self.chose.tree_deltas),
+      (READ_CACHE_HITS, self.chose.read_cache_hits),
+      (READ_CACHE_WIDENED, self.chose.read_cache_widened),
+      (READ_CACHE_REFUSED, self.chose.read_cache_refused),
     ] {
       if by > 0 {
         state.count(name, by);
@@ -1311,6 +1325,22 @@ impl PackSource for ShardPacks {
     self.chose.tree_bytes_most = self.chose.tree_bytes_most.max(counts.tree_bytes_most);
     self.chose.tree_deltas_most = self.chose.tree_deltas_most.max(counts.tree_deltas_most);
     self.chose.tree_deltas = self.chose.tree_deltas.saturating_add(counts.tree_deltas);
+    self.chose.read_cache_hits = self
+      .chose
+      .read_cache_hits
+      .saturating_add(counts.read_cache_hits);
+    self.chose.read_cache_widened = self
+      .chose
+      .read_cache_widened
+      .saturating_add(counts.read_cache_widened);
+    self.chose.read_cache_refused = self
+      .chose
+      .read_cache_refused
+      .saturating_add(counts.read_cache_refused);
+    self.chose.read_cache_budget_most = self
+      .chose
+      .read_cache_budget_most
+      .max(counts.read_cache_budget_most);
     self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
   }
 }
