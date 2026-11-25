@@ -4479,6 +4479,11 @@
 >   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
 >     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
 >     its chunk again, on all three edges, counted.
+> - **Linux hg, run 6 (2026-11-25)** (45605246530, `diag-measurer-main-interop-linux-6` at f5b283016, main 387322d5c with
+>   w-hg's d33fc0b64; release slates, stock hg 7.2.4 installed in the job, the r400 cut of hg's history): **30 of 30 on
+>   ubuntu-latest and 30 of 30 on ubuntu-24.04-arm**, the six changeset evolution rows (ad36e5f09) among them.
+>   Windows pending: run 6's windows-latest leg failed every row at exit 127 on the workflow's own wrapper path (bash
+>   dropped `D:\a\_temp`'s backslashes), not slates; ade67baf3 passes it as a Unix path, for run 7.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
