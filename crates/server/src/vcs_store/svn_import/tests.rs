@@ -1365,14 +1365,15 @@ async fn hog(hold_ns: u64) {
   }
 }
 
-/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
-/// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
-/// overstates it, enlarging the bound past rent or buy). Do: import `full.dump` alone and take the shard's measured
-/// flush as the hold; on the shard, that flush forgotten, run a hog that holds it a hold between yields, and import
-/// `full.dump` again beside it, so every answer its batch's landing awaits resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
-/// awaited it), then stop the hog. Expect the import whole, and `F` under the await it is part of: the store's own
-/// flush, whatever else the shard ran, judged against the batch's own await rather than a time, so a loaded machine's
-/// slow flush is no failure. Red before: `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
+/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a
+/// landing's await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush,
+/// and so overstates it, enlarging the bound past rent or buy). Do: import `full.dump` alone and take the shard's
+/// measured flush as the hold; on the shard, that flush forgotten, run a hog that holds it a hold between yields, and
+/// import `full.dump` again beside it, so every answer its batch's landing awaits resumes late; once the batch's
+/// changeset is durable, read the shard's `F` and that landing's await (as the task awaited it), then stop the hog.
+/// Expect the import whole, and `F` under the await it is part of: the store's own flush, whatever else the shard ran,
+/// judged against the batch's own await rather than a time, so a loaded machine's slow flush is no failure. Red before:
+/// `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
 #[test]
 fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
   use crate::repository::svn_commit::staging::{
