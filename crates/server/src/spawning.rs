@@ -709,7 +709,7 @@ async fn restart() {
     {
       count_on_shard(SPAWNER_REAP_REFUSED);
     }
-    match slates_ipc::spawner::start_here(shards.len()) {
+    match started_off_shard(shards.len()).await {
       Ok(started) => {
         hand_out(started, &shards);
         count_on_shard(SPAWNER_RESTARTED);
@@ -721,6 +721,83 @@ async fn restart() {
       }
     }
   }
+}
+
+/// A spawner started with `ends` ends by a thread of its own, the shard awaiting it: a `posix_spawn` of the daemon's
+/// executable under load held the control shard past its window (main's store-wait at 1948dbdcc: "shard 0 is wedged,
+/// unmoved for 1028 ms … spawning.rs:687"). The thread hands the spawner back and writes a byte to a pipe whose read
+/// end the shard awaits, and is joined once it has answered. The start's length is counted
+/// ([`SPAWNER_START_NS_MOST`], and [`SPAWNER_STARTS_PAST_WINDOW`] where it passed the liveness window).
+async fn started_off_shard(ends: usize) -> std::io::Result<slates_ipc::spawner::Started> {
+  let (wake_read, wake_write) = wake_pipe()?;
+  let (sent, got) = std::sync::mpsc::channel();
+  #[cfg(test)]
+  let delay_ns = TEST_START_DELAY_NS.with(std::cell::Cell::get);
+  let starter = std::thread::Builder::new()
+    .name("slates-spawner-start".to_owned())
+    .spawn(move || {
+      let began = std::time::Instant::now();
+      #[cfg(test)]
+      std::thread::park_timeout(std::time::Duration::from_nanos(delay_ns));
+      let started = slates_ipc::spawner::start_here(ends);
+      let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+      let _ = sent.send((started, took));
+      let _ = rustix::io::write(&wake_write, &[1]);
+    })?;
+  loop {
+    match got.try_recv() {
+      Ok((started, took)) => {
+        let _ = starter.join();
+        count_start(took);
+        return started;
+      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        let _ = starter.join();
+        return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+      }
+      Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+    if slates_rt::readiness::readable(wake_read.as_raw_fd())
+      .await
+      .is_err()
+    {
+      futures::yield_now().await;
+    }
+  }
+}
+
+/// A pipe for a thread to wake a shard's task by: both ends close-on-exec, the read end non-blocking.
+fn wake_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+  let (read, write) = rustix::pipe::pipe().map_err(std::io::Error::from)?;
+  for end in [&read, &write] {
+    rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+  }
+  let flags = rustix::fs::fcntl_getfl(&read).map_err(std::io::Error::from)?;
+  rustix::fs::fcntl_setfl(&read, flags | rustix::fs::OFlags::NONBLOCK)
+    .map_err(std::io::Error::from)?;
+  Ok((read, write))
+}
+
+/// Counts a spawner's start that took `took_ns`.
+fn count_start(took_ns: u64) {
+  let _ = crate::state::with_state_counted(|state| {
+    state.count_max(SPAWNER_START_NS_MOST, took_ns);
+    if took_ns > crate::daemon::LIVENESS_BUDGET_NS {
+      state.count(SPAWNER_STARTS_PAST_WINDOW, 1);
+    }
+  });
+}
+
+/// Counted most: the longest start of a spawner the owner made, in nanoseconds (A-924). Format: a counter name.
+pub(crate) const SPAWNER_START_NS_MOST: &str = "spawner.start_ns_most";
+/// Counter: the spawner's starts that took longer than the liveness window, each of which would have held the control
+/// shard past it on the shard (A-924). Format: a counter name.
+pub(crate) const SPAWNER_STARTS_PAST_WINDOW: &str = "spawner.starts_past_window";
+
+#[cfg(test)]
+thread_local! {
+  /// A test's delay before each spawner's start begun from this shard's thread: what a start slowed by load looks like.
+  pub(crate) static TEST_START_DELAY_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A spawner just started: kept as the owner's next generation, and an end sent to each of `shards`.
