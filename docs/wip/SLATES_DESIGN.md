@@ -64074,6 +64074,17 @@ GAPS.
   and the indexes after each alike (`a_record_planned_a_row_a_step_is_the_record_planned_whole`,
   `every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole`; a builder taken up without its
   next node number fails both); a plan's step after an append is refused out of date.
+  **2b, the rest of the check** (17 ms at 9,000 files after pieces 1 to 5: the fresh texts 9.1 ms, the record's
+  encoding 4.0, the rows' sort 3.6, the stored filter 1.5). `Repository::check_begin` checks the head and the lock
+  entries alone; `check_step` takes the rest on in phases, a unit at least a step and stopping between phases where
+  the step is spent: the texts and property lists the rows name, a row a unit (into the ordered set `named_as` made,
+  so they are taken in its order); those the records do not hold taken from what the revision brought or passed as
+  stored, a name a unit, then the room checked; the stored texts filtered, a text a unit, and the plan begun; then the
+  plan's rows. The check step 17 ms → under 5 ms (the probe's floor); still whole, each in a step of its own, the
+  record's encoding (4.0 ms) and the rows' sort (3.6). Oracle: every dump `svnadmin` wrote imported with every check
+  taken a unit a step holds `full.dump`'s history and exports it byte for byte
+  (`every_dump_svnadmin_wrote_imports_alike_with_every_check_a_unit_a_step`; a resumed naming that skips a row
+  fails it).
 - **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
   walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
   in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
