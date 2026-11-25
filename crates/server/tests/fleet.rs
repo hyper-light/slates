@@ -81,7 +81,9 @@ use slates_ipc::protocol::{
 use slates_ipc::{ClientEnd, HeldRendezvous, IpcError, connect};
 use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
-use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, LinkAfter, SessionHold, host_id_of};
+use slates_server::daemon::{
+  HEARTBEAT_NS, HomingWindowReading, LIVENESS_BUDGET_NS, LinkAfter, SessionHold, host_id_of,
+};
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
 use slates_server::observe::ObserveError;
@@ -36235,7 +36237,14 @@ fn git_fleet(name: &str) -> GitFleet {
 /// The nodes of a [`git_fleet`] named `name`, formed, before its repository is made: their daemons and member ids, their
 /// stores and their serve ports' lease.
 fn started_git_fleet(name: &str) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
-  let names = ["a", "b", "c"];
+  started_git_fleet_of(name, &["a", "b", "c"])
+}
+
+/// [`started_git_fleet`] of the nodes `names`, at `f = 1`.
+fn started_git_fleet_of(
+  name: &str,
+  names: &[&str],
+) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> = names
     .iter()
@@ -37443,6 +37452,105 @@ fn repository_of_creation(
 /// Shape: the coordinator periods A-915's test watches a held creation for: past the record's own f + 1 (76 ms, under one
 /// period at a heartbeat of 100 ms) many times over, so an answer the join was not waited for would come within it.
 const CREATION_WATCH_PERIODS: u64 = 20;
+
+/// A-914 (a) (main 01a20182's rulings of 2026-11-25: learn a death's silence to its takeover install, the real thing).
+/// Do: on a four-node `f = 1` git fleet with a repository on a, push `main`; stretch every node's coordinator periods
+/// (`Daemon::inject_period_stretch`, as a loaded host's run late) and stop d; push a commit on top; once every survivor
+/// took d over (its committed configuration without d, the install each survivor learns the silence at), lift the
+/// stretch, then stretch again, stop c and push on top again. Expect, at the second death, a's homing window to come
+/// from the silence it learned at the first (`samples >= 1`, its source logged as learned, `fleet.homing_window.learned`).
+/// Red before A-914: no node learned anything; the window was always the failover estimate's terms.
+///
+/// Recorded, not asserted: the first death's measured silence beside the estimate's window at it, the red for the
+/// prior a first death still lacks (A-914 (c)): 7 runs, macOS arm64 debug, 2026-11-25, silence 3.99 to 5.24 s against a
+/// window of 3.3 to 3.8 s, that push refused `retry` at its homing in 4 of 7. **Owed, a named debt:** the push during the
+/// second death is not asserted to land. On the learned window (16.9 to 18.7 s) it landed 4 of 7; 2 were refused at
+/// the record barrier (`unable to commit`, the new version's merge records unplaced 13 s after the takeover installed:
+/// A-912's sibling, w-shared's next piece), 1 fell short at its homing. That piece adds the assertion here.
+#[test]
+fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("learned-window", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "learned-window",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main before any death\n"));
+  let mut during = Vec::new();
+  for (death, file) in [(3, "after-d.txt"), (2, "after-c.txt")] {
+    during.push(stretched_death(&mut fleet, death, file));
+  }
+  fleet.stop();
+  eprintln!(
+    "two stretched deaths: first push {first:?}; each (window at it, its push, taken over, after) {during:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before any death landed");
+  let [
+    (first_window, _, first_taken, first_after),
+    (second_window, _, second_taken, _),
+  ] = &during[..]
+  else {
+    panic!("two deaths: {during:?}");
+  };
+  assert!(
+    *first_taken && *second_taken,
+    "every survivor took each dead member over"
+  );
+  // The prior's red, recorded: the first death's silence as measured against the estimate's window at it.
+  eprintln!(
+    "learned-window: the first death's window {:?} ns, its longest measured silence {:?} ns",
+    first_window.as_ref().map(|reading| reading.window_ns),
+    first_after
+      .as_ref()
+      .map(|reading| reading.longest_silence_ns),
+  );
+  assert!(
+    second_window
+      .as_ref()
+      .is_ok_and(|reading| reading.samples >= 1 && reading.learned),
+    "the second death's window came from the learned silence: {second_window:?}"
+  );
+}
+
+/// One of [`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]'s deaths: every node's
+/// periods stretched, node `death` stopped, a push on top from a, every survivor's takeover of it awaited, the stretch
+/// lifted. Returns a's homing window as the death began, the push's answer, whether every survivor took it over, and a's
+/// window after.
+fn stretched_death(
+  fleet: &mut GitFleet,
+  death: usize,
+  file: &str,
+) -> (
+  Result<HomingWindowReading, ObserveError>,
+  Result<(), String>,
+  bool,
+  Result<HomingWindowReading, ObserveError>,
+) {
+  for daemon in &fleet.daemons {
+    daemon.inject_period_stretch(Some(STRETCH_NS)).unwrap();
+  }
+  let gone = fleet.hosts[death];
+  fleet.daemons.remove(death).stop();
+  let window = fleet.daemons[0].homing_window();
+  let pushed = fleet.push_on_top(0, (file, file.as_bytes()));
+  let taken = poll_survivors_retire(&fleet.daemons, gone)
+    && poll_until(
+      &fleet.daemons.iter().collect::<Vec<_>>(),
+      RETIREMENT_DEADLINE,
+      || all_council(&fleet.daemons, |members| !members.contains(&gone)),
+    );
+  for daemon in &fleet.daemons {
+    daemon.inject_period_stretch(None).unwrap();
+  }
+  (window, pushed, taken, fleet.daemons[0].homing_window())
+}
+
+/// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover
+/// estimate measured before the death, as a host loaded several times over runs.
+const STRETCH_NS: u64 = 3 * HEARTBEAT_NS;
 
 /// A-727 (d1a-3), a holder unreachable at first, and the rebuild that makes its answer exist (main 01a20182's ruling of
 /// 2026-11-24 01:36). Do: as the kill point after the entry, with every survivor's resolutions answering unresolved (as

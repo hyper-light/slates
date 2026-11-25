@@ -261,15 +261,30 @@
 > rebuild does (A-908 part 4). Red first (`merge_origin::tests::a913_...`, never acknowledged before), and A-912's
 > push test asserts no created branch is refused at its barrier. OWED (main): a gate and a lint diag; whether A-913
 > plays any part in the window below, main's interleaved batches.
-> **OPEN, w-shared's next piece (A-912's follow-up; main 01a20182's ruling of 2026-11-24): a push's homing window is
-> derived from typical terms, short under load.** With A-912's push test asserting every created branch lands, at a
-> load of about 48 on 18 cores it failed 5 of 10, then 1 of 3, then 0 of 6, each at its homing: "fell short: 1 of 2
-> homes kept it; budget 3247789232 ns", the other home the stopped member, still in the configuration. The window's
-> terms just before the stop (6 runs): detection 0.94 to 2.35 s and confirmation 1.14 to 1.17 s (A-363's typical
-> estimate), period about 105 ms, so 2.7 to 4.1 s; measured from a member's stop to its takeover proposed, 2.2 to 4.7
-> s. Load is the normal case here, so the budget is to be derived from the measured tail of a peer's silence to its
-> takeover install, learned from the detector's and the council's own timings on this deployment; past it, still the
-> typed `retry`. Red: that test asserting every created branch lands, at that load.
+> **FIXED in part (A-914 (a), w-shared, 2026-11-25; main 01a20182's rulings of 2026-11-24 and 2026-11-25): a push's
+> homing window was derived from typical terms, short under load.** With A-912's push test asserting every created
+> branch lands, at a load of about 48 on 18 cores it failed 5 of 10, each at its homing, the window (2.7 to 4.1 s) short
+> of a member's stop to its takeover (2.2 to 4.7 s). Now every member measures each death's silence to its takeover
+> install (from the host's last answer, kept each coordinator period, to the install that raised its epoch) and the
+> window is that learned tail once there is one (`fleet.homing_window.learned`); counted `failover.silence_sampled`,
+> `silence_longest_ns`, `silence_unmeasured`, each death logged beside the detector's and the coordinator's period tails
+> and their recent maxima. Red first: `a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`
+> (coordinator periods stretched 300 ms; 7 of 7 learned) and a unit test of the install's sample. Still OPEN:
+> - **(c) A first death's prior** (w-shared, after the barrier piece below), from main's batch of 10 ambient and 10
+>   loaded runs of A-912's push test. Recorded red: the first stretched death's silence 3.99 to 5.24 s against the
+>   estimate's window of 3.3 to 3.8 s, that push refused `retry` at its homing 4 of 7.
+> - **A named debt: a914's test does not assert its second push lands.** On the learned window (16.9 to 18.7 s) it
+>   landed 4 of 7; 2 refused at the record barrier (the piece below), 1 short at its homing, cause not yet seen. The
+>   barrier piece adds the assertion.
+> - **Noted, not to fix now (main's ruling):** the learned tail from one sample is wide (about 13.3 s from a 4.5 s
+>   silence; 11 to 14 s from two). After (c), whether the tail's estimator should weight its sample count.
+> **OPEN, w-shared's next piece (A-912's sibling; main 01a20182's ruling of 2026-11-25, before A-914 (c)): a push during
+> a death is refused at its record barrier, whatever the homing window.** In a914's scene, the second death's push
+> was refused `unable to commit` 2 of 7 with a learned window: "greens owed (green, version, placed) [(…, 3, Some(2))]",
+> the new version's merge records still unplaced 13 s after the dead member's takeover installed, the names log
+> acknowledged at 4 by the dead member and at 5 by the live one. Flooring the barrier's window at the homing window
+> left 2 refused (reverted): it is a stall, not a window. Red first, the stall's cause logged before any fix; then
+> a914's test asserts its second push lands.
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
 > council's replication shares a node's one record session per peer with every exchange, each borrower taking it whole.
 > A-912 removed the hold found (a home holding a put across the install the council's next append brings) and counts any
