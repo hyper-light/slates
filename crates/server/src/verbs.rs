@@ -22282,7 +22282,11 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       // short sets the flag again at its next number.
       state.store.counters_low = false;
       keep_left_out_records_blocks(state, published);
+      let deferred = state.store.content.arena().deferred_bytes();
       state.store.content.arena_mut().commit_capture();
+      // The released frees given back past the arena's keep in the same step (goal 93 P7).
+      let released = deferred.saturating_sub(state.store.content.arena().deferred_bytes());
+      crate::repository::svn_commit::staging::give_back_released(state, released);
       crate::live_ship::ship_captured(state);
       // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
       // the pool for any shard to claim (A-98).

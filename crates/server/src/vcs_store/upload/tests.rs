@@ -1439,7 +1439,13 @@ fn still() -> u64 {
 
 /// A pace of [`PACED_QUANTUM`] whose waiting is `waiting`, its ceiling `quanta` quanta, and costs that know a commit
 /// unit takes [`PACED_UNIT`].
-fn paced(waiting: fn() -> bool, quanta: u64) -> (super::ChoosePace, slates_pace::Costs<14>) {
+fn paced(
+  waiting: fn() -> bool,
+  quanta: u64,
+) -> (
+  super::ChoosePace,
+  slates_pace::Costs<{ slates_git::negotiation::KINDS }>,
+) {
   let commits = super::kind_at(slates_git::negotiation::UnitKind::Commits);
   let mut costs = slates_pace::Costs::ZERO;
   for _ in 0..PACED_SAMPLES {
@@ -1458,7 +1464,7 @@ fn paced(waiting: fn() -> bool, quanta: u64) -> (super::ChoosePace, slates_pace:
 /// Asks `pace` at each multiple of [`PACED_UNIT`] for another commit unit, until it is spent: when, and what it decided.
 fn asked_until_spent(
   pace: &mut super::ChoosePace,
-  costs: &mut slates_pace::Costs<14>,
+  costs: &mut slates_pace::Costs<{ slates_git::negotiation::KINDS }>,
 ) -> (u64, super::Asked) {
   let commits = super::kind_at(slates_git::negotiation::UnitKind::Commits);
   let mut now: u64 = 0;

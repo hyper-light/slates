@@ -123,6 +123,11 @@ pub(super) struct Selecting<N, G> {
 /// Where a selection is (the stages of [`Selecting`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
+  /// The walk's tips painted, a tip a unit ([`Selecting::tip`]): this one next.
+  Tips {
+    /// The index of the next tip.
+    at: usize,
+  },
   /// The commit walk.
   Commits,
   /// The edges' trees marked held: the sent commit at or after this position next.
@@ -254,43 +259,20 @@ fn size_for<S: Graph>(filter: Option<&Filter>, graph: &S, node: S::Node, kind: K
 }
 
 impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
-  /// Begins the selection of what `request` asks over `sides`: the walk seeded with the wants not answered by a run (and
-  /// the parents of commits a cut made whole) as wanted, and the common haves (and the commits a cut made whole, and the
-  /// wants a run answers) as had.
-  pub(super) fn begin<S: Graph<Node = N, Green = G>>(
-    graph: &S,
-    asked: Asked,
-    sides: Sides<N>,
-    runs: Vec<Run<G>>,
-    admission: &mut Admission,
-  ) -> Result<Selecting<N, G>, Refusal> {
-    let mut paint = Paint::new();
-    let walked = sides
-      .wants
-      .iter()
-      .filter(|want| !sides.one_round.contains(want))
-      .chain(&sides.cut.wants);
-    for want in walked.filter_map(|node| commit_of(graph, *node)) {
-      paint.paint(graph, want, WANT, admission)?;
-    }
-    let had = sides
-      .common
-      .iter()
-      .chain(&sides.cut.haves)
-      .chain(&sides.one_round);
-    for have in had.filter_map(|node| commit_of(graph, *node)) {
-      paint.paint(graph, have, HAVE, admission)?;
-    }
+  /// Begins the selection of what `request` asks over `sides`, its walk's tips painted a unit each after ([`Stage::Tips`]:
+  /// the wants not answered by a run, and the parents of commits a cut made whole, as wanted; the common haves, the
+  /// commits a cut made whole, and the wants a run answers, as had).
+  pub(super) fn begin(asked: Asked, sides: Sides<N>, runs: Vec<Run<G>>) -> Selecting<N, G> {
     let depth_decides = asked
       .filter
       .as_ref()
       .is_some_and(|filter| !filter.is_per_object());
-    Ok(Selecting {
+    Selecting {
       asked,
       sides,
       runs,
-      stage: Stage::Commits,
-      paint,
+      stage: Stage::Tips { at: 0 },
+      paint: Paint::new(),
       sent: Held::default(),
       held: Held::default(),
       mark: Vec::new(),
@@ -311,7 +293,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
         path_peak: Peak::default(),
         taking: None,
       },
-    })
+    }
   }
 
   /// Does units of the selection until `spent` says the owner's quantum is spent, at least one: the objects chosen, as
@@ -337,7 +319,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
   }
 
   /// The kind of the unit [`Selecting::unit`] does next.
-  fn unit_kind(&self) -> super::UnitKind {
+  pub(super) fn unit_kind(&self) -> super::UnitKind {
     use super::UnitKind;
     if !self.mark.is_empty() {
       return UnitKind::Mark;
@@ -346,6 +328,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       return self.chosen.walk_kind();
     }
     match self.stage {
+      Stage::Tips { .. } => UnitKind::Tips,
       Stage::Commits => UnitKind::Commits,
       Stage::Edges { .. } => UnitKind::Edges,
       Stage::Haves => UnitKind::Haves,
@@ -379,6 +362,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       return Ok(false);
     }
     match self.stage {
+      Stage::Tips { at } => self.paint_tip(graph, at, admission)?,
       Stage::Commits => {
         if !self.paint.step(
           graph,
@@ -451,6 +435,54 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
       Stage::Done => return Ok(true),
     }
     Ok(false)
+  }
+
+  /// The walk's tip at `at` and its paint (git's `limit_list` seeded): the wants no run answers and the commits the cut
+  /// made whole wanted, [`WANT`]; then the common haves, the commits the cut made whole, and the wants a run answers,
+  /// had, [`HAVE`]. A want a run answers, met among the wanted, paints nothing there (`None` paint); `None` past the
+  /// last tip.
+  fn tip(&self, at: usize) -> Option<(N, Option<u8>)> {
+    let sides = &self.sides;
+    let lists: [(&[N], u8); 5] = [
+      (&sides.wants, WANT),
+      (&sides.cut.wants, WANT),
+      (&sides.common, HAVE),
+      (&sides.cut.haves, HAVE),
+      (&sides.one_round, HAVE),
+    ];
+    let mut at = at;
+    for (index, (list, paint)) in lists.into_iter().enumerate() {
+      let Some(node) = list.get(at) else {
+        at = at.saturating_sub(list.len());
+        continue;
+      };
+      let answered = index == 0 && sides.one_round.contains(node);
+      return Some((*node, (!answered).then_some(paint)));
+    }
+    None
+  }
+
+  /// One unit of the tips: the tip at `at` painted where it peels to a commit, the walk begun after the last.
+  fn paint_tip<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    at: usize,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let Some((node, paint)) = self.tip(at) else {
+      self.stage = Stage::Commits;
+      return Ok(());
+    };
+    self.stage = Stage::Tips {
+      at: at.saturating_add(1),
+    };
+    let Some(paint) = paint else {
+      return Ok(());
+    };
+    if let Some(commit) = commit_of(graph, node) {
+      self.paint.paint(graph, commit, paint, admission)?;
+    }
+    Ok(())
   }
 
   /// One unit of `include-tag`: a version of a run joined to what the runs carry, or a tag judged.

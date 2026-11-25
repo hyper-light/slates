@@ -1713,10 +1713,15 @@
 > coming back decoded by the store; a stream copies a chunk as it lies, sized by its length, compressing only a raw
 > place. Held by `a_segments_chunks_made_a_step_at_a_time_are_the_one_shot_chunks` (hg) and
 > `a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes` (server: the push chunked within the copy
-> slice, the stream compressing nothing again, the clone decoding the file's chunk). Owed: an import's landings and a
-> whole push's or made changeset's payload (the changegroup its record replays) still land raw, so a stream compresses
-> those at stream time (`Streaming::sized` stays for them); the count pass still reads a chunk place's bytes it could size
-> by its length.
+> slice, the stream compressing nothing again, the clone decoding the file's chunk). An import's landings chunked too
+> (2026-11-25, w-hg; main's order): its segment's record names its rows by identity as a push segment's does, so its
+> payload is made into chunks between the import's turns (`hg_push::chunked_paced`, the same paced steps and counters)
+> and its `Texts` entries held as chunks. Held by `an_imports_files_land_as_chunks_the_clone_decodes` (red: nothing
+> chunked at the import, the clone decoding nothing) and `an_imports_file_texts_held_between_landings_are_bounded_by_its_
+> segment` (the production step's chunk turns counted, none past its copy slice). A made changeset's payload stays raw:
+> its record replays the changegroup itself (`write_made_record`), and no push lands whole any more (every push lands
+> as segments), so a stream compresses only a made changeset's places at stream time (`Streaming::sized` stays for
+> them). Owed: the count pass still reads a chunk place's bytes it could size by its length.
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
@@ -1814,16 +1819,29 @@
 > hg-src's r4000 in process (`hg_clone_store_wait`, debug), stock `hg verify` clean on the clone and its 4,001
 > changesets' manifests the source's: 3,392 sent as stored deltas, 14 stored wholes, 594 whole from a made text (their
 > stored delta the client's own base, a merge's p1); the owner's requests 4,846 to 1,248, the store wait 1.96 s to
-> 1.49 s. Owed: the 594, which versions 02 and 03 could send against any manifest sent earlier (main's condition named
-> the one before); the 57k churn rerun (main's).
+> 1.49 s. The 594 since sent on the parent the client holds (2026-11-25, w-hg; main's ruling, the rule's exact form):
+> a stored delta whose base is a parent's text, that parent a manifest before it a missing changeset links (so sent
+> earlier in this changegroup), goes as that delta, the parents' rows asked in the same want as the batch's, kept only
+> for the batch (no set growing with the repository). Counted `_stored_parent_delta`. Held by
+> `a_clone_sends_a_let_go_manifest_on_its_first_parent_sent_earlier` (two lines over the stock tip, each manifest kept
+> on its first parent; red with the rule off: the stand-in refused a text made whole) and
+> `a_clone_whose_first_manifest_batch_is_the_root_alone_sends_it` (an empty parents log asked beside the root's was
+> taken for a lost row: refused "a manifest revision", as were the daemon-edge and ssh clones past a request's room).
+> At r4000 in process: 3,392 stored deltas, 562 on a parent, 14 wholes, 32 whole from a made text (a delta on neither
+> the one before nor a parent sent); the owner's requests 1,248 to 80, the store wait 1.27 s, `hg verify` clean, every
+> manifest the source's. A pull's base in `::common` is not this walk's: a pull (`Named`) reads each manifest whole to
+> plan its files, so its text is made whatever is sent. Owed: the 32; the 57k churn rerun (main's).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
 > smoothed mean and four mean deviations), at most the machine's measured wake (`spin_before_park_ns`), then parks.
 > Counted `vcs_store.hg_owner_spin_hits`, `_parks`, `_spin_ns`. Held by `back_to_back_reads_are_met_spinning_not_parked`
 > (64 reads back to back: with no spin 64 parks, the red; with a 2 ms cap 61 met spinning, 3 parked while the window was
-> learned). Owed: the 57k clone's split after it (main's), then the request count (812,896, about 14 a changeset under
-> the step bound) with w-perf.
+> learned). Main's 57k split at b4aa00ef8 (release, load ~34) showed no spin: 461,484 parks, 0 hits, because the
+> measurement's daemon (`crates/server/tests/common/hg.rs`) started its owner with a cap of 0; a daemon takes the
+> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Owed: the
+> split again with the real cap (main's), whether a probe's wake (about 9 µs) or the owner's loaded one (about 183 µs a
+> request there) should cap it, then the request count (593,413 at b4aa00ef8) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
@@ -2919,6 +2937,13 @@
 > prints both in both readings, and BENCHMARKS' method note says why RSS across a purge on macOS compares nothing
 > (`the_control_shards_memory_status_names_the_processs_resident_and_on_macos_its_footprint`: red, no such rows). P7's
 > after arm is judged on the footprint on macOS against the bound arm's, at the settled reading (main).
+> A publication that releases deferred frees (A-64) gives back past the keep the arena's last give-back held, in the
+> same step (`staging::give_back_released`, `ShardState::give_back_keep`; main's ruling of 2026-11-25): a batch's
+> let-go texts were released by a publication after its tail, so round 1's settled reading held 103.7 MB resident and
+> free over the bound's 91.9. Its work is as many purge slices as the released bytes span and one more, what the
+> release scrubbed bounding it; an idle purge that settles clears the keep. Red
+> `an_imports_arena_holds_its_keep_once_a_publication_releases_its_deferred_texts` (each releasing publication read in
+> its own step): 6,021,120 B resident and free against a keep of 4,227,072; now at most 4,186,112 of 4,202,496.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);

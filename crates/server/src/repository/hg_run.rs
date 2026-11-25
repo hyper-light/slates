@@ -554,8 +554,8 @@ pub(crate) type Chunks = (Vec<u8>, Vec<core::ops::Range<u64>>);
 
 /// A changeset's `Texts` section: each kept revision's text, base and place in the changeset's payload, named by
 /// `payload`, its identity (w-perf's Texts section, A-645 on A-767): where `chunks` names each revision's chunk's range
-/// (a segment's payload made into chunks, ruling (b)), there, held as a chunk; else its delta's place in the
-/// changegroup, raw (a whole push's or a made changeset's payload, the changegroup its record replays).
+/// (a push's or an import's segment payload made into chunks, ruling (b)), there, held as a chunk; else its delta's
+/// place in the changegroup, raw (a made changeset's payload, the changegroup its record replays).
 pub(crate) fn texts_section(
   texts: &[KeptText],
   (payload, chunks): ([u8; 32], Option<&[core::ops::Range<u64>]>),
