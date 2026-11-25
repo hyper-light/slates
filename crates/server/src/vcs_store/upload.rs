@@ -1108,6 +1108,13 @@ pub(crate) const UNIT_ENTRIES_MOST: &str = "vcs_store.git_upload.unit_entries_mo
 /// Counted most: the longest tree, in bytes, one unit of a fetch's walk read and parsed whole (main 01a20182's order of
 /// 2026-11-25: against the step quantum's bytes on a whole clone). Format: a counter name.
 pub(crate) const TREE_PARSE_BYTES_MOST: &str = "vcs_store.git_upload.tree_parse_bytes_most";
+/// Counted most: the most deltas one of a fetch's tree reads applied going back up the tree's chain in the store
+/// (`slates_git::store::PositionCounts::tree_deltas_most`; main 01a20182's order of 2026-11-25: what a 0.45 to 0.59 ms
+/// `open_tree` unit spends, its parse or the store's read under it). Format: a counter name.
+pub(crate) const TREE_DELTAS_MOST: &str = "vcs_store.git_upload.tree_deltas_most";
+/// Counter: the deltas a fetch's tree reads applied, summed: against the walk's trees opened, a tree's mean chain read.
+/// Format: a counter name.
+pub(crate) const TREE_DELTAS: &str = "vcs_store.git_upload.tree_deltas";
 /// Counter: fetches whose cache of positions was refused the room its walk's work asked, each then as slow as with no
 /// cache (A-911: a cache costs time, never an answer). Format: a counter name.
 pub(crate) const POSITION_CACHE_UNROOMED: &str = "vcs_store.git_upload.position_cache_unroomed";
@@ -1207,11 +1214,13 @@ impl ShardPacks {
     count_units(state);
     state.count_max(UNIT_ENTRIES_MOST, self.chose.entries_most);
     state.count_max(TREE_PARSE_BYTES_MOST, self.chose.tree_bytes_most);
+    state.count_max(TREE_DELTAS_MOST, self.chose.tree_deltas_most);
     for (name, by) in [
       (POSITION_LOOKUPS, self.chose.lookups),
       (POSITION_CACHE_HITS, self.chose.hits),
       (POSITION_CACHE_CONFLICTS, self.chose.conflicts),
       (POSITION_CACHE_UNROOMED, self.chose.unroomed),
+      (TREE_DELTAS, self.chose.tree_deltas),
     ] {
       if by > 0 {
         state.count(name, by);
@@ -1300,6 +1309,8 @@ impl PackSource for ShardPacks {
     self.chose.conflicts = self.chose.conflicts.saturating_add(counts.conflicts);
     self.chose.entries_most = self.chose.entries_most.max(counts.entries_most);
     self.chose.tree_bytes_most = self.chose.tree_bytes_most.max(counts.tree_bytes_most);
+    self.chose.tree_deltas_most = self.chose.tree_deltas_most.max(counts.tree_deltas_most);
+    self.chose.tree_deltas = self.chose.tree_deltas.saturating_add(counts.tree_deltas);
     self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
   }
 }

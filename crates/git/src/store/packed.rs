@@ -212,6 +212,15 @@ pub struct Scratch {
   recent: Recent,
 }
 
+impl Scratch {
+  /// The deltas its last read applied going back up its object's chain: none for an object kept lately or held whole,
+  /// one for each entry of the chain read past the first the scratch kept (what a tree's open costs, main 01a20182's
+  /// order of 2026-11-25: `open_tree` up to 0.59 ms a unit).
+  pub fn deltas_applied(&self) -> usize {
+    self.chain.len()
+  }
+}
+
 /// Objects read lately, by where their entries begin (module docs, "Objects read lately"): none kept past `budget`
 /// bytes, the oldest given back first. Their bytes lie in chunks of the mapped allocation's floor, laid end to end, the
 /// oldest chunk given back whole (goal 93, main 01a20182's ruling of 2026-11-22 04:56): kept as a buffer each, a git/git
