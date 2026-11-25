@@ -37,8 +37,14 @@ const TOOL_VERSIONS: usize = 2_000;
 /// Shape: the asks the tool-id scan test measures, after a first that warms the store.
 const TOOL_ASKS: usize = 8;
 
+/// The sections a landing carries, each with its kind.
+type Sections = Vec<(SectionKind, Vec<u8>)>;
+
+/// One path's ask by tool id: the path, and the tool ids asked under it.
+type ToolAsk = (Vec<u8>, Vec<Vec<u8>>);
+
 /// The texts of [`TOOL_VERSIONS`] versions of `f`, each named by its tool id, landed in one payload.
-fn tool_versions() -> (Vec<Vec<u8>>, Vec<(SectionKind, Vec<u8>)>) {
+fn tool_versions() -> (Vec<Vec<u8>>, Sections) {
   let mut ids = Vec::new();
   let mut entries = Vec::new();
   let mut payload = Vec::new();
@@ -87,7 +93,7 @@ fn an_ask_by_tool_id_scans_into_the_stores_own_buffers() {
   let (ids, sections) = tool_versions();
   let owner = start(&dir);
   let handle = owner.handle();
-  let asks: Vec<Vec<(Vec<u8>, Vec<Vec<u8>>)>> = (0..=TOOL_ASKS)
+  let asks: Vec<Vec<ToolAsk>> = (0..=TOOL_ASKS)
     .map(|_| vec![(b"f".to_vec(), ids.clone())])
     .collect();
   let (found, allocated) = runtime()

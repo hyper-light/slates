@@ -437,13 +437,29 @@ fn print_held(when: &str, (listed, total): &Listed, rows: &BTreeMap<String, u64>
   }
 }
 
+/// Prints, `when`, the bytes the shard image's publications encoded by family (`vcs_store.image.encoded_bytes.<family>`,
+/// each shard's), and their growth since `since` where given (main's order of 2026-11-25: whether a push's let-gos
+/// re-encode the Aways family's tail page whole each publication).
+fn print_encoded(when: &str, rows: &BTreeMap<String, u64>, since: Option<&BTreeMap<String, u64>>) {
+  for (name, value) in rows {
+    if !name.contains(":vcs_store.image.encoded_bytes") {
+      continue;
+    }
+    match since.map(|since| value.saturating_sub(since.get(name).copied().unwrap_or(0))) {
+      Some(grown) => println!("hg_fetch_heap: {when}: {name} = {value} (+{grown} since the push)"),
+      None => println!("hg_fetch_heap: {when}: {name} = {value}"),
+    }
+  }
+}
+
 /// Goal 93 (main's order of 2026-11-25: name what holds the 57k clone's 5.6 GB). Do: start a two-shard daemon holding a
 /// changeset store, its HTTP edge on loopback; with the live-heap sampler on, push a history to it with stock `hg`
 /// (Mercurial's own where `SLATES_HG_PUSH_SOURCE` names it, else a [`CHANGESETS`]-changeset `debugbuilddag` history),
 /// then clone it whole. Expect: the push and the clone succeed. Prints the process's resident set after the push and
 /// after the clone; the live sampled heap by site (the [`LISTED`] largest) after the push, at the clone's peak and as
 /// the clone ends, with the daemon's memory gauges then; and each one's churn by site, the system path's and the mapped
-/// path's apart (main's order of 2026-11-25: 64 GB of system allocations and 418 GB of fresh mapped pages at 57k).
+/// path's apart (main's order of 2026-11-25: 64 GB of system allocations and 418 GB of fresh mapped pages at 57k); the
+/// gauges after the push too, and the bytes the publications encoded by family after the push and after the clone.
 #[test]
 #[ignore = "a measurement (the hg fetch's memory): run by name, with SLATES_HG_PUSH_SOURCE for Mercurial's own history"]
 fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
@@ -467,6 +483,7 @@ fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
   );
   let (after_push, _) = live_now_and_at_peak();
   let push_churn = take_churn();
+  let push_rows = gauges(&served);
   let before = resident_kib();
   reset_peak();
   let cloned = served
@@ -483,7 +500,9 @@ fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
   println!(
     "hg_fetch_heap: source {source}: resident KiB after the push {before}, after the clone {after}"
   );
-  print_held("after the push", &after_push, &BTreeMap::new());
+  print_held("after the push", &after_push, &push_rows);
+  print_encoded("after the push", &push_rows, None);
+  print_encoded("after the clone", &rows, Some(&push_rows));
   print_held("at the clone's peak", &clone_peak, &BTreeMap::new());
   print_held("as the clone ends", &after_clone, &rows);
   print_churn("the push", &push_churn);
