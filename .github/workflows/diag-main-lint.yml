@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 21 (main 01a20182, 2026-11-24 18:23 PST): run 20 found hg_import/tests.rs fronted_history's expects in an Option fn and
+# tests/hg_import_memory.rs at 12 (0d05da26e); main's commit moves them apart.
 # Run 20 (main 01a20182, 2026-11-24 18:09 PST): run 19 found staging.rs stage_deferred at 11 (30195b30e) and hg_push.rs land_in at 11
 # (main's ab8b230c8); main's commit splits the bring-backs and drops the branch. Main at 0d05da26e (A-909, spin_kick, import cut).
 # Run 19 (main 01a20182, 2026-11-24 17:24 PST): run 18 found hg_push.rs landed_after_builds at 11 and Landing::Unbuilt's
