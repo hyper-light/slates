@@ -1,0 +1,97 @@
+name: diag measurer
+# w-interop (2026-11-25, main 01a20182's order, goal 93 "the per-platform counts"): stock Mercurial 7.2.4 against a
+# release slates through ci/interop/hg-matrix.sh, each row's PASS/FAIL and seconds, on ubuntu-latest, ubuntu-24.04-arm
+# and windows-latest. The hg matrix's Linux rows were arena-19's (run 45303764098: 24 of 24), before the six changeset
+# evolution rows (ad36e5f09) and w-hg's push fixes (d33fc0b64, main 0c4bd26fd: 30 of 30 on the MacBook).
+# Stock hg is installed inside the job, never on our machines: on Linux a virtualenv at a fixed path (the matrix runs
+# with HOME set to its scratch, where a `pip --user` install's libraries are not: arena-19's first run, "abort:
+# couldn't find mercurial libraries"); on Windows through uv, as 5942e0c68's Windows matrices ran it. The source is the
+# r400 cut of Mercurial's own history the MacBook runs use (`hg clone -U -r 400`, its tip 8b067bde6679), fetched inside
+# the job. Each leg prints one line `HG-MATRIX <runner>: N of M passed; failed: ...` and a notice with it, so one log
+# read (or the run's annotations) gives the result. Runs only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  # Format: the r400 cut's tip, Mercurial's own revision 400 (the MacBook runs' source).
+  HG_SRC_TIP: 8b067bde6679bbeacae92a4d9b1e9d2a794ef3b4
+  HG_SRC_URL: https://www.mercurial-scm.org/repo/hg
+
+jobs:
+  hg-matrix:
+    name: hg matrix (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      # aws-lc-sys assembles with NASM on Windows (5942e0c68's Windows matrices built so).
+      - uses: ilammy/setup-nasm@v1.5.2
+        if: ${{ runner.os == 'Windows' }}
+      - name: Stock Mercurial 7.2.4 (Linux, a virtualenv)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/hgvenv"
+          "$RUNNER_TEMP/hgvenv/bin/pip" install --disable-pip-version-check --no-input "mercurial==7.2.4"
+          echo "HG=$RUNNER_TEMP/hgvenv/bin/hg" >> "$GITHUB_ENV"
+          echo "SLATES=$PWD/target/release/slates" >> "$GITHUB_ENV"
+      - name: Stock Mercurial 7.2.4 (Windows, through uv)
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          python -m pip install --quiet uv
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '%s\n' '#!/bin/sh' 'exec uvx --quiet --from mercurial==7.2.4 hg "$@"' > "$RUNNER_TEMP/bin/hg"
+          chmod +x "$RUNNER_TEMP/bin/hg"
+          echo "HG=$RUNNER_TEMP/bin/hg" >> "$GITHUB_ENV"
+          echo "SLATES=$(cygpath -w "$PWD/target/release/slates.exe")" >> "$GITHUB_ENV"
+          echo "AWS_LC_SYS_PREBUILT_NASM=0" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: The r400 cut of Mercurial's history (retried, so a cut transfer is fetched again)
+        run: |
+          "$HG" version -q | head -1
+          S="$RUNNER_TEMP/hg-src"
+          for i in 1 2 3 4; do "$HG" clone -q -U -r "$HG_SRC_TIP" "$HG_SRC_URL" "$S" && break; rm -rf "$S"; sleep 15; done
+          tip=$("$HG" -R "$S" log -r tip -T '{rev} {node}')
+          echo "source tip: $tip"
+          [ "$tip" = "400 $HG_SRC_TIP" ] || { echo "the cut's tip is not r400"; exit 1; }
+      - name: The hg matrix
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then echo "nproc $(nproc); load before $(cat /proc/loadavg)"; fi
+          set +e
+          STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$SLATES" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix" 2>&1 \
+            | tee "$RUNNER_TEMP/matrix.out"
+          rc=${PIPESTATUS[0]}
+          if [ "$RUNNER_OS" = Linux ]; then echo "load after $(cat /proc/loadavg)"; fi
+          rows=$(grep -E '^(PASS|FAIL) ' "$RUNNER_TEMP/matrix.out" | sort -u -k2,2)
+          echo "== rows"; echo "$rows" | cut -c1-200
+          passed=$(echo "$rows" | grep -c '^PASS ')
+          total=$(echo "$rows" | grep -c -E '^(PASS|FAIL) ')
+          failed=$(echo "$rows" | sed -n 's/^FAIL \([^ ]*\) .*/\1/p' | paste -sd, -)
+          line="HG-MATRIX ${{ matrix.runner }}: $passed of $total passed; failed: ${failed:-none}; exit $rc"
+          echo "$line"
+          echo "::notice title=hg matrix ${{ matrix.runner }}::$line"
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hg-matrix-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/matrix.out
+            ${{ runner.temp }}/matrix/anchor.log
+            ${{ runner.temp }}/matrix/logs
+          if-no-files-found: warn
