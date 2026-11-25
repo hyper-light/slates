@@ -5141,6 +5141,29 @@ fn node_seal_recipient(
   }
 }
 
+/// This shard's conversation with the daemon's spawner (A-924), before anything on the shard can start a hook: the
+/// control shard owns the spawner too, and restarts it on its death (piece 2b).
+#[cfg(unix)]
+fn install_spawner(
+  owner: Option<(slates_ipc::confined_spawn::SpawnedChild, Vec<u16>, u64)>,
+  end: Option<std::os::fd::OwnedFd>,
+  config: &DaemonConfig,
+  (config_shards, partition): (&[u16], u16),
+) -> Result<(), ServerError> {
+  if let Some((spawner, served, start_took_ns)) = owner {
+    crate::spawning::own(spawner, served, start_took_ns);
+  }
+  if let Some(end) = end {
+    let placement = crate::spawning::Placement {
+      generation: 0,
+      owner: config_shards.first().copied().unwrap_or(partition),
+      bound: config.runtime.tasks_per_shard,
+    };
+    crate::spawning::install(end, placement).map_err(ServerError::Runtime)?;
+  }
+  Ok(())
+}
+
 async fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
@@ -5162,21 +5185,13 @@ async fn init_shard(
   let inherited_dax = holds.dax;
   #[cfg(unix)]
   let stop_watch_install = holds.stop_watch;
-  // This shard's conversation with the daemon's spawner (A-924), before anything on the shard can start a hook; the
-  // control shard owns the spawner too, and restarts it on its death (piece 2b).
   #[cfg(unix)]
-  if let Some((spawner, served, start_took_ns)) = holds.spawner_owner {
-    crate::spawning::own(spawner, served, start_took_ns);
-  }
-  #[cfg(unix)]
-  if let Some(end) = holds.spawner {
-    let placement = crate::spawning::Placement {
-      generation: 0,
-      owner: config_shards.first().copied().unwrap_or(partition),
-      bound: config.runtime.tasks_per_shard,
-    };
-    crate::spawning::install(end, placement).map_err(ServerError::Runtime)?;
-  }
+  install_spawner(
+    holds.spawner_owner,
+    holds.spawner,
+    config,
+    (config_shards, partition),
+  )?;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
