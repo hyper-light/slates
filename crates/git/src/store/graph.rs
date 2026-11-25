@@ -119,9 +119,10 @@ pub struct PositionCounts {
   pub lookups: u64,
   /// Ids the cache answered.
   pub hits: u64,
-  /// Of the ids resolved through the index, those whose slot held another id (a direct-mapped conflict, the id put out
-  /// of it to take it); the rest met an empty slot (an id not met lately, or never). What decides between more ways a
-  /// slot and a wider window (main 01a20182's order of 2026-11-25).
+  /// Of the ids resolved through the index, those whose slot held another id, which this one then put out. An upper
+  /// bound on the ids lost to another's slot, not their count: an id met the first time also finds its slot taken once
+  /// the cache is warm (A-911's 40-commit line: 59 of 157 lookups counted at 4 ways or at 32 slots an id, where nearly
+  /// every miss is a first meeting). The A/B of more ways against more slots reads lookups and time.
   pub conflicts: u64,
   /// Answers whose cache was refused the room its work asked (one an answer).
   pub unroomed: u64,
