@@ -25,6 +25,7 @@ fn applied_a_unit_a_step(
         match green.apply_step(&mut run, &mut inc, applied, &mut || true) {
           ApplyStep::More => {}
           ApplyStep::Done(version) | ApplyStep::Answered(version) => return (version, steps),
+          ApplyStep::Lend(unlent) => panic!("no named text here, yet it asks to lend {unlent:?}"),
         }
       }
     }

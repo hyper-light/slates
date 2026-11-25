@@ -19874,4 +19874,33 @@ entry makes no closing claim until it is explained.
 - **Resident.** The bound arm's is 0.63, 0.52 and 0.50 of the before arm's round by round, and 245, 175 and 155 MiB
   above the after arm's. Its batches of 60 to 91 MB (4 to 7 of them, against 179 of 2 MiB) account for some of that
   excess; how much is w-perf's to explain.
+- **The excess, explained (w-perf, from the same logs' gauges; main checked round 1).** It is the content arena's
+  retained free extents, not live texts and not malloc: A-742's rule is not yet applied to the content arena. Round 1:
+  `arena_mapped` 336 MB, `arena_free` 256 MB, `object_resident` 268 MB against the unit arm's 19. Rounds 2 and 3:
+  `object_resident` 198 and 183 MB, `arena_free` 175 and 161 MB. w-perf is fixing it, and main's rerun adds the fix as
+  a fourth arm.
+
+## The git leg at eedfd23e1, one loaded run: the clone's first pack byte 14.8 s later than at 2dd25afe6, the derivation's units slower (goal 93 perf; main 01a20182's bench7, 2026-11-25 04:53 to 04:59 PST)
+
+**A loaded point, no verdict.** At eedfd23e1 the clone's first pack byte came at 55.112 s, against 40.3 s at 2dd25afe6.
+The derivation took 21.8 ms a unit, against 11.8 ms there. That is open with w-git, and main has an interleaved A/B
+of e89adba55 against its parent queued. This entry makes no closing claim on `derive_behind`.
+
+- **Command.** `~/slates-work/main-ship/git-leg-counters.sh`, run from `p7-true-f.sh`: the in-tree harness's git leg,
+  slates alone, release at eedfd23e1. Record: `~/.cache/main-rounds/git-leg-eedfd23e1/work/interop-speed.txt`.
+- **Machine and load.** The MacBook (adas-macbook-pro-2), load average 18 to 25 with the fleet's agents running. One
+  run. The 2dd25afe6 column was measured at load 38 to 56, so the two are context for each other, not an A/B.
+
+| step | eedfd23e1 (s) | first pack bytes (s) | 2dd25afe6 (s) | its first pack bytes (s) |
+|---|---|---|---|---|
+| push, every branch and tag | 50.943 | | 47.6 | |
+| clone `--mirror` | 95.834 | 55.112 | 79.6 | 40.3 |
+| clone again | 61.220 | 33.437 | 63.4 | |
+| clone `--filter=blob:none` | 34.338 | 27.993 | 53.8 | |
+| incremental push | 0.162 | | | |
+| incremental fetch | 0.278 | | | |
+
+- **The daemon's peak** was 2,978 MiB.
+- **What moved.** The clone's first pack byte is 14.8 s later, the derivation's units running at 21.8 against 11.8 ms
+  each. The partial clone is 19.5 s sooner and the clone-again about even, both at different loads.
 
