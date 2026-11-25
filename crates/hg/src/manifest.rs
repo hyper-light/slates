@@ -146,6 +146,10 @@ pub fn decode(text: &[u8]) -> Result<Entries<'_>, Refusal> {
   Ok(Entries { lines: lines(text) })
 }
 
+/// What [`Checking::update`] hands each line it checks: the line's range in the text, its newline included, and its
+/// entry. A refusal it answers ends the check.
+pub type EachLine<'a> = dyn FnMut(core::ops::Range<u64>, Entry<'_>) -> Result<(), Refusal> + 'a;
+
 /// [`decode`]'s check made over a manifest's text fed a piece at a time (goal 93, C1 (2): a push's manifest made a window
 /// a step, never whole): each line checked and its entry handed on as its newline arrives, with where it lies in the
 /// text, the line not yet ended carried to the next piece. What it keeps between pieces is that line and the path before
@@ -165,11 +169,7 @@ pub struct Checking {
 impl Checking {
   /// Feeds `piece`, the text's next bytes: each line it ends checked as [`decode`] checks it and handed to `each` with
   /// its range in the text (its newline included), in order. Refused as `decode` refuses the line.
-  pub fn update(
-    &mut self,
-    piece: &[u8],
-    each: &mut dyn FnMut(core::ops::Range<u64>, Entry<'_>) -> Result<(), Refusal>,
-  ) -> Result<(), Refusal> {
+  pub fn update(&mut self, piece: &[u8], each: &mut EachLine<'_>) -> Result<(), Refusal> {
     let mut rest = piece;
     while let Some(end) = rest.iter().position(is_newline) {
       let (line, after) = rest.split_at(end);

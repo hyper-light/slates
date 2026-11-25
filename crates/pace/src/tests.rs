@@ -177,3 +177,35 @@ fn the_estimates_window_follows_its_spread_and_count() {
   assert_eq!(wide.window, 64);
   assert!(wide.estimate_ns.abs_diff(50) <= 5, "{wide:?}");
 }
+
+/// A-783 (what makes a ceiling-long step safe, main's 84a question of 2026-11-24: an import's paced checkpoint step ran
+/// 477 ms with no one waiting; a request arriving mid-step must not wait it out). Do: a step of the mixed workload with
+/// a ceiling of 50 quanta, no one waiting until 10 quanta in, someone waiting from then on. Expect: the step stops at
+/// the first quantum's end after the arrival, so within a quantum and one unit of it, never at its ceiling.
+#[test]
+fn a_waiter_arriving_mid_step_ends_it_within_a_quantum() {
+  const ARRIVES: u64 = 10 * QUANTUM;
+  NOW.with(|now| now.set(0));
+  WAITING.with(|w| w.set(false));
+  let mut costs = Costs::<2>::ZERO;
+  let mut done = 0;
+  let mut step = Step::begin(env(50 * QUANTUM), now());
+  while step.more(kind_of(done), &mut costs) {
+    advance(COSTS[kind_of(done)]);
+    done += 1;
+    if now() >= ARRIVES {
+      WAITING.with(|w| w.set(true));
+    }
+  }
+  let ended = now();
+  step.close(ended, &mut costs);
+  assert!(
+    ended >= ARRIVES,
+    "the step stopped at {ended} ns, before anyone waited"
+  );
+  assert!(
+    ended <= ARRIVES + QUANTUM + COSTS[1],
+    "the step stopped {} ns after someone arrived, past a quantum and a unit",
+    ended - ARRIVES
+  );
+}

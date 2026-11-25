@@ -3435,9 +3435,18 @@
 > allocated (452,617 apparent) on the node's changeset store against stock FSFS's 51,020 (40,183), 9.2 and 11.3 times.
 > Under Ada's changeset ruling each revision's changed texts are kept whole (its changeset's Payload and Texts rows),
 > where FSFS keeps skip-deltas; deltas are derived, never stored (A-842). Owed: nothing before Subversion's C and R
-> close; any change keeps the ruling. Found beside it, P7's (where a Subversion import's memory is): of 691,504 KiB
-> resident after the import, the content arena's frees held for a committed image (`arena_deferred_bytes`) were
-> 489,299,968 B, the store's own content 2,624 B.
+> close; any change keeps the ruling. Found beside it, P7's (where a Subversion import's memory is), named the same
+> night (w-perf, main's ruling, w-svn's go on `staging.rs`): the 489,299,968 B of the arena's deferred frees at the
+> import's end were transient (released by the next publication within a second); what climbed was the content
+> store's own windows, 41 MiB at revision 1 to 426 MiB at revision 2,000, none let go, since `Staging::due_before`
+> flushed a batch only for the shard's whole admission, 65,533 records or the end, and a batch gives its texts back
+> only when it lands: git-2000 was one batch. Now a batch also lands once the texts it carries and the next revision's
+> would pass the changeset store's unit (`staging::texts_bound`, `segment_bytes`; `Flush::Texts`, counted
+> `repository.svn_import.flushed_texts`): derived, an import holds at most twice the larger of that unit and its
+> largest revision's texts. Held by `an_imports_texts_are_held_a_batch_at_a_time_within_their_bound` (red: 16,777,216
+> B held after a turn against a 2 MiB bound, 64 rewrites one batch; the oracle, the same history exported with and
+> without the bound). Owed: main's measure of git-2000's import (time and peak); its batches' landings pipelined, as
+> hg's segments are, if their flushes cost real time.
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
