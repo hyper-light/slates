@@ -234,6 +234,12 @@ struct LogTexts {
   unkept: bool,
   /// The texts asked, for the walk's life: the non-vacuity counter.
   asked_count: u64,
+  /// A batch asked ([`LogTexts::ask_batch`]): each revision asked with its text's length, the first the one its unit
+  /// waits for; the texts it asks, once its rows are given, in its revisions' order.
+  batch_asked: Vec<(Node, u64)>,
+  /// The texts a batch was given, each taken by its node as its unit is written ([`LogTexts::take`]): at most the room
+  /// the walk had when it asked them, and let go when the next batch is asked.
+  batch: Vec<(Node, Vec<u8>)>,
 }
 
 impl LogTexts {
@@ -265,9 +271,114 @@ impl LogTexts {
     Ok(())
   }
 
+  /// Asks the changeset store for the texts of `nodes` of `log` in one want of rows and one of texts (goal 93: a clone
+  /// after P5 asked a row and a text a revision, two store asks a changeset and two a manifest, each a scan of the log's
+  /// rows; main's interop bench: hg's 57k clone past 13.5 minutes). The first is the one its unit waits for; the rest
+  /// are the units' after it, as many as `most` bytes hold beside it. What the last batch was given and its units did not
+  /// take is let go. Refused where the store gave nothing for the last one asked, or the log holds no row of the first.
+  fn ask_batch(
+    &mut self,
+    store: &impl Store,
+    log: WholeLog,
+    (nodes, most): (&mut dyn Iterator<Item = Node>, u64),
+  ) -> Result<(), Refusal> {
+    if core::mem::take(&mut self.unkept) {
+      return Err(Refusal::Store {
+        what: "a changelog or manifest text the changeset store keeps no row of",
+      });
+    }
+    self.batch.clear();
+    self.batch_asked.clear();
+    let mut held = 0u64;
+    for node in nodes {
+      let Some(len) = store.log_text_len(log, &node) else {
+        if self.batch_asked.is_empty() {
+          return Err(log.missing());
+        }
+        continue;
+      };
+      if !self.batch_asked.is_empty() && held.saturating_add(len) > most {
+        break;
+      }
+      held = held.saturating_add(len);
+      self.batch_asked.push((node, len));
+    }
+    let Some(first) = self.batch_asked.first().copied() else {
+      return Err(log.missing());
+    };
+    self.asked = Some((first.0, held));
+    self.want = Some(crate::render::Want::Rows {
+      logs: vec![(
+        log.path().to_vec(),
+        self.batch_asked.iter().map(|(node, _)| *node).collect(),
+      )],
+    });
+    self.asked_count = self
+      .asked_count
+      .saturating_add(to_u64(self.batch_asked.len()));
+    Ok(())
+  }
+
+  /// The text of `node` a batch was given, taken; else one given for its unit.
+  fn take(&mut self, node: &Node) -> Option<Vec<u8>> {
+    if let Some(at) = self.batch.iter().position(|(given, _)| given == node) {
+      return Some(self.batch.swap_remove(at).1);
+    }
+    let at = self.given.iter().position(|(given, _)| given == node)?;
+    Some(self.given.swap_remove(at).1)
+  }
+
+  /// The changeset store's answer to a batch ([`LogTexts::ask_batch`]): its rows ask their texts, those of revisions
+  /// the store keeps no row of left out (the first's absence marks it unkept); its texts are kept for their units.
+  fn give_batch(&mut self, given: Given) {
+    self.want = None;
+    match given {
+      Given::Rows(rows) => {
+        let rows: Vec<Option<crate::render::StoredRevision>> =
+          rows.into_iter().next().unwrap_or_default();
+        let mut kept = Vec::new();
+        let mut texts = Vec::new();
+        for (row, asked) in rows.into_iter().zip(self.batch_asked.iter()) {
+          if let Some(row) = row {
+            texts.push(row.text);
+            kept.push(*asked);
+          }
+        }
+        if kept.first().map(|(node, _)| *node) != self.asked.map(|(node, _)| node) {
+          self.unkept = true;
+          self.batch_asked.clear();
+          return;
+        }
+        let most = kept
+          .iter()
+          .fold(0u64, |most, (_, len)| most.saturating_add(*len));
+        self.batch_asked = kept;
+        self.want = Some(crate::render::Want::Texts { texts, most });
+      }
+      Given::Texts(texts) => {
+        self.asked = None;
+        if texts.len() != self.batch_asked.len() {
+          self.unkept = true;
+        } else {
+          self
+            .batch
+            .extend(self.batch_asked.drain(..).map(|(node, _)| node).zip(texts));
+        }
+        self.batch_asked.clear();
+      }
+      Given::Chunks(_) | Given::TextsPast => {
+        self.unkept = true;
+        self.batch_asked.clear();
+      }
+    }
+  }
+
   /// The changeset store's answer: a row asks its text, within the length its log's row names; a text is kept for the
   /// unit taken again; anything else marks the revision unkept.
   fn give(&mut self, given: Given) {
+    if !self.batch_asked.is_empty() {
+      return self.give_batch(given);
+    }
     self.want = None;
     match given {
       Given::Rows(rows) => {
@@ -1211,13 +1322,20 @@ impl Walk {
     let parents = [parent(first)?, parent(second)?];
     let text = match store.changeset_text(rev, room)? {
       Some(text) => text,
-      None => match self.logs.given(&node) {
+      None => match self.logs.take(&node) {
         Some(text) => {
           room.charge(to_u64(text.len()))?;
-          Cow::Borrowed(text)
+          Cow::Owned(text)
         }
         None => {
-          self.logs.ask(store, WholeLog::Changelog, node)?;
+          // This changeset's text and the next missing ones', as the room holds them, in one batch.
+          let missing = &self.missing;
+          let mut ahead =
+            core::iter::successors(Some(rev), |at| missing.next_from(at.saturating_add(1)))
+              .map_while(|at| store.node(at));
+          self
+            .logs
+            .ask_batch(store, WholeLog::Changelog, (&mut ahead, room.left()))?;
           return Ok(Some(At::Changelog(from)));
         }
       },
@@ -1278,15 +1396,24 @@ impl Walk {
         out,
       )?;
     } else {
-      let Some(text) = self.logs.given(&linked.node) else {
-        self.logs.ask(store, WholeLog::Manifest, linked.node)?;
+      let Some(text) = self.logs.take(&linked.node) else {
+        // This manifest's text and those of the next ones a missing changeset links, as the room holds them, in one
+        // batch.
+        let missing = &self.missing;
+        let mut ahead = (position..)
+          .map_while(|at| store.manifest_linked(at))
+          .filter(|linked| linked.link.is_some_and(|link| missing.contains(link)))
+          .map(|linked| linked.node);
+        self
+          .logs
+          .ask_batch(store, WholeLog::Manifest, (&mut ahead, room.left()))?;
         return Ok(Some(At::Manifests(position, sent)));
       };
       let entry = store.manifest_entry(&linked.node).ok_or_else(no_manifest)?;
       room.charge(to_u64(text.len()))?;
       self.put(
         (linked.node, entry.parents, link, entry.flags),
-        text,
+        &text,
         room,
         out,
       )?;

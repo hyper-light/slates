@@ -1134,27 +1134,30 @@ impl Store {
     path: &[u8],
     tool_ids: &[Vec<u8>],
   ) -> Result<Vec<Option<(Identity, TextRow)>>, StoreError> {
-    // The path's tool id rows share their key's prefix, so they are read in one scan of it, a page as large as the
-    // ask, keeping the ones asked: a stream asks for a log's every version, one random lookup each before (r27 on
-    // hg-src: about 230,000 a stream, 1.35 s of its 3.7 s waiting on the store).
+    // The path's tool id rows share their key's prefix and are ordered by tool id, so they are read in scans of it, each
+    // begun at the next asked id not yet passed and a page as large as the asks left: a stream asking for a log's every
+    // version reads it in one scan (r27 on hg-src: about 230,000 random lookups a stream, 1.35 s of its 3.7 s waiting on
+    // the store), and a lone ask reads at its own key. Until 2026-11-24 every scan began at the prefix's first row, so a
+    // lone ask read a page of one row a row up to its own: half the log a text, a clone after P5 quadratic in its history
+    // (main's interop bench at ed71ac0be: hg's 57k clone past 13.5 minutes, stock's 42.4 s).
     let hash = *blake3::hash(path).as_bytes();
     let start = tool_key(repository, &hash, &[]);
     let end = prefix_end(&start);
     let wanted: std::collections::BTreeSet<&[u8]> = tool_ids.iter().map(Vec::as_slice).collect();
     let mut kept: std::collections::BTreeMap<Vec<u8>, (Identity, TextRow)> =
       std::collections::BTreeMap::new();
-    let mut from = start.clone();
     let mut next = Vec::new();
-    loop {
+    // The asked ids not yet passed, in key order: the first is where the next scan begins.
+    let mut left = wanted.iter().copied().peekable();
+    while let Some(first) = left.peek().copied() {
+      let from = tool_key(repository, &hash, first);
+      let page = left.clone().count().max(1);
       let mut out = mantle_engine::rows::Rows::default();
       self.tool_read();
-      let more = self.rows_mut().scan(
-        &from,
-        end.as_deref(),
-        tool_ids.len().max(1),
-        &mut out,
-        &mut next,
-      )?;
+      let more = self
+        .rows_mut()
+        .scan(&from, end.as_deref(), page, &mut out, &mut next)?;
+      let mut last: Option<Vec<u8>> = None;
       for (key, value) in out.iter() {
         let Some(tool_id) = key.strip_prefix(start.as_slice()) else {
           continue;
@@ -1162,11 +1165,16 @@ impl Store {
         if wanted.contains(tool_id) {
           kept.insert(tool_id.to_vec(), decode_tool_value(value)?);
         }
+        last = Some(tool_id.to_vec());
       }
-      if !more || kept.len() == wanted.len() {
+      if !more {
         break;
       }
-      core::mem::swap(&mut from, &mut next);
+      // Every asked id at or before the last row read is passed: found, or held by no row.
+      match last {
+        Some(last) => while left.next_if(|id| *id <= last.as_slice()).is_some() {},
+        None => break,
+      }
     }
     Ok(
       tool_ids

@@ -57,6 +57,27 @@ pub(crate) const FLUSHED_RETENTION: &str = "repository.svn_import.flushed_retent
 pub(crate) const FLUSHED_CHAIN: &str = "repository.svn_import.flushed_chain";
 /// Counter: a batch landed at the import's end, or before a record that moves no version. Format: a counter name.
 pub(crate) const FLUSHED_END: &str = "repository.svn_import.flushed_end";
+/// Counter: a batch landed because the texts it carries and the next revision's would pass the batch's bound
+/// ([`texts_bound`]; goal 93 P7, main 01a20182's ruling of 2026-11-24). Format: a counter name.
+pub(crate) const FLUSHED_TEXTS: &str = "repository.svn_import.flushed_texts";
+
+#[cfg(test)]
+thread_local! {
+  /// A test's import with no texts bound ([`Staging::due_before`] passes over [`Flush::Texts`]), as an import was before
+  /// it: the oracle's other leg, the same repository made with a batch's texts unbounded.
+  pub(crate) static TEXTS_UNBOUNDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Derived: the most bytes of texts a batch carries before it lands (goal 93 P7, main 01a20182's ruling of 2026-11-24):
+/// the node's changeset store's own unit, one trunk node of its memtable (`vcs_store::hg_import::segment_bytes`: the
+/// content plane's chunk times SplinterDB's fanout), the bytes a Mercurial import's segment is cut at, unless one
+/// revision's texts alone are more, which stays one revision since a revision is staged whole. A batch's texts are given
+/// back only once it lands (`give_back_put_some`), and the next revision's are put into the content store as the dump is
+/// read, before its staging asks whether the batch is due: so an import holds at most twice the larger of this bound and
+/// its largest revision's texts, never a history's (git-2000 held 426 MiB in one batch before).
+pub(crate) fn texts_bound(state: &ShardState) -> u64 {
+  u64::try_from(crate::vcs_store::hg_import::segment_bytes(state)).unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 thread_local! {
@@ -117,6 +138,8 @@ pub(crate) enum Flush {
   Chain,
   /// The import's end, or a record that moves no version next.
   End,
+  /// The texts the batch carries and the next revision's would pass its bound ([`texts_bound`]).
+  Texts,
 }
 
 impl Flush {
@@ -128,6 +151,7 @@ impl Flush {
       Flush::Retention => FLUSHED_RETENTION,
       Flush::Chain => FLUSHED_CHAIN,
       Flush::End => FLUSHED_END,
+      Flush::Texts => FLUSHED_TEXTS,
     }
   }
 }
@@ -354,15 +378,34 @@ impl Staging {
     self.held
   }
 
-  /// Why the batch must land before `revision` is staged, if it must: the shard could not admit what the revision
-  /// brings twice (its texts in the content store, and again in its increment's post-state), or the changeset is full.
-  /// An empty batch never flushes.
+  /// Why the batch must land before `revision` is staged, if it must: the changeset is full; the texts the batch
+  /// carries and the revision's would pass the batch's bound ([`texts_bound`], derived: an import holds at most twice
+  /// the larger of it and its largest revision's texts); or the shard could not admit what the revision brings twice
+  /// (its texts in the content store, and again in its increment's post-state). An empty batch never flushes, so a
+  /// revision past the bound alone is one batch.
+  /// Whether the texts the batch carries and `revision`'s would pass the batch's bound ([`texts_bound`]); never in a
+  /// test that unbounds them ([`TEXTS_UNBOUNDED`]).
+  fn texts_past_bound(&self, state: &ShardState, revision: &Revision) -> bool {
+    #[cfg(test)]
+    if TEXTS_UNBOUNDED.with(std::cell::Cell::get) {
+      return false;
+    }
+    let carried = self
+      .carried
+      .iter()
+      .fold(0u64, |total, text| total.saturating_add(text.len));
+    carried.saturating_add(stored_bytes(revision)) > texts_bound(state)
+  }
+
   pub(crate) fn due_before(&self, state: &ShardState, revision: &Revision) -> Option<Flush> {
     if self.records.is_empty() {
       return None;
     }
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
+    }
+    if self.texts_past_bound(state, revision) {
+      return Some(Flush::Texts);
     }
     let charge = admission_charge(revision);
     let admittable = state.store.admittable();

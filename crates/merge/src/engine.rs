@@ -1519,10 +1519,6 @@ fn current_bytes(value: &crate::history::Value) -> usize {
   value.own_len().saturating_add(value.list_bytes())
 }
 
-/// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
-/// except the last of them (the value in effect at `floor`), so lookups at or above the floor are
-/// unchanged. The dropped entries are returned, for the caller to release what they held. Entries are in version
-/// order, as the histories keep them.
 #[cfg(test)]
 thread_local! {
   /// The paths this thread's folds visited ([`Green::fold_history_before`]): the changes since each fold's last floor,
@@ -1543,6 +1539,10 @@ fn fold_paths<T>(
   }
 }
 
+/// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
+/// except the last of them (the value in effect at `floor`), so lookups at or above the floor are
+/// unchanged. The dropped entries are returned, for the caller to release what they held. Entries are in version
+/// order, as the histories keep them.
 fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64) -> Vec<(u64, T)> {
   let below = history
     .iter()
