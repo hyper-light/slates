@@ -344,9 +344,18 @@ pub(crate) const BRING_BACK_PAST_PATIENCE: &str = "vcs_store.git_resident.bring_
 pub(crate) async fn bring_back_within(
   waited: slates_git::store::packed::Waited,
 ) -> Result<u64, super::read_through::ReadThroughRefused> {
+  bring_back_window_within(waited)
+    .await
+    .map(|brought| brought.map_or(0, |(_, len)| len))
+}
+
+/// [`bring_back_within`], naming the window it brought back and its bytes ([`super::read_through::bring_back_window`]).
+pub(crate) async fn bring_back_window_within(
+  waited: slates_git::store::packed::Waited,
+) -> Result<Option<(slates_vcs::ContentId, u64)>, super::read_through::ReadThroughRefused> {
   match slates_rt::futures::within(
     crate::vcs_share::wait::PATIENCE_NS,
-    super::read_through::bring_back(waited),
+    super::read_through::bring_back_window(waited),
   )
   .await
   {

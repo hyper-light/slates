@@ -470,7 +470,7 @@ pub(crate) async fn carry(origin: u16, shards: &[u16], carry: Carry) -> Carried 
         origin,
         shards,
         (bytes, owner),
-        crate::fleet::live_budget(),
+        crate::fleet::homing_budget(),
       )
       .await,
     ),

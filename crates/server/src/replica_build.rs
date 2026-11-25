@@ -142,16 +142,17 @@ fn repository_of(state: &ShardState, green: ObjectId) -> Option<RepositoryRecord
     })
 }
 
-/// `green`'s build driven a turn at a time, a yield between, until it is made or refused.
+/// `green`'s build driven a turn at a time, a yield between, until it is made or refused; the windows it brought back
+/// let go again once it ends (`read_through::BroughtBack`).
 async fn drive(green: ObjectId) {
+  let mut brought = crate::vcs_store::read_through::BroughtBack::default();
   loop {
     match crate::state::with_state_counted(|state| turn(state, green)) {
       Some(Turned::More) => slates_rt::futures::yield_now().await,
       Some(Turned::Waiting(waited)) => {
-        if crate::vcs_store::upload::bring_back_within(waited)
-          .await
-          .is_err()
-        {
+        let back = crate::vcs_store::upload::bring_back_window_within(waited).await;
+        brought.keep(&back);
+        if back.is_err() {
           slates_rt::futures::yield_now().await;
         }
       }
@@ -159,6 +160,7 @@ async fn drive(green: ObjectId) {
     }
   }
   let _ = crate::state::with_state_counted(|state| state.replica_builds.building.remove(&green));
+  brought.let_go();
 }
 
 /// One turn of `green`'s build: the repository's store waited for while its replay runs; then the owed push's build
