@@ -249,6 +249,22 @@ async fn kill_before_entry_where_set() {
   }
 }
 
+/// Counter: the bytes of the content arena's resident free pages an import's batches gave back past their bound
+/// ([`give_back_past`]). Format: a counter name in the status report.
+pub(crate) const PURGED_PAST_BOUND: &str = "repository.svn_import.purged_past_bound_bytes";
+
+/// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
+/// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
+fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
+  let slice = crate::daemon::purge_slice_blocks(state);
+  let purged = state.store.content.arena_mut().purge_past(keep, slice);
+  state.count(
+    PURGED_PAST_BOUND,
+    u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+  );
+  purged.more && state.store.content.arena().resident_free_bytes() > keep
+}
+
 /// A stage of a batch's landing ([`Staging::land`]) a test may kill it at ([`KILL_AT_STAGE`]).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1003,6 +1019,15 @@ impl Staging {
       state.count(TAIL_SLICES, 1);
       give_back_put_some(state, &self.put, (&mut at, slice_deadline_ns()))
     })? {
+      slates_rt::futures::yield_now().await;
+    }
+    // The content arena's resident free pages past what the next batch refills given back, a slice a step (goal 93,
+    // main's ruling of 2026-11-25: A-742's rule for the content plane; an import never leaves its shard idle, so the idle
+    // purge never ran under it, and git-2000's let-go texts stayed resident as free pages, 204 MB of a 438 MB daemon).
+    // The keep is the batch's own bound: a batch takes at most that before it lands, so pages kept past it are pages no
+    // batch of this import refills (`texts_bound`).
+    let keep = usize::try_from(self.bound.bytes).unwrap_or(usize::MAX);
+    while crate::state::with_state(|state| give_back_past(state, keep))? {
       slates_rt::futures::yield_now().await;
     }
     crate::state::with_state(|state| {

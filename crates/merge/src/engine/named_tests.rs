@@ -1029,8 +1029,10 @@ fn judge_lending(
   panic!("a judge refused again with its objects lent");
 }
 
-/// `applied` applied to `green` for `work` as its entry records it, its unlent named texts lent from `plane` first,
-/// then let go: the version it committed.
+/// `applied` applied to `green` for `work` as its entry records it, a unit a step (`Green::apply_step`), each named text
+/// its run asks for lent from `plane` as it asks (`ApplyStep::Lend`, its slice made again), then let go: the version it
+/// committed. The run asks for exactly what a walk of every effect first names (`Green::recorded_unlent`, A-917's
+/// cut 2), each text in a slice that meets it; and applied whole with none lent, the entry commits nothing.
 fn apply_lending(
   green: &mut Green,
   work: &mut Increment,
@@ -1046,10 +1048,27 @@ fn apply_lending(
       head,
       "applied over an unlent text"
     );
-    lend_all(green, &unlent, plane);
     census.replays_lent += 1;
   }
-  let version = green.apply_recorded(work, applied);
+  let mut asked = std::collections::BTreeSet::new();
+  let version = match green.begin_applying(work, applied) {
+    super::Begun::Answered(version) => version,
+    super::Begun::Applying(mut run) => loop {
+      match green.apply_step(&mut run, work, applied, &mut || true) {
+        super::ApplyStep::More => {}
+        super::ApplyStep::Done(version) | super::ApplyStep::Answered(version) => break version,
+        super::ApplyStep::Lend(wanted) => {
+          assert!(
+            wanted.is_subset(&unlent) && !wanted.is_empty(),
+            "the run asked {wanted:?}, the walk named {unlent:?}"
+          );
+          lend_all(green, &wanted, plane);
+          asked.extend(wanted);
+        }
+      }
+    },
+  };
+  assert_eq!(asked, unlent, "the run asked for what the walk names");
   green.let_named_bytes_go();
   version
 }
