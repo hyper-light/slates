@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 34 (main 01a20182, 2026-11-24 21:24 PST): run 33 found git graph.rs:175's bare subtraction (A-911, 8c943afb1); main's commit
+# saturates it. With run 33's manifest alias (4b2430637).
 # Run 33 (main 01a20182, 2026-11-24 21:19 PST): run 32 found hg manifest.rs:171's callback type (105609857); main's commit names
 # it EachLine. Main at e6710411a (w-perf's P7 batch bound).
 # Run 32 (main 01a20182, 2026-11-24 21:12 PST): main at a387b13c3 (run 31's fixes landed), with w-git's A-911 (8c943afb1), w-hg's
