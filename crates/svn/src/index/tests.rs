@@ -2375,3 +2375,108 @@ fn a_plan_is_refused_once_a_revision_was_appended_after_it() {
   assert_eq!(appended.append(record(), ALL_ROOM), Ok(3));
   assert_eq!(format!("{index:?}"), format!("{appended:?}"));
 }
+
+/// `record` planned on `index` one row a step ([`Index::plan_begin`], [`Index::plan_step`], every step spent once its
+/// first row is applied).
+pub(crate) fn planned_a_row_a_step(
+  index: &Index,
+  record: RevisionRecord,
+  room: usize,
+) -> Result<Planned, IndexRefusal> {
+  let mut planning = index.plan_begin(record, room)?;
+  loop {
+    match index.plan_step(planning, &mut || true)? {
+      PlanStep::More(more) => planning = *more,
+      PlanStep::Planned(planned) => return Ok(planned),
+    }
+  }
+}
+
+/// `records` committed in order on two empty indexes, one planning each whole ([`Index::plan`]), the other one row a
+/// step ([`planned_a_row_a_step`]): where the two differ, the first revision's account; else how many were committed.
+pub(crate) fn sliced_against_whole(
+  records: impl IntoIterator<Item = RevisionRecord>,
+) -> Result<usize, String> {
+  let (mut whole, mut sliced) = (Index::new(), Index::new());
+  let mut committed = 0_usize;
+  for record in records {
+    let at = whole.youngest().saturating_add(1);
+    let made = planned_both((&mut whole, &mut sliced), record)
+      .map_err(|why| format!("revision {at}: {why}"))?;
+    committed = committed.saturating_add(usize::from(made));
+    if format!("{whole:?}") != format!("{sliced:?}") {
+      return Err(format!("revision {at}: the indexes differ"));
+    }
+  }
+  Ok(committed)
+}
+
+/// `record` planned on `whole` whole and on `sliced` one row a step, and committed on each where it was planned:
+/// whether it was; where the two differ, how.
+fn planned_both(
+  (whole, sliced): (&mut Index, &mut Index),
+  record: RevisionRecord,
+) -> Result<bool, String> {
+  let planned = (
+    whole.plan(record.clone(), ALL_ROOM),
+    planned_a_row_a_step(sliced, record, ALL_ROOM),
+  );
+  if format!("{:?}", planned.0) != format!("{:?}", planned.1) {
+    return Err(format!("planned {planned:?}"));
+  }
+  let (Ok(one), Ok(other)) = planned else {
+    return Ok(false);
+  };
+  let made = (whole.commit_planned(one), sliced.commit_planned(other));
+  if made.0 != made.1 {
+    return Err(format!("committed {made:?}"));
+  }
+  Ok(made.0.is_ok())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(Config::default()))]
+
+  /// A-920 piece 2 (oracle). Do: generate histories of every kind the naive-filesystem oracle generates (additions,
+  /// copies, copies into their own subtrees, deletions, replacements, text and property changes, empty revisions), and
+  /// commit each revision's record on two indexes, one planning it whole, the other one row a step. Expect the same
+  /// plan or refusal for every revision, and the two indexes alike after each.
+  #[test]
+  fn a_record_planned_a_row_a_step_is_the_record_planned_whole((wishes, _) in histories()) {
+    let mut generated = NaiveFs::new();
+    let mut records = Vec::new();
+    for revision_wishes in &wishes {
+      let mut txn = generated.begin();
+      let changes = txn.rows_from(revision_wishes);
+      let _ = txn.commit();
+      records.push(RevisionRecord {
+        transaction: TRANSACTION.to_owned(),
+        changes,
+      });
+    }
+    let committed = sliced_against_whole(records).map_err(TestCaseError::fail)?;
+    prop_assert_eq!(committed, wishes.len());
+  }
+}
+
+/// A-920 piece 2 (`Index::plan_step`'s contract). Do: begin planning a change of `/trunk/README` after revision 1,
+/// append another revision, then take the plan's next step. Expect it refused out of date (`E160028`), as a stale
+/// plan's commit is.
+#[test]
+fn a_plans_step_is_refused_once_a_revision_was_appended_after_it_began() {
+  let mut index = trunk();
+  let record = RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![edit("/trunk/README", 3)],
+  };
+  let planning = index.plan_begin(record, ALL_ROOM).unwrap();
+  commit(&mut index, vec![edit("/trunk/lib/a.c", 4)]);
+  let refusal = index.plan_step(planning, &mut || true).unwrap_err();
+  assert_eq!(
+    refusal,
+    IndexRefusal::OutOfDate {
+      planned: 2,
+      next: 3
+    }
+  );
+}

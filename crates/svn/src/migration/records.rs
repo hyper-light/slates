@@ -43,8 +43,8 @@ use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::commit::{CommitRefusal, verdict};
 use crate::dump::Uuid;
 use crate::index::{
-  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, Planned, PropertyList,
-  Revision, RevisionRecord, Text,
+  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PlanStep, Planned, Planning,
+  PropertyList, Revision, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockTable};
 use crate::mergeinfo::Contents;
@@ -435,6 +435,21 @@ impl Repository {
   /// records nor the revision hold; [`StepRefusal::Room`] past the room's bytes; the index's refusal of the rows, its
   /// room's among them.
   pub fn check(&self, revision: RevisionToCommit) -> Result<Checked, StepRefusal> {
+    let mut checking = self.check_begin(revision)?;
+    loop {
+      match self.check_step(checking, &mut || false)? {
+        CheckStep::More(more) => checking = *more,
+        CheckStep::Checked(checked) => return Ok(checked),
+      }
+    }
+  }
+
+  /// [`Repository::check`] begun (A-920 piece 2): every check but the index's of the revision's rows, which
+  /// [`Repository::check_step`] makes a slice at a time while the repository stands as it is.
+  ///
+  /// # Errors
+  /// [`Repository::check`]'s but the index's refusals of the rows past their order and the transaction's name.
+  pub fn check_begin(&self, revision: RevisionToCommit) -> Result<Checking, StepRefusal> {
     let youngest = self.youngest();
     if revision.head != youngest {
       return Err(StepRefusal::OutOfDate {
@@ -457,13 +472,48 @@ impl Repository {
       .into_iter()
       .filter(|(identity, _)| !self.holds(identity))
       .collect();
-    let planned = self.index.plan(revision.record, self.room.entries)?;
-    Ok(Checked {
-      planned,
+    let planning = self.index.plan_begin(revision.record, self.room.entries)?;
+    Ok(Checking {
+      planning,
       properties: revision.properties,
       fresh,
       stored,
       lock_entries: revision.lock_entries,
+    })
+  }
+
+  /// One step of `checking` ([`Repository::check_begin`]): the index's plan of its rows a slice further, a row at
+  /// least, until `spent` says the step's slice is spent ([`Index::plan_step`]); checked once every row is.
+  ///
+  /// # Errors
+  /// [`Index::plan_step`]'s, a revision committed since the check began among them.
+  pub fn check_step(
+    &self,
+    checking: Checking,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<CheckStep, StepRefusal> {
+    let Checking {
+      planning,
+      properties,
+      fresh,
+      stored,
+      lock_entries,
+    } = checking;
+    Ok(match self.index.plan_step(planning, spent)? {
+      PlanStep::More(planning) => CheckStep::More(Box::new(Checking {
+        planning: *planning,
+        properties,
+        fresh,
+        stored,
+        lock_entries,
+      })),
+      PlanStep::Planned(planned) => CheckStep::Checked(Checked {
+        planned,
+        properties,
+        fresh,
+        stored,
+        lock_entries,
+      }),
     })
   }
 
@@ -756,6 +806,31 @@ struct Applied {
   properties: Properties,
   /// What the records hold with it.
   held: u64,
+}
+
+/// A revision being checked against a repository a slice at a time ([`Repository::check_begin`],
+/// [`Repository::check_step`]; A-920 piece 2): every check made but the index's plan of its rows, part made.
+#[derive(Debug)]
+pub struct Checking {
+  /// The index's plan of its rows, so far.
+  planning: Planning,
+  /// Its revision properties.
+  properties: Properties,
+  /// The texts and property lists its rows name that the repository does not hold.
+  fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts its rows name that its commit stored in the content store and the repository does not hold yet.
+  stored: BTreeMap<ContentIdentity, u64>,
+  /// Its lock entries.
+  lock_entries: Vec<LockEntry>,
+}
+
+/// What a step of [`Repository::check_step`] left.
+#[derive(Debug)]
+pub enum CheckStep {
+  /// The plan goes on at the next step.
+  More(Box<Checking>),
+  /// Checked: what [`Repository::apply`] commits.
+  Checked(Checked),
 }
 
 /// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]
