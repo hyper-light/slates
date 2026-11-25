@@ -851,3 +851,10 @@
   interleaved A/B. QUEUED: SSH close/seats + hook flakes (lingering child, foreign holder) as one 8a-family piece;
   reconnect bound for a client that truly loses its daemon while starved (reap_map step 4); Windows owned_object
   sibling (reported). hg-over-SSH reds moved to w-hg.
+- 11-25 ~17:45 PST: LANDED read-cache counters 09a60eb5c (merge 47de9566d: read_cache_hits/widened/refused/
+  budget_most; spread_chained_create fixture: 12 hits of 117 tree reads, 698 deltas ≈ no cache 702, budget 4,992 B,
+  refused 0 → the rule is too small, not admission). And the spawner's start off the shard 35c922166 (merge
+  523c522c2: started_off_shard thread + wake pipe; spawner.start_ns_most / starts_past_window; red 3.11 s gap →
+  steps). WAITING: main's git/git leg with the four counters → choose the cache's budget rule (breadth × length for
+  git's newest-whole order; breadth × depth × length for forward chains). NEXT: SSH seats/client-gone + hook flakes
+  (8a family), reap_map reconnect bound, Windows owned_object sibling (reported).
