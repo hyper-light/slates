@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 18 (main 01a20182, 2026-11-24 16:55 PST): main at 142172e1f, w-hg's landing-spin fda5613a1 (hg creates a slice at a time
+# before the landing step) and w-git's GAPS correction, landed after run 17.
 # Run 17 (main 01a20182, 2026-11-24 16:23 PST): run 16 found push_to (tests/fleet.rs:36422) asserting in a Result fn;
 # main's commit makes its commit through committed_in. Main at 8c0d8fce8 merged.
 # Run 16 (main 01a20182, 2026-11-24 16:12 PST): run 15 found AdoptedEngine (green_adopt.rs:129) at large_enum_variant;
