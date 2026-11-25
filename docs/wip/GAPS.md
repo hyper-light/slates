@@ -1186,7 +1186,9 @@
 >   and pulled back by the first client, its 3 markers and 3 obsolete changesets (`evo-markers-back`). Locally against
 >   stock hg 7.2.4 at 29221d5ab (debug, the r400 cut of hg's history as the source): the six rows 6 of 6. The same run's
 >   `merge-push` and `rebase-push` were refused `UnknownDeltaBase { log: Manifests }` (the store answered no text for a
->   manifest an earlier push landed), sent to w-hg as found.
+>   manifest an earlier push landed), sent to w-hg as found; fixed by w-hg at 0c4bd26fd (d33fc0b64: the chain asked
+>   through the let-go tip manifest, now its let-go link asked and the chain above it read from the fork). Rerun at
+>   0c4bd26fd: 30 of 30, both rows and the six evolution rows among them.
 >   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
 >   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
 >   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
