@@ -1,5 +1,12 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 15:55 PST 11-24: LANDED A-908 steps 1-3, main 02bd0ec94: holders replicate a branched green by its lineage
+  (membership from held names-log parts, no format change; founding/branching; OUT_OF_ORDER while a join or source is
+  missing; whole-lineage adoption). Push red green (7.0 s, red at origin/main). NEXT (main): the successor branch
+  refusal, red first with a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies (scratch
+  successor-branch-test.rs): unable to commit, then "cannot lock ref". Then part 4 (rebuilds). Red worktree
+  ~/slates-work/w-shared-red (origin/main at the time) kept; its target deleted.
+
 ## 14:50 PST 11-24: LANDED main 9272195a6: A-907's test fix (28cf8622a: waits for its sender to hold a region window,
   PUSHES_FOR_A_HOME 8; the flake was a home of neither window 1 run in 9) and A-908 part 1 (fdc59391e: holder replicas
   kept as crate::greens::Greens, each alone; lend/lend_mut at holder sites so the owner's P2 gate keeps its meaning).
