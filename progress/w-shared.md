@@ -508,3 +508,13 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   source, a missing ancestor rebuilt a level per ask) by membership; red first with 2 merge_origin tests.
 - Left: A-905 (parked on w-git's question 1). A fleet test that restarts a holder warm between a branch's versions was
   not run (main's to ask for).
+
+## 2026-11-24: A-908 part 4's fleet test landed (2b6b43071, commit 7e04a16c3)
+
+- a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after runs in the anchored git fleet
+  (anchored_git_fleet, GitFleet::restart_warm, push_on_top_of). Green 4 of 4. Red in a scratch copy with part 4's
+  membership step off: unable to commit, b's recompute_mismatch 1.
+- Found: a c stopped instead of refusing a's records left a push refused `retry` 3 of 3. c's takeover moved the
+  configuration from 7 to 13 within the push, and A-902's install wait on the restarted b elapsed. This is the window of
+  a push during a takeover, reported to main.
+- Left: A-905 (parked on w-git's question 1).
