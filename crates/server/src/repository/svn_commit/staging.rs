@@ -1024,9 +1024,8 @@ impl Staging {
     }
   }
 
-  /// [`Staging::staged_in`]'s judge, within the records' lent room: the records' room for the revision reserved and
-  /// its increment judged into the batch's scratch member, kept at once where it commits nothing, else its commit begun
-  /// and stepped until `deadline` ([`Staging::commit_in`]).
+  /// [`Staging::staged_in`]'s judge begun, within the records' lent room: the records' room for the revision reserved
+  /// and its increment's staging begun in the batch, then stepped until `deadline` ([`Staging::commit_in`]).
   fn judged_in(
     &mut self,
     state: &mut ShardState,
@@ -1037,14 +1036,14 @@ impl Staging {
     crate::vcs_store::reserve_svn(state, repository, growth)
       .map_err(|available| Uncommitted::Budget { available })?;
     match batch.stage_begin(state, built) {
-      Ok(Some(_)) => Ok(JudgedIn::Kept),
-      Ok(None) => self.commit_in(state, (repository, growth, deadline)),
+      Ok(()) => self.commit_in(state, (repository, growth, deadline)),
       Err(refused) => stage_refused(state, (repository, growth), refused).map(JudgedIn::PastRoom),
     }
   }
 
-  /// The scratch commit [`Staging::judged_in`] began, stepped until the shard's clock passes `deadline`, a unit at
-  /// least: whether it goes on, or ended, the work kept or past the batch's room.
+  /// The staging [`Staging::judged_in`] began (the increment's reservation a slice at a time, its judge, then its
+  /// verdict's commit into the scratch member a slice at a time; A-920), stepped until the shard's clock passes
+  /// `deadline`, a unit at least: whether it goes on, or ended, the work kept or past the batch's room.
   fn commit_in(
     &mut self,
     state: &mut ShardState,
