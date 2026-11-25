@@ -1618,6 +1618,11 @@ pub(crate) fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u
     .collect()
 }
 
+/// Repository `repository`'s derivation turned to its end on this shard, in this step: every version's sets known.
+fn derive_settled(state: &mut ShardState, repository: RepositoryId) {
+  while super::git_derive::turn(state, repository) == super::git_derive::Turned::More {}
+}
+
 /// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one,
 /// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused.
 pub(crate) fn assert_made_again_whole(
@@ -1629,6 +1634,9 @@ pub(crate) fn assert_made_again_whole(
   // compared (`settle_rebuild`), so the live store is compared settled too: otherwise a build under way holds what it
   // has put so far and the two differ in holders and contents while their rows and refs agree.
   super::paths::whole_build::settle(state);
+  // So are its derivations: a push's end derives its versions behind it (`git_derive::derive_behind`), a cache of sets
+  // kept in memory and never recorded, which a rebuild derives again when asked; each side is derived whole first.
+  derive_settled(state, repository);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
@@ -1638,6 +1646,7 @@ pub(crate) fn assert_made_again_whole(
   super::rebuild(state, repository);
   super::settle_rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
+  derive_settled(state, repository);
   let made = {
     let (content, store) = state
       .vcs_stores
