@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 const CHANGESETS: u64 = 2_000;
 
 /// Format: the counters of a fetch's store asks, the owner's split of them after the first two.
-const COUNTERS: [&str; 23] = [
+const COUNTERS: [&str; 22] = [
   "vcs_store.hg_fetch_manifest_stored_parent_delta",
   "vcs_store.hg_fetch_manifest_at_hand_delta",
   "vcs_store.hg_fetch_manifest_at_hand_whole",
@@ -200,7 +200,7 @@ fn assert_the_clone_is_the_sources(served: &common::hg::Served, source: &str) {
 }
 
 /// Format: the counters of a streamed answer's turns and what lies between them.
-const STREAM_COUNTERS: [&str; 13] = [
+const STREAM_COUNTERS: [&str; 14] = [
   "vcs_store.hg_stream_span_ns",
   "vcs_store.hg_stream_steps",
   "vcs_store.hg_stream_turns_at_ceiling",
