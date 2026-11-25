@@ -624,3 +624,15 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - The exit-4 runs were the A-924 2b spawner's wedges (spawning.rs:668); one a894 push refusal was unrelated.
 - Next: A-921 part 2, the edge routing by owner (git HTTP 307; hg, svn and SSH measured). Its red is parked at
   ~/slates-work/w-shared-scratch/a914/a921_product_test.rs.
+
+## 2026-11-25: A-921 part 2 landed (03c736286, commits d0cfd001b and 552f02516)
+
+- A repository a takeover moved from a readmitted node is answered there with where it went: a 307 to the adopter's
+  announced edge (git and hg follow it; svn names the target), a typed 503 naming the owner or "moved, owner unknown
+  here", and SSH refused typed.
+- One owner lookup (owner_location::locate_owner) now serves the volume forward, the edges and the homes' resolution.
+  The direct route skips a creator retired by a kept takeover; the healer bounds it by its pass.
+- Measured: curl drops a custom Authorization on an origin change, so a cross-node 307 needs a credential helper.
+- Fleet-wide name routing is OPEN, waiting for Ada.
+- My earlier exit-4 wedges were on an old base, before 1bda9a3c1 and 0b9a3f9e8; green through cargo on the merged base.
+- Next (main's order): the a894 "files no commit names" race, A-921's second mode, A-922, A-918 B, then A-914 (c).
