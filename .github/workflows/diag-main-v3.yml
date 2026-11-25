@@ -1,8 +1,8 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 19:03 PST): gate 16 at b7e65cc63, w-shared's A-908 part 4 (7106f83ea: a restarted holder rebuilds a
-# lineage's members by their membership) and the merge-authority test's fix (af061de87). Gate 15 (f387b56d3, A-909)
-# passed 40 of 40. Twenty release then twenty debug runs, stopped after the first three if all three fail. Run only from
-# diag-measurer-main-v3-* branches.
+# main 01a20182 (2026-11-24 22:26 PST): gate 17 at 040a3a69b, w-shared's A-912 (040a3a69b: the coordinator's home exchanges on one
+# lane, a home behind answering Behind at once with the sender's re-ask on the council round, and a homing budget derived
+# from detection and the takeover's churn). Gate 16 (b7e65cc63) passed 40 of 40. Twenty release then twenty debug runs,
+# stopped after the first three if all three fail. Run only from diag-measurer-main-v3-* branches.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -12,13 +12,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 16 at b7e65cc63)
+    name: v3_takeover (gate 17 at 040a3a69b)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b7e65cc6371df53ce30bc3f726ab4b06decf54c2
+          ref: 040a3a69bad2f49ec8f139e3a294a6a3015842f9
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -49,7 +49,7 @@ jobs:
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 16: $pass of $ran passed"
+          echo "== gate 17: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -59,5 +59,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate16
+          name: v3-gate17
           path: ${{ runner.temp }}/*.log
