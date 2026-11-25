@@ -565,6 +565,9 @@ pub struct Repository {
   /// The buffers its objects are read from their packs with, and the objects read lately (`packed::Scratch`), held to
   /// its largest pack's length; in a cell because a read is a look, not a change.
   reading: RefCell<Scratch>,
+  /// The deltas its last read of a stored object applied (`Scratch::deltas_applied`; none for one held whole): what a
+  /// tree's open costs in the store, read by the fetch's walk ([`Repository::last_read_deltas`]).
+  last_deltas: std::cell::Cell<u64>,
   /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
   /// none, and its owner brings the piece back and takes the step again.
   waiting: Cell<Option<packed::Waited>>,
@@ -616,6 +619,7 @@ impl Repository {
       kinds: BTreeMap::new(),
       packs: BTreeMap::new(),
       reading: RefCell::new(Scratch::default()),
+      last_deltas: std::cell::Cell::new(0),
       waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
@@ -743,6 +747,7 @@ impl Repository {
     stored: &StoredAt,
     len: u64,
   ) -> Option<Cow<'s, [u8]>> {
+    self.last_deltas.set(0);
     match stored {
       StoredAt::Whole(content) => stored_bytes(store, content, len),
       StoredAt::InPack(place) => {
@@ -760,6 +765,9 @@ impl Repository {
           &mut out,
         );
         self.note_waited(&read);
+        self
+          .last_deltas
+          .set(u64::try_from(reading.deltas_applied()).unwrap_or(u64::MAX));
         read.ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
@@ -855,6 +863,12 @@ impl Repository {
     content: ContentId,
   ) -> Option<Cow<'s, [u8]>> {
     self.read_stored(store, &self.stored_of(row, content), row.len)
+  }
+
+  /// The deltas its last read of a stored object applied going back up the object's chain: none for one held whole or
+  /// kept lately (`packed::Scratch::deltas_applied`).
+  pub fn last_read_deltas(&self) -> u64 {
+    self.last_deltas.get()
   }
 
   /// The tail and runs of its index its lookups have visited since the index's merge rule last took them.
@@ -2043,6 +2057,7 @@ impl Repository {
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
       reading: RefCell::new(Scratch::default()),
+      last_deltas: std::cell::Cell::new(0),
       waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
