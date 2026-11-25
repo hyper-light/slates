@@ -90,29 +90,7 @@ fn a_mercurial_imports_peak_resident_set_is_named_by_the_daemons_gauges() {
     return;
   }
   let served = common::hg::serve("hg-import-memory", "");
-  let source = match std::env::var("SLATES_HG_IMPORT_SOURCE") {
-    Ok(source) => source,
-    Err(_) => {
-      let made = served.hg(".").args(["init", "source"]).output().unwrap();
-      assert!(made.status.success(), "hg init");
-      let built = served
-        .hg("source")
-        .args([
-          "debugbuilddag",
-          "--new-file",
-          "--overwritten-file",
-          &format!("+{CHANGESETS}"),
-        ])
-        .output()
-        .unwrap();
-      assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-      );
-      format!("{}/source", served.base())
-    }
-  };
+  let source = import_source(&served);
   let mut sampler = served.client();
   let before_kib = resident_kib();
   let before = gauges(&mut sampler);
@@ -169,6 +147,39 @@ fn a_mercurial_imports_peak_resident_set_is_named_by_the_daemons_gauges() {
   println!(
     "hg_import_memory: resident before {before_kib} KiB, peak {peak_kib} KiB at {peak_at:?}, after {after_kib} KiB"
   );
+  print_peak_and_counters(&at_peak, &after);
+  assert!(imported.is_ok(), "the import answered: {imported:?}");
+}
+
+/// The import's source: SLATES_HG_IMPORT_SOURCE where it names one, else a [`CHANGESETS`]-changeset `debugbuilddag`
+/// history stock `hg` makes in the served directory.
+fn import_source(served: &common::hg::Served) -> String {
+  if let Ok(source) = std::env::var("SLATES_HG_IMPORT_SOURCE") {
+    return source;
+  }
+  let made = served.hg(".").args(["init", "source"]).output().unwrap();
+  assert!(made.status.success(), "hg init");
+  let built = served
+    .hg("source")
+    .args([
+      "debugbuilddag",
+      "--new-file",
+      "--overwritten-file",
+      &format!("+{CHANGESETS}"),
+    ])
+    .output()
+    .unwrap();
+  assert!(
+    built.status.success(),
+    "{}",
+    String::from_utf8_lossy(&built.stderr)
+  );
+  format!("{}/source", served.base())
+}
+
+/// Prints the [`LISTED`] largest memory gauges at the peak sample beside their values after the import, then the
+/// import's counters after it.
+fn print_peak_and_counters(at_peak: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) {
   let mut listed: Vec<(&String, &u64)> = at_peak
     .iter()
     .filter(|(name, _)| name.contains(":mem.gauge."))
@@ -178,10 +189,9 @@ fn a_mercurial_imports_peak_resident_set_is_named_by_the_daemons_gauges() {
     let then = after.get(name).copied().unwrap_or(0);
     println!("hg_import_memory: at peak {name} = {value}; after {then}");
   }
-  for (name, value) in &after {
+  for (name, value) in after {
     if name.contains(":vcs_store.hg_import") || name.contains(":vcs.hg.landed_let_go") {
       println!("hg_import_memory: counter {name} = {value}");
     }
   }
-  assert!(imported.is_ok(), "the import answered: {imported:?}");
 }

@@ -697,6 +697,26 @@ fn gauge(state: &ShardState, name: &str) -> u64 {
     .map_or(0, |(_, value)| value)
 }
 
+/// [`fronted_history`]'s directory beside the test binary, made empty: a step that fails here fails the test, so a
+/// skip is only ever `hg` not running.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn scratch_repository(name: &str) -> std::path::PathBuf {
+  let binary = std::env::current_exe().expect("the test binary's path");
+  let dir = binary
+    .parent()
+    .expect("the test binary's directory")
+    .join(format!("hg-import-{name}-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).expect("the repository's directory");
+  dir
+}
+
+/// `bytes` written to `path` for [`fronted_history`]; a write that fails fails the test.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn written(path: &std::path::Path, bytes: &[u8]) {
+  std::fs::write(path, bytes).expect("the file written");
+}
+
 /// A Mercurial repository stock `hg` makes in a directory of its own beside the test binary: one file of
 /// [`HELD_FILE_BYTES`] and a line committed, then a line put at its front in each of the next changesets,
 /// [`HELD_CHANGESETS`] in all.
@@ -714,13 +734,7 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
       .ok()
       .filter(|out| out.status.success())
   };
-  let binary = std::env::current_exe().expect("the test binary's path");
-  let dir = binary
-    .parent()
-    .expect("the test binary's directory")
-    .join(format!("hg-import-{name}-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir_all(&dir).expect("the repository's directory");
+  let dir = scratch_repository(name);
   hg(&dir, &["init"])?;
   let mut text: Vec<u8> = (0..HELD_FILE_BYTES)
     .map(|at| {
@@ -735,7 +749,7 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
     // At the front: every window of the file moves, so no two revisions share one (the content store keeps an object
     // by its windows, and a line appended at the end would leave all but the last shared).
     text.splice(0..0, format!("line {changeset}\n").bytes());
-    std::fs::write(dir.join("big.txt"), &text).expect("the file written");
+    written(&dir.join("big.txt"), &text);
     let message = format!("changeset {changeset}");
     let args: &[&str] = if changeset == 0 {
       &["commit", "-q", "-A", "-m", &message]
