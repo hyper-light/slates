@@ -63596,7 +63596,8 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
     voter's session on the same loan to another plane at two of its replication rounds in a row, a hold across a round
     (a loan seen at one round only overlapped it; the council's own earlier round's loan not counted).
   - A push's homing runs within `fleet::homing_budget`: the live commit's deadline, or the homing window where that is
-    longer, `derived!` `detection + confirmation + (2 + 2 (members − 1)) × period` from the failover estimate (A-363)
+    longer, `derived!` `detection + confirmation + (2 + 2 (members − 1)) × period` from the failover estimate (A-363;
+  since A-914 (a), the learned silence to a takeover install in place of `detection + confirmation` once one is measured)
     and the coordinator's measured period, derived on the control shard and fanned with the failover delay. Within it
     `home_in_region` ranks the window's homes, puts to those that have not kept it (a round within the live deadline),
     and where one did not keep it waits for this node's next configuration install (A-902's install wake) and ranks
@@ -63656,6 +63657,62 @@ lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,
     short under load (5 of 10 at about 48 on 18 cores, at the homing): A-912's follow-up, owed (GAPS).
 - **Applied in the same change to** §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-914 (a) — A push's homing window is the silence to a takeover install this deployment measured, once it has measured one (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-24 and 2026-11-25 ((1), and (a) of its split); A-912's follow-up; amends A-912 and A-363)
+
+- **Why.** A-912's homing window was `detection + confirmation + (2 + 2 (members − 1)) × period`, its first two terms
+  A-363's estimate from typical timings. At a load of about 48 on 18 cores, A-912's push test failed 5 of 10 at its
+  homing: the window (2.7 to 4.1 s) was short of a member's stop to its takeover (2.2 to 4.7 s). Load is the normal case
+  here, so the window is to come from the real thing on this deployment: a death's silence to its takeover install.
+- **The change.**
+  - Every member learns at the install, not only the round's successor. Once a coordinator period, the control shard
+    reads the regional configuration's fencing epochs (`takeover::note_takeover_installs`). A host whose epoch rose
+    since the last read was taken over by an install between (`RegionalConfiguration::take_over` bumps it). A host
+    absent from the last read is not one, so a newcomer's first epoch is no takeover.
+  - The silence runs from the host's last answer to this node's detector to that read, within a period of the install.
+    The last answers are kept each period (`ShardState::last_answers`, bounded by the members), because the detector
+    forgets a dead peer once its death stands, before a loaded council has taken it over. A first version read the
+    detector at the successor's round and found nothing.
+  - Each silence is folded into the failover estimator (`Failover::silence_to_install`). The homing window
+    (`fleet::homing_window`, still `derived!`) is its running tail plus the takeover's steps once there is one, and
+    the estimate's detection and confirmation before.
+  - Counted: `failover.silence_sampled`, `failover.silence_longest_ns`, `failover.silence_unmeasured` (a taken-over
+    host with no answer kept) and `fleet.homing_window.learned`. Each death is logged ("a death's silence to its
+    takeover install") beside the detector's and the coordinator's period tails, their maxima over a recent window
+    (`failover::RecentMax`, the failover delay's worth of periods), and the estimate's terms. Main's batch reads these
+    for (c).
+  - Test support: `Daemon::inject_period_stretch` sleeps before each coordinator period; `Daemon::homing_window` reads
+    the window and its terms.
+- **Measured** (macOS arm64, debug, 2026-11-25, 7 runs of a 4-node `f = 1` fleet, coordinator periods stretched 300 ms,
+  two deaths). Silence to a takeover install: 3.99 to 5.24 s, at every member, at both deaths.
+  - First death: the estimate's window was 3.3 to 3.8 s, and that push was refused `retry` at its homing in 4 of 7.
+    This is the red for a first death's prior, (c), which is still owed.
+  - Second death: the window was learned (16.9 to 18.7 s) in 7 of 7. Its push landed 4 of 7. Two were refused at the
+    record barrier: the new version's merge records were still unplaced 13 s after the takeover installed. That is
+    A-912's sibling, the next piece. One fell short at its homing, cause not yet seen. Once the test awaited each
+    death's unseating from the council, 2 of 6 landed and 4 were refused at the barrier. Without that wait, 2 runs in
+    11 never took the second death over: at `f = 1`, a second death before the first's voter was replaced leaves no
+    council majority. That is the fault model, not a defect.
+  - The learned tail from one sample is wide (about 13.3 s from a 4.5 s silence). Main's ruling: after (c), see
+    whether the estimator should weight its sample count.
+  - A detector stretched as well (a sleep each turn of its loop, one datagram a turn) starved its probes' answers and
+    stated a 949 s window: that is not a loaded host, so only the coordinator is stretched.
+- **Tests.**
+  - Fleet `a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`. At the second death a's
+    window is learned (samples ≥ 1, its source logged as learned). The first death's measured silence beside the
+    estimate's window is recorded, not asserted.
+  - A named debt: the second push is not asserted to land until the barrier piece (GAPS). Red before: nothing was
+    learned, so the window was always the estimate's.
+  - `daemon::tests::a_takeover_install_learns_its_hosts_silence_from_the_answer_kept_for_it`: the kept peer's silence
+    is sampled, the peer with none kept is counted unmeasured, and a newcomer is never taken for a takeover.
+  - `slates-cluster` failover: `a_recent_maximum_forgets_a_slow_stretch_once_its_window_passes` and
+    `the_learned_silence_is_none_before_a_death_and_counts_its_deaths_after`.
+  - Focused fleet runs: a912, a894 and a915.
+- **Models.** None of `docs/wip/models/` models the failover estimate or a push's homing; no spec changed.
+
+Applied in the same change to: the A-912 entry's homing window (learned once measured), `crates/cluster/src/
+{failover,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,lib}.rs`, `crates/server/tests/fleet.rs`,
+GAPS.
 
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 

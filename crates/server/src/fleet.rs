@@ -10869,9 +10869,55 @@ fn refresh_failover(state: &mut ShardState) {
     .and_then(|plane| plane.detection(now_ns));
   let timing = state.council_timing;
   state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+  // A death taken over since the last period: its silence to the install, learned (A-914).
+  crate::takeover::note_takeover_installs(state);
+  // The recent periods' window: the failover delay's worth of the fleet's periods (A-914), what one recovery spans.
+  let window = usize::try_from(takeover_attempts(state.failover_ns)).unwrap_or(usize::MAX);
+  state.failover.set_recent_window(window);
+  if let Some(plane) = state.plane.plane.as_mut() {
+    plane.set_recent_window(window);
+  }
   state.homing_window_ns = homing_window(state).get();
+  note_homing_window_source(state);
   publish_failover(state);
 }
+
+/// Test support (A-914): waits out this node's injected period stretch (`Daemon::inject_period_stretch`) once a
+/// coordinator period, as a loaded host's periods run late; nothing in production. The detector is not stretched: its
+/// loop takes one datagram a turn, so a sleep there starves its probes' answers, not a period. A sleep the runtime could
+/// not time is passed over.
+pub(crate) async fn stretched_period() {
+  let stretch = state::with_state(|s| s.period_stretch_ns).unwrap_or(0);
+  if stretch > 0 {
+    let _ = futures::sleep(stretch).await;
+  }
+}
+
+/// Logs the homing window's source once as it changes (A-914): the failover estimate's terms before this node measured
+/// a death's silence to its takeover install, the learned tail of those after; counted
+/// [`HOMING_WINDOW_LEARNED`] while learned.
+fn note_homing_window_source(state: &mut ShardState) {
+  let learned = state.failover.silence_tail().is_some();
+  if learned == state.homing_window_learned {
+    return;
+  }
+  state.homing_window_learned = learned;
+  slates_machine::log_line!(
+    "slates-server: a push's homing window now from {}: {} ns",
+    if learned {
+      "the learned silence to a takeover install"
+    } else {
+      "the failover estimate's detection and confirmation"
+    },
+    state.homing_window_ns
+  );
+  if learned {
+    state.count(HOMING_WINDOW_LEARNED, 1);
+  }
+}
+
+/// Counter: a push's homing window turned to the learned silence to a takeover install (A-914). Format: a counter name.
+pub(crate) const HOMING_WINDOW_LEARNED: &str = "fleet.homing_window.learned";
 
 /// The window a push's homing in the region must outlast for a member's death not to refuse it (A-912, main 01a20182's
 /// ruling of 2026-11-24): the failover estimate's detection and confirmation (A-363: the detector's periods to condemn a
@@ -10880,10 +10926,17 @@ fn refresh_failover(state: &mut ShardState) {
 /// then is a window homed again among the homes ranked without it (`vcs_store::homes::home_in_region`).
 pub(crate) fn homing_window(state: &ShardState) -> slates_machine::Derived<u64> {
   let estimate = state.failover.estimate();
-  let condemned = estimate
-    .detection
-    .map_or(0, |term| term.ns)
-    .saturating_add(estimate.confirmation.map_or(0, |term| term.ns));
+  // Learned once this node measured a death (A-914): the tail of its silences to their takeover installs, the real
+  // thing; before, the estimate's detection and confirmation.
+  let condemned = state.failover.silence_tail().map_or_else(
+    || {
+      estimate
+        .detection
+        .map_or(0, |term| term.ns)
+        .saturating_add(estimate.confirmation.map_or(0, |term| term.ns))
+    },
+    |learned| learned.ns,
+  );
   let members = u64::try_from(state.fleet.members().len()).unwrap_or(u64::MAX);
   let period = state
     .failover
@@ -10892,8 +10945,9 @@ pub(crate) fn homing_window(state: &ShardState) -> slates_machine::Derived<u64> 
     .max(HEARTBEAT_NS);
   slates_machine::derived!(
     condemned.saturating_add(takeover_steps(members).saturating_mul(period)),
-    "detection + confirmation + (2 + 2 (members − 1)) × coordinator period",
+    "(learned silence to a takeover install, else detection + confirmation) + (2 + 2 (members − 1)) × coordinator period",
     [
+      "a death's silence to its takeover install, learned (A-914)",
       "failover detection (A-363)",
       "failover confirmation (A-363)",
       "members",
@@ -11011,6 +11065,8 @@ async fn run_record_plane(local: HostId) {
     // replies from peers, so the round must outlast the farthest one's round trip ([`consensus_budget`]).
     // On one host every path is inside a heartbeat and this is the budget it always was (R8).
     let budget = consensus_budget(slowest_path_tail_ns());
+    // Test support (A-914): a period stretched as a loaded host's are (`Daemon::inject_period_stretch`).
+    stretched_period().await;
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
     // then the records under the configuration it maintains.
     drive_config_council(local, budget, &mut council_timer, &mut in_flight).await;
