@@ -3360,6 +3360,15 @@
 > `hg_push::unbundle`); the anchor kills the daemon, and stock hg reads `bad HTTP status line: ''` (SSH: `stream ended
 > unexpectedly`). One 64 MiB file, or 16 MiB changed in place, passes.
 >
+> **Goal 93 perf, Subversion's bytes on the store against FSFS's (2026-11-24, w-perf; main 01a20182's order, item 4 of
+> the note of 11-21 21:50, "an order of magnitude faster" after C and R).** Measured, bytes only (BENCHMARKS, "A
+> Subversion repository's bytes on the changeset store against FSFS's"): git-2000's 2,000 revisions take 468,604 KiB
+> allocated (452,617 apparent) on the node's changeset store against stock FSFS's 51,020 (40,183), 9.2 and 11.3 times.
+> Under Ada's changeset ruling each revision's changed texts are kept whole (its changeset's Payload and Texts rows),
+> where FSFS keeps skip-deltas; deltas are derived, never stored (A-842). Owed: nothing before Subversion's C and R
+> close; any change keeps the ruling. Found beside it, P7's (where a Subversion import's memory is): of 691,504 KiB
+> resident after the import, the content arena's frees held for a committed image (`arena_deferred_bytes`) were
+> 489,299,968 B, the store's own content 2,624 B.
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
