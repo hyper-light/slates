@@ -6738,7 +6738,9 @@ fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
   let steps = steps_counted().saturating_sub(steps_before);
   let (long, most) = step_phases(&daemon);
   let (long_work, work_most) = work_stages(&daemon);
-  let units = |names: [&'static str; 14]| names.map(|name| counted_on(&daemon, REPOSITORY, name));
+  let units = |names: [&'static str; slates_git::negotiation::KINDS]| {
+    names.map(|name| counted_on(&daemon, REPOSITORY, name))
+  };
   let (long_units, unit_most) = (
     units(crate::vcs_store::upload::LONG_UNITS),
     units(crate::vcs_store::upload::UNIT_NS_MOST),
