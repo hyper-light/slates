@@ -971,14 +971,13 @@ fn file_push(
   (out, (changeset, manifest, files))
 }
 
-/// Takes `payload`, a changegroup of version 03, into a fork of `index`, the intake's cache bounded at `cache` bytes
-/// where given, each store want answered from the fork's own texts (the tests keep no changeset store): the fork, what
-/// was brought, and how many times the store was asked.
-fn taken_counting(
+/// Takes `payload`, a changegroup of version 03, into a fork of `index`, each store want answered with `given` where
+/// given, else from the fork's own texts (the tests keep no changeset store): the fork, what was brought, and how many
+/// times the store was asked.
+fn taken_answering(
   payload: &[u8],
-  index: &mut HgIndex,
-  store: &mut ContentStore,
-  cache: Option<u64>,
+  (index, store): (&mut HgIndex, &mut ContentStore),
+  given: Option<&[u8]>,
 ) -> (HgIndex, Intaken, u64) {
   let mut intake = Intake::begin(
     (crate::changegroup::Version::V03, payload),
@@ -987,9 +986,6 @@ fn taken_counting(
     &mut room(),
   )
   .unwrap();
-  if let Some(bound) = cache {
-    intake = intake.with_base_cache(bound);
-  }
   let mut asked = 0;
   loop {
     match intake.step(payload, store, &mut room()).unwrap() {
@@ -998,7 +994,10 @@ fn taken_counting(
       Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
       Stepped::Store => {
         asked += 1;
-        intake.answer_from_fork(store);
+        match given {
+          Some(text) => intake.answer_text(Some(text.to_vec())),
+          None => intake.answer_from_fork(store),
+        }
       }
     }
   }
@@ -1006,14 +1005,23 @@ fn taken_counting(
   (fork, intaken, asked)
 }
 
-/// A-767 C1 (main's ruling (b2) over (b1): a file delta's base the intake does not hold as the text kept last). Do: push
-/// one file's four revisions, the third and the fourth each a delta against a revision before the one kept last (a
-/// merge's base, as generaldelta sends one), once with the push's cache and once with none; then push a fifth revision
-/// as a delta against the first, which the first push landed. Expect every text kept as stock 7.2 would make it (the
-/// rows of both takes equal); with the cache, both bases found in it and nothing rebuilt; with none, each rebuilt from
-/// the push's own deltas; and the landed base read from the store, asked once.
+/// [`taken_answering`] from the fork's own texts.
+fn taken_counting(
+  payload: &[u8],
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+) -> (HgIndex, Intaken, u64) {
+  taken_answering(payload, (index, store), None)
+}
+
+/// Goal 93, C1 (2) (a file delta's base read from the fork's rows, a window at a time; it replaces main's rulings (b1)
+/// and (b2): the push's own deltas rebuilt and its own texts cached). Do: push one file's four revisions, the third and
+/// the fourth each a delta against a revision before the one kept last (a merge's base, as generaldelta sends one); then
+/// let the first revision's bytes go, as a landing does, and push a fifth revision as a delta against it. Expect every
+/// text read back as it was pushed; the first push's bases read from the fork, nothing rebuilt and nothing asked; and
+/// the let-go base asked of the store once, brought back and read.
 #[test]
-fn a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store() {
+fn a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows() {
   let texts: [(&[u8], Option<usize>); 4] = [
     (b"a\n", None),
     (b"a\nb\n", Some(0)),
@@ -1022,28 +1030,46 @@ fn a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_s
   ];
   let (payload, after) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
   let mut store = store();
-  let (mut cached_fork, cached, cached_asks) =
-    taken_counting(&payload, &mut HgIndex::new(), &mut store, None);
-  let (mut rebuilt_fork, rebuilt, rebuilt_asks) =
-    taken_counting(&payload, &mut HgIndex::new(), &mut store, Some(0));
+  let (fork, first, first_asks) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
   assert_eq!(
-    rows(&mut cached_fork, &store),
-    rows(&mut rebuilt_fork, &store)
+    (
+      first.kept,
+      first.base_store_reads,
+      first_asks
+    ),
+    (12, 0, 0),
+    "every base read from the fork's rows: four changesets, manifests and file revisions kept"
   );
-  assert_eq!(
-    (cached.base_hits, cached.base_rebuilds, cached_asks),
-    (2, 0, 0),
-    "the cache held both bases"
+  let read_back: Vec<(Node, Vec<u8>)> = after
+    .2
+    .iter()
+    .map(|(node, _)| {
+      let rev = fork.rev(&store, Log::File(b"f"), node).unwrap();
+      (
+        *node,
+        fork.revision_text(&store, Log::File(b"f"), rev).unwrap(),
+      )
+    })
+    .collect();
+  assert_eq!(read_back, after.2, "every text read back as it was pushed");
+  let (first_node, first_text) = after.2.first().cloned().unwrap();
+  let first_rev = fork.rev(&store, Log::File(b"f"), &first_node).unwrap();
+  let row = fork.revision(&store, Log::File(b"f"), first_rev).unwrap();
+  assert!(
+    store.let_go_object(&row.bytes) > 0,
+    "the first revision's bytes let go"
   );
-  assert_eq!(rebuilt.base_hits, 0);
-  assert!(rebuilt.base_rebuilds >= 2, "{rebuilt:?}");
-  assert_eq!(rebuilt_asks, 0);
+  let mut fork = fork;
   let (second, _) = file_push(&[(b"a\ne\n", Some(0))], (after.0, after.1, &after.2));
-  let (_, landed, landed_asks) = taken_counting(&second, &mut cached_fork, &mut store, None);
+  let (_, landed, landed_asks) = taken_answering(
+    &second,
+    (&mut fork, &mut store),
+    Some(first_text.as_slice()),
+  );
   assert_eq!(
     (landed.kept, landed.base_store_reads, landed_asks),
     (3, 1, 1),
-    "the landed base read from the store, asked once"
+    "the let-go base asked of the store once"
   );
 }
 
@@ -1064,7 +1090,7 @@ fn a_revision_longer_than_a_window_is_taken_a_window_a_step() {
   let (payload, _) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
   let take = |window: usize| {
     let mut store = ContentStore::new(1 << 30, window).unwrap();
-    let (mut fork, intaken, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store, None);
+    let (mut fork, intaken, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
     (rows(&mut fork, &store), intaken)
   };
   let (small_rows, small) = take(window);
@@ -1078,6 +1104,30 @@ fn a_revision_longer_than_a_window_is_taken_a_window_a_step() {
   );
   assert_eq!(large.spread, 0);
   assert_eq!(small.kept, large.kept);
+}
+
+/// Goal 93, C1 (2) (main's order of 2026-11-24 16:10: the push intake keeping no whole text; main's r618 reading: a long
+/// revision rebuilt into one buffer, its pending steps half the 57k intake's time). Do: take a push of one file revision
+/// three and a half content windows long and a delta over it into a store of the tests' window (4 KiB). Expect no more
+/// than two windows of text held at once (`Intaken::most_text_held`): the window being made
+/// and the window of its base being read. Red before: the whole rebuilt text, its base and the text kept last.
+#[test]
+fn a_long_revision_is_rebuilt_holding_no_more_than_two_windows_of_text() {
+  let window = 1 << 12;
+  let long: Vec<u8> = (0..window * 7 / 2)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut edited = long.clone();
+  edited.extend_from_slice(b"\nand a line more\n");
+  let texts: [(&[u8], Option<usize>); 2] = [(&long, None), (&edited, Some(0))];
+  let (payload, _) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let mut store = ContentStore::new(1 << 30, window).unwrap();
+  let (_, intaken, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
+  assert!(
+    intaken.most_text_held <= u64::try_from(2 * window).unwrap(),
+    "at most two windows of text held at once: {}",
+    intaken.most_text_held
+  );
 }
 
 /// Whether `refused` is the intake past its admission ([`Refused::past_admission`]).
@@ -1583,13 +1633,13 @@ fn a_pushs_segments_replay_onto_an_index_another_push_moved_their_bases_by_node(
     |range: core::ops::Range<usize>| range.map(|k| format!("f{k:03}")).collect::<Vec<_>>();
   let (first, line) = adding_files(Line::default(), &names(0..4));
   let mut store = store();
-  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store, None);
+  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store);
   let held = index.len(&store, Log::Manifest);
   let (pushed, _) = adding_files(line.clone(), &names(4..7));
   let (other, _) = adding_files(line, &names(9..10));
   let (records, fork, _) = segment_records_over(&pushed, &mut index, &mut store);
   assert!(records.len() > 1, "{} records", records.len());
-  let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
+  let (moved, _, _) = taken_counting(&other, &mut index, &mut store);
   core::mem::replace(&mut index, moved)
     .release(&mut store)
     .unwrap();
@@ -1624,11 +1674,11 @@ fn a_stale_forks_re_base_and_its_segments_replay_make_the_same_index() {
     |range: core::ops::Range<usize>| range.map(|k| format!("f{k:03}")).collect::<Vec<_>>();
   let (first, line) = adding_files(Line::default(), &names(0..4));
   let mut store = store();
-  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store, None);
+  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store);
   let (pushed, _) = adding_files(line.clone(), &names(4..7));
   let (other, _) = adding_files(line, &names(9..10));
   let (records, stale, intaken) = segment_records_over(&pushed, &mut index, &mut store);
-  let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
+  let (moved, _, _) = taken_counting(&other, &mut index, &mut store);
   core::mem::replace(&mut index, moved)
     .release(&mut store)
     .unwrap();

@@ -131,7 +131,7 @@ pub(crate) fn keep_one(
   store: &mut ContentStore,
   log: Log<'_>,
   (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
-  kept: Option<ContentId>,
+  (kept, whole): (Option<ContentId>, Option<u64>),
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
   let mut puts = Puts::default();
@@ -140,7 +140,7 @@ pub(crate) fn keep_one(
     Log::Changelog => changesets(fork, store, one, &mut puts, admission),
     Log::Manifest | Log::File(_) => {
       let files = matches!(log, Log::File(_));
-      revisions(store, (one, kept), &mut puts, admission, files).and_then(|group| {
+      revisions(store, (one, kept, whole), &mut puts, admission, files).and_then(|group| {
         fork
           .append_revisions_after(
             store,
@@ -174,10 +174,16 @@ fn append(
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
   changesets(fork, store, &verified.changesets, puts, admission)?;
-  let manifests = revisions(store, (&verified.manifests, None), puts, admission, false)?;
+  let manifests = revisions(
+    store,
+    (&verified.manifests, None, None),
+    puts,
+    admission,
+    false,
+  )?;
   fork.append_revisions(store, Log::Manifest, &manifests)?;
   for (path, arrived) in &verified.files {
-    let group = revisions(store, (arrived, None), puts, admission, true)?;
+    let group = revisions(store, (arrived, None, None), puts, admission, true)?;
     fork.append_revisions(store, Log::File(path), &group)?;
   }
   Ok(())
@@ -234,7 +240,7 @@ fn changesets(
 /// put's hold is, and given back with them.
 fn revisions(
   store: &mut ContentStore,
-  (arrived, kept): (&[Arrived], Option<ContentId>),
+  (arrived, kept, whole): (&[Arrived], Option<ContentId>, Option<u64>),
   puts: &mut Puts,
   admission: &mut Admission,
   files: bool,
@@ -270,7 +276,8 @@ fn revisions(
       p2,
       link: revision.link,
       flags: 0,
-      len: to_u64(revision.text.len()),
+      // A file revision taken a window a step arrives as its framing alone, its whole length told apart.
+      len: whole.unwrap_or_else(|| to_u64(revision.text.len())),
       bytes,
       block,
     });
