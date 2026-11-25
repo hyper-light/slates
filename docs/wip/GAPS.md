@@ -235,7 +235,10 @@
 > (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. Part 4: a holder's rebuild
 > after a warm restart makes a member by its lineage too (a root founds it, a branch is branched from its source, a
 > missing source rebuilt first a level an ask); red first in `merge_origin` (the branch had been refused as a mismatch).
-> Not run: a fleet test restarting a holder warm between a branch's versions (main's to ask for).
+> End to end (fleet, `a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after`): b restarted
+> warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
+> rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
+> b7e65cc63, part 4 in) held: 40 of 40, release and debug.
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
@@ -1527,6 +1530,23 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> C1 (2), first piece BUILT (main's order of 2026-11-24 16:10; main's r618 reading: a long revision rebuilt into one
+> buffer, the 57k intake's pending steps 51% of its time): a push's file revision is taken a window a step and never
+> whole. Its text is made from its delta over its base by `delta::Patching`, the base read in ranges (`delta::BaseRead`)
+> from the fork's row: its metadata block framed before its bytes, read through the content store's windows
+> (`ContentStore::run_at`), the push's own earlier revisions among them. A landed base whose windows were let go is asked
+> of the changeset store, brought back (`push::held::bring_back_file`) and read the same way. Each window made is hashed
+> into the node's check and the identity, its metadata block read off its front, and its bytes put through the streamed
+> put; the base's identity is the text kept last's, else hashed a window a step (`push::intake`'s `patched`). It
+> replaces rulings (b1) and (b2) for files: the chain rebuild from the push's own deltas, the push's cache of its own
+> texts and the file text kept last are gone. Held by
+> `a_long_revision_is_rebuilt_holding_no_more_than_two_windows_of_text` (a new `Intaken::most_text_held`; a 3.5-window
+> file and a delta at a 4 KiB window: red 43,025 bytes held at once, now at most 8,192),
+> `a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows` (nothing rebuilt or asked; a let-go base asked
+> once) and `a_delta_patched_a_slice_at_a_time_makes_the_same_text` (`Patching` against `apply`, every fill size and
+> refusal). Owed: the manifests a window at a time (kept as a delta against the one before, `Taker::last`, and
+> `read_of` parsing every entry), then the changesets; a let-go base's answer still arrives from the store whole, held
+> for the step that brings it back; and the base's identity hashed by reading the base a second time.
 > R, the import's peak (w-perf, 2026-11-24, main's order of 15:21). Measured at 15e739357, Mercurial's own history
 > (57,036 changesets) imported on an in-process daemon (`hg_import_memory`, ignored, run by name with
 > `SLATES_HG_IMPORT_SOURCE`): peak RSS 1,076,144 KiB, from D's 5.73 GB. Named by the per-shard gauges: the content
@@ -4762,7 +4782,9 @@
 >   `vcs_store.hg_intake_base_asks`) and the recovery's and rebuild's piece replays (`PieceStep::Store`,
 >   `hg_view::answer_wants_over` over the disk alone, since a recovery holds the state). A whole replay cannot wait,
 >   so it is refused typed (`record::Refused::StoreWanted`): no register-held push record remains since e6c3f10cd.
->   The daemon counts each push's `vcs.hg.push_base_hits`, `_rebuilds` and `_store_reads`.
+>   The daemon counts each push's `vcs.hg.push_base_hits`, `_rebuilds` and `_store_reads`. Superseded 2026-11-24 by C1
+>   (2)'s first piece: file bases are read from the fork's rows a window at a time; the cache, the rebuild and their two
+>   counters are gone, and `vcs.hg.push_base_store_reads` counts only a let-go base asked of the store.
 > - Held by `push::intake::tests::a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store`
 >   (one file's four revisions, two deltas against a revision before the last: with the cache 2 hits and nothing
 >   rebuilt; with none every base rebuilt and the rows equal; a later push's base landed before, read from the store
