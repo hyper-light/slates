@@ -1,5 +1,13 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~18:00 PST
+- Goal 93 hg R: measured the 57k import at 15e739357 (peak RSS 1,076,144 KiB, from 5.73 GB; one segment's file texts
+  held whole, about 600 MB, set the content object's high-water). LANDED 0d05da26e: a segment is also cut once its
+  kept file texts reach segment_bytes; counter vcs_store.hg_import.segments_cut_by_texts. Red 46 MB held vs 4.2 MB bound.
+- hg_import_memory (ignored measurement) on main for main's 57k rerun.
+- Logs' texts held until import lands: w-hg's after C1 (2)'s manifest piece.
+- Next (main's close list): deltify job, then svn storage A/B against FSFS.
+
 ## 2026-11-24 ~16:30 PST
 - LANDED 15e739357: every Mercurial replay lets go what it brought back from the changeset store (successor's unknown
   texts, restart's let-go ones) through hg_run::let_go_committed; counter vcs_store.hg_brought_back_let_go equals the
