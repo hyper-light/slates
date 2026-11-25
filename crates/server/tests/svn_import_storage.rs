@@ -58,6 +58,13 @@ fn du_kib(dir: &str) -> (u64, u64) {
   (kib(&["-sk"]), kib(&["-sk", "-A"]))
 }
 
+/// This process's physical footprint, KiB, on macOS (`phys_footprint`, `Facts::footprint_now`); `None` elsewhere, where
+/// the resident set is the honest reading. On macOS a purge's pages leave the footprint at once and stay in the resident
+/// set until the kernel takes them (goal 93 P7, main's ruling of 2026-11-25: judge the arms on this there).
+fn footprint_kib() -> Option<u64> {
+  slates_machine::facts::Facts::footprint_now().map(|bytes| bytes >> 10)
+}
+
 /// The daemon's memory gauges, each shard's by its own name (`s<partition>:<row>`).
 fn gauges(client: &mut slates_client::Client) -> BTreeMap<String, u64> {
   let report = client.daemon_memory_status().unwrap();
@@ -90,9 +97,11 @@ fn a_subversion_imports_bytes_on_the_store_are_measured_against_fsfs() {
   let store = format!("{}/store", served.base());
   let before = du_kib(&store);
   let resident_before = resident_kib();
+  let footprint_before = footprint_kib();
   let imported = client.import_repository("dumped", &dump);
   let measured = Measured {
     resident: (resident_before, resident_kib()),
+    footprint: (footprint_before, footprint_kib()),
     rows: gauges(&mut client),
     store: (before, du_kib(&store)),
   };
@@ -135,7 +144,7 @@ fn settled_reading(
   }
 }
 
-/// Prints the second reading's arena gauges and the import's purge counters, and the time it waited.
+/// Prints the second reading's arena gauges, the process's resident size and (macOS) footprint, and the time it waited.
 fn print_settled((waited, rows): &(std::time::Duration, BTreeMap<String, u64>)) {
   println!(
     "svn_import_storage: settled after {} ms",
@@ -147,6 +156,8 @@ fn print_settled((waited, rows): &(std::time::Duration, BTreeMap<String, u64>)) 
     "content.arena_resident_free_bytes",
     "content.arena_mapped_bytes",
     "content.object_resident_bytes",
+    "process.resident_bytes",
+    "process.footprint_bytes",
   ] {
     println!(
       "svn_import_storage: settled {kind} = {}",
@@ -166,11 +177,14 @@ fn dumped_repository() -> slates_client::RepositorySpec {
   }
 }
 
-/// What the run read while the daemon served: the process's resident set before and after the import (KiB), the
+/// What the run read while the daemon served: the process's resident set and (macOS) footprint before and after the
+/// import (KiB), the
 /// gauges after it, and the store's directory before it and right after it (KiB, allocated and apparent).
 struct Measured {
   /// Resident before and after the import.
   resident: (u64, u64),
+  /// The physical footprint before and after the import, on macOS ([`footprint_kib`]).
+  footprint: (Option<u64>, Option<u64>),
   /// The gauges after the import.
   rows: BTreeMap<String, u64>,
   /// The store before the import and live after it.
@@ -194,6 +208,9 @@ fn print_measured(measured: &Measured, after: (u64, u64)) {
     "svn_import_storage: resident KiB before {}, after the import {}",
     measured.resident.0, measured.resident.1
   );
+  if let (Some(before), Some(after)) = measured.footprint {
+    println!("svn_import_storage: footprint KiB before {before}, after the import {after}");
+  }
   let mut listed: Vec<(&String, &u64)> = measured
     .rows
     .iter()

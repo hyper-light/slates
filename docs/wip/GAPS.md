@@ -2899,6 +2899,11 @@
 > before and after). `object_resident_bytes` now reads `mincore` less the pages a region holds marked reusable, the
 > pages the process still owns (`Region::residency_in_use`; main's ruling of 2026-11-25): red
 > `a_purged_shared_region_reads_its_purged_pages_out_of_its_residency`, 32 MiB read resident after the purge; now 0.
+> A memory status now names the process's resident size (`mem.gauge.process.resident_bytes`) and, on macOS, its
+> physical footprint beside it (`mem.gauge.process.footprint_bytes`, `Facts::footprint_now`); `svn_import_storage`
+> prints both in both readings, and BENCHMARKS' method note says why RSS across a purge on macOS compares nothing
+> (`the_control_shards_memory_status_names_the_processs_resident_and_on_macos_its_footprint`: red, no such rows). P7's
+> after arm is judged on the footprint on macOS against the bound arm's, at the settled reading (main).
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
