@@ -832,3 +832,10 @@
   timer); ids monotonic, old-generation handles SpawnerGone; in-flight bound tasks_per_shard → Busy (NoRoom).
   Red: owned spawner killed → next spawn's child from a new spawner. OWED (main's): footprint on a release daemon.
   NEXT: SSH close + seats, then open_tree delta counters.
+- 11-25 ~22:00 PST: LANDED open_tree counters 4940e5433 (merge 7101fac33): tree_deltas / tree_deltas_most (78/12 on a
+  13-tree chain). Then the fetch's read cache 987280211 (merge fab8df73e): a fetch reads through a FORK
+  (Repository::fork) whose read scratch had budget 0 → every tree read rebuilt its chain (O(depth²)); now
+  Graph::opening_tree → Repository::widen_read_cache (learned_depth × tree len, charged to the fetch's admission),
+  released with the fork. Red 78 → 12 deltas (most stays 12: newest first). Freed 2.4 GiB of my target at main's ask.
+  WAITING: main's watchdog A/B (SSH close/seats + hook_driver lingering-child flake, one piece), main's footprint run
+  (A-924 cost line), main's git leg (real-clone tree_deltas before/after).
