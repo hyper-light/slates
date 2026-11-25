@@ -94,6 +94,8 @@ pub struct Curve {
   sampled: f64,
   /// `Σ R` over every read: the reads counted, in sampled units.
   expected: f64,
+  /// The key map's inserts a read made ([`Curve::key_inserts`]).
+  inserts: u64,
 }
 
 impl Curve {
@@ -113,6 +115,7 @@ impl Curve {
       cold: 0.0,
       sampled: 0.0,
       expected: 0.0,
+      inserts: 0,
     }
   }
 
@@ -130,13 +133,39 @@ impl Curve {
     self.threshold as f64 / f64::from(u64::BITS).exp2()
   }
 
-  /// One read of the object whose uniform hash is `key` and whose length is `bytes`.
+  /// One read of the object whose uniform hash is `key` and whose length is `bytes`. A read of the key read last, at
+  /// the same length, is counted at its own length alone and touches neither the key map nor the tree: no byte was read
+  /// since it, and it is already the newest (a walk re-reading a table's windows read every time through the map, about
+  /// a fifth of a git clone's object-choosing walk; main 01a20182's item of 2026-11-24). It answers as moving it would:
+  /// the same distance counted, the same bytes in the tree, the keys in the same order.
   pub fn read(&mut self, key: u64, bytes: u64) {
+    self.read_guarded(key, bytes, true);
+  }
+
+  /// [`Curve::read`], its guard for the key read last kept or not: the tests' reference, every sampled read moving
+  /// its key, as before the guard.
+  #[cfg(test)]
+  pub(crate) fn read_moving(&mut self, key: u64, bytes: u64) {
+    self.read_guarded(key, bytes, false);
+  }
+
+  /// The key map's inserts the reads made: one a sampled read that moves its key, none a re-read of the key read last
+  /// ([`Curve::read`]).
+  pub fn key_inserts(&self) -> u64 {
+    self.inserts
+  }
+
+  /// [`Curve::read`], the re-read of the key read last counted in place where `guarded`.
+  fn read_guarded(&mut self, key: u64, bytes: u64, guarded: bool) {
     self.expected += self.sampling_rate();
     if key >= self.threshold {
       return;
     }
     self.sampled += 1.0;
+    if guarded && self.is_newest(key, bytes) {
+      self.count(0, bytes);
+      return;
+    }
     match self.keys.get(&key).copied() {
       Some((slot, held)) => {
         let after = self.total().saturating_sub(self.prefix(slot));
@@ -249,6 +278,13 @@ impl Curve {
     }
   }
 
+  /// Whether `key` holds the slot given last, at `bytes`: the key read last, nothing read since it.
+  fn is_newest(&self, key: u64, bytes: u64) -> bool {
+    self.next_slot.checked_sub(1).is_some_and(|last| {
+      self.slot_keys.get(last) == Some(&Some(key)) && self.keys.get(&key) == Some(&(last, bytes))
+    })
+  }
+
   /// Puts `key` at the next slot with `bytes`, renumbering the slots first when none is left.
   fn place(&mut self, key: u64, bytes: u64) {
     if self.next_slot >= self.slot_keys.len() {
@@ -260,6 +296,7 @@ impl Curve {
     }
     self.add(slot, bytes, true);
     self.keys.insert(key, (slot, bytes));
+    self.inserts = self.inserts.saturating_add(1);
     self.next_slot = slot.saturating_add(1);
   }
 

@@ -381,6 +381,12 @@ pub(crate) const SEGMENTS_UNLANDED: &str = "vcs_store.hg_import.segments_unlande
 pub(crate) const SEGMENTS_CUT_BY_TEXTS: &str = "vcs_store.hg_import.segments_cut_by_texts";
 /// Counter: a segment cut by its changegroup's bytes, or at the stream's end. Format: a counter name.
 pub(crate) const SEGMENTS_CUT_BY_BYTES: &str = "vcs_store.hg_import.segments_cut_by_bytes";
+/// Counter: the nanoseconds the import's task waited, summed, for the store to land its segments, each durable before
+/// the next turn (its one flush; main 01a20182's order of 2026-11-24: the landings' own share of an import's time).
+/// Format: a counter name in the status report.
+pub(crate) const SEGMENT_LAND_WAIT_NS: &str = "vcs_store.hg_import.segment_land_wait_ns";
+/// Counter: the longest of those waits, nanoseconds. Format: a counter name.
+pub(crate) const SEGMENT_LAND_WAIT_MAX_NS: &str = "vcs_store.hg_import.segment_land_wait_max_ns";
 
 /// A segment changeset to land: the store, its header, its sections, and its payload's identity.
 pub(crate) type SegmentLanding = (
@@ -1343,9 +1349,14 @@ async fn land_segments(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
       return Some(Ok(()));
     };
     let sequence = header.sequence;
+    let began = slates_rt::futures::now_ns();
     let landed = disk.land(header, parts).await.is_ok();
-    let counted =
-      crate::state::with_state(|state| segment_landed(state, id, (sequence, identity), landed))?;
+    let waited = slates_rt::futures::now_ns().saturating_sub(began);
+    let counted = crate::state::with_state(|state| {
+      state.count(SEGMENT_LAND_WAIT_NS, waited);
+      state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
+      segment_landed(state, id, (sequence, identity), landed)
+    })?;
     if let Err(failed) = counted {
       return Some(Err(failed));
     }

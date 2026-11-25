@@ -697,6 +697,26 @@ fn gauge(state: &ShardState, name: &str) -> u64 {
     .map_or(0, |(_, value)| value)
 }
 
+/// [`fronted_history`]'s directory beside the test binary, made empty: a step that fails here fails the test, so a
+/// skip is only ever `hg` not running.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn scratch_repository(name: &str) -> std::path::PathBuf {
+  let binary = std::env::current_exe().expect("the test binary's path");
+  let dir = binary
+    .parent()
+    .expect("the test binary's directory")
+    .join(format!("hg-import-{name}-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).expect("the repository's directory");
+  dir
+}
+
+/// `bytes` written to `path` for [`fronted_history`]; a write that fails fails the test.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn written(path: &std::path::Path, bytes: &[u8]) {
+  std::fs::write(path, bytes).expect("the file written");
+}
+
 /// A Mercurial repository stock `hg` makes in a directory of its own beside the test binary: one file of
 /// [`HELD_FILE_BYTES`] and a line committed, then a line put at its front in each of the next changesets,
 /// [`HELD_CHANGESETS`] in all.
@@ -714,13 +734,7 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
       .ok()
       .filter(|out| out.status.success())
   };
-  let binary = std::env::current_exe().expect("the test binary's path");
-  let dir = binary
-    .parent()
-    .expect("the test binary's directory")
-    .join(format!("hg-import-{name}-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir_all(&dir).expect("the repository's directory");
+  let dir = scratch_repository(name);
   hg(&dir, &["init"])?;
   let mut text: Vec<u8> = (0..HELD_FILE_BYTES)
     .map(|at| {
@@ -735,7 +749,7 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
     // At the front: every window of the file moves, so no two revisions share one (the content store keeps an object
     // by its windows, and a line appended at the end would leave all but the last shared).
     text.splice(0..0, format!("line {changeset}\n").bytes());
-    std::fs::write(dir.join("big.txt"), &text).expect("the file written");
+    written(&dir.join("big.txt"), &text);
     let message = format!("changeset {changeset}");
     let args: &[&str] = if changeset == 0 {
       &["commit", "-q", "-A", "-m", &message]
@@ -749,19 +763,21 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
 
 /// Goal 93 hg, R (main 01a20182's order of 2026-11-24 15:21; w-perf's measurement of Mercurial's own history at
 /// 15e739357: peak RSS 1.03 GiB, set while one segment's file texts, about 600 MB whole, waited for their segment to be
-/// cut). An import keeps each file revision's whole text in the content store until the segment holding its delta lands,
-/// then lets it go (A-767 C1 step 2b); a segment is cut once its changegroup's bytes reach the segment's bound
+/// cut). An import keeps each file revision's whole text in the content store until the segment holding its delta
+/// lands, then lets it go (A-767 C1 step 2b); a segment is cut once its changegroup's bytes reach the segment's bound
 /// (`segment_bytes`). Derived bound: an import holds one segment at a time, so what it holds of a segment's file texts
-/// is held to the same bound as the segment: at most the bound plus the one text kept by the unit that crosses it, under
-/// twice the bound here (each text [`HELD_FILE_BYTES`] and its lines, under the bound). Do: make, with stock `hg`, one
-/// file of [`HELD_FILE_BYTES`] given a line at its front in each of [`HELD_CHANGESETS`] changesets (whole texts about
-/// 64 MiB, no window shared, deltas a line each); import it through the production host adapter a unit a turn, landing the segments each turn cut before
-/// the next as the shard's task does (`run`), and read after each landing the windows the content store holds
-/// (`mem.gauge.vcs_content.stored_bytes`); once every segment has landed, read them again (the changelog's and the
-/// manifests' texts, held until the import lands, P5). Expect: the most held after any turn at most what is held at the
-/// end plus twice the segment's bound; segments cut by their texts (`vcs_store.hg_import.segments_cut_by_texts`), so the
-/// bound is the cut's doing. Failing first: 46,162,339 bytes held after one turn against 8,950 at the end and a 2 MiB
-/// bound, the whole history's file texts in one segment, its deltas never reaching the bound before the stream's end. Skips, saying so, where `hg` is not installed.
+/// is held to the same bound as the segment: at most the bound plus the one text kept by the unit that crosses it,
+/// under twice the bound here (each text [`HELD_FILE_BYTES`] and its lines, under the bound). Do: make, with stock
+/// `hg`, one file of [`HELD_FILE_BYTES`] given a line at its front in each of [`HELD_CHANGESETS`] changesets (whole
+/// texts about 64 MiB, no window shared, deltas a line each); import it through the production host adapter a unit a
+/// turn, landing the segments each turn cut before the next as the shard's task does (`run`), and read after each
+/// landing the windows the content store holds (`mem.gauge.vcs_content.stored_bytes`); once every segment has landed,
+/// read them again (the changelog's and the manifests' texts, held until the import lands, P5). Expect: the most held
+/// after any turn at most what is held at the end plus twice the segment's bound; segments cut by their texts
+/// (`vcs_store.hg_import.segments_cut_by_texts`), so the bound is the cut's doing; the landings' waits counted
+/// (`vcs_store.hg_import.segment_land_wait_ns`). Failing first: 46,162,339 bytes held after one turn against 8,950 at
+/// the end and a 2 MiB bound, the whole history's file texts in one segment, its deltas never reaching the bound before
+/// the stream's end. Skips, saying so, where `hg` is not installed.
 #[test]
 fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
   let Some(repository) = fronted_history("held") else {
@@ -774,7 +790,7 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   // A task on the shard, a turn a step and its segments landed before the next, as the shard's own task runs an import
   // (`run`): an import of this size in one step spins the shard past its window.
-  let (most, at_end, bound, by_texts) = crate::test_store::run_on_first(
+  let (most, at_end, bound, (by_texts, waited)) = crate::test_store::run_on_first(
     &daemon,
     move || async move {
       use crate::repository::svn_commit::tests::on;
@@ -809,7 +825,12 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
         }
         slates_rt::futures::yield_now().await;
       }
-      let by_texts = on(|state| count(state, super::SEGMENTS_CUT_BY_TEXTS));
+      let by_texts = on(|state| {
+        (
+          count(state, super::SEGMENTS_CUT_BY_TEXTS),
+          count(state, super::SEGMENT_LAND_WAIT_NS),
+        )
+      });
       (most, stored(), bound, by_texts)
     },
     TASK_WAIT,
@@ -824,5 +845,9 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
   assert!(
     by_texts > 0,
     "segments cut by their texts (`vcs_store.hg_import.segments_cut_by_texts`)"
+  );
+  assert!(
+    waited > 0,
+    "the landings' waits counted (`vcs_store.hg_import.segment_land_wait_ns`)"
   );
 }

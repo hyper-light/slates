@@ -168,3 +168,86 @@ fn the_keys_kept_follow_the_memory_given() {
   assert!(keys_within(1 << 20) > keys_within(1 << 10));
   assert!(keys_within(1 << 10) >= 1);
 }
+
+/// A walk that re-reads what it read last: `runs` runs over `objects` objects drawn from a xorshift stream, each run
+/// one object read one to eight times in a row, as an index walk re-reads a table's windows. Each run's object differs
+/// from the one before it.
+fn rereading_trace(objects: u64, runs: usize) -> (Vec<(u64, u64)>, u64) {
+  let mut state = 0x2545_F491_4F6C_DD1Du64;
+  let mut next = || {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+  };
+  let (mut reads, mut last, mut changes) = (Vec::new(), None, 0u64);
+  while reads.len() < runs.saturating_mul(4) && changes < runs as u64 {
+    let object = next() % objects;
+    if last == Some(object) {
+      continue;
+    }
+    last = Some(object);
+    changes += 1;
+    for _ in 0..=(next() % 8) {
+      reads.push((object, bytes_of(object)));
+    }
+  }
+  (reads, changes)
+}
+
+/// Main 01a20182's item of 2026-11-24 (w-git's guard): the curve cost about a fifth of a git clone's object-choosing
+/// walk (`Curve::read` 2,906 and its key map's insert 1,749 of 23,095 work samples), an index walk re-reading a few
+/// table windows so the curve never filled and every read went through the map. Do: read a 2,000-run re-reading trace
+/// ([`rereading_trace`]) over 300 objects into a curve through `read`, and the same trace into one through `read_moving`
+/// (every sampled read moving its key, as before the guard), each at a capacity of 64 keys so its threshold falls and
+/// it shrinks, and again at 4,096 (every key sampled). Expect: the key map's inserts at most one a run (a re-read of
+/// the key read last inserts nothing); and every answer the reference's: the miss ratio and the misses at every cache
+/// of `2^b - 1` windows (`b` 0 to 16) equal to the last bit, the reads, the working set and the edges. Failing first:
+/// one insert every sampled read.
+#[test]
+fn a_reread_of_the_key_read_last_inserts_nothing_and_answers_as_before() {
+  let (reads, runs) = rereading_trace(300, 2_000);
+  assert!(reads.len() as u64 > runs * 3, "re-reads in the trace");
+  for capacity in [64, 4_096] {
+    let mut guarded = Curve::new(capacity, GRANULE);
+    let mut moving = Curve::new(capacity, GRANULE);
+    for &(object, bytes) in &reads {
+      guarded.read(key_of(object), bytes);
+      moving.read_moving(key_of(object), bytes);
+    }
+    assert!(
+      guarded.key_inserts() <= runs,
+      "capacity {capacity}: {} inserts for {runs} runs ({} reads)",
+      guarded.key_inserts(),
+      reads.len()
+    );
+    assert!(
+      moving.key_inserts() > runs,
+      "the reference moves every read"
+    );
+    assert_same_answers(&guarded, &moving, capacity);
+  }
+}
+
+/// Holds `guarded`'s answers to `moving`'s, to the last bit.
+fn assert_same_answers(guarded: &Curve, moving: &Curve, capacity: usize) {
+  for bits in 0..=16u32 {
+    let cache = ((1u64 << bits) - 1) * GRANULE;
+    assert_eq!(
+      guarded.miss_ratio(cache).to_bits(),
+      moving.miss_ratio(cache).to_bits(),
+      "capacity {capacity}, cache {cache}"
+    );
+    assert_eq!(
+      guarded.misses(cache).to_bits(),
+      moving.misses(cache).to_bits(),
+      "capacity {capacity}, cache {cache}"
+    );
+  }
+  assert_eq!(guarded.reads().to_bits(), moving.reads().to_bits());
+  assert_eq!(guarded.working_set(), moving.working_set());
+  assert_eq!(
+    guarded.edges().collect::<Vec<_>>(),
+    moving.edges().collect::<Vec<_>>()
+  );
+}
