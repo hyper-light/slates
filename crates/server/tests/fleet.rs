@@ -37537,24 +37537,30 @@ fn stretched_death(
   fleet.daemons.remove(death).stop();
   let window = fleet.daemons[0].homing_window();
   let pushed = fleet.push_on_top(0, (file, file.as_bytes()));
-  // Taken over, and no longer seated: at `f = 1` the next death must come after this one's recovery, or two voters are
-  // gone at once and the council can commit nothing (2 runs in 11 before this wait: the second takeover never came).
-  let survivors = fleet.daemons.iter().collect::<Vec<_>>();
-  let taken = poll_survivors_retire(&fleet.daemons, gone)
-    && poll_until(&survivors, RETIREMENT_DEADLINE, || {
-      all_council(&fleet.daemons, |members| !members.contains(&gone))
-    })
-    && poll_until(&survivors, RETIREMENT_DEADLINE, || {
-      all_hold(fleet.daemons.iter().map(|daemon| {
-        daemon
-          .council_known_voters()
-          .map(|voters| !voters.contains(&gone))
-      }))
-    });
+  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
   for daemon in &fleet.daemons {
     daemon.inject_period_stretch(None).unwrap();
   }
   (window, pushed, taken, fleet.daemons[0].homing_window())
+}
+
+/// Polls until every survivor retired `gone`, committed a configuration without it (its takeover installed) and no
+/// longer knows it to vote: at `f = 1` a next death must come after this one's recovery, or two voters are gone at once
+/// and the council can commit nothing (a914: 2 runs in 11 before this wait, the second takeover never came). Whether
+/// they all did by the retirement deadline.
+fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
+  let observed = survivors.iter().collect::<Vec<_>>();
+  poll_survivors_retire(survivors, gone)
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(survivors, |members| !members.contains(&gone))
+    })
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_hold(survivors.iter().map(|daemon| {
+        daemon
+          .council_known_voters()
+          .map(|voters| !voters.contains(&gone))
+      }))
+    })
 }
 
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover

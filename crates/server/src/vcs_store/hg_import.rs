@@ -433,6 +433,7 @@ pub(crate) fn segment_changeset(
         offset: kept.place.start,
         len: kept.place.end.saturating_sub(kept.place.start),
       },
+      form: slates_store::texts::Form::Raw,
     })
     .collect();
   let header = slates_store::log::Header {

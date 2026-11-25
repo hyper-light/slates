@@ -91,10 +91,10 @@ const MODE_MASK: u8 = 0b11;
 const UNHASHED_FLAGS: u16 = (1 << 15) | (1 << 14) | (1 << 13);
 
 /// Format: a chunk's zlib header.
-const ZLIB: u8 = b'x';
+pub(crate) const ZLIB: u8 = b'x';
 
 /// Format: a chunk's zstd header, a frame's magic's first byte.
-const ZSTD: u8 = b'(';
+pub(crate) const ZSTD: u8 = b'(';
 
 /// Format: a raw chunk's header, dropped.
 const RAW: u8 = b'u';

@@ -2218,6 +2218,11 @@ pub(crate) const RECOMPUTE_MISMATCH: &str = "merge.recompute_mismatch";
 /// version 0 for a green it already replicates differently); the owner re-ships in order.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const OUT_OF_ORDER: &str = "merge.out_of_order";
+/// Counted on a holder for each merge record it answered behind (A-918, `ContentMessage::Behind`): a version past what
+/// its replica holds that its own ledger cannot bring it to. Format: a counter name.
+pub(crate) const BEHIND_ANSWERED: &str = "merge.behind.answered";
+/// Counted on an owner for each behind answer a target gave a pending version's record (A-918). Format: a counter name.
+pub(crate) const BEHIND_HEARD: &str = "merge.behind.heard";
 /// Counted on a holder whose held inputs did not decode as an increment or origin (a corrupt hold).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const INPUTS_UNDECODABLE: &str = "merge.inputs_undecodable";
@@ -2587,9 +2592,30 @@ pub struct PendingGreen {
 }
 
 impl PendingGreen {
-  /// The versions whose records are not yet placed, oldest first: what a refused push barrier names.
-  pub(crate) fn versions(&self) -> Vec<u64> {
-    self.records.keys().copied().collect()
+  /// What each pending version waits for, for a refused push barrier's log (A-918): its record's candidates,
+  /// acknowledgements and joint cohorts, its inputs' acknowledgements, the targets still lacking inputs or building a
+  /// replica, and the holders still owed each version. Text, for the log alone, on the refusal's cold path; bounded by
+  /// the pending versions times the members.
+  pub(crate) fn waits(&self) -> String {
+    let versions: Vec<String> = self
+      .records
+      .iter()
+      .map(|(version, pending)| {
+        format!(
+          "v{version}: record candidates {:?} acked {:?} joint {:?}; inputs acked {:?}; lacking {:?}; building {:?}; \
+           behind {:?}; shipments {}",
+          pending.record.candidates,
+          pending.record.acked,
+          pending.record.joint,
+          pending.inputs.acked,
+          pending.lacking.keys().collect::<Vec<_>>(),
+          pending.building,
+          pending.behind,
+          pending.shipments,
+        )
+      })
+      .collect();
+    format!("{versions:?} owed {:?}", self.owed)
   }
 
   /// The oldest version whose record is not yet placed, if any: its inputs are read from the chain until it is.
@@ -2702,6 +2728,10 @@ pub struct PendingMergeRecord {
   /// (`ContentMessage::ReplicaBuilding`, A-813's limit): the latest alone, so it holds one word a target; a push's
   /// barrier reads it rising as progress ([`replica_builds_done`]).
   pub building: BTreeMap<HostId, u64>,
+  /// Each target that answered it is behind the record (`ContentMessage::Behind`, A-918), with the newest version its
+  /// replica holds, `None` for none of the green: the latest answer alone, so it holds one entry a target. Bounded by
+  /// the candidates; a target leaves once it acknowledges.
+  pub behind: BTreeMap<HostId, Option<u64>>,
   /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
   pub enqueued_ns: u64,
   /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
@@ -3394,6 +3424,7 @@ pub(crate) fn insert_pending(
       work,
       lacking: BTreeMap::new(),
       building: BTreeMap::new(),
+      behind: BTreeMap::new(),
       enqueued_ns: slates_machine::clock::monotonic_ns(),
       shipments: 0,
       inputs_manifest: None,
@@ -4224,9 +4255,45 @@ async fn ship_record(
     if let Some(placement) = placement {
       record_merge_acks_in(s, local, object, version, placement, quorum, period);
     }
+    record_behind_answers(s, (object, version), &answers);
     record_inputs_answers(s, (object, version, manifest), answers, carried);
   });
   Some(dispatch)
+}
+
+/// Records each target that answered `version`'s record of `object` behind (A-918, `ContentMessage::Behind`) on its
+/// pending record, counted [`BEHIND_HEARD`], so a refused barrier names it and the catch-up reads it; a target that
+/// acknowledged leaves. A record no longer pending records nothing.
+fn record_behind_answers(
+  state: &mut ShardState,
+  (object, version): (ObjectId, u64),
+  answers: &[(HostId, Vec<u8>)],
+) {
+  let mut heard = 0u64;
+  if let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&object)
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  {
+    pending
+      .behind
+      .retain(|host, _| !pending.record.acked.contains(host));
+    for (host, answer) in answers {
+      if let Ok(slates_cluster::content::ContentMessage::Behind {
+        object: behind,
+        sequence,
+        reached,
+      }) = slates_cluster::content::ContentMessage::decode(answer)
+        && behind == object
+        && sequence == version
+      {
+        pending.behind.insert(*host, reached);
+        heard = heard.saturating_add(1);
+      }
+    }
+  }
+  state.count(BEHIND_HEARD, heard);
 }
 
 /// Records what each target that did not acknowledge `version`'s record answered about its inputs, `manifest` (§4.16
@@ -4857,11 +4924,19 @@ const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
 const RECORD_WITHHELD: &str = "merge.record_withheld";
 
 /// Where a merge record's version stands against this holder's replica of its green (§4.16 "Apply on holders").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordStanding {
   /// A version the replica already applied: the acceptor re-acknowledges it (idempotent).
   Applied,
   /// The replica's next version, or version 0 of a green this holder has no replica of: it is recomputed here.
   Next,
+  /// Ahead of what this holder holds, which it cannot catch up to from its own ledger (A-918): answered typed
+  /// ([`ContentMessage::Behind`](slates_cluster::content::ContentMessage::Behind)) with the newest version its replica
+  /// holds, `None` for none of the green, so the owner learns it rather than a silence.
+  Behind {
+    /// The newest version this holder's replica holds, `None` for none of the green.
+    reached: Option<u64>,
+  },
 }
 
 /// The standing of `version` of `object`'s merge records on this holder, or `None` when nothing may be acknowledged now:
@@ -4894,9 +4969,10 @@ fn record_standing(
     (None, 0) => Some(RecordStanding::Next),
     (Some(next), version) if version == next => Some(RecordStanding::Next),
     (Some(next), version) => catch_up(state, object, (next, version), sender),
+    // None of the green held: a candidate a death brought in (A-918).
     _ => {
       state.count(OUT_OF_ORDER, 1);
-      None
+      Some(RecordStanding::Behind { reached: None })
     }
   }
 }
@@ -4909,21 +4985,23 @@ fn record_standing(
 /// from this holder's own ledger: with their inputs held, the replica is advanced through the version before and the
 /// record served as its next; with an input not held, it is fetched by identity from `sender`, the record's owner, which
 /// holds every version's inputs while its records name them (A-244), and the record waits for the owner's next
-/// shipment. A version between whose record this holder lacks is out of order, as before.
+/// shipment. A version between whose record this holder lacks is out of order, and answered behind (A-918), typed.
 fn catch_up(
   state: &mut ShardState,
   object: ObjectId,
   (next, version): (u64, u64),
   sender: HostId,
 ) -> Option<RecordStanding> {
+  let reached = next.checked_sub(1);
   let Some(through) = version.checked_sub(1) else {
     state.count(OUT_OF_ORDER, 1);
-    return None;
+    return Some(RecordStanding::Behind { reached });
   };
   match crate::merge_origin::ledger_unheld(state, object, (next, through)) {
+    // A version between whose record this holder lacks (A-918: answered typed).
     Err(_) => {
       state.count(OUT_OF_ORDER, 1);
-      None
+      Some(RecordStanding::Behind { reached })
     }
     Ok(unheld) if !unheld.is_empty() => {
       crate::fleet::fetch_ledger_inputs(state, object, sender, unheld);
@@ -5021,6 +5099,15 @@ pub(crate) fn accept_merge_record(
       return crate::fleet::accept_held_record(state, local, peer_host, record);
     }
     Some(RecordStanding::Next) => {}
+    Some(RecordStanding::Behind { reached }) => {
+      state.count(BEHIND_ANSWERED, 1);
+      return slates_cluster::content::ContentMessage::Behind {
+        object,
+        sequence: value.version,
+        reached,
+      }
+      .encode();
+    }
   }
   // Version 0 of a green over a base: its replica is seeded from the origin a share at a time (A-286).
   if value.version == 0
@@ -5553,6 +5640,7 @@ mod tests {
       work: None,
       lacking: BTreeMap::new(),
       building: BTreeMap::new(),
+      behind: BTreeMap::new(),
       enqueued_ns: 0,
       shipments: 0,
       inputs_manifest: None,
@@ -5610,6 +5698,120 @@ mod tests {
   /// AC-6.3, §4.16 ordered holder replication; AUD-13: A and B place version 0 while C is
   /// unavailable. Expect version 1 to be shipped to B while C's version 0 remains owed. Once C
   /// acknowledges 0, its next shipment must be 1, preserving its contiguous chain.
+  /// A-918: a holder that holds none of a green answers a later version of it behind, reached none, where it answered
+  /// nothing before; its version 0 is still its next.
+  #[test]
+  fn a_holder_holding_none_of_a_green_stands_behind_a_later_version_and_next_at_version_zero() {
+    let (later, zero, counted) = crate::daemon::audit_on_shard(|state| {
+      let object = ObjectId([31; 16]);
+      let sender = HostId(state.fleet.host().0 ^ 1);
+      let later = record_standing(state, object, 2, sender);
+      let zero = record_standing(state, object, 0, sender);
+      (later, zero, state.refusals.get(OUT_OF_ORDER).copied())
+    });
+    assert_eq!(later, Some(RecordStanding::Behind { reached: None }));
+    assert_eq!(zero, Some(RecordStanding::Next));
+    assert_eq!(counted, Some(1), "still counted out of order");
+  }
+
+  /// A-918: an owner records a target's behind answer to a pending version on that version, counted, and ignores one for
+  /// another version; a target that then acknowledged leaves.
+  #[test]
+  fn an_owner_records_a_targets_behind_answer_on_its_pending_version() {
+    let (recorded, after_ack, heard, newcomer) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let newcomer = HostId(local.0 ^ 1);
+      let object = ObjectId([32; 16]);
+      let candidates = vec![local, newcomer];
+      state.merge.pending.entry(object).or_default().insert(
+        2,
+        PendingMergeRecord {
+          value: MergeRecordValue {
+            version: 2,
+            increment: [1; 32],
+            base: 1,
+            inputs: None,
+            identity: [3; 32],
+            evidence: Vec::new(),
+            name: String::new(),
+            require_evidence: false,
+            owner: Principal::Uid {
+              host: slates_db::HostId(0),
+              uid: 0,
+            },
+            completion: None,
+            signature: None,
+            folded_below: 0,
+            checkpoint_floor: 0,
+          },
+          inputs: Placement {
+            candidates: candidates.clone(),
+            acked: candidates.clone(),
+            mirror_acked: None,
+            joint: Vec::new(),
+          },
+          record: Placement {
+            candidates,
+            acked: vec![local],
+            mirror_acked: None,
+            joint: Vec::new(),
+          },
+          first_period: None,
+          work: None,
+          lacking: BTreeMap::new(),
+          building: BTreeMap::new(),
+          behind: BTreeMap::new(),
+          enqueued_ns: 0,
+          shipments: 0,
+          inputs_manifest: None,
+        },
+      );
+      let behind = |sequence| {
+        slates_cluster::content::ContentMessage::Behind {
+          object,
+          sequence,
+          reached: None,
+        }
+        .encode()
+      };
+      record_behind_answers(
+        state,
+        (object, 2),
+        &[(newcomer, behind(2)), (newcomer, behind(3))],
+      );
+      let pending_behind = |state: &ShardState| {
+        state
+          .merge
+          .pending
+          .get(&object)
+          .and_then(|green| green.records.get(&2))
+          .map(|pending| pending.behind.clone())
+      };
+      let recorded = pending_behind(state);
+      if let Some(pending) = state
+        .merge
+        .pending
+        .get_mut(&object)
+        .and_then(|green| green.records.get_mut(&2))
+      {
+        pending.record.acked.push(newcomer);
+      }
+      record_behind_answers(state, (object, 2), &[]);
+      (
+        recorded,
+        pending_behind(state),
+        state.refusals.get(BEHIND_HEARD).copied(),
+        newcomer,
+      )
+    });
+    assert_eq!(recorded, Some(BTreeMap::from([(newcomer, None)])));
+    assert_eq!(heard, Some(1), "the answer of its own version alone");
+    assert!(
+      after_ack.is_some_and(|behind| behind.is_empty()),
+      "an acknowledging target leaves"
+    );
+  }
+
   #[test]
   fn a_silent_candidate_does_not_block_the_next_versions_quorum() {
     let (before, after, placed) = crate::daemon::audit_on_shard(|state| {
@@ -5658,6 +5860,7 @@ mod tests {
             work: None,
             lacking: BTreeMap::new(),
             building: BTreeMap::new(),
+            behind: BTreeMap::new(),
             enqueued_ns: 0,
             shipments: 0,
             inputs_manifest: None,
@@ -6219,6 +6422,7 @@ mod tests {
           work: None,
           lacking: BTreeMap::new(),
           building: BTreeMap::new(),
+          behind: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
           inputs_manifest: None,

@@ -280,13 +280,27 @@
 >   assertion.
 > - **Noted, not to fix now (main's ruling):** the learned tail from one sample is wide (about 13.3 s from a 4.5 s
 >   silence; 11 to 14 s from two). After (c), whether the tail's estimator should weight its sample count.
-> **OPEN, w-shared's next piece (A-912's sibling; main 01a20182's ruling of 2026-11-25, before A-914 (c)): a push during
-> a death is refused at its record barrier, whatever the homing window.** In a914's scene, the second death's push
-> was refused `unable to commit` 2 of 7 with a learned window: "greens owed (green, version, placed) [(…, 3, Some(2))]",
-> the new version's merge records still unplaced 13 s after the dead member's takeover installed, the names log
-> acknowledged at 4 by the dead member and at 5 by the live one. Flooring the barrier's window at the homing window
-> left 2 refused (reverted): it is a stall, not a window. Red first, the stall's cause logged before any fix; then
-> a914's test asserts its second push lands.
+> **OPEN, w-shared's next pieces (A-918 and A-919; A-912's sibling; main 01a20182's rulings of 2026-11-25): a candidate a
+> death brings in holds none of a green and refuses every later version of it for good.** In a914's scene the second
+> death's push was refused `unable to commit` (2 of 7, then 4 of 6). Logged (the barrier refusal now names each pending
+> version's candidates, acknowledgements, joint cohorts, inputs, builds and behind targets, and the placement): after a
+> death at 3 members every member is a green's candidate, so a node that never held the green joined its cohort; it
+> answered each record out of order (`merge.out_of_order`, 4006 over one red run), untyped, and nothing ships a placed
+> version again (A-412), so it never reached v2. Durability held: A-546's settle certifies `f + 1`, met by the owner
+> and the old candidate. Liveness did not: an `f + 1` for the next version can need the newcomer. Red:
+> `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` (newcomer at `None` after
+> 430 s). The pieces, in main's order:
+> - **(i) FIXED (A-918 (i)):** the holder answers typed, `ContentMessage::Behind { reached }` (kind 11), where it
+>   counted `OUT_OF_ORDER` and answered nothing; the owner records it on the pending version (`merge.behind.heard`)
+>   and the barrier's log names it.
+> - **(iii) OPEN (A-919):** a candidate joining a state log's placement past parts every earlier candidate held is
+>   shipped the log's prefix (state_log's own owed transfer); a repository green's v0 on a fresh candidate needs its
+>   join from it.
+> - **B OPEN (A-918):** on `Behind`, the newcomer rebuilds the green through a takeover successor's own path
+>   (`adopt_ledger_positions`, `rebuild_through`) from a live holder, paced and bounded as replica builds are; one
+>   mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
+>   it holds no per-version records or inputs. Then the red goes green, a914 asserts its second push lands, and
+>   GAP-A9-7's ledger-prefix transfer and AUD-14's new candidate set close.
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
 > council's replication shares a node's one record session per peer with every exchange, each borrower taking it whole.
 > A-912 removed the hold found (a home holding a put across the install the council's next append brings) and counts any
@@ -1643,6 +1657,16 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> Ruling (b), step 1 BUILT (2026-11-25, w-hg; main's ruling: content kept once, on arrival, as stock's revlog chunks):
+> the changeset store's `Texts` entries and `T` rows name each place's form by their mark (`slates_store::texts::Form`;
+> marks 2 and 3, which no store before wrote, so old rows read raw), never by a chunk's first byte; a chunk is read
+> through the decoder the daemon installs (`texts::install_chunk_decoder`, `slates_hg::revlog_chunk::decode_within`:
+> the decoder's memory charged apart, its bytes held to the text's length), counted `TextCache::decoded` and
+> `decoded_most`. Held by `a_texts_chunked_and_raw_rows_make_the_same_bytes`, `a_raw_text_beginning_with_a_chunk_types_
+> byte_reads_as_it_is` and `a_chunked_text_with_no_decoder_installed_is_refused` (`slates-store` tests `chunk_form`,
+> `chunk_form_undecoded`). No writer yet writes a chunk: owed, the push's and the import's landings writing chunks
+> (record v+1, step 2), a fetch's file section decoding them (step 3), the stream copying them (step 4, `Streaming::sized`
+> gone with it), each sliced under the step budget.
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
@@ -4489,6 +4513,11 @@
 >   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
 >     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
 >     its chunk again, on all three edges, counted.
+> - **Linux hg, run 6 (2026-11-25)** (45605246530, `diag-measurer-main-interop-linux-6` at f5b283016, main 387322d5c with
+>   w-hg's d33fc0b64; release slates, stock hg 7.2.4 installed in the job, the r400 cut of hg's history): **30 of 30 on
+>   ubuntu-latest and 30 of 30 on ubuntu-24.04-arm**, the six changeset evolution rows (ad36e5f09) among them.
+>   Windows pending: run 6's windows-latest leg failed every row at exit 127 on the workflow's own wrapper path (bash
+>   dropped `D:\a\_temp`'s backslashes), not slates; ade67baf3 passes it as a Unix path, for run 7.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
