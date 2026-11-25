@@ -64155,10 +64155,24 @@ measured noise of the 100 figure, not a literal.
 > load about 30; `spawner::tests::a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors`), median a
 > spawn on the asking thread: through the spawner 79 to 89 µs at 100 descriptors, 73 to 79 at 10,000, 69 to 72 at
 > 100,000; direct 0.34 ms, 1.33 to 1.35 ms, 10.4 to 15.6 ms (worst 40 ms). Parity: a child through the spawner lists
-> the same descriptors as a direct one. Owed, piece 2: the daemon starts it at its role's start, hands each shard an
-> end, owns, joins and restarts it (back-off, in-flight bound and restart wait derived), and the hook driver and
-> `run_helper` ask it, their exits by its answers; the spawner's footprint measured; Linux's direct cost by a CI
-> diag.
+> the same descriptors as a direct one. Linux (main's diag run 45666757721, 4-core runners, debug): through the
+> spawner 69.9 and 69.8 µs at 100 and 10,000 descriptors on x86_64, 96.9 and 98.5 on arm; direct 193.1 → 531.9 µs on
+> x86_64, 284.3 → 332.7 on arm. The runners' hard `RLIMIT_NOFILE` is 65,536, so the measure holds the most it may and
+> says so (`SPAWN-HELD`).
+>
+> **Piece 2a built (2026-11-25).** `Daemon::start` starts the spawner once its runtime is built, before any client's
+> descriptor is open (`slates_ipc::spawner::start_here`: this executable with `spawner_role --exact --nocapture`; the
+> `slates` binary serves before it reads an argument, a test binary runs its root's `spawner_role!()` test), an end a
+> shard (`ShardHolds::spawner`), and joins it at its stop once the shards' ends have closed (a window later it is
+> killed with its group). Each shard's conversation is one task that owns the end (`crate::spawning`: a readiness
+> registration is one a descriptor and direction, A-149), the requests and exits slots it fills; one spawn request in
+> flight at a time; an asker gone before its answer has its child killed and let go when the answer comes. The hook
+> driver and `run_helper` start through it, and wait on its exit answer: the exit watch, `waitid` and the reaper task
+> are gone, and with them the yield the driver made between macOS's exit note and a readable status. The spawner's
+> death ends a run typed (`StartRefused::SpawnerGone`, worded as a server that could not start a process), the
+> hook's group killed. Red: a hook's parent is the spawner, not the shard's process
+> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`). Owed, piece 2b: the spawner restarted on its death
+> (back-off, in-flight bound, restart wait, each derived) and its footprint measured.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 
