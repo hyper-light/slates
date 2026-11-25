@@ -1,8 +1,9 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-25 02:32 PST): run 9, CI's TSan job at 0cd27990e: run 8's three failures each fixed since: the svn crash
-# test (47eb329ab: recovery makes its store before finding named texts whole), the restart's unpin (d2383560f), and the
-# clone's look-ahead letting go behind its cursor before it brings back (0cd27990e). The step is copied unchanged but
-# for a limit only a hang reaches. Run only from diag-measurer-main-tsan-* branches, never main.
+# main 01a20182 (2026-11-25 04:14 PST): run 10, CI's TSan job at e89adba55: w-git's derive_behind rebuilt (e89adba55: a reader
+# hands the derivation off and the task behind turns a quantum at most; derive turns counted by driver), which run 9's
+# listing test (a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding) failed on in its first form, and
+# w-hg's merge-push fix (d33fc0b64). The step is copied unchanged but for a limit only a hang reaches. Run only from
+# diag-measurer-main-tsan-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-tsan-*"]
