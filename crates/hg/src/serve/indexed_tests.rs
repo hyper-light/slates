@@ -1282,6 +1282,132 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   assert!(sent.iter().any(|(name, _)| name == b"00changelog.i"));
 }
 
+/// A changeset store whose changelog revisions after the first are kept as deltas, each against the revision `against`
+/// names (a bdiff delta replacing its base's whole text), over [`WholeTexts`].
+struct ChangelogDeltas<'s> {
+  inner: WholeTexts<'s>,
+  against: fn(usize) -> usize,
+}
+
+impl crate::render::StoredSource for ChangelogDeltas<'_> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    let mut answered = self.inner.rows(logs)?;
+    for ((log, _), rows) in logs.iter().zip(&mut answered) {
+      if log == b"\0changelog" {
+        self.as_deltas(rows)?;
+      }
+    }
+    Some(answered)
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    self.inner.chunks(places)
+  }
+}
+
+impl ChangelogDeltas<'_> {
+  /// The changelog's rows after the first made deltas against `against`'s revision.
+  fn as_deltas(&mut self, rows: &mut [Option<crate::render::StoredRevision>]) -> Option<()> {
+    let whole: Vec<crate::render::StoredRevision> = rows.iter().copied().collect::<Option<_>>()?;
+    for (rev, row) in rows.iter_mut().enumerate().skip(1) {
+      let base = whole.get((self.against)(rev))?;
+      let base_len = u32::try_from(base.place.len).ok()?;
+      let text = self.inner.texts.get(&whole.get(rev)?.text)?.clone();
+      let mut delta = [0_u32, base_len, u32::try_from(text.len()).ok()?]
+        .iter()
+        .flat_map(|field| field.to_be_bytes())
+        .collect::<Vec<u8>>();
+      delta.extend_from_slice(&text);
+      let payload = *blake3::hash(&delta).as_bytes();
+      let len = u64::try_from(delta.len()).ok()?;
+      self.inner.texts.insert(payload, delta);
+      let stored = row.as_mut()?;
+      stored.base = Some(base.text);
+      stored.place = crate::render::StoredPlace {
+        payload,
+        offset: 0,
+        len,
+      };
+    }
+    Some(())
+  }
+}
+
+/// The `states` repository with its secret root dropped, so it streams: its import, its store and its public roots.
+fn streaming_states() -> (Imported, ContentStore, Vec<PhaseHead>) {
+  let (imported, store) = imported("states");
+  let public = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  (imported, store, public)
+}
+
+/// The changelog's files a stream of `states` from `source` sent: its status, and the `.i` and `.d` (empty if none).
+fn streamed_changelog(
+  source: &mut ChangelogDeltas<'_>,
+  view: &Indexed<'_>,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+  let mut answer = Vec::new();
+  super::super::stream::stream_out(view, source, &mut room(), &mut answer).unwrap();
+  if answer == b"1\n" {
+    return (b"1".to_vec(), Vec::new(), Vec::new());
+  }
+  let (status, sent) = streamed(&answer);
+  let file = |name: &[u8]| {
+    sent
+      .iter()
+      .find(|(sent_name, _)| sent_name == name)
+      .map(|(_, bytes)| bytes.clone())
+      .unwrap_or_default()
+  };
+  (status, file(b"00changelog.i"), file(b"00changelog.d"))
+}
+
+/// Goal 93 perf, the changelog's header (main's order of 2026-11-25: 7.2 writes a new changelog without generaldelta,
+/// `changelog.py`). Do: stream the `states` repository from a changeset store whose changelog revisions after the
+/// first are deltas against the revision before; then from one whose third revision is a delta against the first.
+/// Expect the first stream served, its changelog's header `0x00000001` (version 1, no flag), each entry's base its
+/// delta chain's start (0), and each revision's text read back by the revlog reader (no generaldelta: each delta
+/// against the one before) hashing to its node; the second served no stream (`1\n`, the client clones), since a
+/// changelog without generaldelta cannot hold that delta.
+#[test]
+fn a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_start() {
+  let (imported, store, public) = streaming_states();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut before = ChangelogDeltas {
+    inner: whole_texts(&imported.index, &store),
+    against: |rev| rev - 1,
+  };
+  let (status, index, data) = streamed_changelog(&mut before, &view);
+  assert_eq!(status, b"0");
+  assert_eq!(index[..4], [0, 0, 0, 1], "the changelog's header");
+  let log = crate::revlog::Revlog::open(&index, &data, &mut room()).unwrap();
+  assert!(log.len() > 2, "a changelog of {} revisions", log.len());
+  for rev in 0..log.len() {
+    assert_eq!(
+      log.entry(rev).unwrap().base,
+      0,
+      "revision {rev}'s chain start"
+    );
+    log.text(rev, &mut room()).unwrap();
+  }
+  let mut skipping = ChangelogDeltas {
+    inner: whole_texts(&imported.index, &store),
+    against: |rev| if rev == 2 { 0 } else { rev - 1 },
+  };
+  assert_eq!(streamed_changelog(&mut skipping, &view).0, b"1");
+}
+
 /// Each manifest and file revision a changegroup carries, with its link, as a set: what a fetch brings, whatever the
 /// order its packer took.
 fn carried(packed: &[u8]) -> BTreeSet<(Vec<u8>, Node, Node)> {

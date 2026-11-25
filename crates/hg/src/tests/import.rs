@@ -1542,7 +1542,13 @@ fn rendered_log_as_7_2_stores_it(
     held += u64::try_from(stored.len()).unwrap();
     zstd_chunks += usize::from(stored.first() == Some(&b'('));
   }
-  let may_inline = !path.ends_with(b"00changelog.i");
+  let changelog = path.ends_with(b"00changelog.i");
+  let may_inline = !changelog;
+  // 7.2's header: version 1, generaldelta on every log but a changelog (`changelog.py` clears it on a new one), inline
+  // where inline.
+  let header = u32::from_be_bytes(index[..4].try_into().unwrap());
+  let expected = 1 | (u32::from(!changelog) << 17) | (u32::from(inline) << 16);
+  assert_eq!(header, expected, "{shown}: its header {header:#010x}");
   assert_eq!(
     inline,
     may_inline && held < STOCK_MAX_INLINE,
@@ -1562,7 +1568,8 @@ fn rendered_log_as_7_2_stores_it(
 /// `.hg/requires` names `revlog-compression-zstd`; each stored chunk the one stock's `revlog.compress` makes of the plain
 /// one (zstd at level 3 where shorter, raw where it begins with a NUL, else `u`); each log inline, its `.i` alone and its
 /// fncache line alone, exactly where it may be inline (any but the changelog, `may_inline=False` in 7.2's
-/// `changelog.py`) and its chunks hold under 131,072 bytes; and, so the test is not vacuous, a zstd chunk and an inline
+/// `changelog.py`) and its chunks hold under 131,072 bytes; each header 7.2's, generaldelta on every log but the
+/// changelog (`changelog.py` clears it on a new changelog); and, so the test is not vacuous, a zstd chunk and an inline
 /// log met.
 #[test]
 fn a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does() {

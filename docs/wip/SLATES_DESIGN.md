@@ -15194,8 +15194,9 @@ engine, and every log but the changelog is inline while its chunks hold under 13
 the one codec the stream and, next, the changeset store's intake share); `revlog-compression-zstd` is required. A
 stream compresses at its time, a count pass and a send pass, until the store keeps each chunk in that form from its
 arrival. At r400 of hg's history the stream is 99 files and 466 KB against stock's 102 and 470 KB (before: 195 and
-813 KB). Still owed: the deltas the pinned writer would choose, and the changelog written without generaldelta as 7.2
-writes a new one.
+813 KB). The changelog is written without generaldelta, as 7.2 writes a new one: each delta in it against the
+revision before, its entry's base its chain's start, and a store holding another serves no stream. Still owed: the
+deltas the pinned writer would choose.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
