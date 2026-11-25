@@ -56,6 +56,11 @@ impl Family {
     Family::Landed,
   ];
 
+  /// Its place in [`Family::ALL`], which a count by family ([`Turned::encoded_by_family`]) is in.
+  pub(crate) fn index(self) -> usize {
+    usize::from(self.byte().saturating_sub(1))
+  }
+
   /// Its byte in a page piece's key: its discriminant.
   pub(crate) fn byte(self) -> u8 {
     self as u8
@@ -207,7 +212,7 @@ impl core::ops::Deref for EntryBytes {
 }
 
 /// Format: the bytes a page piece spends on an entry beyond its bytes: its key and its length.
-const ENTRY_HEAD: usize = slates_vfs::recover::HELD_PIECE_KEY_BYTES + size_of::<u32>();
+pub(crate) const ENTRY_HEAD: usize = slates_vfs::recover::HELD_PIECE_KEY_BYTES + size_of::<u32>();
 
 /// The bytes `entries` take in a page piece.
 fn bytes_of(entries: &[Entry]) -> usize {
@@ -492,6 +497,9 @@ pub(crate) struct Turned {
   /// The heap bytes its reads allocated: their buffer's growth and the entries' own buffers (goal 93, main's ruling of
   /// 2026-11-25: against `bytes`, what re-encoding a page costs beyond the page).
   pub(crate) allocated: u64,
+  /// The bytes encoded, by family in [`Family::ALL`]'s order (goal 93, A-923: which family's pages a publication
+  /// re-encodes).
+  pub(crate) encoded_by_family: [u64; Family::ALL.len()],
 }
 
 /// A family's entries over a range of coordinates at the cut, read until their bytes pass a cap into the buffer it is
@@ -603,6 +611,7 @@ impl Encoder {
     let paused = self.paused();
     self.turns = self.turns.saturating_add(1);
     let mut spent = 0usize;
+    let mut by_family = [0u64; Family::ALL.len()];
     let mut imposed = 0usize;
     let mut split_at_stop = (0u64, 0usize);
     let cap = Self::read_cap(page_bytes);
@@ -628,7 +637,11 @@ impl Encoder {
         // The read visited a cap's bytes at least, kept or passed over.
         let read = bytes_of(&held).max(cap);
         spent = spent.saturating_add(read);
-        let kept = self.split_at_stop((family, page), (&held, stop), page_bytes, encoded);
+        let (kept, encoded_len) =
+          self.split_at_stop((family, page), (&held, stop), page_bytes, encoded);
+        if let Some(tally) = by_family.get_mut(family.index()) {
+          *tally = tally.saturating_add(u64::try_from(encoded_len).unwrap_or(u64::MAX));
+        }
         split_at_stop = (
           split_at_stop.0.saturating_add(1),
           split_at_stop.1.saturating_add(read.saturating_sub(kept)),
@@ -655,7 +668,11 @@ impl Encoder {
           .get(range.clone())
           .filter(|held| !held.is_empty())
           .map(encode_page);
-        spent = spent.saturating_add(bytes.as_ref().map_or(0, Vec::len));
+        let len = bytes.as_ref().map_or(0, Vec::len);
+        spent = spent.saturating_add(len);
+        if let Some(tally) = by_family.get_mut(family.index()) {
+          *tally = tally.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        }
         self.pending.insert((family, *into), bytes);
       }
       let split: Vec<Page> = planned
@@ -690,6 +707,7 @@ impl Encoder {
       split: split_at_stop.0,
       discarded: u64::try_from(split_at_stop.1).unwrap_or(u64::MAX),
       allocated: u64::try_from(allocated).unwrap_or(u64::MAX),
+      encoded_by_family: by_family,
     }
   }
 
@@ -715,7 +733,7 @@ impl Encoder {
   /// stay aligned halves, never cut at the read's stop: a page piece's key names its depth and start (the image's format)
   /// and a recovered directory is rebuilt from those keys, so an unaligned page would need a new format; and piece 1's
   /// bound on a family's pages (at most twice its bytes over the page size) rests on halving by bytes. The bytes read
-  /// and kept: what was visited and not kept is read again, at most the read's cap and an entry (a turn splits once at
+  /// and kept, and the bytes of the pages it encoded: what was visited and not kept is read again, at most the read's cap and an entry (a turn splits once at
   /// most, its read spending the turn's slice): the planned page holding `stop` where the plan split, the whole visit
   /// where it halved.
   fn split_at_stop(
@@ -724,7 +742,7 @@ impl Encoder {
     (held, stop): (&[Entry], u64),
     page_bytes: usize,
     encoded: &mut Vec<(Family, Page)>,
-  ) -> usize {
+  ) -> (usize, usize) {
     let mut planned = plan(held, page, page_bytes);
     if let (true, Some((first, second))) = (planned.len() < 2, page.halves()) {
       let split = held.partition_point(|(coordinate, _, _)| *coordinate < second.start);
@@ -733,14 +751,15 @@ impl Encoder {
     // Its own piece removed, the pages it now is put as they are encoded.
     self.pending.insert((family, page), None);
     let mut kept = 0usize;
+    let mut encoded_len = 0usize;
     let mut back = 0u64;
     for (into, range) in &planned {
       if into.last() < stop {
         let entries = held.get(range.clone()).filter(|held| !held.is_empty());
         kept = kept.saturating_add(entries.map_or(0, bytes_of));
-        self
-          .pending
-          .insert((family, *into), entries.map(encode_page));
+        let bytes = entries.map(encode_page);
+        encoded_len = encoded_len.saturating_add(bytes.as_ref().map_or(0, Vec::len));
+        self.pending.insert((family, *into), bytes);
         encoded.push((family, *into));
       } else if let Some(cut) = self.cut.as_mut() {
         cut.remaining.insert((family, *into));
@@ -762,7 +781,7 @@ impl Encoder {
     if let Some((_, bound)) = self.owed.as_mut() {
       *bound = bound.saturating_add(back.saturating_mul(2));
     }
-    kept
+    (kept, encoded_len)
   }
 
   /// The pages a publication carries, where the cut is wholly encoded ([`Encoder::complete`]): each page re-encoded
@@ -1525,6 +1544,68 @@ mod tests {
     );
   }
 
+  /// Shape: the objects a push lets go in the let-go-order test, against the [`ENTRIES`] halved the store holds let go:
+  /// far fewer than the aways' pages.
+  const PUSH_LET_GOES: usize = 20;
+
+  /// The bytes the image's turns have encoded of `family`'s pages ([`crate::content_holder::IMAGE_FAMILY_ENCODED_BYTES`]).
+  fn encoded_of(state: &crate::state::ShardState, family: Family) -> u64 {
+    crate::content_holder::IMAGE_FAMILY_ENCODED_BYTES
+      .get(family.index())
+      .and_then(|name| state.refusals.get(*name).copied())
+      .unwrap_or(0)
+  }
+
+  /// Goal 93, A-923 (main's churn ruling (b) of 2026-11-25: at 57k the Aways family's cut reads and page encodes were
+  /// about 4.3 GB of a push's 26.55 GB of system allocations). Do: on a shard whose pages are small, put [`ENTRIES`]
+  /// objects, carry them and publish; let every second go landed (half the objects away, over many pages of the Aways
+  /// family) and publish; then, as a push would, let [`PUSH_LET_GOES`] more go, spread through the objects, and encode
+  /// the cut. Expect the Aways family's bytes re-encoded for the push within two pages and the push's own entries: its
+  /// let-gos lie together at the family's tail, whatever the aways held before. Red before: each let-go's identity in
+  /// another page, every one of them re-encoded whole.
+  #[test]
+  fn a_pushs_let_goes_re_encode_the_aways_pages_they_fill_not_every_page_of_the_aways_held() {
+    const PAGE: usize = 4096;
+    let (held, pushed) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let ids = put_objects(state, (0, ENTRIES));
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let halved: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
+      let_go(state, &halved);
+      let before = encoded_of(state, Family::Aways);
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let held = encoded_of(state, Family::Aways) - before;
+      let spread = ENTRIES / PUSH_LET_GOES;
+      let pushed: Vec<slates_vcs::ContentId> =
+        ids.iter().skip(1).step_by(spread).copied().collect();
+      let_go(state, &pushed);
+      let before = encoded_of(state, Family::Aways);
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      let pushed = encoded_of(state, Family::Aways) - before;
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (held, pushed)
+    });
+    // An away's entry: its head and its bytes (an identity, a length and its let-go number).
+    let entry = (ENTRY_HEAD + slates_vcs::content::IDENTITY_BYTES + 2 * size_of::<u64>()) as u64;
+    let bound = 2 * PAGE as u64 + PUSH_LET_GOES as u64 * entry;
+    println!(
+      "image_pages: the aways held encoded {held} B; a push of {PUSH_LET_GOES} let-goes re-encoded {pushed} B of them (bound {bound} B)"
+    );
+    assert!(
+      held > bound,
+      "the aways held span more than the bound: {held} B"
+    );
+    assert!(
+      pushed <= bound,
+      "a push of {PUSH_LET_GOES} let-goes re-encoded {pushed} B of the aways, past two pages and its own entries, {bound} B"
+    );
+  }
+
   /// Shape: the entries a page of one coordinate holds in the scratch-bound test: far past what a capped read takes.
   const ONE_COORDINATE_ENTRIES: usize = 4_096;
 
@@ -1666,7 +1747,7 @@ mod tests {
 
   /// A-870 piece 2, the pause under refused publications (main 01a20182's ruling of 2026-11-23: with F2 a cut ends within
   /// its pages, so only a refused publication keeps one owed past its bound). Do: on a shard whose pages are small, put
-  /// [`ENTRIES`] objects and carry them, then let every other one go and publish, so a cut of many pages is owed; refuse the catch-up's publications past the owed bound's turns
+  /// [`ENTRIES`] objects and carry them, then let every other one go and publish, so a cut of many pages is owed; refuse the catch-up's publications past the owed bound's turns, the bound read once the cut's pages are encoded (its splits raise it)
   /// ([`crate::content_holder::CATCH_UP_REFUSALS`]), running the catch-up's steps as its task does, the shard's sweep
   /// beginning it again after each; ask the elective let-go's question while paused; then let the refusals clear.
   /// Expect: paused, the pause and its turns counted, while refused; the pause released, nothing owed, once a
@@ -1684,11 +1765,19 @@ mod tests {
       let_go(state, &every_other);
       crate::verbs::publish_shard(state).unwrap();
       let (_, _, owed) = state.image_encoder.progress();
-      let (_, bound) = owed.expect("a cut owed");
-      let refusals = u32::try_from(bound).unwrap() + 2;
+      assert!(owed.is_some(), "a cut owed");
+      // The cut's own encoding refused its publication first; its splits put pages back, each raising the bound by
+      // two turns (`Encoder::split_at_stop`), so the refusals that keep it owed past its bound are counted from the
+      // bound and the turns once its pages are encoded.
+      crate::content_holder::CATCH_UP_REFUSALS.with(|left| left.set(1));
+      while !crate::content_holder::image_catch_up_step(state).0 {}
+      let (turns, _, owed) = state.image_encoder.progress();
+      let (since, bound) = owed.expect("a cut owed still");
+      let refusals = u32::try_from(bound.saturating_sub(turns - since)).unwrap() + 2;
       crate::content_holder::CATCH_UP_REFUSALS.with(|left| left.set(refusals));
+      let refusals = refusals + 1;
       let mut paused_seen = false;
-      for _ in 0..=refusals {
+      for _ in 0..refusals {
         while !crate::content_holder::image_catch_up_step(state).0 {}
         paused_seen |= crate::content_holder::image_paused(state);
       }
