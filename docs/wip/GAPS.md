@@ -373,7 +373,9 @@
 > Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
 > Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
 > (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
-> **OWED (w-git, 2026-11-25, main 01a20182's ruling): a push's versions derived behind it, withdrawn.** Built at
+> **RETURNED (w-git, 2026-11-25, after both reds below went red then green; was: OWED, withdrawn):** a push's versions
+> derived behind it, the task behind handing a reader the derivation and turning a quantum at most (the design's status,
+> "Deriving a push's versions behind it"). Was: Built at
 > 750d2bca3 (`git_derive::derive_behind`), reverted after two failures: a clone arriving mid-derivation ran it in
 > slivers, the task behind and the fetch each yielding to the other at every unit (main's git leg: first pack byte 40.3 →
 > 61.9 s, 721,260 derive turns); and a ref listing after a push waited behind it under ThreadSanitizer (diag 9,
