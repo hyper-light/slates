@@ -208,6 +208,7 @@ fn a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart() {
         offset: 0,
         len: payload.len() as u64,
       },
+      form: slates_store::texts::Form::Raw,
     };
     changesets.push((payload, texts::encode(&[entry])));
   }

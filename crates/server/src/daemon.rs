@@ -1015,6 +1015,9 @@ impl Daemon {
     // An hg stream's chunk compression is timed on the shard's clock (goal 93 perf, `vcs_store.hg_stream_compress_*`);
     // a second daemon in this process finds it installed.
     slates_hg::revlog_chunk::install_clock(slates_rt::futures::now_ns);
+    // The changeset store reads a text kept as a revlog chunk through Mercurial's own decoder (goal 93, main's ruling (b)
+    // of 2026-11-25), which the store cannot build; a second daemon in this process finds it installed.
+    let _ = slates_store::texts::install_chunk_decoder(slates_hg::revlog_chunk::decode_within);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {

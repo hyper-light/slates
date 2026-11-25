@@ -1631,6 +1631,16 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> Ruling (b), step 1 BUILT (2026-11-25, w-hg; main's ruling: content kept once, on arrival, as stock's revlog chunks):
+> the changeset store's `Texts` entries and `T` rows name each place's form by their mark (`slates_store::texts::Form`;
+> marks 2 and 3, which no store before wrote, so old rows read raw), never by a chunk's first byte; a chunk is read
+> through the decoder the daemon installs (`texts::install_chunk_decoder`, `slates_hg::revlog_chunk::decode_within`:
+> the decoder's memory charged apart, its bytes held to the text's length), counted `TextCache::decoded` and
+> `decoded_most`. Held by `a_texts_chunked_and_raw_rows_make_the_same_bytes`, `a_raw_text_beginning_with_a_chunk_types_
+> byte_reads_as_it_is` and `a_chunked_text_with_no_decoder_installed_is_refused` (`slates-store` tests `chunk_form`,
+> `chunk_form_undecoded`). No writer yet writes a chunk: owed, the push's and the import's landings writing chunks
+> (record v+1, step 2), a fetch's file section decoding them (step 3), the stream copying them (step 4, `Streaming::sized`
+> gone with it), each sliced under the step budget.
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
