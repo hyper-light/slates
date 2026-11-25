@@ -583,3 +583,14 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   barrier 4 of 6.
 - Next (main's order): the record barrier during a death (A-912's sibling), red first with the stall's cause logged;
   then (c), from main's batch; then the replica build's Missing (gate 18 logs in ~/.cache/main-rounds/gate18-logs).
+
+## 2026-11-25: A-918 (i) landed (eedfd23e1, commit 1d2d21f21)
+
+- Barrier sibling's cause: a candidate a death brings in holds none of a green, refused every later version out of
+  order, untyped, for good. Durability held (A-546's f + 1); liveness didn't. Main ruled B: the newcomer catches up
+  through the takeover successor's path. (i) is first: the typed ContentMessage::Behind (kind 11), with the owner
+  recording it and the barrier log naming it.
+- Red a918 (fleet, parked in scratch until B): the newcomer stays at None; with (i) it answers Behind 4001 times.
+- Next: A-919 (a state log's prefix to a candidate joining past it; red at the state_log level), then B.
+- Reviewed w-perf's image-read-side diff: the counter undercounts buffers inlined by EntryBytes::owned, and the
+  scratch bound is broken by the uncapped one-coordinate re-read.
