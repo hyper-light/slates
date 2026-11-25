@@ -21,7 +21,7 @@
 //! id, and each becomes a position through the index, a lookup across its runs. A walk opens each tree once, but a
 //! tree's versions repeat most of its entries: a root tree's unchanged entries are met again in every commit's root.
 //! So the ids met are resolved through a [`PositionCache`], exact and of a fixed size, owned by the answer across its
-//! steps and lent to each step's graph: a direct-mapped table of (id, position) slots, sized from the work as the walk
+//! steps and lent to each step's graph: a set-associative table of (id, position) slots, sized from the work as the walk
 //! meets it (the entries one sent commit's trees resolve, the root tree's first), so its cost is the walk's working
 //! set, never an entry an object (§4.17.1 "A fetch's answer" rule 1). Charged to the answer's admission as it grows;
 //! with no room it stays as it is, down to no slots, where every lookup misses: the same code, the walk as slow as
@@ -91,8 +91,18 @@ pub struct StoreGraph<'r> {
 /// power of two, hold the load between 1/16 and 1/8.
 const SLOTS_AN_ID: u64 = 8;
 
-/// The positions of the ids a walk met lately (A-911, module docs **Positions met again**): exact, direct-mapped, an id
-/// in the slot its first bytes name. Sized from the work, as the walk meets it: the most ids one sent commit's trees
+/// Derived: the slots of one set of a [`PositionCache`], the ids its first bytes name among them, least recently used
+/// put out. At [`SLOTS_AN_ID`]'s load of at most 1/8 a slot, a set of `w` ways holds `w/8` ids on average (Poisson,
+/// each id's set uniform); the ids past its `w` are put out, `E[(X − w)⁺] / (w/8)` of them: about 12 % for one way (the
+/// direct-mapped table), 0.9 % for two, 0.03 % for four. Four is the least at which under 1 in 1,000 ids met again are
+/// put out by another's, at the same slots and bytes. Measured (main 01a20182's A/B of 2026-11-25, git/git's clone,
+/// three interleaved rounds): misses 11,438,922 direct-mapped against 3,963,393 at four ways (−65 %), the median first
+/// pack byte 45.8 → 38.4 s for a clone, 34.0 → 26.5 for a clone again, 28.4 → 22.7 for a partial clone; 32 slots an id,
+/// direct-mapped, missed 3,717,726 at four times the bytes and was no faster, so not taken.
+const WAYS: usize = 4;
+
+/// The positions of the ids a walk met lately (A-911, module docs **Positions met again**): exact, set-associative, an id
+/// in one of the [`WAYS`] slots of the set its first bytes name, the least recently used put out. Sized from the work, as the walk meets it: the most ids one sent commit's trees
 /// resolved, times [`SLOTS_AN_ID`], to a power of two. It costs `slots × size_of::<Slot>()` (48 bytes a slot), charged
 /// to the answer's admission as it grows, so at tens of thousands of concurrent fetches its memory is bounded by theirs:
 /// an answer whose room cannot take the next size keeps the size it has, none at first, and is counted
@@ -119,10 +129,10 @@ pub struct PositionCounts {
   pub lookups: u64,
   /// Ids the cache answered.
   pub hits: u64,
-  /// Of the ids resolved through the index, those whose slot held another id, which this one then put out. An upper
-  /// bound on the ids lost to another's slot, not their count: an id met the first time also finds its slot taken once
-  /// the cache is warm (A-911's 40-commit line: 59 of 157 lookups counted at 4 ways or at 32 slots an id, where nearly
-  /// every miss is a first meeting). The A/B of more ways against more slots reads lookups and time.
+  /// Of the ids resolved through the index, those whose set was full, its least recently used then put out to take
+  /// it. An upper bound on the ids lost to another's slot, not their count: an id met the first time also finds its set
+  /// full once the cache is warm (A-911's 40-commit line: 59 of 157 lookups counted, where nearly every miss is a first
+  /// meeting). The A/B of more ways against more slots read lookups and time.
   pub conflicts: u64,
   /// Answers whose cache was refused the room its work asked (one an answer).
   pub unroomed: u64,
@@ -134,35 +144,58 @@ pub struct PositionCounts {
 }
 
 impl PositionCache {
-  /// The slot `id` lives in: its first bytes, under the slots' mask. With no slots, none.
-  fn slot_of(&self, id: &ObjectId) -> usize {
+  /// The slots of the set `id` lives in: its first bytes, under the sets' mask, [`WAYS`] slots each (fewer where the
+  /// slots are fewer). With no slots, none.
+  fn set_of(&self, id: &ObjectId) -> core::ops::Range<usize> {
     let mut first = [0u8; 8];
     for (to, from) in first.iter_mut().zip(id.as_bytes()) {
       *to = *from;
     }
-    let mask = self.slots.len().wrapping_sub(1);
-    usize::try_from(u64::from_le_bytes(first)).unwrap_or(usize::MAX) & mask
+    let ways = WAYS.min(self.slots.len()).max(1);
+    let mask = (self.slots.len() / ways).wrapping_sub(1);
+    let set = usize::try_from(u64::from_le_bytes(first)).unwrap_or(usize::MAX) & mask;
+    let start = set.saturating_mul(ways);
+    start..start.saturating_add(ways)
   }
 
-  /// The position of `id`: the slot's, where it holds `id`, else `resolve`'s, kept in its slot.
+  /// The position of `id`: its set's, where a slot of it holds `id` (moved to the set's front, most recently used),
+  /// else `resolve`'s, kept at the set's front, its least recently used put out where the set is full.
   fn position(&mut self, id: &ObjectId, resolve: impl FnOnce() -> Option<u64>) -> Option<u64> {
     self.met = self.met.saturating_add(1);
-    let at = self.slot_of(id);
-    if let Some(Some((held, position))) = self.slots.get(at)
-      && held == id
+    let set = self.set_of(id);
+    if let Some(ways) = self.slots.get_mut(set.clone())
+      && let Some(way) = ways
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|(held, _)| held == id))
+      && let Some(used) = ways.get_mut(..=way)
     {
-      self.counts.hits = self.counts.hits.saturating_add(1);
-      return Some(*position);
+      used.rotate_right(1);
+      if let Some(Some((_, position))) = used.first() {
+        self.counts.hits = self.counts.hits.saturating_add(1);
+        return Some(*position);
+      }
     }
     self.counts.lookups = self.counts.lookups.saturating_add(1);
-    if matches!(self.slots.get(at), Some(Some(_))) {
+    if self
+      .slots
+      .get(set.clone())
+      .is_some_and(|ways| ways.iter().all(Option::is_some))
+    {
       self.counts.conflicts = self.counts.conflicts.saturating_add(1);
     }
     let position = resolve()?;
-    if let Some(slot) = self.slots.get_mut(at) {
-      *slot = Some((*id, position));
-    }
+    self.keep(set, (*id, position));
     Some(position)
+  }
+
+  /// Keeps `held` at the front of the slots `set`, its least recently used (or an empty slot) put out.
+  fn keep(&mut self, set: core::ops::Range<usize>, held: (ObjectId, u64)) {
+    if let Some(ways) = self.slots.get_mut(set) {
+      ways.rotate_right(1);
+      if let Some(front) = ways.first_mut() {
+        *front = Some(held);
+      }
+    }
   }
 
   /// A sent commit's trees begin: the ids the last one resolved measured, and the cache grown to what that asks.
@@ -198,11 +231,9 @@ impl PositionCache {
       return;
     }
     let held = core::mem::replace(&mut self.slots, vec![None; asked]);
-    for (id, position) in held.into_iter().flatten() {
-      let at = self.slot_of(&id);
-      if let Some(slot) = self.slots.get_mut(at) {
-        *slot = Some((id, position));
-      }
+    for (id, position) in held.into_iter().flatten().rev() {
+      let set = self.set_of(&id);
+      self.keep(set, (id, position));
     }
   }
 
