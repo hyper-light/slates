@@ -63866,8 +63866,9 @@ Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc
   - Fleet `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins` (a restarted warm before
     the newcomer reads): the read is past tolerance and the newcomer holds nothing. Without the start rule it adopted
     the old holder's prefix. Its scene fails to form about 1 run in 3: the surviving holder refuses a's records after
-    its warm restart, so no part reaches the newcomer. So it asserts the scene forms and is `#[ignore]`d as A-921's
-    red, run by name, until A-921 lands (main's ruling). The rule's own guard is the unit red above.
+    its warm restart, so no part reaches the newcomer. Since A-921 part 1 it asserts a was not taken over by its
+    restart (its fencing epoch unchanged) before it stops anyone, and forms the scene afresh, at most three times,
+    where a was. The rule's own guard is the unit red above.
   - `slates_db::takeover::tests::an_answer_names_nothing_only_from_the_first_position_it_holds` (main's red: Ready
     with epoch 1 before, past tolerance after), `a_read_lists_what_a_candidate_holds_with_its_start_and_moves_nothing`,
     `a_state_logs_fold_adopts_only_parts_that_continue_the_last` (main's red: the part at 30 past a missing 20 never

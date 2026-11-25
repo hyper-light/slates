@@ -2632,6 +2632,22 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.council.debug_state())
   }
 
+  /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
+  /// was recorded for it; and whether a kept retirement still names it (a re-admission waits on none naming it, A-919's
+  /// test settling, A-921). A one-shot control-shard question; its typed refusal when it could not be made.
+  pub fn council_host_standing(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<(Option<u64>, bool), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let configuration = s.council.configuration();
+      (
+        configuration.epochs.get(&host).map(|epoch| epoch.0),
+        configuration.retired.contains_key(&host),
+      )
+    })
+  }
+
   /// The **regional membership** this daemon's configuration council has committed and applied so far
   /// (§4.8, D-14) — the members of the `RegionalConfiguration`, the region the council masters. A one-shot
   /// control-shard question ([`Self::observation`]); an observation the daemon could not make is its typed

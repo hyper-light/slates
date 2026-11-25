@@ -327,6 +327,19 @@ impl UnitKind {
 thread_local! {
   /// The kind of the unit this thread's negotiation began last ([`last_unit`]).
   static LAST_UNIT: core::cell::Cell<UnitKind> = const { core::cell::Cell::new(UnitKind::Done) };
+  /// The kind of the unit it would do next, marked as it asks whether its step is spent ([`next_unit`]).
+  static NEXT_UNIT: core::cell::Cell<UnitKind> = const { core::cell::Cell::new(UnitKind::Done) };
+}
+
+/// The kind of the unit this thread's negotiation would do next, as it asks its owner whether its step is spent: what a
+/// pace that asks whether the next unit fits (`slates_pace::Step::more_at`, A-783) weighs it by.
+pub fn next_unit() -> UnitKind {
+  NEXT_UNIT.with(core::cell::Cell::get)
+}
+
+/// Marks a unit of `kind` as the next the negotiation would do, before it asks whether its step is spent.
+pub(super) fn ask_next(kind: UnitKind) {
+  NEXT_UNIT.with(|next| next.set(kind));
 }
 
 /// The kind of the unit this thread's negotiation began last: an owner timing its units between `spent` asks reads it
@@ -705,6 +718,15 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
       if let Some(outcome) = self.unit(graph, admission, spent)? {
         return Ok(Some(outcome));
       }
+      // The choice asks its own pace between its units and stops where it is spent.
+      if matches!(self.phase, Phase::Selecting(_)) {
+        return Ok(None);
+      }
+      ask_next(match &self.phase {
+        Phase::Ready(..) => UnitKind::Ready,
+        Phase::Cut(..) => UnitKind::Cut,
+        _ => UnitKind::Done,
+      });
       if spent() {
         return Ok(None);
       }
