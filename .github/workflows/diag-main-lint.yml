@@ -1,4 +1,7 @@
 name: diag-main-lint
+# Run 51 (main 01a20182, 2026-11-25 10:25 PST): main at 3f61d5429 after run 50 came back clean (a0b1d570d): w-git's
+# A-924 piece 2a (the daemon's spawner), w-perf's A-923 (Aways numbered, kind-15 migration, the cap rule) and w-hg's
+# push reds (ce768f168).
 # Run 50 (main 01a20182, 2026-11-25 10:00 PST): main at a0b1d570d, main's fix of run 49's three sites (staging's boxed
 # judging state and ToRecord, hg indexed_tests' u64::from), with A-924 piece 1's ipc fix (31f16d02f) and w-hg's push half.
 # Run 49 (main 01a20182, 2026-11-25 09:45 PST): main at 4c4849a5b, w-svn's lint 48 fix (01b1c6e3b + 2148a634c: CheckStep's
