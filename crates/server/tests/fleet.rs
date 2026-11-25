@@ -37922,6 +37922,12 @@ fn a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_succ
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
       all_council(&fleet.daemons, |members| members.contains(&owner))
     });
+  // a learns it was taken over when it installs the configuration that bumped its epoch, which can come after every
+  // node's council names it a member again: until then it believes it owns the repository, and its records are refused.
+  let learned = readmitted
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      Ok(summed_count(&fleet.daemons[0], "fleet.readmission.repositories_yielded") > 0)
+    });
   let pushed = fleet.push_on_top(0, ("after.txt", b"after the false death\n"));
   // At each survivor: the adopter serves the repository; the node that never held it answers not found, as before, since
   // a name resolves only where a partition holds it (D-12, no directory; fleet-wide name routing is owed, GAPS).
@@ -37962,7 +37968,10 @@ fn a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_succ
      a {pushed:?}; refusals {refusals:?}"
   );
   assert_eq!(first, Ok(()), "the push before the false death landed");
-  assert!(taken && readmitted, "a was taken over, then readmitted");
+  assert!(
+    taken && readmitted && learned,
+    "a was taken over, readmitted, and learned it"
+  );
   assert_eq!(
     pushed,
     Ok(()),

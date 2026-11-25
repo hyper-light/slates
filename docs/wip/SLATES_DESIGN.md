@@ -63942,6 +63942,10 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
     every node's edge (keyed by host and port, or one entry for the fleet's host with `credential.useHttpPath`
     unset). A bearer in `http.extraHeader` alone reaches only the first node. The fleet tests' push helpers carry one
     (`token_helper`).
+- **The window before a node learns it was taken over.** A readmitted node learns it lost its repositories when it
+  installs the configuration that bumped its epoch, which can come after every council names it a member again. Until
+  then it serves as their owner, its records are refused, and a push there is refused `unable to commit`, typed. The
+  fleet test waits for its yield before it pushes; a run on the merged base that did not wait met that window once.
 - **Not reproduced end to end: the stale-creator window** (main's ruling).
   - Across three fleet scenes (a cold four-node fleet, and one with the non-holder restarted warm after a's
     readmission), the direct route never named a with the skip turned off. The non-holder's routing, learned again,
