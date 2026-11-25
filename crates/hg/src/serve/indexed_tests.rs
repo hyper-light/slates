@@ -1415,6 +1415,107 @@ fn a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_sta
   assert_eq!(streamed_changelog(&mut skipping, &view).0, b"1");
 }
 
+/// A changeset store that keeps every revision as stock's revlog chunk of its whole (`Form::Chunk`, main's ruling (b)),
+/// over [`WholeTexts`]: and the chunk places' bytes it was asked for, summed.
+struct KeptAsChunks<'s> {
+  /// The store the rows come from, whole.
+  inner: WholeTexts<'s>,
+  /// The bytes of chunk places asked for.
+  chunk_bytes_asked: u64,
+}
+
+impl crate::render::StoredSource for KeptAsChunks<'_> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    let mut answered = self.inner.rows(logs)?;
+    for row in answered.iter_mut().flatten().flatten() {
+      let whole = self.inner.texts.get(&row.place.payload)?.clone();
+      let mut chunk = Vec::new();
+      crate::revlog_chunk::chunk(&whole, crate::revlog_chunk::Pass::Send, &mut chunk).ok()?;
+      let payload = *blake3::hash(&chunk).as_bytes();
+      row.place = crate::render::StoredPlace {
+        payload,
+        offset: 0,
+        len: u64::try_from(chunk.len()).ok()?,
+        chunk: true,
+      };
+      self.inner.texts.insert(payload, chunk);
+    }
+    Some(answered)
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    for place in places.iter().filter(|place| place.chunk) {
+      self.chunk_bytes_asked = self.chunk_bytes_asked.saturating_add(place.len);
+    }
+    self.inner.chunks(places)
+  }
+}
+
+/// Goal 93, main's ruling (b), its owed half (2026-11-25). Do: stream the `states` repository from a changeset store
+/// keeping each revision as its stock chunk, then from one keeping each whole. Expect: the two streams byte for byte the
+/// same (a chunk sent as it lies is the chunk the stream made of the whole); the chunk places' bytes asked for once
+/// each, by the send pass, the count pass sizing each by its place's length (non-vacuity: some asked). Red before: the
+/// count pass read every chunk place's bytes too, twice the store's reads.
+#[test]
+fn a_streams_count_pass_sizes_a_chunk_place_by_its_length_never_reading_it() {
+  use super::super::stream::stream_out;
+  let (imported, store, public) = streaming_states();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut chunked = KeptAsChunks {
+    inner: whole_texts(&imported.index, &store),
+    chunk_bytes_asked: 0,
+  };
+  let mut from_chunks = Vec::new();
+  stream_out(&view, &mut chunked, &mut room(), &mut from_chunks).unwrap();
+  let mut from_wholes = Vec::new();
+  stream_out(
+    &view,
+    &mut whole_texts(&imported.index, &store),
+    &mut room(),
+    &mut from_wholes,
+  )
+  .unwrap();
+  assert!(from_chunks.starts_with(b"0\n"), "the stream served");
+  assert_eq!(from_chunks, from_wholes, "the same stream either way");
+  let sent = sent_chunk_bytes(&from_chunks);
+  assert!(sent > 0, "chunks streamed");
+  assert_eq!(
+    chunked.chunk_bytes_asked, sent,
+    "each chunk place read once, by the send pass"
+  );
+}
+
+/// The bytes of the revlog chunks a version 1 stream carried: each `.d` file whole, and each inline `.i` file less its
+/// entries (one [`ENTRY_BYTES`](crate::render) each).
+fn sent_chunk_bytes(answer: &[u8]) -> u64 {
+  let (_, sent) = streamed(answer);
+  sent
+    .iter()
+    .map(|(name, bytes)| {
+      if name.ends_with(b".d") {
+        return u64::try_from(bytes.len()).unwrap();
+      }
+      if !name.ends_with(b".i") {
+        return 0;
+      }
+      let log = crate::revlog::Revlog::open(bytes, &[], &mut room()).unwrap();
+      let entries = u64::try_from(log.len()).unwrap() * 64;
+      if log.outline().inline() {
+        u64::try_from(bytes.len()).unwrap() - entries
+      } else {
+        0
+      }
+    })
+    .sum()
+}
+
 /// Each manifest and file revision a changegroup carries, with its link, as a set: what a fetch brings, whatever the
 /// order its packer took.
 fn carried(packed: &[u8]) -> BTreeSet<(Vec<u8>, Node, Node)> {

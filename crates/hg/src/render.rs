@@ -337,6 +337,15 @@ enum Stage {
   Done,
 }
 
+/// Which places a stream's batch of stored bytes asks for ([`Streaming`]'s `chunk_at`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Places {
+  /// Every place: the send pass, which writes each.
+  All,
+  /// Raw places alone: the count pass, which sizes a chunk place by its length.
+  Raw,
+}
+
 /// A place in the changeset store (its `texts::Place`): a payload section by its identity, an offset into it and a
 /// length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -815,13 +824,15 @@ impl Streaming {
     }
     let (seq, count) = self.front_log()?;
     if rev < count {
-      let Some(plain) = self.chunk_at(seq, rev)? else {
-        return Ok(Stage::Counting(log, rev));
-      };
-      let length = if self.chunk_place(seq, rev) {
-        to_u64(plain.len())
-      } else {
-        revlog_chunk::chunk_len(&plain, Pass::Count)?
+      // A chunk place is sized by its length, never read: only a raw place is read, to be sized as 7.2 compresses it.
+      let length = match self.chunk_place_len(seq, rev) {
+        Some(len) => len,
+        None => {
+          let Some(plain) = self.chunk_at(seq, rev, Places::Raw)? else {
+            return Ok(Stage::Counting(log, rev));
+          };
+          revlog_chunk::chunk_len(&plain, Pass::Count)?
+        }
       };
       if rev == 0 {
         self.sizing.clear();
@@ -866,12 +877,19 @@ impl Streaming {
   /// Whether revision `rev` of the log numbered `seq` has its place held as a revlog chunk (goal 93, main's ruling (b)):
   /// sent as it lies, sized by its length, never compressed again.
   fn chunk_place(&self, seq: u64, rev: u32) -> bool {
+    self.chunk_place_len(seq, rev).is_some()
+  }
+
+  /// The length of revision `rev`'s place in the log numbered `seq` where it is held as a revlog chunk: its chunk's
+  /// length, which the count pass takes without reading it. None for a raw place.
+  fn chunk_place_len(&self, seq: u64, rev: u32) -> Option<u64> {
     self
       .held
       .iter()
       .find(|held| held.seq == seq)
       .and_then(|held| held.revisions.get(usize::try_from(rev).ok()?))
-      .is_some_and(|row| row.place.chunk)
+      .filter(|row| row.place.chunk)
+      .map(|row| row.place.len)
   }
 
   /// Revision `rev`'s chunk of the log numbered `seq` written to `out` from `plain`, its place's bytes: as they lie where
@@ -899,8 +917,14 @@ impl Streaming {
 
   /// Revision `rev`'s stored bytes in the log numbered `seq` (its delta or its whole, as the store keeps it), when the
   /// batch given holds it next; else none, a batch from it on asked for, running into the logs held after this one: as
-  /// many places as fit the room the last step was given, at least one.
-  fn chunk_at(&mut self, seq: u64, rev: u32) -> Result<Option<Vec<u8>>, Refused> {
+  /// many places as fit the room the last step was given, at least one, of the kinds `places` names (the count pass
+  /// reads raw places alone, so its batch skips chunk places, which it never asks for).
+  fn chunk_at(
+    &mut self,
+    seq: u64,
+    rev: u32,
+    places_asked: Places,
+  ) -> Result<Option<Vec<u8>>, Refused> {
     if self
       .chunks
       .front()
@@ -915,6 +939,7 @@ impl Streaming {
       for (at, row) in (0_u32..)
         .zip(&held.revisions)
         .skip(usize::try_from(from).map_err(|_| Refused::TooLong)?)
+        .filter(|(_, row)| places_asked == Places::All || !row.place.chunk)
       {
         if !places.is_empty() && bytes.saturating_add(row.place.len) > self.room_hint {
           break 'logs;
@@ -986,7 +1011,7 @@ impl Streaming {
     let length = u64::from(length.ok_or_else(unreadable)?);
     // An inline log's chunk is had before anything is written, so a step that must ask the store writes nothing.
     let plain = if inline {
-      self.chunk_at(seq, rev)?
+      self.chunk_at(seq, rev, Places::All)?
     } else {
       None
     };
@@ -1149,7 +1174,7 @@ impl Streaming {
       .filter(|sized| sized.log == log)
       .and_then(|sized| sized.chunks.get(usize::try_from(rev).ok()?).copied())
       .ok_or_else(unreadable)?;
-    let Some(plain) = self.chunk_at(seq, rev)? else {
+    let Some(plain) = self.chunk_at(seq, rev, Places::All)? else {
       return Ok(Stage::Data(log, rev));
     };
     admission.charge(u64::from(length))?;

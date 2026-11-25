@@ -1721,7 +1721,11 @@
 > segment` (the production step's chunk turns counted, none past its copy slice). A made changeset's payload stays raw:
 > its record replays the changegroup itself (`write_made_record`), and no push lands whole any more (every push lands
 > as segments), so a stream compresses only a made changeset's places at stream time (`Streaming::sized` stays for
-> them). Owed: the count pass still reads a chunk place's bytes it could size by its length.
+> them). The count pass sizes a chunk place by its length since (2026-11-25, w-hg): its batch asks only raw places'
+> bytes, which it must compress to size, so a stream reads each chunk once, in its send pass. Held by
+> `a_streams_count_pass_sizes_a_chunk_place_by_its_length_never_reading_it` (the `states` stream from a store keeping
+> each revision as its chunk equals the stream from wholes byte for byte; the chunk bytes asked equal those sent, 907;
+> red: 1,814, each read by both passes).
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
