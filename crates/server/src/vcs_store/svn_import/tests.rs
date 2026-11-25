@@ -1137,3 +1137,134 @@ fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
     "the same history with and without the texts bound"
   );
 }
+
+/// Shape: the appends oracle's revisions, its file's first text, and each append: every text the one before with more
+/// bytes after it, so consecutive revisions hold the same opening windows (windows are named by their bytes).
+const APPEND_REVISIONS: usize = 12;
+/// Shape: see [`APPEND_REVISIONS`].
+const APPEND_FIRST_BYTES: usize = 300 << 10;
+/// Shape: see [`APPEND_REVISIONS`].
+const APPEND_BYTES: usize = 7_001;
+
+/// A format-2 dump of `revisions` revisions after revision 0: revision 1 adds file `f` holding `first` bytes of noise,
+/// and each later one rewrites it whole as the same noise `step` bytes longer: an append, whose text shares every whole
+/// window of the one before.
+fn appends(revisions: usize, first: usize, step: usize) -> Vec<u8> {
+  let props = |entries: &[(&str, &str)]| {
+    let mut section = String::new();
+    for (name, value) in entries {
+      section.push_str(&format!(
+        "K {}\n{name}\nV {}\n{value}\n",
+        name.len(),
+        value.len()
+      ));
+    }
+    section.push_str("PROPS-END\n");
+    section
+  };
+  let mut dump =
+    b"SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000910\n\n".to_vec();
+  let zero = props(&[("svn:date", "2026-11-25T00:00:00.000000Z")]);
+  dump.extend_from_slice(
+    format!(
+      "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+      zero.len()
+    )
+    .as_bytes(),
+  );
+  for number in 1..=revisions {
+    let date = format!("2026-11-25T00:00:00.{number:06}Z");
+    let log = format!("r{number}");
+    let section = props(&[
+      ("svn:author", "alice"),
+      ("svn:date", &date),
+      ("svn:log", &log),
+    ]);
+    let text = crate::test_store::noise(first + (number - 1) * step);
+    dump.extend_from_slice(
+      format!(
+        "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+        section.len()
+      )
+      .as_bytes(),
+    );
+    let (action, empty) = if number == 1 {
+      ("add", "PROPS-END\n")
+    } else {
+      ("change", "")
+    };
+    let props_header = if number == 1 {
+      format!("Prop-content-length: {}\n", empty.len())
+    } else {
+      String::new()
+    };
+    dump.extend_from_slice(
+      format!(
+        "Node-path: f\nNode-kind: file\nNode-action: {action}\n{props_header}Text-content-length: {}\n\
+         Content-length: {}\n\n{empty}",
+        text.len(),
+        empty.len() + text.len()
+      )
+      .as_bytes(),
+    );
+    dump.extend_from_slice(&text);
+    dump.extend_from_slice(b"\n\n");
+  }
+  dump
+}
+
+/// What an import of [`appends`] into a new repository `name` made, its texts bound `bound` where set (`staging::
+/// TEXTS_BOUND`), or passed over where none (`staging::TEXTS_UNBOUNDED`): its youngest revision, the batches it landed
+/// for their texts, and its history exported whole.
+async fn appends_imported(
+  name: &str,
+  bound: Option<u64>,
+) -> (Result<u64, LoadFailed>, u64, Option<(u64, Vec<u8>)>) {
+  let staging = &crate::repository::svn_commit::staging::TEXTS_BOUND;
+  let unbound = &crate::repository::svn_commit::staging::TEXTS_UNBOUNDED;
+  staging.with(|cell| cell.set(bound));
+  unbound.with(|cell| cell.set(bound.is_none()));
+  let before = on(|state| count(state, crate::repository::svn_commit::staging::FLUSHED_TEXTS));
+  let (svn, _) = subversion(name).await;
+  let (loaded, _) = imported(
+    svn,
+    appends(APPEND_REVISIONS, APPEND_FIRST_BYTES, APPEND_BYTES),
+  )
+  .await;
+  staging.with(|cell| cell.set(None));
+  unbound.with(|cell| cell.set(false));
+  let flushed =
+    on(|state| count(state, crate::repository::svn_commit::staging::FLUSHED_TEXTS)) - before;
+  (
+    loaded.map(|loaded| loaded.youngest),
+    flushed,
+    history(svn).await,
+  )
+}
+
+/// Main's oracle of 2026-11-24 (TSan diag 45557094379: on a Linux runner's texts bound, a revision changing a text an
+/// earlier batch landed was refused `Unstored`, the landed text's let-go taking the windows the later text shared). Do:
+/// import [`appends`]'s [`APPEND_REVISIONS`] appends to one file with a texts bound of one byte, so a batch lands before
+/// every revision while the next revision's text is put; then import it again with the bound passed over, one batch.
+/// Expect: both at the last revision, the first cut before every revision but the first, and the two histories,
+/// exported whole, the same byte for byte. Red before: the second revision refused `Unstored`.
+#[test]
+fn an_import_cut_before_every_revision_is_the_import_uncut() {
+  let (cut, uncut) = stored(|| async move {
+    let cut = appends_imported("appends-cut", Some(1)).await;
+    let uncut = appends_imported("appends-uncut", None).await;
+    (cut, uncut)
+  });
+  let youngest = u64::try_from(APPEND_REVISIONS).unwrap_or(u64::MAX);
+  assert_eq!((&cut.0, &uncut.0), (&Ok(youngest), &Ok(youngest)));
+  assert_eq!(
+    cut.1,
+    youngest - 1,
+    "a batch landed before every revision but the first"
+  );
+  assert_eq!(uncut.1, 0, "the uncut import was one batch");
+  assert!(
+    cut.2.is_some() && cut.2 == uncut.2,
+    "the same history cut and uncut"
+  );
+}

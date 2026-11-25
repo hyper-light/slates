@@ -801,11 +801,14 @@ fn a_pushs_changeset_replays_from_its_payload_a_piece_at_a_time() {
   }
 }
 
+/// A changeset a test made: its node, its two parents, its manifest text and its changelog entry.
+type Made = (Node, Node, Node, Vec<u8>, Vec<u8>);
+
 /// The changesets of `decoded` whose delta's base is neither the null node nor the changeset before it: the bases an
 /// intake does not hold as the text it kept last, so rebuilds from the fork (a manifest's and a file revision's are read
 /// over the fork's rows a window at a time since C1 (2), never rebuilt whole).
 fn bases_not_kept_last(decoded: &crate::changegroup::Changegroup<'_>) -> u64 {
-  let groups = vec![decoded.group(&decoded.changelog)];
+  let groups = [decoded.group(&decoded.changelog)];
   groups
     .iter()
     .map(|group| {
@@ -2338,13 +2341,13 @@ fn dag_push(commits: &[([Option<usize>; 2], &[u8])], padding: usize) -> (Vec<u8>
       (path, text, file)
     })
     .collect();
-  let mut made: Vec<(Node, Node, Node, Vec<u8>, Vec<u8>)> = Vec::new();
+  let mut made: Vec<Made> = Vec::new();
   let mut out = Vec::new();
   let (mut manifests, mut files) = (Vec::new(), Vec::new());
   for (at, (parents, text)) in commits.iter().enumerate() {
     let of = |parent: Option<usize>| parent.and_then(|parent| made.get(parent));
     let (first, second) = (of(parents[0]), of(parents[1]));
-    let node_of = |made: Option<&(Node, Node, Node, Vec<u8>, Vec<u8>)>, pick: usize| {
+    let node_of = |made: Option<&Made>, pick: usize| {
       made.map_or(NULL_NODE, |made| [made.0, made.1, made.2][pick])
     };
     let file = node::compute(&node_of(first, 2), &node_of(second, 2), text).unwrap();
@@ -2478,7 +2481,6 @@ fn a_manifest_chain_read_in_ranges_is_its_text() {
   let (fork, _, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
   let mut longest_chain = 0usize;
   for rev in 0..fork.len(&store, Log::Manifest) {
-    let rev = u32::try_from(rev).unwrap();
     let text = fork.revision_text(&store, Log::Manifest, rev).unwrap();
     let chain = Chain::of(&fork, &store, rev).unwrap();
     assert_eq!(chain.len(), to_u64(text.len()));
@@ -2524,11 +2526,7 @@ fn a_manifest_chain_read_in_ranges_is_its_text() {
 /// Each manifest's text the fork reads back, in log order.
 fn manifest_texts(fork: &HgIndex, store: &ContentStore) -> Vec<Vec<u8>> {
   (0..fork.len(store, Log::Manifest))
-    .map(|rev| {
-      fork
-        .revision_text(store, Log::Manifest, u32::try_from(rev).unwrap())
-        .unwrap()
-    })
+    .map(|rev| fork.revision_text(store, Log::Manifest, rev).unwrap())
     .collect()
 }
 
@@ -2613,7 +2611,7 @@ fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
   loop {
     let stepped = taking.step(&payload, &mut store, &mut admission).unwrap();
     while let Some(segment) = taking.take_segment() {
-      records.push(whole_record(&mut taking, &segment, 1 << 20, &store));
+      records.push(whole_record(&taking, &segment, 1 << 20, &store));
     }
     match stepped {
       Stepped::Store => taking.answer_from_fork(&store),
@@ -2623,7 +2621,7 @@ fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
   }
   taking.cut_rest();
   while let Some(segment) = taking.take_segment() {
-    records.push(whole_record(&mut taking, &segment, 1 << 20, &store));
+    records.push(whole_record(&taking, &segment, 1 << 20, &store));
   }
   let (mut fork, intaken) = finished(taking);
   assert_eq!(
