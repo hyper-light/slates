@@ -19731,7 +19731,7 @@ about as often as B (6.2 % against 6.6 % of probes) and is dead even with B on t
   no arm.
 - **The daemon's peak** was alike: A 2,902 to 2,946 MiB, B 2,904 to 2,978, C 2,909 to 2,911.
 
-## The 57k hg clone's memory after its two fixes: the clone adds 27 MiB to a resident 0.98 GiB, in process (goal 93 perf; w-perf's `what_holds`, main 01a20182's run, 2026-11-25 02:05 to 02:10 PST)
+## The 57k hg clone's memory after its two fixes: the clone adds 27 MiB to a resident 983 MiB, in process (goal 93 perf; w-perf's `what_holds`, main 01a20182's run, 2026-11-25 02:05 to 02:10 PST)
 
 **Fixed, by an in-process measure.** With 7c0ea35a1 (the text cache's walk ended for whole reads) and fffd95f79 (a
 fetch's batch bounded by `copy_slice_bytes`), a clone of the 57k history adds 27 MiB to the daemon's resident set. The
