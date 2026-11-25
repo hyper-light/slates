@@ -666,3 +666,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - 35f8a25b5 and 614fc9cad: BENCHMARKS, the 57k hg clone's memory from what_holds (in process; the harness's hg leg
   supersedes it).
 - Left: main's queued run of the 57k stream's compress counters. Nothing else open.
+- ad36e5f09: hg-matrix.sh's evolution rows (evo-repository, evo-amend-push, evo-rebase-push, evo-clone, evo-verify,
+  evo-markers-back): 6 of 6 against stock hg 7.2.4. The same run's merge-push and rebase-push were refused
+  UnknownDeltaBase on manifest 41172a1e, a manifest base carried earlier in the same push. Sent to w-hg (theirs) and
+  main. Logs are kept in w-interop-scratch/hg-matrix-work/logs until w-hg has read them.
