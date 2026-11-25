@@ -485,3 +485,15 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## 2026-11-21 ~04:05 PST: WAITING on main: owner's durable step, shape (A) by-reference chain entry vs (B) sliced db
   append (inbox/main-from-w-shared-lane-byref.md; both reach crates/db or the chain format, overlapping A-767/w-store).
   Family three: kiln r14 queued (adacachy not answering). A-658 3c: waits on w-store wiring.
+
+## 2026-11-24: A-909 landed (f387b56d3, commit c9262f763)
+
+- An owner's own hold fences each object as its holders do (`Acceptor::accept_own`, called by
+  `commit_record_sent_as`). The successor's branch push was refused because its one owner acceptor, fenced at the
+  takeover's epoch 2 by registers it adopted, refused its new green's records at host epoch 1 (`StaleEpoch`).
+- Tests: the fleet test is red without the fix and green with it; 4 slates-db a909 tests; focused register 109,
+  cluster commit 26, server lib takeover and state_log 39, fleet a894, a908 and the new branch's push 3.
+- Models: they fence per register, and the specs are unchanged.
+- Owed (main): gate 15 (v3_takeover) and a lint diag.
+- Left: A-908 part 4 (a holder's rebuild makes a member by its lineage); A-905 (parked on w-git's question 1);
+  the second new branch's `cannot lock ref` is unchecked.
