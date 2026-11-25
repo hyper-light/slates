@@ -580,3 +580,69 @@ proptest! {
     assert_canonical_or_typed(&framed);
   }
 }
+
+std::thread_local! {
+  /// The paced canonicalize test's clock: a read a tick.
+  static TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The paced canonicalize test's clock, a tick a read, so a turn whose deadline is the next tick runs one unit.
+fn ticking() -> u64 {
+  TICKS.with(|ticks| {
+    let now = ticks.get();
+    ticks.set(now + 1);
+    now
+  })
+}
+
+/// `doc` canonicalized owned ([`OpsDoc::canonicalized`]) a turn at a time, each turn's deadline the clock's next tick:
+/// the document, and the turns it took.
+fn canonicalized_a_unit_a_turn(doc: OpsDoc) -> (OpsDoc, u64) {
+  let pace = crate::pace::Pace::new(ticking);
+  let mut canonical = std::pin::pin!(OpsDoc::canonicalized(doc));
+  let mut turns = 0;
+  loop {
+    turns += 1;
+    pace.turn(ticking() + 1);
+    if let std::task::Poll::Ready(doc) = pace.drive(canonical.as_mut()) {
+      return (doc, turns);
+    }
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+  /// A-920 piece 4a (oracle). Do: make documents of up to 40 ops of every kind on random paths, with hard links naming
+  /// random paths, declared in random order; canonicalize each whole and, owned, a unit a turn under a pace. Expect the
+  /// same encoding, and the paced one taking more than one turn wherever the document has more than one op.
+  #[test]
+  fn a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole(
+    ops in prop::collection::vec((0usize..12, 0u8..17, 0u64..64, 0u64..64), 0..40),
+    links in prop::collection::vec((0usize..12, 0usize..12, any::<bool>()), 0..6),
+  ) {
+    let names = names(12);
+    let mut whole = OpsDoc::new();
+    for (path, kind, at, len) in &ops {
+      let path = whole.paths.intern(&names[*path]);
+      whole.ops.push(Op {
+        kind: OpKind::from_wire(*kind).unwrap_or(OpKind::Create),
+        flags: 0,
+        path,
+        at: *at,
+        len: *len,
+        src: u64::MAX,
+      });
+    }
+    for (from, to, made) in &links {
+      let origin = if *made { NodeOrigin::Made } else { NodeOrigin::Base };
+      link(&mut whole, &names[*from], (&names[*to], origin));
+    }
+    let (paced, turns) = canonicalized_a_unit_a_turn(whole.clone());
+    whole.canonicalize();
+    prop_assert_eq!(paced.encode(), whole.encode());
+    if ops.len() > 1 {
+      prop_assert!(turns > 1, "{} ops in one turn", ops.len());
+    }
+  }
+}

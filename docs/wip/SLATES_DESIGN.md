@@ -64088,4 +64088,14 @@ GAPS.
   step 77 ms → 47 ms. Oracle: over generated works of every kind and renames, on the histories every earlier work
   left, the reservation taken a unit a step equals the two whole, before each work is submitted and after
   (`a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole`; a rename's source left uncharged, or a
-  special's node, fails it). Owed: the shares are whole, `copy_entry_room` resolving the work whole where it copies.
+  special's node, fails it). Still whole: the shares, 0.86 ms at 9,000 files with no copy or replace (their scans
+  and the move into the member's numbering); `copy_entry_room` resolves the work whole where it copies.
+- **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
+  the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
+  document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
+  is it plus `canonicalize`, as every other commit takes it) and the staging puts it in order a slice a step
+  (`staging::canonical_in`, inside `readied_in` with the named texts' reads), driving A-752's paced canonicalize, owned
+  (`OpsDoc::canonicalized`), a `Pace` turn to each step's quantum. The build step 51-55 ms → 26-27 ms. Oracle: over
+  generated documents of every op kind with hard links, declared in random order, the document canonicalized a unit
+  a turn encodes as the one canonicalized whole, in more than one turn wherever it has more than one op
+  (`a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole`).
