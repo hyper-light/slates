@@ -121,42 +121,69 @@ pub fn fork_with(
   }
 }
 
+/// Summary of one revision kept by [`keep_one`], avoiding follow-up `HgIndex::len` and
+/// `HgIndex::revision` readbacks during segmented intake.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeptOne {
+  /// The assigned revision number in its log.
+  pub(crate) rev: u32,
+  /// Primary stored content identity (changeset text, manifest delta/text, or file bytes).
+  pub(crate) bytes: ContentId,
+  /// Optional file metadata block content identity.
+  pub(crate) block: Option<ContentId>,
+  /// Resident stored byte length (delta length for delta manifests, else text length).
+  pub(crate) stored_bytes: u64,
+}
+
 /// Keeps one revision a push brought in `fork`'s `log` (A-720, the sliced intake): its text kept as content once and its
 /// row appended, numbered its log's next, as [`fork_with`] keeps a group; the holds its puts took given back. `previous`
 /// is the node and whole text of the revision the intake kept last, so a manifest's delta is made against it rather
-/// than a text rebuilt from its chain (`HgIndex::append_revisions_after`, A-732). Refused, what it put is given back
-/// and `fork` holds none of it.
+/// than a text rebuilt from its chain (`HgIndex::append_revisions_after`, A-732). `known_next` optionally supplies the
+/// caller-tracked next revision number for `log`, avoiding repeated `HgIndex::len` scans on file logs. Refused, what
+/// it put is given back and `fork` holds none of it.
 pub(crate) fn keep_one(
   fork: &mut HgIndex,
   store: &mut ContentStore,
   log: Log<'_>,
   (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
-  kept: Option<ContentId>,
+  (kept, known_next): (Option<ContentId>, Option<u32>),
   admission: &mut Admission,
-) -> Result<(), Unindexed> {
+) -> Result<Option<KeptOne>, Unindexed> {
   let mut puts = Puts::default();
   let one = core::slice::from_ref(arrived);
-  let kept = match log {
+  let outcome = match log {
     Log::Changelog => changesets(fork, store, one, &mut puts, admission),
     Log::Manifest | Log::File(_) => {
       let files = matches!(log, Log::File(_));
       revisions(store, (one, kept), &mut puts, admission, files).and_then(|group| {
-        fork
-          .append_revisions_after(
+        let (revs, last) = fork
+          .append_revisions_at(
             store,
             log,
             &group,
             (previous, &[(arrived.node, arrived.text.as_slice())]),
+            known_next,
           )
-          .map(drop)
-          .map_err(Unindexed::from)
+          .map_err(Unindexed::from)?;
+        Ok(
+          revs
+            .first()
+            .copied()
+            .zip(last)
+            .map(|(rev, (bytes, block, stored_bytes))| KeptOne {
+              rev,
+              bytes,
+              block,
+              stored_bytes,
+            }),
+        )
       })
     }
   };
   let given = puts.give_back(store).map_err(IndexRefused::Content);
-  match (kept, given) {
-    (Ok(()), Ok(())) => Ok(()),
-    (Ok(()), Err(release)) => Err(Unindexed::Fork(release)),
+  match (outcome, given) {
+    (Ok(kept), Ok(())) => Ok(kept),
+    (Ok(_), Err(release)) => Err(Unindexed::Fork(release)),
     (Err(cause), Ok(())) => Err(cause),
     (Err(cause), Err(release)) => Err(Unindexed::Unreleased {
       cause: Box::new(cause),
@@ -173,7 +200,7 @@ fn append(
   puts: &mut Puts,
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
-  changesets(fork, store, &verified.changesets, puts, admission)?;
+  let _ = changesets(fork, store, &verified.changesets, puts, admission)?;
   let manifests = revisions(store, (&verified.manifests, None), puts, admission, false)?;
   let given: Vec<(Node, &[u8])> = verified
     .manifests
@@ -198,7 +225,7 @@ fn changesets(
   arrived: &[Arrived],
   puts: &mut Puts,
   admission: &mut Admission,
-) -> Result<(), Unindexed> {
+) -> Result<Option<KeptOne>, Unindexed> {
   admission.charge_items::<(ChangesetFields, ContentId)>(arrived.len())?;
   let mut fields: Vec<(ChangesetFields, ContentId)> = Vec::with_capacity(arrived.len());
   for changeset in arrived {
@@ -229,8 +256,18 @@ fn changesets(
       },
     )
     .collect();
-  fork.append_changesets(store, &group)?;
-  Ok(())
+  let revs = fork.append_changesets(store, &group)?;
+  let last = revs.last().copied().and_then(|rev| {
+    let (_, bytes) = fields.last()?;
+    let stored_bytes = to_u64(arrived.last()?.text.len());
+    Some(KeptOne {
+      rev,
+      bytes: *bytes,
+      block: None,
+      stored_bytes,
+    })
+  });
+  Ok(last)
 }
 
 /// A manifest log's or a file log's group, each text kept: a file revision's block apart from its bytes and its

@@ -2004,7 +2004,7 @@ fn index_answer(index: &Index, path: &str, revision: Revision) -> Result<Option<
   let Some(node) = asked.map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))? else {
     return Ok(None);
   };
-  let id = |id: NodeRevisionId| id.0;
+  let id = |id: NodeRevisionId| usize::try_from(id.0).unwrap();
   Ok(Some(Answer {
     label: id(node.id()),
     node_id: (node.node_id().revision, node.node_id().number),
@@ -2196,8 +2196,8 @@ fn same_history(
     .map_err(|refusal| format!("{path}: {refusal:?}"))?
     .iter()
     .map(|entry| match entry.event {
-      HistoryEvent::Created(node) => (entry.revision, true, node.0),
-      HistoryEvent::Deleted(node) => (entry.revision, false, node.0),
+      HistoryEvent::Created(node) => (entry.revision, true, usize::try_from(node.0).unwrap()),
+      HistoryEvent::Deleted(node) => (entry.revision, false, usize::try_from(node.0).unwrap()),
     })
     .collect();
   let theirs = naive_history(fs, path);

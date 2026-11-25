@@ -159,7 +159,7 @@ pub(super) fn set(
   key: usize,
   value: NodeRevisionId,
 ) -> Option<u32> {
-  let entry = (u32::try_from(key).ok()?, u32::try_from(value.0).ok()?);
+  let entry = (u32::try_from(key).ok()?, value.0);
   if root == EMPTY {
     return store.push_map_node(MapNode::Leaf(vec![entry]));
   }
@@ -209,10 +209,7 @@ pub(super) fn entries(store: &impl MapRead, root: u32) -> Option<Vec<(usize, Nod
     match store.map_node(handle)? {
       NodeRef::Leaf(entries) => {
         for &(key, value) in entries {
-          out.push((
-            usize::try_from(key).ok()?,
-            NodeRevisionId(usize::try_from(value).ok()?),
-          ));
+          out.push((usize::try_from(key).ok()?, NodeRevisionId(value)));
         }
       }
       NodeRef::Inner(children) => stack.extend(children.iter().rev().map(|(_, child)| *child)),
@@ -288,10 +285,7 @@ fn collect_leaf(
     if out.len() >= most {
       break;
     }
-    out.push((
-      usize::try_from(key).ok()?,
-      NodeRevisionId(usize::try_from(value).ok()?),
-    ));
+    out.push((usize::try_from(key).ok()?, NodeRevisionId(value)));
   }
   Some(())
 }

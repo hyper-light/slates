@@ -64,7 +64,7 @@ impl Store {
             .key_name(u32::try_from(key).unwrap())
             .unwrap()
             .to_owned(),
-          id.0,
+          usize::try_from(id.0).unwrap(),
         )
       }));
       if !more {
@@ -84,7 +84,7 @@ impl Store {
             .key_name(u32::try_from(key).unwrap())
             .unwrap()
             .to_owned(),
-          id.0,
+          usize::try_from(id.0).unwrap(),
         )
       })
       .collect()
@@ -133,7 +133,13 @@ fn run(changes: &[Change], batch: usize) {
     match *change {
       Change::Set(number, copy, id) => {
         let key = store.key(if copy { "source" } else { "own" }, &name(number));
-        root = set(&mut store, root, key, NodeRevisionId(id)).unwrap();
+        root = set(
+          &mut store,
+          root,
+          key,
+          NodeRevisionId(u32::try_from(id).unwrap()),
+        )
+        .unwrap();
         model.insert(name(number), id);
       }
       Change::Remove(number) => {

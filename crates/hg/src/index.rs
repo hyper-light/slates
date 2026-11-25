@@ -1085,6 +1085,83 @@ impl HgIndex {
     ))
   }
 
+  /// Scans file log revisions sequentially starting from `(path, rev)` using a single merged LSM
+  /// cursor, invoking `visit(found_path, found_rev, row)` until `visit` returns `false` or the
+  /// file logs end.
+  pub(crate) fn scan_file_revisions_from(
+    &self,
+    store: &ContentStore,
+    (path, rev): (&[u8], u32),
+    visit: &mut impl FnMut(&[u8], u32, RevisionRow) -> bool,
+  ) {
+    let start = Log::File(path).row_key_small(rev);
+    for row in self.rows.iter_from(store, start.as_slice()) {
+      let Some(rest) = row.key().strip_prefix(&[LOG_ROW, FILE_KEY]) else {
+        break;
+      };
+      let Some((found, number)) = rest.split_last_chunk::<REV_BYTES>() else {
+        break;
+      };
+      let Some(found) = found.strip_suffix(&[PATH_END]) else {
+        break;
+      };
+      let Some(parsed) = read_revision(&row) else {
+        break;
+      };
+      if !visit(found, u32::from_be_bytes(*number), parsed) {
+        break;
+      }
+    }
+  }
+
+  /// Scans manifest log revisions sequentially from `rev` using a single merged LSM cursor.
+  pub(crate) fn scan_manifest_from(
+    &self,
+    store: &ContentStore,
+    rev: u32,
+    visit: &mut impl FnMut(u32, RevisionRow) -> bool,
+  ) {
+    let start = Log::Manifest.row_key_small(rev);
+    for row in self.rows.iter_from(store, start.as_slice()) {
+      let Some(rest) = row.key().strip_prefix(&[LOG_ROW, MANIFEST_KEY]) else {
+        break;
+      };
+      let Ok(number) = <[u8; REV_BYTES]>::try_from(rest) else {
+        break;
+      };
+      let Some(parsed) = read_revision(&row) else {
+        break;
+      };
+      if !visit(u32::from_be_bytes(number), parsed) {
+        break;
+      }
+    }
+  }
+
+  /// Scans changelog revisions sequentially from `rev` using a single merged LSM cursor.
+  pub(crate) fn scan_changelog_from(
+    &self,
+    store: &ContentStore,
+    rev: u32,
+    visit: &mut impl FnMut(u32, ChangesetRow<'_>) -> bool,
+  ) {
+    let start = Log::Changelog.row_key_small(rev);
+    for row in self.rows.iter_from(store, start.as_slice()) {
+      let Some(rest) = row.key().strip_prefix(&[LOG_ROW, CHANGELOG_KEY]) else {
+        break;
+      };
+      let Ok(number) = <[u8; REV_BYTES]>::try_from(rest) else {
+        break;
+      };
+      let Some(parsed) = read_changeset(&row) else {
+        break;
+      };
+      if !visit(u32::from_be_bytes(number), parsed) {
+        break;
+      }
+    }
+  }
+
   /// The changelog's row numbered `rev`.
   pub fn changeset<'s>(&'s self, store: &'s ContentStore, rev: u32) -> Option<ChangesetRow<'s>> {
     let [b0, b1, b2, b3] = rev.to_be_bytes();
@@ -1191,7 +1268,24 @@ impl HgIndex {
     group: &[NewRevision],
     (previous, given): (Option<(&Node, &'t [u8])>, GivenTexts<'_, 't>),
   ) -> Result<Vec<u32>, Refused> {
-    let (revs, mut planned) = self.planned(store, log, group.iter())?;
+    self
+      .append_revisions_at(store, log, group, (previous, given), None)
+      .map(|(revs, _)| revs)
+  }
+
+  /// [`HgIndex::append_revisions_after`] accepting an optional caller-tracked `known_next` revision
+  /// number for `log` (eliminating repeated `first_missing` binary searches during sequential file
+  /// group intake) and returning the last appended row's stored content identity, optional metadata
+  /// block, and stored byte length.
+  pub(crate) fn append_revisions_at<'t>(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    group: &[NewRevision],
+    (previous, given): (Option<(&Node, &'t [u8])>, GivenTexts<'_, 't>),
+    known_next: Option<u32>,
+  ) -> Result<(Vec<u32>, KeptLast), Refused> {
+    let (revs, mut planned) = self.planned_at(store, log, group.iter(), known_next)?;
     let previous = match (log, planned.first()) {
       (Log::Manifest, Some(first)) if first.rev > 0 => {
         let rev = first.rev.saturating_sub(1);
@@ -1214,7 +1308,7 @@ impl HgIndex {
       }
       _ => None,
     };
-    let puts = kept_as(store, log, &mut planned, (previous, given))?;
+    let (puts, last_stored) = kept_as(store, log, &mut planned, (previous, given))?;
     let written = self.write(store, log, &planned);
     for put in &puts {
       drop(store.release(put));
@@ -1225,7 +1319,7 @@ impl HgIndex {
     {
       self.manifest_len = self.manifest_len.max(last.rev.saturating_add(1));
     }
-    written.map(|()| revs)
+    written.map(|()| (revs, last_stored))
   }
 
   /// Appends a group of revisions to `log` as they were stored (A-729 part 2: an import's record names each row's
@@ -1266,10 +1360,24 @@ impl HgIndex {
     log: Log<'_>,
     group: impl Iterator<Item = &'g NewRevision>,
   ) -> Result<(Vec<u32>, Vec<Planned>), Refused> {
+    self.planned_at(store, log, group, None)
+  }
+
+  /// [`HgIndex::planned`] with an optional caller-known starting revision number for `log`.
+  fn planned_at<'g>(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    group: impl Iterator<Item = &'g NewRevision>,
+    known_next: Option<u32>,
+  ) -> Result<(Vec<u32>, Vec<Planned>), Refused> {
     if log == Log::Changelog {
       return Err(Refused::MissingLink { node: NULL_NODE });
     }
-    let mut planner = Planner::new(self, store, log);
+    let mut planner = match known_next {
+      Some(next) => Planner::with_next(self, store, log, next),
+      None => Planner::new(self, store, log),
+    };
     for revision in group {
       let Some((rev, p1, p2)) = planner.place(revision.node, revision.p1, revision.p2)? else {
         continue;
@@ -1419,11 +1527,16 @@ struct Planner<'i> {
 impl<'i> Planner<'i> {
   /// A planner for a group going into `log`.
   fn new(index: &'i HgIndex, store: &'i ContentStore, log: Log<'i>) -> Self {
+    Self::with_next(index, store, log, index.len(store, log))
+  }
+
+  /// A planner for a group going into `log`, starting at caller-known `next`.
+  fn with_next(index: &'i HgIndex, store: &'i ContentStore, log: Log<'i>, next: u32) -> Self {
     Self {
       index,
       store,
       log,
-      next: index.len(store, log),
+      next,
       added: BTreeMap::new(),
       revs: Vec::new(),
       planned: Vec::new(),
@@ -1546,20 +1659,36 @@ type GivenTexts<'g, 't> = &'g [(Node, &'t [u8])];
 /// The row a group's first delta applies to: its revision, its text, and its stored length.
 type KeptPrevious<'t> = Option<(u32, Cow<'t, [u8]>, u64)>;
 
+/// Stored content summary of the last row planned by [`kept_as`]: `(bytes, block, stored_bytes)`.
+pub(crate) type KeptLast = Option<(ContentId, Option<ContentId>, u64)>;
+
+/// Extracts `(bytes, block, stored_bytes)` for `row` after `kept_as` chose its storage `fields`.
+fn row_stored_summary(row: &Planned, fields: Stored, len: Option<u64>) -> KeptLast {
+  let &bytes = row.contents.first()?;
+  let block = row.contents.get(1).copied();
+  let stored_bytes = if fields.0 != NONE {
+    fields.1
+  } else {
+    len.unwrap_or(0)
+  };
+  Some((bytes, block, stored_bytes))
+}
+
 fn kept_as<'t>(
   store: &mut ContentStore,
   log: Log<'_>,
   planned: &mut [Planned],
   (mut previous, given): (KeptPrevious<'t>, GivenTexts<'_, 't>),
-) -> Result<Vec<ContentId>, Refused> {
+) -> Result<(Vec<ContentId>, KeptLast), Refused> {
   let mut puts = Vec::new();
+  let mut last_stored = None;
   for row in planned.iter_mut() {
     let mut fields = WHOLE;
+    let len = row
+      .payload
+      .get(COMMON_BYTES - LEN_BYTES..COMMON_BYTES)
+      .and_then(|len| len.try_into().ok().map(u64::from_le_bytes));
     if log == Log::Manifest {
-      let len = row
-        .payload
-        .get(COMMON_BYTES - LEN_BYTES..COMMON_BYTES)
-        .and_then(|len| len.try_into().ok().map(u64::from_le_bytes));
       // The caller's own copy of the text where it gave one for this node, of the length the row names; else read back.
       let held = given
         .iter()
@@ -1609,11 +1738,12 @@ fn kept_as<'t>(
       }
       previous = Some((row.rev, text, fields.2));
     }
+    last_stored = row_stored_summary(row, fields, len).or(last_stored);
     row.payload.extend_from_slice(&fields.0.to_le_bytes());
     row.payload.extend_from_slice(&fields.1.to_le_bytes());
     row.payload.extend_from_slice(&fields.2.to_le_bytes());
   }
-  Ok(puts)
+  Ok((puts, last_stored))
 }
 
 /// A file revision's text: its metadata block and its bytes between the markers, `len` long in all.

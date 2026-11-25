@@ -277,11 +277,22 @@ impl Walked {
   }
 
   /// Its store path's radix before encoding (`data/<path>`, `00manifest`, `00changelog`).
-  fn radix(&self) -> Vec<u8> {
+  fn store_path(&self, suffix: &[u8]) -> Vec<u8> {
     match self {
-      Walked::File(path) => [DATA, path.as_slice()].concat(),
-      Walked::Manifest => b"00manifest".to_vec(),
-      Walked::Changelog => b"00changelog".to_vec(),
+      Walked::File(path) => {
+        let mut out = Vec::with_capacity(
+          DATA
+            .len()
+            .saturating_add(path.len())
+            .saturating_add(suffix.len()),
+        );
+        out.extend_from_slice(DATA);
+        out.extend_from_slice(path);
+        out.extend_from_slice(suffix);
+        out
+      }
+      Walked::Manifest => [b"00manifest".as_slice(), suffix].concat(),
+      Walked::Changelog => [b"00changelog".as_slice(), suffix].concat(),
     }
   }
 }
@@ -469,14 +480,54 @@ pub fn answer_want(
   Ok(true)
 }
 
+/// Compact revlog index metadata captured while gathering revision nodes for a `Want::Rows` batch
+/// so [`Streaming::index_entry`] emits 64-byte revlog entries in O(1) without a second `HgIndex`
+/// lookup per revision.
+#[derive(Clone, Copy, Debug)]
+struct IndexMeta {
+  /// Parent revision numbers (`NONE` for null).
+  parents: [u32; 2],
+  /// Linkrev (changeset number; self for changelog).
+  link: u32,
+  /// Revlog 7.2 index flags.
+  flags: u16,
+  /// Full text byte length.
+  len: u64,
+  /// Revision node.
+  node: Node,
+}
+
+/// First-revision map for delta base resolution: allocated only for logs that contain at least
+/// one delta revision (`row.base.is_some()`), avoiding per-file `BTreeMap` allocations on
+/// single-revision and snapshot-only logs.
+#[derive(Debug)]
+enum FirstBase {
+  /// No revision in this log carries a delta base.
+  None,
+  /// First revision index holding each full text identity.
+  Map(BTreeMap<[u8; 32], u32>),
+}
+
+impl FirstBase {
+  /// Looks up the first revision holding `base` text identity.
+  fn get(&self, base: &[u8; 32]) -> Option<u32> {
+    match self {
+      Self::None => None,
+      Self::Map(map) => map.get(base).copied(),
+    }
+  }
+}
+
 /// The store's rows of a log the walk holds: its number among the logs given (which tags its chunks), each revision's
-/// stored form, and the first revision of each text (a base names its text, the entry its revision).
+/// stored form, its index metadata captured during gathering, and the first revision of each text (built lazily only
+/// when at least one revision carries a delta base).
 #[derive(Debug)]
 struct StoredLog {
   seq: u64,
   log: Walked,
   revisions: Vec<StoredRevision>,
-  first: BTreeMap<[u8; 32], u32>,
+  meta: Vec<IndexMeta>,
+  first: FirstBase,
   /// Whether every revision of this log has a zero-byte data chunk (inline revlog header).
   no_data: bool,
 }
@@ -511,12 +562,14 @@ pub struct Streaming {
   want: Option<Want>,
   /// The logs the asked rows are for, in order.
   wanted_logs: Vec<Walked>,
+  /// Index metadata parallel to `wanted_logs`, carried into `StoredLog` on `give_rows`.
+  wanted_meta: Vec<Vec<IndexMeta>>,
   /// The rows of the logs held, the one being walked first.
   held: VecDeque<StoredLog>,
   /// Cursor into `held` during `Stage::Counting` so logs that fit `room_hint` are retained into
   /// `Stage::Index` without a second `Want::Rows` pass.
   held_at: usize,
-  /// Byte cost of `StoredRevision` rows currently retained in `held`.
+  /// Byte cost of `StoredRevision` + `IndexMeta` rows currently retained in `held`.
   held_bytes: u64,
   /// The number the next log given takes.
   next_seq: u64,
@@ -533,18 +586,20 @@ pub struct Streaming {
 }
 
 /// A [`Want::Rows`] being gathered (main 01a20182's order of 2026-11-22 10:40: a stream of a 57,054-changeset history
-/// spun its shard past a second gathering the changelog's nodes in one step): the logs gathered whole, their walk, the
-/// bytes their rows will take, and the log being gathered, its next revision and its nodes so far.
+/// spun its shard past a second gathering the changelog's nodes in one step): the logs gathered whole, their walk,
+/// their index metadata, the bytes their rows will take, and the log being gathered.
 #[derive(Debug)]
 struct Gathering {
   /// Each log gathered: its name and its revisions' nodes, in order.
   logs: Vec<(Vec<u8>, Vec<Node>)>,
   /// Those logs as the walk names them.
   wanted: Vec<Walked>,
+  /// Each gathered log's index metadata, in order.
+  metas: Vec<Vec<IndexMeta>>,
   /// What their rows will take.
   bytes: u64,
-  /// The log being gathered, its next revision, and its nodes so far.
-  at: (Walked, u32, Vec<Node>),
+  /// The log being gathered, its next revision, its nodes so far, and its metadata so far.
+  at: (Walked, u32, Vec<Node>, Vec<IndexMeta>),
 }
 
 impl Default for Streaming {
@@ -557,6 +612,7 @@ impl Default for Streaming {
       counted: (0, 0),
       want: None,
       wanted_logs: Vec::new(),
+      wanted_meta: Vec::new(),
       held: VecDeque::new(),
       held_at: 0,
       held_bytes: 0,
@@ -607,24 +663,27 @@ impl Streaming {
   pub fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
     self.want = None;
     let wanted = core::mem::take(&mut self.wanted_logs);
+    let mut wanted_meta = core::mem::take(&mut self.wanted_meta).into_iter();
     if rows.len() != wanted.len() {
       self.not_served = true;
     }
-    let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
+    let row_bytes = held_row_bytes();
     for (log, rows) in wanted.into_iter().zip(rows) {
+      let meta = wanted_meta.next().unwrap_or_default();
       let mut revisions = Vec::with_capacity(rows.len());
-      let mut first = BTreeMap::new();
       let mut no_data = true;
-      for (rev, row) in (0_u32..).zip(rows) {
+      let mut any_based = false;
+      for row in rows {
         match row {
           Some(row) => {
             no_data &= sent_len(&row) == Some(0);
-            first.entry(row.text).or_insert(rev);
+            any_based |= row.base.is_some();
             revisions.push(row);
           }
           None => self.not_served = true,
         }
       }
+      let first = build_first_base(&revisions, any_based);
       self.held_bytes = self
         .held_bytes
         .saturating_add(to_u64(revisions.len()).saturating_mul(row_bytes));
@@ -632,6 +691,7 @@ impl Streaming {
         seq: self.next_seq,
         log,
         revisions,
+        meta,
         first,
         no_data,
       });
@@ -725,10 +785,27 @@ impl Streaming {
     self.gathering = Some(Gathering {
       logs: Vec::new(),
       wanted: Vec::new(),
+      metas: Vec::new(),
       bytes: self.held_bytes,
-      at: (log.clone(), 0, Vec::new()),
+      at: (log.clone(), 0, Vec::new(), Vec::new()),
     });
     false
+  }
+
+  /// Next log in walk order, taken directly from `self.held` when already buffered to avoid
+  /// redundant `HgIndex::file_revision_from` LSM searches.
+  fn next_after(
+    &self,
+    held_slot: usize,
+    log: &Walked,
+    index: &HgIndex,
+    store: &ContentStore,
+  ) -> Option<Walked> {
+    self
+      .held
+      .get(held_slot)
+      .map(|stored| stored.log.clone())
+      .or_else(|| next_log(log, index, store))
   }
 
   /// Whether the rows of `log` are held, retaining counted logs within `room_hint` when `keep_prior`
@@ -742,7 +819,7 @@ impl Streaming {
     log: &Walked,
     keep_prior: bool,
   ) -> Result<bool, Refused> {
-    let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
+    let row_bytes = held_row_bytes();
     if self.gathering.is_none() && self.prepare_held(log, keep_prior, row_bytes) {
       return Ok(true);
     }
@@ -758,13 +835,10 @@ impl Streaming {
       )? {
         GatherStep::Yield => return Ok(false),
         GatherStep::Full => break,
-        GatherStep::LogDone => {
-          let next = next_log(&gathering.at.0, index, store);
-          let done = core::mem::take(&mut gathering.at.2);
-          gathering.logs.push((gathering.at.0.stored_name(), done));
-          gathering.wanted.push(gathering.at.0.clone());
+        GatherStep::LogDone(next) => {
+          finish_gathered_log(gathering);
           match next {
-            Some(next) => gathering.at = (next, 0, Vec::new()),
+            Some(next) => gathering.at = (next, 0, Vec::new(), Vec::new()),
             None => break,
           }
         }
@@ -775,6 +849,7 @@ impl Streaming {
         logs: gathering.logs,
       });
       self.wanted_logs = gathering.wanted;
+      self.wanted_meta = gathering.metas;
     }
     Ok(false)
   }
@@ -817,7 +892,7 @@ impl Streaming {
       }
     }
     self.held_at = self.held_at.saturating_add(1);
-    self.current = next_log(&log, index, store);
+    self.current = self.next_after(self.held_at, &log, index, store);
     Ok(if self.current.is_some() {
       Stage::Counting
     } else {
@@ -917,14 +992,14 @@ impl Streaming {
         return Err(Refused::TooLong);
       };
       if offset == 0 {
-        self.current = next_log(log, index, store);
+        self.current = self.next_after(1, log, index, store);
         return Ok(if self.current.is_some() {
           Stage::Index(0, 0)
         } else {
           next_extra(self.format, &self.extra, 0)
         });
       }
-      let name = [log.radix().as_slice(), b".d"].concat();
+      let name = log.store_path(b".d");
       entry_head(self.format, &name, offset, admission, out)?;
       return Ok(Stage::Data(0));
     }
@@ -936,62 +1011,38 @@ impl Streaming {
       rev,
     };
     if rev == 0 {
-      let name = [log.radix().as_slice(), b".i"].concat();
+      let name = log.store_path(b".i");
       let size = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
       entry_head(self.format, &name, size, admission, out)?;
     }
     admission.charge(to_u64(ENTRY_BYTES))?;
     let stored = self.held.front().ok_or_else(unreadable)?;
-    let row = stored
-      .revisions
-      .get(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
-      .ok_or_else(unreadable)?;
+    let rev_index = usize::try_from(rev).map_err(|_| Refused::TooLong)?;
+    let row = stored.revisions.get(rev_index).ok_or_else(unreadable)?;
+    let meta = stored.meta.get(rev_index).ok_or_else(unreadable)?;
     let based = row.base.is_some();
     let base = match row.base {
       None => rev,
       Some(base) => stored
         .first
         .get(&base)
-        .copied()
         .filter(|base| *base < rev)
         .ok_or_else(unreadable)?,
     };
-    let (parents, link, node, flags, text) = match log.log() {
-      Log::Changelog => {
-        let found = index.changeset(store, rev).ok_or_else(unreadable)?;
-        (
-          [found.p1, found.p2],
-          rev,
-          found.node,
-          found.flags,
-          found.len,
-        )
-      }
-      other => {
-        let found = index.revision(store, other, rev).ok_or_else(unreadable)?;
-        (
-          [found.p1, found.p2],
-          found.link,
-          found.node,
-          found.flags,
-          found.len,
-        )
-      }
-    };
     // A revision against the null base is sent as its text alone, which its place holds (a whole kept raw, A-767 C1).
-    let whole_text = row.place.len == text;
+    let whole_text = row.place.len == meta.len;
     let chunk = sent_len(row)
       .filter(|_| based || whole_text)
       .ok_or_else(unreadable)?;
     let entry = Entry {
       offset,
-      flags,
+      flags: meta.flags,
       chunk: usize::try_from(chunk).map_err(|_| Refused::TooLong)?,
-      text: usize::try_from(text).map_err(|_| Refused::TooLong)?,
+      text: usize::try_from(meta.len).map_err(|_| Refused::TooLong)?,
       base,
-      link,
-      parents,
-      node,
+      link: meta.link,
+      parents: meta.parents,
+      node: meta.node,
     };
     let at = out.len();
     entry.write(out)?;
@@ -1032,7 +1083,7 @@ impl Streaming {
     let count = u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)?;
     if rev >= count {
       // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
-      self.current = next_log(log, index, store);
+      self.current = self.next_after(1, log, index, store);
       return Ok(if self.current.is_some() {
         Stage::Index(0, 0)
       } else {
@@ -1079,22 +1130,32 @@ impl Streaming {
   }
 }
 
-/// A revision's node in `log`.
-fn node_of(index: &HgIndex, store: &ContentStore, log: &Walked, rev: u32) -> Result<Node, Refused> {
-  let unreadable = || Refused::Unreadable {
-    log: unreadable_name(log),
-    rev,
-  };
-  match log.log() {
-    Log::Changelog => index
-      .changeset(store, rev)
-      .map(|row| row.node)
-      .ok_or_else(unreadable),
-    other => index
-      .revision(store, other, rev)
-      .map(|row| row.node)
-      .ok_or_else(unreadable),
+/// Derived: byte cost of one held revision row (`StoredRevision` + `IndexMeta`) in `Streaming::held`.
+fn held_row_bytes() -> u64 {
+  to_u64(core::mem::size_of::<StoredRevision>().saturating_add(core::mem::size_of::<IndexMeta>()))
+}
+
+/// Builds the delta base lookup map only when at least one revision in the log carries a base.
+fn build_first_base(revisions: &[StoredRevision], any_based: bool) -> FirstBase {
+  if !any_based {
+    return FirstBase::None;
   }
+  let mut map = BTreeMap::new();
+  for (rev, row) in (0_u32..).zip(revisions) {
+    map.entry(row.text).or_insert(rev);
+  }
+  FirstBase::Map(map)
+}
+
+/// Moves the completed `gathering.at` log into `gathering`'s completed batch vectors.
+fn finish_gathered_log(gathering: &mut Gathering) {
+  let done_nodes = core::mem::take(&mut gathering.at.2);
+  let done_metas = core::mem::take(&mut gathering.at.3);
+  gathering
+    .logs
+    .push((gathering.at.0.stored_name(), done_nodes));
+  gathering.wanted.push(gathering.at.0.clone());
+  gathering.metas.push(done_metas);
 }
 
 /// The first log the walk writes: the first file log, else the manifest log, else the changelog; none for an empty
@@ -1102,7 +1163,7 @@ fn node_of(index: &HgIndex, store: &ContentStore, log: &Walked, rev: u32) -> Res
 fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
   match index.file_revision_from(store, (&[], 0)) {
     Some((path, _, _)) => Some(Walked::File(path)),
-    None => next_log(&Walked::File(Vec::new()), index, store),
+    None => next_non_file_log(Walked::Manifest, index, store),
   }
 }
 
@@ -1115,20 +1176,26 @@ pub(crate) fn rows_a_step(store: &ContentStore) -> u64 {
     .max(1)
 }
 
+/// First non-empty log at or after `start` among `Manifest` and `Changelog`.
+fn next_non_file_log(start: Walked, index: &HgIndex, store: &ContentStore) -> Option<Walked> {
+  match start {
+    Walked::Manifest if index.len(store, Log::Manifest) > 0 => Some(Walked::Manifest),
+    Walked::Manifest | Walked::Changelog if index.len(store, Log::Changelog) > 0 => {
+      Some(Walked::Changelog)
+    }
+    _ => None,
+  }
+}
+
 /// The log after `log` in the walk's order that holds a revision.
 fn next_log(log: &Walked, index: &HgIndex, store: &ContentStore) -> Option<Walked> {
-  let after = match log {
+  match log {
     Walked::File(path) => match index.file_revision_from(store, (path, u32::MAX)) {
-      Some((found, _, _)) if found != *path => return Some(Walked::File(found)),
-      _ => Walked::Manifest,
+      Some((found, _, _)) if found != *path => Some(Walked::File(found)),
+      _ => next_non_file_log(Walked::Manifest, index, store),
     },
-    Walked::Manifest => Walked::Changelog,
-    Walked::Changelog => return None,
-  };
-  if index.len(store, after.log()) > 0 {
-    Some(after)
-  } else {
-    next_log(&after, index, store)
+    Walked::Manifest => next_non_file_log(Walked::Changelog, index, store),
+    Walked::Changelog => None,
   }
 }
 
@@ -1138,36 +1205,89 @@ enum GatherStep {
   Yield,
   /// Room hint reached before starting this log; emit the batch gathered so far.
   Full,
-  /// Every revision of the current log has been gathered.
-  LogDone,
+  /// Every revision of the current log has been gathered; carries the next log in walk order.
+  LogDone(Option<Walked>),
 }
 
-/// Gathers up to `*budget` revision nodes for `gathering.at`: file logs are scanned sequentially
-/// from `rev = 0` without calling `HgIndex::len` (avoiding `2 * log2(len)` binary-search lookups
-/// per file log), while changelog and manifest logs use their O(1) lengths to pre-size `nodes`.
+/// Gathers up to `*budget` revision nodes and [`IndexMeta`] records for `gathering.at` using a
+/// single sequential LSM scan cursor (`HgIndex::scan_*_from`), eliminating point-lookup and
+/// `next_log` overhead across file, manifest, and changelog revisions.
 fn gather_log_nodes(
   gathering: &mut Gathering,
   (index, store): (&HgIndex, &ContentStore),
   (room_hint, row_bytes, budget): (u64, u64, &mut u64),
 ) -> Result<GatherStep, Refused> {
-  let (at, rev, nodes) = &mut gathering.at;
-  if matches!(at, Walked::File(_)) {
-    if *rev == 0 && !gathering.logs.is_empty() && gathering.bytes >= room_hint {
-      return Ok(GatherStep::Full);
-    }
-    loop {
-      if *budget == 0 {
-        return Ok(GatherStep::Yield);
+  if matches!(gathering.at.0, Walked::File(_)) {
+    return Ok(gather_file_logs(
+      gathering,
+      (index, store),
+      (room_hint, row_bytes, budget),
+    ));
+  }
+  gather_root_log(gathering, (index, store), (room_hint, row_bytes, budget))
+}
+
+/// Sequentially scans file log revisions across consecutive file paths in one `iter_from` cursor.
+fn gather_file_logs(
+  gathering: &mut Gathering,
+  (index, store): (&HgIndex, &ContentStore),
+  (room_hint, row_bytes, budget): (u64, u64, &mut u64),
+) -> GatherStep {
+  if gathering.at.1 == 0 && !gathering.logs.is_empty() && gathering.bytes >= room_hint {
+    return GatherStep::Full;
+  }
+  let start_path = match &gathering.at.0 {
+    Walked::File(path) => path.clone(),
+    _ => return GatherStep::LogDone(None),
+  };
+  let start_rev = gathering.at.1;
+  let mut outcome: Option<GatherStep> = None;
+  index.scan_file_revisions_from(
+    store,
+    (&start_path, start_rev),
+    &mut |found_path, found_rev, row| {
+      let same_path =
+        matches!(&gathering.at.0, Walked::File(current) if current.as_slice() == found_path);
+      if !same_path {
+        finish_gathered_log(gathering);
+        gathering.at = (Walked::File(found_path.to_vec()), 0, Vec::new(), Vec::new());
+        if gathering.bytes >= room_hint {
+          outcome = Some(GatherStep::Full);
+          return false;
+        }
       }
-      let Some(row) = index.revision(store, at.log(), *rev) else {
-        return Ok(GatherStep::LogDone);
-      };
-      nodes.push(row.node);
-      *rev = rev.saturating_add(1);
+      if found_rev != gathering.at.1 {
+        outcome = Some(GatherStep::LogDone(next_log(&gathering.at.0, index, store)));
+        return false;
+      }
+      if *budget == 0 {
+        outcome = Some(GatherStep::Yield);
+        return false;
+      }
+      gathering.at.2.push(row.node);
+      gathering.at.3.push(IndexMeta {
+        parents: [row.p1, row.p2],
+        link: row.link,
+        flags: row.flags,
+        len: row.len,
+        node: row.node,
+      });
+      gathering.at.1 = found_rev.saturating_add(1);
       *budget = budget.saturating_sub(1);
       gathering.bytes = gathering.bytes.saturating_add(row_bytes);
-    }
-  }
+      true
+    },
+  );
+  outcome.unwrap_or_else(|| GatherStep::LogDone(next_non_file_log(Walked::Manifest, index, store)))
+}
+
+/// Sequentially scans manifest or changelog revisions from `gathering.at.1` in one `iter_from` cursor.
+fn gather_root_log(
+  gathering: &mut Gathering,
+  (index, store): (&HgIndex, &ContentStore),
+  (room_hint, row_bytes, budget): (u64, u64, &mut u64),
+) -> Result<GatherStep, Refused> {
+  let (at, rev, nodes, metas) = &mut gathering.at;
   let count = index.len(store, at.log());
   if *rev == 0 {
     let cost = u64::from(count).saturating_mul(row_bytes);
@@ -1175,19 +1295,73 @@ fn gather_log_nodes(
       return Ok(GatherStep::Full);
     }
     gathering.bytes = gathering.bytes.saturating_add(cost);
-    nodes
-      .try_reserve_exact(usize::try_from(count).map_err(|_| Refused::TooLong)?)
-      .map_err(|_| Refused::TooLong)?;
+    let cap = usize::try_from(count).map_err(|_| Refused::TooLong)?;
+    nodes.try_reserve_exact(cap).map_err(|_| Refused::TooLong)?;
+    metas.try_reserve_exact(cap).map_err(|_| Refused::TooLong)?;
   }
-  while *rev < count {
+  if *rev < count {
+    scan_root_window((index, store), (at, rev, nodes, metas), (count, budget));
+  }
+  if *rev < count {
     if *budget == 0 {
       return Ok(GatherStep::Yield);
     }
-    nodes.push(node_of(index, store, at, *rev)?);
+    return Err(Refused::Unreadable {
+      log: unreadable_name(at),
+      rev: *rev,
+    });
+  }
+  let next = match at {
+    Walked::Manifest => next_non_file_log(Walked::Changelog, index, store),
+    _ => None,
+  };
+  Ok(GatherStep::LogDone(next))
+}
+
+/// Reads up to `*budget` consecutive manifest or changelog entries into `(nodes, metas)`.
+fn scan_root_window(
+  (index, store): (&HgIndex, &ContentStore),
+  (at, rev, nodes, metas): (&Walked, &mut u32, &mut Vec<Node>, &mut Vec<IndexMeta>),
+  (count, budget): (u32, &mut u64),
+) {
+  let start_rev = *rev;
+  let mut push = |found_rev: u32, meta: IndexMeta| -> bool {
+    if found_rev != *rev || *rev >= count || *budget == 0 {
+      return false;
+    }
+    nodes.push(meta.node);
+    metas.push(meta);
     *rev = rev.saturating_add(1);
     *budget = budget.saturating_sub(1);
+    *rev < count && *budget > 0
+  };
+  match at {
+    Walked::Changelog => index.scan_changelog_from(store, start_rev, &mut |found_rev, row| {
+      push(
+        found_rev,
+        IndexMeta {
+          parents: [row.p1, row.p2],
+          link: found_rev,
+          flags: row.flags,
+          len: row.len,
+          node: row.node,
+        },
+      )
+    }),
+    Walked::Manifest => index.scan_manifest_from(store, start_rev, &mut |found_rev, row| {
+      push(
+        found_rev,
+        IndexMeta {
+          parents: [row.p1, row.p2],
+          link: row.link,
+          flags: row.flags,
+          len: row.len,
+          node: row.node,
+        },
+      )
+    }),
+    Walked::File(_) => {}
   }
-  Ok(GatherStep::LogDone)
 }
 
 /// The log's name in a refusal: a file log's path, the manifest log's one byte, the changelog's none.

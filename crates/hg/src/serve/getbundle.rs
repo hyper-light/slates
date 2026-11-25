@@ -455,12 +455,19 @@ impl Answering {
     };
     let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
     if !stream2.head_written {
-      if !stream2.streaming.at_head() {
+      let mut budget = crate::render::rows_a_step(content);
+      while !stream2.streaming.at_head() {
         stream2
           .streaming
           .step(index, content, room, out)
           .map_err(super::stream::revlog_refused)?;
-        return Ok(true);
+        if stream2.streaming.wants().is_some() {
+          return Ok(true);
+        }
+        budget = budget.saturating_sub(1);
+        if budget == 0 {
+          return Ok(true);
+        }
       }
       if stream2.streaming.is_not_served() {
         return Err(Refusal::Store { what: "a revlog" });
@@ -468,16 +475,19 @@ impl Answering {
       let (filecount, bytecount) = stream2.streaming.counts();
       write_stream2_head(filecount, bytecount, room, out)?;
       stream2.head_written = true;
-      let mut scratch = Vec::new();
+      stream2.scratch.clear();
       let more = stream2
         .streaming
-        .step(index, content, room, &mut scratch)
+        .step(index, content, room, &mut stream2.scratch)
         .map_err(super::stream::revlog_refused)?;
       if !more {
         crate::bundle2::put_payload_chunk(out, &[]).map_err(|_| unencodable("a chunk"))?;
         self.stream2 = None;
+        return Ok(true);
       }
-      return Ok(true);
+      if stream2.streaming.wants().is_some() {
+        return Ok(true);
+      }
     }
     stream2.scratch.clear();
     let target = content.window().max(1);

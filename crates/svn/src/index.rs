@@ -220,8 +220,17 @@ pub struct CopyId {
 }
 
 /// A node-revision of one index: what FSFS's node-revision ID names, compared only for equality and order.
+/// Stored as `u32` (matching `children::FlatNode` 32-bit map items and `EMPTY_SLOT` sentinel checking
+/// in [`Index::check_plan`]), cutting `HistoryEntry` from 24 B to 16 B and compacting [`Row`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeRevisionId(usize);
+pub struct NodeRevisionId(u32);
+
+impl NodeRevisionId {
+  /// Row index as `usize`, checked for narrow pointer widths.
+  fn index(self) -> Option<usize> {
+    usize::try_from(self.0).ok()
+  }
+}
 
 /// A file's text as the green holds it and a client checks it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -475,7 +484,9 @@ impl IndexRefusal {
   }
 }
 
-/// One node-revision's row (the module documentation's list).
+/// One node-revision's row (the module documentation's list), compacted to 88 bytes by storing
+/// optional file texts, non-empty property lists, and copy sources in flat side tables on [`Index`]
+/// (directories and propertyless nodes pay zero bytes in those tables).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Row {
   /// Its kind.
@@ -485,21 +496,21 @@ struct Row {
   /// The copy it descends through.
   copy_id: CopyId,
   /// The number of the path it was created at.
-  created_path: usize,
+  created_path: u32,
   /// The revision it was created in.
   created_revision: Revision,
-  /// The node-revision it succeeds, across copies.
-  predecessor: Option<NodeRevisionId>,
+  /// The node-revision it succeeds across copies, or [`EMPTY_SLOT`] when none.
+  predecessor: u32,
   /// How many predecessors it has.
   predecessor_count: u64,
-  /// The number of its copy source's path and the source's revision, when a copy made it.
-  copy_from: Option<(usize, Revision)>,
+  /// Index into `Index::copy_sources`, or [`EMPTY_SLOT`] when not made by a copy.
+  copy_from: u32,
   /// The node-revision made by the copy nearest above it in its history, or revision 0's root.
   copy_root: NodeRevisionId,
-  /// Its text; `None` for a directory and for a file with no text.
-  text: Option<Text>,
-  /// Its property list.
-  properties: PropertyList,
+  /// Index into `Index::texts`, or [`EMPTY_SLOT`] for a directory or a file with no text.
+  text: u32,
+  /// Index into `Index::prop_lists`, or [`EMPTY_SLOT`] for [`PropertyList::Empty`].
+  properties: u32,
   /// The nodes holding `svn:mergeinfo` at and beneath it.
   mergeinfo_count: u64,
   /// A directory's children, its map's handle ([`children`], A-759); [`children::EMPTY`] for a file and an empty
@@ -515,7 +526,7 @@ enum Shape {
   /// A copy: beneath it stands what stands beneath its source.
   Copied {
     /// The number of the source's path.
-    from: usize,
+    from: u32,
     /// The source's revision.
     revision: Revision,
   },
@@ -635,6 +646,43 @@ impl PathTable {
   }
 }
 
+/// Inline-first entry list for per-path history and shape logs: stores 0 or 1 entry inline with
+/// zero heap allocation (eliminating ~224 B + malloc metadata per single-event path), spilling to
+/// `Vec<T>` only once a path accumulates two or more events.
+#[derive(Clone, Debug, Default)]
+enum CompactEntries<T> {
+  /// No entries recorded yet.
+  #[default]
+  Empty,
+  /// Single inline entry (zero heap allocation).
+  One(T),
+  /// Two or more entries on the heap.
+  Many(Vec<T>),
+}
+
+impl<T> CompactEntries<T> {
+  /// Borrows the entries as a contiguous slice.
+  fn as_slice(&self) -> &[T] {
+    match self {
+      Self::Empty => &[],
+      Self::One(entry) => core::slice::from_ref(entry),
+      Self::Many(entries) => entries.as_slice(),
+    }
+  }
+
+  /// Appends `entry` in order.
+  fn push(&mut self, entry: T) {
+    match core::mem::take(self) {
+      Self::Empty => *self = Self::One(entry),
+      Self::One(first) => *self = Self::Many(vec![first, entry]),
+      Self::Many(mut entries) => {
+        entries.push(entry);
+        *self = Self::Many(entries);
+      }
+    }
+  }
+}
+
 /// What the index holds about one path.
 #[derive(Clone, Debug)]
 struct PathEntry {
@@ -643,9 +691,9 @@ struct PathEntry {
   /// Byte length in `Index::path_bytes`.
   len: u32,
   /// Its history list, by revision.
-  history: Vec<HistoryEntry>,
+  history: CompactEntries<HistoryEntry>,
   /// Its shape list, by revision.
-  shapes: Vec<ShapeEntry>,
+  shapes: CompactEntries<ShapeEntry>,
 }
 
 impl PathEntry {
@@ -830,6 +878,10 @@ pub struct Node<'index> {
   created_path: &'index str,
   /// Its copy source's path and revision.
   copy_from: Option<(&'index str, Revision)>,
+  /// Its text, resolved from the index's text table.
+  text: Option<Text>,
+  /// Its property list, resolved from the index's property table.
+  properties: PropertyList,
 }
 
 impl<'index> Node<'index> {
@@ -866,7 +918,7 @@ impl<'index> Node<'index> {
   /// The node-revision it succeeds, across copies (`structure`: "The predecessor of a node-rev crosses both soft and
   /// true copies").
   pub fn predecessor(&self) -> Option<NodeRevisionId> {
-    self.row.predecessor
+    (self.row.predecessor != EMPTY_SLOT).then_some(NodeRevisionId(self.row.predecessor))
   }
 
   /// How many predecessors it has.
@@ -887,17 +939,17 @@ impl<'index> Node<'index> {
 
   /// Its text: `None` for a directory and for a file with no text.
   pub fn text(&self) -> Option<Text> {
-    self.row.text
+    self.text
   }
 
   /// Its property list.
   pub fn properties(&self) -> PropertyList {
-    self.row.properties
+    self.properties
   }
 
   /// Whether it holds `svn:mergeinfo` (FSFS's `minfo-here`).
   pub fn has_mergeinfo(&self) -> bool {
-    self.row.properties.has_mergeinfo()
+    self.properties.has_mergeinfo()
   }
 
   /// The nodes holding `svn:mergeinfo` at and beneath it (FSFS's `minfo-cnt`).
@@ -930,6 +982,12 @@ pub struct Index {
   numbers: PathTable,
   /// Every node-revision, by [`NodeRevisionId`].
   rows: Vec<Row>,
+  /// Side table of file texts referenced by [`Row::text`].
+  texts: Vec<Text>,
+  /// Side table of non-empty property lists referenced by [`Row::properties`].
+  prop_lists: Vec<(ContentIdentity, bool)>,
+  /// Side table of `(source_path_number, source_revision)` copy origins referenced by [`Row::copy_from`].
+  copy_sources: Vec<(u32, Revision)>,
   /// Every revision's rows, by revision.
   revisions: Vec<RevisionEntry>,
   /// The youngest revision.
@@ -966,12 +1024,12 @@ impl Index {
       copy_id: ROOT_COPY,
       created_path: 0,
       created_revision: 0,
-      predecessor: None,
+      predecessor: EMPTY_SLOT,
       predecessor_count: 0,
-      copy_from: None,
+      copy_from: EMPTY_SLOT,
       copy_root: FIRST_ROOT,
-      text: None,
-      properties: PropertyList::Empty,
+      text: EMPTY_SLOT,
+      properties: EMPTY_SLOT,
       mergeinfo_count: 0,
       children: children::EMPTY,
     };
@@ -983,8 +1041,8 @@ impl Index {
     let paths = vec![PathEntry {
       start: 0,
       len: u32::try_from(ROOT.len()).unwrap_or(1),
-      history: vec![created],
-      shapes: Vec::new(),
+      history: CompactEntries::One(created),
+      shapes: CompactEntries::Empty,
     }];
     let mut numbers = PathTable::default();
     numbers.insert(0, &path_bytes, &paths);
@@ -993,6 +1051,9 @@ impl Index {
       paths,
       numbers,
       rows: vec![root],
+      texts: Vec::new(),
+      prop_lists: Vec::new(),
+      copy_sources: Vec::new(),
       revisions: vec![RevisionEntry {
         transaction: None,
         changes: Vec::new(),
@@ -1188,7 +1249,10 @@ impl Index {
     let Some(id) = self.resolve(path, revision)? else {
       return Ok(None);
     };
-    let row = self.rows.get(id.0).ok_or(IndexRefusal::Corrupt)?;
+    let row = id
+      .index()
+      .and_then(|at| self.rows.get(at))
+      .ok_or(IndexRefusal::Corrupt)?;
     if row.kind != NodeKind::Directory {
       return Ok(None);
     }
@@ -1205,21 +1269,64 @@ impl Index {
 
   /// The node-revision `id`, as [`Node::predecessor`] and [`Node::copy_root`] name one.
   pub fn node_revision(&self, id: NodeRevisionId) -> Result<Node<'_>, IndexRefusal> {
-    let row = self
-      .rows
-      .get(id.0)
+    let row = id
+      .index()
+      .and_then(|at| self.rows.get(at))
       .ok_or(IndexRefusal::UnknownNodeRevision)?;
-    let created_path = self.path_name(row.created_path)?;
-    let copy_from = match row.copy_from {
-      Some((from, revision)) => Some((self.path_name(from)?, revision)),
+    let created_path = self.path_name_u32(row.created_path)?;
+    let copy_from = match self.copy_source_at(row.copy_from)? {
+      Some((from, revision)) => Some((self.path_name_u32(from)?, revision)),
       None => None,
     };
+    let text = self.text_at(row.text)?;
+    let properties = self.props_at(row.properties)?;
     Ok(Node {
       id,
       row,
       created_path,
       copy_from,
+      text,
+      properties,
     })
+  }
+
+  /// Resolves a text slot from `self.texts`.
+  fn text_at(&self, slot: u32) -> Result<Option<Text>, IndexRefusal> {
+    if slot == EMPTY_SLOT {
+      return Ok(None);
+    }
+    usize::try_from(slot)
+      .ok()
+      .and_then(|at| self.texts.get(at).copied())
+      .map(Some)
+      .ok_or(IndexRefusal::Corrupt)
+  }
+
+  /// Resolves a property list slot from `self.prop_lists`.
+  fn props_at(&self, slot: u32) -> Result<PropertyList, IndexRefusal> {
+    if slot == EMPTY_SLOT {
+      return Ok(PropertyList::Empty);
+    }
+    usize::try_from(slot)
+      .ok()
+      .and_then(|at| self.prop_lists.get(at).copied())
+      .map(|(identity, has_mergeinfo)| PropertyList::Held {
+        identity,
+        has_mergeinfo,
+      })
+      .ok_or(IndexRefusal::Corrupt)
+  }
+
+  /// Resolves a copy-source slot from `self.copy_sources`.
+  fn copy_source_at(&self, slot: u32) -> Result<Option<(u32, Revision)>, IndexRefusal> {
+    if slot == EMPTY_SLOT {
+      return Ok(None);
+    }
+    usize::try_from(slot)
+      .ok()
+      .and_then(|at| self.copy_sources.get(at).copied())
+      .map(Some)
+      .ok_or(IndexRefusal::Corrupt)
   }
 
   /// The node-revisions `revision` created, in the order the index made them: what FSFS's revision file for it holds
@@ -1234,7 +1341,10 @@ impl Index {
       .rows
       .partition_point(|row| row.created_revision <= revision);
     (start..end)
-      .map(|number| self.node_revision(NodeRevisionId(number)))
+      .map(|number| {
+        let id = u32::try_from(number).map_err(|_| IndexRefusal::Corrupt)?;
+        self.node_revision(NodeRevisionId(id))
+      })
       .collect()
   }
 
@@ -1364,6 +1474,12 @@ impl Index {
       .ok_or(IndexRefusal::Corrupt)
   }
 
+  /// The path numbered `number` (`u32` slab index).
+  fn path_name_u32(&self, number: u32) -> Result<&str, IndexRefusal> {
+    let at = usize::try_from(number).map_err(|_| IndexRefusal::Corrupt)?;
+    self.path_name(at)
+  }
+
   /// The node-revision at `path` in `revision`, following copies (module documentation, "Reading").
   fn resolve(
     &self,
@@ -1389,7 +1505,7 @@ impl Index {
   fn decide(&self, path: &str, at: Revision) -> Result<Decided, IndexRefusal> {
     let own = self
       .entry(path)
-      .and_then(|entry| last_at_or_before(&entry.history, at, |entry| entry.revision))
+      .and_then(|entry| last_at_or_before(entry.history.as_slice(), at, |entry| entry.revision))
       .copied();
     match self.shape_above(path, at, own.map(|entry| entry.revision)) {
       None => Ok(Decided::Node(own.and_then(HistoryEntry::created))),
@@ -1400,7 +1516,7 @@ impl Index {
         },
         end,
       )) => Ok(Decided::Copied {
-        source: beneath(self.path_name(from)?, path, end)?,
+        source: beneath(self.path_name_u32(from)?, path, end)?,
         revision,
       }),
       Some(_) => Ok(Decided::Node(None)),
@@ -1423,7 +1539,7 @@ impl Index {
     for (ancestor, end) in inner_ancestors(path) {
       let Some(&change) = self
         .entry(ancestor)
-        .and_then(|entry| last_at_or_before(&entry.shapes, at, |shape| shape.revision))
+        .and_then(|entry| last_at_or_before(entry.shapes.as_slice(), at, |shape| shape.revision))
       else {
         continue;
       };
@@ -1439,14 +1555,11 @@ impl Index {
   /// Refuses a plan naming a path past those it adds or overflowing 32-bit slab indices, so that
   /// [`Index::commit`] cannot miss or truncate anything.
   fn check_plan(&self, plan: &Plan) -> Result<(), IndexRefusal> {
-    let named = self
-      .paths
-      .len()
-      .checked_add(plan.path_spans.len())
-      .ok_or(IndexRefusal::Corrupt)?;
-    if u32::try_from(named).is_err() || named >= usize::try_from(EMPTY_SLOT).unwrap_or(usize::MAX) {
-      return Err(IndexRefusal::Corrupt);
-    }
+    let named = check_u32_slot_len(self.paths.len(), plan.path_spans.len())?;
+    let _ = check_u32_slot_len(self.rows.len(), plan.rows.len())?;
+    let _ = check_u32_slot_len(self.texts.len(), plan.texts.len())?;
+    let _ = check_u32_slot_len(self.prop_lists.len(), plan.prop_lists.len())?;
+    let _ = check_u32_slot_len(self.copy_sources.len(), plan.copy_sources.len())?;
     let total_path_bytes = self
       .path_bytes
       .len()
@@ -1485,12 +1598,15 @@ impl Index {
       self.paths.push(PathEntry {
         start: path_base.saturating_add(rel_start),
         len,
-        history: Vec::new(),
-        shapes: Vec::new(),
+        history: CompactEntries::Empty,
+        shapes: CompactEntries::Empty,
       });
       self.numbers.insert(number, &self.path_bytes, &self.paths);
     }
     self.rows.extend(plan.rows);
+    self.texts.extend(plan.texts);
+    self.prop_lists.extend(plan.prop_lists);
+    self.copy_sources.extend(plan.copy_sources);
     let item_base = u32::try_from(self.map_items.len()).unwrap_or(0);
     self.map_items.extend_from_slice(&plan.map_items);
     self
@@ -1575,11 +1691,27 @@ impl Planned {
   }
 }
 
+/// Checks that `current + added` stays strictly below [`EMPTY_SLOT`] (`u32::MAX`) so every 32-bit
+/// slab slot remains distinguishable from the empty sentinel.
+fn check_u32_slot_len(current: usize, added: usize) -> Result<usize, IndexRefusal> {
+  let total = current.checked_add(added).ok_or(IndexRefusal::Corrupt)?;
+  if u32::try_from(total).is_err() || total >= usize::try_from(EMPTY_SLOT).unwrap_or(usize::MAX) {
+    return Err(IndexRefusal::Corrupt);
+  }
+  Ok(total)
+}
+
 /// A revision built and checked, ready to be committed.
 #[derive(Debug)]
 struct Plan {
   /// The node-revisions it made, numbered after the index's.
   rows: Vec<Row>,
+  /// File texts created by this revision, appended to `Index::texts`.
+  texts: Vec<Text>,
+  /// Non-empty property lists created by this revision, appended to `Index::prop_lists`.
+  prop_lists: Vec<(ContentIdentity, bool)>,
+  /// Copy origins created by this revision, appended to `Index::copy_sources`.
+  copy_sources: Vec<(u32, Revision)>,
   /// New path bytes added by this revision, to be appended to `Index::path_bytes`.
   path_bytes: String,
   /// `(relative_start, len)` spans in `path_bytes`, numbered after the index's paths.
@@ -1646,7 +1778,10 @@ impl Trial<'_> {
     let first = self.builder.index.rows.len();
     (0..self.builder.rows.len())
       .map(|made| {
-        let id = first.checked_add(made).ok_or(IndexRefusal::Corrupt)?;
+        let id = first
+          .checked_add(made)
+          .and_then(|at| u32::try_from(at).ok())
+          .ok_or(IndexRefusal::Corrupt)?;
         self.node_revision(NodeRevisionId(id))
       })
       .collect()
@@ -1655,16 +1790,20 @@ impl Trial<'_> {
   /// Node-revision `id`, the index's or one the transaction made.
   pub fn node_revision(&self, id: NodeRevisionId) -> Result<Node<'_>, IndexRefusal> {
     let row = self.builder.row(id)?;
-    let created_path = self.builder.path_name(row.created_path)?;
-    let copy_from = match row.copy_from {
-      Some((from, revision)) => Some((self.builder.path_name(from)?, revision)),
+    let created_path = self.builder.path_name_u32(row.created_path)?;
+    let copy_from = match self.builder.copy_source_at(row.copy_from)? {
+      Some((from, revision)) => Some((self.builder.path_name_u32(from)?, revision)),
       None => None,
     };
+    let text = self.builder.text_at(row.text)?;
+    let properties = self.builder.props_at(row.properties)?;
     Ok(Node {
       id,
       row,
       created_path,
       copy_from,
+      text,
+      properties,
     })
   }
 
@@ -1675,12 +1814,13 @@ impl Trial<'_> {
       return Ok(None);
     };
     let row = self.builder.row(current.node)?;
+    let properties = self.builder.props_at(row.properties)?;
     Ok(Some(TrialNode {
       id: current.node,
       kind: row.kind,
       node_id: row.node_id,
       copy_id: row.copy_id,
-      properties: row.properties,
+      properties,
     }))
   }
 }
@@ -1725,6 +1865,12 @@ struct Builder<'index> {
   previous: Revision,
   /// The node-revisions made so far.
   rows: Vec<Row>,
+  /// File texts added during this revision, numbered after `index.texts`.
+  texts: Vec<Text>,
+  /// Non-empty property lists added during this revision, numbered after `index.prop_lists`.
+  prop_lists: Vec<(ContentIdentity, bool)>,
+  /// Copy origins added during this revision, numbered after `index.copy_sources`.
+  copy_sources: Vec<(u32, Revision)>,
   /// What has been done at each path so far.
   staged: BTreeMap<String, Staged>,
   /// The paths named so far that the index has not named, in number order.
@@ -1759,6 +1905,9 @@ impl<'index> Builder<'index> {
       revision,
       previous,
       rows: Vec::new(),
+      texts: Vec::new(),
+      prop_lists: Vec::new(),
+      copy_sources: Vec::new(),
       staged: BTreeMap::new(),
       new_paths: Vec::new(),
       new_numbers: BTreeMap::new(),
@@ -1773,9 +1922,9 @@ impl<'index> Builder<'index> {
     let old = *builder.row(old_root)?;
     let root = Row {
       created_revision: revision,
-      predecessor: Some(old_root),
+      predecessor: old_root.0,
       predecessor_count: next_count(old.predecessor_count)?,
-      copy_from: None,
+      copy_from: EMPTY_SLOT,
       ..old
     };
     let id = builder.push(root)?;
@@ -1832,6 +1981,9 @@ impl<'index> Builder<'index> {
     }
     Ok(Plan {
       rows: self.rows,
+      texts: self.texts,
+      prop_lists: self.prop_lists,
+      copy_sources: self.copy_sources,
       path_bytes,
       path_spans,
       events,
@@ -1943,18 +2095,21 @@ impl<'index> Builder<'index> {
   fn fresh_row(&mut self, change: &ChangedPath, parent: &Row) -> Result<Row, IndexRefusal> {
     let properties = change.properties.unwrap_or(PropertyList::Empty);
     check_mergeinfo_flag(change, false, properties.has_mergeinfo())?;
+    let created_path = self.intern_u32(&change.path)?;
+    let text = self.push_text(change.text)?;
+    let prop_slot = self.push_props(properties)?;
     Ok(Row {
       kind: change.kind,
       node_id: self.fresh_node()?,
       copy_id: parent.copy_id,
-      created_path: self.intern(&change.path)?,
+      created_path,
       created_revision: self.revision,
-      predecessor: None,
+      predecessor: EMPTY_SLOT,
       predecessor_count: 0,
-      copy_from: None,
+      copy_from: EMPTY_SLOT,
       copy_root: parent.copy_root,
-      text: change.text,
-      properties,
+      text,
+      properties: prop_slot,
       mergeinfo_count: u64::from(properties.has_mergeinfo()),
       children: children::EMPTY,
     })
@@ -1969,23 +2124,32 @@ impl<'index> Builder<'index> {
     id: NodeRevisionId,
   ) -> Result<(Row, Shape), IndexRefusal> {
     let (source_id, source_row) = self.copy_source(change, source)?;
-    let properties = change.properties.unwrap_or(source_row.properties);
-    let had = source_row.properties.has_mergeinfo();
-    check_mergeinfo_flag(change, had, properties.has_mergeinfo())?;
-    let from = self.intern(&source.path)?;
+    let had = self.props_at(source_row.properties)?.has_mergeinfo();
+    let (prop_slot, has) = match change.properties {
+      Some(props) => (self.push_props(props)?, props.has_mergeinfo()),
+      None => (source_row.properties, had),
+    };
+    check_mergeinfo_flag(change, had, has)?;
+    let from = self.intern_u32(&source.path)?;
+    let created_path = self.intern_u32(&change.path)?;
+    let copy_from = self.push_copy_source((from, source.revision))?;
+    let text = match change.text {
+      Some(text) => self.push_text(Some(text))?,
+      None => source_row.text,
+    };
     let row = Row {
       kind: source_row.kind,
       node_id: source_row.node_id,
       copy_id: self.fresh_copy()?,
-      created_path: self.intern(&change.path)?,
+      created_path,
       created_revision: self.revision,
-      predecessor: Some(source_id),
+      predecessor: source_id.0,
       predecessor_count: next_count(source_row.predecessor_count)?,
-      copy_from: Some((from, source.revision)),
+      copy_from,
       copy_root: id,
-      text: change.text.or(source_row.text),
-      properties,
-      mergeinfo_count: recounted(source_row.mergeinfo_count, had, properties.has_mergeinfo())?,
+      text,
+      properties: prop_slot,
+      mergeinfo_count: recounted(source_row.mergeinfo_count, had, has)?,
       // A copy's children are its source's, the very node-revisions resolution finds beneath it (A-759).
       children: source_row.children,
     };
@@ -2036,15 +2200,24 @@ impl<'index> Builder<'index> {
     node: NodeRevisionId,
     change: &ChangedPath,
   ) -> Result<(bool, bool), IndexRefusal> {
+    let old_props = self.row(node)?.properties;
+    let had = self.props_at(old_props)?.has_mergeinfo();
+    let new_text = match change.text {
+      Some(text) => Some(self.push_text(Some(text))?),
+      None => None,
+    };
+    let (new_props, has) = match change.properties {
+      Some(props) => (Some(self.push_props(props)?), props.has_mergeinfo()),
+      None => (None, had),
+    };
     let row = self.row_mut(node)?;
-    let had = row.properties.has_mergeinfo();
-    if let Some(text) = change.text {
-      row.text = Some(text);
+    if let Some(slot) = new_text {
+      row.text = slot;
     }
-    if let Some(properties) = change.properties {
-      row.properties = properties;
+    if let Some(slot) = new_props {
+      row.properties = slot;
     }
-    Ok((had, row.properties.has_mergeinfo()))
+    Ok((had, has))
   }
 
   /// Refuses a row whose kind differs from the node it names.
@@ -2151,7 +2324,7 @@ impl<'index> Builder<'index> {
     if self.row(child_row.copy_root)?.node_id != child_row.node_id {
       return Ok(Inherit::Parent);
     }
-    if self.path_name(child_row.created_path)? == path {
+    if self.path_name_u32(child_row.created_path)? == path {
       Ok(Inherit::Itself)
     } else {
       Ok(Inherit::Fresh)
@@ -2198,11 +2371,11 @@ impl<'index> Builder<'index> {
     let row = Row {
       copy_id,
       copy_root,
-      created_path: self.intern(path)?,
+      created_path: self.intern_u32(path)?,
       created_revision: self.revision,
-      predecessor: Some(old),
+      predecessor: old.0,
       predecessor_count: next_count(old_row.predecessor_count)?,
-      copy_from: None,
+      copy_from: EMPTY_SLOT,
       ..old_row
     };
     let id = self.push(row)?;
@@ -2257,7 +2430,7 @@ impl<'index> Builder<'index> {
     });
     let found = match shaped {
       Some((Shape::Copied { from, revision }, end)) => {
-        let source = beneath(self.path_name(from)?, path, end)?;
+        let source = beneath(self.path_name_u32(from)?, path, end)?;
         self.index.resolve(&source, revision)?
       }
       Some((Shape::Fresh | Shape::Deleted, _)) => None,
@@ -2295,8 +2468,9 @@ impl<'index> Builder<'index> {
 
   /// The row of `id`, the index's or this revision's.
   fn row(&self, id: NodeRevisionId) -> Result<&Row, IndexRefusal> {
-    match id.0.checked_sub(self.index.rows.len()) {
-      None => self.index.rows.get(id.0),
+    let at = id.index().ok_or(IndexRefusal::Corrupt)?;
+    match at.checked_sub(self.index.rows.len()) {
+      None => self.index.rows.get(at),
       Some(made) => self.rows.get(made),
     }
     .ok_or(IndexRefusal::Corrupt)
@@ -2304,8 +2478,8 @@ impl<'index> Builder<'index> {
 
   /// The row of `id`, which this revision made.
   fn row_mut(&mut self, id: NodeRevisionId) -> Result<&mut Row, IndexRefusal> {
-    let made = id
-      .0
+    let at = id.index().ok_or(IndexRefusal::Corrupt)?;
+    let made = at
       .checked_sub(self.index.rows.len())
       .ok_or(IndexRefusal::Corrupt)?;
     self.rows.get_mut(made).ok_or(IndexRefusal::Corrupt)
@@ -2313,13 +2487,101 @@ impl<'index> Builder<'index> {
 
   /// The id the next row pushed takes.
   fn next_id(&self) -> Result<NodeRevisionId, IndexRefusal> {
-    self
-      .index
-      .rows
-      .len()
-      .checked_add(self.rows.len())
+    let total = check_u32_slot_len(self.index.rows.len(), self.rows.len())?;
+    u32::try_from(total)
       .map(NodeRevisionId)
-      .ok_or(IndexRefusal::Corrupt)
+      .map_err(|_| IndexRefusal::Corrupt)
+  }
+
+  /// Appends an optional text to the side table and returns its slot (or [`EMPTY_SLOT`] for `None`).
+  fn push_text(&mut self, text: Option<Text>) -> Result<u32, IndexRefusal> {
+    let Some(text) = text else {
+      return Ok(EMPTY_SLOT);
+    };
+    let slot = check_u32_slot_len(self.index.texts.len(), self.texts.len())?;
+    self.texts.push(text);
+    u32::try_from(slot).map_err(|_| IndexRefusal::Corrupt)
+  }
+
+  /// Appends a non-empty property list to the side table and returns its slot (or [`EMPTY_SLOT`]).
+  fn push_props(&mut self, props: PropertyList) -> Result<u32, IndexRefusal> {
+    let PropertyList::Held {
+      identity,
+      has_mergeinfo,
+    } = props
+    else {
+      return Ok(EMPTY_SLOT);
+    };
+    let slot = check_u32_slot_len(self.index.prop_lists.len(), self.prop_lists.len())?;
+    self.prop_lists.push((identity, has_mergeinfo));
+    u32::try_from(slot).map_err(|_| IndexRefusal::Corrupt)
+  }
+
+  /// Appends a copy origin to the side table and returns its slot.
+  fn push_copy_source(&mut self, source: (u32, Revision)) -> Result<u32, IndexRefusal> {
+    let slot = check_u32_slot_len(self.index.copy_sources.len(), self.copy_sources.len())?;
+    self.copy_sources.push(source);
+    u32::try_from(slot).map_err(|_| IndexRefusal::Corrupt)
+  }
+
+  /// Resolves a text slot from the index or this revision's side table.
+  fn text_at(&self, slot: u32) -> Result<Option<Text>, IndexRefusal> {
+    if slot == EMPTY_SLOT {
+      return Ok(None);
+    }
+    let at = usize::try_from(slot).map_err(|_| IndexRefusal::Corrupt)?;
+    match at.checked_sub(self.index.texts.len()) {
+      None => self.index.texts.get(at).copied(),
+      Some(made) => self.texts.get(made).copied(),
+    }
+    .map(Some)
+    .ok_or(IndexRefusal::Corrupt)
+  }
+
+  /// Resolves a property list slot from the index or this revision's side table.
+  fn props_at(&self, slot: u32) -> Result<PropertyList, IndexRefusal> {
+    if slot == EMPTY_SLOT {
+      return Ok(PropertyList::Empty);
+    }
+    let at = usize::try_from(slot).map_err(|_| IndexRefusal::Corrupt)?;
+    let (identity, has_mergeinfo) = match at.checked_sub(self.index.prop_lists.len()) {
+      None => self.index.prop_lists.get(at).copied(),
+      Some(made) => self.prop_lists.get(made).copied(),
+    }
+    .ok_or(IndexRefusal::Corrupt)?;
+    Ok(PropertyList::Held {
+      identity,
+      has_mergeinfo,
+    })
+  }
+
+  /// Resolves a copy-source slot from the index or this revision's side table.
+  fn copy_source_at(&self, slot: u32) -> Result<Option<(u32, Revision)>, IndexRefusal> {
+    if slot == EMPTY_SLOT {
+      return Ok(None);
+    }
+    let at = usize::try_from(slot).map_err(|_| IndexRefusal::Corrupt)?;
+    match at.checked_sub(self.index.copy_sources.len()) {
+      None => self.index.copy_sources.get(at).copied(),
+      Some(made) => self.copy_sources.get(made).copied(),
+    }
+    .map(Some)
+    .ok_or(IndexRefusal::Corrupt)
+  }
+
+  /// Interns `path` as a 32-bit slab index.
+  fn intern_u32(&mut self, path: &str) -> Result<u32, IndexRefusal> {
+    let number = self.intern(path)?;
+    if number >= usize::try_from(EMPTY_SLOT).unwrap_or(usize::MAX) {
+      return Err(IndexRefusal::Corrupt);
+    }
+    u32::try_from(number).map_err(|_| IndexRefusal::Corrupt)
+  }
+
+  /// The path numbered `number` (`u32` slab index), the index's or a new one.
+  fn path_name_u32(&self, number: u32) -> Result<&str, IndexRefusal> {
+    let at = usize::try_from(number).map_err(|_| IndexRefusal::Corrupt)?;
+    self.path_name(at)
   }
 
   /// Pushes a row and answers its id.

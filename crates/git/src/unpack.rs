@@ -466,10 +466,10 @@ struct Data {
   header: entry::Header,
   /// Where it begins.
   began: u64,
-  /// Room for exactly its size, filled from the start.
+  /// Room for exactly its size, inflated directly into spare capacity (zero pre-fill).
   content: Vec<u8>,
-  /// The bytes inflated so far.
-  filled: usize,
+  /// Target uncompressed length in bytes.
+  size: usize,
   /// What its size holds of the admission.
   hold: Hold,
 }
@@ -873,7 +873,6 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       .map_err(|_| Refusal::AllocationRefused { bytes: header.size })?;
     let mut content = Vec::new();
     reserve(&mut content, size)?;
-    content.resize(size, 0);
     self
       .inflater
       .state()
@@ -883,7 +882,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       header,
       began,
       content,
-      filled: 0,
+      size,
       hold,
     });
     Ok(mine)
@@ -1500,31 +1499,29 @@ fn inflate(inflater: &mut Decompress, data: &mut Data, rest: &[u8]) -> Result<In
   let size = data.header.size;
   let before_in = inflater.total_in();
   let before_out = inflater.total_out();
-  let full = data.filled >= data.content.len();
-  let mut spare = [0u8; 1];
-  let room: &mut [u8] = if full {
-    &mut spare
+  let before_len = data.content.len();
+  let full = before_len >= data.size;
+  let result = if full {
+    let mut spare = [0u8; 1];
+    inflater.decompress(rest, &mut spare, FlushDecompress::None)
   } else {
-    data.content.get_mut(data.filled..).unwrap_or_default()
+    inflater.decompress_vec(rest, &mut data.content, FlushDecompress::None)
   };
-  let result = inflater.decompress(rest, room, FlushDecompress::None);
   // A byte past the size is judged before the stream's own error: one call can write it and then fail the Adler-32
   // that follows, and the data running past its header is the refusal that names what is wrong.
   let wrote = inflater.total_out().saturating_sub(before_out);
-  if full && wrote > 0 {
+  let total_filled = before_len.saturating_add(usize::try_from(wrote).unwrap_or(usize::MAX));
+  if total_filled > data.size || (full && wrote > 0) {
     return Err(Refusal::LongerThanSize { at, size });
   }
   let status = result.map_err(|_| Refusal::Inflate { at })?;
-  data.filled = data
-    .filled
-    .saturating_add(usize::try_from(wrote).unwrap_or(usize::MAX));
   let took = inflater.total_in().saturating_sub(before_in);
   let ended = status == Status::StreamEnd;
-  if ended && data.filled < data.content.len() {
+  if ended && data.content.len() < data.size {
     return Err(Refusal::ShorterThanSize {
       at,
       size,
-      inflated: to_u64(data.filled),
+      inflated: to_u64(data.content.len()),
     });
   }
   Ok(Inflated { took, ended })

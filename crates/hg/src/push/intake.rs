@@ -448,6 +448,9 @@ struct Taker {
   bringing: u64,
   /// The text kept last, and its node: the next revision's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
+  /// Next revision number for the active log, initialized once per log to avoid repeated
+  /// `HgIndex::len` (`first_missing`) binary searches on multi-revision file logs.
+  next_rev: Option<u32>,
   /// The identity of the text kept last, so the next revision's base is named without hashing it again.
   last_identity: Option<(Node, [u8; 32])>,
   /// Whether the log being taken has kept a revision yet.
@@ -1009,6 +1012,7 @@ impl Intake {
         awaited: BTreeSet::new(),
         bringing,
         last: None,
+        next_rev: None,
         spares: Spares::within(room),
         taking_later: false,
         last_later: false,
@@ -1196,8 +1200,8 @@ impl Taker {
       self.enter(after);
       return Ok(Stepped::More);
     };
-    let kept_before =
-      self.brought.contains(&revision.node) || self.fork.rev(store, log, &revision.node).is_some();
+    let already = self.seen_revision(log, &revision.node, store);
+    let kept_before = already.is_some();
     // For a non-empty manifest log, `HgIndex::append_revisions_after` needs the previous manifest's
     // text to delta-encode the first incoming manifest. If it (or its delta base chain) was let go
     // (`Kept::Away`) and is not in `self.last`, resolve it via the changeset store before taking.
@@ -1251,7 +1255,7 @@ impl Taker {
     if self.take(
       log,
       (&revision, place),
-      given,
+      (already, given),
       (store, admission),
       (after, None),
     )? {
@@ -1425,11 +1429,8 @@ impl Taker {
     };
     // A file delta's base other than the text kept last: rebuilt from the push's own deltas, read from its cache, or
     // read from the store between steps for a revision landed before the push (A-767 C1).
-    let kept_before = self.brought.contains(&revision.node)
-      || self
-        .fork
-        .rev(store, Log::File(&path), &revision.node)
-        .is_some();
+    let already = self.seen_revision(Log::File(&path), &revision.node, store);
+    let kept_before = already.is_some();
     let names_last = self
       .last
       .as_ref()
@@ -1469,7 +1470,7 @@ impl Taker {
     let taken = self.take(
       Log::File(&path),
       (&revision, place),
-      given,
+      (already, given),
       (store, admission),
       (after, position),
     );
@@ -1501,8 +1502,21 @@ impl Taker {
     self.taking_later = false;
     self.last_later = false;
     self.last_identity = None;
+    self.next_rev = None;
     self.logged = false;
     self.stage = stage;
+  }
+
+  /// Checks whether `node` is already in this push's `brought` set (`Some(false)`) or held in the
+  /// fork (`Some(true)`), returning `None` for a new revision.
+  fn seen_revision(&self, log: Log<'_>, node: &Node, store: &ContentStore) -> Option<bool> {
+    if self.brought.contains(node) {
+      Some(false)
+    } else if self.fork.rev(store, log, node).is_some() {
+      Some(true)
+    } else {
+      None
+    }
   }
 
   /// The name `log` takes among the intake's logs, once per log, its name charged to `admission`; nothing is noted
@@ -1510,7 +1524,7 @@ impl Taker {
   fn logged_of(
     &self,
     log: Log<'_>,
-    store: &ContentStore,
+    start_rev: u32,
     admission: &mut Admission,
   ) -> Result<Option<(LogOf, u32)>, Refused> {
     if self.logged {
@@ -1521,7 +1535,7 @@ impl Taker {
     if let LogOf::File(path) = &named {
       admission.charge(to_u64(path.len()))?;
     }
-    Ok(Some((named, self.fork.len(store, log))))
+    Ok(Some((named, start_rev)))
   }
 
   /// Notes the log [`Taker::logged_of`] charged, where it named one.
@@ -1532,25 +1546,21 @@ impl Taker {
     }
   }
 
-  /// Whether revision `node` of `log` is passed over: brought already by this push, or held already by the fork (a
-  /// changeset held is charged and named among the held).
-  fn already_brought(
+  /// Records a passed-over revision (from `seen_revision`): `held == true` means it was already in
+  /// the fork before this push (a changelog node is noted among `held_changesets`).
+  fn record_passed_over(
     &mut self,
     log: Log<'_>,
     node: Node,
-    store: &ContentStore,
+    held: bool,
     admission: &mut Admission,
-  ) -> Result<bool, Refused> {
-    let held = !self.brought.contains(&node) && self.fork.rev(store, log, &node).is_some();
-    if !self.brought.contains(&node) && !held {
-      return Ok(false);
-    }
+  ) -> Result<(), Refused> {
     self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
     if held && log == Log::Changelog {
       admission.charge_items::<Node>(1)?;
       self.intaken.held_changesets.push(node);
     }
-    Ok(true)
+    Ok(())
   }
 
   /// A step of the fork's merge (goal 93, the index seal's reland): a table of the merge the size-tiered rule named
@@ -1602,11 +1612,12 @@ impl Taker {
     &mut self,
     log: Log<'_>,
     (revision, place): (&Revision<'_>, Range<u64>),
-    given: Option<Vec<u8>>,
+    (already, given): (Option<bool>, Option<Vec<u8>>),
     (store, admission): (&mut ContentStore, &mut Admission),
     (after, position): (Stage, Option<usize>),
   ) -> Result<bool, Refused> {
-    if self.already_brought(log, revision.node, store, admission)? {
+    if let Some(held) = already {
+      self.record_passed_over(log, revision.node, held, admission)?;
       return Ok(true);
     }
     self.check_known(log, revision, store)?;
@@ -1827,7 +1838,8 @@ impl Taker {
     // has grown (main 01a20182's ruling of 2026-11-22 03:03: an intake past its admission waits, never refused).
     let mut trial = *admission;
     let read = self.read_of(log, revision, &text, store, &mut trial)?;
-    let logged = self.logged_of(log, store, &mut trial)?;
+    let next_rev = self.next_rev.unwrap_or_else(|| self.fork.len(store, log));
+    let logged = self.logged_of(log, next_rev, &mut trial)?;
     let path = match log {
       Log::Changelog => CHANGELOG_PATH,
       Log::Manifest => MANIFEST_PATH,
@@ -1848,15 +1860,16 @@ impl Taker {
       .last
       .as_ref()
       .map(|(node, text)| (node, text.as_slice()));
-    keep_one(
+    let kept_one = keep_one(
       &mut self.fork,
       store,
       log,
       (&arrived, previous),
-      kept,
+      (kept, Some(next_rev)),
       &mut room,
     )?;
     *admission = trial;
+    self.next_rev = Some(kept_one.map_or(next_rev, |info| info.rev).saturating_add(1));
     self.apply_read(read);
     self.note_logged(logged);
     self.brought.insert(revision.node);
@@ -1876,53 +1889,18 @@ impl Taker {
     };
     match self.cutting.as_mut() {
       Some(cutting) => {
-        let rev = self.fork.len(store, log).saturating_sub(1);
-        let (contents, stored_bytes) = match log {
-          Log::File(_) => self
-            .fork
-            .revision(store, log, rev)
-            .map_or((None, 0), |row| {
-              (
-                Some(FileContents {
-                  path: path.to_vec(),
-                  node: revision.node,
-                  bytes: row.bytes,
-                  block: row.block,
-                }),
-                row.len,
-              )
+        let rev = kept_one.map_or(next_rev, |info| info.rev);
+        let (contents, stored_bytes) = kept_one.map_or((None, 0), |info| {
+          (
+            Some(FileContents {
+              path: path.to_vec(),
+              node: revision.node,
+              bytes: info.bytes,
+              block: info.block,
             }),
-          Log::Changelog => self.fork.changeset(store, rev).map_or((None, 0), |row| {
-            (
-              Some(FileContents {
-                path: CHANGELOG_PATH.to_vec(),
-                node: revision.node,
-                bytes: row.text,
-                block: None,
-              }),
-              row.len,
-            )
-          }),
-          Log::Manifest => self
-            .fork
-            .revision(store, log, rev)
-            .map_or((None, 0), |row| {
-              let stored = if row.base != NONE {
-                row.stored
-              } else {
-                row.len
-              };
-              (
-                Some(FileContents {
-                  path: MANIFEST_PATH.to_vec(),
-                  node: revision.node,
-                  bytes: row.bytes,
-                  block: None,
-                }),
-                stored,
-              )
-            }),
-        };
+            info.stored_bytes,
+          )
+        });
         let charged = to_u64(size_of::<KeptText>())
           .saturating_add(to_u64(path.len()))
           .saturating_add(contents.as_ref().map_or(0, |contents| {
