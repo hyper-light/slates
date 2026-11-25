@@ -547,3 +547,12 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
      patches/w-git-replica-red.patch first; log the read point and the homing, then make it deterministic.
   3. A council session of its own per peer (red: the push test's session_lent == 0; log the held exchange's wait point
      first).
+
+## 2026-11-25: A-915 landed (bd5c1ddf4, commit 17548d18b)
+
+- A creation answers once its root's join is at f + 1 (one wait through names_committed).
+- An adoption refuses a green whose join is unknown (Unjoined), and an adopted repository's name is reserved until its
+  rebuild. a894's flake was my regression from A-908 part 4.
+- Red first: a915 fleet test (hold_state_log_shipping) plus two unit tests.
+- Queue: A-914 (homing window from the measured takeover tail), then the holder replica build Missing a pushed object,
+  then a council session of its own per peer.
