@@ -1,4 +1,7 @@
 name: diag-main-spawner
+# Run 3 (main 01a20182, 2026-11-25 14:15 PST): at main past 0b9a3f9e8, w-git's fd-6 fix (MSG_CMSG_CLOEXEC on Linux,
+#   pipe2(O_CLOEXEC)) and the back-off; the parity test a_child_started_through_the_spawner_holds_what_a_direct_one_holds
+#   must be green on both Linux runners.
 # Run 2 (main 01a20182, 2026-11-25 10:10 PST): at main with A-924 piece 2a and the role fixes (held count from the hard limit).
 # Run 1 (main 01a20182, 2026-11-25 10:05 PST): A-924 piece 1's spawn-cost red on both Linux runners, at main 31f16d02f.
 # It prints each descriptor count's least, median and most spawn time on the asking thread, through the spawner and
