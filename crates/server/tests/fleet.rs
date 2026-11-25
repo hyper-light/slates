@@ -36425,14 +36425,26 @@ fn push_to_edge(
   let work = dir.path.clone();
   committed_in(&dir, (file, bytes));
   let header = format!("http.extraHeader=Authorization: Bearer {token}");
+  let helper = token_helper(token);
   let url = format!("http://127.0.0.1:{port}/project");
   let refspec = format!("HEAD:refs/heads/{branch}");
-  let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
+  let pushed = git_in(
+    &work,
+    &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
+  );
   if pushed.status.success() {
     Ok(())
   } else {
     Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
   }
+}
+
+/// A git credential helper answering the fleet's token as Basic's password for whatever origin asks (A-921 part 2):
+/// git follows a repository's `307` to its owner's edge, and curl drops a custom `Authorization` field (the
+/// extraHeader's bearer) once a redirect leaves the origin, so the owner's `401` is answered by the helper, as a user's
+/// credential helper answers it. Asked only on a `401`; the extraHeader still carries the token on the first request.
+fn token_helper(token: &str) -> String {
+  format!("credential.helper=!f() {{ echo username=slates; echo password={token}; }}; f")
 }
 
 /// Stock git in `dir`, never prompting, its messages C's.
@@ -36520,10 +36532,13 @@ impl GitFleet {
       .vcs_http_port()
       .expect("the edge listens");
     let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
+    let helper = token_helper(&self.token);
     let url = format!("http://127.0.0.1:{port}/project");
     let cloned = git_in(
       &dir.path,
-      &["-c", &header, "clone", "-q", "-b", branch, &url, "copy"],
+      &[
+        "-c", &header, "-c", &helper, "clone", "-q", "-b", branch, &url, "copy",
+      ],
     );
     if !cloned.status.success() {
       return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
@@ -36531,7 +36546,10 @@ impl GitFleet {
     commit_in(&dir, "copy", (file, bytes));
     let work = format!("{}/copy", dir.path);
     let refspec = format!("HEAD:refs/heads/{branch}");
-    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
+    let pushed = git_in(
+      &work,
+      &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
+    );
     if pushed.status.success() {
       Ok(())
     } else {
@@ -37876,6 +37894,263 @@ fn a925_a_node_learns_its_peers_edges_as_each_bound_them() {
     Ok(Err(stranger)),
     "a member of no record: the typed refusal naming it"
   );
+}
+
+/// A-921 (main 01a20182's ruling of 2026-11-25: a stale owner after a false death keeps claiming what it lost). Do: on a
+/// three-node `f = 1` git fleet with a repository on a, push `main`; cut a off on the probe plane until b and c hold a
+/// configuration without it (its takeover installed: the repository's registers moved to a successor); heal it, and
+/// wait until every node's configuration names a a member again (readmitted, its refutation at a higher incarnation);
+/// push on top at a's edge. Expect the push to land, through the repository's successor. Red before A-921: a, readmitted,
+/// still ran the push as the repository's owner, its records refused `Unauthorized` by the holders whose authority the
+/// takeover moved, and the push refused `unable to commit` for as long as a believed it owned the repository (found by
+/// A-919's owner-restart scene, a's warm restart outlasting detection: 1.40 to 1.79 s of silence to the takeover).
+#[test]
+fn a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("stale-owner");
+  let first = fleet.push(0, ("first.txt", b"main before the false death\n"));
+  let owner = fleet.hosts[0];
+  let survivors = &fleet.daemons[1..];
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let cut = probe_plane_cut(&fleet.daemons, &fleet.hosts, true);
+  let taken = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(survivors, |members| !members.contains(&owner))
+    });
+  let healed = probe_plane_cut(&fleet.daemons, &fleet.hosts, false);
+  let readmitted = healed
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons, |members| members.contains(&owner))
+    });
+  let pushed = fleet.push_on_top(0, ("after.txt", b"after the false death\n"));
+  // At each survivor: the adopter serves the repository; the node that never held it answers not found, as before, since
+  // a name resolves only where a partition holds it (D-12, no directory; fleet-wide name routing is owed, GAPS).
+  let listed: Vec<(bool, String)> = (1..fleet.daemons.len())
+    .map(|node| {
+      let port = fleet.daemons[node].vcs_http_port().unwrap_or_default();
+      let dir = common::target::target_dir();
+      let header = format!("http.extraHeader=Authorization: Bearer {}", fleet.token);
+      let url = format!("http://127.0.0.1:{port}/project");
+      let out = git_in(&dir.path, &["-c", &header, "ls-remote", &url]);
+      (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+      )
+    })
+    .collect();
+  let refusals: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      daemon.fleet_refusals().map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(kind, _)| {
+            kind.starts_with("fleet.record.refused")
+              || kind.contains("push_uncommitted")
+              || kind.contains("readmission")
+              || kind.contains("moved")
+              || kind.contains("owner_location")
+          })
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  fleet.stop();
+  eprintln!(
+    "stale-owner: first {first:?}; cut {cut}, taken over {taken}; healed {healed}, readmitted {readmitted}; the push at \
+     a {pushed:?}; refusals {refusals:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the false death landed");
+  assert!(taken && readmitted, "a was taken over, then readmitted");
+  assert_eq!(
+    pushed,
+    Ok(()),
+    "the push at the readmitted old owner landed through its successor"
+  );
+  assert_eq!(
+    listed.iter().filter(|(served, _)| *served).count(),
+    1,
+    "the adopter alone serves it: {listed:?}"
+  );
+  assert!(
+    listed
+      .iter()
+      .any(|(served, said)| !served && said.contains("not found")),
+    "the node that never held it answers not found: {listed:?}"
+  );
+}
+
+/// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the stale-creator skip, for every caller of the one owner
+/// lookup). Do: on a four-node fleet, a volume on a, placed, held by two of its peers; the fourth holds none of it, so its
+/// routing names no owner; cut a off on the probe plane until the survivors hold a configuration without it (taken over),
+/// then heal it until every node names a a member again; ask the volume's status from the fourth node's client. Expect it
+/// served, forwarded to the adopter found by the location round, and a never asked (its `not_owner_here` count 0). Red
+/// before: the lookup offered the volume's creator, a, readmitted and a member again, and the forward went to a first,
+/// refused there `NotOwnerHere`.
+#[test]
+fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_lease, daemons, hosts) = formed_mesh(&["a", "b", "c", "d"]);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("victims-volume")) else {
+    panic!("create on a")
+  };
+  share_with_fleet(&mut owner_client, id, &daemons);
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let holders_of = || -> Vec<usize> {
+    (1..daemons.len())
+      .filter(|node| {
+        daemons[*node]
+          .fleet_holder_head(object)
+          .is_ok_and(|held| held.is_some())
+      })
+      .collect()
+  };
+  let placed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(holders_of().len() == 2)
+  });
+  let holders = holders_of();
+  let Some(stranger) = (1..daemons.len()).find(|node| !holders.contains(node)) else {
+    panic!("a's two remote holders held its volume ({placed}): {holders:?}");
+  };
+  let owner = hosts[0];
+  let owner_host_of_a = owner;
+  let survivors = &daemons[1..];
+  let cut = probe_plane_cut(&daemons, &hosts, true);
+  let taken = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(survivors, |members| !members.contains(&owner))
+    });
+  let healed = probe_plane_cut(&daemons, &hosts, false);
+  let readmitted = healed
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&daemons, |members| members.contains(&owner))
+    });
+  // What the node holding none of it would try first: never a, the stale creator (the skip); before, a.
+  let tried_first = daemons[stranger].known_owner(object);
+  let asked_a_before = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here");
+  let mut forwarded = Client::connect(daemons[stranger].instance());
+  let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(matches!(
+      forwarded.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ))
+  });
+  let asked_a = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here")
+    .saturating_sub(asked_a_before);
+  let claims = summed_count(&daemons[stranger], "fleet.owner_location.claim");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "victims-volume: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
+     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}"
+  );
+  assert!(
+    placed && taken && readmitted,
+    "the volume placed, a taken over, then readmitted"
+  );
+  assert!(
+    served,
+    "the volume's status served from the node holding none of it"
+  );
+  assert_eq!(asked_a, 0, "a, the stale creator, was never asked");
+  assert!(
+    tried_first
+      .as_ref()
+      .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
+    "the direct route never names a: {tried_first:?}"
+  );
+}
+
+/// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the one case the stale-creator skip exists for). Do: on a
+/// four-node anchored fleet, a volume on a, held by two of its peers; cut a off until the survivors take it over, heal it
+/// until every node names a a member again; restart the fourth node (which holds none of the volume) warm, so it comes
+/// back knowing nothing of the volume's owner (its routing is not persisted); ask what its direct route names, then the
+/// volume's status from its client. Expect the direct route never to name a, and the status served, found by the location
+/// round (`fleet.owner_location.claim` moved on the restarted node). Red without the skip: its direct route named a,
+/// readmitted and a member again, the creator of a volume it no longer owns, and the request went there first.
+#[test]
+fn a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet_of("restarted-stranger", &["a", "b", "c", "d"]);
+  let mut owner_client = Client::connect(fleet.daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("victims-volume")) else {
+    panic!("create on a")
+  };
+  share_with_fleet(&mut owner_client, id, &fleet.daemons);
+  let object = ObjectId(id.bytes);
+  let holders_of = |fleet: &GitFleet| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .fleet_holder_head(object)
+          .is_ok_and(|held| held.is_some())
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let placed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(holders_of(&fleet).len() == 2)
+  });
+  let holders = holders_of(&fleet);
+  let Some(stranger) = (1..fleet.daemons.len()).find(|node| !holders.contains(node)) else {
+    fleet.stop();
+    panic!("a's two remote holders held its volume ({placed}): {holders:?}");
+  };
+  let owner = fleet.hosts[0];
+  let cut = probe_plane_cut(&fleet.daemons, &fleet.hosts, true);
+  let taken = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons[1..], |members| !members.contains(&owner))
+    });
+  let healed = probe_plane_cut(&fleet.daemons, &fleet.hosts, false);
+  let readmitted = healed
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons, |members| members.contains(&owner))
+    });
+  let restarted = fleet.restart_warm(stranger);
+  // Watched until it names an owner or the placement deadline passes: just after its restart the node may not yet hold a
+  // eligible, and only once it does would its direct route fall to the creator (the skip's case).
+  let mut named_a = false;
+  let mut tried_first: Result<Option<HostId>, ObserveError> = Ok(None);
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let named = fleet.daemons[stranger].known_owner(object)?;
+    named_a |= named == Some(owner);
+    tried_first = Ok(named);
+    Ok(named.is_some())
+  });
+  let claims_before = summed_count(&fleet.daemons[stranger], "fleet.owner_location.claim");
+  let mut forwarded = Client::connect(fleet.daemons[stranger].instance());
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(matches!(
+      forwarded.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ))
+  });
+  let claims = summed_count(&fleet.daemons[stranger], "fleet.owner_location.claim")
+    .saturating_sub(claims_before);
+  drop(forwarded);
+  drop(owner_client);
+  fleet.stop();
+  eprintln!(
+    "restarted-stranger: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
+     {readmitted} restarted {restarted}; tried first {tried_first:?}, named a {named_a} (a {owner:?}); served {served}; claims {claims}"
+  );
+  assert!(
+    placed && taken && readmitted && restarted,
+    "the scene formed"
+  );
+  assert!(
+    !named_a,
+    "the restarted node's direct route never names a: last {tried_first:?}"
+  );
+  assert!(served, "the volume's status served from the restarted node");
+  // Claims are recorded, not asserted: the restarted node's routing, learned again, may name the adopter before a round.
 }
 
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover

@@ -552,6 +552,11 @@ pub struct ShardState {
   /// (`verbs::lease_verdict`). Bounded by the partition's volume cap: a subset of the catalog, pruned to it at each
   /// yield (`crate::readmission`).
   pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
+  /// The repositories this shard's partition held when this host was taken over and admitted again (A-921 part 2,
+  /// beside [`ShardState::yielded`]): each a successor's now, never served here; a request for one is answered with
+  /// where its owner is (`owner_location::locate_owner`). Bounded by the partition's repositories, pruned to them at each
+  /// yield (`crate::readmission`); A-922 releases the copies.
+  pub(crate) yielded_repositories: std::collections::BTreeSet<slates_db::catalog::RepositoryId>,
   /// The slots of stale copies this shard relinquished to a takeover that named this node again (A-362,
   /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the serve loop (`verbs::step_destroys`)
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume

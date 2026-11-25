@@ -21,8 +21,8 @@ use slates_git::upload::{PackPlan, PackRefused, PackSource, Served as UploadServ
 use slates_vcs::ContentStore;
 
 use super::{
-  Authenticator, GitServices, GitSite, LfsService, Located, Proven, Refused, Repositories,
-  ServiceRefused, Start, StoreLender, Unproven, UploadServices,
+  Authenticator, Elsewhere, GitServices, GitSite, LfsService, Located, Proven, Refused,
+  Repositories, ServiceRefused, Start, StoreLender, Unproven, UploadServices,
 };
 use crate::lfs::LfsCall;
 use crate::vcs_http::daemon_edge::ShardLfs;
@@ -146,6 +146,8 @@ impl Authenticator for Tokens {
 struct Held {
   /// The git repository's rules.
   rules: Vec<PolicyRule>,
+  /// Where its repositories went, where a takeover moved them from this node (A-921 part 2); `None`: served here.
+  elsewhere: Option<Elsewhere>,
 }
 
 /// Shape: the runtime shard [`ELSEWHERE`] lives on.
@@ -185,6 +187,13 @@ impl Repositories for Held {
         hg_publishing: true,
       },
     })
+  }
+
+  fn elsewhere(
+    &self,
+    _repository: &RepositoryRecord,
+  ) -> impl std::future::Future<Output = Option<Elsewhere>> {
+    std::future::ready(self.elsewhere.clone())
   }
 }
 
@@ -251,7 +260,16 @@ impl GitServices for Served {
 
 /// A site over [`Tokens`] and [`Held`] with `rules` on `r.git`, and `services`.
 fn site<S: GitServices>(rules: Vec<PolicyRule>, services: S) -> GitSite<Tokens, Held, S> {
-  GitSite::new(REALM.to_owned(), ROOM, Tokens, Held { rules }, services)
+  GitSite::new(
+    REALM.to_owned(),
+    ROOM,
+    Tokens,
+    Held {
+      rules,
+      elsewhere: None,
+    },
+    services,
+  )
 }
 
 /// The head `input` holds; it must be whole.
@@ -811,6 +829,53 @@ fn a_proven_request_for_another_shards_repository_moves_and_an_unproven_one_is_r
       "{fields:?}"
     );
   }
+}
+
+/// A-921 part 2 (main 01a20182's rulings of 2026-11-25). Do: ask a proven upload's advertisement of a repository a
+/// takeover moved from this node, where it went to an owner's edge, to an owner that announced none, and where no owner
+/// claimed it. Expect `307` to the owner's edge with the request's path and query; `503` naming the owner by member id;
+/// `503` "moved, owner unknown here"; each a typed answer, never the repository served from this node's stale copy.
+#[test]
+fn a_request_for_a_moved_repository_is_answered_with_where_it_went() {
+  let target = "/r.git/info/refs?service=git-upload-pack";
+  let asked = request("GET", target, &[OWNER_BEARER]);
+  let answered = |elsewhere: Elsewhere| {
+    let mut site = GitSite::new(
+      REALM.to_owned(),
+      ROOM,
+      Tokens,
+      Held {
+        rules: Vec::new(),
+        elsewhere: Some(elsewhere),
+      },
+      Unserved,
+    );
+    refusal(&ready(site.answer(&head(&asked), true)))
+  };
+  let field = |fields: &Fields, name: &[u8]| {
+    fields
+      .iter()
+      .find(|(found, _)| found.as_slice() == name)
+      .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+  };
+  let (status, fields, proven) = answered(Elsewhere::Edge("http://127.0.0.1:4321".to_owned()));
+  assert_eq!((status, proven), (Status::TEMPORARY_REDIRECT, true));
+  assert_eq!(
+    field(&fields, b"Location").as_deref(),
+    Some("http://127.0.0.1:4321/r.git/info/refs?service=git-upload-pack")
+  );
+  let (status, fields, _) = answered(Elsewhere::Owner(slates_db::HostId(0x1234)));
+  assert_eq!(status, Status::SERVICE_UNAVAILABLE);
+  assert_eq!(
+    field(&fields, super::MOVED_OWNER_FIELD).as_deref(),
+    Some("member 0000000000001234")
+  );
+  let (status, fields, _) = answered(Elsewhere::Unknown);
+  assert_eq!(status, Status::SERVICE_UNAVAILABLE);
+  assert_eq!(
+    field(&fields, super::MOVED_OWNER_FIELD).as_deref(),
+    Some("moved, owner unknown here")
+  );
 }
 
 /// A-625 part 3 (each refusal typed). Do: decide what each of these proves: no `Authorization`, an unknown scheme, a

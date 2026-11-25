@@ -641,6 +641,16 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Found::BadPath => return self.refuse_url(Refusal::BadPath),
       Found::NoRepository => return self.refuse_url(Refusal::NoRepository { url }),
     };
+    // A repository a takeover moved from this node (A-921 part 2): svnserve's vocabulary has no move, so it is refused as
+    // a repository not here, counted and logged, never served from the stale copy.
+    if self.repositories.moved_here(&record) {
+      crate::fleet::count_refusal(crate::vcs_ssh::site::MOVED_REFUSED);
+      slates_machine::log_line!(
+        "slates-server: svnserve over SSH refused repository {:?}: moved to another node by a takeover",
+        record.id
+      );
+      return self.refuse_url(Refusal::NoRepository { url });
+    }
     if !matches!(
       vcs_policy::reaches(&record, &self.principal, &TUNNEL_RIGHTS),
       Ok(true)

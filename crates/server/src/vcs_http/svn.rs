@@ -357,6 +357,12 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
     else {
       return refused_with(Status::NOT_FOUND, Fields::new(), true);
     };
+    // A repository a takeover moved from this node is answered with where it went (A-921 part 2): Subversion does not
+    // follow a `307` but names its target, "Repository moved temporarily to '<url>'" (measured, svn 1.15), for its user
+    // to relocate to.
+    if let Some(elsewhere) = self.repositories.elsewhere(&repository).await {
+      return super::git::moved(head, elsewhere);
+    }
     match vcs_policy::reaches(&repository, &principal, &[Right::Read]) {
       Ok(true) => {}
       Ok(false) => return refused_with(Status::FORBIDDEN, Fields::new(), true),

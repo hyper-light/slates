@@ -2710,6 +2710,19 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-921 part 2): the owner the one owner lookup's direct route names for `object` here
+  /// (`owner_location::Query::known_owner`, at the object's home region, no cached route): what a forward tries before a
+  /// location round. Never this node, and never a creator the configuration keeps a retirement or a completed takeover
+  /// of. A one-shot control-shard question.
+  pub fn known_owner(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::owner_location::home_query(s, object).known_owner(s, None)
+    })
+  }
+
   /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
   /// was recorded for it; and whether a kept retirement still names it (a re-admission waits on none naming it, A-919's
   /// test settling, A-921). A one-shot control-shard question; its typed refusal when it could not be made.
@@ -5450,6 +5463,7 @@ async fn init_shard(
     mount_attachments: std::collections::BTreeMap::new(),
     unrecovered: std::collections::BTreeMap::new(),
     yielded: std::collections::BTreeSet::new(),
+    yielded_repositories: std::collections::BTreeSet::new(),
     relinquished: Vec::new(),
     candidate_claims: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]

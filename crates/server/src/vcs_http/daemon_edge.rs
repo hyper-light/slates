@@ -123,6 +123,69 @@ impl Repositories for ShardRepositories {
     })
     .flatten()
   }
+
+  fn moved_here(&self, repository: &RepositoryRecord) -> bool {
+    crate::state::with_state(|state| state.yielded_repositories.contains(&repository.id))
+      .unwrap_or(false)
+  }
+
+  fn elsewhere(
+    &self,
+    repository: &RepositoryRecord,
+  ) -> impl std::future::Future<Output = Option<super::git::Elsewhere>> {
+    let id = repository.id;
+    async move { moved_elsewhere(id).await }
+  }
+}
+
+/// Where the repository `id` went, where this shard's partition holds it but a takeover moved it from this node
+/// (A-921 part 2, `ShardState::yielded_repositories`): its owner found on the control shard by the one owner lookup
+/// (`owner_location::locate_owner`, its full budget), then its announced edge (A-925); `None` where it is this node's.
+async fn moved_elsewhere(id: slates_db::catalog::RepositoryId) -> Option<super::git::Elsewhere> {
+  use super::git::Elsewhere;
+  let (origin, control, moved) = crate::state::with_state(|state| {
+    (
+      state.shard,
+      state.shards.first().copied().unwrap_or(state.shard),
+      state.yielded_repositories.contains(&id),
+    )
+  })?;
+  if !moved {
+    return None;
+  }
+  // The lookup's own bound (the failover SLO or the membership horizon, whichever is longer) and one more round.
+  let budget = crate::state::with_state(|state| state.failover_ns)
+    .unwrap_or_default()
+    .max(crate::lease::horizon_ns())
+    .saturating_add(crate::fleet::record_exchange_budget_ns());
+  let found = crate::xshard::task_in_shard_time(
+    origin,
+    control,
+    move || async move {
+      let object = slates_db::register::ObjectId(id.bytes);
+      let query =
+        crate::state::with_state(|state| crate::owner_location::home_query(state, object))?;
+      let owner = crate::owner_location::locate_owner(query, None).await?;
+      crate::state::with_state(|state| {
+        crate::edges::owner_edge(state, owner, false).map_err(|refused| refused.member)
+      })
+    },
+    budget,
+  )
+  .await
+  .flatten();
+  Some(match found {
+    None => Elsewhere::Unknown,
+    Some(Err(member)) => Elsewhere::Owner(member),
+    Some(Ok(edge)) => {
+      let host = if edge.host.contains(':') {
+        format!("[{}]", edge.host)
+      } else {
+        edge.host
+      };
+      Elsewhere::Edge(format!("{}://{}:{}", edge.scheme.text(), host, edge.port))
+    }
+  })
 }
 
 /// Git LFS as the daemon serves it, on the shard its connection reached the repository's owner on (the module doc):

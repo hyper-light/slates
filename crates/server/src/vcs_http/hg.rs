@@ -306,6 +306,11 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     else {
       return refused_with(Status::NOT_FOUND, Fields::new(), true);
     };
+    // A repository a takeover moved from this node is answered with where it went (A-921 part 2): Mercurial follows a
+    // `307` at its first request, as git does (measured, hg 7.2.4).
+    if let Some(elsewhere) = self.repositories.elsewhere(&repository).await {
+      return super::git::moved(head, elsewhere);
+    }
     if let Some(refused) = judged(&repository, &principal, head, routed.permission) {
       return refused;
     }

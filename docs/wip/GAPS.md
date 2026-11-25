@@ -319,12 +319,15 @@
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.
->   - **OPEN, the product half (A-921 part 2), w-shared's next:** a, readmitted after its false death, still ran pushes
->     as the repository's owner (the VCS edges route by the partition holding the repository, never by the
->     configuration's owner), its records refused `Unauthorized` (38 at each holder) and the push `unable to commit`.
->     Red (written, held for its fix): `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`.
->     Fix: every protocol's first request routed by owner, git over HTTP answered 307 to the owner, each other client's
->     handling of a redirect measured, and a typed refusal naming the owner where it does not follow.
+>   - **FIXED, the product half (A-921 part 2):** a readmitted node answers a request for a repository a takeover moved
+>     from it with where it went: `307` to the adopter's announced edge (git, Mercurial over HTTP; Subversion names the
+>     target and stops), a typed `503` naming the owner where it announced no edge, "moved, owner unknown here" where
+>     none claimed it; SSH refused typed. Found by the one owner lookup (`owner_location::locate_owner`), shared with the
+>     volume forward and the homes' resolution. For a cross-node `307`, git needs a credential helper answering every
+>     node's edge (curl drops a custom `Authorization` field on an origin change).
+>   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
+>     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
+>     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
 >   - **OPEN, A-922:** a node whose authority over a repository moved forgets its partition's copy, sliced and bounded,
 >     as `forget_owned_by` does for volumes (AUD-08).
 > - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
