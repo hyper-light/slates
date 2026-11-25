@@ -2651,7 +2651,7 @@ fn taken_landing_after(
   payload: &[u8],
   store: &mut ContentStore,
   (held, pinned): (Node, bool),
-) -> Result<(), Refused> {
+) -> Landing {
   let mut index = HgIndex::new();
   let mut intake = Intake::begin(
     (crate::changegroup::Version::V03, payload),
@@ -2663,45 +2663,74 @@ fn taken_landing_after(
   .cutting(SEGMENT_BYTES);
   let mut counted = crate::push::pins::Counted::default();
   let mut taken: Vec<super::PushSegment> = Vec::new();
-  let outcome = loop {
+  let refused = loop {
     let stepped = match intake.step(payload, store, &mut room()) {
       Ok(stepped) => stepped,
-      Err(refused) => break Err(refused),
+      Err(refused) => break Some(refused),
     };
     if pinned {
       counted.count_kept(store, &intake).unwrap();
     }
-    while let Some(segment) = intake.take_segment() {
-      taken.push(segment);
-    }
-    // Landed only once `held` is kept: its segment's let-go runs while it sits kept and not landed.
-    if intake.kept_contents().any(|kept| kept.node == held) {
-      for segment in taken.drain(..) {
-        if pinned {
-          counted.count_out(store, &segment.contents);
-        }
-        for contents in &segment.contents {
-          for identity in contents.identities() {
-            store.let_go_object_landed(identity, &|_| None);
-          }
-        }
-      }
-    }
+    landed_once_kept(
+      &mut intake,
+      store,
+      (&mut counted, &mut taken),
+      (held, pinned),
+    );
     match stepped {
       Stepped::Store => intake.answer_from_fork(store),
       stepped if more(&stepped) => {}
-      _ => break Ok(()),
+      _ => break None,
     }
   };
   counted.release(store);
   assert!(counted.is_empty(), "nothing left pinned after the push");
-  match outcome {
-    Ok(()) => {
+  match refused {
+    Some(refused) => Landing::Refused(refused),
+    None => {
       let (fork, _) = intake.finish().ok().unwrap();
       fork.release(store).unwrap();
-      Ok(())
+      Landing::Taken
     }
-    Err(refused) => Err(refused),
+  }
+}
+
+/// What [`taken_landing_after`] came to.
+#[derive(Debug)]
+enum Landing {
+  /// The push taken whole.
+  Taken,
+  /// The push refused.
+  Refused(Refused),
+}
+
+/// [`taken_landing_after`]'s landing: the segments `intake` cut taken into `taken`, and all of them landed once revision
+/// `held` is kept (each let go as a durable segment's is, its own pins given back first where `pinned`).
+fn landed_once_kept(
+  intake: &mut Intake,
+  store: &mut ContentStore,
+  (counted, taken): (
+    &mut crate::push::pins::Counted,
+    &mut Vec<super::PushSegment>,
+  ),
+  (held, pinned): (Node, bool),
+) {
+  while let Some(segment) = intake.take_segment() {
+    taken.push(segment);
+  }
+  // Landed only once `held` is kept: its segment's let-go runs while it sits kept and not landed.
+  if !intake.kept_contents().any(|kept| kept.node == held) {
+    return;
+  }
+  for segment in taken.drain(..) {
+    if pinned {
+      counted.count_out(store, &segment.contents);
+    }
+    for contents in &segment.contents {
+      for identity in contents.identities() {
+        store.let_go_object_landed(identity, &|_| None);
+      }
+    }
   }
 }
 
@@ -2723,18 +2752,18 @@ fn a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares() {
   let (payload, pushed) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
   let b_node = pushed.2[1].0;
   let mut store = store();
-  let refused = taken_landing_after(&payload, &mut store, (b_node, false)).err();
+  let refused = taken_landing_after(&payload, &mut store, (b_node, false));
   assert!(
     matches!(
       refused,
-      Some(Refused::Unverified(Unverified::UnknownDeltaBase { node, base, .. })) if node == b_node && base == b_node
+      Landing::Refused(Refused::Unverified(Unverified::UnknownDeltaBase { node, base, .. })) if node == b_node && base == b_node
     ),
     "without the pins, the push refused for B: {refused:?}"
   );
   let mut store = self::store();
   let taken = taken_landing_after(&payload, &mut store, (b_node, true));
   assert!(
-    taken.is_ok(),
+    matches!(taken, Landing::Taken),
     "with the pins, the push taken whole: {taken:?}"
   );
   assert!(
@@ -2906,13 +2935,16 @@ fn taken_as_sent(index: &mut HgIndex, store: &mut ContentStore, payload: &[u8]) 
   finished(taking).0
 }
 
+/// The changeset store's texts of landed revisions, by log path and node: what a test's stand-in answers.
+type Saved = std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>;
+
 /// `payload` taken into a fork of `index`, each ask of a log's text answered as the server answers it, from the changeset
 /// store alone (`saved`: the landed revisions' texts, by log path and node), another ask from the fork: the fork and what
 /// was taken, or the refusal; and the log texts asked.
 fn taken_from_the_store_alone(
   index: &mut HgIndex,
   store: &mut ContentStore,
-  (payload, saved): (&[u8], &std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>),
+  (payload, saved): (&[u8], &Saved),
 ) -> (Result<(HgIndex, Intaken), Refused>, u64) {
   let mut taking = Intake::begin(
     (crate::push::made::CHANGEGROUP_VERSION, payload),
