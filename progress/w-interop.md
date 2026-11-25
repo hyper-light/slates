@@ -670,3 +670,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   evo-markers-back): 6 of 6 against stock hg 7.2.4. The same run's merge-push and rebase-push were refused
   UnknownDeltaBase on manifest 41172a1e, a manifest base carried earlier in the same push. Sent to w-hg (theirs) and
   main. Logs are kept in w-interop-scratch/hg-matrix-work/logs until w-hg has read them.
+- 387322d5c: GAPS shows hg-matrix.sh 30 of 30 at 0c4bd26fd, after w-hg's d33fc0b64.
+- 44db3dc17: BENCHMARKS, the 57k hg push A/B and the hg leg at 608930048.
+- f5b283016 (branch w-interop/hg-matrix-ci): the hg matrix CI job, pushed by main as diag-measurer-main-interop-linux-6
+  (2026-11-25 03:31 PST). Waiting for main to send results; any failed leg's row log comes back to me.
