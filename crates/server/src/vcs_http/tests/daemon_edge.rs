@@ -6578,6 +6578,16 @@ fn an_lfs_object_uploaded_to_the_href_its_batch_hands_out_is_kept_and_downloaded
   assert_eq!((got.0, got.1 == object), (200, true), "the download");
 }
 
+/// The stages of a fetch steps' work as the repository's shard counted them: the steps long by their work, by its longest
+/// stage (choose, begin, write), and each stage's longest.
+fn work_stages(daemon: &Daemon) -> ([u64; 3], [u64; 3]) {
+  let by = |names: [&'static str; 3]| names.map(|name| counted_on(daemon, REPOSITORY, name));
+  (
+    by(crate::vcs_store::upload::LONG_WORK_BY_STAGE),
+    by(crate::vcs_store::upload::WORK_NS_MOST),
+  )
+}
+
 /// The phases of a fetch's steps as the repository's shard counted them: the steps past the quantum by their longest
 /// phase, and each phase's longest.
 fn step_phases(daemon: &Daemon) -> ([u64; 5], [u64; 5]) {
@@ -6610,7 +6620,15 @@ fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
   let fetched = uploaded(edge, &name, &fetch_of(commit));
   let steps = steps_counted().saturating_sub(steps_before);
   let (long, most) = step_phases(&daemon);
+  let (long_work, work_most) = work_stages(&daemon);
   daemon.stop();
+  eprintln!("work by stage (choose, begin, write): long {long_work:?}, longest ns {work_most:?}");
+  assert!(work_most[2] > 0, "the pack's writes timed: {work_most:?}");
+  assert!(
+    long_work.iter().sum::<u64>() <= long[2],
+    "a step long by its work counted under one stage: {long_work:?} of {}",
+    long[2]
+  );
   eprintln!("fetch steps by phase: long {long:?}, longest ns {most:?}, of {steps} steps");
   assert_eq!(fetched.0, 200);
   assert!(most[2] > 0, "the answer's own step timed: {most:?}");
