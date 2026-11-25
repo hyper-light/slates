@@ -172,7 +172,7 @@ impl PositionCache {
     if asked <= have {
       return;
     }
-    let more = u64::try_from(asked - have)
+    let more = u64::try_from(asked.saturating_sub(have))
       .unwrap_or(u64::MAX)
       .saturating_mul(
         u64::try_from(core::mem::size_of::<Option<(ObjectId, u64)>>()).unwrap_or(u64::MAX),
