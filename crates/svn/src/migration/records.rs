@@ -439,7 +439,7 @@ impl Repository {
     loop {
       match self.check_step(checking, &mut || false)? {
         CheckStep::More(more) => checking = *more,
-        CheckStep::Checked(checked) => return Ok(checked),
+        CheckStep::Checked(checked) => return Ok(*checked),
       }
     }
   }
@@ -507,13 +507,13 @@ impl Repository {
         stored,
         lock_entries,
       })),
-      PlanStep::Planned(planned) => CheckStep::Checked(Checked {
+      PlanStep::Planned(planned) => CheckStep::Checked(Box::new(Checked {
         planned,
         properties,
         fresh,
         stored,
         lock_entries,
-      }),
+      })),
     })
   }
 
@@ -830,7 +830,7 @@ pub enum CheckStep {
   /// The plan goes on at the next step.
   More(Box<Checking>),
   /// Checked: what [`Repository::apply`] commits.
-  Checked(Checked),
+  Checked(Box<Checked>),
 }
 
 /// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]
