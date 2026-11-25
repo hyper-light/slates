@@ -714,3 +714,8 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     checkpoint_log/recover) or a move-out/restore in the server: asked main which, and the vfs owner.
   - P7 run 3's 88.6 s explained to main: the await-F read 5.83 s, B 5.7 GB, the history one batch.
   - Waiting: w-shared's review; main's answer on the hand-off; main's 57k churn run (then (b)).
+- 2026-11-25 ~18:00 PST:
+  - LANDED 9e213f94f: A-870 publication copies cut, both halves (main's (a), w-shared reviewed): EntryBytes + lent
+    read buffer (557,456 -> 229,392 B allocated for 306,607 encoded; scratch-cap red 4,096 -> 32), and vfs HeldPieceRef
+    so a delta and a checkpoint encode the encoder's pages borrowed (golden vector; check_publication green).
+  - Next: (b) the Aways family keyed by let-go order -- a design, after main's 57k churn-by-site numbers.
