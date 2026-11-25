@@ -63885,3 +63885,22 @@ GAPS.
   places, `alone`, `named_files`, `commit_begin`'s node moves, links and changed set).
 - **Applied in the same change to** `crates/merge/src/engine.rs`, `engine/copy.rs`, `engine/applying_tests.rs`,
   `crates/server/src/repository/push.rs`, `vcs_store/name_holds.rs` and the import's wide-revision test.
+
+### A-920 — An import revision's staging is taken a slice at a time (2026-11-25, w-svn for main 01a20182, goal 93's slicing 2b; on A-917's run machinery)
+
+- **Why.** A revision's staging (`svn_commit::staging::Staging::stage_in`) was three whole steps at 9,000 files on a debug
+  build, by each step's CPU time on its shard's thread: the record check 101-105 ms, the build 51-55 ms and the judge
+  step 262-265 ms, the longest step an import had left once A-917 cut the apply to 7 ms. The judge step was the work's
+  retention reservation, twice (29 ms each), its verdict (`Green::judge_named`, 57 ms: `compute` 40, `commit_reads` 16),
+  the verdict's commit into the batch's scratch member (`commit_judgment`, 110 ms), the records' apply (12.5 ms) and the
+  held tables (17 ms). Each is linear in the revision's files.
+- **The order** (main's ruling of 2026-11-25): the reservation once; the scratch commit on A-917's `commit_begin` and
+  `commit_step`; the record check; the judge, with the reservation as a walk over the ops; the build; the held tables and
+  the records' apply. Each lands alone with its step's CPU before and after.
+- **The contracts.** The scratch member is read by nothing until the batch lands (the batch holds it, the landing turn
+  keeps every other commit out), and a drop midway abandons the batch with its scratch member. The records are unchanged
+  under the held turn. The green is unchanged between a judge's begin and its verdict; the judge's one write (the
+  rejected cache, the hold) is its last step's.
+- **Piece 0, the reservation once.** `ImportBatch::stage` computed the work's reservation for its room check
+  (`reservation_of`), and `judge_staged` walked the same work at the same head again; the first result is passed
+  through, the scratch member unchanged between but for the texts lent it. The judge step 262-265 ms → 227-228 ms.
