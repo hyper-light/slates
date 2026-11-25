@@ -1855,9 +1855,13 @@
 > back once kept; the small copy is taken from those, reserved to the text's length, and given back; a chain's deltas
 > lie in one such buffer; the let-go link is looked for only where the chain is not read. The cached base 28,578 B a
 > revision (0.17 files), passing; the edit 41,988 B at the 91,200 B manifest (145,223 B before), still past its 16 KiB.
-> Owed: the rest, about 25 KB an edit at any manifest size, which grows with the chain's length: the chain reader's
-> per-manifest levels (`Cursor`) and the bytes a level skips, made into a new buffer a call (`read_level`'s
-> `dropped`), and `holds_whole`'s window list a link (`log_text_at_hand`).
+> Then (w-hg), attributed by allocation site under the test's allocator (each allocation's first `slates_hg` frames
+> summed over an 80-edit history): the push's file and manifest revisions were boxed anew each one, about 7 KB and 7.7 KB
+> (`Patched` and `Manifesting` carry BLAKE3 hashers), now held in the intake in place; a base's chain was looked over a
+> link at a time before it was read (`log_text_at_hand`, a window list a link), now read once, its root looked at alone;
+> a chain's readers and the bytes each level skips keep their buffers among the push's spares; a log's length is probed
+> with one key. Both tests pass: the edit 9,774 B at the 91,200 B manifest (11,059 B before either regression), the
+> cached base 11,851 B a revision (14,007 B before).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
