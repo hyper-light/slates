@@ -19336,6 +19336,90 @@ Outliers, explained where the logs can:
   shallow clone 1.67 to 2.90 s. Under this load the runs cannot tell whether r940's fix holds; the quiet Studio showed
   it did.
 
+## LOADED, round 2 on the MacBook: slates' git clones 42 to 47% faster than round 1, hg's clone working (goal 93 perf; main 01a20182's round, 2026-11-25 05:34 to 06:50 UTC, f8fe97e5e)
+
+**Loaded, like round 1, and read the same way.** The fleet's agents ran throughout (load 25 to 77 on 18 cores), and load
+moves stock's servers more than slates. **The result is slates' own before and after** against round 1, on the same
+machine and datasets. The ratios against stock are loaded points only.
+
+- **Machine, versions, datasets:** round 1's (Mac17,6, Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1; git 2.50.1,
+  Mercurial 7.2.4, Apache 2.4.66; git/git at 77904e546de3 with 425,179 objects; Mercurial at 57035:a933409955d2).
+- **Build:** slates 0.1.0 at f8fe97e5e, release. Since round 1's ed71ac0be it has A-911 (git's position cache), w-hg's
+  clone fix (4f9438625) and w-perf's pipelined hg landing.
+- **Harness:** `interop_speed.sh` as at ed71ac0be, run by `~/slates-work/main-ship/mac-interop-speed-2.sh` from worktree
+  `~/slates-work/main-bench2`, one tool per invocation. git ran as three one-run parts; hg ran three runs once; svn was not
+  rerun. One local change: `git_scale_traced.sh` traces each incremental fetch for w-git, and the trace's writes add to
+  that step. So slates' fetch rows are not comparable with round 1's.
+- **Records:** `~/.cache/main-rounds/interop-speed-mac-2/{hg-1,git-1,git-2,git-3}/` with `git-all.txt`, on the MacBook.
+- **Checks:** refs (1,027) and objects (425,179) identical on all three git servers in every part; hg's changesets
+  (57,036) and tags (307) identical on both servers.
+
+The load each part ran under (1-minute averages):
+
+| part | UTC start | load at start | load at end | highest |
+|---|---|---|---|---|
+| hg runs 1-3 | 05:34:13 | 46.37 | 45.57 | 76.62 |
+| git run 1 | 06:05:39 | 43.83 | 56.95 | 59.80 |
+| git run 2 | 06:23:17 | 47.17 | 28.55 | 47.17 |
+| git run 3 | 06:35:55 | 28.74 | 31.59 | 32.17 |
+
+**Slates against itself**, best of three, round 1 (ed71ac0be) and round 2 (f8fe97e5e):
+
+| slates step | round 1 | round 2 | change |
+|---|---|---|---|
+| git push | 50.002 | 50.493 | same |
+| git clone `--mirror` | 113.063 | 65.808 | 42% less |
+| git clone again | 120.546 | 63.874 | 47% less |
+| git clone `--filter=blob:none` | 81.851 | 44.638 | 45% less |
+| git clone's first pack bytes | 68.992 to 71.142 | 43.357 to 44.376 | about 37% sooner |
+| git clone-again's first pack bytes | 60.003 to 82.288 | 30.830 to 31.469 | about half |
+| git partial's first pack bytes | 65.382 to 83.830 | 28.201 to 29.199 | about 55% sooner |
+| hg push | 96.3 | 87.926 | 9% less |
+| hg clone `-U` | stopped past 30 min | 96.329 | now finishes (w-hg's clone fix) |
+
+Seconds, wall clock at the client, every run shown:
+
+| git | git daemon 1-3 | best | git http-backend 1-3 | best | slates 1-3 | best | slates against best stock (loaded) |
+|---|---|---|---|---|---|---|---|
+| push, every branch and tag | 54.626 58.577 32.873 | 32.873 | 49.282 35.361 55.038 | 35.361 | 52.470 50.493 52.528 | 50.493 | 1.54× slower |
+| clone `--mirror` | 31.603 31.461 25.466 | 25.466 | 33.673 34.462 36.363 | 33.673 | 80.987 65.808 95.804 | 65.808 | 2.58× slower |
+| clone again | 72.264 27.967 46.660 | 27.967 | 49.307 35.230 44.102 | 35.230 | 81.817 63.874 69.844 | 63.874 | 2.28× slower |
+| one-commit push | 0.794 0.859 1.064 | 0.794 | 2.168 0.813 1.115 | 0.813 | 0.816 0.491 0.937 | 0.491 | 1.62× faster |
+| fetch of it (slates traced) | 0.696 0.745 0.767 | 0.696 | 1.159 0.669 0.882 | 0.669 | 1.093 0.855 6.673 | 0.855 | 1.28× slower |
+| clone `--depth 1` | 3.731 3.454 4.407 | 3.454 | 4.484 2.649 3.148 | 2.649 | 1.822 1.917 2.201 | 1.822 | 1.45× faster |
+| clone `--filter=blob:none` | 21.927 15.165 22.260 | 15.165 | 23.015 14.715 17.142 | 14.715 | 48.996 44.638 46.614 | 44.638 | 3.03× slower |
+
+| Mercurial | hg serve 1-3 | best | slates 1-3 | best | slates against stock (loaded) |
+|---|---|---|---|---|---|
+| push, every changeset | 174.764 50.497 68.298 | 50.497 | 92.300 91.695 87.926 | 87.926 | 1.74× slower |
+| clone `-U` | 106.933 48.864 51.764 | 48.864 | 96.329 131.613 118.711 | 96.329 | 1.97× slower |
+| one-changeset push | 1.218 0.561 0.701 | 0.561 | 0.666 1.833 0.543 | 0.543 | 1.03× faster |
+| pull of it | 0.748 0.510 2.313 | 0.510 | 1.296 0.867 0.505 | 0.505 | 1.01× faster |
+| clone `--stream` | 4.071 2.390 8.755 | 2.390 | 11.255 13.414 21.787 | 11.255 | 4.71× slower |
+
+| server kind | peak resident | most CPU |
+|---|---|---|
+| slates daemon, hg leg | 5,987 MiB | 72 s |
+| slates daemon, git leg | 2,817 to 2,913 MiB | 78 to 138 s a part |
+| hg serve | 268 MiB | 37 s |
+| git daemon / httpd with git-http-backend | 7 to 27 MiB | 0 to 2 s |
+
+What it says:
+- **Slates' git clones fell by about half since round 1, on the same machine:** clone 113 to 66 s, clone-again 121 to
+  64 s, partial 82 to 45 s. The time before the pack's first byte fell most (clone 69-71 to 43-44 s), which points at
+  A-911's position cache. The push did not move.
+- **Slates' hg clone now finishes (96 s),** where round 1's ran past 30 minutes: w-hg's clone fix. Its push fell 9%.
+- **Against the 10× goal: still no evidence either way.** These are loaded points. The quiet-machine standing is the
+  Studio's, and the clone's gain needs its quiet Studio round to be measured against stock.
+- **Slates' hg daemon peaked at 5,987 MiB,** about twice its git leg's, against hg serve's 268 MiB. That is worth w-hg's
+  and w-sizing's look.
+
+Outliers, where the logs can say:
+- **Slates' fetch in git run 3, 6.673 s against 0.855 and 1.093:** that run's fetch was traced (`git_scale_traced.sh`),
+  and the trace's writes count in it. The trace file says how much.
+- **hg stock run 1** (push 174.8 s, clone 106.9) ran at the leg's start, where load peaked at 76.6. Slates' stream clone
+  grew run by run (11.3, 13.4, 21.8 s) at load 45 to 50; the record does not say why.
+
 ## The svn use test over HTTP with git-2000: green, every verb timed against stock svnserve (goal 93; main 01a20182's round, 2026-11-24, a0c46b705)
 
 `a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve` over HTTPv2 (`SLATES_SVN_USE_ROUTE=http`) with
