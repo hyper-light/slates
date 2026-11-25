@@ -126,6 +126,11 @@ pub(crate) struct AdoptedGreen {
 
 /// The engine an adoption hands the green's owner shard (A-908): this node's replica as it stands, or a repository's
 /// lineage whole, which a successor adopts as one, or nothing for a member that went with its lineage already.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "a replica moves from the replicas to its owner shard once per adoption, as the engine field did before A-908: \
+            boxing it would allocate per adoption to shrink a value that is moved and consumed, never stored"
+)]
 pub(crate) enum AdoptedEngine {
   /// A replica standing alone (a green of no repository, or one rebuilt standing alone).
   Alone(Green),
