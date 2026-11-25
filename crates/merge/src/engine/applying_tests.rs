@@ -6,7 +6,7 @@ use proptest::prelude::*;
 
 use super::fold_tests::{PATHS, change, folded_state};
 use super::replaced_node_tests::Work;
-use super::{ApplyStep, Begun, Green, Outcome};
+use super::{ApplyStep, Begun, Green, Judgment, Outcome};
 
 /// Applies `applied` for `inc` to `green` a unit a step: the version it answered and the steps it took.
 fn applied_a_unit_a_step(
@@ -102,4 +102,52 @@ fn a_version_of_many_files_is_applied_in_many_steps() {
     steps > FILES as u64,
     "{steps} steps for a version of {FILES} files"
   );
+}
+
+/// Judges `inc` on `green` and commits an accepted verdict a unit a step (`Green::begin_committing`,
+/// `Green::committing_step`): the version it committed, none for any other judgment.
+fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<u64> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return None;
+  };
+  let mut committing = green.begin_committing(held);
+  loop {
+    // Spent after every unit: one unit a step.
+    if let Some((version, _)) = green.committing_step(&mut committing, &mut || true) {
+      return Some(version);
+    }
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+  /// A-920 piece 1 (oracle). Do: give two greens the same generated works changing random paths in every dimension, one
+  /// submitting each whole (`submit_resolved`), the other judging it and committing an accepted verdict a unit a step.
+  /// Expect the same version for every accepted work, and after every work the two read alike: histories, recounted
+  /// bytes, head and the head's identity.
+  #[test]
+  fn a_verdict_committed_a_unit_a_step_is_the_verdict_committed_whole(
+    steps in prop::collection::vec(
+      (prop::collection::vec((0usize..5, any::<u8>()), 1..5), any::<u8>()),
+      1..16,
+    ),
+  ) {
+    let (mut whole, mut sliced) = (Green::new(), Green::new());
+    for (id, (changes, mark)) in (0u64..).zip(&steps) {
+      let mut work = Work::default();
+      for (index, how) in changes {
+        work = change(work, PATHS[*index], *how, *mark);
+      }
+      let inc = work.at(whole.head(), id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let committed = committed_a_unit_a_step(&mut sliced, &inc);
+      if let Outcome::Accepted { version } | Outcome::Identical { version } = outcome {
+        prop_assert_eq!(committed, Some(version));
+      } else {
+        prop_assert_eq!(committed, None);
+      }
+      prop_assert_eq!(read_whole(&mut sliced), read_whole(&mut whole));
+    }
+  }
 }
