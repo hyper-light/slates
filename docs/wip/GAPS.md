@@ -2944,6 +2944,11 @@
 > release scrubbed bounding it; an idle purge that settles clears the keep. Red
 > `an_imports_arena_holds_its_keep_once_a_publication_releases_its_deferred_texts` (each releasing publication read in
 > its own step): 6,021,120 B resident and free against a keep of 4,227,072; now at most 4,186,112 of 4,202,496.
+> The same rule closes `an_imports_arena_keeps_no_more_resident_free_than_its_bound`'s flake (one full parallel run,
+> 4,587,520 B against 4,210,688; main's ruling of 2026-11-25): its daemon is its own, and a loaded run moves when the
+> daemon's own sweep publishes. Red `an_imports_arena_holds_its_keep_when_the_sweep_publishes_after_its_last_tail` (the
+> import's frees left deferred past its last tail, then a sweep pass): with `give_back_released`'s call taken out, the
+> sweep released 1,048,576 B and left 4,939,776 resident and free against 4,202,496; at 6e002e057, 786,432.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);

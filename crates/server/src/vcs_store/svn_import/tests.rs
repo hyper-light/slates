@@ -1307,6 +1307,54 @@ fn an_imports_arena_holds_its_keep_once_a_publication_releases_its_deferred_text
   );
 }
 
+/// Goal 93 P7 (main's ruling of 2026-11-25: [`an_imports_arena_keeps_no_more_resident_free_than_its_bound`] failed once
+/// in a full parallel run, 4,587,520 B against a keep of 4,210,688, and passed alone). Its daemon is its own, so no
+/// other test moves its arena; what a loaded run changes is when the daemon's own idle sweep publishes, and a sweep pass
+/// that finds frees deferred publishes, releasing them (A-64). Do: import as that test does, publishing at each turn
+/// until a turn finds frees deferred and never after, so the batches' let-go texts stay deferred past the last tail;
+/// then run a sweep pass (`daemon::seal_idle_content`) and read the arena's resident free bytes. Expect the pass
+/// released deferred bytes, and the resident free bytes within the bound and one give-back slice. Red before
+/// `give_back_released` (6e002e057's tree with its call taken out): the sweep released 1,048,576 B and left 4,939,776
+/// resident and free against a keep of 4,202,496, the flake's size; now 786,432.
+#[test]
+fn an_imports_arena_holds_its_keep_when_the_sweep_publishes_after_its_last_tail() {
+  let (youngest, (released, resident_free), keep) = stored(|| async move {
+    let mut deferring = false;
+    let (youngest, (), keep, _) = imported_giving_back(
+      |state| {
+        deferring |= state.store.content.arena().deferred_bytes() > 0;
+        if !deferring {
+          let _ = crate::verbs::publish_shard(state);
+        }
+      },
+      |_| (),
+    )
+    .await;
+    let deferred = on(|state| state.store.content.arena().deferred_bytes() as u64);
+    let _ = crate::daemon::seal_idle_content().await;
+    let after = on(|state| {
+      (
+        deferred.saturating_sub(state.store.content.arena().deferred_bytes() as u64),
+        state.store.content.arena().resident_free_bytes() as u64,
+      )
+    });
+    (youngest, after, keep)
+  });
+  let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(youngest, Ok(expected), "the import whole");
+  println!(
+    "svn_import: the sweep's publication released {released} B; the arena resident free {resident_free} B (keep {keep} B)"
+  );
+  assert!(
+    released > 0,
+    "the sweep's publication released the import's deferred texts"
+  );
+  assert!(
+    resident_free <= keep,
+    "{resident_free} B resident and free once the sweep released {released} B, past the keep {keep} B"
+  );
+}
+
 /// The give-back tests' import: [`rewrites`]'s rewrites at a bound of [`GIVE_BACK_UNITS`] units (the flush forced),
 /// `publish` run on the shard after each turn (the shard's publication, as its period would), then `then` run on the
 /// shard as the import ends. Its youngest revision, what `then`
