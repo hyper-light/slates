@@ -375,6 +375,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
               self.chosen.objects.insert(commit, admission)?;
             }
             if let Some(row) = graph.commit(commit) {
+              graph.commit_begun(admission);
               self
                 .chosen
                 .root(graph, &view, row.tree, admission, counters)?;

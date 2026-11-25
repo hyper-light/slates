@@ -34,7 +34,7 @@ use crate::negotiation::{
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band, MAX_BAND_DATA};
-use crate::store::StoreGraph;
+use crate::store::{PositionCache, StoreGraph};
 use crate::v2::fetch::{Event, Response};
 use crate::{Admission, PastAdmission, to_u64};
 
@@ -224,6 +224,8 @@ pub(super) struct Choosing {
   at: u64,
   /// The most data one packet of the pack carries, sized as the sections are written ([`packet_data`]).
   packet: usize,
+  /// The positions of the ids its walk met lately, lent to each step's graph (A-911).
+  positions: PositionCache,
 }
 
 impl Choosing {
@@ -245,6 +247,7 @@ impl Choosing {
       framing: None,
       at: 0,
       packet: 0,
+      positions: PositionCache::default(),
     }
   }
 }
@@ -268,6 +271,7 @@ impl Choosing {
       framing: None,
       at: 0,
       packet: 0,
+      positions: PositionCache::default(),
     }
   }
 }
@@ -445,7 +449,8 @@ impl<K> Answer<K> {
     self.hold_refused();
   }
 
-  /// [`Answer::choose`]'s step.
+  /// [`Answer::choose`]'s step, its graph resolving ids through the answer's cache of positions (A-911): lent to the
+  /// step and kept after it, what it did told to `packs`.
   fn choose_unit<P: PackSource<Pack = K>>(
     &mut self,
     served: &Served<'_>,
@@ -456,9 +461,30 @@ impl<K> Answer<K> {
     let Some(choosing) = self.choosing.as_mut() else {
       return;
     };
-    let graph = StoreGraph::new(served.repository, served.store, served.refs);
+    let positions = core::mem::take(&mut choosing.positions);
+    let graph =
+      StoreGraph::new(served.repository, served.store, served.refs).with_positions(positions);
+    self.choose_on((served, &graph), packs, admission, spent);
+    let mut positions = graph.into_positions();
+    packs.chose(positions.take_counts());
+    if let Some(choosing) = self.choosing.as_mut() {
+      choosing.positions = positions;
+    }
+  }
+
+  /// [`Answer::choose_unit`]'s work on `graph`, `served` read through it.
+  fn choose_on<P: PackSource<Pack = K>>(
+    &mut self,
+    (served, graph): (&Served<'_>, &StoreGraph<'_>),
+    packs: &mut P,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) {
+    let Some(choosing) = self.choosing.as_mut() else {
+      return;
+    };
     if let Some(Opening::V0(opening)) = choosing.before.as_mut() {
-      let acknowledged = opening.acknowledge(&graph, admission, spent);
+      let acknowledged = opening.acknowledge(graph, admission, spent);
       let acknowledged = match graph.fault() {
         Some(fault) => Err(Refusal::Store(fault)),
         None => acknowledged,
@@ -479,7 +505,7 @@ impl<K> Answer<K> {
     };
     let stepped = choosing
       .negotiating
-      .step(&graph, admission, spent)
+      .step(graph, admission, spent)
       .map_err(Refusal::Negotiation);
     let stepped = match graph.fault() {
       Some(fault) => Err(Refusal::Store(fault)),

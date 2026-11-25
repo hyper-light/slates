@@ -92,6 +92,10 @@ pub trait Graph {
   fn size(&self, blob: Self::Node) -> u64;
   /// What an annotated tag names, when the store holds it.
   fn target(&self, tag: Self::Node) -> Option<Self::Node>;
+  /// A sent commit's trees begin to be walked: a graph that learns from the walk's work measures it here, what it holds
+  /// for that charged to `admission` (A-911: the ids one commit's trees resolve size its cache of positions). Nothing
+  /// by default.
+  fn commit_begun(&self, _admission: &mut Admission) {}
   /// What every ref names (`deepen-relative` measures from the client's shallow commits these reach).
   fn tips(&self) -> impl Iterator<Item = Self::Node>;
   /// The annotated tags the refs under `refs/tags/` name (`include-tag` sends those whose object the pack carries).
