@@ -178,6 +178,8 @@ pub struct Indexed<'a> {
   census: Census,
   /// How the texts were lent.
   lends: Cell<Lends>,
+  /// The most bytes of texts one want of a fetch asks the changeset store for ([`Store::text_bytes_a_step`]).
+  text_step: u64,
   /// The tests' changeset store answered at once from the index's own texts ([`Indexed::answering_from_its_texts`]),
   /// each text by its identity as the rows named it; none in the daemon, whose changeset store answers between steps.
   #[cfg(test)]
@@ -186,6 +188,9 @@ pub struct Indexed<'a> {
   /// before their windows were let go ([`Indexed::answering_log_texts`]); and how many it answered.
   #[cfg(test)]
   log_texts: (LogTexts, Cell<u64>),
+  /// Each want of texts the tests' changeset store answered: how many texts, and the bytes they held together.
+  #[cfg(test)]
+  texts_asked: core::cell::RefCell<Vec<(usize, u64)>>,
 }
 
 impl<'a> Indexed<'a> {
@@ -193,12 +198,13 @@ impl<'a> Indexed<'a> {
   /// changeset the changelog holds that 7.2's `served` filter keeps, numbered densely from 0, oldest first. The
   /// filter's state and the view's are charged to `room` before they are made. Refused past `room`; for a marker the
   /// store cannot read; and for a changelog row from the first changeset that is not public on that the index cannot
-  /// read, or that names a parent at or after itself (`Graph` then names the changelog's revision).
+  /// read, or that names a parent at or after itself (`Graph` then names the changelog's revision). A fetch over it asks
+  /// the changeset store for at most `text_step` bytes of texts a want ([`Store::text_bytes_a_step`]).
   pub fn new(
     index: &'a HgIndex,
     store: &'a ContentStore,
     state: State<'a>,
-    room: &mut Admission,
+    (text_step, room): (u64, &mut Admission),
   ) -> Result<Indexed<'a>, Refusal> {
     let lends = Cell::new(Lends::default());
     let markers = lend_markers(index, store, state.markers, &lends, room)?;
@@ -226,10 +232,13 @@ impl<'a> Indexed<'a> {
       markers,
       census,
       lends,
+      text_step: text_step.max(1),
       #[cfg(test)]
       from_texts: None,
       #[cfg(test)]
       log_texts: Default::default(),
+      #[cfg(test)]
+      texts_asked: Default::default(),
     })
   }
 
@@ -254,6 +263,12 @@ impl<'a> Indexed<'a> {
   #[cfg(test)]
   pub(crate) fn log_texts_answered(&self) -> u64 {
     self.log_texts.1.get()
+  }
+
+  /// Each want of texts the tests' changeset store answered: how many texts, and the bytes they held together.
+  #[cfg(test)]
+  pub(crate) fn texts_asked(&self) -> Vec<(usize, u64)> {
+    self.texts_asked.borrow().clone()
   }
 
   /// [`Store::stored_now`] from the index's own texts ([`Indexed::answering_from_its_texts`]).
@@ -325,6 +340,7 @@ impl<'a> Indexed<'a> {
           }
           made.push(text.clone());
         }
+        self.texts_asked.borrow_mut().push((made.len(), total));
         Some(super::getbundle::Given::Texts(made))
       }
     }
@@ -593,6 +609,10 @@ impl Indexed<'_> {
 impl Store for Indexed<'_> {
   fn rows_a_step(&self) -> u64 {
     crate::render::rows_a_step(self.store)
+  }
+
+  fn text_bytes_a_step(&self) -> u64 {
+    self.text_step
   }
 
   fn changeset_text(

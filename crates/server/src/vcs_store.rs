@@ -288,10 +288,6 @@ pub(crate) struct VcsStores {
   /// The text pieces read through the node's store for drives waiting on them (C2 stage B part 2,
   /// [`svn_texts::Pieces`]).
   pub(crate) svn_pieces: svn_texts::Pieces,
-  /// The texts an import put for a revision not landed yet while a batch before it lands
-  /// ([`name_holds::keeping_unlanded`]): a landed text's let-go keeps every window they hold, since windows are named by
-  /// their bytes and a text that shares one with a landed text cannot bring it back until its own changeset lands.
-  pub(crate) svn_unlanded: Vec<slates_svn::index::ContentIdentity>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -3558,7 +3554,8 @@ async fn replay_hg_sliced(
           let _ = with_released(state, more);
           return Some(Err(ReplayRefused::Unlanded));
         };
-        let Some(asked) = replay_answered(&disk, id, &mut more).await else {
+        let step = hg_view::text_bytes_a_step(state);
+        let Some(asked) = replay_answered(&disk, id, (&mut more, step)).await else {
           let _ = with_released(state, more);
           return Some(Err(ReplayRefused::Unlanded));
         };
@@ -3596,19 +3593,22 @@ pub(crate) const HG_REPLAY_UNKNOWN_ASKED: &str = "vcs_store.hg_replay_unknown_as
 
 /// Counts what [`replay_answered`] answered: `(asked, unknown)`, the texts asked and those of them for identities the
 /// store never knew.
-fn count_asked(state: &mut ShardState, (asked, unknown): (u64, u64)) {
+fn count_asked(state: &mut ShardState, (asked, unknown, asks): (u64, u64, hg_view::TextAsks)) {
   state.count(HG_REPLAY_TEXTS_ASKED, asked.saturating_sub(unknown));
   state.count(HG_REPLAY_UNKNOWN_ASKED, unknown);
+  state.count(hg_view::TEXT_REQUESTS, asks.requests);
+  state.count_max(hg_view::TEXT_COPIED_MOST_BYTES, asks.most_copied);
 }
 
-/// Answers `replay`'s ask of the node's changeset store (`Replay::store_wants`) over `disk`: the texts it asked, counted
-/// by its first want (their rows), and those of them for identities the content store never knew; none where the store
-/// did not answer.
+/// Answers `replay`'s ask of the node's changeset store (`Replay::store_wants`) over `disk`, the owner copying at most
+/// `step` bytes a request (the replaying shard's `hg_view::text_bytes_a_step`): the texts it asked, counted by its first
+/// want (their rows), those of them for identities the content store never knew, and what it asked of the owner; none
+/// where the store did not answer.
 async fn replay_answered(
   disk: &slates_store::owner::StoreHandle,
   id: RepositoryId,
-  replay: &mut slates_hg::import::record::Replay,
-) -> Option<(u64, u64)> {
+  (replay, step): (&mut slates_hg::import::record::Replay, u64),
+) -> Option<(u64, u64, hg_view::TextAsks)> {
   let repository = u128::from_be_bytes(id.bytes);
   let unknown = replay.asked_unknown();
   let wants = replay.store_wants()?;
@@ -3618,9 +3618,8 @@ async fn replay_answered(
     }),
     _ => 0,
   };
-  hg_view::answer_wants_over(disk, repository, wants)
-    .await
-    .then_some((asked, unknown))
+  let asks = hg_view::answer_wants_over(disk, repository, wants, step).await?;
+  Some((asked, unknown, asks))
 }
 
 /// [`replay_hg_sliced`]'s one unit over the shard's state (its type's docs): the record's steps taken under one lend
@@ -4052,7 +4051,16 @@ async fn replay_hg_referenced(
       PieceStep::Store(mut more) => {
         let repository = u128::from_be_bytes(id.bytes);
         let answered = match more.store_wants() {
-          Some(wants) => hg_view::answer_wants_over(&disk, repository, wants).await,
+          Some(wants) => {
+            let step = hg_view::text_bytes_a_step(state);
+            hg_view::answer_wants_over(&disk, repository, wants, step)
+              .await
+              .map(|asks| {
+                state.count(hg_view::TEXT_REQUESTS, asks.requests);
+                state.count_max(hg_view::TEXT_COPIED_MOST_BYTES, asks.most_copied);
+              })
+              .is_some()
+          }
           None => false,
         };
         if !answered {
@@ -4655,7 +4663,8 @@ async fn replay_hg_run(
           slices.unit_done().await;
         }
         HgStep::Asked(mut more) => {
-          let Some(asked) = replay_answered(&disk, id, &mut more).await else {
+          let step = hg_view::text_bytes_a_step(state);
+          let Some(asked) = replay_answered(&disk, id, (&mut more, step)).await else {
             let _ = with_released(state, more);
             return Err(ReplayRefused::Unlanded);
           };
@@ -4674,7 +4683,11 @@ async fn replay_hg_run(
 
 /// [`replay_hg_run`] for a rebuild's task, which reaches the shard's state a step at a time.
 async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -> Unit {
-  let Some(disk) = crate::state::with_state(|state| state.vcs_disk.clone()).flatten() else {
+  let Some((disk, step)) = crate::state::with_state(|state| {
+    let step = hg_view::text_bytes_a_step(state);
+    state.vcs_disk.clone().map(|disk| (disk, step))
+  })
+  .flatten() else {
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   let repository = u128::from_be_bytes(id.bytes);
@@ -4698,19 +4711,21 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
       });
       match stepped {
         Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => replay = Some(begun),
-        Some(Ok(HgStep::Asked(mut more))) => match replay_answered(&disk, id, &mut more).await {
-          Some(asked) => {
-            crate::state::with_state(|state| count_asked(state, asked)).unwrap_or_default();
-            replay = Some(more);
+        Some(Ok(HgStep::Asked(mut more))) => {
+          match replay_answered(&disk, id, (&mut more, step)).await {
+            Some(asked) => {
+              crate::state::with_state(|state| count_asked(state, asked)).unwrap_or_default();
+              replay = Some(more);
+            }
+            None => {
+              crate::state::with_state(|state| {
+                let _ = with_released(state, more);
+              })
+              .unwrap_or_default();
+              return Unit::Refused(ReplayRefused::Unlanded);
+            }
           }
-          None => {
-            crate::state::with_state(|state| {
-              let _ = with_released(state, more);
-            })
-            .unwrap_or_default();
-            return Unit::Refused(ReplayRefused::Unlanded);
-          }
-        },
+        }
         Some(Ok(HgStep::Stepped(None))) => break,
         Some(Err(refused)) => return Unit::Refused(refused),
         None => return Unit::Gone,
@@ -5556,7 +5571,23 @@ async fn sectioned_unit(
     Some(Ok(PieceStep::Store(mut more))) => {
       let repository = u128::from_be_bytes(id.bytes);
       let answered = match more.store_wants() {
-        Some(wants) => hg_view::answer_wants_over(disk, repository, wants).await,
+        Some(wants) => {
+          let step = crate::state::with_state(|state| hg_view::text_bytes_a_step(state));
+          match step {
+            Some(step) => match hg_view::answer_wants_over(disk, repository, wants, step).await {
+              Some(asks) => {
+                crate::state::with_state(|state| {
+                  state.count(hg_view::TEXT_REQUESTS, asks.requests);
+                  state.count_max(hg_view::TEXT_COPIED_MOST_BYTES, asks.most_copied);
+                })
+                .unwrap_or_default();
+                true
+              }
+              None => false,
+            },
+            None => false,
+          }
+        }
         None => false,
       };
       if !answered {
@@ -5592,14 +5623,18 @@ async fn record_unit(
       Unit::More
     }
     Some(Ok(HgStep::Asked(mut more))) => {
-      let Some(disk) = crate::state::with_state(|state| state.vcs_disk.clone()).flatten() else {
+      let Some((disk, step)) = crate::state::with_state(|state| {
+        let step = hg_view::text_bytes_a_step(state);
+        state.vcs_disk.clone().map(|disk| (disk, step))
+      })
+      .flatten() else {
         crate::state::with_state(|state| {
           let _ = with_released(state, more);
         })
         .unwrap_or_default();
         return Unit::Refused(ReplayRefused::Unlanded);
       };
-      match replay_answered(&disk, id, &mut more).await {
+      match replay_answered(&disk, id, (&mut more, step)).await {
         Some(asked) => {
           crate::state::with_state(|state| count_asked(state, asked)).unwrap_or_default();
           *replay = Some(more);

@@ -1669,10 +1669,29 @@
 > piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
 > x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
 > reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
-> read whole against one chunk and a text, 1,246,184; now 1,048,576). Owed: the batch itself, sized by the fetch's room
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
-> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`).
+> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
+> (main's ruling of 2026-11-25, w-perf): a want of texts holds at most a step's copy budget
+> (`slates_hg::serve::getbundle::Store::text_bytes_a_step`, the daemon's `copy_slice_bytes`: memcpy rate x step quantum
+> x the copy share, 94,797 B on main's bench), one text at least; the owner copies at most that a request, a text past it
+> in slices across requests (`StoreHandle::text_slice`, `Store::text_slice`, its read's reach told to the text cache so
+> the slice that reaches the text's end ends its walk). Counted `vcs_store.hg_text_copied_most_bytes` (the most one
+> request copied). Reds: `a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes` (a clone of `divergent` walked by its
+> links: two wants of three texts, 236 and 215 B, against a 172 B step; now four of at most 152 B),
+> `a_text_past_a_step_is_copied_a_step_a_request` (one request copying 11,290 B against a 1,024 B step; now 12 of at
+> most 1,024), and `a_text_read_in_slices_past_a_piece_leaves_no_walk_in_flight` (a slice's reach taken for a piece's:
+> bound 6,291,456 B; now 1,048,576). The request count is what the rule makes: about one a manifest at 57k (about
+> 57,000; 3,062 before, over 100,000 before 9a5587e78), main's to measure. A replay's base asks (recovery's and the
+> rebuild's, `hg_view::answer_wants_over`) are held to the same rule, each caller naming its replaying shard's step, and
+> counted alike (`vcs_store.hg_text_requests`, `vcs_store.hg_text_copied_most_bytes`); red
+> `a_replays_ask_past_a_step_is_copied_a_step_a_request` (one request copying 10,990 B against a 1,024 B step; now 11
+> of at most 1,024). The step bounds a request's copy, not what the shard holds: a want past it is one text, held whole
+> as the changegroup sends it. A sliced read that stops before its text's end (past the want's room, or the owner's
+> refusal) leaves that text's walk in flight in the owner's cache until its walks past `reads` push it out: bounded,
+> the shape 7c0ea35a1 closed for every read (w-hg's review). Owed: the 418 GB of fresh pages
+> `mem.large.returned_bytes` counted by the 15b4f1061 clone's end, split between push and clone.
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by

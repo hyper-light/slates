@@ -237,8 +237,11 @@ unsafe impl GlobalAlloc for Sampled {
 #[global_allocator]
 static ALLOCATOR: Sampled = Sampled;
 
+/// Sampled sites with their live bytes, the largest first, and their sum.
+type Listed = (Vec<(String, u64)>, u64);
+
 /// `by_site`'s sites, the largest first, and their sum.
-fn listed(by_site: BTreeMap<String, u64>) -> (Vec<(String, u64)>, u64) {
+fn listed(by_site: BTreeMap<String, u64>) -> Listed {
   let total = by_site.values().sum();
   let mut listed: Vec<(String, u64)> = by_site.into_iter().collect();
   listed.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
@@ -246,7 +249,7 @@ fn listed(by_site: BTreeMap<String, u64>) -> (Vec<(String, u64)>, u64) {
 }
 
 /// The live sampled heap by site now, and at its peak since the last [`reset_peak`].
-fn live_now_and_at_peak() -> ((Vec<(String, u64)>, u64), (Vec<(String, u64)>, u64)) {
+fn live_now_and_at_peak() -> (Listed, Listed) {
   let (now, at_peak) = guarded(|| {
     LIVE
       .lock()
@@ -328,7 +331,7 @@ fn source(served: &common::hg::Served) -> String {
 /// Prints the live sites and the daemon's nonzero memory gauges, `when`.
 fn print_held(
   when: &str,
-  (listed, total): &(Vec<(String, u64)>, u64),
+  (listed, total): &Listed,
   rows: &BTreeMap<String, u64>,
 ) {
   println!("hg_fetch_heap: {when}: live sampled {total} B");

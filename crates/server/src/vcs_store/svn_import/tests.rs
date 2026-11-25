@@ -1268,3 +1268,58 @@ fn an_import_cut_before_every_revision_is_the_import_uncut() {
     "the same history cut and uncut"
   );
 }
+
+/// Main's ruling (B) of 2026-11-24, the case no scoped pin covered: a landed text's let-go by another party between the
+/// import's steps (a client's commit landing between two batches, a reader's give-back), while the import holds texts it
+/// put and has not landed. Do: import [`appends`] cut before every revision, and before each of the import's turns let go
+/// every text it has put so far, as a landed text's let-go would (`name_holds::let_go_landed_texts`); then import it
+/// again uncut with no let-go. Expect: both at the last revision, the same history byte for byte, windows kept for their
+/// unlanded holders (`kept_unlanded` moved) and none found let go as they were pinned (`pinned_away` 0). Red before: the
+/// let-go took the open batch's unlanded texts and the windows the next revision shared, and the import was refused.
+#[test]
+fn a_let_go_between_an_imports_batches_keeps_its_unlanded_texts() {
+  let texts: Vec<[u8; 32]> = (1..=APPEND_REVISIONS)
+    .map(|number| {
+      crate::repository::svn_commit::tests::identity(&crate::test_store::noise(
+        APPEND_FIRST_BYTES + (number - 1) * APPEND_BYTES,
+      ))
+    })
+    .collect();
+  let (cut, uncut, (kept, away)) = stored(move || async move {
+    let staging = &crate::repository::svn_commit::staging::TEXTS_BOUND;
+    staging.with(|cell| cell.set(Some(1)));
+    let (svn, _) = subversion("let-go-between").await;
+    let (loaded, _) = imported_sampling(
+      svn,
+      appends(APPEND_REVISIONS, APPEND_FIRST_BYTES, APPEND_BYTES),
+      &mut || {
+        on(|state| crate::vcs_store::name_holds::let_go_landed_texts(state, &texts));
+      },
+    )
+    .await;
+    staging.with(|cell| cell.set(None));
+    let cut = (loaded.map(|loaded| loaded.youngest), history(svn).await);
+    let counters = on(|state| {
+      state
+        .vcs_stores
+        .content()
+        .map(|content| {
+          (
+            content.counters().kept_unlanded,
+            content.counters().pinned_away,
+          )
+        })
+        .unwrap_or_default()
+    });
+    let uncut = appends_imported("let-go-uncut", None).await;
+    (cut, (uncut.0, uncut.2), counters)
+  });
+  let youngest = u64::try_from(APPEND_REVISIONS).unwrap_or(u64::MAX);
+  assert_eq!((&cut.0, &uncut.0), (&Ok(youngest), &Ok(youngest)));
+  assert!(
+    cut.1.is_some() && cut.1 == uncut.1,
+    "the same history with let-goes between batches"
+  );
+  assert!(kept > 0, "windows kept for their unlanded holders");
+  assert_eq!(away, 0, "no window found let go as it was pinned");
+}
