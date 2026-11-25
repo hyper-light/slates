@@ -367,6 +367,12 @@
 > (`a_derivation_lets_go_the_windows_it_brought_back_once_it_ends`,
 > `a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`) let windows go by hand, standing in for the gated
 > roots, which the lift makes real paths.
+> The lift must also keep `landed_let_go_may`'s wait on live intakes (`intakes_live(id) <= own`, `vcs_store.rs`): it is
+> what keeps a landed pack's windows while a later push of the repository, or the same push's later refs, still reads
+> them (main 01a20182's sibling sweep of 2026-11-25). A lift that drops it opens Mercurial's bug in git: a window let go
+> under a live push, its object then read as a missing delta base (`UnknownDeltaBase`, w-hg's 57k push 2 of 9 times),
+> and the rule it would need is w-hg's push pin (7ad0c7931): a push's kept, unlanded objects' windows held until they
+> land.
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
@@ -1623,6 +1629,17 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> Found by main's round at 15b4f1061 and cut (2026-11-25, w-perf): with that request hg's 57k clone peaked at 10,416
+> MiB and held 10,013 MiB after it (2ed3eb139: 5.7-6.0 GB), 165.8 s; the status after it named 4,792 mapped blocks of
+> about a chunk each still live (5.07 GB mapped, 4.09 GB resident). The owner read each text of the batch once at its
+> start and took it whole, so the text cache took a text longer than a piece (a manifest, 100-250 KB) for a walk's first
+> piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
+> x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
+> reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). Owed: the batch itself, sized by the fetch's room
+> (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
+> system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
+> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`).
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
