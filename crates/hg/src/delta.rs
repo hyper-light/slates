@@ -178,6 +178,160 @@ pub fn apply_into(
   Ok(())
 }
 
+/// A base text read in ranges (goal 93, C1 (2): a delta applied over a base the content store holds in windows, never the
+/// base whole): a slice, or a stored text its reader finds a window at a time.
+pub trait BaseRead {
+  /// The base's length.
+  fn len(&self) -> u64;
+  /// Appends the base's bytes `at..at + n` to `out`: none where the reader does not hold them now (a window let go),
+  /// `out` then as it was.
+  fn read_into(&mut self, at: u64, n: usize, out: &mut Vec<u8>) -> Option<()>;
+}
+
+impl BaseRead for &[u8] {
+  fn len(&self) -> u64 {
+    to_u64(<[u8]>::len(self))
+  }
+
+  fn read_into(&mut self, at: u64, n: usize, out: &mut Vec<u8>) -> Option<()> {
+    let from = usize::try_from(at).ok()?;
+    out.extend_from_slice(self.get(from..from.checked_add(n)?)?);
+    Some(())
+  }
+}
+
+/// What a [`Patching::fill`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filled {
+  /// `most` bytes made, and more to make.
+  More,
+  /// The text made to its end.
+  Done,
+  /// The base's bytes from `at` are not held now: brought back, the fill is taken again where it stopped.
+  Unread {
+    /// Where the base's read stopped.
+    at: u64,
+  },
+}
+
+/// A delta applied over a base a slice at a time (goal 93, C1 (2): a revision rebuilt into one buffer, its base read
+/// whole, held a push's step's working set at a long file's size): each [`Patching::fill`] makes the text's next bytes,
+/// at most as many as asked, reading the base's ranges as the hunks reach them; `mpatch_apply`'s rules held as
+/// [`patched_len`] holds them, each hunk as it is met. What it keeps between fills is fixed in size: where it is in the
+/// delta, the base and the hunk it is writing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Patching {
+  /// Where the next hunk begins in the delta.
+  delta_at: usize,
+  /// The next base byte to copy, or one past the last a hunk replaced.
+  base_at: u64,
+  /// The base is copied up to here before the hunk being written, if any.
+  copy_until: u64,
+  /// The hunk being written: its data's range in the delta and the base byte it resumes at.
+  data: Option<(usize, usize, u64)>,
+  /// The last hunk met: the base is copied to its end, and the text ends.
+  ended: bool,
+  /// The bytes made so far.
+  made: u64,
+}
+
+impl Patching {
+  /// The bytes made so far.
+  pub fn made(&self) -> u64 {
+    self.made
+  }
+
+  /// Appends the text's next bytes to `out`, at most `most` (at least one where any are left), from `delta` over
+  /// `base`: [`Filled::Done`] once it has made the text's last; refused by `mpatch_apply`'s rules at the hunk that breaks
+  /// them, what it appended before it left in `out`.
+  pub fn fill(
+    &mut self,
+    (delta, base): (&[u8], &mut dyn BaseRead),
+    most: usize,
+    out: &mut Vec<u8>,
+  ) -> Result<Filled, Refusal> {
+    let most = most.max(1);
+    let mut written = 0usize;
+    loop {
+      let room = most.saturating_sub(written);
+      if room == 0 {
+        return Ok(Filled::More);
+      }
+      if self.base_at < self.copy_until {
+        let left =
+          usize::try_from(self.copy_until.saturating_sub(self.base_at)).unwrap_or(usize::MAX);
+        let n = room.min(left);
+        if base.read_into(self.base_at, n, out).is_none() {
+          return Ok(Filled::Unread { at: self.base_at });
+        }
+        self.base_at = self.base_at.saturating_add(to_u64(n));
+        self.made = self.made.saturating_add(to_u64(n));
+        written = written.saturating_add(n);
+        continue;
+      }
+      if let Some((at, end, resume)) = self.data {
+        if at < end {
+          let n = room.min(end.saturating_sub(at));
+          let bytes = delta
+            .get(at..at.saturating_add(n))
+            .ok_or(Refusal::Undecodable { at: to_u64(at) })?;
+          out.extend_from_slice(bytes);
+          self.data = Some((at.saturating_add(n), end, resume));
+          self.made = self.made.saturating_add(to_u64(n));
+          written = written.saturating_add(n);
+          continue;
+        }
+        self.base_at = resume;
+        self.data = None;
+        continue;
+      }
+      if self.ended {
+        return Ok(Filled::Done);
+      }
+      self.next_hunk(delta, base.len())?;
+    }
+  }
+
+  /// Reads the hunk at `delta_at`, held to `mpatch_apply`'s rules against what was before it and a base `base` bytes
+  /// long; past the delta's last, the base copied to its end and the text ended.
+  fn next_hunk(&mut self, delta: &[u8], base: u64) -> Result<(), Refusal> {
+    let rest = delta.get(self.delta_at..).unwrap_or_default();
+    let Some(hunk) = hunks(rest).next() else {
+      if self.base_at > base {
+        return Err(Refusal::PastBase {
+          end: self.base_at,
+          base,
+        });
+      }
+      self.copy_until = base;
+      self.ended = true;
+      return Ok(());
+    };
+    let hunk = hunk.map_err(|refusal| match refusal {
+      Refusal::Undecodable { at } => Refusal::Undecodable {
+        at: at.saturating_add(to_u64(self.delta_at)),
+      },
+      other => other,
+    })?;
+    let (start, end) = (u64::from(hunk.start), u64::from(hunk.end));
+    if start < self.base_at {
+      return Err(Refusal::OutOfOrder {
+        start,
+        previous_end: self.base_at,
+      });
+    }
+    if end > base {
+      return Err(Refusal::PastBase { end, base });
+    }
+    let data_at = self.delta_at.saturating_add(HUNK_HEADER_LEN);
+    let data_end = data_at.saturating_add(hunk.data.len());
+    self.copy_until = start;
+    self.data = Some((data_at, data_end, end));
+    self.delta_at = data_end;
+    Ok(())
+  }
+}
+
 /// A hunk's position as an index.
 fn index(value: u32) -> Result<usize, Refusal> {
   usize::try_from(value).map_err(|_| Refusal::TooLong {
@@ -335,8 +489,108 @@ fn hunk_of(
 #[cfg(test)]
 mod tests {
   use super::{
-    Hunk, Refusal, apply, check, encode_full_text, encode_hunk, encode_lines, hunks, patched_len,
+    BaseRead, Filled, Hunk, Patching, Refusal, apply, check, encode_full_text, encode_hunk,
+    encode_lines, hunks, patched_len,
   };
+
+  /// The text `delta` makes of `base` by [`Patching`], `most` bytes a fill, and the longest fill.
+  fn patched_by_fills(base: &[u8], delta: &[u8], most: usize) -> Result<(Vec<u8>, usize), Refusal> {
+    let mut patching = Patching::default();
+    let mut out = Vec::new();
+    let mut longest = 0usize;
+    let mut reader: &[u8] = base;
+    loop {
+      let before = out.len();
+      let filled = patching.fill((delta, &mut reader as &mut dyn BaseRead), most, &mut out)?;
+      longest = longest.max(out.len().saturating_sub(before));
+      match filled {
+        Filled::More => {}
+        Filled::Done => return Ok((out, longest)),
+        Filled::Unread { at } => panic!("a slice holds every byte: unread at {at}"),
+      }
+    }
+  }
+
+  /// Goal 93, C1 (2). Do: apply deltas of every shape (none, a whole, edits at the start, middle and end, an insert, a
+  /// delete, many hunks) over a base, by [`apply`] and by [`Patching`] at fills of 1, 3, 64 and the whole. Expect the
+  /// same text every way, no fill past its most, and the same refusals for a hunk out of order and one past the base.
+  #[test]
+  fn a_delta_patched_a_slice_at_a_time_makes_the_same_text() {
+    let base: Vec<u8> = (0..300u32)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let mut deltas: Vec<Vec<u8>> = vec![Vec::new()];
+    for hunks_of in [
+      vec![(0u32, 300u32, b"whole".to_vec())],
+      vec![(0, 5, b"start".to_vec())],
+      vec![(100, 150, b"middle and longer than it was".to_vec())],
+      vec![(290, 300, Vec::new())],
+      vec![(40, 40, b"inserted".to_vec())],
+      vec![
+        (1, 2, b"a".to_vec()),
+        (10, 20, Vec::new()),
+        (20, 20, b"b".to_vec()),
+        (299, 300, b"z".to_vec()),
+      ],
+    ] {
+      let mut delta = Vec::new();
+      for (start, end, data) in &hunks_of {
+        encode_hunk(
+          &Hunk {
+            start: *start,
+            end: *end,
+            data,
+          },
+          &mut delta,
+        )
+        .unwrap();
+      }
+      deltas.push(delta);
+    }
+    for delta in &deltas {
+      let expected = apply(&base, delta, &mut crate::Admission::new(u64::MAX)).unwrap();
+      for most in [1usize, 3, 64, 1 << 20] {
+        let (made, longest) = patched_by_fills(&base, delta, most).unwrap();
+        assert_eq!(made, expected, "a fill of {most}");
+        assert!(longest <= most, "a fill of {most} made {longest}");
+      }
+    }
+    let mut out_of_order = Vec::new();
+    encode_hunk(
+      &Hunk {
+        start: 10,
+        end: 20,
+        data: b"",
+      },
+      &mut out_of_order,
+    )
+    .unwrap();
+    encode_hunk(
+      &Hunk {
+        start: 15,
+        end: 16,
+        data: b"",
+      },
+      &mut out_of_order,
+    )
+    .unwrap();
+    let mut past = Vec::new();
+    encode_hunk(
+      &Hunk {
+        start: 10,
+        end: 301,
+        data: b"",
+      },
+      &mut past,
+    )
+    .unwrap();
+    for delta in [&out_of_order, &past] {
+      assert_eq!(
+        patched_by_fills(&base, delta, 7).err(),
+        apply(&base, delta, &mut crate::Admission::new(u64::MAX)).err()
+      );
+    }
+  }
   use crate::Admission;
   use proptest::prelude::*;
 
