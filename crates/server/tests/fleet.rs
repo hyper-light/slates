@@ -37466,7 +37466,8 @@ const CREATION_WATCH_PERIODS: u64 = 20;
 /// window of 3.3 to 3.8 s, that push refused `retry` at its homing in 4 of 7. **Owed, a named debt:** the push during the
 /// second death is not asserted to land. On the learned window (16.9 to 18.7 s) it landed 4 of 7; 2 were refused at
 /// the record barrier (`unable to commit`, the new version's merge records unplaced 13 s after the takeover installed:
-/// A-912's sibling, w-shared's next piece), 1 fell short at its homing. That piece adds the assertion here.
+/// A-912's sibling, w-shared's next piece), 1 fell short at its homing. With each death awaited to its unseating, 2 of
+/// 6 landed, 4 refused at the barrier. That piece adds the assertion here.
 #[test]
 fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
   let _serial = serialize_fleet_tests();
@@ -37516,8 +37517,8 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
 }
 
 /// One of [`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]'s deaths: every node's
-/// periods stretched, node `death` stopped, a push on top from a, every survivor's takeover of it awaited, the stretch
-/// lifted. Returns a's homing window as the death began, the push's answer, whether every survivor took it over, and a's
+/// periods stretched, node `death` stopped, a push on top from a, every survivor's takeover of it and its unseating from
+/// the council awaited, the stretch lifted. Returns a's homing window as the death began, the push's answer, whether every survivor took it over, and a's
 /// window after.
 fn stretched_death(
   fleet: &mut GitFleet,
@@ -37536,12 +37537,20 @@ fn stretched_death(
   fleet.daemons.remove(death).stop();
   let window = fleet.daemons[0].homing_window();
   let pushed = fleet.push_on_top(0, (file, file.as_bytes()));
+  // Taken over, and no longer seated: at `f = 1` the next death must come after this one's recovery, or two voters are
+  // gone at once and the council can commit nothing (2 runs in 11 before this wait: the second takeover never came).
+  let survivors = fleet.daemons.iter().collect::<Vec<_>>();
   let taken = poll_survivors_retire(&fleet.daemons, gone)
-    && poll_until(
-      &fleet.daemons.iter().collect::<Vec<_>>(),
-      RETIREMENT_DEADLINE,
-      || all_council(&fleet.daemons, |members| !members.contains(&gone)),
-    );
+    && poll_until(&survivors, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons, |members| !members.contains(&gone))
+    })
+    && poll_until(&survivors, RETIREMENT_DEADLINE, || {
+      all_hold(fleet.daemons.iter().map(|daemon| {
+        daemon
+          .council_known_voters()
+          .map(|voters| !voters.contains(&gone))
+      }))
+    });
   for daemon in &fleet.daemons {
     daemon.inject_period_stretch(None).unwrap();
   }

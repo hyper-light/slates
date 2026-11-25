@@ -63689,7 +63689,10 @@ lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,
     This is the red for a first death's prior, (c), which is still owed.
   - Second death: the window was learned (16.9 to 18.7 s) in 7 of 7. Its push landed 4 of 7. Two were refused at the
     record barrier: the new version's merge records were still unplaced 13 s after the takeover installed. That is
-    A-912's sibling, the next piece. One fell short at its homing, cause not yet seen.
+    A-912's sibling, the next piece. One fell short at its homing, cause not yet seen. Once the test awaited each
+    death's unseating from the council, 2 of 6 landed and 4 were refused at the barrier. Without that wait, 2 runs in
+    11 never took the second death over: at `f = 1`, a second death before the first's voter was replaced leaves no
+    council majority. That is the fault model, not a defect.
   - The learned tail from one sample is wide (about 13.3 s from a 4.5 s silence). Main's ruling: after (c), see
     whether the estimator should weight its sample count.
   - A detector stretched as well (a sleep each turn of its loop, one datagram a turn) starved its probes' answers and

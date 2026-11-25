@@ -274,8 +274,10 @@
 >   loaded runs of A-912's push test. Recorded red: the first stretched death's silence 3.99 to 5.24 s against the
 >   estimate's window of 3.3 to 3.8 s, that push refused `retry` at its homing 4 of 7.
 > - **A named debt: a914's test does not assert its second push lands.** On the learned window (16.9 to 18.7 s) it
->   landed 4 of 7; 2 refused at the record barrier (the piece below), 1 short at its homing, cause not yet seen. The
->   barrier piece adds the assertion.
+>   landed 4 of 7; 2 refused at the record barrier (the piece below), 1 short at its homing, cause not yet seen. With
+>   each death awaited to its unseating from the council (as `f = 1` needs: a second death before the first's voter was
+>   replaced left 2 runs in 11 with no council), 2 of 6 landed, 4 refused at the barrier. The barrier piece adds the
+>   assertion.
 > - **Noted, not to fix now (main's ruling):** the learned tail from one sample is wide (about 13.3 s from a 4.5 s
 >   silence; 11 to 14 s from two). After (c), whether the tail's estimator should weight its sample count.
 > **OPEN, w-shared's next piece (A-912's sibling; main 01a20182's ruling of 2026-11-25, before A-914 (c)): a push during
