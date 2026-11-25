@@ -778,7 +778,8 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
 /// most held after any step at most what is held at the end plus four times the segment's bound; segments cut by
 /// their texts (`vcs_store.hg_import.segments_cut_by_texts`), so the bound is the cut's doing; landings answered while
 /// the import went on (`vcs_store.hg_import.segments_landed_overlapped`), and the import held for less than its
-/// landings took (`segment_land_wait_ns` against `segment_land_ns`). Failing first: 46,162,339 bytes held after one turn
+/// landings took (`segment_land_wait_ns` against `segment_land_ns`); each segment chunked in turns
+/// ([`assert_chunked_in_turns`]). Failing first: 46,162,339 bytes held after one turn
 /// against 8,950 at the end and a 2 MiB bound, the whole history's file texts in one segment; then, cut by its texts,
 /// no landing overlapped, each awaited before the next turn. Skips, saying so, where `hg` is not installed.
 #[test]
@@ -816,6 +817,17 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
     held.waited < held.landing,
     "the import held for less than its landings took: {held:?}"
   );
+  assert_chunked_in_turns(&held);
+}
+
+/// Goal 93, main's ruling (b): each segment's payload made into stock's revlog chunks as it landed, a turn's steps at a
+/// time between the import's own turns (`vcs.hg.segment_chunk_turns`), no step compressing past the copy slice it was
+/// given (`vcs.hg.segment_compress_past_budget_most`). Red before 2026-11-25: an import's payload landed raw, unchunked.
+fn assert_chunked_in_turns(held: &Held) {
+  assert!(
+    held.chunked.0 > 0 && held.chunked.1 == 0,
+    "the segments chunked in turns, none past its slice: {held:?}"
+  );
 }
 
 /// What [`imported_held`] read: the most windows held after a step and at the end, the segment's bound, the segments
@@ -836,6 +848,8 @@ struct Held {
   waited: u64,
   /// The nanoseconds the landings took.
   landing: u64,
+  /// The turns its segments' payloads were made into chunks in, and the most one step compressed past its copy slice.
+  chunked: (u64, u64),
 }
 
 /// Imports the repository at `path` into a new Mercurial repository by the shard task's own step, reading the windows
@@ -867,6 +881,10 @@ async fn imported_held(path: std::path::PathBuf) -> Held {
     overlapped: count(state, super::SEGMENTS_LANDED_OVERLAPPED),
     waited: count(state, super::SEGMENT_LAND_WAIT_NS),
     landing: count(state, super::SEGMENT_LAND_NS),
+    chunked: (
+      count(state, crate::repository::hg_push::SEGMENT_CHUNK_TURNS),
+      count(state, crate::repository::hg_push::COMPRESS_PAST_BUDGET_MOST),
+    ),
   })
 }
 

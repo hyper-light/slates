@@ -2259,6 +2259,37 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
   );
 }
 
+/// Goal 93, main's ruling (b), its owed half (2026-11-25): an import's landings kept as stock's revlog chunks, as a push's
+/// segments are. Do: through a two-shard daemon's edge, import `fixtures/state`'s `states` repository and land it; clone
+/// its served head. Expect: the import's segments made into chunks as they landed (non-vacuity: plain bytes chunked); the
+/// clone answered, its file section decoding the imported chunks on the shard. Red before: an import's payload landed as
+/// the changegroup it cut, raw, so nothing was chunked and the clone decoded nothing.
+#[test]
+fn an_imports_files_land_as_chunks_the_clone_decodes() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_hg_from_states(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let chunked = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::COMPRESS_PLAIN_BYTES,
+  );
+  let head = STATES_SERVED_HEADS.trim_end();
+  let cloned = hg_getbundle((port, &certificate), &name, head);
+  let decoded = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::DECOMPRESS_PLAIN_BYTES,
+  );
+  daemon.stop();
+  assert!(chunked > 0, "the import's payloads made into chunks");
+  assert_eq!(cloned.0, 200, "the clone answered");
+  assert!(decoded > 0, "the clone decoded the imported chunks");
+}
+
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
 /// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
 /// `Content-Type` and body.
