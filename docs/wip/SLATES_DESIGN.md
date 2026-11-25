@@ -64062,3 +64062,40 @@ GAPS.
   and the indexes after each alike (`a_record_planned_a_row_a_step_is_the_record_planned_whole`,
   `every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole`; a builder taken up without its
   next node number fails both); a plan's step after an append is refused out of date.
+- **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
+  walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
+  in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
+  time (`Prep::Sole`, `Prep::Reads`, A-917), which piece 1 left off since the judge had made it. The import's judge
+  (`Green::judge_named_reads_later`) leaves it to its commit: `Judged::reads_checked` says whether its judge made it,
+  `begin_committing` checks the reads where it did not (from `Prep::Reads` where `make_step` found the runs), and
+  `committing_step` answers `CommitStep::Lend` with the texts it met unlent, its slice undone, which the import batch
+  reads from the content plane and lends (`ImportBatch::lend_pending`, counted `repository.import_batch.commit_lent`;
+  a text asked for again once lent is refused, counted as a judge's second miss). The verdict is the same; only where
+  its check is made moves. The judge step 89-92 ms → 77 ms. Oracle: the named-texts history oracle commits every version
+  on a third green judged with its reads left to its commit, a unit a step, lending as asked: the same version and head
+  identity as the judging green, never a text asked for twice, a commit lent in the census
+  (`commits_lent`); and a server batch staging an append over a text its scratch member holds by name alone is lent
+  it once by its commit and makes the file (`a_staged_commit_is_lent_the_named_text_its_reads_meet`).
+  **3b, the reservation.** `Green::history_reservation` plus `changes_reservation` (30 ms whole, computed once since
+  piece 0) are walked a unit at a time (`engine::reserving`): `Green::begin_reserving` and `reserving_step` note each
+  op's path once in an owned map (its content ops, whether an op replaces it, whether the change index records it;
+  a work decoded from bytes is not taken to name a path once), then charge each path its history's and change
+  index's bytes (`superseded_bytes`, a special's node, its change bytes and the links naming a special); the copies'
+  and replaces' shares (`Green::reservation_shares`, whole, nothing for a work with neither) read versions and are
+  added once with the work moved into the scratch member's numbering. Each charge is a saturating sum of charges
+  that are never negative, so the order changes nothing. The import batch takes it as a phase of its own before the
+  judge (`ImportBatch::stage_begin` begins it; `stage_step` takes it on, then judges, `judge_reserved`). The judge
+  step 77 ms → 47 ms. Oracle: over generated works of every kind and renames, on the histories every earlier work
+  left, the reservation taken a unit a step equals the two whole, before each work is submitted and after
+  (`a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole`; a rename's source left uncharged, or a
+  special's node, fails it). Still whole: the shares, 0.86 ms at 9,000 files with no copy or replace (their scans
+  and the move into the member's numbering); `copy_entry_room` resolves the work whole where it copies.
+- **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
+  the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
+  document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
+  is it plus `canonicalize`, as every other commit takes it) and the staging puts it in order a slice a step
+  (`staging::canonical_in`, inside `readied_in` with the named texts' reads), driving A-752's paced canonicalize, owned
+  (`OpsDoc::canonicalized`), a `Pace` turn to each step's quantum. The build step 51-55 ms → 26-27 ms. Oracle: over
+  generated documents of every op kind with hard links, declared in random order, the document canonicalized a unit
+  a turn encodes as the one canonicalized whole, in more than one turn wherever it has more than one op
+  (`a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole`).

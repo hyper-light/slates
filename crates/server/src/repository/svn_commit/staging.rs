@@ -565,10 +565,48 @@ fn build_in(
     }
     batch
       .with_engine_in(greens, |engine| {
-        Building::new(records, engine, (checked, plans)).build(head, work_identity)
+        Building::new(records, engine, (checked, plans)).build_unordered(head, work_identity)
       })
       .ok_or(Uncommitted::NotHeld)?
   })
+}
+
+/// `built`, a revision's increment as its build left it, readied for its judge a slice a step: its document put into
+/// canonical order ([`canonical_in`]), then the texts it names read (A-760), a copy slice a step, held as its post-state
+/// is. None where the shard's state is gone.
+async fn readied_in(mut built: Increment) -> Option<Result<Increment, Uncommitted>> {
+  built.doc = canonical_in(std::mem::take(&mut built.doc)).await?;
+  loop {
+    slates_rt::futures::yield_now().await;
+    let read = crate::state::with_state(|state| {
+      state.count(STAGING_STEPS, 1);
+      super::read_named_slice(state, &mut built)
+    })?;
+    match read {
+      Ok(true) => return Some(Ok(built)),
+      Ok(false) => {}
+      Err(refused) => return Some(Err(refused)),
+    }
+  }
+}
+
+/// `doc`, a revision's increment's document as its build left it (`Building::build_unordered`), put into canonical order
+/// a slice a step, each counted ([`STAGING_STEPS`]; A-920 piece 4a: 27 ms of the build step at 9,000 files, debug), a
+/// unit at least a step. None where the shard's state is gone.
+async fn canonical_in(doc: slates_merge::ops_doc::OpsDoc) -> Option<slates_merge::ops_doc::OpsDoc> {
+  let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+  let mut canonical = core::pin::pin!(slates_merge::ops_doc::OpsDoc::canonicalized(doc));
+  loop {
+    slates_rt::futures::yield_now().await;
+    let polled = crate::state::with_state(|state| {
+      state.count(STAGING_STEPS, 1);
+      pace.turn(slice_deadline_ns());
+      pace.drive(canonical.as_mut())
+    })?;
+    if let core::task::Poll::Ready(doc) = polled {
+      return Some(doc);
+    }
+  }
 }
 
 /// Where a revision's staging stands between its steps ([`Staging::staged_in`]).
@@ -599,7 +637,7 @@ async fn checked_in(
     })
     .await?;
     match stepped {
-      Ok(CheckStep::Checked(checked)) => return Some(Ok((checked, record))),
+      Ok(CheckStep::Checked(checked)) => return Some(Ok((*checked, record))),
       Ok(CheckStep::More(more)) => at = CheckAt::Going(more),
       Err(refused) => return Some(Err(refused)),
     }
@@ -941,24 +979,14 @@ impl Staging {
       )
     })
     .await?;
-    let mut built = match built {
+    let built = match built {
+      Ok(built) => readied_in(built).await?,
+      Err(refused) => Err(refused),
+    };
+    let built = match built {
       Ok(built) => built,
       Err(refused) => return Some(Err(refused)),
     };
-    // The texts it names read before the scratch member judges it (A-760), a copy slice a step, held as its post-state
-    // is.
-    loop {
-      slates_rt::futures::yield_now().await;
-      let read = crate::state::with_state(|state| {
-        state.count(STAGING_STEPS, 1);
-        super::read_named_slice(state, &mut built)
-      })?;
-      match read {
-        Ok(true) => break,
-        Ok(false) => {}
-        Err(refused) => return Some(Err(refused)),
-      }
-    }
     self
       .staged_in(repository, lent, (checked, record, built))
       .await
@@ -1024,9 +1052,8 @@ impl Staging {
     }
   }
 
-  /// [`Staging::staged_in`]'s judge, within the records' lent room: the records' room for the revision reserved and
-  /// its increment judged into the batch's scratch member, kept at once where it commits nothing, else its commit begun
-  /// and stepped until `deadline` ([`Staging::commit_in`]).
+  /// [`Staging::staged_in`]'s judge begun, within the records' lent room: the records' room for the revision reserved
+  /// and its increment's staging begun in the batch, then stepped until `deadline` ([`Staging::commit_in`]).
   fn judged_in(
     &mut self,
     state: &mut ShardState,
@@ -1037,14 +1064,14 @@ impl Staging {
     crate::vcs_store::reserve_svn(state, repository, growth)
       .map_err(|available| Uncommitted::Budget { available })?;
     match batch.stage_begin(state, built) {
-      Ok(Some(_)) => Ok(JudgedIn::Kept),
-      Ok(None) => self.commit_in(state, (repository, growth, deadline)),
+      Ok(()) => self.commit_in(state, (repository, growth, deadline)),
       Err(refused) => stage_refused(state, (repository, growth), refused).map(JudgedIn::PastRoom),
     }
   }
 
-  /// The scratch commit [`Staging::judged_in`] began, stepped until the shard's clock passes `deadline`, a unit at
-  /// least: whether it goes on, or ended, the work kept or past the batch's room.
+  /// The staging [`Staging::judged_in`] began (the increment's reservation a slice at a time, its judge, then its
+  /// verdict's commit into the scratch member a slice at a time; A-920), stepped until the shard's clock passes
+  /// `deadline`, a unit at least: whether it goes on, or ended, the work kept or past the batch's room.
   fn commit_in(
     &mut self,
     state: &mut ShardState,

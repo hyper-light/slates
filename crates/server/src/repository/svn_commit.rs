@@ -1699,8 +1699,22 @@ impl<'b> Building<'b> {
     }
   }
 
-  /// The increment, based at `head` and identified by `id`: every row in path order, then what the revision removes.
-  fn build(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
+  /// The increment, based at `head` and identified by `id`: every row in path order, then what the revision removes;
+  /// its document in canonical order.
+  fn build(self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
+    let mut increment = self.build_unordered(head, id)?;
+    increment.doc.canonicalize();
+    Ok(increment)
+  }
+
+  /// [`Building::build`] but for its document's canonical order, which its caller gives it, a slice at a time where
+  /// it is an import's (A-920 piece 4a, `staging::canonical_in`): nothing of the increment but its document's order
+  /// depends on it.
+  pub(super) fn build_unordered(
+    mut self,
+    head: u64,
+    id: [u8; 32],
+  ) -> Result<Increment, Uncommitted> {
     let checked = self.checked;
     // The post-state holds each text the rows set that is not named (`Building::insert`): sized once at their length,
     // so no append grows it (P7 finding (2): grown a text at a time it doubled). A copy's restored texts may still grow
@@ -1742,7 +1756,6 @@ impl<'b> Building<'b> {
       let op = doc.ops.get_mut(*at).ok_or_else(corrupt)?;
       op.src = op.src.checked_add(inline).ok_or_else(corrupt)?;
     }
-    doc.canonicalize();
     let mut increment = Increment {
       id,
       base: head,

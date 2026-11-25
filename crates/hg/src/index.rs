@@ -1167,6 +1167,13 @@ impl HgIndex {
     if let Some(text) = given_text(&row.node) {
       return Some(text.to_vec());
     }
+    // Its own object's first window first: a revision let go once landed (held, its windows away) has no text here, so
+    // none is begun and no chain gathered (main's churn at e51d998bf: hg's 57k clone allocated 5.51 GB of texts and 0.79
+    // GB of chains reading manifests the store had let go, about a manifest a changeset, none of them made). An object
+    // the store holds no entry for (the empty one) is read as before.
+    if store.contains(&row.bytes) && store.windows(&row.bytes).next().is_none() {
+      return None;
+    }
     if let Some(block) = row.block {
       return framed_text(store, (&block, &row.bytes), row.len);
     }
@@ -1487,10 +1494,16 @@ fn framed_text(
 }
 
 /// The object `root` names, `len` bytes, read from its windows into a text of that length (no copy grown from empty);
-/// `None` where the store holds another length.
+/// `None` where the store holds another length, or none of it (nothing allocated then).
 fn object_text(store: &ContentStore, root: &ContentId, len: u64) -> Option<Vec<u8>> {
+  // The text is made only once its first window is read: an object let go allocates nothing.
+  let mut windows = store.windows(root);
+  let Some(first) = windows.next() else {
+    return (len == 0).then(Vec::new);
+  };
   let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
-  for window in store.windows(root) {
+  text.extend_from_slice(&first);
+  for window in windows {
     text.extend_from_slice(&window);
   }
   (crate::read::to_u64(text.len()) == len).then_some(text)

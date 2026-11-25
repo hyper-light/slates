@@ -106,6 +106,27 @@ fn a_version_of_many_files_is_applied_in_many_steps() {
 
 /// Judges `inc` on `green` and commits an accepted verdict a unit a step (`Green::begin_committing`,
 /// `Green::committing_step`): the version it committed, none for any other judgment.
+/// `inc`'s reservation on `green` taken a unit a step ([`Green::begin_reserving`], [`Green::reserving_step`], every step
+/// spent once its first unit is taken), then its copies' and replaces' shares ([`Green::reservation_shares`]).
+fn reserved_a_unit_a_step(green: &Green, inc: &super::Increment) -> usize {
+  let mut reserving = green.begin_reserving(inc);
+  loop {
+    if let Some(walked) = green.reserving_step(inc, &mut reserving, &mut || true) {
+      return green.reservation_shares(inc, walked);
+    }
+  }
+}
+
+/// `work` with `path` changed as `how` names ([`change`]'s changes, and a rename onto `path` from the path `mark` picks,
+/// whose source the two reservations charge apart).
+fn reserved_change(work: Work, path: &str, how: u8, mark: u8) -> Work {
+  if how % 12 >= 10 {
+    let source = PATHS[usize::from(mark) % PATHS.len()];
+    return work.naming(super::OpKind::Rename, path, source);
+  }
+  change(work, path, how, mark)
+}
+
 fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<u64> {
   let Judgment::Accepted(held) = green.judge(inc) else {
     return None;
@@ -113,7 +134,9 @@ fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<
   let mut committing = green.begin_committing(held);
   loop {
     // Spent after every unit: one unit a step.
-    if let Some((version, _)) = green.committing_step(&mut committing, &mut || true) {
+    if let super::CommitStep::Committed(version, _) =
+      green.committing_step(&mut committing, &mut || true)
+    {
       return Some(version);
     }
   }
@@ -148,6 +171,32 @@ proptest! {
         prop_assert_eq!(committed, None);
       }
       prop_assert_eq!(read_whole(&mut sliced), read_whole(&mut whole));
+    }
+  }
+
+  /// A-920 piece 3b (oracle). Do: on a green, take each generated work's reservation (creates, removals, modes,
+  /// attributes, links, nodes, directories and renames on random paths) a unit a step and whole
+  /// ([`Green::history_reservation`] plus [`Green::changes_reservation`]), before the work is submitted and after.
+  /// Expect the same bytes every time, over the histories every earlier work left, nothing for a work accepted.
+  #[test]
+  fn a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole(
+    steps in prop::collection::vec(
+      (prop::collection::vec((0usize..5, any::<u8>()), 1..5), any::<u8>()),
+      1..16,
+    ),
+  ) {
+    let mut green = Green::new();
+    for (id, (changes, mark)) in (0u64..).zip(&steps) {
+      let mut work = Work::default();
+      for (index, how) in changes {
+        work = reserved_change(work, PATHS[*index], *how, *mark);
+      }
+      let inc = work.at(green.head(), id);
+      for _ in 0..2 {
+        let whole = green.history_reservation(&inc).saturating_add(green.changes_reservation(&inc));
+        prop_assert_eq!(reserved_a_unit_a_step(&green, &inc), whole);
+        let _ = green.submit_resolved(&inc);
+      }
     }
   }
 }
