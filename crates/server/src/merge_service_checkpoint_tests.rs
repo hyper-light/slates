@@ -346,3 +346,80 @@ fn a_checkpoint_stopped_part_way_leaves_the_previous_one_and_the_next_completes(
   assert!(next.1, "its encoding is held whole");
   assert!(!next.2, "the first checkpoint's content is given back");
 }
+
+/// Shape: the files the first-checkpoint test's version sets, each a key of the green's identity backlog: enough that
+/// folding them all is many quanta on a debug build.
+const BACKLOG_FILES: usize = 2_000;
+
+/// Writes one version of `green` setting [`BACKLOG_FILES`] small files through one work, left standing so its floor does
+/// not move and no checkpoint is asked: the green's identity backlog is then one key a file.
+fn backlog_version(state: &mut ShardState, green: VolumeId) {
+  let created = ask(
+    state,
+    RequestBody::CreateWork {
+      green,
+      name: "backlog-work".to_owned(),
+    },
+  );
+  let ReplyBody::WorkCreated { id: work, .. } = created else {
+    panic!("no work over {green:?}: {created:?}")
+  };
+  for file in 0..BACKLOG_FILES {
+    let edited = ask(
+      state,
+      RequestBody::Edit {
+        work,
+        path: format!("/b{file}"),
+        at: 0,
+        delete_len: 0,
+        bytes: format!("backlog file {file}").into_bytes(),
+      },
+    );
+    assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  }
+  let submitted = ask(state, crate::identities::authored(work, "a backlog"));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(_),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+}
+
+/// A-579 (a first checkpoint's identity fold paced a quantum a turn; goal 93: an import's first checkpoint folded 8,991
+/// keys in one poll of 495 ms, debug, its interval nothing and so its deadline passed at its first turn). Do: with
+/// someone waiting on the shard, give a green an identity backlog of 2,000 keys and run two turns of its first
+/// checkpoint, whose interval is nothing. Expect keys left for later turns after both: the first turn learns a key's
+/// cost, and the second folds a quantum's worth, not everything left. Red before: the second turn's budget was all the
+/// backlog's estimated cost, and it folded every key.
+#[test]
+fn a_first_checkpoints_identity_fold_takes_a_quantum_a_turn() {
+  let daemon = crate::daemon::audit_daemon();
+  let left = crate::daemon::observe_first(&daemon, |state| {
+    wait_until_taken(u64::MAX);
+    let root = green(state, "backlog");
+    let id = to_db_volume(root);
+    backlog_version(state, root);
+    let began = slates_rt::futures::now_ns();
+    state.merge.checkpoint_since.insert(id, began);
+    let mut hold = None;
+    for _ in 0..2 {
+      if super::checkpoint_turn(state, id, &mut hold, (began, 1_000_000)) {
+        break;
+      }
+    }
+    state
+      .greens
+      .get(&id)
+      .map_or(0, |engine| engine.identity_backlog())
+  });
+  daemon.stop();
+  assert!(
+    left > 0,
+    "two turns of a first checkpoint folded the green's whole identity backlog"
+  );
+}
