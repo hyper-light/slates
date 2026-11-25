@@ -6882,10 +6882,11 @@ fn a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it() {
 /// unit's time is counted under its own kind.
 #[test]
 fn the_choosing_units_counters_follow_the_negotiations_kinds() {
-  use slates_git::negotiation::UnitKind;
-  let named = [
+  use slates_git::negotiation::{KINDS, UnitKind};
+  let named: [(UnitKind, &str); KINDS] = [
     (UnitKind::Ready, "ready"),
     (UnitKind::Cut, "cut"),
+    (UnitKind::Tips, "tips"),
     (UnitKind::Mark, "mark"),
     (UnitKind::OpenTree, "open_tree"),
     (UnitKind::TakeEntry, "take_entry"),
