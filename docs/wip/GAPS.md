@@ -1936,6 +1936,15 @@
 > answered_whole` and `a_rekey_during_a_blocked_write_sends_no_byte_twice` run through the production edge and its
 > yields, so not this cause. Owed: the blocked first poll's call, if the A/B meets it again (the watchdog's log names
 > the poll, not the call).
+> Two hg-over-SSH clones through the production edge read the whole 41,998,230-byte answer and exit-status 0 but missed
+> the session's end (`(Some(0), false)`, overdue 2, at load 39 to 45 in a whole run of the lib; main's order of
+> 2026-11-25, moved from w-git): `an_ssh_clone_past_many_windows_is_answered_whole` and `a_rekey_during_a_blocked_write_
+> sends_no_byte_twice`. The client calls the session ended when the server ends the connection within its patience
+> (four liveness windows) after the client's close. Not reproduced (w-hg, the MacBook): 6 rounds of the two alone and 4
+> of the whole `vcs_ssh` filter, each beside two spinning threads a core in process, load up to 131: every run saw
+> exit-status, EOF and close in order (`[94, 98, 96, 97]`) and the connection's end 3 µs to 47 ms after the close.
+> Since, a failure names which end it missed: the channel messages' order and the wait for the connection's end after
+> the close (`Adjusted::ending` in `vcs_ssh/tests/hg.rs`). Owed: the next red's line (main's whole runs).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads

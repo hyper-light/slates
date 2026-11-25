@@ -64428,6 +64428,14 @@ measured noise of the 100 figure, not a literal.
 > a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
 > (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
 >
+> **The start off the shard too (2026-11-25).** The restart's start of the next spawner, a `posix_spawn` of the daemon's
+> executable, ran on the control shard, and under load it held the shard past its window (main's store-wait at
+> 1948dbdcc: "shard 0 is wedged, unmoved for 1028 ms … spawning.rs:687"). Now a thread of its own starts it
+> (`started_off_shard`), hands it back and wakes the shard's task through a pipe the task awaits, and is joined once it
+> has answered; the start's length is counted (`spawner.start_ns_most`, and `spawner.starts_past_window` past the
+> liveness window). Red: a start slowed 3 s, as a loaded machine slows one, held its shard 3.11 s on the shard; off it,
+> the shard steps (`a_spawners_start_slowed_past_the_window_never_holds_its_shard`).
+>
 > **Every received descriptor close-on-exec (2026-11-25).** Main's diag run 45672799755 found a child started through
 > the spawner on both Linux lanes holding a descriptor a direct child did not (fd 6). The spawner received the child's
 > streams by `SCM_RIGHTS` without close-on-exec, and Linux's spawn hands a child every descriptor not so marked
