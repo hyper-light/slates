@@ -63401,7 +63401,14 @@ task), `crates/server/src/vcs_store/homes.rs`, `crates/server/src/credentials.rs
   stands alone, as on a record's arrival. Counter `merge.replica.lineage_found_refused`, a bug signal: a root not
   installed because its repository already has a lineage without it. Tests (`merge_origin`, macOS arm64, debug):
   `a908_a_restarted_holder_rebuilds_a_branch_by_its_lineage` (red before: `(Later, None)`, the branch refused) and
-  `a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask` (red before: `[Later, Later]`).
+  `a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask` (red before: `[Later, Later]`). End to end, fleet
+  `a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after` (main 01a20182's order): a git fleet
+  over anchors (`anchored_git_fleet`, `GitFleet::restart_warm`); `main` and a branch pushed, b restarted warm once it
+  had branched, c refusing a's records (`Daemon::inject_record_refusal`), a commit pushed on top of the branch. Green 4
+  of 4 (6.9 to 23.5 s), b counting `member_branched` 1 and no mismatch; red with the rebuild's membership step turned
+  off in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). A c stopped instead of refusing left
+  the push refused `retry` 3 of 3: its takeover moved the configuration 7 to 13 within the push, and a put to a home
+  behind its sender's configuration waits for that install (A-902) past the put's budget.
 
 Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin,green_adopt,
 greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS. Part 4: §4.16
