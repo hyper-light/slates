@@ -2843,8 +2843,12 @@
 > `the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink` (an arena growing from a pool, a seeded
 > mix of allocate, free, captured free, commit live, purge and shrink; red at step 59). The storage test reads the gauges
 > again once a publication has released the import's deferred frees (main's claim: deferred 0 and free within the
-> keep by then). OWED: the purge's kept-short runs, taken out of the record though their pages stay resident, and a
-> grown region's never-used space, once main's arm prints `purged_kept_short_bytes`.
+> keep by then). The purge's kept-short runs (shorter than the discard size) stay recorded now (main's ruling of
+> 2026-11-25): taken out of the record with their pages resident, no later purge or coalesce saw them again, free space a
+> long-lived daemon lost without bound; recorded, a later free beside one joins it into a run a purge gives back
+> (`a_run_kept_short_stays_recorded_so_a_later_free_beside_it_goes_back`: red, the second purge gave back nothing; now
+> the joined two pages). An idle purge walks the kept runs again at each idle pass (sliced) while any stay recorded.
+> OWED: a grown region's never-used space, should the arm show it.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);

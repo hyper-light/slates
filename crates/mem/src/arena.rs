@@ -251,12 +251,15 @@ fn purge_run(
   (first, reach): (usize, usize),
   discard_from: usize,
 ) -> (usize, usize) {
-  slot.dirty.take(first, reach);
   let len = reach.saturating_sub(first);
-  // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
+  // A range shorter than the discard size stays resident, keeping it costing less than faulting it back, and stays
+  // recorded: a later free beside it joins it into a run a later purge gives back (goal 93, main's ruling of
+  // 2026-11-25: taken out of the record, its pages were lost to every later purge and coalesce, a long-lived daemon's
+  // free space left resident without bound).
   if len < discard_from {
     return (0, len);
   }
+  slot.dirty.take(first, reach);
   if slot.region.discard(first, len) {
     (len, 0)
   } else {
@@ -444,7 +447,10 @@ impl ChunkArena {
         }
         visited = visited.saturating_add(1);
         let (discarded, kept_short) = purge_run(slot, (first, reach), discard_from);
-        drained = drained.saturating_add(reach.saturating_sub(first));
+        // A run kept short stays recorded, so it stays counted.
+        if kept_short == 0 {
+          drained = drained.saturating_add(reach.saturating_sub(first));
+        }
         done.bytes = done.bytes.saturating_add(discarded);
         done.kept_short = done.kept_short.saturating_add(kept_short);
         at = reach;
@@ -1813,8 +1819,8 @@ mod tests {
   /// The memory status's short-run path (main 01a20182's ruling of 2026-11-23: arena-12's content object held 753 MiB
   /// resident against 183 MB used). Do: in an arena discarding from four pages, write three one-page blocks, free the
   /// middle one (a run shorter than the discard size between two live blocks), and purge to the end. Expect: the purge
-  /// counts the page kept short and gives nothing back, the arena's resident-free count drops to none, and the
-  /// region's pages in RAM do not fall: the freed page stays resident, which only the kept-short count tells.
+  /// counts the page kept short and gives nothing back, the arena's resident-free count keeps the page (still recorded,
+  /// so a later free beside it can join it; main's ruling of 2026-11-25), and the region's pages in RAM do not fall.
   #[test]
   #[cfg_attr(miri, ignore)] // Miri models no mincore
   fn a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short() {
@@ -1842,11 +1848,71 @@ mod tests {
     }
     assert_eq!(done.kept_short, p, "the short run counted kept: {done:?}");
     assert_eq!(done.bytes, 0, "nothing given back: {done:?}");
-    assert_eq!(arena.resident_free_bytes(), 0);
+    assert_eq!(
+      arena.resident_free_bytes(),
+      p,
+      "the kept page still counted resident and free"
+    );
     let resident_after = arena.residency().resident;
     assert!(
       resident_after >= resident_before && resident_after >= 3 * p as u64,
       "the freed page stays in RAM: {resident_before} then {resident_after}"
+    );
+  }
+
+  /// Purges to the end: the bytes given back and the bytes kept short, all told.
+  fn purge_whole(arena: &mut ChunkArena) -> Purged {
+    let mut done = Purged::default();
+    loop {
+      let purged = arena.purge(1);
+      done.bytes += purged.bytes;
+      done.kept_short += purged.kept_short;
+      if !purged.more {
+        return done;
+      }
+    }
+  }
+
+  /// Goal 93 (main's ruling of 2026-11-25: a run a purge kept short left the record with its pages resident, so no
+  /// later purge or coalesce ever saw it again, free space a long-lived daemon lost without bound). Do: at a discard size
+  /// of two pages, allocate three one-page blocks and write them; free the middle one and purge to the end; then free
+  /// the first, beside it, and purge to the end again. Expect the first purge to give nothing back and keep the page
+  /// counted resident and free; the second to give back the two pages the free joined to it, nothing left resident free.
+  /// Red before: the kept page left the record, so the second purge found the first page alone, short again, and gave
+  /// nothing back.
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no madvise
+  fn a_run_kept_short_stays_recorded_so_a_later_free_beside_it_goes_back() {
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(2 * p);
+    arena
+      .add_region(Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let blocks: Vec<Extent> = (0..3)
+      .map(|_| arena.alloc(p, Owner::Volume).unwrap())
+      .collect();
+    for block in &blocks {
+      arena.bytes_mut(*block).unwrap().fill(0xAB);
+    }
+    arena.free(blocks[1]).unwrap();
+    let first = purge_whole(&mut arena);
+    assert_eq!(
+      (first.bytes, first.kept_short),
+      (0, p),
+      "kept short: {first:?}"
+    );
+    assert_eq!(
+      arena.resident_free_bytes(),
+      p,
+      "the kept page still counted resident and free"
+    );
+    arena.free(blocks[0]).unwrap();
+    let second = purge_whole(&mut arena);
+    assert_eq!(second.bytes, 2 * p, "the joined run given back: {second:?}");
+    assert_eq!(
+      arena.resident_free_bytes(),
+      0,
+      "nothing left resident and free"
     );
   }
 
