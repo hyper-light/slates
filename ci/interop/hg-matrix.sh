@@ -3,7 +3,9 @@
 # for git: starts `slates anchor` with its HTTP and SSH edges on loopback, makes a Mercurial repository, pushes a real
 # repository into it over HTTP (the token as Basic's password), then runs clone, verify, log, annotate, diff,
 # bookmarks, tags, named branches, merge, pull, rebase, incoming/outgoing, a stream clone and SSH clone/pull/push
-# against it, printing PASS or FAIL and the seconds for each.
+# against it, then changeset evolution (`experimental.evolution = all`) on a non-publishing repository of its own: an
+# amend and a rebase pushed with their markers, a clone holding the markers and none of the obsolete drafts and
+# verifying clean, and a marker made on the clone's side pulled back. Prints PASS or FAIL and the seconds for each.
 #
 # Usage: ci/interop/hg-matrix.sh SLATES_BINARY SOURCE_REPOSITORY WORK_DIRECTORY
 #   SOURCE_REPOSITORY: a local Mercurial repository (a clone of hg's own, say); PUSH_REV (default every head) names
@@ -134,6 +136,31 @@ row ssh-pull "${HG[@]}" -R a pull -q "$SSHURL"
 # made: on main 01a20182's run 45037561866 every leg's ssh-clone was red and ssh-push failed at 0 s on `cd: e`.
 row ssh-push bash -c "${HG[*]} clone -q a f && cd f && echo ssh >ssh.txt && ${HG[*]} commit -qAm ssh \
   && ${HG[*]} push -r . $SSHURL"
+
+# Changeset evolution (GAPS "Changeset evolution served"; §4.17.3 decisions 3 and 4): a repository of its own, not
+# publishing, so pushed changesets stay draft and may be rewritten; every command with `experimental.evolution = all`.
+EVURL="http://127.0.0.1:$HTTP/evolve"
+EVO="${HG[*]} --config experimental.evolution=all"
+row evo-repository bash -c "$SLATES --instance $INSTANCE repository create evolve --tool hg >/dev/null \
+  && $SLATES --instance $INSTANCE repository policy evolve --hg-publish false >/dev/null"
+# Drafts `a` and `b` pushed, `b` amended and pushed again: the server tells its one new marker in 7.2's words.
+row evo-amend-push bash -c "$EVO init ev && cd ev && echo a >a && $EVO commit -qAm a && echo b >b \
+  && $EVO commit -qAm b && $EVO push -q $EVURL && echo b2 >b && $EVO commit -q --amend -m 'b amended' \
+  && $EVO push $EVURL >amend.out 2>&1; cat amend.out; grep -q '1 new obsolescence markers' amend.out"
+# `c` made on `a` (rev 0) and rebased onto the amended `b` (rev 2; `b`, rev 1, is hidden), then pushed with its marker.
+row evo-rebase-push bash -c "cd ev && $EVO update -q -r 0 && echo c >c && $EVO commit -qAm c \
+  && $EVO rebase -q -s 3 -d 2 && $EVO push -q $EVURL"
+# A clone takes both markers and the successors, none of the drafts they obsolete (7.2's served view), all draft.
+row evo-clone bash -c "$EVO clone -q $EVURL ev2 && [ \"\$($EVO -R ev2 debugobsolete | wc -l | tr -d ' ')\" = 2 ] \
+  && [ \"\$($EVO -R ev2 log --hidden -T '{desc}\\n' | sort | tr '\\n' ,)\" = 'a,b amended,c,' ] \
+  && [ -z \"\$($EVO -R ev2 log --hidden -r 'not draft()' -T x)\" ]"
+row evo-verify $EVO -R ev2 verify -q
+# A marker made on the clone's side (its tip, the rebased `c`, amended there) pushed, then pulled back by the first
+# client: its third marker, and its own `b`, `c` and rebased `c` the three obsolete.
+row evo-markers-back bash -c "cd ev2 && $EVO update -q -r tip && echo c2 >c && $EVO commit -q --amend -m 'c amended' \
+  && $EVO push -q $EVURL && cd ../ev && $EVO pull -q $EVURL \
+  && [ \"\$($EVO debugobsolete | wc -l | tr -d ' ')\" = 3 ] \
+  && [ \"\$($EVO log --hidden -r 'obsolete()' -T x)\" = xxx ]"
 
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
 echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"

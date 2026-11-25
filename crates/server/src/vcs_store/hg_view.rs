@@ -252,10 +252,12 @@ where
       return false;
     };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
+    let owner = slates_store::owner::take_read_waits();
     let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
     let _ = lender.lend(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
+      count_owner_waits(state, &owner);
       state.count(TEXT_REQUESTS, asks.requests);
       state.count_max(TEXT_COPIED_MOST_BYTES, asks.most_copied);
       if tags {
@@ -270,6 +272,53 @@ where
     });
   }
   true
+}
+
+/// Counter: the requests a fetch's store asks ([`STORE_ASKS`]) made of the node's changeset store's owner, each one
+/// trip to the owner's thread and back (goal 93, main's order of 2026-11-25: the clone's store wait split by part; the
+/// parts below sum to [`OWNER_TOTAL_NS`], and [`STORE_WAIT_NS`] past it is the asking shard's own work between its
+/// requests). Format: a counter name in the status report.
+pub(crate) const OWNER_REQUESTS: &str = "vcs_store.hg_owner_requests";
+
+/// Counter: the nanoseconds those requests waited, each from its send to its answer's taking on the asking task.
+/// Format: a counter name in the status report.
+pub(crate) const OWNER_TOTAL_NS: &str = "vcs_store.hg_owner_total_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the nanoseconds queued behind other requests the owner was serving when each was
+/// sent (another repository's landing and its flush, another fetch's asks). Format: a counter name in the status report.
+pub(crate) const OWNER_BEHIND_NS: &str = "vcs_store.hg_owner_behind_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the owner thread's wake from waiting for work to taking the request. Format: a
+/// counter name in the status report.
+pub(crate) const OWNER_WAKE_NS: &str = "vcs_store.hg_owner_wake_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the owner's service but its log reads: making texts from their chains, reading the
+/// engine's rows, copying the answer. Format: a counter name in the status report.
+pub(crate) const OWNER_SERVE_NS: &str = "vcs_store.hg_owner_serve_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the changeset log's reads within the owner's service (`ChangesetLog::read_ns`).
+/// Format: a counter name in the status report.
+pub(crate) const OWNER_DISK_NS: &str = "vcs_store.hg_owner_disk_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], from the owner's answer to the asking task's taking it: the hop back to the asking
+/// shard and that shard's own turn. Format: a counter name in the status report.
+pub(crate) const OWNER_BACK_NS: &str = "vcs_store.hg_owner_back_ns";
+
+/// Counter: the longest one request's whole wait ([`OWNER_TOTAL_NS`]'s), kept as a maximum. Format: a counter name in
+/// the status report.
+pub(crate) const OWNER_MOST_NS: &str = "vcs_store.hg_owner_most_ns";
+
+/// Counts what a want's requests of the store's owner waited on, split by part ([`OWNER_REQUESTS`] and the counters
+/// after it).
+fn count_owner_waits(state: &mut ShardState, owner: &slates_store::owner::AskWaits) {
+  state.count(OWNER_REQUESTS, owner.asks);
+  state.count(OWNER_TOTAL_NS, owner.total_ns);
+  state.count(OWNER_BEHIND_NS, owner.behind_ns);
+  state.count(OWNER_WAKE_NS, owner.wake_ns);
+  state.count(OWNER_SERVE_NS, owner.serve_ns);
+  state.count(OWNER_DISK_NS, owner.disk_ns);
+  state.count(OWNER_BACK_NS, owner.back_ns);
+  state.count_max(OWNER_MOST_NS, owner.most_ns);
 }
 
 /// Counter: the requests a fetch's texts made of the node's changeset store's owner, each the texts of one want made

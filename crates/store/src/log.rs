@@ -269,6 +269,9 @@ pub struct ChangesetLog<F: BlockFile> {
   /// The record being appended, if one is: its state lives here, not in a borrow, so a record appended a slice at a
   /// time over many requests leaves the log readable between them (the owner's sliced landing).
   open: Option<OpenRecord>,
+  /// The nanoseconds its reads of committed records have taken, all told ([`ChangesetLog::read_ns`]): the disk's share
+  /// of a store request's service (goal 93, main's order of 2026-11-25: a clone's store wait split by part).
+  read_ns: core::cell::Cell<u64>,
 }
 
 /// A record being appended: its header, where it starts and where its next byte goes, its identity so far, the sections
@@ -300,6 +303,7 @@ impl<F: BlockFile> ChangesetLog<F> {
       file,
       end,
       open: None,
+      read_ns: core::cell::Cell::new(0),
     })
   }
 
@@ -467,8 +471,17 @@ impl<F: BlockFile> ChangesetLog<F> {
     if past > self.end {
       return Err(LogError::Corrupt("a read past the committed records"));
     }
-    self.file.read_exact_at(buf, offset)?;
+    let began = slates_machine::clock::monotonic_ns();
+    let read = self.file.read_exact_at(buf, offset);
+    let took = slates_machine::clock::monotonic_ns().saturating_sub(began);
+    self.read_ns.set(self.read_ns.get().saturating_add(took));
+    read?;
     Ok(())
+  }
+
+  /// The nanoseconds its reads of committed records have taken so far ([`ChangesetLog::read_at`]).
+  pub fn read_ns(&self) -> u64 {
+    self.read_ns.get()
   }
 }
 

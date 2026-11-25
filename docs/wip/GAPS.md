@@ -1178,6 +1178,15 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+>   The matrix's row BUILT (2026-11-25, w-interop; main's order): `ci/interop/hg-matrix.sh` makes a non-publishing
+>   repository of its own (`evo-repository`) and runs stock hg with `experimental.evolution = all`: drafts pushed then
+>   one amended and pushed, the server telling `1 new obsolescence markers` (`evo-amend-push`); a draft rebased onto the
+>   amend and pushed (`evo-rebase-push`); a clone holding the 2 markers and exactly the successors, all draft, none of
+>   the drafts they obsolete (`evo-clone`), verifying clean (`evo-verify`); and a marker made on the clone's side pushed
+>   and pulled back by the first client, its 3 markers and 3 obsolete changesets (`evo-markers-back`). Locally against
+>   stock hg 7.2.4 at 29221d5ab (debug, the r400 cut of hg's history as the source): the six rows 6 of 6. The same run's
+>   `merge-push` and `rebase-push` were refused `UnknownDeltaBase { log: Manifests }` (the store answered no text for a
+>   manifest an earlier push landed), sent to w-hg as found.
 >   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
 >   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
 >   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
@@ -1670,6 +1679,15 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
+> 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
+> nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
+> as `vcs_store.hg_owner_{requests,total_ns,behind_ns,wake_ns,serve_ns,disk_ns,back_ns,most_ns}`. In-process (debug,
+> a 2,000-changeset `debugbuilddag` history, this MacBook, `hg_clone_store_wait`): the clone 17.2 s, its store wait
+> 5.77 s over 4,015 requests: the owner's wake from its blocking receive 85.5% (about 1.2 ms a request), its service
+> 12.2%, the hop back 1.8%, its log reads 0.4%, queued behind other work 0.1%. Owed: the 57k clone's split on a release
+> build (main's), then the cut it names (the owner spinning before it parks over a measured inter-arrival, or a fetch
+> keeping its next ask in flight).
 > Found by main's round at 15b4f1061 and cut (2026-11-25, w-perf): with that request hg's 57k clone peaked at 10,416
 > MiB and held 10,013 MiB after it (2ed3eb139: 5.7-6.0 GB), 165.8 s; the status after it named 4,792 mapped blocks of
 > about a chunk each still live (5.07 GB mapped, 4.09 GB resident). The owner read each text of the batch once at its
