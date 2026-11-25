@@ -432,6 +432,21 @@ pub struct TextRow {
   pub form: Form,
 }
 
+/// What a [`TextCache`] holds, as a memory status reports it (goal 93, main's ruling of 2026-11-25: after hg's 57k push
+/// the cache's chunks held 32 MB live, and nothing reported why): the bytes its chunks reserve, its bound, and the
+/// walks in flight that hold the bound up, with their texts' bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextCacheFigures {
+  /// The bytes the chunks hold reserved.
+  pub reserved: u64,
+  /// The most bytes the chunks may hold now.
+  pub bound: u64,
+  /// The walks in flight: texts a read began and has not read to their end.
+  pub walks: u64,
+  /// Their texts' bytes.
+  pub walk_bytes: u64,
+}
+
 /// Whole texts made from their chains, by identity, the least lately read out first, bounded in bytes; and what the
 /// reads did, the red tests' non-vacuity counters.
 ///
@@ -585,6 +600,16 @@ impl TextCache {
   /// The most bytes the cache may hold now.
   pub fn bound(&self) -> u64 {
     self.bound
+  }
+
+  /// What the cache holds now, as a memory status reports it ([`TextCacheFigures`]).
+  pub fn figures(&self) -> TextCacheFigures {
+    TextCacheFigures {
+      reserved: self.reserved,
+      bound: self.bound,
+      walks: to_u64(self.walks.len()),
+      walk_bytes: self.walk_bytes,
+    }
   }
 
   /// The text held under `identity`, if it is.
