@@ -63946,6 +63946,11 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
   installs the configuration that bumped its epoch, which can come after every council names it a member again. Until
   then it serves as their owner, its records are refused, and a push there is refused `unable to commit`, typed. The
   fleet test waits for its yield before it pushes; a run on the merged base that did not wait met that window once.
+  **The client's contract:** that refusal is retryable. Nothing the push wrote is acknowledged, since a push is answered
+  only once its barrier holds. The window ends when the node installs its committed configuration, which it fetches every
+  coordinator period. So a client retries after the failover delay the fleet publishes (`failover_ns`, the bound its
+  takeover is held to). The retry finds the node knowing its takeover and is answered `307` to the adopter, or `503`
+  typed.
 - **Not reproduced end to end: the stale-creator window** (main's ruling).
   - Across three fleet scenes (a cold four-node fleet, and one with the non-holder restarted warm after a's
     readmission), the direct route never named a with the skip turned off. The non-holder's routing, learned again,
