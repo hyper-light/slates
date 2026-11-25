@@ -21,6 +21,7 @@ for tonight).
 
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
+After the Mac rebooted at about 18:35 on 11-24: w-svn 16984, w-hg 18891, w-git 22542, w-interop 23395, w-perf 24525, w-shared 24870; main 24457.
 
 Updates at 16:32 on 11-24:
 - Landed since 13:15, each on origin/main:
