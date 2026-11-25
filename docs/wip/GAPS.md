@@ -1530,6 +1530,16 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
+> 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
+> landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
+> scanning the log's tool id rows from the prefix's first in pages as large as the ask: one row a page up to the node,
+> half the log a text, a clone quadratic in its history. `slates_store::Store::texts_by_tools` now begins each scan at
+> the next asked id not yet passed (a lone ask reads at its own key; a whole log's ask is still one scan), and the fetch
+> asks a unit's text with the next units' in one batch within its room (`serve::getbundle`'s `LogTexts::ask_batch`).
+> Held by `a_lone_version_asked_by_tool_id_is_read_at_its_own_key` (store: 200 engine reads for a lone ask, now 1) and
+> P5's daemon-edge test (a clone of a 7-changeset line: 30 store asks, now 6). Owed: the bookmark and branch walks
+> still ask one text at a time (cheap since the store's fix); main's hg leg of the interop bench re-measures the clone.
 > C1 (2), first piece BUILT (main's order of 2026-11-24 16:10; main's r618 reading: a long revision rebuilt into one
 > buffer, the 57k intake's pending steps 51% of its time): a push's file revision is taken a window a step and never
 > whole. Its text is made from its delta over its base by `delta::Patching`, the base read in ranges (`delta::BaseRead`)
