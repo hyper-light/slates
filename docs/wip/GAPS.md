@@ -14420,6 +14420,56 @@ Open (w-svn): the same diag's one failure in 1,306 library tests,
 `seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
 fixed or explained.
 
+### 8a-hook-exit. Under load, a hook's exit completes seconds late, in batches, and the hook tests' fixed bounds fail on it (2026-11-25, open)
+
+Main's flake list (w-hg's parallel runs; w-git's loops under 8 to 24 CPU burners, full output kept in
+`~/.cache/w-git-ssh-flake-run*.log` and `~/.cache/w-git-hook-red-run*.log` on the MacBook, 18 cores). At load 35 to 48,
+these fail together in one run, never alone:
+- `hook_driver::tests::hooks_spawned_at_once_each_end_at_their_own_exit` (a refusing hook's run 2.2 to 9.4 s against
+  2 s);
+- `git_hooks::tests::a_git_hook_runs_in_its_view_at_each_of_receive_packs_points` ("the run answered within the
+  test's bound", 10 s);
+- `git_push::tests::t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` and
+  `t_a665_an_update_hook_refuses_its_own_command_alone` ("the push went no further within the test's bound").
+
+What was measured (temporary instrumentation in `hook_driver`, since removed):
+- **A stranded run.** The run waits with its words ended, its exit unseen and no deadline (a first run has none; its
+  client leaving is its only end, by design). 16 to 29 strands a run under burners, none in quiet runs.
+- **Not a lost wake.** At the moment it strands, the hook's status is not readable (`waitid` with `NOWAIT | NOHANG`) in
+  79 of 82 strands; the 3 readable were within the kernel's microseconds between the exit note and the status. The
+  run's wait is not missing an event: the hook has closed its descriptors and not finished exiting.
+- **Not starved teardown.** `ps` on a lingering hook reads `?E` (exiting), wait channel `-`, 0 CPU time, 0 RSS, 4 to
+  9 s after its start: its threads and address space are already gone.
+- **Not the sleeping hooks.** Killing the test's sleeping hooks at 8 s instead of 4 s left no run over 1 s in 4 runs at
+  load 53 to 65; with the kill back at 4 s, stranded runs ended at 1.37 and 1.54 s, not at 4.
+- **Released in batches.** Nine refusing hooks' exits completed within 5 ms of each other (1.368 to 1.373 s), four
+  more within 0.5 ms: one process-wide hold, released at once.
+- **Same moments, same process: the SSH edge.** The four seat and client-gone tests in `vcs_ssh::tests::serve` and
+  the two hg-over-SSH tests (`a_rekey_during_a_blocked_write_sends_no_byte_twice`,
+  `an_ssh_clone_past_many_windows_is_answered_whole`) failed in the same runs, each with the server's close not seen
+  within the client's 4 s. `vcs_ssh` alone stayed green 6 of 6 under 24 burners (load about 32): its stalls come with
+  activity elsewhere in its own test process.
+
+**The tests' bounds stay.** They are liveness-derived Shapes (`hook_driver`'s `QUICK_RUN_NS`, half a holder's four
+windows; `git_hooks::tests::TEST_BOUND_NS`, ten windows), and they are what fails during the stall. A bound measured
+at a test's start cannot see an episode that begins mid-test, and a quiet exit (2 to 18 ms) would make it tighter, not
+safer (main's ruling, 2026-11-25). Re-judged once A-924's spawner lands: if the stall is the test process's own spawn
+bursts, the spawner takes them out of it.
+
+**Not named.** The object the exits wait on is unknown: no root on the machine, so no kernel stacks (`spindump`,
+`dtrace`). The hook driver is right to wait for the exit (git waits on a hook's exit, not its pipe; a deadline at
+words-end would cut hooks that close their output and work on). Next: a kernel stack of a stranded hook from a
+machine where one can be taken.
+
+**What it led to (a product finding).** One `posix_spawn` call costs its calling thread about 0.1 ms per 1,000 of the
+parent's open descriptors with `POSIX_SPAWN_CLOEXEC_DEFAULT`, which `slates_ipc::confined_spawn` sets on macOS
+(`~/.cache/w-git-spawnbench`, 7 reps, medians, load ~30): 0.2 to 0.45 ms at 100 descriptors, 1.2 to 4.0 ms at 10,000,
+8.0 to 13.3 ms at 100,000 (max 32 ms); without the flag, 0.5 ms at 10,000 and 1.9 to 3.2 ms at 100,000. The 342 MB
+debug test binary costs about what `/usr/bin/true` does. No measurable hold on the parent's other threads: a second
+thread's worst `dup` + `close` was 6.6 ms during the spawns and 6.0 ms with none. So a hook spawn is a long step on
+the shard that makes it, against the 1 ms bar, in a daemon holding its clients' sockets. Owed: the spawner, A-924 (w-git's
+next piece).
+
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
 The only `RUSTDOCFLAGS` in the tree was in `xtask/src/tsan.rs`, for sanitizer flags. No lane, no xtask and no
