@@ -55,7 +55,15 @@ pub(crate) const TURNS_YIELDED: &str = "vcs_store.git_derive.turns_yielded";
 /// The derivations under way, one a repository (the module doc's bounds), and the repositories a task derives behind a
 /// push ([`derive_behind`]).
 #[derive(Default)]
-pub(crate) struct Derivings(BTreeMap<RepositoryId, Deriving>, BTreeSet<RepositoryId>);
+pub(crate) struct Derivings(
+  BTreeMap<RepositoryId, Deriving>,
+  BTreeSet<RepositoryId>,
+  BTreeMap<RepositoryId, u64>,
+);
+
+/// Counter: a derivation behind a push that stopped because a reader came to drive it ([`derive_behind`]): the reader
+/// turns the derivation kept under way alone. Format: a counter name.
+pub(crate) const BEHIND_HANDED: &str = "vcs_store.git_derive.behind_handed";
 
 /// Counter: a derivation begun behind a push as it ended ([`derive_behind`]), so the repository's first fetch after it
 /// finds its versions' sets known. Format: a counter name.
@@ -234,7 +242,9 @@ pub(crate) fn derive_behind(state: &mut ShardState, id: RepositoryId) {
   }
   state.count(BEHIND, 1);
   let behind = async move {
-    derive_for_read(id).await;
+    let mut brought = super::read_through::BroughtBack::default();
+    derive_bringing_back(id, &mut brought, Driver::Behind).await;
+    brought.let_go();
     let _ = crate::state::with_state_counted(|state| state.vcs_stores.derivings.1.remove(&id));
   };
   match slates_rt::futures::spawn(behind) {
@@ -250,17 +260,64 @@ pub(crate) fn derive_behind(state: &mut ShardState, id: RepositoryId) {
 
 /// Turns repository `id`'s derivation until every version's sets are known, yielding between turns (the module doc):
 /// what a fetch's request runs before it holds its generation. Returns at once where the shard's state is not lent.
-/// The windows it brought back are let go again once it ends, whichever way (`read_through::BroughtBack`).
+/// The windows it brought back are let go again once it ends, whichever way (`read_through::BroughtBack`). While it
+/// runs the repository is marked read-driven, so a derivation behind a push stops and leaves it the derivation kept
+/// under way ([`derive_behind`]): two tasks turning one derivation each yield to the other at every unit (`paced` stops
+/// where someone else waits), a sliver a turn (main 01a20182's git leg of 2026-11-25: 721,260 turns, 22.69 s, for what
+/// one reader alone derives in 338 turns, 12.15 s).
 pub(crate) async fn derive_for_read(id: RepositoryId) {
+  let _ = crate::state::with_state_counted(|state| {
+    let readers = state.vcs_stores.derivings.2.entry(id).or_default();
+    *readers = readers.saturating_add(1);
+  });
   let mut brought = super::read_through::BroughtBack::default();
-  derive_bringing_back(id, &mut brought).await;
+  derive_bringing_back(id, &mut brought, Driver::Reader).await;
   brought.let_go();
+  let _ = crate::state::with_state_counted(|state| {
+    let readers = &mut state.vcs_stores.derivings.2;
+    let left = readers.get(&id).map_or(0, |count| count.saturating_sub(1));
+    if left == 0 {
+      readers.remove(&id);
+    } else {
+      readers.insert(id, left);
+    }
+  });
 }
 
-/// [`derive_for_read`]'s turns, each window brought back kept in `brought`.
-async fn derive_bringing_back(id: RepositoryId, brought: &mut super::read_through::BroughtBack) {
+/// Who turns a derivation: a reader (a fetch's request, [`derive_for_read`]) or the task behind a push
+/// ([`derive_behind`]), which stops wherever a reader drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Driver {
+  /// A reader, which turns to the end.
+  Reader,
+  /// The task behind a push, which leaves the derivation to a reader that comes.
+  Behind,
+}
+
+/// [`derive_for_read`]'s and [`derive_behind`]'s turns, each window brought back kept in `brought`; the task behind a push
+/// stopping before a turn where a reader drives the repository, counted [`BEHIND_HANDED`].
+async fn derive_bringing_back(
+  id: RepositoryId,
+  brought: &mut super::read_through::BroughtBack,
+  driver: Driver,
+) {
   loop {
-    match crate::state::with_state_counted(|state| turn(state, id)) {
+    let step = crate::state::with_state_counted(|state| {
+      if driver == Driver::Behind
+        && state
+          .vcs_stores
+          .derivings
+          .2
+          .get(&id)
+          .is_some_and(|readers| *readers > 0)
+      {
+        state.count(BEHIND_HANDED, 1);
+        return None;
+      }
+      Some(turn(state, id))
+    })
+    .flatten();
+    match step {
       Some(Turned::More) => slates_rt::futures::yield_now().await,
       // A window brought back, turned again; one that brought nothing back (back already, or refused) would only meet the
       // same miss again, so the derivation stops there as a refused one does.
