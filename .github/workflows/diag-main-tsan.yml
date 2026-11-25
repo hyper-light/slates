@@ -1,8 +1,8 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-24 21:57 PST): run 5, CI's TSan job at ac3bf0650 measured whole. Run 4 (09b2f0d3c) failed two A-908 tests (their
-# fix fcb77e918 landed after it) and w-svn's crash test, whose failure message now names the path (ac3bf0650: pieces
-# fetched, named texts brought back, let-go bytes, pins by kind, whole at the first look). The step is copied unchanged
-# but for a limit only a hang reaches. Run only from diag-measurer-main-tsan-* branches, never main.
+# main 01a20182 (2026-11-25 00:04 PST): run 6, CI's TSan job at 4892d3cf9, with w-svn's Unstored fix d3539309d (the import's next
+# revision's texts pinned around a cut's landing; run 5's a_replay_fetches_each_piece_of_a_stored_text_once failed on it)
+# and the crash test's let-go fix 085f6dfad. The step is copied unchanged but for a limit only a hang reaches. Run only
+# from diag-measurer-main-tsan-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-tsan-*"]
