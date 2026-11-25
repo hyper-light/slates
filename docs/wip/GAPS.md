@@ -229,18 +229,21 @@
 > A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
 > format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
 > Nothing is built on either answer.
-> **BUILT, part 4 owed (A-908, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
+> **BUILT (A-908 with part 4, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
 > green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
 > lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
-> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
-> rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
+> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. Part 4: a holder's rebuild
+> after a warm restart makes a member by its lineage too (a root founds it, a branch is branched from its source, a
+> missing source rebuilt first a level an ask); red first in `merge_origin` (the branch had been refused as a mismatch).
+> Not run: a fleet test restarting a holder warm between a branch's versions (main's to ask for).
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
 > made after a takeover was placed. An owner's hold now fences each object as its holders do (`Acceptor::accept_own`);
 > red first (`a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies`, and `slates-db`'s `a909_` tests).
-> OWED (main): gate 15 (`v3_takeover`) and a lint diag. Not checked: the second new branch's `cannot lock ref` 2.3 s
-> after the refused push; no test makes it.
+> Gate 15 (`v3_takeover` at f387b56d3) held: 40 of 40, release and debug; OWED (main): TSan diag 3 and a lint diag.
+> UNOBSERVED since A-909: the second new branch's `cannot lock
+> ref` 2.3 s after a refused push; no test makes it, and it is not chased by reading (main's ruling).
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,

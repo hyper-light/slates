@@ -13650,12 +13650,15 @@ mod tests {
 
   /// AC-6.3, §4.16; AUD-12: a stale epoch, foreign generation or conflicting accepted position
   /// must refuse before holder recomputation. A later legitimate origin must still seed and serve.
+  /// The green is one of no repository, so its id is no family's: a family green's version 0 waits for its join to its
+  /// repository's lineage (A-908), and `[20; 16]`, used here before, carries the family bit (TSan diag 3).
   #[test]
   fn refused_merge_authority_leaves_the_replica_unchanged() {
     use slates_db::register::{Acceptor, Ack, Authority, HostEpoch, ObjectId, Record};
     let (after_refusals, committed, after_commit) = audit_on_shard(|state| {
       let owner = state.fleet.host();
-      let object = ObjectId([20; 16]);
+      let object = ObjectId::new(owner, 20);
+      assert!(!object.is_family(), "a green of no repository");
       let generation = state.fleet.configuration().version;
       let value = crate::merge_service::MergeRecordValue {
         version: 0,
