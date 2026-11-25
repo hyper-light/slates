@@ -246,6 +246,15 @@
 > after a council round, the coordinator's home passes run on their own lane, and a push's homing runs within a window
 > derived from detection, confirmation and the takeover's configuration steps, ranking its homes again at each install.
 > Red first (both `a912_` fleet tests). OWED (main): gate 17 (`v3_takeover`) and a lint diag.
+> **FIXED (A-915, w-shared, 2026-11-24; main 01a20182's ruling (1)): a repository's successor never served it when its
+> owner died as its creation answered (a894, 3 of 120 gate runs since A-908 part 4).** The creation answered once its
+> record was at f + 1, its root's join shipped after, and A-908 part 4's rebuild waited for that join forever. Now the
+> creation answers once its join is at f + 1 too (one wait, a push's barrier), and an adoption refuses a green whose
+> join it does not hold, given up typed. An unacknowledged creation's retry answers typed and the name names one
+> repository: made afresh before the successor adopts the record (the adopted one refused and dropped at its rebuild),
+> or refused `AlreadyExists` naming the adopted one, whose name is reserved until its rebuild (before, the retry made
+> a second repository of the name). Red first (`a915_...`, the kill held between the record and the join). OWED
+> (main): gate 19 at 40 + 40 with each failed run's daemon log.
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
