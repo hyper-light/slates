@@ -81,6 +81,9 @@ use crate::merge_service::{
 };
 use crate::state::ShardState;
 
+/// Counter: a successor's adoption of a family green whose join no names-log part held here records (A-915): never
+/// acknowledged as a member, its adoption refused and given up typed. Format: a counter name in the daemon's status report.
+pub(crate) const ADOPTED_UNJOINED: &str = "merge.takeover.adopted_unjoined";
 /// Counter: a rebuilt lineage root not installed because its repository already has a lineage on this holder without
 /// it (A-908 part 4): a bug signal, since a holder makes a lineage's members only from its root.
 /// Format: a counter name in the daemon's status report.
@@ -749,6 +752,14 @@ pub(crate) enum Rebuild {
   Nothing,
 }
 
+/// A green of a repository's family whose join no names-log part held here records, asked by a successor's adoption
+/// (A-915, [`rebuild_adopted_through`]): the successor holds the repository's names log its takeover gathered from a
+/// quorum, and every acknowledged green's join is in it (a creation answers once its root's join is at `f + 1`), so
+/// this green was never acknowledged as a member. Nothing is built; its adoption is refused, given up typed within its
+/// attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unjoined;
+
 /// Rebuilds `object`'s replica on a holder that accepted the green's records but holds no replica of it (§4.16 "Apply
 /// on holders", §4.8 "Recovery", A-313): a warm restart keeps the records a holder accepted and the inputs it held
 /// (AUD-29-59), not the engine, so every later record was refused `merge.out_of_order` for good. Version 0 is seeded from
@@ -775,16 +786,45 @@ pub(crate) fn rebuild_replica_through(
   object: ObjectId,
   through: u64,
 ) -> Rebuild {
+  // A green's records arriving: the join it lacks is owed by its owner, so it is waited for (`Later`), never `Unjoined`.
+  rebuild_through(state, object, through, Asker::Records).unwrap_or(Rebuild::Later)
+}
+
+/// [`rebuild_replica_through`] for a successor's adoption of `object` (A-333): the same build, but a family green whose
+/// join is unknown here is [`Unjoined`] rather than waited for (A-915), since no owner is left to ship it.
+pub(crate) fn rebuild_adopted_through(
+  state: &mut ShardState,
+  object: ObjectId,
+  through: u64,
+) -> Result<Rebuild, Unjoined> {
+  rebuild_through(state, object, through, Asker::Adoption)
+}
+
+/// Who asks for a rebuild ([`rebuild_through`]): a green's records arriving, whose owner owes the join it lacks, or a
+/// successor's adoption, which holds every join its repository acknowledged (A-915).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Asker {
+  Records,
+  Adoption,
+}
+
+/// [`rebuild_replica_through`] for `asker`: [`Unjoined`] only for an adoption.
+fn rebuild_through(
+  state: &mut ShardState,
+  object: ObjectId,
+  through: u64,
+  asker: Asker,
+) -> Result<Rebuild, Unjoined> {
   if state.merge.seeding.contains(&object) {
     state.count(REPLICA_SEEDING, 1);
-    return Rebuild::Later;
+    return Ok(Rebuild::Later);
   }
   if newest_accepted(state, object).is_none() {
-    return Rebuild::Nothing;
+    return Ok(Rebuild::Nothing);
   }
   let Some(zero) = ledger_value(state, object, 0) else {
     state.count(REPLICA_RECORDS_SHORT, 1);
-    return Rebuild::Later;
+    return Ok(Rebuild::Later);
   };
   // Version 0 by the green's membership of its repository's lineage (A-908 part 4), as a record's own version 0 is made
   // (`merge_service::make_origin_replica`): a green with no origin inputs only, since one seeded from its inputs stands
@@ -796,12 +836,22 @@ pub(crate) fn rebuild_replica_through(
       Some(member) => match member.origin {
         MemberOrigin::Root => lineage = Some(member.repository),
         MemberOrigin::Branch { from, version } => {
-          return rebuild_branch(state, object, (from, version), zero.identity, through);
+          return Ok(rebuild_branch(
+            state,
+            object,
+            (from, version),
+            zero.identity,
+            through,
+          ));
         }
       },
+      None if object.is_family() && asker == Asker::Adoption => {
+        state.count(ADOPTED_UNJOINED, 1);
+        return Err(Unjoined);
+      }
       None if object.is_family() => {
         state.count(crate::merge_service::MEMBER_UNKNOWN, 1);
-        return Rebuild::Later;
+        return Ok(Rebuild::Later);
       }
       None => {}
     }
@@ -815,8 +865,8 @@ pub(crate) fn rebuild_replica_through(
     .replicas
     .lend(&crate::merge_service::replica_key(object))
   {
-    Some(replica) => Rebuild::Installed(replica.reached()),
-    None => Rebuild::Later,
+    Some(replica) => Ok(Rebuild::Installed(replica.reached())),
+    None => Ok(Rebuild::Later),
   }
 }
 
@@ -2536,6 +2586,44 @@ mod tests {
       [Some(repository); 2],
       "the root rebuilt as the lineage's root, the branch its member"
     );
+  }
+
+  /// A-915: a successor's adoption never waits for a join no owner is left to ship. Do: give a holder a family green's
+  /// records (version 0 and 1) and its increment but no names-log part naming it, as a successor holds a green whose
+  /// creation was never acknowledged; ask it to rebuild the green for an adoption, and as its records arriving ask.
+  /// Expect the adoption answered `Unjoined` at once, counted `merge.takeover.adopted_unjoined`, and the records' ask
+  /// still waiting for the join its owner owes (`Later`, counted `merge.replica.member_unknown`), no replica either way.
+  #[test]
+  fn a915_an_adoption_of_a_green_whose_join_is_unknown_is_refused_while_its_records_wait() {
+    let first = creating("main-1", b"one", 1, 0);
+    let (roots, _) = lineage_identities(&first, &creating("branch-1", b"two", 2, 0));
+    let (adopted, recorded, counts, kept) = crate::daemon::audit_on_shard(move |state| {
+      let green = family(1, 2);
+      state.merge.memberships_built = true;
+      let inputs = hold_encoded(state, green, &first.encode());
+      accept_records(
+        state,
+        green,
+        &[(0, None, roots[0]), (1, Some(inputs), roots[1])],
+      );
+      let adopted = rebuild_adopted_through(state, green, 1);
+      let recorded = rebuild_replica_through(state, green, 1);
+      let counts =
+        [ADOPTED_UNJOINED, crate::merge_service::MEMBER_UNKNOWN].map(|name| count_of(state, name));
+      let kept = state
+        .merge
+        .replicas
+        .contains_key(&crate::merge_service::replica_key(green));
+      (adopted, recorded, counts, kept)
+    });
+    assert_eq!(adopted, Err(Unjoined), "the adoption refused at once");
+    assert_eq!(
+      recorded,
+      Rebuild::Later,
+      "the records' ask waits for its owner's join"
+    );
+    assert_eq!(counts, [1, 1], "adopted unjoined, member unknown");
+    assert!(!kept, "no replica built either way");
   }
 
   /// A-908 part 4: a branch of a branch whose sources are both missing is rebuilt a level an ask, never by recursion. Do:

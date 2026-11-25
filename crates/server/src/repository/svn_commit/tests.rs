@@ -1836,6 +1836,260 @@ fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is
 /// the text resident (the landing lets them go once its changeset is durable), with the green's one hold and no byte
 /// held by its named blocks. It did not weaken: an entry holds no bytes. The green's file and the session's read bring
 /// the windows back from the node's store.
+/// w-hg's let-go sweep, site 2 (main's ruling of 2026-11-24: a write path's bring-back lets go at its owner's end on every
+/// path; measure each suspect). Do: commit a text, whose landing lets its windows go while the green keeps it by name;
+/// then commit a second work whose row names that text (so its staging brings it back whole) and copies from a path no
+/// revision holds (so it is refused after the bring-back). Expect the second commit refused, and no window of the text
+/// resident once it answered.
+#[test]
+fn a_commit_refused_after_bringing_a_landed_text_back_lets_it_go() {
+  use slates_svn::commit::drive::TextSink;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    "refused-bring",
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, _green) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let bytes = crate::test_store::noise(200 << 10);
+  let committed = bytes.clone();
+  let named = text(&bytes);
+  let second = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage(None).unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, named.identity).unwrap();
+      let work = Work {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", Action::Add, NodeKind::Directory),
+            ChangedPath {
+              path: "/trunk/a.bin".to_owned(),
+              action: Action::Add,
+              kind: NodeKind::File,
+              copy_from: None,
+              text: Some(named),
+              properties: None,
+              mergeinfo_modified: false,
+            },
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"first".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let landed = super::land_work((&owner(), id), work, &texts).await;
+      assert!(matches!(landed, Some(Ok(_))), "{landed:?}");
+      let copied = Work {
+        head: 1,
+        record: RevisionRecord {
+          transaction: "1-1".to_owned(),
+          changes: vec![ChangedPath {
+            path: "/trunk/b.bin".to_owned(),
+            action: Action::Add,
+            kind: NodeKind::File,
+            copy_from: Some(slates_svn::index::CopySource {
+              path: "/trunk/missing.bin".to_owned(),
+              revision: 1,
+            }),
+            text: Some(named),
+            properties: None,
+            mergeinfo_modified: false,
+          }],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"refused".to_vec())],
+        texts: std::collections::BTreeSet::new(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      super::land_work((&owner(), id), copied, &texts)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let kept = crate::daemon::observe_first(&daemon, move |state| {
+    resident(state, (named.identity, named.size))
+  });
+  daemon.stop();
+  eprintln!("site 2: the second commit answered {second:?}; the text resident after: {kept}");
+  assert!(matches!(second, Some(Err(_))), "{second:?}");
+  assert!(
+    !kept,
+    "a window of the text brought back stayed resident after the refusal"
+  );
+}
+
+/// w-hg's let-go sweep, site 3 (`svn_texts::bring_whole` failing part way). Do: commit a text, whose landing lets its
+/// windows go while the green keeps it by name; then bring it back whole asking one byte past its length, so every piece
+/// is fetched and put and the read then finds nothing more, and the bring-back is abandoned. Expect it refused, and no
+/// window of the text resident after.
+#[test]
+fn a_bring_back_failing_part_way_leaves_no_window_resident() {
+  use slates_svn::commit::drive::TextSink;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    "partial-bring",
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, _green) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let bytes = crate::test_store::noise(300 << 10);
+  let committed = bytes.clone();
+  let named = text(&bytes);
+  let brought = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage(None).unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, named.identity).unwrap();
+      let work = Work {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", Action::Add, NodeKind::Directory),
+            ChangedPath {
+              path: "/trunk/a.bin".to_owned(),
+              action: Action::Add,
+              kind: NodeKind::File,
+              copy_from: None,
+              text: Some(named),
+              properties: None,
+              mergeinfo_modified: false,
+            },
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"partial".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let landed = super::land_work((&owner(), id), work, &texts).await;
+      assert!(matches!(landed, Some(Ok(_))), "{landed:?}");
+      crate::vcs_store::svn_texts::bring_whole(id, named.identity, named.size + 1).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let kept = crate::daemon::observe_first(&daemon, move |state| {
+    resident(state, (named.identity, named.size))
+  });
+  daemon.stop();
+  eprintln!("site 3: the bring-back answered {brought}; the text resident after: {kept}");
+  assert!(!brought, "a bring-back past the text's end refused");
+  assert!(
+    !kept,
+    "a window of the abandoned bring-back stayed resident"
+  );
+}
+
+/// w-hg's let-go sweep, site 2's bring-back branch (`bring_texts` refused part way gives back what it brought). Do:
+/// commit two texts, whose landing lets their windows go while the green keeps them by name; then commit a work whose
+/// rows name both, the second with a length one past its own, so the first is brought back whole and the second's
+/// bring-back fails, and the commit is refused `Unstored`. Expect the refusal, and no window of the first text resident.
+#[test]
+fn a_bring_back_refused_part_way_lets_go_what_it_brought() {
+  use slates_svn::commit::drive::TextSink;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    "two-brought",
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, _green) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let first_bytes = crate::test_store::noise(200 << 10);
+  let second_bytes: Vec<u8> = crate::test_store::noise(201 << 10)
+    .into_iter()
+    .rev()
+    .collect();
+  let (first, second) = (text(&first_bytes), text(&second_bytes));
+  let file = |path: &str, named: Text| ChangedPath {
+    path: path.to_owned(),
+    action: Action::Add,
+    kind: NodeKind::File,
+    copy_from: None,
+    text: Some(named),
+    properties: None,
+    mergeinfo_modified: false,
+  };
+  let answered = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      for (bytes, named) in [(&first_bytes, first), (&second_bytes, second)] {
+        let staged = texts.stage(None).unwrap();
+        texts.append(staged, bytes).unwrap();
+        texts.seal(staged, named.identity).unwrap();
+      }
+      let work = Work {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", Action::Add, NodeKind::Directory),
+            file("/trunk/a.bin", first),
+            file("/trunk/b.bin", second),
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"two".to_vec())],
+        texts: [first.identity, second.identity].into_iter().collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let landed = super::land_work((&owner(), id), work, &texts).await;
+      assert!(matches!(landed, Some(Ok(_))), "{landed:?}");
+      let mut wrong = second;
+      wrong.size = second.size + 1;
+      let both = Work {
+        head: 1,
+        record: RevisionRecord {
+          transaction: "1-1".to_owned(),
+          changes: vec![file("/trunk/c.bin", first), file("/trunk/d.bin", wrong)],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"refused".to_vec())],
+        texts: std::collections::BTreeSet::new(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      super::land_work((&owner(), id), both, &texts)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let kept = crate::daemon::observe_first(&daemon, move |state| {
+    resident(state, (first.identity, first.size))
+  });
+  daemon.stop();
+  eprintln!(
+    "site 2 (bring_texts): the commit answered {answered:?}; the first text resident after: {kept}"
+  );
+  assert!(
+    matches!(answered, Some(Err(Uncommitted::Unstored))),
+    "{answered:?}"
+  );
+  assert!(
+    !kept,
+    "a window of the text brought back before the refusal stayed resident"
+  );
+}
+
 /// TSan diag 45557094379 (the svn crash test's successor held a landed text whole at its start, fetched nothing, let
 /// nothing go, no pin; w-hg's sweep, site 4: `named_lacking` skips a text the restored store holds whole). Do: commit a
 /// text, whose landing lets its windows go; bring it back whole and keep that hold, as the successor's restored store

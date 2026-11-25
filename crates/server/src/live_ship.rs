@@ -1640,7 +1640,7 @@ pub(crate) fn tombstone_target(
 /// placed at `f + 1` before it answers (A-894), or `None` when it need not wait: at `f = 0` (R8), placed already, or no
 /// record of it here.
 pub(crate) fn repository_target(
-  state: &ShardState,
+  state: &mut ShardState,
   repository: slates_db::catalog::RepositoryId,
 ) -> Option<u64> {
   let repositories = state.db.partition().repositories();
@@ -1649,7 +1649,42 @@ pub(crate) fn repository_target(
     .log_position(repository, slates_db::catalog::StateLog::Names)
     .unwrap_or(0);
   let sequence = crate::catalog::repository_sequence(record, names);
-  (!register_placed(state, repository.bytes, sequence)).then_some(sequence)
+  (!placement_done(state, (PlacementOf::Repository, repository.bytes, sequence)))
+    .then_some(sequence)
+}
+
+/// Whether what a reply held for `register` waits for is durable at `sequence` (A-894, A-915): a destroy's tombstone,
+/// its register region-placed ([`register_placed`]); a repository's creation, its record region-placed and its names
+/// log's parts (its root's join) and its greens' versions held at `f + 1` (`crate::state_log::names_committed`, a
+/// push's own barrier), one wait over both, so nothing acknowledged rests on a part only its owner held (A-915: an owner
+/// lost after the answer left its successor no join, and its adoption waited for one forever). Both true at `f = 0`.
+fn placement_done(
+  state: &mut ShardState,
+  (kind, register, sequence): (PlacementOf, [u8; 16], u64),
+) -> bool {
+  register_placed(state, register, sequence)
+    && match kind {
+      PlacementOf::Tombstone => true,
+      PlacementOf::Repository => crate::state_log::names_committed(
+        state,
+        slates_db::catalog::RepositoryId { bytes: register },
+      ),
+    }
+}
+
+/// Answers every repository's creation this shard holds whose wait is now done (A-915): run as a creation's names log or
+/// green is acknowledged, as [`resolve_placed`] runs as its record is.
+pub(crate) fn resolve_held_creations(state: &mut ShardState) {
+  let held: Vec<[u8; 16]> = state
+    .live
+    .placements
+    .iter()
+    .filter(|(_, (kind, _, _))| *kind == PlacementOf::Repository)
+    .map(|(register, _)| *register)
+    .collect();
+  for register in held {
+    resolve_placed(state, register);
+  }
 }
 
 /// Whether `register`'s record is region-placed at `sequence` or past it (always at `f = 0`).
@@ -1757,12 +1792,14 @@ pub(crate) fn take_placement_seat(
   Ok(())
 }
 
-/// Answers the verbs waiting on `register` once its record is region-placed at their sequence ([`defer_until_placed`]).
+/// Answers the verbs waiting on `register` once what they wait for is durable at their sequence ([`placement_done`],
+/// [`defer_until_placed`]).
 pub(crate) fn resolve_placed(state: &mut ShardState, register: [u8; 16]) {
-  let Some((_, sequence, _)) = state.live.placements.get(&register) else {
+  let Some((kind, sequence, _)) = state.live.placements.get(&register) else {
     return;
   };
-  if !register_placed(state, register, *sequence) {
+  let (kind, sequence) = (*kind, *sequence);
+  if !placement_done(state, (kind, register, sequence)) {
     return;
   }
   let Some((kind, _, waiting)) = state.live.placements.remove(&register) else {
