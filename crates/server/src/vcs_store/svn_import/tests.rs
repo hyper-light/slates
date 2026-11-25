@@ -1014,25 +1014,34 @@ const WIDE_TEXT_BYTES: usize = 1024;
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
   // Made before the shard's history begins: the fixture's own work is no step of the import's.
   let dump = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
-  let (loaded, longest_ns, window_ns, (tail_slices, staging_steps)) = stored(move || async move {
-    let (svn, _green) = subversion("wide-revision").await;
-    let (loaded, _turns) = imported(svn, dump).await;
-    let tail_slices = on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
-    let staging_steps =
-      on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
-    let shard = slates_rt::registry::current_shard().expect("on a shard");
-    let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
-      .expect("the shard's entry");
-    (
-      loaded.map(|loaded| loaded.youngest),
-      longest_ns,
-      crate::watchdog::own_window_ns(),
-      (tail_slices, staging_steps),
-    )
-  });
+  let (loaded, longest_ns, window_ns, (tail_slices, staging_steps, apply_steps)) =
+    stored(move || async move {
+      let (svn, _green) = subversion("wide-revision").await;
+      let (loaded, _turns) = imported(svn, dump).await;
+      let tail_slices =
+        on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
+      let staging_steps =
+        on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
+      let apply_steps = on(|state| count(state, crate::repository::push::BATCH_APPLY_STEPS));
+      let shard = slates_rt::registry::current_shard().expect("on a shard");
+      let longest_ns =
+        slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
+          .expect("the shard's entry");
+      (
+        loaded.map(|loaded| loaded.youngest),
+        longest_ns,
+        crate::watchdog::own_window_ns(),
+        (tail_slices, staging_steps, apply_steps),
+      )
+    });
   assert_eq!(loaded, Ok(1));
   // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
   assert!(tail_slices > 2, "the tail took {tail_slices} slice(s)");
+  // Non-vacuity: the revision's version was applied a few units a call (goal 93 piece 3), never in one.
+  assert!(
+    apply_steps > 2,
+    "its version's apply took {apply_steps} call(s)"
+  );
   // Non-vacuity: the revision's staging was split, its check, build, reads and judge each a step of its own.
   assert!(
     staging_steps >= 4,

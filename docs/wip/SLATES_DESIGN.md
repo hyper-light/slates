@@ -63726,3 +63726,34 @@ GAPS.
 - **Evidence.** `git_push::tests::a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again`: red
   on main (the oracle differing), green with the write gone.
 
+
+### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
+
+- **Why.** An import's batch applies each recorded version to its green (`RecordedBatch::apply_slice`), a version in one
+  call of `Green::apply_recorded`: at a revision of 9,000 files that was one call of about 120 ms of a debug build's
+  shard (its effects made 14 ms, mapped files 15, effects applied 21, files set 63), the apply's longest slice 196 ms.
+  The call is linear in the version's files, so a larger revision holds its shard longer, without bound.
+- **The change.** `Green::begin_applying(inc, applied)` begins a run (`Applying`), or answers at once where
+  `apply_recorded` did (a green owing a push, an increment accepted already, a run not read); `Green::apply_step(run, inc,
+  applied, units)` takes it on by `units`: the entry's effects made a slice at a time (each slice's reads checked for a
+  text held by name alone with no bytes lent, `crate::unlent`), then the commit's preparation, then its effects applied,
+  its files removed and its files set a unit each (`Green::commit_begin`, `Green::commit_step`, `CommitRun`). One path:
+  `apply_recorded` is the run with no bound on its units, and `Green::commit`, every verdict's commit, is the commit's
+  run carried to its end. The server's batch takes `repository::push::APPLY_UNITS` units a call and reads the shard's clock between
+  calls, carrying a version's run from one slice to the next.
+- **The contract.** Between a run's begin and its end no reader may read the green and nothing else may change it: its
+  histories hold the version's values before its head names the version. An import's batch keeps it (no session is
+  served while it imports, its landing turn held) and so does a recovery's replay (not served until rebuilt). A run
+  dropped before its end leaves the green part applied; its owner makes the green again from its chain, which holds the
+  version, as a kill between a batch's slices recovers today.
+- **The oracle.** `engine::applying_tests`: generated works in every dimension, submitted to a green, each committed
+  version replayed into one green whole and one a unit a step; after every version the two and the submitter read alike
+  (histories, recounted bytes, head, head identity). A counted test holds a version of 200 files to more steps than its
+  files; the 9,000-file import asserts its version took more than one call (`repository.import_batch.apply_steps`).
+- **Measured** (9,000 files, debug, load about 58): the apply's longest slice 196 ms before, 71 ms after.
+- **Owed.** Three phases are still whole within a slice: the named read at a version's begin (`svn_commit::read_named`,
+  where `read_named_slice` exists), the lend's walk of every effect (`Green::recorded_unlent`), and the commit's
+  preparation (`Green::commit_reads`, `sole_runs`, `make_mapped`, `commit_begin`'s node moves and copies). Each is linear
+  in a version's files; they are the next slices.
+- **Applied in the same change to** `crates/merge/src/engine.rs`, `engine/copy.rs`, `engine/applying_tests.rs`,
+  `crates/server/src/repository/push.rs`, `vcs_store/name_holds.rs` and the import's wide-revision test.

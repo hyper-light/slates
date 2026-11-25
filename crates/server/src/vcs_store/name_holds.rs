@@ -284,6 +284,24 @@ pub(crate) fn apply_recorded_lent(
     &[slates_merge::chain_entry::Applied],
   ),
 ) -> Option<u64> {
+  lend_recorded(state, green, (inc, applied))?;
+  let mut engine = state.greens.get_mut(&green)?;
+  let version = engine.apply_recorded(inc, applied);
+  engine.let_named_bytes_go();
+  Some(version)
+}
+
+/// Lends green `green` the named texts its apply of `applied` for `inc` reads that it holds by name alone
+/// (`Green::recorded_unlent`), from the content plane: what an apply, whole or a slice at a time, needs first, and what
+/// `Green::let_named_bytes_go` gives back once it ends. `None` for a green not here or a text the plane cannot give now.
+pub(crate) fn lend_recorded(
+  state: &mut crate::state::ShardState,
+  green: slates_db::catalog::VolumeId,
+  (inc, applied): (
+    &slates_merge::engine::Increment,
+    &[slates_merge::chain_entry::Applied],
+  ),
+) -> Option<()> {
   let engine = state.greens.get(&green)?;
   let (unlent, head) = (engine.recorded_unlent(inc, applied), engine.head());
   drop(engine);
@@ -297,10 +315,7 @@ pub(crate) fn apply_recorded_lent(
   {
     return None;
   }
-  let mut engine = state.greens.get_mut(&green)?;
-  let version = engine.apply_recorded(inc, applied);
-  engine.let_named_bytes_go();
-  Some(version)
+  Some(())
 }
 
 /// Counted: the bytes of committed texts' windows a landing let go once its changeset was durable on the node's store

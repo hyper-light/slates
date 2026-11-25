@@ -2243,6 +2243,73 @@ impl Resolved {
 /// What a commit applies once every other effect has landed ([`Green::commit`]): the files it removes, then the files it
 /// sets. Removals come first, so a rename's source removal never deletes a file the same increment recreates or renames
 /// into at that path.
+/// What [`Green::begin_applying`] makes of a recorded version: a run to take on a slice at a time, or the version its
+/// entry is answered with at once, nothing begun.
+pub enum Begun {
+  /// Begun: taken on by [`Green::apply_step`] until it ends.
+  Applying(Box<Applying>),
+  /// Answered at once: the version the green owing a push stands for, an accepted increment's, or the head.
+  Answered(u64),
+}
+
+/// What one [`Green::apply_step`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyStep {
+  /// More of the run is left.
+  More,
+  /// The run ended: the version it committed.
+  Done(u64),
+  /// The run ended committing nothing: the head (a text held by name alone with no bytes lent).
+  Answered(u64),
+}
+
+/// A recorded version being applied a slice at a time ([`Green::begin_applying`]; its contract is there): the places of
+/// its entry's copies, the effects made so far and the next to make, then its commit under way.
+pub struct Applying {
+  id: [u8; 32],
+  copies: Vec<usize>,
+  effects: Vec<Effect>,
+  at: usize,
+  commit: Option<CommitRun>,
+}
+
+impl core::fmt::Debug for Applying {
+  fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    formatter
+      .debug_struct("Applying")
+      .field("made", &self.effects.len())
+      .field("at", &self.at)
+      .field("committing", &self.commit.is_some())
+      .finish()
+  }
+}
+
+/// A commit under way ([`Green::commit_begin`], [`Green::commit_step`]): its version, the effects left to apply and the
+/// place of the next, the names of the files named whole, what it staged, its delta and the paths it changed.
+struct CommitRun {
+  version: u64,
+  effects: std::vec::IntoIter<Effect>,
+  place: usize,
+  names: Vec<(usize, crate::named::Identity)>,
+  staged: Staged,
+  delta: BTreeMap<String, Vec<Op>>,
+  changed: BTreeSet<String>,
+  phase: CommitPhase,
+}
+
+/// Where a [`CommitRun`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitPhase {
+  /// Applying its effects in order.
+  Effects,
+  /// Removing the files staged removed.
+  Removed,
+  /// Setting the files staged with new bytes.
+  Set,
+  /// Ended.
+  Ended,
+}
+
 #[derive(Default)]
 struct Staged {
   removed: Vec<String>,
@@ -5910,14 +5977,28 @@ impl Green {
 
   ///
   /// `names` are the effects' places whose files are named for the object they are the whole of
-  /// ([`named_files`]).
+  /// ([`named_files`]). One run of [`Green::commit_begin`] and [`Green::commit_step`] carried to its end, the one path a
+  /// recorded version applied a slice at a time ([`Applying`]) takes too.
   fn commit(
+    &mut self,
+    effects: Vec<Effect>,
+    version: u64,
+    post_state: crate::named::Post<'_>,
+    names: &[(usize, crate::named::Identity)],
+  ) {
+    let mut run = self.commit_begin(effects, version, post_state, names);
+    while !self.commit_step(&mut run, usize::MAX) {}
+  }
+
+  /// A commit's work before any effect is applied ([`Green::commit`]): the mapped files made from the head the verdict
+  /// judged, the node moves and copied links derived from it, and the copies applied, each before the head changes.
+  fn commit_begin(
     &mut self,
     mut effects: Vec<Effect>,
     version: u64,
     post_state: crate::named::Post<'_>,
     names: &[(usize, crate::named::Identity)],
-  ) {
+  ) -> CommitRun {
     // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
     self.make_mapped(&mut effects, post_state, &[]);
     let moves = self.node_moves(&effects);
@@ -5928,34 +6009,79 @@ impl Green {
     effects.extend(linked);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
-    let mut staged = Staged::default();
-    // The effects' places are where the verdict put them: the node moves and links are added after every one.
-    for (place, effect) in effects.into_iter().enumerate() {
-      let name = names
-        .binary_search_by_key(&place, |(named, _)| *named)
-        .ok()
-        .and_then(|at| names.get(at))
-        .map(|(_, identity)| *identity);
-      self.apply_effect(effect, version, &mut staged, name);
+    CommitRun {
+      version,
+      effects: effects.into_iter(),
+      place: 0,
+      names: names.to_vec(),
+      staged: Staged::default(),
+      delta: BTreeMap::new(),
+      changed,
+      phase: CommitPhase::Effects,
     }
-    for path in staged.removed {
-      self.remove_file_now(&path, version);
+  }
+
+  /// Takes `run` on by at most `units` effects, staged removals or staged files: whether it has ended (its delta pushed
+  /// and its changes recorded).
+  fn commit_step(&mut self, run: &mut CommitRun, units: usize) -> bool {
+    for _ in 0..units.max(1) {
+      match run.phase {
+        // The effects' places are where the verdict put them: the node moves and links are added after every one.
+        CommitPhase::Effects => match run.effects.next() {
+          Some(effect) => {
+            let place = run.place;
+            run.place = place.saturating_add(1);
+            let name = run
+              .names
+              .binary_search_by_key(&place, |(named, _)| *named)
+              .ok()
+              .and_then(|at| run.names.get(at))
+              .map(|(_, identity)| *identity);
+            self.apply_effect(effect, run.version, &mut run.staged, name);
+          }
+          None => {
+            // The files removed in the order they were staged.
+            run.staged.removed.reverse();
+            run.phase = CommitPhase::Removed;
+          }
+        },
+        CommitPhase::Removed => match run.staged.removed.pop() {
+          Some(path) => self.remove_file_now(&path, run.version),
+          None => {
+            // The files are set in the order they were staged.
+            run.staged.set.reverse();
+            run.phase = CommitPhase::Set;
+          }
+        },
+        CommitPhase::Set => match run.staged.set.pop() {
+          Some(file) => self.set_file(file, run.version, &mut run.delta),
+          None => {
+            self.commit_finish(run);
+            return true;
+          }
+        },
+        CommitPhase::Ended => return true,
+      }
     }
-    let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
-    for file in staged.set {
-      self.set_file(file, version, &mut delta);
-    }
+    false
+  }
+
+  /// A commit's end: each path emptied takes its metadata with it once nothing stands there, then its delta and changes
+  /// are recorded.
+  fn commit_finish(&mut self, run: &mut CommitRun) {
     // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
     // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
     // so a path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
     // one's mode 0755).
-    for path in staged.emptied {
+    let version = run.version;
+    for path in core::mem::take(&mut run.staged.emptied) {
       if !self.holds(&path) {
         self.drop_metadata(&path, version);
       }
     }
-    self.deltas.push(delta);
-    self.record_changes(version, changed);
+    self.deltas.push(core::mem::take(&mut run.delta));
+    self.record_changes(version, core::mem::take(&mut run.changed));
+    run.phase = CommitPhase::Ended;
   }
 
   /// The effects a version's node moves add to it (A-646: a hard link names its node, never a
@@ -7099,30 +7225,117 @@ impl Green {
     inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
+    match self.begin_applying(inc, applied) {
+      Begun::Answered(version) => version,
+      Begun::Applying(mut run) => loop {
+        match self.apply_step(&mut run, inc, applied, usize::MAX) {
+          ApplyStep::More => {}
+          ApplyStep::Done(version) | ApplyStep::Answered(version) => return version,
+        }
+      },
+    }
+  }
+
+  /// Begins applying `applied` for `inc` as its chain entry records it, a slice at a time ([`Green::apply_step`]); what
+  /// [`Green::apply_recorded`] is, run to its end. Answered at once, nothing begun, for a green that owes a push (the
+  /// entry kept in order, its version answered), an increment accepted already (its version), or one naming a run not
+  /// read yet (the head, nothing committed).
+  ///
+  /// **Contract.** Between its begin and its end ([`ApplyStep::Done`]) no reader may read the green and nothing else may
+  /// change it: its histories hold the version's values before its head names the version. An import's batch (no
+  /// session served while it imports) and a recovery's replay (not served until rebuilt) keep it. A run dropped before
+  /// its end leaves the green part applied: its owner makes it again from its chain, which holds the version.
+  pub fn begin_applying(
+    &mut self,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+  ) -> Begun {
     // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
     // version it stands for is answered, so a replay goes on.
     if let Some(owed) = &self.owed {
       let at = u64::try_from(self.owed_tail.len()).unwrap_or(u64::MAX);
       let version = owed.version().saturating_add(at).saturating_add(1);
       self.owed_tail.push((inc.clone(), applied.to_vec()));
-      return version;
+      return Begun::Answered(version);
     }
     // An increment already accepted is answered its version and commits nothing, as a submit would: a chain holding one
     // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
     if let Some(version) = self.accepted.get(&inc.id) {
-      return *version;
+      return Begun::Answered(*version);
     }
     // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
     // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees. A run the
     // apply names whole, which no op reads, is never read for it (A-887, [`Green::replay_reads`]).
     if inc.unread_among(&inc.replay_reads(applied)).is_some() {
-      return self.head();
+      return Begun::Answered(self.head());
     }
-    // Nor over a text held by name alone with no bytes lent it (A-760 (b) 4d): nothing commits, and its owner lends the
-    // objects [`Green::recorded_unlent`] names and applies the entry again.
-    let (mut effects, unlent) = crate::unlent::scope(|| self.recorded_effects(inc, applied));
+    let copies = applied
+      .iter()
+      .enumerate()
+      .filter(|(_, effect)| matches!(effect, crate::chain_entry::Applied::CopyTree { .. }))
+      .map(|(place, _)| place)
+      .collect();
+    Begun::Applying(Box::new(Applying {
+      id: inc.id,
+      copies,
+      effects: Vec::with_capacity(applied.len()),
+      at: 0,
+      commit: None,
+    }))
+  }
+
+  /// Takes `run` on by at most `units` of its work: an effect of the entry made, or one of its commit's ([`Green::
+  /// commit_step`]); its version once it ends, or the head where a text it reads is held by name alone with no bytes lent
+  /// it (A-760 (b) 4d: nothing committed, its owner lends the objects [`Green::recorded_unlent`] names and applies the
+  /// entry again). `inc` and `applied` are the ones it began with.
+  pub fn apply_step(
+    &mut self,
+    run: &mut Applying,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+    units: usize,
+  ) -> ApplyStep {
+    let Some(commit) = run.commit.as_mut() else {
+      return self.apply_effects_step(run, inc, applied, units);
+    };
+    if self.commit_step(commit, units) {
+      let version = commit.version;
+      self.accepted.insert(run.id, version);
+      ApplyStep::Done(version)
+    } else {
+      ApplyStep::More
+    }
+  }
+
+  /// [`Green::apply_step`] before its commit: the entry's effects made `units` at a time, each read the head checked for
+  /// a text held by name alone with no bytes lent (`crate::unlent`); once every one is made, its commit begun.
+  fn apply_effects_step(
+    &mut self,
+    run: &mut Applying,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+    units: usize,
+  ) -> ApplyStep {
+    if run.at < applied.len() {
+      let end = run.at.saturating_add(units.max(1)).min(applied.len());
+      let copies = copy::EntryCopies::at(applied, &run.copies);
+      let ((), unlent) = crate::unlent::scope(|| {
+        for effect in applied.get(run.at..end).unwrap_or_default() {
+          run
+            .effects
+            .push(self.effect_of(effect, (inc.post(), &copies)));
+        }
+      });
+      if !unlent.is_empty() {
+        return ApplyStep::Answered(self.head());
+      }
+      run.at = end;
+      return ApplyStep::More;
+    }
+    let mut effects = core::mem::take(&mut run.effects);
+    let ((), unlent) = crate::unlent::scope(|| self.commit_reads(&effects, inc.post()));
     if !unlent.is_empty() {
-      return self.head();
+      return ApplyStep::Answered(self.head());
     }
     // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
     // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
@@ -7141,14 +7354,13 @@ impl Green {
     );
     move_whole_runs(&mut effects, &mut read, &wholes);
     let version = self.head().saturating_add(1);
-    self.commit(
+    run.commit = Some(self.commit_begin(
       effects,
       version,
       crate::named::Post::of(&inc.post_state, &read, runs),
       &names,
-    );
-    self.accepted.insert(inc.id, version);
-    version
+    ));
+    ApplyStep::More
   }
 
   /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked
@@ -8208,6 +8420,8 @@ mod node_exclusive_tests;
 #[cfg(test)]
 mod unseen_bytes_tests;
 
+#[cfg(test)]
+mod applying_tests;
 #[cfg(test)]
 mod fold_tests;
 #[cfg(test)]
