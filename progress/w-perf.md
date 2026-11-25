@@ -727,3 +727,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     A-742 design status; merge with main's lint split of Staging::land.
   - Waiting: main's rerun of the 4th arm with purged_kept_short_bytes; then the churn ruling's next cut (the push's
     make_chain keep, 80.9% of its mapped churn; the owner's serve), leaving the clone's hg sites to w-hg's step 3.
+- 2026-11-25 ~22:00 PST:
+  - LANDED 2e85f9d61: arena resident-free count = what regions record (remove_region, settle drift); oracle through
+    growth/shrink (red step 59); storage test's settled second reading.
+  - LANDED 2a4cf8846: kept-short runs stay recorded (red: second purge gave back nothing).
+  - Next: (b) of the churn ruling: the push's make_chain keep (TextCache::keep's chunks, 80.9% of the push's mapped
+    churn at 57k) and the owner's serve (15.3% of the clone's system churn); the clone's hg sites wait for w-hg step 3.
