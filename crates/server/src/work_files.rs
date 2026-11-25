@@ -1404,6 +1404,12 @@ impl WorkFiles {
   pub fn clear(&mut self) {
     self.changed.clear();
   }
+
+  /// Removes and drops one changed file entry, returning `true` while entries remain (used to
+  /// release large work sets cooperatively across shard turns after acceptance).
+  pub fn pop_one(&mut self) -> bool {
+    self.changed.pop_first().is_some()
+  }
 }
 
 #[cfg(test)]

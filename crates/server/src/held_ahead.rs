@@ -91,11 +91,22 @@ impl AheadHold {
     version: u64,
     work: &slates_merge::engine::Increment,
   ) -> Self {
+    Self::from_encoded(green, version, work.id, work.encode())
+  }
+
+  /// Like [`Self::new`], taking an increment encoding already produced cooperatively in copy
+  /// slices (`IncrementEncoder`) so large increments never copy synchronously on a shard step.
+  pub(crate) fn from_encoded(
+    green: DbVolumeId,
+    version: u64,
+    work: [u8; 32],
+    encoding: Vec<u8>,
+  ) -> Self {
     Self {
       green,
-      work: work.id,
+      work,
       version,
-      encoding: work.encode(),
+      encoding,
       extents: Vec::new(),
       hashed: 0,
       staging: None,

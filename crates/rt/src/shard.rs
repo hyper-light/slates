@@ -388,6 +388,9 @@ pub struct ShardContext {
   /// The tasks of the step's batch still to be polled after the one under way (A-783): taken out of the ready queue
   /// with it, so neither the queue nor the control channel shows them, yet each waits on this poll.
   batch_left: Cell<usize>,
+  /// Timestamp (shard clock, ns) when the driver was last harvested or waited in, shared by the
+  /// busy loop and [`ShardContext::others_waiting`] so neither exceeds [`busy_harvest_due`].
+  last_harvest_ns: Cell<u64>,
   fixed_spin_ns: u64,
   /// Whether the shard's thread holds Linux's round-robin real-time class (`slates_machine::round_robin`, 84a's Linux
   /// half): then it never spins idle. It parks at once when it has no work, its idle window none and its closed-loop
@@ -597,6 +600,7 @@ impl ShardContext {
       step_ceiling_ns: Cell::new(None),
       poll_allowed_until_ns: Cell::new(0),
       batch_left: Cell::new(0),
+      last_harvest_ns: Cell::new(0),
       fixed_spin_ns: config.spin_ns,
       parks_at_once: slates_machine::round_robin::holds() == Some(true),
       real_time: driver.kind() != DriverKind::Simulation,
@@ -769,7 +773,13 @@ impl ShardContext {
           pending || pollers || due
         })
         .unwrap_or(false);
-      waiting = inner || self.harvest_io();
+      let needs_harvest = !inner && !self.interests.borrow().is_empty();
+      let harvested = if needs_harvest {
+        self.try_busy_harvest(now, self.quantum_ns())
+      } else {
+        false
+      };
+      waiting = inner || harvested;
       if !waiting {
         // No one waits: the step may go on another quantum from here, or as long as this ask took if longer (the step
         // asks no sooner than an ask costs), and the poll is judged against that.
@@ -1203,6 +1213,12 @@ impl ShardContext {
   /// into a wake goes through here, so an interest word is never taken for a task's. Those paths are the
   /// driver's completions, a same-shard wake, and a word from another shard.
   pub(crate) fn deliver(&self, word: u64) {
+    let _ = self.deliver_waking(word);
+  }
+
+  /// Delivers `word`, returning whether a task was actually queued onto `self.local` (as opposed
+  /// to a readiness event on a socket direction that no task is currently awaiting).
+  fn deliver_waking(&self, word: u64) -> bool {
     let word = Encoded::from_word(word);
     match word.as_interest() {
       Some((raw, writable)) => {
@@ -1213,9 +1229,15 @@ impl ShardContext {
           .flatten();
         if let Some(task) = task {
           self.local.push(Encoded::from_word(task).slot());
+          true
+        } else {
+          false
         }
       }
-      None => self.local.push(word.slot()),
+      None => {
+        self.local.push(word.slot());
+        true
+      }
     }
   }
 
@@ -1410,7 +1432,7 @@ impl ShardContext {
     // step budget (`step_budget_ns`, "a step longer than a peer's wake starves the shard" — §4.3) since
     // its last wait: I/O then keeps pace with tasks under any load, and an idle shard (which reaches
     // `park` every loop) pays nothing for it.
-    let mut last_wait_ns = self.now_ns();
+    self.last_harvest_ns.set(self.now_ns());
     loop {
       let outcome = self.step();
       if outcome.exit {
@@ -1425,17 +1447,12 @@ impl ShardContext {
         // empty harvest sleeps about 13 µs, and stamped before it, every busy step after the first slept.
         let now = self.now_ns();
         let quantum = self.quantum_ns();
-        if busy_harvest_due(last_wait_ns, now, quantum, self.harvest_cost_ns()) {
-          let harvested = self.harvest_io();
-          let after = self.now_ns();
-          if !harvested {
-            self.learn_turn(after.saturating_sub(now));
-          }
-          last_wait_ns = after;
-        } else if now.saturating_sub(last_wait_ns) >= quantum {
-          self.with_inner(|inner| {
-            inner.counters.harvests_deferred = inner.counters.harvests_deferred.saturating_add(1)
-          });
+        let needs_harvest = !self.interests.borrow().is_empty()
+          || self
+            .with_inner(|inner| inner.driver.has_pending())
+            .unwrap_or(false);
+        if needs_harvest {
+          let _ = self.try_busy_harvest(now, quantum);
         }
         continue;
       }
@@ -1452,39 +1469,65 @@ impl ShardContext {
         // socket's readiness waited for the idle work to run out (the daemon's memory sweep on idle time held live
         // writes 50-120 ms, g228; `tests/idle_work_io.rs`).
         let _ = self.harvest_io();
+        self.last_harvest_ns.set(self.now_ns());
         continue;
       }
       self.park(outcome.next_deadline_ns);
-      last_wait_ns = self.now_ns();
+      self.last_harvest_ns.set(self.now_ns());
     }
     drop(entered);
     self.exited.set(true);
   }
 
+  /// Runs a non-blocking busy harvest if [`busy_harvest_due`] says its interval has passed,
+  /// updating `last_harvest_ns` and learning empty harvest cost; otherwise counts a deferred
+  /// harvest once `quantum` has elapsed. Returns `true` only when a task was actually woken.
+  fn try_busy_harvest(&self, now: u64, quantum: u64) -> bool {
+    let last_wait_ns = self.last_harvest_ns.get();
+    if busy_harvest_due(last_wait_ns, now, quantum, self.harvest_cost_ns()) {
+      let (any, woke) = self.harvest_io();
+      let after = self.now_ns();
+      if !any {
+        self.learn_turn(after.saturating_sub(now));
+      }
+      self.last_harvest_ns.set(after);
+      return woke;
+    }
+    if now.saturating_sub(last_wait_ns) >= quantum {
+      self.with_inner(|inner| {
+        inner.counters.harvests_deferred = inner.counters.harvests_deferred.saturating_add(1);
+      });
+    }
+    false
+  }
+
   /// Harvests the driver's ready I/O completions **without blocking** (a zero timeout) and queues their
   /// tasks: for a continuously busy [`Self::run`] that would otherwise never reach [`Self::park`] where I/O is
   /// harvested, and on every turn of the idle spin ([`Self::spin_for_work`]), whose socket readiness
-  /// would otherwise wait out the window. True when a completion was queued. Unlike `park` it does not
-  /// set the parked flag: the shard is not waiting, so a concurrent kick must not believe it is. A
-  /// driver error other than loss is left for the next real wait to surface; loss is likewise deferred
-  /// (this is a best-effort poll, not the loop's liveness point).
-  fn harvest_io(&self) -> bool {
+  /// would otherwise wait out the window. Returns `(any_completion, woke_task)`: `any_completion` tells
+  /// `learn_turn` whether the driver wait was empty, while `woke_task` tells `others_waiting()` and
+  /// `spin_for_work` whether a task was actually queued (avoiding bogus yields on unwatched writable sockets).
+  /// Unlike `park` it does not set the parked flag: the shard is not waiting, so a concurrent kick must not
+  /// believe it is. A driver error other than loss is left for the next real wait to surface; loss is
+  /// likewise deferred (this is a best-effort poll, not the loop's liveness point).
+  fn harvest_io(&self) -> (bool, bool) {
     self
       .with_inner(|inner| {
         let mut completions = std::mem::take(&mut inner.completions);
         let result = inner.driver.wait(Some(0), &mut completions);
-        let harvested = !completions.is_empty();
+        let any = !completions.is_empty();
+        let mut woke = false;
         for c in completions.drain(..) {
           inner.counters.completions = inner.counters.completions.saturating_add(1);
-          self.deliver(c.user_data);
+          woke |= self.deliver_waking(c.user_data);
         }
         inner.completions = completions;
         if matches!(result, Err(RtError::DriverLost)) {
           inner.counters.driver_lost = inner.counters.driver_lost.saturating_add(1);
         }
-        harvested
+        (any, woke)
       })
-      .unwrap_or(false)
+      .unwrap_or((false, false))
   }
 
   /// Spins out the rest of the idle window the last client activity opened
@@ -1533,8 +1576,8 @@ impl ShardContext {
       // message whose kick this harvest took is visible to the looks after it. Looked at before the harvest, a message
       // published between the look and the harvest lost its kick to the harvest, and a spin ending on that turn parked
       // with the message unseen and no kick left to wake it.
-      let harvested = self.harvest_io();
-      if harvested
+      let (_, woke) = self.harvest_io();
+      if woke
         || self.has_inbound()
         || self
           .with_inner(|inner| inner.driver.has_pending() || self.wake_ready_pollers(inner))

@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use super::connect::{Connected, Stopped, Walk, WalkStep, unbounded};
 use super::fsck::{self, SpecialBlob};
 use super::{
-  Checked, HiddenRefs, PackRefusal, PackRefused, Pushed, Refusal, Repository, Request,
+  Checked, HiddenRefs, IdIndex, PackRefusal, PackRefused, Pushed, Refusal, Repository, Request,
   UNPACKER_ERROR, charged_vec, early_refusal, refused,
 };
 use crate::Admission;
@@ -29,22 +29,22 @@ enum Stage {
   },
   /// Special dotfile blobs (`.gitmodules`, `.gitattributes`) referenced by trees, checked one a unit.
   SpecialBlobs {
-    /// Each object's name and position, sorted by name.
-    by_id: Vec<(ObjectId, usize)>,
+    /// Open-addressed O(1) index from [`ObjectId`] to pack position.
+    by_id: IdIndex,
     /// The next entry in `special`.
     at: usize,
   },
   /// The connectivity walk under way, over the objects indexed by name.
   Walk {
-    /// Each object's name and position, sorted by name.
-    by_id: Vec<(ObjectId, usize)>,
+    /// Open-addressed O(1) index from [`ObjectId`] to pack position.
+    by_id: IdIndex,
     /// The walk.
     walk: Walk,
   },
   /// Every check made: each command's connectivity.
   Connected {
-    /// Each object's name and position, sorted by name.
-    by_id: Vec<(ObjectId, usize)>,
+    /// Open-addressed O(1) index from [`ObjectId`] to pack position.
+    by_id: IdIndex,
     /// Each command's connectivity, in the order sent.
     connected: Vec<Connected>,
   },
@@ -297,7 +297,7 @@ impl Checking {
       }
       Stage::Refused | Stage::Fsck { .. } | Stage::SpecialBlobs { .. } | Stage::Walk { .. } => {
         early.extend((0..count).map(|_| Some(refused(UNPACKER_ERROR, None))));
-        Vec::new()
+        IdIndex::default()
       }
     };
     Ok(Checked {
@@ -329,13 +329,12 @@ fn refuse_pack(
 fn check_special_entry<R: Repository + ?Sized>(
   entry: SpecialBlob,
   objects: &[crate::unpack::Placed],
-  by_id: &[(ObjectId, usize)],
+  by_id: &IdIndex,
   contents: &dyn Contents,
   repository: &R,
 ) -> Option<crate::objects::FsckId> {
   let lookup = |id: &ObjectId| {
-    if let Ok(pos) = by_id.binary_search_by(|(known, _)| known.cmp(id))
-      && let Some(&(_, at)) = by_id.get(pos)
+    if let Some(at) = by_id.position(objects, id)
       && let Some(placed) = objects.get(at)
       && let Some(bytes) = contents.content(at, id)
     {

@@ -275,8 +275,9 @@ impl<L: ShardLender> Exchange for Receive<L> {
       self.intake = Some(crate::vcs_share::turns::take_intake(self.push.repository()).await);
     }
     let Self { lender, push, .. } = self;
-    lender
-      .lend(|state| push.input(state, run))
+    push
+      .input_pipelined(lender, run)
+      .await
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
       .map(|_| ())
       .map_err(failed)
@@ -287,7 +288,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
       return Ok(());
     }
     let Self { lender, push, .. } = self;
-    let ended = match lender.lend(|state| push.end(state)) {
+    let ended = match push.end_pipelined(lender).await {
       Some(Ok(_)) => Ok(()),
       Some(Err(failure)) => Err(Cut::Failed(failure)),
       None => Err(Cut::Unserved),
@@ -401,24 +402,19 @@ impl<L: ShardLender> Receive<L> {
     let _ = intake;
     let repository = push.repository();
     loop {
-      // A homing or a landing in flight (R2): awaited no longer than the answer may stay silent, then its keepalive is
-      // written and the wait goes on at the next turn.
-      if let Some(waiting) = carrying.as_mut() {
-        let Some(carried) = carried_within(waiting, silent_until).await? else {
-          return Ok(false);
-        };
-        *carrying = None;
-        lender
-          .lend(|state| push.homed(state, carried))
-          .ok_or_else(unavailable)?;
+      if !finish_carrying(lender, push, carrying, silent_until).await? {
+        return Ok(false);
       }
       if held_report.is_some() {
         return held_report_given(lender, repository, (held_report, given), silent_until).await;
       }
+      if !resolve_waiting_deltas(lender, push, repository, silent_until).await? {
+        return Ok(false);
+      }
       let turn = crate::vcs_share::turns::take(repository).await;
       let before = given.len();
       let step = lender
-        .lend(|state| push.answer_step(state, given))
+        .lend(|state| push.answer_step_paced(state, given, silent_until))
         .ok_or_else(unavailable)?
         .map_err(Cut::Failed)?;
       match step {
@@ -436,17 +432,7 @@ impl<L: ShardLender> Receive<L> {
           }
         }
         Answering::Turned => {
-          // A-864's push readers: a base or object a turn met in a let-go window is brought back and pinned before the next turn.
-          push.bring_back_waited().await;
-          // The push's names and pack homed in the region, then landed on the node's store, before its record names
-          // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top. Taken
-          // before the keepalive's return, so an ask made in the step the keepalive came due in is never left untaken
-          // (which refuses the push, C5 part 2b).
-          if let Some(asked) = push.take_homing() {
-            *carrying = Some(spawn_homing(lender, asked)?);
-          }
-          let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
-          if due || *sent < given.len() && silent_until.is_some() {
+          if !finish_turned(lender, push, carrying, (*sent, given.len(), silent_until)).await? {
             return Ok(false);
           }
           turn.yield_holding().await;
@@ -490,6 +476,66 @@ async fn finish_answered<L: ShardLender>(
   if !crate::state_log::names_committed_within(repository).await {
     given.truncate(before);
     given.extend_from_slice(&crate::git_push::uncommitted_report(&received));
+  }
+  Ok(true)
+}
+
+/// Settles one [`Answering::Turned`] step: brings back any let-go window, launches any requested
+/// homing/landing carry, and returns `Ok(false)` when a keepalive or pending output should flush.
+async fn finish_turned<L: ShardLender>(
+  lender: &mut L,
+  push: &mut ReceivePack,
+  carrying: &mut Option<slates_rt::sync::ChannelReceiver<crate::git_push::Carried>>,
+  (sent, given_len, silent_until): (usize, usize, Option<u64>),
+) -> Result<bool, Cut> {
+  push.bring_back_waited().await;
+  if let Some(asked) = push.take_homing() {
+    *carrying = Some(spawn_homing(lender, asked)?);
+  }
+  let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
+  Ok(!(due || sent < given_len && silent_until.is_some()))
+}
+
+/// Awaits any in-flight homing or changeset landing (R2) within `silent_until`, handing its
+/// outcome back to `push` on the owner shard; returns `Ok(false)` when a keepalive is due.
+async fn finish_carrying<L: ShardLender>(
+  lender: &mut L,
+  push: &mut ReceivePack,
+  carrying: &mut Option<slates_rt::sync::ChannelReceiver<crate::git_push::Carried>>,
+  silent_until: Option<u64>,
+) -> Result<bool, Cut> {
+  if let Some(waiting) = carrying.as_mut() {
+    let Some(carried) = carried_within(waiting, silent_until).await? else {
+      return Ok(false);
+    };
+    *carrying = None;
+    lender
+      .lend(|state| push.homed(state, carried))
+      .ok_or(Cut::Unserved)?;
+  }
+  Ok(true)
+}
+
+/// Drives deferred multi-shard waiting-delta resolution while `push.is_resolving()`, returning
+/// `Ok(true)` once resolution completes or `Ok(false)` when `silent_until` expires so a side-band
+/// keepalive is flushed.
+async fn resolve_waiting_deltas<L: ShardLender>(
+  lender: &mut L,
+  push: &mut ReceivePack,
+  repository: slates_db::catalog::RepositoryId,
+  silent_until: Option<u64>,
+) -> Result<bool, Cut> {
+  while push.is_resolving() {
+    let turn = crate::vcs_share::turns::take(repository).await;
+    let done = push
+      .resolve_step_pipelined(lender)
+      .await
+      .ok_or(Cut::Unserved)?
+      .map_err(Cut::Failed)?;
+    drop(turn);
+    if !done && silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
+      return Ok(false);
+    }
   }
   Ok(true)
 }

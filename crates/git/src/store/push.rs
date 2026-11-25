@@ -97,6 +97,86 @@ pub enum PushRefused<R> {
   Content(ContentRefused),
 }
 
+/// Pre-parsed commit or tag metadata computed on a worker shard alongside SHA-1DC, BLAKE3, and
+/// `fsck`, avoiding re-parsing on the repository's owner shard during quarantine admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedMeta {
+  /// Parsed commit metadata (`tree`, `parents`, committer `date`).
+  Commit {
+    /// Root tree id.
+    tree: ObjectId,
+    /// Parent commit ids.
+    parents: Vec<ObjectId>,
+    /// Committer timestamp seconds.
+    date: u64,
+  },
+  /// Commit failed `Commit::parse` or lacked a valid tree/committer date.
+  BadCommit,
+  /// Annotated tag target object id.
+  Tag {
+    /// Target object id.
+    target: ObjectId,
+  },
+}
+
+/// Parses commit or tag metadata from `content` identically to [`Push::read_commit`] /
+/// [`Push::read_tag`] on a worker shard.
+pub fn parse_meta(
+  format: ObjectFormat,
+  kind: Kind,
+  content: &[u8],
+  room: u64,
+) -> Option<ParsedMeta> {
+  match kind {
+    Kind::Commit => {
+      let Ok(commit) = Commit::parse(content, &mut Admission::new(room)) else {
+        return Some(ParsedMeta::BadCommit);
+      };
+      let Some(tree) = commit.tree(format) else {
+        return Some(ParsedMeta::BadCommit);
+      };
+      let parents: Vec<ObjectId> = commit.parents(format).collect();
+      let Some(date) = commit
+        .committer()
+        .and_then(|line| Ident::parse(line).ok())
+        .map(|ident| ident.seconds)
+      else {
+        return Some(ParsedMeta::BadCommit);
+      };
+      Some(ParsedMeta::Commit {
+        tree,
+        parents,
+        date,
+      })
+    }
+    Kind::Tag => crate::objects::tag::Tag::parse(content, &mut Admission::new(room))
+      .ok()
+      .and_then(|tag| tag.object(format))
+      .map(|target| ParsedMeta::Tag { target }),
+    Kind::Tree | Kind::Blob => None,
+  }
+}
+
+/// Pre-verified, pre-hashed, and pre-parsed pack object admitted via [`Push::admit_precomputed`]
+/// without running SHA-1DC, BLAKE3, or commit/tag parsing on the owner shard.
+#[derive(Clone, Debug)]
+pub struct PrecomputedPlaced {
+  /// Pack entry offset.
+  pub offset: u64,
+  /// Object kind.
+  pub kind: Kind,
+  /// Verified Git object id (SHA-1DC or SHA-256).
+  pub id: ObjectId,
+  /// Pre-computed plain BLAKE3 content identity (`ContentId::of(&content)`).
+  pub identity: ContentId,
+  /// Uncompressed object length.
+  pub len: u64,
+  /// Delta chain depth (`0` for whole).
+  pub depth: u64,
+  /// Pre-parsed commit/tag metadata from [`parse_meta`].
+  pub meta: Option<ParsedMeta>,
+}
+
 /// What a push holds of a commit beyond its bytes: its tree, parents and date, read as it arrived, and its generation
 /// number once the push is sealed (zero before).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,6 +369,72 @@ impl Push {
       return Err(PushRefused::IdMismatch { id: claimed });
     }
     self.admit_placed_named(store, id, (incoming, offset))
+  }
+
+  /// Admits an object whose Git `id`, plain BLAKE3 `identity`, and commit/tag `meta` were already
+  /// computed on a worker shard, skipping all hashing and parsing on the owner shard.
+  pub fn admit_precomputed<R>(
+    &mut self,
+    object: PrecomputedPlaced,
+  ) -> Result<(ObjectId, Admitted), PushRefused<R>> {
+    if object.id.format() != self.format {
+      return Err(PushRefused::IdMismatch { id: object.id });
+    }
+    let number = object.kind.pack_number();
+    let again = match (
+      self.placed.get(&object.id),
+      self.quarantine.object(object.id.as_bytes()),
+    ) {
+      (Some(placed), _) => Some((placed.number, placed.identity)),
+      (None, Some((number, content, _))) => Some((number, content)),
+      (None, None) => None,
+    };
+    self.entries.insert(object.offset, object.id);
+    if let Some(held) = again {
+      return if held == (number, object.identity) {
+        Ok((object.id, Admitted::Again))
+      } else {
+        Err(PushRefused::Collision { id: object.id })
+      };
+    }
+    match object.meta {
+      Some(ParsedMeta::Commit {
+        tree,
+        parents,
+        date,
+      }) => {
+        let named = parents.len();
+        let replaced = self.commits.insert(
+          object.id,
+          Arrived {
+            tree,
+            parents,
+            date,
+            generation: 0,
+          },
+        );
+        let gone = replaced.map_or(0, |replaced| replaced.parents.len());
+        self.parents_held = self.parents_held.saturating_sub(gone).saturating_add(named);
+      }
+      Some(ParsedMeta::BadCommit) => return Err(PushRefused::BadCommit { id: object.id }),
+      Some(ParsedMeta::Tag { target }) => {
+        self.tags.insert(object.id, target);
+      }
+      None => {}
+    }
+    self.largest = self.largest.max(object.len);
+    self.placed.insert(
+      object.id,
+      Placed {
+        number,
+        offset: object.offset,
+        len: object.len,
+        identity: object.identity,
+      },
+    );
+    self.sealed = false;
+    self.deepest = self.deepest.max(object.depth);
+    Ok((object.id, Admitted::New))
   }
 
   /// Admits an object already unpacked and named with collision-detecting SHA-1/SHA-256 by

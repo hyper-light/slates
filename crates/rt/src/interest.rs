@@ -74,6 +74,11 @@ pub(crate) struct Interests {
 }
 
 impl Interests {
+  /// Whether no task currently awaits descriptor readiness on this shard.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.held.is_empty()
+  }
+
   /// Records that the task whose word is `task` awaits `raw`'s `direction`, replacing the key's earlier holder,
   /// and returns the registration's token. Returns `None` once every token has been issued: refused, never
   /// reused, since a reused token could let an old future's drop forget a live registration.

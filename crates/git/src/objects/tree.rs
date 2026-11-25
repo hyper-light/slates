@@ -286,24 +286,29 @@ impl<'a> Tree<'a> {
   }
 }
 
-/// Decodes the entry at `from` as `decode_tree_entry` does: the entry and where the next begins, or the refusal.
-fn entry_at(
+/// Decodes the entry at `from` as `decode_tree_entry` does, assuming `bytes` was already checked
+/// to end with `b'\0'` followed by `format.raw_len()` bytes when `tail_checked` is true.
+fn entry_at_checked(
   bytes: &[u8],
   from: usize,
   format: ObjectFormat,
+  tail_checked: bool,
 ) -> Result<(Entry<'_>, usize), ObjectRefused> {
   let refused = |at: usize, refusal: Refusal| ObjectRefused { at, refusal };
   let rest = bytes.get(from..).unwrap_or_default();
   let raw = format.raw_len();
-  // git first asks that the bytes left end in a NUL and an id ("too-short tree object"): every name it then reads
-  // ends at a NUL with an id after it, inside the tree.
-  let id_from_end = raw.saturating_add(1);
-  let ends_well = rest
-    .len()
-    .checked_sub(id_from_end)
-    .and_then(|nul| rest.get(nul))
-    == Some(&b'\0');
-  if rest.len() < raw.saturating_add(ENTRY_LEAST) || !ends_well {
+  if !tail_checked {
+    let id_from_end = raw.saturating_add(1);
+    let ends_well = rest
+      .len()
+      .checked_sub(id_from_end)
+      .and_then(|nul| rest.get(nul))
+      == Some(&b'\0');
+    if !ends_well {
+      return Err(refused(from, Refusal::TooShortTree));
+    }
+  }
+  if rest.len() < raw.saturating_add(ENTRY_LEAST) {
     return Err(refused(from, Refusal::TooShortTree));
   }
   let space = rest
@@ -323,7 +328,6 @@ fn entry_at(
   }
   let id_from = name_from.saturating_add(name_len).saturating_add(1);
   let next = id_from.saturating_add(raw);
-  // The check above makes both present; a tree that somehow lacks them is the same too-short tree, never a panic.
   let (Some(name), Some(id)) = (
     rest.get(name_from..id_from.saturating_sub(1)),
     rest.get(id_from..next),
@@ -337,6 +341,15 @@ fn entry_at(
     id,
   };
   Ok((entry, from.saturating_add(next)))
+}
+
+/// Decodes the entry at `from` as `decode_tree_entry` does: the entry and where the next begins, or the refusal.
+fn entry_at(
+  bytes: &[u8],
+  from: usize,
+  format: ObjectFormat,
+) -> Result<(Entry<'_>, usize), ObjectRefused> {
+  entry_at_checked(bytes, from, format, false)
 }
 
 /// `parse_mode`: octal digits into 32 bits, wrapping as C's unsigned arithmetic does, the low 16 kept.
@@ -369,13 +382,27 @@ pub fn entries(
   bytes: &[u8],
   format: ObjectFormat,
 ) -> impl Iterator<Item = Result<Entry<'_>, ObjectRefused>> {
+  let raw = format.raw_len();
+  let ends_well = bytes.is_empty()
+    || bytes
+      .len()
+      .checked_sub(raw.saturating_add(1))
+      .and_then(|nul| bytes.get(nul))
+      == Some(&b'\0');
   let mut from = 0;
   let mut stopped = false;
   core::iter::from_fn(move || {
     if stopped || from >= bytes.len() {
       return None;
     }
-    match entry_at(bytes, from, format) {
+    if !ends_well {
+      stopped = true;
+      return Some(Err(ObjectRefused {
+        at: from,
+        refusal: Refusal::TooShortTree,
+      }));
+    }
+    match entry_at_checked(bytes, from, format, true) {
       Ok((entry, next)) => {
         from = next;
         Some(Ok(entry))
@@ -577,27 +604,13 @@ fn check_names<'a>(
 ) -> Result<(), PastAdmission> {
   let name = entry.name;
   flags.null_id |= entry.id.len() == format.raw_len() && entry.id.iter().all(|byte| *byte == 0);
-  flags.full_path |= name.contains(&b'/');
-  flags.dot |= name == b".";
-  flags.dotdot |= name == b"..";
-  flags.dotgit |= dotgit::dotgit(name);
   flags.zero_padded |= entry.mode_text.first() == Some(&b'0');
   flags.large_name |= name.len() > LARGE_PATHNAME;
-  if dotgit::dotgitmodules(name) {
-    gitmodules(entry, checked, admission)?;
-  }
-  if dotgit::dotgitattributes(name) {
-    if entry.is_symlink() {
-      checked.report.report(FsckId::GitattributesSymlink);
-    } else {
-      keep(&mut checked.gitattributes, entry.id, admission)?;
-    }
-  }
-  if entry.is_symlink() && dotgit::dotgitignore(name) {
-    checked.report.report(FsckId::GitignoreSymlink);
-  }
-  if entry.is_symlink() && dotgit::dotmailmap(name) {
-    checked.report.report(FsckId::MailmapSymlink);
+  let (has_slash, has_backslash) = scan_separators(name);
+  flags.full_path |= has_slash;
+  check_special_names(entry, flags, (checked, admission))?;
+  if !has_backslash {
+    return Ok(());
   }
   // NTFS reads a backslash as a separator: the rest of the name after each one is checked as a name of its own (the
   // rest, later backslashes included, as git's `strchr` walk hands it on; not the part up to the next backslash).
@@ -614,6 +627,67 @@ fn check_names<'a>(
       Ok(())
     }
   })
+}
+
+/// Scans `name` in one pass for forward-slash and backslash path separators.
+fn scan_separators(name: &[u8]) -> (bool, bool) {
+  let mut has_slash = false;
+  let mut has_backslash = false;
+  for &byte in name {
+    has_slash |= byte == b'/';
+    has_backslash |= byte == b'\\';
+  }
+  (has_slash, has_backslash)
+}
+
+/// Checks `.`, `..`, `.git*`, and symlink-only special names with a first-byte fast-path guard.
+fn check_special_names<'a>(
+  entry: &Entry<'a>,
+  flags: &mut Flags,
+  (checked, admission): (&mut Checked<'a>, &mut Admission),
+) -> Result<(), PastAdmission> {
+  let name = entry.name;
+  // Fast-path guard: dotfile/NTFS/HFS+ checks can only match names starting with `.`, `g`/`G`,
+  // `m`/`M` (for `.mailmap` on symlinks), `~`, or a non-ASCII UTF-8 lead byte (HFS+ ignorable).
+  let first = name.first().copied().unwrap_or(0);
+  let maybe_special = matches!(first, b'.' | b'g' | b'G' | b'~') || !first.is_ascii();
+  if first == b'.' {
+    flags.dot |= name == b".";
+    flags.dotdot |= name == b"..";
+  }
+  if maybe_special {
+    check_dotgit_names(entry, flags, (checked, admission))?;
+  }
+  if entry.is_symlink() {
+    if maybe_special && dotgit::dotgitignore(name) {
+      checked.report.report(FsckId::GitignoreSymlink);
+    }
+    if (maybe_special || matches!(first, b'm' | b'M')) && dotgit::dotmailmap(name) {
+      checked.report.report(FsckId::MailmapSymlink);
+    }
+  }
+  Ok(())
+}
+
+/// Checks `.git`, `.gitmodules`, and `.gitattributes` on candidate special names.
+fn check_dotgit_names<'a>(
+  entry: &Entry<'a>,
+  flags: &mut Flags,
+  (checked, admission): (&mut Checked<'a>, &mut Admission),
+) -> Result<(), PastAdmission> {
+  let name = entry.name;
+  flags.dotgit |= dotgit::dotgit(name);
+  if dotgit::dotgitmodules(name) {
+    gitmodules(entry, checked, admission)?;
+  }
+  if dotgit::dotgitattributes(name) {
+    if entry.is_symlink() {
+      checked.report.report(FsckId::GitattributesSymlink);
+    } else {
+      keep(&mut checked.gitattributes, entry.id, admission)?;
+    }
+  }
+  Ok(())
 }
 
 /// A `.gitmodules` entry: a symbolic link is `gitmodulesSymlink`, anything else is kept to be checked as the file.

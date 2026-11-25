@@ -180,3 +180,194 @@ fn works_over_a_green_cost_their_divergence_not_the_green() {
     sizes.works
   );
 }
+
+/// Step 4 (GAPS 2026-11-20): a single seed work carrying more than `CARRIED_INCREMENT_MAX` (default
+/// `16 × 256 KiB = 4 MiB` in CI; override with `SLATES_WORK_COW_SINGLE_FILES=1000` and
+/// `SLATES_WORK_COW_SINGLE_BYTES=1073741` for the full 1 GiB single-changeset seed) submits in ONE
+/// call across a multi-shard daemon without splitting the seed and without stalling any shard past
+/// the liveness window: `laid_post_state`, `IncrementEncoder`, `AheadHold`, and `Green::make_step`
+/// all slice cooperatively on both local and cross-shard owner paths.
+#[test]
+fn single_large_seed_work_submits_sliced_without_stalling_shards() {
+  let env_usize = |key: &str, default: usize| {
+    std::env::var(key)
+      .ok()
+      .map_or(default, |value| value.parse().unwrap())
+  };
+  let files = env_usize("SLATES_WORK_COW_SINGLE_FILES", 16);
+  let file_bytes = env_usize("SLATES_WORK_COW_SINGLE_BYTES", 256 * 1024);
+  let shards = env_usize("SLATES_WORK_COW_SINGLE_SHARDS", 4);
+  let profile = common::machine_profile();
+  let instance = format!("srv-single-seed-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(u16::try_from(shards).unwrap())),
+    slates_server::SegmentSource::Create {
+      name: format!("slates-seg-single-seed-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("single-seed-green", false).unwrap();
+  let seed = write_single_large_seed(&mut client, green, files, file_bytes);
+  let started = Instant::now();
+  match client.submit(seed).unwrap() {
+    Submitted::Accepted(version) => assert_eq!(version, 1),
+    other => panic!("single large seed submit was not accepted: {other:?}"),
+  }
+  let submit_wall = started.elapsed();
+  let (prepare_slices, ahead_named, submit_longest_us) = single_seed_counters(&mut client);
+  let submit_pulse_ms = pulse_longest_ms(&daemon);
+  assert!(
+    prepare_slices > 0,
+    "sliced preparation must run (non-vacuity)"
+  );
+  assert!(
+    ahead_named > 0,
+    "chunk-by-chunk AheadHold staging must supply the increment in O(1) (non-vacuity)"
+  );
+  verify_single_seed_green_readback(&mut client, green, files, file_bytes);
+  let land_wall = land_and_verify_single_seed(&daemon, &mut client, green, files, file_bytes);
+  let land_pulse_ms = pulse_longest_ms(&daemon);
+  println!(
+    "single_large_seed: {} files x {} B ({} MiB) on {shards} shards: submit={submit_wall:?} \
+     land={land_wall:?} prepare_slices={prepare_slices} ahead_named={ahead_named} \
+     submit_longest_us={submit_longest_us}us submit_pulse_longest={submit_pulse_ms}ms \
+     land_pulse_longest={land_pulse_ms}ms",
+    files,
+    file_bytes,
+    (files * file_bytes) / (1024 * 1024),
+  );
+  drop(client);
+  daemon.stop();
+}
+
+fn write_single_large_seed(
+  client: &mut Client,
+  green: VolumeId,
+  files: usize,
+  file_bytes: usize,
+) -> VolumeId {
+  let (seed, _) = client.create_work(green, "single-seed-work").unwrap();
+  let mut payload = vec![0u8; file_bytes];
+  let chunk_max = 256 * 1024;
+  for index in 0..files {
+    let fill = u8::try_from((index % 251) + 1).unwrap();
+    payload.fill(fill);
+    let mut off = 0usize;
+    while off < file_bytes {
+      let end = (off + chunk_max).min(file_bytes);
+      client
+        .edit(
+          seed,
+          &path(index),
+          u64::try_from(off).unwrap(),
+          0,
+          &payload[off..end],
+        )
+        .unwrap();
+      off = end;
+    }
+  }
+  seed
+}
+
+fn single_seed_counters(client: &mut Client) -> (u64, u64, u64) {
+  let status = client.daemon_status().unwrap();
+  let sum = |name: &str| -> u64 {
+    status
+      .shards
+      .iter()
+      .flat_map(|s| s.refusals.iter())
+      .filter(|r| r.kind == name)
+      .map(|r| r.count)
+      .sum()
+  };
+  let max = |name: &str| -> u64 {
+    status
+      .shards
+      .iter()
+      .flat_map(|s| s.refusals.iter())
+      .filter(|r| r.kind == name)
+      .map(|r| r.count)
+      .max()
+      .unwrap_or(0)
+  };
+  (
+    sum("merge.submit.prepare_slices"),
+    sum("push.held_ahead.named"),
+    max("merge.submit.longest_step_us"),
+  )
+}
+
+fn pulse_longest_ms(daemon: &Daemon) -> u64 {
+  daemon
+    .shard_pulses()
+    .into_iter()
+    .map(|p| p.longest_step_ns)
+    .max()
+    .unwrap_or(0)
+    / 1_000_000
+}
+
+fn verify_single_seed_green_readback(
+  client: &mut Client,
+  green: VolumeId,
+  files: usize,
+  file_bytes: usize,
+) {
+  for index in [0, files / 2, files - 1] {
+    let expected = u8::try_from((index % 251) + 1).unwrap();
+    let got = client.read(green, &path(index), ReadAt::Head).unwrap();
+    assert_eq!(got.len(), file_bytes, "file {index} length");
+    assert!(
+      got.iter().all(|&b| b == expected),
+      "file {index} bytes mismatch"
+    );
+  }
+}
+
+fn land_and_verify_single_seed(
+  daemon: &Daemon,
+  client: &mut Client,
+  green: VolumeId,
+  files: usize,
+  file_bytes: usize,
+) -> Duration {
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = common::target::target_dir();
+  let land_started = Instant::now();
+  let grant = common::landing::approve(client, &secret, green, None, &target.path);
+  match client.land(
+    green,
+    None,
+    &target.path,
+    slates_ipc::protocol::Filter::default(),
+    Some(grant),
+  ) {
+    Ok(slates_client::Landing::Landed(outcome)) => {
+      assert_eq!(outcome.state, "done");
+      // `outcome.written` counts both files and created parent directories (`dir-00..dir-63`).
+      assert!(
+        outcome.written >= u64::try_from(files).unwrap(),
+        "expected at least {files} written entries, got {}",
+        outcome.written
+      );
+    }
+    other => panic!("single large seed disk landing failed: {other:?}"),
+  }
+  let land_wall = land_started.elapsed();
+  for index in [0, files / 2, files - 1] {
+    let expected = u8::try_from((index % 251) + 1).unwrap();
+    let on_disk = std::fs::read(format!("{}/{}", target.path, path(index))).unwrap();
+    assert_eq!(on_disk.len(), file_bytes, "disk file {index} length");
+    assert!(
+      on_disk.iter().all(|&b| b == expected),
+      "disk file {index} bytes mismatch"
+    );
+  }
+  land_wall
+}

@@ -2625,6 +2625,48 @@ pub(crate) struct Taking {
 }
 
 impl Taking {
+  /// Prepares a read-only batch of self-contained changegroup revisions for parallel multi-shard
+  /// verification (`slates_hg::push::intake::verify_batch_item`). Batch size is derived from half
+  /// of `segment_resident_bytes` clamped to half of `room.left()`, keeping peak RAM bounded to one
+  /// segment while amortizing cross-shard dispatch across all shards (R3, R8).
+  fn prepare_batch(
+    &self,
+    state: &ShardState,
+    room: &Admission,
+  ) -> Option<Vec<slates_hg::push::intake::BatchWork>> {
+    let intake = self.intake.as_ref()?;
+    let (_, payload) = self.changegroup.as_ref()?;
+    let content = state.vcs_stores.content()?;
+    let resident_half = super::hg_run::segment_resident_bytes(state)
+      .checked_div(2)
+      .unwrap_or(0);
+    let room_half = room.left().checked_div(2).unwrap_or(0);
+    let max_bytes = resident_half.min(room_half);
+    let window = u64::try_from(content.window().max(1)).unwrap_or(1);
+    let max_items = usize::try_from(max_bytes.checked_div(window).unwrap_or(0))
+      .unwrap_or(usize::MAX)
+      .max(state.shards.len().saturating_mul(2))
+      .saturating_mul(state.shards.len().max(1));
+    intake.prepare_batch(payload.as_slice(), content, room, (max_bytes, max_items))
+  }
+
+  /// Commits a worker-verified batch in exact changegroup order on the owner shard.
+  fn apply_batch(
+    &mut self,
+    state: &mut ShardState,
+    lend: u64,
+    room: &mut Admission,
+    done: Vec<slates_hg::push::intake::BatchDone>,
+  ) -> Option<Result<(), IntakeRefused>> {
+    let intake = self.intake.as_mut()?;
+    let applied = vcs_store::within_budget(state, lend, |stores| {
+      let content = stores.content_mut()?;
+      Some(intake.apply_batch(content, room, done))
+    });
+    state.count(INTAKE_SLICES, 1);
+    applied
+  }
+
   /// One slice: units taken until the intake is done or the shard's quantum is spent, within the room `lend` gives the
   /// stores; none when the content store is gone.
   fn slice(
@@ -2860,10 +2902,170 @@ async fn store_wants_answered(taking: &mut Taking, repository: RepositoryId) -> 
     .then_some(())
 }
 
-/// `take_sliced`'s steps: a slice at a time, a yield between slices, until the intake is done, the segments each slice
-/// cut landed after it ([`segments_landed`]). A file delta's base landed before the push is read from the node's
-/// changeset store between slices (A-767 C1); a step past its admission waits and is taken again (`retaken`). The
-/// push's refusal where one is; none where the store went away.
+/// One segment changeset currently landing asynchronously on `slates-store` while all shards
+/// verify and ingest the next segment in parallel (at most one in flight, bounding resident texts
+/// to two segments while hiding `F_FULLFSYNC` latency; cancel-safe via `disk.forget` on drop).
+struct InFlightSegment {
+  segment: PushSegment,
+  sequence: u64,
+  outcome: slates_rt::sync::ChannelReceiver<bool>,
+}
+
+/// Awaits and settles any in-flight segment landing, updating `run` and returning its charged
+/// admission room.
+async fn flush_segment(
+  in_flight: &mut Option<InFlightSegment>,
+  room: &mut Admission,
+  run: &mut super::hg_run::Run,
+) -> Option<Result<(), PushOutcome>> {
+  let Some(mut pending) = in_flight.take() else {
+    return Some(Ok(()));
+  };
+  let ok = pending.outcome.recv().await.unwrap_or(false);
+  let settled = crate::state::with_state(|state| {
+    landed_segment(state, (run, &pending.segment), pending.sequence, ok)
+  })?;
+  if let Err(outcome) = settled {
+    return Some(Err(outcome));
+  }
+  room.give_back(pending.segment.charged);
+  #[cfg(test)]
+  super::hg_run::parked_for_a_crash(run).await;
+  Some(Ok(()))
+}
+
+/// Handles an intake step refusal: if an in-flight segment holds admission room and the refusal is
+/// `PastAdmission`, flushes the segment first so its room returns; otherwise falls through to
+/// [`retaken`].
+async fn handle_step_refusal(
+  repository: RepositoryId,
+  (taking, refused): (&mut Taking, IntakeRefused),
+  (room, admitted): (&mut Admission, &mut u64),
+  (run, in_flight): (&mut super::hg_run::Run, &mut Option<InFlightSegment>),
+) -> Option<Result<(), PushOutcome>> {
+  if in_flight.is_some() && refused.past_admission().is_some() {
+    return flush_segment(in_flight, room, run).await;
+  }
+  retaken(repository, (taking, refused), (room, admitted)).await
+}
+
+/// Runs one multi-shard parallel verification batch if `taking` is at a batchable stage.
+/// Returns `Some(Ok(true))` when a batch was executed (caller should loop), `Some(Ok(false))` when
+/// no batch was ready (fall through to `taking.slice`), `Some(Err(outcome))` on refusal, or `None`
+/// if the store or shard went away.
+async fn try_batch_step(
+  repository: RepositoryId,
+  taking: &mut Taking,
+  lend: u64,
+  (room, admitted): (&mut Admission, &mut u64),
+  (run, in_flight): (&mut super::hg_run::Run, &mut Option<InFlightSegment>),
+) -> Option<Result<bool, PushOutcome>> {
+  let (origin, shards, quantum_ns, batch) = crate::state::with_state(|state| {
+    (
+      state.shard,
+      state.shards.clone(),
+      state.config.step_quantum_ns(),
+      taking.prepare_batch(state, room),
+    )
+  })?;
+  let Some(batch) = batch else {
+    return Some(Ok(false));
+  };
+  let done = crate::xshard::scatter_compute(
+    origin,
+    &shards,
+    batch,
+    slates_hg::push::intake::BatchWork::weight,
+    slates_hg::push::intake::verify_batch_item,
+    quantum_ns,
+  )
+  .await?;
+  let applied =
+    crate::state::with_state(|state| taking.apply_batch(state, lend, room, done)).flatten()?;
+  if let Err(outcome) =
+    segments_pipelined(repository, taking, (room, *admitted), (run, in_flight)).await?
+  {
+    return Some(Err(outcome));
+  }
+  if let Err(refused) = applied
+    && let Err(outcome) = handle_step_refusal(
+      repository,
+      (taking, refused),
+      (room, admitted),
+      (run, in_flight),
+    )
+    .await?
+  {
+    return Some(Err(outcome));
+  }
+  slates_rt::futures::yield_now().await;
+  Some(Ok(true))
+}
+
+/// Runs one serial intake slice (when no multi-shard batch applies) and pipelines any cut segments.
+/// Returns `Some(Ok(true))` when intake is done, `Some(Ok(false))` to continue looping.
+async fn step_serial_slice(
+  repository: RepositoryId,
+  taking: &mut Taking,
+  lend: u64,
+  (room, admitted): (&mut Admission, &mut u64),
+  (run, in_flight): (&mut super::hg_run::Run, &mut Option<InFlightSegment>),
+) -> Option<Result<bool, PushOutcome>> {
+  let stepped = crate::state::with_state(|state| taking.slice(state, lend, room)).flatten()?;
+  if matches!(stepped, Ok(Stepped::Done)) {
+    taking.cut_rest();
+  }
+  if let Err(outcome) =
+    segments_pipelined(repository, taking, (room, *admitted), (run, in_flight)).await?
+  {
+    return Some(Err(outcome));
+  }
+  settle_serial_outcome(
+    repository,
+    (taking, stepped),
+    (room, admitted),
+    (run, in_flight),
+  )
+  .await
+}
+
+/// Completes the outcome of one serial slice after any cut segments have been pipelined.
+async fn settle_serial_outcome(
+  repository: RepositoryId,
+  (taking, stepped): (&mut Taking, Result<Stepped, IntakeRefused>),
+  (room, admitted): (&mut Admission, &mut u64),
+  (run, in_flight): (&mut super::hg_run::Run, &mut Option<InFlightSegment>),
+) -> Option<Result<bool, PushOutcome>> {
+  match stepped {
+    Ok(Stepped::More) => {
+      slates_rt::futures::yield_now().await;
+      Some(Ok(false))
+    }
+    Ok(Stepped::Done) => Some(flush_segment(in_flight, room, run).await?.map(|()| true)),
+    Ok(Stepped::Store) => {
+      if let Err(outcome) = flush_segment(in_flight, room, run).await? {
+        return Some(Err(outcome));
+      }
+      store_wants_answered(taking, repository).await?;
+      Some(Ok(false))
+    }
+    Ok(Stepped::Wanted(range)) => Some(Err(intake_outcome(&whole_wanted(&[], range)))),
+    Err(refused) => Some(
+      handle_step_refusal(
+        repository,
+        (taking, refused),
+        (room, admitted),
+        (run, in_flight),
+      )
+      .await?
+      .map(|()| false),
+    ),
+  }
+}
+
+/// `take_sliced`'s steps: multi-shard verification batches where eligible, falling back to a serial
+/// slice for single-unit/pending/store-wait steps, pipelining segment disk landings with compute
+/// until the intake is done.
 async fn stepped_to_end(
   repository: RepositoryId,
   taking: &mut Taking,
@@ -2871,77 +3073,81 @@ async fn stepped_to_end(
   (room, admitted): (&mut Admission, &mut u64),
   run: &mut super::hg_run::Run,
 ) -> Option<Result<(), PushOutcome>> {
+  let mut in_flight: Option<InFlightSegment> = None;
   loop {
-    let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
-    let stepped = sliced.flatten()?;
-    let last = matches!(stepped, Ok(Stepped::Done));
-    if last {
-      taking.cut_rest();
+    match try_batch_step(
+      repository,
+      taking,
+      lend,
+      (room, admitted),
+      (run, &mut in_flight),
+    )
+    .await?
+    {
+      Ok(true) => continue,
+      Ok(false) => {}
+      Err(outcome) => {
+        let _ = flush_segment(&mut in_flight, room, run).await;
+        return Some(Err(outcome));
+      }
     }
-    if let Err(outcome) = segments_landed(repository, taking, (room, *admitted), run).await? {
-      return Some(Err(outcome));
-    }
-    match stepped {
-      Ok(Stepped::More) => slates_rt::futures::yield_now().await,
-      Ok(Stepped::Done) => return Some(Ok(())),
-      Ok(Stepped::Store) => store_wants_answered(taking, repository).await?,
-      // The slice answers a whole changegroup's want as its truncation; none reaches here.
-      Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
-      Err(refused) => {
-        if let Err(outcome) = retaken(
-          repository,
-          (&mut *taking, refused),
-          (&mut *room, &mut *admitted),
-        )
-        .await?
-        {
-          return Some(Err(outcome));
-        }
+    match step_serial_slice(
+      repository,
+      taking,
+      lend,
+      (room, admitted),
+      (run, &mut in_flight),
+    )
+    .await?
+    {
+      Ok(true) => return Some(Ok(())),
+      Ok(false) => {}
+      Err(outcome) => {
+        let _ = flush_segment(&mut in_flight, room, run).await;
+        return Some(Err(outcome));
       }
     }
   }
 }
 
-/// Lands each segment `taking` has cut, oldest first, at its repository's next sequences ([`hg_run`](super::hg_run),
-/// apart from the landing turn), noted in `run`, what its texts charged given back to `room` once it lands. The push's
-/// refusal where a segment was refused; none where the store went away.
-async fn segments_landed(
+/// Pipelines each segment `taking` has cut onto `slates-store` (at most one `disk.land` in flight),
+/// flushing the previous in-flight landing before launching the next.
+async fn segments_pipelined(
   repository: RepositoryId,
   taking: &mut Taking,
   (room, admitted): (&mut Admission, u64),
-  run: &mut super::hg_run::Run,
+  (run, in_flight): (&mut super::hg_run::Run, &mut Option<InFlightSegment>),
 ) -> Option<Result<(), PushOutcome>> {
   while let Some(segment) = taking.take_segment() {
-    run.admission_held(admitted.saturating_sub(room.left()));
-    if let Err(outcome) = segment_landed(repository, taking, &segment, run).await? {
+    if let Err(outcome) = flush_segment(in_flight, room, run).await? {
       return Some(Err(outcome));
     }
-    room.give_back(segment.charged);
-    #[cfg(test)]
-    super::hg_run::parked_for_a_crash(run).await;
+    run.admission_held(admitted.saturating_sub(room.left()));
+    if let Err(outcome) =
+      start_segment_land(repository, taking, segment, (room, run), in_flight).await?
+    {
+      return Some(Err(outcome));
+    }
   }
   Some(Ok(()))
 }
 
-/// `segment` of `taking` landed on the node's store as a changeset at its repository's next sequence
-/// ([`hg_run::segment_changeset`](super::hg_run::segment_changeset)), noted in `run` ([`landed_segment`]); `UNLANDED`
-/// where it could not be made or the store refused it; none where the store went away.
-async fn segment_landed(
+/// Builds `segment`'s record and launches its `disk.land` asynchronously into `in_flight` (or
+/// settles synchronously if a test crash-point is armed or spawning fails).
+async fn start_segment_land(
   repository: RepositoryId,
   taking: &Taking,
-  segment: &PushSegment,
-  run: &mut super::hg_run::Run,
+  segment: PushSegment,
+  (room, run): (&mut Admission, &mut super::hg_run::Run),
+  in_flight: &mut Option<InFlightSegment>,
 ) -> Option<Result<(), PushOutcome>> {
-  // A-740: a shard stuck landing a segment names it.
   let _doing = slates_rt::futures::doing("hg_push::segment");
   let (intake, (_, payload)) = (taking.intake.as_ref()?, taking.changegroup.as_ref()?);
   let unlanded = || Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
-  let Ok(mut writer) = intake.record_writer(segment, taking.room) else {
+  let Ok(mut writer) = intake.record_writer(&segment, taking.room) else {
     return unlanded();
   };
   let mut costs = vcs_store::TurnCosts::ZERO;
-  // The record a turn's steps at a time, a yield between turns (the slice rule: a whole segment's record in one step
-  // ran 316 ms on the big Studio, r499).
   loop {
     match crate::state::with_state(|state| record_turn(state, intake, &mut writer, &mut costs))?? {
       Ok(true) => slates_rt::futures::yield_now().await,
@@ -2953,14 +3159,44 @@ async fn segment_landed(
     return unlanded();
   };
   let changeset = crate::state::with_state(|state| {
-    super::hg_run::segment_changeset(state, repository, (segment, payload), written)
+    super::hg_run::segment_changeset(state, repository, (&segment, payload), written)
   })?;
   let Some(Ok((disk, header, parts))) = changeset else {
-    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
+    return unlanded();
   };
   let sequence = header.sequence;
+  #[cfg(test)]
+  let must_sync = super::hg_run::TEST_PARK_AFTER_SEGMENTS.with(core::cell::Cell::get) > 0;
+  #[cfg(not(test))]
+  let must_sync = false;
+  if !must_sync && let Ok((tx, rx)) = slates_rt::sync::channel::<bool>(1) {
+    let key = u128::from_be_bytes(repository.bytes);
+    let spawned = slates_rt::futures::spawn_detached(async move {
+      let ok = disk.land(header, parts).await.is_ok();
+      if tx.try_send(ok).is_err() && ok {
+        let _ = disk.forget(key, sequence).await;
+      }
+    });
+    if spawned.is_ok() {
+      *in_flight = Some(InFlightSegment {
+        segment,
+        sequence,
+        outcome: rx,
+      });
+      return Some(Ok(()));
+    }
+    return unlanded();
+  }
   let ok = disk.land(header, parts).await.is_ok();
-  crate::state::with_state(|state| landed_segment(state, (run, segment), sequence, ok))
+  let settled =
+    crate::state::with_state(|state| landed_segment(state, (run, &segment), sequence, ok))?;
+  if let Err(outcome) = settled {
+    return Some(Err(outcome));
+  }
+  room.give_back(segment.charged);
+  #[cfg(test)]
+  super::hg_run::parked_for_a_crash(run).await;
+  Some(Ok(()))
 }
 
 /// Counter: the turns a push's segment records were written in, a turn's steps under the shard's paced turn each

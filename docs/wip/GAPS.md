@@ -26606,7 +26606,7 @@ three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,
 256 MiB burst (bound: under a quarter of the burst). The same with the wait's original 250 ms sleep as with a yield, so
 the wait is not the cause. Not chased.
 
-### 2026-11-20: one submit of a 1 GiB or 100,000-file changeset holds its shard past the liveness window — 100,000-file submit CLOSED (Wave 9 `e03254380`, 2026-11-24); 1 GiB landing-side slicing still open
+### 2026-11-20: one submit of a 1 GiB or 100,000-file changeset holds its shard past the liveness window — CLOSED (Wave 9 `e03254380`, 2026-11-24; A-892, 2026-11-25)
 A seed work holding a whole 1 GiB green (1,000 files of 1 MiB) or a 32 MiB green of 100,000 files, submitted at once,
 spun shard 0 for 1,097 ms of CPU without a step against its 1,025 ms window; with no anchor the watchdog ended the
 daemon (exit 4: "shard 0 is spinning ... in task spawned at crates/server/src/identities.rs:243"). Release, Mac Studio
@@ -26617,7 +26617,25 @@ before its seed was split.
   large (`> CARRIED_INCREMENT_MAX`) local and off-owner submits across shard turns under the step quantum. Verified:
   `edit_merge_bench --quiet-only --files 100000` now completes 3/3 runs across all 5 forms (`accept`, `identical`,
   `conflict`, `rebase`, `accept_one`) with 0 watchdog kills and flat p50 (`26.8–44.2 µs`).
-- **Remaining:** landing-side slicing for a single 1 GiB seed changeset if landed in one turn.
+- **Closed for 1 GiB single-changeset submit, checkpoint, and disk landing (A-892, 2026-11-25):**
+  1. **Submit & commit (local and cross-shard):** `laid_post_state` reserves virtually with zero upfront zero-fill and
+     copies per-op sub-slices (`verbs::lay_op_slice`); `IncrementEncoder` encodes in `copy_slice_bytes` slices;
+     `AheadHold::from_encoded` stages large encodings chunk-by-chunk into `state.held_content` and frees the buffer
+     before `Green::judge_computed_taking` + sliced `Green::make_step` + `Judged::restore_buffers_into` + O(files)
+     zero-copy `Green::commit_judged_for`; cross-shard `owner_judge` runs the exact same cooperative pipeline via
+     `refining::start_owner_prepare`; accepted large works drop old buffers cooperatively via `WorkFiles::pop_one`
+     after `tell_floor`.
+  2. **Checkpointing:** `CheckpointEncoder` + `Value::append_range` stream carried files directly from `content_history`
+     into one pre-sized buffer a copy slice at a time (`CHUNK_ENCODED` pace kind), eliminating the synchronous 2 GiB
+     clone+encode and 450 ms single-poll stall in `CheckpointHold::begin`.
+  3. **Disk landing:** `slates-land` slices existing-file BLAKE3 hashing in `Phase::Validate` per `HASH_READ_BYTES`
+     (64 KiB) unit (`FileHash`, closing handles in `LandingRun::abandon`) and streams `manifest::file_identity` in
+     64 KiB chunks instead of allocating per-file buffers.
+  4. **Evidence:** `SLATES_WORK_COW_SINGLE_FILES=1000 SLATES_WORK_COW_SINGLE_BYTES=1073741 SLATES_WORK_COW_SINGLE_SHARDS=4`
+     `work_cow::single_large_seed` passes in release (`submit=3.186s`, `land=4.983s`, `prepare_slices=333,975`,
+     `ahead_named=1`, `submit_longest_us=1,492 µs`, `submit_pulse_longest=185 ms`, `land_pulse_longest=185 ms`, 0
+     watchdog kills, 0 near-misses, `kern.num_files: 14,325 → 14,320`); `slates-merge` byte-exact encoder/checkpoint
+     oracles (2/2) and `slates-land --test oracle` (33/33, including sliced validation hashing) pass.
 
 ### 2026-11-20: the Codex agent's Green/Work and atomic-conflict branches against main — recorded (w-work-cow; main's order, the unowned UI goal)
 The Codex agent (Codex 01a1bdab, "Kiln vs T3code Features") left 476 slates branches on adacachy (~/Projects/slates: work/slates-*,

@@ -388,3 +388,358 @@ fn a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole() {
     assert_eq!(written, answer_to(&whole), "{}", scenario.name);
   }
 }
+
+/// Deferred test site keyed by `ObjectId`, matching `crates/server/src/git_push/intake.rs`.
+struct DeferredSite<'a> {
+  repository: &'a Repo,
+  kept: std::collections::BTreeMap<crate::object_name::ObjectId, Vec<u8>>,
+}
+
+impl crate::receive::Repository for DeferredSite<'_> {
+  fn object(&self, id: &crate::object_name::ObjectId) -> Option<(crate::object_name::Kind, &[u8])> {
+    self.repository.object(id)
+  }
+
+  fn holds(&self, id: &crate::object_name::ObjectId) -> bool {
+    self.repository.holds(id)
+  }
+}
+
+impl crate::unpack::Contents for DeferredSite<'_> {
+  fn content(
+    &self,
+    _at: usize,
+    id: &crate::object_name::ObjectId,
+  ) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .kept
+      .get(id)
+      .map(|bytes| std::borrow::Cow::Borrowed(bytes.as_slice()))
+  }
+}
+
+impl crate::unpack::Keep for DeferredSite<'_> {
+  fn keep(
+    &mut self,
+    _at: usize,
+    object: crate::unpack::Object,
+    hold: crate::Hold,
+    admission: &mut crate::Admission,
+  ) -> Result<(), crate::unpack::Refusal> {
+    self.kept.insert(object.id, object.content);
+    admission.release(hold);
+    Ok(())
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut crate::Admission) {
+    admission.release(hold);
+  }
+}
+
+/// Verifies `batch` via `verify_unpacked`, settles into `session` and `site`, and records any first
+/// verification error.
+fn flush_deferred_batch(
+  session: &mut Session<'_, &super::HideRefs>,
+  site: &mut DeferredSite<'_>,
+  admission: &mut crate::Admission,
+  batch: &mut crate::unpack::DeferredBatch,
+  deferred_error: &mut Option<crate::unpack::Refusal>,
+) {
+  let items = batch.take();
+  if items.is_empty() {
+    return;
+  }
+  let format = session.format();
+  let room = admission.left();
+  let verified: Vec<_> = items
+    .into_iter()
+    .map(|obj| crate::receive::verify_unpacked(format, room, obj))
+    .collect();
+  let (settled, err) = session.settle_deferred(verified, site.repository, admission);
+  if deferred_error.is_none() {
+    *deferred_error = err;
+  }
+  for item in settled {
+    assert_eq!(
+      item.placed.identity,
+      slates_vcs::ContentId::of(&item.content),
+      "precomputed BLAKE3 identity matches object bytes"
+    );
+    site.kept.insert(item.placed.id, item.content);
+    admission.release(item.hold);
+  }
+}
+
+fn settle_items(
+  session: &mut Session<'static, &'static super::HideRefs>,
+  site: &mut DeferredSite<'_>,
+  admission: &mut crate::Admission,
+  items: Vec<crate::unpack::Unverified>,
+  deferred_error: &mut Option<crate::unpack::Refusal>,
+) {
+  if items.is_empty() {
+    return;
+  }
+  let format = session.format();
+  let room = admission.left();
+  let verified: Vec<_> = items
+    .into_iter()
+    .map(|obj| crate::receive::verify_unpacked(format, room, obj))
+    .collect();
+  let (settled, err) = session.settle_deferred(verified, site.repository, admission);
+  if deferred_error.is_none() {
+    *deferred_error = err;
+  }
+  for item in settled {
+    site.kept.insert(item.placed.id, item.content);
+    admission.release(item.hold);
+  }
+}
+
+fn drive_deferred_resolve(
+  session: &mut Session<'static, &'static super::HideRefs>,
+  site: &mut DeferredSite<'_>,
+  admission: &mut crate::Admission,
+  batch: &mut crate::unpack::DeferredBatch,
+  resolve_target: u64,
+) -> Result<bool, crate::receive::Refusal> {
+  let mut clock = super::Ticking(0);
+  let mut deferred_error: Option<crate::unpack::Refusal> = None;
+  while session.is_resolving() {
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    match session.resolve_turn_deferred(site, admission, batch, (resolve_target, quantum)) {
+      Ok(crate::unpack::DeferredResolve::Batch | crate::unpack::DeferredResolve::Away) => {
+        settle_items(session, site, admission, batch.take(), &mut deferred_error);
+        if let Some(err) = deferred_error.take() {
+          session.finish_resolving_with_error(err, site, admission);
+          break;
+        }
+      }
+      Ok(crate::unpack::DeferredResolve::Done) => break,
+      Err(err) => {
+        batch.release_all(admission);
+        return Err(err);
+      }
+    }
+  }
+  let mut checked = Ok(true);
+  while session.is_checking() {
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    checked = session.check_turn_with((&*site, &*site), admission, quantum);
+    if !matches!(checked, Ok(false)) {
+      break;
+    }
+  }
+  if checked == Ok(false) {
+    checked = Ok(session.checked().is_some());
+  }
+  checked
+}
+
+/// Feeds `bytes` through the multi-shard deferred verification API, flushing after every
+/// `batch_limit` unpacked objects (including `batch_limit = 1` to force cross-batch `OFS_DELTA`
+/// resolution), and compares against serial `Session::input`.
+fn fed_deferred(bytes: &[u8], piece: usize, batch_limit: usize, repository: &Repo) -> Answered {
+  let mut session = Session::new(&ADVERTISED, &HIDDEN);
+  let mut site = DeferredSite {
+    repository,
+    kept: std::collections::BTreeMap::new(),
+  };
+  let mut admission = unbounded();
+  let mut batch = crate::unpack::DeferredBatch::default();
+  let mut deferred_error: Option<crate::unpack::Refusal> = None;
+  let mut checked = Ok(false);
+  for chunk in bytes.chunks(piece) {
+    match session.input_deferred(chunk, &mut site, &mut admission, &mut batch) {
+      Ok(crate::receive::DeferredInput::Ready) => {
+        checked = Ok(true);
+        break;
+      }
+      Ok(crate::receive::DeferredInput::More) if batch.len() >= batch_limit => {
+        flush_deferred_batch(
+          &mut session,
+          &mut site,
+          &mut admission,
+          &mut batch,
+          &mut deferred_error,
+        );
+      }
+      Ok(crate::receive::DeferredInput::More) => {}
+      Ok(crate::receive::DeferredInput::PackEnded(read)) => {
+        flush_deferred_batch(
+          &mut session,
+          &mut site,
+          &mut admission,
+          &mut batch,
+          &mut deferred_error,
+        );
+        let read = deferred_error.take().map_or(read, Err);
+        checked = session.finish_deferred(read, &mut site, &mut admission);
+        break;
+      }
+      Err(err) => {
+        batch.release_all(&mut admission);
+        checked = Err(err);
+        break;
+      }
+    }
+  }
+  if checked == Ok(false) {
+    flush_deferred_batch(
+      &mut session,
+      &mut site,
+      &mut admission,
+      &mut batch,
+      &mut deferred_error,
+    );
+    checked = match deferred_error.take() {
+      Some(err) => session.finish_deferred(Err(err), &mut site, &mut admission),
+      None => session.end_into(&mut site, &mut admission),
+    };
+  }
+  if checked == Ok(true) {
+    let target = u64::try_from(batch_limit).unwrap_or(u64::MAX);
+    checked = drive_deferred_resolve(&mut session, &mut site, &mut admission, &mut batch, target);
+    assert!(batch.is_empty());
+  }
+  let mut written = Vec::new();
+  let result = checked.and_then(|_| {
+    let mut policy = git_policy(repository);
+    session.answer_with(&mut policy, Some(&site), &mut written, &mut admission)
+  });
+  Answered { result, written }
+}
+
+/// Multi-shard deferred receive-pack verification oracle: across all 11 captured stock-git
+/// scenarios and multiple piece + batch flush sizes (including 1-object batches forcing cross-batch
+/// `OFS_DELTA` waits resolved through `resolve_turn_deferred`), deferred verification produces
+/// byte-identical wire replies and `Received` state to serial `Session::input`.
+#[test]
+fn deferred_session_matches_serial_session_across_all_scenarios_and_batch_splits() {
+  for scenario in scenarios() {
+    let repository = Repo::from_pack(scenario.before_pack);
+    let serial = fed_in_pieces(scenario.request, 61, &repository);
+    for (piece, batch_limit) in [(1, 1), (17, 1), (61, 2), (usize::MAX, 1), (usize::MAX, 64)] {
+      let deferred = fed_deferred(scenario.request, piece, batch_limit, &repository);
+      assert_eq!(
+        deferred.written, serial.written,
+        "{} (piece={piece}, batch_limit={batch_limit})",
+        scenario.name
+      );
+      assert_eq!(
+        deferred.result, serial.result,
+        "{} (piece={piece}, batch_limit={batch_limit})",
+        scenario.name
+      );
+    }
+  }
+}
+
+fn fed_pipelined_overlap(request: &[u8], repository: &Repo) -> Answered {
+  let mut session = Session::new(&ADVERTISED, &HIDDEN);
+  let mut site = DeferredSite {
+    repository,
+    kept: std::collections::BTreeMap::new(),
+  };
+  let mut admission = unbounded();
+  let mut pending = crate::unpack::DeferredBatch::default();
+  let mut in_flight: Vec<crate::unpack::Unverified> = Vec::new();
+  let mut deferred_error: Option<crate::unpack::Refusal> = None;
+  let mut checked = Ok(false);
+  for chunk in request.chunks(19) {
+    match session.input_deferred(chunk, &mut site, &mut admission, &mut pending) {
+      Ok(crate::receive::DeferredInput::Ready) => {
+        checked = Ok(true);
+        break;
+      }
+      Ok(crate::receive::DeferredInput::More) if !pending.is_empty() => {
+        let prev = core::mem::replace(&mut in_flight, pending.take());
+        settle_items(
+          &mut session,
+          &mut site,
+          &mut admission,
+          prev,
+          &mut deferred_error,
+        );
+      }
+      Ok(crate::receive::DeferredInput::More) => {}
+      Ok(crate::receive::DeferredInput::PackEnded(read)) => {
+        settle_items(
+          &mut session,
+          &mut site,
+          &mut admission,
+          core::mem::take(&mut in_flight),
+          &mut deferred_error,
+        );
+        settle_items(
+          &mut session,
+          &mut site,
+          &mut admission,
+          pending.take(),
+          &mut deferred_error,
+        );
+        let read = deferred_error.take().map_or(read, Err);
+        checked = session.finish_deferred(read, &mut site, &mut admission);
+        break;
+      }
+      Err(err) => {
+        for obj in core::mem::take(&mut in_flight) {
+          admission.release(obj.hold);
+        }
+        pending.release_all(&mut admission);
+        checked = Err(err);
+        break;
+      }
+    }
+  }
+  if checked == Ok(false) {
+    settle_items(
+      &mut session,
+      &mut site,
+      &mut admission,
+      core::mem::take(&mut in_flight),
+      &mut deferred_error,
+    );
+    settle_items(
+      &mut session,
+      &mut site,
+      &mut admission,
+      pending.take(),
+      &mut deferred_error,
+    );
+    checked = match deferred_error.take() {
+      Some(err) => session.finish_deferred(Err(err), &mut site, &mut admission),
+      None => session.end_into(&mut site, &mut admission),
+    };
+  }
+  if checked == Ok(true) {
+    checked = drive_deferred_resolve(&mut session, &mut site, &mut admission, &mut pending, 1);
+  }
+  let mut written = Vec::new();
+  let result = checked.and_then(|_| {
+    let mut policy = git_policy(repository);
+    session.answer_with(&mut policy, Some(&site), &mut written, &mut admission)
+  });
+  Answered { result, written }
+}
+
+/// Pipelined overlap oracle: simulates `ReceivePack::input_pipelined` holding batch N in flight
+/// while batch N+1 unpacks (forcing `OFS_DELTA` entries referencing batch N into `State::Waiting`
+/// and then through `Session::resolve_turn_deferred`), verifying byte-identical wire replies and
+/// `Received` state against serial `Session::input` on all 11 scenarios.
+#[test]
+fn pipelined_overlap_deferred_resolve_matches_serial_across_all_scenarios() {
+  for scenario in scenarios() {
+    let repository = Repo::from_pack(scenario.before_pack);
+    let serial = fed_in_pieces(scenario.request, 61, &repository);
+    let overlap = fed_pipelined_overlap(scenario.request, &repository);
+    assert_eq!(overlap.written, serial.written, "overlap {}", scenario.name);
+    assert_eq!(overlap.result, serial.result, "overlap {}", scenario.name);
+  }
+}

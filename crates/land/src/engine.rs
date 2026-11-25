@@ -82,7 +82,7 @@ const STAGE_MODE: u32 = 0o700;
 /// Format: the read buffer for hashing a file the verdict must identify; one page's worth of
 /// slots keeps the loop bounded per call (the design's chunk window is 64 KiB; hashing reads
 /// are cold-path).
-const HASH_READ_BYTES: usize = 65_536;
+pub(crate) const HASH_READ_BYTES: usize = 65_536;
 
 /// The landing's state (§4.15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3959,12 +3959,210 @@ impl<H> HostSlot<'_, H> {
   }
 }
 
+/// In-progress chunked BLAKE3 hash of an existing disk file during [`Phase::Validate`], allowing
+/// `LandingRun::unit` to hash large files one `HASH_READ_BYTES` slice per turn without stalling
+/// its shard past the step budget.
+struct FileHash {
+  file: HostFile,
+  fingerprint: Fingerprint,
+  length: u64,
+  off: u64,
+  hasher: blake3::Hasher,
+}
+
+/// Result of one validation unit in [`LandingRun`].
+enum ValidateStep {
+  /// Entry validation completed with its report.
+  Done(EntryReport),
+  /// Regular file on disk is larger than one `HASH_READ_BYTES` chunk; continue hashing next unit.
+  Hashing(Box<FileHash>),
+}
+
+impl<'a, 'b, H: LandFs> Landing<'a, 'b, H> {
+  /// Begins validating `entry`, hashing at most one `HASH_READ_BYTES` chunk if the existing file on
+  /// disk requires content hashing and exceeds one chunk.
+  fn begin_validate_entry(
+    &mut self,
+    entry: &LandingEntry,
+    ours: &Ours,
+  ) -> Result<ValidateStep, HostError> {
+    let hash = self.needs_hash(entry)?;
+    self.touched.insert(split(&entry.path).0.into());
+    let check_ours = match (&entry.action, entry.judged) {
+      (Action::Clear, _) => Some(&ours.created),
+      (Action::Rmdir, Judged::Content) => Some(&ours.removed),
+      _ => None,
+    };
+    if let Action::Rename { from } = &entry.action {
+      self.touched.insert(split(from).0.into());
+      let disk = self.rename_state(from, &entry.path)?;
+      return self
+        .finish_validate_entry(entry, disk)
+        .map(ValidateStep::Done);
+    }
+    match self.disk_state_step(&entry.path, hash, check_ours)? {
+      DiskStep::Ready(disk) => self
+        .finish_validate_entry(entry, disk)
+        .map(ValidateStep::Done),
+      DiskStep::Hashing(fh) => Ok(ValidateStep::Hashing(fh)),
+    }
+  }
+
+  /// Advances an in-progress validation hash by one `HASH_READ_BYTES` chunk; closes the file and
+  /// finishes the entry's verdict once all bytes up to the captured length have been hashed.
+  fn continue_validate_entry(
+    &mut self,
+    entry: &LandingEntry,
+    mut fh: Box<FileHash>,
+  ) -> Result<ValidateStep, HostError> {
+    match self.hash_file_chunk(&mut fh) {
+      Ok(false) => Ok(ValidateStep::Hashing(fh)),
+      Ok(true) => {
+        self.host.close_file(fh.file);
+        let disk = DiskState::File {
+          fingerprint: fh.fingerprint,
+          identity: Some(*fh.hasher.finalize().as_bytes()),
+        };
+        self
+          .finish_validate_entry(entry, disk)
+          .map(ValidateStep::Done)
+      }
+      Err(error) => {
+        self.host.close_file(fh.file);
+        Err(error)
+      }
+    }
+  }
+
+  /// Finalizes an entry's validation report once its [`DiskState`] has been observed.
+  fn finish_validate_entry(
+    &mut self,
+    entry: &LandingEntry,
+    disk: DiskState,
+  ) -> Result<EntryReport, HostError> {
+    let v = match entry.judged {
+      Judged::Witness => {
+        let witness = self.witness_of(entry);
+        verdict(
+          &entry.action,
+          witness.as_ref(),
+          disk,
+          entry.overlay.as_ref(),
+        )
+      }
+      Judged::Content => self.judge_by_content(entry, disk)?,
+    };
+    Ok(EntryReport {
+      path: entry.path.clone(),
+      action: entry.action.clone(),
+      verdict: Some(v),
+      outcome: None,
+      window_ns: None,
+    })
+  }
+
+  /// One chunk of [`FileHash`]: returns `Ok(true)` once all captured bytes are hashed (or EOF).
+  fn hash_file_chunk(&mut self, fh: &mut FileHash) -> Result<bool, HostError> {
+    if fh.off >= fh.length {
+      return Ok(true);
+    }
+    let mut buf = vec![0u8; HASH_READ_BYTES];
+    let take = usize::try_from(fh.length.saturating_sub(fh.off))
+      .unwrap_or(buf.len())
+      .min(buf.len());
+    let n = self
+      .host
+      .read_at(fh.file, fh.off, buf.get_mut(..take).unwrap_or_default())?;
+    if n == 0 {
+      return Ok(true);
+    }
+    fh.hasher.update(buf.get(..n).unwrap_or_default());
+    fh.off = fh.off.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    Ok(fh.off >= fh.length)
+  }
+
+  /// Sliced counterpart of [`Landing::disk_state`]: hashes at most one `HASH_READ_BYTES` chunk of
+  /// an existing regular file before returning [`DiskStep::Hashing`].
+  fn disk_state_step(
+    &mut self,
+    path: &str,
+    hash: bool,
+    ours: Option<&BTreeSet<String>>,
+  ) -> Result<DiskStep, HostError> {
+    let (dir_path, name) = split(path);
+    let dir = match self.open_dir_path(dir_path) {
+      Ok(d) => d,
+      Err(HostError::NotFound | HostError::NotDirectory | HostError::NotFile) => {
+        return Ok(DiskStep::Ready(DiskState::Absent));
+      }
+      Err(e) => return Err(e),
+    };
+    match self.host.open_file(dir, name) {
+      Ok(file) => {
+        let fingerprint = match self.host.fstat(file) {
+          Ok(fp) => fp,
+          Err(error) => {
+            self.host.close_file(file);
+            return Err(error);
+          }
+        };
+        if !hash {
+          self.host.close_file(file);
+          return Ok(DiskStep::Ready(DiskState::File {
+            fingerprint,
+            identity: None,
+          }));
+        }
+        let mut fh = FileHash {
+          file,
+          fingerprint,
+          length: fingerprint.size,
+          off: 0,
+          hasher: blake3::Hasher::new(),
+        };
+        match self.hash_file_chunk(&mut fh) {
+          Ok(true) => {
+            self.host.close_file(file);
+            Ok(DiskStep::Ready(DiskState::File {
+              fingerprint,
+              identity: Some(*fh.hasher.finalize().as_bytes()),
+            }))
+          }
+          Ok(false) => Ok(DiskStep::Hashing(Box::new(fh))),
+          Err(error) => {
+            self.host.close_file(file);
+            Err(error)
+          }
+        }
+      }
+      Err(HostError::NotFound) => Ok(DiskStep::Ready(DiskState::Absent)),
+      Err(HostError::NotFile) => self
+        .disk_state_not_file(dir, name, path, ours)
+        .map(DiskStep::Ready),
+      Err(e) => Err(e),
+    }
+  }
+}
+
+/// Result of inspecting a path in sliced validation mode.
+enum DiskStep {
+  /// Disk state is ready immediately.
+  Ready(DiskState),
+  /// Regular file needs additional `HASH_READ_BYTES` chunks to finish hashing.
+  Hashing(Box<FileHash>),
+}
+
 /// Where a run is: one phase of §4.15's sequence after the lease, with its cursor.
 enum Phase {
   /// Settling a crashed earlier attempt's hidden siblings, one directory per unit.
   Sweep { parents: Vec<Box<str>>, next: usize },
-  /// Taking each entry's verdict against the disk, one entry per unit.
-  Validate { ours: Ours, next: usize },
+  /// Taking each entry's verdict against the disk, one entry (or one `HASH_READ_BYTES` hash chunk
+  /// of a large existing disk file) per unit.
+  Validate {
+    ours: Ours,
+    next: usize,
+    hashing: Option<Box<FileHash>>,
+  },
   /// Writing: per unit, one entry, one window of a large file, one batch's barrier or one staged file placed (A-130);
   /// its progress boxed to keep the enum small, as `Advance`'s is.
   Write {
@@ -4302,8 +4500,16 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
   pub fn abandon(&mut self) {
     if let (Some(host), Some(saved)) = (self.host.get(), self.saved.take()) {
       let mut landing = Landing::resume(host, &self.request, saved);
-      if let Phase::Write { progress, .. } = &mut self.phase {
-        landing.release_write(progress);
+      match &mut self.phase {
+        Phase::Validate { hashing, .. } => {
+          if let Some(fh) = hashing.take() {
+            landing.host.close_file(fh.file);
+          }
+        }
+        Phase::Write { progress, .. } => {
+          landing.release_write(progress);
+        }
+        _ => {}
       }
       landing.close_dirs();
       self.saved = Some(landing.suspend());
@@ -4354,20 +4560,18 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
           next_phase = Some(Phase::Validate {
             ours: owned_paths(manifest),
             next: 0,
+            hashing: None,
           });
         }
       },
-      Phase::Validate { ours, next } => match manifest.entries.get(*next) {
-        Some(entry) => match landing.validate_entry(entry, ours) {
-          Ok(report) => {
-            reports.push(report);
-            *next = next.saturating_add(1);
-          }
-          Err(error) => {
-            landing.close_dirs();
-            ended = Some(Err(LandingRefusal::Target(error)));
-          }
-        },
+      Phase::Validate {
+        ours,
+        next,
+        hashing,
+      } => match manifest.entries.get(*next) {
+        Some(entry) => {
+          ended = validate_unit(&mut landing, entry, ours, (next, hashing, reports));
+        }
         None => {
           audit.push(AuditRecord {
             seq: 0,
@@ -4477,6 +4681,39 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       *phase = next;
     }
     ended
+  }
+}
+
+/// Advances one unit of [`Phase::Validate`]: begins or continues chunked hashing of an existing
+/// disk file, returning `Some(Err(..))` on host failure.
+fn validate_unit<H: LandFs>(
+  landing: &mut Landing<'_, '_, H>,
+  entry: &LandingEntry,
+  ours: &Ours,
+  (next, hashing, reports): (
+    &mut usize,
+    &mut Option<Box<FileHash>>,
+    &mut Vec<EntryReport>,
+  ),
+) -> Option<Result<LandingReport, LandingRefusal>> {
+  let step = match hashing.take() {
+    Some(fh) => landing.continue_validate_entry(entry, fh),
+    None => landing.begin_validate_entry(entry, ours),
+  };
+  match step {
+    Ok(ValidateStep::Done(report)) => {
+      reports.push(report);
+      *next = next.saturating_add(1);
+      None
+    }
+    Ok(ValidateStep::Hashing(fh)) => {
+      *hashing = Some(fh);
+      None
+    }
+    Err(error) => {
+      landing.close_dirs();
+      Some(Err(LandingRefusal::Target(error)))
+    }
   }
 }
 

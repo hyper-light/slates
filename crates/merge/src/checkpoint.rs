@@ -512,6 +512,126 @@ fn take_signatures(
   Ok(signatures)
 }
 
+/// One carried file entry planned for cooperative streaming checkpoint encoding
+/// ([`crate::engine::CheckpointEncoder`]): records the sorted key, setting version, and byte length
+/// (`None` when removed) without cloning the file's bytes up front.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedFile {
+  /// The file's path.
+  pub(crate) key: String,
+  /// The version whose change is in effect at the checkpoint.
+  pub(crate) at: u64,
+  /// Byte length when present (`None` when removed at `at`).
+  pub(crate) len: Option<usize>,
+}
+
+impl Checkpoint {
+  /// Begins streaming canonical encoding of `self` (whose `files` table is supplied separately as
+  /// `planned_files`, already sorted by key and filtered for copied paths), returning the single
+  /// output buffer pre-sized to the exact encoded length with header, `accepted`, `signatures`, and
+  /// the `files` table count already written.
+  pub(crate) fn encode_prefix(&mut self, planned_files: &[PlannedFile]) -> Vec<u8> {
+    self.canonicalize();
+    let total = self.planned_encoded_len(planned_files);
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&MAGIC.to_le_bytes());
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&self.version.to_le_bytes());
+    put_count(&mut out, self.accepted.len());
+    for (identity, version) in &self.accepted {
+      out.extend_from_slice(identity);
+      out.extend_from_slice(&version.to_le_bytes());
+    }
+    put_count(&mut out, self.signatures.len());
+    for (version, signature) in &self.signatures {
+      out.extend_from_slice(&version.to_le_bytes());
+      out.push(signature.kind);
+      out.push(signature.detail);
+      out.extend_from_slice(&signature.fingerprint);
+    }
+    put_count(&mut out, planned_files.len());
+    out
+  }
+
+  /// Writes one carried file entry's header (`key`, `at`, presence byte, and when present its
+  /// `u32` byte-length prefix) into `out` so the caller can stream the file's bytes in slices.
+  pub(crate) fn encode_file_header(out: &mut Vec<u8>, entry: &PlannedFile) {
+    put_bytes(out, entry.key.as_bytes());
+    out.extend_from_slice(&entry.at.to_le_bytes());
+    match entry.len {
+      Some(len) => {
+        out.push(PRESENT);
+        put_count(out, len);
+      }
+      None => out.push(ABSENT),
+    }
+  }
+
+  /// Writes the remainder of `self` after the `files` table (`dirs` through `xattrs`, copies
+  /// section, `sum`, `head_check`, and `named` files) into `out`, matching
+  /// [`Checkpoint::into_encoded`] byte-for-byte.
+  pub(crate) fn encode_suffix_into(mut self, out: &mut Vec<u8>) {
+    let tables = self.changed();
+    let path = |out: &mut Vec<u8>, path: &String| put_bytes(out, path.as_bytes());
+    put_table(out, &tables.dirs, path, |_, ()| {});
+    put_table(out, &tables.modes, path, |out, mode| {
+      out.extend_from_slice(&mode.to_le_bytes());
+    });
+    put_table(out, &tables.symlinks, path, |out, target| {
+      put_bytes(out, target.as_bytes());
+    });
+    put_table(out, &tables.hardlinks, path, |out, target| {
+      put_bytes(out, target.as_bytes());
+    });
+    put_table(out, &tables.specials, path, |out, node| {
+      out.extend_from_slice(&node.encode());
+    });
+    put_table(
+      out,
+      &tables.xattrs,
+      |out, (path, name)| {
+        put_bytes(out, path.as_bytes());
+        put_bytes(out, name.as_bytes());
+      },
+      |out, value| put_bytes(out, value),
+    );
+    self.encode_copies_into(out);
+    match &self.sum {
+      Some(sum) => {
+        out.push(PRESENT);
+        out.extend_from_slice(sum.bytes());
+      }
+      None => out.push(ABSENT),
+    }
+    match self.head_check {
+      Some((head, identity)) => {
+        out.push(PRESENT);
+        out.extend_from_slice(&head.to_le_bytes());
+        out.extend_from_slice(&identity);
+      }
+      None => out.push(ABSENT),
+    }
+    put_named(out, &self.named);
+  }
+
+  /// Exact encoded length when `self.files` is empty and carried file entries are described by
+  /// `planned_files`.
+  fn planned_encoded_len(&self, planned_files: &[PlannedFile]) -> usize {
+    let files_bytes = planned_files
+      .iter()
+      .map(|entry| {
+        WORD
+          .saturating_add(entry.key.len())
+          .saturating_add(size_of::<u64>())
+          .saturating_add(1)
+          .saturating_add(entry.len.map_or(0, |len| WORD.saturating_add(len)))
+      })
+      .fold(0usize, usize::saturating_add);
+    // `tables_len` counts `WORD` for the empty `self.files` table already; add only the entries.
+    self.tables_len().saturating_add(files_bytes)
+  }
+}
+
 /// The copies' section, as [`Checkpoint::encode`] writes it: a presence byte and, present, the copies' records and the
 /// copied tables.
 fn take_copies_section(

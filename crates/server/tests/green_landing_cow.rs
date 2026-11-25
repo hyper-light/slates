@@ -86,6 +86,28 @@ fn presenting_and_landing_a_green_copy_none_of_its_head() {
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let large = populated_green(&mut client, "cow-land", files);
+  // Wait for the seed submit's own cooperative background checkpoint (`checkpoint_in_turns`,
+  // A-579) to finish before measuring `presenting`, so the seed's checkpoint staging into
+  // `state.store.content` is never misattributed to the landing presentation.
+  let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+  loop {
+    let counts = daemon.refusals_on_every_shard().unwrap();
+    let taken = counts.get("merge.checkpoint.taken").copied().unwrap_or(0);
+    let in_turns = counts
+      .get("merge.checkpoint.in_turns")
+      .copied()
+      .unwrap_or(0);
+    if taken >= in_turns && (in_turns == 0 || taken >= 1) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < settle_deadline,
+      "background checkpoint did not settle (taken={taken}, in_turns={in_turns})"
+    );
+    // Test-only poll pacing while waiting for the daemon's background checkpoint task to finish.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
   let target = common::target::target_dir();
 
   let presenting = resident();

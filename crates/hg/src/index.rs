@@ -1285,6 +1285,29 @@ impl HgIndex {
     (previous, given): (Option<(&Node, &'t [u8])>, GivenTexts<'_, 't>),
     known_next: Option<u32>,
   ) -> Result<(Vec<u32>, KeptLast), Refused> {
+    let wrapped: Vec<GivenManifest<'t>> = given
+      .iter()
+      .map(|&(node, text)| GivenManifest {
+        node,
+        text,
+        hashed_text: None,
+        incoming_delta: None,
+      })
+      .collect();
+    self.append_revisions_given(store, log, group, (previous, &wrapped), known_next)
+  }
+
+  /// [`HgIndex::append_revisions_at`] taking [`GivenManifest`] descriptors so manifest pushes can
+  /// reuse a verified incoming `mpatch` delta directly against the previous revision (skipping
+  /// `delta::encode_lines`) and pass worker-shard BLAKE3 [`slates_vcs::Hashed`] identities.
+  pub(crate) fn append_revisions_given<'t>(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    group: &[NewRevision],
+    (previous, given): (Option<(&Node, &'t [u8])>, &[GivenManifest<'t>]),
+    known_next: Option<u32>,
+  ) -> Result<(Vec<u32>, KeptLast), Refused> {
     let (revs, mut planned) = self.planned_at(store, log, group.iter(), known_next)?;
     let previous = match (log, planned.first()) {
       (Log::Manifest, Some(first)) if first.rev > 0 => {
@@ -1304,7 +1327,7 @@ impl HgIndex {
             )
           }
         };
-        Some((rev, text, row.chain))
+        Some((rev, row.node, text, row.chain))
       }
       _ => None,
     };
@@ -1656,8 +1679,34 @@ const WHOLE: Stored = (NONE, 0, 0);
 /// The texts a push already holds for a group's rows, by node, as the intake handed them (no copy read back).
 type GivenTexts<'g, 't> = &'g [(Node, &'t [u8])];
 
-/// The row a group's first delta applies to: its revision, its text, and its stored length.
-type KeptPrevious<'t> = Option<(u32, Cow<'t, [u8]>, u64)>;
+/// Incoming verified changegroup delta `(base_node, delta_bytes, optional_hashed_delta)` reused
+/// directly by [`kept_as`] when `base_node` matches the immediately preceding manifest revision.
+#[derive(Clone)]
+pub(crate) struct IncomingDelta<'t> {
+  /// Delta base node as declared in the changegroup.
+  pub(crate) base: Node,
+  /// Raw `mpatch` delta bytes.
+  pub(crate) bytes: &'t [u8],
+  /// Optional pre-computed BLAKE3 identity of `bytes` from a worker shard.
+  pub(crate) hashed: Option<slates_vcs::Hashed<&'t [u8]>>,
+}
+
+/// Caller-supplied manifest text plus optional pre-hashed identities and incoming verified delta
+/// for [`HgIndex::append_revisions_given`].
+pub(crate) struct GivenManifest<'t> {
+  /// The manifest revision's node.
+  pub(crate) node: Node,
+  /// Full manifest text.
+  pub(crate) text: &'t [u8],
+  /// Optional pre-computed BLAKE3 identity of `text` (from a worker shard).
+  pub(crate) hashed_text: Option<slates_vcs::Hashed<&'t [u8]>>,
+  /// Optional verified incoming changegroup delta reused directly when `base` matches the
+  /// immediately preceding manifest revision (skipping `delta::encode_lines`).
+  pub(crate) incoming_delta: Option<IncomingDelta<'t>>,
+}
+
+/// The row a group's first delta applies to: its revision, node, text, and chain delta bytes.
+type KeptPrevious<'t> = Option<(u32, Node, Cow<'t, [u8]>, u64)>;
 
 /// Stored content summary of the last row planned by [`kept_as`]: `(bytes, block, stored_bytes)`.
 pub(crate) type KeptLast = Option<(ContentId, Option<ContentId>, u64)>;
@@ -1674,70 +1723,99 @@ fn row_stored_summary(row: &Planned, fields: Stored, len: Option<u64>) -> KeptLa
   Some((bytes, block, stored_bytes))
 }
 
+/// Stores `bytes` whole in `store`, using `hashed` when a worker shard already computed its BLAKE3.
+fn put_whole_maybe_hashed(
+  store: &mut ContentStore,
+  bytes: &[u8],
+  hashed: Option<slates_vcs::Hashed<&[u8]>>,
+) -> Result<ContentId, Refused> {
+  match hashed {
+    Some(hashed) => store.put_object_whole_hashed(hashed),
+    None => store.put_object_whole(bytes),
+  }
+  .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))
+}
+
+/// Stores one planned manifest row as a delta against `previous` when within the chain bound, or
+/// whole otherwise, updating `previous` to this row's text and chain length.
+fn keep_manifest_row<'t>(
+  store: &mut ContentStore,
+  row: &mut Planned,
+  len: Option<u64>,
+  (previous, given): (&mut KeptPrevious<'t>, &[GivenManifest<'t>]),
+  puts: &mut Vec<ContentId>,
+) -> Result<Stored, Refused> {
+  let matched = given
+    .iter()
+    .find(|item| item.node == row.node && len == Some(crate::read::to_u64(item.text.len())));
+  let text = match matched {
+    Some(item) => Cow::Borrowed(item.text),
+    None => row
+      .contents
+      .first()
+      .zip(len)
+      .and_then(|(id, len)| store.object_bytes(id, len))
+      .map(Cow::Owned)
+      .ok_or(Refused::Unread { rev: row.rev })?,
+  };
+  let mut fields = WHOLE;
+  if let Some((rev, prev_node, prior, chain)) = previous.as_ref()
+    && rev.checked_add(1) == Some(row.rev)
+  {
+    let mut encoded = Vec::new();
+    let (delta_bytes, hashed_delta) = match matched.and_then(|item| item.incoming_delta.clone()) {
+      Some(incoming) if incoming.base == *prev_node => (incoming.bytes, incoming.hashed),
+      _ => {
+        crate::delta::encode_lines(prior.as_ref(), &text, &mut encoded)
+          .map_err(|_| Refused::Unread { rev: row.rev })?;
+        (encoded.as_slice(), None)
+      }
+    };
+    let grown = chain.saturating_add(crate::read::to_u64(delta_bytes.len()));
+    if grown <= crate::read::to_u64(text.len()) {
+      let put = put_whole_maybe_hashed(store, delta_bytes, hashed_delta)?;
+      puts.push(put);
+      if let Some(content) = row.contents.first_mut() {
+        *content = put;
+      }
+      fields = (*rev, crate::read::to_u64(delta_bytes.len()), grown);
+    }
+  }
+  if fields.0 == NONE
+    && row
+      .contents
+      .first()
+      .is_some_and(|id| !store.holds_whole(id))
+  {
+    let hashed_text = matched.and_then(|item| item.hashed_text.clone());
+    let put = put_whole_maybe_hashed(store, &text, hashed_text)?;
+    puts.push(put);
+    if let Some(content) = row.contents.first_mut() {
+      *content = put;
+    }
+  }
+  *previous = Some((row.rev, row.node, text, fields.2));
+  Ok(fields)
+}
+
 fn kept_as<'t>(
   store: &mut ContentStore,
   log: Log<'_>,
   planned: &mut [Planned],
-  (mut previous, given): (KeptPrevious<'t>, GivenTexts<'_, 't>),
+  (mut previous, given): (KeptPrevious<'t>, &[GivenManifest<'t>]),
 ) -> Result<(Vec<ContentId>, KeptLast), Refused> {
   let mut puts = Vec::new();
   let mut last_stored = None;
   for row in planned.iter_mut() {
-    let mut fields = WHOLE;
     let len = row
       .payload
       .get(COMMON_BYTES - LEN_BYTES..COMMON_BYTES)
       .and_then(|len| len.try_into().ok().map(u64::from_le_bytes));
-    if log == Log::Manifest {
-      // The caller's own copy of the text where it gave one for this node, of the length the row names; else read back.
-      let held = given
-        .iter()
-        .find(|(node, text)| *node == row.node && len == Some(crate::read::to_u64(text.len())))
-        .map(|(_, text)| Cow::Borrowed(*text));
-      let text = match held {
-        Some(text) => text,
-        None => row
-          .contents
-          .first()
-          .zip(len)
-          .and_then(|(id, len)| store.object_bytes(id, len))
-          .map(Cow::Owned)
-          .ok_or(Refused::Unread { rev: row.rev })?,
-      };
-      if let Some((rev, prior, chain)) = &previous
-        && rev.checked_add(1) == Some(row.rev)
-      {
-        let mut delta = Vec::new();
-        crate::delta::encode_lines(prior.as_ref(), &text, &mut delta)
-          .map_err(|_| Refused::Unread { rev: row.rev })?;
-        let grown = chain.saturating_add(crate::read::to_u64(delta.len()));
-        if grown <= crate::read::to_u64(text.len()) {
-          let put = store
-            .put_object_whole(&delta)
-            .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
-          puts.push(put);
-          if let Some(content) = row.contents.first_mut() {
-            *content = put;
-          }
-          fields = (*rev, crate::read::to_u64(delta.len()), grown);
-        }
-      }
-      if fields.0 == NONE
-        && row
-          .contents
-          .first()
-          .is_some_and(|id| !store.holds_whole(id))
-      {
-        let put = store
-          .put_object_whole(&text)
-          .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
-        puts.push(put);
-        if let Some(content) = row.contents.first_mut() {
-          *content = put;
-        }
-      }
-      previous = Some((row.rev, text, fields.2));
-    }
+    let fields = if log == Log::Manifest {
+      keep_manifest_row(store, row, len, (&mut previous, given), &mut puts)?
+    } else {
+      WHOLE
+    };
     last_stored = row_stored_summary(row, fields, len).or(last_stored);
     row.payload.extend_from_slice(&fields.0.to_le_bytes());
     row.payload.extend_from_slice(&fields.1.to_le_bytes());

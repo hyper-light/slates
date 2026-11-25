@@ -127,6 +127,19 @@ impl Increment {
     out
   }
 
+  /// Begins encoding this increment cooperatively a bounded copy slice at a time
+  /// ([`IncrementEncoder::step`]), producing bytes identical to [`Increment::encode`] without
+  /// zero-filling or copying a large post-state in one shard turn.
+  pub fn begin_encode(&self) -> IncrementEncoder {
+    let doc_len = self.doc.encoded_len();
+    let total = self.encoded_len_with(doc_len);
+    IncrementEncoder {
+      out: Vec::with_capacity(total),
+      doc_len,
+      stage: EncodeStage::Header,
+    }
+  }
+
   /// The post-state's inline bytes: the post-state itself, since a named run's bytes are read into a buffer of their
   /// own (A-760, `crate::named::Read`).
   fn inline_post_state(&self) -> &[u8] {
@@ -564,6 +577,176 @@ pub struct Made {
   pub copied: u64,
 }
 
+/// Stage of cooperative sliced increment encoding ([`IncrementEncoder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncodeStage {
+  /// Writes `id`, `base`, and `doc_len`.
+  Header,
+  /// Writes `OpsDoc` pieces via [`crate::ops_doc::OpsDoc::encode_piece`].
+  Doc { piece: usize },
+  /// Writes `inline_post_state` in `slice_bytes` slices.
+  Post { off: usize },
+  /// Writes `evidence` and optional `named.runs` trailer.
+  Trailer,
+  /// Finished.
+  Done,
+}
+
+/// Cooperative sliced encoder producing bytes identical to [`Increment::encode`] without copying
+/// a multi-megabyte or 1 GiB post-state in a single shard turn.
+pub struct IncrementEncoder {
+  out: Vec<u8>,
+  doc_len: usize,
+  stage: EncodeStage,
+}
+
+impl IncrementEncoder {
+  /// Advances encoding of `inc` by at most `slice_bytes` (at least one unit), returning `true`
+  /// once the encoding is complete and ready for [`IncrementEncoder::finish`].
+  pub fn step(&mut self, inc: &Increment, slice_bytes: u64) -> bool {
+    let budget = usize::try_from(slice_bytes.max(1)).unwrap_or(usize::MAX);
+    match self.stage {
+      EncodeStage::Header => {
+        self.out.extend_from_slice(&inc.id);
+        self.out.extend_from_slice(&inc.base.to_le_bytes());
+        self
+          .out
+          .extend_from_slice(&(u64::try_from(self.doc_len).unwrap_or(u64::MAX)).to_le_bytes());
+        self.stage = EncodeStage::Doc { piece: 0 };
+        false
+      }
+      EncodeStage::Doc { mut piece } => {
+        let start = self.out.len();
+        while self.out.len().saturating_sub(start) < budget {
+          if !inc.doc.encode_piece(piece, &mut self.out) {
+            let inline_len = u64::try_from(inc.inline_post_state().len()).unwrap_or(u64::MAX);
+            self.out.extend_from_slice(&inline_len.to_le_bytes());
+            self.stage = EncodeStage::Post { off: 0 };
+            return false;
+          }
+          piece = piece.saturating_add(1);
+        }
+        self.stage = EncodeStage::Doc { piece };
+        false
+      }
+      EncodeStage::Post { off } => {
+        let inline = inc.inline_post_state();
+        let end = off.saturating_add(budget).min(inline.len());
+        if let Some(slice) = inline.get(off..end) {
+          self.out.extend_from_slice(slice);
+        }
+        self.stage = if end >= inline.len() {
+          EncodeStage::Trailer
+        } else {
+          EncodeStage::Post { off: end }
+        };
+        false
+      }
+      EncodeStage::Trailer => {
+        let ev_len = u64::try_from(inc.evidence.len()).unwrap_or(u64::MAX);
+        self.out.extend_from_slice(&ev_len.to_le_bytes());
+        for reference in &inc.evidence {
+          self.out.extend_from_slice(reference);
+        }
+        if !inc.named.is_empty() {
+          let run_len = u64::try_from(inc.named.runs.len()).unwrap_or(u64::MAX);
+          self.out.extend_from_slice(&run_len.to_le_bytes());
+          for run in &inc.named.runs {
+            self.out.extend_from_slice(&run.identity.hash);
+            self.out.extend_from_slice(&run.identity.len.to_le_bytes());
+            self.out.extend_from_slice(&run.offset.to_le_bytes());
+            self.out.extend_from_slice(&run.len.to_le_bytes());
+          }
+        }
+        self.stage = EncodeStage::Done;
+        true
+      }
+      EncodeStage::Done => true,
+    }
+  }
+
+  /// Returns the completed encoded bytes once [`IncrementEncoder::step`] returned `true`.
+  pub fn finish(self) -> Vec<u8> {
+    self.out
+  }
+}
+
+/// Cooperative sliced checkpoint encoder ([`Green::begin_checkpoint_encode`]): streams carried
+/// file bytes directly from the green's content history into a single pre-sized encoding buffer a
+/// `slice_bytes` slice at a time, eliminating both the synchronous 1 GiB clone (`Checkpoint.files`)
+/// and the 450+ ms single-poll encode stall on large greens while producing bytes bit-for-bit
+/// identical to [`Green::checkpoint`] followed by [`crate::checkpoint::Checkpoint::into_encoded`].
+pub struct CheckpointEncoder {
+  at: u64,
+  meta: Option<crate::checkpoint::Checkpoint>,
+  planned_files: Vec<crate::checkpoint::PlannedFile>,
+  next_file: usize,
+  file_off: usize,
+  header_written: bool,
+  out: Vec<u8>,
+}
+
+impl CheckpointEncoder {
+  /// Advances encoding by at most `slice_bytes` (at least one entry/slice) against `green`.
+  /// Returns `Some(true)` once the encoding is complete and ready for [`CheckpointEncoder::finish`],
+  /// `Some(false)` when more slices remain, or `None` if `green` folded past the checkpoint
+  /// version before encoding completed.
+  pub fn step(&mut self, green: &Green, slice_bytes: u64) -> Option<bool> {
+    if green.folded_below > self.at || green.owed.is_some() || self.at > green.head() {
+      return None;
+    }
+    let budget = usize::try_from(slice_bytes.max(1)).unwrap_or(usize::MAX);
+    let mut written = 0usize;
+    while self.next_file < self.planned_files.len() && (written == 0 || written < budget) {
+      let left = budget.saturating_sub(written).max(1);
+      written = written.saturating_add(self.step_one_file(green, left)?);
+    }
+    if self.next_file < self.planned_files.len() {
+      return Some(false);
+    }
+    if let Some(meta) = self.meta.take() {
+      meta.encode_suffix_into(&mut self.out);
+    }
+    Some(true)
+  }
+
+  /// Writes one slice (up to `budget` bytes) of `self.planned_files[self.next_file]` into `self.out`.
+  fn step_one_file(&mut self, green: &Green, budget: usize) -> Option<usize> {
+    let Some(entry) = self.planned_files.get(self.next_file) else {
+      return Some(0);
+    };
+    if !self.header_written {
+      crate::checkpoint::Checkpoint::encode_file_header(&mut self.out, entry);
+      self.header_written = true;
+    }
+    let Some(total_len) = entry.len else {
+      self.next_file = self.next_file.saturating_add(1);
+      self.file_off = 0;
+      self.header_written = false;
+      return Some(1);
+    };
+    let end = self.file_off.saturating_add(budget).min(total_len);
+    let wrote = if end > self.file_off {
+      green.append_history_slice(&entry.key, self.at, (self.file_off, end), &mut self.out)?
+    } else {
+      0
+    };
+    self.file_off = end;
+    if self.file_off >= total_len {
+      self.next_file = self.next_file.saturating_add(1);
+      self.file_off = 0;
+      self.header_written = false;
+    }
+    Some(wrote.max(1))
+  }
+
+  /// Returns the completed canonical checkpoint encoding once [`CheckpointEncoder::step`] returned
+  /// `Ok(true)`.
+  pub fn finish(self) -> Vec<u8> {
+    self.out
+  }
+}
+
 impl Judged {
   /// The increment it judged.
   pub fn id(&self) -> [u8; 32] {
@@ -578,6 +761,25 @@ impl Judged {
   /// What the verdict resolved the increment to: what the durable chain records of its version (`crate::chain_entry`).
   pub fn applied(&self) -> &[crate::chain_entry::Applied] {
     &self.applied
+  }
+
+  /// Recovers the moved `post_state` buffer (and named-run buffers) into `inc` if a pre-made
+  /// verdict is discarded because the green's head moved before commit, avoiding any 1 GiB clone.
+  pub fn into_buffers(self) -> (Vec<u8>, Vec<Vec<u8>>) {
+    (self.post_state, self.read)
+  }
+
+  /// Restores the moved `post_state` and named-run buffers onto `inc` while keeping all pre-made
+  /// file buffers in `effects` intact for [`Green::commit_judged_for`].
+  pub fn restore_buffers_into(&mut self, inc: &mut Increment) {
+    inc.post_state = core::mem::take(&mut self.post_state);
+    inc.named.read.0 = core::mem::take(&mut self.read);
+  }
+
+  /// Consumes a discarded pre-made verdict and restores its moved buffers back onto `inc`.
+  pub fn restore_into(self, inc: &mut Increment) {
+    inc.post_state = self.post_state;
+    inc.named.read.0 = self.read;
   }
 }
 
@@ -2789,6 +2991,130 @@ impl Green {
     Green::leave_out_copied(&mut checkpoint, &listed);
     checkpoint.canonicalize();
     Some(checkpoint)
+  }
+
+  /// Begins cooperatively encoding this green's checkpoint at `at` (with optional `head_check`)
+  /// into a single pre-sized buffer without cloning carried file bytes up front
+  /// ([`CheckpointEncoder`]). Returns `None` under the exact same preconditions as
+  /// [`Green::checkpoint`].
+  pub fn begin_checkpoint_encode(
+    &self,
+    at: u64,
+    head_check: Option<(u64, [u8; 32])>,
+  ) -> Option<CheckpointEncoder> {
+    if self.owed.is_some() || at > self.head() || at < self.folded_below || at < self.deltas_from {
+      return None;
+    }
+    let (copied, listed) = self.copied_at(at);
+    let copies = self.copy_records_at(at);
+    let sum = (!copies.is_empty()).then(|| self.sum_at(at));
+    let (mut planned_files, named) = self.planned_content_at(at, &listed);
+    planned_files.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut meta = crate::checkpoint::Checkpoint {
+      version: at,
+      accepted: self
+        .accepted
+        .iter()
+        .filter(|(_, version)| **version <= at)
+        .map(|(id, version)| (*id, *version))
+        .collect(),
+      signatures: self
+        .signatures
+        .range(..=at)
+        .map(|(version, signature)| (*version, *signature))
+        .collect(),
+      files: Vec::new(),
+      named,
+      dirs: self
+        .dir_history
+        .iter()
+        .filter_map(|(path, history)| {
+          let (version, present) = history.iter().rev().find(|(v, _)| *v <= at)?;
+          (*version > 0).then(|| crate::checkpoint::Changed {
+            key: path.clone(),
+            at: *version,
+            value: present.then_some(()),
+          })
+        })
+        .collect(),
+      modes: changed_at(&self.mode_history, at),
+      symlinks: changed_at(&self.symlink_history, at),
+      hardlinks: changed_at(&self.hardlink_history, at),
+      specials: changed_at(&self.special_history, at),
+      xattrs: changed_at(&self.xattr_history, at),
+      copies,
+      copied,
+      sum,
+      head_check,
+    };
+    Green::leave_out_copied(&mut meta, &listed);
+    let out = meta.encode_prefix(&planned_files);
+    Some(CheckpointEncoder {
+      at,
+      meta: Some(meta),
+      planned_files,
+      next_file: 0,
+      file_off: 0,
+      header_written: false,
+      out,
+    })
+  }
+
+  /// Metadata-only counterpart to [`Green::changed_content_at`] for [`CheckpointEncoder`]: returns
+  /// the planned carried files (paths, versions, lengths — zero byte clones) and named files, with
+  /// paths in `listed` excluded.
+  fn planned_content_at(
+    &self,
+    at: u64,
+    listed: &BTreeSet<IdentityKey>,
+  ) -> (
+    Vec<crate::checkpoint::PlannedFile>,
+    Vec<crate::checkpoint::NamedFile>,
+  ) {
+    let mut planned = Vec::new();
+    let mut named = Vec::new();
+    for (path, entries) in &self.content_history {
+      let Some((version, value)) = entries.iter().rev().find(|(v, _)| *v <= at) else {
+        continue;
+      };
+      if *version == 0 || listed.contains(&IdentityKey::File(path.clone())) {
+        continue;
+      }
+      let name = value.as_ref().and_then(|value| {
+        let name = self
+          .content
+          .blocks()
+          .name(value.whole_block(&self.chunks)?)?;
+        (u64::try_from(value.len()).ok() == Some(name.len)).then_some(name)
+      });
+      match name {
+        Some(identity) => named.push(crate::checkpoint::NamedFile {
+          key: path.clone(),
+          at: *version,
+          identity,
+        }),
+        None => planned.push(crate::checkpoint::PlannedFile {
+          key: path.clone(),
+          at: *version,
+          len: value.as_ref().map(|v| v.len()),
+        }),
+      }
+    }
+    (planned, named)
+  }
+
+  /// Appends `[from, to)` of `path`'s content history value in effect at `at` directly into `out`.
+  fn append_history_slice(
+    &self,
+    path: &str,
+    at: u64,
+    (from, to): (usize, usize),
+    out: &mut Vec<u8>,
+  ) -> Option<usize> {
+    let entries = self.content_history.get(path)?;
+    let (_, value) = entries.iter().rev().find(|(v, _)| *v <= at)?;
+    let value = value.as_ref()?;
+    value.append_range((&self.chunks, self.content.blocks()), from, to, out)
   }
 
   /// A green restored from its `origin` and a `checkpoint` of it (§4.16, §4.8 recovery): the origin's state with every
@@ -7181,6 +7507,93 @@ impl Green {
     Ok(judgment)
   }
 
+  /// Like [`Green::judge_computed`], moving `inc.post_state` and `inc.named.read` into the
+  /// returned [`Judged`] instead of cloning them (restoring both buffers if unlent reads force
+  /// `Judgment::ContentUnread`): avoids cloning a 1 GiB post-state during cooperative sliced
+  /// submission (`Green::make_step` -> `Green::commit_judged`).
+  pub fn judge_computed_taking(
+    &mut self,
+    inc: &mut Increment,
+    computed: Computed,
+  ) -> Result<Judgment, PositionRefused> {
+    if computed.id != inc.id || computed.base != inc.base {
+      return Err(PositionRefused::OtherWork);
+    }
+    let head = self.head();
+    if computed.at > head {
+      return Err(PositionRefused::Ahead {
+        at: computed.at,
+        head,
+      });
+    }
+    if let Reached::Before(version) = computed.reached
+      && !self.accepted.contains_key(&inc.id)
+    {
+      return Err(PositionRefused::NotRecorded { version });
+    }
+    let (mut judgment, unlent) = crate::unlent::scope(|| self.hold_computed_taking(inc, computed));
+    if let Some(identity) = unlent.first().copied() {
+      match judgment {
+        Judgment::Conflict { .. } => {
+          self.rejected.remove(&inc.id);
+        }
+        Judgment::Accepted(held) => {
+          let (post, read) = held.into_buffers();
+          inc.post_state = post;
+          inc.named.read.0 = read;
+        }
+        _ => {}
+      }
+      return Ok(Judgment::ContentUnread { identity });
+    }
+    if let Judgment::Accepted(held) = &mut judgment {
+      held.read = core::mem::take(&mut inc.named.read.0);
+    }
+    Ok(judgment)
+  }
+
+  /// [`Green::hold_computed`] moving `inc.post_state` into `Judged` instead of cloning it.
+  fn hold_computed_taking(&mut self, inc: &mut Increment, computed: Computed) -> Judgment {
+    if let Some(version) = self.accepted.get(&inc.id) {
+      return Judgment::AcceptedBefore { version: *version };
+    }
+    if let Some(windows) = self.rejected.get(&inc.id) {
+      return Judgment::Conflict {
+        windows: windows.clone(),
+      };
+    }
+    if inc.base < self.deltas_from {
+      return Judgment::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
+    }
+    let units = match computed.reached {
+      Reached::Before(version) => return Judgment::AcceptedBefore { version },
+      Reached::Verdict { units, .. } => self.at_head(inc, (computed.at, computed.floor), units),
+    };
+    match position::verdict(units) {
+      Ok(effects) => {
+        self.commit_reads(&effects, (&inc.post_state, &inc.named.read.0));
+        let applied = effects.iter().map(Effect::applied).collect();
+        Judgment::Accepted(Judged {
+          id: inc.id,
+          at: self.head(),
+          effects,
+          applied,
+          post_state: core::mem::take(&mut inc.post_state),
+          read: Vec::new(),
+          runs: inc.named.runs.clone(),
+          making: Making::default(),
+        })
+      }
+      Err(windows) => {
+        self.retain_rejected(inc.id, &windows);
+        Judgment::Conflict { windows }
+      }
+    }
+  }
+
   /// The units judged again at a later head than the one they were computed at ([`Green::judge_computed`]): the
   /// non-vacuity counter that a moved green judges only what changed since, never a whole work.
   pub fn judged_again(&self) -> u64 {
@@ -7379,12 +7792,55 @@ impl Green {
     Ok(self.commit_held(judged))
   }
 
+  /// Like [`Green::commit_judged`], borrowing `inc`'s post-state and named-run buffers when a
+  /// pre-made verdict's buffers were restored back onto `inc` via [`Judged::restore_buffers_into`]
+  /// after [`Green::make_step`] completed (zero clone of a 1 GiB post-state).
+  pub fn commit_judged_for(
+    &mut self,
+    judged: Judged,
+    inc: &Increment,
+  ) -> Result<(u64, Vec<crate::chain_entry::Applied>), CommitRefused> {
+    let head = self.head();
+    if judged.at != head {
+      return Err(CommitRefused::Moved(HeadMoved {
+        judged_at: judged.at,
+        head,
+      }));
+    }
+    if let Some(identity) = self.commit_unlent_for(&judged, inc).first() {
+      return Err(CommitRefused::Unlent {
+        identity: *identity,
+      });
+    }
+    Ok(self.commit_held_with(judged, (&inc.post_state, &inc.named.read.0)))
+  }
+
   /// Every object a held verdict's commit (or the rest of its making) reads that no block holds the bytes of now
   /// (A-760 (b) 4d): what its owner lends ([`Green::lend`]) before [`Green::commit_judged`] or [`Green::make_step`],
   /// which refuse while any is unlent. Empty for a verdict whose files are made, or that reads no named text.
   pub fn commit_unlent(&self, judged: &Judged) -> BTreeSet<crate::named::Identity> {
     crate::unlent::scope(|| self.commit_reads(&judged.effects, (&judged.post_state, &judged.read)))
       .1
+  }
+
+  /// Like [`Green::commit_unlent`], falling back to `inc`'s buffers when `judged`'s buffers were
+  /// restored back onto `inc` via [`Judged::restore_buffers_into`].
+  pub fn commit_unlent_for(
+    &self,
+    judged: &Judged,
+    inc: &Increment,
+  ) -> BTreeSet<crate::named::Identity> {
+    let post = if judged.post_state.is_empty() && !inc.post_state.is_empty() {
+      &inc.post_state
+    } else {
+      &judged.post_state
+    };
+    let read = if judged.read.is_empty() && !inc.named.read.0.is_empty() {
+      &inc.named.read.0
+    } else {
+      &judged.read
+    };
+    crate::unlent::scope(|| self.commit_reads(&judged.effects, (post, read))).1
   }
 
   /// Makes `judged`'s files a copy slice of `slice_bytes` a step (A-760; at least a byte), so its commit copies none:
@@ -7522,6 +7978,16 @@ impl Green {
 
   /// Commits a verdict judged at the head: the version after it, and what the chain records of it.
   fn commit_held(&mut self, judged: Judged) -> (u64, Vec<crate::chain_entry::Applied>) {
+    self.commit_held_with(judged, (&[], &[]))
+  }
+
+  /// [`Green::commit_held`], borrowing `(inline_post, read_runs)` when a pre-made verdict's
+  /// buffers were restored back onto its increment after [`Green::make_step`].
+  fn commit_held_with(
+    &mut self,
+    judged: Judged,
+    (inline_post, read_runs): (&[u8], &[Vec<u8>]),
+  ) -> (u64, Vec<crate::chain_entry::Applied>) {
     // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
     let version = judged.at.saturating_add(1);
     let Judged {
@@ -7536,17 +8002,27 @@ impl Green {
     } = judged;
     let mut effects = effects;
     let mut read = read;
+    let effective_post: &[u8] = if post_state.is_empty() && !inline_post.is_empty() {
+      inline_post
+    } else {
+      &post_state
+    };
+    let effective_read: &[Vec<u8>] = if read.is_empty() && !read_runs.is_empty() {
+      read_runs
+    } else {
+      &read
+    };
     // Every file but those a run makes whole is made first, while every run's buffer is in place: a run moved into its
     // file leaves the post-state's later bytes where their ops address them only once nothing reads them any more. The
     // files `make_step` made already are passed over.
     let (wholes, names) = match (making.wholes, making.names) {
       (Some(wholes), Some(names)) => (wholes, names),
       _ => {
-        let sole = self.sole_runs(&effects, &post_state, &read);
+        let sole = self.sole_runs(&effects, effective_post, effective_read);
         (alone(sole.clone()), named_files(&sole, &runs))
       }
     };
-    let post = crate::named::Post::of(&post_state, &read);
+    let post = crate::named::Post::of(effective_post, effective_read);
     let mut skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
     for place in 0..effects.len() {
       if !skip.contains(&place) && self.can_overlay_inplace(place, &effects, post, &names) {
@@ -7555,10 +8031,15 @@ impl Green {
     }
     self.make_mapped(&mut effects, post, &skip);
     move_whole_runs(&mut effects, &mut read, &wholes);
+    let final_read: &[Vec<u8>] = if read.is_empty() && !read_runs.is_empty() {
+      read_runs
+    } else {
+      &read
+    };
     self.commit(
       effects,
       version,
-      crate::named::Post::of(&post_state, &read),
+      crate::named::Post::of(effective_post, final_read),
       &names,
     );
     self.accepted.insert(id, version);
@@ -9079,6 +9560,50 @@ mod tests {
       self
     }
 
+    /// `path` removed.
+    fn remove(mut self, path: &str) -> Steps {
+      let path = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Unlink,
+        flags: 0,
+        path,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self
+    }
+
+    /// Directory `path` created.
+    fn mkdir(mut self, path: &str) -> Steps {
+      let path = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Mkdir,
+        flags: 0,
+        path,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self
+    }
+
+    /// Symlink `path` pointing to `target`.
+    fn symlink(mut self, path: &str, target: &str) -> Steps {
+      let path = self.doc.paths.intern(path);
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(target.as_bytes());
+      self.doc.ops.push(Op {
+        kind: OpKind::Symlink,
+        flags: 0,
+        path,
+        at: 0,
+        len: target.len() as u64,
+        src,
+      });
+      self
+    }
+
     /// The increment `id` based on version `base`.
     fn at(self, id: u8, base: u64) -> Increment {
       Increment {
@@ -9540,5 +10065,137 @@ mod tests {
       green.submit(&lagging_conflict),
       Outcome::Conflict { .. }
     ));
+  }
+
+  /// Step 4 oracle: cooperative [`IncrementEncoder`] produces byte-for-byte identical encodings to
+  /// [`Increment::encode`] at every slice size (including 1 byte/turn), and
+  /// [`Green::judge_computed_taking`] + [`Green::make_step`] + [`Judged::restore_buffers_into`] +
+  /// [`Green::commit_judged_for`] matches [`Green::submit`] without cloning `post_state`.
+  #[test]
+  fn sliced_increment_encoder_and_taking_commit_match_serial_oracle() {
+    let mut base_green = Green::new();
+    let v1 = Steps::default().create("a.bin", b"hello world!").at(1, 0);
+    assert_eq!(base_green.submit(&v1), Outcome::Accepted { version: 1 });
+
+    let mut inc = Steps::default()
+      .create("big.bin", &vec![b'Q'; 4096])
+      .overwrite("a.bin", 6, b"slates")
+      .at(2, 1);
+    inc.evidence = vec![[0xAA; 32], [0xBB; 32]];
+    assert_increment_encoder_matches_serial(&inc);
+
+    let mut serial_green = Green::new();
+    assert_eq!(serial_green.submit(&v1), Outcome::Accepted { version: 1 });
+    assert_eq!(serial_green.submit(&inc), Outcome::Accepted { version: 2 });
+
+    assert_taking_commit_matches_serial(&mut base_green, &mut serial_green, &inc);
+  }
+
+  fn assert_taking_commit_matches_serial(
+    base_green: &mut Green,
+    serial_green: &mut Green,
+    inc: &Increment,
+  ) {
+    let computed = base_green.compute(inc).expect("compute");
+    let mut inc_taking = inc.clone();
+    let Judgment::Accepted(mut judged) = base_green
+      .judge_computed_taking(&mut inc_taking, computed)
+      .expect("judge_computed_taking")
+    else {
+      panic!("expected Accepted");
+    };
+    assert!(
+      inc_taking.post_state.is_empty(),
+      "judge_computed_taking must move post_state instead of cloning"
+    );
+    let make_turns = drive_make_step(base_green, &mut judged, 256);
+    assert!(make_turns > 1, "make_step must slice across turns");
+    judged.restore_buffers_into(&mut inc_taking);
+    assert_eq!(inc_taking.post_state, inc.post_state);
+    let (version, _) = base_green
+      .commit_judged_for(judged, &inc_taking)
+      .expect("commit_judged_for");
+    assert_eq!(version, 2);
+    assert_eq!(
+      base_green.content_at("big.bin", 2),
+      serial_green.content_at("big.bin", 2)
+    );
+    assert_eq!(
+      base_green.content_at("a.bin", 2),
+      serial_green.content_at("a.bin", 2)
+    );
+    assert_eq!(base_green.head_identity(), serial_green.head_identity());
+  }
+
+  fn assert_increment_encoder_matches_serial(inc: &Increment) {
+    let expected_bytes = inc.encode();
+    for slice in [1u64, 7, 63, 256, 8192] {
+      let mut enc = inc.begin_encode();
+      let mut steps = 0usize;
+      while !enc.step(inc, slice) {
+        steps += 1;
+        assert!(steps < 20_000, "encoder must terminate for slice={slice}");
+      }
+      assert_eq!(
+        enc.finish(),
+        expected_bytes,
+        "IncrementEncoder must match Increment::encode byte-for-byte at slice={slice}"
+      );
+    }
+  }
+
+  fn drive_make_step(green: &Green, judged: &mut Judged, slice: u64) -> usize {
+    let mut turns = 0usize;
+    loop {
+      let made = green.make_step(judged, slice).expect("make_step");
+      turns += 1;
+      if made.done {
+        return turns;
+      }
+    }
+  }
+
+  /// Step 4 checkpoint encoder oracle: cooperative [`CheckpointEncoder`] produces bytes identical
+  /// to [`Green::checkpoint`] + [`crate::checkpoint::Checkpoint::into_encoded`] across creates,
+  /// edits, removals, directories, symlinks, and head checks at every slice size down to 1 B/turn.
+  #[test]
+  fn sliced_checkpoint_encoder_matches_checkpoint_into_encoded() {
+    let mut green = Green::new();
+    let v1 = Steps::default().create("a.bin", b"hello world!").at(1, 0);
+    let v2 = Steps::default()
+      .create("big.bin", &vec![b'Q'; 4096])
+      .overwrite("a.bin", 6, b"slates")
+      .at(2, 1);
+    let v3 = Steps::default()
+      .create("removed.bin", b"ephemeral")
+      .mkdir("sub")
+      .symlink("sub/link", "../a.bin")
+      .at(3, 2);
+    let v4 = Steps::default().remove("removed.bin").at(4, 3);
+    for (inc, expected) in [(&v1, 1), (&v2, 2), (&v3, 3), (&v4, 4)] {
+      assert_eq!(green.submit(inc), Outcome::Accepted { version: expected });
+    }
+    let head_check = Some((green.head(), green.head_identity()));
+    let mut expected_cp = green.checkpoint(4).expect("checkpoint at 4");
+    expected_cp.head_check = head_check;
+    let expected_bytes = expected_cp.into_encoded();
+    for slice in [1u64, 7, 128, 4096, 65536] {
+      let mut enc = green
+        .begin_checkpoint_encode(4, head_check)
+        .expect("begin_checkpoint_encode");
+      let mut steps = 0usize;
+      while !enc.step(&green, slice).expect("step") {
+        steps += 1;
+        assert!(
+          steps < 50_000,
+          "checkpoint encoder must terminate for slice={slice}"
+        );
+      }
+      assert_eq!(
+        enc.finish(),
+        expected_bytes,
+        "CheckpointEncoder must match Checkpoint::into_encoded byte-for-byte at slice={slice}"
+      );
+    }
   }
 }

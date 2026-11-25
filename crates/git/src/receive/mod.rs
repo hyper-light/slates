@@ -81,7 +81,9 @@ pub use report::{
   write_report_held,
 };
 pub use request::{Command, Request, RequestReader, Requested};
-pub use session::Session;
+pub use session::{
+  DeferredInput, Session, SettledObject, VerifiedBody, VerifiedObject, verify_unpacked,
+};
 
 use crate::object_name::{Kind, ObjectId};
 use crate::objects::FsckId;
@@ -259,13 +261,188 @@ pub struct Received {
   pub outcomes: Vec<Outcome>,
 }
 
+/// Format: empty bucket sentinel in [`IdIndex::buckets`] (pack counts are `< u32::MAX`).
+const EMPTY_SLOT: u32 = u32::MAX;
+
+/// Derived: Knuth Vol 3 §6.4 linear-probing load ceiling (`alpha <= 1/2` gives <= 1.5 expected
+/// hit probes and <= 2.5 miss probes) at 4 bytes/slot + 20 bytes/entry for SHA-1 (`<= 36 bytes/obj`
+/// worst case, strictly smaller than a sorted `(ObjectId, usize)` table of 48 bytes/obj for every
+/// object count) so both tables fit in L2 cache without touching the 104-byte `Placed` array.
+const INDEX_LOAD_FACTOR_DENOM: usize = 2;
+
+/// Format: raw byte length of a SHA-1 Git object id.
+const SHA1_RAW_BYTES: usize = 20;
+/// Format: leading byte prefix of a raw cryptographic digest read as a little-endian `usize`
+/// bucket index (`size_of::<usize>()` fits both 32-bit and 64-bit targets without truncation).
+const HASH_PREFIX_BYTES: usize = size_of::<usize>();
+
+/// Open-addressed power-of-two hash table mapping pushed [`ObjectId`]s to their pack order index
+/// in `objects`. Because `ObjectId` is already a cryptographic digest (SHA-1DC or SHA-256), its
+/// leading bytes are uniformly distributed. For SHA-1 packs (raw 20-byte ids), `sha1_ids` stores
+/// packed 20-byte digests alongside 4-byte `buckets` (~12.5 MiB for 425k objects, L2-resident),
+/// avoiding 40M DRAM cache misses into the 44 MiB `Placed` slice during tree connectivity walks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdIndex {
+  /// Pack position (`EMPTY_SLOT` when empty); length is 0 when empty or a power of two >= `2 * N`.
+  buckets: Vec<u32>,
+  /// Packed 20-byte SHA-1 digests indexed by pack position (`at`), populated for SHA-1 packs.
+  sha1_ids: Vec<[u8; SHA1_RAW_BYTES]>,
+}
+
+impl IdIndex {
+  /// Extracts the primary bucket hash from the leading cryptographic bytes of a raw digest.
+  fn hash_raw(bytes: &[u8]) -> usize {
+    let head: [u8; HASH_PREFIX_BYTES] = bytes
+      .get(..HASH_PREFIX_BYTES)
+      .and_then(|s| s.try_into().ok())
+      .unwrap_or([0; HASH_PREFIX_BYTES]);
+    usize::from_le_bytes(head)
+  }
+
+  /// Builds an [`IdIndex`] over `objects`, charging its tables to `admission` first.
+  pub(crate) fn new(objects: &[Placed], admission: &mut Admission) -> Result<Self, Refusal> {
+    if objects.is_empty() {
+      return Ok(Self::default());
+    }
+    if u32::try_from(objects.len())
+      .ok()
+      .is_none_or(|n| n == EMPTY_SLOT)
+    {
+      return Err(Refusal::AllocationRefused {
+        bytes: crate::to_u64(objects.len()),
+      });
+    }
+    let cap = objects
+      .len()
+      .checked_mul(INDEX_LOAD_FACTOR_DENOM)
+      .and_then(usize::checked_next_power_of_two)
+      .ok_or_else(|| Refusal::AllocationRefused {
+        bytes: crate::to_u64(objects.len()),
+      })?;
+    let all_sha1 = objects
+      .first()
+      .is_some_and(|first| first.id.as_bytes().len() == SHA1_RAW_BYTES);
+    admission
+      .charge_items::<u32>(cap)
+      .map_err(Refusal::PastAdmission)?;
+    let mut sha1_ids = Vec::new();
+    if all_sha1 {
+      admission
+        .charge_items::<[u8; SHA1_RAW_BYTES]>(objects.len())
+        .map_err(Refusal::PastAdmission)?;
+      reserve(&mut sha1_ids, objects.len())?;
+    }
+    let mut buckets = Vec::new();
+    reserve(&mut buckets, cap)?;
+    buckets.resize(cap, EMPTY_SLOT);
+    let mask = cap.saturating_sub(1);
+    for (at, placed) in objects.iter().enumerate() {
+      if all_sha1 {
+        let raw: [u8; SHA1_RAW_BYTES] = placed
+          .id
+          .as_bytes()
+          .try_into()
+          .unwrap_or([0; SHA1_RAW_BYTES]);
+        sha1_ids.push(raw);
+      }
+      Self::insert_one(&mut buckets, &sha1_ids, objects, mask, at, &placed.id);
+    }
+    Ok(Self { buckets, sha1_ids })
+  }
+
+  /// Inserts one `(at, id)` entry into `buckets`, skipping duplicate object ids.
+  fn insert_one(
+    buckets: &mut [u32],
+    sha1_ids: &[[u8; SHA1_RAW_BYTES]],
+    objects: &[Placed],
+    mask: usize,
+    at: usize,
+    id: &ObjectId,
+  ) {
+    let Ok(at_u32) = u32::try_from(at) else {
+      return;
+    };
+    let raw = id.as_bytes();
+    let mut slot = Self::hash_raw(raw) & mask;
+    for _ in 0..buckets.len() {
+      let Some(&slot_at) = buckets.get(slot) else {
+        return;
+      };
+      if slot_at == EMPTY_SLOT {
+        if let Some(entry) = buckets.get_mut(slot) {
+          *entry = at_u32;
+        }
+        return;
+      }
+      if let Ok(existing) = usize::try_from(slot_at) {
+        let matches = if let Some(stored) = sha1_ids.get(existing) {
+          stored.as_slice() == raw
+        } else {
+          objects
+            .get(existing)
+            .is_some_and(|other| other.id.as_bytes() == raw)
+        };
+        if matches {
+          return;
+        }
+      }
+      slot = slot.wrapping_add(1) & mask;
+    }
+  }
+
+  /// Returns the pack order position of `id` in `objects`, if present.
+  pub(crate) fn position(&self, objects: &[Placed], id: &ObjectId) -> Option<usize> {
+    self.position_raw(objects, id.as_bytes())
+  }
+
+  /// Returns the pack order position of raw digest bytes `raw` in `objects`, if present.
+  pub(crate) fn position_raw(&self, objects: &[Placed], raw: &[u8]) -> Option<usize> {
+    let cap = self.buckets.len();
+    if cap == 0 {
+      return None;
+    }
+    let mask = cap.saturating_sub(1);
+    let mut slot = Self::hash_raw(raw) & mask;
+    if !self.sha1_ids.is_empty() {
+      let needle: &[u8; 20] = raw.try_into().ok()?;
+      for _ in 0..cap {
+        let &slot_at = self.buckets.get(slot)?;
+        if slot_at == EMPTY_SLOT {
+          return None;
+        }
+        let at = usize::try_from(slot_at).ok()?;
+        if self.sha1_ids.get(at) == Some(needle) {
+          return Some(at);
+        }
+        slot = slot.wrapping_add(1) & mask;
+      }
+      return None;
+    }
+    for _ in 0..cap {
+      let &slot_at = self.buckets.get(slot)?;
+      if slot_at == EMPTY_SLOT {
+        return None;
+      }
+      let at = usize::try_from(slot_at).ok()?;
+      if objects
+        .get(at)
+        .is_some_and(|placed| placed.id.as_bytes() == raw)
+      {
+        return Some(at);
+      }
+      slot = slot.wrapping_add(1) & mask;
+    }
+    None
+  }
+}
+
 /// The objects a push's pack brought, by name: each one's place, and its bytes where the caller
 /// lends them (A-719 part 3: a server's judge reads them from its own store instead).
 pub struct Pushed<'a> {
   /// The objects' places, in pack order.
   objects: &'a [Placed],
-  /// Each object's name and position, sorted by name.
-  by_id: Vec<(ObjectId, usize)>,
+  /// Open-addressed O(1) index from [`ObjectId`] to position in `objects`.
+  by_id: IdIndex,
   /// Where their bytes are read, where the caller lends them.
   contents: Option<&'a dyn Contents>,
 }
@@ -278,18 +455,7 @@ impl<'a> Pushed<'a> {
     contents: Option<&'a dyn Contents>,
     admission: &mut Admission,
   ) -> Result<Self, Refusal> {
-    admission
-      .charge_items::<(ObjectId, usize)>(objects.len())
-      .map_err(Refusal::PastAdmission)?;
-    let mut by_id = Vec::new();
-    reserve(&mut by_id, objects.len())?;
-    by_id.extend(
-      objects
-        .iter()
-        .enumerate()
-        .map(|(at, object)| (object.id, at)),
-    );
-    by_id.sort_unstable();
+    let by_id = IdIndex::new(objects, admission)?;
     Ok(Self {
       objects,
       by_id,
@@ -318,12 +484,13 @@ impl<'a> Pushed<'a> {
 
   /// The position in pack order of the object named `id`, if the pack brought it.
   pub fn position(&self, id: &ObjectId) -> Option<usize> {
-    self
-      .by_id
-      .binary_search_by(|(known, _)| known.cmp(id))
-      .ok()
-      .and_then(|at| self.by_id.get(at))
-      .map(|(_, at)| *at)
+    self.by_id.position(self.objects, id)
+  }
+
+  /// Whether the pack brought an object with raw digest bytes `raw` (avoids constructing an
+  /// [`ObjectId`] during high-fanout tree connectivity walks).
+  pub(crate) fn contains_raw(&self, raw: &[u8]) -> bool {
+    self.by_id.position_raw(self.objects, raw).is_some()
   }
 
   /// The objects' places, in pack order.
@@ -588,8 +755,8 @@ pub struct Checked {
   pub unpacked: Option<Result<Kept, PackRefused>>,
   /// Each command's refusal by the checks, in the order sent; `None` for one they passed.
   pub early: Vec<Option<Outcome>>,
-  /// The pushed objects' names and positions, sorted by name, charged once by [`check`].
-  by_id: Vec<(ObjectId, usize)>,
+  /// Open-addressed O(1) index from pushed [`ObjectId`] to pack position, charged once by [`check`].
+  by_id: IdIndex,
 }
 
 impl Checked {
@@ -646,8 +813,8 @@ pub struct Deciding<A> {
   request: Request,
   /// The pack's objects' places, or why it was refused.
   unpacked: Option<Result<Kept, PackRefused>>,
-  /// The pushed objects' names and positions, sorted by name.
-  by_id: Vec<(ObjectId, usize)>,
+  /// Open-addressed O(1) index from pushed [`ObjectId`] to pack position.
+  by_id: IdIndex,
   /// Each command's refusal by the checks, taken as its step comes.
   early: Vec<Option<Outcome>>,
   /// The outcomes so far, in the order sent: under `atomic` made in that order; without it each in its command's slot,

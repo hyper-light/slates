@@ -2264,6 +2264,32 @@ impl GitPush {
     self.push.extend_pack(input.get(from..).unwrap_or_default());
   }
 
+  /// Admits `objects`, pre-verified and pre-hashed on worker shards (`slates_git::receive::verify_unpacked`),
+  /// skipping SHA-1DC, BLAKE3, and commit/tag parsing on the owner shard.
+  pub(crate) fn admit_precomputed_all(
+    &mut self,
+    state: &mut ShardState,
+    objects: Vec<(slates_git::store::PrecomputedPlaced, Vec<u8>)>,
+  ) -> Result<(), GitRefused> {
+    within_budget(state, 0, |stores| {
+      let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
+      for (placed, bytes) in objects {
+        let offset = placed.offset;
+        let kind = placed.kind;
+        admit_precomputed_object(content, store, (&mut self.push, &mut self.record), placed)?;
+        // Git packfiles order commits -> trees -> blobs; caching blobs here copies gigabytes of
+        // blob bytes into `Recent` only to evict every commit and tree right before connectivity
+        // checking (`Checking::turn`, which never reads blobs). Keep commits/trees/tags hot while
+        // any cross-batch blob delta base inflates on demand from the in-RAM pack.
+        if kind != slates_git::object_name::Kind::Blob {
+          self.push.keep_read(offset, kind, bytes);
+        }
+      }
+      self.push.true_up_recent(content);
+      Ok(())
+    })
+  }
+
   /// Admits `objects`, a pack's as its reader resolved them, each held where its entry lies in the push's pack
   /// ([`GitPush::keep_pack_to`]): its bytes named and checked, then kept only as read lately (`Push::keep_read`, taken
   /// whole). Refused at the first object refused; the push keeps what it admitted before, for its caller to abandon.
@@ -2486,6 +2512,34 @@ fn abandon_push(state: &mut ShardState, push: Push) {
 /// one. So the record names exactly the objects its commit positions.
 /// Admits an object already unpacked and named with collision-detecting SHA-1/SHA-256 by
 /// `slates_git::unpack::Reader` without re-hashing its content a second time.
+fn admit_precomputed_object(
+  content: &ContentStore,
+  store: &GitStore,
+  (push, record): (&mut Push, &mut RecordWriter),
+  placed: slates_git::store::PrecomputedPlaced,
+) -> Result<(), GitRefused> {
+  if store.repository.object(content, &placed.id).is_some() {
+    push.entry_at(placed.offset, placed.id);
+    return Ok(());
+  }
+  let kind = placed.kind;
+  let (id, admitted) = push
+    .admit_precomputed::<Infallible>(placed)
+    .map_err(GitRefused::Object)?;
+  if admitted == Admitted::New {
+    let held = push
+      .object(&id)
+      .ok_or(GitRefused::Store(StoreRefused::Unreadable { id }))?;
+    record.object(Noted {
+      kind,
+      id,
+      identity: held.identity,
+      len: held.len,
+    });
+  }
+  Ok(())
+}
+
 fn admit_unpacked_object(
   content: &mut ContentStore,
   store: &GitStore,

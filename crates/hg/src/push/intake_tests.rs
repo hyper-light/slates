@@ -828,9 +828,8 @@ fn bases_not_kept_last(decoded: &crate::changegroup::Changegroup<'_>) -> u64 {
 /// Main's ruling of 2026-11-21 05:12 (c), red first (w-perf's profile of hg-src's first push, base 94c1696bb: 57% of the
 /// shard's time in checking each new manifest's files, which rebuilt the manifest's text and its first parent's from
 /// their chains, two whole texts a manifest, the push's memory 5.8 GiB at its end). Do: take stock 7.2's bundle through
-/// the intake. Expect a whole text rebuilt from the fork's chains only for a delta whose base is not the text kept just
-/// before it in its group; none to check a new manifest's files, which reads the lines its delta wrote (14 rebuilt
-/// before, two a manifest).
+/// the intake. Expect at most `bases_not_kept_last(&decoded)` texts rebuilt from the fork's chains — and 0 once
+/// `BaseCache` keeps later-referenced manifest bases (`Frame::based_later`) just as it keeps file bases.
 #[test]
 fn a_pushs_intake_rebuilds_a_text_only_for_a_base_it_does_not_hold() {
   let part = stock();
@@ -840,12 +839,82 @@ fn a_pushs_intake_rebuilds_a_text_only_for_a_base_it_does_not_hold() {
   let mut store = store();
   let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
   assert!(!intaken.changesets.is_empty(), "{intaken:?}");
-  assert_eq!(
+  assert!(
+    intaken.rebuilt <= bases_not_kept_last(&decoded),
+    "rebuilt {} exceeded non-adjacent bases {}",
     intaken.rebuilt,
-    bases_not_kept_last(&decoded),
-    "texts rebuilt from the fork's chains"
+    bases_not_kept_last(&decoded)
+  );
+  assert_eq!(
+    intaken.rebuilt, 0,
+    "manifest BaseCache serves intra-push non-adjacent bases without chain rebuilds"
   );
   fork.release(&mut store).unwrap();
+}
+
+/// Multi-shard batch intake oracle: `prepare_batch` + `verify_batch_item` + `apply_batch` over
+/// stock 7.2's bundle must execute batched verification non-vacuously and produce byte-identical
+/// `Intaken` records, `KeptText` BLAKE3 identities/bases/places, and reconstructed revision texts
+/// as the serial `Intake::step` path.
+#[test]
+fn batched_intake_matches_serial_intake_byte_for_byte() {
+  let part = stock();
+  let mut serial_index = HgIndex::new();
+  let mut serial_store = store();
+  let (serial_fork, serial_intaken, _) =
+    intake(&part, &mut serial_index, &mut serial_store, &mut room()).unwrap();
+
+  let mut batch_index = HgIndex::new();
+  let mut batch_store = store();
+  let mut batch_room = room();
+  let mut taking = Intake::begin(
+    (part.version, part.payload.as_slice()),
+    &mut batch_index,
+    &mut batch_store,
+    &mut batch_room,
+  )
+  .unwrap();
+  let mut batches = 0_usize;
+  let mut batched_items = 0_usize;
+  loop {
+    if let Some(work) = taking.prepare_batch(
+      part.payload.as_slice(),
+      &batch_store,
+      &batch_room,
+      (1 << 20, 64),
+    ) {
+      batches += 1;
+      batched_items += work.len();
+      let done: Vec<_> = work.into_iter().map(super::verify_batch_item).collect();
+      taking
+        .apply_batch(&mut batch_store, &mut batch_room, done)
+        .unwrap();
+      continue;
+    }
+    match taking
+      .step(part.payload.as_slice(), &mut batch_store, &mut batch_room)
+      .unwrap()
+    {
+      Stepped::More => {}
+      Stepped::Done => break,
+      other => panic!("unexpected step outcome: {other:?}"),
+    }
+  }
+  let (batch_fork, batch_intaken) = taking.finish().ok().unwrap();
+  assert!(batches > 0 && batched_items > 0, "expected batched work");
+  assert_eq!(batch_intaken.changesets, serial_intaken.changesets);
+  assert_eq!(batch_intaken.kept, serial_intaken.kept);
+  assert_eq!(batch_intaken.bytes, serial_intaken.bytes);
+  assert_eq!(batch_intaken.texts, serial_intaken.texts);
+  for rev in 0..serial_fork.len(&serial_store, Log::Manifest) {
+    assert_eq!(
+      batch_fork.revision_text(&batch_store, Log::Manifest, rev),
+      serial_fork.revision_text(&serial_store, Log::Manifest, rev),
+      "manifest rev {rev} text mismatch"
+    );
+  }
+  serial_fork.release(&mut serial_store).unwrap();
+  batch_fork.release(&mut batch_store).unwrap();
 }
 
 /// Main's ruling of 2026-11-21 05:12 (a), the refusal side (hostile input): a new manifest's files are checked from

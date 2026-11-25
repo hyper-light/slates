@@ -349,8 +349,12 @@ const IDENTITY_KEY: usize = 0;
 const CHUNK_HASHED: usize = 1;
 /// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
 const CHUNK_STAGED: usize = 2;
-/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`].
-pub(crate) const CHECKPOINT_KINDS: usize = CHUNK_STAGED + 1;
+/// Format: pace kind index of one copy slice of a checkpoint's encoding streamed directly from the
+/// green's content history ([`CheckpointHold::step`]).
+const CHUNK_ENCODED: usize = CHUNK_STAGED + 1;
+/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`],
+/// [`CHUNK_STAGED`], and [`CHUNK_ENCODED`].
+pub(crate) const CHECKPOINT_KINDS: usize = CHUNK_ENCODED + 1;
 
 /// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, then its encoding held
 /// in the content store a paced step a turn (`hold`, begun already when the identity was folded in the asking step),
@@ -434,7 +438,10 @@ pub(crate) struct CheckpointHold {
   green: DbVolumeId,
   /// The version the checkpoint is the green's state at: its checkpoint floor when it was built.
   version: u64,
-  /// The checkpoint's encoding (`slates_merge::checkpoint`).
+  /// Cooperative encoder streaming the green's carried files directly into `encoding` a copy slice
+  /// at a time (`None` once encoding is complete).
+  encoder: Option<slates_merge::engine::CheckpointEncoder>,
+  /// The checkpoint's encoding (`slates_merge::checkpoint`), populated once `encoder` finishes.
   encoding: Vec<u8>,
   /// The manifest's extents hashed so far, one a chunk in order.
   extents: Vec<slates_archive::manifest::Extent>,
@@ -456,9 +463,9 @@ pub(crate) enum Held {
 }
 
 impl CheckpointHold {
-  /// Builds and encodes `green`'s checkpoint at its checkpoint floor when the doubling rule takes one now (always, with
-  /// [`Doubling::Now`]): none when the rule waits, the floor folds nothing, or the engine cannot take one there (counted
-  /// `merge.checkpoint.unavailable`; the chain stays whole).
+  /// Begins cooperatively encoding `green`'s checkpoint at its checkpoint floor when the doubling
+  /// rule takes one now (always, with [`Doubling::Now`]): collects metadata only (zero file-byte
+  /// clone) so even a 1 GiB green begins in O(files) without stalling its shard.
   pub(crate) fn begin(
     state: &mut ShardState,
     green: DbVolumeId,
@@ -470,10 +477,9 @@ impl CheckpointHold {
     }
     let floor = inputs.floor;
     // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
-    let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
-      let mut checkpoint = engine.checkpoint(floor)?;
-      checkpoint.head_check = Some((engine.head(), engine.head_identity()));
-      Some(checkpoint)
+    let Some(encoder) = state.greens.get_mut(&green).and_then(|mut engine| {
+      let head_check = Some((engine.head(), engine.head_identity()));
+      engine.begin_checkpoint_encode(floor, head_check)
     }) else {
       state.count(CHECKPOINT_UNAVAILABLE, 1);
       return None;
@@ -481,7 +487,8 @@ impl CheckpointHold {
     Some(CheckpointHold {
       green,
       version: floor,
-      encoding: checkpoint.into_encoded(),
+      encoder: Some(encoder),
+      encoding: Vec::new(),
       extents: Vec::new(),
       hashed: 0,
       staging: None,
@@ -506,7 +513,9 @@ impl CheckpointHold {
         let mut costs = state.merge.checkpoint_costs;
         let mut step = slates_pace::Step::begin(env, (env.clock)());
         let held = loop {
-          let kind = if self.staging.is_some() {
+          let kind = if self.encoder.is_some() {
+            CHUNK_ENCODED
+          } else if self.staging.is_some() {
             CHUNK_STAGED
           } else {
             CHUNK_HASHED
@@ -533,9 +542,42 @@ impl CheckpointHold {
     held
   }
 
-  /// One unit: a chunk hashed, the stage opened once every chunk is, a chunk staged, or the stage completed and the
+  /// Advances the cooperative checkpoint encoder by one copy slice; returns `Held::Ended` if the
+  /// green disappeared or folded past `self.version`.
+  fn encode_unit(&mut self, state: &mut ShardState) -> Held {
+    let Some(mut encoder) = self.encoder.take() else {
+      return Held::More;
+    };
+    let slice = state
+      .config
+      .copy_slice_bytes_within(state.config.step_quantum_ns())
+      .max(1);
+    let stepped = state
+      .greens
+      .get(&self.green)
+      .and_then(|engine| encoder.step(&engine, slice));
+    match stepped {
+      Some(true) => {
+        self.encoding = encoder.finish();
+        Held::More
+      }
+      Some(false) => {
+        self.encoder = Some(encoder);
+        Held::More
+      }
+      None => {
+        state.count(CHECKPOINT_HOLD_SUPERSEDED, 1);
+        Held::Ended
+      }
+    }
+  }
+
+  /// One unit: an encode slice, a chunk hashed, the stage opened once every chunk is, a chunk staged, or the stage completed and the
   /// checkpoint recorded.
   fn unit(&mut self, state: &mut ShardState) -> Held {
+    if self.encoder.is_some() {
+      return self.encode_unit(state);
+    }
     let object = checkpoint_object(self.green);
     let Some(manifest) = self.staging else {
       let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);

@@ -10,10 +10,10 @@
 //! leaves the repository's objects exactly as they were. Each text's hold is given back once the rows hold it, as the
 //! import gives its holds back (A-630).
 
-use slates_vcs::{ContentId, ContentRefused, ContentStore, IndexRefused};
+use slates_vcs::{ContentId, ContentRefused, ContentStore, Hashed, IndexRefused};
 
 use super::verify::{Arrived, Verified};
-use crate::index::{self, HgIndex, Log, NewChangeset, NewRevision};
+use crate::index::{self, GivenManifest, HgIndex, IncomingDelta, Log, NewChangeset, NewRevision};
 use crate::read::to_u64;
 use crate::{Admission, Node, PastAdmission, changeset, filerev};
 
@@ -81,6 +81,17 @@ impl Puts {
     Ok(identity)
   }
 
+  /// Keeps pre-hashed `hashed` as content without re-running BLAKE3 on the owner shard.
+  fn put_hashed(
+    &mut self,
+    store: &mut ContentStore,
+    hashed: Hashed<&[u8]>,
+  ) -> Result<ContentId, Unindexed> {
+    let identity = store.put_object_whole_hashed(hashed)?;
+    self.0.push(identity);
+    Ok(identity)
+  }
+
   /// Gives back every hold: the first refusal, if any.
   fn give_back(self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     let mut first = Ok(());
@@ -135,25 +146,92 @@ pub(crate) struct KeptOne {
   pub(crate) stored_bytes: u64,
 }
 
-/// Keeps one revision a push brought in `fork`'s `log` (A-720, the sliced intake): its text kept as content once and its
-/// row appended, numbered its log's next, as [`fork_with`] keeps a group; the holds its puts took given back. `previous`
-/// is the node and whole text of the revision the intake kept last, so a manifest's delta is made against it rather
-/// than a text rebuilt from its chain (`HgIndex::append_revisions_after`, A-732). `known_next` optionally supplies the
-/// caller-tracked next revision number for `log`, avoiding repeated `HgIndex::len` scans on file logs. Refused, what
-/// it put is given back and `fork` holds none of it.
-pub(crate) fn keep_one(
+/// Precomputed manifest inputs for [`PrecomputedKeep::Manifest`].
+pub(crate) struct PrecomputedManifest<'a> {
+  /// Full manifest text (borrowed from `Hashed` or `Arrived`).
+  pub(crate) text: &'a [u8],
+  /// Pre-hashed full manifest text, if computed on a worker shard.
+  pub(crate) hashed_text: Option<Hashed<&'a [u8]>>,
+  /// Optional incoming verified delta reused directly against the preceding manifest revision.
+  pub(crate) incoming_delta: Option<IncomingDelta<'a>>,
+}
+
+/// Precomputed file inputs for [`PrecomputedKeep::File`].
+pub(crate) struct PrecomputedFile<'a> {
+  /// Full file revision text length (metadata header plus body).
+  pub(crate) text_len: usize,
+  /// Stored first parent after `filerev::split` issue6528 normalization.
+  pub(crate) p1: Node,
+  /// Stored second parent after `filerev::split` issue6528 normalization.
+  pub(crate) p2: Node,
+  /// Pre-hashed file body bytes.
+  pub(crate) hashed_bytes: Hashed<&'a [u8]>,
+  /// Optional pre-hashed metadata block bytes.
+  pub(crate) hashed_block: Option<Hashed<&'a [u8]>>,
+}
+
+/// Worker-precomputed metadata and BLAKE3 identities for [`keep_one_prepared`], allowing owner-shard
+/// commits to skip redundant parsing, `delta::encode_lines`, and BLAKE3 hashing.
+pub(crate) enum PrecomputedKeep<'a> {
+  /// Changeset text already decoded and BLAKE3-hashed on a worker shard.
+  Changeset {
+    /// Pre-hashed changeset text.
+    hashed: Hashed<&'a [u8]>,
+    /// Decoded manifest node.
+    manifest: Node,
+    /// Decoded branch name.
+    branch: &'a [u8],
+    /// Whether the changeset closes its branch.
+    closed: bool,
+  },
+  /// Manifest revision with optional pre-hashed text and optional verified incoming delta.
+  Manifest(PrecomputedManifest<'a>),
+  /// File revision already split and BLAKE3-hashed on a worker shard.
+  File(PrecomputedFile<'a>),
+}
+
+/// Keeps one revision a push brought in `fork`'s `log` (A-720, the sliced intake) with optional
+/// [`PrecomputedKeep`] data computed on a worker shard or supplied from the incoming changegroup
+/// delta: its text kept as content once and its row appended, numbered its log's next, as
+/// [`fork_with`] keeps a group; the holds its puts took given back. `previous` is the node and
+/// whole text of the revision the intake kept last, so a manifest's delta is made against it rather
+/// than a text rebuilt from its chain (`HgIndex::append_revisions_after`, A-732). `known_next`
+/// optionally supplies the caller-tracked next revision number for `log`. Refused, what it put is
+/// given back and `fork` holds none of it.
+pub(crate) fn keep_one_prepared(
   fork: &mut HgIndex,
   store: &mut ContentStore,
   log: Log<'_>,
   (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
-  (kept, known_next): (Option<ContentId>, Option<u32>),
+  (kept, known_next, precomputed): (Option<ContentId>, Option<u32>, Option<PrecomputedKeep<'_>>),
   admission: &mut Admission,
 ) -> Result<Option<KeptOne>, Unindexed> {
   let mut puts = Puts::default();
   let one = core::slice::from_ref(arrived);
-  let outcome = match log {
-    Log::Changelog => changesets(fork, store, one, &mut puts, admission),
-    Log::Manifest | Log::File(_) => {
+  let outcome = match (log, precomputed) {
+    (
+      Log::Changelog,
+      Some(PrecomputedKeep::Changeset {
+        hashed,
+        manifest,
+        branch,
+        closed,
+      }),
+    ) => keep_precomputed_changeset(
+      fork,
+      store,
+      arrived,
+      (hashed, manifest, branch, closed),
+      &mut puts,
+    ),
+    (Log::Changelog, _) => changesets(fork, store, one, &mut puts, admission),
+    (Log::Manifest, Some(PrecomputedKeep::Manifest(manifest))) => {
+      keep_manifest_one(fork, store, (arrived, previous), manifest, known_next)
+    }
+    (Log::File(_), Some(PrecomputedKeep::File(file))) => {
+      keep_precomputed_file(fork, store, log, arrived, file, (known_next, &mut puts))
+    }
+    (Log::Manifest | Log::File(_), _) => {
       let files = matches!(log, Log::File(_));
       revisions(store, (one, kept), &mut puts, admission, files).and_then(|group| {
         let (revs, last) = fork
@@ -190,6 +268,121 @@ pub(crate) fn keep_one(
       release,
     }),
   }
+}
+
+/// Appends one changeset whose text was already decoded and BLAKE3-hashed on a worker shard.
+fn keep_precomputed_changeset(
+  fork: &mut HgIndex,
+  store: &mut ContentStore,
+  arrived: &Arrived,
+  (hashed, manifest, branch, closed): (Hashed<&[u8]>, Node, &[u8], bool),
+  puts: &mut Puts,
+) -> Result<Option<KeptOne>, Unindexed> {
+  let text_len = to_u64(hashed.bytes().len());
+  let text = puts.put_hashed(store, hashed)?;
+  let row = NewChangeset {
+    node: arrived.node,
+    p1: arrived.p1,
+    p2: arrived.p2,
+    flags: 0,
+    len: text_len,
+    text,
+    manifest,
+    closed,
+    branch,
+  };
+  let revs = fork.append_changesets(store, &[row])?;
+  Ok(revs.first().copied().map(|rev| KeptOne {
+    rev,
+    bytes: text,
+    block: None,
+    stored_bytes: text_len,
+  }))
+}
+
+/// Appends one manifest using [`HgIndex::append_revisions_given`] so incoming verified deltas and
+/// worker-computed BLAKE3 identities bypass `delta::encode_lines` and owner-shard hashing.
+fn keep_manifest_one(
+  fork: &mut HgIndex,
+  store: &mut ContentStore,
+  (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
+  manifest: PrecomputedManifest<'_>,
+  known_next: Option<u32>,
+) -> Result<Option<KeptOne>, Unindexed> {
+  /// Format: placeholder identity replaced by `HgIndex::kept_as`.
+  const PENDING_MANIFEST: ContentId = ContentId([0u8; 32]);
+  let row = NewRevision {
+    node: arrived.node,
+    p1: arrived.p1,
+    p2: arrived.p2,
+    link: arrived.link,
+    flags: 0,
+    len: to_u64(manifest.text.len()),
+    bytes: PENDING_MANIFEST,
+    block: None,
+  };
+  let given = [GivenManifest {
+    node: arrived.node,
+    text: manifest.text,
+    hashed_text: manifest.hashed_text,
+    incoming_delta: manifest.incoming_delta,
+  }];
+  let (revs, last) = fork
+    .append_revisions_given(store, Log::Manifest, &[row], (previous, &given), known_next)
+    .map_err(Unindexed::from)?;
+  Ok(
+    revs
+      .first()
+      .copied()
+      .zip(last)
+      .map(|(rev, (bytes, block, stored_bytes))| KeptOne {
+        rev,
+        bytes,
+        block,
+        stored_bytes,
+      }),
+  )
+}
+
+/// Appends one file revision whose split and BLAKE3 identities were computed on a worker shard.
+fn keep_precomputed_file(
+  fork: &mut HgIndex,
+  store: &mut ContentStore,
+  log: Log<'_>,
+  arrived: &Arrived,
+  file: PrecomputedFile<'_>,
+  (known_next, puts): (Option<u32>, &mut Puts),
+) -> Result<Option<KeptOne>, Unindexed> {
+  let block = file
+    .hashed_block
+    .map(|hashed| puts.put_hashed(store, hashed))
+    .transpose()?;
+  let bytes = puts.put_hashed(store, file.hashed_bytes)?;
+  let row = NewRevision {
+    node: arrived.node,
+    p1: file.p1,
+    p2: file.p2,
+    link: arrived.link,
+    flags: 0,
+    len: to_u64(file.text_len),
+    bytes,
+    block,
+  };
+  let (revs, last) = fork
+    .append_revisions_given(store, log, &[row], (None, &[]), known_next)
+    .map_err(Unindexed::from)?;
+  Ok(
+    revs
+      .first()
+      .copied()
+      .zip(last)
+      .map(|(rev, (bytes, block, stored_bytes))| KeptOne {
+        rev,
+        bytes,
+        block,
+        stored_bytes,
+      }),
+  )
 }
 
 /// Appends the changelog's, the manifest log's and each file log's new revisions to `fork`.

@@ -34,15 +34,20 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use slates_vcs::{ContentId, ContentStore, IndexRefused, Merge, MergeStep};
 
 use super::classify::ReadChangeset;
-use super::commit::{Unindexed, keep_one};
+use super::commit::{PrecomputedKeep, PrecomputedManifest, Unindexed, keep_one_prepared};
 use super::held::IndexHeld;
 use super::verify::{Arrived, Held, LogOf, Unverified, audit};
 use crate::changegroup::{Revision, Version};
 use crate::filerev::FileContents;
 use crate::framing::{Collect, Framed, Framing, Halt, Source, Wanted};
-use crate::index::{HgIndex, Log, NONE};
+use crate::index::{HgIndex, IncomingDelta, Log, NONE};
 use crate::read::to_u64;
 use crate::{Admission, NULL_NODE, Node, changeset, delta, filerev, manifest, node};
+
+#[path = "intake_batch.rs"]
+mod batch;
+
+pub use batch::{BatchDone, BatchWork, verify_batch_item};
 
 /// Why an intake was refused; its caller gives its fork back.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -678,6 +683,8 @@ impl PendingLog {
 struct BaseCache {
   /// The texts, by node.
   held: BTreeMap<Node, Vec<u8>>,
+  /// Optional pre-computed BLAKE3 identities of cached texts, avoiding re-hashing on base reuse.
+  identities: BTreeMap<Node, [u8; 32]>,
   /// Their order of arrival, oldest first.
   order: VecDeque<Node>,
   /// The bytes they hold.
@@ -695,9 +702,25 @@ impl BaseCache {
     }
   }
 
+  /// Pre-computed BLAKE3 identity of a cached node, if kept.
+  fn identity(&self, node: &Node) -> Option<[u8; 32]> {
+    self.identities.get(node).copied()
+  }
+
   /// Keeps `text` as `node`'s, letting the oldest go until it fits, each text let go handed to `spares`; a text past
   /// the bound alone is not kept, and handed to them too.
   fn put(&mut self, node: Node, text: Vec<u8>, spares: &mut Spares) {
+    self.put_with_identity(node, text, None, spares);
+  }
+
+  /// [`BaseCache::put`] storing an optional pre-computed BLAKE3 identity alongside `text`.
+  fn put_with_identity(
+    &mut self,
+    node: Node,
+    text: Vec<u8>,
+    identity: Option<[u8; 32]>,
+    spares: &mut Spares,
+  ) {
     let len = to_u64(text.len());
     if len > self.bound || self.held.contains_key(&node) {
       spares.give(text);
@@ -708,6 +731,7 @@ impl BaseCache {
         break;
       };
       if let Some(gone) = self.held.remove(&oldest) {
+        self.identities.remove(&oldest);
         self.bytes = self.bytes.saturating_sub(to_u64(gone.len()));
         spares.give(gone);
       }
@@ -715,12 +739,16 @@ impl BaseCache {
     self.bytes = self.bytes.saturating_add(len);
     self.order.push_back(node);
     self.held.insert(node, text);
+    if let Some(id) = identity {
+      self.identities.insert(node, id);
+    }
   }
 
   /// Lets `node`'s text go, handed to `spares`, where the cache holds it (its place in the order is passed over when
   /// the oldest are let go).
   fn release(&mut self, node: &Node, spares: &mut Spares) {
     if let Some(text) = self.held.remove(node) {
+      self.identities.remove(node);
       self.bytes = self.bytes.saturating_sub(to_u64(text.len()));
       spares.give(text);
     }
@@ -731,6 +759,7 @@ impl BaseCache {
     for (_, text) in core::mem::take(&mut self.held) {
       spares.give(text);
     }
+    self.identities.clear();
     self.order.clear();
     self.bytes = 0;
   }
@@ -1116,6 +1145,7 @@ impl Intake {
           Log::Changelog,
           (store, admission),
           Stage::Manifests(0),
+          (false, false),
         )
       }
       Stage::Manifests(at) => {
@@ -1124,7 +1154,11 @@ impl Intake {
           Err(wanted) => return Ok(Stepped::Wanted(wanted.range)),
         };
         let after = Stage::Files { file: 0, at: 0 };
-        taker.take_or(next, Log::Manifest, (store, admission), after)
+        let base_flags = (
+          frame.based_later(&frame.0.manifests, at),
+          frame.last_on_base(&frame.0.manifests, at),
+        );
+        taker.take_or(next, Log::Manifest, (store, admission), after, base_flags)
       }
       Stage::Files { file, at } => taker.file_step((frame, payload), (file, at), store, admission),
       Stage::ManifestsPresent(at) => taker.manifest_present(at, store),
@@ -1195,6 +1229,7 @@ impl Taker {
     log: Log<'_>,
     (store, admission): (&mut ContentStore, &mut Admission),
     after: Stage,
+    (based_later, last_on_base): (bool, bool),
   ) -> Result<Stepped, Refused> {
     let Some((revision, place)) = next else {
       self.enter(after);
@@ -1252,6 +1287,7 @@ impl Taker {
       other => other,
     };
     // A revision longer than a window is taken over the steps after this one ([`Pending`]), which move the stage on.
+    self.taking_later = based_later;
     if self.take(
       log,
       (&revision, place),
@@ -1259,6 +1295,9 @@ impl Taker {
       (store, admission),
       (after, None),
     )? {
+      if last_on_base {
+        self.cache.release(&revision.base, &mut self.spares);
+      }
       self.stage = after;
     }
     Ok(Stepped::More)
@@ -1860,12 +1899,23 @@ impl Taker {
       .last
       .as_ref()
       .map(|(node, text)| (node, text.as_slice()));
-    let kept_one = keep_one(
+    let precomputed = (log == Log::Manifest && !revision.data.is_empty()).then_some(
+      PrecomputedKeep::Manifest(PrecomputedManifest {
+        text: arrived.text.as_slice(),
+        hashed_text: None,
+        incoming_delta: Some(IncomingDelta {
+          base: revision.base,
+          bytes: revision.data,
+          hashed: None,
+        }),
+      }),
+    );
+    let kept_one = keep_one_prepared(
       &mut self.fork,
       store,
       log,
       (&arrived, previous),
-      (kept, Some(next_rev)),
+      (kept, Some(next_rev), precomputed),
       &mut room,
     )?;
     *admission = trial;
@@ -1878,7 +1928,15 @@ impl Taker {
       .intaken
       .bytes
       .saturating_add(to_u64(arrived.text.len()));
-    let identity = identity.unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
+    let identity = identity
+      .or_else(|| {
+        kept_one.and_then(|info| {
+          let same_as_stored =
+            log == Log::Changelog || (matches!(log, Log::File(_)) && info.block.is_none());
+          same_as_stored.then_some(info.bytes.0)
+        })
+      })
+      .unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
     let kept = KeptText {
       path: path.to_vec(),
       node: revision.node,
@@ -1910,14 +1968,19 @@ impl Taker {
       }
       None => self.intaken.texts.push(kept),
     }
+    let prev_id = self.last_identity;
     self.last_identity = Some((revision.node, identity));
-    // The text kept before this one may be a later delta's base: the push's cache keeps a file's ((b2)). A changeset's or
-    // a manifest's is no later delta's base once this one is kept (each rests on the one before), so its buffer is the
-    // next rebuild's.
-    // Only a text a delta past the next one rests on is kept; the next delta rests on the text kept last.
+    // Only a text a delta past the next one rests on is kept in BaseCache (both files and
+    // manifests, auto-evicted at `last_on_base` and cleared on log transitions); the next delta
+    // rests on `self.last`.
     match (log, self.last.take()) {
-      (Log::File(_), Some((node, text))) if self.last_later => {
-        self.cache.put(node, text, &mut self.spares);
+      (Log::File(_) | Log::Manifest, Some((node, text))) if self.last_later => {
+        self.cache.put_with_identity(
+          node,
+          text,
+          prev_id.filter(|(n, _)| *n == node).map(|(_, id)| id),
+          &mut self.spares,
+        );
       }
       (_, Some((_, text))) => self.spares.give(text),
       (_, None) => {}
@@ -2076,7 +2139,7 @@ impl Taker {
     {
       return Some(Cow::Borrowed(text.as_slice()));
     }
-    if let Log::File(_) = log
+    if matches!(log, Log::File(_) | Log::Manifest)
       && let Some(text) = self.cache.held.get(&revision.base)
     {
       return Some(Cow::Borrowed(text.as_slice()));
@@ -2132,7 +2195,12 @@ impl Taker {
         })?;
       }
       _ => {
-        manifest::decode(text).map_err(|fault| Unverified::Manifest { node, fault })?;
+        let checked = if revision.base == NULL_NODE || revision.is_full_text() {
+          manifest::decode(text).map(|_| ())
+        } else {
+          manifest::validate_delta(text, revision.data)
+        };
+        checked.map_err(|fault| Unverified::Manifest { node, fault })?;
         return self.awaited_of(text, revision, (store, admission));
       }
     }
@@ -2764,6 +2832,16 @@ fn written_entries(
   text: &[u8],
   revision: &Revision<'_>,
 ) -> Result<Vec<(Vec<u8>, Node)>, delta::Refusal> {
+  written_entries_parts(text, revision.base, revision.is_full_text(), revision.data)
+}
+
+/// [`written_entries`] parameterized by raw `(base, is_full_text, delta)` for worker shards.
+pub(super) fn written_entries_parts(
+  text: &[u8],
+  base: Node,
+  is_full_text: bool,
+  delta_bytes: &[u8],
+) -> Result<Vec<(Vec<u8>, Node)>, delta::Refusal> {
   let entries_of = |lines: &[u8]| -> Vec<(Vec<u8>, Node)> {
     lines
       .split(|byte| *byte == b'\n')
@@ -2771,7 +2849,7 @@ fn written_entries(
       .map(|entry| (entry.path.to_vec(), entry.node))
       .collect()
   };
-  if revision.is_full_text() || revision.base == NULL_NODE {
+  if is_full_text || base == NULL_NODE {
     return Ok(entries_of(text));
   }
   let line_start = |at: usize| {
@@ -2790,7 +2868,7 @@ fn written_entries(
   };
   let mut written = Vec::new();
   let (mut produced, mut base_at, mut covered) = (0_usize, 0_usize, 0_usize);
-  for hunk in delta::hunks(revision.data) {
+  for hunk in delta::hunks(delta_bytes) {
     let hunk = hunk?;
     let start = usize::try_from(hunk.start).unwrap_or(usize::MAX);
     let end = usize::try_from(hunk.end).unwrap_or(usize::MAX);

@@ -146,6 +146,126 @@ pub fn decode(text: &[u8]) -> Result<Entries<'_>, Refusal> {
   Ok(Entries { lines: lines(text) })
 }
 
+/// Validates a manifest `text` produced by applying `delta` (`crate::delta::apply`) to a base
+/// manifest that already passed [`decode`]: returns `Ok(())` if and only if [`decode(text)`]
+/// returns `Ok`, and on any invalidity falls back to [`decode(text)`] so the returned [`Refusal`]
+/// carries the exact line number.
+///
+/// Proof of equivalence: every line completely outside the expanded intervals `[lo..hi)` was copied
+/// verbatim with its bounding newlines from the already-valid base manifest, so it parses and is
+/// strictly ordered relative to its untouched neighbors. Expanding each hunk outward to include the
+/// full immediately preceding line and the full immediately following line guarantees every
+/// modified, split, joined, or newly adjacent consecutive line pair lies inside one checked
+/// interval.
+pub fn validate_delta(text: &[u8], delta: &[u8]) -> Result<(), Refusal> {
+  if text.is_empty() {
+    return Ok(());
+  }
+  if !text.ends_with(&[NEWLINE]) {
+    return Err(Refusal::Unterminated);
+  }
+  let mut produced: usize = 0;
+  let mut base_at: usize = 0;
+  let mut open: Option<(usize, usize)> = None;
+  for hunk in crate::delta::hunks(delta) {
+    let Ok(hunk) = hunk else {
+      return decode(text).map(|_| ());
+    };
+    let start = usize::try_from(hunk.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(hunk.end).unwrap_or(usize::MAX);
+    let new_start = produced.saturating_add(start.saturating_sub(base_at));
+    let new_end = new_start.saturating_add(hunk.data.len());
+    produced = new_end;
+    base_at = end;
+    let (lo, hi) = delta_check_span(text, new_start.min(text.len()), new_end.min(text.len()));
+    match open {
+      Some((open_lo, open_hi)) if lo <= open_hi => {
+        open = Some((open_lo, open_hi.max(hi)));
+      }
+      Some((open_lo, open_hi)) => {
+        if !validate_span(text, open_lo, open_hi) {
+          return decode(text).map(|_| ());
+        }
+        open = Some((lo, hi));
+      }
+      None => open = Some((lo, hi)),
+    }
+  }
+  if let Some((open_lo, open_hi)) = open
+    && !validate_span(text, open_lo, open_hi)
+  {
+    return decode(text).map(|_| ());
+  }
+  Ok(())
+}
+
+/// Start of the line containing `at` (byte after the preceding `\n`, or `0`).
+fn line_start_of(text: &[u8], at: usize) -> usize {
+  text
+    .get(..at)
+    .and_then(|before| before.iter().rposition(is_newline))
+    .map_or(0, |newline| newline.saturating_add(1))
+}
+
+/// Byte immediately after the `\n` ending the line at or after `at` (or `text.len()`).
+fn line_end_after(text: &[u8], at: usize) -> usize {
+  text
+    .get(at..)
+    .and_then(|after| after.iter().position(is_newline))
+    .map_or(text.len(), |newline| {
+      at.saturating_add(newline).saturating_add(1)
+    })
+}
+
+/// Expands a delta hunk's output range `[new_start..new_end)` in newline-terminated `text` to
+/// include the full preceding line (`lo`) and the full following line (`hi`).
+fn delta_check_span(text: &[u8], new_start: usize, new_end: usize) -> (usize, usize) {
+  let lo = if new_start == 0 {
+    0
+  } else if text.get(new_start.saturating_sub(1)) == Some(&NEWLINE) {
+    line_start_of(text, new_start.saturating_sub(1))
+  } else {
+    let modified_start = line_start_of(text, new_start);
+    if modified_start == 0 {
+      0
+    } else {
+      line_start_of(text, modified_start.saturating_sub(1))
+    }
+  };
+  let hi = if new_end >= text.len() {
+    text.len()
+  } else {
+    let first_end = line_end_after(text, new_end);
+    if first_end < text.len() {
+      line_end_after(text, first_end)
+    } else {
+      text.len()
+    }
+  };
+  (lo, hi)
+}
+
+/// Verifies every line in newline-aligned `text[lo..hi]` parses and is strictly path-sorted.
+fn validate_span(text: &[u8], lo: usize, hi: usize) -> bool {
+  let Some(slice) = text.get(lo..hi) else {
+    return false;
+  };
+  if slice.is_empty() {
+    return true;
+  }
+  let mut previous: Option<&[u8]> = None;
+  for line in lines(slice) {
+    let Some(entry) = parse(line) else {
+      return false;
+    };
+    if previous.is_some_and(|before| before >= entry.path) {
+      return false;
+    }
+    previous = Some(entry.path);
+  }
+  true
+}
+
 /// The entry of `path` in a manifest's text that [`decode`] has checked, found by halving the text (A-680): its lines
 /// are sorted by path, so the line holding the middle byte of what is left says which half holds `path`, as 7.2's pure
 /// reader halves its lines (`manifest.py` `_lazymanifest.bsearch` \[C\], over an index of line starts it builds first;
@@ -472,6 +592,93 @@ mod tests {
         encode(&entries, &mut out).unwrap();
         prop_assert_eq!(out, bytes);
       }
+    }
+
+    /// Oracle: `validate_delta` over any delta applied to a valid base manifest must agree
+    /// identically (Ok vs exact Err variant and line number) with full `decode`, covering both
+    /// valid manifest edits and arbitrary hostile mutations (newline splits/joins, order
+    /// inversions, duplicate paths, invalid hex/flags, truncation).
+    #[test]
+    fn validate_delta_matches_decode_oracle_on_valid_and_hostile_deltas(
+      base_map in proptest::collection::btree_map(
+        "[a-f/._-]{1,6}",
+        (any::<[u8; 20]>(), 0_u8..3),
+        0..28,
+      ),
+      ops in proptest::collection::vec(
+        (0_usize..1000, 0_usize..40, proptest::collection::vec(any::<u8>(), 0..64)),
+        0..6,
+      ),
+      valid_edits in proptest::collection::btree_map(
+        "[a-f/._-]{1,6}",
+        proptest::option::of((any::<[u8; 20]>(), 0_u8..3)),
+        0..6,
+      ),
+    ) {
+      let flags = [Flag::Regular, Flag::Executable, Flag::Link];
+      let build_manifest = |map: &std::collections::BTreeMap<String, ([u8; 20], u8)>| {
+        let entries: Vec<Entry<'_>> = map
+          .iter()
+          .map(|(path, (node, flag))| Entry {
+            path: path.as_bytes(),
+            node: *node,
+            flag: flags[usize::from(*flag)],
+          })
+          .collect();
+        let mut out = Vec::new();
+        encode(&entries, &mut out).unwrap();
+        out
+      };
+      let base = build_manifest(&base_map);
+
+      // 1. Valid manifest edit delta via `delta::encode_lines`.
+      let mut edited_map = base_map.clone();
+      for (path, change) in valid_edits {
+        match change {
+          Some(val) => {
+            edited_map.insert(path, val);
+          }
+          None => {
+            edited_map.remove(&path);
+          }
+        }
+      }
+      let target = build_manifest(&edited_map);
+      let mut line_delta = Vec::new();
+      crate::delta::encode_lines(&base, &target, &mut line_delta).unwrap();
+      prop_assert_eq!(
+        super::validate_delta(&target, &line_delta),
+        decode(&target).map(|_| ())
+      );
+
+      // 2. Arbitrary hostile multi-hunk delta against `base`.
+      let mut sorted_ops: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+      let mut cursor = 0_usize;
+      for (skip, del, data) in ops {
+        if cursor > base.len() {
+          break;
+        }
+        let remaining = base.len().saturating_sub(cursor);
+        let start = cursor.saturating_add(skip % remaining.saturating_add(1));
+        let end = start.saturating_add(del).min(base.len());
+        sorted_ops.push((start, end, data));
+        cursor = end;
+      }
+      let mut raw_delta = Vec::new();
+      for (start, end, data) in &sorted_ops {
+        let hunk = crate::delta::Hunk {
+          start: u32::try_from(*start).unwrap(),
+          end: u32::try_from(*end).unwrap(),
+          data,
+        };
+        crate::delta::encode_hunk(&hunk, &mut raw_delta).unwrap();
+      }
+      let mut room = crate::Admission::new(1 << 20);
+      let patched = crate::delta::apply(&base, &raw_delta, &mut room).unwrap();
+      prop_assert_eq!(
+        super::validate_delta(&patched, &raw_delta),
+        decode(&patched).map(|_| ())
+      );
     }
   }
 }

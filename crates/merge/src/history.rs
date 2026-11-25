@@ -1159,6 +1159,46 @@ impl Value {
     Some(out)
   }
 
+  /// Appends this value's bytes in `[from, to)` (clamped to `self.len`) directly into `out` without
+  /// allocating an intermediate buffer (`CheckpointEncoder` cooperative streaming). Returns the
+  /// number of bytes appended, or `None` if a piece names a content-plane object with no lent bytes.
+  pub(crate) fn append_range(
+    &self,
+    (chunks, blocks): (&Chunks, &Blocks),
+    from: usize,
+    to: usize,
+    out: &mut Vec<u8>,
+  ) -> Option<usize> {
+    let to = to.min(self.len);
+    if to <= from {
+      return Some(0);
+    }
+    let before = out.len();
+    if let Repr::Tree { tree, version, .. } = &self.repr {
+      let span = to.saturating_sub(from);
+      let mut pieces = Vec::new();
+      chunks.resolve_tree_range(*tree, version, (from, span), &mut pieces)?;
+      for piece in &pieces {
+        out.extend_from_slice(chunks.bytes_of(blocks, piece)?);
+      }
+      return Some(out.len().saturating_sub(before));
+    }
+    let mut logical = 0usize;
+    for piece in self.concrete(chunks).iter() {
+      let start = logical;
+      let end = logical.saturating_add(piece.len);
+      logical = end;
+      if end <= from || start >= to {
+        continue;
+      }
+      let run = chunks.bytes_of(blocks, piece)?;
+      let lo = from.max(start).saturating_sub(start);
+      let hi = to.min(end).saturating_sub(start);
+      out.extend_from_slice(run.get(lo..hi).unwrap_or_default());
+    }
+    Some(out.len().saturating_sub(before))
+  }
+
   /// Whether the value's bytes are `bytes`, compared piece by piece without a copy.
   #[cfg(test)]
   pub(crate) fn equals(&self, (chunks, blocks): (&Chunks, &Blocks), bytes: &[u8]) -> bool {

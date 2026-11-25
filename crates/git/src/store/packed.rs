@@ -375,7 +375,9 @@ impl Recent {
     slates_mem::large::floor().min(self.budget).max(1)
   }
 
-  /// Copies `bytes` to the end of the newest chunk, or of a new one where it has no room.
+  /// Copies `bytes` to the end of the newest chunk, or of a new one where it has no room (reusing
+  /// an evicted non-whole chunk of the same length when cycling inside the budget, avoiding repeated
+  /// `munmap` + `mmap` + zero-fill page faults while still returning all pages on [`Self::let_go`]).
   fn lay(&mut self, place: InPack, kind: Kind, bytes: &[u8]) {
     let room = self
       .chunks
@@ -386,11 +388,19 @@ impl Recent {
       });
     if room < bytes.len() {
       let len = self.chunk_len();
-      self.make_room(len);
-      let mut fresh = Vec::new();
-      if fresh.try_reserve_exact(len).is_err() {
-        return;
-      }
+      let fresh = match self.make_room_reusing(len) {
+        Some(mut recycled) => {
+          recycled.clear();
+          recycled
+        }
+        None => {
+          let mut fresh = Vec::new();
+          if fresh.try_reserve_exact(len).is_err() {
+            return;
+          }
+          fresh
+        }
+      };
       self.push_chunk(fresh, false);
     }
     let number = self.newest();
@@ -456,11 +466,30 @@ impl Recent {
     }
   }
 
+  /// Like [`Self::make_room`], returning the first evicted non-whole chunk whose capacity matches
+  /// `len` so [`Self::lay`] can reuse its mapped buffer without `munmap`/`mmap` page-fault churn.
+  fn make_room_reusing(&mut self, len: usize) -> Option<Vec<u8>> {
+    let mut reused = None;
+    while self.held.saturating_add(len) > self.budget && !self.chunks.is_empty() {
+      if let Some(chunk) = self.pop_oldest()
+        && reused.is_none()
+        && !chunk.whole
+        && chunk.bytes.capacity() == len
+      {
+        reused = Some(chunk.bytes);
+      }
+    }
+    reused
+  }
+
   /// Gives back the oldest chunk whole, forgetting the objects laid in it.
   fn drop_oldest(&mut self) {
-    let Some(oldest) = self.chunks.pop_front() else {
-      return;
-    };
+    let _ = self.pop_oldest();
+  }
+
+  /// Pops the oldest chunk, updating `first`, `held`, `bytes`, `order`, and `objects`.
+  fn pop_oldest(&mut self) -> Option<Chunk> {
+    let oldest = self.chunks.pop_front()?;
     let number = self.first;
     self.first = self.first.saturating_add(1);
     self.held = self.held.saturating_sub(oldest.bytes.capacity());
@@ -475,6 +504,7 @@ impl Recent {
         self.objects.remove(&key);
       }
     }
+    Some(oldest)
   }
 
   /// The bytes kept.
@@ -1122,5 +1152,36 @@ mod recent_tests {
     assert!(recent.get(at(5)).is_none());
     recent.keep(at(9), Kind::Blob, vec![6; chunk() / 4]);
     assert!(recent.get(at(9)).is_some_and(|(_, bytes)| bytes[0] == 6));
+  }
+
+  /// Recycling an evicted non-whole chunk in `Recent::lay` keeps every live object byte-exact,
+  /// invalidates evicted objects, bounds `held <= budget`, and releases everything on `let_go`.
+  #[test]
+  fn recycled_chunks_preserve_bytes_and_stay_within_budget() {
+    let mut recent = Recent::default();
+    recent.set_budget(2 * chunk());
+    let obj_len = chunk() / 4;
+    for n in 0..40_u64 {
+      let fill = u8::try_from((n % 251) + 1).unwrap();
+      recent.keep(at(n), Kind::Blob, vec![fill; obj_len]);
+      assert!(
+        recent.held <= 2 * chunk(),
+        "held {} exceeded budget {}",
+        recent.held,
+        2 * chunk()
+      );
+      let (kind, bytes) = recent.get(at(n)).expect("just-inserted object is present");
+      assert_eq!(kind, Kind::Blob);
+      assert_eq!(bytes.len(), obj_len);
+      assert!(bytes.iter().all(|&b| b == fill));
+    }
+    assert!(recent.get(at(0)).is_none(), "oldest object was evicted");
+    for n in 36..40_u64 {
+      let fill = u8::try_from((n % 251) + 1).unwrap();
+      let (_, bytes) = recent.get(at(n)).expect("latest chunk objects survive");
+      assert!(bytes.iter().all(|&b| b == fill));
+    }
+    recent.let_go();
+    assert_eq!((recent.held, recent.bytes, recent.chunks.len()), (0, 0, 0));
   }
 }

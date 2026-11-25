@@ -1135,10 +1135,29 @@ fn file_identity(
   {
     return Ok(w.identity);
   }
-  let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
-  let n = source.read(vol, store, host, no, &mut bytes)?;
-  bytes.truncate(n);
-  Ok(*blake3::hash(&bytes).as_bytes())
+  let mut hasher = blake3::Hasher::new();
+  let mut buf = vec![
+    0u8;
+    crate::engine::HASH_READ_BYTES
+      .min(usize::try_from(size).unwrap_or(crate::engine::HASH_READ_BYTES))
+      .max(1)
+  ];
+  let mut off = 0u64;
+  while off < size {
+    let take = usize::try_from(size.saturating_sub(off))
+      .unwrap_or(buf.len())
+      .min(buf.len());
+    let Some(window) = buf.get_mut(..take) else {
+      break;
+    };
+    let n = source.read_at(vol, store, host, no, off, window)?;
+    if n == 0 {
+      break;
+    }
+    hasher.update(buf.get(..n).unwrap_or_default());
+    off = off.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+  }
+  Ok(*hasher.finalize().as_bytes())
 }
 
 fn split(path: &str) -> (&str, &str) {

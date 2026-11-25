@@ -28,7 +28,7 @@
 use super::{Pushed, Refusal, Repository, Request, reserve};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
-use crate::objects::{self, ObjectRefused, commit::Commit, tag::Tag, tree::Tree};
+use crate::objects::{self, ObjectRefused, commit::Commit, tag::Tag};
 use crate::store::hook_view::Quantum;
 use crate::store::learn::Clock;
 use crate::unpack::Placed;
@@ -250,21 +250,27 @@ impl Walk {
       self.at = self.at.saturating_add(1);
       return Ok(WalkStep::More);
     }
-    let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
-    let mut state = Connected::Complete;
-    let read = edges_of(
-      (self.at, object),
-      (request.format, pushed),
-      &mut |target, parent| {
-        if pushed.position(&target).is_none() && !repository.holds(&target) {
-          state = state.max(if parent && shallow_commit {
-            Connected::Shallow
-          } else {
-            Connected::Missing
-          });
-        }
-      },
-    )?;
+    let (read, state) = if object.kind == Kind::Tree {
+      judge_tree(self.at, (request.format, pushed, repository))
+    } else {
+      let shallow_commit =
+        !self.shallow.is_empty() && self.shallow.binary_search(&object.id).is_ok();
+      let mut state = Connected::Complete;
+      let read = edges_of(
+        (self.at, object),
+        (request.format, pushed),
+        &mut |target, parent| {
+          if pushed.position(&target).is_none() && !repository.holds(&target) {
+            state = state.max(if parent && shallow_commit {
+              Connected::Shallow
+            } else {
+              Connected::Missing
+            });
+          }
+        },
+      )?;
+      (read, state)
+    };
     if !read
       && let Some(away) = pushed.away()
       && self.stopped != Some((Pass::States, self.at, away))
@@ -488,6 +494,33 @@ fn grown(stack: &mut Vec<Frame>, admission: &mut Admission) -> Result<(), Refusa
   reserve(stack, more)
 }
 
+/// Judges one pushed tree at `at` directly from raw entry digests against `pushed` before
+/// constructing an [`ObjectId`] or probing `repository`, avoiding 40M enum copies on large pushes
+/// while keeping exact malformed-tree and submodule handling.
+fn judge_tree<R: Repository + ?Sized>(
+  at: usize,
+  (format, pushed, repository): (ObjectFormat, &Pushed<'_>, &R),
+) -> (bool, Connected) {
+  let Some(content) = pushed.content(at) else {
+    return (false, Connected::Missing);
+  };
+  let mut state = Connected::Complete;
+  for entry in crate::objects::tree::entries(&content, format) {
+    let Ok(entry) = entry else {
+      return (false, Connected::Missing);
+    };
+    if entry.kind() == Kind::Commit || pushed.contains_raw(entry.id) {
+      continue;
+    }
+    match entry.object_id(format) {
+      Some(id) if repository.holds(&id) => {}
+      Some(_) => state = Connected::Missing,
+      None => return (false, Connected::Missing),
+    }
+  }
+  (true, state)
+}
+
 /// The edges of the object at position `at`, as `pushed` lends its bytes, handed to `each`: whether it could be read.
 /// A blob names nothing, so its bytes are not read; an object whose bytes are not lent could not be read.
 fn edges_of(
@@ -534,9 +567,7 @@ fn for_each_edge(
       commit.parents(format).for_each(|parent| each(parent, true));
       tree.is_some()
     }),
-    Kind::Tree => {
-      Tree::parse(content, format, &mut scratch).map(|tree| tree_edges(&tree, format, each))
-    }
+    Kind::Tree => tree_edges_raw(content, format, each),
     Kind::Tag => Tag::parse(content, &mut scratch).map(|tag| {
       let target = tag.object(format);
       if let Some(target) = target {
@@ -556,23 +587,24 @@ fn for_each_edge(
   }
 }
 
-/// Hands each object `tree`'s entries name to `each`, but a submodule's commit, which lies in
-/// another repository: whether every name could be read.
-fn tree_edges(
-  tree: &Tree<'_>,
+/// Hands each object raw tree bytes `content` name to `each`, skipping submodule commits
+/// (`Kind::Commit`), in a single zero-allocation streaming pass matching [`objects::tree::Tree::parse`]:
+/// returns whether every non-submodule entry's id decoded cleanly, or `Err` on a malformed entry.
+fn tree_edges_raw(
+  content: &[u8],
   format: ObjectFormat,
   each: &mut impl FnMut(ObjectId, bool),
-) -> bool {
+) -> Result<bool, ObjectRefused> {
   let mut whole = true;
-  for entry in tree
-    .entries()
-    .iter()
-    .filter(|entry| entry.kind() != Kind::Commit)
-  {
+  for entry in crate::objects::tree::entries(content, format) {
+    let entry = entry?;
+    if entry.kind() == Kind::Commit {
+      continue;
+    }
     match entry.object_id(format) {
       Some(id) => each(id, false),
       None => whole = false,
     }
   }
-  whole
+  Ok(whole)
 }

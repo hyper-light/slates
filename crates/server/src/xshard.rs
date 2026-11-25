@@ -1205,6 +1205,309 @@ pub async fn within_shard_time<T: 'static>(
   }
 }
 
+/// Counter: remote shard chunks dispatched by [`ComputeScatter`] / [`scatter_compute`] (non-vacuity
+/// counter proving multi-shard parallel compute actually ran off the origin shard).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const COMPUTE_SCATTER_REMOTE_CHUNKS: &str = "xshard.compute_scatter_remote_chunks";
+
+/// A bounded, cancel-safe, lock-free multi-shard compute scatter in flight (R2: zero `Arc`/locks,
+/// R8: single code path degenerating locally at one shard).
+///
+/// Items are balanced across `shards` by caller-supplied byte weight using longest-processing-time
+/// assignment, dispatched to remote shards via `Control::Spawn` with a 1-slot `slates_rt::sync`
+/// handoff (so a `ControlFull` or channel-capacity refusal keeps that chunk locally with zero lost
+/// work), and reassembled in exact original item order in [`ComputeScatter::finish`].
+pub(crate) struct ComputeScatter<I, O, F> {
+  /// Total number of items to reassemble in original order.
+  total: usize,
+  /// Chunks kept on the origin shard (bucket 0 plus any fallback chunks whose remote dispatch met
+  /// backpressure).
+  local: Vec<Vec<(usize, I)>>,
+  /// Remote shard result channels in flight (`Send`, lock-free wake on completion, cancel-safe on
+  /// drop).
+  remote: Vec<slates_rt::sync::ChannelReceiver<IndexedChunk<O>>>,
+  /// Pure stateless work function run on each item.
+  work: F,
+  /// Cooperative pacing interval derived from the shard's step quantum.
+  quantum_ns: u64,
+}
+
+impl<I, O, F> ComputeScatter<I, O, F>
+where
+  I: Send + 'static,
+  O: Send + 'static,
+  F: Fn(I) -> O + Copy + Send + 'static,
+{
+  /// Splits `items` across `shards` balanced by `weight`, launches remote chunks immediately on
+  /// every shard other than `origin`, and holds `origin`'s chunk for [`ComputeScatter::finish`].
+  ///
+  /// When `shards.len() <= 1` or `items.len() <= 1`, no cross-shard message is sent (R8).
+  pub(crate) fn launch(
+    origin: u16,
+    shards: &[u16],
+    items: Vec<I>,
+    weight: impl Fn(&I) -> u64,
+    work: F,
+    quantum_ns: u64,
+  ) -> Self {
+    Self::launch_with(origin, shards, true, items, weight, work, quantum_ns)
+  }
+
+  /// Like [`ComputeScatter::launch`], but when `shards` contains remote shards (`!= origin`),
+  /// dispatches 100% of `items` to remote shards so `origin` can pipeline its own work (such as
+  /// pack inflation) with zero local serial tail in [`ComputeScatter::finish`]. Degenerates locally
+  /// at 1 shard (R8).
+  pub(crate) fn launch_remote(
+    origin: u16,
+    shards: &[u16],
+    items: Vec<I>,
+    weight: impl Fn(&I) -> u64,
+    work: F,
+    quantum_ns: u64,
+  ) -> Self {
+    Self::launch_with(origin, shards, false, items, weight, work, quantum_ns)
+  }
+
+  /// Shared launcher parameterized by whether `origin` receives a local bucket alongside remote
+  /// shards.
+  fn launch_with(
+    origin: u16,
+    shards: &[u16],
+    include_origin: bool,
+    items: Vec<I>,
+    weight: impl Fn(&I) -> u64,
+    work: F,
+    quantum_ns: u64,
+  ) -> Self {
+    let total = items.len();
+    let targets = scatter_targets(origin, shards, include_origin);
+    if (targets.len() == 1 && targets.first() == Some(&origin)) || total == 0 {
+      let indexed = items.into_iter().enumerate().collect();
+      return Self {
+        total,
+        local: vec![indexed],
+        remote: Vec::new(),
+        work,
+        quantum_ns,
+      };
+    }
+    let buckets = assign_lpt_buckets(items, targets.len(), weight);
+    let mut local = Vec::new();
+    let mut remote = Vec::with_capacity(targets.len());
+    let mut dispatched: u64 = 0;
+    for (target, bucket) in targets.into_iter().zip(buckets) {
+      if bucket.is_empty() {
+        continue;
+      }
+      if target == origin {
+        local.push(bucket);
+        continue;
+      }
+      match dispatch_compute_chunk(target, bucket, work, quantum_ns) {
+        Ok(receiver) => {
+          remote.push(receiver);
+          dispatched = dispatched.saturating_add(1);
+        }
+        Err(returned) => local.push(returned),
+      }
+    }
+    if dispatched > 0 {
+      state::with_state_counted(|s| s.count(COMPUTE_SCATTER_REMOTE_CHUNKS, dispatched));
+    }
+    Self {
+      total,
+      local,
+      remote,
+      work,
+      quantum_ns,
+    }
+  }
+
+  /// Runs any local chunks cooperatively on `origin`, awaits every remote chunk, and returns all
+  /// outputs in exact original item order. Returns `None` if a remote shard shut down before
+  /// delivering its chunk.
+  pub(crate) async fn finish(self) -> Option<Vec<O>> {
+    let mut slots: Vec<Option<O>> = Vec::with_capacity(self.total);
+    slots.resize_with(self.total, || None);
+    for chunk in self.local {
+      let done = run_compute_chunk_paced(chunk, self.work, self.quantum_ns).await;
+      place_compute_outputs(&mut slots, done);
+    }
+    for mut receiver in self.remote {
+      let done = receiver.recv().await.ok()?;
+      place_compute_outputs(&mut slots, done);
+    }
+    slots.into_iter().collect()
+  }
+}
+
+/// Convenience wrapper for synchronous multi-shard scatter-gather: launches [`ComputeScatter`] and
+/// awaits [`ComputeScatter::finish`].
+pub(crate) async fn scatter_compute<I, O, F>(
+  origin: u16,
+  shards: &[u16],
+  items: Vec<I>,
+  weight: impl Fn(&I) -> u64,
+  work: F,
+  quantum_ns: u64,
+) -> Option<Vec<O>>
+where
+  I: Send + 'static,
+  O: Send + 'static,
+  F: Fn(I) -> O + Copy + Send + 'static,
+{
+  ComputeScatter::launch(origin, shards, items, weight, work, quantum_ns)
+    .finish()
+    .await
+}
+
+/// Ordered deduplicated scatter targets: includes `origin` when `include_origin` is true or when
+/// no remote shard exists (R8).
+fn scatter_targets(origin: u16, shards: &[u16], include_origin: bool) -> Vec<u16> {
+  let mut targets = Vec::with_capacity(shards.len().max(1));
+  if include_origin {
+    targets.push(origin);
+  }
+  for &shard in shards {
+    if shard != origin && !targets.contains(&shard) {
+      targets.push(shard);
+    }
+  }
+  if targets.is_empty() {
+    targets.push(origin);
+  }
+  targets
+}
+
+/// Assigns indexed `items` across `count` buckets using longest-processing-time-first balancing by
+/// `weight`, keeping every shard's byte workload closely matched even under skewed object sizes.
+fn assign_lpt_buckets<I>(
+  items: Vec<I>,
+  count: usize,
+  weight: impl Fn(&I) -> u64,
+) -> Vec<Vec<(usize, I)>> {
+  let mut weighted: Vec<(u64, usize, I)> = items
+    .into_iter()
+    .enumerate()
+    .map(|(index, item)| (weight(&item), index, item))
+    .collect();
+  weighted.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+  let mut buckets: Vec<Vec<(usize, I)>> = (0..count).map(|_| Vec::new()).collect();
+  let mut loads = vec![0u64; count];
+  for (cost, index, item) in weighted {
+    let lightest = loads
+      .iter()
+      .enumerate()
+      .min_by_key(|&(_, load)| *load)
+      .map_or(0, |(bucket, _)| bucket);
+    if let Some(bucket) = buckets.get_mut(lightest) {
+      bucket.push((index, item));
+    }
+    if let Some(load) = loads.get_mut(lightest) {
+      *load = load.saturating_add(cost.max(1));
+    }
+  }
+  buckets
+}
+
+/// Indexed compute slice moved across shards and reassembled in original order.
+type IndexedChunk<T> = Vec<(usize, T)>;
+
+/// Dispatches `chunk` to `target` via `Control::Spawn` and bounded 1-slot handoff channels so a
+/// `ControlFull` or cell-capacity refusal returns `chunk` intact for local execution.
+fn dispatch_compute_chunk<I, O, F>(
+  target: u16,
+  chunk: IndexedChunk<I>,
+  work: F,
+  quantum_ns: u64,
+) -> Result<slates_rt::sync::ChannelReceiver<IndexedChunk<O>>, IndexedChunk<I>>
+where
+  I: Send + 'static,
+  O: Send + 'static,
+  F: Fn(I) -> O + Copy + Send + 'static,
+{
+  let Ok((in_sender, mut in_receiver)) = slates_rt::sync::channel::<IndexedChunk<I>>(1) else {
+    return Err(chunk);
+  };
+  let Ok((out_sender, out_receiver)) = slates_rt::sync::channel::<IndexedChunk<O>>(1) else {
+    return Err(chunk);
+  };
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let Ok(received) = in_receiver.recv().await else {
+        return;
+      };
+      let out = run_compute_chunk_paced(received, work, quantum_ns).await;
+      let _ = out_sender.try_send(out);
+    }),
+    None,
+  );
+  if registry::send_control(target, Control::Spawn(Box::new(task))).is_err() {
+    return Err(chunk);
+  }
+  if let Err(unsent) = in_sender.try_send(chunk) {
+    return Err(match unsent {
+      slates_rt::sync::SyncError::Closed(chunk)
+      | slates_rt::sync::SyncError::Full(chunk)
+      | slates_rt::sync::SyncError::NotOnShardThread(chunk) => chunk,
+    });
+  }
+  Ok(out_receiver)
+}
+
+/// Executes `chunk` cooperatively on the current shard, yielding at the shard's step ceiling or
+/// whenever another task/client waits past the derived pacing quantum.
+async fn run_compute_chunk_paced<I, O, F>(
+  chunk: Vec<(usize, I)>,
+  work: F,
+  quantum_ns: u64,
+) -> Vec<(usize, O)>
+where
+  F: Fn(I) -> O,
+{
+  let mut out = Vec::with_capacity(chunk.len());
+  let ceiling_ns = slates_rt::futures::step_ceiling_ns().unwrap_or(quantum_ns);
+  let ask_ns = slates_rt::futures::wake_cost_ns()
+    .unwrap_or(quantum_ns)
+    .max(quantum_ns);
+  let mut turn_began = slates_rt::futures::now_ns();
+  let mut next_ask = turn_began.saturating_add(ask_ns);
+  for (index, item) in chunk {
+    out.push((index, work(item)));
+    if ceiling_ns == 0 {
+      continue;
+    }
+    let now = slates_rt::futures::now_ns();
+    let past_ceiling = now.saturating_sub(turn_began) >= ceiling_ns;
+    let must_yield = if past_ceiling {
+      true
+    } else if now >= next_ask {
+      let waiting = slates_rt::futures::others_waiting();
+      let after_ask = slates_rt::futures::now_ns();
+      let ask_cost = after_ask.saturating_sub(now);
+      next_ask = after_ask.saturating_add(ask_ns.max(ask_cost));
+      waiting
+    } else {
+      false
+    };
+    if must_yield {
+      slates_rt::futures::yield_now().await;
+      turn_began = slates_rt::futures::now_ns();
+      next_ask = turn_began.saturating_add(ask_ns);
+    }
+  }
+  out
+}
+
+/// Places `(index, output)` results back into their original positions in `slots`.
+fn place_compute_outputs<O>(slots: &mut [Option<O>], outputs: Vec<(usize, O)>) {
+  for (index, value) in outputs {
+    if let Some(slot) = slots.get_mut(index) {
+      *slot = Some(value);
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -2051,6 +2354,106 @@ mod tests {
         "cancelled call retained the reply; delivered first: {delivered_first}"
       );
     }
+  }
+
+  /// R2 / R8: multi-shard `scatter_compute` preserves exact item order on skewed weights, proves
+  /// remote shards ran via `COMPUTE_SCATTER_REMOTE_CHUNKS`, degenerates cleanly at 1 shard, and
+  /// tolerates mid-flight cancellation without leaking state.
+  #[test]
+  fn scatter_compute_balances_across_shards_preserves_order_and_cancels_cleanly() {
+    let daemon = crate::daemon::audit_daemon();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let origin = state.shard;
+      let shards = state.shards.clone();
+      let quantum = state.config.step_quantum_ns();
+      let task = slates_rt::futures::spawn(async move {
+        let items: Vec<(usize, Vec<u8>)> = (0..64)
+          .map(|idx| {
+            let len = if idx % 11 == 0 { 4096 } else { 37 + idx * 13 };
+            (idx, vec![u8::try_from(idx).unwrap_or(0); len])
+          })
+          .collect();
+        let expected: Vec<(usize, [u8; 32])> = items
+          .iter()
+          .map(|(idx, bytes)| (*idx, *blake3::hash(bytes).as_bytes()))
+          .collect();
+
+        // Single-shard degenerate (R8): zero remote chunks, identical outputs.
+        let one = scatter_compute(
+          origin,
+          &[origin],
+          items.clone(),
+          |(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+          |(idx, bytes)| (idx, *blake3::hash(&bytes).as_bytes()),
+          quantum,
+        )
+        .await
+        .expect("single-shard scatter");
+        assert_eq!(one, expected);
+
+        // Multi-shard scatter across all daemon shards.
+        let before = state::with_state(|s| {
+          s.refusals
+            .get(COMPUTE_SCATTER_REMOTE_CHUNKS)
+            .copied()
+            .unwrap_or(0)
+        })
+        .unwrap_or(0);
+        let many = scatter_compute(
+          origin,
+          &shards,
+          items.clone(),
+          |(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+          |(idx, bytes)| (idx, *blake3::hash(&bytes).as_bytes()),
+          quantum,
+        )
+        .await
+        .expect("multi-shard scatter");
+        assert_eq!(many, expected);
+        let after = state::with_state(|s| {
+          s.refusals
+            .get(COMPUTE_SCATTER_REMOTE_CHUNKS)
+            .copied()
+            .unwrap_or(0)
+        })
+        .unwrap_or(0);
+        if shards.len() > 1 {
+          assert!(
+            after > before,
+            "expected remote shards to run chunks: before={before} after={after}"
+          );
+        }
+
+        // Cancellation safety: dropping a launched scatter mid-flight leaves subsequent scatters healthy.
+        let dropped = ComputeScatter::launch(
+          origin,
+          &shards,
+          items.clone(),
+          |(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+          |(idx, bytes)| (idx, *blake3::hash(&bytes).as_bytes()),
+          quantum,
+        );
+        drop(dropped);
+        let after_cancel = scatter_compute(
+          origin,
+          &shards,
+          items,
+          |(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+          |(idx, bytes)| (idx, *blake3::hash(&bytes).as_bytes()),
+          quantum,
+        )
+        .await
+        .expect("scatter after cancel");
+        assert_eq!(after_cancel, expected);
+        let _ = tx.send(());
+      })
+      .expect("spawn scatter test");
+      let _ = slates_rt::futures::detach(task);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(15))
+      .expect("scatter test completed");
+    daemon.stop();
   }
 }
 

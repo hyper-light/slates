@@ -62603,3 +62603,49 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   `texts`/`prop_lists`/`copy_sources` side tables (2.48× lower live index heap); zero-fill-free `decompress_vec` inflate in
   `slates-git` while preserving exact `LongerThanSize`-before-`Inflate` refusal precedence.
 - **Applied in the same change to:** `crates/{rt,mem,anchor,store,merge,vfs,ipc,server,git,hg,svn,client}/`, BENCHMARKS, GAPS.
+
+### A-892 — Multi-shard Git/Hg full push verification, runtime I/O harvest precision, and end-to-end 1 GiB single-changeset submit/checkpoint/landing slicing (2026-11-25; §4.3, §4.15, §4.16, §4.17)
+
+- **Lock-free multi-shard compute scatter & pre-hashed content seam (R2, D-8, D-9):**
+  - Added unforgeable `slates_vcs::Hashed<B>` + `ContentStore::put_object_whole_hashed` / `keep_with_id` so worker shards
+    can compute BLAKE3 content hashes off the owner shard while the content store retains the exact safety invariant that
+    every stored id matches its bytes.
+  - Added `crates/server/src/xshard.rs` (`ComputeScatter`, `scatter_compute`, `COMPUTE_SCATTER_REMOTE_CHUNKS`): scatters
+    owned work chunks to peer shards via `spawn_detached_on` + 1-slot bounded `ChannelReceiver<IndexedChunk<O>>`, zero
+    `Arc`/`Mutex`/`RwLock`, cancel-safe on drop.
+- **Runtime I/O harvest wake precision (`slates-rt`):**
+  - Added `Interests::is_empty`, `ShardContext::try_busy_harvest`, and `deliver_waking` / `harvest_io -> (any, woke)` so
+    `others_waiting()` and `spin_for_work()` wake only when a driver completion actually queued a task onto `self.local`,
+    eliminating bogus yields from unwatched level-triggered writable HTTP sockets while preserving `learn_turn`'s empty
+    wait signal.
+- **Multi-shard Hg full push (`slates-hg`, `repository/hg_push.rs`):**
+  - Worker shards verify incoming changegroup revisions, compute BLAKE3 hashes (`Hashed`), validate manifest deltas
+    (`validate_delta`, `IncomingDelta`/`GivenManifest`, `BaseCache`), and encode manifest deltas on branch merges
+    (`encode_manifest_delta`), while `InFlightSegment` pipelines Mantle `disk.land` (`F_FULLFSYNC`) with multi-shard
+    compute. Interleaved 3-round release push of `hg-src` (57,036 changesets): `48.600s → 18.051s` (**2.69× faster**,
+    `1.76×` local stock `hg`).
+- **Multi-shard Git full push (`slates-git`, `git_push`, HTTP/SSH receive):**
+  - Added deferred unpack & delta resolution (`DeferredBatch`, `PendingBase`, `read_deferred`, `settle_named`,
+    `resolve_turn_deferred`, `verify_unpacked`) piped through remote-only `input_pipelined` and `resolve_step_pipelined`
+    on both HTTP and SSH, with R3-derived batch sizing and `Recent` chunk reuse (`make_room_reusing`) skipping blob
+    caching so commits/trees remain resident for `Checking::turn`.
+  - Replaced sorted `Vec<(ObjectId, usize)>` binary searches in connectivity checking with L2-cache-resident
+    open-addressed `IdIndex` (`buckets: Vec<u32>` + packed `sha1_ids: Vec<[u8; 20]>`) and zero-alloc streaming
+    `tree_edges_raw` + hoisted `ends_well` in `tree::entries`. Interleaved 3-round release push of `git/git` (424,984
+    objects / 310.71 MiB / 1,027 refs): `41.962s → 17.487s` (**2.40× faster**, `1.78×` local stock `git`).
+- **End-to-end 1 GiB single-changeset submit, checkpoint & disk landing slicing (`slates-merge`, `slates-land`, `slates-server`):**
+  - Closed the 2026-11-20 1 GiB single-changeset gap across every stage: zero-fill-free sliced `laid_post_state` +
+    `lay_op_slice`, cooperative `IncrementEncoder`, chunked `AheadHold::from_encoded`, zero-clone
+    `Green::judge_computed_taking` + sliced `Green::make_step` + `Judged::restore_buffers_into` + O(files)
+    `Green::commit_judged_for` shared by local and cross-shard `owner_judge` (`start_owner_prepare`), cooperative
+    post-`tell_floor` `WorkFiles::pop_one` drop, single-buffer sliced `CheckpointEncoder` + `Value::append_range`
+    (`CHUNK_ENCODED`), and sliced `slates-land` `Phase::Validate` hashing + streaming `manifest::file_identity`.
+  - Verified: `work_cow::single_large_seed` (1,000 × 1 MiB on 4 shards) submits in `3.186s` (`submit_longest_us=1,492 µs`),
+    lands onto disk in `4.983s` (`pulse_longest=185 ms`), 0 watchdog kills, 0 near-misses; 117/117 VCS interop compliance
+    rows pass.
+- **Applied in the same change to:** `crates/rt/src/{interest,shard}.rs`, `crates/vcs/src/{content,lib}.rs`,
+  `crates/hg/src/{manifest,index,push/{commit,intake,intake_batch,intake_tests}}.rs`,
+  `crates/git/src/{unpack,objects/{dotgit,tree},store/{mod,packed,push},receive/{mod,checking,connect,session,tests/session}}.rs`,
+  `crates/merge/src/{checkpoint,engine,history}.rs`, `crates/land/{src/{engine,manifest,source}.rs,tests/oracle.rs}`,
+  `crates/server/{src/{xshard,vcs_store,git_push,git_push/intake,vcs_http/git/receive,vcs_ssh/receive,repository/hg_push,held_ahead,merge_service,refining,verbs,work_files}.rs,tests/{work_cow,green_landing_cow}.rs}`,
+  BENCHMARKS, GAPS.

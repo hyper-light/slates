@@ -10014,6 +10014,60 @@ fn assemble_post_state(
   Ok(post)
 }
 
+/// Lays one slice (`sub_off..sub_off+take`) of a single content op into `post` (growing `post`
+/// lazily with `resize` only up to the slice end, never zero-filling a 1 GiB post-state up front).
+/// Returns `(bytes_copied, op_finished)` so even a single multi-megabyte file op stays within one
+/// copy slice per turn (`refining::laid_post_state`).
+pub(crate) fn lay_op_slice(
+  post: &mut Vec<u8>,
+  op: &slates_merge::ops_doc::Op,
+  (doc, plan): (
+    &slates_merge::ops_doc::OpsDoc,
+    &slates_merge::increment::PostStatePlan,
+  ),
+  (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+  (sub_off, budget): (u64, u64),
+) -> Result<(u64, bool), crate::work_files::BaseGone> {
+  use slates_merge::ops_doc::OpKind;
+  if op.src == u64::MAX {
+    return Ok((0, true));
+  }
+  let Some(path) = doc.paths.path(op.path) else {
+    return Ok((0, true));
+  };
+  let is_content = matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
+  if !is_content {
+    let end = usize::try_from(op.src.saturating_add(op.len)).unwrap_or(0);
+    if post.len() < end {
+      post.resize(end, 0);
+    }
+    let copied = lay_op(post, op, (doc, plan), (files, base), journal)?;
+    return Ok((u64::try_from(copied).unwrap_or(u64::MAX), true));
+  }
+  let Some(&plan_at) = plan.get(&op.src) else {
+    return Ok((0, true));
+  };
+  let rem = op.len.saturating_sub(sub_off);
+  let take_u64 = rem.min(budget.max(1));
+  let (Ok(dst), Ok(take)) = (
+    usize::try_from(op.src.saturating_add(sub_off)),
+    usize::try_from(take_u64),
+  ) else {
+    return Ok((0, true));
+  };
+  let dst_end = dst.saturating_add(take);
+  if post.len() < dst_end {
+    post.resize(dst_end, 0);
+  }
+  if let Some(into) = post.get_mut(dst..dst_end)
+    && files.copy_range(base, path, plan_at.saturating_add(sub_off), into)? != Some(take)
+  {
+    into.fill(0);
+  }
+  Ok((take_u64, sub_off.saturating_add(take_u64) >= op.len))
+}
+
 /// Lays the bytes the ops of `doc` in `ops` contribute into `post` ([`assemble_post_state`]'s body, which a sliced
 /// build runs a range at a time, A-787 part 3). Returns the bytes copied, what a slice is budgeted by; or `BaseGone` when
 /// an op's range names base bytes `base` does not hold ([`lay_op`]).
@@ -11017,7 +11071,7 @@ pub(crate) fn settle_submit(
   ) {
     return refused(refusal_of_db(&e));
   }
-  reset_accepted_work(state, work_id, version);
+  let deferred_drop = reset_accepted_work(state, work_id, version);
   // The session log's mark (A-773): the version the work's last submission made, which it now stands on, and whether
   // it changed nothing (A-782).
   let identical = accepted_identical(&reply);
@@ -11025,6 +11079,9 @@ pub(crate) fn settle_submit(
     work.accepted = Some((version, identical));
   }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
+  if let Some(old_files) = deferred_drop {
+    defer_drop_work_files(state, old_files);
+  }
   reply
 }
 
@@ -11072,6 +11129,25 @@ fn verdict_once(
   sealed: &crate::work_home::SealedWork,
   (inc, hold): (&slates_merge::engine::Increment, bool),
 ) -> Option<Result<(Judged, Option<slates_merge::engine::Judged>), String>> {
+  // Pre-made accepted verdict built cooperatively via `Green::make_step` during sliced preparation:
+  // commits in O(files) with zero byte copy when the green's head has not moved and nothing is unlent.
+  if !hold
+    && sealed.computed.is_none()
+    && let Some(judged) = crate::refining::take_made(state, sealed.work, inc.id)
+  {
+    let mut engine = state.greens.get_mut(&green_id)?;
+    if judged.at() == engine.head()
+      && engine.commit_unlent_for(&judged, inc).is_empty()
+      && let Ok((version, applied)) = engine.commit_judged_for(judged, inc)
+    {
+      let outcome = if applied.is_empty() {
+        slates_merge::engine::Outcome::Identical { version }
+      } else {
+        slates_merge::engine::Outcome::Accepted { version }
+      };
+      return Some(Ok(((outcome, Some(applied)), None)));
+    }
+  }
   // The verdict the refinement job computed at the head it saw (A-787 part 3), taken by position: only what a later
   // head changed is judged again, so the outcome is the one this head's own judgment reaches.
   let local = if sealed.computed.is_none() {
@@ -11383,6 +11459,31 @@ fn increment_held(
         let _ = crate::merge_service::settle_green_retention(state, green_id);
       });
   }
+  if let Some(held_ahead) = crate::refining::take_held(state, sealed.work, inc.id) {
+    if let Err(refusal) = chain_room_admitted(state, green_id, inc, 0) {
+      crate::held_ahead::give_back(state, &[held_ahead]);
+      return Err(refusal);
+    }
+    if let Err(refusal) = retention_secured(state, green_id, inc) {
+      crate::held_ahead::give_back(state, &[held_ahead]);
+      return Err(refusal);
+    }
+    return crate::merge_service::increment_already_held(state, green_id, held_ahead.inputs)
+      .map(|held| {
+        state.count(crate::held_ahead::AHEAD_NAMED, 1);
+        HeldPlacement::Ready {
+          held: crate::merge_service::HeldIncrement {
+            inputs: held.inputs,
+            fresh: held_ahead.fresh,
+          },
+          carried: None,
+        }
+      })
+      .inspect_err(|_| {
+        crate::held_ahead::give_back(state, &[held_ahead]);
+        let _ = crate::merge_service::settle_green_retention(state, green_id);
+      });
+  }
   let pre_encoded = crate::refining::take_encoded(state, sealed.work, inc.id);
   let encoded_len = pre_encoded
     .as_ref()
@@ -11424,7 +11525,7 @@ pub(crate) const CARRIED_CHAIN_SHARE: usize = 64;
 
 /// Whether an increment encoding `len` bytes long is carried in its chain entry: at most [`CARRIED_INCREMENT_MAX`] and
 /// [`CARRIED_CHAIN_SHARE`]'s share of the partition's green-chain cap, derived (A-854).
-fn carries(state: &ShardState, len: usize) -> bool {
+pub(crate) fn carries(state: &ShardState, len: usize) -> bool {
   let share = state.db.partition().caps().green_chain_bytes / CARRIED_CHAIN_SHARE;
   len <= CARRIED_INCREMENT_MAX.min(share)
 }
@@ -11985,13 +12086,15 @@ fn chain_admits_len(
 /// the reset a second submit would re-declare the already-merged operations against the old base). It then holds
 /// nothing of its own (`crate::work_files`), so the reset is O(1) whatever the green holds — it copied every file of
 /// the green into the work before 2026-11-04 — and its charge falls to nothing (`crate::work_charge`).
-fn reset_accepted_work(state: &mut ShardState, work_id: DbVolumeId, version: u64) {
-  let Some(w) = state.works.get_mut(&work_id) else {
-    return;
-  };
+fn reset_accepted_work(
+  state: &mut ShardState,
+  work_id: DbVolumeId,
+  version: u64,
+) -> Option<crate::work_files::WorkFiles> {
+  let w = state.works.get_mut(&work_id)?;
   w.base_version = version;
   w.journal.clear();
-  w.files.clear();
+  let old_files = core::mem::take(&mut w.files);
   // The entries were the old base's (A-247).
   w.entries.clear();
   w.revision = w.revision.wrapping_add(1);
@@ -12000,6 +12103,34 @@ fn reset_accepted_work(state: &mut ShardState, work_id: DbVolumeId, version: u64
   // The recount of what it now keeps: nothing, so the charge only falls and cannot be refused.
   let kept = crate::work_charge::footprint(&w.files, &w.journal);
   let _ = crate::work_charge::set_to(state, work_id, kept);
+  crate::refining::clear_work(state, work_id);
+  let drop_threshold = state
+    .config
+    .copy_slice_bytes_within(state.config.step_quantum_ns());
+  (old_files.footprint() > drop_threshold).then_some(old_files)
+}
+
+/// Drops a large accepted work's old buffers cooperatively across shard turns after `tell_floor`
+/// (so the detached drop task does not make `others_waiting()` appear true during an idle shard's
+/// `checkpoint_green`, while still keeping `munmap` cost out of a single turn on 1 GiB seeds).
+fn defer_drop_work_files(state: &ShardState, mut old_files: crate::work_files::WorkFiles) {
+  let quantum = state.config.step_quantum_ns().max(1);
+  let _ = slates_rt::futures::spawn_detached(async move {
+    loop {
+      let began = slates_rt::futures::now_ns();
+      let mut more = false;
+      while old_files.pop_one() {
+        more = true;
+        if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+          break;
+        }
+      }
+      if !more {
+        break;
+      }
+      slates_rt::futures::yield_now().await;
+    }
+  });
 }
 
 /// The retention settle after a refused submit: nothing was retained but the rejected result, so the
@@ -13279,6 +13410,43 @@ pub(crate) fn owner_judge(
     return crate::green_ready::park(state, green, parked)
       .err()
       .map(refused);
+  }
+  // Cross-shard large submit (> CARRIED_INCREMENT_MAX): restore the increment prepared by an
+  // owner-side slicing job, or park behind one so encoding, AheadHold staging, and Green::make_step
+  // run cooperatively across turns before committing in O(files) with zero byte copy.
+  if sealed.composed.is_none()
+    && let Some(inc) =
+      crate::refining::take_owner_increment(state, sealed.work, sealed.base_version)
+  {
+    sealed.composed = Some(inc);
+  }
+  if sealed.held.is_none()
+    && sealed.composed.as_ref().is_some_and(|inc| {
+      !carries(state, inc.encoded_len())
+        && !crate::refining::is_owner_prepared(state, sealed.work, inc.id)
+    })
+  {
+    let work = sealed.work;
+    let green = sealed.green;
+    if let Some(inc) = sealed.composed.take() {
+      if crate::refining::start_owner_prepare(state, work, green, inc) {
+        let parked = ParkedSubmit {
+          origin,
+          id,
+          route: Some(back),
+          kind: ParkedKind::Owner {
+            sealed: Box::new(sealed),
+            evidence,
+            policy,
+          },
+          parked_ns: state.clock.monotonic_ns(),
+        };
+        return crate::refining::park(state, work, parked)
+          .err()
+          .map(refused);
+      }
+      return Some(refused(Refusal::Overloaded { shard: state.shard }));
+    }
   }
   // A Subversion repository's green: the repository's landing turn before the verdict, or the step waits for it,
   // parked (`crate::made_commit`, main's landing order).

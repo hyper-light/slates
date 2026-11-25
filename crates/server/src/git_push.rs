@@ -217,6 +217,54 @@ pub(crate) enum PushFailed {
   Unlanded,
 }
 
+/// Derived: two pipelined verification batches (`pending_batch` and `in_flight`) plus equal
+/// working headroom for delta application share the push's remaining admission (`2 × 2 = 4`).
+const PIPELINE_ROOM_DIVISOR: u64 = 4;
+
+/// One unpacked Git pack object plus session context moved to a worker shard for parallel
+/// SHA-1DC/SHA-256 naming, BLAKE3 content hashing, strict `fsck`, and commit/tag parsing.
+struct VerifyItem {
+  format: slates_git::object_name::ObjectFormat,
+  room: u64,
+  object: slates_git::unpack::Unverified,
+}
+
+/// Stateless worker entry point passed to [`crate::xshard::ComputeScatter`].
+fn run_verify_item(item: VerifyItem) -> slates_git::receive::VerifiedObject {
+  slates_git::receive::verify_unpacked(item.format, item.room, item.object)
+}
+
+/// In-flight multi-shard verification scatter for a pipelined Git push.
+type GitVerifyScatter = crate::xshard::ComputeScatter<
+  VerifyItem,
+  slates_git::receive::VerifiedObject,
+  fn(VerifyItem) -> slates_git::receive::VerifiedObject,
+>;
+
+/// Routing and pacing context snapshot read on the owner shard before launching a scatter batch.
+struct DispatchMeta {
+  origin: u16,
+  shards: Vec<u16>,
+  quantum_ns: u64,
+  window_bytes: u64,
+  format: slates_git::object_name::ObjectFormat,
+  room: u64,
+}
+
+/// Result of one synchronous deferred-unpack step on the owner shard.
+enum DeferredStep {
+  /// Delete-only push already checked.
+  Ready,
+  /// More pack bytes expected; `dispatch` carries routing metadata when `pending_batch` reached
+  /// the derived batch target and should be dispatched to worker shards.
+  More(Option<DispatchMeta>),
+  /// Pack reached its trailer or an unpack error; flush in-flight and pending batches, then finish.
+  PackEnded {
+    read: Result<(), slates_git::unpack::Refusal>,
+    meta: DispatchMeta,
+  },
+}
+
 /// One git push over one connection, on its repository's owner shard (module docs), its hooks'
 /// views shown by its presenter `P` (A-665 part 3).
 pub(crate) struct ReceivePack<P = Unpresented> {
@@ -258,6 +306,14 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// Let-go pack windows brought back for this push's reads, pinned until the push ends so
   /// concurrent fetches cannot evict them mid-push.
   resident: crate::vcs_http::git::upload::Resident,
+  /// Unpacked-but-unnamed objects buffered on the owner shard until the batch reaches the derived
+  /// scatter target or the pack ends.
+  pending_batch: slates_git::unpack::DeferredBatch,
+  /// Previous batch currently running SHA-1DC + BLAKE3 + fsck + commit/tag parse across remote
+  /// shards while the owner shard inflates the next batch.
+  in_flight: Option<GitVerifyScatter>,
+  /// First worker collision error observed while settling pipelined batches, applied in pack order.
+  deferred_error: Option<slates_git::unpack::Refusal>,
 }
 
 /// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
@@ -564,6 +620,9 @@ impl<P> ReceivePack<P> {
       unadmitted: None,
       refusal_names: None,
       resident: crate::vcs_http::git::upload::Resident::new(),
+      pending_batch: slates_git::unpack::DeferredBatch::default(),
+      in_flight: None,
+      deferred_error: None,
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -591,6 +650,457 @@ impl<P> ReceivePack<P> {
       crate::vcs_share::Bound::Snapshot { room } => PushFailed::PastSnapshot { past, room },
       crate::vcs_share::Bound::Shard => failed,
     }
+  }
+
+  /// Hands the push the client's next `bytes`, pipelining multi-shard SHA-1DC + BLAKE3 + fsck +
+  /// commit/tag verification across all daemon shards while the owner shard inflates incoming pack
+  /// bytes (R2, R3, R8). Returns `None` if `lender` could not lend the shard or a remote shard
+  /// shut down mid-batch.
+  pub(crate) async fn input_pipelined<L: crate::vcs_http::git::ShardLender>(
+    &mut self,
+    lender: &mut L,
+    bytes: &[u8],
+  ) -> Option<Result<bool, PushFailed>> {
+    let step = match lender.lend(|state| self.input_deferred_on_shard(state, bytes))? {
+      Ok(step) => step,
+      Err(failed) => {
+        self.in_flight = None;
+        self.pending_batch.release_all(&mut self.admission);
+        return Some(Err(failed));
+      }
+    };
+    match step {
+      DeferredStep::Ready => Some(Ok(true)),
+      DeferredStep::More(None) => Some(Ok(false)),
+      DeferredStep::More(Some(meta)) => {
+        self.flush_in_flight(lender).await?;
+        self.launch_pending(&meta, true, false);
+        Some(Ok(false))
+      }
+      DeferredStep::PackEnded { read, meta } => {
+        self.flush_in_flight(lender).await?;
+        if !self.pending_batch.is_empty() {
+          let scatter_remote = self.pending_batch.bytes() >= meta.window_bytes;
+          self.launch_pending(&meta, scatter_remote, true);
+          self.flush_in_flight(lender).await?;
+        }
+        let read = match (self.deferred_error.take(), read) {
+          (Some(err), _) => Err(err),
+          (None, other) => other,
+        };
+        lender.lend(|state| self.finish_deferred_on_shard(state, read))
+      }
+    }
+  }
+
+  /// Flushes any pipelined or buffered verification batches and ends input on the owner shard.
+  pub(crate) async fn end_pipelined<L: crate::vcs_http::git::ShardLender>(
+    &mut self,
+    lender: &mut L,
+  ) -> Option<Result<bool, PushFailed>> {
+    self.flush_in_flight(lender).await?;
+    if !self.pending_batch.is_empty() {
+      let meta = lender.lend(|state| self.dispatch_meta(state))?;
+      let scatter_remote = self.pending_batch.bytes() >= meta.window_bytes;
+      self.launch_pending(&meta, scatter_remote, true);
+      self.flush_in_flight(lender).await?;
+    }
+    if let Some(err) = self.deferred_error.take() {
+      return lender.lend(|state| self.finish_deferred_on_shard(state, Err(err)));
+    }
+    lender.lend(|state| self.end(state))
+  }
+
+  /// Awaits the previous in-flight scatter batch (if any) and settles its verified objects into
+  /// `Reader`, `Session`, and `Quarantine` in exact pack order on the owner shard.
+  async fn flush_in_flight<L: crate::vcs_http::git::ShardLender>(
+    &mut self,
+    lender: &mut L,
+  ) -> Option<()> {
+    let Some(scatter) = self.in_flight.take() else {
+      return Some(());
+    };
+    let verified = scatter.finish().await?;
+    lender.lend(|state| self.settle_on_shard(state, verified))?;
+    Some(())
+  }
+
+  /// Launches `self.pending_batch` onto `meta.shards` (excluding `meta.origin` when
+  /// `!include_origin` so `origin` inflates the next batch with zero serial tail, or locally on
+  /// `meta.origin` when `!scatter_remote`), storing the handle in `self.in_flight`.
+  fn launch_pending(&mut self, meta: &DispatchMeta, scatter_remote: bool, include_origin: bool) {
+    let raw = self.pending_batch.take();
+    if raw.is_empty() {
+      return;
+    }
+    let format = meta.format;
+    let room = meta.room;
+    let items: Vec<VerifyItem> = raw
+      .into_iter()
+      .map(|object| VerifyItem {
+        format,
+        room,
+        object,
+      })
+      .collect();
+    let targets: &[u16] = if scatter_remote {
+      &meta.shards
+    } else {
+      core::slice::from_ref(&meta.origin)
+    };
+    let weight = |item: &VerifyItem| {
+      u64::try_from(item.object.content.len())
+        .unwrap_or(u64::MAX)
+        .max(1)
+    };
+    let work: fn(VerifyItem) -> slates_git::receive::VerifiedObject = run_verify_item;
+    let scatter = if scatter_remote && !include_origin {
+      crate::xshard::ComputeScatter::launch_remote(
+        meta.origin,
+        targets,
+        items,
+        weight,
+        work,
+        meta.quantum_ns,
+      )
+    } else {
+      crate::xshard::ComputeScatter::launch(
+        meta.origin,
+        targets,
+        items,
+        weight,
+        work,
+        meta.quantum_ns,
+      )
+    };
+    self.in_flight = Some(scatter);
+  }
+
+  /// Snapshots routing and pacing metadata from `state` for [`Self::launch_pending`].
+  fn dispatch_meta(&self, state: &ShardState) -> DispatchMeta {
+    let window_bytes = state
+      .vcs_stores
+      .content()
+      .map_or(1, |content| u64::try_from(content.window()).unwrap_or(1))
+      .max(1);
+    let room = state
+      .vcs_stores
+      .content()
+      .map_or(0, ContentStore::room)
+      .max(self.admission.left());
+    DispatchMeta {
+      origin: state.shard,
+      shards: state.shards.clone(),
+      quantum_ns: state.config.step_quantum_ns(),
+      window_bytes,
+      format: self.session.format(),
+      room,
+    }
+  }
+
+  /// Whether the pack's waiting deltas are still resolving (`State::Resolving`).
+  pub(crate) fn is_resolving(&self) -> bool {
+    self.session.is_resolving()
+  }
+
+  /// Derived batch target (bytes) for deferred multi-shard Git verification: sized from the
+  /// machine's measured BLAKE3 throughput over `step_ceiling_ns`, floored by one content window per
+  /// shard, and capped to a quarter of remaining admission (`PIPELINE_ROOM_DIVISOR`).
+  fn deferred_batch_target(&self, state: &ShardState, meta: &DispatchMeta) -> u64 {
+    let ceiling_ns = slates_rt::futures::step_ceiling_ns().unwrap_or(meta.quantum_ns);
+    let rate_batch = state.config.archive_slice_bytes_within(ceiling_ns);
+    let min_batch = meta
+      .window_bytes
+      .saturating_mul(u64::try_from(meta.shards.len().max(1)).unwrap_or(1));
+    let room_cap = self
+      .admission
+      .left()
+      .checked_div(PIPELINE_ROOM_DIVISOR)
+      .unwrap_or(0);
+    rate_batch
+      .max(min_batch)
+      .min(room_cap.max(meta.window_bytes))
+  }
+
+  /// Runs one multi-shard batch of deferred waiting-delta resolution: applies ready deltas into
+  /// `pending_batch` cooperatively on the owner shard, scatters SHA-1DC + BLAKE3 + fsck +
+  /// commit/tag parse across all daemon shards, settles the batch in pack order, and brings back
+  /// any let-go pack window before returning whether resolution is finished.
+  pub(crate) async fn resolve_step_pipelined<L: crate::vcs_http::git::ShardLender>(
+    &mut self,
+    lender: &mut L,
+  ) -> Option<Result<bool, PushFailed>> {
+    let (outcome, meta) = match lender.lend(|state| self.resolve_deferred_on_shard(state))? {
+      Ok(step) => step,
+      Err(failed) => {
+        self.pending_batch.release_all(&mut self.admission);
+        return Some(Err(failed));
+      }
+    };
+    if !self.pending_batch.is_empty() {
+      let scatter_remote = self.pending_batch.bytes() >= meta.window_bytes;
+      self.launch_pending(&meta, scatter_remote, true);
+      self.flush_in_flight(lender).await?;
+    }
+    if let Some(err) = self.deferred_error.take() {
+      lender.lend(|state| self.finish_resolving_error_on_shard(state, err))?;
+      return Some(Ok(true));
+    }
+    match outcome {
+      slates_git::unpack::DeferredResolve::Done => Some(Ok(true)),
+      slates_git::unpack::DeferredResolve::Away => {
+        self.bring_back_waited().await;
+        Some(Ok(false))
+      }
+      slates_git::unpack::DeferredResolve::Batch => {
+        slates_rt::futures::yield_now().await;
+        Some(Ok(false))
+      }
+    }
+  }
+
+  /// Owner-shard paced step of [`Self::resolve_step_pipelined`]: applies waiting deltas into
+  /// `self.pending_batch` up to the derived batch target or shard step ceiling (yielding promptly
+  /// if another task waits on this shard).
+  fn resolve_deferred_on_shard(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<(slates_git::unpack::DeferredResolve, DispatchMeta), PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let meta = self.dispatch_meta(state);
+    let batch_target = self.deferred_batch_target(state, &meta);
+    let quantum_ns = meta.quantum_ns;
+    let ceiling_ns = slates_rt::futures::step_ceiling_ns().unwrap_or(quantum_ns);
+    let outcome = self.resolve_deferred_loop(state, batch_target, (began, quantum_ns, ceiling_ns));
+    charge_step(state, self.repository, began, 0);
+    let outcome = outcome.map_err(|failed| self.bounded(failed))?;
+    Ok((outcome, meta))
+  }
+
+  /// Inner paced loop for [`Self::resolve_deferred_on_shard`].
+  fn resolve_deferred_loop(
+    &mut self,
+    state: &mut ShardState,
+    batch_target: u64,
+    (began, quantum_ns, ceiling_ns): (u64, u64, u64),
+  ) -> Result<slates_git::unpack::DeferredResolve, PushFailed> {
+    let mut next_ask = began.saturating_add(quantum_ns);
+    loop {
+      let step = {
+        let Self {
+          repository,
+          session,
+          admission,
+          quarantine,
+          pending_batch,
+          ..
+        } = self;
+        with_room(state, |state| {
+          let (content, git) = state
+            .vcs_stores
+            .git_ref(*repository)
+            .ok_or(PushFailed::NoStore)?;
+          let mut site = intake::Intake {
+            indexed: IndexedObjects::new(&git.repository, content, admission.left()),
+            quarantined: intake::Quarantined {
+              push: quarantine.as_ref().map(GitPush::quarantine),
+              store: content,
+              repository: &git.repository,
+            },
+            queue: BTreeMap::new(),
+          };
+          let mut clock = ShardClock;
+          let quantum = Quantum {
+            clock: &mut clock,
+            ns: quantum_ns,
+          };
+          session
+            .resolve_turn_deferred(&mut site, admission, pending_batch, (batch_target, quantum))
+            .map_err(PushFailed::Exchange)
+        })?
+      };
+      if step != slates_git::unpack::DeferredResolve::Batch
+        || self.pending_batch.bytes() >= batch_target
+      {
+        return Ok(step);
+      }
+      let now = slates_rt::futures::now_ns();
+      if now.saturating_sub(began) >= ceiling_ns {
+        return Ok(step);
+      }
+      if now >= next_ask {
+        if slates_rt::futures::others_waiting() {
+          return Ok(step);
+        }
+        let after = slates_rt::futures::now_ns();
+        next_ask = after.saturating_add(quantum_ns.max(after.saturating_sub(now)));
+      }
+    }
+  }
+
+  /// Transitions `State::Resolving` to `State::Checking` with a worker collision error.
+  fn finish_resolving_error_on_shard(
+    &mut self,
+    state: &mut ShardState,
+    err: slates_git::unpack::Refusal,
+  ) {
+    let Self {
+      repository,
+      session,
+      admission,
+      quarantine,
+      ..
+    } = self;
+    with_room(state, |state| {
+      let Some((content, git)) = state.vcs_stores.git_ref(*repository) else {
+        return;
+      };
+      let mut site = intake::Intake {
+        indexed: IndexedObjects::new(&git.repository, content, admission.left()),
+        quarantined: intake::Quarantined {
+          push: quarantine.as_ref().map(GitPush::quarantine),
+          store: content,
+          repository: &git.repository,
+        },
+        queue: BTreeMap::new(),
+      };
+      session.finish_resolving_with_error(err, &mut site, admission);
+    });
+  }
+
+  /// Synchronous owner-shard step of [`Self::input_pipelined`]: unpacks `bytes` into
+  /// `self.pending_batch` without synchronous SHA-1DC/BLAKE3/fsck.
+  fn input_deferred_on_shard(
+    &mut self,
+    state: &mut ShardState,
+    bytes: &[u8],
+  ) -> Result<DeferredStep, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let (deferred, queue) = {
+      let Self {
+        repository,
+        session,
+        admission,
+        quarantine,
+        pending_batch,
+        ..
+      } = self;
+      with_room(state, |state| {
+        let (content, git) = state
+          .vcs_stores
+          .git_ref(*repository)
+          .ok_or(PushFailed::NoStore)?;
+        let mut site = intake::Intake {
+          indexed: IndexedObjects::new(&git.repository, content, admission.left()),
+          quarantined: intake::Quarantined {
+            push: quarantine.as_ref().map(GitPush::quarantine),
+            store: content,
+            repository: &git.repository,
+          },
+          queue: BTreeMap::new(),
+        };
+        let called = session.input_deferred(bytes, &mut site, admission, pending_batch);
+        Ok::<_, PushFailed>((called, site.queue))
+      })?
+    };
+    match (self.quarantine.as_mut(), self.unadmitted.is_some()) {
+      (Some(quarantine), false) => {
+        quarantine.keep_pack_to(self.session.pack_len(), bytes);
+        if !queue.is_empty()
+          && let Err(refused) = intake::admit_queued(state, quarantine, queue, &mut self.admission)
+        {
+          self.unadmitted = Some(refused);
+        }
+      }
+      _ => {
+        for (_, hold) in queue.into_values() {
+          self.admission.release(hold);
+        }
+      }
+    }
+    let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.read_bytes = self.read_bytes.saturating_add(bytes_in);
+    charge_step(state, self.repository, began, bytes_in);
+    let outcome = deferred
+      .map_err(PushFailed::Exchange)
+      .map_err(|failed| self.bounded(failed))?;
+    self
+      .keep_refusal_names()
+      .map_err(|failed| self.bounded(failed))?;
+    let meta = self.dispatch_meta(state);
+    let batch_target = self.deferred_batch_target(state, &meta);
+    Ok(match outcome {
+      slates_git::receive::DeferredInput::Ready => DeferredStep::Ready,
+      slates_git::receive::DeferredInput::More => {
+        let should_dispatch = self.pending_batch.bytes() >= batch_target;
+        DeferredStep::More(should_dispatch.then_some(meta))
+      }
+      slates_git::receive::DeferredInput::PackEnded(read) => DeferredStep::PackEnded { read, meta },
+    })
+  }
+
+  /// Settles one worker-verified batch into `Session`, `Reader`, and `Quarantine` in exact pack
+  /// order on the owner shard.
+  fn settle_on_shard(
+    &mut self,
+    state: &mut ShardState,
+    verified: Vec<slates_git::receive::VerifiedObject>,
+  ) {
+    let began = slates_rt::futures::now_ns();
+    let settled = {
+      let Self {
+        repository,
+        session,
+        admission,
+        ..
+      } = self;
+      with_room(state, |state| {
+        let Some((content, git)) = state.vcs_stores.git_ref(*repository) else {
+          for item in verified {
+            admission.release(item.hold);
+          }
+          return (Vec::new(), None);
+        };
+        let indexed = IndexedObjects::new(&git.repository, content, admission.left());
+        session.settle_deferred(verified, &indexed, admission)
+      })
+    };
+    let (settled, err) = settled;
+    if self.deferred_error.is_none() {
+      self.deferred_error = err;
+    }
+    match (self.quarantine.as_mut(), self.unadmitted.is_some()) {
+      (Some(quarantine), false) => {
+        if let Err(refused) = intake::admit_settled(state, quarantine, settled, &mut self.admission)
+        {
+          self.unadmitted = Some(refused);
+        }
+      }
+      _ => {
+        for item in settled {
+          self.admission.release(item.hold);
+        }
+      }
+    }
+    charge_step(state, self.repository, began, 0);
+  }
+
+  /// Completes deferred pack intake on the owner shard once all in-flight batches have settled.
+  fn finish_deferred_on_shard(
+    &mut self,
+    state: &mut ShardState,
+    read: Result<(), slates_git::unpack::Refusal>,
+  ) -> Result<bool, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let finished = self.intake(state, &[], |session, site, admission| {
+      session.finish_deferred(read, site, admission)
+    });
+    charge_step(state, self.repository, began, 0);
+    let finished = finished.map_err(|failed| self.bounded(failed))?;
+    self
+      .keep_refusal_names()
+      .map_err(|failed| self.bounded(failed))?;
+    Ok(finished)
   }
 
   /// Hands the push the client's next `bytes`, its pack's objects admitted to the quarantine as
@@ -1020,6 +1530,24 @@ impl<P> ReceivePack<P> {
     }
   }
 
+  /// Whether the edge must step out after `answer_step` to bring back a let-go window or run a
+  /// homing/landing carry task off the shard.
+  fn needs_edge_io(&self, state: &ShardState) -> bool {
+    let homing_asked = matches!(
+      &self.answer,
+      AnswerState::Deciding(decision)
+        if matches!(
+          decision.homing,
+          Homing::Asked(..) | Homing::PackAsked(..) | Homing::LandAsked(..)
+        )
+    );
+    homing_asked
+      || state
+        .vcs_stores
+        .git_ref(self.repository)
+        .is_some_and(|(_, store)| store.repository.peek_waiting().is_some())
+  }
+
   /// What a decision asks the edge to carry off the shard's step ([`Homing`], [`Carry`]), once: the edge awaits
   /// [`carry`] and hands the outcome to [`Self::homed`].
   pub(crate) fn take_homing(&mut self) -> Option<Carry> {
@@ -1161,6 +1689,43 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     stepped
   }
 
+  /// Runs [`Self::answer_step`] cooperatively up to the shard's derived step ceiling while no
+  /// other task waits (`others_waiting`), stopping immediately whenever the edge must write output,
+  /// bring back a let-go window, run a homing/landing carry, send a keepalive, or run a hook.
+  pub(crate) fn answer_step_paced(
+    &mut self,
+    state: &mut ShardState,
+    out: &mut Vec<u8>,
+    silent_until: Option<u64>,
+  ) -> Result<Answering, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let before_out = out.len();
+    let quantum = state.config.step_quantum_ns();
+    let ceiling = slates_rt::futures::step_ceiling_ns().unwrap_or(quantum);
+    let mut next_ask = began.saturating_add(quantum);
+    loop {
+      let step = self.answer_step(state, out)?;
+      if !matches!(step, Answering::Turned) {
+        return Ok(step);
+      }
+      let now = slates_rt::futures::now_ns();
+      if out.len() > before_out
+        || self.needs_edge_io(state)
+        || silent_until.is_some_and(|until| now >= until)
+        || now.saturating_sub(began) >= ceiling
+      {
+        return Ok(Answering::Turned);
+      }
+      if now >= next_ask {
+        if slates_rt::futures::others_waiting() {
+          return Ok(Answering::Turned);
+        }
+        let after = slates_rt::futures::now_ns();
+        next_ask = after.saturating_add(quantum.max(after.saturating_sub(now)));
+      }
+    }
+  }
+
   /// One step of the answer, uncounted ([`Self::answer_step`] counts it).
   fn answer_turn(
     &mut self,
@@ -1261,6 +1826,43 @@ impl<P> ReceivePack<P> {
       .map_err(|failed| self.bounded(failed));
     charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
+  }
+
+  /// Runs [`Self::answer_step`] cooperatively up to the shard's derived step ceiling while no
+  /// other task waits (`others_waiting`), stopping immediately whenever the edge must write output,
+  /// bring back a let-go window, run a homing/landing carry, send a keepalive, or run a hook.
+  pub(crate) fn answer_step_paced(
+    &mut self,
+    state: &mut ShardState,
+    out: &mut Vec<u8>,
+    silent_until: Option<u64>,
+  ) -> Result<Answering, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let before_out = out.len();
+    let quantum = state.config.step_quantum_ns();
+    let ceiling = slates_rt::futures::step_ceiling_ns().unwrap_or(quantum);
+    let mut next_ask = began.saturating_add(quantum);
+    loop {
+      let step = self.answer_step(state, out)?;
+      if !matches!(step, Answering::Turned) {
+        return Ok(step);
+      }
+      let now = slates_rt::futures::now_ns();
+      if out.len() > before_out
+        || self.needs_edge_io(state)
+        || silent_until.is_some_and(|until| now >= until)
+        || now.saturating_sub(began) >= ceiling
+      {
+        return Ok(Answering::Turned);
+      }
+      if now >= next_ask {
+        if slates_rt::futures::others_waiting() {
+          return Ok(Answering::Turned);
+        }
+        let after = slates_rt::futures::now_ns();
+        next_ask = after.saturating_add(quantum.max(after.saturating_sub(now)));
+      }
+    }
   }
 
   /// One step of the answer, uncounted ([`Self::answer_step`] counts it).

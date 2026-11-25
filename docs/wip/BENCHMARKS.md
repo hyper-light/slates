@@ -19107,3 +19107,61 @@ producing 2 truncated HTTP responses); daemon had 0 crashes/restarts and peak Gi
 - **VCS Interop Compliance Matrices (`slates-final`, 2026-11-25):** **117 / 117 PASS** (`git-matrix.sh` 27/27 peak RSS
   71 MiB; `hg-matrix.sh` 24/24 peak RSS 58 MiB; `svn-matrix.sh ROUTE=svn` 33/33; `svn-matrix.sh ROUTE=http` 33/33;
   `kern.num_files: 13,756 → 13,824`).
+
+---
+
+## Multi-Shard Full Git/Hg Push & 1 GiB Single-Changeset Submit/Landing Slicing (A-892; 2026-11-25)
+
+**Hardware & environment:** Apple M5 Max, 18 cores, 128 GiB RAM, macOS arm64, Rust 1.98.1 (`--release`), stock `git 2.56.1`,
+`hg 7.2.4`, `svn 1.15.0`. Host `vm.loadavg` during measurements: `25–53` (interleaved head-to-head against baseline
+`8dc22f950` and stock local tools under the same load).
+
+### 1. Interleaved 3-Round Head-to-Head Full Push (`$SCRATCH/bench_head_to_head.sh`, 2026-11-25)
+
+- **Git full push** (`git-git.git`, 424,984 objects / 310.71 MiB, 1,027 refs; stock = local `git init --bare`, slates =
+  loopback HTTP with full fsck, SHA-1DC, BLAKE3, Mantle `F_FULLFSYNC`, and 1,027 Merge greens):
+  - **Stock `git push` (local):** `11.014s`, `10.195s`, **`9.839s`** (best-of-3: **`9.839s`**).
+  - **Baseline (`8dc22f950`, single-shard):** **`41.962s`** (568.5 MiB), `42.698s` (568.6 MiB), `42.982s` (828.7 MiB)
+    (best-of-3: **`41.962s`**, `4.26×` stock).
+  - **Multi-shard (`A-892`):** **`17.487s`** (1,418.7 MiB, `scatter=276`), `18.273s` (1,382.1 MiB, `scatter=276`),
+    `18.191s` (1,479.7 MiB, `scatter=268`) — best-of-3: **`17.487s`** (**`2.40×` faster** than baseline, `-58.3%`;
+    `1.78×` local stock over HTTP).
+- **Hg full push** (`hg-src`, 57,036 changesets, `--force --new-branch`; stock = local `hg init`, slates = loopback HTTP
+  with full revlog verification, BLAKE3, manifest delta encoding, and Mantle `F_FULLFSYNC`):
+  - **Stock `hg push` (local):** **`10.251s`**, `13.882s`, `14.545s` (best-of-3: **`10.251s`**).
+  - **Baseline (`8dc22f950`, single-shard):** **`48.600s`** (413.1 MiB), `50.878s` (387.9 MiB), `50.141s` (409.6 MiB)
+    (best-of-3: **`48.600s`**, `4.74×` stock).
+  - **Multi-shard (`A-892`):** `19.808s` (444.2 MiB, `scatter=5,874`), **`18.051s`** (506.5 MiB, `scatter=5,957`),
+    `18.360s` (519.5 MiB, `scatter=5,850`) — best-of-3: **`18.051s`** (**`2.69×` faster** than baseline, `-62.9%`;
+    `1.76×` local stock over HTTP).
+
+### 2. 1 GiB Single-Changeset Submit, Checkpoint & Disk Landing (`work_cow` & `green_landing_cow`, 2026-11-25)
+
+- **Command (1 GiB single-changeset seed across 4 shards, submit + granted disk landing):**
+  ```sh
+  SLATES_WORK_COW_SINGLE_FILES=1000 SLATES_WORK_COW_SINGLE_BYTES=1073741 SLATES_WORK_COW_SINGLE_SHARDS=4 \
+    cargo test --release -p slates-server --test work_cow -- --nocapture
+  ```
+  - Result (load 43.37 → 39.67): **PASS, 0 watchdog kills, 0 near-misses** — submit **`3.186s`** (`prepare_slices=333,975`,
+    `ahead_named=1`, `submit_longest_us=1,492 µs`), granted disk landing **`4.983s`** (`submit_pulse_longest=185 ms`,
+    `land_pulse_longest=185 ms`, byte-exact green + disk readback; `kern.num_files: 14,325 → 14,320`). Previously killed
+    shard 0 (`exit 4`, 1,097 ms CPU stall past the 1,025 ms watchdog window).
+- **Command (64 MiB default & 1 GiB `16,384 × 64 KiB` single-seed green presentation + landing CoW):**
+  ```sh
+  cargo test --release -p slates-server --test green_landing_cow -- --nocapture
+  SLATES_MOUNT_COW_FILES=16384 cargo test --release -p slates-server --test green_landing_cow -- --nocapture
+  ```
+  - 64 MiB default (load 47.12): **PASS** (`1.30s`), `presenting +1.70 MiB`, `landing +0 B` (bound `16 MiB`).
+  - 1 GiB (`16,384 × 64 KiB`): **0 watchdog kills** (`23.88s`), `presenting +18.25 MiB` (~1.1 KiB/file inode + plan
+    entry overhead; down **105×** from `+2,006 MiB` prior to cooperative `CheckpointEncoder`), `landing +0 B`.
+
+### 3. Compliance Matrices & Static Gates (`A-892`, 2026-11-25)
+
+- **VCS Interop Compliance Matrices (`slates-multishard`):** **117 / 117 PASS** (`git-matrix.sh` 27/27 peak RSS 125 MiB;
+  `hg-matrix.sh PUSH_REV=1.5` 24/24 peak RSS 205 MiB; `svn-matrix.sh ROUTE=svn` 33/33 peak RSS 1,202 MiB;
+  `svn-matrix.sh ROUTE=http` 33/33 peak RSS 1,201 MiB; `kern.num_files: 14,397 → 14,440`).
+- **Static & unit gates:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` (43 crates),
+  cross-target clippy (`x86_64-unknown-linux-gnu` & `x86_64-pc-windows-msvc` on `slates-rt`/`slates-merge`), `cargo xtask
+  check` (all 6 gates; `unsafe-budget.toml` unchanged), `slates-rt` (86/86 + 5/5 pacing), `slates-git receive::` (52/52),
+  `slates-hg --lib` (443/443), `slates-land --test oracle` (33/33), `slates-merge` sliced oracles (2/2), `slates-server`
+  checkpoint tests (15/15).

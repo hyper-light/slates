@@ -119,6 +119,49 @@ pub const NAMES_COUNT_BYTES: usize = size_of::<u32>();
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentId(pub [u8; IDENTITY_BYTES]);
 
+/// Bytes paired with their plain BLAKE3 [`ContentId`] already computed inside `slates-vcs`
+/// ([`Hashed::of`]): allows worker shards to compute content identities in parallel while
+/// preserving [`ContentStore`]'s invariant that no caller can forge a mismatched identity (the
+/// fields are private to this module).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hashed<B = Vec<u8>> {
+  bytes: B,
+  identity: ContentId,
+}
+
+impl<B: AsRef<[u8]>> Hashed<B> {
+  /// Hashes `bytes` with plain BLAKE3 and pairs them with the resulting [`ContentId`].
+  pub fn of(bytes: B) -> Self {
+    let identity = ContentId::of(bytes.as_ref());
+    Self { bytes, identity }
+  }
+
+  /// Borrows the paired bytes and identity without cloning or moving.
+  pub fn as_ref(&self) -> Hashed<&[u8]> {
+    Hashed {
+      bytes: self.bytes.as_ref(),
+      identity: self.identity,
+    }
+  }
+
+  /// The paired bytes.
+  pub fn bytes(&self) -> &[u8] {
+    self.bytes.as_ref()
+  }
+}
+
+impl<B> Hashed<B> {
+  /// The plain BLAKE3 identity computed by [`Hashed::of`].
+  pub fn identity(&self) -> ContentId {
+    self.identity
+  }
+
+  /// Unwraps the underlying bytes buffer.
+  pub fn into_bytes(self) -> B {
+    self.bytes
+  }
+}
+
 /// What a content's bytes are, which decides how its identity is hashed and what freeing it gives back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
@@ -743,6 +786,17 @@ impl ContentStore {
   /// Keeps `bytes` as a content of `form`, or holds the one kept already, within the budget.
   fn keep(&mut self, form: Form, bytes: &[u8]) -> Result<Stored, ContentRefused> {
     let identity = ContentId::named(form, bytes);
+    self.keep_with_id(identity, form, bytes)
+  }
+
+  /// Keeps `bytes` under its already-verified `identity` as a content of `form`, or holds the one
+  /// kept already, within the budget.
+  fn keep_with_id(
+    &mut self,
+    identity: ContentId,
+    form: Form,
+    bytes: &[u8],
+  ) -> Result<Stored, ContentRefused> {
     if self.entries.contains_key(&identity) {
       // A window let go is brought back by its own bytes put again (A-724 piece 4).
       if self.is_away(&identity) {
@@ -857,6 +911,24 @@ impl ContentStore {
   pub fn put_object_whole(&mut self, bytes: &[u8]) -> Result<ContentId, ContentRefused> {
     let root = self.put_object_root(bytes, true)?;
     Ok(self.named_object(ContentId::of(bytes), root))
+  }
+
+  /// [`ContentStore::put_object_whole`] for bytes already hashed inside `slates-vcs`
+  /// ([`Hashed::of`]): avoids hashing the bytes a second time on the owner shard when a worker shard
+  /// computed the BLAKE3 identity in parallel.
+  pub fn put_object_whole_hashed(
+    &mut self,
+    hashed: Hashed<&[u8]>,
+  ) -> Result<ContentId, ContentRefused> {
+    let identity = hashed.identity;
+    let bytes = hashed.bytes;
+    if bytes.len() <= self.window.get() {
+      return self
+        .keep_with_id(identity, Form::Window, bytes)
+        .map(|stored| stored.identity);
+    }
+    let root = self.put_object_root(bytes, true)?;
+    Ok(self.named_object(identity, root))
   }
 
   /// [`ContentStore::put_object`]'s tree: its root; `whole`, each of its windows held let go brought back from `bytes`
@@ -3468,5 +3540,35 @@ mod tests {
     assert!(!store.mark_landed(&root));
     assert_eq!(store.let_go(&root), Err(LetGoRefused::NotAWindow));
     assert_eq!(store.counters.let_go, 0);
+  }
+
+  /// Do: put empty, single-window, and multi-window objects via `Hashed::of` + `put_object_whole_hashed`
+  /// alongside `put_object_whole`. Expect: identical content identities, deduplication counts, and
+  /// byte-exact readback, including bringing back a let-go window.
+  #[test]
+  fn put_object_whole_hashed_matches_put_object_whole_and_deduplicates() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    for payload in [Vec::new(), patterned(777), patterned(window * 2 + 123)] {
+      let hashed = Hashed::of(payload.as_slice());
+      let first = store.put_object_whole_hashed(hashed).unwrap();
+      let second = store.put_object_whole(&payload).unwrap();
+      assert_eq!(first, second);
+      assert_eq!(
+        store.object_bytes(&first, u64::try_from(payload.len()).unwrap()),
+        Some(payload.clone())
+      );
+      store.release(&second).unwrap();
+      store.release(&first).unwrap();
+    }
+    let away = patterned(512);
+    let id = store.put_object_whole(&away).unwrap();
+    store.mark_landed(&id);
+    store.let_go(&id).unwrap();
+    let brought = store
+      .put_object_whole_hashed(Hashed::of(away.as_slice()))
+      .unwrap();
+    assert_eq!(brought, id);
+    assert_eq!(store.bytes_of(&id).as_deref(), Some(away.as_slice()));
   }
 }

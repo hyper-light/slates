@@ -181,6 +181,19 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
           next: Next::More,
         });
       }
+      if push.is_resolving() {
+        let turn = crate::vcs_share::turns::take(self.repository).await;
+        let _ = push
+          .resolve_step_pipelined(&mut self.lender)
+          .await
+          .ok_or_else(|| died(NOT_SERVED))?
+          .map_err(|failed| refused(failed, &self.name))?;
+        self.turn = Some(turn);
+        return Ok(Stepped {
+          consumed: 0,
+          next: Next::More,
+        });
+      }
       let turn = crate::vcs_share::turns::take(self.repository).await;
       let (next, kept) = answer_step(
         &mut self.lender,
@@ -194,16 +207,19 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
     }
     if !self.input.is_empty() {
       let consumed = self.input.len();
-      self.checked = lent(&mut self.lender, |state| push.input(state, &self.input))?
+      let input = core::mem::take(&mut self.input);
+      self.checked = push
+        .input_pipelined(&mut self.lender, &input)
+        .await
+        .ok_or_else(|| died(NOT_SERVED))?
         .map_err(|failed| refused(failed, &self.name))?;
-      self.input.clear();
       return Ok(Stepped {
         consumed,
         next: self.waiting(),
       });
     }
     if self.input_ended {
-      self.checked = ended(&mut self.lender, push, &self.name)?;
+      self.checked = ended_pipelined(&mut self.lender, push, &self.name).await?;
       return Ok(Stepped {
         consumed: 0,
         next: Next::More,
@@ -248,8 +264,10 @@ async fn answer_step<S: ShardLender>(
   #[cfg(not(unix))]
   let _ = gone;
   let before = out.len();
-  let answering = lent(lender, |state| push.answer_step(state, &mut *out))?
-    .map_err(|failed| refused(failed, name))?;
+  let answering = lent(lender, |state| {
+    push.answer_step_paced(state, &mut *out, None)
+  })?
+  .map_err(|failed| refused(failed, name))?;
   match answering {
     Answering::Answered(received) => {
       // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c); past the barrier's
@@ -277,14 +295,18 @@ async fn answer_step<S: ShardLender>(
   }
 }
 
-/// The client's input ended before the push was checked: checked now (a pack cut short, which the report answers), or
-/// refused as git's reader refuses a request cut short. An end that leaves no push to check is that refusal too.
-fn ended<S: ShardLender>(
+/// The client's input ended before the push was checked: flushes any pipelined batches and checks
+/// the push (a pack cut short, which the report answers), or refuses a request cut short.
+async fn ended_pipelined<S: ShardLender>(
   lender: &mut S,
   push: &mut ReceivePack,
   name: &str,
 ) -> Result<bool, Refused> {
-  let checked = lent(lender, |state| push.end(state))?.map_err(|failed| refused(failed, name))?;
+  let checked = push
+    .end_pipelined(lender)
+    .await
+    .ok_or_else(|| died(NOT_SERVED))?
+    .map_err(|failed| refused(failed, name))?;
   if checked {
     Ok(true)
   } else {

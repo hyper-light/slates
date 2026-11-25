@@ -128,18 +128,6 @@ impl Source {
     }
   }
 
-  /// A file's bytes from its start, the base's unpinned ranges read from the disk.
-  pub(crate) fn read(
-    self,
-    vol: &mut Volume,
-    store: &mut Store,
-    host: &mut dyn HostFs,
-    no: InodeNo,
-    buf: &mut [u8],
-  ) -> Result<usize, VfsError> {
-    self.read_at(vol, store, host, no, 0, buf)
-  }
-
   /// The bytes of `no` from `off`, as far as `buf` holds: a landing copies a file a window at a time
   /// (AUD-29-25).
   pub(crate) fn read_at(

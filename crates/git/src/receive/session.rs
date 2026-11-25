@@ -35,6 +35,110 @@ use crate::out::Out;
 use crate::store::hook_view::Quantum;
 use crate::unpack::{self, Contents, Held, Keep, NoIndex};
 
+/// Outcome of [`Session::input_deferred`]: whether more pack bytes are needed, the pack reached
+/// its trailer or an unpack error (caller must settle any in-flight batches before calling
+/// [`Session::finish_deferred`]), or a delete-only request completed immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredInput {
+  /// More pack bytes expected; caller may dispatch `batch` once it reaches the scatter threshold.
+  More,
+  /// Pack reached its trailer (`Ok(())`) or an unpack refusal (`Err(refusal)`); caller must flush
+  /// and settle all pending batches and then call [`Session::finish_deferred`].
+  PackEnded(Result<(), unpack::Refusal>),
+  /// Request carried no pack (delete-only) and is already checked.
+  Ready,
+}
+
+/// Worker-verified payload for one [`unpack::Unverified`] pack entry ([`verify_unpacked`]).
+#[derive(Debug)]
+pub struct VerifiedBody {
+  /// Verified Git object id (SHA-1DC or SHA-256).
+  pub id: ObjectId,
+  /// Plain BLAKE3 content identity (`slates_vcs::ContentId::of(&content)`).
+  pub content_id: slates_vcs::ContentId,
+  /// Uncompressed object bytes.
+  pub content: Vec<u8>,
+  /// Strict `fsck` refusal, if any (applied only when `!repository.holds(&id)`).
+  pub(crate) fsck_refusal: Option<crate::objects::FsckId>,
+  /// Any `.gitmodules` / `.gitattributes` entries referenced by a pushed tree.
+  pub(crate) special: Vec<super::fsck::SpecialBlob>,
+  /// Pre-parsed commit or tag metadata for `Push::admit_precomputed`.
+  pub meta: Option<crate::store::ParsedMeta>,
+}
+
+/// Result of verifying one [`unpack::Unverified`] entry on a worker shard ([`verify_unpacked`]).
+#[derive(Debug)]
+pub struct VerifiedObject {
+  /// Pack position (`at`).
+  pub at: usize,
+  /// Pack byte offset.
+  pub offset: u64,
+  /// Stored byte length in the pack.
+  pub stored: u64,
+  /// Object kind.
+  pub kind: crate::object_name::Kind,
+  /// Delta chain depth (`0` for whole).
+  pub depth: u64,
+  /// Admission hold covering `content`.
+  pub hold: crate::Hold,
+  /// Verification result (`Err` on SHA-1 collision attack).
+  pub outcome: Result<VerifiedBody, unpack::Refusal>,
+}
+
+/// One settled, pre-verified pack object ready for O(1) owner-shard quarantine admission.
+#[derive(Debug)]
+pub struct SettledObject {
+  /// Precomputed placement metadata for [`crate::store::Push::admit_precomputed`].
+  pub placed: crate::store::PrecomputedPlaced,
+  /// Uncompressed object content (moved into `Recent` cache on the owner shard).
+  pub content: Vec<u8>,
+  /// Admission hold to release after admission.
+  pub hold: crate::Hold,
+}
+
+/// Pure stateless worker function executed across shards via `xshard::scatter_compute`: computes
+/// SHA-1DC/SHA-256 object naming, plain BLAKE3 content identity, strict `fsck`, and commit/tag
+/// metadata in parallel.
+pub fn verify_unpacked(
+  format: crate::object_name::ObjectFormat,
+  room: u64,
+  object: unpack::Unverified,
+) -> VerifiedObject {
+  let outcome = match crate::object_name::name_of(format, object.kind, &object.content) {
+    Ok(id) => {
+      let content_id = slates_vcs::ContentId::of(&object.content);
+      let mut special = Vec::new();
+      let fsck_refusal = if object.kind != crate::object_name::Kind::Blob {
+        super::fsck::check_object(object.kind, &object.content, format, &mut special)
+      } else {
+        None
+      };
+      let meta = crate::store::parse_meta(format, object.kind, &object.content, room);
+      Ok(VerifiedBody {
+        id,
+        content_id,
+        content: object.content,
+        fsck_refusal,
+        special,
+        meta,
+      })
+    }
+    Err(attack) => Err(unpack::Refusal::Collision {
+      at: object.offset,
+      attack,
+    }),
+  };
+  VerifiedObject {
+    at: object.at,
+    offset: object.offset,
+    stored: object.stored,
+    kind: object.kind,
+    depth: object.depth,
+    hold: object.hold,
+    outcome,
+  }
+}
+
 /// What a session reads or does next.
 enum State<'s> {
   /// The request, as its bytes arrive.
@@ -123,6 +227,154 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let taken = self.input_into(bytes, &mut site, admission);
     self.held = held;
     taken
+  }
+
+  /// The repository's hash format advertised by this session.
+  pub fn format(&self) -> crate::object_name::ObjectFormat {
+    self.advertised.format
+  }
+
+  /// [`Session::input_into`] in deferred-naming mode: unpacks entries into `batch` without running
+  /// synchronous SHA-1DC, `fsck`, or BLAKE3 on the owner shard so the caller can pipeline
+  /// [`verify_unpacked`] across all shards.
+  pub fn input_deferred<S: Keep + Repository>(
+    &mut self,
+    bytes: &[u8],
+    site: &mut S,
+    admission: &mut Admission,
+    batch: &mut unpack::DeferredBatch,
+  ) -> Result<DeferredInput, Refusal> {
+    let taken = self.take_deferred(bytes, site, admission, batch);
+    if taken.is_err() {
+      self.state = State::Done;
+    }
+    taken
+  }
+
+  /// [`Session::input_deferred`]'s inner body before a refusal ends the session.
+  fn take_deferred<S: Keep + Repository>(
+    &mut self,
+    bytes: &[u8],
+    site: &mut S,
+    admission: &mut Admission,
+    batch: &mut unpack::DeferredBatch,
+  ) -> Result<DeferredInput, Refusal> {
+    let mut rest = bytes;
+    if let State::Request(reader) = &mut self.state {
+      let took = reader.read(rest, admission)?;
+      if !reader.is_whole() {
+        return Ok(DeferredInput::More);
+      }
+      rest = rest.get(took..).unwrap_or_default();
+      let State::Request(reader) = core::mem::replace(&mut self.state, State::Done) else {
+        return Ok(DeferredInput::More);
+      };
+      let request = reader.request()?;
+      if !request.wants_pack() {
+        let checked = check(request, None, (&*site, &*site), &self.hidden, admission)?;
+        self.state = State::Checked(checked);
+        return Ok(DeferredInput::Ready);
+      }
+      let reader = unpack::Reader::new(self.advertised.format, &NO_INDEX);
+      self.state = State::Pack { request, reader };
+    }
+    let State::Pack { reader, .. } = &mut self.state else {
+      return Ok(DeferredInput::More);
+    };
+    admission
+      .charge(crate::to_u64(rest.len()))
+      .map_err(Refusal::PastAdmission)?;
+    self.pack_len = self.pack_len.saturating_add(crate::to_u64(rest.len()));
+    let mut fscking = Fscking {
+      site: &mut *site,
+      format: self.advertised.format,
+      refused: &mut self.refused,
+      special: &mut self.special,
+    };
+    let read = reader
+      .read_deferred(rest, admission, &mut fscking, batch)
+      .map(|_| ());
+    if read.is_ok() && !reader.is_whole() {
+      return Ok(DeferredInput::More);
+    }
+    Ok(DeferredInput::PackEnded(read))
+  }
+
+  /// Settles a batch of worker-verified [`VerifiedObject`] entries in exact pack order into the
+  /// active pack reader and session fsck state: returns `(settled, first_collision_error)` while
+  /// ensuring any holds past a collision error are released back to `admission`.
+  pub fn settle_deferred<R: Repository + ?Sized>(
+    &mut self,
+    verified: Vec<VerifiedObject>,
+    repository: &R,
+    admission: &mut Admission,
+  ) -> (Vec<SettledObject>, Option<unpack::Refusal>) {
+    let reader = match &mut self.state {
+      State::Pack { reader, .. } | State::Resolving { reader, .. } => reader,
+      _ => {
+        for item in verified {
+          admission.release(item.hold);
+        }
+        return (Vec::new(), None);
+      }
+    };
+    let mut settled = Vec::with_capacity(verified.len());
+    let mut first_error = None;
+    for item in verified {
+      if first_error.is_some() {
+        admission.release(item.hold);
+        continue;
+      }
+      let body = match item.outcome {
+        Ok(body) => body,
+        Err(refusal) => {
+          admission.release(item.hold);
+          first_error = Some(refusal);
+          continue;
+        }
+      };
+      let _ = reader.settle_named(item.at, body.id);
+      if self.refused.is_none()
+        && item.kind != crate::object_name::Kind::Blob
+        && !repository.holds(&body.id)
+      {
+        if let Some(finding) = body.fsck_refusal {
+          self.refused = Some((body.id, finding));
+        } else {
+          self.special.extend(body.special);
+        }
+      }
+      let len = crate::to_u64(body.content.len());
+      settled.push(SettledObject {
+        placed: crate::store::PrecomputedPlaced {
+          offset: item.offset,
+          kind: item.kind,
+          id: body.id,
+          identity: body.content_id,
+          len,
+          depth: item.depth,
+          meta: body.meta,
+        },
+        content: body.content,
+        hold: item.hold,
+      });
+    }
+    (settled, first_error)
+  }
+
+  /// Completes deferred pack intake once every in-flight batch has been settled via
+  /// [`Session::settle_deferred`], entering [`State::Resolving`] or [`State::Checking`].
+  pub fn finish_deferred<S: Keep + Repository>(
+    &mut self,
+    read: Result<(), unpack::Refusal>,
+    site: &mut S,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let finished = self.check_pack(read, site, admission);
+    if finished.is_err() {
+      self.state = State::Done;
+    }
+    finished
   }
 
   /// [`Session::input`], the pack read into `site` (A-719 part 3): its keeper, which a server's
@@ -436,6 +688,64 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     };
     self.finish_pack(request, reader, read, site, admission);
     Ok(true)
+  }
+
+  /// [`Session::resolve_turn_into`] in deferred-naming mode: applies ready waiting deltas into
+  /// `batch` without running synchronous SHA-1DC/BLAKE3/fsck so the caller can scatter verification
+  /// across all daemon shards and settle each batch via [`Session::settle_deferred`]. Transitions
+  /// `State::Resolving` to `State::Checking` once all waiting deltas finish (or on unpack refusal).
+  pub fn resolve_turn_deferred<S: Keep + Repository>(
+    &mut self,
+    site: &mut S,
+    admission: &mut Admission,
+    batch: &mut unpack::DeferredBatch,
+    (target_bytes, quantum): (u64, Quantum<'_>),
+  ) -> Result<unpack::DeferredResolve, Refusal> {
+    let State::Resolving { reader, .. } = &mut self.state else {
+      return Ok(unpack::DeferredResolve::Done);
+    };
+    let mut fscking = Fscking {
+      site: &mut *site,
+      format: self.advertised.format,
+      refused: &mut self.refused,
+      special: &mut self.special,
+    };
+    let turned = reader.resolve_turn_deferred(
+      admission,
+      &mut super::Thin(&mut fscking),
+      batch,
+      (target_bytes, quantum),
+    );
+    let read = match turned {
+      Ok(unpack::DeferredResolve::Batch) => return Ok(unpack::DeferredResolve::Batch),
+      Ok(unpack::DeferredResolve::Away) => return Ok(unpack::DeferredResolve::Away),
+      Ok(unpack::DeferredResolve::Done) => Ok(()),
+      Err(refusal) => {
+        batch.release_all(admission);
+        Err(refusal)
+      }
+    };
+    let State::Resolving { request, reader } = core::mem::replace(&mut self.state, State::Done)
+    else {
+      return Ok(unpack::DeferredResolve::Done);
+    };
+    self.finish_pack(request, reader, read, site, admission);
+    Ok(unpack::DeferredResolve::Done)
+  }
+
+  /// Transitions `State::Resolving` to `State::Checking` with a worker-detected collision refusal
+  /// encountered while settling a deferred resolution batch.
+  pub fn finish_resolving_with_error<S: Keep + Repository>(
+    &mut self,
+    err: unpack::Refusal,
+    site: &mut S,
+    admission: &mut Admission,
+  ) {
+    let State::Resolving { request, reader } = core::mem::replace(&mut self.state, State::Done)
+    else {
+      return;
+    };
+    self.finish_pack(request, reader, Err(err), site, admission);
   }
 
   /// One turn of the pack's checks against `repository`, the objects read back from the session's

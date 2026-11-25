@@ -128,6 +128,9 @@ fn is_ntfs_git(name: &[u8]) -> bool {
   if !matches!(name.first(), Some(b'.' | b'g' | b'G')) {
     return false;
   }
+  if matches!(name.first(), Some(b'g' | b'G')) && !matches!(name.get(1), Some(b'i' | b'I')) {
+    return false;
+  }
   strip_prefix_folded(name, b".git")
     .or_else(|| strip_prefix_folded(name, b"git~1"))
     .is_some_and(|rest| only_spaces_and_dots(rest, DOTGIT_ENDS))
@@ -159,6 +162,19 @@ fn is_ntfs_dot(name: &[u8], dotgit_name: &[u8], prefix: &[u8; SHORT_NAME_PREFIX]
       .is_none_or(|byte| !first.eq_ignore_ascii_case(byte))
   {
     return false;
+  }
+  if first != b'.' && first != b'~' {
+    let second = name.get(1).copied().unwrap_or(0);
+    if second != b'~'
+      && dotgit_name
+        .get(1)
+        .is_none_or(|byte| !second.eq_ignore_ascii_case(byte))
+      && prefix
+        .get(1)
+        .is_none_or(|byte| !second.eq_ignore_ascii_case(byte))
+    {
+      return false;
+    }
   }
   if let Some(rest) = name
     .strip_prefix(b".")

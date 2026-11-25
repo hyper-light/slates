@@ -1964,3 +1964,43 @@ fn a_file_whose_bytes_its_batch_already_staged_is_cloned_where_the_target_can() 
     assert!(hidden_names(&host).is_empty(), "{:?}", hidden_names(&host));
   }
 }
+
+/// Step 4 (sliced disk validation hashing): validating a landing over an existing large file on
+/// disk (`4 × 64 KiB = 256 KiB`, > `HASH_READ_BYTES`) slices its BLAKE3 hash across multiple
+/// `LandingRun::step` units (`budget_ns = 0`) instead of hashing the whole file in one shard turn,
+/// and accepts an identical file cleanly.
+#[test]
+fn validating_a_large_existing_file_slices_hashing_across_landing_units() {
+  let payload: Vec<u8> = (0..(256 * 1024usize))
+    .map(|i| u8::try_from((i * 31) % 251).unwrap())
+    .collect();
+  let mut host = SimHost::new();
+  host.replace_file("/big.bin", &payload);
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  // Creating a file that already exists on disk with identical bytes forces `needs_hash = true`
+  // so `Phase::Validate` must hash the full 256 KiB existing disk file chunk by chunk.
+  write_file(&mut vol, &mut host, &mut store, "/big.bin", &payload);
+  let mut session = Session::sliced();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(1))
+  .unwrap();
+  // 256 KiB file requires 4 × 64 KiB hash units in Validate alone, plus Sweep/Write/Sync/Advance.
+  assert!(
+    session.slices >= 6,
+    "expected >= 6 units for sliced 256 KiB hash validation, got {}",
+    session.slices
+  );
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(
+    report.skipped, 1,
+    "identical existing file skipped: {report:?}"
+  );
+}

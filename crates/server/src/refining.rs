@@ -78,9 +78,10 @@ struct Done {
 /// A refined submit's increment, verdict and encoding, made by the job a bounded slice a turn so the submit's own step
 /// only commits (A-787 part 3; main's ruling of 2026-11-21 09:25 on the 415 ms step): the increment composed as
 /// `verbs::compose_increment` composes it (its post-state laid a copy slice a turn, its identity hashed a hash slice a
-/// turn), its verdict computed at the head the job saw (`Green::compute`, which the submit takes by position:
-/// `Green::submit_computed`, judging again only what a later head changed), and its encoding. For the submit that
-/// parked with `evidence`; taken a part at a time as the submit reaches each, and gone with the work's next refinement.
+/// turn), its encoding made via `IncrementEncoder` in copy slices, large increments staged chunk-by-chunk in
+/// `state.held_content` via `AheadHold`, and accepted file buffers pre-made via `Green::make_step` so the submit
+/// step commits in O(files) with zero byte copying. For the submit that parked with `evidence`; taken a part at a time
+/// as the submit reaches each, and gone with the work's next refinement.
 struct Prepared {
   /// The submit's evidence, which the increment carries.
   evidence: Vec<[u8; 32]>,
@@ -90,8 +91,14 @@ struct Prepared {
   id: [u8; 32],
   /// Its verdict computed at the head the job saw, until the submit takes it.
   computed: Option<slates_merge::engine::Computed>,
-  /// Its encoding, until the submit takes it.
+  /// Pre-made accepted verdict whose file buffers are already copied in slices via `Green::make_step`,
+  /// ready for zero-copy `Green::commit_judged` when the green's head has not moved.
+  made: Option<slates_merge::engine::Judged>,
+  /// Its encoding (for small carried increments; `None` once staged into `held`), until the submit takes it.
   encoded: Option<Vec<u8>>,
+  /// Large increment already staged chunk-by-chunk in `state.held_content` via `AheadHold`, ready
+  /// for O(1) `merge_service::increment_already_held`. Given back if untaken when replaced or cleared.
+  held: Option<crate::held_ahead::HeldAhead>,
 }
 
 /// The shard's refinements: the jobs running, their results, and the local verbs waiting on them.
@@ -650,6 +657,21 @@ fn turn(turns: &mut TurnCounts, longest: &mut u64, began: u64) {
   *longest = (*longest).max(took);
 }
 
+/// Releases any untaken content-store hold held by a superseded or cleared [`Done`] record.
+fn release_done(state: &mut ShardState, old: Done) {
+  if let Some(held) = old.prepared.and_then(|p| p.held) {
+    crate::held_ahead::give_back(state, &[held]);
+  }
+}
+
+/// Clears any prepared refinement/owner-staging state for `work` (called when `work` accepts or
+/// is destroyed), returning any untaken `HeldAhead` content hold to the shard's store.
+pub(crate) fn clear_work(state: &mut ShardState, work: DbVolumeId) {
+  if let Some(old) = state.refining.done.remove(&work) {
+    release_done(state, old);
+  }
+}
+
 /// Ends `work`'s job: its result kept under its key (none when it gave up), its turns counted, and the verbs waiting on
 /// it run again.
 fn finish(
@@ -679,21 +701,127 @@ fn finish(
     if prepared.is_some() {
       state.count(PREPARED, 1);
     }
-    state.refining.done.insert(
+    if let Some(old) = state.refining.done.insert(
       work,
       Done {
         key,
         refined,
         prepared,
       },
-    );
+    ) {
+      release_done(state, old);
+    }
   } else {
-    state.refining.done.remove(&work);
+    if let Some(held) = prepared.and_then(|p| p.held) {
+      crate::held_ahead::give_back(state, &[held]);
+    }
+    clear_work(state, work);
   }
   if let Some(parked) = state.refining.parked.remove(&work) {
     crate::verbs::resume_all(state, parked);
   }
   crate::work_home::refined(state, work);
+}
+
+/// Sentinel journal length used as the key for cross-shard owner-side sliced preparation jobs
+/// (`start_owner_prepare`), distinct from any real work journal length on the same shard.
+const OWNER_PREPARE_JOURNAL: usize = usize::MAX;
+
+/// Whether the owner shard already has a prepared owner-side staging/verdict record for `(work, id)`.
+pub(crate) fn is_owner_prepared(state: &ShardState, work: DbVolumeId, id: [u8; 32]) -> bool {
+  state
+    .refining
+    .done
+    .get(&work)
+    .and_then(|done| done.prepared.as_ref())
+    .is_some_and(|p| p.id == id)
+}
+
+/// Starts cooperative owner-shard preparation for a cross-shard large submit (`owner_judge`):
+/// slices `IncrementEncoder`, `AheadHold` content-store staging, and `Green::make_step` across
+/// bounded shard turns so a 1 GiB cross-shard submit commits in O(files) with zero watchdog risk.
+pub(crate) fn start_owner_prepare(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  green: DbVolumeId,
+  inc: slates_merge::engine::Increment,
+) -> bool {
+  let key = (inc.base, OWNER_PREPARE_JOURNAL);
+  if state.refining.running.get(&work) == Some(&key) {
+    return true;
+  }
+  let id = inc.id;
+  let task = async move {
+    let mut turns = (0u64, [0u64; PAST_MULTIPLES.len()]);
+    let mut longest = 0u64;
+    let mut increment = inc;
+    let parts = prepare_owner_parts(green, &mut increment, (&mut turns, &mut longest), |s| {
+      s.greens.contains_key(&green).then_some(())
+    })
+    .await;
+    let prepared = parts.map(|(computed, made, encoded, held)| Prepared {
+      evidence: increment.evidence.clone(),
+      increment: Some(increment),
+      id,
+      computed,
+      made,
+      encoded,
+      held,
+    });
+    let _ = crate::state::with_state(|s| {
+      finish_owner(s, work, (key, prepared), (turns, longest));
+    });
+  };
+  match slates_rt::futures::spawn(task) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+      state.refining.running.insert(work, key);
+      state.count(REFINE_STARTED, 1);
+      true
+    }
+    Err(_) => false,
+  }
+}
+
+/// Finishes a cross-shard owner preparation job, storing `prepared` under `work` and resuming
+/// any parked `ParkedKind::Owner` submits waiting on it.
+fn finish_owner(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  (key, prepared): (Key, Option<Prepared>),
+  (turns, longest): (TurnCounts, u64),
+) {
+  state.count(REFINE_TURNS, turns.0);
+  for (name, count) in REFINE_PAST_QUANTUM.iter().zip(turns.1) {
+    state.count(name, count);
+  }
+  state.count(
+    REFINE_LONGEST_TURN_US,
+    longest / crate::daemon::NANOS_PER_MICRO,
+  );
+  state.refining.longest_turn_ns = state.refining.longest_turn_ns.max(longest);
+  if state.refining.running.get(&work) == Some(&key) {
+    state.refining.running.remove(&work);
+  }
+  let has_parked = state.refining.parked.contains_key(&work);
+  if has_parked && let Some(prepared) = prepared {
+    state.count(PREPARED, 1);
+    if let Some(old) = state.refining.done.insert(
+      work,
+      Done {
+        key,
+        refined: None,
+        prepared: Some(prepared),
+      },
+    ) {
+      release_done(state, old);
+    }
+  } else if let Some(held) = prepared.and_then(|p| p.held) {
+    crate::held_ahead::give_back(state, &[held]);
+  }
+  if let Some(parked) = state.refining.parked.remove(&work) {
+    crate::verbs::resume_all(state, parked);
+  }
 }
 
 /// Counter: a refined submit's increment, verdict and encoding prepared off its step (A-787 part 3). Format: a counter
@@ -738,12 +866,10 @@ fn still_owed(s: &ShardState, (work, _green, key): (DbVolumeId, DbVolumeId, Key)
   ((w.base_version, w.journal.len()) == key).then_some(())
 }
 
-/// Prepares the parked submit's increment (and, when the green lives on this shard, its verdict and
-/// encoding) over `(doc, plan)` a bounded slice a turn ([`Prepared`]): the post-state a copy slice
-/// a turn (the shard's measured memcpy rate within its quantum), the identity a hash slice a turn
-/// (its measured BLAKE3 rate), and the document's encoding (and local verdict/encoding) a turn
-/// each. `None`, nothing kept, where nothing waits for it or the work changed: the submit then
-/// composes and judges in its step as before.
+/// Prepares the parked submit's increment (and, when the green lives on this shard, its verdict,
+/// pre-made file buffers, and encoding/content-store hold) over `(doc, plan)` a bounded slice a
+/// turn ([`Prepared`]). `None`, nothing kept, where nothing waits for it or the work changed: the
+/// submit then composes and judges in its step as before.
 async fn prepare(
   (work, green, key): (DbVolumeId, DbVolumeId, Key),
   (doc, plan): (&OpsDoc, &PostStatePlan),
@@ -767,7 +893,7 @@ async fn prepare(
   .await?;
   let id = hashed_identity(at, (&doc_bytes, &post), (&mut *turns, &mut *longest)).await?;
   drop(doc_bytes);
-  let increment = slates_merge::engine::Increment {
+  let mut increment = slates_merge::engine::Increment {
     id,
     base: key.0,
     doc: doc.clone(),
@@ -776,57 +902,231 @@ async fn prepare(
     named: Default::default(),
   };
   let local_green = crate::state::with_state(|s| s.greens.contains_key(&green)).unwrap_or(false);
-  let (computed, encoded) = if local_green {
-    prepare_local_parts(at, (doc, plan), &increment, (&mut *turns, &mut *longest)).await?
+  let (computed, made, encoded, held) = if local_green {
+    prepare_local_parts(
+      at,
+      (doc, plan),
+      &mut increment,
+      (&mut *turns, &mut *longest),
+    )
+    .await?
   } else {
-    (None, None)
+    (None, None, None, None)
   };
   Some(Prepared {
     evidence,
     increment: Some(increment),
     id,
     computed,
+    made,
     encoded,
+    held,
   })
 }
 
-/// Runs the local-green half of [`prepare`]: debug-build whole-compose oracle check, computed
-/// verdict at the observed head, and increment encoding, each in its own bounded turn.
+/// Output of owner-side sliced preparation: computed verdict, optional pre-made accepted `Judged`,
+/// optional carried `encoded` bytes, and optional staged `HeldAhead`.
+type OwnerParts = (
+  Option<slates_merge::engine::Computed>,
+  Option<slates_merge::engine::Judged>,
+  Option<Vec<u8>>,
+  Option<crate::held_ahead::HeldAhead>,
+);
+
+/// Runs the local-green half of [`prepare`]: debug-build whole-compose oracle check (for carried
+/// sizes), sliced increment encoding, sliced content-store staging for large increments, and
+/// sliced `Green::make_step` file assembly.
 async fn prepare_local_parts(
   at: (DbVolumeId, DbVolumeId, Key),
   (_doc, _plan): (&OpsDoc, &PostStatePlan),
-  increment: &slates_merge::engine::Increment,
+  increment: &mut slates_merge::engine::Increment,
   (turns, longest): (&mut TurnCounts, &mut u64),
-) -> Option<(Option<slates_merge::engine::Computed>, Option<Vec<u8>>)> {
+) -> Option<OwnerParts> {
   let (_work, green, _key) = at;
-  // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
-  // `compose_increment`), compared whole with the sliced one, in a turn of its own (A-821).
+  // Debug oracle compares small/medium increments whole; skip past CARRIED_INCREMENT_MAX so a 1 GiB
+  // submit never clones/lays 1 GiB synchronously in a debug test.
   #[cfg(debug_assertions)]
-  let _ = prepare_turn((&mut *turns, &mut *longest), |s| {
-    let whole = crate::verbs::composed_whole(
-      s,
-      (_work, green, _key.0),
-      (_doc.clone(), _plan.clone()),
-      increment.evidence.clone(),
-    )?;
-    s.count(PREPARED_CHECKED, 1);
-    if whole != *increment {
-      s.count(PREPARED_MISMATCH, 1);
-    }
-    Some(())
-  })
-  .await;
+  if !needs_sliced_prepare(_doc) {
+    let _ = prepare_turn((&mut *turns, &mut *longest), |s| {
+      let whole = crate::verbs::composed_whole(
+        s,
+        (_work, green, _key.0),
+        (_doc.clone(), _plan.clone()),
+        increment.evidence.clone(),
+      )?;
+      s.count(PREPARED_CHECKED, 1);
+      if whole != *increment {
+        s.count(PREPARED_MISMATCH, 1);
+      }
+      Some(())
+    })
+    .await;
+  }
+  prepare_owner_parts(green, increment, (turns, longest), |s| still_owed(s, at)).await
+}
+
+/// Owner-shard cooperative preparation shared by local (`prepare_local_parts`) and cross-shard
+/// (`start_owner_prepare`) submits: encodes `increment` in copy slices, stages large encodings
+/// chunk-by-chunk via `AheadHold` (freeing the encoding buffer immediately before `make_step`),
+/// computes the verdict, and slices `Green::make_step` across turns so commit copies zero bytes.
+async fn prepare_owner_parts(
+  green: DbVolumeId,
+  increment: &mut slates_merge::engine::Increment,
+  (turns, longest): (&mut TurnCounts, &mut u64),
+  still_live: impl Fn(&ShardState) -> Option<()>,
+) -> Option<OwnerParts> {
+  let encoded =
+    encode_increment_sliced(increment, (&mut *turns, &mut *longest), &still_live).await?;
+  let (encoded, held) = stage_encoded_if_large(
+    green,
+    increment.id,
+    encoded,
+    (&mut *turns, &mut *longest),
+    &still_live,
+  )
+  .await?;
   let computed = prepare_turn((&mut *turns, &mut *longest), |s| {
-    still_owed(s, at)?;
+    still_live(s)?;
     s.greens.get(&green)?.compute(increment).ok()
   })
-  .await?;
-  let encoded = prepare_turn((&mut *turns, &mut *longest), |s| {
-    still_owed(s, at)?;
-    Some(increment.encode())
+  .await;
+  let Some(computed) = computed else {
+    if let Some(h) = held {
+      let _ = crate::state::with_state(|s| crate::held_ahead::give_back(s, &[h]));
+    }
+    return None;
+  };
+  let (computed, made) = make_verdict_if_large(
+    green,
+    increment,
+    computed,
+    (&mut *turns, &mut *longest),
+    &still_live,
+  )
+  .await;
+  Some((computed, made, encoded, held))
+}
+
+/// Encodes `increment` in `copy_slice_bytes` slices using [`slates_merge::engine::IncrementEncoder`].
+async fn encode_increment_sliced(
+  increment: &slates_merge::engine::Increment,
+  (turns, longest): (&mut TurnCounts, &mut u64),
+  still_live: &impl Fn(&ShardState) -> Option<()>,
+) -> Option<Vec<u8>> {
+  let mut encoder = increment.begin_encode();
+  loop {
+    let done = prepare_turn((&mut *turns, &mut *longest), |s| {
+      still_live(s)?;
+      let slice = s
+        .config
+        .copy_slice_bytes_within(s.config.step_quantum_ns())
+        .max(1);
+      Some(encoder.step(increment, slice))
+    })
+    .await?;
+    if done {
+      return Some(encoder.finish());
+    }
+  }
+}
+
+/// Stages `encoded` chunk-by-chunk into `state.held_content` via `AheadHold` when it exceeds the
+/// carried increment threshold, freeing the `encoded` buffer immediately once staged.
+async fn stage_encoded_if_large(
+  green: DbVolumeId,
+  id: [u8; 32],
+  encoded: Vec<u8>,
+  (turns, longest): (&mut TurnCounts, &mut u64),
+  still_live: &impl Fn(&ShardState) -> Option<()>,
+) -> Option<(Option<Vec<u8>>, Option<crate::held_ahead::HeldAhead>)> {
+  let next_version = crate::state::with_state(|s| {
+    still_live(s)?;
+    if crate::verbs::carries(s, encoded.len()) {
+      return Some(None);
+    }
+    Some(Some(s.db.partition().green_head(green).saturating_add(1)))
   })
-  .await?;
-  Some((Some(computed), Some(encoded)))
+  .flatten()?;
+  let Some(version) = next_version else {
+    return Some((Some(encoded), None));
+  };
+  let mut hold = crate::held_ahead::AheadHold::from_encoded(green, version, id, encoded);
+  loop {
+    let step = prepare_turn((&mut *turns, &mut *longest), |s| {
+      still_live(s)?;
+      Some(hold.unit(s))
+    })
+    .await?;
+    match step {
+      Ok(crate::held_ahead::Ahead::More) => {}
+      Ok(crate::held_ahead::Ahead::Held(held)) => return Some((None, Some(held))),
+      Err(_) => return Some((None, None)),
+    }
+  }
+}
+
+/// Pre-makes an accepted large verdict's file buffers via `Green::make_step` across copy-slice
+/// turns (moving `increment.post_state` with zero clone, and restoring it if the green's head
+/// moves before completion).
+async fn make_verdict_if_large(
+  green: DbVolumeId,
+  increment: &mut slates_merge::engine::Increment,
+  computed: slates_merge::engine::Computed,
+  (turns, longest): (&mut TurnCounts, &mut u64),
+  still_live: &impl Fn(&ShardState) -> Option<()>,
+) -> (
+  Option<slates_merge::engine::Computed>,
+  Option<slates_merge::engine::Judged>,
+) {
+  let should_slice = crate::state::with_state(|s| {
+    let slice = s.config.copy_slice_bytes_within(s.config.step_quantum_ns());
+    u64::try_from(increment.post_state.len()).unwrap_or(u64::MAX) > slice
+  })
+  .unwrap_or(false);
+  if !should_slice {
+    return (Some(computed), None);
+  }
+  let mut computed_opt = Some(computed);
+  let judged = prepare_turn((&mut *turns, &mut *longest), |s| {
+    still_live(s)?;
+    let comp = computed_opt.take()?;
+    let mut engine = s.greens.get_mut(&green)?;
+    match engine.judge_computed_taking(increment, comp) {
+      Ok(slates_merge::engine::Judgment::Accepted(judged)) => Some(Some(judged)),
+      _ => Some(None),
+    }
+  })
+  .await
+  .flatten();
+  let Some(mut judged) = judged else {
+    return (computed_opt, None);
+  };
+  loop {
+    let step = prepare_turn((&mut *turns, &mut *longest), |s| {
+      still_live(s)?;
+      let slice = s
+        .config
+        .copy_slice_bytes_within(s.config.step_quantum_ns())
+        .max(1);
+      let engine = s.greens.get(&green)?;
+      Some(engine.make_step(&mut judged, slice))
+    })
+    .await;
+    match step {
+      Some(Ok(made)) if made.done => {
+        // Restore post_state/read onto `increment` (zero clone) so all submit-time checks
+        // (`retention_secured`, `chain_room_admitted`, retries, head-moved fallback) see the full
+        // increment while `judged.effects` retains every pre-made file buffer for `commit_judged_for`.
+        judged.restore_buffers_into(increment);
+        return (None, Some(judged));
+      }
+      Some(Ok(_)) => {}
+      _ => {
+        judged.restore_into(increment);
+        return (None, None);
+      }
+    }
+  }
 }
 
 /// The prepared part of `work`'s submit `take` reads (A-787 part 3), counted when taken.
@@ -869,6 +1169,24 @@ pub(crate) fn take_increment(
   })
 }
 
+/// Takes back the increment held by an owner-side preparation job for a cross-shard submit.
+pub(crate) fn take_owner_increment(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  base: u64,
+) -> Option<slates_merge::engine::Increment> {
+  let key = (base, OWNER_PREPARE_JOURNAL);
+  let matches = state
+    .refining
+    .done
+    .get(&work)
+    .is_some_and(|done| done.key == key);
+  if !matches {
+    return None;
+  }
+  take_prepared(state, work, |prepared| prepared.increment.take())
+}
+
 /// The encoding of the increment `id` the job prepared for `work`'s submit (A-787 part 3), taken once.
 pub(crate) fn take_encoded(
   state: &mut ShardState,
@@ -879,6 +1197,28 @@ pub(crate) fn take_encoded(
     (prepared.id == id)
       .then(|| prepared.encoded.take())
       .flatten()
+  })
+}
+
+/// The content-store hold staged ahead for `work`'s large submit `id`, taken once.
+pub(crate) fn take_held(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  id: [u8; 32],
+) -> Option<crate::held_ahead::HeldAhead> {
+  take_prepared(state, work, |prepared| {
+    (prepared.id == id).then(|| prepared.held.take()).flatten()
+  })
+}
+
+/// The pre-made accepted verdict (all file buffers copied in slices) for `work`'s submit `id`, taken once.
+pub(crate) fn take_made(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  id: [u8; 32],
+) -> Option<slates_merge::engine::Judged> {
+  take_prepared(state, work, |prepared| {
+    (prepared.id == id).then(|| prepared.made.take()).flatten()
   })
 }
 
@@ -895,63 +1235,100 @@ pub(crate) fn take_computed(
   })
 }
 
-/// The increment's post-state laid over `(doc, plan)` a copy slice a turn ([`prepare`]): the ops whose bytes fit the
-/// shard's copy slice within its quantum (its measured memcpy rate), at least one a turn.
+/// The increment's post-state laid over `(doc, plan)` a copy slice a turn ([`prepare`]): reserves
+/// virtual capacity without upfront zero-fill and copies each op (or sub-slice of a large op)
+/// within the shard's derived copy slice so even a 1 GiB seed changeset never stalls a shard.
 async fn laid_post_state(
   at: (DbVolumeId, DbVolumeId, Key),
   (doc, plan): (&OpsDoc, &PostStatePlan),
   (turns, longest): (&mut TurnCounts, &mut u64),
 ) -> Option<Vec<u8>> {
-  let (work, green, key) = at;
   let size = usize::try_from(crate::verbs::post_state_size(doc)).ok()?;
-  let mut post = vec![0u8; size];
+  let mut post = Vec::new();
+  post.try_reserve_exact(size).ok()?;
   let ops = doc.ops.len();
-  let mut next = 0usize;
+  let (mut next, mut sub_off) = (0usize, 0u64);
   while next < ops {
-    next = prepare_turn((&mut *turns, &mut *longest), |s| {
+    let (new_next, new_sub) = prepare_turn((&mut *turns, &mut *longest), |s| {
       still_owed(s, at)?;
-      let budget = s
-        .config
-        .copy_slice_bytes_within(s.config.step_quantum_ns())
-        .max(1);
-      let mut end = next;
-      let mut bytes = 0u64;
-      while end < ops && (end == next || bytes < budget) {
-        bytes = bytes.saturating_add(doc.ops.get(end).map_or(0, |op| op.len));
-        end = end.saturating_add(1);
-      }
-      let w = s.works.get(&work)?;
-      let engine = s.greens.get(&green);
-      let base = match engine.as_deref() {
-        Some(engine) => crate::work_files::Base {
-          green: Some(engine),
-          fetched: None,
-          version: key.0,
-          entries: None,
-          plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
-        },
-        None => crate::work_files::Base {
-          green: None,
-          fetched: crate::work_home::parked_fetched(s, work),
-          version: key.0,
-          entries: Some(&w.entries),
-          plane: None,
-        },
-      };
-      // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
-      crate::verbs::lay_ops(
-        &mut post,
-        (doc, plan),
-        (&w.files, base),
-        &w.journal,
-        next..end,
+      lay_post_state_slice(s, at, (doc, plan), &mut post, (next, sub_off))
+    })
+    .await?;
+    next = new_next;
+    sub_off = new_sub;
+  }
+  while post.len() < size {
+    prepare_turn((&mut *turns, &mut *longest), |s| {
+      still_owed(s, at)?;
+      let slice = usize::try_from(
+        s.config
+          .copy_slice_bytes_within(s.config.step_quantum_ns())
+          .max(1),
       )
-      .ok()?;
-      Some(end)
+      .unwrap_or(usize::MAX);
+      post.resize(post.len().saturating_add(slice).min(size), 0);
+      Some(())
     })
     .await?;
   }
   Some(post)
+}
+
+/// One bounded copy-slice turn of [`laid_post_state`].
+fn lay_post_state_slice(
+  s: &ShardState,
+  (work, green, key): (DbVolumeId, DbVolumeId, Key),
+  (doc, plan): (&OpsDoc, &PostStatePlan),
+  post: &mut Vec<u8>,
+  (mut next, mut sub_off): (usize, u64),
+) -> Option<(usize, u64)> {
+  let budget = s
+    .config
+    .copy_slice_bytes_within(s.config.step_quantum_ns())
+    .max(1);
+  let w = s.works.get(&work)?;
+  let engine = s.greens.get(&green);
+  let base = match engine.as_deref() {
+    Some(engine) => crate::work_files::Base {
+      green: Some(engine),
+      fetched: None,
+      version: key.0,
+      entries: None,
+      plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
+    },
+    None => crate::work_files::Base {
+      green: None,
+      fetched: crate::work_home::parked_fetched(s, work),
+      version: key.0,
+      entries: Some(&w.entries),
+      plane: None,
+    },
+  };
+  let mut copied = 0u64;
+  while next < doc.ops.len() && (copied == 0 || copied < budget) {
+    let Some(op) = doc.ops.get(next) else {
+      break;
+    };
+    let left = budget.saturating_sub(copied).max(1);
+    let (took, finished) = crate::verbs::lay_op_slice(
+      post,
+      op,
+      (doc, plan),
+      (&w.files, base),
+      &w.journal,
+      (sub_off, left),
+    )
+    .ok()?;
+    copied = copied.saturating_add(took);
+    if finished {
+      next = next.saturating_add(1);
+      sub_off = 0;
+    } else {
+      sub_off = sub_off.saturating_add(took);
+      break;
+    }
+  }
+  Some((next, sub_off))
 }
 
 /// The increment's identity hashed a hash slice a turn ([`prepare`]): the work and its base, then the encoded document

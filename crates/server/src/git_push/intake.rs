@@ -123,6 +123,27 @@ impl Contents for Quarantined<'_> {
   }
 }
 
+/// Admits `settled`, pre-verified objects settled from a multi-shard compute batch, to
+/// `quarantine` without re-hashing on the owner shard, then releases every hold back to `admission`.
+pub(super) fn admit_settled(
+  state: &mut ShardState,
+  quarantine: &mut GitPush,
+  settled: Vec<slates_git::receive::SettledObject>,
+  admission: &mut Admission,
+) -> Result<(), GitRefused> {
+  let mut objects = Vec::with_capacity(settled.len());
+  let mut holds = Vec::with_capacity(settled.len());
+  for item in settled {
+    objects.push((item.placed, item.content));
+    holds.push(item.hold);
+  }
+  let admitted = quarantine.admit_precomputed_all(state, objects);
+  for hold in holds {
+    admission.release(hold);
+  }
+  admitted
+}
+
 /// Admits `queue`, the objects a session call resolved, to `quarantine` on the shard's state, each held where it lies in
 /// the push's pack ([`GitPush::admit_placed_all`]), then gives each one's hold back to `admission` (the module docs).
 /// Refused at the first object the store does not admit; every hold is given back whatever the outcome.

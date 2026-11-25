@@ -484,12 +484,141 @@ struct Record {
   state: State,
 }
 
-/// An entry's object, or its delta waiting for its base.
+/// An entry's object, awaiting parallel naming, or its delta waiting for its base.
 enum State {
   /// The object, named.
   Resolved(Resolved),
+  /// Unpacked (`Whole` or `OfsDelta`) with its type, chain depth, and optional base entry known,
+  /// awaiting parallel worker naming (`sha1_checked` / SHA-256) before settling to [`State::Resolved`].
+  PendingName(PendingName),
   /// A delta whose base is not yet resolved.
   Waiting(Waiting),
+}
+
+/// How a [`PendingName`] entry relates to its delta base (if any), used by [`Reader::settle_named`]
+/// once its worker-computed [`ObjectId`] arrives.
+#[derive(Clone, Copy)]
+enum PendingBase {
+  /// Stored whole (not a delta).
+  Whole,
+  /// Delta against an earlier entry in this pack; its base id is read from `entries[entry]` on settle.
+  Entry(usize),
+  /// Thin-pack delta against a repository object outside this pack whose id is already known.
+  Outside(ObjectId),
+}
+
+/// Metadata kept on a [`Record`] while its content is being named on a worker shard.
+#[derive(Clone, Copy)]
+struct PendingName {
+  /// Its object type.
+  kind: Kind,
+  /// Where its delta base lives, if it is a delta.
+  base: PendingBase,
+  /// Delta chain depth (`0` for whole).
+  depth: u64,
+}
+
+/// Outcome of one deferred waiting-delta resolution turn ([`Reader::resolve_turn_deferred`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredResolve {
+  /// Produced unverified objects in `batch` (or hit target/quantum) ready for multi-shard
+  /// verification and settling via [`Reader::settle_named`] before the next turn.
+  Batch,
+  /// Paused because a base object lies in a let-go pack window; caller must settle any objects
+  /// already placed in `batch` and bring back the window before calling again.
+  Away,
+  /// Every waiting delta is resolved and settled; caller may finish the pack.
+  Done,
+}
+
+/// Outcome of one pending-delta unit inside [`Reader::resolve_turn_deferred`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferredUnit {
+  /// Resolved or skipped; keep advancing the current turn.
+  Continue,
+  /// Base is `PendingName` with an index `expected` id check; settle the current batch first.
+  NeedSettle,
+  /// Base lies in a let-go pack window; pause and let the caller bring it back.
+  Away,
+}
+
+/// One unpacked entry (`Whole`, `OfsDelta`, or resolved `RefDelta`) ready for stateless parallel
+/// naming, `fsck`, BLAKE3 hashing, and commit/tag parsing on any shard before settling into
+/// [`Reader`] in pack order.
+#[derive(Debug)]
+pub struct Unverified {
+  /// Pack order position (`at`) in [`Reader::entries`].
+  pub at: usize,
+  /// Entry byte offset in the pack.
+  pub offset: u64,
+  /// Stored byte length in the pack.
+  pub stored: u64,
+  /// Object kind.
+  pub kind: Kind,
+  /// Delta chain depth (`0` for whole).
+  pub depth: u64,
+  /// Uncompressed object bytes.
+  pub content: Vec<u8>,
+  /// Admission hold covering `content`.
+  pub hold: Hold,
+}
+
+/// Bounded batch of unpacked-but-unnamed objects accumulated across [`Reader::read_deferred`] calls
+/// before scattering across shards for parallel verification.
+#[derive(Debug, Default)]
+pub struct DeferredBatch {
+  /// Unverified objects in exact pack order.
+  objects: Vec<Unverified>,
+  /// Maps pack entry index (`at`) -> index in `objects`, enabling O(1) `OFS_DELTA` base lookups
+  /// within the same batch without copying into `Recent`.
+  index: std::collections::BTreeMap<usize, usize>,
+  /// Total uncompressed content bytes held in `objects`.
+  bytes: u64,
+}
+
+impl DeferredBatch {
+  /// Total uncompressed bytes currently buffered in this batch.
+  pub fn bytes(&self) -> u64 {
+    self.bytes
+  }
+
+  /// Number of unverified objects buffered in this batch.
+  pub fn len(&self) -> usize {
+    self.objects.len()
+  }
+
+  /// Whether no objects are buffered.
+  pub fn is_empty(&self) -> bool {
+    self.objects.is_empty()
+  }
+
+  /// Pushes one unpacked entry into the batch.
+  fn push(&mut self, object: Unverified) {
+    let pos = self.objects.len();
+    self.bytes = self.bytes.saturating_add(to_u64(object.content.len()));
+    self.index.insert(object.at, pos);
+    self.objects.push(object);
+  }
+
+  /// Borrows the content of an in-batch entry at pack position `at`.
+  fn content(&self, at: usize) -> Option<&[u8]> {
+    let &pos = self.index.get(&at)?;
+    self.objects.get(pos).map(|obj| obj.content.as_slice())
+  }
+
+  /// Takes all buffered objects in exact pack order and resets the batch.
+  pub fn take(&mut self) -> Vec<Unverified> {
+    self.index.clear();
+    self.bytes = 0;
+    core::mem::take(&mut self.objects)
+  }
+
+  /// Releases every buffered admission hold and drops buffered objects (on refusal or teardown).
+  pub fn release_all(&mut self, admission: &mut Admission) {
+    for object in self.take() {
+      admission.release(object.hold);
+    }
+  }
 }
 
 /// An object resolved: named, its bytes gone to the keeper.
@@ -784,6 +913,282 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       });
     }
     Ok(Kept { objects, checksum })
+  }
+
+  /// [`Reader::read_into`] deferring SHA-1DC/SHA-256 naming of `Whole` and `OfsDelta` entries into
+  /// `batch` so the caller can scatter naming, `fsck`, BLAKE3 hashing, and commit/tag parsing
+  /// across shards in parallel before settling entries in pack order via [`Reader::settle_named`].
+  ///
+  /// `OFS_DELTA` entries resolve immediately against `batch` (in RAM) or already-settled entries
+  /// in `keep` without waiting for SHA-1DC; `REF_DELTA` entries (and any `OFS_DELTA` targeting an
+  /// earlier in-flight batch) stay in [`State::Waiting`] for [`Reader::resolve_turn`].
+  pub fn read_deferred<K: Keep + ?Sized>(
+    &mut self,
+    bytes: &[u8],
+    admission: &mut Admission,
+    keep: &mut K,
+    batch: &mut DeferredBatch,
+  ) -> Result<usize, Refusal> {
+    let mut used = 0usize;
+    loop {
+      let rest = bytes.get(used..).unwrap_or_default();
+      if rest.is_empty() || matches!(self.stage, Stage::Done(_)) {
+        return Ok(used);
+      }
+      let Some(took) = self.step_deferred(rest, admission, keep, batch)? else {
+        return Ok(used);
+      };
+      used = used.saturating_add(took);
+    }
+  }
+
+  /// Settles one entry previously placed in [`State::PendingName`] by [`Reader::read_deferred`] or
+  /// [`Reader::resolve_turn_deferred`] once its worker-computed [`ObjectId`] is known, in exact
+  /// pack order: returns the entry's resolved [`Chain`], and if deferred delta resolution is under
+  /// way, queues any `REF_DELTA` children waiting on `Key::Id(id)`.
+  pub fn settle_named(&mut self, at: usize, id: ObjectId) -> Option<Option<Chain>> {
+    let pending = match self.entries.get(at).map(|record| &record.state) {
+      Some(State::PendingName(pending)) => *pending,
+      _ => return None,
+    };
+    let chain = match pending.base {
+      PendingBase::Whole => None,
+      PendingBase::Entry(base_idx) => {
+        let base_id = match self.entries.get(base_idx).map(|record| &record.state) {
+          Some(State::Resolved(resolved)) => resolved.id,
+          _ => return None,
+        };
+        Some(Chain {
+          base: base_id,
+          depth: pending.depth,
+        })
+      }
+      PendingBase::Outside(base_id) => Some(Chain {
+        base: base_id,
+        depth: pending.depth,
+      }),
+    };
+    if let Some(record) = self.entries.get_mut(at) {
+      record.state = State::Resolved(Resolved {
+        kind: pending.kind,
+        id,
+        chain,
+      });
+    }
+    if let Some(resolving) = &mut self.resolving {
+      let _ = list_children_for_key(
+        &self.entries,
+        at,
+        Key::Id(id),
+        &resolving.waiting,
+        &mut resolving.pending,
+      );
+    }
+    Some(chain)
+  }
+
+  /// Reads from `rest` what the stage takes next in deferred-naming mode.
+  fn step_deferred<K: Keep + ?Sized>(
+    &mut self,
+    rest: &[u8],
+    admission: &mut Admission,
+    keep: &mut K,
+    batch: &mut DeferredBatch,
+  ) -> Result<Option<usize>, Refusal> {
+    match self.stage {
+      Stage::PackHeader => self.pack_header(rest, admission).map(Some),
+      Stage::EntryHeader => self.entry_header(rest, admission).map(Some),
+      Stage::Data(_) => self.data_deferred(rest, admission, keep, batch),
+      Stage::Trailer => self.trailer(rest).map(Some),
+      Stage::Done(_) => Ok(None),
+    }
+  }
+
+  /// Inflates entry data in deferred-naming mode, pushing resolved `Whole` / `OfsDelta` payloads
+  /// into `batch` without running synchronous SHA-1DC naming.
+  fn data_deferred<K: Keep + ?Sized>(
+    &mut self,
+    rest: &[u8],
+    admission: &mut Admission,
+    keep: &mut K,
+    batch: &mut DeferredBatch,
+  ) -> Result<Option<usize>, Refusal> {
+    let Stage::Data(data) = &mut self.stage else {
+      return Ok(None);
+    };
+    let inflater = self
+      .inflater
+      .state()
+      .ok_or(Refusal::Inflate { at: data.began })?;
+    let inflated = inflate(inflater, data, rest)?;
+    let took = usize::try_from(inflated.took).unwrap_or(usize::MAX);
+    let piece = rest.get(..took).unwrap_or_default();
+    self.checksum.update(piece);
+    self.at = self.at.saturating_add(inflated.took);
+    if !inflated.ended {
+      return Ok((took > 0).then_some(took));
+    }
+    let Stage::Data(data) = core::mem::replace(&mut self.stage, Stage::EntryHeader) else {
+      return Ok(Some(took));
+    };
+    let stored = self.at.saturating_sub(data.began);
+    let at = self.entries.len();
+    let (record, unverified) = self.record_deferred(at, data, stored, (admission, keep, batch))?;
+    self.entries.push(record);
+    if let Some(unverified) = unverified {
+      batch.push(unverified);
+    }
+    self.remaining = self.remaining.saturating_sub(1);
+    self.stage = self.after_entry();
+    Ok(Some(took))
+  }
+
+  /// Builds the [`Record`] and optional [`Unverified`] payload for an entry finished in deferred
+  /// mode.
+  fn record_deferred<K: Keep + ?Sized>(
+    &self,
+    at: usize,
+    data: Data,
+    stored: u64,
+    (admission, keep, batch): (&mut Admission, &mut K, &DeferredBatch),
+  ) -> Result<(Record, Option<Unverified>), Refusal> {
+    let Data {
+      header,
+      began,
+      content,
+      hold,
+      ..
+    } = data;
+    let (state, unverified) = match header.representation {
+      Representation::Whole(kind) => (
+        State::PendingName(PendingName {
+          kind,
+          base: PendingBase::Whole,
+          depth: 0,
+        }),
+        Some(Unverified {
+          at,
+          offset: began,
+          stored,
+          kind,
+          depth: 0,
+          content,
+          hold,
+        }),
+      ),
+      Representation::OfsDelta { base } => {
+        let entry = self
+          .entry_at(base)
+          .ok_or(Refusal::BaseNotAnEntry { at: began, base })?;
+        self.ofs_delta_deferred(
+          (at, began, stored),
+          (entry, content, hold),
+          (admission, keep, batch),
+        )?
+      }
+      Representation::RefDelta { base } => {
+        let placed = self.index.offset_of(&base);
+        let expected = placed.map(|_| base);
+        let base = match placed {
+          Some(offset) if offset < began => {
+            Base::Entry(self.entry_at(offset).ok_or(Refusal::BaseNotAnEntry {
+              at: began,
+              base: offset,
+            })?)
+          }
+          Some(offset) => Base::Offset(offset),
+          None => Base::Id(base),
+        };
+        (
+          State::Waiting(Waiting {
+            delta: content,
+            hold,
+            base,
+            expected,
+          }),
+          None,
+        )
+      }
+    };
+    Ok((
+      Record {
+        offset: began,
+        stored,
+        state,
+      },
+      unverified,
+    ))
+  }
+
+  /// Applies an `OFS_DELTA` in deferred mode against an in-batch [`State::PendingName`] base or an
+  /// already-settled [`State::Resolved`] base; queues in [`State::Waiting`] when the base is still
+  /// waiting or currently in flight on remote worker shards.
+  fn ofs_delta_deferred<K: Keep + ?Sized>(
+    &self,
+    (at, began, stored): (usize, u64, u64),
+    (base_idx, delta, hold): (usize, Vec<u8>, Hold),
+    (admission, keep, batch): (&mut Admission, &mut K, &DeferredBatch),
+  ) -> Result<(State, Option<Unverified>), Refusal> {
+    let base_info = match self.entries.get(base_idx) {
+      Some(Record {
+        state: State::PendingName(pending),
+        ..
+      }) => batch
+        .content(base_idx)
+        .map(|bytes| (pending.kind, pending.depth, Cow::Borrowed(bytes))),
+      Some(Record {
+        state: State::Resolved(source),
+        offset,
+        ..
+      }) => match keep.content(base_idx, &source.id) {
+        Some(bytes) => Some((
+          source.kind,
+          source.chain.map_or(0, |chain| chain.depth),
+          bytes,
+        )),
+        None if keep.away().is_some() => None,
+        None => {
+          return Err(Refusal::DeltaBaseMissing {
+            at: *offset,
+            base: source.id,
+          });
+        }
+      },
+      _ => None,
+    };
+    let Some((kind, base_depth, base_bytes)) = base_info else {
+      return Ok((
+        State::Waiting(Waiting {
+          delta,
+          hold,
+          base: Base::Entry(base_idx),
+          expected: None,
+        }),
+        None,
+      ));
+    };
+    let (content, target_hold) = held_while(admission, |admission| {
+      delta::apply(&base_bytes, &delta, admission)
+        .map_err(|refusal| Refusal::Delta { at: began, refusal })
+    })?;
+    keep.release(hold, admission);
+    let depth = base_depth.saturating_add(1);
+    Ok((
+      State::PendingName(PendingName {
+        kind,
+        base: PendingBase::Entry(base_idx),
+        depth,
+      }),
+      Some(Unverified {
+        at,
+        offset: began,
+        stored,
+        kind,
+        depth,
+        content,
+        hold: target_hold,
+      }),
+    ))
   }
 
   /// Reads from `rest` what the stage takes next: how many bytes it took, or `None` when it can go no further without
@@ -1145,6 +1550,36 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     Ok(take)
   }
 
+  /// Initializes or resumes [`Reader::resolving`]: returns `Ok(None)` when no entry is waiting.
+  fn init_resolving(&mut self, admission: &mut Admission) -> Result<Option<Resolving>, Refusal> {
+    if let Some(resolving) = self.resolving.take() {
+      return Ok(Some(resolving));
+    }
+    let count = self
+      .entries
+      .iter()
+      .filter(|record| matches!(record.state, State::Waiting(_)))
+      .count();
+    if count == 0 {
+      self.resolving = Some(Resolving {
+        next: self.entries.len(),
+        ..Resolving::default()
+      });
+      return Ok(None);
+    }
+    let waiting = self.waiting_table(count, admission)?;
+    charge_items::<usize>(admission, count)?;
+    let mut pending = Vec::new();
+    reserve(&mut pending, count)?;
+    Ok(Some(Resolving {
+      waiting,
+      pending,
+      next: 0,
+      outside: 0,
+      stopped: None,
+    }))
+  }
+
   /// One turn of resolving the waiting deltas into `keep` (A-724's starvation fix), for `quantum` and at least one unit:
   /// whether every one is resolved. Each unit looks for the children of one entry or of one delta just resolved (their
   /// table sorted by base, by the entry's position and by its name), or resolves the deltas on bases outside the pack
@@ -1159,33 +1594,8 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     if !matches!(self.stage, Stage::Done(_)) {
       return Err(Refusal::Truncated { at: self.at });
     }
-    let mut resolving = match self.resolving.take() {
-      Some(resolving) => resolving,
-      None => {
-        let count = self
-          .entries
-          .iter()
-          .filter(|record| matches!(record.state, State::Waiting(_)))
-          .count();
-        if count == 0 {
-          self.resolving = Some(Resolving {
-            next: self.entries.len(),
-            ..Resolving::default()
-          });
-          return Ok(true);
-        }
-        let waiting = self.waiting_table(count, admission)?;
-        charge_items::<usize>(admission, count)?;
-        let mut pending = Vec::new();
-        reserve(&mut pending, count)?;
-        Resolving {
-          waiting,
-          pending,
-          next: 0,
-          outside: 0,
-          stopped: None,
-        }
-      }
+    let Some(mut resolving) = self.init_resolving(admission)? else {
+      return Ok(true);
     };
     let began = quantum.clock.now_ns();
     let mut units = 0u64;
@@ -1238,6 +1648,361 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       Some(first) => Err(self.unresolved(first)),
       None => Ok(true),
     }
+  }
+
+  /// [`Reader::resolve_turn`] in deferred-naming mode: applies ready waiting deltas via
+  /// `delta::apply` into `batch` (`State::PendingName`) without running synchronous SHA-1DC/keep
+  /// so the caller can scatter naming, `fsck`, BLAKE3, and metadata parsing across all shards
+  /// and settle via [`Reader::settle_named`] before the next turn.
+  pub fn resolve_turn_deferred<K: Keep + Outside + ?Sized>(
+    &mut self,
+    admission: &mut Admission,
+    keep: &mut K,
+    batch: &mut DeferredBatch,
+    (target_bytes, quantum): (u64, crate::store::hook_view::Quantum<'_>),
+  ) -> Result<DeferredResolve, Refusal> {
+    if !matches!(self.stage, Stage::Done(_)) {
+      return Err(Refusal::Truncated { at: self.at });
+    }
+    let Some(mut resolving) = self.init_resolving(admission)? else {
+      return Ok(DeferredResolve::Done);
+    };
+    let step = self.resolve_deferred_loop(
+      &mut resolving,
+      (admission, keep, batch),
+      (target_bytes, quantum),
+    )?;
+    self.resolving = Some(resolving);
+    if step != DeferredResolve::Done {
+      return Ok(step);
+    }
+    if !batch.is_empty() {
+      return Ok(DeferredResolve::Batch);
+    }
+    let first = self
+      .entries
+      .iter()
+      .position(|record| matches!(record.state, State::Waiting(_)));
+    match first {
+      Some(first) => Err(self.unresolved(first)),
+      None => Ok(DeferredResolve::Done),
+    }
+  }
+
+  /// Inner bounded loop for [`Reader::resolve_turn_deferred`].
+  fn resolve_deferred_loop<K: Keep + Outside + ?Sized>(
+    &mut self,
+    resolving: &mut Resolving,
+    (admission, keep, batch): (&mut Admission, &mut K, &mut DeferredBatch),
+    (target_bytes, quantum): (u64, crate::store::hook_view::Quantum<'_>),
+  ) -> Result<DeferredResolve, Refusal> {
+    let began = quantum.clock.now_ns();
+    let mut units = 0u64;
+    loop {
+      if batch.bytes() >= target_bytes
+        || (units > 0 && quantum.clock.now_ns().saturating_sub(began) >= quantum.ns)
+      {
+        return Ok(DeferredResolve::Batch);
+      }
+      units = units.saturating_add(1);
+      if let Some((parent, child)) = resolving.pending.pop() {
+        match self.resolve_pending_unit_deferred(
+          (parent, child),
+          resolving,
+          (admission, &mut *keep, batch),
+        )? {
+          DeferredUnit::Continue => continue,
+          DeferredUnit::NeedSettle => return Ok(DeferredResolve::Batch),
+          DeferredUnit::Away => return Ok(DeferredResolve::Away),
+        }
+      }
+      if resolving.next < self.entries.len() {
+        let entry = resolving.next;
+        resolving.next = resolving.next.saturating_add(1);
+        self.list_children(entry, &resolving.waiting, &mut resolving.pending)?;
+        continue;
+      }
+      if let Some((key, child)) = resolving.waiting.get(resolving.outside).copied() {
+        // Settle every in-pack PendingName object (and queue its Key::Id children) before probing
+        // outside repository bases, preserving exact serial resolution semantics on thin packs.
+        if !batch.is_empty() {
+          return Ok(DeferredResolve::Batch);
+        }
+        if self.resolve_outside_unit_deferred(
+          (key, child),
+          resolving,
+          (admission, &mut *keep, batch),
+        )? {
+          return Ok(DeferredResolve::Away);
+        }
+        continue;
+      }
+      return Ok(DeferredResolve::Done);
+    }
+  }
+
+  /// One outside-base unit for [`Reader::resolve_deferred_loop`]: returns `Ok(true)` if paused on
+  /// a let-go pack window.
+  fn resolve_outside_unit_deferred<K: Keep + Outside + ?Sized>(
+    &mut self,
+    (key, child): (Key, usize),
+    resolving: &mut Resolving,
+    (admission, keep, batch): (&mut Admission, &mut K, &mut DeferredBatch),
+  ) -> Result<bool, Refusal> {
+    let row = resolving.outside;
+    resolving.outside = resolving.outside.saturating_add(1);
+    if self.resolve_outside_deferred(key, child, (admission, &mut *keep, batch))? {
+      resolving.stopped = None;
+      list_children_for_key(
+        &self.entries,
+        child,
+        Key::Entry(child),
+        &resolving.waiting,
+        &mut resolving.pending,
+      )?;
+      return Ok(false);
+    }
+    if let Some(at) = Outside::away(&*keep).or_else(|| Contents::away(&*keep))
+      && resolving.stopped != Some((StoppedIn::Outside, row, at))
+    {
+      resolving.outside = row;
+      resolving.stopped = Some((StoppedIn::Outside, row, at));
+      return Ok(true);
+    }
+    Ok(false)
+  }
+
+  /// One pending child delta unit in deferred mode.
+  fn resolve_pending_unit_deferred<K: Keep + Outside + ?Sized>(
+    &mut self,
+    (parent, child): (usize, usize),
+    resolving: &mut Resolving,
+    (admission, keep, batch): (&mut Admission, &mut K, &mut DeferredBatch),
+  ) -> Result<DeferredUnit, Refusal> {
+    match self.resolve_child_deferred(parent, child, (admission, &mut *keep, batch))? {
+      ChildDeferred::Applied => {
+        resolving.stopped = None;
+        list_children_for_key(
+          &self.entries,
+          child,
+          Key::Entry(child),
+          &resolving.waiting,
+          &mut resolving.pending,
+        )?;
+        Ok(DeferredUnit::Continue)
+      }
+      ChildDeferred::Skipped => Ok(DeferredUnit::Continue),
+      ChildDeferred::NeedSettle => {
+        resolving.pending.push((parent, child));
+        Ok(DeferredUnit::NeedSettle)
+      }
+      ChildDeferred::Away => {
+        let Some(at) = Contents::away(&*keep).or_else(|| Outside::away(&*keep)) else {
+          return Ok(DeferredUnit::Continue);
+        };
+        if resolving.stopped != Some((StoppedIn::Pending, child, at)) {
+          resolving.pending.push((parent, child));
+          resolving.stopped = Some((StoppedIn::Pending, child, at));
+          return Ok(DeferredUnit::Away);
+        }
+        if let Some(Record {
+          offset,
+          state: State::Resolved(source),
+          ..
+        }) = self.entries.get(parent)
+        {
+          return Err(Refusal::DeltaBaseMissing {
+            at: *offset,
+            base: source.id,
+          });
+        }
+        Ok(DeferredUnit::Continue)
+      }
+    }
+  }
+
+  /// Applies the waiting delta at `child` against `parent` (either in-batch `PendingName` or
+  /// already-settled `Resolved`) into `batch` without synchronous SHA-1DC naming.
+  fn resolve_child_deferred<K: Keep + Outside + ?Sized>(
+    &mut self,
+    parent: usize,
+    child: usize,
+    (admission, keep, batch): (&mut Admission, &mut K, &mut DeferredBatch),
+  ) -> Result<ChildDeferred, Refusal> {
+    let Some(Record {
+      offset,
+      stored,
+      state: State::Waiting(waiting),
+    }) = self.entries.get(child)
+    else {
+      return Ok(ChildDeferred::Skipped);
+    };
+    let (offset, stored, expected) = (*offset, *stored, waiting.expected);
+    let applied = self.apply_parent_deferred(
+      parent,
+      (&waiting.delta, expected, offset),
+      (admission, &*keep, &*batch),
+    )?;
+    let AppliedParent::Ready {
+      kind,
+      depth,
+      content,
+      hold,
+    } = applied
+    else {
+      return Ok(applied.into_deferred());
+    };
+    let Some(record) = self.entries.get_mut(child) else {
+      admission.release(hold);
+      return Ok(ChildDeferred::Skipped);
+    };
+    let prev = core::mem::replace(
+      &mut record.state,
+      State::PendingName(PendingName {
+        kind,
+        base: PendingBase::Entry(parent),
+        depth,
+      }),
+    );
+    if let State::Waiting(old) = prev {
+      keep.release(old.hold, admission);
+    }
+    batch.push(Unverified {
+      at: child,
+      offset,
+      stored,
+      kind,
+      depth,
+      content,
+      hold,
+    });
+    Ok(ChildDeferred::Applied)
+  }
+
+  /// Looks up `parent`'s content (from `batch` or `keep`) and applies `delta` in deferred mode.
+  fn apply_parent_deferred<K: Keep + Outside + ?Sized>(
+    &self,
+    parent: usize,
+    (delta, expected, at): (&[u8], Option<ObjectId>, u64),
+    (admission, keep, batch): (&mut Admission, &K, &DeferredBatch),
+  ) -> Result<AppliedParent, Refusal> {
+    let (kind, base_depth, base_bytes) = match self.entries.get(parent) {
+      Some(Record {
+        state: State::PendingName(pending),
+        ..
+      }) => {
+        if expected.is_some() {
+          return Ok(AppliedParent::NeedSettle);
+        }
+        let Some(bytes) = batch.content(parent) else {
+          return Ok(AppliedParent::NeedSettle);
+        };
+        (pending.kind, pending.depth, Cow::Borrowed(bytes))
+      }
+      Some(Record {
+        state: State::Resolved(source),
+        offset,
+        ..
+      }) => {
+        if let Some(name) = expected
+          && name != source.id
+        {
+          return Err(Refusal::BaseMisplaced {
+            at,
+            base: name,
+            found: source.id,
+          });
+        }
+        match keep.content(parent, &source.id) {
+          Some(bytes) => (
+            source.kind,
+            source.chain.map_or(0, |chain| chain.depth),
+            bytes,
+          ),
+          None
+            if Contents::away(keep)
+              .or_else(|| Outside::away(keep))
+              .is_some() =>
+          {
+            return Ok(AppliedParent::Away);
+          }
+          None => {
+            return Err(Refusal::DeltaBaseMissing {
+              at: *offset,
+              base: source.id,
+            });
+          }
+        }
+      }
+      _ => return Ok(AppliedParent::Skipped),
+    };
+    let (content, hold) = held_while(admission, |admission| {
+      delta::apply(&base_bytes, delta, admission).map_err(|refusal| Refusal::Delta { at, refusal })
+    })?;
+    Ok(AppliedParent::Ready {
+      kind,
+      depth: base_depth.saturating_add(1),
+      content,
+      hold,
+    })
+  }
+
+  /// Applies the waiting delta at `child` against an outside repository base `key` into `batch`
+  /// without copying the base or running synchronous SHA-1DC naming.
+  fn resolve_outside_deferred<K: Keep + Outside + ?Sized>(
+    &mut self,
+    key: Key,
+    child: usize,
+    (admission, keep, batch): (&mut Admission, &mut K, &mut DeferredBatch),
+  ) -> Result<bool, Refusal> {
+    let Key::Id(id) = key else {
+      return Ok(false);
+    };
+    let (kind, offset, stored, content, hold) = {
+      let Some(Record {
+        offset,
+        stored,
+        state: State::Waiting(waiting),
+      }) = self.entries.get(child)
+      else {
+        return Ok(false);
+      };
+      let Some((kind, base_bytes)) = keep.object(&id) else {
+        return Ok(false);
+      };
+      let (content, hold) = held_while(admission, |admission| {
+        delta::apply(base_bytes, &waiting.delta, admission).map_err(|refusal| Refusal::Delta {
+          at: *offset,
+          refusal,
+        })
+      })?;
+      (kind, *offset, *stored, content, hold)
+    };
+    let Some(record) = self.entries.get_mut(child) else {
+      admission.release(hold);
+      return Ok(false);
+    };
+    let prev = core::mem::replace(
+      &mut record.state,
+      State::PendingName(PendingName {
+        kind,
+        base: PendingBase::Outside(id),
+        depth: 1,
+      }),
+    );
+    if let State::Waiting(old) = prev {
+      keep.release(old.hold, admission);
+    }
+    batch.push(Unverified {
+      at: child,
+      offset,
+      stored,
+      kind,
+      depth: 1,
+      content,
+      hold,
+    });
+    Ok(true)
   }
 
   /// One pending child delta unit: resolves `child` against `parent`, or pauses the turn (`Ok(true)`)
@@ -1320,19 +2085,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       return Ok(());
     };
     for key in [Key::Entry(parent), Key::Id(resolved.id)] {
-      let start = waiting.partition_point(|(base, _)| *base < key);
-      let children = waiting.get(start..).unwrap_or_default();
-      for (_, child) in children.iter().take_while(|(base, _)| *base == key) {
-        if matches!(
-          self.entries.get(*child).map(|record| &record.state),
-          Some(State::Waiting(_))
-        ) {
-          if pending.len() == pending.capacity() {
-            reserve(pending, pending.len().max(1))?;
-          }
-          pending.push((parent, *child));
-        }
-      }
+      list_children_for_key(&self.entries, parent, key, waiting, pending)?;
     }
     Ok(())
   }
@@ -1481,6 +2234,71 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       .map_or(self.at, |record| record.offset);
     Refusal::Cycle { at }
   }
+}
+
+/// Result of attempting to apply one waiting delta child against its parent in deferred mode.
+enum ChildDeferred {
+  /// Applied and pushed into the batch (`child` is now `State::PendingName`).
+  Applied,
+  /// Skipped (`child` no longer waiting or `parent` not ready).
+  Skipped,
+  /// `parent` is `PendingName` and an index `expected` id check needs it settled first.
+  NeedSettle,
+  /// `parent` is `Resolved` but its content lies in a let-go pack window.
+  Away,
+}
+
+/// Result of looking up a parent base and applying a delta in deferred mode.
+enum AppliedParent {
+  /// Delta applied cleanly.
+  Ready {
+    kind: Kind,
+    depth: u64,
+    content: Vec<u8>,
+    hold: Hold,
+  },
+  /// Skipped (`parent` is still waiting or out of range).
+  Skipped,
+  /// `parent` must settle before applying.
+  NeedSettle,
+  /// `parent` content lies in a let-go pack window.
+  Away,
+}
+
+impl AppliedParent {
+  /// Maps a non-`Ready` outcome into [`ChildDeferred`].
+  fn into_deferred(self) -> ChildDeferred {
+    match self {
+      Self::Ready { .. } => ChildDeferred::Applied,
+      Self::Skipped => ChildDeferred::Skipped,
+      Self::NeedSettle => ChildDeferred::NeedSettle,
+      Self::Away => ChildDeferred::Away,
+    }
+  }
+}
+
+/// Lists every waiting delta keyed on `key` under `parent` into `pending`.
+fn list_children_for_key(
+  entries: &[Record],
+  parent: usize,
+  key: Key,
+  waiting: &[(Key, usize)],
+  pending: &mut Vec<(usize, usize)>,
+) -> Result<(), Refusal> {
+  let start = waiting.partition_point(|(base, _)| *base < key);
+  let children = waiting.get(start..).unwrap_or_default();
+  for (_, child) in children.iter().take_while(|(base, _)| *base == key) {
+    if matches!(
+      entries.get(*child).map(|record| &record.state),
+      Some(State::Waiting(_))
+    ) {
+      if pending.len() == pending.capacity() {
+        reserve(pending, pending.len().max(1))?;
+      }
+      pending.push((parent, *child));
+    }
+  }
+  Ok(())
 }
 
 /// What one turn of the inflater did with an entry's data.
