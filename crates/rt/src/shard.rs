@@ -1186,9 +1186,16 @@ impl ShardContext {
   }
 
   /// Forgets registration `token` of `raw`'s `direction`, because its future was dropped: a completion that
-  /// arrives for it later wakes no one (counted, `Counters::interests_unclaimed`).
+  /// arrives for it later wakes no one (counted, `Counters::interests_unclaimed`), and any batched
+  /// driver drops its not-yet-submitted registration before the descriptor can close or be reused.
   pub(crate) fn forget_interest(&self, raw: i32, direction: Direction, token: u64) {
-    self.with_interests(|interests| interests.forget(raw, direction, token));
+    let forgot = self
+      .with_interests(|interests| interests.forget(raw, direction, token))
+      .unwrap_or(false);
+    if forgot {
+      let writable = matches!(direction, Direction::Writable);
+      let _ = self.with_inner(|inner| inner.driver.forget_readiness(raw, writable));
+    }
   }
 
   /// Wakes the task a word names (§4.3). An interest word marks its registration fired and wakes the task

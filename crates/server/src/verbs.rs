@@ -19324,6 +19324,16 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   let now = state.clock.monotonic_ns();
   for (index, handle) in handles {
     any |= serve_client(state, index, handle, now);
+    if let Some(client_id) = state
+      .clients
+      .get(handle)
+      .ok()
+      .filter(|c| !c.retiring && c.end.is_closed())
+      .map(|c| c.client_id)
+    {
+      crate::reap::client_closed(state, handle, client_id);
+      any = true;
+    }
   }
   // The closed loop's clock (`loop_hold`; A-326): the end of a round's client I/O, the requests of its clients' loops
   // read and the replies to them written, before the round's background work, so a client's think time is read from its

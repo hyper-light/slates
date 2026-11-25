@@ -705,6 +705,13 @@ impl ClientEnd {
     cmd.push(self.region.object_mut(), self.next_request, slot, stamp)?;
     self.request_stamp = stamp;
     self.next_request = self.next_request.wrapping_add(1);
+    self.notify_daemon_if_parked()
+  }
+
+  /// Rings the doorbell for this region's shard if it announced it is going idle, after the
+  /// doorbell protocol's fence ([`crate::doorbell`]). Shared by [`Self::send`] and clean-disconnect
+  /// notification in [`Drop`].
+  fn notify_daemon_if_parked(&self) -> Result<(), IpcError> {
     let announced = self.region.daemon_parked()?;
     let parked =
       crate::doorbell::after_publishing_idle_announced(|| announced.load(Ordering::Relaxed) != 0);
@@ -1304,6 +1311,23 @@ impl ClientEnd {
   }
 }
 
+impl Drop for ClientEnd {
+  fn drop(&mut self) {
+    // Stop any completion bridge before unmapping the region.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    drop(self.bridge.take());
+    // Notify the daemon on clean client drop so macOS and Windows (which have no per-client
+    // control socket) retire the seat, attachments, mappings, and descriptors promptly without
+    // waiting for the client process to exit.
+    if self.liveness.is_some()
+      && let Ok(closed) = self.region.client_closed()
+    {
+      closed.store(1, Ordering::Release);
+      let _ = self.notify_daemon_if_parked();
+    }
+  }
+}
+
 /// The daemon's end.
 pub struct DaemonEnd {
   region: ClientRegion,
@@ -1355,6 +1379,14 @@ impl DaemonEnd {
   /// The region, mutably (the bulk area).
   pub fn region_mut(&mut self) -> &mut ClientRegion {
     &mut self.region
+  }
+
+  /// Whether the client closed its end cleanly (`ClientEnd::drop`).
+  pub fn is_closed(&self) -> bool {
+    self
+      .region
+      .client_closed()
+      .is_ok_and(|closed| closed.load(Ordering::Acquire) != 0)
   }
 
   /// Wakes issued so far.

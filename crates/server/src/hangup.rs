@@ -34,7 +34,9 @@
 //! in the same turn). Every seat is bounded (`clients_per_shard`), so the watches and their descriptors are too: one task
 //! and one descriptor a client, both counted in the shard's task bound (`config::TASKS_PER_CLIENT`).
 
+#[cfg(not(target_os = "macos"))]
 use slates_ipc::rendezvous::platform::Control;
+#[cfg_attr(target_os = "macos", cfg(test))]
 use slates_rt::RtError;
 
 /// What ended a client, as its watch saw it.
@@ -49,6 +51,7 @@ pub(crate) enum Ended {
 }
 
 /// Why a client's hang-up cannot be watched, so it is not seated: nothing would reclaim it (A-475).
+#[cfg_attr(target_os = "macos", cfg(test))]
 #[derive(Debug)]
 pub(crate) enum Unwatchable {
   /// The rendezvous kept no control socket for it (Linux), so nothing closes at its death.
@@ -58,6 +61,7 @@ pub(crate) enum Unwatchable {
   Refused(slates_ipc::IpcError),
 }
 
+#[cfg_attr(target_os = "macos", cfg(test))]
 impl std::fmt::Display for Unwatchable {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
@@ -69,13 +73,16 @@ impl std::fmt::Display for Unwatchable {
 }
 
 /// The wait on one client's hang-up, holding the descriptor it waits on (the module doc).
+#[cfg_attr(target_os = "macos", cfg(test))]
 pub(crate) struct Hangup {
   inner: platform::Hangup,
 }
 
+#[cfg_attr(target_os = "macos", cfg(test))]
 impl Hangup {
-  /// The watch on a client the rendezvous admitted with `control` and process `pid`, which started at `started` (macOS,
-  /// Windows; A-522: the claim names its process by both, so a pid reused before the watch is not taken for it).
+  /// The watch on a client the rendezvous admitted with `control` and process `pid`, which started at `started` (Linux
+  /// control socket; Windows process handle; macOS shards multiplex all client PIDs through `reap::ExitWatcher`).
+  #[cfg(not(target_os = "macos"))]
   pub(crate) fn of_client(
     control: Option<&Control>,
     pid: u32,
@@ -107,7 +114,7 @@ impl Hangup {
 /// Polls `wait` once with the polling task's own context, so a wait through the shard registers, and answers what that
 /// poll answered: the registration's moment, after which a test once catches what happened before it. A wait that
 /// answered here is not polled again.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", all(target_os = "macos", test)))]
 async fn poll_once<F: std::future::Future>(
   mut wait: std::pin::Pin<&mut F>,
 ) -> std::task::Poll<F::Output> {
@@ -185,28 +192,20 @@ mod platform {
   }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 mod platform {
   use std::os::fd::AsRawFd;
   use std::task::Poll;
 
   use slates_ipc::exit_watch::ExitWatch;
-  use slates_ipc::rendezvous::platform::Control;
   use slates_rt::RtError;
 
   use super::{Ended, Unwatchable};
 
-  /// The exit watch on the client's process: a kqueue of the watch's own holding `NOTE_EXIT` for it.
+  /// The exit watch on one client's process (used in unit tests on macOS; production macOS shards
+  /// multiplex all client PIDs on one `ExitMux` in `crate::reap::ExitWatcher`).
   pub(super) struct Hangup {
     exit: ExitWatch,
-  }
-
-  pub(super) fn of_client(
-    _control: Option<&Control>,
-    pid: u32,
-    started: u64,
-  ) -> Result<Hangup, Unwatchable> {
-    of_process(pid, started)
   }
 
   /// The watch on process `pid` alone if it started at `started`: a pid reused by another process reads exited at once.

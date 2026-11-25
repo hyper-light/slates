@@ -174,8 +174,10 @@ impl CompletionBridge {
     // Two independent second mappings of the one shared region: the thread waits on one, the owner
     // wakes the other to stop it. Both see the same physical wake word (the doorbell pattern). Each maps a
     // duplicate of the region's descriptor, since the region has no name to open (GAP-A9-9).
-    let waiter = region.open_again()?;
-    let waker = region.open_again()?;
+    let mut waiter = region.open_again()?;
+    waiter.close_descriptor();
+    let mut waker = region.open_again()?;
+    waker.close_descriptor();
     let (read, write) = self_pipe()?;
     // The stop is a channel the two ends own and free: the thread takes the receiver, the owner keeps the sender. No
     // `Arc` (R2), and nothing kept past the bridge.

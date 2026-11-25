@@ -721,6 +721,9 @@ pub struct ShardState {
   pub(crate) dead_clients: std::collections::VecDeque<(slates_mem::Handle<ClientSlot>, u32)>,
   /// The shard's reaper task, woken when a client's watch reports it gone while the reaper idles (A-475).
   pub(crate) reaper_task: Option<slates_rt::TaskId>,
+  /// Per-shard multiplexed client-process exit watcher (macOS: one shared `kqueue` for all client
+  /// PIDs; Windows: one shared process watch per distinct PID; Linux: no-op, uses control sockets).
+  pub(crate) exit_watcher: crate::reap::ExitWatcher,
   /// The seats whose status capture has a deadline, by it (A-522, `crate::deadlines`): a seat once at most.
   pub(crate) capture_deadlines: crate::deadlines::CaptureDeadlines,
   /// The shard's deadline keeper, woken when a deadline is set earlier than the one it sleeps for (A-522).
@@ -1779,12 +1782,13 @@ pub fn any_ring_ready() -> bool {
 pub fn ring_ready_in(s: &ShardState) -> bool {
   s.clients.iter().any(|(_, c)| {
     !c.retiring
-      && c
+      && (c
         .end
         .region()
         .cmd()
         .depth(c.end.region().object())
         .is_ok_and(|d| d > 0)
+        || c.end.is_closed())
   }) || !s.deferred.is_empty()
 }
 

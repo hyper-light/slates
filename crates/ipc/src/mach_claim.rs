@@ -900,7 +900,14 @@ mod tests {
     let (name, _service) = token("once");
     let kept = region("once", 7);
     let wake = Semaphore::create().unwrap();
-    keep(&name, 1, std::process::id(), kept.as_fd(), wake.port()).unwrap();
+    keep(
+      &name,
+      1,
+      std::process::id(),
+      kept.try_as_fd().unwrap(),
+      wake.port(),
+    )
+    .unwrap();
     let (fd, _right) = fetch("test", &name, 1).unwrap();
     let fetched = SharedObject::from_descriptor(fd, REGION_BYTES, Words::new()).unwrap();
     let mut first = [0u8; 16];
@@ -920,7 +927,14 @@ mod tests {
     let (name, _service) = token("wake");
     let kept = region("wake", 3);
     let wake = Semaphore::create().unwrap();
-    keep(&name, 3, std::process::id(), kept.as_fd(), wake.port()).unwrap();
+    keep(
+      &name,
+      3,
+      std::process::id(),
+      kept.try_as_fd().unwrap(),
+      wake.port(),
+    )
+    .unwrap();
     let (_fd, right) = fetch("test", &name, 3).unwrap();
     right.signal().unwrap();
     assert_eq!(
@@ -937,7 +951,14 @@ mod tests {
     let (name, _service) = token("other");
     let kept = region("other", 9);
     let wake = Semaphore::create().unwrap();
-    keep(&name, 2, std::process::id() + 1, kept.as_fd(), wake.port()).unwrap();
+    keep(
+      &name,
+      2,
+      std::process::id() + 1,
+      kept.try_as_fd().unwrap(),
+      wake.port(),
+    )
+    .unwrap();
     assert!(fetch("test", &name, 2).is_err());
   }
 
@@ -991,7 +1012,14 @@ mod tests {
       .expect("the test's token is free");
     let kept = region("late", 9);
     let wake = Semaphore::create().unwrap();
-    keep(&name, 1, std::process::id(), kept.as_fd(), wake.port()).unwrap();
+    keep(
+      &name,
+      1,
+      std::process::id(),
+      kept.try_as_fd().unwrap(),
+      wake.port(),
+    )
+    .unwrap();
     let fetching = name.clone();
     let started = std::time::Instant::now();
     let fetcher = std::thread::spawn(move || {
@@ -1050,7 +1078,7 @@ mod tests {
       &name,
       0,
       victim.parse().unwrap(),
-      planted.as_fd(),
+      planted.try_as_fd().unwrap(),
       wake.port(),
     )
     .unwrap();

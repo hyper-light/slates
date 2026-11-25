@@ -65,6 +65,10 @@ pub const WORDS_OFFSET: usize = HEADER_BYTES;
 const AT_WAKE: usize = WORDS_OFFSET;
 /// Format: the client parked flag's offset.
 const AT_CLIENT_PARKED: usize = WORDS_OFFSET + 64;
+/// Format: the client's clean-disconnect flag (1 once `ClientEnd` drops; 0 while open), in the
+/// client's own `AT_CLIENT_PARKED` cache line so macOS and Windows daemons retire seats on clean
+/// client drop without waiting for process exit.
+const AT_CLIENT_CLOSED: usize = AT_CLIENT_PARKED + 4;
 /// Format: the daemon parked flag's offset.
 const AT_DAEMON_PARKED: usize = WORDS_OFFSET + 128;
 /// Format: the doorbell's offset.
@@ -149,12 +153,14 @@ impl RegionGeometry {
   }
 }
 
-/// The region's own words: wake, the two parked flags and the doorbell, each a run of one, the run of reply stamps, and
-/// the session key, racy (the client may write it while the daemon copies it).
-const REGION_WORDS: [WordRun; 6] = [
+/// The region's own words: wake, the client parked and closed flags, the daemon parked flag and
+/// the doorbell, each a run of one, the run of reply stamps, and the session key, racy (the client
+/// may write it while the daemon copies it).
+const REGION_WORDS: [WordRun; 7] = [
   WordRun::racy(AT_SESSION_KEY, SESSION_KEY_BYTES),
   WordRun::one(AT_WAKE, Width::U32),
   WordRun::one(AT_CLIENT_PARKED, Width::U32),
+  WordRun::one(AT_CLIENT_CLOSED, Width::U32),
   WordRun::one(AT_DAEMON_PARKED, Width::U32),
   WordRun::one(AT_DOORBELL, Width::U32),
   WordRun::strided(
@@ -171,6 +177,7 @@ const REGION_WORDS: [WordRun; 6] = [
 struct RegionIds {
   wake: RunId,
   client_parked: RunId,
+  client_closed: RunId,
   daemon_parked: RunId,
   doorbell: RunId,
   reply_stamp: RunId,
@@ -182,6 +189,7 @@ impl RegionIds {
       _session_key,
       wake,
       client_parked,
+      client_closed,
       daemon_parked,
       doorbell,
       reply_stamp,
@@ -189,6 +197,7 @@ impl RegionIds {
     Ok(RegionIds {
       wake: object.resolve(&wake)?,
       client_parked: object.resolve(&client_parked)?,
+      client_closed: object.resolve(&client_closed)?,
       daemon_parked: object.resolve(&daemon_parked)?,
       doorbell: object.resolve(&doorbell)?,
       reply_stamp: object.resolve(&reply_stamp)?,
@@ -317,7 +326,13 @@ impl ClientRegion {
     }
     cmd.init(&object)?;
     cpl.init(&object)?;
-    for id in [ids.wake, ids.client_parked, ids.daemon_parked, ids.doorbell] {
+    for id in [
+      ids.wake,
+      ids.client_parked,
+      ids.client_closed,
+      ids.daemon_parked,
+      ids.doorbell,
+    ] {
       object.run_u32(id, 0)?.store(0, Ordering::Release);
     }
     for slot in 0..REPLY_STAMP_SLOTS {
@@ -374,12 +389,21 @@ impl ClientRegion {
   /// maps it again by, now that a macOS region has no name to open (GAP-A9-9).
   #[cfg(unix)]
   pub fn open_again(&self) -> Result<ClientRegion, IpcError> {
-    let fd =
-      rustix::io::fcntl_dupfd_cloexec(self.object.as_fd(), 0).map_err(|e| IpcError::OsRefused {
-        call: "fcntl(F_DUPFD_CLOEXEC)",
-        code: Some(e.raw_os_error()),
-      })?;
+    let fd = self.object.try_as_fd().ok_or(IpcError::Layout {
+      reason: "region descriptor was already closed",
+    })?;
+    let fd = rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(|e| IpcError::OsRefused {
+      call: "fcntl(F_DUPFD_CLOEXEC)",
+      code: Some(e.raw_os_error()),
+    })?;
     Self::from_descriptor(fd, self.object.len())
+  }
+
+  /// Closes the underlying `shm_open`/`memfd` descriptor while keeping the live `mmap` intact.
+  /// Call after the region has been handed off and no further [`Self::open_again`] is needed.
+  #[cfg(unix)]
+  pub fn close_descriptor(&mut self) {
+    self.object.close_descriptor();
   }
 
   /// Removes the region's name (macOS), so only a descriptor the daemon hands on reaches it (GAP-A9-9).
@@ -607,6 +631,11 @@ impl ClientRegion {
   /// The client's parked flag.
   pub fn client_parked(&self) -> Result<&AtomicU32, IpcError> {
     Ok(self.object.run_u32(self.ids.client_parked, 0)?)
+  }
+
+  /// The client's clean-disconnect flag (`0` while connected, `1` once `ClientEnd` drops).
+  pub fn client_closed(&self) -> Result<&AtomicU32, IpcError> {
+    Ok(self.object.run_u32(self.ids.client_closed, 0)?)
   }
 
   /// The daemon's parked flag.

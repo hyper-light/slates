@@ -191,6 +191,15 @@ impl Driver for KqueueDriver {
     Ok(())
   }
 
+  fn forget_readiness(&mut self, raw: i32, writable: bool) {
+    self.changes.retain(|ev| {
+      !matches!(
+        (ev.filter(), writable),
+        (EventFilter::Read(fd), false) | (EventFilter::Write(fd), true) if fd == raw
+      )
+    });
+  }
+
   fn has_pending(&self) -> bool {
     !self.nops.is_empty()
   }

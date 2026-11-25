@@ -122,8 +122,8 @@ impl Interests {
   }
 
   /// Forgets registration `token` of `raw`'s `direction`, because its future was dropped. A later holder of the
-  /// key is kept.
-  pub(crate) fn forget(&mut self, raw: i32, direction: Direction, token: u64) {
+  /// key is kept. Returns `true` if `token` was still the active registration and was removed.
+  pub(crate) fn forget(&mut self, raw: i32, direction: Direction, token: u64) -> bool {
     let key = (raw, direction);
     if self
       .held
@@ -131,7 +131,9 @@ impl Interests {
       .is_some_and(|registration| registration.token == token)
     {
       self.held.remove(&key);
+      return true;
     }
+    false
   }
 
   /// Completions that found no registration holding their key (their futures were dropped first).

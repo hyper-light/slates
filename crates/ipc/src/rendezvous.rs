@@ -92,14 +92,14 @@ impl std::fmt::Debug for Accepted {
 
 #[cfg(unix)]
 impl Accepted {
-  /// A dup of the completion fd the platform handed the daemon for this client (Linux's eventfd today;
-  /// macOS/Windows owed) — the original stays in the client slot for its liveness socket. The dup
-  /// shares the eventfd object, so the daemon's `DaemonEnd` nudging it wakes the client's poll (D-19).
-  pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
+  /// Takes the completion fd the platform handed the daemon for this client (Linux's eventfd;
+  /// `None` on macOS/Windows), moving it into `DaemonEnd` without keeping a duplicate open on
+  /// `Control`.
+  pub fn take_completion(&mut self) -> Option<std::os::fd::OwnedFd> {
     self
       .control
-      .as_ref()
-      .and_then(platform::Control::completion_dup)
+      .as_mut()
+      .and_then(platform::Control::take_completion)
   }
 }
 
@@ -932,8 +932,8 @@ pub mod platform {
   pub struct Control {
     /// The socket.
     pub socket: OwnedFd,
-    /// The completion eventfd.
-    pub completion: OwnedFd,
+    /// The completion eventfd, moved into `DaemonEnd` via [`Self::take_completion`].
+    completion: Option<OwnedFd>,
     /// The channel this client's deliveries are sealed on. Borrowed for one seal at a time on the shard that serves the
     /// client, so the borrow never meets another.
     seal: RefCell<Box<dyn SealedChannel>>,
@@ -946,12 +946,10 @@ pub mod platform {
   }
 
   impl Control {
-    /// A dup of the completion eventfd, for the daemon's end to nudge — the original stays here for the
-    /// liveness socket's owner. Dup'ing shares the eventfd object, so a nudge on the dup increments the
-    /// counter the client's own dup reads. Close-on-exec: a plain `dup` made one without it, and every hook the daemon
-    /// spawned held a duplicate of each connected client's eventfd (2026-11-23).
-    pub fn completion_dup(&self) -> Option<OwnedFd> {
-      rustix::io::fcntl_dupfd_cloexec(&self.completion, 0).ok()
+    /// Moves the completion eventfd out for `DaemonEnd` to nudge on parked replies (D-19), avoiding
+    /// keeping a duplicate descriptor open on `Control`.
+    pub fn take_completion(&mut self) -> Option<OwnedFd> {
+      self.completion.take()
     }
 
     /// Sends a direct-map delivery to the client over the control socket (§4.6, A-171): the descriptor of
@@ -1739,7 +1737,12 @@ pub mod platform {
     body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&client_id.to_le_bytes());
     body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
     {
-      let fds = [region.object().as_fd(), completion.as_fd(), kick.as_fd()];
+      let region_fd = region.object().try_as_fd().ok_or_else(|| {
+        lost(IpcError::Layout {
+          reason: "region descriptor was closed before handoff",
+        })
+      })?;
+      let fds = [region_fd, completion.as_fd(), kick.as_fd()];
       let mut space =
         [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
       let mut control = SendAncillaryBuffer::new(&mut space);
@@ -1753,6 +1756,9 @@ pub mod platform {
       )
       .map_err(|e| lost(refused("sendmsg", e)))?;
     }
+    // The memfd is already mapped here and handed over via SCM_RIGHTS; close the daemon's fd.
+    let mut region = region;
+    region.close_descriptor();
     Ok(Accepted {
       client_id,
       uid,
@@ -1761,7 +1767,7 @@ pub mod platform {
       region,
       control: Some(Control {
         socket: peer,
-        completion,
+        completion: Some(completion),
         seal: RefCell::new(channel),
       }),
     })
@@ -2093,7 +2099,9 @@ pub mod platform {
     // inherited one is the process's: docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md) and closes only
     // the duplicate, so every connection left the received descriptor open with its region's memory
     // (docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md).
-    let region = ClientRegion::from_descriptor(region_fd, len)?;
+    let mut region = ClientRegion::from_descriptor(region_fd, len)?;
+    // Linux clients never re-map via `open_again`; closing the memfd fd keeps the mmap alive at 0 FDs.
+    region.close_descriptor();
     Ok(Connected {
       region,
       doorbell: Doorbell::Eventfd(kick),
@@ -3103,7 +3111,7 @@ pub mod platform {
   #[cfg(unix)]
   impl Control {
     /// No completion fd on macOS yet (the control socket is owed); the daemon nudges nothing.
-    pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
+    pub fn take_completion(&mut self) -> Option<std::os::fd::OwnedFd> {
       None
     }
 
@@ -3161,6 +3169,9 @@ pub mod platform {
   pub struct Liveness {
     instance: String,
     generation: u64,
+    #[cfg(target_os = "macos")]
+    watch: crate::exit_watch::ProcessStamp,
+    #[cfg(not(target_os = "macos"))]
     watch: crate::exit_watch::ExitWatch,
   }
 
@@ -3182,10 +3193,14 @@ pub mod platform {
         endpoint: instance.to_owned(),
         why: "the daemon has not yet published its rendezvous object",
       })?;
+      #[cfg(target_os = "macos")]
+      let watch = crate::exit_watch::ProcessStamp::of(pid)?;
+      #[cfg(not(target_os = "macos"))]
+      let watch = crate::exit_watch::ExitWatch::on(pid)?;
       Ok(Liveness {
         instance: instance.to_owned(),
         generation,
-        watch: crate::exit_watch::ExitWatch::on(pid)?,
+        watch,
       })
     }
 
@@ -3294,9 +3309,14 @@ pub mod platform {
 
   impl Bell {
     /// The doorbell of `instance` over a mapping of its bootstrap object.
-    fn new(object: SharedObject, instance: &str) -> Result<Bell, IpcError> {
+    #[cfg_attr(windows, allow(unused_mut))]
+    fn new(mut object: SharedObject, instance: &str) -> Result<Bell, IpcError> {
       #[cfg(not(windows))]
       let _ = instance;
+      // Bell only touches atomic words in its mapping; closing its shm descriptor immediately
+      // saves 1 FD per connected client without affecting the live mapping.
+      #[cfg(unix)]
+      object.close_descriptor();
       Ok(Bell {
         object,
         #[cfg(windows)]
@@ -3951,13 +3971,19 @@ pub mod platform {
       let wake = region.wake_semaphore_port().ok_or(IpcError::Layout {
         reason: "a daemon's region with no reply wake semaphore to hand over",
       })?;
+      let region_fd = region.object().try_as_fd().ok_or(IpcError::Layout {
+        reason: "region descriptor was closed before handoff",
+      })?;
       crate::mach_claim::keep(
         &owner_token_name(&self.instance),
         index,
         pid,
-        region.object().as_fd(),
+        region_fd,
         wake,
       )?;
+      // The daemon keeps the live mmap; closing its shm descriptor after `mach_claim::keep`
+      // avoids holding 1 FD per seated client on macOS.
+      region.close_descriptor();
       Ok((String::new(), len))
     }
 
@@ -4564,6 +4590,9 @@ pub mod platform {
       // The daemon that answered was alive: watch its process from here, and judge it by its own stamp (A-143). The
       // header names whichever daemon published last; a claim begun before a restart is answered by the next daemon
       // (A-114), and one answered just before a restart is read after it.
+      #[cfg(target_os = "macos")]
+      let watch = crate::exit_watch::ProcessStamp::of(daemon_pid)?;
+      #[cfg(not(target_os = "macos"))]
       let watch = crate::exit_watch::ExitWatch::on(daemon_pid)?;
       let bell = self.bell.take().ok_or(IpcError::Layout {
         reason: "the claim's doorbell was already taken",
@@ -5338,7 +5367,7 @@ pub mod platform {
   #[cfg(unix)]
   impl Control {
     /// No completion fd on this platform.
-    pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
+    pub fn take_completion(&mut self) -> Option<std::os::fd::OwnedFd> {
       None
     }
   }

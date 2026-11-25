@@ -5132,6 +5132,7 @@ async fn init_shard(
     start_report: None,
     dead_clients: std::collections::VecDeque::new(),
     reaper_task: None,
+    exit_watcher: crate::reap::ExitWatcher::default(),
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
     deadline_task: None,
     base_hints: crate::base_hints::BaseHints::default(),
@@ -5404,6 +5405,9 @@ async fn init_shard(
   // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
   let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reaper);
+  // The per-shard multiplexed client exit watcher (macOS: 1 kqueue FD per shard for all client PIDs).
+  let exit_watcher = futures::spawn(crate::reap::exit_watcher()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(exit_watcher);
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
@@ -6852,7 +6856,7 @@ async fn control_loop(
       );
     }
     {
-      for a in round.accepted {
+      for mut a in round.accepted {
         let shard = ShardId(a.region.shard());
         let principal = Principal::Uid {
           host: anchor,
@@ -6864,11 +6868,10 @@ async fn control_loop(
           control,
           seated: false,
         };
-        // Dup the completion eventfd (Linux) for the daemon's end to nudge on a reply to a parked
-        // client, so an async SDK event loop wakes (D-19); the original stays in the slot's control for
-        // liveness. macOS/Windows have no completion fd yet.
+        // Move the completion eventfd (Linux) into the daemon's end to nudge on a reply to a parked
+        // client, so an async SDK event loop wakes (D-19) without keeping a duplicate fd on Control.
         #[cfg(unix)]
-        let completion = a.completion_dup();
+        let completion = a.take_completion();
         let control = a.control;
         let pid = a.pid;
         let started = a.started;
@@ -6881,19 +6884,6 @@ async fn control_loop(
             // The server task may be idle with its parked flags set on the clients it knew;
             // a wake makes it mark the new client too before it idles again.
             let server = state::with_state(|s| {
-              // Its hang-up is watched from its seat on (A-475). A client whose hang-up cannot be watched is not seated,
-              // since nothing would reclaim it: its control closes with this task, which its client reads as the daemon
-              // gone, and the admission gives its id back.
-              let hangup = match crate::hangup::Hangup::of_client(control.as_ref(), pid, started) {
-                Ok(hangup) => hangup,
-                Err(refusal) => {
-                  s.count(crate::reap::UNWATCHABLE, 1);
-                  slates_machine::log_line!(
-                    "slates-server: client {client_id} is not seated: its hang-up cannot be watched ({refusal})"
-                  );
-                  return None;
-                }
-              };
               match s.clients.insert(ClientSlot {
                 status_pages: crate::status_pages::StatusPages::default(),
                 end,
@@ -6914,7 +6904,7 @@ async fn control_loop(
                 maps_sent: std::collections::BTreeSet::new(),
               }) {
                 Ok(seat) => {
-                  if crate::reap::start_watch(s, seat, client_id, hangup) {
+                  if crate::reap::seat_client(s, seat, client_id, pid, started) {
                     admission.seat();
                   }
                 }

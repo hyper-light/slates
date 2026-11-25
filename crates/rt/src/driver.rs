@@ -194,6 +194,11 @@ pub trait Driver {
   /// completion-native drivers refused it as owed, which they no longer do.
   fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
+  /// Drops any not-yet-flushed readiness registration for `(raw, writable)` when its future is
+  /// cancelled or dropped before the next `wait` (prevents batched drivers like kqueue from
+  /// submitting stale `EV_ADD` entries for descriptors closed before the changelist flushes).
+  fn forget_readiness(&mut self, _raw: i32, _writable: bool) {}
+
   /// Takes a Windows pipe end into the driver (§4.6, A-179): `handle` is the end's live handle, which the caller owns
   /// and keeps open until [`Self::release_pipe`]; `raw` is the value the readiness seam names it by; `sizes` are the
   /// most bytes one read asks for and one write takes. Only the IOCP driver serves pipes; the simulation refuses.

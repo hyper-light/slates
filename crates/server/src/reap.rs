@@ -26,7 +26,9 @@ use slates_rt::{RtError, TaskId};
 use slates_vfs::clock::Clock;
 use slates_wire::request::RequestId;
 
-use crate::hangup::{Ended, Hangup};
+use crate::hangup::Ended;
+#[cfg(not(target_os = "macos"))]
+use crate::hangup::Hangup;
 use crate::state::{self, ClientSlot, ShardState};
 
 /// Format: the counter of seats given back because their clients hung up (A-475): the event path's non-vacuity count,
@@ -47,10 +49,346 @@ pub(crate) const WATCH_CANCEL_REFUSED: &str = "client.watch_cancel_refused";
 /// Format: the counter of retirements an owner shard deferred, each tried again by the reaper.
 const RETIREMENT_DEFERRED: &str = "client.retirement_deferred";
 
+/// Counter of seats given back because their client dropped cleanly (`ClientEnd::drop`).
+const REAPED_BY_CLOSE: &str = "client.reaped_by_close";
+
+/// Seated clients sharing one OS process on this shard (macOS `ExitMux` and Windows handle watch).
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug)]
+struct WatchedPid {
+  started: u64,
+  #[cfg(windows)]
+  task: TaskId,
+  seats: Vec<(Handle<ClientSlot>, u32)>,
+}
+
+/// Per-shard multiplexed client-process exit watcher:
+/// - macOS: one shared `kqueue` (`slates_ipc::exit_watch::ExitMux`) watching all distinct client
+///   PIDs seated on this shard, so 10,000 clients cost 1 FD and 1 task per shard instead of 10,000.
+/// - Windows: one shared `ExitWatch` task and process handle per distinct live client PID per shard.
+/// - Linux / other: unused (Linux detects hang-up via each client's control socket).
+#[derive(Debug, Default)]
+pub(crate) struct ExitWatcher {
+  #[cfg(target_os = "macos")]
+  mux: Option<slates_ipc::exit_watch::ExitMux>,
+  #[cfg(any(target_os = "macos", windows))]
+  pids: std::collections::BTreeMap<u32, WatchedPid>,
+}
+
+/// Retires every seat attached to a `WatchedPid` and wakes the reaper if any seat was queued.
+#[cfg(any(target_os = "macos", windows))]
+fn retire_watched_seats(
+  state: &mut ShardState,
+  seats: Vec<(Handle<ClientSlot>, u32)>,
+  ended: &Result<Ended, RtError>,
+) -> Option<TaskId> {
+  let mut wake_reaper = None;
+  for (seat, client_id) in seats {
+    if let Some(reaper) = hung_up(state, seat, client_id, ended) {
+      wake_reaper = Some(reaper);
+    }
+  }
+  wake_reaper
+}
+
+/// If `pid` was previously recorded with a different start stamp, retires its stale seats first.
+#[cfg(any(target_os = "macos", windows))]
+fn retire_stale_pid(state: &mut ShardState, pid: u32, started: u64) {
+  let stale = state
+    .exit_watcher
+    .pids
+    .get(&pid)
+    .is_some_and(|entry| entry.started != started);
+  if !stale {
+    return;
+  }
+  let Some(old) = state.exit_watcher.pids.remove(&pid) else {
+    return;
+  };
+  #[cfg(windows)]
+  let _ = slates_rt::futures::cancel(old.task);
+  if let Some(reaper) = retire_watched_seats(state, old.seats, &Ok(Ended::HungUp)) {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Records an unwatchable client, logs once, removes its seat, and returns `false` for admission.
+fn unseat_unwatchable(
+  state: &mut ShardState,
+  seat: Handle<ClientSlot>,
+  client_id: u32,
+  detail: &dyn std::fmt::Display,
+) -> bool {
+  state.count(UNWATCHABLE, 1);
+  slates_machine::log_line!(
+    "slates-server: client {client_id} is not seated: its hang-up cannot be watched ({detail})"
+  );
+  if let Ok(slot) = state.clients.remove(seat) {
+    drop(slot);
+  }
+  false
+}
+
+/// Ensures the shard's macOS `ExitMux` is open and returns its raw descriptor.
+#[cfg(target_os = "macos")]
+fn ensure_exit_mux(state: &mut ShardState) -> Option<std::os::fd::RawFd> {
+  use std::os::fd::AsRawFd;
+  if state.exit_watcher.mux.is_none() {
+    match slates_ipc::exit_watch::ExitMux::open() {
+      Ok(mux) => state.exit_watcher.mux = Some(mux),
+      Err(refusal) => {
+        state.count(UNWATCHABLE, 1);
+        slates_machine::log_line!(
+          "slates-server: shard {} could not open its client exit mux: {refusal}",
+          state.shard
+        );
+        return None;
+      }
+    }
+  }
+  state
+    .exit_watcher
+    .mux
+    .as_ref()
+    .map(|mux| mux.readiness().as_raw_fd())
+}
+
+/// Drains exited client PIDs from the shard's macOS `ExitMux` in bounded slices, marking every
+/// seat belonging to an exited PID hung up and returning the reaper task to wake if any.
+#[cfg(target_os = "macos")]
+fn drain_exited_pids(state: &mut ShardState) -> Result<Option<TaskId>, slates_ipc::IpcError> {
+  let batch = state.config.runtime.batch.max(1);
+  let mut exited = Vec::with_capacity(batch);
+  if let Some(mux) = state.exit_watcher.mux.as_ref() {
+    mux.drain_exited(batch, &mut exited)?;
+  }
+  let mut wake_reaper = None;
+  for pid in exited {
+    if let Some(entry) = state.exit_watcher.pids.remove(&pid)
+      && let Some(reaper) = retire_watched_seats(state, entry.seats, &Ok(Ended::HungUp))
+    {
+      wake_reaper = Some(reaper);
+    }
+  }
+  Ok(wake_reaper)
+}
+
+/// One persistent detached task per macOS shard: awaits the shard's single `ExitMux` descriptor
+/// readable and reaps every client seated from each exited process. No-op on Linux and Windows.
+#[cfg(target_os = "macos")]
+pub(crate) async fn exit_watcher() {
+  let Some(Some(raw)) = state::with_state(ensure_exit_mux) else {
+    return;
+  };
+  loop {
+    let drained = state::with_state_counted(drain_exited_pids);
+    match drained {
+      None => return,
+      Some(Ok(Some(reaper))) => slates_rt::registry::wake(reaper.0),
+      Some(Ok(None)) => {}
+      Some(Err(refusal)) => {
+        let _ = state::with_state(|s| s.count(WATCH_REFUSED, 1));
+        slates_machine::log_line!(
+          "slates-server: client exit mux drain refused ({refusal}); stopping exit watcher"
+        );
+        return;
+      }
+    }
+    if let Err(refusal) = slates_rt::readiness::readable(raw).await {
+      let _ = state::with_state(|s| s.count(WATCH_REFUSED, 1));
+      slates_machine::log_line!(
+        "slates-server: client exit mux wait refused ({refusal}); stopping exit watcher"
+      );
+      return;
+    }
+  }
+}
+
+/// Paired non-macOS arm: Linux uses per-client control sockets and Windows uses per-PID handle tasks.
+#[cfg(not(target_os = "macos"))]
+pub(crate) async fn exit_watcher() {}
+
+/// Watches all seated clients of `(pid, started)` on one Windows process handle task.
+#[cfg(windows)]
+async fn watch_windows_pid(pid: u32, started: u64, hangup: Hangup) {
+  let ended = hangup.wait().await;
+  drop(hangup);
+  let reaper = state::with_state_counted(|state| {
+    if state
+      .exit_watcher
+      .pids
+      .get(&pid)
+      .is_none_or(|entry| entry.started != started)
+    {
+      return None;
+    }
+    let entry = state.exit_watcher.pids.remove(&pid)?;
+    retire_watched_seats(state, entry.seats, &ended)
+  })
+  .flatten();
+  if let Some(reaper) = reaper {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Arms the platform hang-up watch for a newly seated client at `seat`. If the watch cannot be
+/// armed, unseats the client and returns `false` so admission releases its id.
+pub(crate) fn seat_client(
+  state: &mut ShardState,
+  seat: Handle<ClientSlot>,
+  client_id: u32,
+  pid: u32,
+  started: u64,
+) -> bool {
+  #[cfg(target_os = "macos")]
+  {
+    if ensure_exit_mux(state).is_none() {
+      if let Ok(slot) = state.clients.remove(seat) {
+        drop(slot);
+      }
+      return false;
+    }
+    retire_stale_pid(state, pid, started);
+    if let Some(entry) = state.exit_watcher.pids.get_mut(&pid) {
+      entry.seats.push((seat, client_id));
+      return true;
+    }
+    let watched = match state.exit_watcher.mux.as_ref() {
+      Some(mux) => mux.watch(pid, started),
+      None => Err(slates_ipc::IpcError::Unsupported {
+        feature: "client exit mux",
+      }),
+    };
+    match watched {
+      Ok(true) => {
+        state.exit_watcher.pids.insert(
+          pid,
+          WatchedPid {
+            started,
+            seats: vec![(seat, client_id)],
+          },
+        );
+        true
+      }
+      Ok(false) => {
+        // Process already exited before seating completed: trigger hang-up retirement immediately.
+        if let Some(reaper) = hung_up(state, seat, client_id, &Ok(Ended::HungUp)) {
+          slates_rt::registry::wake(reaper.0);
+        }
+        true
+      }
+      Err(refusal) => unseat_unwatchable(state, seat, client_id, &refusal),
+    }
+  }
+  #[cfg(windows)]
+  {
+    retire_stale_pid(state, pid, started);
+    if let Some(entry) = state.exit_watcher.pids.get_mut(&pid) {
+      entry.seats.push((seat, client_id));
+      return true;
+    }
+    let hangup = match Hangup::of_client(None, pid, started) {
+      Ok(hangup) => hangup,
+      Err(refusal) => return unseat_unwatchable(state, seat, client_id, &refusal),
+    };
+    let started_task =
+      slates_rt::futures::spawn(watch_windows_pid(pid, started, hangup)).and_then(|task| {
+        slates_rt::futures::detach(task)
+          .map(|()| task)
+          .inspect_err(|_| {
+            let _cancelled = slates_rt::futures::cancel(task);
+          })
+      });
+    match started_task {
+      Ok(task) => {
+        state.exit_watcher.pids.insert(
+          pid,
+          WatchedPid {
+            started,
+            task,
+            seats: vec![(seat, client_id)],
+          },
+        );
+        true
+      }
+      Err(refusal) => unseat_unwatchable(state, seat, client_id, &refusal),
+    }
+  }
+  #[cfg(not(any(target_os = "macos", windows)))]
+  {
+    let hangup = {
+      let control = state
+        .clients
+        .get(seat)
+        .ok()
+        .and_then(|client| client.control.as_ref());
+      Hangup::of_client(control, pid, started)
+    };
+    let hangup = match hangup {
+      Ok(hangup) => hangup,
+      Err(refusal) => return unseat_unwatchable(state, seat, client_id, &refusal),
+    };
+    start_watch(state, seat, client_id, hangup)
+  }
+}
+
+/// Removes `(seat, client_id)` from the shard's multiplexed process watcher when its seat ends
+/// (clean disconnect or reap), deleting the kernel watch once no seats remain for `pid`.
+fn unwatch_client(state: &mut ShardState, seat: Handle<ClientSlot>, client_id: u32, pid: u32) {
+  #[cfg(target_os = "macos")]
+  {
+    let empty = if let Some(entry) = state.exit_watcher.pids.get_mut(&pid) {
+      entry
+        .seats
+        .retain(|&(s, cid)| !(s == seat && cid == client_id));
+      entry.seats.is_empty()
+    } else {
+      false
+    };
+    if empty {
+      state.exit_watcher.pids.remove(&pid);
+      if let Some(mux) = state.exit_watcher.mux.as_ref() {
+        mux.unwatch(pid);
+      }
+    }
+  }
+  #[cfg(windows)]
+  {
+    let empty = if let Some(entry) = state.exit_watcher.pids.get_mut(&pid) {
+      entry
+        .seats
+        .retain(|&(s, cid)| !(s == seat && cid == client_id));
+      entry.seats.is_empty()
+    } else {
+      false
+    };
+    if empty && let Some(entry) = state.exit_watcher.pids.remove(&pid) {
+      if slates_rt::futures::cancel(entry.task).is_err() {
+        state.count(WATCH_CANCEL_REFUSED, 1);
+      }
+    }
+  }
+  #[cfg(not(any(target_os = "macos", windows)))]
+  {
+    let _ = (state, seat, client_id, pid);
+  }
+}
+
+/// Handles a client that signaled clean disconnect (`ClientEnd::drop`), immediately beginning the
+/// same retirement path as a hang-up so macOS and Windows release seats, attachments, and
+/// descriptors without waiting for the client process to exit.
+pub(crate) fn client_closed(state: &mut ShardState, seat: Handle<ClientSlot>, client_id: u32) {
+  state.count(REAPED_BY_CLOSE, 1);
+  if let Some(reaper) = hung_up(state, seat, client_id, &Ok(Ended::HungUp)) {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
 /// Starts the watch on the client just seated at `seat` with `hangup`, held by its seat (`ClientSlot::watch`) and
 /// detached, since nothing joins it: its seat cancels it at most. A watch the shard's task arena refuses unseats the
 /// client again, since nothing would reclaim it: its slot closes here, which its client reads as the daemon gone, and the
 /// caller's admission gives its id back. Whether the client stays seated.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn start_watch(
   state: &mut ShardState,
   seat: Handle<ClientSlot>,
@@ -92,10 +430,11 @@ pub(crate) fn start_watch(
 
 /// The watch on the client seated at `seat` (A-475): awaits its hang-up, then reports it. The wait is dropped before the
 /// watch's descriptor closes, since it borrows it (`crate::hangup`), and the report comes after both.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) async fn watch(seat: Handle<ClientSlot>, client_id: u32, hangup: Hangup) {
   let ended = hangup.wait().await;
   drop(hangup);
-  let reaper = state::with_state_counted(|state| hung_up(state, seat, client_id, ended)).flatten();
+  let reaper = state::with_state_counted(|state| hung_up(state, seat, client_id, &ended)).flatten();
   if let Some(reaper) = reaper {
     slates_rt::registry::wake(reaper.0);
   }
@@ -109,7 +448,7 @@ fn hung_up(
   state: &mut ShardState,
   seat: Handle<ClientSlot>,
   client_id: u32,
-  ended: Result<Ended, RtError>,
+  ended: &Result<Ended, RtError>,
 ) -> Option<TaskId> {
   match ended {
     Ok(Ended::HungUp) => {}
@@ -400,6 +739,7 @@ pub(crate) fn end_unproven(state: &mut ShardState, handle: Handle<ClientSlot>) {
     return;
   };
   cancel_watch(state, &mut client);
+  unwatch_client(state, handle, client.client_id, client.pid);
   crate::deadlines::forget_seat(state, handle, &client);
   client.status_pages.clear(&mut state.store.metadata);
   if let Some(control) = state.shards.first().copied() {
@@ -427,6 +767,7 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
     return false;
   };
   cancel_watch(state, &mut client);
+  unwatch_client(state, handle, client_id, client.pid);
   crate::deadlines::forget_seat(state, handle, &client);
   client.status_pages.clear(&mut state.store.metadata);
   // The files' copies the client was handed by the direct map were let go on every shard that held them, after its
@@ -518,9 +859,11 @@ mod tests {
   /// Shape: the pause between the test's looks at the daemon's seats, short beside the bound.
   const LOOK_PAUSE_NS: u64 = 1_000_000;
 
-  /// Seats client [`WATCHED`] on `state`'s shard, proven, with process `pid` and its hang-up watched by `hangup`, as an
-  /// admission does (A-475); its region is the shard's geometry, made here.
-  fn seat(state: &mut crate::state::ShardState, pid: u32, hangup: crate::hangup::Hangup) {
+  /// Inserts a proven seat for [`WATCHED`] on `state`'s shard with process `pid`, returning its handle.
+  fn insert_seat(
+    state: &mut crate::state::ShardState,
+    pid: u32,
+  ) -> slates_mem::Handle<crate::state::ClientSlot> {
     static REGIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let name = format!(
       "slates-cr-hangup-{}-{}",
@@ -532,7 +875,7 @@ mod tests {
       slates_ipc::ClientRegion::create(&name, WATCHED, state.shard, state.config.region).unwrap();
     #[cfg(target_os = "macos")]
     region.unlink_name().unwrap();
-    let seat = state
+    state
       .clients
       .insert(crate::state::ClientSlot {
         status_pages: crate::status_pages::StatusPages::default(),
@@ -556,8 +899,7 @@ mod tests {
         remote_volumes: Vec::new(),
         maps_sent: std::collections::BTreeSet::new(),
       })
-      .unwrap();
-    assert!(super::start_watch(state, seat, WATCHED, hangup));
+      .unwrap()
   }
 
   /// Seats a watched client whose control socket's other end a child process holds as its standard input (Linux): the
@@ -575,7 +917,8 @@ mod tests {
       )
       .unwrap();
       let hangup = crate::hangup::Hangup::of_socket(seat_end.as_fd()).unwrap();
-      seat(state, 0, hangup);
+      let seat = insert_seat(state, 0);
+      assert!(super::start_watch(state, seat, WATCHED, hangup));
       sent.send(client_end).unwrap();
     });
     let client_end = received.recv().unwrap();
@@ -586,7 +929,7 @@ mod tests {
       .unwrap()
   }
 
-  /// Seats a client process watched by its process (macOS, Windows).
+  /// Seats a client process watched through the production `seat_client` path (macOS `ExitMux`, Windows per-PID watch).
   #[cfg(any(target_os = "macos", windows))]
   fn seat_client_process(daemon: &crate::daemon::Daemon) -> std::process::Child {
     #[cfg(target_os = "macos")]
@@ -604,8 +947,8 @@ mod tests {
       let started = slates_ipc::exit_watch::ExitWatch::start_of(pid)
         .unwrap()
         .unwrap();
-      let hangup = crate::hangup::Hangup::of_process(pid, started).unwrap();
-      seat(state, pid, hangup);
+      let seat = insert_seat(state, pid);
+      assert!(super::seat_client(state, seat, WATCHED, pid, started));
     });
     child
   }

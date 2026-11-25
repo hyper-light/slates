@@ -133,17 +133,187 @@ impl ExitWatch {
 /// (`crate::mach_claim`).
 #[cfg(target_os = "macos")]
 pub(crate) use platform::bsd_info;
+#[cfg(target_os = "macos")]
+pub use platform::{ExitMux, ProcessStamp};
 
 #[cfg(target_os = "macos")]
 mod platform {
   use std::cell::Cell;
-  use std::os::fd::OwnedFd;
+  use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
   use std::time::Duration;
 
   use rustix::event::kqueue::{Event, EventFilter, EventFlags, ProcessEvents, kevent, kqueue};
   use rustix::process::Pid;
 
   use crate::error::IpcError;
+
+  /// Format: `SZOMB` from macOS `<sys/proc.h>` (`pbi_status == 5` marks an exited, unreaped zombie).
+  const PROCESS_ZOMBIE: u32 = 5;
+
+  /// Single `kevent(2)` wrapper shared by [`ExitWatch`] and [`ExitMux`], keeping all unsafe
+  /// `kevent` calls in one site. Pass an empty `&mut [MaybeUninit<Event>]` for change-only
+  /// registrations (so `nevents == 0` returns immediately without blocking or dequeuing events)
+  /// or `rustix::buffer::spare_capacity(&mut vec)` for draining fired events.
+  fn kevent_raw<Buf: rustix::buffer::Buffer<Event>>(
+    queue: &OwnedFd,
+    changes: &[Event],
+    events: Buf,
+    timeout: Option<Duration>,
+  ) -> rustix::io::Result<Buf::Output> {
+    // SAFETY: `queue` is our live owned kqueue descriptor, `changes` is a valid slice, and
+    // `events` is a valid `rustix::buffer::Buffer<Event>` output buffer for `kevent`.
+    unsafe { kevent(queue, changes, events, timeout) }
+  }
+
+  /// A descriptor-free liveness check for a macOS process identified by `(pid, start_time)`
+  /// (`proc_pidinfo(PROC_PIDTBSDINFO)`): detects exit, unreaped zombies (`SZOMB`), and PID reuse
+  /// without allocating a `kqueue` descriptor per client connection.
+  #[derive(Debug)]
+  pub struct ProcessStamp {
+    pid: u32,
+    started: u64,
+    exited: Cell<bool>,
+  }
+
+  impl ProcessStamp {
+    /// Captures process `pid`'s start stamp. Refuses `pid == 0`; a process already exited or
+    /// zombie reads exited at once.
+    pub fn of(pid: u32) -> Result<ProcessStamp, IpcError> {
+      if pid == 0 {
+        return Err(IpcError::Layout {
+          reason: "the bootstrap header names no daemon process",
+        });
+      }
+      match alive_start_of(pid) {
+        Some(started) => Ok(ProcessStamp {
+          pid,
+          started,
+          exited: Cell::new(false),
+        }),
+        None => Ok(ProcessStamp {
+          pid,
+          started: 0,
+          exited: Cell::new(true),
+        }),
+      }
+    }
+
+    /// Whether the process has exited (including unreaped zombies or PID reuse), remembered once true.
+    pub fn exited(&self) -> bool {
+      if self.exited.get() {
+        return true;
+      }
+      let gone = alive_start_of(self.pid) != Some(self.started);
+      if gone {
+        self.exited.set(true);
+      }
+      gone
+    }
+  }
+
+  /// One `kqueue` descriptor multiplexing `EVFILT_PROC | NOTE_EXIT` watches for any number of
+  /// distinct macOS client processes on a shard (1 FD per shard instead of 1 per client).
+  #[derive(Debug)]
+  pub struct ExitMux {
+    queue: OwnedFd,
+  }
+
+  impl ExitMux {
+    /// Opens a fresh `kqueue` descriptor for multiplexed process-exit watching.
+    pub fn open() -> Result<ExitMux, IpcError> {
+      let queue = kqueue().map_err(|e| IpcError::OsRefused {
+        call: "kqueue",
+        code: Some(e.raw_os_error()),
+      })?;
+      Ok(ExitMux { queue })
+    }
+
+    /// The `kqueue` descriptor, readable whenever any watched process has exited.
+    pub fn readiness(&self) -> BorrowedFd<'_> {
+      self.queue.as_fd()
+    }
+
+    /// Registers an `EVFILT_PROC | NOTE_EXIT | EV_ONESHOT` watch on `pid` verified against
+    /// `started`. Returns `Ok(true)` if the process is alive and now watched, or `Ok(false)` if it
+    /// already exited or `pid` was reused by another process (cleaning up the filter in that case).
+    pub fn watch(&self, pid: u32, started: u64) -> Result<bool, IpcError> {
+      let process = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or(IpcError::Layout {
+          reason: "the claim names a pid out of range",
+        })?;
+      let note = Event::new(
+        EventFilter::Proc {
+          pid: process,
+          flags: ProcessEvents::EXIT,
+        },
+        EventFlags::ADD | EventFlags::ONESHOT,
+        std::ptr::null_mut(),
+      );
+      let mut none: [std::mem::MaybeUninit<Event>; 0] = [];
+      match kevent_raw(&self.queue, &[note], &mut none[..], None) {
+        Ok(_) => {
+          // Register first, verify start after (A-522): if another process reused `pid` before
+          // registration, remove the note and report already exited.
+          if start_of(pid)? != Some(started) {
+            self.unwatch(pid);
+            return Ok(false);
+          }
+          Ok(true)
+        }
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(e) => Err(IpcError::OsRefused {
+          call: "kevent(EVFILT_PROC)",
+          code: Some(e.raw_os_error()),
+        }),
+      }
+    }
+
+    /// Removes the exit watch for `pid` when no clients of that process remain on this shard.
+    pub fn unwatch(&self, pid: u32) {
+      let Some(process) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return;
+      };
+      let delete = Event::new(
+        EventFilter::Proc {
+          pid: process,
+          flags: ProcessEvents::EXIT,
+        },
+        EventFlags::DELETE,
+        std::ptr::null_mut(),
+      );
+      let mut none: [std::mem::MaybeUninit<Event>; 0] = [];
+      let _ = kevent_raw(&self.queue, &[delete], &mut none[..], None);
+    }
+
+    /// Drains up to `max` exited process ids without blocking, appending them to `out`.
+    pub fn drain_exited(&self, max: usize, out: &mut Vec<u32>) -> Result<(), IpcError> {
+      let mut fired: Vec<Event> = Vec::with_capacity(max.max(1));
+      match kevent_raw(
+        &self.queue,
+        &[],
+        rustix::buffer::spare_capacity(&mut fired),
+        Some(Duration::ZERO),
+      ) {
+        Ok(_) => {
+          for event in fired {
+            if let EventFilter::Proc { pid, .. } = event.filter()
+              && let Ok(raw) = u32::try_from(pid.as_raw_nonzero().get())
+            {
+              out.push(raw);
+            }
+          }
+          Ok(())
+        }
+        Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(e) => Err(IpcError::OsRefused {
+          call: "kevent(drain EVFILT_PROC)",
+          code: Some(e.raw_os_error()),
+        }),
+      }
+    }
+  }
 
   pub(super) struct ExitWatch {
     queue: OwnedFd,
@@ -172,10 +342,8 @@ mod platform {
         EventFlags::ADD | EventFlags::ONESHOT,
         std::ptr::null_mut(),
       );
-      let mut none: Vec<Event> = Vec::new();
-      // SAFETY: one valid change record (no user data pointer) on the queue just created; the empty
-      // output vector receives nothing.
-      match unsafe { kevent(&queue, &[note], &mut none, None) } {
+      let mut none: [std::mem::MaybeUninit<Event>; 0] = [];
+      match kevent_raw(&queue, &[note], &mut none[..], None) {
         Ok(_) => Ok(ExitWatch {
           queue,
           exited: Cell::new(false),
@@ -194,15 +362,12 @@ mod platform {
         return true;
       }
       let mut fired: Vec<Event> = Vec::with_capacity(1);
-      // SAFETY: no changes; the output buffer is the vector's spare capacity (one record).
-      let outcome = unsafe {
-        kevent(
-          &self.queue,
-          &[],
-          rustix::buffer::spare_capacity(&mut fired),
-          Some(Duration::ZERO),
-        )
-      };
+      let outcome = kevent_raw(
+        &self.queue,
+        &[],
+        rustix::buffer::spare_capacity(&mut fired),
+        Some(Duration::ZERO),
+      );
       let exited = match outcome {
         Ok(count) => count > 0,
         Err(rustix::io::Errno::INTR) => false,
@@ -212,8 +377,8 @@ mod platform {
       exited
     }
 
-    pub(super) fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-      (!self.exited.get()).then(|| std::os::fd::AsFd::as_fd(&self.queue))
+    pub(super) fn readiness(&self) -> Option<BorrowedFd<'_>> {
+      (!self.exited.get()).then(|| self.queue.as_fd())
     }
 
     pub(super) fn on_started(pid: u32, started: u64) -> Result<ExitWatch, IpcError> {
@@ -231,13 +396,21 @@ mod platform {
   /// Format: microseconds per second, the unit the start's two fields combine in.
   const MICROS_PER_SECOND: u64 = 1_000_000;
 
+  fn start_from_info(info: &libc::proc_bsdinfo) -> u64 {
+    info
+      .pbi_start_tvsec
+      .saturating_mul(MICROS_PER_SECOND)
+      .saturating_add(info.pbi_start_tvusec)
+  }
+
+  /// Process `pid`'s start stamp when it exists and is not an exited zombie (`SZOMB`).
+  fn alive_start_of(pid: u32) -> Option<u64> {
+    let info = bsd_info(pid)?;
+    (info.pbi_status != PROCESS_ZOMBIE).then(|| start_from_info(&info))
+  }
+
   pub(super) fn start_of(pid: u32) -> Result<Option<u64>, IpcError> {
-    Ok(bsd_info(pid).map(|info| {
-      info
-        .pbi_start_tvsec
-        .saturating_mul(MICROS_PER_SECOND)
-        .saturating_add(info.pbi_start_tvusec)
-    }))
+    Ok(bsd_info(pid).map(|info| start_from_info(&info)))
   }
 
   pub(super) fn own_start() -> Result<u64, IpcError> {
@@ -593,6 +766,108 @@ mod tests {
       ExitWatch::own_start().unwrap(),
       ExitWatch::start_of(std::process::id()).unwrap().unwrap()
     );
+  }
+
+  /// macOS descriptor-free liveness check ([`ProcessStamp`]): detects running, stopped (`SIGSTOP`),
+  /// unreaped zombie (`SIGKILL` before `wait`), reaped exit, and `pid == 0`, while opening zero FDs.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn process_stamp_tracks_lifecycle_without_opening_descriptors() {
+    let _gate = crate::descriptor_test_gate();
+    let mut child = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .unwrap();
+    #[allow(clippy::disallowed_methods)] // Read-only count of this process's descriptors.
+    let before = std::fs::read_dir("/dev/fd").map_or(0, Iterator::count);
+    let stamps: Vec<ProcessStamp> = (0..64)
+      .map(|_| ProcessStamp::of(child.id()).unwrap())
+      .collect();
+    #[allow(clippy::disallowed_methods)]
+    let after = std::fs::read_dir("/dev/fd").map_or(0, Iterator::count);
+    assert!(
+      after <= before + 4,
+      "ProcessStamp must not open per-watch descriptors: before={before}, after={after}"
+    );
+    assert!(
+      stamps.iter().all(|s| !s.exited()),
+      "running process is alive"
+    );
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+    assert!(
+      stamps.iter().all(|s| !s.exited()),
+      "stopped process is alive"
+    );
+    child.kill().unwrap();
+    // Wait briefly for the kernel to transition the killed child into zombie (`SZOMB`) before wait().
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !stamps[0].exited() && std::time::Instant::now() < deadline {
+      std::thread::yield_now();
+    }
+    assert!(
+      stamps.iter().all(ProcessStamp::exited),
+      "killed zombie process reads exited even before wait()"
+    );
+    child.wait().unwrap();
+    assert!(stamps[0].exited(), "exit stays remembered after wait()");
+    assert!(ProcessStamp::of(0).is_err());
+  }
+
+  /// macOS multiplexed process-exit watcher ([`ExitMux`]): one `kqueue` watches many PIDs, wakes
+  /// on exit, respects `unwatch`, and rejects mismatched start stamps.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn exit_mux_watches_many_processes_on_one_descriptor() {
+    let _gate = crate::descriptor_test_gate();
+    let mux = ExitMux::open().unwrap();
+    let mut first = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .unwrap();
+    let mut second = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .unwrap();
+    let start_one = ExitWatch::start_of(first.id()).unwrap().unwrap();
+    let start_two = ExitWatch::start_of(second.id()).unwrap().unwrap();
+    assert!(mux.watch(first.id(), start_one).unwrap());
+    assert!(mux.watch(second.id(), start_two).unwrap());
+    // Mismatched start time is rejected immediately and does not leave a stale watch.
+    let mut third = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .unwrap();
+    let start_three = ExitWatch::start_of(third.id()).unwrap().unwrap();
+    assert!(!mux.watch(third.id(), start_three.wrapping_add(1)).unwrap());
+
+    let mut exited = Vec::new();
+    mux.drain_exited(8, &mut exited).unwrap();
+    assert!(exited.is_empty(), "no process exited yet");
+
+    // Unwatch second before killing it; kill first and expect only first to report.
+    mux.unwatch(second.id());
+    second.kill().unwrap();
+    second.wait().unwrap();
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    let fd = mux.readiness();
+    let mut interest = [rustix::event::PollFd::new(
+      &fd,
+      rustix::event::PollFlags::IN,
+    )];
+    let timeout = rustix::event::Timespec {
+      tv_sec: 5,
+      tv_nsec: 0,
+    };
+    let ready = rustix::event::poll(&mut interest, Some(&timeout)).unwrap();
+    assert_eq!(ready, 1, "mux readiness woke on first child's exit");
+    mux.drain_exited(8, &mut exited).unwrap();
+    assert_eq!(exited, vec![first.id()]);
+
+    third.kill().unwrap();
+    third.wait().unwrap();
   }
 
   /// AUD-29-20 (Windows). Do: watch a child process, then kill it and reap it. Expect: not exited while

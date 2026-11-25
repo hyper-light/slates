@@ -165,7 +165,7 @@ pub fn make_extent(_handoff: &Handoff, _len: usize) -> Result<(), MemError> {
 
 /// A shared memory object and its full view, reached by copy and through its declared words.
 pub struct SharedObject {
-  inner: platform::Inner,
+  inner: platform::SharedInner,
   len: usize,
   words: Layout,
 }
@@ -210,7 +210,7 @@ impl SharedObject {
   /// where it is the handoff; on Linux it is the descriptor's label), whose concurrent words are `words`.
   pub fn create(name: &str, len: usize, words: Words) -> Result<SharedObject, MemError> {
     let words = words.layout(len)?;
-    let inner = platform::create(name, len)?;
+    let inner = platform::create_shared(name, len)?;
     Ok(SharedObject { inner, len, words })
   }
 
@@ -218,7 +218,7 @@ impl SharedObject {
   /// `words` (the creator's layout: both sides declare the same).
   pub fn open(handoff: &Handoff, len: usize, words: Words) -> Result<SharedObject, MemError> {
     let words = words.layout(len)?;
-    let inner = platform::open(handoff, len)?;
+    let inner = platform::open_shared(handoff, len)?;
     Ok(SharedObject { inner, len, words })
   }
 
@@ -231,7 +231,7 @@ impl SharedObject {
     words: Words,
   ) -> Result<SharedObject, MemError> {
     let words = words.layout(len)?;
-    let inner = platform::from_descriptor(fd, len)?;
+    let inner = platform::from_descriptor_shared(fd, len)?;
     Ok(SharedObject { inner, len, words })
   }
 
@@ -265,11 +265,19 @@ impl SharedObject {
     self.inner.handoff()
   }
 
-  /// A borrow of the object's descriptor, for mapping a range of it into a VMM's DAX cache region (§4.6). Unix only
-  /// (the DAX window is a Linux/vhost-user feature); no reference to the bytes is formed.
+  /// A borrow of the object's descriptor while still open (`None` after [`Self::close_descriptor`]),
+  /// for handing off or duplicating the mapping. Unix only; no reference to the bytes is formed.
   #[cfg(unix)]
-  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-    self.inner.as_fd()
+  pub fn try_as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self.inner.try_as_fd()
+  }
+
+  /// Closes the underlying `shm_open`/`memfd` descriptor while keeping the live `mmap` intact.
+  /// On Unix, the kernel VM mapping holds its own reference to the shared memory object once
+  /// mapped, so releasing the descriptor after handoff frees per-client FDs without affecting I/O.
+  #[cfg(unix)]
+  pub fn close_descriptor(&mut self) {
+    self.inner.close_descriptor();
   }
 
   /// The mapped length.
@@ -457,7 +465,7 @@ impl ExclusiveObject {
       return Err(MemError::OutOfRange { offset, len });
     }
     let words = Words::new().layout(len)?;
-    let inner = platform::open_range(handoff, offset, len)?;
+    let inner = platform::open_range_shared(handoff, offset, len)?;
     Ok(ExclusiveObject(SharedObject { inner, len, words }, offset))
   }
 
@@ -476,11 +484,11 @@ impl ExclusiveObject {
     self.0.handoff()
   }
 
-  /// A borrow of the object's descriptor, for the virtio-fs DAX window mapping a content block's pages into a VMM's
-  /// cache region (§4.6). Unix only; no reference to the bytes is formed, so the arena's exclusivity is kept.
+  /// A borrow of the object's descriptor while open, for the virtio-fs DAX window mapping a content block's pages into
+  /// a VMM's cache region (§4.6). Unix only; no reference to the bytes is formed, so the arena's exclusivity is kept.
   #[cfg(unix)]
-  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-    self.0.as_fd()
+  pub fn try_as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self.0.try_as_fd()
   }
 
   /// This view's byte offset within its descriptor: 0 for a whole object ([`ExclusiveObject::new`]), the
@@ -888,8 +896,8 @@ impl SparseObject {
     let mut acc = init;
     let mut offset = first;
     for index in 0..count {
-      let value =
-        word_view::<AtomicU64>(&self.inner, offset)?.load(std::sync::atomic::Ordering::Relaxed);
+      let word: &AtomicU64 = word_view(&self.inner, offset)?;
+      let value = word.load(std::sync::atomic::Ordering::Relaxed);
       acc = fold(acc, index, value);
       offset = offset.saturating_add(stride);
     }
@@ -932,8 +940,8 @@ impl SparseObject {
       let id_base = group.saturating_mul(group_stride);
       let mut offset = group_offset;
       for part in 0..active {
-        let value =
-          word_view::<AtomicU64>(&self.inner, offset)?.load(std::sync::atomic::Ordering::Relaxed);
+        let word: &AtomicU64 = word_view(&self.inner, offset)?;
+        let value = word.load(std::sync::atomic::Ordering::Relaxed);
         acc = fold(acc, id_base.saturating_add(part), part, value);
         offset = offset.saturating_add(stride);
       }
@@ -978,8 +986,30 @@ fn check_racy(
   Ok(())
 }
 
+/// Uniform access to the mapping base pointer across both `Inner` (`SparseObject`) and
+/// `SharedInner` (`SharedObject`, whose Unix descriptor may be closed after mapping).
+trait MappingBase {
+  fn base(&self) -> *mut u8;
+}
+
+#[cfg(unix)]
+impl<F> MappingBase for platform::Inner<F> {
+  #[inline]
+  fn base(&self) -> *mut u8 {
+    platform::Inner::base(self)
+  }
+}
+
+#[cfg(windows)]
+impl MappingBase for platform::Inner {
+  #[inline]
+  fn base(&self) -> *mut u8 {
+    platform::Inner::base(self)
+  }
+}
+
 /// Copies the `into.len()` bytes at `offset` out (inside the map; the caller checked).
-fn copy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
+fn copy_out<M: MappingBase>(inner: &M, offset: usize, into: &mut [u8]) {
   // SAFETY: `[offset, offset + into.len())` lies inside the live map (the caller checked) and is
   // committed where the platform commits; the source is the mapping's raw pointer, never a reference, and
   // `into` is this process's own buffer, so the two cannot overlap. These are plain bytes, which the
@@ -990,7 +1020,7 @@ fn copy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
 }
 
 /// Copies `from` in at `offset` (inside the map; the caller checked).
-fn copy_in(inner: &mut platform::Inner, offset: usize, from: &[u8]) {
+fn copy_in<M: MappingBase>(inner: &mut M, offset: usize, from: &[u8]) {
   // SAFETY: as for `copy_out`, in the other direction; `&mut` is this process's only writer through the
   // object.
   unsafe {
@@ -999,7 +1029,7 @@ fn copy_in(inner: &mut platform::Inner, offset: usize, from: &[u8]) {
 }
 
 /// Copies declared racy bytes out through `AtomicU8`, relaxed (the seqlock's generation orders them).
-fn racy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
+fn racy_out<M: MappingBase>(inner: &M, offset: usize, into: &mut [u8]) {
   let base = inner.base().wrapping_add(offset);
   for (index, byte) in into.iter_mut().enumerate() {
     // SAFETY: the byte lies inside the live map (the caller checked the span) and is a declared racy
@@ -1016,7 +1046,7 @@ fn racy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
 }
 
 /// Copies `from` into declared racy bytes through `AtomicU8`, relaxed.
-fn racy_in(inner: &platform::Inner, offset: usize, from: &[u8]) {
+fn racy_in<M: MappingBase>(inner: &M, offset: usize, from: &[u8]) {
   let base = inner.base().wrapping_add(offset);
   for (index, byte) in from.iter().enumerate() {
     // SAFETY: as in `racy_out`.
@@ -1073,7 +1103,7 @@ impl Word for AtomicU64 {}
 /// The declared word at `offset` (checked by the caller: inside the map, aligned to `W`, declared of `W`'s
 /// width, touched by no copy) as the atomic `W`.
 #[inline]
-fn word_view<W: Word>(inner: &platform::Inner, offset: usize) -> Result<&W, MemError> {
+fn word_view<W: Word>(inner: &impl MappingBase, offset: usize) -> Result<&W, MemError> {
   let word = inner.base().wrapping_add(offset);
   if !(word as usize).is_multiple_of(align_of::<W>()) {
     return Err(refused(offset, size_of::<W>(), LayoutRefusal::Misaligned));
@@ -1092,9 +1122,11 @@ mod platform {
   use super::Handoff;
   use crate::error::MemError;
 
-  pub(super) struct Inner {
+  pub(super) type SharedInner = Inner<Option<OwnedFd>>;
+
+  pub(super) struct Inner<F = OwnedFd> {
     map: Mapped,
-    fd: OwnedFd,
+    fd: F,
     /// The object's name (macOS: what a handoff carries, known to the creator and to an
     /// opener alike, so an attached process can hand the object on again).
     #[cfg(target_os = "macos")]
@@ -1105,7 +1137,7 @@ mod platform {
   }
 
   #[cfg(target_os = "macos")]
-  impl Drop for Inner {
+  impl<F> Drop for Inner<F> {
     fn drop(&mut self) {
       if self.creator {
         let _ = rustix::shm::unlink(self.name.as_str());
@@ -1305,7 +1337,11 @@ mod platform {
   #[cfg(not(target_os = "linux"))]
   fn advise_huge_object(_map: &Mapped) {}
 
-  pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
+  fn create_with<F>(
+    name: &str,
+    len: usize,
+    wrap: impl FnOnce(OwnedFd) -> F,
+  ) -> Result<Inner<F>, MemError> {
     let created = create_object(name)?;
     let size = u64::try_from(len).map_err(|_| MemError::OsRefused {
       call: "ftruncate",
@@ -1317,7 +1353,7 @@ mod platform {
     let map = map(&created.fd, 0, len, Access::ReadWrite)?;
     Ok(Inner {
       map,
-      fd: created.fd,
+      fd: wrap(created.fd),
       #[cfg(target_os = "macos")]
       name: created.name,
       #[cfg(target_os = "macos")]
@@ -1325,17 +1361,29 @@ mod platform {
     })
   }
 
+  pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
+    create_with(name, len, |fd| fd)
+  }
+
+  pub(super) fn create_shared(name: &str, len: usize) -> Result<SharedInner, MemError> {
+    create_with(name, len, Some)
+  }
+
   pub(super) fn open(handoff: &Handoff, len: usize) -> Result<Inner, MemError> {
     open_range(handoff, 0, len)
   }
 
+  pub(super) fn open_shared(handoff: &Handoff, len: usize) -> Result<SharedInner, MemError> {
+    open_range_shared(handoff, 0, len)
+  }
+
   /// The object behind `fd`, which this process was handed, mapped whole; it carries no name, so nothing is unlinked at
   /// its drop.
-  pub(super) fn from_descriptor(fd: OwnedFd, len: usize) -> Result<Inner, MemError> {
+  pub(super) fn from_descriptor_shared(fd: OwnedFd, len: usize) -> Result<SharedInner, MemError> {
     let map = map(&fd, 0, len, Access::ReadWrite)?;
     Ok(Inner {
       map,
-      fd,
+      fd: Some(fd),
       #[cfg(target_os = "macos")]
       name: String::new(),
       #[cfg(target_os = "macos")]
@@ -1344,7 +1392,7 @@ mod platform {
   }
 
   #[cfg(target_os = "macos")]
-  impl Inner {
+  impl<F> Inner<F> {
     /// Unlinks the name this process created the object under, once: the drop has nothing left to unlink.
     pub(super) fn unlink_name(&mut self) -> Result<(), MemError> {
       if !self.creator {
@@ -1355,17 +1403,17 @@ mod platform {
     }
   }
 
-  /// `[offset, offset + len)` of the object `handoff` names, mapped on its own.
-  pub(super) fn open_range(
+  fn open_range_with<F>(
     handoff: &Handoff,
     offset: usize,
     len: usize,
-  ) -> Result<Inner, MemError> {
+    wrap: impl FnOnce(OwnedFd) -> F,
+  ) -> Result<Inner<F>, MemError> {
     let fd = open_object(handoff)?;
     let map = map(&fd, offset, len, Access::ReadWrite)?;
     Ok(Inner {
       map,
-      fd,
+      fd: wrap(fd),
       #[cfg(target_os = "macos")]
       name: match handoff {
         Handoff::Name(name) => name.clone(),
@@ -1374,6 +1422,24 @@ mod platform {
       #[cfg(target_os = "macos")]
       creator: false,
     })
+  }
+
+  /// `[offset, offset + len)` of the object `handoff` names, mapped on its own.
+  pub(super) fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    open_range_with(handoff, offset, len, |fd| fd)
+  }
+
+  /// `[offset, offset + len)` of the object `handoff` names, with a releasable descriptor.
+  pub(super) fn open_range_shared(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<SharedInner, MemError> {
+    open_range_with(handoff, offset, len, Some)
   }
 
   struct Created {
@@ -1614,7 +1680,7 @@ mod platform {
     }
   }
 
-  impl Inner {
+  impl<F> Inner<F> {
     /// The map's first byte, as the raw pointer the mapping returned (no reference to its bytes is formed).
     pub(super) fn base(&self) -> *mut u8 {
       self.map.as_ptr().cast_mut()
@@ -1628,14 +1694,6 @@ mod platform {
     /// The whole map, writable, for [`super::ExclusiveObject`] only.
     pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
       &mut self.map
-    }
-
-    /// A borrow of the object's descriptor (its `memfd`/`shm` fd), for a caller that maps a range of the object
-    /// *elsewhere* — the virtio-fs DAX window mapping a content block's pages into a VMM's cache region (§4.6). No
-    /// reference to the bytes is formed; the borrow lasts only as long as `&self`.
-    pub(super) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-      use std::os::fd::AsFd;
-      self.fd.as_fd()
     }
 
     /// Gives the whole pages inside `offset .. offset + len` back to the OS, leaving a hole that reads as zeros in
@@ -1691,20 +1749,8 @@ mod platform {
       })
     }
 
-    /// The object's own descriptor's number: close-on-exec, open while this object lives, and owned by nothing the
-    /// number reaches. An open of it duplicates it, and a spawn that hands it on clears close-on-exec in its child alone
-    /// (`slates_anchor`'s supervisor). Until 2026-11-23 this made a duplicate without close-on-exec that nothing owned:
-    /// every call left one open, an anchor two more at each daemon start, and every child of the daemon inherited them
-    /// (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
-    #[cfg(target_os = "linux")]
-    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
-      use std::os::fd::AsRawFd;
-      Ok(Handoff::Descriptor(self.fd.as_raw_fd()))
-    }
-
     #[cfg(target_os = "macos")]
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
-      let _ = &self.fd;
       if self.name.is_empty() {
         return Err(MemError::OsRefused {
           call: "handoff of an object opened without a name",
@@ -1716,11 +1762,57 @@ mod platform {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
-      let _ = &self.fd;
       Err(MemError::OsRefused {
         call: "handoff",
         code: None,
       })
+    }
+  }
+
+  impl Inner<OwnedFd> {
+    /// A borrow of the object's descriptor (its `memfd`/`shm` fd), for a caller that maps a range of the object
+    /// *elsewhere* — the virtio-fs DAX window mapping a content block's pages into a VMM's cache region (§4.6). No
+    /// reference to the bytes is formed; the borrow lasts only as long as `&self`.
+    pub(super) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+      use std::os::fd::AsFd;
+      self.fd.as_fd()
+    }
+
+    /// The object's own descriptor's number: close-on-exec, open while this object lives, and owned by nothing the
+    /// number reaches. An open of it duplicates it, and a spawn that hands it on clears close-on-exec in its child alone
+    /// (`slates_anchor`'s supervisor). Until 2026-11-23 this made a duplicate without close-on-exec that nothing owned:
+    /// every call left one open, an anchor two more at each daemon start, and every child of the daemon inherited them
+    /// (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
+    #[cfg(target_os = "linux")]
+    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      use std::os::fd::AsRawFd;
+      Ok(Handoff::Descriptor(self.fd.as_raw_fd()))
+    }
+  }
+
+  impl Inner<Option<OwnedFd>> {
+    /// A borrow of the object's descriptor while still open (`None` after [`Self::close_descriptor`]).
+    pub(super) fn try_as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+      use std::os::fd::AsFd;
+      self.fd.as_ref().map(AsFd::as_fd)
+    }
+
+    /// Drops and closes the underlying `shm_open`/`memfd` descriptor while keeping `self.map` mapped.
+    pub(super) fn close_descriptor(&mut self) {
+      self.fd = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      use std::os::fd::AsRawFd;
+      self
+        .fd
+        .as_ref()
+        .map(|fd| Handoff::Descriptor(fd.as_raw_fd()))
+        .ok_or(MemError::OsRefused {
+          call: "handoff of an object whose descriptor was closed",
+          code: None,
+        })
     }
   }
 }
@@ -1743,6 +1835,8 @@ mod platform {
 
   use super::Handoff;
   use crate::error::MemError;
+
+  pub(super) type SharedInner = Inner;
 
   /// The section and its view. The view is kept as its exposed address, not a pointer, so
   /// the object is `Send` (a mapping belongs to the process, not a thread) without an unsafe
@@ -1816,6 +1910,10 @@ mod platform {
 
   pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
     create_section(Some(name), len, PAGE_READWRITE)
+  }
+
+  pub(super) fn create_shared(name: &str, len: usize) -> Result<SharedInner, MemError> {
+    create(name, len)
   }
 
   pub(super) fn create_unnamed(len: usize) -> Result<Inner, MemError> {
@@ -1935,6 +2033,10 @@ mod platform {
     open_view(handoff, 0, len)
   }
 
+  pub(super) fn open_shared(handoff: &Handoff, len: usize) -> Result<SharedInner, MemError> {
+    open(handoff, len)
+  }
+
   /// `[offset, offset + len)` of the section `handoff` names, mapped on its own and committed whole: a
   /// sparse section's pages are not readable until committed, and an exclusive range is reached by
   /// reference, so it cannot commit page by page as the copies do.
@@ -1946,6 +2048,14 @@ mod platform {
     let inner = open_view(handoff, offset, len)?;
     Commits::new(len)?.commit(&inner, 0, len)?;
     Ok(inner)
+  }
+
+  pub(super) fn open_range_shared(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<SharedInner, MemError> {
+    open_range(handoff, offset, len)
   }
 
   /// The offset granule of a mapping: the allocation granularity.

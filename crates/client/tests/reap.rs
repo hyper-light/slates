@@ -275,3 +275,122 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   );
   daemon.stop();
 }
+
+/// Counts this process's open descriptors on Unix (`/dev/fd` on macOS, `/proc/self/fd` on Linux).
+#[cfg(unix)]
+fn open_descriptors() -> usize {
+  #[cfg(target_os = "linux")]
+  const DIR: &str = "/proc/self/fd";
+  #[cfg(not(target_os = "linux"))]
+  const DIR: &str = "/dev/fd";
+  #[allow(clippy::disallowed_methods)] // Read-only descriptor count of this process (not disk I/O).
+  std::fs::read_dir(DIR).map_or(0, |entries| entries.count())
+}
+
+/// §4.7 "Failure matrix", clean disconnect and descriptor hygiene. Do: connect a wave of in-process
+/// clients to a live daemon, attach each to a volume, measure open descriptors while all are live,
+/// then drop all of them without exiting the process. Expect: on macOS live connections do not
+/// multiply kqueue/shm descriptors (at most ~1 fd per live client plus daemon slack); once dropped,
+/// the daemon promptly retires every seat, reclaims every attachment, frees their client ids for
+/// resumption, and returns open descriptors to baseline (zero leak).
+#[test]
+fn dropped_in_process_clients_release_seats_attachments_and_descriptors() {
+  if std::env::var_os(ROLE).is_some() {
+    return;
+  }
+  /// Shape: enough concurrent clients in one wave that per-client fd leaks and 4x fd multipliers
+  /// stand clearly above daemon noise.
+  const WAVE: usize = 64;
+  /// Shape: attachments taken in the wave (fits inside the quick profile's derived attachment cap).
+  const ATTACHED: usize = 8;
+  /// Shape: slack for transient descriptors (e.g. a sibling test's pipe or `/dev/fd` itself).
+  #[cfg(unix)]
+  const SLACK: usize = 24;
+
+  let profile = MachineProfile::measure_patiently(&ProfileOptions {
+    budget_per_probe: Duration::from_millis(PROBE_MS),
+    codecs: false,
+    core_matrix: false,
+  })
+  .expect("the machine profile measures");
+  let instance = format!("cl-drop-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(2));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-drop-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut observer = Client::connect(&instance, deadlines()).unwrap();
+  let volume = observer
+    .create(&slates_client::CreateSpec {
+      name: "drop-0".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+
+  #[cfg(unix)]
+  let baseline_fds = open_descriptors();
+  let reaped_before = CLIENTS_REAPED.load(Ordering::Acquire);
+
+  let mut clients: Vec<Client> = Vec::with_capacity(WAVE);
+  for n in 0..WAVE {
+    let mut client = Client::connect(&instance, deadlines()).unwrap();
+    if n < ATTACHED {
+      client.attach(volume, None, Intent::Read).unwrap();
+    } else {
+      let _ = client.status(volume).unwrap();
+    }
+    clients.push(client);
+  }
+  let sample_id = clients[0].client_id();
+  assert_eq!(
+    observer.status(volume).unwrap().attachments,
+    u32::try_from(ATTACHED).unwrap(),
+    "every attached live client holds its attachment"
+  );
+
+  #[cfg(target_os = "macos")]
+  {
+    let live_fds = open_descriptors();
+    let delta = live_fds.saturating_sub(baseline_fds);
+    assert!(
+      delta <= WAVE + SLACK,
+      "64 live macOS clients opened {delta} descriptors (baseline {baseline_fds}, live {live_fds}); expected <= {}",
+      WAVE + SLACK
+    );
+  }
+
+  drop(clients);
+
+  wait_until(
+    "dropped in-process clients' attachments are reclaimed",
+    || observer.status(volume).unwrap().attachments == 0,
+  );
+  assert!(
+    CLIENTS_REAPED.load(Ordering::Acquire) >= reaped_before + u64::try_from(WAVE).unwrap(),
+    "every dropped client was reaped"
+  );
+  let resumed = resume_when_free(&instance, sample_id);
+  assert!(
+    resumed.is_ok(),
+    "a dropped client's id must be freed for resumption: {resumed:?}"
+  );
+  drop(resumed);
+
+  #[cfg(unix)]
+  wait_until(
+    "open descriptors return to baseline after clean disconnect",
+    || open_descriptors() <= baseline_fds + SLACK,
+  );
+
+  daemon.stop();
+}
