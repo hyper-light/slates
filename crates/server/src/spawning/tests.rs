@@ -155,18 +155,23 @@ fn a_spawn_past_its_shards_bound_is_refused_busy() {
   assert_eq!(first, Ok(false));
 }
 
-/// A-924 piece 2b, the back-off (RFC 6298 §5.5's doubling, capped at the liveness window). Do: ask the back-off after
-/// one, two, three and forty deaths in a row of a spawner whose start took a millisecond. Expect: none after one (a
-/// spawner that died once is restarted at once), then the start's length, then twice it, and at forty the liveness
-/// window, never past it.
+/// A-924 piece 2b, the back-off (main's question on (c)'s red: a spawner that ended at once was started 12 times in a
+/// window and a half, the doubling of a few milliseconds' start slow to reach the window). Do: ask the back-off after
+/// one, two, three and forty deaths in a row. Expect: none after one (a spawner that died once is restarted at once),
+/// then a whole liveness window after each later one, so a spawner that cannot stay up is started at most twice a
+/// window. Red before: a millisecond's start waited a millisecond after two deaths, two after three.
 #[test]
-fn the_spawners_back_off_doubles_its_start_up_to_the_liveness_window() {
-  let start_ns = 1_000_000;
-  let waits: Vec<u64> = [1, 2, 3, 40]
-    .into_iter()
-    .map(|deaths| super::back_off_ns(deaths, start_ns))
-    .collect();
-  assert_eq!(waits, [0, start_ns, 2 * start_ns, LIVENESS_BUDGET_NS]);
+fn the_spawners_back_off_is_a_liveness_window_after_its_first_death() {
+  let waits: Vec<u64> = [1, 2, 3, 40].into_iter().map(super::back_off_ns).collect();
+  assert_eq!(
+    waits,
+    [
+      0,
+      LIVENESS_BUDGET_NS,
+      LIVENESS_BUDGET_NS,
+      LIVENESS_BUDGET_NS
+    ]
+  );
 }
 
 /// Shape: how long [`a_lingering_spawner_role`] lives after it drops its ends: three liveness windows, past the bound a
@@ -265,7 +270,7 @@ fn reaped_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
     ];
     let slates_ipc::spawner::Started { child, ends } =
       slates_ipc::spawner::start(&program, &args, 1).expect("the lingering spawner");
-    super::own(child, vec![here], 0, None);
+    super::own(child, vec![here], None);
     for end in ends {
       let placement = super::Placement {
         generation: 0,

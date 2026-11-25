@@ -64297,8 +64297,9 @@ measured noise of the 100 figure, not a literal.
 > **Piece 2b built (2026-11-25).** The control shard owns the spawner (`crate::spawning::own`, handed it by the
 > daemon's start with the measured length of that start). A shard whose end closes answers that generation's waiters
 > `SpawnerGone` and tells the owner; the owner restarts once per generation, after a back-off (`back_off_ns`: none
-> after one death, then the measured start's length doubled for each death within a liveness window of its start,
-> capped at the liveness window, RFC 6298 §5.5), and sends each shard its new end (`run_on_waiting`), or tells each
+> after one death, a whole liveness window after each later death within a window of its start, so a spawner that
+> cannot stay up starts at most twice a window; until 2026-11-25 it doubled a start's measured milliseconds, 12 starts
+> in a window and a half), and sends each shard its new end (`run_on_waiting`), or tells each
 > the attempt failed and tries again after a longer back-off. The restart wait is no timer: a spawn asked while a
 > restart is awaited waits for that attempt's answer, which always comes (the new end or the failure); between
 > attempts it is refused at once. Ids keep rising across generations and a handle of a gone generation answers
@@ -64319,6 +64320,13 @@ measured noise of the 100 figure, not a literal.
 > daemon's process thread at its drop (`Daemon::stop_parts` joins it, `join_spawner`, once the runtime has ended). Red:
 > a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
 > (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
+>
+> **Every received descriptor close-on-exec (2026-11-25).** Main's diag run 45672799755 found a child started through
+> the spawner on both Linux lanes holding a descriptor a direct child did not (fd 6). The spawner received the child's
+> streams by `SCM_RIGHTS` without close-on-exec, and Linux's spawn hands a child every descriptor not so marked
+> (macOS's `POSIX_SPAWN_CLOEXEC_DEFAULT` hid it). Now `Inbound::read` receives with `MSG_CMSG_CLOEXEC` on Linux and
+> marks each descriptor just after elsewhere, and the spawner's self-pipe is made with `pipe2(O_CLOEXEC)` on Linux.
+> Red: `a_descriptor_riding_a_request_is_received_close_on_exec` (received without the flag on every platform).
 >
 > **Its cost** (main's measurements, 2026-11-25). macOS, release daemon at 5c7381734, idle: the spawner's footprint
 > 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no

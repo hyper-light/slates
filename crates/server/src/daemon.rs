@@ -1104,8 +1104,6 @@ impl Daemon {
     // The daemon's spawner (A-924): started now, before any client's descriptor is open, with an end a shard. Every hook
     // and helper a shard starts is started by it, so a spawn never copies this process's descriptor table.
     #[cfg(unix)]
-    let spawner_began = std::time::Instant::now();
-    #[cfg(unix)]
     let slates_ipc::spawner::Started {
       child: spawner,
       ends: spawner_ends,
@@ -1115,9 +1113,6 @@ impl Daemon {
         code: error.raw_os_error(),
       })
     })?;
-    #[cfg(unix)]
-    let spawner_start_took_ns =
-      u64::try_from(spawner_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
     #[cfg(unix)]
     let mut spawner_ends = spawner_ends.into_iter();
     // The control shard owns it (`crate::spawning::own`): the one that restarts it, an end to each shard in this order.
@@ -1129,7 +1124,6 @@ impl Daemon {
     let mut spawner_owner = Some((
       spawner,
       shards.iter().map(|shard| shard.0).collect::<Vec<u16>>(),
-      spawner_start_took_ns,
       spawner_join_send,
     ));
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
@@ -4951,13 +4945,12 @@ struct ShardHolds {
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
-/// The spawner the control shard owns (A-924): the process, the shards it serves in its ends' order, how long its start
-/// took, and where its owner hands it back to be joined.
+/// The spawner the control shard owns (A-924): the process, the shards it serves in its ends' order, and where its owner
+/// hands it back to be joined.
 #[cfg(unix)]
 type SpawnerOwner = (
   slates_ipc::confined_spawn::SpawnedChild,
   Vec<u16>,
-  u64,
   std::sync::mpsc::Sender<slates_ipc::confined_spawn::SpawnedChild>,
 );
 
@@ -5223,8 +5216,8 @@ fn install_spawner(
   config: &DaemonConfig,
   (config_shards, partition): (&[u16], u16),
 ) -> Result<(), ServerError> {
-  if let Some((spawner, served, start_took_ns, join_to)) = owner {
-    crate::spawning::own(spawner, served, start_took_ns, Some(join_to));
+  if let Some((spawner, served, join_to)) = owner {
+    crate::spawning::own(spawner, served, Some(join_to));
   }
   if let Some(end) = end {
     let placement = crate::spawning::Placement {
