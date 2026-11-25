@@ -2151,6 +2151,98 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
   );
 }
 
+/// Goal 93, main's ruling (b) (content kept once, on arrival, as stock's revlog chunks). Do: through a two-shard daemon's
+/// edge, push one changeset whose file is twice a request's room and compresses (every byte odd); stream-clone it; clone
+/// it. Expect: the push's segment made into chunks as it landed, each step compressing at most the shard's copy slice;
+/// the stream sending the file's chunk byte for byte with nothing compressed again (its count and send passes' zstd at
+/// zero); the clone's changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the
+/// decoded bytes at least the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at
+/// arrival.
+#[test]
+fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let config = crate::DaemonConfig::derive(&crate::daemon::test_profile(), &instance, Some(SHARDS));
+  let (room, slice) = (super::bounds_of(&config).room, config.copy_slice_bytes());
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|at| b"abcdefgh"[at % 8] | 1)
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let chunked = (
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_push::COMPRESS_PLAIN_BYTES,
+    ),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_push::COMPRESS_BYTES_MOST,
+    ),
+  );
+  let request = format!(
+    "GET /{name}?cmd=stream_out HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  let streamed = typed_exchange(port, &certificate, request.as_bytes());
+  let recompressed = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::COMPRESS_COUNT_NS,
+  ) + counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::COMPRESS_SEND_NS,
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  let cloned = hg_getbundle(edge, &name, &tip);
+  let decoded = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::DECOMPRESS_PLAIN_BYTES,
+  );
+  daemon.stop();
+  assert_hg_answered(&pushed);
+  assert!(
+    chunked.0 >= large.len() as u64,
+    "the push's file made into a chunk: {chunked:?}"
+  );
+  assert!(
+    chunked.1 > 0 && chunked.1 <= slice,
+    "a step's compression within the copy slice {slice}: {chunked:?}"
+  );
+  let mut chunk = Vec::new();
+  slates_hg::revlog_chunk::chunk(large, slates_hg::revlog_chunk::Pass::Send, &mut chunk)
+    .expect("the file's chunk");
+  assert!(
+    streamed
+      .2
+      .windows(chunk.len().min(64))
+      .any(|window| window == &chunk[..64]),
+    "the stream carries the file's chunk"
+  );
+  assert_eq!(recompressed, 0, "the stream compressed nothing again");
+  assert!(
+    decoded >= large.len() as u64,
+    "the clone decoded the file's chunk: {decoded}"
+  );
+  let stream = cloned
+    .2
+    .strip_prefix(b"\x04none")
+    .expect("an uncompressed answer");
+  assert!(
+    stream.windows(64).any(|window| window == &large[..64]),
+    "the clone carries the file's bytes"
+  );
+}
+
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
 /// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
 /// `Content-Type` and body.

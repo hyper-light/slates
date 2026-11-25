@@ -347,6 +347,9 @@ pub struct StoredPlace {
   pub offset: u64,
   /// The bytes.
   pub len: u64,
+  /// Whether they are a revlog chunk as stock stores it (`slates_store::texts::Form::Chunk`; goal 93, main's ruling
+  /// (b)): a stream copies it as it lies, a fetch decodes it; else its delta or whole as it is.
+  pub chunk: bool,
 }
 
 /// A revision as the changeset store keeps it (its `I` row: the version of a log by its node, as it landed): its full
@@ -815,7 +818,11 @@ impl Streaming {
       let Some(plain) = self.chunk_at(seq, rev)? else {
         return Ok(Stage::Counting(log, rev));
       };
-      let length = revlog_chunk::chunk_len(&plain, Pass::Count)?;
+      let length = if self.chunk_place(seq, rev) {
+        to_u64(plain.len())
+      } else {
+        revlog_chunk::chunk_len(&plain, Pass::Count)?
+      };
       if rev == 0 {
         self.sizing.clear();
       }
@@ -854,6 +861,33 @@ impl Streaming {
       inline,
     });
     Ok(next.map_or(Stage::Head, |next| Stage::Counting(next, 0)))
+  }
+
+  /// Whether revision `rev` of the log numbered `seq` has its place held as a revlog chunk (goal 93, main's ruling (b)):
+  /// sent as it lies, sized by its length, never compressed again.
+  fn chunk_place(&self, seq: u64, rev: u32) -> bool {
+    self
+      .held
+      .iter()
+      .find(|held| held.seq == seq)
+      .and_then(|held| held.revisions.get(usize::try_from(rev).ok()?))
+      .is_some_and(|row| row.place.chunk)
+  }
+
+  /// Revision `rev`'s chunk of the log numbered `seq` written to `out` from `plain`, its place's bytes: as they lie where
+  /// they are a chunk already ([`Streaming::chunk_place`]); else made into one by 7.2's rule (a place kept before the
+  /// ruling, or one a store keeps raw). Its length.
+  fn stored_into(
+    &self,
+    (seq, rev): (u64, u32),
+    plain: &[u8],
+    out: &mut Vec<u8>,
+  ) -> Result<u64, Refused> {
+    if self.chunk_place(seq, rev) {
+      out.extend_from_slice(plain);
+      return Ok(to_u64(plain.len()));
+    }
+    Ok(revlog_chunk::chunk(plain, Pass::Send, out)?)
   }
 
   /// The number and revision count of the log whose rows are held first.
@@ -979,7 +1013,7 @@ impl Streaming {
     }
     self.chain_base = entry.base;
     if let Some(plain) = plain
-      && revlog_chunk::chunk(&plain, Pass::Send, out)? != length
+      && self.stored_into((seq, rev), &plain, out)? != length
     {
       return Err(unreadable());
     }
@@ -1072,8 +1106,9 @@ impl Streaming {
         (found.node, found.flags, found.len)
       }
     };
-    // A revision against the null base is sent as its text alone, which its place holds (a whole kept raw, A-767 C1).
-    if !based && row.place.len != text {
+    // A revision against the null base is sent as its text alone, which a raw place holds whole (A-767 C1); a chunk's
+    // place holds its stored chunk, whatever its length (ruling (b)).
+    if !based && !row.place.chunk && row.place.len != text {
       return Err(unreadable());
     }
     Ok(Entry {
@@ -1118,7 +1153,7 @@ impl Streaming {
       return Ok(Stage::Data(log, rev));
     };
     admission.charge(u64::from(length))?;
-    if revlog_chunk::chunk(&plain, Pass::Send, out)? != u64::from(length) {
+    if self.stored_into((seq, rev), &plain, out)? != u64::from(length) {
       return Err(unreadable());
     }
     Ok(Stage::Data(log, rev.saturating_add(1)))
