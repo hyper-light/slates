@@ -262,7 +262,7 @@ mod tests {
       .map(|at| b"manifest line\n"[(at % 14) as usize])
       .collect();
     let incompressible: Vec<u8> = (0..3_000u32)
-      .map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8)
+      .map(|at| u8::try_from((at.wrapping_mul(2_654_435_761) >> 13) & 0xff).unwrap())
       .collect();
     let deltas = vec![
       Vec::new(),
@@ -287,7 +287,8 @@ mod tests {
       assert!(budget >= total || steps > 1, "{budget}: more than one step");
       let (payload, places) = chunked.finish();
       for (delta, place) in deltas.iter().zip(&places) {
-        let stored = &payload[place.start as usize..place.end as usize];
+        let range = usize::try_from(place.start).unwrap()..usize::try_from(place.end).unwrap();
+        let stored = &payload[range];
         let mut one_shot = Vec::new();
         crate::revlog_chunk::chunk(delta, crate::revlog_chunk::Pass::Send, &mut one_shot).unwrap();
         assert_eq!(stored, one_shot.as_slice(), "{budget}: the one-shot chunk");
