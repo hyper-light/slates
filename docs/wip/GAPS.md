@@ -1713,12 +1713,14 @@
 > FIXED by w-shared's A-902 (d48863ddb: the put carries the sender's configuration version, and a home behind it waits
 > for its own install within the put's budget).
 >
-> A git push of many new refs makes every new green in its landing's one step, OWED (w-git, 2026-11-24, main's order of
-> 15:06): git/git's whole history creates about 1,027 refs, mostly tags, each a Create whose make, secure, judge, hold
-> and commit run in the step that appends the entry, the cost w-hg measured for Mercurial's heads (452 heads held a
-> shard 3.5 s, watchdog exit). The way is w-hg's prepared-creates seam in `repository/push.rs` (agreed in writing
-> 2026-11-24: `prepare_create`, `PreparedCreates` handed to `push_planned`, prepared in slices under the landing turn
-> before the step, ids reserved ahead): git's driver hands its Creates in as Mercurial's does, once that lands.
+> A git push of many new refs makes every new green in its landing's one step, TO MEASURE (w-git, 2026-11-24, main's
+> order of 15:06; corrected the same day): git/git's whole history creates about 1,027 refs, mostly tags. A git create
+> is P2's deferred one (`BranchChange::CreateDeferred`, planned as `Step::Create { work: None, deferred: Some(push) }`),
+> so in the step it is only made (`Greens::branch`, a green at a version by identity, no walk) and owes its push
+> (`Greens::defer`): none of the secure, judge, hold and commit that cost Mercurial's heads 3.5 s for 452 (w-hg). Whether
+> 1,027 makes and defers hold a step past its quantum is unmeasured: `repository.push.landing_step_works_most` and the
+> landing step's time in a git leg's push of git/git decide it. If they do, w-hg's prepared-creates seam
+> (`repository/push.rs`, `PreparedCreates`, landed fda5613a1) is the way, its plan taught deferred creates too.
 >
 > One push's reading spread over several shards, NOT IN THE DESIGN (for Ada; w-git, 2026-11-24, main's order of 09:50):
 > stock git's `index-pack` resolves one pack's deltas over threads; slates reads one push on one shard. §4.17.1 item 2
