@@ -1354,6 +1354,13 @@ pub(crate) enum StartRefused {
   /// Another failure, by the operating system's number.
   Other(i32),
   /// The daemon's spawner was not there to start it or to answer its end (A-924): it never started, or it went.
+  #[cfg_attr(
+    not(unix),
+    allow(
+      dead_code,
+      reason = "Windows starts a hook with CreateProcess directly (A-924), so no spawner can be gone there"
+    )
+  )]
   SpawnerGone,
 }
 

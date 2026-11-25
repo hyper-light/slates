@@ -309,7 +309,7 @@ impl Hook {
       drop(write);
       read
     });
-    let child = spawned.map_err(|refused| spawn_refused(refused))?;
+    let child = spawned.map_err(spawn_refused)?;
     let input = Some(OwnedFd::from(input_write));
     let words = OwnedFd::from(words_read);
     let output = output_read.map(OwnedFd::from);
