@@ -135,3 +135,8 @@ fn a_green_behind_a_held_floor_retains_what_its_versions_changed_not_the_file() 
   );
   assert!(head.unwrap() == after(EDITS), "the head reads every edit");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

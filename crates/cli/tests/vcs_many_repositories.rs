@@ -1057,3 +1057,8 @@ fn many_repositories_on_one_daemon_each_hold_exactly_their_own_history() {
     failures.join("\n")
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

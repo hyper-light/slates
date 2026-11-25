@@ -20,6 +20,12 @@
 
 #[cfg(target_os = "linux")]
 fn main() {
+  // The daemon's spawner (A-924): this binary started as one serves before anything else runs, or a daemon it starts
+  // in process would start this binary again, whole, as its spawner.
+  #[cfg(unix)]
+  if let Some(served) = slates_ipc::spawner::serve_from_env() {
+    std::process::exit(i32::from(served.is_err()));
+  }
   linux::run();
 }
 

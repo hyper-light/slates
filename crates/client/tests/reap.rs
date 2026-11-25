@@ -275,3 +275,8 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   );
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -37959,3 +37959,8 @@ fn t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_n
     "resolved to the records by the rebuild's event alone: {held:?}; {state}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

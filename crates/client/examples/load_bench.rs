@@ -2700,6 +2700,12 @@ fn started_daemon(profile: &MachineProfile, instance: &str, external: bool) -> O
 }
 
 fn main() {
+  // The daemon's spawner (A-924): this binary started as one serves before anything else runs, or a daemon it starts
+  // in process would start this binary again, whole, as its spawner.
+  #[cfg(unix)]
+  if let Some(served) = slates_ipc::spawner::serve_from_env() {
+    std::process::exit(i32::from(served.is_err()));
+  }
   let tree = arg("--tree").unwrap_or_default();
   let levels = levels_arg();
   let profile = MachineProfile::measure_patiently(&ProfileOptions {

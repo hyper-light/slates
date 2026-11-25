@@ -611,3 +611,8 @@ fn a_status_on_a_starved_shard_is_refused_overloaded_on_time() {
   println!("status on a starved shard answered in {took:?}");
   check_typed_refusal("status on a starved shard", (shard, reply, took));
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

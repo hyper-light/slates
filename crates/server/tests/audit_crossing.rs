@@ -169,3 +169,8 @@ fn a_batch_sent_again_after_a_lost_acknowledgement_appends_nothing_twice() {
     "a batch sent again appended nothing twice: {after:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -563,3 +563,8 @@ fn read_file_of(stream: &mut TcpStream, export: &str, xid: u32) -> Vec<u8> {
   let fh = common::nfs::lookup(stream, &root, FILE, xid + 1);
   read_at(stream, &fh, (0, count(PAGE)), xid + 2).unwrap()
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

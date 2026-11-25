@@ -400,3 +400,8 @@ fn judge(client: &mut Client, green: VolumeId, told: &[Told], seed: &[u8]) {
     told.iter().filter(|t| t.answer.is_err()).count()
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();
