@@ -670,3 +670,10 @@ Waiting: main's route; arena-7 and arena-8.
 - Owed (GAPS): hundreds of existing heads moved in one push; the record's write grows with heads × tree; one green a slice; git's driver adopting PreparedCreates (w-git).
 - Process slips, owned: two git resets (one bare, one path-limited), neither touching work; one `cargo build --tests` that filled the shared disk (freed through kiln).
 - Next: C1 (2), the intake keeping no whole text; then stream and push speed, then pending steps.
+
+## 2026-11-24 ~20:00: after the reboot, TSan fix and C1 (2) piece 1 landed
+- f289d786f: TSan diag 3's parking test read its parked interval before the release begins (the release's round trip had been inside it); an ordering claim, nothing scaled or skipped.
+- f754c36f6 + 4885954fa: C1 (2) piece 1. A push's file revision is taken a window a step, never whole (`delta::Patching` over a base read from the fork's rows via `run_at`; a let-go base asked and brought back). The base cache and chain rebuild are gone for files. Red: 43,025 bytes held → ≤ 8,192.
+- Reported to main, not mine: the A-908 holder-rebuild test fails 4/5 alone under load (Later vs Installed(1)).
+- Run request to main: 57k push+restart and r618 intake_steps in release.
+- Next: C1 (2) piece 2, manifests a window at a time (Taker::last, read_of parsing every entry), then changesets.
