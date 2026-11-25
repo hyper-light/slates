@@ -796,6 +796,9 @@ fn serve(
     waiting,
     next: 0,
   };
+  // Whether a request was served yet: the wait before the first is the owner's start, not a gap between asks, and is
+  // never learned as one (a slow start, a test's setup under load, read as a long gap, kept a burst parked).
+  let mut served_once = false;
   loop {
     landings.let_go_if_dropped(&mut store);
     // From here the owner waits for work: a request sent after it waited on the owner's wake, one before on its work.
@@ -808,9 +811,17 @@ fn serve(
       },
     };
     let dequeued_ns = slates_machine::clock::monotonic_ns();
-    if met != Met::Queued {
-      gaps.learn(dequeued_ns.saturating_sub(idle_ns));
+    // The gap is the asker's: from the wait's start to the request's send, where it carries one sent after it, never to
+    // its taking, which for one met parked adds the wake itself (a gap and a wake learned so, the next gap always
+    // predicted past the wake, and one park kept the owner parked for good).
+    if met != Met::Queued && served_once {
+      let arrived_ns = match asked.timed {
+        Some(_) if asked.sent_ns >= idle_ns => asked.sent_ns.min(dequeued_ns),
+        _ => dequeued_ns,
+      };
+      gaps.learn(arrived_ns.saturating_sub(idle_ns));
     }
+    served_once = true;
     // A timed request met parked carries what the park's wake cost: from the later of its send and the park.
     if let (Met::Parked(spun), true) = (met, asked.timed.is_some()) {
       let parked_ns = idle_ns.saturating_add(spun).max(asked.sent_ns);
@@ -1555,3 +1566,6 @@ fn texts_made(
   }
   Ok(MadeTexts::Made(made))
 }
+
+#[cfg(test)]
+mod tests;

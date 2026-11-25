@@ -1891,9 +1891,13 @@
 > the later of a request's send and the park to its taking, gain 1/8, seeded by the profile's wake), and spins, at most
 > that wake, only where the next gap is predicted within it; else it parks at once. Held by
 > `reads_further_apart_than_a_wake_park_at_once` (16 reads 20 ms apart, the wake seeded at 2 ms: every read parked,
-> none spun; red under the capped rule: 40.56 ms spun, none met) and `back_to_back_reads_are_met_spinning_not_parked`
-> (seeded at 2 ms: 64 of 64 met spinning). Unseeded on an idle MacBook the owner parks back to back: its wake, about 8 µs,
-> is shorter than the asker's turnaround. Owed: the 57k split under the rule (main's); the request count (3,387 at
+> none spun; red under the capped rule: 40.56 ms spun, none met), and over fixed histories by `owner/tests.rs`
+> (`a_gap_predicted_past_the_wake_parks_at_once`, red under the capped rule; within the wake spun for at most it; a wake
+> cheaper than the gap parks; the learned wake displaces the seed; a burst after an idle gap spun again). Back to back the
+> owner spins where its asker's gap is within the wake (64 of 64 on the MacBook at load 30, five runs of eight) and parks
+> where the asker is descheduled as long as a wake (the rest): the machine decides, so that test holds the count and the
+> parts' sum alone. Found on the way: a gap learned to the request's taking holds the wake itself, so one park kept the
+> owner parked for good; the gap is learned to the request's send, and the owner's start is never one. Owed: the 57k split under the rule (main's); the request count (3,387 at
 > 7a9cb385e) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
