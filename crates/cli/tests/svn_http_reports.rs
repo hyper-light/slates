@@ -687,3 +687,8 @@ fn stock_svn_blames_merged_revisions_over_the_vcs_http_edge_as_against_svnserve(
     "merged blame over HTTP as against svnserve"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

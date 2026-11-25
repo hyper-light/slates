@@ -317,3 +317,8 @@ fn a_write_through_one_fuse_mount_reaches_another_just_after_its_reply() {
   drop(map);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

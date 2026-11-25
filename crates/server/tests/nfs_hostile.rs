@@ -1922,3 +1922,8 @@ fn a_scope_whose_body_panics_still_stops_its_spinners() {
     "the scope ended with its body's panic instead of waiting on its spinner"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

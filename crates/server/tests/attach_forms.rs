@@ -1122,3 +1122,8 @@ fn assert_the_root_is_no_bind_source(client: &mut Client, id: VolumeId, root: &R
     );
   }
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

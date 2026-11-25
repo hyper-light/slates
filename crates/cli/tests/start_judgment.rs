@@ -381,3 +381,8 @@ fn a_stuck_start_is_killed_and_restarted() {
     "killed within the window and replaced: after {replaced_after:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

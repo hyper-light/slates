@@ -257,3 +257,8 @@ fn one_target_has_one_landing_lease_whichever_shard_and_spelling_lands_it() {
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

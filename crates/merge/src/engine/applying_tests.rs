@@ -33,13 +33,16 @@ fn applied_a_unit_a_step(
 }
 
 /// Everything a reader of `green` reads that a version's apply changes: its histories ([`folded_state`]), its head and
-/// the head's identity.
+/// the head's identity, and its change index (each version's entries, each path's last change, their bytes).
 fn read_whole(green: &mut Green) -> String {
   format!(
-    "{} {:?}\n{}",
+    "{} {:?}\n{}\n{:?}\n{:?} {}",
     green.head(),
     green.head_identity(),
-    folded_state(green)
+    folded_state(green),
+    green.changes,
+    green.latest_change,
+    green.changes_bytes,
   )
 }
 

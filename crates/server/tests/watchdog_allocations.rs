@@ -200,3 +200,8 @@ fn the_watchdogs_beat_allocates_nothing_once_it_runs() {
   );
   drop(daemon);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

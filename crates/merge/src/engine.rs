@@ -2397,6 +2397,12 @@ struct CommitRun {
   staged: Staged,
   delta: BTreeMap<String, Vec<Op>>,
   changed: BTreeSet<String>,
+  /// The hard links naming a changed path that was a special, found so far: changed with it (A-920 piece 1b).
+  links: Vec<String>,
+  /// The last changed path whose links were found.
+  links_after: Option<String>,
+  /// The version's change entries recorded so far, in path order.
+  entries: Vec<ChangeEntry>,
   phase: CommitPhase,
 }
 
@@ -2409,6 +2415,12 @@ enum CommitPhase {
   Removed,
   /// Setting the files staged with new bytes.
   Set,
+  /// Dropping the metadata of each path emptied where nothing stands there now.
+  Emptied,
+  /// Finding the hard links naming each changed path that was a special.
+  Links,
+  /// Recording each changed path in the change index.
+  Changes,
   /// Ended.
   Ended,
 }
@@ -5884,6 +5896,9 @@ impl Green {
       staged: Staged::default(),
       delta: BTreeMap::new(),
       changed,
+      links: Vec::new(),
+      links_after: None,
+      entries: Vec::new(),
       phase: CommitPhase::Effects,
     }
   }
@@ -5924,10 +5939,18 @@ impl Green {
         CommitPhase::Set => match run.staged.set.pop() {
           Some(file) => self.set_file(file, run.version, &mut run.delta),
           None => {
-            self.commit_finish(run);
-            return true;
+            // The paths emptied in the order they were staged.
+            run.staged.emptied.reverse();
+            run.phase = CommitPhase::Emptied;
           }
         },
+        CommitPhase::Emptied => self.emptied_one(run),
+        CommitPhase::Links => self.links_one(run),
+        CommitPhase::Changes => {
+          if self.change_one(run) {
+            return true;
+          }
+        }
         CommitPhase::Ended => return true,
       }
       if spent() {
@@ -5936,22 +5959,81 @@ impl Green {
     }
   }
 
-  /// A commit's end: each path emptied takes its metadata with it once nothing stands there, then its delta and changes
-  /// are recorded.
-  fn commit_finish(&mut self, run: &mut CommitRun) {
-    // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
-    // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
-    // so a path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
-    // one's mode 0755).
-    let version = run.version;
-    for path in core::mem::take(&mut run.staged.emptied) {
-      if !self.holds(&path) {
-        self.drop_metadata(&path, version);
+  /// A commit's end, a unit a step (A-920 piece 1b: 6.6 ms whole at 9,000 files, debug): a path emptied takes its mode
+  /// and attributes with it once nothing stands there. A file, a directory or a link this version removed takes them
+  /// once nothing stands at its path (a rename or a file made again in the same version keeps them), as a special's do:
+  /// they are the inode's, so a path made again later starts without them (A-618; a file a client deleted and pushed
+  /// again kept the deleted one's mode 0755). Once every one is, the version's delta is kept and its changes recorded.
+  fn emptied_one(&mut self, run: &mut CommitRun) {
+    match run.staged.emptied.pop() {
+      Some(path) => {
+        if !self.holds(&path) {
+          self.drop_metadata(&path, run.version);
+        }
+      }
+      None => {
+        self.deltas.push(core::mem::take(&mut run.delta));
+        run.phase = CommitPhase::Links;
       }
     }
-    self.deltas.push(core::mem::take(&mut run.delta));
-    self.record_changes(version, core::mem::take(&mut run.changed));
-    run.phase = CommitPhase::Ended;
+  }
+
+  /// The hard links naming the next changed path where it was a special, a path a unit: changed with it. Once every
+  /// changed path is looked at, they join the changed paths, and their recording begins.
+  fn links_one(&mut self, run: &mut CommitRun) {
+    let after = run.links_after.as_deref();
+    let bounds = (
+      after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+      std::ops::Bound::Unbounded,
+    );
+    let Some(path) = run.changed.range::<str, _>(bounds).next() else {
+      run.changed.extend(core::mem::take(&mut run.links));
+      run.phase = CommitPhase::Changes;
+      return;
+    };
+    if self.was_special(path) {
+      run
+        .links
+        .extend(self.links_to.get(path).into_iter().flatten().cloned());
+    }
+    run.links_after = Some(path.clone());
+  }
+
+  /// The next changed path recorded as changed at the commit's version, a path a unit: the path's last change, its
+  /// earlier version's entry no longer the last, its bytes charged. Once every one is, the version's list kept (none
+  /// for a version that changed nothing): whether the commit ended.
+  fn change_one(&mut self, run: &mut CommitRun) -> bool {
+    let version = run.version;
+    let Some(path) = run.changed.pop_first() else {
+      if !run.entries.is_empty() {
+        self
+          .changes
+          .insert(version, core::mem::take(&mut run.entries));
+      }
+      run.phase = CommitPhase::Ended;
+      return true;
+    };
+    let bytes = change_bytes(&path);
+    match self.latest_change.insert(path.clone(), version) {
+      None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
+      // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
+      Some(earlier) => {
+        if let Some(entries) = self.changes.get_mut(&earlier)
+          && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path))
+          && let Some(entry) = entries.get_mut(at)
+        {
+          entry.last = false;
+        }
+      }
+    }
+    self.changes_bytes = self.changes_bytes.saturating_add(bytes);
+    let index = u32::try_from(run.entries.len()).unwrap_or(u32::MAX);
+    run.entries.push(ChangeEntry {
+      index,
+      path,
+      last: true,
+    });
+    false
   }
 
   /// The effects a version's node moves add to it (A-646: a hard link names its node, never a
@@ -6283,40 +6365,6 @@ impl Green {
       || self.specials.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
-  }
-
-  /// Records what version `version` changed in the change index (`changes`): every path an effect changed, and every
-  /// hard link naming one of them that is or was a special, as [`Green::changed_between`] counts a link changed with
-  /// the special it names. The cost of the version's own changes and their links.
-  fn record_changes(&mut self, version: u64, mut changed: BTreeSet<String>) {
-    let links: Vec<String> = changed
-      .iter()
-      .filter(|path| self.was_special(path))
-      .filter_map(|path| self.links_to.get(path))
-      .flatten()
-      .cloned()
-      .collect();
-    changed.extend(links);
-    if changed.is_empty() {
-      return;
-    }
-    for path in &changed {
-      let bytes = change_bytes(path);
-      match self.latest_change.insert(path.clone(), version) {
-        None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
-        // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
-        Some(earlier) => {
-          if let Some(entries) = self.changes.get_mut(&earlier)
-            && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(path))
-            && let Some(entry) = entries.get_mut(at)
-          {
-            entry.last = false;
-          }
-        }
-      }
-      self.changes_bytes = self.changes_bytes.saturating_add(bytes);
-    }
-    self.changes.insert(version, numbered(changed));
   }
 
   /// Each path's last change after the origin in any dimension, read off the histories' last entries.

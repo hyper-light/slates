@@ -64101,6 +64101,17 @@ GAPS.
   1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds the shard's flush measured by
   an import alone first, not 500 ms: every staging step waits a hold, and the first batch's 151 steps took it past its
   patience (61 s at 150 ms; 3.5-5.3 s at a flush, its await 0.45-1.1 s against `F` 5.6-9.8 ms).
+  **1b, the commit's end** (12.7-13.6 ms at 9,000 files after 4c: `commit_finish` 6.6-7.0, then the batch's
+  `finish_staged` 6.7). `commit_finish` and `record_changes` are now phases of the commit run (`CommitPhase::Emptied`,
+  `Links`, `Changes`), a unit each: the metadata of each emptied path where nothing stands there; the links naming
+  each changed path that was a special, then joined to the changed paths; then each changed path recorded (its last
+  change, its earlier version's entry no longer the last, its bytes), its entry numbered as it is taken from the
+  ordered set, so the version's list is the one `numbered` made, kept once every path is (none for a version that
+  changed nothing). The commit's end step 12.7-13.6 ms → 6.2-6.4 ms (`finish_staged`'s `encoded_len`, 1c). Oracles:
+  the applying oracle's greens, whole and a unit a step, now compare their change index too (each version's entries,
+  each path's last change, their bytes); `changed_since_reports_every_dimension_as_changed_between_does` and
+  `changed_since_reads_the_span_alone_and_folds_with_the_histories` (merge's integration tests) fail where an earlier
+  entry stays marked last, which no lib test caught; a version's list never kept fails 33 lib tests.
 - **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
   (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
   texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:

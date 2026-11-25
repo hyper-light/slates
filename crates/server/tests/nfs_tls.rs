@@ -457,3 +457,8 @@ fn a_reply_larger_than_the_tls_send_buffer_is_sealed_whole() {
   session.transmit(&mut ciphertext).unwrap();
   assert_eq!(client_receives(&mut client, &ciphertext), record);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

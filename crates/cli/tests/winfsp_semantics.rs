@@ -1776,3 +1776,8 @@ fn an_exact_drive_keeps_two_spellings_two_files() {
   assert_eq!(std::fs::read(drive.path("a.txt")).unwrap(), b"lower");
   drop(held);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

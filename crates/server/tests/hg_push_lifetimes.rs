@@ -455,3 +455,8 @@ fn a_pushs_allocation_by_site_size_and_life_under_stock_mercurial() {
   assert!(total > 0 && !sites.is_empty(), "the sampler counted");
   println!("hg_push_lifetimes: kept-class bytes sampled {kept}");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();
