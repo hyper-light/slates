@@ -710,3 +710,7 @@ Waiting: main's route; arena-7 and arena-8.
 - Landed main 0c4bd26fd: d33fc0b64 (merge-push manifest base: ask the chain's let-go link, read over it; red a_pushs_manifest_reads_one_the_same_push_kept_over_a_let_go_chain) and bbcfe756e (pins within each paced step; counters hg_push.pin_{revisions,windows}_step_most; no unit red, main's 57k counter is the check).
 - (B) verified at 57k by main: 6/6 ok, pinned_away 0, at pre-(B) speed.
 - Next (main's order): stream turn pacing (~100 ms a turn, heartbeat?): log yield→next-poll gap as a counter first; then (b).
+- Merge-push fix confirmed by main and w-interop: hg-matrix 30/30 at 0c4bd26fd.
+- Landed main b33c6a4b4: stream counters (span, turn_ns, steps, turns_at_ceiling, write_ns/waits, vcs_http.reply_yield_gap_ns). In-process: no gap between turns (span = turns + store waits); 57k likely step-cost bound (turns at ceiling). Waiting on main's 57k read.
+- Reported to main: git test a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding fails 4/4 on main (w-git's).
+- Next: (b) step 1 (T row form byte + read_place decode + red 1) unless main asks stream step cost first.
