@@ -1178,6 +1178,15 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+>   The matrix's row BUILT (2026-11-25, w-interop; main's order): `ci/interop/hg-matrix.sh` makes a non-publishing
+>   repository of its own (`evo-repository`) and runs stock hg with `experimental.evolution = all`: drafts pushed then
+>   one amended and pushed, the server telling `1 new obsolescence markers` (`evo-amend-push`); a draft rebased onto the
+>   amend and pushed (`evo-rebase-push`); a clone holding the 2 markers and exactly the successors, all draft, none of
+>   the drafts they obsolete (`evo-clone`), verifying clean (`evo-verify`); and a marker made on the clone's side pushed
+>   and pulled back by the first client, its 3 markers and 3 obsolete changesets (`evo-markers-back`). Locally against
+>   stock hg 7.2.4 at 29221d5ab (debug, the r400 cut of hg's history as the source): the six rows 6 of 6. The same run's
+>   `merge-push` and `rebase-push` were refused `UnknownDeltaBase { log: Manifests }` (the store answered no text for a
+>   manifest an earlier push landed), sent to w-hg as found.
 >   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
 >   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
 >   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
