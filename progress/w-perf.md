@@ -1,5 +1,14 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~21:30 PST
+- LANDED 1227afcb1: vcs_store.hg_import.segment_land_wait_ns / _max_ns (main reruns the 57k on it: 2,087 segments,
+  peak 361 MB at 0d05da26e; the time question rests on the landings' share).
+- LANDED 75005ae26 (in 8894c0096): svn storage A/B, git-2000: slates 468,604 KiB allocated vs FSFS 51,020 (9.2x;
+  11.3x apparent); tests/svn_import_storage.rs; BENCHMARKS + GAPS. No storage change (changeset ruling).
+- LANDED 567932413: mrc re-read of the key read last counted in place (red 2,529 inserts/1,766 runs; answers equal).
+- Deltify job: none to build (A-842 closed it; deltas derived, never stored).
+- Next (main): P7, what holds the arena's 489 MB deferred frees after the svn import, red first.
+
 ## 2026-11-24 ~18:00 PST
 - Goal 93 hg R: measured the 57k import at 15e739357 (peak RSS 1,076,144 KiB, from 5.73 GB; one segment's file texts
   held whole, about 600 MB, set the content object's high-water). LANDED 0d05da26e: a segment is also cut once its
