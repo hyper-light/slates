@@ -5598,6 +5598,12 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   )
   .saturating_sub(logs_before);
   let held_after = ids.map(|id| log_windows_held(&daemon, id));
+  let files_after = file_windows_held(&daemon, ids[1]);
+  let work_texts = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::WORK_TEXTS_READ,
+  );
   let asked = counted_on(
     &daemon,
     REPOSITORY,
@@ -5659,6 +5665,18 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
     "the pull read its changeset's and manifests' texts whole from the store"
   );
   assert_clone_reads_its_texts_in_batches(clone_before, clone_read);
+  println!(
+    "file objects held after the pushes {files_after:?}; the works read {work_texts} texts back"
+  );
+  assert!(
+    work_texts > 0,
+    "the last push's work read a let-go file text back"
+  );
+  assert_eq!(
+    (files_after.1, files_after.2),
+    (0, 0),
+    "no landed file text held once the pushes end"
+  );
 }
 
 /// What a daemon's fetches have read of the changeset store so far: the changelog's and manifests' texts read whole
@@ -5821,6 +5839,42 @@ fn log_windows_held(
     })
   })
   .expect("the repository's rows")
+}
+
+/// `repository`'s file revisions on its shard: how many, how many of their bytes' objects with any bytes have a window
+/// held in its content store, and those objects' bytes (as [`log_windows_held`] counts the logs').
+fn file_windows_held(
+  daemon: &Daemon,
+  repository: slates_db::catalog::RepositoryId,
+) -> (usize, usize, u64) {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      let index = &store.index;
+      let mut objects = Vec::new();
+      let paths: Vec<Vec<u8>> = index.file_logs(content).map(<[u8]>::to_vec).collect();
+      for path in &paths {
+        let log = slates_hg::index::Log::File(path);
+        for rev in 0..index.len(content, log) {
+          let row = index.revision(content, log, rev)?;
+          objects.push(row.bytes);
+        }
+      }
+      let held: Vec<u64> = objects
+        .iter()
+        .filter(|object| content.len_of(object).is_some_and(|len| len > 0))
+        .filter(|object| {
+          content
+            .object_layout(object)
+            .iter()
+            .any(|(window, _)| !content.is_away(window))
+        })
+        .map(|object| content.len_of(object).unwrap_or(0))
+        .collect();
+      Some((objects.len(), held.len(), held.iter().sum()))
+    })
+  })
+  .expect("the repository's file rows")
 }
 
 /// Lets go every object `repository`'s changelog and manifest rows name on its shard: how many of those with any bytes

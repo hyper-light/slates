@@ -1150,6 +1150,13 @@ fn landed_put_back(
   })?;
   if put {
     state.count(LANDED_BROUGHT_BACK, 1);
+    // A read-back, cached by the repository its landed note names (`vcs_share::read_backs`).
+    crate::vcs_share::read_backs::brought_back(
+      state,
+      *window,
+      len,
+      crate::vcs_share::read_backs::Holder::Landed,
+    );
   }
   Ok(())
 }
@@ -1547,16 +1554,14 @@ pub(crate) fn region_held_here() -> Vec<ContentId> {
 /// Counter: a home message of another version this member refused at once, typed (A-727 (d1a): no mixed-version
 /// homing). Format: a counter name.
 pub(crate) const VERSION_REFUSED: &str = "vcs_store.homes.version_refused";
-/// Format: the status count of a put a home not ranked by its own configuration waited on because it is behind its
-/// sender (the carried configuration newer than its own installed one, or the sender not among its members): A-902's
-/// wait for its own install, begun.
-pub(crate) const INSTALL_WAITS: &str = "vcs_store.homes.install_waits";
-/// Format: such waits that an install ended, this node ranked a home or no longer behind its sender, the put then judged
-/// as any other.
-pub(crate) const INSTALL_WAIT_CAUGHT_UP: &str = "vcs_store.homes.install_wait_caught_up";
-/// Format: such waits that met their budget still not ranked a home, the put refused `NotAHome`: the bound a sender pays
-/// once for a home that never installs its configuration (removed, or cut off).
-pub(crate) const INSTALL_WAIT_ELAPSED: &str = "vcs_store.homes.install_wait_elapsed";
+/// Format: the status count of a put (or a put's first part) this node answered `Behind` at once, behind the
+/// configuration its sender ranked by (A-912; A-902's wait for its own install, answered rather than held).
+pub(crate) const BEHIND_ANSWERED: &str = "vcs_store.homes.behind_answered";
+/// Format: the status count of a home a region exchange found behind it (its answer `Behind`), asked again once a
+/// council round had passed (A-912).
+pub(crate) const BEHIND_ASKED_AGAIN: &str = "vcs_store.homes.behind_asked_again";
+/// Format: the status count of such a home that kept the put when asked again: A-912's path, run and accepted.
+pub(crate) const BEHIND_KEPT_AFTER: &str = "vcs_store.homes.behind_kept_after";
 /// Counter: a home's reply refusing this member's version, or one it could not read, its exchange failed at once
 /// (A-727 (d1a)). Format: a counter name.
 pub(crate) const REPLY_OTHER_VERSION: &str = "vcs_store.homes.reply_other_version";
@@ -1715,101 +1720,61 @@ async fn read_part(
   })
 }
 
-/// Waits, within `budget_ns`, until this node is not behind the configuration a put's `sender` ranked the window's homes
-/// by, `carried` (A-902; gate 8 and 9: a fresh fleet's first push refused `HomedShort` by a home answering `NotAHome`
-/// about 1 ms into its budget, before it had installed the region's configuration). Behind means: this node's own
-/// configuration does not rank it among the window's homes, and either `carried` is newer than its own installed version
-/// or `sender` is not among its members (a joiner's configuration before the region's comes from its own council, whose
-/// versions are not the region's). Each changing install wakes the wait ([`InstallChange`]), and it ranks again; no
-/// timer. A node ranked a home, or at the sender's version with the sender among its members, is not behind: a true
-/// `NotAHome` or a stale sender is answered at once. Returns the nanoseconds spent; past the budget the put is judged as
-/// it stands, refused `NotAHome`, counted [`INSTALL_WAIT_ELAPSED`].
-async fn caught_up(
+/// Whether this node is behind the configuration a put's `sender` ranked the window's homes by, `carried` (A-902's rule):
+/// its own configuration does not rank it among the window's homes, and either `carried` is newer than its own installed
+/// version or `sender` is not among its members (a joiner's configuration before the region's comes from its own
+/// council, whose versions are not the region's). Its installed version where it is behind; `None` where it is not (a
+/// node ranked a home, or at the sender's version with the sender among its members, answers as it stands: a true
+/// `NotAHome` or a stale sender at once), and off a shard.
+fn behind_its_sender(
   identity: &[u8; 32],
   (sender, carried): (slates_db::HostId, u64),
-  budget_ns: u64,
-) -> u64 {
-  let began = slates_rt::futures::now_ns();
-  let mut waited = false;
-  while let Some((behind, seen)) = crate::state::with_state(|state| {
+) -> Option<u64> {
+  crate::state::with_state(|state| {
     let local = state.fleet.host();
     let members = state.fleet.members();
+    let installed = state.fleet.configuration().version;
     let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
     let ranked = slates_db::identity_homes::homes(identity, members, f).contains(&local);
-    let behind =
-      !ranked && (carried > state.fleet.configuration().version || !members.contains(&sender));
-    (behind, state.fleet.installs())
-  }) {
-    if !behind {
-      if waited {
-        let _ = crate::state::with_state(|state| state.count(INSTALL_WAIT_CAUGHT_UP, 1));
-      }
-      break;
-    }
-    if !waited {
-      waited = true;
-      let _ = crate::state::with_state(|state| state.count(INSTALL_WAITS, 1));
-    }
-    let spent = slates_rt::futures::now_ns().saturating_sub(began);
-    let left = budget_ns.saturating_sub(spent);
-    let woken = if left == 0 {
-      None
-    } else {
-      match slates_rt::futures::within(left, InstallChange { seen, token: None }).await {
-        Ok(Some(true)) => Some(true),
-        Ok(Some(false)) | Err(_) => Some(false),
-        Ok(None) => None,
-      }
-    };
-    match woken {
-      Some(true) => {}
-      // No wait could be made (off a shard): judged as it stands, never a spin.
-      Some(false) => break,
-      None => {
-        let _ = crate::state::with_state(|state| state.count(INSTALL_WAIT_ELAPSED, 1));
-        break;
-      }
-    }
-  }
-  slates_rt::futures::now_ns().saturating_sub(began)
+    (!ranked && (carried > installed || !members.contains(&sender))).then_some(installed)
+  })
+  .flatten()
 }
 
-/// The wait of [`caught_up`] (A-902): ready once this shard's fleet node has made a changing install since `seen`
-/// (`true`), its waker registered with the node under its token meanwhile; `false` when the shard's state cannot be read
-/// (off a shard). Dropped, it takes its registration away, so none outlives it.
-struct InstallChange {
-  seen: u64,
-  token: Option<u64>,
-}
-
-impl std::future::Future for InstallChange {
-  type Output = bool;
-
-  fn poll(
-    self: std::pin::Pin<&mut Self>,
-    cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<bool> {
-    let this = self.get_mut();
-    let polled = crate::state::with_state(|state| {
-      if state.fleet.installs() != this.seen {
-        if let Some(token) = this.token.take() {
-          state.fleet.forget_install_waiter(token);
-        }
-        return std::task::Poll::Ready(true);
-      }
-      this.token = Some(state.fleet.await_install(this.token, cx.waker()));
-      std::task::Poll::Pending
-    });
-    polled.unwrap_or(std::task::Poll::Ready(false))
-  }
-}
-
-impl Drop for InstallChange {
-  fn drop(&mut self) {
-    if let Some(token) = self.token.take() {
-      let _ = crate::state::with_state(|state| state.fleet.forget_install_waiter(token));
+/// The answer a put (or a put's first part) from `sender` gets from a node behind the configuration it was ranked by
+/// (A-912, main 01a20182's ruling of 2026-11-24): `Behind` with this node's installed version, at once, counted
+/// [`BEHIND_ANSWERED`]. A-902 had the node hold the put until its own install, but that install comes with the council's
+/// next round, whose append to this node rides the record session the sender's put held: neither moved until the put's
+/// budget ran out. The sender asks again once a council round has passed (`exchange`). `None` for any other message, or
+/// a node not behind.
+fn answered_behind(
+  message: &slates_cluster::homes::HomeMessage,
+  sender: slates_db::HostId,
+) -> Option<Vec<u8>> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let (identity, carried) = match message {
+    HomeMessage::Put {
+      identity,
+      configuration,
+      ..
     }
-  }
+    | HomeMessage::PutPart {
+      identity,
+      configuration,
+      offset: 0,
+      ..
+    } => (identity, *configuration),
+    _ => return None,
+  };
+  let installed = behind_its_sender(identity, (sender, carried))?;
+  let _ = crate::state::with_state(|state| state.count(BEHIND_ANSWERED, 1));
+  Some(
+    HomeMessage::Answer {
+      identity: *identity,
+      outcome: HomeOutcome::Behind { installed },
+    }
+    .encode(),
+  )
 }
 
 /// Serves one home exchange from another member of the region on shard `origin` (module docs, "From the region";
@@ -1818,7 +1783,7 @@ impl Drop for InstallChange {
 /// shard's image holding it is published ([`published`], A-727's barrier); a read answered with the bytes; a let-go
 /// answered once its holder is let go. Each wait is judged in its target's own time within `budget_ns`. Malformed bytes
 /// answer nothing, as the session's other streams do. A put (or a put's first part) from `sender` that this node is
-/// behind waits first for this node's own install ([`caught_up`], A-902).
+/// behind is answered `Behind` at once ([`answered_behind`], A-912), never held for this node's install.
 pub(crate) async fn serve_remote(
   (origin, sender): (u16, slates_db::HostId),
   request: &[u8],
@@ -1832,8 +1797,9 @@ pub(crate) async fn serve_remote(
     Ok(message) => message,
     Err(answer) => return answer,
   };
-  // What is left of the message's budget once this node is not behind its sender's configuration is the keep's.
-  let budget_ns = budget_ns.saturating_sub(spent_catching_up(&message, sender, budget_ns).await);
+  if let Some(behind) = answered_behind(&message, sender) {
+    return behind;
+  }
   let Some((local, members, f, shards)) = crate::state::with_state(|state| {
     state.count(REMOTE_SERVED, 1);
     (
@@ -1964,30 +1930,6 @@ fn decoded(request: &[u8]) -> Result<slates_cluster::homes::HomeMessage, Vec<u8>
       )
     }
     Err(_) => Err(Vec::new()),
-  }
-}
-
-/// The nanoseconds of a message's `budget_ns` spent waiting until this node is not behind the configuration its
-/// `sender` ranked by ([`caught_up`], A-902): a put or a put's first part waits; nothing else does.
-async fn spent_catching_up(
-  message: &slates_cluster::homes::HomeMessage,
-  sender: slates_db::HostId,
-  budget_ns: u64,
-) -> u64 {
-  use slates_cluster::homes::HomeMessage;
-  match message {
-    HomeMessage::Put {
-      identity,
-      configuration,
-      ..
-    }
-    | HomeMessage::PutPart {
-      identity,
-      configuration,
-      offset: 0,
-      ..
-    } => caught_up(identity, (sender, *configuration), budget_ns).await,
-    _ => 0,
   }
 }
 
@@ -2940,111 +2882,233 @@ pub(crate) async fn home_in_region(
   (bytes, owner): (Vec<u8>, HomeOwner),
   budget: slates_cluster::CommitBudget,
 ) -> Homed {
-  let Some((local, members, f)) = crate::state::with_state(|state| {
-    (
-      state.fleet.host(),
-      state.fleet.members().to_vec(),
-      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
-    )
-  }) else {
-    return Homed {
-      outcome: Err(HomeRefused::Unanswered),
-      bytes,
-    };
-  };
   let identity = ContentId::of(&bytes);
-  let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
   let budget_ns = budget.max_deadline_ns();
-  let mut kept = 0usize;
-  let mut here = None;
   let began = slates_rt::futures::now_ns();
-  if homes.contains(&local) {
-    match kept_here(origin, shards, (&bytes, owner), budget_ns).await {
-      Ok((durable, refused)) => {
-        kept = durable;
-        here = Some(refused);
+  let mut homing = Homing {
+    kept_by: Vec::new(),
+    bytes,
+    ranked: Vec::new(),
+    reranked: false,
+    other_version: false,
+  };
+  loop {
+    let Some((local, members, f, installs)) = crate::state::with_state(|state| {
+      (
+        state.fleet.host(),
+        state.fleet.members().to_vec(),
+        usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+        state.fleet.installs(),
+      )
+    }) else {
+      return homing.ended(Err(HomeRefused::Unanswered));
+    };
+    let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
+    if !homing.ranked.is_empty() && homing.ranked != homes {
+      homing.reranked = true;
+    }
+    homing.ranked.clone_from(&homes);
+    let wanted: Vec<slates_db::HostId> = homes
+      .iter()
+      .copied()
+      .filter(|home| !homing.kept_by.contains(home))
+      .collect();
+    if wanted.is_empty() && !homes.is_empty() {
+      if homing.reranked {
+        let _ = crate::state::with_state(|state| state.count(HOMING_RERANKED_KEPT, 1));
       }
-      Err(refused) => {
-        slates_machine::log_line!(
-          "slates-server: a homing of {identity:?} fell short at once: this node, one of its {} homes, refused its keep \
-           in {} ns: {refused:?}",
-          homes.len(),
-          slates_rt::futures::now_ns().saturating_sub(began)
-        );
-        return Homed {
-          outcome: Err(refused),
-          bytes,
-        };
-      }
+      crate::state::with_state(|state| state.count(HOMED_IN_REGION, 1));
+      return homing.ended(Ok(identity));
+    }
+    let left_ns = budget_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    // No home ranked (no members known) is never homed, and never a loop.
+    if left_ns == 0 || homes.is_empty() {
+      return homing.short(identity, (&homes, budget_ns));
+    }
+    // A round of puts within the live commit's deadline, or what is left: a home that died unseen costs one round, not
+    // the whole window (A-912).
+    let round = slates_cluster::CommitBudget::hard(
+      left_ns.min(crate::fleet::live_budget().max_deadline_ns()),
+      budget.poll_interval_ns,
+    );
+    if let Err(refused) = homing
+      .round(origin, shards, (identity, owner), (local, &wanted), round)
+      .await
+    {
+      return homing.ended(Err(refused));
+    }
+    if homes.iter().all(|home| homing.kept_by.contains(home)) {
+      continue;
+    }
+    // A member of another version: refused at once, never waited for (A-727 (d1a): no mixed-version homing).
+    if homing.other_version {
+      return homing.short(identity, (&homes, budget_ns));
+    }
+    // A home did not keep it: ranked again once this node installs a configuration (a death dropped, A-912), never on a
+    // timer, within what is left.
+    let left_ns = budget_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    if left_ns == 0 || !install_after(installs, left_ns).await {
+      return homing.short(identity, (&homes, budget_ns));
     }
   }
-  let local_ns = slates_rt::futures::now_ns().saturating_sub(began);
-  let others: Vec<slates_db::HostId> = homes
-    .iter()
-    .copied()
-    .filter(|home| *home != local)
-    .collect();
-  // The other homes reached from the control shard, which holds the record sessions (`crate::fleet::take_sessions`):
-  // on any other shard none is found and every homing there fell short (the three-node A/B, 2026-11-20).
-  let began = slates_rt::futures::now_ns();
-  let mut bytes = bytes;
-  let mut remote_kept = None;
-  let asked_others = others.len();
-  if !others.is_empty() {
-    let control = shards.first().copied().unwrap_or(origin);
-    // The bytes go to the control shard's task and come back with its count, so a caller that moves them on (a push's
-    // pack into the changeset store, A-767 C5) makes no copy; a task that never answered took them with it.
-    let answered = crate::xshard::task_in_shard_time(
-      origin,
-      control,
-      move || put_remote(others, identity, (vec![owner], bytes), budget),
-      budget_ns,
-    )
-    .await;
-    remote_kept = answered.as_ref().map(|(remote, _)| *remote);
-    let (remote, back) = answered.unwrap_or_default();
-    kept = kept.saturating_add(remote);
-    bytes = back;
-  }
-  let region_ns = slates_rt::futures::now_ns().saturating_sub(began);
-  crate::state::with_state(|state| {
-    state.count(HOMING_LOCAL_NS, local_ns);
-    state.count(HOMING_REGION_NS, region_ns);
-    state.count_max(HOMING_LONGEST_REGION_NS, region_ns);
-  });
-  let homed = kept >= homes.len() && !homes.is_empty();
-  if !homed {
-    // Which branch fell short and how long each took (main 01a20182's gate 7: a pack's homing came back short 0.9 ms
-    // after the push's body, never waiting its budget; w-shared agreed this line, 2026-11-24).
-    slates_machine::log_line!(
-      "slates-server: a homing of {identity:?} fell short: {kept} of {} homes kept it; this node {} in {local_ns} ns; \
-       {} of {asked_others} other homes in {region_ns} ns (the control shard's task {}); budget {budget_ns} ns",
-      homes.len(),
-      match here {
-        None => "not one of its homes".to_owned(),
-        Some(None) => "kept it durable".to_owned(),
-        Some(Some(refused)) => format!("kept it, not durable: {refused:?}"),
-      },
-      remote_kept.unwrap_or(0),
-      if remote_kept.is_some() || asked_others == 0 {
-        "answered"
+}
+
+/// One homing in the region as it goes ([`home_in_region`], A-912): the homes that kept the window so far, its bytes, the
+/// homes it was last ranked at, and whether a configuration installed meanwhile ranked them differently.
+struct Homing {
+  kept_by: Vec<slates_db::HostId>,
+  bytes: Vec<u8>,
+  ranked: Vec<slates_db::HostId>,
+  reranked: bool,
+  /// A home answered as a member of another home wire version: no install changes that (A-727 (d1a)).
+  other_version: bool,
+}
+
+impl Homing {
+  /// One round of puts to `wanted` within `round`: kept here where this node is one of them (once durable), the rest
+  /// sent from the control shard, which holds the record sessions (`crate::fleet::take_sessions`). Refused where this
+  /// node's own keep was.
+  async fn round(
+    &mut self,
+    origin: u16,
+    shards: &[u16],
+    (identity, owner): (ContentId, HomeOwner),
+    (local, wanted): (slates_db::HostId, &[slates_db::HostId]),
+    round: slates_cluster::CommitBudget,
+  ) -> Result<(), HomeRefused> {
+    let round_ns = round.max_deadline_ns();
+    let began = slates_rt::futures::now_ns();
+    if wanted.contains(&local) {
+      let (durable, refused) = kept_here(origin, shards, (&self.bytes, owner), round_ns)
+        .await
+        .inspect_err(|refused| {
+          slates_machine::log_line!(
+            "slates-server: a homing of {identity:?} fell short at once: this node, one of its homes, refused its keep \
+             in {} ns: {refused:?}",
+            slates_rt::futures::now_ns().saturating_sub(began)
+          );
+        })?;
+      if durable == 1 {
+        self.kept_by.push(local);
       } else {
-        "never ran"
+        slates_machine::log_line!(
+          "slates-server: a homing of {identity:?}: this node kept it, not durable: {refused:?}"
+        );
       }
-    );
+    }
+    let local_ns = slates_rt::futures::now_ns().saturating_sub(began);
+    let others: Vec<slates_db::HostId> = wanted
+      .iter()
+      .copied()
+      .filter(|home| *home != local)
+      .collect();
+    let began = slates_rt::futures::now_ns();
+    if !others.is_empty() {
+      let control = shards.first().copied().unwrap_or(origin);
+      let bytes = std::mem::take(&mut self.bytes);
+      // The bytes go to the control shard's task and come back with its answer, so a caller that moves them on (a push's
+      // pack into the changeset store, A-767 C5) makes no copy; a task that never answered took them with it.
+      let answered = crate::xshard::task_in_shard_time(
+        origin,
+        control,
+        move || put_remote(others, identity, (vec![owner], bytes), round),
+        round_ns,
+      )
+      .await;
+      if let Some((remote, back)) = answered {
+        self.kept_by.extend(remote.kept);
+        self.other_version |= remote.other_version;
+        self.bytes = back;
+      }
+    }
+    let region_ns = slates_rt::futures::now_ns().saturating_sub(began);
+    crate::state::with_state(|state| {
+      state.count(HOMING_LOCAL_NS, local_ns);
+      state.count(HOMING_REGION_NS, region_ns);
+      state.count_max(HOMING_LONGEST_REGION_NS, region_ns);
+    });
+    Ok(())
   }
-  crate::state::with_state(|state| {
-    state.count(if homed { HOMED_IN_REGION } else { HOMED_SHORT }, 1)
-  });
-  Homed {
-    outcome: if homed {
-      Ok(identity)
-    } else {
-      Err(HomeRefused::Unanswered)
-    },
-    bytes,
+
+  /// The homing ended `outcome`, its bytes given back.
+  fn ended(self, outcome: Result<ContentId, HomeRefused>) -> Homed {
+    Homed {
+      outcome,
+      bytes: self.bytes,
+    }
+  }
+
+  /// The homing fell short of `homes` within `budget_ns`: logged (main 01a20182's gate 7: which homes kept it, and
+  /// for how long it ran), counted, and refused `Unanswered`, the typed `retry` its push answers.
+  fn short(self, identity: ContentId, (homes, budget_ns): (&[slates_db::HostId], u64)) -> Homed {
+    slates_machine::log_line!(
+      "slates-server: a homing of {identity:?} fell short: {} of {} homes kept it ({:?} of {homes:?}); budget {budget_ns} \
+       ns",
+      self
+        .kept_by
+        .iter()
+        .filter(|kept| homes.contains(kept))
+        .count(),
+      homes.len(),
+      self.kept_by
+    );
+    crate::state::with_state(|state| state.count(HOMED_SHORT, 1));
+    self.ended(Err(HomeRefused::Unanswered))
   }
 }
+
+/// Waits, within `left_ns`, for this node to install a configuration after the `seen` installs (A-902's install wake,
+/// `slates_cluster::fleet::FleetNode::await_install`), for a homing to rank its homes again (A-912): whether one came.
+/// An event, never a timer; off a shard, none.
+async fn install_after(seen: u64, left_ns: u64) -> bool {
+  let change = InstallChange { seen, token: None };
+  matches!(
+    slates_rt::futures::within(left_ns, change).await,
+    Ok(Some(true))
+  )
+}
+
+/// The wait of [`install_after`]: ready once this shard's fleet node has made a changing install since `seen` (`true`),
+/// its waker registered with the node under its token meanwhile; `false` off a shard. Dropped, it takes its registration
+/// away, so none outlives it.
+struct InstallChange {
+  seen: u64,
+  token: Option<u64>,
+}
+
+impl std::future::Future for InstallChange {
+  type Output = bool;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<bool> {
+    let this = self.get_mut();
+    let polled = crate::state::with_state(|state| {
+      if state.fleet.installs() != this.seen {
+        if let Some(token) = this.token.take() {
+          state.fleet.forget_install_waiter(token);
+        }
+        return std::task::Poll::Ready(true);
+      }
+      this.token = Some(state.fleet.await_install(this.token, cx.waker()));
+      std::task::Poll::Pending
+    });
+    polled.unwrap_or(std::task::Poll::Ready(false))
+  }
+}
+
+impl Drop for InstallChange {
+  fn drop(&mut self) {
+    if let Some(token) = self.token.take() {
+      let _ = crate::state::with_state(|state| state.fleet.forget_install_waiter(token));
+    }
+  }
+}
+
+/// Counter: a homing that ranked its homes again after a configuration installed meanwhile (a death dropped) and was
+/// then kept at every home ranked (A-912): the path past a dead home, run and accepted. Format: a counter name.
+pub(crate) const HOMING_RERANKED_KEPT: &str = "vcs_store.homes.homing_reranked_kept";
 
 /// What [`home_in_region`] answers: its outcome, and the bytes it was handed, given back so the caller can move them on
 /// (a push's pack into the node's changeset store, A-767 C5) with no copy; empty where a home's task took them and
@@ -3110,19 +3174,27 @@ async fn exchange(
   let spend = budget.max_deadline_ns();
   let mut left: Vec<slates_db::HostId> = hosts.to_vec();
   let mut answers = Vec::new();
+  let mut behind: Vec<slates_db::HostId> = Vec::new();
   while !left.is_empty() {
-    exchange_round(&mut left, request, budget, &mut answers).await;
+    // Counted before the round asks, so a round that passes between a `Behind` answer and the wait is not missed.
+    let seen = crate::state::with_state(|state| state.council_rounds.count()).unwrap_or(0);
+    let answered_behind =
+      exchange_round(&mut left, request, budget, (&mut answers, &mut behind)).await;
     let spent = slates_rt::futures::now_ns().saturating_sub(began);
     if left.is_empty() || spent >= spend {
       break;
     }
-    // A session out on another exchange's loan: wait for its return (or its link's change), then look again.
-    match crate::fleet::session_returned(&left, spend.saturating_sub(spent)).await {
-      Some(true) => {}
-      waited => {
-        log_unanswered(&left, began, waited);
-        return answers;
-      }
+    let waited = if answered_behind {
+      // A home behind this node's configuration (A-912): asked again once a council round has passed here, the round
+      // whose append brings its install, its record session given back meanwhile.
+      council_round_after(seen, spend.saturating_sub(spent), &behind).await
+    } else {
+      // A session out on another exchange's loan: wait for its return (or its link's change), then look again.
+      crate::fleet::session_returned(&left, spend.saturating_sub(spent)).await
+    };
+    if waited != Some(true) {
+      log_unanswered(&left, began, waited);
+      return answers;
     }
   }
   if !left.is_empty() {
@@ -3139,14 +3211,18 @@ async fn exchange_round(
   left: &mut Vec<slates_db::HostId>,
   request: &[u8],
   budget: slates_cluster::CommitBudget,
-  answers: &mut Vec<(slates_db::HostId, Vec<u8>)>,
-) {
+  (answers, behind): (
+    &mut Vec<(slates_db::HostId, Vec<u8>)>,
+    &mut Vec<slates_db::HostId>,
+  ),
+) -> bool {
   use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome, HomeRefusal};
   let sessions =
     crate::fleet::take_sessions("vcs_store.homes.exchange", |host| left.contains(&host));
   if sessions.is_empty() {
-    return;
+    return false;
   }
+  let mut answered_behind = false;
   let outgoing: Vec<_> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, request.to_vec(), endpoint))
@@ -3159,19 +3235,47 @@ async fn exchange_round(
   )
   .await;
   let mut take = |host: slates_db::HostId, bytes: Vec<u8>| {
+    let decoded = HomeMessage::decode(&bytes);
+    // A home behind this node's configuration stays left, asked again after a council round (A-912).
+    if matches!(
+      decoded,
+      Ok(HomeMessage::Answer {
+        outcome: HomeOutcome::Behind { .. },
+        ..
+      })
+    ) {
+      answered_behind = true;
+      if !behind.contains(&host) {
+        behind.push(host);
+      }
+      return;
+    }
     left.retain(|waiting| *waiting != host);
     let readable = !matches!(
-      HomeMessage::decode(&bytes),
+      decoded,
       Ok(HomeMessage::Answer {
         outcome: HomeOutcome::Refused(HomeRefusal::Version),
         ..
       }) | Err(_)
     );
-    if readable {
-      answers.push((host, bytes));
-    } else {
+    if !readable {
+      // Kept with the answers, so a caller that must end at once on another version (a homing, A-727 (d1a)) sees it.
       let _ = crate::state::with_state(|state| state.count(REPLY_OTHER_VERSION, 1));
+      answers.push((host, bytes));
+      return;
     }
+    if behind.contains(&host)
+      && matches!(
+        decoded,
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Kept { .. },
+          ..
+        })
+      )
+    {
+      let _ = crate::state::with_state(|state| state.count(BEHIND_KEPT_AFTER, 1));
+    }
+    answers.push((host, bytes));
   };
   let mut returned = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -3184,6 +3288,29 @@ async fn exchange_round(
   for (host, bytes) in crate::fleet::settled_stragglers(stragglers).await {
     take(host, bytes);
   }
+  answered_behind
+}
+
+/// Waits, within `left_ns`, for a council round to pass through this node after the `seen` counted
+/// (`crate::fleet::CouncilRound`, A-912), then counts each home of `behind` as asked again: `Some(true)` once one has,
+/// `Some(false)` at the deadline, `None` when no wait could be made (off a shard). An event, never a timer.
+async fn council_round_after(
+  seen: u64,
+  left_ns: u64,
+  behind: &[slates_db::HostId],
+) -> Option<bool> {
+  let round = crate::fleet::CouncilRound { seen, token: None };
+  let waited = match slates_rt::futures::within(left_ns, round).await {
+    Ok(Some(true)) => Some(true),
+    // No wait could be made (off a shard): the exchange ends as it stands, never a spin.
+    Ok(Some(false)) | Err(_) => None,
+    Ok(None) => Some(false),
+  };
+  if waited == Some(true) {
+    let asked = u64::try_from(behind.len()).unwrap_or(u64::MAX);
+    let _ = crate::state::with_state(|state| state.count(BEHIND_ASKED_AGAIN, asked));
+  }
+  waited
 }
 
 /// Logs the hosts of an exchange that never answered, how long it ran, and why it stopped (gate 8: a homing short in about
@@ -3208,19 +3335,23 @@ fn installed_configuration() -> u64 {
 }
 
 /// The object `bytes` named `identity` sent to the other homes `homes` (A-724 piece 8c), whole within one message or a
-/// part at a time past it ([`put_in_parts`]): how many answered kept. Run on the control shard.
+/// part at a time past it ([`put_in_parts`]): the homes that answered kept. Run on the control shard.
 async fn put_remote(
   homes: Vec<slates_db::HostId>,
   identity: ContentId,
   (owners, bytes): (Vec<HomeOwner>, Vec<u8>),
   budget: slates_cluster::CommitBudget,
-) -> (usize, Vec<u8>) {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
+) -> (RemoteKept, Vec<u8>) {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal, PART_BYTES};
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PART_BYTES {
-    let kept = put_in_parts(&homes, (identity, &owners), &bytes, budget)
-      .await
-      .len();
-    return (kept, bytes);
+    let kept = put_in_parts(&homes, (identity, &owners), &bytes, budget).await;
+    return (
+      RemoteKept {
+        kept,
+        other_version: false,
+      },
+      bytes,
+    );
   }
   let message = HomeMessage::Put {
     identity: identity.0,
@@ -3234,8 +3365,17 @@ async fn put_remote(
     _ => Vec::new(),
   };
   let began = slates_rt::futures::now_ns();
-  let kept = exchange(&homes, &request, budget)
-    .await
+  let answers = exchange(&homes, &request, budget).await;
+  let other_version = answers.iter().any(|(_, reply)| {
+    matches!(
+      HomeMessage::decode(reply),
+      Ok(HomeMessage::Answer {
+        outcome: HomeOutcome::Refused(HomeRefusal::Version),
+        ..
+      }) | Err(_)
+    )
+  });
+  let kept = answers
     .into_iter()
     .filter(|(host, reply)| {
       let decoded = HomeMessage::decode(reply);
@@ -3257,8 +3397,23 @@ async fn put_remote(
       }
       kept
     })
-    .count();
-  (kept, bytes)
+    .map(|(host, _)| host)
+    .collect();
+  (
+    RemoteKept {
+      kept,
+      other_version,
+    },
+    bytes,
+  )
+}
+
+/// What [`put_remote`] answers of its homes: those that kept the window, and whether one answered as a member of another
+/// home wire version, which no install changes, so its homing ends short at once (A-727 (d1a)).
+#[derive(Debug, Default)]
+struct RemoteKept {
+  kept: Vec<slates_db::HostId>,
+  other_version: bool,
 }
 
 /// The object named `identity` read from one of the other homes `homes`, a part at a time from each in turn

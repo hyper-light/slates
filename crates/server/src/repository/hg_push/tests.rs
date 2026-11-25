@@ -813,6 +813,60 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
   assert_eq!(after.as_deref(), Some(&b"bxx\n"[..]), "edited again");
 }
 
+/// Main's ruling of 2026-11-24 on write-path bring-backs (w-hg's sweep: `hg_named::bring_back_named`'s group refused
+/// partway left what it had brought out of its let-go). Do: on a store-backed daemon, rebuild the fixtures' repository
+/// as one push, its root green holding `b` by its object's name; edit `b` in place over a work; let `b`'s base go; then
+/// run the re-adoption's pre-pass (`hg_named::bring_back_named_live`) with the group refused once its base came back (a
+/// store that gave it back short), and let go what it returns, as the re-adoption does. Expect the base among what it
+/// returns, and not held after the let-go. Red before: nothing returned for the refused group, the base held for good.
+#[test]
+fn a_named_group_refused_partway_lets_go_what_it_brought_back() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (green, base) = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "named-partial");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    let base = match state.greens.get(&hg.root).unwrap().content("b") {
+      Some(slates_merge::engine::Content::Named(identity)) => identity.hash,
+      other => panic!("`b` not named: {other:?}"),
+    };
+    (hg.root, base)
+  });
+  let (submitted, _, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { edited_named(green).await },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    !matches!(submitted, ReplyBody::Refused { .. }),
+    "{submitted:?}"
+  );
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &[base]);
+  });
+  let (brought, held_after) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      crate::vcs_store::hg_named::NOT_WHOLE.with(|refuse| refuse.set(true));
+      let brought = crate::vcs_store::hg_named::bring_back_named_live(green).await;
+      let held_after = crate::repository::svn_commit::tests::on(|state| {
+        crate::vcs_store::name_holds::let_go_landed_texts(state, &brought);
+        state
+          .vcs_stores
+          .content()
+          .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(base)))
+      });
+      (brought, held_after)
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert!(
+    brought.contains(&base),
+    "the base returned for its let-go: {brought:?}"
+  );
+  assert!(!held_after, "the base let go again after the refused group");
+}
+
 /// Retires every member of `repository`'s lineage, the latest joined first, their engines and arenas released.
 fn retire_lineage(state: &mut ShardState, repository: RepositoryId) {
   let members: Vec<DbVolumeId> = state

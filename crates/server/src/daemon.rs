@@ -1682,9 +1682,13 @@ impl Daemon {
     Ok(longest)
   }
 
-  /// Test support (A-727 (d1a)): the deadline a homing waits its homes within (`fleet::live_budget`), nanoseconds.
+  /// Test support (A-727 (d1a)): the deadline a homing waits its homes within (`fleet::homing_budget`, A-912), nanoseconds.
   pub fn homing_budget_ns(&self) -> u64 {
-    crate::fleet::live_budget().max_deadline_ns()
+    self
+      .observe(self.shards.first().copied(), |_| {
+        crate::fleet::homing_budget().max_deadline_ns()
+      })
+      .unwrap_or_else(|_| crate::fleet::live_budget().max_deadline_ns())
   }
 
   /// Test support (A-727 (d1a-3)'s trace of a repository's takeover, A-636 part 2c): across this node's shards, whether
@@ -5342,6 +5346,7 @@ async fn init_shard(
     nfs_service: crate::nfs::ServiceTimes::default(),
     callbacks: crate::callback::Callbacks::default(),
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
+    council_rounds: crate::fleet::CouncilRounds::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
     member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
@@ -5439,6 +5444,7 @@ async fn init_shard(
     failover,
     failover_ns,
     injected_failover_ns: None,
+    homing_window_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
     consensus_ready: false,
