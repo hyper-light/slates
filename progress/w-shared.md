@@ -615,3 +615,12 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Next (main's order): A-921 part 2, the edge routing by owner with git over HTTP answered 307. Its red is parked at
   ~/slates-work/w-shared-scratch/a914/a921_product_test.rs. Then the second mode (red first, counters printed, "held 1"
   settled against the rule), then A-922, then A-918 B.
+
+## 2026-11-25: A-925 landed (db48422ad, commit 150f8d2bc)
+
+- Each node announces its own edges (git HTTP/HTTPS, SSH) to its peers on stream 33, as a client reaches them. A
+  record is held only from its own authenticated session; parsing is bounded; an owner with no learned edge gets the
+  typed refusal naming it.
+- The exit-4 runs were the A-924 2b spawner's wedges (spawning.rs:668); one a894 push refusal was unrelated.
+- Next: A-921 part 2, the edge routing by owner (git HTTP 307; hg, svn and SSH measured). Its red is parked at
+  ~/slates-work/w-shared-scratch/a914/a921_product_test.rs.
