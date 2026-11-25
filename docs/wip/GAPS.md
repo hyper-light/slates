@@ -246,6 +246,13 @@
 > after a council round, the coordinator's home passes run on their own lane, and a push's homing runs within a window
 > derived from detection, confirmation and the takeover's configuration steps, ranking its homes again at each install.
 > Red first (both `a912_` fleet tests). OWED (main): gate 17 (`v3_takeover`) and a lint diag.
+> **OPEN, w-shared's next piece (A-912's sibling; main 01a20182's ruling of 2026-11-24): a branch created during a
+> member's death refused `unable to commit` at the record barrier.** A-912's push test creates three branches at once
+> while c dies; their homing is accepted, but in 2 of 4 runs one was refused at the barrier: "greens owed (green,
+> version, placed) [(8c70…0003, 1, None)]; names log at Some(9), acknowledged by both; merge.inputs_unplaced 4; pending
+> [0, 1]", the new green's versions 0 and 1 never placed, their merge records waiting for their inputs to place while
+> the death moved the candidates. Red: that test asserting every created branch lands. To measure first: when versions 0
+> and 1's inputs place against the barrier window, across runs.
 > **OPEN, structural alternative, not built (A-912): a council session of its own per peer.** The council's replication
 > shares a node's one record session per peer with every exchange, each borrower taking it whole. A-912 removes the one
 > hold-and-wait found (a home holding a put across the install the council's next append brings) and counts any breach,

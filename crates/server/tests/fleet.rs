@@ -36381,6 +36381,27 @@ fn founded_git_fleet(
   }
 }
 
+/// [`GitFleet::push_to`] through the edge on `port` with `token`: a fresh history pushed to branch `branch`, a create of a
+/// new branch. Of plain data alone, so pushes can run at once on threads of their own.
+fn push_to_edge(
+  (port, token): (u16, &str),
+  (file, bytes): (&str, &[u8]),
+  branch: &str,
+) -> Result<(), String> {
+  let dir = common::target::target_dir();
+  let work = dir.path.clone();
+  committed_in(&dir, (file, bytes));
+  let header = format!("http.extraHeader=Authorization: Bearer {token}");
+  let url = format!("http://127.0.0.1:{port}/project");
+  let refspec = format!("HEAD:refs/heads/{branch}");
+  let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
+  if pushed.status.success() {
+    Ok(())
+  } else {
+    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+  }
+}
+
 /// Stock git in `dir`, never prompting, its messages C's.
 fn git_in(dir: &str, args: &[&str]) -> std::process::Output {
   std::process::Command::new("git")
@@ -36487,21 +36508,10 @@ impl GitFleet {
 
   /// [`GitFleet::push`] of a fresh history to branch `branch` rather than `main`: a create of a new branch, its own green.
   fn push_to(&self, node: usize, (file, bytes): (&str, &[u8]), branch: &str) -> Result<(), String> {
-    let dir = common::target::target_dir();
-    let work = dir.path.clone();
-    committed_in(&dir, (file, bytes));
     let port = self.daemons[node]
       .vcs_http_port()
       .expect("the edge listens");
-    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
-    let url = format!("http://127.0.0.1:{port}/project");
-    let refspec = format!("HEAD:refs/heads/{branch}");
-    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
-    if pushed.status.success() {
-      Ok(())
-    } else {
-      Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
-    }
+    push_to_edge((port, &self.token), (file, bytes), branch)
   }
 
   /// Stops node `node` and starts it warm over its anchor (an [`anchored_git_fleet`] only): whether every other node
@@ -37112,12 +37122,23 @@ fn a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_aft
   );
 }
 
+/// Format: the words a push's answer carries when its objects were not kept by enough homes in the region within its
+/// homing (`git_push::words`, `Unlanded::HomedShort`: the typed `retry`).
+const HOMED_SHORT_ANSWER: &str = "not kept by enough homes";
+
+/// Shape: the new branches A-912's push test creates at once with the branch's next version while a member dies: with
+/// two objects a push, each ranked at two of three members, all of them missing the dead member is `(1/3)^(2 (n + 1))`,
+/// under 1 in 6,000 at 3.
+const DEATH_WINDOW_PUSHES: usize = 3;
+
 /// A-912 (main 01a20182's ruling of 2026-11-24: a git client must not see `retry` for a second after a death). Do: the
-/// scene of [`branch_then_restart_b`]; stop c for good; push a commit on top of `after` through a at once, while c is
+/// scene of [`branch_then_restart_b`]; stop c for good; push a commit on top of `after` through a at once, beside
+/// [`DEATH_WINDOW_PUSHES`] new branches, while c is
 /// still a member and then while its takeover moves the region's configuration. Expect it to land: a home that does not
 /// answer is passed over once the configuration drops it, its windows homed again among the homes ranked then
-/// (`vcs_store.homes.homing_reranked_kept`), within one budget derived from the detector's confirmation and the
-/// takeover's configuration steps; and no voter's session found lent at a council round. Red before A-912: refused
+/// (`vcs_store.homes.homing_reranked_kept`), no new branch refused at its homing, within one budget derived from the
+/// detector's confirmation and the takeover's configuration steps; and no voter's session found lent at a council
+/// round. Red before A-912: refused
 /// `retry`, its objects homed short, 3 of 3 (c undetected among the homes within the 2 s homing budget, or b's wait for
 /// its install held by the coordinator's own heal).
 #[test]
@@ -37132,7 +37153,35 @@ fn a912_a_push_while_a_holders_takeover_moves_the_configuration_is_accepted() {
     },
   ) = branch_then_restart_b("push-in-churn");
   fleet.daemons.remove(2).stop();
-  let after = fleet.push_on_top_of(0, ("next.txt", b"the branch's next version\n"), "after");
+  // A push homes two objects, each at two of the three members, so one push misses c about 1 time in 9: the branch's next
+  // version and [`DEATH_WINDOW_PUSHES`] new branches pushed at once, so some object ranks c (the re-rank path certain).
+  let edge = fleet.daemons[0].vcs_http_port().expect("the edge listens");
+  let token = fleet.token.clone();
+  let (after, created) = std::thread::scope(|scope| {
+    let token = &token;
+    let created: Vec<_> = (0..DEATH_WINDOW_PUSHES)
+      .map(|branch| {
+        scope.spawn(move || {
+          let file = format!("created-{branch}.txt");
+          push_to_edge(
+            (edge, token),
+            (&file, file.as_bytes()),
+            &format!("created-{branch}"),
+          )
+        })
+      })
+      .collect();
+    let after = fleet.push_on_top_of(0, ("next.txt", b"the branch's next version\n"), "after");
+    let created: Vec<Result<(), String>> = created
+      .into_iter()
+      .map(|push| {
+        push
+          .join()
+          .unwrap_or_else(|_| Err("its thread panicked".to_owned()))
+      })
+      .collect();
+    (after, created)
+  });
   let [lent, reranked] = [
     "fleet.council.session_lent",
     "vcs_store.homes.homing_reranked_kept",
@@ -37154,6 +37203,16 @@ fn a912_a_push_while_a_holders_takeover_moves_the_configuration_is_accepted() {
     "b branched, then rejoined after its warm restart"
   );
   assert_eq!(after, Ok(()), "the push during c's takeover landed");
+  // A-912 is the homing's window: no push in it refused `retry`, its objects short of their homes. A created branch's
+  // merge records not placed within the barrier while the death moves the candidates (`unable to commit`, 2 of 4 runs)
+  // are A-912's sibling, owed (GAPS), whose red asserts every created branch lands.
+  assert!(
+    created.iter().all(|push| push
+      .as_ref()
+      .err()
+      .is_none_or(|refused| !refused.contains(HOMED_SHORT_ANSWER))),
+    "no branch created during c's takeover refused at its homing: {created:?}"
+  );
   assert_eq!(
     lent, 0,
     "no voter's session found lent to another exchange at a council round"

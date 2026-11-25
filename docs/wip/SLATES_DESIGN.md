@@ -55865,10 +55865,10 @@ Applied in the same change to:
   the push is refused `retry`, typed, as before.
 
 > **Status (2026-11-24, A-912).** Built. The invariant's breach is counted: the leader finding a voter's record session
-> out on another exchange's loan at its replication round (`fleet.council.session_lent`), held at 0 by the A-912 fleet
-> tests. Counters `vcs_store.homes.behind_answered`, `behind_asked_again`, `behind_kept_after`, `homing_reranked_kept`,
-> `fleet.home_passes.{in_flight, longest_ns, unspawned}`. A council session of its own per peer, never lent to another
-> plane, is the structural alternative, not built (GAPS).
+> on the same loan to another plane at two of its replication rounds in a row (`fleet.council.session_lent`), held at 0
+> by the A-912 fleet tests. Counters `vcs_store.homes.behind_answered`, `behind_asked_again`, `behind_kept_after`,
+> `homing_reranked_kept`, `fleet.home_passes.{in_flight, longest_ns, unspawned}`. A council session of its own per peer,
+> never lent to another plane, is the structural alternative, not built (GAPS).
 
 - **Piece 6's region half, the sender and the healer (2026-11-20; the transport done).** A home keeps one region hold
   a window however often the region offers it (`keep_for_region`, `let_go_for_region`), so offers are idempotent. The
@@ -63551,10 +63551,10 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
     again once a council round has passed through its node (`fleet::CouncilRound`: the leader's replication round, or a
     council message a voter served; an event, never a timer), its session given back meanwhile: counted
     `behind_asked_again`, and `behind_kept_after` where it then kept.
-- The invariant, written in the A-724 entry's piece 6 region half: no exchange holds a peer's record session across
-    a wait that needs the council's next round. Its breach is counted, `fleet.council.session_lent` (the leader finding
-    a voter's session out on another plane's loan at its replication round; the council's own earlier round's loan not
-    counted).
+  - The invariant, written in the A-724 entry's piece 6 region half: no exchange holds a peer's record session across a
+    wait that needs the council's next round. Its breach is counted, `fleet.council.session_lent`: the leader finding a
+    voter's session on the same loan to another plane at two of its replication rounds in a row, a hold across a round
+    (a loan seen at one round only overlapped it; the council's own earlier round's loan not counted).
   - A push's homing runs within `fleet::homing_budget`: the live commit's deadline, or the homing window where that is
     longer, `derived!` `detection + confirmation + (2 + 2 (members − 1)) × period` from the failover estimate (A-363)
     and the coordinator's measured period, derived on the control shard and fanned with the failover delay. Within it
@@ -63572,7 +63572,10 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
     then): the original coordinator, 2 of 2 (b's wait ran out); the lane alone, 3 of 3. Green: b's longest lag 176 ms,
     `session_lent` 0.
   - Fleet `a912_a_push_while_a_holders_takeover_moves_the_configuration_is_accepted` (the A-908 part 4 scene, c stopped,
-    the push at once): red 3 of 3 (`retry`, homed short); green, `homing_reranked_kept` 1, `session_lent` 0.
+    the push at once, with three branches created at once beside it, since one push misses c as a home about 1 time in
+    9): red 3 of 3 (`retry`, homed short); green, the branch's next version landed every run, `homing_reranked_kept` 3
+    to 4, `session_lent` 0, no created branch refused at its homing. A created branch refused at the record barrier (2
+    of 4 runs, its new green's merge records not placed while the death moved the candidates) is A-912's sibling, owed.
   - `vcs_store::homes::tests::a_home_behind_its_senders_configuration_answers_behind_at_once_and_keeps_once_it_installs`
     (A-902's test rewritten: `Behind` at once for a newer sender and for one not among the members, `NotAHome` at the
     same version, kept once installed); `slates-cluster` homes wire round trips `Behind`; the failover fan carries the
@@ -63580,7 +63583,8 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
   - Focused: homes, fan, takeover and state_log lib (56), `slates-cluster` homes (4), fleet A-727 (d1a)'s mixed-version
     homing, a894, a907, both a908 and the new branch's push (6).
 - **GAPS.** A council session of its own per peer, never lent to another plane, is the structural alternative, not
-  built: a piece if `fleet.council.session_lent` ever moves.
+  built: a piece if `fleet.council.session_lent` ever moves. The record barrier's window during a death (A-912's
+  sibling) is owed.
 
 Applied in the same change to: the A-724 entry's piece 6 region half (the invariant, the home's answer, the healer's
 lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,

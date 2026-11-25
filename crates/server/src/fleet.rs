@@ -11114,6 +11114,16 @@ pub(crate) struct CouncilRounds {
   /// The tasks waiting for the next round, by token, each woken and dropped at it.
   /// Derived: at most one a region exchange this shard runs, each holding one registration (`CouncilRound`).
   waiters: std::collections::BTreeMap<u64, std::task::Waker>,
+  /// Each voter whose record session the leader's last replication round found out on another plane's loan, with that
+  /// loan's session and borrower ([`count_council_sessions_lent`]): what tells a loan held across a round from one that
+  /// merely overlapped it. Derived: at most one a council voter.
+  lent_at_last_round: std::collections::BTreeMap<
+    HostId,
+    (
+      Option<slates_transport::endpoint::ConnectionId>,
+      &'static str,
+    ),
+  >,
 }
 
 impl CouncilRounds {
@@ -11175,28 +11185,44 @@ impl Drop for CouncilRound {
   }
 }
 
-/// Counts each council voter whose record session the leader found out on another loan at its replication round (A-912):
-/// a bug signal, since no exchange may hold a peer's record session across a wait that needs the council's next round
-/// (A-902's invariant). A session still out on the council's own earlier round (a voter gone silent) is not counted. Moving at all after A-912 makes a council session of its own per peer (GAPS) a piece.
+/// Counts each council voter whose record session the leader found out on the same loan to another plane at two of its
+/// replication rounds in a row (A-912): a loan held across a council round, the breach of A-902's invariant (no exchange
+/// holds a peer's record session across a wait that needs the council's next round), a bug signal. A loan seen at one
+/// round alone overlapped it, as any exchange's brief round may; a session out on the council's own earlier round (a
+/// voter gone silent) is the council's. Moving at all after A-912 makes a council session of its own per peer (GAPS) a
+/// piece.
 fn count_council_sessions_lent(others: &[HostId], taken: &[(HostId, Endpoint)]) {
   let _ = state::with_state(|s| {
+    let mut lent_now = std::collections::BTreeMap::new();
     for host in others {
-      // A session the council's own earlier round still holds (a straggler of a voter gone silent) is the council's.
-      let lent = s.record_sessions.get(host).is_some_and(|link| {
-        link.endpoint.is_none()
-          && link
-            .lent_to
-            .is_some_and(|borrower| borrower != "fleet.lent_to.drive_council_replication")
-      }) && !taken.iter().any(|(taken, _)| taken == host);
-      if lent {
-        s.count(COUNCIL_SESSION_LENT, 1);
+      if taken.iter().any(|(taken, _)| taken == host) {
+        continue;
       }
+      let Some(link) = s.record_sessions.get(host) else {
+        continue;
+      };
+      if let (None, Some(borrower)) = (&link.endpoint, link.lent_to)
+        && borrower != "fleet.lent_to.drive_council_replication"
+      {
+        lent_now.insert(*host, (link.borrowed, borrower));
+      }
+    }
+    let held = lent_now
+      .iter()
+      .filter(|(host, loan)| s.council_rounds.lent_at_last_round.get(*host) == Some(*loan))
+      .count();
+    s.council_rounds.lent_at_last_round = lent_now;
+    if held > 0 {
+      s.count(
+        COUNCIL_SESSION_LENT,
+        u64::try_from(held).unwrap_or(u64::MAX),
+      );
     }
   });
 }
 
-/// Counter: a council voter's record session found out on another loan at the leader's replication round (A-912), a bug
-/// signal. Format: a counter name.
+/// Counter: a council voter's record session found out on the same loan to another plane at two of the leader's
+/// replication rounds in a row (A-912): held across a council round, a bug signal. Format: a counter name.
 pub(crate) const COUNCIL_SESSION_LENT: &str = "fleet.council.session_lent";
 
 /// The coordinator's home passes on a lane of their own (A-912): `vcs_store::homes::heal_region`, `resolve_ended`,
