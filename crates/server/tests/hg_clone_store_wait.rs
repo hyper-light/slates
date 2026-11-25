@@ -25,7 +25,8 @@ use std::collections::BTreeMap;
 const CHANGESETS: u64 = 2_000;
 
 /// Format: the counters of a fetch's store asks, the owner's split of them after the first two.
-const COUNTERS: [&str; 21] = [
+const COUNTERS: [&str; 22] = [
+  "vcs_store.hg_fetch_manifest_stored_parent_delta",
   "vcs_store.hg_fetch_manifest_at_hand_delta",
   "vcs_store.hg_fetch_manifest_at_hand_whole",
   "vcs_store.hg_fetch_manifest_stored_delta",
