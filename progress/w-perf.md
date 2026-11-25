@@ -1,5 +1,11 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~01:30 PST
+- LANDED e6710411a: P7, svn import batch lands once its texts reach texts_bound (segment_bytes); Flush::Texts,
+  flushed_texts. Red 16,777,216 B vs 2 MiB; oracle same history with/without. w-svn's go on staging.rs.
+- Gave w-hg go on record.rs kept_again (C1 (2) B' manifest rule).
+- Owed: main's git-2000 time/peak at e6710411a; 57k A/B (main's); pipelining svn batch landings if costly.
+
 ## 2026-11-24 ~23:30 PST
 - LANDED d41c93388: hg import segment landing pipelined (one in flight, in order, texts on own durable answer; bound
   two segments < 4x segment_bytes). Red: 0 overlapped, waited ~= landing time. Main runs the 57k A/B.
