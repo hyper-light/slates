@@ -336,6 +336,26 @@
 > Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
 > Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
 > (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
+> **PRECONDITION OF THE NEXT LIFT (w-git, 2026-11-25, main 01a20182's ruling): a holder's replica build reads a let-go
+> window as missing.** Found writing the red for main's ruling of 2026-11-24 (a write path's bring-back lets go at its
+> owner's end, a64f385b1). Scene (a three-node `f = 1` fleet, git repository on a): push `main`; push two new branches,
+> `first` and `second` (each holder's replica of each owing its push, P2); push a commit on top of `first` (each holder
+> builds its replica of `first`, making its store of the repository); let go every window b and c hold, each home told
+> first; push a commit on top of `second`. Both holders' replica builds refused `a holder's replica's owed push was
+> refused building: Object { path: "", id: …, why: Missing }`, and the push was refused `unable to commit`: the
+> holder's read answers Missing, never noting the window waited (`replica_build::turn`'s `Turned::Waiting` is never
+> reached), so nothing is brought back. Unreachable while `LANDED_LET_GO` is false: the only roots of a git window's
+> let-go are a commit's (`vcs_store::commit`) and a rebuild's or recovery's (`put_changeset`), both under it; the home's
+> let-go (`homes::landed_pack_here`) is reached only from their sliced let-go; every other let-go takes only windows a
+> read brought back (`vcs_share::read_backs`, the fetch's look-ahead, `read_through::BroughtBack`). So **the lift must
+> first make a holder's replica-store read note a let-go window as waiting and bring it back through its node store**,
+> red first with the scene above: `patches/w-git-replica-red.patch` on `agents/fanout-state` (the fleet test
+> `a_holders_replica_build_lets_go_the_windows_it_brought_back_once_it_is_made` and its `Daemon::let_go_vcs_windows` and
+> `vcs_windows_held` hooks), which then also proves the replica build's let-go of what it brought back. Every git
+> bring-back is dormant until the lift; the derivation's and green build's reds of that let-go
+> (`a_derivation_lets_go_the_windows_it_brought_back_once_it_ends`,
+> `a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`) let windows go by hand, standing in for the gated
+> roots, which the lift makes real paths.
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
