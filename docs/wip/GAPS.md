@@ -1798,7 +1798,10 @@
 > its mapped churn; a fresh 1 MiB chunk 240 us against 85 us kept). Now the chunk the room was made from is laid again
 > when it is an ordinary one of the length wanted, held for no longer than that call so the bound holds
 > (`TextCache::chunks_mapped`; `a_cache_lays_its_next_chunk_in_the_one_it_gives_back`: red, 7 chunks mapped fresh for
-> 400 texts through a two-chunk cache; now 2). The batch itself was sized by the fetch's room
+> 400 texts through a two-chunk cache; now 2). A text the owner answers in slices is assembled in the asker's buffer,
+> handed to the owner and back a request, no slice a buffer of its own (`StoreHandle::text_slice_into`; hg's 57k clone
+> allocated 6.2 GB in those answers, 15.3% of its system churn; `owner_slices_heap`: red, 331,464 bytes allocated for a
+> 307,200-byte text read in 64 KiB slices; now 24,264). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
