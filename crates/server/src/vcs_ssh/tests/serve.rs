@@ -479,9 +479,15 @@ impl Peer {
 
   /// Waits until the connection ends: whether it ended before the client's patience ran out.
   fn ended(&mut self) -> bool {
+    self.ended_waited().0
+  }
+
+  /// [`Peer::ended`], and how long the client waited for the connection to end.
+  fn ended_waited(&mut self) -> (bool, Duration) {
     let started = Instant::now();
     while self.pump() {}
-    started.elapsed() < Duration::from_nanos(PATIENCE_NS)
+    let waited = started.elapsed();
+    (waited < Duration::from_nanos(PATIENCE_NS), waited)
   }
 }
 

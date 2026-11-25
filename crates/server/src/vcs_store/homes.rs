@@ -2231,6 +2231,12 @@ pub(crate) fn resolve_owed() {
   RESOLVE_OWED.with(|owed| owed.set(true));
 }
 
+/// Whether a resolution pass is owed (test support, A-921 part 2): a pass its deadline cut short leaves one owed.
+#[cfg(test)]
+pub(crate) fn resolution_owed() -> bool {
+  RESOLVE_OWED.with(std::cell::Cell::get)
+}
+
 /// An attempt's holds in the region (A-727 (d1a), (d1a-3)): the owner they are for, made at the attempt's first homing,
 /// and the objects homed for it. Ended once, by its record's commit ([`AttemptHolds::committed`]: each moved to the
 /// records) or its refusal ([`AttemptHolds::released`]: each let go); dropped before either (its push's task gone), it
@@ -2698,6 +2704,10 @@ pub(crate) async fn resolve_ended(
     return;
   }
   let budget_ns = budget.max_deadline_ns();
+  // One deadline for the whole pass (A-921 part 2, main 01a20182's ruling of 2026-11-25): each attempt asks within what
+  // is left of it, so a pass over several unclaimed attempts never holds the home passes' lane past its budget; one left
+  // unasked stays kept, and the pass is owed again, for a later one.
+  let pass_ends = slates_rt::futures::now_ns().saturating_add(budget_ns);
   for shard in shards.iter().copied() {
     let attempts =
       crate::xshard::call_in_shard_time(origin, shard, |_| attempt_holds_here(), budget_ns)
@@ -2705,9 +2715,21 @@ pub(crate) async fn resolve_ended(
         .unwrap_or_default();
     for (identity, attempt) in attempts {
       let ended = crate::state::with_state(|state| process_ended(state, &attempt)).unwrap_or(false);
-      if ended {
-        resolve_one((origin, shards, shard), (identity, attempt), budget).await;
+      if !ended {
+        continue;
       }
+      let left_ns = pass_ends.saturating_sub(slates_rt::futures::now_ns());
+      if left_ns == 0 {
+        RESOLVE_OWED.with(|owed| owed.set(true));
+        let _ = crate::state::with_state(|state| state.count(RESOLVE_KEPT, 1));
+        continue;
+      }
+      resolve_one(
+        (origin, shards, shard),
+        (identity, attempt),
+        (budget, left_ns),
+      )
+      .await;
     }
   }
 }
@@ -2763,7 +2785,7 @@ fn process_ended(state: &ShardState, attempt: &HomeOwner) -> bool {
 async fn resolve_one(
   (origin, shards, home): (u16, &[u16], u16),
   (identity, attempt): (ContentId, HomeOwner),
-  budget: slates_cluster::CommitBudget,
+  (budget, left_ns): (slates_cluster::CommitBudget, u64),
 ) {
   let budget_ns = budget.max_deadline_ns();
   let repository = attempt.repository();
@@ -2775,7 +2797,7 @@ async fn resolve_one(
   }
   let mut resolution = answer_resolve(origin, shards, (identity, attempt), budget_ns).await;
   if resolution == Resolution::NotHeld {
-    resolution = resolve_elsewhere((origin, shards), (identity, attempt), budget).await;
+    resolution = resolve_elsewhere((origin, shards), (identity, attempt), (budget, left_ns)).await;
   }
   let records = HomeOwner::Record { repository };
   let applied = match resolution {
@@ -2804,42 +2826,31 @@ async fn resolve_one(
   let _ = crate::state::with_state(|state| state.count(counter, 1));
 }
 
-/// [`resolve_one`] asked of the node that holds the attempt's repository now, where this node does not: this node's
-/// routing for the repository's register, else the committed configuration's lineage for it (its member, or the
-/// successor its retirement names), else a location round.
+/// [`resolve_one`] asked of the node that holds the attempt's repository now, where this node does not: found by the one
+/// owner lookup every object's forward makes (`owner_location::locate_owner`, A-921 part 2, main 01a20182's ruling of
+/// 2026-11-25), at the repository's home region, within this pass's budget (the home passes' lane is never held past
+/// it); an attempt whose holder no one claimed within it stays unresolved, kept, for a later pass. Before, its own
+/// sequence (routing, then the configuration's lineage, then one round at region 0 with no eligibility filter and no
+/// budget) could name a host a takeover had succeeded, and drift from the volume forward's.
 async fn resolve_elsewhere(
   (origin, shards): (u16, &[u16]),
   (identity, attempt): (ContentId, HomeOwner),
-  budget: slates_cluster::CommitBudget,
+  (budget, left_ns): (slates_cluster::CommitBudget, u64),
 ) -> Resolution {
   use slates_cluster::homes::{HomeMessage, HomeOutcome};
   let object = slates_db::register::ObjectId(attempt.repository());
-  let HomeOwner::Attempt { node, .. } = attempt else {
+  if !matches!(attempt, HomeOwner::Attempt { .. }) {
     return Resolution::Unresolved;
-  };
-  // Where the repository's register belongs now, from the committed configuration alone (every node names the same
-  // one, `RegionalConfiguration::lineage`): the attempt's member while it is one (a process that only restarted), else the
-  // successor its retirement names.
-  let Some((local, routed, configured, query)) = crate::state::with_state(|state| {
-    let regional = state.council.configuration();
-    let configured = match regional.lineage(node, object) {
-      slates_db::register::Lineage::Successor { successor, .. } => Some(successor),
-      _ if state.fleet.members().contains(&node) => Some(node),
-      _ => None,
-    };
+  }
+  let Some((local, query)) = crate::state::with_state(|state| {
     (
       state.fleet.host(),
-      state.fleet.object_owner(object),
-      configured,
-      crate::owner_location::Query::new(state, object, 0),
+      crate::owner_location::home_query(state, object),
     )
   }) else {
     return Resolution::Unresolved;
   };
-  let holder = match routed.or(configured) {
-    Some(holder) => Some(holder),
-    None => crate::owner_location::locate(query).await.ok(),
-  };
+  let holder = crate::owner_location::locate_owner(query, Some(left_ns)).await;
   let Some(holder) = holder.filter(|holder| *holder != local) else {
     return Resolution::Unresolved;
   };

@@ -6973,6 +6973,17 @@ version.
 > beside two spinners a CPU: 1 or 2 calls refused in every false death under one liveness budget of wall time). The
 > operator's failover SLO caps the whole on the wall. Counted: `fleet.owner_location.gave_up`, and the budget's two
 > ends, `budget_spent` and `slo_ended`.
+>
+> **Amended by A-921 part 2 (2026-11-25, AUD-08's rule for every object).** That loop is now the one owner lookup,
+> `owner_location::locate_owner(query, bound)`, called by the volume forward, the version-control edges and the homes'
+> resolution (`vcs_store::homes::resolve_elsewhere`, whose own sequence, routing then lineage then one region-0 round
+> with no filter and no budget, is gone).
+> - A caller's bound only stops the one sequence sooner: the home healer passes what is left of its pass, and the
+>   forward and the edges pass none.
+> - The query is at the object's home region (`owner_location::home_query`).
+> - The direct route never offers a first owner the configuration keeps a retirement or a completed takeover of: a host
+>   readmitted after a false death is a member again, but not the owner of what it held then. The location round finds
+>   the adopter, which claims while it serves, so letting the takeover's records go (A-309) opens no gap.
 
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
@@ -63894,6 +63905,75 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
 `crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
 `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
 
+### A-921 part 2 — A repository a takeover moved from a node is answered there with where it went, found by the one owner lookup (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; amends AUD-08's lookup status)
+
+- **Why.** A node readmitted after a false death kept serving pushes as the repository's owner. The VCS edges route by
+  the partition that holds a repository's name, never by its owner. Its records were refused `Unauthorized` (38 at each
+  holder) and every push `unable to commit`. Red: `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`.
+- **The change.**
+  - **The moved set.** At a re-admission (`readmission::install_placement`'s readmitted branch, beside the volumes'
+    `yield_catalogued`), each shard marks every repository its partition holds as yielded
+    (`ShardState::yielded_repositories`, counted `fleet.readmission.repositories_yielded`). It is bounded by the
+    partition's repositories; A-922 releases the copies.
+  - **The one owner lookup.** A yielded repository's owner is found on the control shard by
+    `owner_location::locate_owner`: the volume forward's loop, lifted so the forward, the edges and the homes'
+    resolution share it (AUD-08's status, amended). The query is at the object's home region. The direct route never
+    offers a creator retired by a kept takeover, so the location round finds the adopter.
+  - **The answer, git and Mercurial over HTTP.** `307 Temporary Redirect` to the owner's announced edge (A-925), with
+    the request's path and query, counted `vcs_http.git.moved_redirected`. It is temporary because a takeover may move
+    the repository again. Two typed `503`s carry the answer in `Slates-Repository-Owner`: "member <id>" where the owner
+    announced no edge (`moved_no_edge`), and "moved, owner unknown here" where no owner claimed it within the lookup's
+    budget (`moved_owner_unknown`, the existing `OwnerUnreachable`, not a new variant).
+  - **Subversion over HTTP** gets the same answers.
+  - **SSH** has no redirect; a moved repository is refused typed ("moved to another node by a takeover; this node no
+    longer serves it", `vcs_ssh.moved_refused`). The SSH dispatch is synchronous, so it does not name the owner.
+    svnserve's vocabulary has no move, so it answers no repository there, counted and logged.
+  - **The home healer** passes what is left of its pass to the shared lookup. A pass over unclaimed attempts ends
+    within its budget; an attempt left unasked stays kept, and the pass is owed again.
+- **Measured, clients' redirects** (stock clients against a local `307`, macOS arm64, 2026-11-25):
+  - **git** follows a `307` at its first request (`http.followRedirects`'s default, `initial`).
+  - **Mercurial 7.2.4** follows it at its first request (`capabilities`).
+  - **Subversion 1.15** does not follow. It stops with `E170011: Repository moved temporarily to '<url>'`, naming the
+    target for its user to `svn relocate` to.
+  - **Credentials (git):** curl drops a custom `Authorization` field, here git's `http.extraHeader` bearer, once a
+    redirect changes origin, and a different port is a different origin. The owner then answers `401`, and git asks
+    its credential helper for the new origin.
+  - **What a user must configure for a `307` across nodes:** a credential helper that answers the fleet's token for
+    every node's edge (keyed by host and port, or one entry for the fleet's host with `credential.useHttpPath`
+    unset). A bearer in `http.extraHeader` alone reaches only the first node. The fleet tests' push helpers carry one
+    (`token_helper`).
+- **The window before a node learns it was taken over.** A readmitted node learns it lost its repositories when it
+  installs the configuration that bumped its epoch, which can come after every council names it a member again. Until
+  then it serves as their owner, its records are refused, and a push there is refused `unable to commit`, typed. The
+  fleet test waits for its yield before it pushes; a run on the merged base that did not wait met that window once.
+- **Not reproduced end to end: the stale-creator window** (main's ruling).
+  - Across three fleet scenes (a cold four-node fleet, and one with the non-holder restarted warm after a's
+    readmission), the direct route never named a with the skip turned off. The non-holder's routing, learned again,
+    named the adopter before a became eligible again.
+  - The skip guards the window between them. Its red is the unit test on the exact state.
+- **Fleet-wide name routing is not in this piece** (main's ruling (a)). A node holding no copy of a repository answers
+  `404` as before: a name resolves only where a partition holds it (D-12, no directory). It is in GAPS, owed, waiting
+  for Ada's word.
+- **Tests** (macOS arm64, debug, 2026-11-25).
+  - Fleet `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`: green, the push at a
+    redirected and landed at the adopter. The adopter alone serves the repository, and the node that never held it
+    answers not found.
+  - Fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` and
+    `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`: served forwards, never a.
+  - Unit `owner_location::tests::the_direct_route_never_names_a_creator_a_kept_takeover_retired`: red without the skip
+    (the creator named).
+  - Unit `vcs_http::git::tests::a_request_for_a_moved_repository_is_answered_with_where_it_went`: `307` with its path,
+    the `503` naming the owner, and the `503` unknown.
+  - `git_push::tests::a_resolution_pass_over_unclaimed_attempts_ends_within_its_budget`.
+  - Fleet runs were made directly, past the A-924 2b spawner's wedges (`spawning.rs:668`), which ended about 2 runs in
+    3 at their start.
+- **Models.** None; routing and lookups are outside the register's state machine.
+
+Applied in the same change to: AUD-08's lookup status (§4.8), `crates/server/src/{owner_location,verbs,readmission,state,
+daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/server/src/vcs_ssh/{site,svn}.rs`,
+`crates/server/src/vcs_store/homes.rs`, `crates/http/src/reply.rs`, `crates/server/tests/fleet.rs` and
+`crates/server/src/{vcs_http/tests/git,git_push/tests}.rs`, GAPS.
+
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
 - **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
@@ -64357,6 +64437,14 @@ measured noise of the 100 figure, not a literal.
 > daemon's process thread at its drop (`Daemon::stop_parts` joins it, `join_spawner`, once the runtime has ended). Red:
 > a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
 > (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
+>
+> **The start off the shard too (2026-11-25).** The restart's start of the next spawner, a `posix_spawn` of the daemon's
+> executable, ran on the control shard, and under load it held the shard past its window (main's store-wait at
+> 1948dbdcc: "shard 0 is wedged, unmoved for 1028 ms … spawning.rs:687"). Now a thread of its own starts it
+> (`started_off_shard`), hands it back and wakes the shard's task through a pipe the task awaits, and is joined once it
+> has answered; the start's length is counted (`spawner.start_ns_most`, and `spawner.starts_past_window` past the
+> liveness window). Red: a start slowed 3 s, as a loaded machine slows one, held its shard 3.11 s on the shard; off it,
+> the shard steps (`a_spawners_start_slowed_past_the_window_never_holds_its_shard`).
 >
 > **Every received descriptor close-on-exec (2026-11-25).** Main's diag run 45672799755 found a child started through
 > the spawner on both Linux lanes holding a descriptor a direct child did not (fd 6). The spawner received the child's

@@ -74,6 +74,7 @@ pub(crate) fn install_placement(
   state.fleet.install_configuration(configuration, members);
   if readmitted {
     yield_catalogued(state);
+    yield_repositories(state);
     let_go_own_registers(state, local);
   }
 }
@@ -118,6 +119,31 @@ fn let_go_own_registers(state: &mut ShardState, local: HostId) {
 /// at once ([`let_go_own_registers`], A-415); the next publication carries it.
 pub(crate) const REGISTERS_LET_GO_UNPUBLISHED: &str =
   "fleet.readmission.registers_let_go_unpublished";
+
+/// Marks every repository this shard's partition holds as yielded (A-921 part 2), after pruning the set to the
+/// partition's repositories: a successor's now, answered with where its owner is, never served here. Counted.
+fn yield_repositories(state: &mut ShardState) {
+  let held: BTreeSet<slates_db::catalog::RepositoryId> = state
+    .db
+    .partition()
+    .repositories()
+    .repositories()
+    .map(|record| record.id)
+    .collect();
+  state
+    .yielded_repositories
+    .retain(|repository| held.contains(repository));
+  let before = state.yielded_repositories.len();
+  state.yielded_repositories.extend(held);
+  let added = state.yielded_repositories.len().saturating_sub(before);
+  state.count(
+    REPOSITORIES_YIELDED,
+    u64::try_from(added).unwrap_or(u64::MAX),
+  );
+}
+
+/// Format: the status count of repositories marked yielded at a re-admission (A-921 part 2).
+pub(crate) const REPOSITORIES_YIELDED: &str = "fleet.readmission.repositories_yielded";
 
 /// Marks every volume this shard catalogues as yielded, after pruning the set to the catalog (so it stays within the
 /// partition's volume cap), counts the volumes it adds, and ends each newly yielded volume's FUSE mounts here at once

@@ -300,3 +300,48 @@ fn reaped_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
     (TICK_MOST.with(std::cell::Cell::get), code)
   })
 }
+
+/// Main 01a20182's store-wait at 1948dbdcc (2026-11-25, load about 31: "shard 0 is wedged, unmoved for 1028 ms … in task
+/// spawned at spawning.rs:687"): the restart's start of the next spawner, a `posix_spawn` of the daemon's executable,
+/// ran on the control shard. Do: make this shard its spawner's owner, every start from it slowed by [`LINGER_NS`] as a
+/// loaded machine slows one (`TEST_START_DELAY_NS`); run a task stepping once a tick; kill the spawner; ask for
+/// `sh -c 'exit 4'` until the restarted spawner starts it. Expect: the child exits 4, and the shard never held past a
+/// liveness window while the start ran. Red before: the start ran on the shard, a gap of its [`LINGER_NS`].
+#[test]
+fn a_spawners_start_slowed_past_the_window_never_holds_its_shard() {
+  let (gap, code) = on_a_thread_within(|| started_while_stepping());
+  assert_eq!(code, Ok(Some(4)));
+  assert!(
+    gap < LIVENESS_BUDGET_NS,
+    "the shard stepped while the next spawner started: its longest gap {gap} ns against {LIVENESS_BUDGET_NS}"
+  );
+}
+
+/// [`a_spawners_start_slowed_past_the_window_never_holds_its_shard`]'s work on its own runtime: the shard's longest gap
+/// between steps, and the child's exit code.
+fn started_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
+  on_runtime(async {
+    let spawner = TestSpawner::owned();
+    super::TEST_START_DELAY_NS.with(|delay| delay.set(LINGER_NS));
+    TICK_STOP.with(|stop| stop.set(false));
+    TICK_MOST.with(|most| most.set(0));
+    slates_rt::futures::spawn(tick())
+      .and_then(slates_rt::futures::detach)
+      .expect("the ticker");
+    spawner.kill();
+    let exiting = [OsStr::new("-c"), OsStr::new("exit 4")];
+    let child = loop {
+      match spawn(&shell(&exiting)).await {
+        Ok(child) => break child,
+        Err(SpawnRefused::SpawnerGone) => slates_rt::futures::yield_now().await,
+        Err(refused) => panic!("refused {refused:?}"),
+      }
+    };
+    let code = child.exit().await.map(|status| status.code());
+    drop(child);
+    TICK_STOP.with(|stop| stop.set(true));
+    super::TEST_START_DELAY_NS.with(|delay| delay.set(0));
+    drop(spawner);
+    (TICK_MOST.with(std::cell::Cell::get), code)
+  })
+}

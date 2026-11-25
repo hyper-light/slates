@@ -330,12 +330,15 @@
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.
->   - **OPEN, the product half (A-921 part 2), w-shared's next:** a, readmitted after its false death, still ran pushes
->     as the repository's owner (the VCS edges route by the partition holding the repository, never by the
->     configuration's owner), its records refused `Unauthorized` (38 at each holder) and the push `unable to commit`.
->     Red (written, held for its fix): `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`.
->     Fix: every protocol's first request routed by owner, git over HTTP answered 307 to the owner, each other client's
->     handling of a redirect measured, and a typed refusal naming the owner where it does not follow.
+>   - **FIXED, the product half (A-921 part 2):** a readmitted node answers a request for a repository a takeover moved
+>     from it with where it went: `307` to the adopter's announced edge (git, Mercurial over HTTP; Subversion names the
+>     target and stops), a typed `503` naming the owner where it announced no edge, "moved, owner unknown here" where
+>     none claimed it; SSH refused typed. Found by the one owner lookup (`owner_location::locate_owner`), shared with the
+>     volume forward and the homes' resolution. For a cross-node `307`, git needs a credential helper answering every
+>     node's edge (curl drops a custom `Authorization` field on an origin change).
+>   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
+>     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
+>     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
 >   - **OPEN, A-922:** a node whose authority over a repository moved forgets its partition's copy, sliced and bounded,
 >     as `forget_owned_by` does for volumes (AUD-08).
 > - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
@@ -1933,6 +1936,15 @@
 > answered_whole` and `a_rekey_during_a_blocked_write_sends_no_byte_twice` run through the production edge and its
 > yields, so not this cause. Owed: the blocked first poll's call, if the A/B meets it again (the watchdog's log names
 > the poll, not the call).
+> Two hg-over-SSH clones through the production edge read the whole 41,998,230-byte answer and exit-status 0 but missed
+> the session's end (`(Some(0), false)`, overdue 2, at load 39 to 45 in a whole run of the lib; main's order of
+> 2026-11-25, moved from w-git): `an_ssh_clone_past_many_windows_is_answered_whole` and `a_rekey_during_a_blocked_write_
+> sends_no_byte_twice`. The client calls the session ended when the server ends the connection within its patience
+> (four liveness windows) after the client's close. Not reproduced (w-hg, the MacBook): 6 rounds of the two alone and 4
+> of the whole `vcs_ssh` filter, each beside two spinning threads a core in process, load up to 131: every run saw
+> exit-status, EOF and close in order (`[94, 98, 96, 97]`) and the connection's end 3 µs to 47 ms after the close.
+> Since, a failure names which end it missed: the channel messages' order and the wait for the connection's end after
+> the close (`Adjusted::ending` in `vcs_ssh/tests/hg.rs`). Owed: the next red's line (main's whole runs).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads

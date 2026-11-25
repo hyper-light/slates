@@ -4303,6 +4303,77 @@ fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object(
   );
 }
 
+/// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the home healer waits the shared owner lookup within its own
+/// budget). Do: on a store-backed shard, hold three objects for earlier-process attempts of repositories no shard holds
+/// (nobody will claim them), then run one resolution pass within the live budget. Expect the pass over within that budget
+/// and one look's pace past it (the lane never held past it), each hold kept, counted, and no hold let go or moved.
+/// Before, the shared lookup waited its own horizon for each unclaimed attempt in turn.
+#[test]
+fn a_resolution_pass_over_unclaimed_attempts_ends_within_its_budget() {
+  use crate::vcs_store::homes;
+  use slates_cluster::homes::HomeOwner;
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let (node, process) = (state.fleet.host(), state.member_process_nonce ^ 1);
+    let held: Option<Vec<slates_vcs::ContentId>> = (0u8..3)
+      .map(|number| {
+        let owner = HomeOwner::Attempt {
+          repository: [0xE0 | number; 16],
+          node,
+          process,
+          attempt: u64::from(number),
+        };
+        homes::keep_for_region(state, &[b'u', number], &[owner])
+          .ok()
+          .map(|(identity, _)| identity)
+      })
+      .collect();
+    let (origin, shards) = (state.shard, state.shards.clone());
+    let task = slates_rt::futures::spawn(async move {
+      let Some(held) = held else {
+        let _ = sent.send(Err("not held".to_owned()));
+        return;
+      };
+      let budget = crate::fleet::live_budget();
+      homes::resolve_owed();
+      let began = slates_rt::futures::now_ns();
+      homes::resolve_ended(origin, &shards, budget).await;
+      let took = slates_rt::futures::now_ns().saturating_sub(began);
+      let seen = crate::state::with_state(|state| {
+        let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          held
+            .iter()
+            .map(homes::region_holds_here)
+            .collect::<Vec<_>>(),
+          [
+            counted(homes::RESOLVED_RECORD),
+            counted(homes::RESOLVED_LET_GO),
+            counted(homes::RESOLVE_KEPT),
+          ],
+        )
+      });
+      let _ = sent.send(Ok((took, budget.max_deadline_ns(), seen)));
+    })
+    .expect("the task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (took, budget_ns, seen) = got.recv().expect("the pass ended").expect("held");
+  let (holds, counts) = seen.expect("the shard's state");
+  let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+  println!(
+    "a919: a resolution pass over three unclaimed attempts took {took} ns of its {budget_ns} ns budget"
+  );
+  assert!(
+    took <= budget_ns.saturating_add(pace),
+    "the pass ended within its budget and one look's pace: {took} ns of {budget_ns} ns"
+  );
+  assert_eq!(holds, vec![1, 1, 1], "every unclaimed hold kept");
+  assert_eq!((counts[0], counts[1]), (0, 0), "none moved or let go");
+  assert!(counts[2] >= 3, "each kept, counted: {counts:?}");
+}
+
 /// A-727 (d1a-3) (main 01a20182's ruling (u) of 2026-11-23: a hold an attempt a crash left is resolved from the homes'
 /// side once its process ended, by its repository's current holder, from its records; never on a timer). Do: on a
 /// store-backed shard (one node, `f = 0`: the home and the holder are this node), push stock git's `create` whole, its

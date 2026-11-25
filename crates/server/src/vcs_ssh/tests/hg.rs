@@ -40,8 +40,8 @@ use super::super::site::{
   Start, Stepped, ToolCommand, ToolServices, ToolSite, Unserved,
 };
 use super::{
-  HELD_SEED, HOLDER, Keys, ONE_SEAT, Peer, ROOM_BYTES, TICK_NS, Transcript, exec, query, send_data,
-  served_by, served_keyed, sign, transcript,
+  HELD_SEED, HOLDER, Keys, ONE_SEAT, PATIENCE_NS, Peer, ROOM_BYTES, TICK_NS, Transcript, exec,
+  query, send_data, served_by, served_keyed, sign, transcript,
 };
 use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
 use crate::repository::hg_push::{self, Pushing, line_name};
@@ -1851,10 +1851,34 @@ impl HgStores for GrownLends {
   }
 }
 
+/// A session read as OpenSSH's client reads it ([`transcript_adjusting`]): everything it gave, and how long the client
+/// waited for the connection to end after the channel's close, none where no close came. Which of the session's ends a
+/// client missed is in the transcript's `order` (exit-status 98, EOF 96, close 97) and this wait (main's order of
+/// 2026-11-25: two clones read the whole answer and missed the end at load 39 to 45).
+struct Adjusted {
+  /// The session's transcript.
+  transcript: Transcript,
+  /// The wait for the connection's end after the close.
+  close_wait: Option<Duration>,
+}
+
+impl Adjusted {
+  /// What a failure names: the channel messages' order and the wait for the connection's end.
+  fn ending(&self) -> String {
+    format!(
+      "messages {:?}, the connection's end waited {:?} after the close (patience {:?})",
+      self.transcript.order,
+      self.close_wait,
+      Duration::from_nanos(PATIENCE_NS)
+    )
+  }
+}
+
 /// Reads the session as OpenSSH's client does: each data message's bytes counted, the window given back
-/// (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, until the server closes the session; everything it gave.
-fn transcript_adjusting(peer: &mut Peer) -> Transcript {
+/// (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, until the server closes the session ([`Adjusted`]).
+fn transcript_adjusting(peer: &mut Peer) -> Adjusted {
   let mut transcript = Transcript::default();
+  let mut close_wait = None;
   let mut unadjusted: u32 = 0;
   while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
     let number = message[0];
@@ -1895,13 +1919,18 @@ fn transcript_adjusting(peer: &mut Peer) -> Transcript {
         let mut close = vec![97];
         close.extend_from_slice(&peer.channel.to_be_bytes());
         peer.send(&close);
-        transcript.ended = peer.ended();
+        let (ended, waited) = peer.ended_waited();
+        transcript.ended = ended;
+        close_wait = Some(waited);
         break;
       }
       _ => {}
     }
   }
-  transcript
+  Adjusted {
+    transcript,
+    close_wait,
+  }
 }
 
 /// A-745 (found by use, w-interop, release 295d8723d: `ssh-clone` of Mercurial's repository wrote 25 MB, then the
@@ -1937,12 +1966,14 @@ fn an_ssh_clone_past_many_windows_is_answered_whole() {
       Some(transcript_adjusting(&mut peer))
     },
   );
-  let transcript = transcript.expect("the session");
+  let adjusted = transcript.expect("the session");
+  let transcript = &adjusted.transcript;
   let sent = transcript.out.len();
   assert_eq!(
     (transcript.status, transcript.ended),
     (Some(EXIT_STATUS), true),
-    "{sent} bytes of the answer read"
+    "{sent} bytes of the answer read; {}",
+    adjusted.ending()
   );
   assert!(
     sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
@@ -1986,11 +2017,12 @@ fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
       (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
       exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
       send_data(&mut peer, &clone_request(&head));
-      let transcript = transcript_adjusting(&mut peer);
-      Some((transcript, peer.client.exchanges()))
+      let adjusted = transcript_adjusting(&mut peer);
+      Some((adjusted, peer.client.exchanges()))
     },
   );
-  let (transcript, exchanges) = transcript.expect("the session");
+  let (adjusted, exchanges) = transcript.expect("the session");
+  let transcript = &adjusted.transcript;
   let sent = transcript.out.len();
   assert!(
     exchanges > 1,
@@ -1999,7 +2031,8 @@ fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
   assert_eq!(
     (transcript.status, transcript.ended),
     (Some(EXIT_STATUS), true),
-    "{sent} bytes of the answer read over {exchanges} key exchanges; the edge saw {seen:?}"
+    "{sent} bytes of the answer read over {exchanges} key exchanges; {}; the edge saw {seen:?}",
+    adjusted.ending()
   );
   assert!(
     sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
@@ -2029,7 +2062,7 @@ fn an_ssh_answer_refused_past_its_start_exits_as_an_abort() {
       (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
       exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
       send_data(&mut peer, &clone_request(&head));
-      Some(transcript_adjusting(&mut peer))
+      Some(transcript_adjusting(&mut peer).transcript)
     },
   );
   let transcript = transcript.expect("the session");
