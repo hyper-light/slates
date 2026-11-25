@@ -9,28 +9,69 @@
 //! **Design and evidence.** Profiling initial pushes of `git.git` (424,984 objects) and `hg-src` (57,036 changesets)
 //! showed RustCrypto's scalar `sha1-checked` taking ~73–74% of all daemon CPU because it runs scalar Rust SHA-1
 //! compression on every 64-byte block so intermediate states at rounds 58 and 65 are always available. Across the 32
-//! Stevens disturbance vectors, however, the unavoidable bit conditions (`ubc_check`) pass on only ~2.5–3.5% of random
-//! blocks (~97% return `ubc_mask == 0`).
+//! Stevens disturbance vectors, however, the unavoidable bit conditions (`ubc_check`) pass on a measured 4.74% of
+//! uniform random blocks (95.26% return `ubc_mask == 0`).
 //!
 //! This module splits every 64-byte block along that boundary with **zero `unsafe`** in `slates`:
-//! 1. [`ubc`] expands only `W[0..65]` (the highest word `ubc_check` reads is `W[64]`) four blocks at a time in
-//!    4-lane `[u32; 4]` arrays so LLVM auto-vectorizes the message schedule and unconditional bit-condition filters
-//!    into 128-bit SIMD.
-//! 2. Contiguous zero-mask runs (~97% of blocks, averaging ~33 blocks / ~2 KiB per run so data stays L1-hot) feed
+//! 1. [`ubc`] expands only `W[0..65]` (the highest word `ubc_check` reads is `W[64]`) eight blocks at a time in
+//!    8-lane `[u32; 8]` arrays (`2 × u32x4` NEON/SSE registers per word, lazily allocated only when at least
+//!    [`OCTET_BLOCKS`] full blocks are present) so LLVM auto-vectorizes the message schedule and Stage 1 bit-condition
+//!    filters into 128-bit SIMD.
+//! 2. Contiguous zero-mask runs (95.26% of blocks, averaging ~20 blocks / ~1.3 KiB per run so data stays L1-hot) feed
 //!    directly into `sha1::block_api::compress` (RustCrypto `sha1 0.11.0`), which dispatches at run time to ARMv8
-//!    `vsha1c/p/m/su0/su1`, x86 SHA-NI, or scalar fallback.
-//! 3. Only the ~2.5–3.5% of single blocks with `ubc_mask != 0` run [`recompress::compress_and_check`] starting from
+//!    `vsha1c/p/m/su0/su1`, x86 SHA-NI, or scalar fallback (paired under `#[cfg(miri)]` with canonical scalar
+//!    [`recompress::compress_block`] because Miri does not emulate `llvm.aarch64.crypto.sha1h`).
+//! 3. Only the 4.74% of single blocks with `ubc_mask != 0` run [`recompress::compress_and_check`] starting from
 //!    the exact incoming chaining state `ihv`, capturing rounds 58 and 65 and running Stevens's backward/forward
 //!    recompression for each set bit in `ubc_mask`.
 //!
 //! **What was rejected.** Whole-object fallback (running hardware SHA-1 first and falling back to scalar `sha1-checked`
-//! whenever any block in the object had `ubc_mask != 0`) was ruled out by probability before coding: at ~3% per block,
-//! an 80–150 KiB Mercurial manifest (1,300–2,400 blocks) triggers at least one block with probability > 99.999%,
-//! giving zero speedup on large objects. Per-block recompression accelerates objects of any size equally.
+//! whenever any block in the object had `ubc_mask != 0`) was ruled out by probability before coding: at 4.74% per
+//! block, an 80–150 KiB Mercurial manifest (1,300–2,400 blocks) triggers at least one block with probability > 99.999%,
+//! giving zero speedup on large objects. Four-lane `[u32; 4]` (924 MB/s vs 1,363 MB/s for 8-lane), `if`-branching
+//! Stage 1 (breaks LLVM SLP), and raw NEON intrinsics without `unsafe` (E0133) were also measured and rejected.
 //!
-//! **Oracle.** Held bit-for-bit against `sha1-checked` across golden vectors, SHAttered-1/2, boundary lengths,
-//! arbitrary streaming chunk splits, all 32 disturbance vectors, and proptest histories, with non-vacuity counters
-//! proving both the hardware fast path and the recompression slow path execute.
+//! **Oracle.** Held bit-for-bit against both `sha1-checked` and an in-tree 32-DV reference oracle across golden
+//! vectors, SHAttered-1/2 (including `>= 512`-byte inputs driving the 8-lane path), boundary lengths, arbitrary
+//! streaming chunk splits, all 32 disturbance vectors, all 32 UBC mask bits, unperturbed round-58/65 recompression,
+//! and proptest histories, with non-vacuity counters proving the 8-lane path, hardware fast path, and recompression
+//! slow path all execute.
+//!
+//! **Upstream attribution.** The UBC filter and disturbance-vector tables translate Marc Stevens & Dan Shumow's
+//! `sha1collisiondetection` (`lib/ubc_check.c`, `lib/sha1.c`):
+//!
+//! ```text
+//! MIT License
+//!
+//! Copyright (c) 2017:
+//!     Marc Stevens
+//!     Cryptology Group
+//!     Centrum Wiskunde & Informatica
+//!     P.O. Box 94079, 1090 GB Amsterdam, Netherlands
+//!     marc@marc-stevens.nl
+//!
+//!     Dan Shumow
+//!     Microsoft Research
+//!     danshu@microsoft.com
+//!
+//! Permission is hereby granted, free of charge, to any person obtaining a copy
+//! of this software and associated documentation files (the "Software"), to deal
+//! in the Software without restriction, including without limitation the rights
+//! to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//! copies of the Software, and to permit persons to whom the Software is
+//! furnished to do so, subject to the following conditions:
+//!
+//! The above copyright notice and this permission notice shall be included in all
+//! copies or substantial portions of the Software.
+//!
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//! IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//! FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//! AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//! LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//! SOFTWARE.
+//! ```
 
 mod recompress;
 mod ubc;
@@ -65,7 +106,14 @@ const STATE_WORDS: usize = 5;
 type State = [u32; STATE_WORDS];
 
 /// Format: SHA-1 initial chaining state `H0..H4` (FIPS 180-4 §5.3.1).
-const INITIAL_STATE: State = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+const INITIAL_STATE: State = [
+  0x6745_2301,
+  0xefcd_ab89,
+  0x98ba_dcfe,
+  // Format: SHA-1 initial chaining state `H3..H4` (FIPS 180-4 §5.3.1).
+  0x1032_5476,
+  0xc3d2_e1f0,
+];
 
 /// An input in which SHA-1 collision detection found a known collision attack, carrying the input's plain SHA-1 digest
 /// (as git's `sha1dc_git.c` and Mercurial's `thirdparty/sha1dc/cext.c` compute with `safe_hash = false`).
@@ -80,7 +128,7 @@ pub struct CollisionAttack {
 /// Occupies 96 bytes on the stack (no heap allocation, no internal 80-word buffers retained across calls).
 #[derive(Clone)]
 pub struct Hasher {
-  state: [u32; 5],
+  state: State,
   total_bytes: u64,
   tail: [u8; BLOCK_LEN],
   tail_len: u8,
@@ -89,6 +137,8 @@ pub struct Hasher {
   fast_blocks: u64,
   #[cfg(test)]
   recompressed_blocks: u64,
+  #[cfg(test)]
+  octet_batches: u64,
 }
 
 impl Default for Hasher {
@@ -111,6 +161,8 @@ impl Hasher {
       fast_blocks: 0,
       #[cfg(test)]
       recompressed_blocks: 0,
+      #[cfg(test)]
+      octet_batches: 0,
     }
   }
 
@@ -185,10 +237,30 @@ impl Hasher {
   /// non-zero.
   fn process_blocks(&mut self, blocks: &[[u8; BLOCK_LEN]]) {
     let (octets, trailing) = blocks.as_chunks::<OCTET_BLOCKS>();
+    if !octets.is_empty() {
+      self.process_octets(blocks, octets);
+    }
+    if !trailing.is_empty() {
+      self.process_trailing(trailing);
+    }
+  }
+
+  /// Processes one or more full eight-block octets, lazily allocating [`ubc::OctetScratch`] on the stack only when
+  /// `blocks.len() >= OCTET_BLOCKS` so small inputs avoid zero-filling 2,080 bytes.
+  #[inline(never)]
+  fn process_octets(
+    &mut self,
+    blocks: &[[u8; BLOCK_LEN]],
+    octets: &[[[u8; BLOCK_LEN]; OCTET_BLOCKS]],
+  ) {
     let mut clean_start: usize = 0;
     let mut scratch = ubc::OctetScratch::new();
 
     for (octet_index, octet) in octets.iter().enumerate() {
+      #[cfg(test)]
+      {
+        self.octet_batches = self.octet_batches.saturating_add(1);
+      }
       let masks = ubc::check_octet(octet, &mut scratch);
       if masks == [0; OCTET_BLOCKS] {
         continue;
@@ -201,7 +273,10 @@ impl Hasher {
 
     let octets_end = octets.len().saturating_mul(OCTET_BLOCKS);
     self.flush_clean_run(blocks, clean_start, octets_end);
+  }
 
+  /// Processes `1..OCTET_BLOCKS` trailing blocks with single-block UBC filtering without allocating an octet scratch.
+  fn process_trailing(&mut self, trailing: &[[u8; BLOCK_LEN]]) {
     let mut tail_clean_start: usize = 0;
     for (index, block) in trailing.iter().enumerate() {
       let mask = ubc::check_one(block);
@@ -259,7 +334,7 @@ impl Hasher {
   /// Runs hardware-accelerated SHA-1 compression over blocks known to have `ubc_mask == 0`.
   #[inline]
   fn compress_fast(&mut self, blocks: &[[u8; BLOCK_LEN]]) {
-    sha1::block_api::compress(&mut self.state, blocks);
+    compress_clean_blocks(&mut self.state, blocks);
     #[cfg(test)]
     {
       self.fast_blocks = self
@@ -292,6 +367,30 @@ impl Hasher {
   pub(crate) fn recompressed_blocks(&self) -> u64 {
     self.recompressed_blocks
   }
+
+  /// Non-vacuity test counter: full eight-block SIMD octets processed by [`Self::process_octets`].
+  #[cfg(test)]
+  pub(crate) fn octet_batches(&self) -> u64 {
+    self.octet_batches
+  }
+}
+
+/// Compresses zero-UBC-mask blocks through hardware-accelerated SHA-1 (`sha1::block_api::compress`: ARMv8 SHA, x86
+/// SHA-NI, or scalar fallback).
+#[cfg(not(miri))]
+#[inline]
+fn compress_clean_blocks(state: &mut State, blocks: &[[u8; BLOCK_LEN]]) {
+  sha1::block_api::compress(state, blocks);
+}
+
+/// Compresses zero-UBC-mask blocks through canonical scalar SHA-1 under Miri, because `sha1 0.11.0`'s ARMv8 crypto
+/// backend invokes `llvm.aarch64.crypto.sha1h`, which Miri does not emulate.
+#[cfg(miri)]
+#[inline]
+fn compress_clean_blocks(state: &mut State, blocks: &[[u8; BLOCK_LEN]]) {
+  for block in blocks {
+    recompress::compress_block(state, block);
+  }
 }
 
 /// One-shot collision-detecting SHA-1 of `bytes`.
@@ -320,5 +419,7 @@ fn encode_state(state: &State) -> [u8; DIGEST_LEN] {
   out
 }
 
+#[cfg(test)]
+mod oracle;
 #[cfg(test)]
 mod tests;

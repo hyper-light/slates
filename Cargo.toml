@@ -136,7 +136,7 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 # SHA-1 with collision detection for git's object names (§4.17.2, A-600) and Mercurial's nodes (§4.17.3, A-588), as git's
 # own sha1dc and Mercurial 7.2's sha1dc binding (`thirdparty/sha1dc/cext.c`) detect the SHAttered and later attacks:
 # `slates_vcs::sha1dc` pairs RustCrypto's hardware-accelerated `sha1` block compression (`sha1::block_api::compress`:
-# ARMv8 SHA instructions, x86 SHA-NI, scalar fallback; zero `unsafe` in slates) with 4-lane SIMD-friendly Marc Stevens
+# ARMv8 SHA instructions, x86 SHA-NI, scalar fallback; zero `unsafe` in slates) with 8-lane SIMD-friendly Marc Stevens
 # UBC filtering and exact single-block recompression on triggered blocks, held bit-for-bit to RustCrypto's `sha1-checked`
 # oracle in tests. Neither crate uses `std` or OID tables.
 sha1 = { version = "0.11.0", default-features = false }

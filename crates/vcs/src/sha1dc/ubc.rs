@@ -14,6 +14,39 @@
 //!
 //! Because every UBC equation clears bits with bitwise AND, reordering equations between Stage 1 and Stage 2 produces
 //! the bit-for-bit identical 32-bit `ubc_mask` on every possible 64-byte block.
+//!
+//! ```text
+//! MIT License
+//!
+//! Copyright (c) 2017:
+//!     Marc Stevens
+//!     Cryptology Group
+//!     Centrum Wiskunde & Informatica
+//!     P.O. Box 94079, 1090 GB Amsterdam, Netherlands
+//!     marc@marc-stevens.nl
+//!
+//!     Dan Shumow
+//!     Microsoft Research
+//!     danshu@microsoft.com
+//!
+//! Permission is hereby granted, free of charge, to any person obtaining a copy
+//! of this software and associated documentation files (the "Software"), to deal
+//! in the Software without restriction, including without limitation the rights
+//! to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//! copies of the Software, and to permit persons to whom the Software is
+//! furnished to do so, subject to the following conditions:
+//!
+//! The above copyright notice and this permission notice shall be included in all
+//! copies or substantial portions of the Software.
+//!
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//! IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//! FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//! AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//! LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//! SOFTWARE.
+//! ```
 
 use super::{BLOCK_LEN, OCTET_BLOCKS, WORD_BYTES};
 
@@ -51,45 +84,69 @@ impl OctetScratch {
   }
 }
 
-/// Format: Stevens disturbance-vector mask bit positions (`lib/ubc_check.c`, `tools/data/3565`).
+/// Format: Stevens disturbance-vector mask bit 0 for `I(43, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_43_0: u32 = 1 << 0;
+/// Format: Stevens disturbance-vector mask bit 1 for `I(44, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_44_0: u32 = 1 << 1;
+/// Format: Stevens disturbance-vector mask bit 2 for `I(45, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_45_0: u32 = 1 << 2;
+/// Format: Stevens disturbance-vector mask bit 3 for `I(46, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_46_0: u32 = 1 << 3;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 4 for `I(46, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_46_2: u32 = 1 << 4;
+/// Format: Stevens disturbance-vector mask bit 5 for `I(47, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_47_0: u32 = 1 << 5;
+/// Format: Stevens disturbance-vector mask bit 6 for `I(47, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_47_2: u32 = 1 << 6;
+/// Format: Stevens disturbance-vector mask bit 7 for `I(48, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_48_0: u32 = 1 << 7;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 8 for `I(48, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_48_2: u32 = 1 << 8;
+/// Format: Stevens disturbance-vector mask bit 9 for `I(49, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_49_0: u32 = 1 << 9;
+/// Format: Stevens disturbance-vector mask bit 10 for `I(49, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_49_2: u32 = 1 << 10;
+/// Format: Stevens disturbance-vector mask bit 11 for `I(50, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_50_0: u32 = 1 << 11;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 12 for `I(50, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_50_2: u32 = 1 << 12;
+/// Format: Stevens disturbance-vector mask bit 13 for `I(51, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_51_0: u32 = 1 << 13;
+/// Format: Stevens disturbance-vector mask bit 14 for `I(51, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_51_2: u32 = 1 << 14;
+/// Format: Stevens disturbance-vector mask bit 15 for `I(52, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_I_52_0: u32 = 1 << 15;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 16 for `II(45, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_45_0: u32 = 1 << 16;
+/// Format: Stevens disturbance-vector mask bit 17 for `II(46, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_46_0: u32 = 1 << 17;
+/// Format: Stevens disturbance-vector mask bit 18 for `II(46, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_46_2: u32 = 1 << 18;
+/// Format: Stevens disturbance-vector mask bit 19 for `II(47, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_47_0: u32 = 1 << 19;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 20 for `II(48, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_48_0: u32 = 1 << 20;
+/// Format: Stevens disturbance-vector mask bit 21 for `II(49, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_49_0: u32 = 1 << 21;
+/// Format: Stevens disturbance-vector mask bit 22 for `II(49, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_49_2: u32 = 1 << 22;
+/// Format: Stevens disturbance-vector mask bit 23 for `II(50, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_50_0: u32 = 1 << 23;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 24 for `II(50, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_50_2: u32 = 1 << 24;
+/// Format: Stevens disturbance-vector mask bit 25 for `II(51, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_51_0: u32 = 1 << 25;
+/// Format: Stevens disturbance-vector mask bit 26 for `II(51, 2)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_51_2: u32 = 1 << 26;
+/// Format: Stevens disturbance-vector mask bit 27 for `II(52, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_52_0: u32 = 1 << 27;
-// Format: Stevens disturbance-vector mask bit positions (continued).
+/// Format: Stevens disturbance-vector mask bit 28 for `II(53, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_53_0: u32 = 1 << 28;
+/// Format: Stevens disturbance-vector mask bit 29 for `II(54, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_54_0: u32 = 1 << 29;
+/// Format: Stevens disturbance-vector mask bit 30 for `II(55, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_55_0: u32 = 1 << 30;
+/// Format: Stevens disturbance-vector mask bit 31 for `II(56, 0)` (`lib/ubc_check.c`, `tools/data/3565`).
 const DV_II_56_0: u32 = 1 << 31;
 
 /// All `b = 0` type-I disturbance-vector mask bits.
@@ -139,47 +196,180 @@ type Eq = (usize, usize, u32);
 
 /// Format: Stevens `ubc_check` Stage 1 `eq_same(..., shift = 29)` equations (`tools/data/3565`).
 const EQ_SAME_29: &[Eq] = &[
-  // Format: Stevens `eq_same(shift = 29)` equations.
-  (44, 45, !(DV_I_48_0 | DV_I_51_0 | DV_I_52_0 | DV_II_45_0 | DV_II_46_0 | DV_II_50_0 | DV_II_51_0)),
-  (49, 50, !(DV_I_46_0 | DV_II_45_0 | DV_II_50_0 | DV_II_51_0 | DV_II_55_0 | DV_II_56_0)),
-  (48, 49, !(DV_I_45_0 | DV_I_52_0 | DV_II_49_0 | DV_II_50_0 | DV_II_54_0 | DV_II_55_0)),
-  (47, 48, !(DV_I_44_0 | DV_I_51_0 | DV_II_48_0 | DV_II_49_0 | DV_II_53_0 | DV_II_54_0)),
-  // Format: Stevens `eq_same(shift = 29)` equations (continued).
-  (46, 47, !(DV_I_43_0 | DV_I_50_0 | DV_II_47_0 | DV_II_48_0 | DV_II_52_0 | DV_II_53_0)),
-  (45, 46, !(DV_I_49_0 | DV_I_52_0 | DV_II_46_0 | DV_II_47_0 | DV_II_51_0 | DV_II_52_0)),
-  (43, 44, !(DV_I_47_0 | DV_I_50_0 | DV_I_51_0 | DV_II_45_0 | DV_II_49_0 | DV_II_50_0)),
-  (40, 41, !(DV_I_44_0 | DV_I_47_0 | DV_I_48_0 | DV_II_46_0 | DV_II_47_0 | DV_II_56_0)),
-  // Format: Stevens `eq_same(shift = 29)` equations (continued).
-  (54, 55, !(DV_I_51_0 | DV_II_47_0 | DV_II_50_0 | DV_II_55_0 | DV_II_56_0)),
-  (53, 54, !(DV_I_50_0 | DV_II_46_0 | DV_II_49_0 | DV_II_54_0 | DV_II_55_0)),
-  (52, 53, !(DV_I_49_0 | DV_II_45_0 | DV_II_48_0 | DV_II_53_0 | DV_II_54_0)),
-  (50, 51, !(DV_I_47_0 | DV_II_46_0 | DV_II_51_0 | DV_II_52_0 | DV_II_56_0)),
-  // Format: Stevens `eq_same(shift = 29)` equations (continued).
-  (42, 43, !(DV_I_46_0 | DV_I_49_0 | DV_I_50_0 | DV_II_48_0 | DV_II_49_0)),
-  (41, 42, !(DV_I_45_0 | DV_I_48_0 | DV_I_49_0 | DV_II_47_0 | DV_II_48_0)),
+  // Format: Stevens EQ_SAME_29 word pair (44, 45) (`tools/data/3565`).
+  (
+    44,
+    45,
+    !(DV_I_48_0 | DV_I_51_0 | DV_I_52_0 | DV_II_45_0 | DV_II_46_0 | DV_II_50_0 | DV_II_51_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (49, 50) (`tools/data/3565`).
+  (
+    49,
+    50,
+    !(DV_I_46_0 | DV_II_45_0 | DV_II_50_0 | DV_II_51_0 | DV_II_55_0 | DV_II_56_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (48, 49) (`tools/data/3565`).
+  (
+    48,
+    49,
+    !(DV_I_45_0 | DV_I_52_0 | DV_II_49_0 | DV_II_50_0 | DV_II_54_0 | DV_II_55_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (47, 48) (`tools/data/3565`).
+  (
+    47,
+    48,
+    !(DV_I_44_0 | DV_I_51_0 | DV_II_48_0 | DV_II_49_0 | DV_II_53_0 | DV_II_54_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (46, 47) (`tools/data/3565`).
+  (
+    46,
+    47,
+    !(DV_I_43_0 | DV_I_50_0 | DV_II_47_0 | DV_II_48_0 | DV_II_52_0 | DV_II_53_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (45, 46) (`tools/data/3565`).
+  (
+    45,
+    46,
+    !(DV_I_49_0 | DV_I_52_0 | DV_II_46_0 | DV_II_47_0 | DV_II_51_0 | DV_II_52_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (43, 44) (`tools/data/3565`).
+  (
+    43,
+    44,
+    !(DV_I_47_0 | DV_I_50_0 | DV_I_51_0 | DV_II_45_0 | DV_II_49_0 | DV_II_50_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (40, 41) (`tools/data/3565`).
+  (
+    40,
+    41,
+    !(DV_I_44_0 | DV_I_47_0 | DV_I_48_0 | DV_II_46_0 | DV_II_47_0 | DV_II_56_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (54, 55) (`tools/data/3565`).
+  (
+    54,
+    55,
+    !(DV_I_51_0 | DV_II_47_0 | DV_II_50_0 | DV_II_55_0 | DV_II_56_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (53, 54) (`tools/data/3565`).
+  (
+    53,
+    54,
+    !(DV_I_50_0 | DV_II_46_0 | DV_II_49_0 | DV_II_54_0 | DV_II_55_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (52, 53) (`tools/data/3565`).
+  (
+    52,
+    53,
+    !(DV_I_49_0 | DV_II_45_0 | DV_II_48_0 | DV_II_53_0 | DV_II_54_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (50, 51) (`tools/data/3565`).
+  (
+    50,
+    51,
+    !(DV_I_47_0 | DV_II_46_0 | DV_II_51_0 | DV_II_52_0 | DV_II_56_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (42, 43) (`tools/data/3565`).
+  (
+    42,
+    43,
+    !(DV_I_46_0 | DV_I_49_0 | DV_I_50_0 | DV_II_48_0 | DV_II_49_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (41, 42) (`tools/data/3565`).
+  (
+    41,
+    42,
+    !(DV_I_45_0 | DV_I_48_0 | DV_I_49_0 | DV_II_47_0 | DV_II_48_0),
+  ),
+  // Format: Stevens EQ_SAME_29 word pair (51, 52) (`tools/data/3565`).
   (51, 52, !(DV_I_48_0 | DV_II_47_0 | DV_II_52_0 | DV_II_53_0)),
 ];
 
 /// Format: Stevens `ubc_check` Stage 1 `eq_diff(..., 4, ..., 29)` equations (`tools/data/3565`).
 const EQ_DIFF_4_29: &[Eq] = &[
-  // Format: Stevens `eq_diff(4, 29)` equations.
-  (47, 50, !(DV_I_47_0 | DV_I_49_0 | DV_I_51_0 | DV_II_45_0 | DV_II_51_0 | DV_II_56_0)),
-  (46, 49, !(DV_I_46_0 | DV_I_48_0 | DV_I_50_0 | DV_I_52_0 | DV_II_50_0 | DV_II_55_0)),
-  (45, 48, !(DV_I_45_0 | DV_I_47_0 | DV_I_49_0 | DV_I_51_0 | DV_II_49_0 | DV_II_54_0)),
-  (44, 47, !(DV_I_44_0 | DV_I_46_0 | DV_I_48_0 | DV_I_50_0 | DV_II_48_0 | DV_II_53_0)),
-  // Format: Stevens `eq_diff(4, 29)` equations (continued).
-  (43, 46, !(DV_I_43_0 | DV_I_45_0 | DV_I_47_0 | DV_I_49_0 | DV_II_47_0 | DV_II_52_0)),
-  (42, 45, !(DV_I_44_0 | DV_I_46_0 | DV_I_48_0 | DV_I_52_0 | DV_II_46_0 | DV_II_51_0)),
-  (41, 44, !(DV_I_43_0 | DV_I_45_0 | DV_I_47_0 | DV_I_51_0 | DV_II_45_0 | DV_II_50_0)),
-  (50, 53, !(DV_I_50_0 | DV_I_52_0 | DV_II_46_0 | DV_II_48_0 | DV_II_54_0)),
-  // Format: Stevens `eq_diff(4, 29)` equations (continued).
-  (49, 52, !(DV_I_49_0 | DV_I_51_0 | DV_II_45_0 | DV_II_47_0 | DV_II_53_0)),
-  (48, 51, !(DV_I_48_0 | DV_I_50_0 | DV_I_52_0 | DV_II_46_0 | DV_II_52_0)),
-  (40, 43, !(DV_I_44_0 | DV_I_46_0 | DV_I_50_0 | DV_II_49_0 | DV_II_56_0)),
-  (39, 42, !(DV_I_43_0 | DV_I_45_0 | DV_I_49_0 | DV_II_48_0 | DV_II_55_0)),
-  // Format: Stevens `eq_diff(4, 29)` equations (continued).
-  (37, 40, !(DV_I_43_0 | DV_I_47_0 | DV_II_46_0 | DV_II_53_0 | DV_II_55_0)),
-  (38, 41, !(DV_I_44_0 | DV_I_48_0 | DV_II_47_0 | DV_II_54_0 | DV_II_56_0)),
+  // Format: Stevens EQ_DIFF_4_29 word pair (47, 50) (`tools/data/3565`).
+  (
+    47,
+    50,
+    !(DV_I_47_0 | DV_I_49_0 | DV_I_51_0 | DV_II_45_0 | DV_II_51_0 | DV_II_56_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (46, 49) (`tools/data/3565`).
+  (
+    46,
+    49,
+    !(DV_I_46_0 | DV_I_48_0 | DV_I_50_0 | DV_I_52_0 | DV_II_50_0 | DV_II_55_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (45, 48) (`tools/data/3565`).
+  (
+    45,
+    48,
+    !(DV_I_45_0 | DV_I_47_0 | DV_I_49_0 | DV_I_51_0 | DV_II_49_0 | DV_II_54_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (44, 47) (`tools/data/3565`).
+  (
+    44,
+    47,
+    !(DV_I_44_0 | DV_I_46_0 | DV_I_48_0 | DV_I_50_0 | DV_II_48_0 | DV_II_53_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (43, 46) (`tools/data/3565`).
+  (
+    43,
+    46,
+    !(DV_I_43_0 | DV_I_45_0 | DV_I_47_0 | DV_I_49_0 | DV_II_47_0 | DV_II_52_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (42, 45) (`tools/data/3565`).
+  (
+    42,
+    45,
+    !(DV_I_44_0 | DV_I_46_0 | DV_I_48_0 | DV_I_52_0 | DV_II_46_0 | DV_II_51_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (41, 44) (`tools/data/3565`).
+  (
+    41,
+    44,
+    !(DV_I_43_0 | DV_I_45_0 | DV_I_47_0 | DV_I_51_0 | DV_II_45_0 | DV_II_50_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (50, 53) (`tools/data/3565`).
+  (
+    50,
+    53,
+    !(DV_I_50_0 | DV_I_52_0 | DV_II_46_0 | DV_II_48_0 | DV_II_54_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (49, 52) (`tools/data/3565`).
+  (
+    49,
+    52,
+    !(DV_I_49_0 | DV_I_51_0 | DV_II_45_0 | DV_II_47_0 | DV_II_53_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (48, 51) (`tools/data/3565`).
+  (
+    48,
+    51,
+    !(DV_I_48_0 | DV_I_50_0 | DV_I_52_0 | DV_II_46_0 | DV_II_52_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (40, 43) (`tools/data/3565`).
+  (
+    40,
+    43,
+    !(DV_I_44_0 | DV_I_46_0 | DV_I_50_0 | DV_II_49_0 | DV_II_56_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (39, 42) (`tools/data/3565`).
+  (
+    39,
+    42,
+    !(DV_I_43_0 | DV_I_45_0 | DV_I_49_0 | DV_II_48_0 | DV_II_55_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (37, 40) (`tools/data/3565`).
+  (
+    37,
+    40,
+    !(DV_I_43_0 | DV_I_47_0 | DV_II_46_0 | DV_II_53_0 | DV_II_55_0),
+  ),
+  // Format: Stevens EQ_DIFF_4_29 word pair (38, 41) (`tools/data/3565`).
+  (
+    38,
+    41,
+    !(DV_I_44_0 | DV_I_48_0 | DV_II_47_0 | DV_II_54_0 | DV_II_56_0),
+  ),
 ];
 
 /// Format: Stevens `ubc_check` Stage 1 `eq_same(..., shift = 6)` equations (`tools/data/3565`).
@@ -261,13 +451,17 @@ const NE_SAME_29: &[Eq] = &[
   (44, 46, !(DV_I_43_0 | DV_I_45_0 | DV_I_47_0)),
 ];
 
-/// Format: bit shift constants used by the Stage 1 table groups (`tools/data/3565`).
+/// Format: bit shift 1 for Stage 1 Stevens UBC equations (`EQ_DIFF_1_6`, `NE_DIFF_1_6`, `NE_SAME_1`; `tools/data/3565`).
 const SHIFT_1: u32 = 1;
+/// Format: bit shift 2 for Stage 1 Stevens UBC equations (`NE_DIFF_2_7`; `tools/data/3565`).
 const SHIFT_2: u32 = 2;
+/// Format: bit shift 4 for Stage 1 Stevens UBC equations (`EQ_DIFF_4_29`; `tools/data/3565`).
 const SHIFT_4: u32 = 4;
+/// Format: bit shift 6 for Stage 1 Stevens UBC equations (`EQ_SAME_6`, `EQ_DIFF_1_6`, `NE_DIFF_1_6`; `tools/data/3565`).
 const SHIFT_6: u32 = 6;
-// Format: bit shift constants (continued).
+/// Format: bit shift 7 for Stage 1 Stevens UBC equations (`NE_DIFF_2_7`; `tools/data/3565`).
 const SHIFT_7: u32 = 7;
+/// Format: bit shift 29 for Stage 1 Stevens UBC equations (`EQ_SAME_29`, `EQ_DIFF_4_29`, `NE_SAME_29`; `tools/data/3565`).
 const SHIFT_29: u32 = 29;
 
 /// Computes the exact 32-bit Stevens UBC mask for eight 64-byte blocks in parallel using auto-vectorized NEON/SSE.
@@ -339,7 +533,8 @@ fn expand_65_x8(blocks: &[[u8; BLOCK_LEN]; OCTET_BLOCKS], w: &mut [Octet; UBC_WO
     }
   }
   for step in 0..EXPAND_STEPS {
-    if let Some([w0, _, w2, _, _, _, _, _, w8, _, _, _, _, w13, _, _, dst, ..]) = w.get_mut(step..) {
+    if let Some([w0, _, w2, _, _, _, _, _, w8, _, _, _, _, w13, _, _, dst, ..]) = w.get_mut(step..)
+    {
       for (out, (((a, b), c), d)) in dst
         .iter_mut()
         .zip(w0.iter().zip(w2.iter()).zip(w8.iter()).zip(w13.iter()))
@@ -476,7 +671,8 @@ fn expand_65_one(block: &[u8; BLOCK_LEN]) -> [u32; UBC_WORDS] {
     }
   }
   for step in 0..EXPAND_STEPS {
-    if let Some([w0, _, w2, _, _, _, _, _, w8, _, _, _, _, w13, _, _, dst, ..]) = w.get_mut(step..) {
+    if let Some([w0, _, w2, _, _, _, _, _, w8, _, _, _, _, w13, _, _, dst, ..]) = w.get_mut(step..)
+    {
       *dst = (*w13 ^ *w8 ^ *w2 ^ *w0).rotate_left(1);
     }
   }
@@ -494,8 +690,15 @@ fn wt1(tail: &[u32; TAIL_WORDS], index: usize) -> u32 {
 
 /// Scalar `eq_same` check for Stage 2 refinement.
 #[inline(always)]
-fn eq_same(mask: u32, left: u32, right: u32, shift: u32, bits: u32) -> u32 {
-  if ((left ^ right) & 1u32.wrapping_shl(shift)) != 0 {
+fn eq_same(
+  mask: u32,
+  t: &[u32; TAIL_WORDS],
+  left: usize,
+  right: usize,
+  shift: u32,
+  bits: u32,
+) -> u32 {
+  if ((wt1(t, left) ^ wt1(t, right)) & 1u32.wrapping_shl(shift)) != 0 {
     mask & !bits
   } else {
     mask
@@ -504,9 +707,17 @@ fn eq_same(mask: u32, left: u32, right: u32, shift: u32, bits: u32) -> u32 {
 
 /// Scalar `eq_diff` check (`shift_r >= shift_l`) for Stage 2 refinement.
 #[inline(always)]
-fn eq_diff(mask: u32, left: u32, shift_l: u32, right: u32, shift_r: u32, bits: u32) -> u32 {
+fn eq_diff(
+  mask: u32,
+  t: &[u32; TAIL_WORDS],
+  left: usize,
+  shift_l: u32,
+  right: usize,
+  shift_r: u32,
+  bits: u32,
+) -> u32 {
   let delta = shift_r.saturating_sub(shift_l);
-  if ((left ^ right.wrapping_shr(delta)) & 1u32.wrapping_shl(shift_l)) != 0 {
+  if ((wt1(t, left) ^ wt1(t, right).wrapping_shr(delta)) & 1u32.wrapping_shl(shift_l)) != 0 {
     mask & !bits
   } else {
     mask
@@ -515,9 +726,17 @@ fn eq_diff(mask: u32, left: u32, shift_l: u32, right: u32, shift_r: u32, bits: u
 
 /// Scalar `ne_diff` check (`shift_r >= shift_l`) for Stage 2 refinement.
 #[inline(always)]
-fn ne_diff(mask: u32, left: u32, shift_l: u32, right: u32, shift_r: u32, bits: u32) -> u32 {
+fn ne_diff(
+  mask: u32,
+  t: &[u32; TAIL_WORDS],
+  left: usize,
+  shift_l: u32,
+  right: usize,
+  shift_r: u32,
+  bits: u32,
+) -> u32 {
   let delta = shift_r.saturating_sub(shift_l);
-  if ((left ^ right.wrapping_shr(delta)) & 1u32.wrapping_shl(shift_l)) == 0 {
+  if ((wt1(t, left) ^ wt1(t, right).wrapping_shr(delta)) & 1u32.wrapping_shl(shift_l)) == 0 {
     mask & !bits
   } else {
     mask
@@ -526,8 +745,15 @@ fn ne_diff(mask: u32, left: u32, shift_l: u32, right: u32, shift_r: u32, bits: u
 
 /// Scalar `ne_same` check for Stage 2 refinement.
 #[inline(always)]
-fn ne_same(mask: u32, left: u32, right: u32, shift: u32, bits: u32) -> u32 {
-  if ((left ^ right) & 1u32.wrapping_shl(shift)) == 0 {
+fn ne_same(
+  mask: u32,
+  t: &[u32; TAIL_WORDS],
+  left: usize,
+  right: usize,
+  shift: u32,
+  bits: u32,
+) -> u32 {
+  if ((wt1(t, left) ^ wt1(t, right)) & 1u32.wrapping_shl(shift)) == 0 {
     mask & !bits
   } else {
     mask
@@ -570,130 +796,134 @@ fn refine_tail(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
 
 /// Guarded `b = 0` multi-DV equations (part 1).
 fn refine_b0_groups_a(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
+  let bits_55_56 = DV_I_52_0 | DV_II_48_0 | DV_II_51_0 | DV_II_56_0;
+  let bits_52_55 = DV_I_52_0 | DV_II_48_0 | DV_II_50_0 | DV_II_56_0;
+  let bits_51_54 = DV_I_51_0 | DV_II_47_0 | DV_II_49_0 | DV_II_55_0;
+  let bits_36_40 = DV_I_46_0 | DV_I_49_0 | DV_II_45_0 | DV_II_48_0;
   // Format: Stevens `ubc_check` multi-DV `b = 0` equations (`tools/data/3565`).
-  m = eq_same(m, wt1(t, 55), wt1(t, 56), 29, DV_I_52_0 | DV_II_48_0 | DV_II_51_0 | DV_II_56_0);
-  m = eq_diff(m, wt1(t, 52), 4, wt1(t, 55), 29, DV_I_52_0 | DV_II_48_0 | DV_II_50_0 | DV_II_56_0);
-  m = eq_diff(m, wt1(t, 51), 4, wt1(t, 54), 29, DV_I_51_0 | DV_II_47_0 | DV_II_49_0 | DV_II_55_0);
-  m = eq_diff(m, wt1(t, 36), 4, wt1(t, 40), 29, DV_I_46_0 | DV_I_49_0 | DV_II_45_0 | DV_II_48_0);
+  m = eq_same(m, t, 55, 56, 29, bits_55_56);
+  m = eq_diff(m, t, 52, 4, 55, 29, bits_52_55);
+  m = eq_diff(m, t, 51, 4, 54, 29, bits_51_54);
+  m = eq_diff(m, t, 36, 4, 40, 29, bits_36_40);
   // Format: Stevens `ubc_check` multi-DV `b = 0` equations (continued).
-  m = ne_same(m, wt1(t, 53), wt1(t, 56), 29, DV_I_52_0 | DV_II_48_0 | DV_II_49_0);
-  m = ne_same(m, wt1(t, 51), wt1(t, 54), 29, DV_I_50_0 | DV_II_46_0 | DV_II_47_0);
-  m = ne_same(m, wt1(t, 50), wt1(t, 52), 29, DV_I_49_0 | DV_I_51_0 | DV_II_45_0);
-  m = ne_same(m, wt1(t, 49), wt1(t, 51), 29, DV_I_48_0 | DV_I_50_0 | DV_I_52_0);
+  m = ne_same(m, t, 53, 56, 29, DV_I_52_0 | DV_II_48_0 | DV_II_49_0);
+  m = ne_same(m, t, 51, 54, 29, DV_I_50_0 | DV_II_46_0 | DV_II_47_0);
+  m = ne_same(m, t, 50, 52, 29, DV_I_49_0 | DV_I_51_0 | DV_II_45_0);
+  m = ne_same(m, t, 49, 51, 29, DV_I_48_0 | DV_I_50_0 | DV_I_52_0);
   // Format: Stevens `ubc_check` multi-DV `b = 0` equations (continued).
-  m = ne_same(m, wt1(t, 48), wt1(t, 50), 29, DV_I_47_0 | DV_I_49_0 | DV_I_51_0);
-  m = ne_same(m, wt1(t, 47), wt1(t, 49), 29, DV_I_46_0 | DV_I_48_0 | DV_I_50_0);
-  m = ne_same(m, wt1(t, 46), wt1(t, 48), 29, DV_I_45_0 | DV_I_47_0 | DV_I_49_0);
-  m = ne_same(m, wt1(t, 45), wt1(t, 47), 29, DV_I_44_0 | DV_I_46_0 | DV_I_48_0);
+  m = ne_same(m, t, 48, 50, 29, DV_I_47_0 | DV_I_49_0 | DV_I_51_0);
+  m = ne_same(m, t, 47, 49, 29, DV_I_46_0 | DV_I_48_0 | DV_I_50_0);
+  m = ne_same(m, t, 46, 48, 29, DV_I_45_0 | DV_I_47_0 | DV_I_49_0);
+  m = ne_same(m, t, 45, 47, 29, DV_I_44_0 | DV_I_46_0 | DV_I_48_0);
   // Format: Stevens `ubc_check` multi-DV `b = 0` equations (continued).
-  m = ne_same(m, wt1(t, 40), wt1(t, 42), 4, DV_I_44_0 | DV_I_46_0 | DV_II_56_0);
-  m = ne_same(m, wt1(t, 39), wt1(t, 41), 4, DV_I_43_0 | DV_I_45_0 | DV_II_55_0);
-  m = ne_same(m, wt1(t, 38), wt1(t, 40), 4, DV_I_44_0 | DV_II_54_0 | DV_II_56_0);
-  m = ne_same(m, wt1(t, 37), wt1(t, 39), 4, DV_I_43_0 | DV_II_53_0 | DV_II_55_0);
+  m = ne_same(m, t, 40, 42, 4, DV_I_44_0 | DV_I_46_0 | DV_II_56_0);
+  m = ne_same(m, t, 39, 41, 4, DV_I_43_0 | DV_I_45_0 | DV_II_55_0);
+  m = ne_same(m, t, 38, 40, 4, DV_I_44_0 | DV_II_54_0 | DV_II_56_0);
+  m = ne_same(m, t, 37, 39, 4, DV_I_43_0 | DV_II_53_0 | DV_II_55_0);
   // Format: Stevens `ubc_check` multi-DV `b = 0` equations (continued).
-  eq_diff(m, wt1(t, 35), 4, wt1(t, 39), 29, DV_I_45_0 | DV_I_48_0 | DV_II_47_0)
+  eq_diff(m, t, 35, 4, 39, 29, DV_I_45_0 | DV_I_48_0 | DV_II_47_0)
 }
 
 /// Guarded `b = 0` multi-DV equations (part 2).
 fn refine_b0_groups_b(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
   // Format: Stevens `ubc_check` two-DV `b = 0` equations (`tools/data/3565`).
-  m = ne_diff(m, wt1(t, 63), 0, wt1(t, 64), 5, DV_I_48_0 | DV_II_48_0);
-  m = ne_diff(m, wt1(t, 63), 1, wt1(t, 64), 6, DV_I_45_0 | DV_II_45_0);
-  m = ne_diff(m, wt1(t, 62), 0, wt1(t, 63), 5, DV_I_47_0 | DV_II_47_0);
-  m = ne_diff(m, wt1(t, 61), 0, wt1(t, 62), 5, DV_I_46_0 | DV_II_46_0);
+  m = ne_diff(m, t, 63, 0, 64, 5, DV_I_48_0 | DV_II_48_0);
+  m = ne_diff(m, t, 63, 1, 64, 6, DV_I_45_0 | DV_II_45_0);
+  m = ne_diff(m, t, 62, 0, 63, 5, DV_I_47_0 | DV_II_47_0);
+  m = ne_diff(m, t, 61, 0, 62, 5, DV_I_46_0 | DV_II_46_0);
   // Format: Stevens `ubc_check` two-DV `b = 0` equations (continued).
-  m = ne_diff(m, wt1(t, 60), 0, wt1(t, 61), 5, DV_I_45_0 | DV_II_45_0);
-  m = eq_same(m, wt1(t, 58), wt1(t, 59), 29, DV_II_51_0 | DV_II_54_0);
-  m = eq_same(m, wt1(t, 57), wt1(t, 58), 29, DV_II_50_0 | DV_II_53_0);
-  m = eq_diff(m, wt1(t, 56), 4, wt1(t, 59), 29, DV_II_52_0 | DV_II_54_0);
+  m = ne_diff(m, t, 60, 0, 61, 5, DV_I_45_0 | DV_II_45_0);
+  m = eq_same(m, t, 58, 59, 29, DV_II_51_0 | DV_II_54_0);
+  m = eq_same(m, t, 57, 58, 29, DV_II_50_0 | DV_II_53_0);
+  m = eq_diff(m, t, 56, 4, 59, 29, DV_II_52_0 | DV_II_54_0);
   // Format: Stevens `ubc_check` two-DV `b = 0` equations (continued).
-  m = ne_same(m, wt1(t, 56), wt1(t, 59), 29, DV_II_51_0 | DV_II_52_0);
-  m = eq_same(m, wt1(t, 56), wt1(t, 57), 29, DV_II_49_0 | DV_II_52_0);
-  m = eq_diff(m, wt1(t, 55), 4, wt1(t, 58), 29, DV_II_51_0 | DV_II_53_0);
-  m = eq_diff(m, wt1(t, 54), 4, wt1(t, 57), 29, DV_II_50_0 | DV_II_52_0);
+  m = ne_same(m, t, 56, 59, 29, DV_II_51_0 | DV_II_52_0);
+  m = eq_same(m, t, 56, 57, 29, DV_II_49_0 | DV_II_52_0);
+  m = eq_diff(m, t, 55, 4, 58, 29, DV_II_51_0 | DV_II_53_0);
+  m = eq_diff(m, t, 54, 4, 57, 29, DV_II_50_0 | DV_II_52_0);
   // Format: Stevens `ubc_check` two-DV `b = 0` equations (continued).
-  m = eq_diff(m, wt1(t, 53), 4, wt1(t, 56), 29, DV_II_49_0 | DV_II_51_0);
-  m = ne_same(m, wt1(t, 48), wt1(t, 55), 29, DV_I_51_0 | DV_I_52_0);
-  m = eq_diff(m, wt1(t, 39), 4, wt1(t, 43), 29, DV_I_52_0 | DV_II_51_0);
-  m = eq_diff(m, wt1(t, 38), 4, wt1(t, 42), 29, DV_I_51_0 | DV_II_50_0);
+  m = eq_diff(m, t, 53, 4, 56, 29, DV_II_49_0 | DV_II_51_0);
+  m = ne_same(m, t, 48, 55, 29, DV_I_51_0 | DV_I_52_0);
+  m = eq_diff(m, t, 39, 4, 43, 29, DV_I_52_0 | DV_II_51_0);
+  m = eq_diff(m, t, 38, 4, 42, 29, DV_I_51_0 | DV_II_50_0);
   // Format: Stevens `ubc_check` two-DV `b = 0` equations (continued).
-  m = eq_diff(m, wt1(t, 37), 4, wt1(t, 41), 29, DV_I_50_0 | DV_II_49_0);
-  m = ne_same(m, wt1(t, 36), wt1(t, 38), 4, DV_II_52_0 | DV_II_54_0);
-  eq_diff(m, wt1(t, 35), 3, wt1(t, 39), 28, DV_I_51_0 | DV_II_47_0)
+  m = eq_diff(m, t, 37, 4, 41, 29, DV_I_50_0 | DV_II_49_0);
+  m = ne_same(m, t, 36, 38, 4, DV_II_52_0 | DV_II_54_0);
+  eq_diff(m, t, 35, 3, 39, 28, DV_I_51_0 | DV_II_47_0)
 }
 
 /// Single-DV `b = 0` type-I equations.
 fn refine_b0_single_i(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
   // Format: Stevens `ubc_check` single-DV `b = 0` type-I equations (`tools/data/3565`).
-  m = ne_diff(m, wt1(t, 61), 1, wt1(t, 62), 6, DV_I_43_0);
-  m = eq_diff(m, wt1(t, 59), 5, wt1(t, 63), 30, DV_I_43_0);
-  m = ne_diff(m, wt1(t, 58), 0, wt1(t, 63), 30, DV_I_43_0);
-  m = ne_diff(m, wt1(t, 62), 1, wt1(t, 63), 6, DV_I_44_0);
+  m = ne_diff(m, t, 61, 1, 62, 6, DV_I_43_0);
+  m = eq_diff(m, t, 59, 5, 63, 30, DV_I_43_0);
+  m = ne_diff(m, t, 58, 0, 63, 30, DV_I_43_0);
+  m = ne_diff(m, t, 62, 1, 63, 6, DV_I_44_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-I equations (continued).
-  m = eq_diff(m, wt1(t, 60), 5, wt1(t, 64), 30, DV_I_44_0);
-  m = ne_diff(m, wt1(t, 59), 0, wt1(t, 64), 30, DV_I_44_0);
-  m = ne_same(m, wt1(t, 36), wt1(t, 37), 4, DV_I_50_0);
-  m = ne_same(m, wt1(t, 37), wt1(t, 38), 4, DV_I_51_0);
+  m = eq_diff(m, t, 60, 5, 64, 30, DV_I_44_0);
+  m = ne_diff(m, t, 59, 0, 64, 30, DV_I_44_0);
+  m = ne_same(m, t, 36, 37, 4, DV_I_50_0);
+  m = ne_same(m, t, 37, 38, 4, DV_I_51_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-I equations (continued).
-  ne_same(m, wt1(t, 38), wt1(t, 39), 4, DV_I_52_0)
+  ne_same(m, t, 38, 39, 4, DV_I_52_0)
 }
 
 /// Single-DV `b = 0` type-II equations (`48..=52`).
 fn refine_b0_single_ii_low(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (`tools/data/3565`).
-  m = eq_diff(m, wt1(t, 36), 3, wt1(t, 40), 28, DV_II_48_0);
-  m = ne_diff(m, wt1(t, 40), 28, wt1(t, 35), 30, DV_II_48_0);
-  m = eq_diff(m, wt1(t, 37), 3, wt1(t, 41), 28, DV_II_49_0);
-  m = ne_diff(m, wt1(t, 41), 28, wt1(t, 36), 30, DV_II_49_0);
+  m = eq_diff(m, t, 36, 3, 40, 28, DV_II_48_0);
+  m = ne_diff(m, t, 40, 28, 35, 30, DV_II_48_0);
+  m = eq_diff(m, t, 37, 3, 41, 28, DV_II_49_0);
+  m = ne_diff(m, t, 41, 28, 36, 30, DV_II_49_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (continued).
-  m = ne_same(m, wt1(t, 55), wt1(t, 58), 29, DV_II_50_0);
-  m = eq_diff(m, wt1(t, 38), 3, wt1(t, 42), 28, DV_II_50_0);
-  m = ne_diff(m, wt1(t, 42), 28, wt1(t, 37), 30, DV_II_50_0);
-  m = eq_diff(m, wt1(t, 39), 3, wt1(t, 43), 28, DV_II_51_0);
+  m = ne_same(m, t, 55, 58, 29, DV_II_50_0);
+  m = eq_diff(m, t, 38, 3, 42, 28, DV_II_50_0);
+  m = ne_diff(m, t, 42, 28, 37, 30, DV_II_50_0);
+  m = eq_diff(m, t, 39, 3, 43, 28, DV_II_51_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (continued).
-  m = ne_diff(m, wt1(t, 43), 28, wt1(t, 38), 30, DV_II_51_0);
-  m = eq_same(m, wt1(t, 59), wt1(t, 60), 29, DV_II_52_0);
-  m = eq_diff(m, wt1(t, 40), 3, wt1(t, 44), 28, DV_II_52_0);
-  m = eq_diff(m, wt1(t, 40), 4, wt1(t, 44), 29, DV_II_52_0);
+  m = ne_diff(m, t, 43, 28, 38, 30, DV_II_51_0);
+  m = eq_same(m, t, 59, 60, 29, DV_II_52_0);
+  m = eq_diff(m, t, 40, 3, 44, 28, DV_II_52_0);
+  m = eq_diff(m, t, 40, 4, 44, 29, DV_II_52_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (continued).
-  ne_diff(m, wt1(t, 44), 28, wt1(t, 39), 30, DV_II_52_0)
+  ne_diff(m, t, 44, 28, 39, 30, DV_II_52_0)
 }
 
 /// Single-DV `b = 0` type-II equations (`53..=56`).
 fn refine_b0_single_ii_high(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (`tools/data/3565`).
-  m = ne_same(m, wt1(t, 58), wt1(t, 61), 29, DV_II_53_0);
-  m = eq_diff(m, wt1(t, 57), 4, wt1(t, 61), 29, DV_II_53_0);
-  m = eq_diff(m, wt1(t, 41), 3, wt1(t, 45), 28, DV_II_53_0);
-  m = eq_diff(m, wt1(t, 41), 4, wt1(t, 45), 29, DV_II_53_0);
+  m = ne_same(m, t, 58, 61, 29, DV_II_53_0);
+  m = eq_diff(m, t, 57, 4, 61, 29, DV_II_53_0);
+  m = eq_diff(m, t, 41, 3, 45, 28, DV_II_53_0);
+  m = eq_diff(m, t, 41, 4, 45, 29, DV_II_53_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (continued).
-  m = eq_diff(m, wt1(t, 58), 4, wt1(t, 62), 29, DV_II_54_0);
-  m = eq_diff(m, wt1(t, 42), 3, wt1(t, 46), 28, DV_II_54_0);
-  m = eq_diff(m, wt1(t, 42), 4, wt1(t, 46), 29, DV_II_54_0);
-  m = eq_diff(m, wt1(t, 59), 4, wt1(t, 63), 29, DV_II_55_0);
+  m = eq_diff(m, t, 58, 4, 62, 29, DV_II_54_0);
+  m = eq_diff(m, t, 42, 3, 46, 28, DV_II_54_0);
+  m = eq_diff(m, t, 42, 4, 46, 29, DV_II_54_0);
+  m = eq_diff(m, t, 59, 4, 63, 29, DV_II_55_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (continued).
-  m = eq_diff(m, wt1(t, 57), 4, wt1(t, 59), 29, DV_II_55_0);
-  m = eq_diff(m, wt1(t, 43), 3, wt1(t, 47), 28, DV_II_55_0);
-  m = eq_diff(m, wt1(t, 43), 4, wt1(t, 47), 29, DV_II_55_0);
-  m = eq_diff(m, wt1(t, 60), 4, wt1(t, 64), 29, DV_II_56_0);
+  m = eq_diff(m, t, 57, 4, 59, 29, DV_II_55_0);
+  m = eq_diff(m, t, 43, 3, 47, 28, DV_II_55_0);
+  m = eq_diff(m, t, 43, 4, 47, 29, DV_II_55_0);
+  m = eq_diff(m, t, 60, 4, 64, 29, DV_II_56_0);
   // Format: Stevens `ubc_check` single-DV `b = 0` type-II equations (continued).
-  m = eq_diff(m, wt1(t, 44), 3, wt1(t, 48), 28, DV_II_56_0);
-  eq_diff(m, wt1(t, 44), 4, wt1(t, 48), 29, DV_II_56_0)
+  m = eq_diff(m, t, 44, 3, 48, 28, DV_II_56_0);
+  eq_diff(m, t, 44, 4, 48, 29, DV_II_56_0)
 }
 
 /// Residual `b = 2` type-I equations not already evaluated in Stage 1.
 fn refine_b2_i(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
   if (m & (DV_I_46_2 | DV_I_47_2 | DV_I_50_2)) != 0 {
     // Format: Stevens `ubc_check` residual `b = 2` type-I equations (`tools/data/3565`).
-    m = eq_same(m, wt1(t, 40), wt1(t, 42), 6, DV_I_46_2);
-    m = ne_diff(m, wt1(t, 62), 2, wt1(t, 63), 7, DV_I_47_2);
-    m = eq_same(m, wt1(t, 41), wt1(t, 43), 6, DV_I_47_2);
-    m = ne_same(m, wt1(t, 43), wt1(t, 51), 1, DV_I_50_2);
+    m = eq_same(m, t, 40, 42, 6, DV_I_46_2);
+    m = ne_diff(m, t, 62, 2, 63, 7, DV_I_47_2);
+    m = eq_same(m, t, 41, 43, 6, DV_I_47_2);
+    m = ne_same(m, t, 43, 51, 1, DV_I_50_2);
   }
   if (m & DV_I_51_2) != 0 {
     // Format: Stevens `ubc_check` residual `b = 2` type-I equations (continued).
-    m = eq_diff(m, wt1(t, 37), 1, wt1(t, 37), 6, DV_I_51_2);
-    m = eq_diff(m, wt1(t, 35), 5, wt1(t, 39), 30, DV_I_51_2);
+    m = eq_diff(m, t, 37, 1, 37, 6, DV_I_51_2);
+    m = eq_diff(m, t, 35, 5, 39, 30, DV_I_51_2);
   }
   m
 }
@@ -702,17 +932,17 @@ fn refine_b2_i(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
 fn refine_b2_ii(mut m: u32, t: &[u32; TAIL_WORDS]) -> u32 {
   if (m & DV_II_46_2) != 0 {
     // Format: Stevens `ubc_check` residual `b = 2` type-II equations (`tools/data/3565`).
-    m = ne_same(m, wt1(t, 47), wt1(t, 51), 1, DV_II_46_2);
+    m = ne_same(m, t, 47, 51, 1, DV_II_46_2);
   }
   if (m & (DV_II_49_2 | DV_II_50_2 | DV_II_51_2)) != 0 {
     // Format: Stevens `ubc_check` residual `b = 2` type-II equations (continued).
-    m = eq_diff(m, wt1(t, 37), 5, wt1(t, 41), 30, DV_II_49_2);
-    m = ne_diff(m, wt1(t, 36), 0, wt1(t, 41), 30, DV_II_49_2);
-    m = eq_diff(m, wt1(t, 38), 5, wt1(t, 42), 30, DV_II_50_2);
-    m = ne_diff(m, wt1(t, 37), 0, wt1(t, 42), 30, DV_II_50_2);
+    m = eq_diff(m, t, 37, 5, 41, 30, DV_II_49_2);
+    m = ne_diff(m, t, 36, 0, 41, 30, DV_II_49_2);
+    m = eq_diff(m, t, 38, 5, 42, 30, DV_II_50_2);
+    m = ne_diff(m, t, 37, 0, 42, 30, DV_II_50_2);
     // Format: Stevens `ubc_check` residual `b = 2` type-II equations (continued).
-    m = eq_diff(m, wt1(t, 39), 5, wt1(t, 43), 30, DV_II_51_2);
-    m = ne_diff(m, wt1(t, 38), 0, wt1(t, 43), 30, DV_II_51_2);
+    m = eq_diff(m, t, 39, 5, 43, 30, DV_II_51_2);
+    m = ne_diff(m, t, 38, 0, 43, 30, DV_II_51_2);
   }
   m
 }

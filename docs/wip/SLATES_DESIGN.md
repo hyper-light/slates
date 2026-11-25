@@ -13146,7 +13146,8 @@ engine: the verdict, rebase, position mapping, the register).
 > object header (`<type> SP <decimal size> NUL`) as git does. A header longer than git's `MAX_HEADER_LEN` is refused,
 > and so is a non-canonical size; a pack-only type is refused by kind; the size is charged to the caller's admission
 > before any content is read. `object-format` maps both ways. An object is named in either format: SHA-1 with collision
-> detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
+> detection (originally RustCrypto's `sha1-checked`; superseded in production by A-893's `slates_vcs::sha1dc` with
+> `sha1-checked` kept as the test oracle, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
 >
@@ -14364,7 +14365,8 @@ signature verification).
 > escaped as `encodeextra` writes them), a flat manifest (`manifest`: sorted lines of a path, a lower-case node and an
 > `x` or `l` flag, refused where 7.2's C reader refuses), and a file revision (`filerev`: its metadata block apart from
 > its bytes, the copy 7.2's `renamed` reads, and the parents in the order 7.2 stores them). It computes each node
-> (`node`) as 7.2 does: the SHA-1 of the lower parent, the higher and the text, with sha1collisiondetection on, since
+> (`node`) as 7.2 does: the SHA-1 of the lower parent, the higher and the text, with sha1collisiondetection on
+> (`slates_vcs::sha1dc` since A-893, originally `sha1-checked`), since
 > 7.2's `hashutil.sha1` is sha1dc's wherever its C extension is built, so a known collision attack is refused
 > (`CollisionAttack`). Proven against every revision of one repository stock 7.2 stored (`crates/hg/fixtures/objects`:
 > each text from `hg debugdata`, each log from `hg debugindex --debug`, and what 7.2's own readers read; the command
@@ -43490,6 +43492,8 @@ Applied in the same change to:
   - it is pure Rust (`sha1`, `digest`, no C);
   - it refuses git's own t0013 vector: `t/t0013/shattered-1.pdf` at v2.50.1, SHA-256 `2bb787a7…`, byte-identical to
     the crate's own copy.
+  (Superseded in production by A-893's zero-`unsafe` `slates_vcs::sha1dc` paired with RustCrypto `sha1 0.11.0`;
+  `sha1-checked 0.10.0` remains a dev-dependency differential oracle.)
 - **Golden vectors.** `make-object-fixtures.sh` (run on the MacBook with git 2.50.1, Apple Git-155, 2026-11-19) makes
   one object of each type in a SHA-1 and a SHA-256 repository (a blob, a tree with a subtree, a commit, an annotated
   tag) and records each object's raw content and its name. Each name is computed by `git hash-object` from that content
@@ -43714,7 +43718,8 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   and refuses: `SHA1DCSetSafeHash(&(self->ctx), 0)` ("We don't want "safe" sha1s ... We just want to detect
   collisions") and, in `finalize`, `PyErr_SetString(PyExc_OverflowError, "sha1 collision attack detected")`
   (`mercurial/thirdparty/sha1dc/cext.c`, lines 36 and 83-84 of `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`). So
-  aws-lc-rs would accept revisions 7.2 refuses. Nodes go through `sha1-checked`, configured as A-600 configures it for
+  aws-lc-rs would accept revisions 7.2 refuses. Nodes go through `sha1-checked` (superseded in production by A-893's
+  `slates_vcs::sha1dc`, with `sha1-checked` kept as the test oracle), configured as A-600 configures it for
   git (detection on, the safe hash off), and an attack is refused as `CollisionAttack`, named by its plain SHA-1.
 - **From the sources (`research/mercurial-server.md` §15).** 7.2's `changelog.py` (`changelogrevision`, `readfiles`,
   `add`, `encodeextra`, `decodeextra`, `_string_escape`, `_string_unescape`), `cext/manifest.c` (`find_lines`),
@@ -62649,3 +62654,64 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
   `crates/merge/src/{checkpoint,engine,history}.rs`, `crates/land/{src/{engine,manifest,source}.rs,tests/oracle.rs}`,
   `crates/server/{src/{xshard,vcs_store,git_push,git_push/intake,vcs_http/git/receive,vcs_ssh/receive,repository/hg_push,held_ahead,merge_service,refining,verbs,work_files}.rs,tests/{work_cow,green_landing_cow}.rs}`,
   BENCHMARKS, GAPS.
+
+### A-893 — Hardware-accelerated collision-detecting SHA-1 (`slates_vcs::sha1dc`: 8-lane SIMD UBC + RustCrypto `sha1` block compression) (2026-11-25; §4.17.2, §4.17.3; updates A-600, A-588)
+
+- **Design (`crates/vcs/src/sha1dc/`):**
+  - Replaces scalar `sha1-checked` on the production Git (`slates-git::object_name`) and Mercurial (`slates-hg::node`)
+    hashing paths with an in-house zero-`unsafe` Marc Stevens SHA-1DC implementation (`detect_collision = true`,
+    `safe_hash = false`, 100% parity with `git_SHA1DCInit` and Mercurial 7.2's `thirdparty/sha1dc/cext.c`).
+  - Splits each 64-byte block along the unavoidable bit-condition (UBC) boundary:
+    1. `ubc.rs` expands only `W[0..65]` (the highest word `ubc_check` reads is `W[64]`) eight blocks at a time in
+       8-lane `[u32; 8]` SOA arrays (`2 × u32x4` NEON/SSE registers) using table-driven Stage 1 filters followed by
+       guarded scalar Stage 2 refinement on surviving lanes. The 2,080-byte `OctetScratch` is allocated lazily inside
+       `Hasher::process_octets` only when `blocks.len() >= 8`, avoiding stack zero-fill on small commits, trees, and
+       blobs.
+    2. Contiguous zero-mask runs (measured `95.26%` of uniform random blocks, mean clean run ~20 blocks / ~1.3 KiB,
+       L1-hot) feed directly into `sha1::block_api::compress` (RustCrypto `sha1 0.11.0`, runtime dispatch to ARMv8
+       SHA crypto, x86 SHA-NI, or scalar fallback), paired under `#[cfg(miri)]` with canonical scalar
+       `recompress::compress_block` (identical signature, zero `unsafe`) because Miri does not emulate
+       `llvm.aarch64.crypto.sha1h`.
+    3. Only the measured `4.74%` of blocks with `ubc_mask != 0` run `recompress::compress_and_check`, capturing rounds
+       58 and 65 and executing Stevens's backward/forward recompression from four L1-resident shifted base tables
+       (`DM_1_0`, `DM_1_2`, `DM_2_0`, `DM_2_2`; 1.4 KiB vs 10 KiB) with compile-time-verified exact `[u32; 80]`
+       windows (`Dv::dm_words`).
+- **Measured evidence & rejected experiments (Apple M5 Max, 2026-11-25):**
+  - Uniform random block UBC hit rate: `4.74%` non-zero mask (`95.26%` fast-path clean blocks).
+  - Microbench `cargo run --release --offline -p slates-hg --example sha1_ab -- 64 5`:
+    - Initial Step 1 baseline (`c5d3d2cc3`): `714 → 1,363 MB/s` (`1.91×`).
+    - Post-remediation (with lazy `OctetScratch` and exact-length `dm_words`, 5 rounds under load): 240 KiB pieces
+      `1336 1368 1360 1348 1352 MB/s` (median `1,352 MB/s`, best `1,368 MB/s` vs `sha1-checked` `734 MB/s`, `1.84×`);
+      8 KiB pieces `1332 1328 1329 1311 1325 MB/s` (median `1,328 MB/s`, best `1,332 MB/s` vs `sha1-checked` `729 MB/s`,
+      `1.82×`).
+    - Small inputs (avoiding 2,080 B `OctetScratch` zero-fill): 128 B `231.7 ns/obj` (`553 MB/s`), 256 B `438.1 ns/obj`
+      (`584 MB/s`), 384 B `598.0 ns/obj` (`642 MB/s`); 8-lane SIMD crossover at 512 B `448.1 ns/obj` (`1,143 MB/s`),
+      1,024 B `789.4 ns/obj` (`1,297 MB/s`).
+  - Rejected designs kept on record: whole-object hardware-then-fallback (`> 99.999%` trigger probability on 80–150 KiB
+    manifests at `4.74%`/block); 4-lane `[u32; 4]` UBC (`924 MB/s`); `if`-branching Stage 1 (breaks LLVM SLP
+    auto-vectorization); raw NEON intrinsics without `unsafe` (`E0133`).
+- **Updated approval basis, dependencies & upstream notices:**
+  - Production crates (`slates-vcs`, `slates-git`, `slates-hg`) depend on RustCrypto `sha1 0.11.0`
+    (`default-features = false`, no `std`, no OID tables) for vetted hardware block compression; collision detection
+    is in-house zero-`unsafe` Rust held bit-for-bit against both `sha1-checked 0.10.0` (retained as dev-dependency
+    oracle in `slates-vcs` and `slates-hg`) and an in-tree 32-DV reference oracle (`crates/vcs/src/sha1dc/oracle.rs`).
+  - Workspace lockfile additions: `sha1 0.11.0`, `digest 0.11.3`, `block-buffer 0.12.1`, `crypto-common 0.2.2`,
+    `hybrid-array 0.4.15`, `cpufeatures 0.3.1`.
+  - Verbatim Marc Stevens & Dan Shumow (2017) MIT copyright and permission notice (`cr-marcstevens/sha1collisiondetection`)
+    bundled in `NOTICE` and `crates/vcs/src/sha1dc/{mod,ubc,recompress,oracle}.rs`; RustCrypto `sha1-checked 0.10.0`
+    MIT/Apache-2.0 attribution in `NOTICE` and `crates/vcs/src/sha1dc/oracle.rs`.
+- **Verification:**
+  - `cargo test --offline -p slates-vcs --lib sha1dc`: 8/8 passing (0.33s), covering all 32 `DVS[0..32]` `dm[80]` and
+    `T58`/`T65` entries against `oracle::SHA1_DVS`, full `check_one`/`check_octet` vs `oracle::ubc_check` across
+    structured edge blocks (`0x00`, `0xff`, 1,024 single-bit blocks) and seeded random blocks with all 32 mask bits
+    non-vacuously observed (`seen == u32::MAX`; mutation-checked by dropping `DV_I_43_0`), unperturbed
+    `recompress_58`/`recompress_65` and Miri scalar `compress_block` parity, SHAttered-1/2 prefixes and `>= 512`-byte
+    extensions (`576 B`, `1,024 B`) driving `process_octets` (`octet_batches >= 1`), and proptest chunk splits against
+    `sha1-checked`.
+  - `cargo test --offline -p slates-git --lib object_name`: 8/8; `cargo test --offline -p slates-hg --lib node`: 22/22.
+  - `slates-hg/examples/sha1_ab.rs` handles `CollisionAttack` explicitly instead of panicking on `.unwrap()`.
+- **Applied in the same change to:** `Cargo.toml`, `Cargo.lock`, `NOTICE`,
+  `crates/vcs/{Cargo.toml,src/{lib.rs,sha1dc/{mod,ubc,recompress,oracle,tests}.rs}}`,
+  `crates/git/{Cargo.toml,src/object_name.rs}`,
+  `crates/hg/{Cargo.toml,src/{node.rs,push/intake_batch.rs},examples/sha1_ab.rs}`,
+  `docs/wip/{SLATES_DESIGN.md,GAPS.md}`.

@@ -2358,7 +2358,7 @@
 > **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
 > header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
 > `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
-> `sha1-checked`, configured as git configures sha1dc (detection on, safe hash off), so git's own t0013 SHAttered vector
+> `sha1-checked` (superseded in production by A-893's `slates_vcs::sha1dc`; `sha1-checked` kept as the test oracle), configured as git configures sha1dc (detection on, safe hash off), so git's own t0013 SHAttered vector
 > and its twin are refused, typed, naming their plain SHA-1; and SHA-256 through aws-lc-rs. Golden vectors are every
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
@@ -3476,7 +3476,7 @@
 > **Built (A-588):** the objects: a changeset's text with its extras' escapes, a flat manifest, a file revision's
 > metadata block apart from its bytes with the copy 7.2's `renamed` reads and the parents' order 7.2 stores (issue6528's
 > fix-up), each reader and writer accepting exactly the same objects; and each node computed as 7.2 computes it, SHA-1
-> with sha1collisiondetection on (`sha1-checked`, A-600's crate, since 7.2's `hashutil.sha1` is sha1dc's), a known
+> with sha1collisiondetection on (`sha1-checked`, A-600's crate, superseded in production by A-893's `slates_vcs::sha1dc` with `sha1-checked` kept as the test oracle, since 7.2's `hashutil.sha1` is sha1dc's), a known
 > collision attack refused by kind; proven by `cargo test -p slates-hg --lib`, 158 of 158 on the Mac Studio
 > (2026-11-19, debug, load 3.0), against every revision of one repository stock `hg` 7.2 stored, made twice byte for
 > byte alike (`crates/hg/fixtures/objects/make-object-fixtures.sh`: texts by `hg debugdata`, logs by `hg debugindex
@@ -26858,7 +26858,9 @@ interleaved head-to-head stock results recorded in `BENCHMARKS.md`.
 - **Measured structural ceilings remaining (honest record, not hidden):**
   - Initial full push of `git/git` (86,386 commits, 424,984 objects): `42.5s` vs stock `9.5s` (~75% of active CPU is
     mandatory single-shard pure-Rust SHA-1DC collision checking via `sha1-checked` + ~12% BLAKE3 content hashing, whereas
-    stock `git index-pack` runs C SHA-1DC across all 18 cores).
+    stock `git index-pack` runs C SHA-1DC across all 18 cores). *(Updated 2026-11-25, A-892/A-893: multi-shard scatter
+    plus 8-lane SIMD UBC + hardware SHA-1DC in `slates_vcs::sha1dc` raised SHA-1DC throughput from `714 → 1,363 MB/s`,
+    post-remediation median `1,352 MB/s` / best `1,368 MB/s` at 240 KiB with zero `unsafe`.)*
   - Initial full push of `hg-src` (57,036 changesets): `48.3s` vs stock `9.7s` (BLAKE3 content hashing + manifest delta
     encoding + Mantle disk persistence in `slates-store`).
   - Single-host 10,000-socket simultaneous loopback blasts on macOS encounter host kernel `kern.ipc.somaxconn=128` SYN

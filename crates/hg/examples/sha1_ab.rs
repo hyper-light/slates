@@ -42,7 +42,10 @@ fn sha1dc(detect: bool, piece: &[u8]) -> [u8; 20] {
 }
 
 fn slates_sha1dc(piece: &[u8]) -> [u8; 20] {
-  slates_vcs::sha1dc::hash(piece).unwrap()
+  match slates_vcs::sha1dc::hash(piece) {
+    Ok(digest) => digest,
+    Err(attack) => attack.sha1,
+  }
 }
 
 fn hardware(piece: &[u8]) -> [u8; 20] {

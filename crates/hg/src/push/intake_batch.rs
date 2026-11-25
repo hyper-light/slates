@@ -227,7 +227,7 @@ pub struct FileRevDone {
   base_rebuilt: bool,
 }
 
-/// Pure stateless worker function: verifies node hash (`sha1_checked`), decodes/validates format,
+/// Pure stateless worker function: verifies node hash (`slates_vcs::sha1dc`), decodes/validates format,
 /// and computes BLAKE3 content identities (`Hashed::of`) for one [`BatchWork`] item.
 pub fn verify_batch_item(work: BatchWork) -> BatchDone {
   match work {
