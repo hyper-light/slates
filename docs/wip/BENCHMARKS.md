@@ -19435,3 +19435,32 @@ What it says:
   landings that took 15.9 to 31.0 s. The landings' own time doubles with the machine's load, and the overlap hides less
   of it as they slow (941 of 2,087 overlapped at 31.0 s, 1,879 at 15.9 s). Kept: C.
 
+## A Subversion import's batches cut by their texts: git-2000's resident set 3.7 times lower, its time about 40 % higher (goal 93 P7; main 01a20182's A/B, 2026-11-24)
+
+- **What, and why.** e6710411a lands an import's batch once the texts it carries and the next revision's would pass the
+  changeset store's unit (`staging::texts_bound`, `segment_bytes`), so an import holds a batch's texts, never a
+  history's: before it, git-2000's 2,000 revisions were one batch, its texts all held until the end (w-perf's probe: the
+  content store's windows 41 MiB at revision 1 to 426 MiB at revision 2,000).
+- **Arms.** Before: a387b13c3 (e6710411a's parent). After: e6710411a. Each `cargo test --release -p slates-server --test
+  svn_import_storage --no-run` at its commit, kept as `~/.cache/main-rounds/p7ab/{before-a387b13c3,after-e6710411a}`.
+- **Command.** `SLATES_SVN_IMPORT_DUMP=~/.cache/main-rounds/data/git-2000.dump <binary>
+  a_subversion_imports_bytes_on_the_store_are_measured_against_fsfs --ignored --nocapture`, the arms interleaved three
+  rounds, 22:25 to 22:26 PST. Results and logs: `~/.cache/main-rounds/p7ab/results.txt` and `run-*.log`.
+- **Machine and load.** Adas-MacBook-Pro-2.local (M-series, 18 cores, 128 GB), load 28 to 31; the seconds are loaded
+  and whole (the test's own), read as ratios.
+
+| round | arm | resident after the import, KiB | wall, s |
+|---|---|---|---|
+| 1 | before | 696,688 | 10 |
+| 1 | after | 189,744 | 13 |
+| 2 | before | 697,856 | 8 |
+| 2 | after | 189,888 | 12 |
+| 3 | before | 700,896 | 9 |
+| 3 | after | 189,632 | 14 |
+
+- **The gauges.** Before: the content object 494,387,200 B resident after the import, the import one batch. After: 20,971,520
+  B resident, its windows 3,080,192 B, 48,051,358 B let go; batches landed for their texts 179, at the end 1.
+- **What it says.** Resident after the import 3.7 times lower; the time about 40 % higher (8 to 10 s against 12 to 14
+  s), the Mercurial import's pattern before its pipelining: each of the 180 batches' flushes awaited in turn. Owed: the
+  batches' landings pipelined, as the Mercurial import's segments are (main's ruling).
+

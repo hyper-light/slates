@@ -3427,11 +3427,22 @@
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
 > `--vcs-store`, without which `repository create --tool git` failed since A-767 C5); hg and svn by their stock clients
 > (`multi_repo_stock.py`, main's 21:35 ruling (a)). Open: the rounds (main's).
-> **A-724 piece 4 (A-851): let go past the grant, built, no reader yet** (`ContentStore::let_go`/`bring_back`,
+> **A-724 piece 4 (A-851): let go past the grant, built** (`ContentStore::let_go`/`bring_back`,
 > `vcs_share::grants::let_go_past_grant`; tests `a_landed_window_is_let_go_and_brought_back_by_its_own_bytes`,
-> `t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go`). Open: git's and hg's read-through (w-git, w-hg:
-> red tests queued in their inboxes), landed marks and window lists from the tools; a restart's image no longer holding
-> a let-go window (recovery reads it back through the node's store, with the read-through).
+> `t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go`). Its reader WIRED (2026-11-25, w-perf; main
+> 01a20182's rulings (b) and (i'), from w-hg's sweep of the bring-back sites): what a read brings back is a cache the
+> division bounds (`vcs_share::read_backs`; §4.17.5's status). Each window attributed at the one bring-back step to the
+> repository whose store holds its object (`VcsStores::subversion_storing`, `VcsStores::git_holding_pack`: a scan of the
+> shard's git stores' packs, `O(repositories × packs)`, only on a bring-back; a home's landed note), let go past its
+> grant at each division (`grants::current_at`), coldest first, never pinned, never younger than a cadence; one no
+> store claims let go at the division. Counted `vcs_share.read_backs_attributed_{text,pack,hg}`, `_unattributed`,
+> `_let_go`, `_unattributed_let_go`, `_pinned_kept`, `_past_bound`. Held by
+> `what_a_read_brings_back_is_let_go_past_its_repositorys_grant` (red: 1,048,576 B of sixteen read-back texts resident
+> against a 196,608 B grant; the hot text kept, the cold let go), `a_pinned_read_back_is_never_let_go_however_cold`,
+> `a_read_back_no_store_claims_is_let_go_once_unpinned` and
+> `a_packs_window_is_attributed_to_the_repository_whose_store_holds_it` (24 repositories, the scan's time printed).
+> Open: a pack-to-repository index, should the scan ever show beside the store read it follows; a restart's image no
+> longer holding a let-go window (recovery reads it back through the node's store, with the read-through).
 > **A-724 piece 6 DEFERRED (main 01a20182, 2026-11-21 21:35):** the fleet's placement of content by identity (amends
 > §4.10) waits until goal 93's servers are complete and correct; Ada asked for many repositories on a single server, and
 > the N=1 homes and the region rule exist (1729a9c5a, 58f756e0a, 9f57e4810).

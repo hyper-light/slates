@@ -1150,6 +1150,13 @@ fn landed_put_back(
   })?;
   if put {
     state.count(LANDED_BROUGHT_BACK, 1);
+    // A read-back, cached by the repository its landed note names (`vcs_share::read_backs`).
+    crate::vcs_share::read_backs::brought_back(
+      state,
+      *window,
+      len,
+      crate::vcs_share::read_backs::Holder::Landed,
+    );
   }
   Ok(())
 }

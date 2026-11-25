@@ -535,7 +535,12 @@ async fn bring_back_text_window(
     });
     // A read-back, its repository's to cache within its grant (`vcs_share::read_backs`, §4.17.5 "The cold trigger").
     if let Ok(true) = brought {
-      crate::vcs_share::read_backs::noted(state, repository, window, width);
+      crate::vcs_share::read_backs::brought_back(
+        state,
+        window,
+        width,
+        crate::vcs_share::read_backs::Holder::Text(repository),
+      );
     }
     brought.map(drop)
   })
