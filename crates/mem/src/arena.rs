@@ -817,6 +817,11 @@ impl ChunkArena {
     while self.position.last().is_some_and(Option::is_none) {
       self.position.pop();
     }
+    // Its freed blocks go with it, out of the resident free count (goal 93 P7: left counted, the count read 116.7 MB
+    // against 33.6 MB mapped once its regions had gone back to the pool).
+    self.resident_free = self
+      .resident_free
+      .saturating_sub(removed.dirty.recorded_bytes());
     Ok(removed.region)
   }
 
@@ -1391,7 +1396,9 @@ impl ChunkArena {
     self.settle(Buddy::commit_live);
   }
 
-  /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total.
+  /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total. Those blocks go
+  /// back unscrubbed, so no region records them as freed and resident, and the resident free count does not count them
+  /// (goal 93 P7: it did, bytes no purge walks).
   fn settle(&mut self, step: fn(&mut Buddy)) {
     let mut released_total = 0usize;
     for slot in self.slots.iter_mut() {
@@ -1401,7 +1408,6 @@ impl ChunkArena {
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
-    self.resident_free = self.resident_free.saturating_add(released_total);
   }
 
   /// What of the arena's regions is in RAM, each read from the kernel's page table ([`crate::resident::of_range`], the
@@ -2143,6 +2149,94 @@ mod tests {
     fn available(&self) -> usize {
       self.free.iter().map(|(_, region)| region.len()).sum()
     }
+  }
+
+  /// Goal 93 P7 (main's ruling of 2026-11-25: P7's verdict rests on the arena's gauges, and
+  /// `mem.gauge.content.arena_resident_free_bytes` read 116.7 MB against 33.6 MB mapped in the one-unit arm). Do: on an
+  /// arena growing from a pool of regions, take a seeded mix of steps (allocate, growing from the pool when refused; free;
+  /// free under a capture, then commit or abandon it; commit the live blocks; purge a block; shrink to what is held) and
+  /// read the resident free count after each. Expect it always the bytes the regions record as freed and resident (what
+  /// the purge walks), and never above the free bytes nor the capacity. Red before: a region shrunk away with freed
+  /// blocks recorded left them counted, past the capacity once every region went; and a recovery's commit counted bytes
+  /// no region recorded.
+  #[test]
+  fn the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena.set_source(Box::new(TestPool {
+      free: (1..=6u16)
+        .map(|id| (id, Region::map(p * 16, p, false).unwrap()))
+        .collect(),
+    }));
+    arena.published = true;
+    let mut live: Vec<Extent> = Vec::new();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state
+    };
+    let (mut shrunk, mut committed_live) = (0usize, 0usize);
+    for step in 0..3_000u32 {
+      let pick = |live: &Vec<Extent>, at: u64| (at as usize) % live.len();
+      match next() % 8 {
+        0..=2 => {
+          let len = p * (1 + (next() % 4) as usize);
+          match arena.alloc(len, Owner::Volume) {
+            Ok(extent) => live.push(extent),
+            Err(_) => {
+              arena.grow(len);
+              if let Ok(extent) = arena.alloc(len, Owner::Volume) {
+                live.push(extent);
+              }
+            }
+          }
+        }
+        3 | 4 if !live.is_empty() => {
+          let at = pick(&live, next());
+          arena.free(live.swap_remove(at)).unwrap();
+        }
+        5 if !live.is_empty() => {
+          arena.capture();
+          let at = pick(&live, next());
+          arena.free(live.swap_remove(at)).unwrap();
+          if next() % 2 == 0 {
+            arena.commit_capture();
+          } else {
+            arena.abandon_capture();
+          }
+        }
+        6 => {
+          arena.purge(1);
+        }
+        7 => {
+          if next() % 4 == 0 {
+            arena.commit_live();
+            committed_live += 1;
+          } else {
+            shrunk += arena.shrink(0);
+          }
+        }
+        _ => {}
+      }
+      let recorded: usize = arena.held().map(|slot| slot.dirty.recorded_bytes()).sum();
+      let counted = arena.resident_free_bytes();
+      assert_eq!(
+        counted, recorded,
+        "step {step}: the count is what the regions record"
+      );
+      assert!(
+        counted <= arena.free_bytes() && counted <= arena.capacity(),
+        "step {step}: {counted} resident free, past the free {} or the capacity {}",
+        arena.free_bytes(),
+        arena.capacity()
+      );
+    }
+    assert!(
+      shrunk > 0 && committed_live > 0,
+      "the mix shrank ({shrunk}) and committed live ({committed_live})"
+    );
   }
 
   fn pooled(p: usize, ids: &[u16]) -> ChunkArena {

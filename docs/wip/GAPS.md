@@ -2834,8 +2834,17 @@
 > pages kept past it are pages no batch of the import refills. Counted `repository.svn_import.purged_past_bound_bytes`.
 > Red `an_imports_arena_keeps_no_more_resident_free_than_its_bound` (16 MiB of rewrites at a bound of two units,
 > published each turn): 6,250,496 bytes resident and free as the import ended against a keep of 4,202,496; now
-> 2,449,408, 3,801,088 given back. OWED: main's fourth P7 arm; the deferred frees of the import's last batch wait for the
-> next publication and the idle purge, as any shard's do.
+> 2,449,408, 3,801,088 given back. Main's fourth P7 arm (2b977b986): the recorded resident free within the bound each
+> round; the last batches' deferred frees (A-64) and free space the purge does not record ended above it, and the
+> resident free gauge read above the arena's mapped bytes in the other arms (116.7 MB against 33.6). That gauge's drift
+> fixed (w-perf; main's ruling of 2026-11-25): a region shrunk back to the pool took its recorded freed blocks out of
+> the arena but not out of the count, and a recovery's commit (`settle`) counted blocks it released unscrubbed, which no
+> region records; the count is now what the regions record, held by
+> `the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink` (an arena growing from a pool, a seeded
+> mix of allocate, free, captured free, commit live, purge and shrink; red at step 59). The storage test reads the gauges
+> again once a publication has released the import's deferred frees (main's claim: deferred 0 and free within the
+> keep by then). OWED: the purge's kept-short runs, taken out of the record though their pages stay resident, and a
+> grown region's never-used space, once main's arm prints `purged_kept_short_bytes`.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
