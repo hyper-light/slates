@@ -183,6 +183,10 @@ pub fn apply_into(
 pub trait BaseRead {
   /// The base's length.
   fn len(&self) -> u64;
+  /// Whether the base has no bytes: a delta over it can only insert.
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
   /// Appends the base's bytes `at..at + n` to `out`: none where the reader does not hold them now (a window let go),
   /// `out` then as it was.
   fn read_into(&mut self, at: u64, n: usize, out: &mut Vec<u8>) -> Option<()>;
@@ -547,19 +551,23 @@ mod tests {
     encode_lines, hunks, patched_len,
   };
 
-  /// The text `delta` makes of `base` by [`Patching`], `most` bytes a fill, and the longest fill.
-  fn patched_by_fills(base: &[u8], delta: &[u8], most: usize) -> Result<(Vec<u8>, usize), Refusal> {
+  /// The text `delta` makes of `base` by [`Patching`], `most` bytes a fill, or its refusal; and the longest fill. A slice
+  /// holds every byte, so a base read that stops fails the test.
+  fn patched_by_fills(base: &[u8], delta: &[u8], most: usize) -> (Result<Vec<u8>, Refusal>, usize) {
     let mut patching = Patching::default();
     let mut out = Vec::new();
     let mut longest = 0usize;
     let mut reader: &[u8] = base;
     loop {
       let before = out.len();
-      let filled = patching.fill((delta, &mut reader as &mut dyn BaseRead), most, &mut out)?;
+      let filled = match patching.fill((delta, &mut reader as &mut dyn BaseRead), most, &mut out) {
+        Ok(filled) => filled,
+        Err(refusal) => return (Err(refusal), longest),
+      };
       longest = longest.max(out.len().saturating_sub(before));
       match filled {
         Filled::More => {}
-        Filled::Done => return Ok((out, longest)),
+        Filled::Done => return (Ok(out), longest),
         Filled::Unread { at } => panic!("a slice holds every byte: unread at {at}"),
       }
     }
@@ -604,8 +612,8 @@ mod tests {
     for delta in &deltas {
       let expected = apply(&base, delta, &mut crate::Admission::new(u64::MAX)).unwrap();
       for most in [1usize, 3, 64, 1 << 20] {
-        let (made, longest) = patched_by_fills(&base, delta, most).unwrap();
-        assert_eq!(made, expected, "a fill of {most}");
+        let (made, longest) = patched_by_fills(&base, delta, most);
+        assert_eq!(made.unwrap(), expected, "a fill of {most}");
         assert!(longest <= most, "a fill of {most} made {longest}");
       }
     }
@@ -640,7 +648,7 @@ mod tests {
     .unwrap();
     for delta in [&out_of_order, &past] {
       assert_eq!(
-        patched_by_fills(&base, delta, 7).err(),
+        patched_by_fills(&base, delta, 7).0.err(),
         apply(&base, delta, &mut crate::Admission::new(u64::MAX)).err()
       );
     }
