@@ -3921,3 +3921,53 @@ fn t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records() 
   assert_eq!(orphan, 1, "the unheld repository's hold kept");
   assert_eq!(counts, [1, 1, 1], "each counted by its outcome");
 }
+
+/// Shape: the new refs one push makes in [`landing_counts_of_a_push_of_new_refs`]: several, so a step making them all is
+/// told from one making one.
+const NEW_REFS: usize = 5;
+
+/// A push of [`NEW_REFS`] new refs to repository `name` on an audit shard, each a tag at one commit, its first command
+/// asking `capabilities`: its reasons, and what the landing counted most of the creates one step made itself and of one
+/// step's time.
+fn landing_counts_of_a_push_of_new_refs(
+  name: &'static str,
+  capabilities: &'static [u8],
+) -> (Vec<Vec<u8>>, u64, u64) {
+  crate::test_store::audit_on_stored_shard(name, move |state| {
+    let repository = git_repository(state, name);
+    let (head, objects) = flat_commit(1, "a tagged commit", None);
+    let head = head.to_string();
+    let refs: Vec<String> = (0..NEW_REFS).map(|at| format!("refs/tags/v{at}")).collect();
+    let commands: Vec<(&str, &str, &[u8])> = refs
+      .iter()
+      .map(|name| ("", head.as_str(), name.as_bytes()))
+      .collect();
+    let received = pushed(
+      state,
+      repository,
+      &request(&commands, capabilities, &pack_of_objects(&objects)),
+    );
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      reasons(&received),
+      count(crate::repository::push::LANDING_STEP_CREATES),
+      count(crate::repository::push::LANDING_STEP_NS),
+    )
+  })
+}
+
+/// w-git's measure before slicing git's creates (main 01a20182, 2026-11-24: a git create is P2's deferred one, with no
+/// work, so `repository.push.landing_step_works_most` cannot see it). Do: push five new tags at one commit to a fresh
+/// repository, as stock git pushes them (no `atomic`), then again to another with `atomic`. Expect: every ref `ok` in
+/// both; without `atomic` each ref lands in a step of its own (one create the most a step made), so git/git's ~1,027 new
+/// refs are ~1,027 small steps, never one; with `atomic` all five in one step; and each step's time counted.
+#[test]
+fn a_push_of_new_refs_counts_the_creates_its_landing_step_made_and_the_steps_time() {
+  let (said, creates, took) = landing_counts_of_a_push_of_new_refs("landing-counts", CAPABILITIES);
+  assert_eq!(said, vec![b"ok".to_vec(); NEW_REFS]);
+  assert_eq!((creates, took > 0), (1, true), "a ref a step, timed");
+  let (said, creates, took) = landing_counts_of_a_push_of_new_refs("landing-atomic", ATOMIC);
+  assert_eq!(said, vec![b"ok".to_vec(); NEW_REFS]);
+  let all = u64::try_from(NEW_REFS).unwrap();
+  assert_eq!((creates, took > 0), (all, true), "all in one step, timed");
+}

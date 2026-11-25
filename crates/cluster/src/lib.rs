@@ -1014,8 +1014,9 @@ pub async fn commit_record_sent_as(
   budget: CommitBudget,
 ) -> Committed {
   let mut acked: Vec<HostId> = Vec::new();
-  // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them").
-  if owner_acceptor.accept(record).is_ok() && placement.candidates.contains(&owner) {
+  // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them"), fenced for this object
+  // alone as each holder fences it (A-909): one acceptor holds every object this owner writes.
+  if owner_acceptor.accept_own(record).is_ok() && placement.candidates.contains(&owner) {
     acked.push(owner);
   }
 
