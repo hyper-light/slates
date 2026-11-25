@@ -812,3 +812,11 @@
   seat/client-gone tests (A-594/A-730, authors gone, mine now) + w-hg's git_hooks pair under 8 burners, full output
   kept; suspected test premises (fixed 2 s pause vs a measured first RTO; g90's fixed 100 ms before close). THEN
   open_tree: deltas-applied counters per tree read (most, sum) for main's leg, before slicing.
+- 11-25 ~15:00 PST: LANDED a95b34dfa (GAPS 8a-hook-exit: hook exits seconds late in batches under load, unnamed;
+  ?E/0 CPU/0 RSS; not lost wake (79/82 unreadable), not sleepers, not teardown; tests' bounds stay) and A-924 piece 1
+  bda920b70 (merge f5907bd5d): slates_ipc::spawner (frames, SCM_RIGHTS streams, WNOWAIT exits, reap on release,
+  SIGCHLD self-pipe, end-gone kills groups, 5×ARG_MAX+2×PATH_MAX cap), confined_spawn Spawn::handed. Red: through
+  the spawner 69–89 µs flat at 100/10k/100k descriptors vs direct 0.34/1.33/10.4–15.6 ms. A-924 claimed on
+  amendments.tsv. NEXT (piece 2): daemon starts/owns/restarts the spawner at role start, an end a shard, derived
+  back-off / in-flight / restart wait; hook_driver + run_helper ask it; footprint measured. THEN: SSH close + seats
+  (8a-hook-exit's same episodes), then open_tree delta counters. Spawn timer: ~/.cache/w-git-spawnbench.
