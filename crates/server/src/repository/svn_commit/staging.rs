@@ -253,6 +253,15 @@ async fn kill_before_entry_where_set() {
 /// ([`give_back_past`]). Format: a counter name in the status report.
 pub(crate) const PURGED_PAST_BOUND: &str = "repository.svn_import.purged_past_bound_bytes";
 
+/// Runs `step` a slice a step, yielding between slices, until it answers that it is done: each slice within the shard's
+/// budget, as the step bounds itself. None where the shard's state is gone.
+async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()> {
+  while !crate::state::with_state(&mut step)? {
+    slates_rt::futures::yield_now().await;
+  }
+  Some(())
+}
+
 /// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
 /// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
 fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
@@ -900,52 +909,12 @@ impl Staging {
         return Some(Err(refused));
       }
     };
-    let records = std::mem::take(&mut self.records);
-    let revisions = records.len();
-    // The changeset, every text the batch's entry names in its Payload, is durable before the entry is appended: so a
-    // named text outlives every entry naming it (A-760; `vcs_store::svn_texts::bring_back_named` relies on it).
-    #[cfg(test)]
-    kill_at_stage_where_set(LandStage::BeforeChangeset).await;
-    let flushing = slates_rt::futures::now_ns();
-    let landed =
-      landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
-    let committing = slates_rt::futures::now_ns();
-    // The device's durable flush, the least this shard meets: the bound's `F` (`texts_bound`), as the store's own
-    // `sync_data` took it, never the landing's await, which holds the owner's queue and the writes before it.
-    if landed.is_ok()
-      && let Some(flush_ns) = slates_store::owner::take_landed_flush_ns()
-    {
-      flushed_in(flush_ns);
-    }
-    #[cfg(test)]
-    kill_before_entry_where_set().await;
-    #[cfg(test)]
-    kill_at_stage_where_set(LandStage::BeforeEntry).await;
+    let revisions = self.records.len();
+    let (landed, flushing, committing) = self
+      .land_changeset_timed(&disk, (repository, sequence))
+      .await;
     let recorded = crate::state::with_state(|state| {
-      // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
-      // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
-      // after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
-      // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`).
-      if landed.is_ok() {
-        crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
-      }
-      landed.and_then(|()| {
-        if landing::next_sequence(state, repository) != sequence {
-          state.count(super::DIVERGED, 1);
-          return Err(Uncommitted::Diverged);
-        }
-        let reference = landing::reference(sequence);
-        crate::vcs_store::admit_objects(state, reference.len())
-          .map_err(|available| Uncommitted::Budget { available })?;
-        let batch = self.batch.take().ok_or(Uncommitted::NotHeld)?;
-        let parts = EntryParts {
-          objects: reference,
-          ..EntryParts::default()
-        };
-        batch
-          .commit(state, (principal, repository), parts)
-          .map_err(Uncommitted::Append)
-      })
+      self.record_landed(state, landed, principal, (repository, sequence))
     })?;
     let mut recorded = match recorded {
       Ok(recorded) => recorded,
@@ -954,16 +923,7 @@ impl Staging {
         return Some(Err(refused));
       }
     };
-    // The batch is the register's now: its versions applied to the green a slice a turn (`RecordedBatch`), the
-    // landing turn and the import's read gate held until the last; a kill between slices recovers from the record.
-    #[cfg(test)]
-    kill_at_stage_where_set(LandStage::BeforeApply).await;
-    let applying = slates_rt::futures::now_ns();
-    apply_slices(&mut recorded).await?;
-    slates_rt::futures::yield_now().await;
-    #[cfg(test)]
-    kill_at_stage_where_set(LandStage::BeforeTail).await;
-    let tailing = slates_rt::futures::now_ns();
+    let (applying, tailing) = apply_recorded(&mut recorded).await?;
     self.land_tail(cause).await?;
     let ended = slates_rt::futures::now_ns();
     crate::state::with_state(|state| {
@@ -978,6 +938,69 @@ impl Staging {
     Some(Ok(revisions))
   }
 
+  /// Lands the batch's changeset at `place` on `disk`: every text the batch's entry names in its Payload is durable
+  /// before the entry is appended, so a named text outlives every entry naming it (A-760;
+  /// `vcs_store::svn_texts::bring_back_named` relies on it). The landing's outcome, and when its flush began and ended.
+  async fn land_changeset_timed(
+    &mut self,
+    disk: &slates_store::owner::StoreHandle,
+    place: (RepositoryId, u64),
+  ) -> (Result<(), Uncommitted>, u64, u64) {
+    let records = std::mem::take(&mut self.records);
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::BeforeChangeset).await;
+    let flushing = slates_rt::futures::now_ns();
+    let landed = landing::land_changeset(disk, place, records, &self.carried).await;
+    let committing = slates_rt::futures::now_ns();
+    // The device's durable flush, the least this shard meets: the bound's `F` (`texts_bound`), as the store's own
+    // `sync_data` took it, never the landing's await, which holds the owner's queue and the writes before it.
+    if landed.is_ok()
+      && let Some(flush_ns) = slates_store::owner::take_landed_flush_ns()
+    {
+      flushed_in(flush_ns);
+    }
+    #[cfg(test)]
+    kill_before_entry_where_set().await;
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::BeforeEntry).await;
+    (landed, flushing, committing)
+  }
+
+  /// The batch's register entry by `principal`, once its changeset `landed` at `sequence`: the batch's texts unpinned
+  /// first, then the entry appended, refused `Diverged` where the register moved past `sequence`. The recorded batch,
+  /// whose versions are applied next.
+  fn record_landed(
+    &mut self,
+    state: &mut ShardState,
+    landed: Result<(), Uncommitted>,
+    principal: &Principal,
+    (repository, sequence): (RepositoryId, u64),
+  ) -> Result<crate::repository::push::RecordedBatch, Uncommitted> {
+    // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
+    // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
+    // after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
+    // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`).
+    if landed.is_ok() {
+      crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
+    }
+    landed?;
+    if landing::next_sequence(state, repository) != sequence {
+      state.count(super::DIVERGED, 1);
+      return Err(Uncommitted::Diverged);
+    }
+    let reference = landing::reference(sequence);
+    crate::vcs_store::admit_objects(state, reference.len())
+      .map_err(|available| Uncommitted::Budget { available })?;
+    let batch = self.batch.take().ok_or(Uncommitted::NotHeld)?;
+    let parts = EntryParts {
+      objects: reference,
+      ..EntryParts::default()
+    };
+    batch
+      .commit(state, (principal, repository), parts)
+      .map_err(Uncommitted::Append)
+  }
+
   /// A landed batch's tail, once its versions are applied: counted, its green checkpointed and folded to its readers;
   /// then the per-text work a slice of the shard's budget a step, counted (goal 93: a revision of 9,000 files ran its
   /// tail in one step of 580 ms on a debug build): the green's held table follows the batch, then the batch's texts are
@@ -986,12 +1009,11 @@ impl Staging {
     let green = self.green;
     // The green's identity brought to its head a slice of the shard's budget a step, counted, before the fold reads it
     // (A-910; goal 93: the fold brought 9,000 changed keys' identity to the head in one step of 482 ms, debug).
-    while !crate::state::with_state(|state| {
+    until_done(|state| {
       state.count(TAIL_SLICES, 1);
       identity_some(state, green, slice_deadline_ns())
-    })? {
-      slates_rt::futures::yield_now().await;
-    }
+    })
+    .await?;
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, (cause, self.bound));
@@ -1003,7 +1025,7 @@ impl Staging {
       .map(|(path, identity)| (identity, path))
       .collect();
     let mut at = 0usize;
-    while !crate::state::with_state(|state| {
+    until_done(|state| {
       state.count(TAIL_SLICES, 1);
       crate::vcs_store::svn_texts::follow_some(
         state,
@@ -1011,25 +1033,21 @@ impl Staging {
         (&self.released, &holding),
         (&mut at, slice_deadline_ns()),
       )
-    })? {
-      slates_rt::futures::yield_now().await;
-    }
+    })
+    .await?;
     let mut at = 0usize;
-    while !crate::state::with_state(|state| {
+    until_done(|state| {
       state.count(TAIL_SLICES, 1);
       give_back_put_some(state, &self.put, (&mut at, slice_deadline_ns()))
-    })? {
-      slates_rt::futures::yield_now().await;
-    }
+    })
+    .await?;
     // The content arena's resident free pages past what the next batch refills given back, a slice a step (goal 93,
     // main's ruling of 2026-11-25: A-742's rule for the content plane; an import never leaves its shard idle, so the idle
     // purge never ran under it, and git-2000's let-go texts stayed resident as free pages, 204 MB of a 438 MB daemon).
     // The keep is the batch's own bound: a batch takes at most that before it lands, so pages kept past it are pages no
     // batch of this import refills (`texts_bound`).
     let keep = usize::try_from(self.bound.bytes).unwrap_or(usize::MAX);
-    while crate::state::with_state(|state| give_back_past(state, keep))? {
-      slates_rt::futures::yield_now().await;
-    }
+    until_done(|state| !give_back_past(state, keep)).await?;
     crate::state::with_state(|state| {
       self.put.clear();
       if let Some(turn) = self.turn.take() {
@@ -1096,6 +1114,22 @@ async fn brought_for_staging(
       Some(Err(refused))
     }
   }
+}
+
+/// A recorded batch applied: the batch is the register's now, its versions applied to the green a slice a turn
+/// (`RecordedBatch`), the landing turn and the import's read gate held until the last; a kill between slices recovers
+/// from the record. When the apply began and ended; None where the shard's state is gone.
+async fn apply_recorded(
+  recorded: &mut crate::repository::push::RecordedBatch,
+) -> Option<(u64, u64)> {
+  #[cfg(test)]
+  kill_at_stage_where_set(LandStage::BeforeApply).await;
+  let applying = slates_rt::futures::now_ns();
+  apply_slices(recorded).await?;
+  slates_rt::futures::yield_now().await;
+  #[cfg(test)]
+  kill_at_stage_where_set(LandStage::BeforeTail).await;
+  Some((applying, slates_rt::futures::now_ns()))
 }
 
 /// Applies a recorded batch's versions to its green ([`crate::repository::push::RecordedBatch::apply_slice`]), each slice
