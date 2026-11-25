@@ -229,19 +229,17 @@
 > A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
 > format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
 > Nothing is built on either answer.
-> **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
-> creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
-> (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
-> both count `merge.recompute_mismatch` and refuse the new green at version 0 ("the recomputed identity does not match the
-> record"). A branch's green is made at a version of its source (`Lineage::branch`, A-575), so its version 0 is the
-> source's state there, while a holder recomputes every version 0 as an empty green (`merge_service::recompute`) and the
-> record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
-> `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
-> makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
-> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing). A-908, main's
-> ruling of 12:42: part 1 BUILT, the holder's replicas kept by the owner's own type (`crate::greens::Greens`), each
-> standing alone; part 2 owed: version 0's record names its membership, a holder founds and branches lineages,
-> adoption moves a lineage whole, and a branch is rebuilt by branching its source.
+> **BUILT, part 4 owed (A-908, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
+> green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
+> lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
+> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
+> rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
+> **IN FLIGHT (w-shared, 2026-11-24): a branch made on a repository's successor after its owner died is refused.** With
+> A-908 the successor adopts the lineage (`merge.takeover.lineage_adopted` 1) and makes the branch's green (no longer
+> `ContentUnavailable`, origin/main's red), and the other survivor branches its replica; but the push is refused `unable
+> to commit` (its barrier: the new green's version 1 unplaced, the names log at 6 acknowledged by none, no refusal counted
+> on either survivor), and a push of another new name 2.3 s later `cannot lock ref: it moved since the push read it`. Red
+> test kept off main until the fix.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1496,6 +1494,25 @@
 >   by the heads it began over (`TagsRead::same_heads`). Held by
 >   `a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made` (red: refused
 >   `ContentUnavailable`).
+> Found and closed (main's orders of 2026-11-24 10:18, 14:26 and 14:32; w-git's written OK of 14:57): a push of a
+> history with many heads spun its landing's one step. Each head is a line green of its own, and the step made,
+> secured, judged, held and committed every new green: a 4,067-changeset history with 452 heads held shard 0 for 3,553
+> ms of CPU (debug, the daemon ended by its watchdog); 152 heads took 1.89 s. A new green is no reader's until its record
+> lands, so each create is now made by one function (`push::prepare_create`) a slice at a time before the step, under
+> the repository's landing turn (`hg_push::land_sliced`, `push::PreparedCreates`, w-svn's loop; counted
+> `repository.push.create_slices`): its id minted once and reserved (`ShardState::family_reserved_through`, every family
+> id minted through `verbs::fresh_family_id_at`), its retention charged to the push's room before the first slice
+> (refused `BudgetExceeded` past it), its chain entry encoded with it; the step takes each by name (misses counted,
+> `repository.push.create_misses`), and what it does not take is given back. git's pushes make their creates by the same
+> function within the step. After (debug): 152 heads, the step 166 ms, 151 slices of at most 23 ms; 452 heads, the step
+> 567 ms, 451 slices of at most 123 ms, the push accepted. Held by
+> `t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step` (red: the step did 64 greens' works, now
+> 1), `creates_made_ahead_of_a_landing_and_not_taken_are_given_back` and
+> `creates_past_their_pushs_room_are_refused_before_any_is_made`. Owed: (1) a push that moves hundreds of existing heads
+> still does their works in the one step (an update's green is a reader's, so it is not made ahead); (2) the step's
+> record carries every new green's chain entry, so its write grows with heads times tree (377 ms of the 452-head step,
+> debug); (3) a slice makes one green whole, its tree's work (123 ms at 452 heads, debug); (4) git's pushes (git/git's
+> 1,027 refs) take the same slices once their driver hands its creates in (w-git's piece).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
@@ -1708,12 +1725,16 @@
 > FIXED by w-shared's A-902 (d48863ddb: the put carries the sender's configuration version, and a home behind it waits
 > for its own install within the put's budget).
 >
-> A git push of many new refs makes every new green in its landing's one step, OWED (w-git, 2026-11-24, main's order of
-> 15:06): git/git's whole history creates about 1,027 refs, mostly tags, each a Create whose make, secure, judge, hold
-> and commit run in the step that appends the entry, the cost w-hg measured for Mercurial's heads (452 heads held a
-> shard 3.5 s, watchdog exit). The way is w-hg's prepared-creates seam in `repository/push.rs` (agreed in writing
-> 2026-11-24: `prepare_create`, `PreparedCreates` handed to `push_planned`, prepared in slices under the landing turn
-> before the step, ids reserved ahead): git's driver hands its Creates in as Mercurial's does, once that lands.
+> A git push of many new refs makes every new green in one landing step only under `atomic`, MEASURED (w-git,
+> 2026-11-24, main's order of 15:06; corrected the same day). A git create is P2's deferred one
+> (`BranchChange::CreateDeferred`: made by identity and owing its push, none of the secure, judge, hold and commit that
+> cost Mercurial's 452 heads 3.5 s), and a push without `atomic` appends each ref in an entry of its own, so git/git's
+> ~1,027 new refs, pushed as stock git pushes them, are ~1,027 small steps, never one
+> (`a_push_of_new_refs_counts_the_creates_its_landing_step_made_and_the_steps_time`: five new tags, one create the most
+> a step made; with `atomic`, five in one step). Counted from now (`repository.push.landing_step_creates_most`, the
+> creates a landing step made itself; `repository.push.landing_step_ns_most`, its time). OWED only for an `atomic` push
+> of many refs, should those counters show its step past the quantum: w-hg's prepared-creates seam
+> (`repository/push.rs`, `PreparedCreates`, fda5613a1), its plan taught deferred creates.
 >
 > One push's reading spread over several shards, NOT IN THE DESIGN (for Ada; w-git, 2026-11-24, main's order of 09:50):
 > stock git's `index-pack` resolves one pack's deltas over threads; slates reads one push on one shard. §4.17.1 item 2

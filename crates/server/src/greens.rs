@@ -48,6 +48,25 @@ pub struct Greens {
   given_back: Vec<slates_merge::engine::NameHold>,
 }
 
+/// A repository's lineage taken out of one [`Greens`] whole, with its members' handles, to be put in another
+/// ([`Greens::take_lineage`], [`Greens::put_lineage`]; A-908: a holder's replicas become a successor's greens at a
+/// takeover, the lineage the holder made by the owner's own found and branch).
+pub struct TakenLineage {
+  /// The repository.
+  repository: RepositoryId,
+  /// The lineage, its arenas in it.
+  lineage: Lineage,
+  /// Each member's green and its handle in the lineage.
+  members: Vec<(VolumeId, LineageGreen)>,
+}
+
+impl TakenLineage {
+  /// The members it carries.
+  pub fn member_ids(&self) -> Vec<VolumeId> {
+    self.members.iter().map(|(id, _)| *id).collect()
+  }
+}
+
 /// A held verdict previewed as a member of its green's lineage ([`Greens::preview`]).
 #[must_use = "a preview holds its lineage's nodes until it is retired"]
 pub struct Preview {
@@ -504,6 +523,95 @@ impl Greens {
       .ok_or(LineageRefused::Stale)?
       .get_mut()
       .put_back(handle, green)
+  }
+
+  /// `id`'s engine taken out for work that runs past one lend (A-908, a holder's replica built over many slices): a lone
+  /// engine as it stands, a member out of its lineage with the arenas in it ([`Greens::take`], every other lend of the
+  /// lineage refused until [`Greens::put_back_any`]). `None` when there is none, or its lineage is out already.
+  pub fn take_any(&mut self, id: &VolumeId) -> Option<Green> {
+    if let Some(green) = self.alone.remove(id) {
+      return Some(green);
+    }
+    self.take(id).ok()
+  }
+
+  /// Puts back the engine [`Greens::take_any`] took for `id`: a member into its lineage, a lone engine as one. A member
+  /// whose lineage refuses it back (none taken out) is dropped, counted as a busy lend.
+  pub fn put_back_any(&mut self, id: &VolumeId, green: Green) {
+    if self.members.contains_key(id) {
+      if self.put_back(id, green).is_err() {
+        self.busy.set(self.busy.get().saturating_add(1));
+      }
+      return;
+    }
+    self.alone.insert(*id, green);
+  }
+
+  /// Drops `id`'s engine whatever its kind (A-908, a holder's replica refused or forgotten): a lone engine at once, a
+  /// member retired from its lineage and released whole. Nothing when there is none.
+  pub fn drop_any(&mut self, id: &VolumeId) {
+    if self.remove(id).is_some() {
+      return;
+    }
+    if let Some((repository, Ok(mut release))) = self.retire(id) {
+      while self
+        .release_step(repository, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
+  }
+
+  /// The members of `repository`'s lineage here, in id order.
+  pub fn lineage_members(&self, repository: RepositoryId) -> Vec<VolumeId> {
+    self
+      .members
+      .iter()
+      .filter(|(_, (of, _))| *of == repository)
+      .map(|(id, _)| *id)
+      .collect()
+  }
+
+  /// `repository`'s lineage taken out whole with its members (A-908), for another [`Greens`] to take
+  /// ([`Greens::put_lineage`]). `None` when there is none here, or a member of it is taken out or lent now.
+  pub fn take_lineage(&mut self, repository: RepositoryId) -> Option<TakenLineage> {
+    let members: Vec<(VolumeId, LineageGreen)> = self
+      .members
+      .iter()
+      .filter(|(_, (of, _))| *of == repository)
+      .map(|(id, (_, handle))| (*id, *handle))
+      .collect();
+    // A lend of any member is refused while one is taken out: the lineage is whole only then.
+    let (_, first) = members.first()?;
+    let lineage = self.lineages.get_mut(&repository)?;
+    if lineage.get_mut().with(*first, |_| ()).is_err() {
+      return None;
+    }
+    let lineage = self.lineages.remove(&repository)?.into_inner();
+    for (id, _) in &members {
+      self.members.remove(id);
+    }
+    Some(TakenLineage {
+      repository,
+      lineage,
+      members,
+    })
+  }
+
+  /// Puts a lineage another [`Greens`] gave up whole ([`Greens::take_lineage`]) here (A-908), its members with it.
+  /// Refused, handed back whole, when this one has a lineage of its repository or an engine of any of its members.
+  pub fn put_lineage(&mut self, taken: TakenLineage) -> Result<(), Box<TakenLineage>> {
+    if self.lineages.contains_key(&taken.repository)
+      || taken.members.iter().any(|(id, _)| self.contains_key(id))
+    {
+      return Err(Box::new(taken));
+    }
+    for (id, handle) in &taken.members {
+      self.members.insert(*id, (taken.repository, *handle));
+    }
+    self
+      .lineages
+      .insert(taken.repository, RefCell::new(taken.lineage));
+    Ok(())
   }
 
   /// Lends refused because a lineage was lent already: zero in every correct use (module docs).

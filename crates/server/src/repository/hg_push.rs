@@ -1235,6 +1235,7 @@ pub(crate) fn land(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   prepared: Prepared,
+  creates: Option<&mut push::PreparedCreates>,
 ) -> Landed {
   let Prepared {
     changes,
@@ -1294,7 +1295,7 @@ pub(crate) fn land(
     Some(record) => push::push_hg(
       state,
       (principal, repository),
-      (changes, &held_ahead),
+      (changes, &held_ahead, creates),
       parts,
       record,
     ),
@@ -1555,29 +1556,41 @@ async fn landed_after_builds(
         return Some(outcome);
       }
     };
-    let landing_step = slates_rt::futures::doing("hg_push::landing");
+    let judging_step = slates_rt::futures::doing("hg_push::landing");
     let tried = crate::state::with_state(|state| {
-      land_built(
+      judge_built(
         state,
         (repository, (principal, name), unbundle),
         (forked.take(), &mut built, &plan, &ahead),
-        (room, &mut committing),
+        room,
       )
     });
-    drop(landing_step);
-    match tried? {
-      Landing::Done(outcome) => return outcome,
+    drop(judging_step);
+    let landed = match tried? {
+      Judging::Done(outcome) => outcome,
+      // Its creates made a slice a turn ahead of its landing's step, under the turn it holds (goal 93, the landing spin).
+      Judging::Judged(prepared) => {
+        land_sliced((principal, repository), prepared, &ahead, room).await
+      }
       // The landing's plan named a work not built: the view moved between the plan and the landing. Built again while
       // the plan changes; the same plan missing twice is refused, typed, never looped on.
-      Landing::Unbuilt(back) => {
+      Judging::Unbuilt(back) => {
+        crate::state::with_state(|state| crate::held_ahead::give_back(state, &ahead))?;
         forked = *back;
         if last_plan.as_ref() == Some(&plan) {
           give_back(forked);
           return Some(PushOutcome::refused(&abort(UNBUILT.to_vec())));
         }
         last_plan = Some(plan);
+        continue;
       }
-    }
+    };
+    // What its entry did not name given back whatever it answered, and its turn noted landed.
+    crate::state::with_state(|state| {
+      crate::held_ahead::give_back(state, &ahead);
+      committing.landed(state);
+    })?;
+    return landed;
   }
 }
 
@@ -1612,9 +1625,9 @@ async fn readied(
   Some(readied)
 }
 
-/// A push's landing, its one step, over its works built ([`landing`]): what its entry did not name given back whatever
-/// it answered, and its turn noted landed where it landed.
-fn land_built(
+/// A push's landing judged in a step of its own, over its works built ([`judged_landing`]): its driver lands what it
+/// judged ([`land_sliced`]), then gives back what its entry did not name and notes its turn landed.
+fn judge_built(
   state: &mut ShardState,
   (repository, (principal, name), unbundle): (RepositoryId, (&Principal, [u8; 32]), &Unbundle),
   (forked, built, plan, ahead): (
@@ -1623,9 +1636,9 @@ fn land_built(
     &[WorkKey],
     &[crate::held_ahead::HeldAhead],
   ),
-  (room, committing): (&mut Admission, &mut Committing),
-) -> Landing {
-  let tried = landing(
+  room: &mut Admission,
+) -> Judging {
+  judged_landing(
     state,
     repository,
     (principal, name),
@@ -1640,12 +1653,7 @@ fn land_built(
       },
       room,
     ),
-  );
-  crate::held_ahead::give_back(state, ahead);
-  if matches!(tried, Landing::Done(_)) {
-    committing.landed(state);
-  }
-  tried
+  )
 }
 
 /// A push's entry's commit under its repository's landing turn (main 01a20182's rulings of 2026-11-22 07:32 and 12:00):
@@ -2648,7 +2656,7 @@ pub(crate) fn land_stored(
       released: Ok(()),
     };
   }
-  let landed = land(state, (principal, repository), prepared);
+  let landed = land(state, (principal, repository), prepared, None);
   settled_whole(state, run, landed.answer.is_ok());
   landed
 }
@@ -3993,9 +4001,8 @@ fn brought_of(
   Ok((read, forked.intaken.held_changesets.clone()))
 }
 
-/// The driver's last step (A-720): a fork made from an index another push has replaced since is refused; else the push
-/// judged over the served view as it is now, its texts read through its fork, admitted, and landed. Every refusal gives
-/// the fork back.
+/// The driver's last step (A-720) in one step: [`judged_landing`], then [`landed_judged`] making every create within it
+/// (a test's whole landing, which holds the shard through its push). Every refusal gives the fork back.
 fn landing(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -4004,6 +4011,46 @@ fn landing(
   forked: Option<Forked>,
   (works, room): (&mut Works<'_>, &mut Admission),
 ) -> Landing {
+  match judged_landing(
+    state,
+    repository,
+    (principal, name),
+    unbundle,
+    forked,
+    (works, room),
+  ) {
+    Judging::Done(outcome) => Landing::Done(outcome),
+    Judging::Unbuilt(back) => Landing::Unbuilt(back),
+    Judging::Judged(prepared) => Landing::Done(landed_judged(
+      state,
+      (principal, repository),
+      *prepared,
+      None,
+    )),
+  }
+}
+
+/// A landing judged ([`judged_landing`]).
+enum Judging {
+  /// Its outcome; none when no view could be made.
+  Done(Option<PushOutcome>),
+  /// A work its plan names was not built before it ([`Works::Built`]): its fork, for its driver to build again.
+  Unbuilt(Box<Option<Forked>>),
+  /// Judged and admitted, its fork in it: to land.
+  Judged(Box<Prepared>),
+}
+
+/// The driver's judging (A-720): a fork made from an index another push has replaced since is refused; else the push
+/// judged over the served view as it is now, its texts read through its fork, and admitted. Every refusal gives the fork
+/// back.
+fn judged_landing(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (principal, name): (&Principal, [u8; 32]),
+  unbundle: &Unbundle,
+  forked: Option<Forked>,
+  (works, room): (&mut Works<'_>, &mut Admission),
+) -> Judging {
   let moved = forked
     .as_ref()
     .is_some_and(|forked| state.vcs_stores.generation_of(repository) != Some(forked.generation));
@@ -4024,7 +4071,7 @@ fn landing(
   };
   // A work the landing's plan names was not built before it: the fork goes back to the driver, which builds again.
   if matches!(works, Works::Built { missed: true, .. }) {
-    return Landing::Unbuilt(Box::new(forked));
+    return Judging::Unbuilt(Box::new(forked));
   }
   let mut prepared = match judged {
     Some(Ok(prepared)) => prepared,
@@ -4034,7 +4081,7 @@ fn landing(
       {
         state.count(vcs_store::RELEASE_REFUSED, 1);
       }
-      return Landing::Done(other.map(|judged| {
+      return Judging::Done(other.map(|judged| {
         judged
           .err()
           .unwrap_or(PushOutcome::Unprocessed(MOVED.to_vec()))
@@ -4045,14 +4092,92 @@ fn landing(
   if let Works::Built { ahead, .. } = works {
     prepared.held_ahead = ahead.to_vec();
   }
-  let landed = land(state, (principal, repository), prepared);
+  Judging::Judged(Box::new(prepared))
+}
+
+/// A judged push landed ([`land`]), its creates taken from `creates` where its driver made them ahead of this step: its
+/// outcome.
+fn landed_judged(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  prepared: Prepared,
+  creates: Option<&mut push::PreparedCreates>,
+) -> Option<PushOutcome> {
+  let landed = land(state, (principal, repository), prepared, creates);
   if landed.released.is_err() {
     state.count(vcs_store::RELEASE_REFUSED, 1);
   }
-  Landing::Done(Some(match landed.answer {
+  Some(match landed.answer {
     Ok(reply) => PushOutcome::Accepted(reply),
     Err(refused) => PushOutcome::refused(&refused),
-  }))
+  })
+}
+
+/// A judged push's creates made ahead of its landing's step, a slice a turn (goal 93, the landing spin;
+/// `push::PreparedCreates`): planned and charged to `room` in a step, made a slice of the shard's budget a step with a
+/// yield between, under the repository's landing turn its driver holds; then landed in a step of its own, and what the
+/// landing did not take given back. Refused typed where the plan or a create was, with what was made and the fork given
+/// back; none where the shard's state is gone.
+async fn land_sliced(
+  (principal, repository): (&Principal, RepositoryId),
+  mut prepared: Box<Prepared>,
+  ahead: &[crate::held_ahead::HeldAhead],
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  let give_back_fork = |state: &mut ShardState, prepared: Box<Prepared>| {
+    if let Some(forked) = prepared.forked
+      && release_index(state, forked.fork).is_err()
+    {
+      state.count(vcs_store::RELEASE_REFUSED, 1);
+    }
+  };
+  let planned = crate::state::with_state(|state| {
+    push::PreparedCreates::plan(
+      state,
+      (principal, repository),
+      &mut prepared.changes,
+      room.left(),
+    )
+  })?;
+  let mut creates = match planned {
+    Ok((creates, charged)) => {
+      // Checked against what was left: charged within it.
+      let _ = room.charge(charged);
+      creates
+    }
+    Err(refused) => {
+      crate::state::with_state(|state| give_back_fork(state, prepared))?;
+      return Some(PushOutcome::refused(&append_refused(&refused)));
+    }
+  };
+  loop {
+    let made = crate::state::with_state(|state| creates.prepare_some(state, ahead))?;
+    match made {
+      Ok(true) => break,
+      Ok(false) => slates_rt::futures::yield_now().await,
+      Err(refused) => {
+        crate::state::with_state(|state| {
+          creates.give_back(state);
+          give_back_fork(state, prepared);
+        })?;
+        return Some(PushOutcome::refused(&append_refused(&refused)));
+      }
+    }
+  }
+  slates_rt::futures::yield_now().await;
+  let landing_step = slates_rt::futures::doing("hg_push::landing");
+  let landed = crate::state::with_state(|state| {
+    let outcome = landed_judged(
+      state,
+      (principal, repository),
+      *prepared,
+      Some(&mut creates),
+    );
+    creates.give_back(state);
+    outcome
+  });
+  drop(landing_step);
+  landed.flatten()
 }
 
 /// What a landing came to ([`landing`]).

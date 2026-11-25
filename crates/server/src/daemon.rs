@@ -9652,15 +9652,29 @@ mod tests {
         })
         .ok()
     };
+    // Settled: recovered with nothing of the text resident, or a replay refused. A recovery goes on after the daemon's
+    // start returns and lets go what it read last, so a slow lane can read the repository recovered with the text still
+    // resident (main's TSan diag 45411303175: `(true, 0, true)` at the first recovered read); a let-go that never came
+    // still fails, at the lane's patience.
+    let patience = u32::try_from(600 * crate::test_lane::slowdown()).unwrap_or(u32::MAX);
     let deadline =
-      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(patience);
+    let settled = |seen: &(bool, u64, bool)| (seen.0 && !seen.2) || seen.1 > 0;
     let mut seen = read();
-    while std::time::Instant::now() < deadline
-      && !seen.as_ref().is_some_and(|seen| seen.0 || seen.1 > 0)
-    {
+    while std::time::Instant::now() < deadline && !seen.as_ref().is_some_and(settled) {
       std::thread::park_timeout(std::time::Duration::from_millis(50));
       seen = read();
     }
+    // What the successor brought back and let go, so a failure in a slow lane says which side of the let-go it read.
+    let counted = second
+      .observe(shard, |state| {
+        [
+          crate::vcs_store::svn_texts::PIECE_FETCHED,
+          crate::vcs_store::name_holds::LANDED_TEXT_LET_GO_BYTES,
+        ]
+        .map(|name| (name, state.refusals.get(name).copied().unwrap_or(0)))
+      })
+      .ok();
     // The text read back whole through the node's store, as a reader that needs it whole does, then given back.
     let (sent, got) = std::sync::mpsc::channel();
     let len = text.size;
@@ -9688,7 +9702,7 @@ mod tests {
       .expect("the read answered");
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, 0, false)));
+    assert_eq!(seen, Some((true, 0, false)), "{counted:?}");
     assert!(
       whole == Some(bytes),
       "the text did not read back whole through the store"
@@ -14095,6 +14109,117 @@ mod tests {
     for crash in 1..=segments {
       b1_crash_leaves_none_then_whole(&bundle, crash, segments, &named);
     }
+  }
+
+  /// Shape: the heads [`t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step`] pushes, each a line
+  /// green of its own: enough that their works in one step show, few enough that a debug build's step stays inside the
+  /// watchdog's window before the fix (64 greens' works, about 0.8 s at 12.5 ms a green, measured 2026-11-24).
+  const MANY_HEADS: usize = 64;
+
+  /// Goal 93, the landing spin (main's order of 2026-11-24 10:18 and 14:26: a 4,067-changeset history with 452 heads
+  /// spun shard 0 for 3,553 ms of CPU in one poll of `hg_push::landing`, the daemon ended by its watchdog). Do: push a
+  /// root and [`MANY_HEADS`] - 1 changesets on it, each a head of its own, through the daemon's driver
+  /// (`hg_push::unbundle`). Expect the push accepted, a line green for every head, and the landing's one step doing the
+  /// work of the line that existed alone (`repository.push.landing_step_works_most` 1), each new line's made before it a
+  /// slice a step (`repository.push.create_slices` moved) and taken by it (`repository.push.create_misses` 0). Red
+  /// before: every head's work in the one step (64).
+  #[test]
+  fn t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step() {
+    use crate::repository::hg_push::tests::history_of;
+    let names: Vec<String> = (0..MANY_HEADS).map(|at| format!("head-{at}")).collect();
+    let names: &'static [String] = Box::leak(names.into_boxed_slice());
+    let commits: Vec<crate::repository::hg_push::tests::Commit> = (0..MANY_HEADS)
+      .map(|at| {
+        let parent = if at == 0 { None } else { Some(0) };
+        (
+          names[at].as_str(),
+          names[at].as_str(),
+          names[at].as_bytes(),
+          parent,
+          "default",
+        )
+      })
+      .collect();
+    let made = history_of(&commits);
+    let all: Vec<usize> = (0..made.len()).collect();
+    let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &all);
+    let profile = test_profile();
+    let instance = format!("many-heads-{}", std::process::id());
+    let store = crate::test_store::TestStore::start("many-heads");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let daemon = super::Daemon::start(
+      &profile,
+      config,
+      super::SegmentSource::Create {
+        name: instance.clone(),
+      },
+    )
+    .unwrap();
+    daemon.bootstrap(true).unwrap();
+    let repository = daemon
+      .observe(daemon.shards.first().copied(), move |state| {
+        let reply = crate::test_store::create(
+          state,
+          &b1_owner(),
+          slates_ipc::protocol::RequestBody::CreateRepository {
+            name: "many-heads".to_owned(),
+            tool: slates_ipc::protocol::VcsTool::Mercurial,
+            format: slates_ipc::protocol::ObjectFormat::Sha1,
+            default_branch: crate::repository::hg_push::line_name(b"default", 0),
+            green: None,
+          },
+        );
+        assert!(
+          matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
+          "{reply:?}"
+        );
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named("many-heads")
+          .unwrap()
+          .id
+      })
+      .unwrap();
+    let (sent, answered) = std::sync::mpsc::channel();
+    b1_push(&daemon, repository, &bundle, sent);
+    let outcome = answered.recv().ok().flatten();
+    let (lines, (in_step, slices, misses)) = daemon
+      .observe(daemon.shards.first().copied(), move |state| {
+        let lines = state
+          .db
+          .partition()
+          .repositories()
+          .members_of(repository)
+          .count();
+        let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          lines,
+          (
+            counted(crate::repository::push::LANDING_STEP_WORKS),
+            counted(crate::repository::push::CREATE_SLICES),
+            counted(crate::repository::push::CREATE_MISSES),
+          ),
+        )
+      })
+      .unwrap();
+    daemon.stop();
+    assert!(
+      matches!(outcome, Some(slates_hg::push::Outcome::Accepted(_))),
+      "{outcome:?}"
+    );
+    assert_eq!(lines, MANY_HEADS, "a line green for every head");
+    assert_eq!(
+      in_step, 1,
+      "the landing's step did the existing line's work alone"
+    );
+    assert!(slices > 0, "the new lines made a slice at a time: {slices}");
+    assert_eq!(
+      misses, 0,
+      "every line made ahead taken by the landing's step"
+    );
   }
 
   /// The oracle's push: four changesets on one line, each a file of 1,536 bytes, so that a push cut at

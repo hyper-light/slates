@@ -36418,6 +36418,25 @@ impl GitFleet {
     }
   }
 
+  /// [`GitFleet::push`] of a fresh history to branch `branch` rather than `main`: a create of a new branch, its own green.
+  fn push_to(&self, node: usize, (file, bytes): (&str, &[u8]), branch: &str) -> Result<(), String> {
+    let dir = common::target::target_dir();
+    let work = dir.path.clone();
+    committed_in(&dir, (file, bytes));
+    let port = self.daemons[node]
+      .vcs_http_port()
+      .expect("the edge listens");
+    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
+    let url = format!("http://127.0.0.1:{port}/project");
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
+    if pushed.status.success() {
+      Ok(())
+    } else {
+      Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    }
+  }
+
   fn stop(self) {
     for daemon in self.daemons {
       daemon.stop();
@@ -36854,6 +36873,22 @@ fn a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session() {
     settled[0] >= 1,
     "a put its late homes' sessions back on their links (returned, redialed): {settled:?}"
   );
+}
+
+/// A branch's create in a fleet (found writing A-907's test, main 01a20182's order of 2026-11-24 12:36). Do: on a
+/// three-node `f = 1` fleet with a git repository on a, push a history to `main`, then push another, fresh, history to
+/// `refs/heads/after` (a new branch, its own green). Expect: both pushes land. Red before the fix: the second push is
+/// refused `unable to commit`, its barrier finding the new branch's green unplaced at version 1 and its names log
+/// acknowledged by none.
+#[test]
+fn a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("branch-create");
+  let first = fleet.push(0, ("first.txt", b"main's first history\n"));
+  let branch = fleet.push_to(0, ("branch.txt", b"a new branch's own history\n"), "after");
+  fleet.stop();
+  assert_eq!(first, Ok(()), "the push to main landed");
+  assert_eq!(branch, Ok(()), "the new branch's push landed");
 }
 
 /// A-727 (d1a-3), a holder unreachable at first, and the rebuild that makes its answer exist (main 01a20182's ruling of

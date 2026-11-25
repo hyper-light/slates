@@ -118,10 +118,29 @@ pub(crate) struct AdoptedGreen {
   /// its records are written at it (`merge_service::record_epoch`), and the adoption keeps it in the green's record
   /// (`VolumeRecord::taken_over`), so a restart of this node, which forgets `placed_heads`, writes them there still.
   pub(crate) epoch: u64,
-  /// The engine at `head`: this node's replica.
-  pub(crate) engine: Green,
+  /// The engine at `head`: this node's replica, standing alone, or its lineage's (A-908).
+  pub(crate) engine: AdoptedEngine,
   /// The submit completions the ledger's records carried, each with its version.
   pub(crate) completions: Vec<(u64, SubmitCompletion)>,
+}
+
+/// The engine an adoption hands the green's owner shard (A-908): this node's replica as it stands, or a repository's
+/// lineage whole, which a successor adopts as one, or nothing for a member that went with its lineage already.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "a replica moves from the replicas to its owner shard once per adoption, as the engine field did before A-908: \
+            boxing it would allocate per adoption to shrink a value that is moved and consumed, never stored"
+)]
+pub(crate) enum AdoptedEngine {
+  /// A replica standing alone (a green of no repository, or one rebuilt standing alone).
+  Alone(Green),
+  /// The replica's lineage, every member of it at its adopted version, its members' engines with it.
+  Lineage(Box<crate::greens::TakenLineage>),
+  /// A member whose lineage another member's adoption took ([`MergeShardState::moved_with_lineage`]): its engine is on
+  /// its owner shard already, or arrives there with that adoption.
+  ///
+  /// [`MergeShardState::moved_with_lineage`]: crate::merge_service::MergeShardState::moved_with_lineage
+  InLineage,
 }
 
 /// A green recovered on its owner shard that its takeover adopted from this node's holder ledger (A-333;
@@ -175,6 +194,10 @@ pub(crate) fn engine_for_adoption(
   if state.merge.seeding.contains(&object) {
     return Engine::Building;
   }
+  // Gone with its lineage, at its adopted version, by another member's adoption (A-908).
+  if state.merge.moved_with_lineage.contains(&object) {
+    return Engine::Ready;
+  }
   match state
     .merge
     .replicas
@@ -187,7 +210,7 @@ pub(crate) fn engine_for_adoption(
       state
         .merge
         .replicas
-        .remove(&crate::merge_service::replica_key(object));
+        .drop_any(&crate::merge_service::replica_key(object));
       state.count(REPLICA_PAST_ADOPTION, 1);
       rebuild(state, object, through, identity)
     }
@@ -246,7 +269,7 @@ fn at_adopted(state: &mut ShardState, object: ObjectId, identity: [u8; 32]) -> E
       state
         .merge
         .replicas
-        .remove(&crate::merge_service::replica_key(object));
+        .drop_any(&crate::merge_service::replica_key(object));
       state.count(ADOPTION_MISMATCH, 1);
       slates_machine::log_line!(
         "slates-server: taken-over green {}: this node's replica at version {head} is not the adopted record's \
@@ -259,25 +282,88 @@ fn at_adopted(state: &mut ShardState, object: ObjectId, identity: [u8; 32]) -> E
   }
 }
 
-/// Takes the green's engine, `object`'s replica, out of this node's replicas, for its owner shard.
-pub(crate) fn take_engine(state: &mut ShardState, object: ObjectId) -> Option<Green> {
+/// Takes the green's engine, `object`'s replica, out of this node's replicas, for its owner shard. A replica standing
+/// alone goes as it is. A lineage's member takes its lineage whole (A-908: a successor adopts a repository's family as
+/// one, so every member is being adopted here), once every other member's replica is at its adopted version too; until
+/// then `None`, and the adoption waits as one whose replica is building does. The members that went with it are noted, so
+/// their own adoptions hand [`AdoptedEngine::InLineage`].
+pub(crate) fn take_engine(state: &mut ShardState, object: ObjectId) -> Option<AdoptedEngine> {
+  if state.merge.moved_with_lineage.remove(&object) {
+    return Some(AdoptedEngine::InLineage);
+  }
+  let key = crate::merge_service::replica_key(object);
+  let Some(repository) = state.merge.replicas.lineage_of(&key) else {
+    return state.merge.replicas.remove(&key).map(AdoptedEngine::Alone);
+  };
+  let others: Vec<ObjectId> = state
+    .merge
+    .replicas
+    .lineage_members(repository)
+    .into_iter()
+    .map(|member| ObjectId(member.bytes))
+    .filter(|member| *member != object)
+    .collect();
+  if !others
+    .iter()
+    .all(|member| at_adopted_version(state, *member))
+  {
+    state.count(LINEAGE_WAITS_FOR_MEMBERS, 1);
+    return None;
+  }
+  let taken = state.merge.replicas.take_lineage(repository)?;
+  state.merge.moved_with_lineage.extend(others);
+  state.count(LINEAGE_ADOPTED, 1);
+  Some(AdoptedEngine::Lineage(Box::new(taken)))
+}
+
+/// Whether this node's replica of `member` is at the version and identity its pending adoption names (A-908): a
+/// lineage moves to its successor only once every member is.
+fn at_adopted_version(state: &mut ShardState, member: ObjectId) -> bool {
+  let Some(adopted) = state
+    .pending_green_materializations
+    .get(&member)
+    .map(|pending| (pending.merge.version, pending.merge.identity))
+  else {
+    return false;
+  };
   state
     .merge
     .replicas
-    .remove(&crate::merge_service::replica_key(object))
+    .lend_mut(&crate::merge_service::replica_key(member))
+    .is_some_and(|mut replica| (replica.reached(), replica.head_identity()) == adopted)
 }
+
+/// Counter: a lineage's member whose adoption waited for another member's replica to reach its adopted version (A-908).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const LINEAGE_WAITS_FOR_MEMBERS: &str = "merge.takeover.lineage_waits_for_members";
+/// Counter: a repository's lineage handed whole to its successor's owner shard (A-908).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const LINEAGE_ADOPTED: &str = "merge.takeover.lineage_adopted";
 
 /// Gives a refused or unanswered adoption's engine back to this node's replicas, where it waits for the next attempt.
 pub(crate) fn give_back(state: &mut ShardState, object: ObjectId, adopted: AdoptedGreen) {
-  if !state
-    .merge
-    .replicas
-    .contains_key(&crate::merge_service::replica_key(object))
-  {
-    state
-      .merge
-      .replicas
-      .insert(crate::merge_service::replica_key(object), adopted.engine);
+  let key = crate::merge_service::replica_key(object);
+  match adopted.engine {
+    AdoptedEngine::Alone(engine) => {
+      if !state.merge.replicas.contains_key(&key) {
+        state.merge.replicas.insert(key, engine);
+      }
+    }
+    // The lineage back whole (A-908), its other members' adoptions handing it again from here.
+    AdoptedEngine::Lineage(taken) => {
+      let members = taken.member_ids();
+      if state.merge.replicas.put_lineage(*taken).is_ok() {
+        for member in members {
+          state
+            .merge
+            .moved_with_lineage
+            .remove(&ObjectId(member.bytes));
+        }
+      }
+    }
+    AdoptedEngine::InLineage => {
+      state.merge.moved_with_lineage.insert(object);
+    }
   }
   state.merge.adoption_completions.insert(
     object,
@@ -685,7 +771,7 @@ async fn rebuilt_engine(object: ObjectId, through: u64) -> Option<Green> {
   let begun = crate::state::with_state(|s| {
     s.merge
       .replicas
-      .remove(&crate::merge_service::replica_key(object));
+      .drop_any(&crate::merge_service::replica_key(object));
     crate::merge_origin::rebuild_replica_through(s, object, through)
   })?;
   if matches!(begun, Rebuild::Nothing) {
@@ -701,8 +787,13 @@ async fn rebuilt_engine(object: ObjectId, through: u64) -> Option<Green> {
       .replicas
       .lend(&crate::merge_service::replica_key(object))
       .map(|replica| replica.reached());
+    // A rebuild makes a replica standing alone (A-908 part 4 makes a lineage's member's), taken as it stands.
     (at == Some(through))
-      .then(|| take_engine(s, object))
+      .then(|| {
+        s.merge
+          .replicas
+          .remove(&crate::merge_service::replica_key(object))
+      })
       .flatten()
   })
   .flatten()
