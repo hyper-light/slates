@@ -216,7 +216,7 @@ where
     };
     // Read before the answer, which ends the want it names.
     let logs = wants.reads_logs();
-    let Some(whole) = answer_one(&disk, repository, want, wants).await else {
+    let Some((whole, requests)) = answer_one(&disk, repository, want, wants).await else {
       return false;
     };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
@@ -224,6 +224,7 @@ where
     let _ = lender.lend(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
+      state.count(TEXT_REQUESTS, requests);
       if tags {
         state.count(LOOKUP_STORE_ASKS, 1);
       } else if bases {
@@ -237,6 +238,11 @@ where
   }
   true
 }
+
+/// Counter: the requests a fetch's texts made of the node's changeset store's owner, each the texts of one want made
+/// whole there (goal 93: a request a text, and a piece a request, before: over 100,000 for hg's 57k clone). Format: a
+/// counter name in the status report.
+pub(crate) const TEXT_REQUESTS: &str = "vcs_store.hg_text_requests";
 
 /// Counter: the asks a push's intake (or its replay) made of the node's changeset store for a file delta's base landed
 /// before the push (A-767 C1, main's ruling (b2); `slates_hg::push::intake::Stepped::Store`), each a want of rows or of
@@ -265,7 +271,7 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
   repository: u128,
   want: slates_hg::render::Want,
   wants: &mut W,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
   use slates_hg::render::{StoredPlace, StoredRevision, Want};
   match want {
     Want::Rows { logs } => {
@@ -300,7 +306,7 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
           })
           .collect(),
       );
-      Some(0)
+      Some((0, 0))
     }
     Want::Chunks { places } => {
       let asked = places
@@ -313,17 +319,17 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
         .collect();
       let chunks = disk.places(asked).await.ok()?;
       wants.give_chunks(chunks);
-      Some(0)
+      Some((0, 0))
     }
     Want::Texts { texts, most } => match texts_made(disk, repository, &texts, most).await? {
-      MadeTexts::Past => {
+      (MadeTexts::Past, requests) => {
         wants.texts_past();
-        Some(0)
+        Some((0, requests))
       }
-      MadeTexts::Made(made) => {
+      (MadeTexts::Made(made), requests) => {
         let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
         wants.give_texts(made);
-        Some(whole)
+        Some((whole, requests))
       }
     },
   }
@@ -347,27 +353,14 @@ pub(crate) async fn texts_made(
   repository: u128,
   texts: &[[u8; 32]],
   most: u64,
-) -> Option<MadeTexts> {
-  let mut made = Vec::new();
-  made.try_reserve_exact(texts.len()).ok()?;
-  let mut total = 0_u64;
-  for identity in texts {
-    let mut text = Vec::new();
-    loop {
-      let at = u64::try_from(text.len()).ok()?;
-      let piece = disk.text(repository, *identity, at).await.ok()??;
-      if piece.is_empty() {
-        break;
-      }
-      total = total.saturating_add(u64::try_from(piece.len()).ok()?);
-      if total > most {
-        return Some(MadeTexts::Past);
-      }
-      text.extend_from_slice(&piece);
-    }
-    made.push(text);
+) -> Option<(MadeTexts, u64)> {
+  // One request of the store's owner for the batch (goal 93: a request a text and a piece before, over 100,000 trips to
+  // the owner for hg's 57k clone), counted ([`TEXT_REQUESTS`]).
+  match disk.texts(repository, texts.to_vec(), most).await.ok()? {
+    slates_store::owner::MadeTexts::Made(made) => Some((MadeTexts::Made(made), 1)),
+    slates_store::owner::MadeTexts::Past => Some((MadeTexts::Past, 1)),
+    slates_store::owner::MadeTexts::Missing => None,
   }
-  Some(MadeTexts::Made(made))
 }
 
 /// [`held`], for the tests.

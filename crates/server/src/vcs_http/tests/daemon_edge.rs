@@ -5696,7 +5696,7 @@ fn assert_the_pushes_file_texts_let_go(work_texts: u64, files_after: (usize, usi
 
 /// What a daemon's fetches have read of the changeset store so far: the changelog's and manifests' texts read whole
 /// (`vcs_store.hg_pull_log_texts`) and the store's asks (`vcs_store.hg_stream_store_asks`).
-fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64) {
+fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64, u64) {
   (
     counted_on(
       daemon,
@@ -5704,18 +5704,27 @@ fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64) {
       crate::vcs_store::hg_view::PULL_LOG_TEXTS,
     ),
     counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::STORE_ASKS),
+    counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::TEXT_REQUESTS),
   )
 }
 
 /// Goal 93 (main's interop bench at ed71ac0be: `hg clone` of the 57k history after P5 ran 13.5 minutes, stock's 42.4 s;
 /// the daemon's sample a store scan a text). A clone of the whole line, its changelog's and manifests' texts let go,
 /// reads each of the line's changesets and manifests once, and asks the store in batches: a want of rows and one of texts
-/// (a file's, its chunks) for each of the changelog, the manifests and the files, within the fetch's room. Red before:
-/// 30 asks, a want of a row and one of its text for every changeset and manifest.
-fn assert_clone_reads_its_texts_in_batches(before: (u64, u64), after: (u64, u64)) {
+/// (a file's, its chunks) for each of the changelog, the manifests and the files, within the fetch's room, each want's
+/// texts made by one request of the store's owner (`vcs_store.hg_text_requests`). Red before: 30 asks, a want of a row
+/// and one of its text for every changeset and manifest; then a request of the owner a text.
+fn assert_clone_reads_its_texts_in_batches(before: (u64, u64, u64), after: (u64, u64, u64)) {
   let texts = after.0.saturating_sub(before.0);
   let asks = after.1.saturating_sub(before.1);
-  println!("a clone of {LET_GO_LINE} changesets read {texts} log texts in {asks} store asks");
+  let requests = after.2.saturating_sub(before.2);
+  println!(
+    "a clone of {LET_GO_LINE} changesets read {texts} log texts in {asks} store asks, {requests} owner requests"
+  );
+  assert!(
+    requests <= asks,
+    "the clone's texts made by {requests} requests of the store's owner: one a want, never one a text"
+  );
   assert_eq!(
     texts,
     2 * u64::try_from(LET_GO_LINE).unwrap(),

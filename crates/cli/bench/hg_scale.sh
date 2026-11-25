@@ -110,7 +110,7 @@ echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n h
 # The daemon's resident set in MiB, or "-" where it is gone.
 rss_of() { ps -o rss= -p "$1" 2> /dev/null | awk '{ printf "%.0f", $1 / 1024 }' || echo -; }
 
-ANCHOR="" DAEMON="" STOCK=""
+ANCHOR="" DAEMON="" STOCK="" INSTANCE=""
 stop_servers() {
   if [ -n "$ANCHOR" ]; then kill -9 "$ANCHOR" 2> /dev/null || true; wait "$ANCHOR" 2> /dev/null || true; fi
   if [ -n "$DAEMON" ]; then
@@ -127,6 +127,7 @@ first() { sed -n "$2" "$1" | head -1; }
 # Starts a fresh slates anchor for run $1 and makes the repository and a token: sets URL, AUTH, ANCHOR, DAEMON.
 start_slates() {
   local instance="w-perf-hg-$$-$1" log="$WORK/anchor-$1.log" exports token streak=0 port
+  INSTANCE=$instance
   # A Mercurial repository's history is kept on the node's changeset store (A-767): the run's own, under WORK.
   mkdir -p "$WORK/store-$1"
   "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 --vcs-store "$WORK/store-$1" > /dev/null 2> "$log" &
@@ -157,7 +158,7 @@ start_slates() {
     --config "auth.slates.password=$token")
 }
 # KEEP_LOGS in the environment names a directory the servers' logs and each step's output are copied into at the end.
-trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
+trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/status.*.json "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
 
 # Starts `hg serve` over a fresh empty repository for run $1: sets URL and STOCK.
 start_stock() {
@@ -206,6 +207,41 @@ steps() {
   [ "$server" = slates ] && echo "slates daemon rss after push: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   timed "$server clone $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q -U "$URL" "$clone"
   [ "$run" = 1 ] && check "$clone" "$server"
+  # A run whose fill or clone failed has no repository to change and no clone to pull into: its incremental push
+  # and pull would push and fetch the whole history under the incremental names (main's rerun at 2ed3eb139: run 2's
+  # "incremental-push 115.070" and "incremental-pull 112.096" beside 0.900). They are skipped, named, and kept out of
+  # the table and its best-of; the failed fill or clone fails the harness itself.
+  local missed=""
+  step_ok "$server" "$run" push push-chunked import || missed="its push"
+  step_ok "$server" "$run" clone || missed="${missed:+$missed and }its clone"
+  if [ -n "$missed" ]; then
+    for step in incremental-push incremental-pull; do
+      echo "$server skipped $step $run: $missed failed" | tee -a "$RESULTS"
+    done
+    echo "$server skipped incremental check $run: $missed failed" | tee -a "$RESULTS"
+  else
+    incremental "$server" "$run" "$clone" "$scratch"
+  fi
+  stream "$server" "$run"
+  [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
+  rm -rf "$clone" "$scratch" "$WORK/$server-stream-$run"
+}
+
+# Whether server $1's run $2 recorded one of the steps after it (the run's fill: push, push-chunked or import; or its
+# clone) and that step ended ok.
+step_ok() {
+  local server=$1 run=$2 step
+  shift 2
+  for step in "$@"; do
+    grep -qE "^$server $step $run [0-9.]+ ok$" "$RESULTS" && return 0
+  done
+  return 1
+}
+
+# The incremental steps of server $1's run $2: one changeset made on SOURCE's tip in scratch $4 and pushed, then pulled
+# into clone $3, which must then hold it.
+incremental() {
+  local server=$1 run=$2 clone=$3 scratch=$4 new
   h clone -q -r tip "$SOURCE" "$scratch"
   echo "one more changeset, $server run $run" > "$scratch/a-699-scale.txt"
   h -R "$scratch" commit -q -A -m "one more changeset" "$scratch/a-699-scale.txt"
@@ -217,9 +253,51 @@ steps() {
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
-  timed "$server stream $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q -U --stream "$URL" "$WORK/$server-stream-$run"
-  [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
-  rm -rf "$clone" "$scratch" "$WORK/$server-stream-$run"
+}
+
+# The stream counters w-hg reads (`crates/server/src` `vcs_store.hg_stream_*`), for its stream clone's slowness.
+STREAM_COUNTERS="vcs_store.hg_stream_store_asks vcs_store.hg_stream_store_wait_ns vcs_store.hg_stream_turns"
+
+# Slates' daemon at `$1` (before or after) step $2 of run $3: its `status --json` kept beside the logs
+# (status.WHEN-STEP-RUN.json), and a line of STREAM_COUNTERS, each summed over every shard's report of it, as
+# git_scale.sh's counters_at sums its own. Read outside the step's timing.
+counters_at() {
+  local file="$WORK/status.$1-$2-$3.json"
+  if ! "$SLATES" --instance "$INSTANCE" status --json > "$file" 2> /dev/null; then
+    echo "slates counters $1 $2 $3: status refused" | tee -a "$RESULTS"
+    return 0
+  fi
+  # shellcheck disable=SC2086 # the counters' names are words
+  python3 -I - "$file" $STREAM_COUNTERS << 'PY' | sed "s/^/slates counters $1 $2 $3: /" | tee -a "$RESULTS"
+import json, sys
+names = sys.argv[2:]
+sums = dict.fromkeys(names, 0)
+def walk(node):
+    if isinstance(node, dict):
+        if node.get("kind") in sums and isinstance(node.get("count"), int):
+            sums[node["kind"]] += node["count"]
+        for value in node.values():
+            walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value)
+walk(json.load(open(sys.argv[1])))
+print(" ".join(f"{name.split('vcs_store.')[-1]}={sums[name]}" for name in names))
+PY
+}
+
+# Server $1's stream clone in run $2, without `-q`, so hg prints what it moved, kept as a line of its own: Mercurial 7.2
+# prints "N files to transfer, X of data" and "stream-cloned N files / X in S seconds (R/sec)", an older hg
+# "transferred X in S seconds". For slates, the daemon's counters before and after it.
+stream() {
+  local server=$1 run=$2 name
+  name="$server stream $run"
+  [ "$server" = slates ] && counters_at before stream "$run"
+  timed "$name" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -U --stream "$URL" "$WORK/$server-stream-$run"
+  [ "$server" = slates ] && counters_at after stream "$run"
+  local moved
+  moved=$(grep -E '^([0-9]+ files to transfer|stream-cloned |transferred )' "$WORK/out.${name// /-}" | paste -sd ';' -)
+  echo "$server transferred stream $run: ${moved:-no transfer line}" | tee -a "$RESULTS"
 }
 
 for run in $(seq 1 "$RUNS"); do

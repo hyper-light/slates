@@ -118,7 +118,8 @@ first() { sed -n "$2" "$1" | head -1; }
 # stock's 10.7 (r811) and its later fetches' slowdown can be told apart by what the daemon did.
 COUNTERS=$(printf 'vcs_store.git_upload.%s ' parts_copied parts_by_entry entries_judged entries_copied headers_rewritten \
   made_whole loose_whole loose_deltas loose_unsearched reused_whole reused_deltas reuse_refused reuse_no_entry \
-  reuse_unread reuse_crc_missed reuse_rebuilt backward_reads stops
+  reuse_unread reuse_crc_missed reuse_rebuilt backward_reads stops position_lookups position_cache_hits \
+  position_cache_conflicts position_cache_unroomed
   printf 'vcs_store.git_deflate.%s ' states_made states_reused states_dropped
   printf 'vcs_store.git_encode.%s ' begun encoded turns behind ahead_stopped reused_whole reused_deltas reuse_refused \
     units_past_budget

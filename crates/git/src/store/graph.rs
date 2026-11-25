@@ -119,6 +119,10 @@ pub struct PositionCounts {
   pub lookups: u64,
   /// Ids the cache answered.
   pub hits: u64,
+  /// Of the ids resolved through the index, those whose slot held another id (a direct-mapped conflict, the id put out
+  /// of it to take it); the rest met an empty slot (an id not met lately, or never). What decides between more ways a
+  /// slot and a wider window (main 01a20182's order of 2026-11-25).
+  pub conflicts: u64,
   /// Answers whose cache was refused the room its work asked (one an answer).
   pub unroomed: u64,
 }
@@ -145,6 +149,9 @@ impl PositionCache {
       return Some(*position);
     }
     self.counts.lookups = self.counts.lookups.saturating_add(1);
+    if matches!(self.slots.get(at), Some(Some(_))) {
+      self.counts.conflicts = self.counts.conflicts.saturating_add(1);
+    }
     let position = resolve()?;
     if let Some(slot) = self.slots.get_mut(at) {
       *slot = Some((*id, position));

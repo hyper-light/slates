@@ -125,6 +125,12 @@ enum Request {
     offset: u64,
     answer: Sender<Result<Option<Vec<u8>>, StoreError>>,
   },
+  Texts {
+    repository: u128,
+    identities: Vec<Identity>,
+    most: u64,
+    answer: Sender<Result<MadeTexts, StoreError>>,
+  },
   TextRow {
     repository: u128,
     identity: Identity,
@@ -252,6 +258,17 @@ impl fmt::Debug for Request {
         .field("repository", repository)
         .field("sequence", sequence)
         .finish_non_exhaustive(),
+      Request::Texts {
+        repository,
+        identities,
+        most,
+        ..
+      } => f
+        .debug_struct("Texts")
+        .field("repository", repository)
+        .field("identities", &identities.len())
+        .field("most", most)
+        .finish_non_exhaustive(),
       Request::TextRow { repository, .. } => f
         .debug_struct("TextRow")
         .field("repository", repository)
@@ -361,6 +378,7 @@ fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
       Request::Sections { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Read { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Changesets { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Texts { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::TextRow { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Forget { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::PathTexts { answer, .. } => drop(answer.try_send(unopened(reason))),
@@ -515,6 +533,18 @@ fn serve(
             })
           });
         let _ = answer.try_send(read);
+      }
+      Request::Texts {
+        repository,
+        identities,
+        most,
+        answer,
+      } => {
+        let _ = answer.try_send(texts_made(
+          (&mut store, &staging, &mut texts),
+          repository,
+          (&identities, most),
+        ));
       }
       Request::TextRow {
         repository,
@@ -791,6 +821,31 @@ impl StoreHandle {
       .await
   }
 
+  /// The texts `identities` of `repository`, each made whole from its chain on the owner, in order, in one request
+  /// (goal 93: a clone after P5 made each let-go changelog and manifest text by a request of its own, a piece a request,
+  /// over 100,000 trips to the owner for hg's 57k history; main's interop bench, its clone about 1.7 times its load's
+  /// slowing past stock's): [`MadeTexts::Past`] where they hold more than `most` bytes together, none made past it;
+  /// [`MadeTexts::Missing`] where one is no text a landed changeset kept.
+  pub async fn texts(
+    &self,
+    repository: u128,
+    identities: Vec<Identity>,
+    most: u64,
+  ) -> Result<MadeTexts, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::Texts {
+          repository,
+          identities,
+          most,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
   /// The text `identity` of `repository` from `offset`, as far as one piece reaches, made from its chain on the owner
   /// (A-645's derived per-path read form, [`Store::text_at`]): empty at its end, none past it or for a text no landed
   /// changeset kept.
@@ -983,4 +1038,39 @@ impl Drop for SlicedLanding {
       let _ = self.handle.requests.try_send(Request::Dropped);
     }
   }
+}
+
+/// What a [`StoreHandle::texts`] request made: every text asked, whole, in order; or why not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MadeTexts {
+  /// Each text, in the order asked.
+  Made(Vec<Vec<u8>>),
+  /// The texts hold more than the bytes allowed: none made past them.
+  Past,
+  /// A text no landed changeset kept.
+  Missing,
+}
+
+/// Makes `identities` of `repository` whole, in order, within `most` bytes together ([`StoreHandle::texts`]).
+fn texts_made(
+  (store, staging, cache): (&mut Store, &Staging, &mut TextCache),
+  repository: u128,
+  (identities, most): (&[Identity], u64),
+) -> Result<MadeTexts, StoreError> {
+  let mut made = Vec::new();
+  if made.try_reserve_exact(identities.len()).is_err() {
+    return Ok(MadeTexts::Past);
+  }
+  let mut total = 0u64;
+  for identity in identities {
+    let Some(text) = store.text_at(staging, repository, identity, 0, cache)? else {
+      return Ok(MadeTexts::Missing);
+    };
+    total = total.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+    if total > most {
+      return Ok(MadeTexts::Past);
+    }
+    made.push(text.to_vec());
+  }
+  Ok(MadeTexts::Made(made))
 }

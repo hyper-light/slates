@@ -60,8 +60,10 @@ say "runs: $RUNS of each server, interleaved, stock first; bound $BOUND s a step
 # (seconds), one line a sample, until the harnesses end.
 kind_of() {
   case $1 in
-    *"slates --instance"*" anchor"*) echo slates-anchor ;;
-    *"slates --instance"*" daemon"*) echo slates-daemon ;;
+    # By `--instance NAME anchor|daemon`, whatever the binary is named: main's rounds run copies named
+    # slates-<sha>, which `slates --instance` never matched, so those daemons went unsampled.
+    *" --instance "*" anchor"*) echo slates-anchor ;;
+    *" --instance "*" daemon"*) echo slates-daemon ;;
     *"git daemon"* | *"git-daemon"*) echo git-daemon ;;
     *httpd*"stock-http-"* | *git-http-backend*) echo httpd-git ;;
     *hg*" serve "*) echo hg-serve ;; # hg_scale.sh runs `hg -R ROOT serve ...`
