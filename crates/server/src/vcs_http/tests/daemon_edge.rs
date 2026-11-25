@@ -6883,3 +6883,72 @@ fn the_choosing_units_counters_follow_the_negotiations_kinds() {
     assert!(crate::vcs_store::upload::UNIT_NS_MOST[at].ends_with(&format!(".{name}")));
   }
 }
+
+/// Fetches at once of one history ([`a_fetchs_choosing_steps_end_within_the_span_their_pace_allowed`]): enough that
+/// each one's steps find the others waiting.
+/// Derived: four clients, three waiting behind any one's step.
+const FETCHERS: usize = 4;
+
+/// `request` sent on `FETCHERS` connections at once; each answer's status.
+fn fetched_at_once(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  name: &str,
+  request: &[u8],
+) -> Vec<u16> {
+  std::thread::scope(|scope| {
+    let asks: Vec<_> = (0..FETCHERS)
+      .map(|_| scope.spawn(|| uploaded((port, certificate), name, request).0))
+      .collect();
+    asks
+      .into_iter()
+      .map(|ask| ask.join().expect("a fetch"))
+      .collect()
+  })
+}
+
+/// A-783's pace for a fetch's choosing (main's order of 2026-11-25: a choose step asked whether it was spent only after
+/// each unit, so every step ran past its quantum by up to a unit, 82 % of a clone's polls). Do: start a store-backed
+/// daemon with its edge; push [`tagged_line_create`]; list its refs; fetch `main`'s head on [`FETCHERS`] connections at
+/// once, each one's steps finding the others waiting. Expect: every fetch `200`; the choosing units timed by kind; and
+/// no choosing step past the span its pace allowed (its quantum, or the quanta it took while nobody waited) by more than
+/// its last unit ran past that kind's estimate, unless one unit alone was past the quantum
+/// (`vcs_store.git_upload.choose_overran` zero; those units counted by kind, `long_units`). Red before: a step granted
+/// its next unit while its quantum had any time left, whatever the unit's kind cost.
+#[test]
+fn a_fetchs_choosing_steps_end_within_the_span_their_pace_allowed() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  assert_git_pushed(&pushed((port, &certificate), &name, &tagged_line_create()));
+  let listed = uploaded((port, &certificate), &name, &ls_refs_all());
+  let head = String::from_utf8_lossy(&listed.1)
+    .lines()
+    .find(|line| line.ends_with("refs/heads/main"))
+    .and_then(|line| line.get(4..44))
+    .map(named)
+    .expect("main listed");
+  let statuses = fetched_at_once(port, &certificate, &name, &fetch_of(head));
+  let overran = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::upload::CHOOSE_OVERRAN,
+  );
+  let most =
+    crate::vcs_store::upload::UNIT_NS_MOST.map(|name| counted_on(&daemon, REPOSITORY, name));
+  let long = crate::vcs_store::upload::LONG_UNITS.map(|name| counted_on(&daemon, REPOSITORY, name));
+  daemon.stop();
+  eprintln!("choose: {overran} overran; units past the quantum alone {long:?}; longest {most:?}");
+  assert!(
+    statuses.iter().all(|status| *status == 200),
+    "every fetch answered: {statuses:?}"
+  );
+  assert!(most.iter().any(|ns| *ns > 0), "the choosing units timed");
+  assert_eq!(
+    overran, 0,
+    "no choosing step past the span its pace allowed"
+  );
+}
