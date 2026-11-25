@@ -1923,6 +1923,15 @@ async fn serve_peer_records(
             crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A current candidate reads a register's ledger it lacks (A-919).
+          crate::ledger_read::LEDGER_READ_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::ledger_read::serve_ledger_read(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           // A moved volume's new owner asks its cohort by name (A-291).
           crate::moves::MOVE_STREAM => state::with_state(|s| {
             let peer_host = s
@@ -2147,6 +2156,7 @@ fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
     RegisterError::Unauthorized => "fleet.record.refused.unauthorized",
     RegisterError::ForeignGeneration { .. } => "fleet.record.refused.foreign_generation",
     RegisterError::ConflictingPosition => "fleet.record.refused.conflicting_position",
+    RegisterError::Behind { .. } => "fleet.record.refused.behind",
   };
   state.count(kind, 1);
 }
@@ -2807,16 +2817,28 @@ pub(crate) fn owed_work_catalog(
     .map(OwedCatalog)
 }
 
+/// The owner's hold of a record it commits (A-919): the commit takes it once, before it sends anything
+/// (`slates_cluster::OwnerHold`), borrowing the control shard's acceptor for that call alone. Whether it held it; never
+/// where the record plane has not begun (no hold yet).
+pub(crate) fn owner_hold() -> impl FnOnce(&Record) -> bool {
+  |record: &Record| with_owner_hold(|hold| hold.accept_own(record).is_ok()).unwrap_or(false)
+}
+
+/// Runs `f` over this node's own hold (`ShardState::owner_hold`, A-919) on the shard it is called on, borrowed for that
+/// call alone; `None` where there is none (another shard, or before the record plane began).
+pub(crate) fn with_owner_hold<T>(f: impl FnOnce(&mut Acceptor) -> T) -> Option<T> {
+  state::with_state(|s| s.owner_hold.as_mut().map(f)).flatten()
+}
+
 /// Ships an owed catalog register as the period's head shipment does ([`ship_head`]): to every candidate still missing
 /// it, committed at `f + 1`, its placement recorded on its owner shard.
 pub(crate) async fn ship_owed_catalog(
   origin: u16,
-  owner_acceptor: &mut Acceptor,
   local: HostId,
   catalog: &OwedCatalog,
   budget: CommitBudget,
 ) -> HeadShipped {
-  ship_head(origin, owner_acceptor, local, &catalog.0, budget).await
+  ship_head(origin, local, &catalog.0, budget).await
 }
 
 /// What shipping a head did ([`ship_head`]): the dispatch whose stragglers are still in flight, when anything was sent,
@@ -5074,6 +5096,8 @@ async fn adopt_and_serve(
   in_flight: &mut Vec<Dispatch>,
 ) {
   in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
+  // A register's ledger this node lacks the prefix of, read from its cohort (A-919).
+  in_flight.extend(crate::ledger_read::drive_ledger_reads(local, budget).await);
   // Each volume the configuration moved to this node: phase one over its recorded cohort, adoption, then its seal and
   // the report that it is adopted (A-291).
   crate::moves::drive_adoptions(origin, local, budget, in_flight).await;
@@ -11030,7 +11054,8 @@ async fn run_record_plane(local: HostId) {
   let Some(authority) = owner_authority(local) else {
     return;
   };
-  let mut owner_acceptor = Acceptor::new(local, authority);
+  // The owner's own hold, in the control shard's state from here (A-919): a ledger read answers from it.
+  let _ = state::with_state(|s| s.owner_hold = Some(Acceptor::new(local, authority)));
   // The home passes' lane (A-912): a child of this task, so it ends with it.
   let mut home_passes = HomePassLane::default();
   // This shard (the control shard) holds the peer sessions and coordinates; every shard owns volumes, so
@@ -11081,35 +11106,19 @@ async fn run_record_plane(local: HostId) {
       &shards,
       local,
       budget,
-      (&mut owner_acceptor, &mut home_passes),
+      &mut home_passes,
       &mut in_flight,
     )
     .await;
     for shard in shards.iter().copied() {
-      run_record_period(
-        origin,
-        shard,
-        local,
-        budget,
-        &mut owner_acceptor,
-        &mut in_flight,
-      )
-      .await;
+      run_record_period(origin, shard, local, budget, &mut in_flight).await;
     }
     // Drive each takeover this node owes a confirmation of: one batched phase-one round per retired host
     // across its recovery neighbourhoods, adopting each object once its cohorts have promised and confirming
     // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
     // this node's (they arrive over this shard's sessions), so this runs here.
     adopt_and_serve(origin, local, budget, &mut in_flight).await;
-    pace_running_merges(
-      origin,
-      &shards,
-      local,
-      budget,
-      &mut owner_acceptor,
-      &mut in_flight,
-    )
-    .await;
+    pace_running_merges(origin, &shards, local, budget, &mut in_flight).await;
   }
 }
 
@@ -11126,7 +11135,6 @@ async fn pace_running_merges(
   shards: &[u16],
   local: HostId,
   budget: CommitBudget,
-  owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
   let period_ends = slates_rt::futures::now_ns().saturating_add(HEARTBEAT_NS);
@@ -11139,15 +11147,7 @@ async fn pace_running_merges(
       Ok(Some(())) => {
         in_flight.retain_mut(|dispatch| !dispatch.settle());
         for shard in shards.iter().copied() {
-          crate::merge_service::run_merge_period(
-            origin,
-            shard,
-            local,
-            budget,
-            owner_acceptor,
-            in_flight,
-          )
-          .await;
+          crate::merge_service::run_merge_period(origin, shard, local, budget, in_flight).await;
         }
       }
       Ok(None) => return,
@@ -11375,7 +11375,7 @@ async fn follow_configuration(
   shards: &[u16],
   local: HostId,
   budget: CommitBudget,
-  (owner_acceptor, home_passes): (&mut Acceptor, &mut HomePassLane),
+  home_passes: &mut HomePassLane,
   in_flight: &mut Vec<Dispatch>,
 ) {
   // Install the configuration the council has agreed into this node's placement view, and take over any
@@ -11395,7 +11395,7 @@ async fn follow_configuration(
   home_passes.drive(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
-  crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
+  crate::moves::drive_outgoing(origin, local, budget, in_flight).await;
   crate::moves::report_forgotten(local, budget, in_flight).await;
   // Report this node's neighbourhood change placed once every shard holds all it owns at `f + 1` of each
   // cohort of its current placement, so the council retires the old set (§4.8 "Neighbourhood changes").
@@ -11406,7 +11406,7 @@ async fn follow_configuration(
   // this, no head provisioned after a membership change could ever place. Never refused: the version only
   // advances, and `install_authority` accepts an equal-or-higher generation.
   if let Some(authority) = owner_authority(local) {
-    let _ = owner_acceptor.install_authority(authority);
+    let _ = with_owner_hold(|hold| hold.install_authority(authority));
   }
 }
 
@@ -11461,7 +11461,6 @@ async fn run_record_period(
   shard: u16,
   local: HostId,
   budget: CommitBudget,
-  owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
   // Advance the shard's seals one bounded slice each and put the completed archives' content to their
@@ -11475,18 +11474,17 @@ async fn run_record_period(
     crate::mirror::ship(origin, shard, local, budget, in_flight).await;
   }
   deliver_pairs(origin, shard, local, budget).await;
-  ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
+  ship_shard_heads(origin, shard, local, budget, in_flight).await;
   // Live volumes' entries a holder still lacks (A-200): writes ship at their barrier; this catches up a lost message or
   // a holder that was away.
   crate::live_ship::period(origin, shard).await;
   // Record durably each seal whose content and head have both placed.
   crate::xshard::run_on_counted(origin, shard, record_placed_seals);
   crate::xshard::run_on_counted(origin, shard, record_mirrored_seals);
-  retire_shard_tombstones(origin, shard, local, owner_acceptor).await;
+  retire_shard_tombstones(origin, shard, local).await;
   // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
   // while unplaced, its record shipped in order once they are.
-  crate::merge_service::run_merge_period(origin, shard, local, budget, owner_acceptor, in_flight)
-    .await;
+  crate::merge_service::run_merge_period(origin, shard, local, budget, in_flight).await;
 }
 
 /// Delivers `shard`'s pair key to each host of its neighbourhood it has not yet delivered one to in this daemon's life
@@ -11944,7 +11942,6 @@ async fn ship_shard_heads(
   shard: u16,
   local: HostId,
   budget: CommitBudget,
-  owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
   let work = call_within(
@@ -11960,10 +11957,7 @@ async fn ship_shard_heads(
   .await
   .unwrap_or_default();
   for head in work {
-    if let Some(dispatch) = ship_head(origin, owner_acceptor, local, &head, budget)
-      .await
-      .dispatch
-    {
+    if let Some(dispatch) = ship_head(origin, local, &head, budget).await.dispatch {
       in_flight.push(dispatch);
     }
   }
@@ -11971,12 +11965,7 @@ async fn ship_shard_heads(
 
 /// Retires each destroyed volume's tombstone on `shard` that every candidate holds (AUD-29-43); the owner's
 /// acceptor forgets the volume's and its catalog's registers with it.
-async fn retire_shard_tombstones(
-  origin: u16,
-  shard: u16,
-  local: HostId,
-  owner_acceptor: &mut Acceptor,
-) {
+async fn retire_shard_tombstones(origin: u16, shard: u16, local: HostId) {
   let retired = call_within(
     origin,
     shard,
@@ -11986,8 +11975,10 @@ async fn retire_shard_tombstones(
   .await
   .unwrap_or_default();
   for object in retired {
-    owner_acceptor.forget_object(object);
-    owner_acceptor.forget_object(object.catalog());
+    with_owner_hold(|hold| {
+      hold.forget_object(object);
+      hold.forget_object(object.catalog());
+    });
     // A destroyed volume this node owned under a moved-object exception: the exception goes with it (A-291).
     let _ = state::with_state_counted(|s| crate::moves::note_destroyed(s, object, local));
     // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
@@ -12019,13 +12010,7 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// an earlier round, a later round re-shipping to a straggler is short of quorum on its own — `commit_record`
 /// counts only its own round — and discarding its acknowledgements re-shipped that straggler forever at
 /// `f > 1`. Returns the dispatch to settle, or `None` if no holder could be reached this period.
-async fn ship_head(
-  origin: u16,
-  owner_acceptor: &mut Acceptor,
-  local: HostId,
-  head: &Head,
-  budget: CommitBudget,
-) -> HeadShipped {
+async fn ship_head(origin: u16, local: HostId, head: &Head, budget: CommitBudget) -> HeadShipped {
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
@@ -12050,7 +12035,7 @@ async fn ship_head(
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let committed = commit_record(
     local,
-    owner_acceptor,
+    owner_hold(),
     &head.shape,
     &head.record,
     head.quorum,
@@ -12095,7 +12080,7 @@ async fn ship_head(
   };
   // The owner's own acceptor keeps a single-value register at its newest position only (AUD-29-43).
   if crate::catalog::is_single_value(&head.record.value) {
-    owner_acceptor.compact_below(head.object, head.record.sequence);
+    with_owner_hold(|hold| hold.compact_below(head.object, head.record.sequence));
   }
   // The placement is the owner shard's fact: record it there.
   let (object, sequence, epoch) = (head.object, head.record.sequence, head.record.epoch);
@@ -14376,6 +14361,63 @@ mod state_log_tests {
         })
         .collect(),
     }
+  }
+
+  /// A-919 (main 01a20182's rulings of 2026-11-25). Do: on a holder in a region of three at `f = 1` that holds none of a
+  /// repository's names log (a candidate a death brought in), receive the owner's part from 2 to 3; then the first, 0
+  /// to 2; then the part from 3 to 5, past what it holds. Expect each part past its copy refused typed, `Behind` with the
+  /// newest position held (none, then 2), counted `behind`, where it answered nothing before; the first acknowledged.
+  #[test]
+  fn a_holder_answers_a_state_log_part_past_its_copy_behind_with_the_position_it_holds() {
+    let replies = crate::daemon::audit_on_shard(|state| {
+      let (local, [owner, _]) = region_of_three(state);
+      let repo = RepositoryId {
+        bytes: ObjectId::new(owner, 6).0,
+      };
+      let register = LogName::State {
+        repository: repo,
+        log: StateLog::Names,
+      }
+      .register();
+      let generation = state.fleet.configuration().version;
+      let shipped = |part: &StateLogRecord| Record {
+        owner,
+        object: register,
+        sequence: part.to,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: crate::state_log::value_of(part),
+      };
+      let replies: Vec<Vec<u8>> = [(2, 3), (0, 2), (3, 5)]
+        .into_iter()
+        .map(|span| {
+          super::accept_held_record(state, local, owner, &shipped(&names_part(repo, span)))
+        })
+        .collect();
+      (
+        replies,
+        state.refusals.get("fleet.record.refused.behind").copied(),
+      )
+    });
+    let decoded: Vec<_> = replies
+      .0
+      .iter()
+      .map(|reply| slates_db::register::decode_refusal(reply))
+      .collect();
+    assert_eq!(
+      decoded,
+      vec![
+        Some(slates_db::register::Refusal::Behind { held: None }),
+        None,
+        Some(slates_db::register::Refusal::Behind { held: Some(2) }),
+      ],
+      "{replies:?}"
+    );
+    assert!(
+      Ack::decode(&replies.0[1]).is_ok(),
+      "the first part acknowledged"
+    );
+    assert_eq!(replies.1, Some(2), "each counted");
   }
 
   /// A-636 part 2b. Do: on a holder in a region of three at `f = 1`, receive from a repository's owner its names log's

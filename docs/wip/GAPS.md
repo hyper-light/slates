@@ -293,12 +293,21 @@
 > - **(i) FIXED (A-918 (i)):** the holder answers typed, `ContentMessage::Behind { reached }` (kind 11), where it
 >   counted `OUT_OF_ORDER` and answered nothing; the owner records it on the pending version (`merge.behind.heard`)
 >   and the barrier's log names it.
-> - **(iii) OPEN (A-919):** a candidate joining a state log's placement past parts every earlier candidate held is
->   shipped the log's prefix (state_log's own owed transfer); a repository green's v0 on a fresh candidate needs its
->   join from it.
-> - **B OPEN (A-918):** on `Behind`, the newcomer rebuilds the green through a takeover successor's own path
->   (`adopt_ledger_positions`, `rebuild_through`) from a live holder, paced and bounded as replica builds are; one
->   mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
+> - **(iii) FIXED (A-919):** a candidate joining a state log's placement past parts every earlier one held reads the
+>   prefix from its cohort, the owner among them, under the start rule, and continues. Red: a's parts stayed at 933
+>   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0.
+> - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
+>   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
+>   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
+>   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
+>   but the record plane builds it empty, and no image carries it. An owner's warm restart spends one of `f`, unseen,
+>   on every record it counted itself in: commit at {owner, departed}, restart the owner warm, retire the departed,
+>   and the record is gone after one failure anyone saw. Traced from the code, not observed. Root fix: publish and
+>   recover the owner's hold as a holder's is.
+> - **B OPEN (A-918):** on `Behind`, the newcomer reads the green's chain through A-919's read (the same read a
+>   takeover's successor makes), folds it under the start rule, and rebuilds its replica from it, paced and bounded
+>   as replica builds are; one mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
 >   it holds no per-version records or inputs. Then the red goes green, a914 asserts its second push lands, and
 >   GAP-A9-7's ledger-prefix transfer and AUD-14's new candidate set close.
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The

@@ -2165,9 +2165,7 @@ use std::collections::BTreeSet;
 use slates_archive::Archive;
 use slates_cluster::content::{chunk_requests, offer_request, raw_chunk_request};
 use slates_cluster::{ClusterError, CommitBudget, commit_record_sent_as};
-use slates_db::register::{
-  Acceptor, Configuration, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
-};
+use slates_db::register::{Configuration, HostEpoch, HostId, ObjectId, Placement, Quorum, Record};
 use slates_merge::engine::{Green, Increment, Outcome};
 use slates_wire::Wire;
 
@@ -4128,7 +4126,6 @@ pub(crate) async fn run_merge_period(
   shard: u16,
   local: HostId,
   budget: CommitBudget,
-  owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
   // The coordinator period this pass runs in, read on the control shard, where the coordinator counts them.
@@ -4158,7 +4155,6 @@ pub(crate) async fn run_merge_period(
           origin,
           shard,
           local,
-          owner_acceptor,
           (object, version, record, (inputs, manifest)),
           targets,
           shape,
@@ -4168,8 +4164,7 @@ pub(crate) async fn run_merge_period(
         .await
       }
       MergeWork::ShipWorkCatalog(catalog) => {
-        let shipped =
-          crate::fleet::ship_owed_catalog(origin, owner_acceptor, local, &catalog, budget).await;
+        let shipped = crate::fleet::ship_owed_catalog(origin, local, &catalog, budget).await;
         // A placement that came back is recorded on the catalog's owner shard ahead of the next pass's question there,
         // which this wakes, so the version that waited for it ships at once. Only that nudges, as only an event that
         // makes new work does ([`nudge_record_plane`]): a ship that found no session, or that the runtime refused, sent
@@ -4206,7 +4201,6 @@ async fn ship_record(
   origin: u16,
   shard: u16,
   local: HostId,
-  owner_acceptor: &mut Acceptor,
   (object, version, record, (inputs, manifest)): (ObjectId, u64, Record, VersionInputs),
   targets: Vec<HostId>,
   shape: Placement,
@@ -4227,7 +4221,7 @@ async fn ship_record(
   let committed = commit_record_sent_as(
     MERGE_RECORD_STREAM,
     local,
-    owner_acceptor,
+    crate::fleet::owner_hold(),
     &shape,
     &record,
     encode_shipment(&frames),
@@ -6738,7 +6732,7 @@ mod tests {
       }
       .register();
       let owner = slates_db::HostId(5);
-      let mut acceptor = Acceptor::new(
+      let mut acceptor = slates_db::register::Acceptor::new(
         state.fleet.host(),
         slates_db::register::Authority {
           generation: state.fleet.configuration().version,

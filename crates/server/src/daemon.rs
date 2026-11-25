@@ -1789,6 +1789,17 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-919): the bytes of the state logs' parts this node's shards still hold as an owner, owed to some
+  /// candidate (`state_log::StateLogs::bytes`): a part is let go once every candidate holds it, so this falls back to
+  /// zero once each has caught up. Summed over the shards; the typed refusal when one could not be observed.
+  pub fn state_log_parts_bytes(&self) -> Result<usize, ObserveError> {
+    let mut bytes = 0usize;
+    for shard in self.shards.clone() {
+      bytes = bytes.saturating_add(self.observe(Some(shard), |s| s.state_logs.bytes())?);
+    }
+    Ok(bytes)
+  }
+
   /// Test support (A-914): this node's homing window and the terms it was derived from ([`HomingWindowReading`]).
   pub fn homing_window(&self) -> Result<HomingWindowReading, ObserveError> {
     self.observe(self.shards.first().copied(), |s| {
@@ -5515,6 +5526,8 @@ async fn init_shard(
     homing_window_learned: false,
     takeover_epochs_seen: None,
     last_answers: std::collections::BTreeMap::new(),
+    owner_hold: None,
+    ledger_reads: crate::ledger_read::LedgerReads::default(),
     period_stretch_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,

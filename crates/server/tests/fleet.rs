@@ -36290,10 +36290,12 @@ fn started_git_fleet_of(
 /// over its anchor ([`GitFleet::restart_warm`]): its records and the inputs it held kept, its replicas rebuilt from them.
 /// Each node's changeset store outlives its daemon as its anchor does.
 fn anchored_git_fleet(name: &str) -> GitFleet {
-  let names: Vec<String> = ["a", "b", "c"]
-    .iter()
-    .map(|node| format!("{name}-{node}"))
-    .collect();
+  anchored_git_fleet_of(name, &["a", "b", "c"])
+}
+
+/// [`anchored_git_fleet`] of the nodes `nodes`, at `f = 1`.
+fn anchored_git_fleet_of(name: &str, nodes: &[&str]) -> GitFleet {
+  let names: Vec<String> = nodes.iter().map(|node| format!("{name}-{node}")).collect();
   let names: Vec<&str> = names.iter().map(String::as_str).collect();
   let mut anchored = AnchoredFleet::new(name, &names);
   let stores: Vec<NodeStore> = (0..names.len())
@@ -37562,6 +37564,188 @@ fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
       }))
     })
 }
+
+/// A-919 (main 01a20182's rulings of 2026-11-25: the worse failure of a candidate a death brings in). Do: on a four-node
+/// `f = 1` git fleet with a repository on a, push `main` and wait for both of a's remote candidates to hold its green's
+/// version 1 (and so the repository's state logs); stop one of them, so the fourth node, which holds none of the
+/// repository's state logs, becomes a candidate once the survivors took the dead one over; push on top twice. Expect
+/// a's state logs' parts let go again (`Daemon::state_log_parts_bytes` back to zero): the newcomer caught up on each
+/// log's prefix and acknowledged its next parts. Red before A-919: the newcomer refused every part past its empty copy
+/// (`discontinuous`), untyped, so its acknowledgement stayed below every part and a kept every part from then on,
+/// until its parts reached the partition's bound and every change to the repository was refused `Overloaded`.
+#[test]
+fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_their_parts_are_let_go()
+ {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("fresh-log-candidate", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "fresh-log-candidate",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let first = fleet.push(0, ("first.txt", b"main before the death\n"));
+  let holders_of = |fleet: &GitFleet| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .merge_holder_state(green)
+          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= 1))
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(holders_of(&fleet).len() == 2)
+  });
+  let holders = holders_of(&fleet);
+  let Some(&stopped) = holders.first() else {
+    fleet.stop();
+    panic!("a's two remote candidates held version 1 ({both_hold}): {holders:?}");
+  };
+  let gone = fleet.hosts[stopped];
+  fleet.daemons.remove(stopped).stop();
+  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
+  let pushes: Vec<Result<(), String>> = [
+    ("second.txt", b"after the death\n" as &[u8]),
+    ("third.txt", b"again\n"),
+  ]
+  .into_iter()
+  .map(|change| fleet.push_on_top(0, change))
+  .collect();
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+  });
+  let bytes = fleet.daemons[0].state_log_parts_bytes();
+  let refusals: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      daemon.fleet_refusals().map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(kind, _)| {
+            kind.contains("state_log") || kind.contains("behind") || kind.contains("ledger")
+          })
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  fleet.stop();
+  eprintln!(
+    "fresh-log-candidate: first {first:?}; holders {holders:?} (both {both_hold}); taken over {taken}; pushes \
+     {pushes:?}; a's parts bytes {bytes:?} (let go {let_go}); counters {refusals:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the death landed");
+  assert!(
+    both_hold && taken,
+    "both candidates held, and the dead one was taken over"
+  );
+  assert!(
+    pushes.iter().all(Result::is_ok),
+    "the pushes after the death landed: {pushes:?}"
+  );
+  assert!(let_go, "a let its state logs' parts go again: {bytes:?}");
+}
+
+/// A-919 (main 01a20182's start rule of 2026-11-25). Do: on a four-node `f = 1` anchored git fleet with a repository on a,
+/// push `main` and wait for both of a's remote candidates to hold it; restart a warm (its own hold of the repository's
+/// state logs rebuilt empty, as no image carries it); stop one of the candidates, so the fourth node, which holds none
+/// of the logs, becomes a candidate; push on top. Expect the newcomer to adopt nothing of the logs' prefix (no position
+/// held from a read) and its read counted past tolerance: below where a's hold now begins, a counts as one gone, and the
+/// old holder alone is no quorum, so the newest surviving value is never taken for the committed one (the open edge:
+/// refused typed, the register's candidacy owed). Red without the start rule: a's empty answer named nothing there,
+/// the old holder's prefix adopted on its word alone.
+#[test]
+fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet_of("restarted-owner-log", &["a", "b", "c", "d"]);
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let first = fleet.push(0, ("first.txt", b"main before the restart\n"));
+  let holders_of = |fleet: &GitFleet| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .merge_holder_state(green)
+          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= 1))
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(holders_of(&fleet).len() == 2)
+  });
+  let holders = holders_of(&fleet);
+  let restarted = fleet.restart_warm(0);
+  let (Some(&stopped), Some(newcomer)) = (
+    holders.first(),
+    (1..fleet.daemons.len()).find(|node| !holders.contains(node)),
+  ) else {
+    fleet.stop();
+    panic!("a's two remote candidates held version 1 ({both_hold}): {holders:?}");
+  };
+  let newcomer_host = fleet.hosts[newcomer];
+  let gone = fleet.hosts[stopped];
+  fleet.daemons.remove(stopped).stop();
+  let newcomer = fleet
+    .daemons
+    .iter()
+    .position(|daemon| {
+      daemon
+        .member_identity()
+        .is_ok_and(|host| host == newcomer_host)
+    })
+    .unwrap_or(newcomer);
+  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
+  let counted = |fleet: &GitFleet, name: &str| {
+    fleet.daemons[newcomer]
+      .fleet_refusals()
+      .map(|counters| counters.get(name).copied().unwrap_or(0))
+  };
+  // The scene needs a part shipped to the newcomer: the restarted owner holds no part from before it, so only a push's
+  // own records reach the newcomer, and a push refused before its records ships none. Pushed again until one did, at
+  // most `SCENE_PUSHES` times.
+  let mut pushed = Vec::new();
+  for attempt in 0..SCENE_PUSHES {
+    let file = format!("after-{attempt}.txt");
+    pushed.push(fleet.push_on_top(0, (&file, file.as_bytes())));
+    let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+    if poll_until(&observed, RETIREMENT_DEADLINE, || {
+      Ok(counted(&fleet, "fleet.record.refused.behind")? > 0)
+    }) {
+      break;
+    }
+  }
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let refused = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(counted(&fleet, "fleet.ledger_read.past_tolerance")? > 0)
+  });
+  let held = counted(&fleet, "fleet.ledger_read.positions_held");
+  fleet.stop();
+  eprintln!(
+    "restarted-owner-log: first {first:?}; holders {holders:?} (both {both_hold}); restarted {restarted}; taken over \
+     {taken}; pushes {pushed:?}; the newcomer's read past tolerance {refused}, positions held {held:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the restart landed");
+  assert!(both_hold && restarted && taken, "the scene formed");
+  assert!(refused, "the newcomer's read was past tolerance");
+  assert_eq!(
+    held,
+    Ok(0),
+    "the newcomer adopted nothing on the old holder's word alone"
+  );
+}
+
+/// Shape: the pushes A-919's owner-restart test makes for a part to reach the newcomer: a few, as a push during a death
+/// may be refused before it writes its records.
+const SCENE_PUSHES: usize = 3;
 
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover
 /// estimate measured before the death, as a host loaded several times over runs.
