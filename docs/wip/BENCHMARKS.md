@@ -19400,3 +19400,38 @@ What it says:
   committed image (`arena_deferred_bytes`) and 627,953,664 B free; the content store holds 2,624 B (50,527,383 B of
   texts let go, 4,817 entries). P7's question (GAPS): what holds the image.
 
+## Mercurial's own history imported: segments cut by their texts, their landings serial and pipelined (goal 93 hg, R; main 01a20182's A/B, 2026-11-24)
+
+- **What, and why.** w-perf's 0d05da26e cut an import's segment once the whole file texts it keeps reach the changeset
+  store's unit (`segment_bytes`), so an import holds a segment's texts, never a history's; it made 2,087 segment
+  landings of the 76 before, each one durable flush, awaited before the next turn (1227afcb1 counts the wait). d41c93388
+  lands a segment beside the next turns, one in flight (`hg_import::step`). Three arms, interleaved.
+- **Arms.** A: 15e739357 with the measurement test (`hg_import_memory`), segments cut by their changegroup's bytes
+  alone. B: 1227afcb1, cut by texts, landings serial, the wait counted. C: d41c93388, cut by texts, landings pipelined.
+  Each built `cargo test --release --locked -p slates-server --test hg_import_memory --no-run` at its commit (three
+  distinct binaries by checksum), kept as `~/.cache/main-rounds/ab57k/{A-15e739357,B-1227afcb1,C-d41c93388}`.
+- **Command.** `SLATES_HG_IMPORT_SOURCE=~/.cache/main-rounds/data/hg-src <binary>
+  a_mercurial_imports_peak_resident_set_is_named_by_the_daemons_gauges --ignored --nocapture` (Mercurial's own
+  repository at 57035:a933409955d2, 57,036 changesets, 115,443 file revisions), rounds A, B, C three times, 21:20 to
+  21:34 PST. Results and logs: `~/.cache/main-rounds/ab57k/results.txt` and `run-*.log`.
+- **Machine and load.** Adas-MacBook-Pro-2.local (M-series, 18 cores, 128 GB), load 29 to 60 (other agents' builds):
+  the seconds are loaded, read as ratios between interleaved arms.
+
+| round | arm | import, s | peak RSS, KiB | segments | landing wait, s | landings' own time, s | overlapped | load (1 min) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | A | 83.05 | 1,080,448 | 76 | | | | 36.15 |
+| 1 | B | 94.01 | 478,544 | 2,087 | 16.21 | | | 29.26 |
+| 1 | C | 80.43 | 514,624 | 2,087 | 1.30 | 15.88 | 1,879 | 47.26 |
+| 2 | A | 83.60 | 1,080,112 | 76 | | | | 33.77 |
+| 2 | B | 91.20 | 444,128 | 2,087 | 16.20 | | | 37.89 |
+| 2 | C | 83.44 | 524,032 | 2,087 | 9.43 | 31.04 | 941 | 45.43 |
+| 3 | A | 86.26 | 1,063,392 | 76 | | | | 59.32 |
+| 3 | B | 112.42 | 547,264 | 2,087 | 33.57 | | | 60.18 |
+| 3 | C | 77.49 | 627,376 | 2,087 | 5.06 | 25.68 | 1,124 | 42.48 |
+
+- **What it says.** Best of three: C 77.49 s against A's 83.05 (7 % faster; 4 % at the median, 80.43 against 83.60)
+  and B's 91.20 (15 %), at about half A's peak (514,624 against 1,063,392 KiB at best). The cut by texts alone (B)
+  traded A's peak for its landings' serial flushes (16.2 to 33.6 s); pipelined (C), the import waited 1.3 to 9.4 s of
+  landings that took 15.9 to 31.0 s. The landings' own time doubles with the machine's load, and the overlap hides less
+  of it as they slow (941 of 2,087 overlapped at 31.0 s, 1,879 at 15.9 s). Kept: C.
+
