@@ -610,6 +610,93 @@ pub(crate) const WORK_NS_MOST: [&str; 3] = [
   "vcs_store.git_upload.work_ns_most.write",
 ];
 
+/// Counters: a fetch's choosing units past the step quantum on the shard's clock, by the negotiation's kind of unit
+/// (`slates_git::negotiation::UnitKind`, in its `ALL` order; main 01a20182's order of 2026-11-25: choosing was 82 % of a
+/// clone's long steps, the slowest 9.6 ms), each unit timed between the `spent` asks around it. Format: counter names.
+pub(crate) const LONG_UNITS: [&str; 14] = [
+  "vcs_store.git_upload.long_units.ready",
+  "vcs_store.git_upload.long_units.cut",
+  "vcs_store.git_upload.long_units.mark",
+  "vcs_store.git_upload.long_units.open_tree",
+  "vcs_store.git_upload.long_units.take_entry",
+  "vcs_store.git_upload.long_units.frame",
+  "vcs_store.git_upload.long_units.commits",
+  "vcs_store.git_upload.long_units.edges",
+  "vcs_store.git_upload.long_units.haves",
+  "vcs_store.git_upload.long_units.choose",
+  "vcs_store.git_upload.long_units.wants",
+  "vcs_store.git_upload.long_units.carried",
+  "vcs_store.git_upload.long_units.tags",
+  "vcs_store.git_upload.long_units.done",
+];
+
+/// Counted most: the longest unit of each kind, in nanoseconds, in [`LONG_UNITS`]'s order. Format: counter names.
+pub(crate) const UNIT_NS_MOST: [&str; 14] = [
+  "vcs_store.git_upload.unit_ns_most.ready",
+  "vcs_store.git_upload.unit_ns_most.cut",
+  "vcs_store.git_upload.unit_ns_most.mark",
+  "vcs_store.git_upload.unit_ns_most.open_tree",
+  "vcs_store.git_upload.unit_ns_most.take_entry",
+  "vcs_store.git_upload.unit_ns_most.frame",
+  "vcs_store.git_upload.unit_ns_most.commits",
+  "vcs_store.git_upload.unit_ns_most.edges",
+  "vcs_store.git_upload.unit_ns_most.haves",
+  "vcs_store.git_upload.unit_ns_most.choose",
+  "vcs_store.git_upload.unit_ns_most.wants",
+  "vcs_store.git_upload.unit_ns_most.carried",
+  "vcs_store.git_upload.unit_ns_most.tags",
+  "vcs_store.git_upload.unit_ns_most.done",
+];
+
+thread_local! {
+  /// This shard thread's choosing units since its last count ([`count_units`]): by kind, those past the quantum and the
+  /// longest, filled by the `spent` asks of [`ShardPacks`]'s turns.
+  static UNITS: core::cell::RefCell<[(u64, u64); 14]> = const { core::cell::RefCell::new([(0, 0); 14]) };
+}
+
+/// Notes a choosing unit of the kind the negotiation began last, `took` nanoseconds, against `quantum_ns`.
+fn note_unit(took: u64, quantum_ns: u64) {
+  let kind = slates_git::negotiation::last_unit();
+  let Some(at) = slates_git::negotiation::UnitKind::ALL
+    .iter()
+    .position(|each| *each == kind)
+  else {
+    return;
+  };
+  UNITS.with(|units| {
+    if let Ok(mut units) = units.try_borrow_mut()
+      && let Some((long, most)) = units.get_mut(at)
+    {
+      if took > quantum_ns {
+        *long = long.saturating_add(1);
+      }
+      *most = (*most).max(took);
+    }
+  });
+}
+
+/// Counts on `state` this thread's choosing units noted since the last count ([`LONG_UNITS`], [`UNIT_NS_MOST`]).
+fn count_units(state: &mut ShardState) {
+  let noted = UNITS.with(|units| {
+    units
+      .try_borrow_mut()
+      .map(|mut units| core::mem::take(&mut *units))
+      .ok()
+  });
+  let Some(noted) = noted else {
+    return;
+  };
+  for ((long, most), (long_name, most_name)) in noted
+    .into_iter()
+    .zip(LONG_UNITS.iter().zip(UNIT_NS_MOST.iter()))
+  {
+    if long > 0 {
+      state.count(long_name, long);
+    }
+    state.count_max(most_name, most);
+  }
+}
+
 /// Counts the stages of a fetch step's `work` nanoseconds, `staged` the pack source's begin and write within it: each
 /// stage's longest kept, and the step, where `long` (past the quantum by its work), counted under its longest stage.
 fn count_work_stages(state: &mut ShardState, (work, staged): (u64, [u64; 2]), long: bool) {
@@ -991,6 +1078,7 @@ impl ShardPacks {
   /// shard thread made and took again ([`count_deflaters`]).
   fn count_on(&self, state: &mut ShardState) {
     count_deflaters(state);
+    count_units(state);
     state.count_max(UNIT_ENTRIES_MOST, self.chose.entries_most);
     state.count_max(TREE_PARSE_BYTES_MOST, self.chose.tree_bytes_most);
     for (name, by) in [
@@ -1032,7 +1120,14 @@ impl PackSource for ShardPacks {
   fn turn(&self) -> impl FnMut() -> bool + 'static {
     let began = slates_rt::futures::now_ns();
     let quantum = self.quantum_ns;
-    move || slates_rt::futures::now_ns().saturating_sub(began) >= quantum
+    let mut last = began;
+    // Each ask follows a unit: the time since the last ask is that unit's, noted by its kind ([`note_unit`]).
+    move || {
+      let now = slates_rt::futures::now_ns();
+      note_unit(now.saturating_sub(last), quantum);
+      last = now;
+      now.saturating_sub(began) >= quantum
+    }
   }
 
   fn begin(

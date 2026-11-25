@@ -6718,7 +6718,17 @@ fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
   let steps = steps_counted().saturating_sub(steps_before);
   let (long, most) = step_phases(&daemon);
   let (long_work, work_most) = work_stages(&daemon);
+  let units = |names: [&'static str; 14]| names.map(|name| counted_on(&daemon, REPOSITORY, name));
+  let (long_units, unit_most) = (
+    units(crate::vcs_store::upload::LONG_UNITS),
+    units(crate::vcs_store::upload::UNIT_NS_MOST),
+  );
   daemon.stop();
+  eprintln!("choosing units by kind: long {long_units:?}, longest ns {unit_most:?}");
+  assert!(
+    unit_most.iter().any(|most| *most > 0),
+    "the choosing's units timed by kind: {unit_most:?}"
+  );
   eprintln!("work by stage (choose, begin, write): long {long_work:?}, longest ns {work_most:?}");
   assert!(work_most[2] > 0, "the pack's writes timed: {work_most:?}");
   assert!(
@@ -6844,4 +6854,32 @@ fn a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it() {
     took <= patience,
     "the listing answered within {patience:?}: {took:?}"
   );
+}
+
+/// The choosing units' counters name the negotiation's kinds in its order (`slates_git::negotiation::UnitKind::ALL`), so a
+/// unit's time is counted under its own kind.
+#[test]
+fn the_choosing_units_counters_follow_the_negotiations_kinds() {
+  use slates_git::negotiation::UnitKind;
+  let named = [
+    (UnitKind::Ready, "ready"),
+    (UnitKind::Cut, "cut"),
+    (UnitKind::Mark, "mark"),
+    (UnitKind::OpenTree, "open_tree"),
+    (UnitKind::TakeEntry, "take_entry"),
+    (UnitKind::Frame, "frame"),
+    (UnitKind::Commits, "commits"),
+    (UnitKind::Edges, "edges"),
+    (UnitKind::Haves, "haves"),
+    (UnitKind::Choose, "choose"),
+    (UnitKind::Wants, "wants"),
+    (UnitKind::Carried, "carried"),
+    (UnitKind::Tags, "tags"),
+    (UnitKind::Done, "done"),
+  ];
+  for (at, (kind, name)) in named.iter().enumerate() {
+    assert_eq!(UnitKind::ALL[at], *kind);
+    assert!(crate::vcs_store::upload::LONG_UNITS[at].ends_with(&format!(".{name}")));
+    assert!(crate::vcs_store::upload::UNIT_NS_MOST[at].ends_with(&format!(".{name}")));
+  }
 }
