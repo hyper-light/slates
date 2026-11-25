@@ -1527,6 +1527,18 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> R, the import's peak (w-perf, 2026-11-24, main's order of 15:21). Measured at 15e739357, Mercurial's own history
+> (57,036 changesets) imported on an in-process daemon (`hg_import_memory`, ignored, run by name with
+> `SLATES_HG_IMPORT_SOURCE`): peak RSS 1,076,144 KiB, from D's 5.73 GB. Named by the per-shard gauges: the content
+> object's high-water, set by one segment's file texts held whole until it landed (744 MB used before the first file
+> segment's cut, 628 MB let go at its landing). A segment was cut by its changegroup's bytes alone (`segment_bytes`, 2
+> MiB here), and a text runs to hundreds of times its delta. Now it is cut too once the whole file texts it keeps reach
+> the same bound (`Emitter::due`): the import holds under twice the segment's bound of file texts, counted
+> `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`; held by
+> `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` (red: 46,162,339 bytes held after one turn,
+> 8,950 at the end, a 2 MiB bound). Owed: main's rerun of the 57k (segments, peak, time against 15e739357); the
+> changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
+> manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the

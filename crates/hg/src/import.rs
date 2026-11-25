@@ -934,12 +934,15 @@ impl Import {
     held.give_back(store, outcome)?;
     // A changeset's text is let go once the import lands (goal 93, C1 (1) P5).
     if let (Some(emitter), Some(text_id)) = (self.emitter.as_mut(), text_kept) {
-      emitter.note_contents(crate::filerev::FileContents {
-        path: crate::push::intake::CHANGELOG_PATH.to_vec(),
-        node: entry.node,
-        bytes: text_id,
-        block: None,
-      });
+      emitter.note_contents(
+        crate::filerev::FileContents {
+          path: crate::push::intake::CHANGELOG_PATH.to_vec(),
+          node: entry.node,
+          bytes: text_id,
+          block: None,
+        },
+        0,
+      );
     }
     log.cached = Some((rev, text));
     self.cut_when_due(store, false)?;
@@ -1026,20 +1029,26 @@ impl Import {
     // (1) P5).
     if let (Some(emitter), Some((bytes, block))) = (self.emitter.as_mut(), kept_as) {
       match reading.log {
-        Log::File(path) => emitter.note_contents(crate::filerev::FileContents {
-          path: path.to_vec(),
-          node: entry.node,
-          bytes,
-          block,
-        }),
+        Log::File(path) => emitter.note_contents(
+          crate::filerev::FileContents {
+            path: path.to_vec(),
+            node: entry.node,
+            bytes,
+            block,
+          },
+          to_u64(text.len()),
+        ),
         Log::Manifest => {
           if let Some(row) = self.imported.index.revision(store, Log::Manifest, rev) {
-            emitter.note_contents(crate::filerev::FileContents {
-              path: crate::push::intake::MANIFEST_PATH.to_vec(),
-              node: entry.node,
-              bytes: row.bytes,
-              block: None,
-            });
+            emitter.note_contents(
+              crate::filerev::FileContents {
+                path: crate::push::intake::MANIFEST_PATH.to_vec(),
+                node: entry.node,
+                bytes: row.bytes,
+                block: None,
+              },
+              0,
+            );
           }
         }
         Log::Changelog => {}

@@ -1527,20 +1527,15 @@ async fn landed_after_builds(
   let mut last_plan: Option<Vec<WorkKey>> = None;
   let mut committing = Committing::default();
   loop {
-    // A fork another landing made stale while its segments landed is re-based before its works are planned over it.
-    if let Err(outcome) = committing.fresh(repository, &mut forked).await? {
-      give_back(forked);
-      return Some(outcome);
-    }
-    let (plan, (mut built, named), ahead) = match works_held_ahead(
+    let held = fresh_works_held_ahead(
       repository,
       (principal, name),
       unbundle,
-      forked.as_ref(),
+      (&mut committing, &mut forked),
       room,
     )
-    .await?
-    {
+    .await?;
+    let (plan, (mut built, named), ahead) = match held {
       Ok(prepared) => prepared,
       Err(outcome) => {
         give_back(forked);
@@ -1747,14 +1742,19 @@ fn uses_of(plan: &[WorkKey]) -> BTreeMap<WorkKey, usize> {
 
 /// Gives a push's fork back where its landing will not take it.
 fn give_back(forked: Option<Forked>) {
+  if forked.is_some() {
+    let _ = crate::state::with_state(|state| give_back_in(state, forked));
+  }
+}
+
+/// [`give_back`] on a shard whose state the caller holds already (a nested `with_state` would answer nothing).
+fn give_back_in(state: &mut ShardState, forked: Option<Forked>) {
   let Some(forked) = forked else {
     return;
   };
-  let _ = crate::state::with_state(|state| {
-    if release_index(state, forked.fork).is_err() {
-      state.count(vcs_store::RELEASE_REFUSED, 1);
-    }
-  });
+  if release_index(state, forked.fork).is_err() {
+    state.count(vcs_store::RELEASE_REFUSED, 1);
+  }
 }
 
 /// Counter: a push's work built a unit a turn before its landing (A-767 C1, the push spin; main's ruling (1)). Format: a
@@ -1762,6 +1762,29 @@ fn give_back(forked: Option<Forked>) {
 pub(crate) const WORKS_BUILT: &str = "vcs.hg.push_works_built";
 /// Counter: the turns a push's works took to build. Format: a counter name in the status report.
 pub(crate) const WORK_TURNS: &str = "vcs.hg.push_work_turns";
+
+/// [`landed_after_builds`]' try, before its judge: a fork another landing made stale while its segments landed re-based
+/// first ([`Committing::fresh`]), then its works built and held ahead over it ([`works_held_ahead`]). The push's refusal
+/// where either refused it; `None` where the store went away.
+async fn fresh_works_held_ahead(
+  repository: RepositoryId,
+  (principal, name): (&Principal, [u8; 32]),
+  unbundle: &Unbundle,
+  (committing, forked): (&mut Committing, &mut Option<Forked>),
+  room: &Admission,
+) -> Option<Result<(Vec<WorkKey>, BuiltWorks, Vec<crate::held_ahead::HeldAhead>), PushOutcome>> {
+  if let Err(outcome) = committing.fresh(repository, forked).await? {
+    return Some(Err(outcome));
+  }
+  works_held_ahead(
+    repository,
+    (principal, name),
+    unbundle,
+    forked.as_ref(),
+    room,
+  )
+  .await
+}
 
 /// A landing try's works and their increments, held ahead of its step. The works first, a unit a turn (main's ruling
 /// (1)): the landing's one step takes them, never builds them. Their increments held in the content store next, a unit
@@ -3653,8 +3676,9 @@ pub(crate) fn land_in(
       settled_whole(state, run, accepted);
       outcome
     }
-    // Built from the plan its landing judges, it misses no work.
-    Landing::Unbuilt(_) => {
+    // Built from the plan its landing judges, it misses no work; were it to, its fork goes back as a refusal's does.
+    Landing::Unbuilt(back) => {
+      give_back_in(state, *back);
       settled_whole(state, run, false);
       None
     }
