@@ -3561,7 +3561,7 @@ mod tests {
     let mut store = ContentStore::new(1 << 24, window).unwrap();
     for at in 0..64usize {
       let mut bytes = patterned(window * 3 + 10);
-      bytes[0] = at as u8;
+      bytes[0] = u8::try_from(at).unwrap_or(u8::MAX);
       let object = store.put_object(&bytes).unwrap();
       store.let_go_object(&object);
     }
@@ -3786,7 +3786,8 @@ mod tests {
     );
     before.clear_changes();
     let second = order[1];
-    let made_of = windows.iter().position(|id| *id == second).unwrap() as u8;
+    let made_of =
+      u8::try_from(windows.iter().position(|id| *id == second).unwrap()).unwrap_or(u8::MAX);
     let bytes = [made_of; 100];
     before.bring_back(&second, &bytes).unwrap();
     assert_eq!(
