@@ -293,12 +293,28 @@
 > - **(i) FIXED (A-918 (i)):** the holder answers typed, `ContentMessage::Behind { reached }` (kind 11), where it
 >   counted `OUT_OF_ORDER` and answered nothing; the owner records it on the pending version (`merge.behind.heard`)
 >   and the barrier's log names it.
-> - **(iii) OPEN (A-919):** a candidate joining a state log's placement past parts every earlier candidate held is
->   shipped the log's prefix (state_log's own owed transfer); a repository green's v0 on a fresh candidate needs its
->   join from it.
-> - **B OPEN (A-918):** on `Behind`, the newcomer rebuilds the green through a takeover successor's own path
->   (`adopt_ledger_positions`, `rebuild_through`) from a live holder, paced and bounded as replica builds are; one
->   mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
+> - **(iii) FIXED (A-919):** a candidate joining a state log's placement past parts every earlier one held reads the
+>   prefix from its cohort, the owner among them, under the start rule, and continues. Red: a's parts stayed at 933
+>   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0.
+> - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
+>   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
+>   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
+>   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **OPEN, w-shared's next piece (A-921, found by A-919's owner-restart scene; before A-918 B): after an owner's warm
+>   restart and a death, the surviving original holder refuses the owner's later records about 1 run in 3.** The names
+>   log stays acknowledged by the owner alone, the green's next version is owed to the old holder, every push is
+>   refused `unable to commit`, and no part reaches a newcomer. Red:
+>   `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`, `#[ignore]`d until A-921
+>   (`cargo test -p slates-server --test fleet <that name> -- --ignored --exact`). Red first, from the old holder's
+>   refusal counters: which refusal, at what epoch and position. It may be the sibling below showing itself.
+> - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
+>   but the record plane builds it empty, and no image carries it. An owner's warm restart spends one of `f`, unseen,
+>   on every record it counted itself in: commit at {owner, departed}, restart the owner warm, retire the departed,
+>   and the record is gone after one failure anyone saw. Traced from the code, not observed. Root fix: publish and
+>   recover the owner's hold as a holder's is.
+> - **B OPEN (A-918):** on `Behind`, the newcomer reads the green's chain through A-919's read (the same read a
+>   takeover's successor makes), folds it under the start rule, and rebuilds its replica from it, paced and bounded
+>   as replica builds are; one mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
 >   it holds no per-version records or inputs. Then the red goes green, a914 asserts its second push lands, and
 >   GAP-A9-7's ledger-prefix transfer and AUD-14's new candidate set close.
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
@@ -1812,7 +1828,10 @@
 > its mapped churn; a fresh 1 MiB chunk 240 us against 85 us kept). Now the chunk the room was made from is laid again
 > when it is an ordinary one of the length wanted, held for no longer than that call so the bound holds
 > (`TextCache::chunks_mapped`; `a_cache_lays_its_next_chunk_in_the_one_it_gives_back`: red, 7 chunks mapped fresh for
-> 400 texts through a two-chunk cache; now 2). The batch itself was sized by the fetch's room
+> 400 texts through a two-chunk cache; now 2). A text the owner answers in slices is assembled in the asker's buffer,
+> handed to the owner and back a request, no slice a buffer of its own (`StoreHandle::text_slice_into`; hg's 57k clone
+> allocated 6.2 GB in those answers, 15.3% of its system churn; `owner_slices_heap`: red, 331,464 bytes allocated for a
+> 307,200-byte text read in 64 KiB slices; now 24,264). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut

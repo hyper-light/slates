@@ -1359,6 +1359,16 @@ pub struct ShardState {
   /// it (A-914): kept past the detector's own report, which forgets a dead peer once its death stands, so a takeover
   /// installed later still knows where its host's silence began. Bounded by the members.
   pub(crate) last_answers: BTreeMap<slates_db::HostId, u64>,
+  /// The owner's own hold of every record this node writes as an owner (§4.8 "the owner among them"; A-909's
+  /// `Acceptor::accept_own`), on the control shard, from the record plane's start (`None` before, and on every other
+  /// shard). A-919 (main 01a20182's ruling of 2026-11-25) moved it here from the record plane's coordinator, where A-235
+  /// kept it: a ledger read answers from it, the owner counting among `f + 1`. Borrowed briefly, never across an await
+  /// (the commits hold it through `slates_cluster::OwnerHold`, once, before they send). Rebuilt empty at a restart, as
+  /// before: no image carries its positions (A-919's sibling, owed).
+  pub(crate) owner_hold: Option<slates_db::register::Acceptor>,
+  /// The registers this node reads a ledger range of from its cohort, a part past its copy refused (A-919,
+  /// `crate::ledger_read`). At most one a register.
+  pub(crate) ledger_reads: crate::ledger_read::LedgerReads,
   /// Test support (A-914): the nanoseconds each coordinator period waits before it runs
   /// (`Daemon::inject_period_stretch`), 0 in production.
   pub(crate) period_stretch_ns: u64,

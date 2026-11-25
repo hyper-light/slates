@@ -35,10 +35,13 @@
 //! placed there through its new version ([`names_committed_within`], the barrier, §4.8's commit rule): the HTTP and SSH
 //! edges wait on it before the report goes out.
 //!
-//! **Owed** (A-636's entry): a candidate
-//! that joins a log's placement past parts every earlier candidate held, which needs the log's state installed before
-//! its next part (a state-log checkpoint, which also lets holders drop the records below it); the parts rebuilt after
-//! the owner restarts; parts batched a shipment; a repository's destroy forgetting its four state logs' registers; and
+//! **A candidate that joins past parts every earlier one held** (A-919): it refuses the next part typed
+//! (`RegisterError::Behind`), reads the prefix from its cohort, the owner among them (`crate::ledger_read`), and
+//! continues; where its read is past tolerance it holds nothing, refused typed, and the owner keeps the parts until its
+//! candidacy is left (owed, the configuration's).
+//!
+//! **Owed** (A-636's entry): a state-log checkpoint, which would let holders drop the records below it; the parts
+//! rebuilt after the owner restarts; parts batched a shipment; a repository's destroy forgetting its four state logs' registers; and
 //! the successor's adoption of the logs (part 2c).
 
 use std::collections::BTreeMap;
@@ -164,8 +167,7 @@ impl StateLogs {
       .map(|(register, log)| (*register, &log.parts, &log.acked))
   }
 
-  /// The bytes of every part held; only the tests read it.
-  #[cfg(test)]
+  /// The bytes of every part held: the unit tests and `Daemon::state_log_parts_bytes` (A-919) read it.
   pub(crate) fn bytes(&self) -> usize {
     self.bytes
   }
@@ -589,6 +591,21 @@ pub(crate) fn check_held(
   });
   match judge((record.object, record.sequence), part.as_ref(), log, held) {
     Ok(()) => Ok(()),
+    // Past what this holder holds of the log (a candidate a death brought in, A-919): answered typed, with the newest
+    // position it holds, where it answered nothing.
+    Err(PartRefusal::Discontinuous) => {
+      state.count(PartRefusal::Discontinuous.counter(), 1);
+      let held = state
+        .holder_records
+        .get(&record.object)
+        .and_then(|acceptor| acceptor.highest(record.object))
+        .map(|(position, _)| position);
+      // The positions between read from the register's cohort (A-919, `crate::ledger_read`).
+      if let Some(part) = part.as_ref() {
+        crate::ledger_read::want(state, (record.object, record.owner), held, part.from);
+      }
+      Err(RegisterError::Behind { held })
+    }
     Err(refusal) => {
       state.count(refusal.counter(), 1);
       Err(RegisterError::MalformedRecord)
