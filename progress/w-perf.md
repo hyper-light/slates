@@ -719,3 +719,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     read buffer (557,456 -> 229,392 B allocated for 306,607 encoded; scratch-cap red 4,096 -> 32), and vfs HeldPieceRef
     so a delta and a checkpoint encode the encoder's pages borrowed (golden vector; check_publication green).
   - Next: (b) the Aways family keyed by let-go order -- a design, after main's 57k churn-by-site numbers.
+- 2026-11-25 ~20:30 PST:
+  - LANDED ac8fa0cf0 (in 2b977b986): an import's batch tail gives the content arena's resident free past its bound
+    back (ChunkArena::purge_past); main's 4th P7 arm: recorded resident free within B, but arena_free above B from
+    deferred last-batch frees and free space the purge can't see (kept-short runs or grown regions' pre-faulted space).
+  - LANDED 8cafe5fe9: flush test judged against its own await (was flaky at 4 threads); purge counters printed;
+    A-742 design status; merge with main's lint split of Staging::land.
+  - Waiting: main's rerun of the 4th arm with purged_kept_short_bytes; then the churn ruling's next cut (the push's
+    make_chain keep, 80.9% of its mapped churn; the owner's serve), leaving the clone's hg sites to w-hg's step 3.
