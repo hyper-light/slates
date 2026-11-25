@@ -523,15 +523,26 @@ async fn bring_back_text_window(
     at = at.saturating_add(u64::try_from(taken.len()).unwrap_or(u64::MAX));
   }
   crate::state::with_state(|state| {
-    super::within_budget(state, width, |stores| {
+    let brought = super::within_budget(state, width, |stores| {
       let content = stores.content_mut().ok_or(ReadThroughRefused::NoStore)?;
       if !content.is_away(&window) {
-        return Ok(());
+        return Ok(false);
       }
       content
         .bring_back(&window, &bytes)
+        .map(|()| true)
         .map_err(ReadThroughRefused::Refused)
-    })
+    });
+    // A read-back, its repository's to cache within its grant (`vcs_share::read_backs`, §4.17.5 "The cold trigger").
+    if let Ok(true) = brought {
+      crate::vcs_share::read_backs::brought_back(
+        state,
+        window,
+        width,
+        crate::vcs_share::read_backs::Holder::Text(repository),
+      );
+    }
+    brought.map(drop)
   })
   .ok_or(ReadThroughRefused::NoStore)?
 }

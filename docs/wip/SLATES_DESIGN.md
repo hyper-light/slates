@@ -16839,6 +16839,16 @@ landed changeset on the node's store holds and no other holder keeps, each read 
 next read (A-851, replacing "compress cold content"); hold cold content only at its f+1 holders (§4.10), fetched by
 identity when read.
 
+> **Status (2026-11-25, w-perf; main 01a20182's rulings (b) and (i')): the cold trigger is wired for what reads bring
+> back.** Each window a read brings back from the node's store is attributed, at the one step it takes into the content
+> store, to the repository whose store holds its object (a Subversion text's, the git store holding its pack, a home's
+> landed note), never a map of its own (`vcs_share::read_backs`). At each division (`grants::current_at`, which a
+> read asks too, so a shard that only reads still divides at its cadence) each repository's read-backs past its grant
+> go, coldest by last read first; a read taking a repository past its grant plus the spare lets go at once. A window a
+> reader pins, one younger than a whole cadence (no let-go under a read that brought it back), and one a home holds
+> here stay; a window no store here claims goes at the next division it is old enough for. Write paths let go what
+> they brought back at their own ends (w-git's `read_through::BroughtBack`), not through this cache.
+
 **Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
 refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else
 spreads. An intake's decoding, hashing and checks run on the shard its connection arrived at, and only its landing on
@@ -55835,19 +55845,45 @@ Applied in the same change to:
   of nine keep it, others refused `NotAHome`; other bytes under its name `Misnamed`; hostile lengths and kinds). Owed
   (6c-2): the daemon serving the stream (the home shard's `keep_here`, the answer after its image is published), the
   sender's batched calls and the healer's loop at each configuration change.
-- **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM` to
-  `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows (`fleet.members()`,
-  its quorum's f; since A-902, once this node is not behind the configuration its sender ranked by, waited for within
-  the put's budget) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
-  the window, and answered `Kept` only once that shard's image holding it is published (`published`, A-727's barrier);
-  reads and let-goes by identity. Until A-727 a3 calls the barrier's hooks no image holds the content store, so a put
-  from the region answers `Unanswered`, never a `Kept` the image could not back; a put so answered may have kept the
-  window, which the sender's let-go or the healer releases. Test: `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
+- **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM`
+  to `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows
+  (`fleet.members()`, its quorum's f; a node behind the configuration its sender ranked by answers `Behind` with its
+  installed version at once, A-912, where A-902 had held the put for its install) ranks it among the window's homes and
+  the bytes hash to their name, on the node's own home shard for the window, and answered `Kept` only once that shard's
+  image holding it is published (`published`, A-727's barrier); reads and let-goes by identity. Until A-727 a3 calls the
+  barrier's hooks no image holds the content store, so a put from the region answers `Unanswered`, never a `Kept` the
+  image could not back; a put so answered may have kept the window, which the sender's let-go or the healer releases.
+  Test:
+  `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
   (the barrier played by hand: no `Kept` before publication, `Kept` after, read back, let go, gone, misnamed refused).
   Owed: the sender (batched puts to the homes `homes()` names) and the healer's loop at each configuration change.
+- **A home behind its sender, and the invariant (A-912, 2026-11-24; A-902's wait moved from the home to the sender).**
+  No exchange holds a peer's record session across a wait that needs the council's next round. A node keeps one record
+  session per peer and a borrower takes it whole (`fleet::take_sessions`), and the council's replication rides it too: a
+  home that held a put until its own install (A-902) held its sender's session across the very append that brings the
+  install, and the coordinator awaited its healer inline, so neither moved until the put's budget ran out. Now a home
+  behind its sender (not ranked by its own configuration, the sender's version newer or the sender not among its
+  members) answers `Behind { installed }` at once (home wire 0x85), and the sender's exchange keeps that home and asks
+  it again once a council round has passed through its node (`fleet::CouncilRound`: the leader's replication round, or a
+  council message a voter served), its session given back meanwhile. The coordinator's home passes (`heal_region`,
+  `resolve_ended`, `announce_rebuilt`, `credentials::heal_region`) run on a lane of their own, one child task in flight,
+  joined at the next period (`fleet::HomePassLane`). A push's homing runs within a window derived from the failover
+  estimate's detection and confirmation and the configuration changes one death makes, each a council round of the
+  coordinator's measured period (`fleet::homing_window`: `detection + confirmation + (2 + 2 (members − 1)) × period`,
+  fanned to every shard with the failover delay); within it a home that does not keep the window is ranked again once
+  the node installs a configuration (A-902's install wake), and the window is homed among the homes ranked then. Past it
+  the push is refused `retry`, typed, as before.
+
+> **Status (2026-11-24, A-912).** Built. The invariant's breach is counted: the leader finding a voter's record session
+> on the same loan to another plane at two of its replication rounds in a row (`fleet.council.session_lent`), held at 0
+> by the A-912 fleet tests. Counters `vcs_store.homes.behind_answered`, `behind_asked_again`, `behind_kept_after`,
+> `homing_reranked_kept`, `fleet.home_passes.{in_flight, longest_ns, unspawned}`. A council session of its own per peer,
+> never lent to another plane, is the structural alternative, not built (GAPS).
+
 - **Piece 6's region half, the sender and the healer (2026-11-20; the transport done).** A home keeps one region hold
   a window however often the region offers it (`keep_for_region`, `let_go_for_region`), so offers are idempotent. The
-  healer (`vcs_store::homes::heal_region`), called from the control shard's `follow_configuration` every period, begins
+  healer (`vcs_store::homes::heal_region`), begun from the control shard's `follow_configuration` every period (on the
+  home passes' own lane since A-912, never awaited there), begins
   a pass only at a new configuration version (never on a write's path, §2 ban 10): it walks the windows this node holds
   for the region, a turn a period within the round budget, offers each to its homes (`homes()`, a `Put` broadcast on
   `HOME_STREAM` over the record sessions), and lets this node's hold go once `heal()` finds every home holding it and
@@ -63501,3 +63537,66 @@ Applied in the same change to: §4.8 (the owner's own hold, with a status line),
 Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/git/src/negotiation/{mod,objects}.rs`,
 `crates/git/src/upload/{answer,mod}.rs`, `crates/server/src/vcs_store/upload.rs` and its tests.
 
+### A-912 — A push during a member's death is accepted: no exchange holds a peer's record session across a wait that needs the council's next round, and a push's homing outlasts a death (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 ((i), (1), (a), (b)); found by A-908 part 4's fleet test; amends A-902; A-363, A-724 piece 6, A-727 (d1a), A-907)
+
+- **Why.** A git push made right after a member died was refused `retry` ("the push's objects were not kept by enough
+  homes in the region yet"), 3 of 3 in the scene of A-908 part 4's fleet test with c stopped (macOS arm64, debug,
+  timestamped logs over 8 runs). Two windows, measured:
+  - **Detection.** c stopped until a's detector condemned it: 1.27 to 3.02 s; until the leader proposed its takeover,
+    0.97 to 2.43 s more. A window whose homes ranked c stayed short within the push's 2 s homing budget.
+  - **Churn.** One death makes six configuration changes at three members (TakeOver, each survivor's Settle and
+    Confirm, the council's Seat: versions 7 to 12), a coordinator period (about 104 ms) apart. b followed a 35 to 130
+    ms behind when nothing held it, but 2.1 to 3.1 s behind in every other run: a's coordinator awaited its healer
+    inline, whose put b held for its own install (A-902), and that install needed the coordinator's next council
+    append (`heal_region` took 1.0 s and 2.0 s, no council round between). With the healer on its own lane, the put
+    held a's record session to b instead, and the council skipped b (`council replication finds b's session lent to
+    vcs_store.homes.heal`), b's wait running out 3 of 3: a circular wait on one exclusive resource either way.
+- **The change.**
+  - The coordinator's home passes (`heal_region`, `resolve_ended`, `announce_rebuilt`, `credentials::heal_region`) run
+    on a lane of their own, `fleet::HomePassLane`: one child task of the coordinator in flight, its end told on a
+    channel and joined at the next period, cancelled with the lane; counted `fleet.home_passes.{in_flight, longest_ns,
+    unspawned}`. The council's rounds never wait on a home exchange.
+  - A home behind its sender answers `Behind { installed }` at once (home wire 0x85; a member of 0x84 is refused typed
+    by A-727 (d1a)'s rule), counted `vcs_store.homes.behind_answered`. The sender's exchange keeps that home and asks it
+    again once a council round has passed through its node (`fleet::CouncilRound`: the leader's replication round, or a
+    council message a voter served; an event, never a timer), its session given back meanwhile: counted
+    `behind_asked_again`, and `behind_kept_after` where it then kept.
+  - The invariant, written in the A-724 entry's piece 6 region half: no exchange holds a peer's record session across a
+    wait that needs the council's next round. Its breach is counted, `fleet.council.session_lent`: the leader finding a
+    voter's session on the same loan to another plane at two of its replication rounds in a row, a hold across a round
+    (a loan seen at one round only overlapped it; the council's own earlier round's loan not counted).
+  - A push's homing runs within `fleet::homing_budget`: the live commit's deadline, or the homing window where that is
+    longer, `derived!` `detection + confirmation + (2 + 2 (members − 1)) × period` from the failover estimate (A-363)
+    and the coordinator's measured period, derived on the control shard and fanned with the failover delay. Within it
+    `home_in_region` ranks the window's homes, puts to those that have not kept it (a round within the live deadline),
+    and where one did not keep it waits for this node's next configuration install (A-902's install wake) and ranks
+    again: a home a death dropped is passed over, the window homed among the homes ranked then (counted
+    `homing_reranked_kept`). One path; past the window the push is refused `retry`, typed. A home of another wire
+    version ends the homing short at once, never waited for (A-727 (d1a)).
+- **Models.** None of `docs/wip/models/` models the home exchanges, the healer's timing or A-902's hold:
+  `InstallInTurns` models a configuration installed on a holder's register copies, `FencedRegister` and `FencedLedger`
+  a register's acceptance. This is scheduling outside the register's state machine; the specs are unchanged.
+- **Tests** (macOS arm64, debug, 2026-11-24).
+  - Fleet `a912_a_coordinators_home_passes_never_hold_its_council_through_a_takeover`: b installs each of the
+    takeover's six steps within one put's budget of a, and no session is found lent. Red before (as an install wait
+    then): the original coordinator, 2 of 2 (b's wait ran out); the lane alone, 3 of 3. Green: b's longest lag 176 ms,
+    `session_lent` 0.
+  - Fleet `a912_a_push_while_a_holders_takeover_moves_the_configuration_is_accepted` (the A-908 part 4 scene, c stopped,
+    the push at once, with three branches created at once beside it, since one push misses c as a home about 1 time in
+    9): red 3 of 3 (`retry`, homed short); green, the branch's next version landed every run, `homing_reranked_kept` 3
+    to 4, `session_lent` 0, no created branch refused at its homing. A created branch refused at the record barrier (2
+    of 4 runs, its new green's merge records not placed while the death moved the candidates) is A-912's sibling, owed.
+  - `vcs_store::homes::tests::a_home_behind_its_senders_configuration_answers_behind_at_once_and_keeps_once_it_installs`
+    (A-902's test rewritten: `Behind` at once for a newer sender and for one not among the members, `NotAHome` at the
+    same version, kept once installed); `slates-cluster` homes wire round trips `Behind`; the failover fan carries the
+    homing window (`a_shard_is_fanned_the_failover_delay_when_it_moves`).
+  - Focused: homes, fan, takeover and state_log lib (56), `slates-cluster` homes (4), fleet A-727 (d1a)'s mixed-version
+    homing, a894, a907, both a908 and the new branch's push (6).
+- **GAPS.** A council session of its own per peer, never lent to another plane, is the structural alternative, not
+  built: a piece if `fleet.council.session_lent` ever moves. The record barrier's window during a death (A-912's
+  sibling) is owed.
+
+Applied in the same change to: the A-724 entry's piece 6 region half (the invariant, the home's answer, the healer's
+lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,
+`crates/server/src/{fleet,state,daemon,git_push}.rs`, `crates/server/src/vcs_store/homes.rs` and its tests,
+`crates/server/tests/fleet.rs`, GAPS.

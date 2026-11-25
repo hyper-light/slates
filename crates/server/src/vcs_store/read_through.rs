@@ -117,6 +117,59 @@ pub(crate) const BROUGHT_BACK_BYTES: &str = "vcs_store.read_through.brought_back
 
 /// Brings back the let-go window `waited` names (module docs): the bytes put back; 0 where it is back already.
 pub(crate) async fn bring_back(waited: Waited) -> Result<u64, ReadThroughRefused> {
+  bring_back_window(waited)
+    .await
+    .map(|brought| brought.map_or(0, |(_, len)| len))
+}
+
+/// Counter: the windows a write path brought back ([`BroughtBack`]: a green's build, a replica's build, a derivation)
+/// and let go again at its end (main 01a20182's ruling of 2026-11-24: a write-path bring-back lets go at its owner's end
+/// on every path; their bytes counted as a landed let-go's, `vcs_store::LANDED_LET_GO_BYTES`). Format: a counter name.
+pub(crate) const WRITE_PATH_LET_GO: &str = "vcs_store.read_through.write_path_let_go";
+
+/// The windows a write path brought back ([`bring_back_window`]), each let go again once the path ends, whichever way it
+/// ends ([`BroughtBack::let_go`]): a build or derivation reads a window it brought back as long as it runs, then gives it
+/// back, never leaving it held (main 01a20182's ruling of 2026-11-24, w-hg's sweep of the bring-back sites).
+#[derive(Debug, Default)]
+pub(crate) struct BroughtBack(Vec<slates_vcs::ContentId>);
+
+impl BroughtBack {
+  /// Keeps the window `brought` names, if one was brought back: the bytes it brought, 0 for none or a refusal.
+  pub(crate) fn keep(
+    &mut self,
+    brought: &Result<Option<(slates_vcs::ContentId, u64)>, ReadThroughRefused>,
+  ) -> u64 {
+    match brought {
+      Ok(Some((window, len))) => {
+        self.0.push(*window);
+        *len
+      }
+      _ => 0,
+    }
+  }
+
+  /// Lets go again each window kept ([`crate::vcs_store::let_go_read`]: a home holding it here keeps it, `Pinned`),
+  /// counted [`WRITE_PATH_LET_GO`]; none where the shard's state is not lent.
+  pub(crate) fn let_go(self) {
+    if self.0.is_empty() {
+      return;
+    }
+    let _ = with_state(|state| {
+      for window in &self.0 {
+        if crate::vcs_store::let_go_read(state, window).is_ok() {
+          state.count(WRITE_PATH_LET_GO, 1);
+        }
+      }
+    });
+  }
+}
+
+/// [`bring_back`], naming the window it brought back and its bytes; none where it is back already. A window brought back
+/// is cached by the repository whose git store holds its pack, within its grant (`vcs_share::read_backs`).
+pub(crate) async fn bring_back_window(
+  waited: Waited,
+) -> Result<Option<(slates_vcs::ContentId, u64)>, ReadThroughRefused> {
+  let pack = waited.pack;
   let found = with_state(|state| {
     let disk = state.vcs_disk.clone().ok_or(ReadThroughRefused::NoDisk)?;
     let content = state
@@ -128,7 +181,7 @@ pub(crate) async fn bring_back(waited: Waited) -> Result<u64, ReadThroughRefused
   })
   .ok_or(ReadThroughRefused::NoStore)??;
   let Some((disk, identity, (window, start, len))) = found else {
-    return Ok(0);
+    return Ok(None);
   };
   let end = start.saturating_add(len);
   let mut bytes = Vec::new();
@@ -159,8 +212,14 @@ pub(crate) async fn bring_back(waited: Waited) -> Result<u64, ReadThroughRefused
     {
       state.count(BROUGHT_BACK, 1);
       state.count(BROUGHT_BACK_BYTES, brought);
+      crate::vcs_share::read_backs::brought_back(
+        state,
+        window,
+        brought,
+        crate::vcs_share::read_backs::Holder::Pack(pack),
+      );
     }
-    put
+    put.map(|brought| (brought > 0).then_some((window, brought)))
   })
   .ok_or(ReadThroughRefused::NoStore)?
 }
