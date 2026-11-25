@@ -2253,14 +2253,18 @@ pub enum Begun {
 }
 
 /// What one [`Green::apply_step`] came to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyStep {
   /// More of the run is left.
   More,
   /// The run ended: the version it committed.
   Done(u64),
-  /// The run ended committing nothing: the head (a text held by name alone with no bytes lent).
+  /// The run ended committing nothing: the head (an apply with no owner to lend it texts, [`Green::apply_recorded`]).
   Answered(u64),
+  /// The run waits for these texts, held by name alone with no bytes lent (A-760 (b) 4d), and has undone the slice that
+  /// met them: its owner lends them (`Green::lend`) and takes it on again, which makes that slice again. What the owner
+  /// learned by walking every effect first (`Green::recorded_unlent`), met a slice at a time instead.
+  Lend(BTreeSet<crate::named::Identity>),
 }
 
 /// A recorded version being applied a slice at a time ([`Green::begin_applying`]; its contract is there): the places of
@@ -7234,6 +7238,8 @@ impl Green {
         match self.apply_step(&mut run, inc, applied, &mut || false) {
           ApplyStep::More => {}
           ApplyStep::Done(version) | ApplyStep::Answered(version) => return version,
+          // No owner here to lend them: nothing commits, the head answered (its owner applies again once it has).
+          ApplyStep::Lend(_) => return self.head(),
         }
       },
     }
@@ -7322,6 +7328,7 @@ impl Green {
   ) -> ApplyStep {
     if run.at < applied.len() {
       let copies = copy::EntryCopies::at(applied, &run.copies);
+      let (from, made) = (run.at, run.effects.len());
       let ((), unlent) = crate::unlent::scope(|| {
         while let Some(effect) = applied.get(run.at) {
           run
@@ -7334,14 +7341,18 @@ impl Green {
         }
       });
       if !unlent.is_empty() {
-        return ApplyStep::Answered(self.head());
+        // The slice undone, to be made again once its texts are lent.
+        run.effects.truncate(made);
+        run.at = from;
+        return ApplyStep::Lend(unlent);
       }
       return ApplyStep::More;
     }
     let mut effects = core::mem::take(&mut run.effects);
     let ((), unlent) = crate::unlent::scope(|| self.commit_reads(&effects, inc.post()));
     if !unlent.is_empty() {
-      return ApplyStep::Answered(self.head());
+      run.effects = effects;
+      return ApplyStep::Lend(unlent);
     }
     // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
     // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
