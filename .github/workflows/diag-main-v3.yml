@@ -1,8 +1,10 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 23:14 PST): gate 18 at 1fe3a3b05, w-shared's A-913 (1fe3a3b05: a holder's record path makes a missing
-# branch source). Gate 17 (040a3a69b, A-912) passed 39 of 40; its one failure (release 3, "no survivor served the
-# repository") is the older replica-build Missing seen in gate 10 debug-7, its own piece. Twenty release then twenty
-# debug runs, stopped after the first three if all three fail. Run only from diag-measurer-main-v3-* branches.
+# main 01a20182 (2026-11-25 00:52 PST): gate 19 at bd5c1ddf4, w-shared's A-915 (17548d18b: a creation answers once its record and
+# its names-log join are both at f + 1; an adoption meeting an unknown join is refused typed, Unjoined; an adopted name
+# reserved until its rebuild). Gates 16-18 since A-908 part 4 failed 3 of 120 at "no survivor served the repository".
+# Forty release then forty debug runs, stopped after the first three if all three fail; every run's log uploaded, so
+# a failure's daemon lines tell A-915's end state from the older replica-build Missing. Run only from
+# diag-measurer-main-v3-* branches.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -12,13 +14,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 18 at 1fe3a3b05)
+    name: v3_takeover (gate 19 at bd5c1ddf4)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1fe3a3b053e79620a347594188dc598bdc07ad78
+          ref: bd5c1ddf43e2fed2508f495b5f8843fc81c2d09c
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -28,28 +30,28 @@ jobs:
           git log -1 --format='at %h %s' | cut -c1-120
           cargo test --release --locked -p slates-cli --test v3_takeover --no-run
           cargo test --locked -p slates-cli --test v3_takeover --no-run
-      - name: Run it, twenty release then twenty debug back to back
+      - name: Run it, forty release then forty debug back to back
         env:
           SLATES_TEST_CLI: "1"
         run: |
           set +e
           pass=0; ran=0
-          for n in $(seq 1 20); do
+          for n in $(seq 1 40); do
             timeout 1200 cargo test --release --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/release-$n.log" 2>&1
             rc=$?; ran=$((ran + 1)); [ $rc -eq 0 ] && pass=$((pass + 1))
             echo "release $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/release-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/release-$n.log" | head -4 | cut -c1-300
             if [ $ran -eq 3 ] && [ $pass -eq 0 ]; then echo "the first three runs failed; stopping"; break; fi
           done
-          if [ $ran -ge 20 ] || [ $pass -gt 0 ]; then
-          for n in $(seq 1 20); do
+          if [ $ran -ge 40 ] || [ $pass -gt 0 ]; then
+          for n in $(seq 1 40); do
             timeout 1800 cargo test --locked -p slates-cli --test v3_takeover -- --test-threads=1 --nocapture > "$RUNNER_TEMP/debug-$n.log" 2>&1
             rc=$?; ran=$((ran + 1)); [ $rc -eq 0 ] && pass=$((pass + 1))
             echo "debug $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/debug-$n.log" | tail -1)"
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 18: $pass of $ran passed"
+          echo "== gate 19: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -59,5 +61,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate18
+          name: v3-gate19
           path: ${{ runner.temp }}/*.log
