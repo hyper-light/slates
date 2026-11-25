@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 39 (main 01a20182, 2026-11-24 23:14 PST): run 38 found hg intake_tests.rs sites and fleet.rs:37080's mut; main's commits fix
+# them (with 834cc5115). Main past 2ed3eb139.
 # Run 38 (main 01a20182, 2026-11-24 22:30 PST): run 36 found three sites in hg's (B') (b47217878); main's commit fixes them. Main
 # at 040a3a69b (A-912).
 # Run 37 (main 01a20182, 2026-11-24 22:26 PST): main at 040a3a69b, w-shared's A-912 (d44be7d64, b97c77c37) and w-git's write-path
