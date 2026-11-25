@@ -2427,11 +2427,63 @@ fn planned_both(
   let (Ok(one), Ok(other)) = planned else {
     return Ok(false);
   };
-  let made = (whole.commit_planned(one), sliced.commit_planned(other));
+  let made = (
+    whole.commit_planned(one),
+    committed_a_unit_a_step(sliced, other)?,
+  );
   if made.0 != made.1 {
     return Err(format!("committed {made:?}"));
   }
   Ok(made.0.is_ok())
+}
+
+/// `planned` committed on `index` a unit a step ([`Index::commit_begin`], [`Index::commit_step`], every step spent
+/// after its first unit), the index read between every two steps as it read before the commit began: every path it
+/// names or the revision names, at every revision up to the youngest then. The commit's answer; where a read moved
+/// mid-commit, which.
+pub(crate) fn committed_a_unit_a_step(
+  index: &mut Index,
+  planned: Planned,
+) -> Result<Result<Revision, IndexRefusal>, String> {
+  let names: BTreeSet<String> = index
+    .paths
+    .iter()
+    .map(|entry| entry.path.to_string())
+    .chain(planned.changes().iter().map(|change| change.path.clone()))
+    .collect();
+  let youngest = index.youngest();
+  let before = reads(index, &names, youngest);
+  let mut committing = match index.commit_begin(planned) {
+    Ok(committing) => committing,
+    Err(refusal) => return Ok(Err(refusal)),
+  };
+  loop {
+    match index.commit_step(&mut committing, &mut || true) {
+      Ok(Some(revision)) => return Ok(Ok(revision)),
+      Ok(None) => {}
+      Err(refusal) => return Ok(Err(refusal)),
+    }
+    if reads(index, &names, youngest) != before {
+      return Err(format!(
+        "a read moved mid-commit of revision {}",
+        youngest + 1
+      ));
+    }
+  }
+}
+
+/// What `index` answers of each of `names` at every revision up to `youngest`: its node there, and the youngest.
+fn reads(index: &Index, names: &BTreeSet<String>, youngest: Revision) -> String {
+  let mut read = format!("youngest {}\n", index.youngest());
+  for name in names {
+    for revision in 0..=youngest {
+      read.push_str(&format!(
+        "{name}@{revision}: {:?}\n",
+        index.node(name, revision)
+      ));
+    }
+  }
+  read
 }
 
 proptest! {

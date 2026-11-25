@@ -64222,6 +64222,22 @@ GAPS.
   it cost N²: a revision removing 9,000 files took 246 ms of CPU over its fold's steps, its longest call 70 µs, once
   its first import landed (`t_a920_a_revision_removing_thousands_of_files_imports_whole`). The released paths are now
   a set beside the list (`Staging::released_paths`): 7.2-7.6 ms over the same steps, the longest call 10-28 µs.
+  **5b, the records' apply** (12.2-12.5 ms at 9,000 files after 1b: the index's commit of the planned revision 6.3,
+  the stored texts named 6.3). `Repository::apply_begin` checks the plan's revision, its lock entries and the room
+  again (`apply_checks`, which a recovery's replay shares) and keeps its property lists; `apply_step` names its stored
+  texts a text a unit, then commits its rows through `Index::commit_begin` and `commit_step` (its new paths a path a
+  unit, its node-revisions and maps, its events an event a unit), and in its last step adds the revision itself, its
+  lock entries, its properties and what the records hold; `apply` and `Index::commit_planned` are these carried to
+  their end. Until that last step the records and the index read as before the apply began: what a step adds is
+  reached only through the revision, and every read is at or below the youngest. The records step 12.2-12.5 ms →
+  under 5 ms (2 runs, load 33-48). Still whole: a recovery's replay of a revision, in its two stages. Oracles: over
+  generated histories and every revision of every dump `svnadmin` wrote, a revision committed a unit a step equals it
+  committed whole, and between every two of its steps every path at every revision reads as before the commit began
+  (`a_record_planned_a_row_a_step_is_the_record_planned_whole` and its golden twin; a youngest moved at the first unit
+  fails both); every dump imported with every check and apply a unit a step exports `full.dump` byte for byte (a
+  stored text dropped fails it). With it, the change index's rule stated on its own (main's order of 2026-11-25): after
+  every generated work, each changed path has exactly one entry marked last, at its last change
+  (`only_a_paths_newest_change_is_marked_last`; an earlier entry left marked last fails it, which no lib test caught).
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
