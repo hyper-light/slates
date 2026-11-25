@@ -85,8 +85,30 @@
 //! back a chunk a step ([`Chunks::release_step`]). Every function that reads a value's bytes takes the blocks with the
 //! chunks.
 
+use crate::byte_places::{BytePlaces, IDENTITIES, Place};
 use crate::dims::{Block, Blocks};
 use crate::ops_doc::{Op, OpKind};
+use crate::piece_tree::{NODE_BYTES as TREE_NODE_BYTES, Part, PieceTrees, Run, Version};
+
+/// Format: source-id offset separating direct owned chunks (`chunk + 1`) from byte identities
+/// (`IDENTITIES == 0`) inside a [`Version`] tree (A-818 piece 2b).
+const CHUNK_SOURCE_OFFSET: usize = 1;
+
+/// Per-path identity-to-location state backing `Repr::Tree` versions (A-818 piece 2b): one anchor
+/// chunk naming the path's newest file block, one [`BytePlaces`] index mapping byte identities to
+/// current offsets or stored chunks, and a refcount map of live version sequence numbers so
+/// folding immediately retires dead stored chunks.
+#[derive(Debug)]
+struct PathTree {
+  /// The chunk slot naming this path's newest file block (swapped in O(1) per edit).
+  anchor: usize,
+  /// Where each byte identity lives (newest block via treap rank, or stored owned chunk).
+  places: BytePlaces,
+  /// Next local version number assigned to a change on this path (1, 2, ...).
+  next_seq: u64,
+  /// Live `Repr::Tree` values per sequence number; the smallest key is the retirement floor.
+  live_seqs: std::collections::BTreeMap<u64, usize>,
+}
 
 /// A run of a value's bytes: `len` bytes at `at` within chunk `chunk`, read as of `epoch` (module docs, "A layered
 /// anchor"): [`CURRENT`] reads the chunk's bytes as they are; an earlier epoch of an anchor chunk reads them as they
@@ -243,6 +265,14 @@ pub(crate) struct Chunks {
   entries: usize,
   /// The layers reads have examined, in all: the non-vacuity counter of a read's cost through layers.
   examined: std::cell::Cell<u64>,
+  /// Persistent AVL piece trees shared across tree-backed history versions (A-818 piece 2b).
+  piece_trees: PieceTrees,
+  /// Per-path byte-identity location indexes backing `Repr::Tree` values.
+  path_trees: Vec<Option<PathTree>>,
+  /// Freed slots in `path_trees`.
+  free_trees: Vec<usize>,
+  /// Running byte charge of all live `PathTree::places` indexes.
+  tree_places_bytes: usize,
 }
 
 impl Chunks {
@@ -251,9 +281,19 @@ impl Chunks {
     self.examined.get()
   }
 
-  /// The bytes the live chunks hold, owned or named, and the layers' entries.
+  /// Bytes charged for all live piece-tree nodes and `BytePlaces` indexes.
+  fn tree_bytes(&self) -> usize {
+    self
+      .tree_places_bytes
+      .saturating_add(self.piece_trees.live().saturating_mul(TREE_NODE_BYTES))
+  }
+
+  /// The bytes the live chunks hold, owned or named, plus layer entries and piece-tree indexes.
   pub(crate) fn bytes(&self) -> usize {
-    self.bytes.saturating_add(self.entries)
+    self
+      .bytes
+      .saturating_add(self.entries)
+      .saturating_add(self.tree_bytes())
   }
 
   /// The bytes the live chunks own: what the history copied (A-728: none for a value stored whole).
@@ -267,6 +307,10 @@ impl Chunks {
     let Some(slot) = self.slots.pop() else {
       self.free.clear();
       self.layers.clear();
+      self.path_trees.clear();
+      self.free_trees.clear();
+      self.piece_trees.clear();
+      self.tree_places_bytes = 0;
       self.entries = 0;
       self.bytes = 0;
       self.named = 0;
@@ -287,9 +331,35 @@ impl Chunks {
   /// running total is held to (a chunk no value names is a leak, a value naming a freed chunk a double release).
   pub(crate) fn referenced_bytes<'a>(&self, values: impl Iterator<Item = &'a Value>) -> usize {
     let mut seen = std::collections::BTreeSet::new();
+    let mut seen_trees = std::collections::BTreeSet::new();
+    let mut seen_tree_nodes = std::collections::BTreeSet::new();
     for value in values {
-      for piece in &value.pieces {
-        seen.insert(piece.chunk);
+      match &value.repr {
+        Repr::Pieces(pieces) => {
+          for piece in pieces {
+            seen.insert(piece.chunk);
+          }
+        }
+        Repr::Tree {
+          tree,
+          version,
+          extra_chunks,
+          ..
+        } => {
+          seen_trees.insert(*tree);
+          self
+            .piece_trees
+            .reachable_nodes(version, &mut seen_tree_nodes);
+          seen.extend(extra_chunks.iter().copied());
+        }
+      }
+    }
+    let mut places_bytes = 0usize;
+    for tree in seen_trees {
+      if let Some(Some(path_tree)) = self.path_trees.get(tree) {
+        seen.insert(path_tree.anchor);
+        seen.extend(path_tree.places.stored_chunks());
+        places_bytes = places_bytes.saturating_add(path_tree.places.bytes());
       }
     }
     // An anchor's layers are held by the anchor: their owned chunks and their entries.
@@ -307,6 +377,95 @@ impl Chunks {
       .map(|(source, _)| source.len())
       .sum::<usize>()
       .saturating_add(entries.saturating_mul(LAYER_BYTES))
+      .saturating_add(places_bytes)
+      .saturating_add(seen_tree_nodes.len().saturating_mul(TREE_NODE_BYTES))
+  }
+
+  /// Allocates a `PathTree` slot and charges its `BytePlaces` index.
+  fn alloc_path_tree(&mut self, path_tree: PathTree) -> usize {
+    self.tree_places_bytes = self
+      .tree_places_bytes
+      .saturating_add(path_tree.places.bytes());
+    if let Some(id) = self.free_trees.pop()
+      && let Some(slot) = self.path_trees.get_mut(id)
+    {
+      *slot = Some(path_tree);
+      return id;
+    }
+    self.path_trees.push(Some(path_tree));
+    self.path_trees.len().saturating_sub(1)
+  }
+
+  /// Resolves a byte range `[from, from + len)` of a `Repr::Tree` version into concrete `Piece`s.
+  fn resolve_tree_range(
+    &self,
+    tree: usize,
+    version: &Version,
+    (from, len): (usize, usize),
+    out: &mut Vec<Piece>,
+  ) -> Option<()> {
+    if len == 0 {
+      return Some(());
+    }
+    let path_tree = self.path_trees.get(tree)?.as_ref()?;
+    let from_u64 = u64::try_from(from).ok()?;
+    let len_u64 = u64::try_from(len).ok()?;
+    let mut failed = false;
+    self
+      .piece_trees
+      .read(version, (from_u64, len_u64), &mut |run| {
+        if failed {
+          return;
+        }
+        if run.source == IDENTITIES {
+          if path_tree
+            .places
+            .locate((run.at, run.len), &mut |place| match place {
+              Place::Current { at, len } => {
+                if let (Ok(at), Ok(len)) = (usize::try_from(at), usize::try_from(len)) {
+                  out.push(Piece {
+                    chunk: path_tree.anchor,
+                    at,
+                    len,
+                    epoch: CURRENT,
+                  });
+                } else {
+                  failed = true;
+                }
+              }
+              Place::Stored { chunk, at, len } => {
+                if let (Ok(at), Ok(len)) = (usize::try_from(at), usize::try_from(len)) {
+                  out.push(Piece {
+                    chunk,
+                    at,
+                    len,
+                    epoch: CURRENT,
+                  });
+                } else {
+                  failed = true;
+                }
+              }
+            })
+            .is_err()
+          {
+            failed = true;
+          }
+        } else {
+          let chunk = run.source.saturating_sub(CHUNK_SOURCE_OFFSET);
+          if let (Ok(at), Ok(len)) = (usize::try_from(run.at), usize::try_from(run.len)) {
+            out.push(Piece {
+              chunk,
+              at,
+              len,
+              epoch: CURRENT,
+            });
+          } else {
+            failed = true;
+          }
+        }
+      })
+      .ok()?;
+    (!failed).then_some(())
   }
 
   /// Adds a chunk holding `bytes`, named by no piece yet.
@@ -543,11 +702,33 @@ impl Chunks {
   }
 }
 
-/// One version of a file in the history: its pieces and its length (module docs).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Storage representation of a history [`Value`]: either a flat piece list (for whole blocks and
+/// pure length-preserving layered overwrites) or a persistent AVL piece tree backed by a shared
+/// [`PathTree`] (`BytePlaces` + anchor block, A-818 piece 2b) for O(parts × log n) edits of any kind.
+#[derive(Debug, PartialEq, Eq)]
+enum Repr {
+  Pieces(Vec<Piece>),
+  Tree {
+    tree: usize,
+    seq: u64,
+    version: Version,
+    /// Non-anchor owned chunks referenced directly via `Run::source = chunk + 1` (non-empty only for
+    /// earlier layered values converted once when a path transitions to a `PathTree`).
+    extra_chunks: Vec<usize>,
+  },
+}
+
+impl Default for Repr {
+  fn default() -> Self {
+    Self::Pieces(Vec::new())
+  }
+}
+
+/// One version of a file in the history: its representation and length (module docs).
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Value {
-  /// The runs whose concatenation is the value, in order.
-  pieces: Vec<Piece>,
+  /// The value's pieces or persistent piece tree.
+  repr: Repr,
   /// The value's length.
   len: usize,
   /// While the value is its path's latest, the chunk naming the file's current block and that block's length: the
@@ -736,23 +917,43 @@ impl Value {
     self.len
   }
 
+  /// Borrows the flat piece slice when `Repr::Pieces`, empty otherwise.
+  fn pieces_slice(&self) -> &[Piece] {
+    match &self.repr {
+      Repr::Pieces(pieces) => pieces,
+      Repr::Tree { .. } => &[],
+    }
+  }
+
   /// The value's pieces as concrete runs (module docs, "A layered anchor"): as they are where none reads an anchor
   /// through its layers, else each such piece resolved ([`Chunks::resolve_into`]). What every reader of its bytes walks.
   fn concrete<'v>(&'v self, chunks: &Chunks) -> std::borrow::Cow<'v, [Piece]> {
-    let layered = self.pieces.iter().any(|piece| chunks.layered(piece));
-    if !layered {
-      return std::borrow::Cow::Borrowed(&self.pieces);
+    match &self.repr {
+      Repr::Pieces(pieces) => {
+        let layered = pieces.iter().any(|piece| chunks.layered(piece));
+        if !layered {
+          return std::borrow::Cow::Borrowed(pieces);
+        }
+        let mut out = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+          chunks.resolve_into(piece, &mut out);
+        }
+        std::borrow::Cow::Owned(out)
+      }
+      Repr::Tree { tree, version, .. } => {
+        let mut out = Vec::new();
+        let _ = chunks.resolve_tree_range(*tree, version, (0, self.len), &mut out);
+        std::borrow::Cow::Owned(out)
+      }
     }
-    let mut out = Vec::with_capacity(self.pieces.len());
-    for piece in &self.pieces {
-      chunks.resolve_into(piece, &mut out);
-    }
-    std::borrow::Cow::Owned(out)
   }
 
-  /// The bytes its piece list costs.
+  /// The bytes its piece list costs (zero for `Repr::Tree`, whose nodes are charged once in `Chunks::bytes`).
   pub(crate) fn list_bytes(&self) -> usize {
-    self.pieces.len().saturating_mul(PIECE_BYTES)
+    match &self.repr {
+      Repr::Pieces(pieces) => pieces.len().saturating_mul(PIECE_BYTES),
+      Repr::Tree { .. } => 0,
+    }
   }
 
   /// What [`Value::owned`] of `len` bytes holds, without making it: its bytes and its one piece's list entry (nothing
@@ -775,12 +976,12 @@ impl Value {
     let chunk = chunks.add_source(Source::Block { block, len });
     chunks.retain(chunk);
     Value {
-      pieces: vec![Piece {
+      repr: Repr::Pieces(vec![Piece {
         chunk,
         at: 0,
         len,
         epoch: CURRENT,
-      }],
+      }]),
       len,
       own: Some((chunk, len)),
     }
@@ -795,7 +996,7 @@ impl Value {
   /// The file block the value is whole, named as its one chunk (A-728), if it is one: what a checkpoint names a file by
   /// when that block is named for a content-plane object (A-866, A-869).
   pub(crate) fn whole_block(&self, chunks: &Chunks) -> Option<Block> {
-    match self.pieces.as_slice() {
+    match self.pieces_slice() {
       [piece] => match chunks.slots.get(piece.chunk) {
         Some(Some((Source::Block { block, len }, _)))
           if piece.at == 0 && piece.len == *len && self.len == *len =>
@@ -808,9 +1009,10 @@ impl Value {
     }
   }
 
-  /// Whether the value is `block` whole, named as its one chunk (A-728).
+  /// Whether the value is `block` whole, named as its one chunk (A-728). Returns `false` for `Repr::Tree` so
+  /// `rename_alone` collapses a lone tree-backed latest value back to a 1-piece block after folding to head.
   pub(crate) fn is_block(&self, chunks: &Chunks, block: Block) -> bool {
-    match self.pieces.as_slice() {
+    match self.pieces_slice() {
       [piece] => matches!(
         chunks.slots.get(piece.chunk),
         Some(Some((Source::Block { block: named, len, .. }, _)))
@@ -820,28 +1022,48 @@ impl Value {
     }
   }
 
-  /// Whether this value is a single `CURRENT` piece naming `block` as its anchor chunk with layer room left,
-  /// ready for [`overlay_inplace`].
+  /// Whether this value is a current anchor naming `block` ready for [`overlay_inplace`] (both `Repr::Pieces`
+  /// and `Repr::Tree`).
   pub(crate) fn is_current_anchor(&self, chunks: &Chunks, block: Block) -> bool {
-    let [piece] = self.pieces.as_slice() else {
-      return false;
-    };
-    if piece.epoch != CURRENT || piece.at != 0 || piece.len != self.len {
-      return false;
+    match &self.repr {
+      Repr::Pieces(pieces) => {
+        let [piece] = pieces.as_slice() else {
+          return false;
+        };
+        if piece.epoch != CURRENT || piece.at != 0 || piece.len != self.len {
+          return false;
+        }
+        let matches_block = matches!(
+          chunks.slots.get(piece.chunk),
+          Some(Some((Source::Block { block: named, len }, _)))
+            if *named == block && *len == self.len
+        );
+        if !matches_block {
+          return false;
+        }
+        let next = chunks
+          .layers
+          .get(&piece.chunk)
+          .map_or(0, |layers| layers.next);
+        next < CURRENT.saturating_sub(1)
+      }
+      Repr::Tree { tree, .. } => {
+        let Some((own_anchor, own_len)) = self.own else {
+          return false;
+        };
+        let Some(Some(path_tree)) = chunks.path_trees.get(*tree) else {
+          return false;
+        };
+        if path_tree.anchor != own_anchor || own_len != self.len {
+          return false;
+        }
+        matches!(
+          chunks.slots.get(path_tree.anchor),
+          Some(Some((Source::Block { block: named, len }, _)))
+            if *named == block && *len == self.len
+        )
+      }
     }
-    let matches_block = matches!(
-      chunks.slots.get(piece.chunk),
-      Some(Some((Source::Block { block: named, len }, _)))
-        if *named == block && *len == self.len
-    );
-    if !matches_block {
-      return false;
-    }
-    let next = chunks
-      .layers
-      .get(&piece.chunk)
-      .map_or(0, |layers| layers.next);
-    next < CURRENT.saturating_sub(1)
   }
 
   /// `bytes` as one new chunk the history owns, taken without a copy (none for no bytes): a value whose pieces outweigh
@@ -854,12 +1076,12 @@ impl Value {
     let chunk = chunks.add(bytes);
     chunks.retain(chunk);
     Value {
-      pieces: vec![Piece {
+      repr: Repr::Pieces(vec![Piece {
         chunk,
         at: 0,
         len,
         epoch: CURRENT,
-      }],
+      }]),
       len,
       own: None,
     }
@@ -875,12 +1097,12 @@ impl Value {
     let chunk = chunks.add(bytes.to_vec());
     chunks.retain(chunk);
     Value {
-      pieces: vec![Piece {
+      repr: Repr::Pieces(vec![Piece {
         chunk,
         at: 0,
         len,
         epoch: CURRENT,
-      }],
+      }]),
       len,
       own: None,
     }
@@ -907,6 +1129,19 @@ impl Value {
     to: usize,
   ) -> Option<Vec<u8>> {
     let to = to.min(self.len);
+    if to <= from {
+      return Some(Vec::new());
+    }
+    if let Repr::Tree { tree, version, .. } = &self.repr {
+      let span = to.saturating_sub(from);
+      let mut pieces = Vec::new();
+      chunks.resolve_tree_range(*tree, version, (from, span), &mut pieces)?;
+      let mut out = Vec::with_capacity(span);
+      for piece in &pieces {
+        out.extend_from_slice(chunks.bytes_of(blocks, piece)?);
+      }
+      return Some(out);
+    }
     let mut out = Vec::with_capacity(to.saturating_sub(from));
     let mut logical = 0usize;
     for piece in self.concrete(chunks).iter() {
@@ -1059,10 +1294,82 @@ impl Value {
     Some(runs)
   }
 
-  /// Gives the value's chunks back: each piece's reference released, a chunk's block let go with its last.
+  /// Releases one `Repr::Tree` value's piece tree, extra chunks, and sequence hold, retiring any
+  /// stored chunks below the new minimum live sequence number.
+  fn release_tree(
+    chunks: &mut Chunks,
+    blocks: &mut Blocks,
+    (tree, seq): (usize, u64),
+    version: Version,
+    extra_chunks: Vec<usize>,
+  ) {
+    chunks.piece_trees.release(version);
+    for chunk in extra_chunks {
+      chunks.release(chunk, blocks);
+    }
+    let mut freed = Vec::new();
+    let dropped_tree = Self::retire_tree_seq(chunks, (tree, seq), &mut freed);
+    if let Some(mut path_tree) = dropped_tree {
+      chunks.tree_places_bytes = chunks
+        .tree_places_bytes
+        .saturating_sub(path_tree.places.bytes());
+      path_tree
+        .places
+        .retire_through(u64::MAX, &mut |chunk| freed.push(chunk));
+      freed.push(path_tree.anchor);
+      chunks.free_trees.push(tree);
+    }
+    for chunk in freed {
+      chunks.release(chunk, blocks);
+    }
+  }
+
+  /// Decrements `seq` on `path_trees[tree]`, retiring dead stored chunks or taking the whole `PathTree`
+  /// when its last live version goes.
+  fn retire_tree_seq(
+    chunks: &mut Chunks,
+    (tree, seq): (usize, u64),
+    freed: &mut Vec<usize>,
+  ) -> Option<PathTree> {
+    let slot = chunks.path_trees.get_mut(tree)?;
+    let path_tree = slot.as_mut()?;
+    if let Some(count) = path_tree.live_seqs.get_mut(&seq) {
+      *count = count.saturating_sub(1);
+      if *count == 0 {
+        path_tree.live_seqs.remove(&seq);
+      }
+    }
+    if path_tree.live_seqs.is_empty() {
+      return slot.take();
+    }
+    if let Some(&floor) = path_tree.live_seqs.keys().next() {
+      let before = path_tree.places.bytes();
+      path_tree
+        .places
+        .retire_through(floor, &mut |chunk| freed.push(chunk));
+      let after = path_tree.places.bytes();
+      chunks.tree_places_bytes = chunks
+        .tree_places_bytes
+        .saturating_sub(before)
+        .saturating_add(after);
+    }
+    None
+  }
+
+  /// Gives the value's chunks (and piece-tree handles) back, retiring dead stored chunks on fold.
   pub(crate) fn release(self, chunks: &mut Chunks, blocks: &mut Blocks) {
-    for piece in self.pieces {
-      chunks.release_piece(&piece, blocks);
+    match self.repr {
+      Repr::Pieces(pieces) => {
+        for piece in pieces {
+          chunks.release_piece(&piece, blocks);
+        }
+      }
+      Repr::Tree {
+        tree,
+        seq,
+        version,
+        extra_chunks,
+      } => Self::release_tree(chunks, blocks, (tree, seq), version, extra_chunks),
     }
   }
 
@@ -1115,8 +1422,9 @@ impl Value {
   /// and the rest left where they are, in order, unmerged and unreferenced (the caller builds the value with
   /// [`Value::push`]).
   fn remapped(&self, kept: &KeptIndex<'_>, anchor: usize) -> Vec<Piece> {
-    let mut out = Vec::with_capacity(self.pieces.len());
-    for piece in &self.pieces {
+    let pieces = self.pieces_slice();
+    let mut out = Vec::with_capacity(pieces.len());
+    for piece in pieces {
       let end = piece.at.saturating_add(piece.len);
       let mut cursor = piece.at;
       while cursor < end {
@@ -1160,8 +1468,11 @@ impl Value {
     if piece.len == 0 {
       return;
     }
+    let Repr::Pieces(pieces) = &mut self.repr else {
+      return;
+    };
     self.len = self.len.saturating_add(piece.len);
-    if let Some(last) = self.pieces.last_mut()
+    if let Some(last) = pieces.last_mut()
       && last.chunk == piece.chunk
       && last.epoch == piece.epoch
       && last.at.saturating_add(last.len) == piece.at
@@ -1170,7 +1481,7 @@ impl Value {
       return;
     }
     chunks.retain_piece(&piece);
-    self.pieces.push(piece);
+    pieces.push(piece);
   }
 
   /// The runs the engine's `apply` would produce over this value, in order: shared runs of this value and runs of
@@ -1255,18 +1566,38 @@ impl Value {
 /// whose pieces then outweigh its bytes is stored whole. The new latest value names the new block whole, one holder of
 /// it taken. `None`, with nothing changed, when the ops do not reproduce the new block from the latest or keep none of
 /// it: the caller then names the new block whole and the history keeps the earlier one, as for a whole replace.
+/// Tries the layered / piece-tree fast paths before falling back to a full piece-list re-anchor.
+fn try_layered_reanchor(
+  values: &mut [&mut Value],
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (block, ops): (Block, &[Op]),
+) -> Option<Reanchored> {
+  if !layered_allowed() {
+    return None;
+  }
+  if matches!(values.last().map(|v| &v.repr), Some(Repr::Tree { .. })) {
+    return values
+      .last_mut()
+      .and_then(|latest| tree_step(latest, chunks, blocks, (block, ops)));
+  }
+  overlay(values, chunks, blocks, (block, ops))
+    .or_else(|| promote_and_step(values, chunks, blocks, (block, ops)))
+}
+
 pub(crate) fn reanchor(
   mut values: Vec<&mut Value>,
   chunks: &mut Chunks,
   blocks: &mut Blocks,
   (block, ops): (Block, &[Op]),
 ) -> Option<Reanchored> {
-  if layered_allowed()
-    && let Some(overlaid) = overlay(&mut values, chunks, blocks, (block, ops))
-  {
-    return Some(overlaid);
+  if let Some(fast) = try_layered_reanchor(&mut values, chunks, blocks, (block, ops)) {
+    return Some(fast);
   }
   let latest = values.last()?;
+  if matches!(latest.repr, Repr::Tree { .. }) {
+    return None;
+  }
   // A new block held by its object's name alone (A-760 (b) 4d) is a whole replace by that object: such a block is made
   // only of one named run that is its object whole, its identity the run's (main 01a20182's ruling of 2026-11-23: the
   // check is by identity, not skipped), so it keeps nothing, as a whole replace does, and the earlier block stays that
@@ -1284,12 +1615,11 @@ pub(crate) fn reanchor(
   flatten(&mut values, chunks, blocks);
   blocks.hold(block);
   let anchor = chunks.add_source(Source::Block { block, len });
-  let latest_value = Value {
-    pieces: Vec::new(),
+  let mut latest_value = Value {
+    repr: Repr::Pieces(Vec::new()),
     len: 0,
     own: Some((anchor, len)),
   };
-  let mut latest_value = latest_value;
   latest_value.push(
     chunks,
     Piece {
@@ -1475,6 +1805,444 @@ fn record_inplace_layers(
   *count = count.saturating_add(1);
 }
 
+/// Builds `PieceTrees` / `BytePlaces` parts from `ops` over `before` -> `after`, checking
+/// byte-for-byte that every kept run matches `before` and `after` and that at least one byte
+/// is kept (`None` for a whole replace, mismatch, empty output, or invalid offsets).
+fn ops_to_parts(ops: &[Op], before: &[u8], after: &[u8]) -> Option<Vec<Part>> {
+  let base_len = u64::try_from(before.len()).ok()?;
+  let next_len = after.len();
+  if next_len == 0 {
+    return None;
+  }
+  let mut parts: Vec<Part> = Vec::with_capacity(ops.len().saturating_mul(2).saturating_add(1));
+  let mut pos = 0u64;
+  let mut out = 0usize;
+  let mut kept_bytes = 0usize;
+  for op in ops {
+    if op.at > pos {
+      let start = pos.min(base_len);
+      let end = op.at.min(base_len);
+      append_kept_part(
+        &mut parts,
+        (before, after),
+        (start, end),
+        (&mut out, &mut kept_bytes),
+      )?;
+      pos = op.at;
+    }
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      OpKind::Overwrite => {
+        append_added_part(&mut parts, op.len, &mut out)?;
+        pos = pos.saturating_add(op.len);
+      }
+      OpKind::Insert | OpKind::Extend => append_added_part(&mut parts, op.len, &mut out)?,
+      _ => {}
+    }
+  }
+  if pos < base_len {
+    append_kept_part(
+      &mut parts,
+      (before, after),
+      (pos, base_len),
+      (&mut out, &mut kept_bytes),
+    )?;
+  }
+  (out == next_len && kept_bytes > 0).then_some(parts)
+}
+
+/// Validates and appends a `Part::Kept` covering `before[start..end]` against `after[out..]`.
+fn append_kept_part(
+  parts: &mut Vec<Part>,
+  (before, after): (&[u8], &[u8]),
+  (start, end): (u64, u64),
+  (out, kept_bytes): (&mut usize, &mut usize),
+) -> Option<()> {
+  if end <= start {
+    return Some(());
+  }
+  let from = usize::try_from(start).ok()?;
+  let to = usize::try_from(end).ok()?;
+  let len = to.checked_sub(from)?;
+  let out_end = out.checked_add(len)?;
+  if before.get(from..to)? != after.get(*out..out_end)? {
+    return None;
+  }
+  parts.push(Part::Kept {
+    from: start,
+    len: u64::try_from(len).ok()?,
+  });
+  *out = out_end;
+  *kept_bytes = kept_bytes.saturating_add(len);
+  Some(())
+}
+
+/// Appends or coalesces a `Part::Added` run of `len` bytes at output offset `*out`.
+fn append_added_part(parts: &mut Vec<Part>, len: u64, out: &mut usize) -> Option<()> {
+  let len_usize = usize::try_from(len).ok()?;
+  if len_usize == 0 {
+    return Some(());
+  }
+  let at = u64::try_from(*out).ok()?;
+  *out = out.checked_add(len_usize)?;
+  match parts.last_mut() {
+    Some(Part::Added(last)) => last.len = last.len.checked_add(len)?,
+    _ => parts.push(Part::Added(Run {
+      source: IDENTITIES,
+      at,
+      len,
+    })),
+  }
+  Some(())
+}
+
+/// Builds `Part`s covering `0..len` for disjoint sorted pure-overwrite `ranges`.
+fn overwrite_ranges_to_parts(ranges: &[(usize, usize)], len: usize) -> Option<Vec<Part>> {
+  let mut parts = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+  let mut cursor = 0usize;
+  for &(start, end) in ranges {
+    if start > cursor {
+      parts.push(Part::Kept {
+        from: u64::try_from(cursor).ok()?,
+        len: u64::try_from(start.saturating_sub(cursor)).ok()?,
+      });
+    }
+    let width = end.saturating_sub(start);
+    if width > 0 {
+      parts.push(Part::Added(Run {
+        source: IDENTITIES,
+        at: u64::try_from(start).ok()?,
+        len: u64::try_from(width).ok()?,
+      }));
+    }
+    cursor = end;
+  }
+  if cursor < len {
+    parts.push(Part::Kept {
+      from: u64::try_from(cursor).ok()?,
+      len: u64::try_from(len.saturating_sub(cursor)).ok()?,
+    });
+  }
+  Some(parts)
+}
+
+/// Runs `BytePlaces::change` on `path_tree`, packing all removed slices of `before` into a single
+/// owned chunk in `chunks` (with exact retain counts matching `stored.chunks`), and updates
+/// `chunks.tree_places_bytes`.
+fn apply_places_change(
+  chunks: &mut Chunks,
+  tree: usize,
+  before: &[u8],
+  parts: &[Part],
+) -> Option<(u64, Vec<Part>, usize)> {
+  let mut path_tree = chunks.path_trees.get_mut(tree)?.take()?;
+  let seq = path_tree.next_seq;
+  let places_before = path_tree.places.bytes();
+  let mut owned = Vec::new();
+  let mut held_chunk: Option<usize> = None;
+  let mut failed = false;
+  let made = path_tree.places.change(seq, parts, &mut |from, len| {
+    let start = usize::try_from(from).map_err(|_| crate::piece_tree::Refusal::OutOfRange)?;
+    let width = usize::try_from(len).map_err(|_| crate::piece_tree::Refusal::OutOfRange)?;
+    let end = start
+      .checked_add(width)
+      .ok_or(crate::piece_tree::Refusal::Overflow)?;
+    let slice = before
+      .get(start..end)
+      .ok_or(crate::piece_tree::Refusal::OutOfRange)?;
+    let offset = u64::try_from(owned.len()).map_err(|_| crate::piece_tree::Refusal::Overflow)?;
+    owned.extend_from_slice(slice);
+    let chunk = match held_chunk {
+      Some(id) => id,
+      None => {
+        let id = chunks.add(Vec::new());
+        held_chunk = Some(id);
+        id
+      }
+    };
+    chunks.retain(chunk);
+    Ok((chunk, offset))
+  });
+  let copied = owned.len();
+  if let Some(chunk) = held_chunk
+    && let Some(Some((Source::Owned(buf), _))) = chunks.slots.get_mut(chunk)
+  {
+    chunks.bytes = chunks.bytes.saturating_add(copied);
+    *buf = owned;
+  }
+  let places_after = path_tree.places.bytes();
+  chunks.tree_places_bytes = chunks
+    .tree_places_bytes
+    .saturating_sub(places_before)
+    .saturating_add(places_after);
+  if made.is_ok() {
+    path_tree.next_seq = seq.saturating_add(1);
+    let count = path_tree.live_seqs.entry(seq).or_default();
+    *count = count.saturating_add(1);
+  } else {
+    failed = true;
+  }
+  if let Some(slot) = chunks.path_trees.get_mut(tree) {
+    *slot = Some(path_tree);
+  }
+  if failed {
+    return None;
+  }
+  Some((seq, made.ok()?, copied))
+}
+
+/// Applies ANY change (overwrite, replace, insert, delete, truncate, extend) to a `Repr::Tree`
+/// latest value in O(parts × log n), walking `values == 1` regardless of history length (A-818 piece 2b).
+fn tree_step(
+  latest: &mut Value,
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (block, ops): (Block, &[Op]),
+) -> Option<Reanchored> {
+  let Repr::Tree { tree, .. } = &latest.repr else {
+    return None;
+  };
+  let tree = *tree;
+  let anchor = chunks.path_trees.get(tree)?.as_ref()?.anchor;
+  let (old, old_len) = match chunks.slots.get(anchor) {
+    Some(Some((Source::Block { block: old, len }, _))) => (*old, *len),
+    _ => return None,
+  };
+  if old_len != latest.len || old == block {
+    return None;
+  }
+  let before = blocks.bytes(old)?;
+  let after = blocks.bytes(block)?;
+  let new_len = after.len();
+  let parts = ops_to_parts(ops, before, after)?;
+  let (seq, made_parts, copied) = apply_places_change(chunks, tree, before, &parts)?;
+  let new_version = match &latest.repr {
+    Repr::Tree { version, .. } => chunks.piece_trees.rebuild(version, &made_parts).ok()?,
+    Repr::Pieces(_) => return None,
+  };
+  // Swap `anchor` to the new block and update `chunks.bytes`/`chunks.named` atomically.
+  blocks.hold(block);
+  if let Some(Some((source, _))) = chunks.slots.get_mut(anchor) {
+    let previous = std::mem::replace(
+      source,
+      Source::Block {
+        block,
+        len: new_len,
+      },
+    );
+    chunks.bytes = chunks.bytes.saturating_sub(old_len).saturating_add(new_len);
+    chunks.named = chunks.named.saturating_sub(old_len).saturating_add(new_len);
+    previous.let_go(blocks);
+  }
+  Some(Reanchored {
+    value: Value {
+      repr: Repr::Tree {
+        tree,
+        seq,
+        version: new_version,
+        extra_chunks: Vec::new(),
+      },
+      len: new_len,
+      own: Some((anchor, new_len)),
+    },
+    lists: (0, 0),
+    latest_list: (0, 0),
+    blocks_cut: 1,
+    bytes_cut: copied,
+    values: 1,
+  })
+}
+
+/// Validates that `values` holds all references to its latest anchor and can transition to a `PathTree`.
+fn promotion_anchor(
+  values: &[&mut Value],
+  chunks: &Chunks,
+  blocks: &Blocks,
+  (block, ops): (Block, &[Op]),
+) -> Option<(usize, usize)> {
+  let latest = values.last()?;
+  let [piece] = latest.pieces_slice() else {
+    return None;
+  };
+  if piece.epoch != CURRENT || piece.at != 0 || piece.len != latest.len {
+    return None;
+  }
+  let old_anchor = piece.chunk;
+  let (old_block, old_len, anchor_refs) = match chunks.slots.get(old_anchor) {
+    Some(Some((Source::Block { block: old, len }, refs))) => (*old, *len, *refs),
+    _ => return None,
+  };
+  if old_len != latest.len || old_block == block {
+    return None;
+  }
+  let before = blocks.bytes(old_block)?;
+  let after = blocks.bytes(block)?;
+  let _ = ops_to_parts(ops, before, after)?;
+  let refs_in_values: usize = values
+    .iter()
+    .flat_map(|v| v.pieces_slice().iter())
+    .filter(|p| p.chunk == old_anchor)
+    .count();
+  (refs_in_values == anchor_refs).then_some((old_anchor, old_len))
+}
+
+/// Converts one flattened `Repr::Pieces` value referencing `old_anchor` into a `Repr::Tree` at `seq = 0`.
+fn convert_value_to_tree(
+  value: &mut Value,
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (tree, old_anchor): (usize, usize),
+) -> bool {
+  let mut runs = Vec::with_capacity(value.pieces_slice().len());
+  let mut extra_chunks = Vec::new();
+  for p in value.pieces_slice() {
+    let (Ok(at), Ok(len)) = (u64::try_from(p.at), u64::try_from(p.len)) else {
+      continue;
+    };
+    if p.chunk == old_anchor {
+      runs.push(Run {
+        source: IDENTITIES,
+        at,
+        len,
+      });
+    } else {
+      chunks.retain(p.chunk);
+      extra_chunks.push(p.chunk);
+      runs.push(Run {
+        source: p.chunk.saturating_add(CHUNK_SOURCE_OFFSET),
+        at,
+        len,
+      });
+    }
+  }
+  let Ok(version) = chunks.piece_trees.of_runs(&runs) else {
+    for chunk in extra_chunks {
+      chunks.release(chunk, blocks);
+    }
+    return false;
+  };
+  let val_len = value.len;
+  let own = value.own;
+  let old = std::mem::replace(
+    value,
+    Value {
+      repr: Repr::Tree {
+        tree,
+        seq: 0,
+        version,
+        extra_chunks,
+      },
+      len: val_len,
+      own,
+    },
+  );
+  old.release(chunks, blocks);
+  true
+}
+
+/// One-time transition of a path from `Repr::Pieces` (initial block + any prior layered overwrites)
+/// to a [`PathTree`], followed immediately by [`tree_step`] on the offset-shifting change. Zero bytes
+/// of the file are copied during promotion: anchor runs become `IDENTITIES` and prior layer chunks
+/// stay directly referenced via `chunk + CHUNK_SOURCE_OFFSET`.
+fn promote_and_step(
+  values: &mut [&mut Value],
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (block, ops): (Block, &[Op]),
+) -> Option<Reanchored> {
+  let (old_anchor, old_len) = promotion_anchor(values, chunks, blocks, (block, ops))?;
+  let latest_before = values.last().map_or(0, |v| v.list_bytes());
+  let lists_before = values
+    .iter()
+    .map(|v| v.list_bytes())
+    .fold(0usize, usize::saturating_add);
+  flatten(values, chunks, blocks);
+  let (places, _) = BytePlaces::first(u64::try_from(old_len).ok()?);
+  chunks.retain(old_anchor);
+  let tree = chunks.alloc_path_tree(PathTree {
+    anchor: old_anchor,
+    places,
+    next_seq: 1,
+    live_seqs: std::collections::BTreeMap::new(),
+  });
+  let mut promoted_count = 0usize;
+  let last_idx = values.len().saturating_sub(1);
+  for (idx, value) in values.iter_mut().enumerate() {
+    let touches = idx == last_idx || value.pieces_slice().iter().any(|p| p.chunk == old_anchor);
+    if touches && convert_value_to_tree(value, chunks, blocks, (tree, old_anchor)) {
+      promoted_count = promoted_count.saturating_add(1);
+    }
+  }
+  if let Some(Some(path_tree)) = chunks.path_trees.get_mut(tree) {
+    path_tree.live_seqs.insert(0, promoted_count);
+  }
+  let mut stepped = values
+    .last_mut()
+    .and_then(|latest| tree_step(latest, chunks, blocks, (block, ops)))?;
+  let lists_after = values
+    .iter()
+    .map(|v| v.list_bytes())
+    .fold(0usize, usize::saturating_add);
+  let latest_after = values.last().map_or(0, |v| v.list_bytes());
+  stepped.lists = (lists_before, lists_after);
+  stepped.latest_list = (latest_before, latest_after);
+  stepped.values = promoted_count.max(1);
+  Some(stepped)
+}
+
+/// In-place overwrite on a `Repr::Tree` latest value: copies overwritten slices into one stored
+/// chunk via `BytePlaces::change`, patches `block` in place, and rebuilds the piece tree in O(parts × log n).
+fn overlay_inplace_tree(
+  latest: &mut Value,
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (block, ops, post_state): (Block, &[Op], crate::named::Post<'_>),
+) -> Option<Reanchored> {
+  let Repr::Tree { tree, .. } = &latest.repr else {
+    return None;
+  };
+  let tree = *tree;
+  let anchor = chunks.path_trees.get(tree)?.as_ref()?.anchor;
+  let (old, len) = match chunks.slots.get(anchor) {
+    Some(Some((Source::Block { block: old, len }, _))) => (*old, *len),
+    _ => return None,
+  };
+  if old != block || len != latest.len || latest.own != Some((anchor, len)) {
+    return None;
+  }
+  let ranges = overwritten(ops, len)?;
+  if ranges.first() == Some(&(0, len)) {
+    return None;
+  }
+  let parts = overwrite_ranges_to_parts(&ranges, len)?;
+  let before = blocks.bytes(block).filter(|b| b.len() == len)?;
+  let (seq, made_parts, copied) = apply_places_change(chunks, tree, before, &parts)?;
+  let buf = blocks.bytes_mut_unique(block)?;
+  patch_block_in_place(buf, ops, post_state)?;
+  let new_version = match &latest.repr {
+    Repr::Tree { version, .. } => chunks.piece_trees.rebuild(version, &made_parts).ok()?,
+    Repr::Pieces(_) => return None,
+  };
+  Some(Reanchored {
+    value: Value {
+      repr: Repr::Tree {
+        tree,
+        seq,
+        version: new_version,
+        extra_chunks: Vec::new(),
+      },
+      len,
+      own: Some((anchor, len)),
+    },
+    lists: (0, 0),
+    latest_list: (0, 0),
+    blocks_cut: 1,
+    bytes_cut: copied,
+    values: 1,
+  })
+}
+
 /// In-place layered overwrite for a uniquely-owned block (Wave 8C): saves the overwritten slices of `block` into
 /// a new history layer at `number`, patches `block`'s bytes in place from `(ops, post_state)`, and returns the
 /// new latest `Value` sharing the same `anchor` chunk (`CURRENT`) while the superseded latest reads at `number`.
@@ -1487,8 +2255,11 @@ pub(crate) fn overlay_inplace(
   blocks: &mut Blocks,
   (block, ops, post_state): (Block, &[Op], crate::named::Post<'_>),
 ) -> Option<Reanchored> {
+  if matches!(latest.repr, Repr::Tree { .. }) {
+    return overlay_inplace_tree(latest, chunks, blocks, (block, ops, post_state));
+  }
   let latest_list = latest.list_bytes();
-  let [piece] = latest.pieces.as_slice() else {
+  let [piece] = latest.pieces_slice() else {
     return None;
   };
   let anchor = piece.chunk;
@@ -1516,11 +2287,13 @@ pub(crate) fn overlay_inplace(
   let copied = owned.len();
   let held = chunks.add(owned);
   record_inplace_layers(chunks, (anchor, held, number), &ranges, places);
-  if let Some(piece) = latest.pieces.first_mut() {
+  if let Repr::Pieces(pieces) = &mut latest.repr
+    && let Some(piece) = pieces.first_mut()
+  {
     piece.epoch = number;
   }
   let mut value = Value {
-    pieces: Vec::new(),
+    repr: Repr::Pieces(Vec::new()),
     len: 0,
     own: Some((anchor, len)),
   };
@@ -1543,8 +2316,9 @@ pub(crate) fn overlay_inplace(
   })
 }
 
-/// Fast O(1) layered overlay on the path's `latest` value alone (without allocating a `Vec<&mut Value>` over the
-/// entire history): returns `None` if the change is not a pure length-preserving overwrite on a layered anchor.
+/// Fast O(1) / O(parts × log n) re-anchor on the path's `latest` value alone (without allocating a
+/// `Vec<&mut Value>` over the entire history): serves both pure layered overwrites and every edit
+/// on a tree-backed path (`Repr::Tree`).
 pub(crate) fn overlay_latest(
   latest: &mut Value,
   chunks: &mut Chunks,
@@ -1553,6 +2327,9 @@ pub(crate) fn overlay_latest(
 ) -> Option<Reanchored> {
   if !layered_allowed() {
     return None;
+  }
+  if matches!(latest.repr, Repr::Tree { .. }) {
+    return tree_step(latest, chunks, blocks, (block, ops));
   }
   let mut one = [latest];
   overlay(&mut one, chunks, blocks, (block, ops))
@@ -1586,7 +2363,7 @@ fn overlay(
 ) -> Option<Reanchored> {
   let latest = values.last()?;
   let latest_list = latest.list_bytes();
-  let [piece] = latest.pieces.as_slice() else {
+  let [piece] = latest.pieces_slice() else {
     return None;
   };
   if piece.epoch != CURRENT || piece.at != 0 || piece.len != latest.len {
@@ -1656,7 +2433,8 @@ fn overlay(
   let count = layers.epochs.entry(number).or_default();
   *count = count.saturating_add(1);
   if let Some(superseded) = values.last_mut()
-    && let Some(piece) = superseded.pieces.first_mut()
+    && let Repr::Pieces(pieces) = &mut superseded.repr
+    && let Some(piece) = pieces.first_mut()
   {
     piece.epoch = number;
   }
@@ -1667,7 +2445,7 @@ fn overlay(
     previous.let_go(blocks);
   }
   let mut value = Value {
-    pieces: Vec::new(),
+    repr: Repr::Pieces(Vec::new()),
     len: 0,
     own: Some((anchor, len)),
   };
@@ -1732,6 +2510,9 @@ fn replaced_here(op: &Op, next: Option<&Op>) -> bool {
 /// reads any more are dropped as the old pieces go ([`Chunks::release_piece`]).
 fn flatten(values: &mut [&mut Value], chunks: &mut Chunks, blocks: &mut Blocks) {
   for value in values.iter_mut() {
+    if matches!(value.repr, Repr::Tree { .. }) {
+      continue;
+    }
     let concrete = match value.concrete(chunks) {
       std::borrow::Cow::Borrowed(_) => continue,
       std::borrow::Cow::Owned(pieces) => pieces,
@@ -1764,7 +2545,7 @@ fn cut_superseded_blocks(
     };
     let named_here = values
       .iter()
-      .flat_map(|value| value.pieces.iter())
+      .flat_map(|value| value.pieces_slice().iter())
       .filter(|piece| piece.chunk == chunk)
       .count();
     // A block held by its object's name alone (A-760 (b) 4d) has no bytes to cut to: it is left whole, its hold with it.
@@ -1774,7 +2555,7 @@ fn cut_superseded_blocks(
     // The union of the runs still named, in chunk order: each run's place in the owned copy.
     let mut runs: Vec<(usize, usize)> = values
       .iter()
-      .flat_map(|value| value.pieces.iter())
+      .flat_map(|value| value.pieces_slice().iter())
       .filter(|piece| piece.chunk == chunk)
       .map(|piece| (piece.at, piece.at.saturating_add(piece.len)))
       .collect();
@@ -1824,7 +2605,10 @@ fn cut_superseded_blocks(
     let copied = owned.len();
     let cut = chunks.add(owned);
     for value in values.iter_mut() {
-      for piece in value.pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
+      let Repr::Pieces(pieces) = &mut value.repr else {
+        continue;
+      };
+      for piece in pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
         // The union is sorted by start and disjoint: the run covering the piece is the last starting at or before it,
         // found by a binary search (a scan per piece was O(pieces x runs), A-787 part 2's red).
         let Some((start, _, place)) = union
@@ -1871,7 +2655,7 @@ mod tests {
   /// order covering it. The oracle the index must equal.
   fn remapped_by_scan(value: &Value, kept: &[Kept], anchor: usize) -> Vec<Piece> {
     let mut out = Vec::new();
-    for piece in &value.pieces {
+    for piece in value.pieces_slice() {
       let end = piece.at + piece.len;
       let mut cursor = piece.at;
       while cursor < end {
@@ -1919,7 +2703,7 @@ mod tests {
       runs in prop::collection::vec((0usize..3, 0usize..200, 0usize..40, 0usize..500), 0..40),
     ) {
       let value = Value {
-        pieces: pieces.iter().map(|&(chunk, at, len)| Piece { chunk, at, len, epoch: CURRENT }).collect(),
+        repr: Repr::Pieces(pieces.iter().map(|&(chunk, at, len)| Piece { chunk, at, len, epoch: CURRENT }).collect()),
         len: 0,
         own: None,
       };

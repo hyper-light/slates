@@ -44,10 +44,10 @@
 //! typed refusal, [`Refusal::Missing`], and counted ([`PieceTrees::missing`]); an offset past a version's end is
 //! [`Refusal::OutOfRange`], and lengths add checked ([`Refusal::Overflow`]).
 
-// Its caller outside tests is the content history's engine switch (A-818 piece 2).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::cell::Cell;
+
+/// Format: bytes charged per live node in [`PieceTrees::slots`].
+pub(crate) const NODE_BYTES: usize = size_of::<Option<Node>>();
 
 /// A node's place in the arena.
 type Slot = usize;
@@ -148,16 +148,19 @@ pub(crate) struct PieceTrees {
 
 impl PieceTrees {
   /// Nodes copied because another holder named them: the non-vacuity counter of sharing.
+  #[cfg(test)]
   pub(crate) fn copied(&self) -> u64 {
     self.copied
   }
 
   /// Nodes reads visited.
+  #[cfg(test)]
   pub(crate) fn visited(&self) -> u64 {
     self.visited.get()
   }
 
   /// Links that named no node: zero in every correct use.
+  #[cfg(test)]
   pub(crate) fn missing(&self) -> u64 {
     self.missing.get()
   }
@@ -181,6 +184,7 @@ impl PieceTrees {
   }
 
   /// Another hold of `version`: O(1).
+  #[cfg(test)]
   pub(crate) fn fork(&mut self, version: &Version) -> Result<Version, Refusal> {
     self.retain(version.root)?;
     Ok(Version { root: version.root })
@@ -191,12 +195,42 @@ impl PieceTrees {
     self.release_tree(version.root);
   }
 
+  /// Drops every node in the arena (for a retired green whose values are all dropped together).
+  pub(crate) fn clear(&mut self) {
+    self.slots.clear();
+    self.free.clear();
+  }
+
+  /// Collects every distinct node slot reachable from `version` (for balanced-accounting recounts).
+  pub(crate) fn reachable_nodes(
+    &self,
+    version: &Version,
+    seen: &mut std::collections::BTreeSet<usize>,
+  ) {
+    let mut stack: Vec<Slot> = version.root.into_iter().collect();
+    while let Some(slot) = stack.pop() {
+      if !seen.insert(slot) {
+        continue;
+      }
+      if let Ok(node) = self.node(slot) {
+        if let Some(left) = node.left {
+          stack.push(left);
+        }
+        if let Some(right) = node.right {
+          stack.push(right);
+        }
+      }
+    }
+  }
+
   /// The bytes in `version`.
+  #[cfg(test)]
   pub(crate) fn len(&self, version: &Version) -> Result<u64, Refusal> {
     self.total(version.root)
   }
 
   /// The height of `version`'s tree, in nodes.
+  #[cfg(test)]
   pub(crate) fn height(&self, version: &Version) -> Result<u32, Refusal> {
     self.height_of(version.root)
   }

@@ -290,7 +290,7 @@ impl Green {
 
   /// One version's content change at `path`, the file `lengths` long before and after it.
   fn content_step(&self, path: &str, version: u64, lengths: (usize, usize), change: &mut Change) {
-    let replaced = self.file_removed.get(path) == Some(&version);
+    let replaced = self.file_removed_of(path) == Some(&version);
     match self.delta_at(version, path) {
       Some(ops) if !replaced && accounts(ops, lengths) => change.edits.push(ops.to_vec()),
       _ => change.node = true,
@@ -318,8 +318,7 @@ impl Green {
   fn node_changed_in(&self, path: &str, (from, to): (u64, u64)) -> bool {
     let span = (from, to);
     self
-      .file_removed
-      .get(path)
+      .file_removed_of(path)
       .is_some_and(|version| from < *version && *version <= to)
       || removed_or_made(self.symlink_history.get(path), span)
       || removed_or_made(self.hardlink_history.get(path), span)

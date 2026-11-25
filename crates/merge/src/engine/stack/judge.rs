@@ -155,7 +155,7 @@ impl Green {
   fn linked_by_another(&self, path: &str, against: &Against<'_>) -> bool {
     let (base, landed) = against.since;
     self.links_to.get(path).into_iter().flatten().any(|link| {
-      let changed = self.changed_last(self.hardlink_changed.get(link), link);
+      let changed = self.changed_last(self.hardlink_changed_of(link), link);
       changed > base && !landed.contains(&changed)
     })
   }

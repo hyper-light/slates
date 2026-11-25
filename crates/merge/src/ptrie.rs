@@ -34,20 +34,343 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-/// A node's place in its arena.
-type Slot = usize;
+/// A node's place in its arena: 32-bit index halves child-slot and free-list footprint while
+/// addressing up to `u32::MAX` live trie nodes.
+type Slot = u32;
+
+/// Converts a 32-bit arena slot to a slice index.
+#[inline]
+fn slot_index(slot: Slot) -> usize {
+  usize::try_from(slot).unwrap_or(usize::MAX)
+}
+
+/// Format: inline edge-label bytes fitting inside `size_of::<Vec<u8>>()` (24B on 64-bit:
+/// 1B enum tag + 1B length + 22B inline payload = 24B; eliminates heap allocations for ~95% of path edges).
+const INLINE_LABEL_BYTES: usize = size_of::<Vec<u8>>().saturating_sub(2);
+
+/// Compact edge label stored inline up to [`INLINE_LABEL_BYTES`] bytes and boxed on the heap beyond.
+#[derive(Clone, Debug)]
+enum CompactLabel {
+  Inline {
+    len: u8,
+    bytes: [u8; INLINE_LABEL_BYTES],
+  },
+  Heap(Box<[u8]>),
+}
+
+impl Default for CompactLabel {
+  fn default() -> Self {
+    Self::Inline {
+      len: 0,
+      bytes: [0u8; INLINE_LABEL_BYTES],
+    }
+  }
+}
+
+impl CompactLabel {
+  fn from_slice(bytes: &[u8]) -> Self {
+    if bytes.len() <= INLINE_LABEL_BYTES {
+      let mut buf = [0u8; INLINE_LABEL_BYTES];
+      if let Some(dst) = buf.get_mut(..bytes.len()) {
+        dst.copy_from_slice(bytes);
+      }
+      Self::Inline {
+        len: u8::try_from(bytes.len()).unwrap_or(0),
+        bytes: buf,
+      }
+    } else {
+      Self::Heap(bytes.into())
+    }
+  }
+
+  fn from_concat(head: &[u8], tail: &[u8]) -> Self {
+    let total = head.len().saturating_add(tail.len());
+    if total <= INLINE_LABEL_BYTES {
+      let mut buf = [0u8; INLINE_LABEL_BYTES];
+      if let Some(dst) = buf.get_mut(..head.len()) {
+        dst.copy_from_slice(head);
+      }
+      if let Some(dst) = buf.get_mut(head.len()..total) {
+        dst.copy_from_slice(tail);
+      }
+      Self::Inline {
+        len: u8::try_from(total).unwrap_or(0),
+        bytes: buf,
+      }
+    } else {
+      let mut vec = Vec::with_capacity(total);
+      vec.extend_from_slice(head);
+      vec.extend_from_slice(tail);
+      Self::Heap(vec.into_boxed_slice())
+    }
+  }
+
+  #[inline]
+  fn as_slice(&self) -> &[u8] {
+    match self {
+      Self::Inline { len, bytes } => bytes.get(..usize::from(*len)).unwrap_or_default(),
+      Self::Heap(bytes) => bytes,
+    }
+  }
+
+  #[inline]
+  fn len(&self) -> usize {
+    self.as_slice().len()
+  }
+
+  #[cfg(test)]
+  #[inline]
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  #[inline]
+  fn first(&self) -> Option<&u8> {
+    self.as_slice().first()
+  }
+}
+
+/// Format: inline child entries fitting within `size_of::<Vec<(u8, Slot)>>()` (24B on 64-bit:
+/// 1B tag + 1B len + 3B keys + 12B slots = 20B <= 24B; avoids heap allocations for leaf and low-fanout nodes).
+const SMALL_CHILDREN_CAP: usize = 3;
+
+/// Compact ascending child table keyed by each child edge's first byte.
+#[derive(Clone, Debug, Default)]
+enum CompactChildren {
+  #[default]
+  Empty,
+  One(u8, Slot),
+  Small {
+    len: u8,
+    keys: [u8; SMALL_CHILDREN_CAP],
+    slots: [Slot; SMALL_CHILDREN_CAP],
+  },
+  Many(Vec<(u8, Slot)>),
+}
+
+impl CompactChildren {
+  #[inline]
+  fn len(&self) -> usize {
+    match self {
+      Self::Empty => 0,
+      Self::One(_, _) => 1,
+      Self::Small { len, .. } => usize::from(*len),
+      Self::Many(vec) => vec.len(),
+    }
+  }
+
+  #[inline]
+  fn get(&self, index: usize) -> Option<(u8, Slot)> {
+    match self {
+      Self::Empty => None,
+      Self::One(first, slot) => (index == 0).then_some((*first, *slot)),
+      Self::Small { len, keys, slots } => {
+        if index < usize::from(*len) {
+          Some((*keys.get(index)?, *slots.get(index)?))
+        } else {
+          None
+        }
+      }
+      Self::Many(vec) => vec.get(index).copied(),
+    }
+  }
+
+  #[inline]
+  fn only(&self) -> Option<(u8, Slot)> {
+    match self {
+      Self::One(first, slot) => Some((*first, *slot)),
+      Self::Small {
+        len: 1,
+        keys,
+        slots,
+      } => Some((*keys.first()?, *slots.first()?)),
+      Self::Many(vec) => match vec.as_slice() {
+        [entry] => Some(*entry),
+        _ => None,
+      },
+      _ => None,
+    }
+  }
+
+  #[inline]
+  fn find(&self, byte: u8) -> Option<(usize, Slot)> {
+    match self {
+      Self::Empty => None,
+      Self::One(first, slot) => (*first == byte).then_some((0, *slot)),
+      Self::Small { len, keys, slots } => {
+        let count = usize::from(*len).min(SMALL_CHILDREN_CAP);
+        for index in 0..count {
+          if keys.get(index) == Some(&byte) {
+            return slots.get(index).copied().map(|slot| (index, slot));
+          }
+        }
+        None
+      }
+      Self::Many(vec) => vec
+        .binary_search_by_key(&byte, |(first, _)| *first)
+        .ok()
+        .and_then(|index| vec.get(index).map(|(_, slot)| (index, *slot))),
+    }
+  }
+
+  #[inline]
+  fn set_slot(&mut self, index: usize, child: Slot) {
+    match self {
+      Self::Empty => {}
+      Self::One(_, slot) => {
+        if index == 0 {
+          *slot = child;
+        }
+      }
+      Self::Small { len, slots, .. } => {
+        if index < usize::from(*len)
+          && let Some(slot) = slots.get_mut(index)
+        {
+          *slot = child;
+        }
+      }
+      Self::Many(vec) => {
+        if let Some(entry) = vec.get_mut(index) {
+          entry.1 = child;
+        }
+      }
+    }
+  }
+
+  fn insert(&mut self, first: u8, child: Slot) {
+    match self {
+      Self::Empty => *self = Self::One(first, child),
+      Self::One(k0, s0) => {
+        let (k0, s0) = (*k0, *s0);
+        let mut keys = [0u8; SMALL_CHILDREN_CAP];
+        let mut slots = [0 as Slot; SMALL_CHILDREN_CAP];
+        if first < k0 {
+          keys[0] = first;
+          slots[0] = child;
+          keys[1] = k0;
+          slots[1] = s0;
+        } else {
+          keys[0] = k0;
+          slots[0] = s0;
+          keys[1] = first;
+          slots[1] = child;
+        }
+        *self = Self::Small {
+          len: 2,
+          keys,
+          slots,
+        };
+      }
+      Self::Small { len, keys, slots } => {
+        let count = usize::from(*len).min(SMALL_CHILDREN_CAP);
+        if count < SMALL_CHILDREN_CAP {
+          let at = keys
+            .get(..count)
+            .map_or(count, |ks| ks.partition_point(|byte| *byte < first));
+          for idx in (at..count).rev() {
+            let next = idx.saturating_add(1);
+            if let (Some(&k), Some(&s)) = (keys.get(idx), slots.get(idx))
+              && let (Some(kd), Some(sd)) = (keys.get_mut(next), slots.get_mut(next))
+            {
+              *kd = k;
+              *sd = s;
+            }
+          }
+          if let (Some(kd), Some(sd)) = (keys.get_mut(at), slots.get_mut(at)) {
+            *kd = first;
+            *sd = child;
+          }
+          *len = u8::try_from(count.saturating_add(1)).unwrap_or(*len);
+        } else {
+          let mut vec = Vec::with_capacity(SMALL_CHILDREN_CAP.saturating_add(1));
+          for idx in 0..count {
+            if let (Some(&k), Some(&s)) = (keys.get(idx), slots.get(idx)) {
+              vec.push((k, s));
+            }
+          }
+          let at = vec.partition_point(|(byte, _)| *byte < first);
+          vec.insert(at, (first, child));
+          *self = Self::Many(vec);
+        }
+      }
+      Self::Many(vec) => {
+        let at = vec.partition_point(|(byte, _)| *byte < first);
+        vec.insert(at, (first, child));
+      }
+    }
+  }
+
+  fn remove_small(&mut self, index: usize) {
+    let Self::Small { len, keys, slots } = self else {
+      return;
+    };
+    let count = usize::from(*len).min(SMALL_CHILDREN_CAP);
+    if index >= count {
+      return;
+    }
+    let next_count = count.saturating_sub(1);
+    for idx in index..next_count {
+      let src = idx.saturating_add(1);
+      if let (Some(&k), Some(&s)) = (keys.get(src), slots.get(src))
+        && let (Some(kd), Some(sd)) = (keys.get_mut(idx), slots.get_mut(idx))
+      {
+        *kd = k;
+        *sd = s;
+      }
+    }
+    match next_count {
+      0 => *self = Self::Empty,
+      1 => {
+        if let (Some(&k), Some(&s)) = (keys.first(), slots.first()) {
+          *self = Self::One(k, s);
+        }
+      }
+      _ => *len = u8::try_from(next_count).unwrap_or(0),
+    }
+  }
+
+  fn remove(&mut self, index: usize) {
+    match self {
+      Self::Empty => {}
+      Self::One(_, _) => {
+        if index == 0 {
+          *self = Self::Empty;
+        }
+      }
+      Self::Small { .. } => self.remove_small(index),
+      Self::Many(vec) => {
+        if index < vec.len() {
+          vec.remove(index);
+          match vec.as_slice() {
+            [] => *self = Self::Empty,
+            [entry] => *self = Self::One(entry.0, entry.1),
+            _ => {}
+          }
+        }
+      }
+    }
+  }
+
+  fn for_each(&self, mut visit: impl FnMut(u8, Slot)) {
+    for index in 0..self.len() {
+      if let Some((first, slot)) = self.get(index) {
+        visit(first, slot);
+      }
+    }
+  }
+}
 
 /// One node: the edge bytes from its parent, the value whose key ends here, and its children.
 #[derive(Debug)]
 struct Node<V> {
   /// The edge's bytes from the parent: empty only at a map's root.
-  label: Vec<u8>,
+  label: CompactLabel,
   /// The value whose key ends here.
   value: Option<V>,
   /// The children, each under the first byte of its label (distinct), ascending.
-  children: Vec<(u8, Slot)>,
+  children: CompactChildren,
   /// The values in this node's subtree, its own included.
-  count: usize,
+  count: u32,
   /// The maps, parents and held subtrees that name this node.
   holders: u32,
 }
@@ -116,7 +439,7 @@ impl<V> Nodes<V> {
   }
 
   fn node(&self, slot: Slot) -> Option<&Node<V>> {
-    let node = self.slots.get(slot).and_then(Option::as_ref);
+    let node = self.slots.get(slot_index(slot)).and_then(Option::as_ref);
     if node.is_none() {
       self.missing.set(self.missing.get().saturating_add(1));
     }
@@ -124,7 +447,10 @@ impl<V> Nodes<V> {
   }
 
   fn node_mut(&mut self, slot: Slot) -> Option<&mut Node<V>> {
-    let node = self.slots.get_mut(slot).and_then(Option::as_mut);
+    let node = self
+      .slots
+      .get_mut(slot_index(slot))
+      .and_then(Option::as_mut);
     if node.is_none() {
       self.missing.set(self.missing.get().saturating_add(1));
     }
@@ -134,18 +460,19 @@ impl<V> Nodes<V> {
   /// A new node, in a freed slot when there is one.
   fn alloc(&mut self, node: Node<V>) -> Slot {
     if let Some(slot) = self.free.pop()
-      && let Some(place) = self.slots.get_mut(slot)
+      && let Some(place) = self.slots.get_mut(slot_index(slot))
     {
       *place = Some(node);
       return slot;
     }
+    let slot = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
     self.slots.push(Some(node));
-    self.slots.len().saturating_sub(1)
+    slot
   }
 
   /// Takes a node out of its slot, which is freed.
   fn take(&mut self, slot: Slot) -> Option<Node<V>> {
-    let node = self.slots.get_mut(slot).and_then(Option::take);
+    let node = self.slots.get_mut(slot_index(slot)).and_then(Option::take);
     match node {
       Some(_) => self.free.push(slot),
       None => self.missing.set(self.missing.get().saturating_add(1)),
@@ -162,7 +489,9 @@ impl<V> Nodes<V> {
 
   /// The values in the subtree at `slot`.
   fn count(&self, slot: Slot) -> usize {
-    self.node(slot).map_or(0, |node| node.count)
+    self
+      .node(slot)
+      .map_or(0, |node| usize::try_from(node.count).unwrap_or(usize::MAX))
   }
 
   /// Gives one hold on the subtree at `slot` back: each node no holder names any more is freed, its value told.
@@ -187,9 +516,9 @@ impl<V> Nodes<V> {
       return true;
     }
     if let Some(node) = self.take(slot) {
-      releasing
-        .pending
-        .extend(node.children.iter().map(|(_, child)| *child));
+      node
+        .children
+        .for_each(|_, child| releasing.pending.push(child));
       if let Some(value) = node.value {
         holders.freed(value);
       }
@@ -215,17 +544,7 @@ impl Releasing {
 
 /// The child of `node` whose label starts with `byte`: its index in the children and its slot.
 fn child_of<V>(node: &Node<V>, byte: u8) -> Option<(usize, Slot)> {
-  node
-    .children
-    .binary_search_by_key(&byte, |(first, _)| *first)
-    .ok()
-    .and_then(|index| node.children.get(index).map(|(_, slot)| (index, *slot)))
-}
-
-/// Puts `child` among `children`, keeping them ordered by first byte.
-fn add_child(children: &mut Vec<(u8, Slot)>, first: u8, child: Slot) {
-  let at = children.partition_point(|(byte, _)| *byte < first);
-  children.insert(at, (first, child));
+  node.children.find(byte)
 }
 
 /// The bytes `a` and `b` begin with alike.
@@ -253,9 +572,7 @@ fn unique<V: Clone>(nodes: &mut Nodes<V>, slot: Slot, holders: &mut impl Holders
   if let Some(value) = &copy.value {
     holders.copied(value);
   }
-  for (_, child) in &copy.children {
-    nodes.hold(*child);
-  }
+  copy.children.for_each(|_, child| nodes.hold(child));
   nodes.copied = nodes.copied.saturating_add(1);
   nodes.alloc(copy)
 }
@@ -388,9 +705,9 @@ impl<V: Clone> Ptrie<V> {
       Some(root) => root,
       None => {
         let root = nodes.alloc(Node {
-          label: Vec::new(),
+          label: CompactLabel::default(),
           value: None,
-          children: Vec::new(),
+          children: CompactChildren::Empty,
           count: 0,
           holders: 1,
         });
@@ -472,7 +789,7 @@ impl<V: Clone> Ptrie<V> {
         return Some((at, above, label));
       };
       let (_, child) = child_of(node, *first)?;
-      let label = &nodes.node(child)?.label;
+      let label = nodes.node(child)?.label.as_slice();
       let common = common_prefix(label, rest);
       if common == rest.len() {
         return Some((child, above, common));
@@ -595,14 +912,11 @@ fn graft_top<V: Clone>(
   // A map's root may be a bare edge (no value, one child); a grafted node may not, so the child takes its place, the
   // edge's bytes before its own.
   if top.value.is_none()
-    && let [(_, only)] = top.children.as_slice()
+    && let Some((_, only)) = top.children.only()
   {
-    let only = *only;
     let mut below = copy_of(nodes, only, 0, holders);
     nodes.release(only, holders);
-    let mut label = std::mem::take(&mut top.label);
-    label.append(&mut below.label);
-    below.label = label;
+    below.label = CompactLabel::from_concat(top.label.as_slice(), below.label.as_slice());
     top = below;
   }
   top
@@ -617,11 +931,7 @@ fn copy_of<V: Clone>(
   holders: &mut impl Holders<V>,
 ) -> Node<V> {
   let copy = nodes.node(slot).map(|node| Node {
-    label: node
-      .label
-      .get(skip..)
-      .map(<[u8]>::to_vec)
-      .unwrap_or_default(),
+    label: CompactLabel::from_slice(node.label.as_slice().get(skip..).unwrap_or_default()),
     value: node.value.clone(),
     children: node.children.clone(),
     count: node.count,
@@ -629,9 +939,9 @@ fn copy_of<V: Clone>(
   });
   let Some(copy) = copy else {
     return Node {
-      label: Vec::new(),
+      label: CompactLabel::default(),
       value: None,
-      children: Vec::new(),
+      children: CompactChildren::Empty,
       count: 0,
       holders: 1,
     };
@@ -639,19 +949,15 @@ fn copy_of<V: Clone>(
   if let Some(value) = &copy.value {
     holders.copied(value);
   }
-  for (_, child) in &copy.children {
-    nodes.hold(*child);
-  }
+  copy.children.for_each(|_, child| nodes.hold(child));
   copy
 }
 
 /// Points the child at `index` of the node at `slot` at `child`: the node's slot is unique-made already, so the
 /// edit touches no other map's node.
 fn set_child<V>(nodes: &mut Nodes<V>, slot: Slot, index: usize, child: Slot) {
-  if let Some(node) = nodes.node_mut(slot)
-    && let Some(entry) = node.children.get_mut(index)
-  {
-    entry.1 = child;
+  if let Some(node) = nodes.node_mut(slot) {
+    node.children.set_slot(index, child);
   }
 }
 
@@ -682,7 +988,7 @@ fn graft_at<V: Clone>(
       Some(first) => {
         let child = nodes.alloc(top);
         if let Some(node) = nodes.node_mut(slot) {
-          add_child(&mut node.children, first, child);
+          node.children.insert(first, child);
         }
       }
     }
@@ -691,42 +997,47 @@ fn graft_at<V: Clone>(
   let found = nodes.node(slot).and_then(|node| child_of(node, first));
   match found {
     None => {
-      let mut label = rest.to_vec();
-      label.append(&mut top.label);
-      top.label = label;
+      top.label = CompactLabel::from_concat(rest, top.label.as_slice());
       let child = nodes.alloc(top);
       if let Some(node) = nodes.node_mut(slot) {
-        add_child(&mut node.children, first, child);
+        node.children.insert(first, child);
       }
     }
     Some((index, child)) => {
-      let label = nodes
-        .node(child)
-        .map(|node| node.label.clone())
-        .unwrap_or_default();
-      let common = common_prefix(&label, rest);
-      if common == label.len() {
+      let (label_len, common) = nodes.node(child).map_or((0, 0), |node| {
+        let slice = node.label.as_slice();
+        (slice.len(), common_prefix(slice, rest))
+      });
+      if common == label_len {
         let below = rest.get(common..).unwrap_or_default();
         let child = graft_at(nodes, child, below, top, holders);
         set_child(nodes, slot, index, child);
       } else {
         // The destination and the child part within the child's label: split it there.
         let child = unique(nodes, child, holders);
-        let tail = label.get(common..).map(<[u8]>::to_vec).unwrap_or_default();
-        let child_count = nodes.count(child);
-        let tail_first = tail.first().copied().unwrap_or_default();
+        let (prefix_label, tail_label, child_count) = nodes
+          .node(child)
+          .map(|node| {
+            let slice = node.label.as_slice();
+            (
+              CompactLabel::from_slice(slice.get(..common).unwrap_or_default()),
+              CompactLabel::from_slice(slice.get(common..).unwrap_or_default()),
+              node.count,
+            )
+          })
+          .unwrap_or_default();
+        let tail_first = tail_label.first().copied().unwrap_or_default();
         if let Some(node) = nodes.node_mut(child) {
-          node.label = tail;
+          node.label = tail_label;
         }
-        let mut grafted_label = rest.get(common..).map(<[u8]>::to_vec).unwrap_or_default();
-        let grafted_first = grafted_label.first().copied().unwrap_or_default();
-        grafted_label.append(&mut top.label);
-        top.label = grafted_label;
+        let rest_tail = rest.get(common..).unwrap_or_default();
+        let grafted_first = rest_tail.first().copied().unwrap_or_default();
+        top.label = CompactLabel::from_concat(rest_tail, top.label.as_slice());
         let grafted = nodes.alloc(top);
-        let mut children = vec![(tail_first, child)];
-        add_child(&mut children, grafted_first, grafted);
+        let mut children = CompactChildren::One(tail_first, child);
+        children.insert(grafted_first, grafted);
         let middle = nodes.alloc(Node {
-          label: label.get(..common).map(<[u8]>::to_vec).unwrap_or_default(),
+          label: prefix_label,
           value: None,
           children,
           count: child_count.saturating_add(added),
@@ -764,24 +1075,23 @@ fn insert_at<V: Clone>(
   let replaced = match found {
     None => {
       let leaf = nodes.alloc(Node {
-        label: rest.to_vec(),
+        label: CompactLabel::from_slice(rest),
         value: Some(value),
-        children: Vec::new(),
+        children: CompactChildren::Empty,
         count: 1,
         holders: 1,
       });
       if let Some(node) = nodes.node_mut(slot) {
-        add_child(&mut node.children, first, leaf);
+        node.children.insert(first, leaf);
       }
       None
     }
     Some((index, child)) => {
-      let label = nodes
-        .node(child)
-        .map(|node| node.label.clone())
-        .unwrap_or_default();
-      let common = common_prefix(&label, rest);
-      if common == label.len() {
+      let (label_len, common) = nodes.node(child).map_or((0, 0), |node| {
+        let slice = node.label.as_slice();
+        (slice.len(), common_prefix(slice, rest))
+      });
+      if common == label_len {
         let below = rest.get(common..).unwrap_or_default();
         let (child, replaced) = insert_at(nodes, child, below, value, holders);
         set_child(nodes, slot, index, child);
@@ -789,33 +1099,40 @@ fn insert_at<V: Clone>(
       } else {
         // The key leaves the child's label partway: split the label there.
         let child = unique(nodes, child, holders);
-        let tail = label.get(common..).map(<[u8]>::to_vec).unwrap_or_default();
-        let tail_first = tail.first().copied().unwrap_or_default();
-        let child_count = nodes.count(child);
+        let (prefix_label, tail_label, child_count) = nodes
+          .node(child)
+          .map(|node| {
+            let slice = node.label.as_slice();
+            (
+              CompactLabel::from_slice(slice.get(..common).unwrap_or_default()),
+              CompactLabel::from_slice(slice.get(common..).unwrap_or_default()),
+              node.count,
+            )
+          })
+          .unwrap_or_default();
+        let tail_first = tail_label.first().copied().unwrap_or_default();
         if let Some(node) = nodes.node_mut(child) {
-          node.label = tail;
+          node.label = tail_label;
         }
         let mut middle = Node {
-          label: label.get(..common).map(<[u8]>::to_vec).unwrap_or_default(),
+          label: prefix_label,
           value: None,
-          children: vec![(tail_first, child)],
+          children: CompactChildren::One(tail_first, child),
           count: child_count.saturating_add(1),
           holders: 1,
         };
         match rest.get(common..) {
           Some(below) if !below.is_empty() => {
             let leaf = nodes.alloc(Node {
-              label: below.to_vec(),
+              label: CompactLabel::from_slice(below),
               value: Some(value),
-              children: Vec::new(),
+              children: CompactChildren::Empty,
               count: 1,
               holders: 1,
             });
-            add_child(
-              &mut middle.children,
-              below.first().copied().unwrap_or_default(),
-              leaf,
-            );
+            middle
+              .children
+              .insert(below.first().copied().unwrap_or_default(), leaf);
           }
           _ => middle.value = Some(value),
         }
@@ -855,16 +1172,8 @@ fn remove_at<V: Clone>(
       let (child, removed) = remove_at(nodes, child, below, false, holders);
       if let Some(node) = nodes.node_mut(slot) {
         match child {
-          Some(child) => {
-            if let Some(entry) = node.children.get_mut(index) {
-              entry.1 = child;
-            }
-          }
-          None => {
-            if index < node.children.len() {
-              node.children.remove(index);
-            }
-          }
+          Some(child) => node.children.set_slot(index, child),
+          None => node.children.remove(index),
         }
       }
       removed
@@ -889,24 +1198,23 @@ fn tidied<V: Clone>(
   holders: &mut impl Holders<V>,
 ) -> Option<Slot> {
   let node = nodes.node(slot)?;
-  let (bare, children) = (node.value.is_none(), node.children.clone());
-  if !bare {
+  if node.value.is_some() {
     return Some(slot);
   }
-  match children.as_slice() {
-    [] => {
+  match node.children.len() {
+    0 => {
       nodes.take(slot);
       None
     }
-    [(_, only)] => {
-      let only = unique(nodes, *only, holders);
-      let mut label = nodes
+    1 => {
+      let (_, only) = node.children.only()?;
+      let only = unique(nodes, only, holders);
+      let prefix = nodes
         .node(slot)
-        .map(|node| node.label.clone())
+        .map(|n| n.label.clone())
         .unwrap_or_default();
       if let Some(node) = nodes.node_mut(only) {
-        label.append(&mut node.label);
-        node.label = label;
+        node.label = CompactLabel::from_concat(prefix.as_slice(), node.label.as_slice());
       }
       nodes.take(slot);
       Some(only)
@@ -935,7 +1243,7 @@ fn cut_at<V: Clone>(
   let label = nodes.node(child).map_or(0, |node| node.label.len());
   let common = nodes
     .node(child)
-    .map_or(0, |node| common_prefix(&node.label, rest));
+    .map_or(0, |node| common_prefix(node.label.as_slice(), rest));
   let (replacement, cut) = if common == rest.len() {
     // The prefix ends inside the child's label or at its end: every key below the child starts with it, and the link
     // to the child is the subtree's hold.
@@ -978,18 +1286,12 @@ fn relink_child<V>(
     return;
   };
   match replacement {
-    Some(replacement) => {
-      if let Some(entry) = node.children.get_mut(index) {
-        entry.1 = replacement;
-      }
-    }
-    None => {
-      if index < node.children.len() {
-        node.children.remove(index);
-      }
-    }
+    Some(replacement) => node.children.set_slot(index, replacement),
+    None => node.children.remove(index),
   }
-  node.count = node.count.saturating_sub(taken);
+  node.count = node
+    .count
+    .saturating_sub(u32::try_from(taken).unwrap_or(u32::MAX));
 }
 
 /// A walk of a map in byte order, each node it visits counted.
@@ -1030,7 +1332,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
         }
         nodes.visited.set(nodes.visited.get().saturating_add(1));
         self.key.truncate(base);
-        self.key.extend_from_slice(&node.label);
+        self.key.extend_from_slice(node.label.as_slice());
         if let Some(value) = &node.value {
           return Some((self.key.clone(), value));
         }
@@ -1043,7 +1345,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
           }
           let below = base.saturating_add(node.label.len());
           self.key.truncate(below);
-          self.stack.push((*child, 0, below, false));
+          self.stack.push((child, 0, below, false));
         }
         None => {
           self.stack.pop();
@@ -1139,13 +1441,16 @@ mod tests {
   /// Every node's count is its subtree's values, and every non-root node has a label and is not a bare single edge.
   fn checked(nodes: &Nodes<u32>, slot: Slot, root: bool) -> usize {
     let node = nodes.node(slot).expect("a live node");
-    let below: usize = node
+    let mut entries = Vec::with_capacity(node.children.len());
+    node
       .children
+      .for_each(|first, child| entries.push((first, child)));
+    let below: usize = entries
       .iter()
       .map(|(_, child)| checked(nodes, *child, false))
       .sum();
     let count = below + usize::from(node.value.is_some());
-    assert_eq!(node.count, count, "a stale count");
+    assert_eq!(usize::try_from(node.count).unwrap(), count, "a stale count");
     if !root {
       assert!(!node.label.is_empty(), "an empty label below the root");
       assert!(
@@ -1153,10 +1458,10 @@ mod tests {
         "a bare edge left in place"
       );
     }
-    for pair in node.children.windows(2) {
+    for pair in entries.windows(2) {
       assert!(pair[0].0 < pair[1].0, "children out of order");
     }
-    for (first, child) in &node.children {
+    for (first, child) in &entries {
       assert_eq!(
         nodes.node(*child).expect("a child").label.first(),
         Some(first)

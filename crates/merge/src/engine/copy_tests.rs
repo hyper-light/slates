@@ -400,8 +400,8 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   replica_reads_alike(&mut replica, &mut green);
   // The file the copy brought and its own increment edited replaced no file: A-612's removals record none, live or
   // replayed.
-  assert!(!green.file_removed.contains_key("b/a"));
-  assert!(!replica.file_removed.contains_key("b/a"));
+  assert!(green.file_removed_of("b/a").is_none());
+  assert!(replica.file_removed_of("b/a").is_none());
 }
 
 /// The edits of the copy's own increment on what the copy brought at `b`, and the trunk untouched.

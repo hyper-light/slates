@@ -520,3 +520,84 @@ fn a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_ov
     );
   }
 }
+
+/// Asserts that every version in `range` (1-based) reads back equal to `versions[v - 1]`.
+fn assert_versions_match(green: &Green, versions: &[Vec<u8>], range: impl Iterator<Item = u64>) {
+  for version in range {
+    let index = usize::try_from(version - 1).unwrap();
+    assert_eq!(
+      green.content_ref_at_bytes("f", version).as_deref(),
+      Some(versions[index].as_slice()),
+      "version {version}"
+    );
+  }
+}
+
+/// Applies one alternating overwrite or insert step on `"f"` and returns `(walked, next_bytes)`.
+fn apply_alternating_step(green: &mut Green, step: u64, prev: &[u8]) -> (u64, Vec<u8>) {
+  let version = step + 2;
+  let at = (step * 97) % u64::try_from(prev.len() - 64).unwrap();
+  let payload = [u8::try_from(version % 251).unwrap(); 64];
+  let kind = if step.is_multiple_of(2) {
+    OpKind::Overwrite
+  } else {
+    OpKind::Insert
+  };
+  let mut inc = increment(0, version - 1, "f", &[(kind, at, 64)], &payload);
+  inc.id[..8].copy_from_slice(&version.to_le_bytes());
+  let before_walked = green.history_reanchored_values();
+  assert_eq!(green.submit(&inc), Outcome::Accepted { version });
+  let walked = green.history_reanchored_values() - before_walked;
+  let mut next = prev.to_vec();
+  let pos = usize::try_from(at).unwrap();
+  if kind == OpKind::Overwrite {
+    next[pos..pos + 64].copy_from_slice(&payload);
+  } else {
+    next.splice(pos..pos, payload);
+  }
+  (walked, next)
+}
+
+/// A-818 piece 2b (non-vacuity for `PieceTrees` + `BytePlaces` in `history.rs`). Do: create a 16 KiB
+/// file and submit 300 alternating overwrites and inserts with nothing folded, then verify every version
+/// reads back byte-exact, fold partway and verify remaining versions + balanced accounting, then fold
+/// to head and verify the tree collapses back cleanly. Expect: `walked_last == 1` (never 300).
+#[test]
+fn alternating_overwrites_and_inserts_walk_one_value_and_balance_through_folds() {
+  const LEN: usize = 16 * 1024;
+  const VERSIONS: u64 = 300;
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let mut green = Green::new();
+  let len = u64::try_from(LEN).unwrap();
+  let made = green.submit(&increment(
+    1,
+    0,
+    "f",
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    &first,
+  ));
+  assert_eq!(made, Outcome::Accepted { version: 1 });
+  let mut versions = vec![first];
+  let mut walked_last = 0;
+  for step in 0..VERSIONS {
+    let (walked, next) = apply_alternating_step(&mut green, step, versions.last().unwrap());
+    walked_last = walked;
+    versions.push(next);
+  }
+  assert_eq!(
+    walked_last, 1,
+    "offset-shifting alternating edits must walk 1 value via PathTree, walked {walked_last}"
+  );
+  balanced(&green);
+  assert_versions_match(&green, &versions, 1..=VERSIONS + 1);
+  // Partial fold retires dead stored chunks while keeping versions >= 150 readable and balanced.
+  green.fold_history_before(150);
+  balanced(&green);
+  assert_versions_match(&green, &versions, (150..=VERSIONS + 1).step_by(25));
+  // Folding to head collapses the lone tree-backed latest value back to a single named block.
+  let head = green.head();
+  green.fold_history_before(head);
+  balanced(&green);
+  assert_versions_match(&green, &versions, std::iter::once(head));
+  assert_eq!(green.history_owned_bytes(), 0);
+}

@@ -322,11 +322,7 @@ impl Green {
         fix: None,
       },
     );
-    let last = self
-      .last_changed
-      .entry(record.destination.clone())
-      .or_insert(record.version);
-    *last = (*last).max(record.version);
+    self.bump_last_changed(&record.destination, record.version);
     self.changes_bytes = self
       .changes_bytes
       .saturating_add(appearance_bytes(&record.destination, &record.source));

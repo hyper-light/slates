@@ -41,9 +41,6 @@
 //! **No panics.** Every slot is read with `get`; a link to no node and an identity no entry holds are
 //! [`Refusal::Missing`]; parts out of order are [`Refusal::Unordered`], which the caller answers as a whole replace.
 
-// Its caller outside tests is the content history's engine switch (A-818 piece 2b).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::piece_tree::{Part, Refusal, Run};
@@ -468,11 +465,13 @@ impl BytePlaces {
   }
 
   /// The index's entries.
+  #[cfg(test)]
   pub(crate) fn entries(&self) -> usize {
     self.index.len()
   }
 
   /// The latest version's length.
+  #[cfg(test)]
   pub(crate) fn len(&self) -> Result<u64, Refusal> {
     self.order.len()
   }
@@ -664,6 +663,14 @@ impl BytePlaces {
       }
       Entry::Stored { chunk, at, len } => Ok((len, Place::Stored { chunk, at, len })),
     }
+  }
+
+  /// Every chunk handle currently referenced by unretired stored runs (for balanced-accounting recounts).
+  pub(crate) fn stored_chunks(&self) -> impl Iterator<Item = usize> + '_ {
+    self
+      .log
+      .iter()
+      .flat_map(|stored| stored.chunks.iter().copied())
   }
 
   /// Retires what the changes making versions up to `floor` stored: no retained version (each at `floor` or later)

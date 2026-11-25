@@ -950,6 +950,68 @@ pub enum RebasedParts {
   },
 }
 
+/// Format: presence bit for `PathVersions::last_changed`.
+const PV_CONTENT: u8 = 1 << 0;
+/// Format: presence bit for `PathVersions::file_removed`.
+const PV_REMOVED: u8 = 1 << 1;
+/// Format: presence bit for `PathVersions::mode_changed`.
+const PV_MODE: u8 = 1 << 2;
+/// Format: presence bit for `PathVersions::symlink_changed`.
+const PV_SYMLINK: u8 = 1 << 3;
+/// Format: presence bit for `PathVersions::hardlink_changed`.
+const PV_HARDLINK: u8 = 1 << 4;
+/// Format: presence bit for `PathVersions::special_changed`.
+const PV_SPECIAL: u8 = 1 << 5;
+
+/// Unified per-path version watermarks replacing six separate `BTreeMap<String, u64>` maps.
+#[derive(Clone, Copy, Debug, Default)]
+struct PathVersions {
+  present: u8,
+  last_changed: u64,
+  file_removed: u64,
+  mode_changed: u64,
+  symlink_changed: u64,
+  hardlink_changed: u64,
+  special_changed: u64,
+}
+
+impl PathVersions {
+  #[inline]
+  fn get<'a>(&self, bit: u8, value: &'a u64) -> Option<&'a u64> {
+    (self.present & bit != 0).then_some(value)
+  }
+
+  #[inline]
+  fn last_changed(&self) -> Option<&u64> {
+    self.get(PV_CONTENT, &self.last_changed)
+  }
+
+  #[inline]
+  fn file_removed(&self) -> Option<&u64> {
+    self.get(PV_REMOVED, &self.file_removed)
+  }
+
+  #[inline]
+  fn mode_changed(&self) -> Option<&u64> {
+    self.get(PV_MODE, &self.mode_changed)
+  }
+
+  #[inline]
+  fn symlink_changed(&self) -> Option<&u64> {
+    self.get(PV_SYMLINK, &self.symlink_changed)
+  }
+
+  #[inline]
+  fn hardlink_changed(&self) -> Option<&u64> {
+    self.get(PV_HARDLINK, &self.hardlink_changed)
+  }
+
+  #[inline]
+  fn special_changed(&self) -> Option<&u64> {
+    self.get(PV_SPECIAL, &self.special_changed)
+  }
+}
+
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
@@ -1487,7 +1549,6 @@ pub struct Green {
   /// them), a running total: what [`Green::history_bytes`] leaves out, as the current values were always left out.
   specials: Dim<SpecialNode>,
   special_history: ValueHistory<SpecialNode>,
-  special_changed: BTreeMap<String, u64>,
   dirs: Dim<()>,
   modes: Dim<u32>,
   symlinks: Dim<String>,
@@ -1508,21 +1569,12 @@ pub struct Green {
   /// The version the green was restored at from a checkpoint ([`Green::restore`]), 0 for a green built from its origin:
   /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
   deltas_from: u64,
-  last_changed: BTreeMap<String, u64>,
-  /// The last version that removed the file at each path, a file of any type: a regular file (an
-  /// unlink, a rename away, or a rename onto it, which removes the file it replaces; A-612), a
-  /// symbolic link, a hard link's name, an IPC node or a directory (A-631). A work based before it
-  /// names a file that is gone, whatever stands at the path now (made again, renamed onto it), so
-  /// the verdict answers delete against modify for an edit, a mode change or an attribute set or
-  /// removed there, and rename against rename for a rename of it, never a change or a move of the
-  /// file that took its place. Unlike the content history it is never folded, so a base below the
-  /// fold floor meets it too. One entry a path the green ever removed a file at, as `last_changed`
-  /// holds one a path it ever changed; empty in a green restored from a checkpoint or made as a
-  /// branch, whose bases are never before its first version.
-  file_removed: BTreeMap<String, u64>,
-  mode_changed: BTreeMap<String, u64>,
-  symlink_changed: BTreeMap<String, u64>,
-  hardlink_changed: BTreeMap<String, u64>,
+  /// Unified per-path version watermarks across all six sparse path dimensions (`last_changed`,
+  /// `file_removed`, `mode_changed`, `symlink_changed`, `hardlink_changed`, `special_changed`):
+  /// stores each path string once and updates existing entries without cloning (Wave 8.2B).
+  /// Unlike the content history, `file_removed` is never folded, so a base below the fold floor
+  /// still meets it (A-612, A-631).
+  path_versions: BTreeMap<String, PathVersions>,
   xattr_changed: BTreeMap<(String, String), u64>,
   /// Every accepted increment's identity and the version it committed: the idempotency record a
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
@@ -2805,7 +2857,7 @@ impl Green {
   /// recorded as [`Green::restore_file`] records a carried one.
   fn restore_named_file(&mut self, file: &crate::checkpoint::NamedFile) {
     self.place_named_file(&file.key, file.identity);
-    self.last_changed.insert(file.key.clone(), file.at);
+    self.set_last_changed(&file.key, file.at);
     self.clear_content_history(&file.key);
     let value = self.named_value(&file.key);
     self.push_content(file.key.clone(), file.at, Some(value));
@@ -2813,7 +2865,7 @@ impl Green {
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
     self.place_file(&changed.key, changed.value.as_deref());
-    self.last_changed.insert(changed.key.clone(), changed.at);
+    self.set_last_changed(&changed.key, changed.at);
     self.clear_content_history(&changed.key);
     // The file just placed: its block named, not copied (A-728).
     let value = changed
@@ -2833,7 +2885,7 @@ impl Green {
 
   fn restore_mode(&mut self, changed: &crate::checkpoint::Changed<String, u32>) {
     self.place_mode(&changed.key, changed.value);
-    self.mode_changed.insert(changed.key.clone(), changed.at);
+    self.set_mode_changed(&changed.key, changed.at);
     self
       .mode_history
       .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
@@ -2841,12 +2893,13 @@ impl Green {
 
   fn restore_link(&mut self, tag: &[u8], changed: &crate::checkpoint::Changed<String, String>) {
     self.place_link(tag, &changed.key, changed.value.as_deref());
-    let (changed_map, history) = if tag == IDENTITY_TAG_SYMLINK {
-      (&mut self.symlink_changed, &mut self.symlink_history)
+    let history = if tag == IDENTITY_TAG_SYMLINK {
+      self.set_symlink_changed(&changed.key, changed.at);
+      &mut self.symlink_history
     } else {
-      (&mut self.hardlink_changed, &mut self.hardlink_history)
+      self.set_hardlink_changed(&changed.key, changed.at);
+      &mut self.hardlink_history
     };
-    changed_map.insert(changed.key.clone(), changed.at);
     history.insert(
       changed.key.clone(),
       vec![(changed.at, changed.value.clone())],
@@ -2855,7 +2908,7 @@ impl Green {
 
   fn restore_special(&mut self, changed: &crate::checkpoint::Changed<String, SpecialNode>) {
     self.place_special(&changed.key, changed.value);
-    self.special_changed.insert(changed.key.clone(), changed.at);
+    self.set_special_changed(&changed.key, changed.at);
     self
       .special_history
       .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
@@ -4615,13 +4668,130 @@ impl Green {
       .saturating_add(self.special_history_bytes)
   }
 
+  /// Updates the `PathVersions` entry for `path` without allocating a `String` key when already present.
+  #[inline]
+  fn update_path_versions(&mut self, path: &str, update: impl FnOnce(&mut PathVersions)) {
+    if let Some(entry) = self.path_versions.get_mut(path) {
+      update(entry);
+    } else {
+      let mut entry = PathVersions::default();
+      update(&mut entry);
+      self.path_versions.insert(path.to_owned(), entry);
+    }
+  }
+
+  #[inline]
+  pub(super) fn set_last_changed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      pv.present |= PV_CONTENT;
+      pv.last_changed = version;
+    });
+  }
+
+  #[inline]
+  pub(super) fn bump_last_changed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      if pv.present & PV_CONTENT == 0 || version > pv.last_changed {
+        pv.present |= PV_CONTENT;
+        pv.last_changed = version;
+      }
+    });
+  }
+
+  #[inline]
+  fn set_file_removed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      pv.present |= PV_REMOVED;
+      pv.file_removed = version;
+    });
+  }
+
+  #[inline]
+  fn set_mode_changed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      pv.present |= PV_MODE;
+      pv.mode_changed = version;
+    });
+  }
+
+  #[inline]
+  fn set_symlink_changed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      pv.present |= PV_SYMLINK;
+      pv.symlink_changed = version;
+    });
+  }
+
+  #[inline]
+  fn set_hardlink_changed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      pv.present |= PV_HARDLINK;
+      pv.hardlink_changed = version;
+    });
+  }
+
+  #[inline]
+  fn set_special_changed(&mut self, path: &str, version: u64) {
+    self.update_path_versions(path, |pv| {
+      pv.present |= PV_SPECIAL;
+      pv.special_changed = version;
+    });
+  }
+
+  #[inline]
+  fn last_changed_of(&self, path: &str) -> Option<&u64> {
+    self
+      .path_versions
+      .get(path)
+      .and_then(PathVersions::last_changed)
+  }
+
+  #[inline]
+  pub(super) fn file_removed_of(&self, path: &str) -> Option<&u64> {
+    self
+      .path_versions
+      .get(path)
+      .and_then(PathVersions::file_removed)
+  }
+
+  #[inline]
+  fn mode_changed_of(&self, path: &str) -> Option<&u64> {
+    self
+      .path_versions
+      .get(path)
+      .and_then(PathVersions::mode_changed)
+  }
+
+  #[inline]
+  fn symlink_changed_of(&self, path: &str) -> Option<&u64> {
+    self
+      .path_versions
+      .get(path)
+      .and_then(PathVersions::symlink_changed)
+  }
+
+  #[inline]
+  pub(super) fn hardlink_changed_of(&self, path: &str) -> Option<&u64> {
+    self
+      .path_versions
+      .get(path)
+      .and_then(PathVersions::hardlink_changed)
+  }
+
+  #[inline]
+  fn special_changed_of(&self, path: &str) -> Option<&u64> {
+    self
+      .path_versions
+      .get(path)
+      .and_then(PathVersions::special_changed)
+  }
+
   /// Whether the node at `path` was removed after version `base` (`file_removed`): a file of any
   /// type, removed, renamed away or renamed onto after the base, whatever stands at the path now
   /// (A-612, A-631).
   fn file_removed_since(&self, path: &str, base: u64) -> bool {
     self
-      .file_removed
-      .get(path)
+      .file_removed_of(path)
       .is_some_and(|version| *version > base)
   }
 
@@ -4788,7 +4958,7 @@ impl Green {
     {
       return Err(Green::window(dst, MergeConflictClass::TypeChanged));
     }
-    if self.changed_last(self.last_changed.get(dst), dst) > base {
+    if self.changed_last(self.last_changed_of(dst), dst) > base {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
     }
     if cleared.contains(dst) {
@@ -4882,7 +5052,7 @@ impl Green {
     if self.replaced_after(from, base) && !ops.is_empty() {
       return Err(Green::window(dst, MergeConflictClass::DeleteModify));
     }
-    let unchanged = self.changed_last(self.last_changed.get(from), from) <= base;
+    let unchanged = self.changed_last(self.last_changed_of(from), from) <= base;
     let intervening = if unchanged {
       Vec::new()
     } else {
@@ -4975,13 +5145,13 @@ impl Green {
       return Ok(Some(Effect::RemoveContent(path.to_owned())));
     }
     if self.symlinks.contains_key(path) {
-      if self.changed_last(self.symlink_changed.get(path), path) > base {
+      if self.changed_last(self.symlink_changed_of(path), path) > base {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
       }
       return Ok(Some(Effect::RemoveSymlink(path.to_owned())));
     }
     if self.hardlinks.contains_key(path) {
-      if self.changed_last(self.hardlink_changed.get(path), path) > base {
+      if self.changed_last(self.hardlink_changed_of(path), path) > base {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
       }
       return Ok(Some(Effect::RemoveHardlink(path.to_owned())));
@@ -5012,7 +5182,7 @@ impl Green {
     if let Some(class) = self.content_refused(inc, path) {
       return position::Unit::of(Err(Green::window(path, class)));
     }
-    let base_changed = self.changed_last(self.last_changed.get(path), path);
+    let base_changed = self.changed_last(self.last_changed_of(path), path);
     let unchanged = base_changed <= inc.base;
     if unchanged {
       self
@@ -5332,7 +5502,7 @@ impl Green {
     if !established && self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    if self.changed_last(self.mode_changed.get(path), path) > base {
+    if self.changed_last(self.mode_changed_of(path), path) > base {
       if self.modes.get(path).copied() == Some(mode) {
         return Ok(None);
       }
@@ -5357,7 +5527,7 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    if self.changed_last(self.symlink_changed.get(path), path) > base {
+    if self.changed_last(self.symlink_changed_of(path), path) > base {
       if self.symlinks.get(path).map(String::as_str) == Some(target) {
         return Ok(None);
       }
@@ -5394,7 +5564,7 @@ impl Green {
         .node_home(target, base)
         .map_err(|class| Green::window(path, class))?,
     };
-    if self.changed_last(self.hardlink_changed.get(path), path) > base {
+    if self.changed_last(self.hardlink_changed_of(path), path) > base {
       if self.hardlinks.get(path) == Some(&home) {
         return Ok(None);
       }
@@ -5530,7 +5700,7 @@ impl Green {
         return Ok(None);
       }
     }
-    if self.changed_last(self.special_changed.get(path), path) > base {
+    if self.changed_last(self.special_changed_of(path), path) > base {
       return Err(Green::window(path, MergeConflictClass::CreateCreate));
     }
     Ok(Some(Effect::Special(path.to_owned(), node)))
@@ -5811,7 +5981,7 @@ impl Green {
       .get(path)
       .into_iter()
       .flatten()
-      .any(|link| self.changed_last(self.hardlink_changed.get(link), link) > base);
+      .any(|link| self.changed_last(self.hardlink_changed_of(link), link) > base);
     let outlived = |link: &String| !r.unlinks.contains(link) && !r.hardlinks.contains_key(link);
     gained
       && !self
@@ -5845,7 +6015,7 @@ impl Green {
     (home, unlinked): (&str, bool),
     (base, post_state): (u64, crate::named::Post<'_>),
   ) -> Result<Vec<Effect>, ConflictWindow> {
-    let link_changed = self.changed_last(self.hardlink_changed.get(heir), heir) > base;
+    let link_changed = self.changed_last(self.hardlink_changed_of(heir), heir) > base;
     if link_changed || self.changed_after(home, base) {
       return Err(Green::window(heir, MergeConflictClass::DeleteModify));
     }
@@ -5948,7 +6118,7 @@ impl Green {
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
-    self.special_changed.insert(path.clone(), version);
+    self.set_special_changed(&path, version);
     self
       .special_history
       .entry(path)
@@ -5958,7 +6128,7 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
-    self.file_removed.insert(path.clone(), version);
+    self.set_file_removed(&path, version);
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
@@ -5972,7 +6142,7 @@ impl Green {
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
-    self.special_changed.insert(path.clone(), version);
+    self.set_special_changed(&path, version);
     self.drop_metadata(&path, version);
     self
       .special_history
@@ -5997,7 +6167,7 @@ impl Green {
       self
         .identity_dirty
         .insert(IdentityKey::Mode(path.to_owned()));
-      self.mode_changed.insert(path.to_owned(), version);
+      self.set_mode_changed(path, version);
       self
         .mode_history
         .entry(path.to_owned())
@@ -6391,7 +6561,7 @@ impl Green {
           .push((version, true));
       }
       Effect::RemoveDir(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.set_file_removed(&path, version);
         staged.emptied.push(path.clone());
         let stood = self.dirs.contains_key(&path).then_some(true);
         let at = self.seed_of(&self.dir_history, &path, &path, version);
@@ -6412,7 +6582,7 @@ impl Green {
           at,
         );
         self.modes.insert(&path, mode);
-        self.mode_changed.insert(path.clone(), version);
+        self.set_mode_changed(&path, version);
         self
           .mode_history
           .entry(path)
@@ -6421,13 +6591,13 @@ impl Green {
       }
       Effect::Symlink(path, target) => self.set_symlink(path, Some(target), version),
       Effect::RemoveSymlink(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.set_file_removed(&path, version);
         staged.emptied.push(path.clone());
         self.set_symlink(path, None, version);
       }
       Effect::Hardlink(path, target) => self.set_hardlink(path, Some(target), version),
       Effect::RemoveHardlink(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.set_file_removed(&path, version);
         staged.emptied.push(path.clone());
         self.set_hardlink(path, None, version);
       }
@@ -6455,7 +6625,7 @@ impl Green {
         self.symlinks.remove(&path);
       }
     }
-    self.symlink_changed.insert(path.clone(), version);
+    self.set_symlink_changed(&path, version);
     self
       .symlink_history
       .entry(path)
@@ -6478,7 +6648,7 @@ impl Green {
       None => self.hardlinks.remove(&path),
     };
     relink(&mut self.links_to, &path, old.as_deref(), target.as_deref());
-    self.hardlink_changed.insert(path.clone(), version);
+    self.set_hardlink_changed(&path, version);
     self
       .hardlink_history
       .entry(path)
@@ -6510,8 +6680,8 @@ impl Green {
     self.seed_content(path, version);
     self.content.remove(path);
     self.supersede_latest(path);
-    self.last_changed.insert(path.to_owned(), version);
-    self.file_removed.insert(path.to_owned(), version);
+    self.set_last_changed(path, version);
+    self.set_file_removed(path, version);
     self.push_content(path.to_owned(), version, None);
   }
 
@@ -6528,7 +6698,7 @@ impl Green {
     // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already. A file
     // this version's own copy brought and its increment edited (A-586) was no other file: nothing was removed.
     if renamed && self.content.contains_key(&path) && !self.copied_in(&path, version) {
-      self.file_removed.insert(path.clone(), version);
+      self.set_file_removed(&path, version);
     }
     // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the history
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
@@ -6563,7 +6733,7 @@ impl Green {
           .set(self.mapped_files_made.get().saturating_add(1));
         self.supersede_latest(&path);
         let value = self.record_reanchored(anchored);
-        self.last_changed.insert(path.clone(), version);
+        self.set_last_changed(&path, version);
         self.push_content(path.clone(), version, Some(value));
         self
           .path_deltas
@@ -6577,7 +6747,7 @@ impl Green {
       self.content.insert(&path, made);
       self.supersede_latest(&path);
       let value = self.content_value(&path, &ops);
-      self.last_changed.insert(path.clone(), version);
+      self.set_last_changed(&path, version);
       self.push_content(path.clone(), version, Some(value));
       self
         .path_deltas
@@ -6595,7 +6765,7 @@ impl Green {
     }
     self.supersede_latest(&path);
     let value = self.content_value(&path, &ops);
-    self.last_changed.insert(path.clone(), version);
+    self.set_last_changed(&path, version);
     self.push_content(path.clone(), version, Some(value));
     self
       .path_deltas

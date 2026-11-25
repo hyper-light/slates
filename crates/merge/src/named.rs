@@ -107,25 +107,47 @@ impl<'a> Post<'a> {
 
   /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was).
   pub(crate) fn span(&self, src: u64, len: u64) -> std::borrow::Cow<'a, [u8]> {
+    if self.runs.is_empty() {
+      let inline_len = self.inline.len();
+      let from = usize::try_from(src).unwrap_or(usize::MAX).min(inline_len);
+      let to = from
+        .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+        .min(inline_len);
+      return std::borrow::Cow::Borrowed(self.inline.get(from..to).unwrap_or_default());
+    }
     let end = src.saturating_add(len).min(self.len());
-    let mut pieces: Vec<&'a [u8]> = Vec::new();
+    let mut first_hit: Option<&'a [u8]> = None;
+    let mut joined: Option<Vec<u8>> = None;
     let mut start = 0u64;
     for piece in core::iter::once(self.inline).chain(self.runs.iter().map(Vec::as_slice)) {
       let piece_end = start.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
       if src < piece_end && end > start {
         let from = usize::try_from(src.saturating_sub(start)).unwrap_or(usize::MAX);
         let to = usize::try_from(end.min(piece_end).saturating_sub(start)).unwrap_or(usize::MAX);
-        pieces.push(piece.get(from..to).unwrap_or_default());
+        let slice = piece.get(from..to).unwrap_or_default();
+        if let Some(buf) = joined.as_mut() {
+          buf.extend_from_slice(slice);
+        } else if let Some(prev) = first_hit {
+          let mut buf = Vec::with_capacity(
+            usize::try_from(end.saturating_sub(src))
+              .unwrap_or(prev.len().saturating_add(slice.len())),
+          );
+          buf.extend_from_slice(prev);
+          buf.extend_from_slice(slice);
+          joined = Some(buf);
+        } else {
+          first_hit = Some(slice);
+        }
       }
       if piece_end >= end {
         break;
       }
       start = piece_end;
     }
-    match pieces.as_slice() {
-      [] => std::borrow::Cow::Borrowed(&[]),
-      [one] => std::borrow::Cow::Borrowed(one),
-      many => std::borrow::Cow::Owned(many.concat()),
+    match (joined, first_hit) {
+      (Some(buf), _) => std::borrow::Cow::Owned(buf),
+      (None, Some(one)) => std::borrow::Cow::Borrowed(one),
+      (None, None) => std::borrow::Cow::Borrowed(&[]),
     }
   }
 }

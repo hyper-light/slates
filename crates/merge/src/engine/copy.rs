@@ -1600,7 +1600,7 @@ impl Green {
         self.copies_grafted = self.copies_grafted.saturating_add(1);
       }
     }
-    self.last_changed.insert(dst.to_owned(), version);
+    self.set_last_changed(dst, version);
     let record = Appearance {
       version,
       source: src.to_owned(),
