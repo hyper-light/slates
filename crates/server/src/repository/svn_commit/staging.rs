@@ -913,6 +913,9 @@ pub(crate) struct Staging {
   /// The texts the green's held table holds at the paths the batch changes, as it held them before the batch: let go
   /// once the batch commits (S4 c1, `vcs_store::svn_texts`).
   released: Vec<(ContentIdentity, String)>,
+  /// The paths of `released`, looked up as the held table is followed ([`Staging::fold_some`]): a scan of `released`
+  /// a path cost a batch removing N paths N² (A-920 piece 5: 246 ms at 9,000, debug).
+  released_paths: std::collections::BTreeSet<String>,
   /// The text each path the batch changed holds after it, by path: held once the batch commits.
   holding: std::collections::BTreeMap<String, ContentIdentity>,
   /// The most bytes of texts the batch carries before it lands, read as it began, with its inputs ([`texts_bound`]).
@@ -944,6 +947,7 @@ impl Staging {
           held: 0,
           staged: 0,
           released: Vec::new(),
+          released_paths: std::collections::BTreeSet::new(),
           holding: std::collections::BTreeMap::new(),
           bound,
         }),
@@ -1326,7 +1330,7 @@ impl Staging {
   /// let go the first time the batch reaches it; each path's last text held. Then the record kept.
   fn fold_some(&mut self, recording: &mut Recording, spent: &mut dyn FnMut() -> bool) -> Recorded {
     while let Some((path, identity)) = recording.before.pop_first() {
-      if self.holding.remove(&path).is_none() && !self.released.iter().any(|(_, at)| *at == path) {
+      if self.holding.remove(&path).is_none() && self.released_paths.insert(path.clone()) {
         self.released.push((identity, path));
       }
       if spent() {

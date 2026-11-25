@@ -873,6 +873,37 @@ fn wide_revisions(files: usize, size: usize, (revisions, apart): (usize, bool)) 
   dump.into_bytes()
 }
 
+/// A format-2 dump continuing a repository at revision 1 with revision 2, which removes the `files` files `f0`..
+/// [`wide_revisions`]' first revision added, a row each.
+fn wide_removal(files: usize) -> Vec<u8> {
+  let section = "K 10\nsvn:author\nV 5\nalice\nK 8\nsvn:date\nV 27\n2026-11-24T00:00:00.000002Z\nK 7\nsvn:log\nV 2\nr2\nPROPS-END\n";
+  let mut dump = format!(
+    "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000894\n\nRevision-number: 2\n\
+     Prop-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+    section.len()
+  );
+  for file in 0..files {
+    dump.push_str(&format!("Node-path: f{file}\nNode-action: delete\n\n"));
+  }
+  dump.into_bytes()
+}
+
+/// A-920 piece 5 (main's order of 2026-11-25: the released fold's cost). Do: import [`wide_revisions`]' one revision
+/// adding [`WIDE_REVISION_FILES`] files, landed; then import [`wide_removal`]'s revision 2 removing every one, whose
+/// batch lets go every text from before it. Expect both imports whole.
+#[test]
+fn t_a920_a_revision_removing_thousands_of_files_imports_whole() {
+  let added = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
+  let removed = wide_removal(WIDE_REVISION_FILES);
+  let (first, second) = stored(move || async move {
+    let (svn, _green) = subversion("wide-removal").await;
+    let first = imported(svn, added).await.0.map(|loaded| loaded.youngest);
+    let second = imported(svn, removed).await.0.map(|loaded| loaded.youngest);
+    (first, second)
+  });
+  assert_eq!((first, second), (Ok(1), Ok(2)));
+}
+
 /// Shape: the green's retention cap the lone-revision test runs under: below what one revision adding [`WIDE_FILES`]
 /// paths reserves of the change index alone.
 const TINY_GREEN_CAP: usize = 16 << 10;

@@ -64131,6 +64131,11 @@ GAPS.
   walks. The records step 29-31 ms → 12.4 ms (the apply). Oracle: the svn import tests, whose shard quantum of a few
   microseconds takes these walks a row a step over the golden dumps, hold the texts each batch lets go and keeps;
   focused set 110 passed. Still whole: a row that adds or replaces a directory walks its tree in one unit.
+  **5a', the released fold** (main's order of 2026-11-25). The held table's fold looked a path up among the batch's
+  released texts by a scan of them (`released.iter().any`), so a batch removing N paths whose texts came from before
+  it cost N²: a revision removing 9,000 files took 246 ms of CPU over its fold's steps, its longest call 70 µs, once
+  its first import landed (`t_a920_a_revision_removing_thousands_of_files_imports_whole`). The released paths are now
+  a set beside the list (`Staging::released_paths`): 7.2-7.6 ms over the same steps, the longest call 10-28 µs.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
