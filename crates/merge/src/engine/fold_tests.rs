@@ -62,8 +62,7 @@ proptest! {
     ),
   ) {
     let mut twins = [Green::new(), Green::new()];
-    let mut id = 0u64;
-    for (changes, mark, fold) in &steps {
+    for ((changes, mark, fold), id) in steps.iter().zip(0u64..) {
       for green in &mut twins {
         let mut work = Work::default();
         for (index, how) in changes {
@@ -71,7 +70,6 @@ proptest! {
         }
         let _ = green.submit(&work.at(green.head(), id));
       }
-      id += 1;
       prop_assert_eq!(twins[0].head(), twins[1].head());
       let head = twins[0].head();
       let below = twins[0].folded_below;
