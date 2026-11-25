@@ -294,10 +294,16 @@ mod tests {
     let mut block = SharedObject::create(&name("block"), page, Words::new()).unwrap();
     block.write(0, &[0x5A; 64]).unwrap();
 
-    let mut region = DaxCacheRegion::new(cache.as_fd(), window as u64).unwrap();
+    let mut region = DaxCacheRegion::new(cache.try_as_fd().unwrap(), window as u64).unwrap();
     // Map the block writable at the second page of the window.
     region
-      .map(page as u64, page as u64, block.as_fd(), 0, true)
+      .map(
+        page as u64,
+        page as u64,
+        block.try_as_fd().unwrap(),
+        0,
+        true,
+      )
       .unwrap();
 
     // The window shows the block's bytes (shared mapping of the same object).
@@ -328,11 +334,17 @@ mod tests {
     let (page, window) = (page(), window());
     let cache = SharedObject::create(&name("bounds-c"), window, Words::new()).unwrap();
     let block = SharedObject::create(&name("bounds-b"), page, Words::new()).unwrap();
-    let mut region = DaxCacheRegion::new(cache.as_fd(), window as u64).unwrap();
+    let mut region = DaxCacheRegion::new(cache.try_as_fd().unwrap(), window as u64).unwrap();
 
     // Past the window.
     assert_eq!(
-      region.map(window as u64, page as u64, block.as_fd(), 0, false),
+      region.map(
+        window as u64,
+        page as u64,
+        block.try_as_fd().unwrap(),
+        0,
+        false,
+      ),
       Err(DaxCacheError::BadRange)
     );
     // Straddling the end.
@@ -340,7 +352,7 @@ mod tests {
       region.map(
         (window - page) as u64,
         (2 * page) as u64,
-        block.as_fd(),
+        block.try_as_fd().unwrap(),
         0,
         false
       ),
@@ -348,12 +360,12 @@ mod tests {
     );
     // Unaligned offset.
     assert_eq!(
-      region.map(1, page as u64, block.as_fd(), 0, false),
+      region.map(1, page as u64, block.try_as_fd().unwrap(), 0, false),
       Err(DaxCacheError::BadRange)
     );
     // Zero length.
     assert_eq!(
-      region.map(0, 0, block.as_fd(), 0, false),
+      region.map(0, 0, block.try_as_fd().unwrap(), 0, false),
       Err(DaxCacheError::BadRange)
     );
     assert_eq!(region.mapped(), 0, "nothing was mapped");

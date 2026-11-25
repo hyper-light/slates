@@ -694,6 +694,6 @@ impl VmmSeam for SimVmm {
     self
       .dax_window
       .as_ref()
-      .map(|(object, bytes)| (object.as_fd(), *bytes))
+      .and_then(|(object, bytes)| object.try_as_fd().map(|fd| (fd, *bytes)))
   }
 }

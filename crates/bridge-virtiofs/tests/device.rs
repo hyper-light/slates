@@ -1696,7 +1696,11 @@ mod backed {
           )
           .unwrap();
           device.install_dax_window(Some(
-            slates_bridge_virtiofs::dax::DaxCacheRegion::new(object.as_fd(), window).unwrap(),
+            slates_bridge_virtiofs::dax::DaxCacheRegion::new(
+              object.try_as_fd().expect("dax window fd open"),
+              window,
+            )
+            .unwrap(),
           ));
           Some(object)
         }
