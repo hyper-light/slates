@@ -1,5 +1,12 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~03:30 PST
+- LANDED f72985f75: 57k hg import A/B in BENCHMARKS (pipelined 77.49 s best vs 83.05 / 91.20, half the peak).
+- LANDED 4d255fa9d: read-path cold trigger (vcs_share::read_backs): read-backs attributed by the store holding their
+  object, let go past grant at each division (current_at), never pinned / home-held / younger than a cadence.
+  Reds: 1,048,576 B vs 196,608 B grant; pinned; unattributed. P7 A/B (3.7x lower resident, +40% time) in BENCHMARKS.
+- Next (main): svn import batch landings pipelined, as hg's segments.
+
 ## 2026-11-25 ~01:30 PST
 - LANDED e6710411a: P7, svn import batch lands once its texts reach texts_bound (segment_bytes); Flush::Texts,
   flushed_texts. Red 16,777,216 B vs 2 MiB; oracle same history with/without. w-svn's go on staging.rs.
