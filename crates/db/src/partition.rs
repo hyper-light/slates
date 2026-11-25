@@ -1691,6 +1691,21 @@ impl Partition {
     }
   }
 
+  /// Checks whether `green` exists and the partition's green-chain byte cap admits an entry of
+  /// `increment_len` bytes, without allocating a placeholder `Op::GreenAdvanced` buffer (Wave 8.2A).
+  pub fn check_green_advance(&self, green: VolumeId, increment_len: usize) -> Result<(), DbError> {
+    self.volume(green).ok_or(DbError::NotFound)?;
+    // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
+    // is refused once the partition's green chains would exceed their byte budget — the typed
+    // refusal at the bound; a checkpoint (W3) folds the increments below the reachable floor.
+    if self.green_chain_bytes.saturating_add(increment_len) > self.caps.green_chain_bytes {
+      return Err(DbError::Capacity {
+        table: "green_chains",
+      });
+    }
+    Ok(())
+  }
+
   /// The guard the live path runs before appending: refuses what the log must never record.
   pub fn check(&self, op: &Op, now_ns: u64) -> Result<(), DbError> {
     match op {
@@ -1922,18 +1937,7 @@ impl Partition {
       | Op::AuditOwed { .. }
       | Op::AuditDelivered { .. }
       | Op::AuditBatchAppended { .. } => Ok(()),
-      Op::GreenAdvanced { green, increment } => {
-        self.volume(*green).ok_or(DbError::NotFound)?;
-        // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
-        // is refused once the partition's green chains would exceed their byte budget — the typed
-        // refusal at the bound; a checkpoint (W3) folds the increments below the reachable floor.
-        if self.green_chain_bytes.saturating_add(increment.len()) > self.caps.green_chain_bytes {
-          return Err(DbError::Capacity {
-            table: "green_chains",
-          });
-        }
-        Ok(())
-      }
+      Op::GreenAdvanced { green, increment } => self.check_green_advance(*green, increment.len()),
       Op::WorkLogged { work, entry } => {
         self.volume(*work).ok_or(DbError::NotFound)?;
         self.merge_bytes_fit(0, entry.len())

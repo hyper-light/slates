@@ -11317,17 +11317,55 @@ pub(crate) const SUBMIT_LONGEST_STEP_US: &str = "merge.submit.longest_step_us";
 /// Counter: submit judgments whose one step ran past the shard's derived step bound (`step_ceiling_ns`, A-783).
 pub(crate) const SUBMIT_STEPS_PAST_CEILING: &str = "merge.submit.steps_past_ceiling";
 
+/// Placement of an increment prepared before its verdict ([`increment_held`]): either already placed (`Ready`, for
+/// held large increments and holder-staged increments) or deferred (`DeferredCarried`, for carried increments so
+/// `inc.encode()` and BLAKE3 archive hashing run only when the verdict accepts or is identical, never on conflicts;
+/// Wave 8.2A).
+enum HeldPlacement {
+  Ready {
+    held: crate::merge_service::HeldIncrement,
+    carried: Option<Vec<u8>>,
+  },
+  DeferredCarried(Option<Vec<u8>>),
+}
+
+impl HeldPlacement {
+  /// Releases any content-store hold taken before a refused or conflicting verdict.
+  fn release_refused(self, state: &mut ShardState, green_id: DbVolumeId) {
+    if let HeldPlacement::Ready { held, .. } = self {
+      crate::merge_service::release_refused_increment(state, green_id, held);
+    }
+  }
+
+  /// Finalizes placement after an `Accepted` or `Identical` verdict, encoding and computing the carried archive
+  /// identity only for increments that actually advance the green.
+  fn into_accepted(
+    self,
+    state: &mut ShardState,
+    inc: &slates_merge::engine::Increment,
+  ) -> (crate::merge_service::HeldIncrement, Option<Vec<u8>>) {
+    match self {
+      HeldPlacement::Ready { held, carried } => (held, carried),
+      HeldPlacement::DeferredCarried(pre_encoded) => {
+        let increment_bytes = pre_encoded.unwrap_or_else(|| inc.encode());
+        let held = crate::merge_service::carried_increment(state, &increment_bytes);
+        (held, Some(increment_bytes))
+      }
+    }
+  }
+}
+
 /// `inc` admitted and placed before its verdict: encoded (by the refinement job where it prepared it, A-787 part 3, else
-/// here), its chain room admitted and its retention secured, then, up to [`CARRIED_INCREMENT_MAX`], given back to be
-/// carried in its chain entry (format 7, A-854: durable with the append, nothing held), else held in the shard's content
-/// store, where its chain entry names it (lane (A), chain entry format 6), refused typed at the shard's room, the green's
-/// retention settled again on that refusal.
+/// here), its chain room admitted and its retention secured, then, up to [`CARRIED_INCREMENT_MAX`], deferred to be
+/// carried in its chain entry on accept (format 7, A-854: durable with the append, nothing held, zero encode/hash on
+/// conflict), else held in the shard's content store, where its chain entry names it (lane (A), chain entry format 6),
+/// refused typed at the shard's room, the green's retention settled again on that refusal.
 fn increment_held(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
   green_id: DbVolumeId,
   inc: &slates_merge::engine::Increment,
-) -> Result<(crate::merge_service::HeldIncrement, Option<Vec<u8>>), Refusal> {
+) -> Result<HeldPlacement, Refusal> {
   // A holder's submit names an increment this shard already holds (lane (A) 3b): neither encoded nor hashed again. One
   // small enough is carried all the same, read from the store, so its accept orders no publication before its append.
   if let Some(inputs) = sealed.held {
@@ -11339,24 +11377,29 @@ fn increment_held(
     chain_room_admitted(state, green_id, inc, carried.as_ref().map_or(0, Vec::len))?;
     retention_secured(state, green_id, inc)?;
     return crate::merge_service::increment_already_held(state, green_id, inputs)
-      .map(|held| (held, carried))
+      .map(|held| HeldPlacement::Ready { held, carried })
       .inspect_err(|_| {
         let _ = crate::merge_service::settle_green_retention(state, green_id);
       });
   }
-  let increment_bytes =
-    crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
-  if carries(state, increment_bytes.len()) {
-    chain_room_admitted(state, green_id, inc, increment_bytes.len())?;
+  let pre_encoded = crate::refining::take_encoded(state, sealed.work, inc.id);
+  let encoded_len = pre_encoded
+    .as_ref()
+    .map_or_else(|| inc.encoded_len(), Vec::len);
+  if carries(state, encoded_len) {
+    chain_room_admitted(state, green_id, inc, encoded_len)?;
     retention_secured(state, green_id, inc)?;
-    let held = crate::merge_service::carried_increment(state, &increment_bytes);
-    return Ok((held, Some(increment_bytes)));
+    return Ok(HeldPlacement::DeferredCarried(pre_encoded));
   }
+  let increment_bytes = pre_encoded.unwrap_or_else(|| inc.encode());
   chain_room_admitted(state, green_id, inc, 0)?;
   retention_secured(state, green_id, inc)?;
   let next = state.db.partition().green_head(green_id).saturating_add(1);
   crate::merge_service::hold_increment(state, green_id, next, &increment_bytes)
-    .map(|held| (held, None))
+    .map(|held| HeldPlacement::Ready {
+      held,
+      carried: None,
+    })
     .inspect_err(|_| {
       let _ = crate::merge_service::settle_green_retention(state, green_id);
     })
@@ -11417,12 +11460,7 @@ fn chain_room_admitted(
   let bound = slates_merge::chain_entry::entry_bound(inc)
     .saturating_add(room)
     .saturating_add(carried);
-  let admission = Op::GreenAdvanced {
-    green: green_id,
-    increment: vec![0; bound],
-  };
-  let now = state.clock.monotonic_ns();
-  chain_admits(state, green_id, &admission, now)
+  chain_admits_len(state, green_id, bound)
 }
 
 /// The retention `inc` will take secured before the verdict: the superseded values it charges (incoming bytes do not
@@ -11560,7 +11598,7 @@ fn judged_submission(
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
   // Encoded by the refinement job where it prepared the increment (A-787 part 3), else here.
-  let (held_increment, carried) = match increment_held(state, sealed, green_id, &inc) {
+  let placement = match increment_held(state, sealed, green_id, &inc) {
     Ok(placed) => placed,
     Err(refusal) => return refused(refusal),
   };
@@ -11572,24 +11610,17 @@ fn judged_submission(
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
   let hold = crate::made_commit::holds(state, green_id);
   let Some(judged) = verdict_of(state, green_id, sealed, (&inc, hold)) else {
-    crate::merge_service::release_refused_increment(state, green_id, held_increment);
+    placement.release_refused(state, green_id);
     return refused(Refusal::NotFound);
   };
   let ((outcome, applied), held_verdict) = match judged {
     Ok(judged) => judged,
     Err(reason) => {
-      crate::merge_service::release_refused_increment(state, green_id, held_increment);
+      placement.release_refused(state, green_id);
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       return refused(Refusal::BadRequest { reason });
     }
   };
-  if !matches!(
-    &outcome,
-    slates_merge::engine::Outcome::Accepted { .. }
-      | slates_merge::engine::Outcome::Identical { .. }
-  ) {
-    crate::merge_service::release_refused_increment(state, green_id, held_increment);
-  }
   if sealed.computed.is_some() {
     state.count(TAKEN_BY_POSITION, 1);
   }
@@ -11619,6 +11650,7 @@ fn judged_submission(
     // alike; its reply says it changed nothing (A-782, `merge_service::accepted_reply`).
     slates_merge::engine::Outcome::Accepted { version }
     | slates_merge::engine::Outcome::Identical { version } => {
+      let (held_increment, carried) = placement.into_accepted(state, &inc);
       // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
       // (`vcs_store::svn_made`).
       let copies = crate::vcs_store::svn_made::copies_of(&inc);
@@ -11637,6 +11669,7 @@ fn judged_submission(
       accepted_answer(state, (green_id, version), parts, (copies, held_verdict))
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
+      placement.release_refused(state, green_id);
       // The work is not reset: the bound secured for a reset is released.
       settle_after_conflict(state, green_id, &inc.id);
       // Every window, for the work's shard to keep with the work and carry as far as one reply holds
@@ -11646,6 +11679,7 @@ fn judged_submission(
     // A base below the green's checkpoint (W3) is no live reader's, so it is unknown: never judged, and nothing
     // retained, so the bytes secured are credited back.
     slates_merge::engine::Outcome::BaseUnavailable { base, .. } => {
+      placement.release_refused(state, green_id);
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       refused(Refusal::UnknownBase {
         green: to_wire_volume(green_id),
@@ -11653,11 +11687,13 @@ fn judged_submission(
       })
     }
     slates_merge::engine::Outcome::CopyRefused { path, case } => {
+      placement.release_refused(state, green_id);
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       refused(copy_refused(path, case))
     }
     // A named run not read yet (A-760): the content is not here to judge; nothing judged or applied.
     slates_merge::engine::Outcome::ContentUnread { .. } => {
+      placement.release_refused(state, green_id);
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       refused(Refusal::ContentUnavailable)
     }
@@ -11923,19 +11959,22 @@ pub(crate) fn commit_settled(state: &mut ShardState) -> Result<Option<u64>, slat
   state.db.commit(&mut state.segment)
 }
 
-fn chain_admits(
+/// Zero-allocation version of [`Op::GreenAdvanced`] admission, checking green-chain byte room directly from
+/// `bound` without allocating a zeroed placeholder buffer (Wave 8.2A).
+fn chain_admits_len(
   state: &mut ShardState,
   green: DbVolumeId,
-  record: &Op,
-  now: u64,
+  bound: usize,
 ) -> Result<(), Refusal> {
-  if let Err(slates_db::DbError::Capacity { .. }) = state.db.partition().check(record, now) {
+  if let Err(slates_db::DbError::Capacity { .. }) =
+    state.db.partition().check_green_advance(green, bound)
+  {
     crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);
   }
   state
     .db
     .partition()
-    .check(record, now)
+    .check_green_advance(green, bound)
     .map_err(|e| refusal_of_db(&e))
 }
 

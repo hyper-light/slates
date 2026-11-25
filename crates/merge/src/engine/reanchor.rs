@@ -170,12 +170,7 @@ impl Green {
 
   /// The ops the change committed at `version` made to `path`'s content: the version's delta on the path.
   fn delta_on(&self, version: u64, path: &str) -> Option<&[Op]> {
-    let index = version.checked_sub(self.deltas_from)?.checked_sub(1)?;
-    self
-      .deltas
-      .get(usize::try_from(index).ok()?)?
-      .get(path)
-      .map(Vec::as_slice)
+    self.delta_for(version, path)
   }
 
   /// Whether `range` covers whole lines of a content history value's bytes ([`covers_whole_lines`]): the byte before

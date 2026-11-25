@@ -432,13 +432,27 @@ impl OpsDoc {
     .await;
   }
 
+  /// Exact byte length of [`OpsDoc::encode`] without allocating (Wave 8.2A).
+  pub fn encoded_len(&self) -> usize {
+    let paths_len: usize = self
+      .paths
+      .paths()
+      .iter()
+      .map(|path| PATH_MIN_BYTES.saturating_add(path.len()))
+      .fold(0usize, usize::saturating_add);
+    HEADER_BYTES
+      .saturating_add(paths_len)
+      .saturating_add(self.nodes.nodes().len().saturating_mul(NODE_BYTES))
+      .saturating_add(self.ops.len().saturating_mul(OP_BYTES))
+  }
+
   /// The canonical byte encoding: the header (magic and version, `u32` each; path, node and op counts, `u64` each), then
   /// each path as a `u32` length-prefixed byte string, then each node as a fixed record of [`NODE_BYTES`] (its origin, a
   /// byte, and its path, a `u64`; A-646), then each operation as a fixed record of [`OP_BYTES`] (kind and flags, a byte
   /// each; path, offset, length and source, `u64` each). Little-endian throughout; no host-dependent padding. A count's
   /// conversion to 64 bits cannot fail on the targets slates builds for.
   pub fn encode(&self) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(self.encoded_len());
     let mut piece = 0usize;
     while self.encode_piece(piece, &mut out) {
       piece = piece.saturating_add(1);
@@ -577,6 +591,9 @@ fn take_nodes(
   Ok(nodes)
 }
 
+/// Format: the fixed ops-document header size (magic + version `u32`s and path, node, op `u64` counts).
+const HEADER_BYTES: usize =
+  size_of::<u32>() + size_of::<u32>() + size_of::<u64>() + size_of::<u64>() + size_of::<u64>();
 /// The smallest a path entry can be in the encoding: its length prefix (a `u32`), for an empty path.
 const PATH_MIN_BYTES: usize = size_of::<u32>();
 /// Format: a node record's size (A-646, version 3): its origin, a byte, and its path's index, a `u64`.

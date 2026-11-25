@@ -1430,41 +1430,125 @@ struct AskItem {
   back: ReplyRoute,
 }
 
-/// A shard's asks to one owner shard: those waiting, the batches out, and a data-derived batch size target (`aim`)
-/// adapted from observed owner answers and handbacks so bursts never bounce oversized batches back and forth. At most
-/// [`BATCHES_OUT`] are out at a time, so a burst of asks rides a few messages, each carrying what gathered while the
-/// others were out, and an owner's channel holds at most that many messages from each asking shard (A-388).
+/// Priority class of an outbox ask: tiny O(1) control/base asks vs heavy merge-engine asks, kept in separate
+/// queues with 1:1 starvation-free alternation and independent step-derived batch targets (Wave 8.2A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskClass {
+  Fast,
+  Merge,
+}
+
+impl AskClass {
+  fn of(need: &Need) -> Self {
+    match need {
+      Need::Verdict { .. } | Need::Rebase { .. } => Self::Merge,
+      Need::Files(_)
+      | Need::Lengths(_)
+      | Need::Page { .. }
+      | Need::Sizes
+      | Need::Admit { .. }
+      | Need::ReserveName { .. }
+      | Need::Route
+      | Need::Refine(_) => Self::Fast,
+    }
+  }
+}
+
+/// A shard's asks to one owner shard: fast control/base asks and merge asks in separate queues with 1:1
+/// starvation-free alternation, the batches out, and data-derived batch size targets (`fast_aim`, `merge_aim`)
+/// adapted from observed `(elapsed_ns, step_budget_ns, answered)` so bursts never bounce oversized batches back
+/// and forth or starve fast `CreateWork`/`Edit` asks behind merge conflict storms. At most [`BATCHES_OUT`] are out
+/// at a time, so a burst of asks rides a few messages, each carrying what gathered while the others were out, and
+/// an owner's channel holds at most that many messages from each asking shard (A-388).
 #[derive(Default)]
 pub(crate) struct Outbox {
+  fast: VecDeque<AskItem>,
   waiting: VecDeque<AskItem>,
   /// The batches out to the owner now, one a sender task ([`send_batches`]).
   out: usize,
-  /// Data-derived batch size target (`0` = uninitialized, starts at `batch_bound`). Shrinks to `answered.max(1)`
-  /// whenever the owner hands back unfinished items, and doubles back toward `bound` once full batches finish cleanly.
-  aim: usize,
+  /// Data-derived batch size target for `fast` asks (`0` = uninitialized, starts at `batch_bound`).
+  fast_aim: usize,
+  /// Data-derived batch size target for `waiting` (merge) asks (`0` = uninitialized, starts at `batch_bound`).
+  merge_aim: usize,
+  /// Alternates between `fast` and `waiting` when both queues are non-empty so neither can starve the other.
+  next_fast: bool,
 }
 
 impl Outbox {
-  /// Number of items the next batch should drain from this outbox, clamped to `1..=bound`.
-  fn take_limit(&self, bound: usize) -> usize {
-    let cap = bound.max(1);
-    if self.aim == 0 {
-      cap
-    } else {
-      self.aim.clamp(1, cap)
+  fn push_back(&mut self, item: AskItem) {
+    match AskClass::of(&item.need) {
+      AskClass::Fast => self.fast.push_back(item),
+      AskClass::Merge => self.waiting.push_back(item),
     }
   }
 
-  /// Updates the batch target from one completed (or handed-back) owner batch.
-  fn note_batch(&mut self, answered: usize, handed_back: bool, bound: usize) {
-    let cap = bound.max(1);
-    if handed_back {
-      self.aim = answered.clamp(1, cap);
-    } else {
-      let current = self.take_limit(cap);
-      if answered >= current {
-        self.aim = current.saturating_mul(2).min(cap);
+  fn push_front(&mut self, class: AskClass, item: AskItem) {
+    match class {
+      AskClass::Fast => self.fast.push_front(item),
+      AskClass::Merge => self.waiting.push_front(item),
+    }
+  }
+
+  fn pick_class(&mut self) -> Option<AskClass> {
+    match (!self.fast.is_empty(), !self.waiting.is_empty()) {
+      (false, false) => None,
+      (true, false) => Some(AskClass::Fast),
+      (false, true) => Some(AskClass::Merge),
+      (true, true) => {
+        let chosen = if self.next_fast {
+          AskClass::Fast
+        } else {
+          AskClass::Merge
+        };
+        self.next_fast = !self.next_fast;
+        Some(chosen)
       }
+    }
+  }
+
+  /// Number of items the next batch of `class` should drain from this outbox, clamped to `1..=bound`.
+  fn take_limit(&self, class: AskClass, bound: usize) -> usize {
+    let cap = bound.max(1);
+    let aim = match class {
+      AskClass::Fast => self.fast_aim,
+      AskClass::Merge => self.merge_aim,
+    };
+    if aim == 0 { cap } else { aim.clamp(1, cap) }
+  }
+
+  /// Updates `class`'s batch target from one completed (or handed-back) owner batch using measured
+  /// `(elapsed_ns, budget_ns)` so `aim` converges directly to `budget_ns / observed_per_item_ns` without
+  /// oscillating when a single ask fills the step budget (R3).
+  fn note_batch(
+    &mut self,
+    class: AskClass,
+    answered: usize,
+    handed_back: bool,
+    (elapsed_ns, budget_ns): (u64, u64),
+    bound: usize,
+  ) {
+    let cap = bound.max(1);
+    let aim = match class {
+      AskClass::Fast => &mut self.fast_aim,
+      AskClass::Merge => &mut self.merge_aim,
+    };
+    if handed_back {
+      *aim = answered.clamp(1, cap);
+      return;
+    }
+    if answered == 0 {
+      return;
+    }
+    let current = if *aim == 0 { cap } else { (*aim).clamp(1, cap) };
+    let answered_u64 = u64::try_from(answered).unwrap_or(u64::MAX).max(1);
+    let per_item_ns = elapsed_ns.checked_div(answered_u64).unwrap_or(1).max(1);
+    let fit = usize::try_from(budget_ns.checked_div(per_item_ns).unwrap_or(1))
+      .unwrap_or(cap)
+      .clamp(1, cap);
+    if fit < current {
+      *aim = fit;
+    } else if answered >= current {
+      *aim = fit.min(current.saturating_mul(2)).clamp(1, cap);
     }
   }
 }
@@ -1681,7 +1765,7 @@ fn start_ask(
   };
   let asked_kind = asked_kind(&need);
   let outbox = state.work_home.outboxes.entry(owner).or_default();
-  outbox.waiting.push_back(AskItem {
+  outbox.push_back(AskItem {
     queue,
     need,
     green,
@@ -1723,18 +1807,20 @@ fn start_ask(
         return true;
       }
       // Nothing will send what waits: every ask in this outbox is answered unanswered now.
-      let left = state
-        .work_home
-        .outboxes
-        .remove(&owner)
-        .map(|outbox| outbox.waiting)
-        .unwrap_or_default();
-      for item in left {
-        if item.queue != queue {
-          resolve(state, item.queue, None);
-        }
-      }
+      resolve_unsent_outbox(state, owner, queue);
       false
+    }
+  }
+}
+
+/// Answers every queued ask in `owner`'s outbox (both fast and merge queues) unanswered except `skip`.
+fn resolve_unsent_outbox(state: &mut ShardState, owner: u16, skip: DbVolumeId) {
+  let Some(outbox) = state.work_home.outboxes.remove(&owner) else {
+    return;
+  };
+  for item in outbox.fast.into_iter().chain(outbox.waiting) {
+    if item.queue != skip {
+      resolve(state, item.queue, None);
     }
   }
 }
@@ -2391,23 +2477,26 @@ enum Outcome {
 
 /// Answers `items` in order with `answer` while the clock (`now`, nanoseconds) has spent less than `budget_ns` since the
 /// first: always the first, so a batch always moves; the rest, unanswered and in order, for the asker to send again
-/// (A-797: an owner's step for a batch is bounded by its step budget, CLAUDE.md "Bounded work everywhere").
+/// (A-797: an owner's step for a batch is bounded by its step budget, CLAUDE.md "Bounded work everywhere"). Returns
+/// `(answers, remaining, elapsed_ns)` so the sender derives its next batch size directly from measured cost.
 fn answer_within<T, A>(
   items: Vec<T>,
   budget_ns: u64,
   mut now: impl FnMut() -> u64,
   mut answer: impl FnMut(T) -> A,
-) -> (Vec<A>, Vec<T>) {
+) -> (Vec<A>, Vec<T>, u64) {
   let started = now();
   let mut answers = Vec::with_capacity(items.len());
   let mut items = items.into_iter();
+  let mut elapsed = 0u64;
   for item in items.by_ref() {
     answers.push(answer(item));
-    if now().saturating_sub(started) >= budget_ns {
+    elapsed = now().saturating_sub(started);
+    if elapsed >= budget_ns {
       break;
     }
   }
-  (answers, items.collect())
+  (answers, items.collect(), elapsed)
 }
 
 /// Format: a batch the green's owner answered in part within its step budget, handing the rest back to be asked again
@@ -2418,10 +2507,9 @@ pub(crate) const BATCH_HANDED_BACK: &str = "merge.work.batch_handed_back";
 /// to `owner`, each awaiting its own batch's answers (A-388).
 async fn send_batches(here: u16, owner: u16) {
   loop {
-    let batch = state::with_state(|s| take_batch(s, owner)).unwrap_or_default();
-    if batch.is_empty() {
+    let Some((class, batch)) = state::with_state(|s| take_batch(s, owner)).flatten() else {
       return;
-    }
+    };
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
     let budget = crate::lease::lease_bound_ns();
     // The owner answers within its step budget and hands back the rest (A-797), which go out again first.
@@ -2430,15 +2518,17 @@ async fn send_batches(here: u16, owner: u16) {
       owner,
       move |s| {
         let step = slates_rt::futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
-        answer_within(batch, step, slates_machine::clock::monotonic_ns, |item| {
-          answer_on_owner(s, item)
-        })
+        let (answered, rest, elapsed) =
+          answer_within(batch, step, slates_machine::clock::monotonic_ns, |item| {
+            answer_on_owner(s, item)
+          });
+        (answered, rest, elapsed, step)
       },
       budget,
     )
     .await;
     let _ = state::with_state_counted(|s| match answers {
-      Some((answers, rest)) => {
+      Some((answers, rest, elapsed_ns, step_ns)) => {
         let answered = answers.len();
         let handed_back = !rest.is_empty();
         for (queue, outcome) in keys.into_iter().zip(answers) {
@@ -2446,10 +2536,10 @@ async fn send_batches(here: u16, owner: u16) {
         }
         let bound = batch_bound(s);
         if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
-          outbox.note_batch(answered, handed_back, bound);
+          outbox.note_batch(class, answered, handed_back, (elapsed_ns, step_ns), bound);
           if handed_back {
             for item in rest.into_iter().rev() {
-              outbox.waiting.push_front(item);
+              outbox.push_front(class, item);
             }
           }
         }
@@ -2460,7 +2550,7 @@ async fn send_batches(here: u16, owner: u16) {
       None => {
         let bound = batch_bound(s);
         if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
-          outbox.note_batch(1, true, bound);
+          outbox.note_batch(class, 1, true, (budget, 1), bound);
         }
         for queue in keys {
           resolve(s, queue, None);
@@ -2474,19 +2564,22 @@ async fn send_batches(here: u16, owner: u16) {
 /// creation's committed before its ask goes (`stage_pending`, `create_need`); one whose verb's transaction did not
 /// commit is answered unanswered. Loops past unstaged items so `outbox.out` is decremented whenever an empty batch
 /// ends this sender task.
-fn take_batch(state: &mut ShardState, owner: u16) -> Vec<AskItem> {
+fn take_batch(state: &mut ShardState, owner: u16) -> Option<(AskClass, Vec<AskItem>)> {
   let bound = batch_bound(state);
   loop {
-    let items: Vec<AskItem> = {
-      let Some(outbox) = state.work_home.outboxes.get_mut(&owner) else {
-        return Vec::new();
-      };
-      if outbox.waiting.is_empty() {
+    let (class, items): (AskClass, Vec<AskItem>) = {
+      let outbox = state.work_home.outboxes.get_mut(&owner)?;
+      let Some(class) = outbox.pick_class() else {
         outbox.out = outbox.out.saturating_sub(1);
-        return Vec::new();
-      }
-      let take = outbox.waiting.len().min(outbox.take_limit(bound));
-      outbox.waiting.drain(..take).collect()
+        return None;
+      };
+      let limit = outbox.take_limit(class, bound);
+      let queue = match class {
+        AskClass::Fast => &mut outbox.fast,
+        AskClass::Merge => &mut outbox.waiting,
+      };
+      let take = queue.len().min(limit);
+      (class, queue.drain(..take).collect())
     };
     let (ready, unstaged): (Vec<AskItem>, Vec<AskItem>) =
       items.into_iter().partition(|item| staged(state, item));
@@ -2494,7 +2587,7 @@ fn take_batch(state: &mut ShardState, owner: u16) -> Vec<AskItem> {
       resolve(state, item.queue, None);
     }
     if !ready.is_empty() {
-      return ready;
+      return Some((class, ready));
     }
   }
 }
@@ -3130,7 +3223,7 @@ mod tests {
   #[test]
   fn a_batch_is_answered_within_the_owners_step_budget_and_the_rest_handed_back() {
     let clock = std::cell::Cell::new(0u64);
-    let (answers, rest) = answer_within(
+    let (answers, rest, elapsed) = answer_within(
       (0..10).collect::<Vec<u32>>(),
       10,
       || clock.get(),
@@ -3140,11 +3233,11 @@ mod tests {
       },
     );
     assert_eq!(
-      (answers, rest),
-      (vec![0, 10, 20, 30], vec![4, 5, 6, 7, 8, 9])
+      (answers, rest, elapsed),
+      (vec![0, 10, 20, 30], vec![4, 5, 6, 7, 8, 9], 12)
     );
     clock.set(0);
-    let (answers, rest) = answer_within(
+    let (answers, rest, elapsed) = answer_within(
       vec![1u32, 2],
       10,
       || clock.get(),
@@ -3153,7 +3246,7 @@ mod tests {
         item
       },
     );
-    assert_eq!((answers, rest), (vec![1], vec![2]));
+    assert_eq!((answers, rest, elapsed), (vec![1], vec![2], 50));
   }
 
   /// The verb a test parks: a status asked by a local client, with nowhere to reply (answered `Overloaded` at its release,
@@ -3431,7 +3524,7 @@ mod tests {
       let green = DbVolumeId { bytes: [3; 16] };
       let outbox = state.work_home.outboxes.entry(owner).or_default();
       outbox.out = 1;
-      outbox.waiting.push_back(super::AskItem {
+      outbox.push_back(super::AskItem {
         queue: work,
         need: super::Need::Admit {
           green,
@@ -3454,7 +3547,7 @@ mod tests {
         },
       });
       let batch = super::take_batch(state, owner);
-      assert!(batch.is_empty(), "unstaged admit must not be sent");
+      assert!(batch.is_none(), "unstaged admit must not be sent");
       assert_eq!(
         state.work_home.outboxes.get(&owner).map_or(0, |o| o.out),
         0,
@@ -3463,32 +3556,35 @@ mod tests {
     });
   }
 
-  /// Wave 8.1 adaptive batch sizing: an outbox starts at `bound`, snaps to the owner's actual per-step answer count
-  /// on handback (eliminating 60+ item bounce storms), and doubles back toward `bound` as full batches succeed cleanly.
+  /// Wave 8.2A data-derived batch sizing: an outbox derives its per-class batch size directly from measured
+  /// `(elapsed_ns, budget_ns, answered)`, refuses to oscillate `1 -> 2 -> 1` when a single merge ask fills the step
+  /// budget, and converges smoothly to `budget_ns / per_item_ns` without arbitrary constants.
   #[test]
   fn outbox_aim_adapts_to_owner_step_capacity() {
+    use super::AskClass;
     let mut outbox = super::Outbox::default();
-    let bound = 64;
-    assert_eq!(outbox.take_limit(bound), 64);
-    // Owner only finished 3 of 64 before step budget expired: snap aim straight to 3.
-    outbox.note_batch(3, true, bound);
-    assert_eq!(outbox.take_limit(bound), 3);
-    // Partial drain (only 2 items waited, both answered cleanly): do not inflate aim.
-    outbox.note_batch(2, false, bound);
-    assert_eq!(outbox.take_limit(bound), 3);
-    // Full batch of 3 finished cleanly: double to 6, then 12, clamping at bound.
-    outbox.note_batch(3, false, bound);
-    assert_eq!(outbox.take_limit(bound), 6);
-    outbox.note_batch(6, false, bound);
-    assert_eq!(outbox.take_limit(bound), 12);
-    outbox.note_batch(12, false, bound);
-    assert_eq!(outbox.take_limit(bound), 24);
-    outbox.note_batch(24, false, bound);
-    assert_eq!(outbox.take_limit(bound), 48);
-    outbox.note_batch(48, false, bound);
-    assert_eq!(outbox.take_limit(bound), 64);
-    // Zero answered + handback still clamps at 1 so progress never stalls.
-    outbox.note_batch(0, true, bound);
-    assert_eq!(outbox.take_limit(bound), 1);
+    let (bound, budget) = (64usize, 20_000u64);
+    assert_eq!(outbox.take_limit(AskClass::Merge, bound), 64);
+    assert_eq!(outbox.take_limit(AskClass::Fast, bound), 64);
+    // Heavy merge ask: 1 item takes 25 us (> 20 us budget). Handback snaps aim to 1, and clean single-item
+    // batches taking 25 us keep aim at 1 (no 1 -> 2 -> 1 handback oscillation).
+    outbox.note_batch(AskClass::Merge, 1, true, (25_000, budget), bound);
+    assert_eq!(outbox.take_limit(AskClass::Merge, bound), 1);
+    outbox.note_batch(AskClass::Merge, 1, false, (25_000, budget), bound);
+    assert_eq!(outbox.take_limit(AskClass::Merge, bound), 1);
+    // Fast ask class adapts independently: 10 items in 10 us -> fit = 20.
+    outbox.note_batch(AskClass::Fast, 10, true, (20_000, budget), bound);
+    outbox.note_batch(AskClass::Fast, 10, false, (10_000, budget), bound);
+    assert_eq!(outbox.take_limit(AskClass::Fast, bound), 20);
+    // When merge asks later speed up (4 us each -> fit = 5), merge_aim grows smoothly to 5 and holds there.
+    for (answered, elapsed, expected) in
+      [(1, 4_000, 2), (2, 8_000, 4), (4, 16_000, 5), (5, 20_000, 5)]
+    {
+      outbox.note_batch(AskClass::Merge, answered, false, (elapsed, budget), bound);
+      assert_eq!(outbox.take_limit(AskClass::Merge, bound), expected);
+    }
+    // Zero answered + handback clamps at 1 so progress never stalls.
+    outbox.note_batch(AskClass::Merge, 0, true, (budget, budget), bound);
+    assert_eq!(outbox.take_limit(AskClass::Merge, bound), 1);
   }
 }

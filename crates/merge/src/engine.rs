@@ -203,10 +203,10 @@ impl Increment {
   }
 
   /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
-  /// part 5: a push encoded each increment once only to read this length, a revision's bytes each time). Only the ops
-  /// document is encoded, which is small beside the post-state.
+  /// part 5: a push encoded each increment once only to read this length, a revision's bytes each time). Zero allocation:
+  /// computes the ops document's exact encoded length directly (`OpsDoc::encoded_len`, Wave 8.2A).
   pub fn encoded_len(&self) -> usize {
-    self.encoded_len_with(self.doc.encode().len())
+    self.encoded_len_with(self.doc.encoded_len())
   }
 
   /// [`Increment::encoded_len`] given the ops document's encoded length.
@@ -1201,6 +1201,233 @@ pub struct HeadUnder {
   pub specials: Vec<String>,
 }
 
+/// Extracts `(start, end, overlaps_start)` stamps when every content op in `ops` is either a non-empty `Overwrite`
+/// (`overlaps_start = false`) or a same-length `[Delete(at, len), Insert(at, len)]` pair (`overlaps_start = true`).
+/// Returns `None` if any content op shifts coordinates or has zero length.
+fn pure_length_preserving_stamps(ops: &[Op]) -> Option<Vec<(u64, u64, bool)>> {
+  let mut stamps = Vec::with_capacity(ops.len());
+  let mut iter = ops.iter().peekable();
+  while let Some(op) = iter.next() {
+    if crate::map::effect_of(op).is_none() {
+      continue;
+    }
+    if op.kind == OpKind::Overwrite && op.len > 0 {
+      stamps.push((op.at, op.at.saturating_add(op.len), false));
+      continue;
+    }
+    if op.kind == OpKind::Delete
+      && op.len > 0
+      && let Some(next) = iter.peek().copied()
+      && next.kind == OpKind::Insert
+      && next.at == op.at
+      && next.len == op.len
+    {
+      iter.next();
+      stamps.push((op.at, op.at.saturating_add(op.len), true));
+      continue;
+    }
+    return None;
+  }
+  Some(stamps)
+}
+
+/// One disjoint byte interval `[start, end)` stamped by pure length-preserving overwrites after `last_shift`.
+/// `version` is the highest version that overwrote every byte in `[start, end)`; `split_interior` is the highest
+/// version of an overwrite that strictly crossed `start` (`op.at < start < op.at + op.len`), preserving exact
+/// overlap semantics for zero-length point queries (`Range::new(p, 0)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverwriteSpan {
+  end: u64,
+  version: u64,
+  split_interior: u64,
+}
+
+/// One path's content deltas in strictly increasing version order (Wave 8.2A), replacing per-version
+/// `BTreeMap<String, Vec<Op>>` so `intervening` avoids per-version map lookups and, whenever `base >= last_shift`
+/// (every intervening content op is a non-empty `Overwrite`), `overwritten` answers `map_range` in O(log intervals)
+/// instead of O(intervening_deltas).
+#[derive(Debug, Default)]
+struct PathDeltas {
+  entries: Vec<(u64, Vec<Op>)>,
+  /// Highest version on this path that applied any length-changing or zero-length content op (`0` if none).
+  last_shift: u64,
+  /// Disjoint intervals overwritten strictly after `last_shift`, keyed by `start`.
+  overwritten: BTreeMap<u64, OverwriteSpan>,
+}
+
+impl PathDeltas {
+  /// Records `ops` committed at strictly increasing `version` on this path. Recognizes both pure non-empty
+  /// `Overwrite` ops (`overlaps_start = false`, edge rule) and SDK same-length `[Delete(at, len), Insert(at, len)]`
+  /// replacement pairs (`overlaps_start = true`, since `Insert` at `at` overlaps point `Range(at, 0)`), keeping the
+  /// O(log intervals) overwrite index active across SDK edits (Wave 8.2A).
+  fn record(&mut self, version: u64, ops: Vec<Op>) {
+    if let Some(stamps) = pure_length_preserving_stamps(&ops) {
+      for (start, end, overlaps_start) in stamps {
+        self.stamp_overwrite(start, end, version, overlaps_start);
+      }
+    } else {
+      self.last_shift = version;
+      self.overwritten.clear();
+    }
+    self.entries.push((version, ops));
+  }
+
+  /// Splits any span starting strictly before `start` that straddles `start`, returning the `split_interior`
+  /// version at `start` and `true` if that span also extended strictly past `end` (in which case `[start, end)`
+  /// and its right remainder are already inserted).
+  fn split_before(
+    &mut self,
+    start: u64,
+    end: u64,
+    version: u64,
+    overlaps_start: bool,
+  ) -> (u64, bool) {
+    let prev = self
+      .overwritten
+      .range(..start)
+      .next_back()
+      .map(|(&s, &span)| (s, span));
+    let Some((prev_start, prev_span)) = prev else {
+      return (0, false);
+    };
+    if prev_span.end <= start {
+      return (0, false);
+    }
+    if let Some(entry) = self.overwritten.get_mut(&prev_start) {
+      entry.end = start;
+    }
+    if prev_span.end > end {
+      self.overwritten.insert(
+        start,
+        OverwriteSpan {
+          end,
+          version,
+          split_interior: if overlaps_start {
+            version
+          } else {
+            prev_span.version
+          },
+        },
+      );
+      self.overwritten.insert(
+        end,
+        OverwriteSpan {
+          end: prev_span.end,
+          version: prev_span.version,
+          split_interior: prev_span.version,
+        },
+      );
+      return (prev_span.version, true);
+    }
+    (prev_span.version, false)
+  }
+
+  /// Stamps pure overwrite `[start, end)` (`start < end`) at strictly increasing `version`. When `overlaps_start`
+  /// is true (a `[Delete(start, len), Insert(start, len)]` pair), `split_interior` at `start` is bumped to `version`
+  /// so zero-length point queries at `start` match `map_range`'s overlap with the `Insert`.
+  fn stamp_overwrite(&mut self, start: u64, end: u64, version: u64, overlaps_start: bool) {
+    let (prev_si, straddled) = self.split_before(start, end, version, overlaps_start);
+    if straddled {
+      return;
+    }
+    let start_si = if overlaps_start {
+      version
+    } else if prev_si > 0 {
+      prev_si
+    } else {
+      self
+        .overwritten
+        .get(&start)
+        .map_or(0, |span| span.split_interior)
+    };
+    let covered: Vec<u64> = self
+      .overwritten
+      .range(start..end)
+      .map(|(&key, _)| key)
+      .collect();
+    let mut right_tail: Option<OverwriteSpan> = None;
+    for key in covered {
+      if let Some(span) = self.overwritten.remove(&key)
+        && span.end > end
+      {
+        right_tail = Some(OverwriteSpan {
+          end: span.end,
+          version: span.version,
+          split_interior: span.version,
+        });
+      }
+    }
+    self.overwritten.insert(
+      start,
+      OverwriteSpan {
+        end,
+        version,
+        split_interior: start_si,
+      },
+    );
+    if let Some(tail) = right_tail {
+      self.overwritten.insert(end, tail);
+    }
+  }
+
+  /// Whether any pure-overwrite op in `(base, head]` overlaps `range` (requires `base >= self.last_shift`).
+  fn overlaps_since(&self, base: u64, range: Range) -> bool {
+    if range.len == 0 {
+      let point = range.start;
+      let inside_prev = self
+        .overwritten
+        .range(..point)
+        .next_back()
+        .is_some_and(|(_, span)| span.end > point && span.version > base);
+      let crossed_boundary = self
+        .overwritten
+        .get(&point)
+        .is_some_and(|span| span.split_interior > base);
+      return inside_prev || crossed_boundary;
+    }
+    let lo = range.start;
+    let hi = range.end();
+    let from_prev = self
+      .overwritten
+      .range(..lo)
+      .next_back()
+      .is_some_and(|(_, span)| span.end > lo && span.version > base);
+    if from_prev {
+      return true;
+    }
+    self
+      .overwritten
+      .range(lo..hi)
+      .any(|(_, span)| span.version > base)
+  }
+
+  /// Number of recorded deltas on this path with `version > base`.
+  fn count_after(&self, base: u64) -> usize {
+    let after = self.entries.partition_point(|(v, _)| *v <= base);
+    self.entries.len().saturating_sub(after)
+  }
+
+  /// Deltas on this path with `version > base`, in version order.
+  fn after(&self, base: u64) -> impl Iterator<Item = &[Op]> {
+    let after = self.entries.partition_point(|(v, _)| *v <= base);
+    self
+      .entries
+      .get(after..)
+      .unwrap_or_default()
+      .iter()
+      .map(|(_, ops)| ops.as_slice())
+  }
+
+  /// The delta recorded at exact `version`, if any.
+  fn delta_at(&self, version: u64) -> Option<&[Op]> {
+    let at = self
+      .entries
+      .binary_search_by_key(&version, |(v, _)| *v)
+      .ok()?;
+    self.entries.get(at).map(|(_, ops)| ops.as_slice())
+  }
+}
+
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
 /// base version can be reconstructed for a lagging work. The content dimension's history is copy-on-write
@@ -1271,8 +1498,13 @@ pub struct Green {
   symlink_history: ValueHistory<String>,
   hardlink_history: ValueHistory<String>,
   xattr_history: XattrHistory,
-  /// The deltas of the versions after `deltas_from`, in order: `deltas[i]` is version `deltas_from + i + 1`'s.
-  deltas: Vec<BTreeMap<String, Vec<Op>>>,
+  /// Per-path content deltas for versions after `deltas_from` (Wave 8.2A), indexed by path for zero-lookup
+  /// slice walks and O(log intervals) pure-overwrite mapping when `base >= last_shift`.
+  path_deltas: BTreeMap<String, PathDeltas>,
+  /// The current head version (`deltas_from` plus the number of versions committed since).
+  head_version: u64,
+  /// Non-vacuity counter for O(log intervals) `PathDeltas::overlaps_since` hits in position mapping.
+  overwrite_index_hits: std::cell::Cell<u64>,
   /// The version the green was restored at from a checkpoint ([`Green::restore`]), 0 for a green built from its origin:
   /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
   deltas_from: u64,
@@ -2554,6 +2786,7 @@ impl Green {
     green.accepted = checkpoint.accepted.iter().copied().collect();
     green.signatures = checkpoint.signatures.iter().copied().collect();
     green.deltas_from = checkpoint.version;
+    green.head_version = checkpoint.version;
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
     green.special_history_bytes = green.special_history_recounted();
@@ -2638,9 +2871,19 @@ impl Green {
     );
   }
 
-  /// The head version: the checkpoint's version, if restored from one, plus the deltas committed since.
+  /// The head version: the checkpoint's version, if restored from one, plus the versions committed since.
   pub fn head(&self) -> u64 {
-    self.deltas_from.saturating_add(self.deltas.len() as u64)
+    self.head_version
+  }
+
+  /// Non-vacuity counter: content-merge ops placed via the O(log intervals) pure-overwrite index.
+  pub fn overwrite_index_hits(&self) -> u64 {
+    self.overwrite_index_hits.get()
+  }
+
+  /// The content delta committed at exact `version` on `path`, if any.
+  pub(super) fn delta_for(&self, version: u64, path: &str) -> Option<&[Op]> {
+    self.path_deltas.get(path)?.delta_at(version)
   }
 
   /// The oldest base the green still judges and maps: the version it was restored at from a checkpoint, else 0.
@@ -4224,6 +4467,60 @@ impl Green {
   }
 
   /// Whether `ops`, applied to `path` as it was at `base`, make exactly the head's file: the whole-file identity check
+  /// Returns `true` if `head` contains `span` starting at output offset `out`.
+  fn head_matches_span(head: &[u8], out: u64, span: &[u8]) -> bool {
+    let Ok(start) = usize::try_from(out) else {
+      return false;
+    };
+    start
+      .checked_add(span.len())
+      .is_some_and(|end| head.get(start..end) == Some(span))
+  }
+
+  /// Fast O(ops + edit_size) pre-check for [`Green::lands_on_head`]: when `head` is resident, verifies that the
+  /// applied length equals `head.len()` and that every byte emitted by `Overwrite`/`Insert`/`Extend` matches `head`
+  /// at its exact output offset, rejecting genuine conflicts in ~15 ns without reading `content_history` or resolving
+  /// history layers (Wave 8.2A). Returns `true` if all emitted spans and final length match (or if `head` is named
+  /// and must go through the existing unlent/digest path).
+  fn emitted_matches_head(
+    &self,
+    path: &str,
+    base_len: u64,
+    (ops, post_state): (&[Op], crate::named::Post<'_>),
+  ) -> bool {
+    let Some(Content::Bytes(head)) = self.content.get(path) else {
+      return true;
+    };
+    let mut pos = 0u64;
+    let mut out = 0u64;
+    for op in ops {
+      if op.at > pos {
+        out = out.saturating_add(op.at.min(base_len).saturating_sub(pos.min(base_len)));
+        pos = op.at;
+      }
+      match op.kind {
+        OpKind::Delete => pos = pos.saturating_add(op.len),
+        OpKind::Truncate => pos = base_len,
+        OpKind::Overwrite | OpKind::Insert | OpKind::Extend => {
+          let span = post_state.span(op.src, op.len);
+          if !Green::head_matches_span(head, out, &span) {
+            return false;
+          }
+          out = out.saturating_add(u64::try_from(span.len()).unwrap_or(u64::MAX));
+          if op.kind == OpKind::Overwrite {
+            pos = pos.saturating_add(op.len);
+          }
+        }
+        _ => {}
+      }
+    }
+    if pos < base_len {
+      out = out.saturating_add(base_len.saturating_sub(pos));
+    }
+    out == u64::try_from(head.len()).unwrap_or(u64::MAX)
+  }
+
+  /// Whether applying `ops` (against `base`) to `path`'s value at `base` yields the head's exact bytes: the verdict
   /// of a length-changing op that overlaps an intervening change. Compared through the content history's values
   /// ([`crate::history::Value::applied_equals`]): the base's value and the head's share every run no version between
   /// them changed, and those are equal unread, so the check reads what the ops added and what changed since the base,
@@ -4244,6 +4541,9 @@ impl Green {
     let base_len = self
       .content_len_at(path, base)
       .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX));
+    if !self.emitted_matches_head(path, base_len, ops_and_post) {
+      return false;
+    }
     if !keeps_base(base_len, ops_and_post.0) {
       let made = apply_over((&[], base_len), ops_and_post.0, ops_and_post.1);
       let digest = (
@@ -4325,48 +4625,16 @@ impl Green {
       .is_some_and(|version| *version > base)
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
-  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
-  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
-  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
-  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
-  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
+  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read directly from `path`'s
+  /// per-path delta list (`path_deltas`), so the walk costs only `path`'s own changes since `base`, even below the
+  /// history fold floor (Wave 8.2A).
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
-    if base < self.folded_below {
-      return self.intervening_walk(path, base);
-    }
-    let Some(history) = self.content_history.get(path) else {
+    let Some(pd) = self.path_deltas.get(path) else {
       return Vec::new();
     };
-    let after = history.partition_point(|(version, _)| *version <= base);
-    let ops: Vec<&[Op]> = history
-      .get(after..)
-      .unwrap_or_default()
-      .iter()
-      .filter_map(|(version, _)| {
-        let index = version.checked_sub(self.deltas_from)?.checked_sub(1)?;
-        self
-          .deltas
-          .get(usize::try_from(index).ok()?)?
-          .get(path)
-          .map(Vec::as_slice)
-      })
-      .collect();
-    self.count_visited(history.len().saturating_sub(after));
+    let ops: Vec<&[Op]> = pd.after(base).collect();
+    self.count_visited(ops.len());
     ops
-  }
-
-  /// [`Green::intervening`] by walking every delta in `(base, head]`: for a base below the fold.
-  fn intervening_walk(&self, path: &str, base: u64) -> Vec<&[Op]> {
-    // `submit` and `rebase` refuse a base below `deltas_from`, so the skip is the base's own place in the deltas.
-    let skip = usize::try_from(base.saturating_sub(self.deltas_from)).unwrap_or(usize::MAX);
-    self.count_visited(self.deltas.len().saturating_sub(skip));
-    self
-      .deltas
-      .iter()
-      .skip(skip)
-      .filter_map(|delta| delta.get(path).map(Vec::as_slice))
-      .collect()
   }
 
   /// Adds `deltas` to the verdict's visited count.
@@ -4753,31 +5021,102 @@ impl Green {
     }
     let placed: Vec<position::Placed> = match placed {
       Some((at, placed)) if placed.len() == ops.len() => {
-        let since = if unchanged {
-          Vec::new()
+        if unchanged {
+          placed
         } else {
-          self.intervening(path, at)
-        };
-        placed
-          .into_iter()
-          .map(|place| place.advanced(&since))
-          .collect()
+          self.advance_placed_ops(path, at, placed)
+        }
       }
       _ => {
-        let intervening = if unchanged {
-          Vec::new()
+        if unchanged {
+          ops
+            .iter()
+            .map(|op| {
+              position::Placed::from_parts(
+                crate::map::Mapped::Shifted(touched_range(op)),
+                crate::map::Mapped::Shifted(Range::new(op.at, 0)),
+              )
+            })
+            .collect()
         } else {
-          self.intervening(path, inc.base)
-        };
-        ops
-          .iter()
-          .map(|op| position::Placed::of(op, &intervening))
-          .collect()
+          self.place_ops_from_base(path, inc.base, ops)
+        }
       }
     };
     let mut unit = position::Unit::content(self.content_at_head(inc, path, (ops, &placed)));
     unit.placed = placed;
     unit
+  }
+
+  /// Maps `ops` on `path` from `base` to head: uses the O(log intervals) pure-overwrite index when no
+  /// length-changing delta occurred after `base`, else walks `path`'s intervening deltas.
+  fn place_ops_from_base(&self, path: &str, base: u64, ops: &[Op]) -> Vec<position::Placed> {
+    if let Some(pd) = self.path_deltas.get(path)
+      && base >= pd.last_shift
+    {
+      let count = pd.count_after(base);
+      self.count_visited(count);
+      if count > 0 {
+        self
+          .overwrite_index_hits
+          .set(self.overwrite_index_hits.get().saturating_add(1));
+      }
+      let map = |range: Range| {
+        if count > 0 && pd.overlaps_since(base, range) {
+          crate::map::Mapped::Overlaps
+        } else {
+          crate::map::Mapped::Shifted(range)
+        }
+      };
+      return ops
+        .iter()
+        .map(|op| position::Placed::from_parts(map(touched_range(op)), map(Range::new(op.at, 0))))
+        .collect();
+    }
+    let intervening = self.intervening(path, base);
+    ops
+      .iter()
+      .map(|op| position::Placed::of(op, &intervening))
+      .collect()
+  }
+
+  /// Advances previously placed ops on `path` from `at` to head, taking the O(log intervals) pure-overwrite index
+  /// when no length-changing delta occurred after `at`.
+  fn advance_placed_ops(
+    &self,
+    path: &str,
+    at: u64,
+    placed: Vec<position::Placed>,
+  ) -> Vec<position::Placed> {
+    if let Some(pd) = self.path_deltas.get(path)
+      && at >= pd.last_shift
+    {
+      let count = pd.count_after(at);
+      self.count_visited(count);
+      if count > 0 {
+        self
+          .overwrite_index_hits
+          .set(self.overwrite_index_hits.get().saturating_add(1));
+      }
+      let advance = |mapped: crate::map::Mapped| match mapped {
+        crate::map::Mapped::Shifted(range) if count > 0 && pd.overlaps_since(at, range) => {
+          crate::map::Mapped::Overlaps
+        }
+        other => other,
+      };
+      return placed
+        .into_iter()
+        .map(|place| {
+          let (range, point) = place.parts();
+          position::Placed::from_parts(advance(range), advance(point))
+        })
+        .collect();
+    }
+    let since = self.intervening(path, at);
+    placed
+      .into_iter()
+      .map(|place| place.advanced(&since))
+      .collect()
   }
 
   /// Why an edit of `path` is refused before its ops are placed, if it is: no file at the path (a type change, or delete
@@ -5868,9 +6207,8 @@ impl Green {
     for path in staged.removed {
       self.remove_file_now(&path, version);
     }
-    let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     for file in staged.set {
-      self.set_file(file, version, &mut delta, post_state);
+      self.set_file(file, version, post_state);
     }
     // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
     // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
@@ -5881,7 +6219,7 @@ impl Green {
         self.drop_metadata(&path, version);
       }
     }
-    self.deltas.push(delta);
+    self.head_version = version;
     self.record_changes(version, changed);
   }
 
@@ -6177,14 +6515,8 @@ impl Green {
     self.push_content(path.to_owned(), version, None);
   }
 
-  /// Sets a staged file to its new bytes at `version`, its delta recorded in `delta`.
-  fn set_file(
-    &mut self,
-    file: StagedFile,
-    version: u64,
-    delta: &mut BTreeMap<String, Vec<Op>>,
-    post_state: crate::named::Post<'_>,
-  ) {
+  /// Sets a staged file to its new bytes at `version`, recording its delta into `path_deltas`.
+  fn set_file(&mut self, file: StagedFile, version: u64, post_state: crate::named::Post<'_>) {
     let StagedFile {
       path,
       bytes,
@@ -6233,7 +6565,11 @@ impl Green {
         let value = self.record_reanchored(anchored);
         self.last_changed.insert(path.clone(), version);
         self.push_content(path.clone(), version, Some(value));
-        delta.insert(path, ops);
+        self
+          .path_deltas
+          .entry(path)
+          .or_default()
+          .record(version, ops);
         return;
       }
       // Unreachable given `can_overlay_inplace`, but safe fallback: materialize from untouched head bytes.
@@ -6243,7 +6579,11 @@ impl Green {
       let value = self.content_value(&path, &ops);
       self.last_changed.insert(path.clone(), version);
       self.push_content(path.clone(), version, Some(value));
-      delta.insert(path, ops);
+      self
+        .path_deltas
+        .entry(path)
+        .or_default()
+        .record(version, ops);
       return;
     }
     // The file first, so the value names its block (A-728); the value it supersedes marked so before the path's history
@@ -6257,7 +6597,11 @@ impl Green {
     let value = self.content_value(&path, &ops);
     self.last_changed.insert(path.clone(), version);
     self.push_content(path.clone(), version, Some(value));
-    delta.insert(path, ops);
+    self
+      .path_deltas
+      .entry(path)
+      .or_default()
+      .record(version, ops);
   }
 
   /// Whether anything stands at `path`: a file, a directory, a special node, a symbolic link or a hard link.
@@ -8880,5 +9224,151 @@ mod tests {
         );
       })
       .expect("read branch");
+  }
+
+  /// Wave 8.2A exact encoding length: `OpsDoc::encoded_len` and `Increment::encoded_len` must equal the exact
+  /// byte length produced by `encode()` across empty, multi-op, evidence-carrying, and named-run increments.
+  #[test]
+  fn increment_encoded_len_matches_encode_bytes() {
+    let empty = Increment {
+      id: [1u8; 32],
+      base: 0,
+      doc: OpsDoc::default(),
+      post_state: Vec::new(),
+      evidence: Vec::new(),
+      named: crate::named::Named::default(),
+    };
+    assert_eq!(empty.doc.encoded_len(), empty.doc.encode().len());
+    assert_eq!(empty.encoded_len(), empty.encode().len());
+
+    let mut rich = Steps::default()
+      .create("dir/alpha.txt", b"hello world")
+      .overwrite("dir/beta.rs", 12, b"patch")
+      .at(7, 42);
+    rich.evidence.push([9u8; 32]);
+    rich.evidence.push([11u8; 32]);
+    let _ = rich.push_named(crate::named::NamedRun {
+      identity: crate::named::Identity {
+        hash: [5u8; 32],
+        len: 4096,
+      },
+      offset: 0,
+      len: 4096,
+    });
+    assert_eq!(rich.doc.encoded_len(), rich.doc.encode().len());
+    assert_eq!(rich.encoded_len(), rich.encode().len());
+  }
+
+  /// Checks one generated pure-overwrite history against `crate::map::map_range` across all bases, ranges, and points.
+  fn assert_overwrite_case_matches_oracle(seed: &mut u64) {
+    use crate::map::{Mapped, map_range};
+    let mut next = || {
+      *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      *seed
+    };
+    let mut pd = PathDeltas::default();
+    let mut raw: Vec<Vec<Op>> = Vec::new();
+    for version in 1u64..=32 {
+      let count = usize::try_from(next() % 3).unwrap_or(1) + 1;
+      let mut ops = Vec::with_capacity(count);
+      let mut cursor = 0u64;
+      for _ in 0..count {
+        let at = cursor.saturating_add(next() % 16);
+        let len = (next() % 20) + 1;
+        if next() % 2 == 0 {
+          ops.push(Op {
+            kind: OpKind::Overwrite,
+            flags: 0,
+            path: 0,
+            at,
+            len,
+            src: 0,
+          });
+        } else {
+          // SDK same-length replacement pair: Delete(at, len) + Insert(at, len).
+          ops.push(Op {
+            kind: OpKind::Delete,
+            flags: 0,
+            path: 0,
+            at,
+            len,
+            src: u64::MAX,
+          });
+          ops.push(Op {
+            kind: OpKind::Insert,
+            flags: 0,
+            path: 0,
+            at,
+            len,
+            src: 0,
+          });
+        }
+        cursor = at.saturating_add(len);
+      }
+      raw.push(ops.clone());
+      pd.record(version, ops);
+    }
+    assert_eq!(pd.last_shift, 0);
+    for base in 0u64..=32 {
+      let slice: Vec<&[Op]> = raw[usize::try_from(base).unwrap_or(0)..]
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+      for start in 0u64..96 {
+        for len in [0u64, 1, 2, 5, 13, 32] {
+          let range = Range::new(start, len);
+          let oracle = matches!(map_range(&slice, range), Mapped::Overlaps);
+          assert_eq!(
+            pd.overlaps_since(base, range),
+            oracle,
+            "mismatch at base={base} range={range:?}"
+          );
+        }
+      }
+    }
+  }
+
+  /// Wave 8.2A oracle: `PathDeltas::overlaps_since` must match `crate::map::map_range` across every generated
+  /// history of overwrites (including overlapping, adjacent, nested, identical-start, and split spans) and
+  /// across every non-empty range and zero-length point query at every base version, and must activate on real
+  /// `Green::submit` overwrites (non-vacuity `overwrite_index_hits`).
+  #[test]
+  fn overwrite_index_matches_map_range_oracle() {
+    let mut seed = 0x51a7_e582_a001_u64;
+    for _ in 0..64 {
+      assert_overwrite_case_matches_oracle(&mut seed);
+    }
+
+    // Non-vacuity on Green::submit with lagging pure overwrites.
+    let mut green = Green::new();
+    let base_v1 = Steps::default().create("hot.bin", &[b'A'; 256]).at(1, 0);
+    assert_eq!(green.submit(&base_v1), Outcome::Accepted { version: 1 });
+    for step in 0..16u64 {
+      let inc = Steps::default()
+        .overwrite("hot.bin", step * 8, &[b'B'; 8])
+        .at(u8::try_from(step + 2).unwrap_or(255), step + 1);
+      assert_eq!(green.submit(&inc), Outcome::Accepted { version: step + 2 });
+    }
+    let before_hits = green.overwrite_index_hits();
+    let lagging_disjoint = Steps::default()
+      .overwrite("hot.bin", 200, &[b'C'; 8])
+      .at(99, 1);
+    assert_eq!(
+      green.submit(&lagging_disjoint),
+      Outcome::Accepted { version: 18 }
+    );
+    assert!(
+      green.overwrite_index_hits() > before_hits,
+      "overwrite_index_hits must advance on pure-overwrite lagging submit"
+    );
+    let lagging_conflict = Steps::default()
+      .overwrite("hot.bin", 16, &[b'Z'; 8])
+      .at(100, 1);
+    assert!(matches!(
+      green.submit(&lagging_conflict),
+      Outcome::Conflict { .. }
+    ));
   }
 }

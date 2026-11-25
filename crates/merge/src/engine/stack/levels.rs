@@ -299,12 +299,7 @@ impl Green {
 
   /// The delta the version `version` recorded at `path`.
   fn delta_at(&self, version: u64, path: &str) -> Option<&[Op]> {
-    let index = version.checked_sub(self.deltas_from)?.checked_sub(1)?;
-    self
-      .deltas
-      .get(usize::try_from(index).ok()?)?
-      .get(path)
-      .map(Vec::as_slice)
+    self.delta_for(version, path)
   }
 
   /// The attributes of `path` whose values changed in `span`.
