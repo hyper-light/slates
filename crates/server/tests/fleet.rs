@@ -37077,7 +37077,7 @@ fn branch_then_restart_b(name: &str) -> (GitFleet, BranchRestarted) {
 fn a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after() {
   let _serial = serialize_fleet_tests();
   let (
-    mut fleet,
+    fleet,
     BranchRestarted {
       landed,
       held_before,
