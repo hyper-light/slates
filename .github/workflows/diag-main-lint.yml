@@ -1,4 +1,8 @@
 name: diag-main-lint
+# Run 45 (main 01a20182, 2026-11-25 05:00 PST): main at 9e213f94f, the landings after run 44: w-perf's churn (a) with
+# HeldPieceRef (97d7f37cf, 7edf532ec, a966f1de1), w-hg's owner spin (f01ea12dd), A-918 (i) Behind (1d2d21f21), the fetch
+# work split (2eec91f9b), the revlog-chunk place (367b2bea6), derive_behind again (e89adba55), svn's sliced apply
+# (5d426b725, 04fe9cc26), the true-F bound (db17077e1), the pins in the intake step (bbcfe756e), and the rest since 0cd27990e.
 # Run 44 (main 01a20182, 2026-11-25 02:32 PST): main at 0cd27990e: run 43's hg_fetch_heap type fixed (e8e33fe6f), with arm B
 # (d9af8b94f), stored chunks (5114fd09e), A-916 (92b74ac50), derive_behind (608930048), the pin quadratic (8ec5fb287),
 # the unlanded-count restart test (fc163e79b), the replay sweep (7f5ad8a37), the crash-test fix (47eb329ab), the
