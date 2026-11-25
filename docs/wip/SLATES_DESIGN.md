@@ -1390,6 +1390,15 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > 1,000-revision Subversion import ends at 1,431 to 1,495 MB of footprint against 2,417 to 2,551 MB, at once and steady,
 > in the same time (BENCHMARKS.md). `slates status --json` prints each shard's `retained_bytes` and `retained_versions`,
 > and the control shard's `mem.large.*` give-back counters.
+>
+> **Status (2026-11-25, A-742 for the content arena under an import; goal 93 P7, main's ruling).** The idle purge (A-105)
+> gives a shard's resident free content pages back only once the shard is idle, and an import never leaves it so: an
+> import's batch tail now gives back the content arena's resident free pages past the batch's own texts bound, a slice of
+> the idle purge's size a step (`ChunkArena::purge_past`, `daemon::purge_slice_blocks`), counted
+> `repository.svn_import.purged_past_bound_bytes` and `purged_kept_short_bytes`. The keep is the bound because a batch
+> takes at most it before it lands. Main's fourth P7 arm (2b977b986, git-2000) holds the arena's recorded resident free
+> within the bound each round; the free space it does not record (the last batches' deferred frees until the next
+> publication, and free space past the purge's reach) is the open part (GAPS, A-742).
 
 > **Status (2026-11-20, A-744: the anchor's memory, range by range).** `slates status --json` prints, per shard,
 > `content_ranges`: its slice of the anchor content object (write log, image slots, delta log, DAX range table, chunk

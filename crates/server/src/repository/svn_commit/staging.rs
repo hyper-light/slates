@@ -181,6 +181,20 @@ pub(crate) fn durable_flush_ns() -> Option<u64> {
   DURABLE_FLUSH_NS.with(std::cell::Cell::get)
 }
 
+/// Test support: forgets the device's flush this shard measured, and the last landing's await, so a test reads its own
+/// batch's.
+#[cfg(test)]
+pub(crate) fn forget_durable_flush() {
+  DURABLE_FLUSH_NS.with(|measured| measured.set(None));
+  LANDING_AWAITED_NS.with(|awaited| awaited.set(None));
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Test support: the last batch's changeset landing as its task awaited it, set as its flush is taken for `F`.
+  pub(crate) static LANDING_AWAITED_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Records `flush_ns`, the store's flush of a batch's changeset, as the device's where it is the least this shard met.
 fn flushed_in(flush_ns: u64) {
   DURABLE_FLUSH_NS.with(|measured| {
@@ -252,6 +266,10 @@ async fn kill_before_entry_where_set() {
 /// Counter: the bytes of the content arena's resident free pages an import's batches gave back past their bound
 /// ([`give_back_past`]). Format: a counter name in the status report.
 pub(crate) const PURGED_PAST_BOUND: &str = "repository.svn_import.purged_past_bound_bytes";
+/// Counter: the bytes of free runs an import's give-back walked and kept resident, each shorter than the discard size
+/// ([`give_back_past`]; the arena counts them out of its resident free bytes though their pages stay). Format: a counter
+/// name in the status report.
+pub(crate) const PURGE_KEPT_SHORT: &str = "repository.svn_import.purged_kept_short_bytes";
 
 /// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
 /// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
@@ -261,6 +279,10 @@ fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
   state.count(
     PURGED_PAST_BOUND,
     u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+  );
+  state.count(
+    PURGE_KEPT_SHORT,
+    u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
   );
   purged.more && state.store.content.arena().resident_free_bytes() > keep
 }
@@ -915,6 +937,8 @@ impl Staging {
     if landed.is_ok()
       && let Some(flush_ns) = slates_store::owner::take_landed_flush_ns()
     {
+      #[cfg(test)]
+      LANDING_AWAITED_NS.with(|awaited| awaited.set(Some(committing.saturating_sub(flushing))));
       flushed_in(flush_ns);
     }
     #[cfg(test)]

@@ -150,4 +150,10 @@ fn print_measured(measured: &Measured, after: (u64, u64)) {
   for (name, value) in listed.into_iter().take(LISTED) {
     println!("svn_import_storage: after the import {name} = {value}");
   }
+  // The import's own memory counters, whatever their size (goal 93 P7: what its batches gave back, main's ask).
+  for (name, value) in &measured.rows {
+    if name.contains(":repository.svn_import.purged") || name.contains(":content.purge") {
+      println!("svn_import_storage: after the import {name} = {value}");
+    }
+  }
 }
