@@ -714,3 +714,4 @@ Waiting: main's route; arena-7 and arena-8.
 - Landed main b33c6a4b4: stream counters (span, turn_ns, steps, turns_at_ceiling, write_ns/waits, vcs_http.reply_yield_gap_ns). In-process: no gap between turns (span = turns + store waits); 57k likely step-cost bound (turns at ceiling). Waiting on main's 57k read.
 - Reported to main: git test a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding fails 4/4 on main (w-git's).
 - Next: (b) step 1 (T row form byte + read_place decode + red 1) unless main asks stream step cost first.
+- Landed main c4e034694: (b) step 1 (367b2bea6): store Form mark on Texts entries/T rows (2,3), installed chunk decoder (revlog_chunk::decode_within), make_chain decodes; reds chunk_form/chunk_form_undecoded. Next: step 2 (push/import landings write chunks, record v+1, compress sliced under step budget, compress_bytes_most).
