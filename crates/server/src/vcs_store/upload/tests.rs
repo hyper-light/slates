@@ -1405,3 +1405,118 @@ fn a_fetchs_walk_takes_one_entry_a_unit_never_a_tree_whole() {
   assert!(tree_bytes_most > 0, "trees parsed: {tree_bytes_most} bytes");
   assert_eq!(entries_most, 1, "one entry a unit, never a tree whole");
 }
+
+/// The paced choose's quantum in these tests, nanoseconds.
+/// Derived: a round quantum, three [`PACED_UNIT`]s and a third.
+const PACED_QUANTUM: u64 = 100;
+/// A target error that takes every sample as it comes: the whole of a million parts.
+/// Derived: one million parts per million.
+const PACED_PPM: u64 = 1_000_000;
+/// The samples the costs take before the step: more than one, so the estimate is a mean.
+/// Derived: three.
+const PACED_SAMPLES: usize = 3;
+/// How far past the quantum the tests let a step ask before they call it unpaced, in quanta.
+/// Derived: ten, past any ceiling here.
+const PACED_GIVE_UP: u64 = 10;
+/// One choosing unit's cost in these tests, nanoseconds.
+/// Derived: a tenth of [`PACED_QUANTUM`] times three, so a quantum's last unit (at 90) would cross it.
+const PACED_UNIT: u64 = 30;
+
+/// Someone waits on the shard.
+fn waits() -> bool {
+  true
+}
+
+/// No one waits on the shard.
+fn alone() -> bool {
+  false
+}
+
+/// A clock that stands still: each ask passes its own time.
+fn still() -> u64 {
+  0
+}
+
+/// A pace of [`PACED_QUANTUM`] whose waiting is `waiting`, its ceiling `quanta` quanta, and costs that know a commit
+/// unit takes [`PACED_UNIT`].
+fn paced(waiting: fn() -> bool, quanta: u64) -> (super::ChoosePace, slates_pace::Costs<14>) {
+  let commits = super::kind_at(slates_git::negotiation::UnitKind::Commits);
+  let mut costs = slates_pace::Costs::ZERO;
+  for _ in 0..PACED_SAMPLES {
+    costs.units[commits].add(PACED_UNIT, PACED_PPM);
+  }
+  let env = slates_pace::Env {
+    clock: still,
+    waiting,
+    quantum_ns: PACED_QUANTUM,
+    ceiling_ns: PACED_QUANTUM.saturating_mul(quanta),
+    target_ppm: PACED_PPM,
+  };
+  (super::ChoosePace::begin(env, 0), costs)
+}
+
+/// Asks `pace` at each multiple of [`PACED_UNIT`] for another commit unit, until it is spent: when, and what it decided.
+fn asked_until_spent(
+  pace: &mut super::ChoosePace,
+  costs: &mut slates_pace::Costs<14>,
+) -> (u64, super::Asked) {
+  let commits = super::kind_at(slates_git::negotiation::UnitKind::Commits);
+  let mut now: u64 = 0;
+  loop {
+    now = now.saturating_add(PACED_UNIT);
+    let asked = pace.ask(now, (commits, commits), costs, PACED_QUANTUM);
+    if asked.spent || now > PACED_QUANTUM.saturating_mul(PACED_GIVE_UP) {
+      return (now, asked);
+    }
+  }
+}
+
+/// A-783's pace for a fetch's choosing (main's order of 2026-11-25). Do: a choosing step whose shard has someone waiting,
+/// its commit units known to take [`PACED_UNIT`] of a [`PACED_QUANTUM`] quantum, asked after each. Expect: spent at 90,
+/// before the unit that would end at 120, past the quantum; no overrun. Red before: the next unit granted while the
+/// quantum had any time left, spent at 120, 20 past the span the pace allowed, an overrun.
+#[test]
+fn a_choosing_step_with_someone_waiting_ends_within_its_quantum() {
+  let (mut pace, mut costs) = paced(waits, 1);
+  let (spent_at, asked) = asked_until_spent(&mut pace, &mut costs);
+  assert_eq!(
+    spent_at, 90,
+    "spent before the unit that would cross the quantum"
+  );
+  assert!(!asked.overran, "no overrun: {asked:?}");
+}
+
+/// A-783 (main's order of 2026-11-25). Do: a choosing step whose shard has no one else waiting, ceiling three quanta.
+/// Expect: it takes more quanta and is spent at 300, its ceiling, the unit that would end at 330 refused; within the span
+/// the pace allowed, no overrun.
+#[test]
+fn a_lone_choosing_step_takes_more_quanta_to_its_ceiling() {
+  let (mut pace, mut costs) = paced(alone, 3);
+  let (spent_at, asked) = asked_until_spent(&mut pace, &mut costs);
+  assert_eq!(
+    spent_at, 300,
+    "more quanta while no one waits, to the ceiling"
+  );
+  assert!(!asked.overran, "no overrun: {asked:?}");
+}
+
+/// A-783 (main's order of 2026-11-25). Do: a choosing step whose first unit alone ran past the quantum (130 of 100).
+/// Expect: spent, the step not counted as an overrun (the unit is counted by kind, `long_units`).
+#[test]
+fn a_unit_alone_past_the_quantum_is_no_overrun_of_its_step() {
+  let commits = super::kind_at(slates_git::negotiation::UnitKind::Commits);
+  let (mut pace, mut costs) = paced(waits, 1);
+  let asked = pace.ask(
+    PACED_QUANTUM.saturating_add(PACED_UNIT),
+    (commits, commits),
+    &mut costs,
+    PACED_QUANTUM,
+  );
+  assert_eq!(
+    asked,
+    super::Asked {
+      spent: true,
+      overran: false
+    }
+  );
+}
