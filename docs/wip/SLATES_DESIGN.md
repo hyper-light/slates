@@ -64171,5 +64171,19 @@ measured noise of the 100 figure, not a literal.
 > are gone, and with them the yield the driver made between macOS's exit note and a readable status. The spawner's
 > death ends a run typed (`StartRefused::SpawnerGone`, worded as a server that could not start a process), the
 > hook's group killed. Red: a hook's parent is the spawner, not the shard's process
-> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`). Owed, piece 2b: the spawner restarted on its death
-> (back-off, in-flight bound, restart wait, each derived) and its footprint measured.
+> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`).
+>
+> **Piece 2b built (2026-11-25).** The control shard owns the spawner (`crate::spawning::own`, handed it by the
+> daemon's start with the measured length of that start). A shard whose end closes answers that generation's waiters
+> `SpawnerGone` and tells the owner; the owner restarts once per generation, after a back-off (`back_off_ns`: none
+> after one death, then the measured start's length doubled for each death within a liveness window of its start,
+> capped at the liveness window, RFC 6298 §5.5), and sends each shard its new end (`run_on_waiting`), or tells each
+> the attempt failed and tries again after a longer back-off. The restart wait is no timer: a spawn asked while a
+> restart is awaited waits for that attempt's answer, which always comes (the new end or the failure); between
+> attempts it is refused at once. Ids keep rising across generations and a handle of a gone generation answers
+> `SpawnerGone`, so no handle names a new spawner's child. A shard's spawns in flight (asked, running, not let go) are
+> at most its task bound (`RuntimeConfig::tasks_per_shard`, from the admission limit: each task asks for one child at a
+> time), one past it refused `Busy` (`StartRefused::NoRoom` to a hook). The owner joins the spawner when it is dropped
+> at the stop, killing it with its group a liveness window later. Red: a spawn after the spawner's death gets its
+> child from a new spawner (`a_dead_spawner_is_restarted_and_a_spawn_asked_after_its_death_gets_its_child`); before,
+> every spawn after it was refused. Owed: the spawner's footprint, measured on a release daemon (main's).
