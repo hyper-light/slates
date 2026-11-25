@@ -771,6 +771,13 @@ pub(crate) const POSITION_CACHE_HITS: &str = "vcs_store.git_upload.position_cach
 /// lost to another's slot, since an id met the first time finds a taken slot too once the cache is warm
 /// (`slates_git::store::PositionCounts::conflicts`). Format: a counter name.
 pub(crate) const POSITION_CACHE_CONFLICTS: &str = "vcs_store.git_upload.position_cache_conflicts";
+/// Counted most: the most entries one unit of a fetch's walk took before asking whether its step was spent (main
+/// 01a20182's order of 2026-11-25: 280,392 polls past the step quantum in one clone of git/git, a tree opened whole a
+/// unit). Format: a counter name.
+pub(crate) const UNIT_ENTRIES_MOST: &str = "vcs_store.git_upload.unit_entries_most";
+/// Counted most: the longest tree, in bytes, one unit of a fetch's walk read and parsed whole (main 01a20182's order of
+/// 2026-11-25: against the step quantum's bytes on a whole clone). Format: a counter name.
+pub(crate) const TREE_PARSE_BYTES_MOST: &str = "vcs_store.git_upload.tree_parse_bytes_most";
 /// Counter: fetches whose cache of positions was refused the room its walk's work asked, each then as slow as with no
 /// cache (A-911: a cache costs time, never an answer). Format: a counter name.
 pub(crate) const POSITION_CACHE_UNROOMED: &str = "vcs_store.git_upload.position_cache_unroomed";
@@ -861,6 +868,8 @@ impl ShardPacks {
   /// shard thread made and took again ([`count_deflaters`]).
   fn count_on(&self, state: &mut ShardState) {
     count_deflaters(state);
+    state.count_max(UNIT_ENTRIES_MOST, self.chose.entries_most);
+    state.count_max(TREE_PARSE_BYTES_MOST, self.chose.tree_bytes_most);
     for (name, by) in [
       (POSITION_LOOKUPS, self.chose.lookups),
       (POSITION_CACHE_HITS, self.chose.hits),
@@ -936,6 +945,8 @@ impl PackSource for ShardPacks {
     self.chose.lookups = self.chose.lookups.saturating_add(counts.lookups);
     self.chose.hits = self.chose.hits.saturating_add(counts.hits);
     self.chose.conflicts = self.chose.conflicts.saturating_add(counts.conflicts);
+    self.chose.entries_most = self.chose.entries_most.max(counts.entries_most);
+    self.chose.tree_bytes_most = self.chose.tree_bytes_most.max(counts.tree_bytes_most);
     self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
   }
 }

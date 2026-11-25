@@ -466,10 +466,22 @@ impl<K> Answer<K> {
       StoreGraph::new(served.repository, served.store, served.refs).with_positions(positions);
     self.choose_on((served, &graph), packs, admission, spent);
     let mut positions = graph.into_positions();
-    packs.chose(positions.take_counts());
+    let mut counts = positions.take_counts();
+    counts.entries_most = self.entries_most();
+    packs.chose(counts);
     if let Some(choosing) = self.choosing.as_mut() {
       choosing.positions = positions;
     }
+  }
+
+  /// The most entries one unit of its walk took so far: its negotiation's while choosing, its outcome's once chosen.
+  pub fn entries_most(&self) -> u64 {
+    self
+      .choosing
+      .as_ref()
+      .map(|choosing| choosing.negotiating.counters())
+      .or(self.counters)
+      .map_or(0, |counters| counters.entries_most)
   }
 
   /// [`Answer::choose_unit`]'s work on `graph`, `served` read through it.

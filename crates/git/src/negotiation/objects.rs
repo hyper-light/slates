@@ -177,6 +177,21 @@ struct Sets<N> {
   path: Vec<u8>,
   /// The path's cost: its longest.
   path_peak: Peak,
+  /// The tree opened and not yet taken: its entries' ids, the next first, and the depth they are met at, each taken in
+  /// a unit of its own (main 01a20182's order of 2026-11-25: a unit past the step quantum is the bounded-work rule's bug
+  /// signal, and a tree's entries are its user's to number). One tree at a time, its ids held from the admission while
+  /// it is taken and given back once its last is (a tree's ids are the walk's for a while, never its answer's).
+  taking: Option<Taking>,
+}
+
+/// A tree's entries being taken one a unit ([`Sets::taking`]).
+struct Taking {
+  /// The ids not yet taken, the next last.
+  ids: Vec<ObjectId>,
+  /// The depth they are met at.
+  depth: u64,
+  /// The admission the ids hold, given back once the last is taken.
+  held: Hold,
 }
 
 /// The trees a walk opened: as runs where each opens once (every filter but `tree:`), with the depth each was last met
@@ -294,6 +309,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
         frames: Vec::new(),
         path: Vec::new(),
         path_peak: Peak::default(),
+        taking: None,
       },
     })
   }
@@ -533,7 +549,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
 impl<N: Copy + Ord + Into<u64>> Sets<N> {
   /// Whether a tree walk is under way.
   fn walking(&self) -> bool {
-    !self.open.is_empty() || !self.frames.is_empty()
+    self.taking.is_some() || !self.open.is_empty() || !self.frames.is_empty()
   }
 
   /// One entry of the walk under way: the next tree to open, or the `sparse:oid` walk's next entry.
@@ -544,6 +560,9 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
+    if self.taking.is_some() {
+      return self.take_one(graph, view, admission, counters);
+    }
     if let Some((tree, depth)) = self.open.pop() {
       return self.open_one(graph, view, tree, depth, admission, counters);
     }
@@ -615,21 +634,56 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       }
     }
     counters.trees = counters.trees.saturating_add(1);
-    for entry in graph
-      .entries(tree)
-      .filter(|entry| !view.held.contains(*entry))
+    let mut ids = graph.entry_ids(tree);
+    if ids.is_empty() {
+      return Ok(());
+    }
+    ids.reverse();
+    let bytes =
+      crate::to_u64(ids.len()).saturating_mul(crate::to_u64(core::mem::size_of::<ObjectId>()));
+    let held = admission.hold(bytes).map_err(Refusal::PastAdmission)?;
+    self.taking = Some(Taking { ids, depth, held });
+    Ok(())
+  }
+
+  /// The tree being taken's next entry, in a unit of its own: chosen where the filter admits it, queued to open where
+  /// it is a tree; the tree done once its last is taken.
+  fn take_one<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    view: &View<'_>,
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    let Some(taking) = self.taking.as_mut() else {
+      return Ok(());
+    };
+    let (next, depth) = (taking.ids.pop(), taking.depth);
+    if taking.ids.is_empty()
+      && let Some(done) = self.taking.take()
     {
-      let kind = graph.kind(entry);
-      let size = view.size_of(graph, entry, kind);
-      if view.admits(kind, size, depth) {
-        self.objects.insert(entry, admission)?;
-      }
-      if kind == Kind::Tree {
-        self.open.push((entry, depth.saturating_add(1)));
-        self
-          .open_peak
-          .reach::<(N, u64)>(self.open.len(), admission)?;
-      }
+      admission.release(done.held);
+    }
+    let Some(id) = next else {
+      return Ok(());
+    };
+    counters.entries_most = counters.entries_most.max(1);
+    let Some(entry) = graph.entry_node(&id) else {
+      return Ok(());
+    };
+    if view.held.contains(entry) {
+      return Ok(());
+    }
+    let kind = graph.kind(entry);
+    let size = view.size_of(graph, entry, kind);
+    if view.admits(kind, size, depth) {
+      self.objects.insert(entry, admission)?;
+    }
+    if kind == Kind::Tree {
+      self.open.push((entry, depth.saturating_add(1)));
+      self
+        .open_peak
+        .reach::<(N, u64)>(self.open.len(), admission)?;
     }
     Ok(())
   }

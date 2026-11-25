@@ -38,7 +38,8 @@ use crate::state::ShardState;
 
 /// Counter: a version's sets derived and kept. Format: a counter name.
 pub(crate) const DERIVED: &str = "vcs_store.git_derive.derived";
-/// Counter: a derivation's turns. Format: a counter name.
+/// Counter: a derivation's turns: those that turned one, never a call that found nothing to derive (every encoding turn
+/// asks first). Format: a counter name.
 pub(crate) const TURNS: &str = "vcs_store.git_derive.turns";
 /// Counter: a derivation refused (the content store's room, a damaged record), dropped. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_derive.refused";
@@ -74,8 +75,13 @@ pub(crate) enum Turned {
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   let quantum_ns = state.config.step_quantum_ns();
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
-  let (turned, derived, refused) =
-    super::lent_state(state, |state| turn_lent(state, id, quantum_ns));
+  let Some((turned, derived, refused)) =
+    super::lent_state(state, |state| turn_lent(state, id, quantum_ns))
+  else {
+    // Nothing to derive: no turn of a derivation, and none counted (main 01a20182, 2026-11-25: every encoding turn asks
+    // here first, so counting these read as a derivation spinning, 63,153 turns deriving nothing in one clone).
+    return Turned::Idle;
+  };
   state.count(TURNS, 1);
   if YIELDED.with(|yielded| yielded.replace(false)) {
     state.count(TURNS_YIELDED, 1);
@@ -89,14 +95,19 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   turned
 }
 
-/// [`turn`]'s work inside its lend: what it came to, the versions it kept, and whether it was refused.
-fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turned, u64, bool) {
+/// [`turn`]'s work inside its lend: what it came to, the versions it kept, and whether it was refused; none where there
+/// was no derivation to turn (no git store of `id` here, or every version's sets known).
+fn turn_lent(
+  state: &mut ShardState,
+  id: RepositoryId,
+  quantum_ns: u64,
+) -> Option<(Turned, u64, bool)> {
   let stores = &mut state.vcs_stores;
   let (Some(content), Some(super::RepositoryStore::Git(store))) =
     (stores.content.as_mut(), stores.entries.get_mut(&id))
   else {
     super::settle(state);
-    return (Turned::Idle, 0, false);
+    return None;
   };
   let repository = &store.repository;
   let deriving = match stores.derivings.0.remove(&id) {
@@ -104,7 +115,7 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
     None if repository.derivations_due() => repository.deriving_due(content),
     None => {
       super::settle(state);
-      return (Turned::Idle, 0, false);
+      return None;
     }
   };
   let mut deriving = deriving;
@@ -129,7 +140,7 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
     },
   };
   super::settle(state);
-  answer
+  Some(answer)
 }
 
 thread_local! {
