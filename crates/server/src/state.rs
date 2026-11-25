@@ -519,6 +519,10 @@ pub struct ShardState {
   pub by_id: BTreeMap<VolumeId, slates_mem::Handle<VolumeSlot>>,
   /// The clients.
   pub clients: Slab<ClientSlot>,
+  /// Reusable scratch buffer holding `(index, handle)` pairs of active or closed clients during
+  /// [`crate::verbs::serve_round`], avoiding a per-round heap allocation and skipping idle rings.
+  /// Bounded by `clients_per_shard` (the client slab's cap).
+  pub(crate) serve_scratch: Vec<(u32, slates_mem::Handle<ClientSlot>)>,
   /// The next inode prefix a volume takes (unique per volume on the host: the shard in the
   /// high bits and a counter below).
   pub next_prefix: u16,

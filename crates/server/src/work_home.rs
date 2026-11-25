@@ -464,18 +464,22 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
 }
 
 /// What the verb needs of the owner that it does not already have, given what the verb now holds in `state.work_home`.
-fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<Need> {
-  let w = state.works.get(&work)?;
-  let home = &state.work_home;
-  let fetched = home.fetched.is_some();
-  let file_if_unheld = |path: &str| {
+fn need_of(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -> Option<Need> {
+  let fetched = state.work_home.fetched.is_some();
+  let has_verdict = state.work_home.verdict.is_some();
+  let has_rebased = state.work_home.rebased.is_some();
+  let file_if_unheld = |state: &ShardState, path: &str| {
+    let w = state.works.get(&work)?;
     let key = canonical_path(path);
     // A length the work's kept entry of the path names (its base's, A-247) is read there, not asked (A-808).
     (!fetched && !w.files.holds(key) && !w.entries.contains_key(key))
       .then(|| Need::Lengths(vec![key.to_owned()]))
   };
+  let w = state.works.get(&work)?;
   match body {
-    RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
+    RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => {
+      file_if_unheld(state, path)
+    }
     RequestBody::ReadRange {
       path,
       at: ReadAt::Head,
@@ -505,15 +509,14 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
     | RequestBody::SubmitSigned { .. }
     | RequestBody::SubmitHeld { .. }
     | RequestBody::SubmitApproved { .. } => {
-      if home.verdict.is_some() {
+      if has_verdict {
         return None;
       }
       let (evidence, approval, signature) = submitted(body)?;
       let authorship = body.authorship().cloned().unwrap_or_default();
-      Some(verdict_need(
+      Some(verdict_need_live(
         state,
         work,
-        seal(state, work),
         (evidence, approval, signature, authorship),
       ))
     }
@@ -562,11 +565,10 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       page_if_unheld(w, fetched, path, *offset, (*max).min(page_room()))
     }
     RequestBody::Rebase { .. } => {
-      if home.rebased.is_some() {
+      if has_rebased {
         return None;
       }
-      let sealed = seal(state, work);
-      Some(prepare_rebase_need(state, sealed, None))
+      Some(prepare_rebase_need_live(state, work, None))
     }
     RequestBody::EditSubmit {
       path,
@@ -584,10 +586,10 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       evidence,
       ..
     } => {
-      if let Some(need) = file_if_unheld(path) {
+      if let Some(need) = file_if_unheld(state, path) {
         return Some(need);
       }
-      if home.verdict.is_some() {
+      if has_verdict {
         return None;
       }
       let approval = if matches!(body, RequestBody::EditSubmitHeld { .. }) {
@@ -633,6 +635,159 @@ fn submitted(body: &RequestBody) -> Option<Submitted<'_>> {
   }
 }
 
+/// Plans a live work directly from `state.works` without deep-cloning its journal or changed files
+/// (Wave 9): reuses any increment already sliced by `crate::refining`, parks large (`> CARRIED_INCREMENT_MAX`)
+/// or whole-file-rewrite submits behind a sliced refining job, and otherwise composes in place over
+/// `&w.files`/`&w.journal` — cloning `w.files` only when `holds_copy` or composition fails.
+fn prepare_live(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  evidence: Vec<[u8; 32]>,
+) -> Result<SealedWork, Box<Need>> {
+  let Some((green, base_version, journal_len, has_copy)) = state.works.get(&work).map(|w| {
+    (
+      w.green,
+      w.base_version,
+      w.journal.len(),
+      holds_copy(&w.journal),
+    )
+  }) else {
+    return Ok(seal(state, work));
+  };
+  if has_copy {
+    let mut sealed = seal(state, work);
+    sealed.composes_here = true;
+    return Ok(sealed);
+  }
+  let key = (base_version, journal_len);
+  if let Some(inc) = crate::refining::take_increment(state, work, key, &evidence) {
+    return Ok(SealedWork {
+      work,
+      green,
+      base_version,
+      journal: Vec::new(),
+      files: WorkFiles::default(),
+      composed: Some(inc),
+      computed: None,
+      held: None,
+      merge: None,
+      composes_here: true,
+    });
+  }
+  let (planned_base, planned_doc) = plan_live_work(state, work);
+  if let Some(w) = state.works.get(&work)
+    && let Some(need) = base_missing_for(
+      state,
+      (work, base_version),
+      (&w.journal, &w.files),
+      planned_doc.as_ref().map(|(doc, _)| doc),
+    )
+  {
+    return Err(Box::new(need));
+  }
+  if let (Some(base), Some((doc, plan))) = (&planned_base, &planned_doc) {
+    let refine_pairs =
+      crate::refining::owed_pairs(state, (work, base_version), journal_len, base, (doc, plan));
+    let sliced_large =
+      crate::refining::needs_sliced_prepare(doc) && !crate::refining::is_done(state, work, key);
+    if !refine_pairs.is_empty() || sliced_large {
+      let Some((doc, plan)) = planned_doc else {
+        return Ok(seal(state, work));
+      };
+      let owed = crate::refining::make_owed(key, doc, plan, refine_pairs);
+      return Err(Box::new(Need::Refine(Box::new(owed))));
+    }
+  }
+  Ok(compose_live(
+    state,
+    work,
+    evidence,
+    planned_base.as_ref(),
+    planned_doc,
+  ))
+}
+
+/// Plans `work`'s current journal against its kept entries in one pass without cloning its files.
+fn plan_live_work(
+  state: &ShardState,
+  work: DbVolumeId,
+) -> (
+  Option<slates_merge::increment::Base>,
+  Option<(
+    slates_merge::ops_doc::OpsDoc,
+    slates_merge::increment::PostStatePlan,
+  )>,
+) {
+  let Some(w) = state.works.get(&work) else {
+    return (None, None);
+  };
+  let named: std::collections::BTreeSet<&str> = w
+    .journal
+    .iter()
+    .flat_map(VolumeOp::names)
+    .flatten()
+    .collect();
+  let base = slates_merge::increment::Base::for_names(&named, &w.entries);
+  let planned = base
+    .as_ref()
+    .and_then(|b| slates_merge::increment::compose_volume_planned(b, &w.journal).ok());
+  (base, planned)
+}
+
+/// Composes `work`'s increment directly from `state.works` (zero clone of `w.files`/`w.journal`),
+/// falling back to [`seal`] only when composition refuses so the owner returns the typed refusal.
+fn compose_live(
+  state: &ShardState,
+  work: DbVolumeId,
+  evidence: Vec<[u8; 32]>,
+  planned_base: Option<&slates_merge::increment::Base>,
+  planned_doc: Option<(
+    slates_merge::ops_doc::OpsDoc,
+    slates_merge::increment::PostStatePlan,
+  )>,
+) -> SealedWork {
+  let Some(w) = state.works.get(&work) else {
+    return seal(state, work);
+  };
+  let Some(base) = planned_base else {
+    let mut sealed = seal(state, work);
+    sealed.composes_here = true;
+    return sealed;
+  };
+  let files_base = Base {
+    green: None,
+    fetched: state.work_home.fetched.as_ref(),
+    version: w.base_version,
+    entries: Some(&w.entries),
+    plane: None,
+  };
+  let kept = crate::refining::kept(state, work, (w.base_version, w.journal.len()));
+  let planned = kept.or(planned_doc);
+  let Ok(inc) = crate::verbs::compose_increment(
+    (work, w.base_version),
+    (base, planned),
+    (&w.files, files_base),
+    &w.journal,
+    evidence,
+  ) else {
+    let mut sealed = seal(state, work);
+    sealed.composes_here = true;
+    return sealed;
+  };
+  SealedWork {
+    work,
+    green: w.green,
+    base_version: w.base_version,
+    journal: Vec::new(),
+    files: WorkFiles::default(),
+    composed: Some(inc),
+    computed: None,
+    held: None,
+    merge: None,
+    composes_here: true,
+  }
+}
+
 /// Plans `sealed` once against the work's kept entries (Wave 8A): computes `(base, (doc, plan))` a single time
 /// instead of up to 4 times across `base_missing` / `refine_owed` / `composed`, checks missing base files or
 /// whole-file refinements, and otherwise composes the increment on this shard.
@@ -664,7 +819,12 @@ fn prepare_sealed(
     }
     None => (None, None),
   };
-  if let Some(need) = base_missing_with(state, &sealed, planned_doc.as_ref().map(|(doc, _)| doc)) {
+  if let Some(need) = base_missing_for(
+    state,
+    (sealed.work, sealed.base_version),
+    (&sealed.journal, &sealed.files),
+    planned_doc.as_ref().map(|(doc, _)| doc),
+  ) {
     return Err(Box::new(need));
   }
   let own = state
@@ -702,9 +862,13 @@ fn prepare_sealed(
   ))
 }
 
-/// Builds the rebase/merge need using [`prepare_sealed`] so the journal is planned at most once.
-fn prepare_rebase_need(state: &ShardState, sealed: SealedWork, ask: Option<MergeAsk>) -> Need {
-  match prepare_sealed(state, sealed, Vec::new()) {
+/// Builds the rebase/merge need directly from `state.works` using [`prepare_live`] with zero file cloning.
+fn prepare_rebase_need_live(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  ask: Option<MergeAsk>,
+) -> Need {
+  match prepare_live(state, work, Vec::new()) {
     Err(need) => *need,
     Ok(mut prepared) => {
       prepared.merge = ask;
@@ -712,6 +876,30 @@ fn prepare_rebase_need(state: &ShardState, sealed: SealedWork, ask: Option<Merge
         sealed: Box::new(prepared),
       }
     }
+  }
+}
+
+/// [`verdict_need`] directly from `state.works` via [`prepare_live`] (zero clone of `w.files`/`w.journal`).
+fn verdict_need_live(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  (evidence, approval, signature, authorship): (
+    &[[u8; 32]],
+    crate::verbs::Approval,
+    Option<Vec<u8>>,
+    slates_ipc::protocol::Authorship,
+  ),
+) -> Need {
+  if !route_committed(state, work) {
+    return Need::Route;
+  }
+  match prepare_live(state, work, evidence.to_vec()) {
+    Err(need) => *need,
+    Ok(prepared) => Need::Verdict {
+      evidence: evidence.to_vec(),
+      sealed: Box::new(prepared),
+      policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
+    },
   }
 }
 
@@ -744,12 +932,11 @@ fn verdict_need(
 
 /// What a merge check or a resolution needs of the green's owner (A-796): a rebase's base and refinement first, then the
 /// rebase itself carrying `ask`.
-fn merge_need(state: &ShardState, work: DbVolumeId, ask: MergeAsk) -> Option<Need> {
+fn merge_need(state: &mut ShardState, work: DbVolumeId, ask: MergeAsk) -> Option<Need> {
   if state.work_home.rebased.is_some() {
     return None;
   }
-  let sealed = seal(state, work);
-  Some(prepare_rebase_need(state, sealed, Some(ask)))
+  Some(prepare_rebase_need_live(state, work, Some(ask)))
 }
 
 fn page_if_unheld(
@@ -807,6 +994,34 @@ pub(crate) fn parked_fetched(state: &ShardState, work: DbVolumeId) -> Option<&Fe
     .as_ref()
 }
 
+/// The evidence carried by the off-owner submit or rebase parked at the front of `work`'s queue,
+/// for `crate::refining::prepare` to slice post-state assembly and identity hashing off the verb
+/// (Wave 9). `None` when no submit/rebase is parked.
+pub(crate) fn parked_submit_evidence(
+  state: &ShardState,
+  work: DbVolumeId,
+) -> Option<Vec<[u8; 32]>> {
+  let body = &state
+    .work_home
+    .queues
+    .get(&work)?
+    .waiting
+    .front()?
+    .verb
+    .body;
+  if let Some((evidence, _, _)) = submitted(body) {
+    return Some(evidence.to_vec());
+  }
+  matches!(
+    body,
+    RequestBody::Rebase { .. }
+      | RequestBody::CheckMerge { .. }
+      | RequestBody::ResolveMerge { .. }
+      | RequestBody::ResolveConflict { .. }
+  )
+  .then(Vec::new)
+}
+
 /// The base bytes of `path` the owner sent `work`'s parked verb (A-247): `None` when none was sent.
 pub(crate) fn parked_fetch<'s>(
   state: &'s ShardState,
@@ -820,35 +1035,32 @@ pub(crate) fn refined(state: &mut ShardState, work: DbVolumeId) {
   resolve(state, work, Some(Answered::Refined));
 }
 
-/// The paths a sealed work's journal names whose base the work does not hold, to fetch before it composes (A-247): a
+/// The paths a work's journal names whose base the work does not hold, to fetch before it composes (A-247): a
 /// path whose base entries it has not fetched, or one it neither holds nor has fetched the bytes of; and every path its
 /// composition replaces whole, whose base bytes its refinement reads (A-776, close item C1: until 2026-11-20 a file
 /// the work held was never fetched, so a work off its green's shard composed a whole-file save unrefined and conflicted
 /// with any edit of the file). `None` when it has all it needs: when this verb's fetch holds every such path (asked
 /// again when it does not, as one ask of the union, since the fetch is the verb's own), or the green is gone.
-fn base_missing_with(
+fn base_missing_for(
   state: &ShardState,
-  sealed: &SealedWork,
+  (work, base_version): (DbVolumeId, u64),
+  (journal, files): (&[VolumeOp], &WorkFiles),
   planned_doc: Option<&slates_merge::ops_doc::OpsDoc>,
 ) -> Option<Need> {
   // A journal holding a copy is composed by the owner, which holds the copied trees (`COPY_COMPOSED_BY_OWNER`).
-  if holds_copy(&sealed.journal) {
+  if holds_copy(journal) {
     return None;
   }
   let fetched = state.work_home.fetched.as_ref();
   if fetched.is_some_and(|fetched| fetched.gone) {
     return None;
   }
-  let w = state.works.get(&sealed.work)?;
-  let named: std::collections::BTreeSet<&str> = sealed
-    .journal
-    .iter()
-    .flat_map(VolumeOp::names)
-    .flatten()
-    .collect();
+  let w = state.works.get(&work)?;
+  let named: std::collections::BTreeSet<&str> =
+    journal.iter().flat_map(VolumeOp::names).flatten().collect();
   let mut wanted: std::collections::BTreeSet<String> = named
     .iter()
-    .filter(|path| !w.entries.contains_key(**path) || !sealed.files.holds(path))
+    .filter(|path| !w.entries.contains_key(**path) || !files.holds(path))
     .map(|path| (*path).to_owned())
     .collect();
   // With every entry known, the composition says which paths it replaces whole: their base bytes are wanted too.
@@ -863,7 +1075,7 @@ fn base_missing_with(
       let known = crate::work_files::Base {
         green: None,
         fetched: None,
-        version: sealed.base_version,
+        version: base_version,
         entries: Some(&w.entries),
         plane: None,
       }
@@ -879,7 +1091,7 @@ fn base_missing_with(
     for path in &named {
       if !w.entries.contains_key(*path) {
         unentried = unentried.saturating_add(1);
-      } else if !sealed.files.holds(path) {
+      } else if !files.holds(path) {
         unheld = unheld.saturating_add(1);
       }
     }

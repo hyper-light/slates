@@ -119,34 +119,6 @@ pub(crate) fn nodes_to_set(
   Ok(needed)
 }
 
-/// The nodes [`remove`] of `no` allocates: a copy of each node on its path born before `epoch` (none
-/// when `no` is absent, which changes nothing).
-fn nodes_to_remove(
-  nodes: &Slab<TrieNode>,
-  root: Handle<TrieNode>,
-  no: InodeNo,
-  epoch: Epoch,
-) -> Result<usize, VfsError> {
-  if get(nodes, root, no).is_none() {
-    return Ok(0);
-  }
-  let copy = |node: Handle<TrieNode>| -> Result<usize, VfsError> {
-    Ok(usize::from(nodes.get(node)?.born != epoch))
-  };
-  let mut needed = copy(root)?;
-  let mut node = root;
-  for level in 0..LEVELS {
-    match nodes.get(node)?.at(digit(no, level)) {
-      Slot::Node(child) => {
-        needed = needed.saturating_add(copy(child)?);
-        node = child;
-      }
-      Slot::Empty | Slot::Inode(_) => break,
-    }
-  }
-  Ok(needed)
-}
-
 /// Refuses, before anything changes, a mutation that needs more nodes than the slab can issue — so a
 /// set or remove either completes or leaves the trie and the slab exactly as they were (AUD-29-40: a
 /// refusal halfway down the path left copies no root reached, and a lost copied root).
@@ -185,7 +157,11 @@ fn set_reaching(
   epoch: Epoch,
   dead: &mut Deadlist,
 ) -> Result<Reached, VfsError> {
-  admit(nodes, nodes_to_set(nodes, root, no, epoch)?)?;
+  // `nodes_to_set` allocates at most one node per level, so skip the read-only pre-walk when the
+  // slab already has room for the worst case.
+  if nodes.room() < usize::try_from(LEVELS).unwrap_or(usize::MAX) {
+    admit(nodes, nodes_to_set(nodes, root, no, epoch)?)?;
+  }
   let mut node = ensure_current(nodes, root, epoch, dead)?;
   let new_root = node;
   let mut previous = None;
@@ -270,33 +246,71 @@ pub fn remove(
   epoch: Epoch,
   dead: &mut Deadlist,
 ) -> Result<(Handle<TrieNode>, Option<Handle<Inode>>), VfsError> {
-  if get(nodes, root, no).is_none() {
-    return Ok((root, None));
-  }
-  admit(nodes, nodes_to_remove(nodes, root, no, epoch)?)?;
-  let mut node = ensure_current(nodes, root, epoch, dead)?;
-  let new_root = node;
-  let mut path: Vec<(Handle<TrieNode>, usize)> =
-    Vec::with_capacity(usize::try_from(LEVELS).unwrap_or(0));
+  // Single read-only descent on the stack locates `no`, records its parent path and counts
+  // pre-epoch copies needed. When every node on the path is already current (`needed == 0`), the
+  // slot is cleared and pruned directly with no second walk and no heap allocation.
+  let mut read_path = [(root, 0usize); LEVELS as usize];
+  let mut node = root;
+  let mut needed = usize::from(nodes.get(root)?.born != epoch);
   for level in 0..LEVELS {
     let d = digit(no, level);
-    let current = nodes.get(node)?.at(d);
-    match current {
+    let depth = usize::try_from(level).unwrap_or(0);
+    match nodes.get(node)?.at(d) {
       Slot::Inode(old) => {
-        nodes.get_mut(node)?.put(d, Slot::Empty);
-        prune(nodes, node, &path)?;
+        let parents = read_path.get(..depth).unwrap_or_default();
+        if needed == 0 {
+          nodes.get_mut(node)?.put(d, Slot::Empty);
+          prune(nodes, node, parents)?;
+          return Ok((root, Some(old)));
+        }
+        admit(nodes, needed)?;
+        let new_root = copy_path_and_remove(nodes, root, parents, d, epoch, dead)?;
         return Ok((new_root, Some(old)));
       }
       Slot::Node(child) => {
-        let child = ensure_current(nodes, child, epoch, dead)?;
-        nodes.get_mut(node)?.put(d, Slot::Node(child));
-        path.push((node, d));
+        if let Some(entry) = read_path.get_mut(depth) {
+          *entry = (node, d);
+        }
+        needed = needed.saturating_add(usize::from(nodes.get(child)?.born != epoch));
         node = child;
       }
-      Slot::Empty => return Ok((new_root, None)),
+      Slot::Empty => return Ok((root, None)),
     }
   }
-  Ok((new_root, None))
+  Ok((root, None))
+}
+
+/// Copies any pre-epoch nodes along `parents` into `epoch`, clears `leaf_slot` in the reached leaf,
+/// and prunes newly empty nodes back up the copied path.
+fn copy_path_and_remove(
+  nodes: &mut Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  parents: &[(Handle<TrieNode>, usize)],
+  leaf_slot: usize,
+  epoch: Epoch,
+  dead: &mut Deadlist,
+) -> Result<Handle<TrieNode>, VfsError> {
+  let mut cur = ensure_current(nodes, root, epoch, dead)?;
+  let new_root = cur;
+  let mut write_path = [(new_root, 0usize); LEVELS as usize];
+  for (level, &(_, d)) in parents.iter().enumerate() {
+    let Slot::Node(child) = nodes.get(cur)?.at(d) else {
+      return Ok(new_root);
+    };
+    let child = ensure_current(nodes, child, epoch, dead)?;
+    nodes.get_mut(cur)?.put(d, Slot::Node(child));
+    if let Some(entry) = write_path.get_mut(level) {
+      *entry = (cur, d);
+    }
+    cur = child;
+  }
+  nodes.get_mut(cur)?.put(leaf_slot, Slot::Empty);
+  prune(
+    nodes,
+    cur,
+    write_path.get(..parents.len()).unwrap_or_default(),
+  )?;
+  Ok(new_root)
 }
 
 /// Frees `node` while it holds nothing, then its parent likewise, up `path` (each entry a parent and the slot that

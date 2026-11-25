@@ -493,6 +493,16 @@ pub(crate) enum CopyUp {
   Metadata,
 }
 
+/// Internal copy-up strategy controlling whether bytes are kept in memory for immediate ownership
+/// or pinning, or stream-hashed in chunk-sized reads without a whole-file allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyUpPlan {
+  Metadata,
+  Content,
+  Capture,
+  Pin,
+}
+
 /// The base plane's tables, owned by the volume.
 #[derive(Debug)]
 pub struct BasePlane {
@@ -2961,11 +2971,32 @@ impl Overlay<'_> {
     no: InodeNo,
     kind: CopyUp,
   ) -> Result<(), VfsError> {
+    let plan = match kind {
+      CopyUp::Metadata => CopyUpPlan::Metadata,
+      CopyUp::Content => CopyUpPlan::Content,
+    };
+    let _ = self.copy_up_with(store, no, plan)?;
+    Ok(())
+  }
+
+  /// Copy-up driver shared by metadata copy-up, content copy-up, capture and pin:
+  /// - metadata copy-up and large-class content copy-up stream-hash the file in chunk-sized steps
+  ///   without allocating a whole-file heap buffer;
+  /// - small-class content copy-up and capture read and hash the file once and move the buffer into
+  ///   the inode through [`Self::own_whole`];
+  /// - large-class pin reads and hashes the file once, journals `Op::Witness`, and returns the read
+  ///   buffer so [`Self::pin_windows_from_bytes`] seals the windows without a second disk read.
+  fn copy_up_with(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    plan: CopyUpPlan,
+  ) -> Result<Option<Vec<u8>>, VfsError> {
     let Some(plane) = self.vol.base.as_ref() else {
-      return Ok(());
+      return Ok(None);
     };
     if plane.is_witnessed(no) {
-      return Ok(());
+      return Ok(None);
     }
     if let Body::BaseLink(target) = &self.vol.inode(store, no)?.body {
       // A base symlink's copy-up is its target becoming the volume's own: nothing is read from the disk (the target
@@ -2979,14 +3010,15 @@ impl Overlay<'_> {
       self
         .vol
         .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
-      return Ok(());
+      return Ok(None);
     }
     if let Body::Directory(dir) = self.vol.inode(store, no)?.body {
-      return self.witness_directory(store, no, dir);
+      self.witness_directory(store, no, dir)?;
+      return Ok(None);
     }
     let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));
     if !is_base {
-      return Ok(());
+      return Ok(None);
     }
     // §4.15 "invalidated before any mutation": every mutation of a base entry — content or
     // metadata — copies it up first, so the digest kept for it is dropped here, before the
@@ -3006,20 +3038,29 @@ impl Overlay<'_> {
     // (until 2026-10-24).
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let racy = self.host.now_ns().saturating_sub(fp.mtime_ns) <= granularity;
-    let bytes = self.read_whole(file, fp.size)?;
-    let identity = *blake3::hash(&bytes).as_bytes();
-    let witness = Witness {
-      fingerprint: fp,
-      identity,
-      witnessed_at: self.vol.clock.monotonic_ns(),
-      racy,
-    };
     let large = fp.size
       > self
         .vol
         .base
         .as_ref()
         .map_or(u64::MAX, |b| b.large_class_bytes);
+    let own_now = plan == CopyUpPlan::Capture
+      || (!large && matches!(plan, CopyUpPlan::Content | CopyUpPlan::Pin));
+    let keep_bytes = own_now || (plan == CopyUpPlan::Pin && large);
+    let (bytes, identity) = if keep_bytes {
+      let bytes = self.read_whole(file, fp.size)?;
+      let identity = *blake3::hash(&bytes).as_bytes();
+      (Some(bytes), identity)
+    } else {
+      let identity = self.hash_file(file, fp.size, store.content.chunk_bytes())?;
+      (None, identity)
+    };
+    let witness = Witness {
+      fingerprint: fp,
+      identity,
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy,
+    };
     let handle = self.vol.make_current_inode(store, no)?;
     let prev = store.inodes.get(handle)?.version;
     let changed = {
@@ -3044,19 +3085,21 @@ impl Overlay<'_> {
     let at = self.vol.witness_clock();
     let home = home_parent.map(|home| (home, name.clone().into()));
     self.plane()?.record_witness(no, witness, home, at);
-    if kind == CopyUp::Content && !large {
-      // The small class: the bytes come in whole and the body becomes plain content.
+    let pinned_bytes = if own_now {
+      // The small class (or capture of any size): the bytes come in whole and the body becomes plain content.
       self.host.close_file(file);
       self.plane()?.descriptors.remove(&no);
-      self.own_whole(store, no, &bytes)?;
+      self.own_whole(store, no, bytes.unwrap_or_default())?;
+      None
     } else {
       self.plane()?.descriptors.insert(no, file);
-    }
+      bytes
+    };
     let path = self.vol.path_of_inode(store, no).unwrap_or_default();
     self
       .vol
       .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
-    Ok(())
+    Ok(pinned_bytes)
   }
 
   /// A base directory's witness, taken before its metadata changes (A-501): its fingerprint on the disk now, through the
@@ -3092,13 +3135,13 @@ impl Overlay<'_> {
     Ok(())
   }
 
-  /// A captured file's bytes become the volume's own, whatever its size (§4.15 `capture_base`, A-291): it is copied up as
-  /// a write would copy it, and a large file the copy-up kept on its descriptor (pinned or not) is then read whole,
-  /// checked against its witness and made plain content, its descriptor closed. A source that changed under the capture
-  /// is refused `DigestUnverified` (the caller captures again once it is quiesced); a file already the volume's own is
-  /// left as it is.
+  /// A captured file's bytes become the volume's own, whatever its size (§4.15 `capture_base`, A-291): an unwitnessed
+  /// file is read, hashed and made plain content in one pass; an already-witnessed large file kept on its descriptor
+  /// (pinned or not) is read whole, checked against its witness and made plain content, its descriptor closed. A source
+  /// that changed under the capture is refused `DigestUnverified` (the caller captures again once it is quiesced); a
+  /// file already the volume's own is left as it is.
   fn capture_file(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
-    self.copy_up(store, no, CopyUp::Content)?;
+    let _ = self.copy_up_with(store, no, CopyUpPlan::Capture)?;
     let (base_len, identity) = match &self.vol.inode(store, no)?.body {
       Body::Base(base) => (base.base_len, base.witness.as_ref().map(|w| w.identity)),
       _ => return Ok(()),
@@ -3109,7 +3152,7 @@ impl Overlay<'_> {
     if identity != Some(*blake3::hash(&bytes).as_bytes()) {
       return Err(VfsError::DigestUnverified);
     }
-    self.own_whole(store, no, &bytes)?;
+    self.own_whole(store, no, bytes)?;
     if let Some(file) = self.plane()?.descriptors.remove(&no) {
       self.host.close_file(file);
     }
@@ -3118,8 +3161,8 @@ impl Overlay<'_> {
 
   /// Makes `bytes` the whole content of the base file `no`, its body plain content from here on: charged and admitted
   /// before the base body is replaced, so the copy lands whole or not at all (T-1.1). The small class's copy-up and a
-  /// capture's large file both end here.
-  fn own_whole(&mut self, store: &mut Store, no: InodeNo, bytes: &[u8]) -> Result<(), VfsError> {
+  /// capture's large file both end here; inline-sized buffers move directly into `Body::Inline` with no second copy.
+  fn own_whole(&mut self, store: &mut Store, no: InodeNo, bytes: Vec<u8>) -> Result<(), VfsError> {
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let handle = self.vol.make_current_inode(store, no)?;
     let charge = self.vol.write_charge(store, no, 0, len)?;
@@ -3138,7 +3181,95 @@ impl Overlay<'_> {
       .vol
       .reconcile(before, crate::volume::EpochContent::Empty);
     if !bytes.is_empty() {
-      self.vol.apply_write_whole(store, handle, 0, bytes)?;
+      self.vol.apply_write_inline_owned(store, handle, bytes)?;
+    }
+    Ok(())
+  }
+
+  /// Stream-hashes `file` up to `size` bytes in chunk-sized reads without allocating a whole-file
+  /// heap buffer (used for metadata copy-ups and large-class content copy-ups that keep the file on
+  /// its descriptor).
+  fn hash_file(
+    &mut self,
+    file: HostFile,
+    size: u64,
+    chunk_bytes: usize,
+  ) -> Result<[u8; 32], VfsError> {
+    let mut hasher = blake3::Hasher::new();
+    let cap = usize::try_from(size)
+      .unwrap_or(usize::MAX)
+      .min(chunk_bytes.max(1));
+    let mut buf = vec![0u8; cap];
+    let mut done = 0u64;
+    while done < size {
+      let want = usize::try_from(size.saturating_sub(done))
+        .unwrap_or(usize::MAX)
+        .min(buf.len());
+      let Some(slice) = buf.get_mut(..want) else {
+        break;
+      };
+      let n = self.host.read_at(file, done, slice).map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      if let Some(got) = slice.get(..n) {
+        hasher.update(got);
+      }
+      done = done.saturating_add(u64::try_from(n).unwrap_or(0));
+    }
+    Ok(*hasher.finalize().as_bytes())
+  }
+
+  /// Pins every unpinned chunk window of a freshly witnessed large-class base body directly from
+  /// `bytes` (which [`Self::copy_up_with`] already read and hashed), avoiding a second disk read.
+  fn pin_windows_from_bytes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    bytes: &[u8],
+  ) -> Result<(), VfsError> {
+    let base_len = match &self.vol.inode(store, no)?.body {
+      Body::Base(b) => b.base_len,
+      _ => return Ok(()),
+    };
+    let chunk = store.content.chunk_bytes().max(1);
+    let mut start = 0usize;
+    let total = usize::try_from(base_len)
+      .unwrap_or(bytes.len())
+      .min(bytes.len());
+    while start < total {
+      let end = start.saturating_add(chunk).min(total);
+      let Some(window) = bytes.get(start..end) else {
+        break;
+      };
+      let charge = u64::try_from(window.len()).unwrap_or(0);
+      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
+      if !self
+        .vol
+        .quota
+        .admit(self.vol.bytes.total(), charge, &mut store.budget)
+      {
+        return Err(VfsError::NoSpace);
+      }
+      let handle = self.vol.make_current_inode(store, no)?;
+      let before = crate::volume::content_by_epoch(store, handle);
+      let epoch = self.vol.epoch;
+      let mut open = store.content.open(
+        u64::try_from(start).unwrap_or(0),
+        window.len(),
+        epoch,
+        (self.vol.locked, Owner::Volume),
+      )?;
+      store.content.write_open(&mut open, 0, window)?;
+      if let Some(extent) = store.content.seal(open, self.vol.seal_key)?
+        && let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body
+      {
+        crate::volume::insert_extent(&mut b.pinned, extent);
+      }
+      self
+        .vol
+        .reconcile(before, crate::volume::content_by_epoch(store, handle));
+      start = end;
     }
     Ok(())
   }
@@ -4707,8 +4838,9 @@ impl Overlay<'_> {
     if let Some(no) = walk.files.pop() {
       if walk.capture {
         self.capture_file(store, no)?;
+      } else if let Some(bytes) = self.copy_up_with(store, no, CopyUpPlan::Pin)? {
+        self.pin_windows_from_bytes(store, no, &bytes)?;
       } else {
-        self.copy_up(store, no, CopyUp::Content)?;
         let size = self.vol.inode(store, no)?.attrs.size;
         self.pin_windows(store, no, 0, size)?;
       }

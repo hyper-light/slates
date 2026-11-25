@@ -422,6 +422,28 @@ pub struct VolumeConfig {
   pub clock: Box<dyn Clock>,
 }
 
+/// Shape: inline stack buffer of ancestor path segments collected by `Volume::path_of` before
+/// spilling to a heap vector (covers typical source-tree depths with zero heap allocation; no
+/// semantic depth limit).
+const INLINE_PATH_DEPTH: usize = 16;
+
+/// Assembles `/seg_k/.../seg_0/name` from reverse-order ancestor segments with one exact-capacity
+/// allocation and no UTF-8 re-validation scan.
+fn build_path(inline: &[&str], extra: &[&str], name: &str, total: usize) -> String {
+  let mut out = String::with_capacity(total);
+  for seg in extra.iter().rev() {
+    out.push('/');
+    out.push_str(seg);
+  }
+  for seg in inline.iter().rev() {
+    out.push('/');
+    out.push_str(seg);
+  }
+  out.push('/');
+  out.push_str(name);
+  out
+}
+
 /// The volume.
 pub struct Volume {
   pub(crate) prefix: u16,
@@ -430,6 +452,9 @@ pub struct Volume {
   pub(crate) epoch: Epoch,
   pub(crate) root: Handle<DirNode>,
   pub(crate) inode_root: Handle<TrieNode>,
+  /// Cached leaf of the inode trie for monotonic fresh-inode installs (15 of every 16 creates hit
+  /// the same leaf without a 12-level root walk, checked by root handle, upper digits and epoch).
+  pub(crate) leaf_cursor: trie::LeafCursor,
   pub(crate) next_counter: u64,
   /// The counter the last committed publication recorded for this volume (A-150): every number below it is covered by a
   /// reservation a successor honours, so a reply may hand it out with no barrier. A number at or past it is
@@ -837,6 +862,7 @@ impl Volume {
       epoch,
       root,
       inode_root,
+      leaf_cursor: trie::LeafCursor::default(),
       next_counter: 2,
       // Its own root is reserved by the create's publication, which precedes every client's first sight of the
       // volume (a verb publishes before its completion), so only numbers issued after it can be unreserved.
@@ -970,6 +996,7 @@ impl Volume {
       epoch: epoch.next(),
       root,
       inode_root,
+      leaf_cursor: trie::LeafCursor::default(),
       next_counter: origin.next_counter,
       // The numbers it starts with are reserved by the clone's publication, which precedes every client's first sight
       // of it.
@@ -1086,6 +1113,7 @@ impl Volume {
       epoch,
       root,
       inode_root,
+      leaf_cursor: trie::LeafCursor::default(),
       next_counter: seed.next_counter,
       // The recorded counter is a committed publication's ceiling: every number below it may have been handed out.
       counter_ceiling: seed.next_counter,
@@ -1314,6 +1342,18 @@ impl Volume {
   ) -> Result<Located, VfsError> {
     names::check_length(name)?;
     let dir = self.head_dir(store, dir)?;
+    self.lookup_head(store, dir, name)
+  }
+
+  /// [`Self::lookup`] for an already-resolved head directory handle (name length already checked or
+  /// checked here).
+  fn lookup_head(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<Located, VfsError> {
+    names::check_length(name)?;
     let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
     let entry = node
       .lookup(&store.blocks, self.policy, name)
@@ -2045,17 +2085,25 @@ impl Volume {
     let kind = leaf.kind();
     self.live()?;
     names::check(name)?;
-    self.refuse_existing(store, dir, name)?;
+    let dir = self.head_dir(store, dir)?;
+    self.refuse_existing_head(store, dir, name)?;
     self.admit_namespace(true)?;
     let mut needs = Needs::default();
-    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
-    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    let dir_current = store.dirs.get(dir)?.born == self.epoch;
+    if !dir_current {
+      let dir_no = store.dirs.get(dir)?.inode;
+      self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    }
     self.need_new_inode(store, &mut needs)?;
-    self.need_insert(store, dir, name, &mut needs)?;
+    self.need_insert_head(store, dir, name, &mut needs)?;
     self.admit_needs(store, &needs)?;
     // Admitted: the directory's path made current (with its inode, so the touch below allocates
     // nothing), the inode installed, then the name published.
-    let dir = self.make_current_dir(store, dir)?;
+    let dir = if dir_current {
+      dir
+    } else {
+      self.make_current_dir(store, dir)?
+    };
     let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
@@ -2281,14 +2329,15 @@ impl Volume {
     name: &str,
   ) -> Result<(), VfsError> {
     self.live()?;
-    let located = self.lookup(store, dir, name)?;
+    let dir = self.head_dir(store, dir)?;
+    let located = self.lookup_head(store, dir, name)?;
     if matches!(located.child, Child::Dir(_)) {
       return Err(VfsError::IsDirectory);
     }
     // The last name of a file whose content a snapshot pins retains that content (§4.2 retention):
     // secured before the entry goes, so a refusal changes nothing.
     let retention = self.retention_of_drop(store, located.inode)?;
-    self.admit_removal(store, dir, name, located.inode)?;
+    self.admit_removal_head(store, dir, name, located.inode)?;
     self.secure_retention(store, retention)?;
     let unlinked = self.unlink_secured(store, dir, name, located);
     self.settle_retention(store);
@@ -2303,12 +2352,16 @@ impl Volume {
     name: &str,
     located: Located,
   ) -> Result<(), VfsError> {
-    let dir = self.make_current_dir(store, dir)?;
+    let dir = if store.dirs.get(dir)?.born == self.epoch {
+      dir
+    } else {
+      self.make_current_dir(store, dir)?
+    };
     // The dropped inode made current before its name goes, so the link drop allocates nothing.
     self.make_current_inode(store, located.inode)?;
     let now = self.clock.wall_ns();
     let path = self.path_of(store, dir, name);
-    self.dir_remove(store, dir, name)?;
+    let (_, left_whiteout) = self.dir_remove(store, dir, name)?;
     self.drop_link(store, located.inode)?;
     self.touch_dir(store, dir, now)?;
     self.record(
@@ -2318,7 +2371,9 @@ impl Volume {
       Some(located.inode),
       0,
     );
-    self.record_whiteout(store, dir, name, &path)?;
+    if left_whiteout {
+      self.record(&mut store.metadata, Op::Whiteout, path.as_str(), None, 0);
+    }
     Ok(())
   }
 
@@ -2330,19 +2385,24 @@ impl Volume {
     name: &str,
   ) -> Result<(), VfsError> {
     self.live()?;
-    let located = self.lookup(store, dir, name)?;
+    let dir = self.head_dir(store, dir)?;
+    let located = self.lookup_head(store, dir, name)?;
     let Child::Dir(child) = located.child else {
       return Err(VfsError::NotDirectory);
     };
     if !self.empty_for_rmdir(store, child)? {
       return Err(VfsError::NotEmpty);
     }
-    self.admit_removal(store, dir, name, located.inode)?;
-    let dir = self.make_current_dir(store, dir)?;
+    self.admit_removal_head(store, dir, name, located.inode)?;
+    let dir = if store.dirs.get(dir)?.born == self.epoch {
+      dir
+    } else {
+      self.make_current_dir(store, dir)?
+    };
     self.make_current_inode(store, located.inode)?;
     let now = self.clock.wall_ns();
     let path = self.path_of(store, dir, name);
-    self.dir_remove(store, dir, name)?;
+    let (_, left_whiteout) = self.dir_remove(store, dir, name)?;
     // The directory's node is released with its inode (`release_body`), not here: a transport may still
     // hold the directory, and an orphan must keep a valid, empty directory until its last reference.
     self.drop_link(store, located.inode)?;
@@ -2356,7 +2416,9 @@ impl Volume {
       Some(located.inode),
       0,
     );
-    self.record_whiteout(store, dir, name, &path)?;
+    if left_whiteout {
+      self.record(&mut store.metadata, Op::Whiteout, path.as_str(), None, 0);
+    }
     Ok(())
   }
 
@@ -2531,16 +2593,17 @@ impl Volume {
   ) -> Result<(), VfsError> {
     let (from_dir, from_name) = from;
     let (to_dir, to_name) = to;
-    let from_path = self.path_of(store, from_dir, from_name);
     let replaced = target.filter(|t| t.child != Child::Whiteout);
-    self.admit_needs(
-      store,
-      &self.rename_needs(store, from, to, source, replaced)?,
-    )?;
-    // Admitted (AUD-29-40): every copy-up the rename needs, before any name changes, so nothing after
-    // publication allocates; then the publication; then its consequences.
+    // Admitted by `admit_rename` right before `secure_retention` (AUD-29-40): every copy-up the
+    // rename needs runs before any name changes, so nothing after publication allocates; then the
+    // publication; then its consequences.
     let from_dir = self.make_current_dir(store, from_dir)?;
-    let to_dir = self.make_current_dir(store, to_dir)?;
+    let to_dir = if to_dir == from_dir {
+      from_dir
+    } else {
+      self.make_current_dir(store, to_dir)?
+    };
+    let mut moved_inode = None;
     let moving = match source.child {
       Child::Dir(moving) => Some(self.make_current_dir_node(store, moving)?),
       Child::File(no)
@@ -2549,20 +2612,35 @@ impl Volume {
       | Child::Socket(no)
       | Child::BlockDevice(no)
       | Child::CharDevice(no) => {
-        self.make_current_inode(store, no)?;
+        moved_inode = Some(self.make_current_inode(store, no)?);
         None
       }
       Child::Whiteout => None,
     };
     // The handles may have moved with the copy-ups (a moved directory's parent re-points to it).
-    let from_dir = self.head_dir(store, from_dir)?;
-    let to_dir = self.head_dir(store, to_dir)?;
+    let (from_dir, to_dir) = if moving.is_some() {
+      (
+        self.head_dir(store, from_dir)?,
+        self.head_dir(store, to_dir)?,
+      )
+    } else {
+      (from_dir, to_dir)
+    };
     if let Some(t) = replaced {
       self.make_current_inode(store, t.inode)?;
     }
     let moved_child = match (source.child, moving) {
       (Child::Dir(_), Some(moving)) => Child::Dir(moving),
       (child, _) => child,
+    };
+    let same_dir = from_dir == to_dir;
+    let (from_path, to_path) = if same_dir {
+      self.path_pair_in(store, from_dir, from_name, to_name)
+    } else {
+      (
+        self.path_of(store, from_dir, from_name),
+        self.path_of(store, to_dir, to_name),
+      )
     };
     let now = self.clock.wall_ns();
     // Publication: each step all or nothing, the second undone if refused, so the names are either
@@ -2575,6 +2653,40 @@ impl Volume {
       replaced,
     )?;
     // Consequences, which allocate nothing now that every version they touch is current.
+    self.finish_rename(
+      store,
+      (from_dir, to_dir),
+      (to_name, moved_child, moved_inode),
+      replaced,
+      now,
+    )?;
+    self.record(
+      &mut store.metadata,
+      Op::Rename {
+        from: from_path.into(),
+      },
+      to_path,
+      Some(source.inode),
+      0,
+    );
+    let from_no = store.dirs.get(from_dir)?.inode;
+    self
+      .departures
+      .insert(from_no, (from_name.into(), source.inode));
+    Ok(())
+  }
+
+  /// Post-publication consequences of [`Self::rename_secured`]: drops links on any replaced target,
+  /// updates the moved directory's parent/name or file's home, and stamps touched directories.
+  fn finish_rename(
+    &mut self,
+    store: &mut Store,
+    (from_dir, to_dir): (Handle<DirNode>, Handle<DirNode>),
+    (to_name, moved_child, moved_inode): (&str, Child, Option<Handle<Inode>>),
+    replaced: Option<Located>,
+    now: i64,
+  ) -> Result<(), VfsError> {
+    let same_dir = from_dir == to_dir;
     if let Some(t) = replaced {
       match t.child {
         // The replaced directory's node goes with its inode (`release_body`), as `rmdir`'s does.
@@ -2598,7 +2710,7 @@ impl Volume {
         let node = store.dirs.get_mut(moving)?;
         node.parent = Some(to_no);
         node.name = to_name.into();
-        if from_dir != to_dir {
+        if !same_dir {
           self.adjust_nlink(store, store.dirs.get(from_dir)?.inode, -1)?;
           self.adjust_nlink(store, to_no, 1)?;
         }
@@ -2609,28 +2721,19 @@ impl Volume {
       | Child::Socket(no)
       | Child::BlockDevice(no)
       | Child::CharDevice(no) => {
-        // The file's home follows it.
-        let handle = self.make_current_inode(store, no)?;
+        // The file's home follows it (reuse the current inode handle obtained before publication).
+        let handle = match moved_inode {
+          Some(handle) => handle,
+          None => self.make_current_inode(store, no)?,
+        };
         store.inodes.get_mut(handle)?.home = Home::new(to_no, self.policy.hash(to_name));
       }
       Child::Whiteout => {}
     }
     self.touch_dir(store, from_dir, now)?;
-    self.touch_dir(store, to_dir, now)?;
-    let to_path = self.path_of(store, to_dir, to_name);
-    self.record(
-      &mut store.metadata,
-      Op::Rename {
-        from: from_path.into(),
-      },
-      to_path,
-      Some(source.inode),
-      0,
-    );
-    let from_no = store.dirs.get(from_dir)?.inode;
-    self
-      .departures
-      .insert(from_no, (from_name.into(), source.inode));
+    if !same_dir {
+      self.touch_dir(store, to_dir, now)?;
+    }
     Ok(())
   }
 
@@ -4276,36 +4379,72 @@ impl Volume {
 
   /// The path of `name` under `dir`, for the journal.
   pub fn path_of(&self, store: &Store, dir: Handle<DirNode>, name: &str) -> String {
-    // Two walks up the parent chain and one allocation of exactly the path's length, filled from its end: the path a
-    // create journals cost seven allocations and two reallocations built as boxed parts joined (2026-10-06,
-    // `create_heap`). The walk is the one the parts were collected by, so the path is the same.
-    let mut len = name.len().saturating_add(1);
-    self.walk_up(store, dir, |segment| {
-      len = len.saturating_add(segment.len()).saturating_add(1);
-    });
-    let mut bytes = vec![b'/'; len];
-    let mut end = len;
-    let mut place = |segment: &str| {
-      let start = end.saturating_sub(segment.len());
-      if let Some(slot) = bytes.get_mut(start..end) {
-        slot.copy_from_slice(segment.as_bytes());
-      }
-      // The separator before it stays the `/` the buffer was filled with.
-      end = start.saturating_sub(1);
-    };
-    place(name);
-    self.walk_up(store, dir, place);
-    String::from_utf8(bytes).unwrap_or_default()
+    // Single walk up the parent chain into a stack array (spilling to a vector only past typical
+    // depths), stopping before the root's own trie lookup, then one exact-capacity `String` build
+    // with no UTF-8 re-validation scan.
+    let (inline, inline_len, extra, dir_len) = self.collect_dir_segments(store, dir);
+    let total = dir_len.saturating_add(1).saturating_add(name.len());
+    build_path(
+      inline.get(..inline_len).unwrap_or_default(),
+      &extra,
+      name,
+      total,
+    )
   }
 
-  /// Calls `visit` with each directory's own name from `dir` up to (not including) the root, through the head's
-  /// current directories, bounded at `u16::MAX` steps as a cycle guard.
-  fn walk_up(&self, store: &Store, dir: Handle<DirNode>, mut visit: impl FnMut(&str)) {
+  /// The paths of two names in the same directory `dir` (a same-directory rename's old and new
+  /// paths), sharing one ancestor walk.
+  fn path_pair_in(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    first: &str,
+    second: &str,
+  ) -> (String, String) {
+    let (inline, inline_len, extra, dir_len) = self.collect_dir_segments(store, dir);
+    let segs = inline.get(..inline_len).unwrap_or_default();
+    let first_path = build_path(
+      segs,
+      &extra,
+      first,
+      dir_len.saturating_add(1).saturating_add(first.len()),
+    );
+    let second_path = build_path(
+      segs,
+      &extra,
+      second,
+      dir_len.saturating_add(1).saturating_add(second.len()),
+    );
+    (first_path, second_path)
+  }
+
+  /// Collects ancestor directory names from `dir` up to (not including) the root in reverse order
+  /// in one walk, returning `(inline_stack, inline_count, overflow_vec, prefix_bytes_with_slashes)`.
+  fn collect_dir_segments<'s>(
+    &self,
+    store: &'s Store,
+    dir: Handle<DirNode>,
+  ) -> ([&'s str; INLINE_PATH_DEPTH], usize, Vec<&'s str>, usize) {
+    let root_no = store.dirs.get(self.root).ok().map(|node| node.inode);
+    let mut inline = [""; INLINE_PATH_DEPTH];
+    let mut inline_len = 0usize;
+    let mut extra = Vec::new();
+    let mut dir_len = 0usize;
     let mut current = dir;
     let mut guard = 0usize;
     while let Ok(node) = store.dirs.get(current) {
       let Some(parent_no) = node.parent else { break };
-      visit(&node.name);
+      let seg: &'s str = &node.name;
+      dir_len = dir_len.saturating_add(seg.len()).saturating_add(1);
+      if let Some(slot) = inline.get_mut(inline_len) {
+        *slot = seg;
+        inline_len = inline_len.saturating_add(1);
+      } else {
+        extra.push(seg);
+      }
+      if root_no == Some(parent_no) {
+        break;
+      }
       let Ok(parent) = self.current_dir(store, parent_no) else {
         break;
       };
@@ -4315,6 +4454,7 @@ impl Volume {
         break;
       }
     }
+    (inline, inline_len, extra, dir_len)
   }
 
   // ------------------------------------------------------------------ internals
@@ -4459,12 +4599,13 @@ impl Volume {
     let no = InodeNo::compose(self.prefix, self.next_counter);
     needs.inodes = needs.inodes.saturating_add(1);
     needs.fresh = needs.fresh.saturating_add(1);
-    needs.tries = needs.tries.saturating_add(trie::nodes_to_set(
-      &store.tries,
-      self.inode_root,
-      no,
-      self.epoch,
-    )?);
+    let worst = usize::try_from(trie::LEVELS).unwrap_or(usize::MAX);
+    let add = if store.tries.room() >= needs.tries.saturating_add(worst) {
+      worst
+    } else {
+      trie::nodes_to_set(&store.tries, self.inode_root, no, self.epoch)?
+    };
+    needs.tries = needs.tries.saturating_add(add);
     Ok(())
   }
 
@@ -4476,14 +4617,33 @@ impl Volume {
     name: &str,
     needs: &mut Needs,
   ) -> Result<(), VfsError> {
-    let node = store.dirs.get(self.head_dir(store, dir)?)?;
-    needs.blocks = needs.blocks.saturating_add(node.insert_blocks(
-      &store.blocks,
-      self.epoch,
-      self.policy,
-      name,
-      store.dir_cutover,
-    )?);
+    let dir = self.head_dir(store, dir)?;
+    self.need_insert_head(store, dir, name, needs)
+  }
+
+  /// [`Self::need_insert`] for an already-resolved head directory handle, using the O(1) upper
+  /// bound whenever the block store has ample room.
+  fn need_insert_head(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    needs: &mut Needs,
+  ) -> Result<(), VfsError> {
+    let node = store.dirs.get(dir)?;
+    let worst = node.max_insert_blocks();
+    let add = if store.blocks.room() >= needs.blocks.saturating_add(worst) {
+      worst
+    } else {
+      node.insert_blocks(
+        &store.blocks,
+        self.epoch,
+        self.policy,
+        name,
+        store.dir_cutover,
+      )?
+    };
+    needs.blocks = needs.blocks.saturating_add(add);
     Ok(())
   }
 
@@ -4495,20 +4655,35 @@ impl Volume {
     name: &str,
     needs: &mut Needs,
   ) -> Result<(), VfsError> {
-    let node = store.dirs.get(self.head_dir(store, dir)?)?;
-    needs.blocks = needs.blocks.saturating_add(node.change_blocks(
-      &store.blocks,
-      self.epoch,
-      self.policy,
-      name,
-    )?);
+    let dir = self.head_dir(store, dir)?;
+    self.need_change_head(store, dir, name, needs)
+  }
+
+  /// [`Self::need_change`] for an already-resolved head directory handle, using the O(1) upper
+  /// bound whenever the block store has ample room.
+  fn need_change_head(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    needs: &mut Needs,
+  ) -> Result<(), VfsError> {
+    let node = store.dirs.get(dir)?;
+    let worst = node.max_change_blocks();
+    let add = if store.blocks.room() >= needs.blocks.saturating_add(worst) {
+      worst
+    } else {
+      node.change_blocks(&store.blocks, self.epoch, self.policy, name)?
+    };
+    needs.blocks = needs.blocks.saturating_add(add);
     Ok(())
   }
 
-  /// Admits a removal of `name` (naming inode `removed`) from the head's `dir` (AUD-29-40): the
-  /// directory's path made current, the removed inode's version (its link count drops), and the
-  /// entry tree's copies — so an unlink or rmdir is refused before its first change or not at all.
-  fn admit_removal(
+  /// Admits a removal of `name` (naming inode `removed`) from an already-resolved head `dir`
+  /// (AUD-29-40): the directory's path made current, the removed inode's version (its link count
+  /// drops), and the entry tree's copies — so an unlink or rmdir is refused before its first
+  /// change or not at all.
+  fn admit_removal_head(
     &self,
     store: &Store,
     dir: Handle<DirNode>,
@@ -4516,10 +4691,12 @@ impl Volume {
     removed: InodeNo,
   ) -> Result<(), VfsError> {
     let mut needs = Needs::default();
-    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
-    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    let node = store.dirs.get(dir)?;
+    if node.born != self.epoch {
+      self.need_current_dir(store, node.inode, &mut needs, &mut Vec::new())?;
+    }
     self.need_current_inode(store, removed, &mut needs)?;
-    self.need_change(store, dir, name, &mut needs)?;
+    self.need_change_head(store, dir, name, &mut needs)?;
     self.admit_needs(store, &needs)
   }
 
@@ -4571,6 +4748,16 @@ impl Volume {
     name: &str,
   ) -> Result<(), VfsError> {
     let dir = self.head_dir(store, dir)?;
+    self.refuse_existing_head(store, dir, name)
+  }
+
+  /// [`Self::refuse_existing`] for an already-resolved head directory handle.
+  fn refuse_existing_head(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
     if store
       .dirs
       .get(dir)?
@@ -4604,7 +4791,8 @@ impl Volume {
   }
 
   /// Installs a fresh inode under a number [`Volume::next_no`] issued: its version in the slab and its
-  /// table entry, both or neither (a refusal gives the charge back).
+  /// table entry, both or neither (a refusal gives the charge back). Uses the volume's
+  /// [`trie::LeafCursor`] because fresh inode counters are monotonic.
   fn install(
     &mut self,
     store: &mut Store,
@@ -4618,7 +4806,7 @@ impl Volume {
         return Err(refusal.into());
       }
     };
-    if let Err(refusal) = self.table_set(store, no, handle) {
+    if let Err(refusal) = self.table_set_fresh(store, no, handle) {
       let undo = store.inodes.remove(handle);
       self.unissue_no();
       return Err(refusal.after_undo(undo));
@@ -5197,6 +5385,32 @@ impl Volume {
     Ok(previous)
   }
 
+  /// [`Self::table_set`] through this volume's persistent [`trie::LeafCursor`], for monotonic fresh
+  /// inode installs (`Volume::install`).
+  fn table_set_fresh(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    handle: Handle<Inode>,
+  ) -> Result<Option<Handle<Inode>>, VfsError> {
+    let mut scratch = Deadlist::default();
+    let (root, previous) = trie::set_in_order(
+      &mut store.tries,
+      self.inode_root,
+      no,
+      handle,
+      self.epoch,
+      &mut scratch,
+      &mut self.leaf_cursor,
+    )?;
+    self.inode_root = root;
+    self.dirty.inode(no.0);
+    for d in scratch.take() {
+      self.retire(store, d)?;
+    }
+    Ok(previous)
+  }
+
   /// [`Self::table_set`] through a [`trie::LeafCursor`], for a run that sets numbers in increasing order (a rebuild's
   /// placing loop).
   pub(crate) fn table_set_in_order(
@@ -5546,28 +5760,19 @@ impl Volume {
     let mut retired = Retired::new();
     let node = store.dirs.get_mut(dir)?;
     self.dirty.entry(node.inode.0, name);
-    let over_whiteout = node
-      .lookup(&store.blocks, policy, name)
-      .is_some_and(|e| e.child == Child::Whiteout);
-    let placed = if over_whiteout {
-      node
-        .set_child(&mut store.blocks, epoch, &mut retired, policy, name, child)
-        .map(drop)
-    } else {
-      node.insert(
-        &mut store.blocks,
-        epoch,
-        &mut retired,
-        policy,
-        name,
-        child,
-        cutover,
-      )
-    };
+    let placed = node.place(
+      &mut store.blocks,
+      epoch,
+      &mut retired,
+      policy,
+      name,
+      child,
+      cutover,
+    );
     // The blocks a copy replaced are retired whether or not the step completed: an all-or-nothing
     // step refuses before copying, and a completed one has replaced them.
     self.retire_blocks(store, retired)?;
-    placed?;
+    let over_whiteout = placed?;
     // A whiteout is no live entry (§4.2, as `dir_remove` and `DirNode::live_len` keep it), so only a
     // name that names a child counts. Before A-572 a recovery that placed a whiteout counted it.
     if child != Child::Whiteout {
@@ -5757,26 +5962,6 @@ impl Volume {
     Ok(())
   }
 
-  /// Journals a whiteout when the removal of `name` left one (a base name, §4.5).
-  fn record_whiteout(
-    &mut self,
-    store: &mut Store,
-    dir: Handle<DirNode>,
-    name: &str,
-    path: &str,
-  ) -> Result<(), VfsError> {
-    let dir = self.head_dir(store, dir)?;
-    let left = store
-      .dirs
-      .get(dir)?
-      .lookup(&store.blocks, self.policy, name)
-      .is_some_and(|e| e.child == Child::Whiteout);
-    if left {
-      self.record(&mut store.metadata, Op::Whiteout, path, None, 0);
-    }
-    Ok(())
-  }
-
   /// Retires blocks a directory mutation replaced or dropped, by the epoch rule.
   pub(crate) fn retire_blocks(
     &mut self,
@@ -5789,12 +5974,14 @@ impl Volume {
     Ok(())
   }
 
+  /// Removes `name` from `dir`, returning `(removed_child, left_whiteout)` so callers journal
+  /// `Op::Whiteout` without re-walking the inode trie and directory tree.
   pub(crate) fn dir_remove(
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
     name: &str,
-  ) -> Result<Child, VfsError> {
+  ) -> Result<(Child, bool), VfsError> {
     let cutover = store.dir_cutover;
     let epoch = self.epoch;
     let policy = self.policy;
@@ -5833,7 +6020,7 @@ impl Volume {
     // A real entry left the namespace: return its credit (§4.2). A base name becomes a whiteout,
     // which is not a live entry, so it is a decrement too.
     self.live_entries = self.live_entries.saturating_sub(1);
-    Ok(child)
+    Ok((child, in_base))
   }
 
   pub(crate) fn touch_dir(
@@ -6936,6 +7123,38 @@ impl Volume {
       }));
     }
     Ok(())
+  }
+
+  /// [`Volume::apply_write_whole`] taking owned `bytes` from offset 0 onto an empty `Body::Inline`
+  /// inode: moves the buffer directly into `Body::Inline` when it fits inline (zero second
+  /// allocation and zero copy), falling back to [`Self::apply_write_whole`] for chunked bodies.
+  pub(crate) fn apply_write_inline_owned(
+    &mut self,
+    store: &mut Store,
+    handle: Handle<Inode>,
+    bytes: Vec<u8>,
+  ) -> Result<(), VfsError> {
+    if bytes.is_empty() {
+      return Ok(());
+    }
+    if bytes.len() <= store.inline_bytes
+      && matches!(store.inodes.get(handle)?.body, Body::Inline(_))
+    {
+      let before = content_by_epoch_within(store, handle, None);
+      let written_no = store.inodes.get(handle)?.no.0;
+      let write_end = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      self.dirty.written(written_no, None, (0, write_end));
+      let inode = store.inodes.get_mut(handle)?;
+      inode.body = Body::Inline(bytes);
+      if self.seal_key.is_some() {
+        self.written.insert(inode.no, self.sweep_tick);
+        self.idle_pending.remove(&inode.no);
+        store.sweep_owed = true;
+      }
+      self.reconcile(before, content_by_epoch_within(store, handle, None));
+      return Ok(());
+    }
+    self.apply_write_whole(store, handle, 0, &bytes)
   }
 
   /// The write applied to `body`, which it owns: the body it leaves, always whole — the original one when a refusal

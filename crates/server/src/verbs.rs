@@ -10130,7 +10130,7 @@ fn lay_op(
 /// the refusal to reply with.
 fn build_increment(
   state: &ShardState,
-  sealed: &crate::work_home::SealedWork,
+  sealed: &mut crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
@@ -10145,9 +10145,9 @@ fn build_increment(
       green: to_wire_volume(green_id),
       version: base_version,
     })?;
-  // A work off this shard composed its own (A-247): the owner only judges it.
-  if let Some(composed) = &sealed.composed {
-    return Ok((green_id, composed.clone()));
+  // A work off this shard composed its own (A-247): move it out without cloning.
+  if let Some(composed) = sealed.composed.take() {
+    return Ok((green_id, composed));
   }
   // Only the base entries the journal names (`Green::base_for`): the deriver reads nothing else, and the
   // whole base cloned every path's name on every submit.
@@ -10936,12 +10936,12 @@ fn submit(
         }
         crate::made_commit::Taken::Held | crate::made_commit::Taken::Unhooked => {}
       }
-      let Some(sealed) = take_sealed(state, work_id) else {
+      let Some(mut sealed) = take_sealed(state, work_id) else {
         crate::made_commit::release(state);
         return refused(Refusal::NotFound);
       };
       let policy = SubmitPolicy::of_work(state, work_id, (approval, signature, authorship));
-      let reply = judge_submission(state, &sealed, evidence, policy);
+      let reply = judge_submission(state, &mut sealed, evidence, policy);
       put_back_sealed(state, sealed);
       crate::made_commit::release(state);
       // An accept a made commit's task commits settles the work there, in the step that commits the version.
@@ -11265,22 +11265,23 @@ fn refused_before_building(
 /// shard did not compose it (A-697's measured breakdown: the compose phase wherever it runs).
 fn composed_here(
   state: &mut ShardState,
-  sealed: &crate::work_home::SealedWork,
+  sealed: &mut crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
-  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+  let precomposed = sealed.composed.is_some();
+  if !precomposed && crate::work_home::holds_copy(&sealed.journal) {
     state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
   }
   // A refined submit's increment the refinement job prepared a slice a turn (A-787 part 3): composed off this step.
   let key = (sealed.base_version, sealed.journal.len());
-  if sealed.composed.is_none()
+  if !precomposed
     && let Some(inc) = crate::refining::take_increment(state, sealed.work, key, &evidence)
   {
     return Ok((sealed.green, inc));
   }
   let compose_start = state.clock.monotonic_ns();
   let built = build_increment(state, sealed, evidence)?;
-  if sealed.composed.is_none() {
+  if !precomposed {
     let composed_ns = state.clock.monotonic_ns().saturating_sub(compose_start);
     crate::merge_service::count_phase(state, crate::work_home::SUBMIT_COMPOSE, composed_ns);
   }
@@ -11292,7 +11293,7 @@ fn composed_here(
 /// through [`owner_judge`]. The work's own reset is the caller's to settle.
 fn judge_submission(
   state: &mut ShardState,
-  sealed: &crate::work_home::SealedWork,
+  sealed: &mut crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
   policy: SubmitPolicy,
 ) -> ReplyBody {
@@ -11550,7 +11551,7 @@ fn accepted_answer(
 /// [`judge_submission`]'s judgment itself.
 fn judged_submission(
   state: &mut ShardState,
-  sealed: &crate::work_home::SealedWork,
+  sealed: &mut crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
   policy: SubmitPolicy,
 ) -> ReplyBody {
@@ -12037,10 +12038,10 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
         };
         return park_on_refinement(state, (work_id, green_id), owed, kind);
       }
-      let Some(sealed) = take_sealed(state, work_id) else {
+      let Some(mut sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
-      let answer = map_rebase(state, &sealed);
+      let answer = map_rebase(state, &mut sealed);
       put_back_sealed(state, sealed);
       answer
     }
@@ -12073,14 +12074,14 @@ fn local_merge(
   ask: crate::work_home::MergeAsk,
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  if refinement_owed(state, (work_id, green_id)).is_some() {
+  if refinement_owed(state, (work_id, green_id), false).is_some() {
     return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
   }
   let Some(mut sealed) = take_sealed(state, work_id) else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   sealed.merge = Some(ask);
-  let answer = map_rebase(state, &sealed);
+  let answer = map_rebase(state, &mut sealed);
   put_back_sealed(state, sealed);
   answer
 }
@@ -12331,10 +12332,11 @@ fn give_up_windows(
 /// changed by a rebase.
 fn map_rebase(
   state: &mut ShardState,
-  sealed: &crate::work_home::SealedWork,
+  sealed: &mut crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+  let precomposed = sealed.composed.is_some();
+  if !precomposed && crate::work_home::holds_copy(&sealed.journal) {
     state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
   }
   let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
@@ -12348,7 +12350,7 @@ fn map_rebase(
   merge_answer(
     &engine,
     (green_id, inc),
-    sealed.composed.is_some() || sealed.composes_here,
+    precomposed || sealed.composes_here,
     sealed.merge.as_ref(),
   )
 }
@@ -13020,7 +13022,7 @@ fn submit_computed(
     authorship: carried.authorship,
   };
   let evidence = inc.evidence.clone();
-  let sealed = crate::work_home::SealedWork {
+  let mut sealed = crate::work_home::SealedWork {
     work: to_db_volume(work),
     green: to_db_volume(green),
     base_version: inc.base,
@@ -13045,7 +13047,7 @@ fn submit_computed(
     }
     crate::made_commit::Taken::Held | crate::made_commit::Taken::Unhooked => {}
   }
-  let reply = judge_submission(state, &sealed, evidence, policy);
+  let reply = judge_submission(state, &mut sealed, evidence, policy);
   crate::made_commit::release(state);
   let _ = crate::made_commit::take_deferred(state);
   reply
@@ -13204,7 +13206,7 @@ pub(crate) fn owner_sizes(
 pub(crate) fn owner_judge(
   state: &mut ShardState,
   (origin, id): (u64, RequestId),
-  (sealed, evidence, policy): (crate::work_home::SealedWork, Vec<[u8; 32]>, SubmitPolicy),
+  (mut sealed, evidence, policy): (crate::work_home::SealedWork, Vec<[u8; 32]>, SubmitPolicy),
   back: crate::merge_service::ReplyRoute,
 ) -> Option<ReplyBody> {
   match state
@@ -13301,7 +13303,7 @@ pub(crate) fn owner_judge(
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = Some(back);
-  let reply = judge_submission(state, &sealed, evidence, policy);
+  let reply = judge_submission(state, &mut sealed, evidence, policy);
   state.current_request = None;
   state.reply_route = None;
   crate::made_commit::release(state);
@@ -13546,19 +13548,25 @@ fn parkable_refinement(
   (work, green): (DbVolumeId, DbVolumeId),
 ) -> Option<crate::refining::Owed> {
   state.current_request?;
-  refinement_owed(state, (work, green))
+  refinement_owed(state, (work, green), true)
 }
 
 /// The refinement `work`'s journal owes on this shard (A-787 part 2), read where the work holds it.
 fn refinement_owed(
   state: &ShardState,
   (work, green): (DbVolumeId, DbVolumeId),
+  slice_large: bool,
 ) -> Option<crate::refining::Owed> {
   let w = state.works.get(&work)?;
   if crate::work_home::holds_copy(&w.journal) {
     return None;
   }
-  crate::refining::owed(state, (work, green, w.base_version), &w.journal)
+  crate::refining::owed(
+    state,
+    (work, green, w.base_version),
+    &w.journal,
+    slice_large,
+  )
 }
 
 /// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
@@ -13694,9 +13702,9 @@ pub(crate) fn answered_on(
 /// and a retry runs it again.
 pub(crate) fn owner_rebase(
   state: &mut ShardState,
-  sealed: crate::work_home::SealedWork,
+  mut sealed: crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
-  map_rebase(state, &sealed)
+  map_rebase(state, &mut sealed)
 }
 
 /// Moves or releases a work's floor on its green's partition, and folds what that frees (A-247).
@@ -19314,27 +19322,32 @@ async fn run_pin(mut job: PinJob) {
 pub fn serve_round(state: &mut ShardState) -> bool {
   let mut any = retry_forwards(state);
   any |= retry_deferred(state);
-  let handles: Vec<(u32, Handle<ClientSlot>)> = state
-    .clients
-    .iter()
-    .filter(|(_, client)| !client.retiring)
-    .map(|(handle, _)| (handle.index(), handle))
-    .collect();
-  // One clock read per round marks every client served in it (the reap's silence clock).
-  let now = state.clock.monotonic_ns();
-  for (index, handle) in handles {
-    any |= serve_client(state, index, handle, now);
-    if let Some(client_id) = state
-      .clients
-      .get(handle)
-      .ok()
-      .filter(|c| !c.retiring && c.end.is_closed())
-      .map(|c| c.client_id)
-    {
-      crate::reap::client_closed(state, handle, client_id);
-      any = true;
+  let mut handles = std::mem::take(&mut state.serve_scratch);
+  handles.clear();
+  for (handle, client) in state.clients.iter() {
+    if !client.retiring && (client.end.has_pending() || client.end.is_closed()) {
+      handles.push((handle.index(), handle));
     }
   }
+  if !handles.is_empty() {
+    // One clock read per round marks every client served in it (the reap's silence clock).
+    let now = state.clock.monotonic_ns();
+    for &(index, handle) in &handles {
+      any |= serve_client(state, index, handle, now);
+      if let Some(client_id) = state
+        .clients
+        .get(handle)
+        .ok()
+        .filter(|c| !c.retiring && c.end.is_closed())
+        .map(|c| c.client_id)
+      {
+        crate::reap::client_closed(state, handle, client_id);
+        any = true;
+      }
+    }
+    handles.clear();
+  }
+  state.serve_scratch = handles;
   // The closed loop's clock (`loop_hold`; A-326): the end of a round's client I/O, the requests of its clients' loops
   // read and the replies to them written, before the round's background work, so a client's think time is read from its
   // reply, not from the round's start, and a destroy's slices, a lease's expiry or an acknowledgement never stand in for

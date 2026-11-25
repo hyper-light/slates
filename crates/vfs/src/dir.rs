@@ -13,7 +13,7 @@
 use slates_mem::Handle;
 
 use crate::dirblocks::{BlockRef, BlockStore};
-use crate::dirtree::{Retired, Tree, TreeCursor};
+use crate::dirtree::{Retired, Tree, TreeCursor, TreeIter};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
 use crate::inode::Kind;
@@ -301,6 +301,56 @@ impl Small {
   }
 }
 
+/// Zero-allocation iterator over a [`DirNode`]'s entries in canonical `(hash, folded name)` order.
+// Stack-only iterator (never stored in collections); keeping `TreeIter` inline avoids a heap
+// allocation on every `readdir` and `readdir_page`.
+#[allow(clippy::large_enum_variant)]
+pub enum DirIter<'a> {
+  /// Inline small-directory scan, skipping entries below `min_hash`.
+  Small {
+    /// Inline array being scanned.
+    small: &'a Small,
+    /// Next slot index to visit.
+    index: usize,
+    /// Lower bound on entry hash (`0` for full iteration).
+    min_hash: u64,
+  },
+  /// Indexed B-tree iterator.
+  Indexed(TreeIter<'a>),
+}
+
+impl<'a> Iterator for DirIter<'a> {
+  type Item = EntryRef<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    match self {
+      DirIter::Small {
+        small,
+        index,
+        min_hash,
+      } => {
+        let entries = small.entries();
+        while let Some(&e) = entries.get(*index) {
+          *index = index.saturating_add(1);
+          if e.hash >= *min_hash {
+            return Some(EntryRef {
+              hash: e.hash,
+              name: small.name(e),
+              child: e.child,
+            });
+          }
+        }
+        None
+      }
+      DirIter::Indexed(tree) => {
+        tree
+          .next()
+          .map(|(hash, name, child)| EntryRef { hash, name, child })
+      }
+    }
+  }
+}
+
 /// The entries.
 #[derive(Clone, Copy, Debug)]
 pub enum DirEntries {
@@ -504,6 +554,60 @@ impl DirNode {
     }
   }
 
+  /// Places `name → child` in one pass: replaces an existing whiteout in place (returning
+  /// `Ok(true)`), inserts a new entry when absent (returning `Ok(false)`), or refuses
+  /// `AlreadyExists` for a live entry.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn place(
+    &mut self,
+    blocks: &mut BlockStore,
+    epoch: Epoch,
+    retired: &mut Retired,
+    policy: NameEquivalence,
+    name: &str,
+    child: Child,
+    cutover: usize,
+  ) -> Result<bool, VfsError> {
+    match &mut self.entries {
+      DirEntries::Small(s) => {
+        let hash = policy.hash(name);
+        if let Ok(at) = s.position(policy, hash, name) {
+          let Some(entry) = s.entries.get_mut(at) else {
+            return Err(VfsError::Invalid);
+          };
+          if entry.child != Child::Whiteout {
+            return Err(VfsError::AlreadyExists);
+          }
+          entry.child = child;
+          return Ok(true);
+        }
+        self
+          .insert(blocks, epoch, retired, policy, name, child, cutover)
+          .map(|()| false)
+      }
+      DirEntries::Indexed(t) => t.place(blocks, epoch, retired, policy, name, child),
+    }
+  }
+
+  /// Worst-case upper bound on blocks an insert into this directory can allocate (O(1), no
+  /// tree descent): used by volume admission to skip [`Self::insert_blocks`] whenever the block
+  /// store has ample room.
+  pub(crate) const fn max_insert_blocks(&self) -> usize {
+    match &self.entries {
+      DirEntries::Small(_) => SMALL_TO_TREE_BLOCKS,
+      DirEntries::Indexed(t) => t.max_insert_blocks(),
+    }
+  }
+
+  /// Worst-case upper bound on blocks an in-place change or removal in this directory can
+  /// allocate (O(1), no tree descent).
+  pub(crate) const fn max_change_blocks(&self) -> usize {
+    match &self.entries {
+      DirEntries::Small(_) => 0,
+      DirEntries::Indexed(t) => t.max_change_blocks(),
+    }
+  }
+
   /// The most directory blocks an insert of `name` can take (AUD-29-40's reservation): inline, none
   /// while the name fits; the move to a tree, one; a tree, its insert's copies and worst-case split.
   pub fn insert_blocks(
@@ -635,19 +739,14 @@ impl DirNode {
   }
 
   /// The entries in canonical `(hash, folded name)` order.
-  pub fn iter<'a>(&'a self, blocks: &'a BlockStore) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
+  pub fn iter<'a>(&'a self, blocks: &'a BlockStore) -> DirIter<'a> {
     match &self.entries {
-      DirEntries::Small(s) => Box::new(s.entries().iter().map(move |e| EntryRef {
-        hash: e.hash,
-        name: s.name(*e),
-        child: e.child,
-      })),
-      DirEntries::Indexed(t) => {
-        Box::new(
-          t.iter(blocks)
-            .map(|(hash, name, child)| EntryRef { hash, name, child }),
-        )
-      }
+      DirEntries::Small(small) => DirIter::Small {
+        small,
+        index: 0,
+        min_hash: 0,
+      },
+      DirEntries::Indexed(t) => DirIter::Indexed(t.iter(blocks)),
     }
   }
 
@@ -693,23 +792,14 @@ impl DirNode {
   /// The entries in canonical order whose name hash is at least `hash`: a directory listing resumed from a
   /// hash cookie, one descent into the indexed form (the small form is a scan of its inline array, bounded by
   /// its capacity) — §4.5; AUD-29-86.
-  pub fn iter_from_hash<'a>(
-    &'a self,
-    blocks: &'a BlockStore,
-    hash: u64,
-  ) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
+  pub fn iter_from_hash<'a>(&'a self, blocks: &'a BlockStore, hash: u64) -> DirIter<'a> {
     match &self.entries {
-      DirEntries::Small(s) => Box::new(s.entries().iter().filter(move |e| e.hash >= hash).map(
-        move |e| EntryRef {
-          hash: e.hash,
-          name: s.name(*e),
-          child: e.child,
-        },
-      )),
-      DirEntries::Indexed(t) => Box::new(
-        t.iter_from_hash(blocks, hash)
-          .map(|(hash, name, child)| EntryRef { hash, name, child }),
-      ),
+      DirEntries::Small(small) => DirIter::Small {
+        small,
+        index: 0,
+        min_hash: hash,
+      },
+      DirEntries::Indexed(t) => DirIter::Indexed(t.iter_from_hash(blocks, hash)),
     }
   }
 

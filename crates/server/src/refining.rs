@@ -207,20 +207,34 @@ pub(crate) fn make_owed(
   }
 }
 
-/// The refinement `work`'s composition owes, at `base_version` over `journal`: none when it replaces nothing whole, when
-/// its refinement is kept already (or gave up) under this key, or when it does not compose (the verb refuses it typed).
-pub(crate) fn owed(
-  state: &ShardState,
-  (work, green, base_version): (DbVolumeId, DbVolumeId, u64),
-  journal: &[VolumeOp],
-) -> Option<Owed> {
-  let key = (base_version, journal.len());
-  if state
+/// Whether `work` already has a finished refinement or preparation record under `key`.
+pub(crate) fn is_done(state: &ShardState, work: DbVolumeId, key: Key) -> bool {
+  state
     .refining
     .done
     .get(&work)
     .is_some_and(|done| done.key == key)
-  {
+}
+
+/// Whether `doc`'s post-state exceeds one carried increment (`CARRIED_INCREMENT_MAX`), so post-state
+/// assembly and BLAKE3 identity hashing are sliced off the submit verb across bounded shard turns
+/// rather than running synchronously in one poll (Wave 9).
+pub(crate) fn needs_sliced_prepare(doc: &OpsDoc) -> bool {
+  crate::verbs::post_state_size(doc)
+    > u64::try_from(crate::verbs::CARRIED_INCREMENT_MAX).unwrap_or(u64::MAX)
+}
+
+/// The refinement `work`'s composition owes, at `base_version` over `journal`: none when it replaces nothing whole (and
+/// either `slice_large` is false or its post-state fits one carried increment), when its refinement is kept already (or
+/// gave up) under this key, or when it does not compose (the verb refuses it typed).
+pub(crate) fn owed(
+  state: &ShardState,
+  (work, green, base_version): (DbVolumeId, DbVolumeId, u64),
+  journal: &[VolumeOp],
+  slice_large: bool,
+) -> Option<Owed> {
+  let key = (base_version, journal.len());
+  if is_done(state, work, key) {
     return None;
   }
   let base = compose_base(state, (work, green, base_version), journal)?;
@@ -232,7 +246,7 @@ pub(crate) fn owed(
     &base,
     (&doc, &plan),
   );
-  (!pairs.is_empty()).then_some(Owed {
+  (!pairs.is_empty() || (slice_large && needs_sliced_prepare(&doc))).then_some(Owed {
     key,
     doc,
     plan,
@@ -543,63 +557,68 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
         }
       }
     }
-    // The refinement, a pace turn a step.
-    let refining = async move {
-      let (mut doc, mut plan) = (doc, plan);
-      let mut refiner = slates_merge::refine::Refiner::new();
-      let ticks = slates_merge::pace::Ticks;
-      let mut files = |base_path: &str, path: &str| {
-        copies
-          .iter()
-          .find(|copy| copy.base_path == base_path && copy.path == path)
-          .map(|copy| {
-            (
-              std::borrow::Cow::Borrowed(copy.base.as_slice()),
-              std::borrow::Cow::Borrowed(copy.post.as_slice()),
-            )
-          })
+    let (doc, plan) = if copies.is_empty() {
+      (doc, plan)
+    } else {
+      // The refinement, a pace turn a step.
+      let refining = async move {
+        let (mut doc, mut plan) = (doc, plan);
+        let mut refiner = slates_merge::refine::Refiner::new();
+        let ticks = slates_merge::pace::Ticks;
+        let mut files = |base_path: &str, path: &str| {
+          copies
+            .iter()
+            .find(|copy| copy.base_path == base_path && copy.path == path)
+            .map(|copy| {
+              (
+                std::borrow::Cow::Borrowed(copy.base.as_slice()),
+                std::borrow::Cow::Borrowed(copy.post.as_slice()),
+              )
+            })
+        };
+        slates_merge::refine::refine_rewrites_paced(
+          &mut doc,
+          &mut plan,
+          &mut refiner,
+          (&mut files, &ticks),
+        )
+        .await;
+        // The scratch and the copies go back to the owner, to be given back a slice a turn.
+        (doc, plan, refiner, copies)
       };
-      slates_merge::refine::refine_rewrites_paced(
-        &mut doc,
-        &mut plan,
-        &mut refiner,
-        (&mut files, &ticks),
-      )
-      .await;
-      // The scratch and the copies go back to the owner, to be given back a slice a turn.
-      (doc, plan, refiner, copies)
-    };
-    let mut refining = core::pin::pin!(refining);
-    let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-    let (doc, plan, mut refiner, copies) = loop {
-      let budget = crate::state::with_state(|s| s.config.step_quantum_ns() / 2).unwrap_or(1);
-      let began = slates_rt::futures::now_ns();
-      pace.turn(began.saturating_add(budget.max(1)));
-      let polled = pace.drive(refining.as_mut());
-      turn(&mut turns, &mut longest, began);
-      if let core::task::Poll::Ready(refined) = polled {
-        break refined;
-      }
-      slates_rt::futures::yield_now().await;
-    };
-    // What the job held, given back a buffer a turn: freed together, the copies and the scratch of a 2 MiB rewrite cost
-    // about a millisecond in one step (A-787 part 2).
-    let mut copies = copies.into_iter();
-    loop {
-      let began = slates_rt::futures::now_ns();
-      let done = match copies.next() {
-        Some(copy) => {
-          drop(copy);
-          false
+      let mut refining = core::pin::pin!(refining);
+      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+      let (doc, plan, mut refiner, copies) = loop {
+        let budget = crate::state::with_state(|s| s.config.step_quantum_ns() / 2).unwrap_or(1);
+        let began = slates_rt::futures::now_ns();
+        pace.turn(began.saturating_add(budget.max(1)));
+        let polled = pace.drive(refining.as_mut());
+        turn(&mut turns, &mut longest, began);
+        if let core::task::Poll::Ready(refined) = polled {
+          break refined;
         }
-        None => refiner.release_step(),
+        slates_rt::futures::yield_now().await;
       };
-      turn(&mut turns, &mut longest, began);
-      if done {
-        break;
+      // What the job held, given back a buffer a turn: freed together, the copies and the scratch of a 2 MiB rewrite cost
+      // about a millisecond in one step (A-787 part 2).
+      let mut copies = copies.into_iter();
+      loop {
+        let began = slates_rt::futures::now_ns();
+        let done = match copies.next() {
+          Some(copy) => {
+            drop(copy);
+            false
+          }
+          None => refiner.release_step(),
+        };
+        turn(&mut turns, &mut longest, began);
+        if done {
+          break;
+        }
+        slates_rt::futures::yield_now().await;
       }
-      slates_rt::futures::yield_now().await;
-    }
+      (doc, plan)
+    };
     // The parked submit's increment, verdict and encoding, a bounded slice a turn (A-787 part 3).
     let prepared = prepare(
       (work, green, key),
@@ -712,18 +731,19 @@ async fn prepare_turn<T>(
   done
 }
 
-/// What the work still is and what the green holds for a prepare's turn: `None` once the work changed (another key),
-/// the green is not on this shard, or no local submit waits for the refinement.
-fn still_owed(s: &ShardState, (work, green, key): (DbVolumeId, DbVolumeId, Key)) -> Option<()> {
+/// What the work still is for a prepare's turn: `None` once the work is gone or changed (another
+/// key). Works on both the green's owner shard and an off-owner work shard (Wave 9).
+fn still_owed(s: &ShardState, (work, _green, key): (DbVolumeId, DbVolumeId, Key)) -> Option<()> {
   let w = s.works.get(&work)?;
-  ((w.base_version, w.journal.len()) == key && s.greens.contains_key(&green)).then_some(())
+  ((w.base_version, w.journal.len()) == key).then_some(())
 }
 
-/// Prepares the parked submit's increment, verdict and encoding over `(doc, plan)`, the refinement's result, a bounded
-/// slice a turn ([`Prepared`]): the post-state a copy slice a turn (the shard's measured memcpy rate within its
-/// quantum), the identity a hash slice a turn (its measured BLAKE3 rate), and the document's encoding, the verdict and
-/// the increment's encoding a turn each. `None`, nothing kept, where nothing waits for it or the work or the green
-/// changed: the submit then composes and judges in its step as before.
+/// Prepares the parked submit's increment (and, when the green lives on this shard, its verdict and
+/// encoding) over `(doc, plan)` a bounded slice a turn ([`Prepared`]): the post-state a copy slice
+/// a turn (the shard's measured memcpy rate within its quantum), the identity a hash slice a turn
+/// (its measured BLAKE3 rate), and the document's encoding (and local verdict/encoding) a turn
+/// each. `None`, nothing kept, where nothing waits for it or the work changed: the submit then
+/// composes and judges in its step as before.
 async fn prepare(
   (work, green, key): (DbVolumeId, DbVolumeId, Key),
   (doc, plan): (&OpsDoc, &PostStatePlan),
@@ -732,7 +752,11 @@ async fn prepare(
   let at = (work, green, key);
   let evidence = crate::state::with_state(|s| {
     still_owed(s, at)?;
-    crate::verbs::parked_local_evidence(s.refining.parked.get(&work)?)
+    s.refining
+      .parked
+      .get(&work)
+      .and_then(|parked| crate::verbs::parked_local_evidence(parked))
+      .or_else(|| crate::work_home::parked_submit_evidence(s, work))
   })
   .flatten()?;
   let post = laid_post_state(at, (doc, plan), (&mut *turns, &mut *longest)).await?;
@@ -751,18 +775,42 @@ async fn prepare(
     evidence: evidence.clone(),
     named: Default::default(),
   };
+  let local_green = crate::state::with_state(|s| s.greens.contains_key(&green)).unwrap_or(false);
+  let (computed, encoded) = if local_green {
+    prepare_local_parts(at, (doc, plan), &increment, (&mut *turns, &mut *longest)).await?
+  } else {
+    (None, None)
+  };
+  Some(Prepared {
+    evidence,
+    increment: Some(increment),
+    id,
+    computed,
+    encoded,
+  })
+}
+
+/// Runs the local-green half of [`prepare`]: debug-build whole-compose oracle check, computed
+/// verdict at the observed head, and increment encoding, each in its own bounded turn.
+async fn prepare_local_parts(
+  at: (DbVolumeId, DbVolumeId, Key),
+  (_doc, _plan): (&OpsDoc, &PostStatePlan),
+  increment: &slates_merge::engine::Increment,
+  (turns, longest): (&mut TurnCounts, &mut u64),
+) -> Option<(Option<slates_merge::engine::Computed>, Option<Vec<u8>>)> {
+  let (_work, green, _key) = at;
   // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
   // `compose_increment`), compared whole with the sliced one, in a turn of its own (A-821).
   #[cfg(debug_assertions)]
   let _ = prepare_turn((&mut *turns, &mut *longest), |s| {
     let whole = crate::verbs::composed_whole(
       s,
-      (work, green, key.0),
-      (doc.clone(), plan.clone()),
-      evidence.clone(),
+      (_work, green, _key.0),
+      (_doc.clone(), _plan.clone()),
+      increment.evidence.clone(),
     )?;
     s.count(PREPARED_CHECKED, 1);
-    if whole != increment {
+    if whole != *increment {
       s.count(PREPARED_MISMATCH, 1);
     }
     Some(())
@@ -770,7 +818,7 @@ async fn prepare(
   .await;
   let computed = prepare_turn((&mut *turns, &mut *longest), |s| {
     still_owed(s, at)?;
-    s.greens.get(&green)?.compute(&increment).ok()
+    s.greens.get(&green)?.compute(increment).ok()
   })
   .await?;
   let encoded = prepare_turn((&mut *turns, &mut *longest), |s| {
@@ -778,13 +826,7 @@ async fn prepare(
     Some(increment.encode())
   })
   .await?;
-  Some(Prepared {
-    evidence,
-    increment: Some(increment),
-    id,
-    computed: Some(computed),
-    encoded: Some(encoded),
-  })
+  Some((Some(computed), Some(encoded)))
 }
 
 /// The prepared part of `work`'s submit `take` reads (A-787 part 3), counted when taken.
@@ -879,13 +921,22 @@ async fn laid_post_state(
         end = end.saturating_add(1);
       }
       let w = s.works.get(&work)?;
-      let engine = s.greens.get(&green)?;
-      let base = crate::work_files::Base {
-        green: Some(&*engine),
-        fetched: None,
-        version: key.0,
-        entries: None,
-        plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
+      let engine = s.greens.get(&green);
+      let base = match engine.as_deref() {
+        Some(engine) => crate::work_files::Base {
+          green: Some(engine),
+          fetched: None,
+          version: key.0,
+          entries: None,
+          plane: crate::vcs_store::named_objects::plane(&s.vcs_stores, &s.store.content),
+        },
+        None => crate::work_files::Base {
+          green: None,
+          fetched: crate::work_home::parked_fetched(s, work),
+          version: key.0,
+          entries: Some(&w.entries),
+          plane: None,
+        },
       };
       // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
       crate::verbs::lay_ops(

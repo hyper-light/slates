@@ -888,6 +888,22 @@ impl Tree {
     Ok(())
   }
 
+  /// Derived: worst-case upper bound on blocks an insert or respell can allocate (`height` path
+  /// copies plus `2 * height + 1` cascade blocks — 3 per level plus a new root): when
+  /// `blocks.room()` meets this bound, the read-only [`Self::descent_cost`] pre-walk is skipped.
+  pub(crate) const fn max_insert_blocks(&self) -> usize {
+    let height = self.height as usize;
+    height
+      .saturating_add(height.saturating_mul(2))
+      .saturating_add(1)
+  }
+
+  /// Worst-case upper bound on blocks a removal or in-place child update can allocate (`height`
+  /// path copies): when `blocks.room()` meets this bound, [`Self::descent_cost`] is skipped.
+  pub(crate) const fn max_change_blocks(&self) -> usize {
+    self.height as usize
+  }
+
   /// The most blocks an insert of `name` can take: the path's copies, and when the leaf cannot take
   /// the name, the cascade's worst case ([`Tree::cascade`]) — what [`Tree::insert`] admits.
   pub(crate) fn insert_blocks(
@@ -970,8 +986,10 @@ impl Tree {
     child: Child,
   ) -> Result<(), VfsError> {
     let hash = policy.hash(name);
-    let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, name, name.len())?;
-    Self::admit(blocks, copies.saturating_add(self.cascade(fits)))?;
+    if blocks.room() < self.max_insert_blocks() {
+      let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, name, name.len())?;
+      Self::admit(blocks, copies.saturating_add(self.cascade(fits)))?;
+    }
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let depth = usize::from(self.height).saturating_sub(1);
     let (leaf, _) = step(&path, Some(depth))?;
@@ -992,6 +1010,62 @@ impl Tree {
     self.insert_split(blocks, epoch, retired, place, entry)?;
     self.count = self.count.saturating_add(1);
     Ok(())
+  }
+
+  /// Places `name → child` in one descent: replaces an existing whiteout in place (returning
+  /// `Ok(true)`), inserts a new entry when absent (returning `Ok(false)`), or refuses
+  /// `AlreadyExists` for a live entry. All or nothing before the first block changes.
+  pub(crate) fn place(
+    &mut self,
+    blocks: &mut BlockStore,
+    epoch: Epoch,
+    retired: &mut Retired,
+    policy: NameEquivalence,
+    name: &str,
+    child: Child,
+  ) -> Result<bool, VfsError> {
+    let hash = policy.hash(name);
+    if blocks.room() < self.max_insert_blocks() {
+      let over_whiteout = self
+        .lookup(blocks, policy, name)
+        .is_some_and(|(_, existing, _)| existing == Child::Whiteout);
+      let fit_len = if over_whiteout { 0 } else { name.len() };
+      let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, name, fit_len)?;
+      let extra = if over_whiteout { 0 } else { self.cascade(fits) };
+      Self::admit(blocks, copies.saturating_add(extra))?;
+    }
+    let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
+    let depth = usize::from(self.height).saturating_sub(1);
+    let (leaf, _) = step(&path, Some(depth))?;
+    match view(blocks, leaf)?.find(policy, hash, name) {
+      Ok(at) => {
+        let mut leaf = edit(blocks, leaf)?;
+        let old = leaf.read().slot(at);
+        if old.to_child() != Child::Whiteout {
+          return Err(VfsError::AlreadyExists);
+        }
+        let mut s = Slot::from_child(hash, child);
+        s.name_off = old.name_off;
+        s.name_len = old.name_len;
+        leaf.set_slot(at, s);
+        Ok(true)
+      }
+      Err(at) => {
+        let entry = Entry {
+          at,
+          slot: Slot::from_child(hash, child),
+          name,
+        };
+        let place = Place {
+          path: &path,
+          depth,
+          block: leaf,
+        };
+        self.insert_split(blocks, epoch, retired, place, entry)?;
+        self.count = self.count.saturating_add(1);
+        Ok(false)
+      }
+    }
   }
 
   /// Inserts into the block at `place`, growing it, or splitting it upward at the largest class, as needed.
@@ -1135,8 +1209,10 @@ impl Tree {
     let hash = policy.hash(old);
     // A removed name stays a hole until the block compacts, so even a shorter spelling may need a
     // new block: the cascade's worst case is reserved whenever the leaf cannot take the new spelling now.
-    let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, old, new.len())?;
-    Self::admit(blocks, copies.saturating_add(self.cascade(fits)))?;
+    if blocks.room() < self.max_insert_blocks() {
+      let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, old, new.len())?;
+      Self::admit(blocks, copies.saturating_add(self.cascade(fits)))?;
+    }
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, old)?;
     let depth = usize::from(self.height).saturating_sub(1);
     let (leaf, _) = step(&path, Some(depth))?;
@@ -1172,8 +1248,10 @@ impl Tree {
     name: &str,
   ) -> Result<Option<Child>, VfsError> {
     let hash = policy.hash(name);
-    let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
-    Self::admit(blocks, copies)?;
+    if blocks.room() < self.max_change_blocks() {
+      let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
+      Self::admit(blocks, copies)?;
+    }
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let depth = usize::from(self.height).saturating_sub(1);
     let (leaf, _) = step(&path, Some(depth))?;
@@ -1352,8 +1430,10 @@ impl Tree {
     child: Child,
   ) -> Result<bool, VfsError> {
     let hash = policy.hash(name);
-    let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
-    Self::admit(blocks, copies)?;
+    if blocks.room() < self.max_change_blocks() {
+      let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
+      Self::admit(blocks, copies)?;
+    }
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let (leaf, _) = step(&path, usize::from(self.height).checked_sub(1))?;
     let Ok(at) = view(blocks, leaf)?.find(policy, hash, name) else {

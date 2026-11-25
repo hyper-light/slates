@@ -5077,6 +5077,7 @@ async fn init_shard(
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
     clients: Slab::new(config.caps.segment_slots, config.clients_per_shard),
+    serve_scratch: Vec::new(),
     next_prefix: partition
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),

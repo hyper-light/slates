@@ -1389,6 +1389,17 @@ impl DaemonEnd {
       .is_ok_and(|closed| closed.load(Ordering::Acquire) != 0)
   }
 
+  /// Whether the next command-ring slot holds a published request (one Acquire load on the slot's
+  /// sequence word). Returns `true` on any mapping error so the caller still takes and handles it
+  /// through [`Self::try_take`].
+  pub fn has_pending(&self) -> bool {
+    self
+      .region
+      .cmd()
+      .can_pop(self.region.object(), self.next_request)
+      .unwrap_or(true)
+  }
+
   /// Wakes issued so far.
   pub fn wakes(&self) -> u64 {
     self.wakes
