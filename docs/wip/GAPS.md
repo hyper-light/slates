@@ -341,6 +341,16 @@
 > for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
 > piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
 > the step budget (the volumes' images paged too only if past it).
+> **Publication churn (goal 93, w-perf; main's ruling of 2026-11-25 (a), w-shared's go):** at 2,000 changesets about
+> 65% of a push's system allocations were its publications (`crates/server/tests/hg_fetch_heap.rs`'s churn by site): a
+> delta re-encodes only the pages its changes lie in, but a re-encoded page was read a buffer of entries and a heap
+> buffer an entry, then copied into the delta's or checkpoint's piece. Now a page's entries are read into the encoder's
+> buffer, lent and kept (`FamilyReader`), each entry's bytes inline where they fit two identities (`EntryBytes`):
+> counted `vcs_store.image.read_allocated_bytes` beside `encoded_bytes`; red
+> `a_re_encoded_page_allocates_no_more_than_it_encodes` (a cut of 300 let-goes over small pages: 557,456 bytes
+> allocated for 306,607 encoded; now 217,296, the windows' pieces read out of the arena). OWED: the encoder's page
+> bytes handed to a delta and a checkpoint without a second copy (`image_cut`, `held_image_paged`), then (b), the away
+> windows keyed by let-go order, should the 57k churn show the Aways family leading and growing with history.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
