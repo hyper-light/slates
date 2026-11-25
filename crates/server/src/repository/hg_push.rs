@@ -2704,11 +2704,16 @@ fn landed_segment(
   let kept = super::hg_run::contents_bytes(state, &segment.contents);
   // An elective change: none while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
   // progress rule); the texts then stay until the run commits, whose let-go waits for the pause to end.
+  let skips = super::hg_run::push_pin_skips();
   let freed = if crate::content_holder::image_paused(state) {
     0
   } else {
     super::hg_run::let_go_landed(state, None, &segment.contents)
   };
+  state.count(
+    super::hg_run::PUSH_PIN_SKIPS,
+    super::hg_run::push_pin_skips().saturating_sub(skips),
+  );
   let (held, texts) = run.texts_landed((kept, freed));
   state.count_max(PUSH_HELD_HIGH_BYTES, held);
   state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
@@ -2766,6 +2771,9 @@ pub(crate) struct Taking {
   generation: u64,
   /// An intake step's measured cost, across its slices (A-783's paced turn).
   costs: vcs_store::TurnCosts,
+  /// The windows its kept-but-unlanded revisions pin on its shard (`hg_run::PUSH_PINS`), counted after each slice, a
+  /// segment's counted out as it lands, the rest given back however the push ends.
+  counted: slates_hg::push::pins::Counted,
 }
 
 impl Taking {
@@ -2784,9 +2792,10 @@ impl Taking {
     // yielded at its first quantum (2.2 us on an M4 Max) was one step, a turn a revision for hg-src's ~230,000.
     let mut paced = vcs_store::paced_turn(quantum, slates_rt::futures::now_ns());
     let costs = &mut self.costs;
+    let counted = &mut self.counted;
     let sliced = vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
-      Some(loop {
+      let stepped = loop {
         if !paced.more(vcs_store::ANSWER_STEP, costs) {
           break Ok(Stepped::More);
         }
@@ -2796,7 +2805,16 @@ impl Taking {
           Ok(Stepped::Wanted(range)) => break Err(whole_wanted(payload, range)),
           other => break other,
         }
-      })
+      };
+      // What the slice kept pins the windows it names until its own segment lands (goal 93, main's ruling of
+      // 2026-11-24): a pin past the bound refused typed, never grown.
+      let pinned = super::hg_run::pins_count_kept(content, counted, intake.kept_contents())
+        .map_err(|_| {
+          IntakeRefused::Unindexed(slates_hg::push::commit::Unindexed::from(
+            slates_vcs::ContentRefused::CountExhausted,
+          ))
+        });
+      Some(pinned.and(stepped))
     });
     paced.close(slates_rt::futures::now_ns(), costs);
     state.count(INTAKE_SLICES, 1);
@@ -2851,6 +2869,8 @@ impl Taking {
 
 impl Drop for Taking {
   fn drop(&mut self) {
+    // However the push ended: its pins given back on the shard that counted them.
+    super::hg_run::pins_release(&mut self.counted);
     if let Some(intake) = self.intake.take() {
       // Dropped mid-intake (its connection ended): given back on the shard that holds its store.
       crate::state::with_state(|state| abandon(state, intake)).unwrap_or_default();
@@ -2894,6 +2914,7 @@ fn begin_intake(
           room: before,
           generation,
           costs: vcs_store::TurnCosts::ZERO,
+          counted: slates_hg::push::pins::Counted::default(),
         }),
         Err(refused) => Err(refused),
       },
@@ -3050,6 +3071,8 @@ async fn segments_landed(
 ) -> Option<Result<(), PushOutcome>> {
   while let Some(segment) = taking.take_segment() {
     run.admission_held(admitted.saturating_sub(room.left()));
+    // Its own revisions' pins out before its let-go; a window a later kept revision names keeps its count.
+    super::hg_run::pins_count_out(&mut taking.counted, &segment.contents);
     if let Err(outcome) = segment_landed(repository, taking, &segment, run).await? {
       return Some(Err(outcome));
     }

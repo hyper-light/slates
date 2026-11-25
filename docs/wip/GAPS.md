@@ -1614,6 +1614,20 @@
 > releases the repository's store whole (`vcs_store::replayed`'s `release_charged`), its rows' holds with it: no leak.
 > Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
 > base's identity hashed by a second read.
+> Found by main's push loop at 2ed3eb139 and closed (2026-11-24; main's ruling, w-perf's design, w-hg's build): hg's 57k
+> push refused `UnknownDeltaBase` on `i18n/da.po` (2 of 8 pushes; revs 103-106, one chain of a 260 KB text with small
+> deltas). A landed segment's let-go (`let_go_object_landed`, whatever its holders) took a window a later revision of the
+> same push still named, kept and not landed (an unchanged run of the file); the next delta on it found its base's window
+> away and asked the store, which keeps no row of an unlanded revision. The windowed intake (C1 (2)) exposed it, reading
+> a base's windows where it once held the base whole. Now a push's kept-but-unlanded revisions pin the windows they name
+> (`slates_hg::push::pins`, `hg_run::PUSH_PINS` behind `vcs_store::landed_pin`): counted after each intake slice
+> (`Intake::kept_contents`), a segment's own counted out just before its let-go, the rest given back however the push
+> ends (`Taking`'s drop); bounded by the content store's windows, refused typed past them. `landed_pin` asks the reader's
+> and the push's pins before a home's landed note (the note first let a read-pinned window go mid-read). Held by
+> `a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares` (without the pins: refused `UnknownDeltaBase` for
+> the kept revision, main's failure; with them: taken, `Pins::skipped` moved, nothing left counted), counted
+> `vcs.hg.push_pin_skips`. Owed: the sibling sweep (svn's import batches, git's push, hg's import segments) and main's
+> loop re-run.
 > Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
 > fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request
 > (`hg_view::texts_made`: 28 requests for a 7-changeset clone's 14 texts; over 100,000 for hg's 57k). A want's texts are

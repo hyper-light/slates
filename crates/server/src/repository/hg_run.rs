@@ -89,6 +89,74 @@ pub(crate) const REBASED_IN_TURN: &str = "vcs.hg.push_rebased_in_turn";
 pub(crate) const TURN_PAST_PATIENCE: &[u8] =
   b"push refused: another landing on this repository held its turn past the server's patience; push again";
 
+std::thread_local! {
+  /// This shard's push pins (`slates_hg::push::pins`; goal 93, main's ruling of 2026-11-24, w-perf's design): the windows
+  /// its pushes' kept-but-unlanded revisions name, each counted, which a landed segment's let-go keeps
+  /// ([`crate::vcs_store::landed_pin`]). Made at a push's first count, bounded by the content store's windows.
+  static PUSH_PINS: core::cell::RefCell<Option<slates_hg::push::pins::Pins>> =
+    const { core::cell::RefCell::new(None) };
+}
+
+/// Counter: the windows a landed segment's let-go kept because a push's kept-but-unlanded revision still named them (the
+/// push pins' non-vacuity counter; main's 57k push at 2ed3eb139 was refused `UnknownDeltaBase` for want of them). Format:
+/// a counter name in the status report.
+pub(crate) const PUSH_PIN_SKIPS: &str = "vcs.hg.push_pin_skips";
+
+/// Whether a push's kept-but-unlanded revision on this shard names `window` ([`PUSH_PINS`]): a let-go keeps it.
+pub(crate) fn push_pinned(window: &slates_vcs::ContentId) -> bool {
+  PUSH_PINS.with(|pins| {
+    pins
+      .borrow()
+      .as_ref()
+      .is_some_and(|pins| pins.holds(window))
+  })
+}
+
+/// The windows the shard's let-goes kept for its push pins so far.
+pub(crate) fn push_pin_skips() -> u64 {
+  PUSH_PINS.with(|pins| {
+    pins
+      .borrow()
+      .as_ref()
+      .map_or(0, slates_hg::push::pins::Pins::skipped)
+  })
+}
+
+/// Counts into the shard's push pins the windows of `kept` (an intake's kept and not yet taken) `counted` has not
+/// counted, the pins made over `content` at the first: refused typed past their bound.
+pub(crate) fn pins_count_kept<'k>(
+  content: &slates_vcs::ContentStore,
+  counted: &mut slates_hg::push::pins::Counted,
+  kept: impl Iterator<Item = &'k FileContents>,
+) -> Result<(), slates_hg::push::pins::PinsFull> {
+  PUSH_PINS.with(|pins| {
+    let mut pins = pins.borrow_mut();
+    let pins = pins.get_or_insert_with(|| slates_hg::push::pins::Pins::for_store(content));
+    counted.count_kept((pins, content), kept)
+  })
+}
+
+/// Counts out of the shard's push pins `segment`'s revisions `counted` counted, before its let-go.
+pub(crate) fn pins_count_out(
+  counted: &mut slates_hg::push::pins::Counted,
+  segment: &[FileContents],
+) {
+  PUSH_PINS.with(|pins| {
+    if let Some(pins) = pins.borrow_mut().as_mut() {
+      counted.count_out(pins, segment);
+    }
+  });
+}
+
+/// Gives back everything `counted` counted into the shard's push pins: its push ended, however.
+pub(crate) fn pins_release(counted: &mut slates_hg::push::pins::Counted) {
+  PUSH_PINS.with(|pins| {
+    if let Some(pins) = pins.borrow_mut().as_mut() {
+      counted.release(pins);
+    }
+  });
+}
+
 #[cfg(test)]
 std::thread_local! {
   /// A test's segment bound on this shard's thread, in place of [`segment_bytes`]'s derivation where more than none: a

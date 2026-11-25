@@ -3005,14 +3005,20 @@ pub(crate) fn let_go_landed_pack_among(
 /// so it holds across a restart. None for a window whose home recorded what brings it back, and for any other window:
 /// where an identity ranks pins nothing, since nothing is homed by that rank but what the region holds.
 pub(crate) fn landed_pin(window: &slates_vcs::ContentId) -> Option<&'static str> {
+  // A reader brought it back and reads it still (A-760 (b) 4d): kept until that read's last step. Asked before a home's
+  // landed note: until 2026-11-24 the note was asked first, so a read-pinned window with a note was let go mid-read.
+  if named_objects::read_pinned(window) {
+    return Some("reader");
+  }
+  // A push's kept-but-unlanded revision names it (goal 93, main's ruling of 2026-11-24): kept until that revision's own
+  // segment lands, which a landed one's let-go would otherwise take while it is on no store.
+  if crate::repository::hg_run::push_pinned(window) {
+    return Some("push");
+  }
   // A window whose home recorded what brings it back (its place in a landed pack, or its Mercurial file revision) is
   // brought back by that record (goal 93 item 2b(b)).
   if homes::landed(window).is_some() {
     return None;
-  }
-  // A reader brought it back and reads it still (A-760 (b) 4d): kept until that read's last step.
-  if named_objects::read_pinned(window) {
-    return Some("reader");
   }
   // Held for the region here, itself or as a window of an object the region holds (a region hold names its object).
   (homes::region_holds_here(window) > 0 || homes::region_holds_window(window)).then_some("homes")
