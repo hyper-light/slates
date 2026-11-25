@@ -1081,6 +1081,37 @@ fn paced_line_pushed(state: &mut ShardState, name: &str) -> (RepositoryId, Vec<u
   (repository, pack)
 }
 
+/// The derivation's time and turns as this shard counted them.
+fn derive_time(state: &mut ShardState) -> (u64, u64) {
+  use crate::vcs_store::git_derive::{NS, TURNS};
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (count(NS), count(TURNS))
+}
+
+/// Main 01a20182's order of 2026-11-25 (a first clone's first pack byte spends about a third of its time deriving its
+/// tags, told so far only by difference). Do: push a line of [`PACED_HISTORY`] commits and derive it as a fetch's
+/// request does; then derive it again, nothing left due. Expect: the derivation's time counted
+/// (`vcs_store.git_derive.ns`) with its turns; and the second, which turns no derivation, counts neither time nor a turn
+/// (every encoding turn asks first: counted, 63,153 such asks in one clone read as a derivation spinning). Red before:
+/// no time counted, and the second counted a turn.
+#[test]
+fn a_derivations_own_time_is_counted_and_a_call_with_nothing_due_counts_nothing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, _) =
+    crate::daemon::observe_first(&daemon, |state| paced_line_pushed(state, "derive-time"));
+  let before = crate::daemon::observe_first(&daemon, derive_time);
+  derived_for_read(&daemon, repository);
+  let derived = crate::daemon::observe_first(&daemon, derive_time);
+  derived_for_read(&daemon, repository);
+  let again = crate::daemon::observe_first(&daemon, derive_time);
+  daemon.stop();
+  assert!(
+    derived.0 > before.0 && derived.1 > before.1,
+    "time and turns counted: {before:?} → {derived:?}"
+  );
+  assert_eq!(again, derived, "nothing due, nothing counted");
+}
+
 /// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
 /// window marked landed; the commit's own let-go is withdrawn, `vcs_store::LANDED_LET_GO`): the windows.
 fn let_go_by_hand(state: &mut ShardState, pack: &[u8]) -> Vec<slates_vcs::ContentId> {

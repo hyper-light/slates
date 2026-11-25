@@ -2289,3 +2289,230 @@ fn a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store() {
     "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n"
   );
 }
+
+/// A `stream2` part's payload read back (7.2's `consumev2`): each file's source, name and bytes.
+fn stream2_files(mut payload: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+  let uvarint = |rest: &mut &[u8]| {
+    let (mut value, mut shift) = (0_u64, 0_u32);
+    loop {
+      let (byte, tail) = rest.split_first().unwrap();
+      *rest = tail;
+      value |= u64::from(byte & 0x7f) << shift;
+      if byte & 0x80 == 0 {
+        return usize::try_from(value).unwrap();
+      }
+      shift += 7;
+    }
+  };
+  let mut files = Vec::new();
+  while let Some((source, tail)) = payload.split_first() {
+    payload = tail;
+    let (name_len, size) = (uvarint(&mut payload), uvarint(&mut payload));
+    let (name, tail) = payload.split_at(name_len);
+    let (bytes, tail) = tail.split_at(size);
+    files.push((*source, name.to_vec(), bytes.to_vec()));
+    payload = tail;
+  }
+  files
+}
+
+/// `getbundle`'s answer to `asked`, its store wants answered by `source` between steps, as an edge answers them.
+fn answered_getbundle(
+  view: &Indexed<'_>,
+  asked: &super::super::getbundle::Asked<'_>,
+  source: &mut impl crate::render::StoredSource,
+) -> Result<Vec<u8>, Refusal> {
+  use super::super::getbundle::{Answering, Given};
+  let mut answering = Answering::begin(view, asked, &mut room())?;
+  let mut out = Vec::new();
+  loop {
+    match answering.wants().cloned() {
+      Some(crate::render::Want::Rows { logs }) => {
+        answering.give(Given::Rows(source.rows(&logs).unwrap()));
+      }
+      Some(crate::render::Want::Chunks { places }) => {
+        answering.give(Given::Chunks(source.chunks(&places).unwrap()));
+      }
+      Some(crate::render::Want::Texts { .. }) => panic!("a stream reads no text whole"),
+      None => {}
+    }
+    if !answering.step(view, &mut room(), &mut out)? {
+      return Ok(out);
+    }
+  }
+}
+
+/// The `states` repository imported, its secret roots dropped as `keep_secret` says, served as a view.
+fn states_view(keep_secret: bool) -> (Imported, ContentStore, Vec<PhaseHead>) {
+  let (imported, store) = imported("states");
+  let roots: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| keep_secret || root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  (imported, store, roots)
+}
+
+/// A client's `getbundle` asking a stream clone (7.2's `_pullbundle2` streaming: `cg=0`, `stream=1`), its bundle2
+/// capabilities `blob`.
+fn stream_asked(bundlecaps: &[u8]) -> super::super::getbundle::Asked<'_> {
+  super::super::getbundle::Asked {
+    bundlecaps,
+    cg: Some(b"0"),
+    stream: Some(b"1"),
+    ..super::super::getbundle::Asked::default()
+  }
+}
+
+/// A `getbundle` capability list: `HG20`, then the bundle2 capability blob `blob`, quoted.
+fn stream_caps(blob: &[u8]) -> Vec<u8> {
+  let mut caps = b"HG20,bundle2=".to_vec();
+  crate::quote::quote(blob, b"", &mut caps);
+  caps
+}
+
+/// Stream clones part 3 (main 01a20182's order of 2026-11-25: w-interop's comparison found 7.2's client falling back to
+/// `stream_out` against slates, where stock serves a `stream2` part). Do: ask `capabilities` over SSH of the `states`
+/// repository with its secret changeset and without it. Expect `bundle2`'s blob to list `stream=v2` only while a stream
+/// is served, beside `streamreqs`.
+#[test]
+fn bundle2_lists_stream_v2_only_while_a_stream_is_served() {
+  for keep_secret in [true, false] {
+    let (imported, store, roots) = states_view(keep_secret);
+    let state = State {
+      roots: &roots,
+      ..state_of(&imported)
+    };
+    let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let _ = super::super::session::serve(
+      &view,
+      b"capabilities\n",
+      &mut room(),
+      &mut stdout,
+      &mut stderr,
+    );
+    let line = stdout.splitn(2, |byte| *byte == b'\n').nth(1).unwrap();
+    let listed = crate::capabilities::decode(line);
+    let quoted = listed.get(b"bundle2").flatten().unwrap();
+    let mut blob = Vec::new();
+    crate::quote::unquote(quoted, &mut blob);
+    let lists_v2 = blob
+      .split(|byte| *byte == b'\n')
+      .any(|cap| cap == b"stream=v2");
+    assert_eq!(lists_v2, !keep_secret, "secret kept: {keep_secret}");
+    assert_eq!(listed.get(b"streamreqs").is_some(), !keep_secret);
+  }
+}
+
+/// Stream clones part 3 (7.2's `addpartbundlestream2`, version `v2`). Do: ask a `getbundle` stream clone of the
+/// `states` repository, its secret root dropped, from a client listing `stream=v2`, the repository publishing and not.
+/// Expect one `STREAM2` part, its mandatory `bytecount`, `filecount` and quoted `requirements` naming what its payload
+/// carries; the payload every non-empty revlog of `render::revlogs` in its order, each from the store (`s`), named by
+/// its store path before encoding, its bytes byte for byte; then, not publishing, `phaseroots` with each draft root
+/// sorted (7.2's `_writeroots`), which its client takes for its phases; no changegroup beside it.
+#[test]
+fn a_stream_clone_over_bundle2_sends_the_rendered_revlogs_as_a_stream2_part() {
+  for publishing in [true, false] {
+    stream2_of_states(publishing);
+  }
+}
+
+/// [`a_stream_clone_over_bundle2_sends_the_rendered_revlogs_as_a_stream2_part`] of a repository `publishing` or not.
+fn stream2_of_states(publishing: bool) {
+  let (imported, store, roots) = states_view(false);
+  let state = State {
+    roots: &roots,
+    publishing,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let caps = stream_caps(b"HG20\nbookmarks\nchangegroup=01,02,03\nstream=v2");
+  let answer = answered_getbundle(
+    &view,
+    &stream_asked(&caps),
+    &mut whole_texts(&imported.index, &store),
+  )
+  .unwrap();
+  let bundle = crate::bundle2::Bundle2::decode(&answer, &mut room()).unwrap();
+  let parts: Vec<_> = bundle.top_level().collect();
+  assert_eq!(parts.len(), 1, "the stream alone");
+  let (index, part) = parts[0];
+  assert_eq!(part.kind, b"STREAM2");
+  assert_eq!(part.mandatory_params, 3);
+  let payload = bundle.payload_bytes(index, &mut room()).unwrap();
+  let files = stream2_files(&payload);
+  let mut expected: Vec<(u8, Vec<u8>, Vec<u8>)> =
+    crate::render::revlogs(&imported.index, &store, &mut room())
+      .unwrap()
+      .into_iter()
+      .filter(|(_, bytes)| !bytes.is_empty())
+      .map(|(name, bytes)| (b's', name, bytes))
+      .collect();
+  if !publishing {
+    let mut drafts: Vec<Node> = view.draft_roots().collect();
+    assert!(!drafts.is_empty(), "a draft root to send (non-vacuity)");
+    drafts.sort_unstable();
+    let mut lines = Vec::new();
+    for root in &drafts {
+      lines.extend_from_slice(b"1 ");
+      crate::pushkey::encode_hex(root, &mut lines);
+      lines.push(b'\n');
+    }
+    expected.push((b's', b"phaseroots".to_vec(), lines));
+  }
+  assert_eq!(files, expected, "publishing: {publishing}");
+  assert!(
+    files.iter().any(|(_, name, _)| name == b"00changelog.i"),
+    "the changelog sent (non-vacuity)"
+  );
+  stream2_params_name(part, &files);
+}
+
+/// `part`'s parameters name `files`: their count, their bytes, and the rendered store's requirements, quoted.
+fn stream2_params_name(part: &crate::bundle2::Part<'_>, files: &[(u8, Vec<u8>, Vec<u8>)]) {
+  let bytes: usize = files.iter().map(|(_, _, bytes)| bytes.len()).sum();
+  assert_eq!(
+    part.param(b"filecount"),
+    Some(files.len().to_string().as_bytes())
+  );
+  assert_eq!(part.param(b"bytecount"), Some(bytes.to_string().as_bytes()));
+  assert_eq!(
+    part.param(b"requirements"),
+    Some(&b"generaldelta%2Crevlogv1%2Csparserevlog"[..])
+  );
+}
+
+/// Stream clones part 3, hostile asks (7.2's `addpartbundlestream2` aborts). Do: ask a stream clone from a client that
+/// lists no stream version, and one of the `states` repository with its secret changeset. Expect each refused before
+/// anything is written: no common stream version; no stream served.
+#[test]
+fn a_stream_clone_over_bundle2_is_refused_without_a_common_version_or_a_served_stream() {
+  let (imported, store, roots) = states_view(false);
+  let state = State {
+    roots: &roots,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let old = stream_caps(b"HG20\nchangegroup=01,02,03");
+  let refused = answered_getbundle(
+    &view,
+    &stream_asked(&old),
+    &mut whole_texts(&imported.index, &store),
+  );
+  assert!(matches!(refused, Err(Refusal::NoCommonExchange { .. })));
+  let (imported, store, roots) = states_view(true);
+  let state = State {
+    roots: &roots,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let caps = stream_caps(b"HG20\nchangegroup=01,02,03\nstream=v2");
+  let refused = answered_getbundle(
+    &view,
+    &stream_asked(&caps),
+    &mut whole_texts(&imported.index, &store),
+  );
+  assert!(matches!(refused, Err(Refusal::Store { .. })));
+}

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# r870's word-at-a-time union kept a bit table unsettled when the other side was empty (w-git, 2026-11-25).
+cc bc841cc532206863472600367e7dd69853e50275484b908d588f0f479030db7c # shrinks to left = [(1, 1, 1), (1, 85, 1)], right = [], left_from = 41, right_from = 0

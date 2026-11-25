@@ -227,6 +227,10 @@ fn finish_brought(
   });
   if !made {
     state.count(PIECE_UNFETCHED, 1);
+    // The pieces put before it failed brought the text's let-go windows back (a put of a window the store keeps let go
+    // brings it back): the text is landed, so they go again, as a whole bring-back's give-back lets them go (w-hg's
+    // sweep, site 3: an abandoned bring-back's windows stayed resident).
+    crate::vcs_store::name_holds::let_go_landed_texts(state, &[identity]);
   }
   made
 }

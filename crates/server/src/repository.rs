@@ -381,6 +381,14 @@ pub(crate) fn create_repository(
   asked: (&str, VcsTool, ObjectFormat, &str),
   green: Option<VolumeId>,
 ) -> ReplyBody {
+  // A repository of the name taken over here and not yet rebuilt (A-915): the name is its, as it will be once rebuilt.
+  if let Some(existing) = state.adopted_names.get(asked.0) {
+    return refused(Refusal::AlreadyExists {
+      existing: VolumeId {
+        bytes: existing.bytes,
+      },
+    });
+  }
   if let Some(refusal) = no_store_for(state, asked.1) {
     return refused(refusal);
   }
@@ -1783,6 +1791,39 @@ mod tests {
     let destroyed = ask(state, &owner(), RequestBody::Destroy { volume: work });
     assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
     version
+  }
+
+  /// A-915: a repository's name taken over and not yet rebuilt here is the adopted repository's. Do: reserve `project`
+  /// for a repository this shard took over (`ShardState::adopted_names`), then create `project`. Expect it refused
+  /// `AlreadyExists` naming the adopted repository, and nothing made: a client's retry of a creation whose owner died
+  /// meets the repository the takeover holds, never a second of the name.
+  #[test]
+  fn a915_a_creation_of_a_name_taken_over_and_not_yet_rebuilt_is_refused_naming_it() {
+    let (reply, made) = crate::daemon::audit_on_shard(|state| {
+      let adopted = slates_db::catalog::RepositoryId { bytes: [7; 16] };
+      state.adopted_names.insert("project".to_owned(), adopted);
+      let reply = super::create_repository(
+        state,
+        &owner(),
+        ("project", VcsTool::Git, ObjectFormat::Sha1, "main"),
+        None,
+      );
+      let made = state
+        .db
+        .partition()
+        .repositories()
+        .repository_named("project")
+        .is_some();
+      (reply, made)
+    });
+    assert!(
+      matches!(
+        reply,
+        ReplyBody::Refused { refusal: Refusal::AlreadyExists { existing } } if existing.bytes == [7; 16]
+      ),
+      "{reply:?}"
+    );
+    assert!(!made, "no second repository of the name");
   }
 
   /// `green`'s file `f` at its head.

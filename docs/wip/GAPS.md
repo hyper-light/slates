@@ -246,6 +246,15 @@
 > after a council round, the coordinator's home passes run on their own lane, and a push's homing runs within a window
 > derived from detection, confirmation and the takeover's configuration steps, ranking its homes again at each install.
 > Red first (both `a912_` fleet tests). OWED (main): gate 17 (`v3_takeover`) and a lint diag.
+> **FIXED (A-915, w-shared, 2026-11-24; main 01a20182's ruling (1)): a repository's successor never served it when its
+> owner died as its creation answered (a894, 3 of 120 gate runs since A-908 part 4).** The creation answered once its
+> record was at f + 1, its root's join shipped after, and A-908 part 4's rebuild waited for that join forever. Now the
+> creation answers once its join is at f + 1 too (one wait, a push's barrier), and an adoption refuses a green whose
+> join it does not hold, given up typed. An unacknowledged creation's retry answers typed and the name names one
+> repository: made afresh before the successor adopts the record (the adopted one refused and dropped at its rebuild),
+> or refused `AlreadyExists` naming the adopted one, whose name is reserved until its rebuild (before, the retry made
+> a second repository of the name). Red first (`a915_...`, the kill held between the record and the join). OWED
+> (main): gate 19 at 40 + 40 with each failed run's daemon log.
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
@@ -1620,6 +1629,30 @@
 > releases the repository's store whole (`vcs_store::replayed`'s `release_charged`), its rows' holds with it: no leak.
 > Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
 > base's identity hashed by a second read.
+> Found by main's push loop at 2ed3eb139 and closed (2026-11-24; main's ruling, w-perf's design, w-hg's build): hg's 57k
+> push refused `UnknownDeltaBase` on `i18n/da.po` (2 of 8 pushes; revs 103-106, one chain of a 260 KB text with small
+> deltas). A landed segment's let-go (`let_go_object_landed`, whatever its holders) took a window a later revision of the
+> same push still named, kept and not landed (an unchanged run of the file); the next delta on it found its base's window
+> away and asked the store, which keeps no row of an unlanded revision. The windowed intake (C1 (2)) exposed it, reading
+> a base's windows where it once held the base whole. Now one rule at the one let-go every path uses (main's ruling (B)):
+> the content store keeps beside each window how many unlanded objects name it, and no let-go takes a window while any
+> does (`ContentStore::pin_unlanded`/`unpin_unlanded`, refused `LetGoRefused::Unlanded`, counted
+> `vcs_store.content.kept_unlanded`; the count's width refused typed, `ContentRefused::CountExhausted`, never wrapped; a
+> pin of nothing refused `NotHeld`; a window found let go as it is pinned counted `vcs_store.content.pinned_away`, a bug
+> signal that must stay 0; an unpin comes before its holder releases the object). A
+> push pins each revision as its intake keeps it (`slates_hg::push::pins::Counted` over `Intake::kept_contents`, after
+> each slice), unpins a segment's own just before that segment's let-go (`landed_segment`; never at its taking, since its
+> record is written over turns before it lands), and the rest however the push ends (`Taking`'s drop). `landed_pin` asks
+> the reader's pin before a home's landed note (the note first let a read-pinned window go mid-read). Held by
+> `a_window_an_unlanded_object_names_is_never_let_go_until_it_is_unpinned` (the store's rule) and
+> `a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares` (without the pins: refused `UnknownDeltaBase`
+> for the kept revision, main's failure; with them: taken, `kept_unlanded` moved, `pinned_away` 0, nothing left pinned)
+> and `a_pin_that_finds_a_window_let_go_counts_it_and_a_pin_of_nothing_is_refused`. Sibling sweep:
+> git's push and hg's import not of this shape; svn's import batches were (fixed in d3539309d, to move onto the store's
+> pins). A made changeset's (`hg_made`, and the tests' `take_whole`) texts are unpinned at their intake's finish, before
+> the `disk.land` it awaits: nothing reads them between (its intake and record are made in one step), and once landed a
+> window let go meanwhile comes back from the store; a reader before the landing would need the pins kept to its let-go.
+> Owed: main's push loop re-run.
 > Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
 > fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request
 > (`hg_view::texts_made`: 28 requests for a 7-changeset clone's 14 texts; over 100,000 for hg's 57k). A want's texts are
@@ -2529,6 +2562,20 @@
 > inline (`data/a.i` alone), the changelog's `.d` before its `.i`, cache files (`branch2-served`, `rbc-names-v2`,
 > `rbc-revs-v2`, `tags2`) after; an empty `phaseroots` left out. Open before it is served: which store files a draft
 > repository's stream carries (`phaseroots`, `obsstore`), and the requirements a server without zstd revlogs names.
+> BUILT (2026-11-25, w-hg; main 01a20182's order after w-interop's comparison found 7.2's client falling back to
+> `stream_out` against slates): `bundle2` lists `stream=v2` while a stream is served, and `getbundle`'s `stream=1`
+> answers one mandatory `STREAM2` part, its `bytecount`, `filecount` and quoted `requirements` as 7.2 writes them, its
+> payload `render::Streaming` framed as `_emit2` frames it (`s`, the name's length and the size as uvarints, the store
+> path before encoding), counted before its header is written, then sent a step at a time as `stream_out` is; a
+> non-publishing repository's draft roots follow as `phaseroots` (none where no changeset is draft), since the client
+> asks no phases beside a stream; no changegroup beside it. Refused before anything is written: a client listing no
+> stream version (7.2's "no common supported version"), a store serving no stream (a secret changeset). Held by
+> `bundle2_lists_stream_v2_only_while_a_stream_is_served`,
+> `a_stream_clone_over_bundle2_sends_the_rendered_revlogs_as_a_stream2_part` (the payload `render::revlogs`' files
+> byte for byte, publishing and not) and `..._is_refused_without_a_common_version_or_a_served_stream` (all three red
+> with the change off). Markers travel as the `OBSMARKERS` part the client asks beside the stream, not as an `obsstore`
+> file; no cache file is sent (each is optional to 7.2's client). Owed: stock `hg clone --stream` negotiating `stream2`
+> by use (`crates/cli/bench/hg_stream_compare.sh`), then the bytes (zstd chunks) and the files (small revlogs inline).
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

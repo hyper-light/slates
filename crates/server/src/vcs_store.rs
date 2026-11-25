@@ -181,9 +181,18 @@ pub(crate) const CONTENT_LET_GO: &str = "vcs_store.content.let_go";
 /// name.
 pub(crate) const CONTENT_BROUGHT_BACK: &str = "vcs_store.content.brought_back";
 
-/// The shard's content store's figures for its status report, each named ([`CONTENT_READS`] and the four after it); none
+/// Figure: windows a let-go kept because an unlanded object named them (`ContentCounters::kept_unlanded`; goal 93, main's
+/// ruling (B) of 2026-11-24: a push's kept-but-unlanded revisions pin their windows, `ContentStore::pin_unlanded`).
+/// Format: a counter name.
+pub(crate) const CONTENT_KEPT_UNLANDED: &str = "vcs_store.content.kept_unlanded";
+
+/// Figure: windows found let go as their unlanded holder pinned them (`ContentCounters::pinned_away`; ruling (B)): that
+/// holder's bytes gone before it landed, a bug signal that must stay 0. Format: a counter name.
+pub(crate) const CONTENT_PINNED_AWAY: &str = "vcs_store.content.pinned_away";
+
+/// The shard's content store's figures for its status report, each named ([`CONTENT_READS`] and the six after it); none
 /// where the shard made no content store.
-pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 5] {
+pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 7] {
   let (reads, counters) = stores
     .content()
     .map_or((0, ContentCounters::default()), |content| {
@@ -195,6 +204,8 @@ pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 5] {
     (CONTENT_FREED, counters.freed),
     (CONTENT_LET_GO, counters.let_go),
     (CONTENT_BROUGHT_BACK, counters.brought_back),
+    (CONTENT_KEPT_UNLANDED, counters.kept_unlanded),
+    (CONTENT_PINNED_AWAY, counters.pinned_away),
   ]
 }
 /// Counter (A-727 slice a3): repository windows a recovery took back from the shard image, their chunks claimed.
@@ -277,10 +288,6 @@ pub(crate) struct VcsStores {
   /// The text pieces read through the node's store for drives waiting on them (C2 stage B part 2,
   /// [`svn_texts::Pieces`]).
   pub(crate) svn_pieces: svn_texts::Pieces,
-  /// The texts an import put for a revision not landed yet while a batch before it lands
-  /// ([`name_holds::keeping_unlanded`]): a landed text's let-go keeps every window they hold, since windows are named by
-  /// their bytes and a text that shares one with a landed text cannot bring it back until its own changeset lands.
-  pub(crate) svn_unlanded: Vec<slates_svn::index::ContentIdentity>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -3009,14 +3016,15 @@ pub(crate) fn let_go_landed_pack_among(
 /// so it holds across a restart. None for a window whose home recorded what brings it back, and for any other window:
 /// where an identity ranks pins nothing, since nothing is homed by that rank but what the region holds.
 pub(crate) fn landed_pin(window: &slates_vcs::ContentId) -> Option<&'static str> {
+  // A reader brought it back and reads it still (A-760 (b) 4d): kept until that read's last step. Asked before a home's
+  // landed note: until 2026-11-24 the note was asked first, so a read-pinned window with a note was let go mid-read.
+  if named_objects::read_pinned(window) {
+    return Some("reader");
+  }
   // A window whose home recorded what brings it back (its place in a landed pack, or its Mercurial file revision) is
   // brought back by that record (goal 93 item 2b(b)).
   if homes::landed(window).is_some() {
     return None;
-  }
-  // A reader brought it back and reads it still (A-760 (b) 4d): kept until that read's last step.
-  if named_objects::read_pinned(window) {
-    return Some("reader");
   }
   // Held for the region here, itself or as a window of an object the region holds (a region hold names its object).
   (homes::region_holds_here(window) > 0 || homes::region_holds_window(window)).then_some("homes")

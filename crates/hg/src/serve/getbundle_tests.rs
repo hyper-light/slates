@@ -528,6 +528,7 @@ fn asked<'a>(arguments: &Arguments<'a>) -> Asked<'a> {
     bookmarks: arguments.entry(b"bookmarks"),
     obsmarkers: arguments.entry(b"obsmarkers"),
     listkeys: arguments.entry(b"listkeys"),
+    stream: arguments.entry(b"stream"),
   }
 }
 
@@ -1784,6 +1785,7 @@ proptest! {
       bookmarks: maybe(4, 5),
       obsmarkers: maybe(8, 6),
       listkeys: maybe(16, 7),
+      stream: None,
     };
     let mut out = Vec::new();
     if getbundle(&cloned(), &asked, &mut Admission::new(1 << 20), &mut out).is_ok() {
