@@ -22484,7 +22484,9 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   let owned = crate::content_holder::owned_of(&held);
   // The paged families' pages encoded in place from the encoder (goal 93, main's ruling of 2026-11-25: copied into
   // every checkpoint before): the encoder is taken out of the shard's state for the stream, which reads it nowhere, and
-  // put back as the stream ends, the pages borrowed from it dropped first.
+  // put back as the stream ends, the pages borrowed from it dropped first. Until it is back the shard's encoder is an
+  // empty stand-in: nothing in the loop below may read or write `state.image_encoder` (a mark, `image_committed`, a
+  // turn), or it would be lost with the stand-in when the encoder is put back (w-shared's review).
   let encoder = core::mem::take(&mut state.image_encoder);
   let (pages, image_carried) = crate::content_holder::paged_whole(&encoder);
   let mut pieces: Vec<slates_vfs::recover::HeldPieceRef<'_>> = held
