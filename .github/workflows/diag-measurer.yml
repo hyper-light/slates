@@ -9,6 +9,12 @@ name: diag measurer
 # r400 cut of Mercurial's own history the MacBook runs use (`hg clone -U -r 400`, its tip 8b067bde6679), fetched inside
 # the job. Each leg prints one line `HG-MATRIX <runner>: N of M passed; failed: ...` and a notice with it, so one log
 # read (or the run's annotations) gives the result. Runs only from `diag-measurer-*` branches, never main.
+# Since interop-linux-9 (main's order of 2026-11-25): beside it, ci/interop/git-matrix.sh on the same three runners
+# (stock git as each runner has it; git/git fetched in the job and pushed cut at v1.0.0, as the MacBook's runs do), one
+# `GIT-MATRIX <runner>: ...` line a leg; and ci/interop/svn-matrix.sh on the two Linux runners over both its routes
+# (stock Subversion from the distribution; git-2000.dump made in the job by its recorded recipe,
+# crates/cli/bench/git_to_svn_dump.py), one `SVN-MATRIX <runner> <route>: ...` line a leg. svn on Windows waits on
+# Ada's go (GAPS' close list).
 
 on:
   push:
@@ -92,6 +98,128 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hg-matrix-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/matrix.out
+            ${{ runner.temp }}/matrix/anchor.log
+            ${{ runner.temp }}/matrix/logs
+          if-no-files-found: warn
+
+  git-matrix:
+    name: git matrix (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+        if: ${{ runner.os == 'Windows' }}
+      - name: The slates binary's path
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "SLATES=$(cygpath -w "$PWD/target/release/slates.exe")" >> "$GITHUB_ENV"
+            echo "AWS_LC_SYS_PREBUILT_NASM=0" >> "$GITHUB_ENV"
+          else
+            echo "SLATES=$PWD/target/release/slates" >> "$GITHUB_ENV"
+          fi
+          git --version; ssh -V 2>&1
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: git/git, by clone (retried, so a cut transfer is fetched again)
+        run: |
+          S="$RUNNER_TEMP/git-src"
+          for i in 1 2 3; do git clone -q --bare https://github.com/git/git.git "$S" && break; rm -rf "$S"; sleep 10; done
+          git -C "$S" rev-parse 'v1.0.0^{commit}'
+      - name: The git matrix
+        run: |
+          set +e
+          PUSH_REFS='v1.0.0^{commit}:refs/heads/master' STEP_LIMIT=2400 \
+            ci/interop/git-matrix.sh "$SLATES" "$RUNNER_TEMP/git-src" "$RUNNER_TEMP/matrix" 2>&1 | tee "$RUNNER_TEMP/matrix.out"
+          rc=${PIPESTATUS[0]}
+          rows=$(grep -E '^(PASS|FAIL) ' "$RUNNER_TEMP/matrix.out" | sort -u -k2,2)
+          echo "== rows"; echo "$rows" | cut -c1-200
+          passed=$(echo "$rows" | grep -c '^PASS ')
+          total=$(echo "$rows" | grep -c -E '^(PASS|FAIL) ')
+          failed=$(echo "$rows" | sed -n 's/^FAIL \([^ ]*\) .*/\1/p' | paste -sd, -)
+          line="GIT-MATRIX ${{ matrix.runner }}: $passed of $total passed; failed: ${failed:-none}; exit $rc"
+          echo "$line"
+          echo "::notice title=git matrix ${{ matrix.runner }}::$line"
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-matrix-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/matrix.out
+            ${{ runner.temp }}/matrix/anchor.log
+            ${{ runner.temp }}/matrix/logs
+          if-no-files-found: warn
+
+  svn-matrix:
+    name: svn matrix (${{ matrix.runner }}, route ${{ matrix.route }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        route: [svn, http]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Stock Subversion
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q subversion openssh-client
+          svn --version --quiet; ssh -V 2>&1
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: git/git, by clone (retried, so a cut transfer is fetched again)
+        run: |
+          S="$RUNNER_TEMP/git-src"
+          for i in 1 2 3; do git clone -q --bare https://github.com/git/git.git "$S" && break; rm -rf "$S"; sleep 10; done
+          git -C "$S" rev-parse master
+      - name: git-2000.dump by its recorded recipe
+        run: |
+          start=$(date +%s)
+          python3 -I crates/cli/bench/git_to_svn_dump.py "$RUNNER_TEMP/git-src" master 2000 > "$RUNNER_TEMP/git-2000.dump"
+          echo "git-2000.dump: $(stat -c %s "$RUNNER_TEMP/git-2000.dump") bytes in $(( $(date +%s) - start )) s"
+      - name: The svn matrix
+        run: |
+          set +e
+          ROUTE=${{ matrix.route }} STEP_LIMIT=2400 \
+            ci/interop/svn-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/git-2000.dump" "$RUNNER_TEMP/matrix" 2>&1 \
+            | tee "$RUNNER_TEMP/matrix.out"
+          rc=${PIPESTATUS[0]}
+          rows=$(grep -E '^(PASS|FAIL) ' "$RUNNER_TEMP/matrix.out" | sort -u -k2,2)
+          echo "== rows"; echo "$rows" | cut -c1-200
+          passed=$(echo "$rows" | grep -c '^PASS ')
+          total=$(echo "$rows" | grep -c -E '^(PASS|FAIL) ')
+          failed=$(echo "$rows" | sed -n 's/^FAIL \([^ ]*\) .*/\1/p' | paste -sd, -)
+          line="SVN-MATRIX ${{ matrix.runner }} ${{ matrix.route }}: $passed of $total passed; failed: ${failed:-none}; exit $rc"
+          echo "$line"
+          echo "::notice title=svn matrix ${{ matrix.runner }} ${{ matrix.route }}::$line"
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: svn-matrix-${{ matrix.runner }}-${{ matrix.route }}
           path: |
             ${{ runner.temp }}/matrix.out
             ${{ runner.temp }}/matrix/anchor.log
