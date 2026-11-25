@@ -19420,6 +19420,115 @@ Outliers, where the logs can say:
 - **hg stock run 1** (push 174.8 s, clone 106.9) ran at the leg's start, where load peaked at 76.6. Slates' stream clone
   grew run by run (11.3, 13.4, 21.8 s) at load 45 to 50; the record does not say why.
 
+## LOADED, the night's rerun on the MacBook: hg at 2ed3eb139 and 15b4f1061, the six-push loop, P7 again (goal 93 perf; main 01a20182's runs, 2026-11-24/25)
+
+All on the MacBook (adas-macbook-pro-2: Apple M5 Max, 18 cores, 128 GiB), release builds, with the fleet's six agents
+running. The load is given beside each figure, and these are loaded points as in rounds 1 and 2. Datasets as round 2
+(Mercurial at 57035:a933409955d2; git-2000.dump of f7de81456940).
+
+**hg leg at 2ed3eb139, slates alone, two runs** (round 2's harness through main's LEGS copy; load 40 to 60):
+
+| step | run 1 | run 2 |
+|---|---|---|
+| push, every changeset | 99.284 s, 691 MiB resident after | **refused** after 68.732 s: `UnknownDeltaBase`, i18n/da.po rev 105 (4c823fa0c331) |
+| clone `-U` | **VOID**: failed (255) at 173.319 s (see below) | 112.096 s as "incremental-pull" (not an incremental; see below) |
+| one-changeset push | failed after the void clone | 115.070 s as "incremental-push" (not an incremental; see below) |
+| clone `--stream` | 10.154 s | 13.880 s |
+| daemon peak | 5,724 MiB (main's 2 s sampler, before the kill) | 5,966 MiB, 5,659 MiB at the end |
+
+- **Why run 1's clone is void:** main's `vmmap` suspended the daemon past a second, and the anchor judged it stuck and
+  killed it ("no progress for 1012 ms"). It says nothing about the clone. The run's incremental pull then failed and its
+  check missed as a consequence.
+- **Run 2's incremental rows are not incremental:** with the full push refused, the harness of then timed a full push
+  as "incremental-push" and a full fetch as "incremental-pull". The harness now skips a run's incremental steps when its
+  fill or clone failed (67ec37368).
+
+**The six-push loop at 2ed3eb139** (a fresh anchor for each push; full pushes of Mercurial's history):
+
+| push | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| seconds | 93.487 | 90.827 | 101.023 | 100.056 **refused** | 112.115 | 105.021 |
+| resident after, MiB | 692 | 724 | 845 | 519 | 773 | 773 |
+
+Push 4 was refused `UnknownDeltaBase` on i18n/da.po rev 103 (58829f4841d3). With run 2 above, **2 of 9 full pushes were
+refused at 2ed3eb139**, where f8fe97e5e pushed 3 of 3. The cause: a landed segment's let-go took windows a later,
+not yet landed revision shares. The svn import had the same shape (w-svn's d3539309d). The fix in flight is one
+content-store rule (w-hg).
+
+**P7, `svn_import_storage` over git-2000.dump, interleaved three times** (load 44 to 50):
+
+| build | import, s (1-3) | best | resident after the import, KiB (1-3) | the import's turns (1-3) |
+|---|---|---|---|---|
+| a387b13c3 | 10.49 11.29 9.28 | 9.28 | 698,128 700,624 694,720 | 14,007 16,840 19,293 |
+| 084ffb65d | 15.15 13.96 13.45 | 13.45 | 191,584 189,296 191,648 | 53,014 10,779 13,959 |
+
+The best import takes 45% longer at 084ffb65d (9.28 to 13.45 s) for 3.7 times less memory after it, as main's run at
+22:25 found.
+
+P7's landing stages, measured again interleaved three times at lower load (26 to 36). 084ffb65d's binary carried a
+local, uncommitted print of `repository.svn_import.*`, added by main for this measurement; the import code is
+unchanged.
+
+| build | import, s (1-3) | resident after, KiB (1-3) |
+|---|---|---|
+| a387b13c3 | 6.58 8.43 5.90 | 700,416 696,592 697,344 |
+| 084ffb65d | 8.37 8.28 13.69 | 188,192 188,704 188,848 |
+
+| 084ffb65d's landing stage, ms | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `land_flush_ns` (the durable flush) | 4,223 | 4,351 | 10,183 |
+| `land_commit_ns` | 85 | 85 | 85 |
+| `land_apply_ns` | 211 | 201 | 214 |
+| `land_tail_ns` | 273 | 300 | 282 |
+| the flush's share of the stages | 88.1% | 88.1% | 94.6% |
+| the flush per batch (180 batches) | 23.5 | 24.2 | 56.6 |
+
+Each run landed 180 batches (`land_batches`) and flushed 179 texts (`flushed_texts`). **The durable flush is P7's time
+cost:** 88 to 95% of the landing stages, about 23.5 ms a batch at 180 batches, where a387b13c3 landed the import in
+one. The earlier run's first 084ffb65d import took 53,014 turns against about 11,000 to 14,000 for the others; it did
+not recur here, and the turn spread follows the load.
+
+**hg leg at 15b4f1061 with the harness at 67ec37368, stock then slates, one run** (load 29 to 36):
+
+| step | stock (hg serve) | slates | slates against stock |
+|---|---|---|---|
+| push, every changeset | 87.403 | 93.486 (888 MiB resident after) | 1.07× slower |
+| clone `-U` | 25.810 | 165.831 | 6.43× slower |
+| one-changeset push | 0.874 | 0.453 | 1.93× faster |
+| pull of it | 0.690 | 0.365 | 1.89× faster |
+| clone `--stream` | 4.290: 4,284 files, 74.1 MB | 6.055: 8,454 files, 144 MB | 1.41× slower, sending twice the files and bytes |
+
+- **The stream counters** around slates' stream clone (`vcs_store.hg_stream_*`, from 67ec37368's harness): store asks
+  6,232 → 6,270, store wait 121.35 → 123.35 s and turns 153 → 205. The stream itself asked the store 38 times and
+  waited 2.0 s on it.
+- **Slates' stream clone sent 8,454 files and 144 MB, against stock's 4,284 files and 74.1 MB from the same
+  repository.** That is twice the data for one store, and w-hg's to explain.
+- **The daemon peaked at 10,416 MiB,** against 5.7 to 6.0 GB in the runs before. That is a regression traced to 9a5587e78
+  (one owner texts request a want), measured once, and w-perf's piece.
+
+**git at 15b4f1061, slates alone, one run** (harness 67ec37368; load 29 to 36), with A-911's position cache counted:
+
+| step | seconds | first pack bytes |
+|---|---|---|
+| push, every branch and tag | 50.725 | |
+| clone `--mirror` | 68.743 | 45.777 |
+| clone again | 59.147 | 31.428 |
+| clone `--depth 1` | 1.772 | |
+| clone `--filter=blob:none` | 39.476 | 28.841 |
+
+| A-911's counters over the step | clone | clone again | partial |
+|---|---|---|---|
+| `git_upload.position_lookups` | 11,438,922 | 11,438,922 | 11,438,954 |
+| `git_upload.position_cache_hits` | 48,667,293 | the same as the clone's | |
+| `git_upload.position_cache_conflicts` | 11,372,728 | 11,372,728 | 11,372,760 |
+| `git_upload.position_cache_unroomed` | 0 | 0 | |
+
+`position_cache_conflicts` is an upper bound (a8ca56a4f's doc). The runtime's long steps against all its steps, per
+step's fetch: 293,850 of 298,815, then 332,411 against 281,158, then 194,387 of 198,505. Nearly every step of a clone's
+serve runs long, which is w-git's next piece. Slates' clone (68.7 s) and clone-again (59.1 s) are within loaded round 2's
+range at f8fe97e5e (65.8 and 63.9 s best). The A/B of A-911's arms (four-way, four times) is a separate record, to
+follow.
+
 ## The svn use test over HTTP with git-2000: green, every verb timed against stock svnserve (goal 93; main 01a20182's round, 2026-11-24, a0c46b705)
 
 `a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve` over HTTPv2 (`SLATES_SVN_USE_ROUTE=http`) with
