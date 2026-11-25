@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 22 (main 01a20182, 2026-11-24 18:57 PST): main at a7685b09e, w-hg's f289d786f (the hg parks test reads its interval before the
+# release), landed after run 21.
 # Run 21 (main 01a20182, 2026-11-24 18:23 PST): run 20 found hg_import/tests.rs fronted_history's expects in an Option fn and
 # tests/hg_import_memory.rs at 12 (0d05da26e); main's commit moves them apart.
 # Run 20 (main 01a20182, 2026-11-24 18:09 PST): run 19 found staging.rs stage_deferred at 11 (30195b30e) and hg_push.rs land_in at 11
