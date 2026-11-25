@@ -36205,7 +36205,7 @@ fn node_store(disk: u64) -> NodeStore {
       disk,
       ..GIT_STORE_SIZING
     },
-    GIT_STORE_WAITING,
+    (GIT_STORE_WAITING, 0),
   )
   .unwrap();
   NodeStore { owner, _dir: dir }

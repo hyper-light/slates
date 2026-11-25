@@ -70,7 +70,7 @@ fn landed_history_is_not_held_in_memory() {
     extent_bytes: 128 << 10,
     fanout: 8,
   };
-  let owner = StoreOwner::start(StoreRoot::open(&dir, &grant).unwrap(), sizing, 4).unwrap();
+  let owner = StoreOwner::start(StoreRoot::open(&dir, &grant).unwrap(), sizing, (4, 0)).unwrap();
   let handle = owner.handle();
   let runtime = runtime();
   let baseline = Facts::resident_now().unwrap();
