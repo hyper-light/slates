@@ -497,3 +497,14 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Owed (main): gate 15 (v3_takeover) and a lint diag.
 - Left: A-908 part 4 (a holder's rebuild makes a member by its lineage); A-905 (parked on w-git's question 1);
   the second new branch's `cannot lock ref` is unchecked.
+
+## 2026-11-24: TSan diag 3's failure and A-908 part 4 landed (b7e65cc63)
+
+- af061de87: daemon::tests::refused_merge_authority_leaves_the_replica_unchanged used ObjectId([20; 16]), a family id.
+  Since A-908 steps 1-3 its version 0 waits for a join (member_unknown 1, out_of_order 1). It is red natively at main
+  and at A-909's parent 142172e1f, so it comes from neither A-909 nor TSan. The test now uses a non-family id. Sibling
+  family-bit ids pass natively (10 of 10).
+- 7106f83ea: A-908 part 4. A restarted holder rebuilds a root (founding its lineage) and a branch (branched from its
+  source, a missing ancestor rebuilt a level per ask) by membership; red first with 2 merge_origin tests.
+- Left: A-905 (parked on w-git's question 1). A fleet test that restarts a holder warm between a branch's versions was
+  not run (main's to ask for).
