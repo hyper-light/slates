@@ -1,7 +1,8 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-25 00:39 PST): run 7, CI's TSan job at ee1861c82: run 6's one failure, the status sweep test past its sixty
-# liveness budgets under the clock interceptor, now held to progress alone under slates_tsan (46e718f71); with w-perf's
-# text cache walk fix (7c0ea35a1). The step is copied unchanged but for a limit only a hang reaches. Run only from
+# main 01a20182 (2026-11-25 01:15 PST): run 8, CI's TSan job at 5b28c312e: the content-store unlanded rule (123d8c280) with
+# svn on it (a55d7cfa6: ImportTexts::seal pins, unpinned at the batch's landing and every other end; the between-
+# batches red), w-svn's bring-back give-backs (f8fd11504), A-915, hg stream v2. Run 7 (ee1861c82) checks the sweep
+# test under slates_tsan. The step is copied unchanged but for a limit only a hang reaches. Run only from
 # diag-measurer-main-tsan-* branches, never main.
 on:
   push:
