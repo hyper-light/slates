@@ -106,6 +106,8 @@ pub mod lease;
 mod lease_wait;
 // A candidate a death brought in reads a register's ledger it lacks from its cohort (A-919).
 mod ledger_read;
+// A node's version-control edges announced to its peers, for an answer naming where a client goes (A-925).
+mod edges;
 mod lfs;
 mod live_hold;
 mod live_ship;
