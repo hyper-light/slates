@@ -239,6 +239,18 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
+> `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
+> append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
+> stayed ranked past the push's 2 s homing budget. Now a behind home answers `Behind` at once and its sender asks again
+> after a council round, the coordinator's home passes run on their own lane, and a push's homing runs within a window
+> derived from detection, confirmation and the takeover's configuration steps, ranking its homes again at each install.
+> Red first (both `a912_` fleet tests). OWED (main): gate 17 (`v3_takeover`) and a lint diag.
+> **OPEN, structural alternative, not built (A-912): a council session of its own per peer.** The council's replication
+> shares a node's one record session per peer with every exchange, each borrower taking it whole. A-912 removes the one
+> hold-and-wait found (a home holding a put across the install the council's next append brings) and counts any breach,
+> `fleet.council.session_lent`, held at 0 by A-912's tests; a council session never lent to another plane would make the
+> invariant structural. A piece if that counter ever moves.
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it

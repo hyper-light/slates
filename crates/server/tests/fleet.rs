@@ -37025,6 +37025,36 @@ fn a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies() {
   );
 }
 
+/// What [`branch_then_restart_b`] saw: main's and the branch's pushes, whether b branched the branch's replica before
+/// its restart, and whether the other nodes count b alive after it.
+struct BranchRestarted {
+  landed: [Result<(), String>; 2],
+  held_before: bool,
+  rejoined: bool,
+}
+
+/// An [`anchored_git_fleet`] named `name` with `main` and a new branch `after` pushed through a, b restarted warm once it
+/// has branched the branch's replica: the scene A-908 part 4's and A-912's tests start from.
+fn branch_then_restart_b(name: &str) -> (GitFleet, BranchRestarted) {
+  let mut fleet = anchored_git_fleet(name);
+  let first = fleet.push(0, ("first.txt", b"main before the restart\n"));
+  let branched = fleet.push_to(0, ("branch.txt", b"the branch's first version\n"), "after");
+  // The push is answered once the branch is placed at f + 1, which a and c can make alone, so b's own branch is waited
+  // for: the restart must come between versions b holds (one run of three read 0 before this wait).
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let held_before = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    refusal_count(&fleet.daemons[1], "merge.replica.member_branched").map(|branched| branched >= 1)
+  });
+  drop(observed);
+  let rejoined = fleet.restart_warm(1);
+  let seen = BranchRestarted {
+    landed: [first, branched],
+    held_before,
+    rejoined,
+  };
+  (fleet, seen)
+}
+
 /// A-908 part 4, end to end (main 01a20182's order of 2026-11-24): a holder restarted warm between a branch's versions
 /// serves the branch after. Do: on a three-node `f = 1` git fleet over anchors that outlive their daemons, push `main`
 /// and a new branch `after` through the owner a; restart b warm (its records and held inputs kept, its replicas not);
@@ -37036,17 +37066,14 @@ fn a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies() {
 #[test]
 fn a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after() {
   let _serial = serialize_fleet_tests();
-  let mut fleet = anchored_git_fleet("branch-restart");
-  let first = fleet.push(0, ("first.txt", b"main before the restart\n"));
-  let branched = fleet.push_to(0, ("branch.txt", b"the branch's first version\n"), "after");
-  // The push is answered once the branch is placed at f + 1, which a and c can make alone, so b's own branch is waited
-  // for: the restart must come between versions b holds (one run of three read 0 before this wait).
-  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
-  let held_before = poll_until(&observed, PLACEMENT_DEADLINE, || {
-    refusal_count(&fleet.daemons[1], "merge.replica.member_branched").map(|branched| branched >= 1)
-  });
-  drop(observed);
-  let rejoined = fleet.restart_warm(1);
+  let (
+    mut fleet,
+    BranchRestarted {
+      landed,
+      held_before,
+      rejoined,
+    },
+  ) = branch_then_restart_b("branch-restart");
   // c refuses a's records from here, as a holder that never received them would, so a's next version needs b's
   // acknowledgement. A c stopped instead set off its takeover's configuration changes (7 to 13 within one push), and a
   // put to a home behind its sender's configuration waits for that install (A-902), so the push was refused `retry`.
@@ -37060,11 +37087,7 @@ fn a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_aft
     "branch across a holder's warm restart: b branched before {held_before}, after the restart {counts:?} \
      (branched, mismatched)"
   );
-  assert_eq!(
-    (first, branched),
-    (Ok(()), Ok(())),
-    "main and the branch landed"
-  );
+  assert_eq!(landed, [Ok(()), Ok(())], "main and the branch landed");
   assert!(
     held_before,
     "b branched the branch's replica before its restart"
@@ -37086,6 +37109,149 @@ fn a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_aft
     counts,
     [1, 0],
     "b rebuilt the branch by its lineage, no mismatch"
+  );
+}
+
+/// A-912 (main 01a20182's ruling of 2026-11-24: a git client must not see `retry` for a second after a death). Do: the
+/// scene of [`branch_then_restart_b`]; stop c for good; push a commit on top of `after` through a at once, while c is
+/// still a member and then while its takeover moves the region's configuration. Expect it to land: a home that does not
+/// answer is passed over once the configuration drops it, its windows homed again among the homes ranked then
+/// (`vcs_store.homes.homing_reranked_kept`), within one budget derived from the detector's confirmation and the
+/// takeover's configuration steps; and no voter's session found lent at a council round. Red before A-912: refused
+/// `retry`, its objects homed short, 3 of 3 (c undetected among the homes within the 2 s homing budget, or b's wait for
+/// its install held by the coordinator's own heal).
+#[test]
+fn a912_a_push_while_a_holders_takeover_moves_the_configuration_is_accepted() {
+  let _serial = serialize_fleet_tests();
+  let (
+    mut fleet,
+    BranchRestarted {
+      landed,
+      held_before,
+      rejoined,
+    },
+  ) = branch_then_restart_b("push-in-churn");
+  fleet.daemons.remove(2).stop();
+  let after = fleet.push_on_top_of(0, ("next.txt", b"the branch's next version\n"), "after");
+  let [lent, reranked] = [
+    "fleet.council.session_lent",
+    "vcs_store.homes.homing_reranked_kept",
+  ]
+  .map(|name| {
+    fleet
+      .daemons
+      .iter()
+      .map(|daemon| summed_counters(daemon).get(name).copied().unwrap_or(0))
+      .sum::<u64>()
+  });
+  fleet.stop();
+  eprintln!(
+    "a push during a takeover: sessions lent {lent}, homings re-ranked and kept {reranked}"
+  );
+  assert_eq!(landed, [Ok(()), Ok(())], "main and the branch landed");
+  assert!(
+    held_before && rejoined,
+    "b branched, then rejoined after its warm restart"
+  );
+  assert_eq!(after, Ok(()), "the push during c's takeover landed");
+  assert_eq!(
+    lent, 0,
+    "no voter's session found lent to another exchange at a council round"
+  );
+  assert!(
+    reranked >= 1,
+    "a homing passed over a home the configuration dropped, and kept"
+  );
+}
+
+/// The configuration changes one death makes at a council of `members` (A-912, measured at three: v7 to v12): the
+/// takeover, each survivor's settlement of the neighbourhood it fixed and its confirmation of its share, and the council's
+/// seat of its voters without the dead. Derived: `2 + 2 (members - 1)`.
+fn takeover_steps(members: u64) -> u64 {
+  2 + 2 * members.saturating_sub(1)
+}
+
+/// Follows `leader`'s and `follower`'s installed configuration versions from `from` until both have installed
+/// `from + steps` or `within` passes: the longest a version took the follower after the leader installed it, if both got
+/// there.
+fn longest_install_lag(
+  leader: &Daemon,
+  follower: &Daemon,
+  (from, steps): (u64, u64),
+  within: Duration,
+) -> Option<Duration> {
+  let target = from + steps;
+  let began = Instant::now();
+  let mut first_seen: [std::collections::BTreeMap<u64, Instant>; 2] = Default::default();
+  while began.elapsed() < within {
+    for (seen, daemon) in first_seen.iter_mut().zip([leader, follower]) {
+      if let Ok((installed, _)) = daemon.configuration_versions() {
+        for version in from + 1..=installed.min(target) {
+          seen.entry(version).or_insert_with(Instant::now);
+        }
+      }
+    }
+    if first_seen.iter().all(|seen| seen.contains_key(&target)) {
+      return (from + 1..=target)
+        .filter_map(|version| {
+          let [led, followed] =
+            [&first_seen[0], &first_seen[1]].map(|seen| seen.get(&version).copied());
+          Some(followed?.saturating_duration_since(led?))
+        })
+        .max();
+    }
+    std::thread::yield_now();
+  }
+  None
+}
+
+/// A-912 (i) and (1), main 01a20182's rulings of 2026-11-24: no exchange holds a peer's record session across a wait that
+/// needs the council's next round. Do: on a three-node `f = 1` git fleet, push `main` through a (its windows homed in the
+/// region), then stop c; follow a's and b's installs through the takeover's configuration steps ([`takeover_steps`]).
+/// Expect b to install each within one put's budget of a (`LIVENESS_BUDGET_NS`, the budget a home's answer had been
+/// held to), and the leader never to find a voter's record session out on another loan at its replication round
+/// (`fleet.council.session_lent`, A-902's invariant made visible). Red before: a's coordinator awaited its heal inline,
+/// whose put b held for its install (A-902), which needed the coordinator's next council append: b 2.1 to 3.1 s behind;
+/// with the heal on its own lane, the put held a's session to b instead, so the council skipped b (`council replication
+/// finds b's session lent to vcs_store.homes.heal`), b's wait ran out 3 of 3.
+#[test]
+fn a912_a_coordinators_home_passes_never_hold_its_council_through_a_takeover() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("passes-lane");
+  let pushed = fleet.push(0, ("first.txt", b"homed before the death\n"));
+  let before = fleet.daemons[0]
+    .configuration_versions()
+    .map_or(0, |(installed, _)| installed);
+  fleet.daemons.remove(2).stop();
+  let steps = takeover_steps(3);
+  let lag = longest_install_lag(
+    &fleet.daemons[0],
+    &fleet.daemons[1],
+    (before, steps),
+    PLACEMENT_DEADLINE,
+  );
+  let lent = fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      summed_counters(daemon)
+        .get("fleet.council.session_lent")
+        .copied()
+        .unwrap_or(0)
+    })
+    .sum::<u64>();
+  fleet.stop();
+  eprintln!(
+    "a takeover's {steps} configuration steps: b's longest lag behind a {lag:?}, sessions lent {lent}"
+  );
+  assert_eq!(pushed, Ok(()), "the push before the death landed");
+  assert!(
+    lag.is_some_and(|lag| lag < Duration::from_nanos(LIVENESS_BUDGET_NS)),
+    "b installed each of the takeover's steps within one put's budget of a: {lag:?}"
+  );
+  assert_eq!(
+    lent, 0,
+    "no voter's session found lent to another exchange at a council round"
   );
 }
 
