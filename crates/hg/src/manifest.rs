@@ -146,6 +146,73 @@ pub fn decode(text: &[u8]) -> Result<Entries<'_>, Refusal> {
   Ok(Entries { lines: lines(text) })
 }
 
+/// What [`Checking::update`] hands each line it checks: the line's range in the text, its newline included, and its
+/// entry. A refusal it answers ends the check.
+pub type EachLine<'a> = dyn FnMut(core::ops::Range<u64>, Entry<'_>) -> Result<(), Refusal> + 'a;
+
+/// [`decode`]'s check made over a manifest's text fed a piece at a time (goal 93, C1 (2): a push's manifest made a window
+/// a step, never whole): each line checked and its entry handed on as its newline arrives, with where it lies in the
+/// text, the line not yet ended carried to the next piece. What it keeps between pieces is that line and the path before
+/// it, each a manifest line's length (a path, a NUL, forty hexadecimal digits and a flag).
+#[derive(Clone, Debug, Default)]
+pub struct Checking {
+  /// The line not yet ended.
+  partial: Vec<u8>,
+  /// The path of the line before it, once there is one.
+  previous: Option<Vec<u8>>,
+  /// The lines checked.
+  line: u64,
+  /// The bytes fed.
+  fed: u64,
+}
+
+impl Checking {
+  /// Feeds `piece`, the text's next bytes: each line it ends checked as [`decode`] checks it and handed to `each` with
+  /// its range in the text (its newline included), in order. Refused as `decode` refuses the line.
+  pub fn update(&mut self, piece: &[u8], each: &mut EachLine<'_>) -> Result<(), Refusal> {
+    let mut rest = piece;
+    while let Some(end) = rest.iter().position(is_newline) {
+      let (line, after) = rest.split_at(end);
+      self.partial.extend_from_slice(line);
+      let start = self
+        .fed
+        .saturating_sub(to_u64(self.partial.len().saturating_sub(line.len())));
+      let consumed = to_u64(end).saturating_add(1);
+      let range = start..self.fed.saturating_add(consumed);
+      let index = self.line;
+      let entry = parse(&self.partial).ok_or(Refusal::Line { line: index })?;
+      if self
+        .previous
+        .as_deref()
+        .is_some_and(|before| before >= entry.path)
+      {
+        return Err(Refusal::Order { line: index });
+      }
+      each(range, entry)?;
+      let previous = self.previous.get_or_insert_with(Vec::new);
+      previous.clear();
+      previous.extend_from_slice(entry.path);
+      self.partial.clear();
+      self.line = index.saturating_add(1);
+      self.fed = self.fed.saturating_add(consumed);
+      rest = after.get(1..).unwrap_or_default();
+    }
+    self.partial.extend_from_slice(rest);
+    self.fed = self.fed.saturating_add(to_u64(rest.len()));
+    Ok(())
+  }
+
+  /// After the text's last piece: refused where a line is left unended, as `decode` refuses a text that does not end
+  /// in a newline.
+  pub fn finish(self) -> Result<(), Refusal> {
+    if self.partial.is_empty() {
+      Ok(())
+    } else {
+      Err(Refusal::Unterminated)
+    }
+  }
+}
+
 /// The entry of `path` in a manifest's text that [`decode`] has checked, found by halving the text (A-680): its lines
 /// are sorted by path, so the line holding the middle byte of what is left says which half holds `path`, as 7.2's pure
 /// reader halves its lines (`manifest.py` `_lazymanifest.bsearch` \[C\], over an index of line starts it builds first;

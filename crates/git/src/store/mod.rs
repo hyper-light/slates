@@ -102,7 +102,7 @@ pub use push::{Entries, HeldAt, HeldObject, Incoming, Push, PushRefused, StoredA
 pub use repository::abbrev::Abbrev;
 pub use repository::admitting::Admitting;
 pub use repository::deriving::{Derived, Deriving};
-pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
+pub use repository::graph::{GraphFault, NamedRef, PositionCache, PositionCounts, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned, UnsignedCommit};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};
 pub use repository::staging::Staging;

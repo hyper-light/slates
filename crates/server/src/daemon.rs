@@ -9638,6 +9638,16 @@ mod tests {
     let shard = second.shards.first().copied();
     let identity = text.identity;
     let size = text.size;
+    // Whether the successor's first look found the text whole in its content store: a restore that kept it, which a
+    // recovery bringing back only what it lacks never lets go (main's TSan diag 45544003056).
+    let whole_at_start = second
+      .observe(shard, move |state| {
+        state
+          .vcs_stores
+          .content()
+          .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(identity)))
+      })
+      .ok();
     let read = || {
       second
         .observe(shard, move |state| {
@@ -9671,12 +9681,16 @@ mod tests {
       std::thread::park_timeout(std::time::Duration::from_millis(50));
       seen = read();
     }
-    // What the successor brought back and let go, so a failure in a slow lane says which side of the let-go it read.
+    // What the successor brought back, let go and kept pinned, and whether it held the text whole at its first look: a
+    // failure in a slow lane tells a pin's refusal, a whole restore and a text the recovery never named apart.
     let counted = second
       .observe(shard, |state| {
         [
           crate::vcs_store::svn_texts::PIECE_FETCHED,
+          crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK,
           crate::vcs_store::name_holds::LANDED_TEXT_LET_GO_BYTES,
+          crate::vcs_store::name_holds::LANDED_TEXT_PINNED_READER,
+          crate::vcs_store::name_holds::LANDED_TEXT_PINNED_HOMES,
         ]
         .map(|name| (name, state.refusals.get(name).copied().unwrap_or(0)))
       })
@@ -9708,7 +9722,11 @@ mod tests {
       .expect("the read answered");
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, 0, false)), "{counted:?}");
+    assert_eq!(
+      seen,
+      Some((true, 0, false)),
+      "{counted:?}; whole at the successor's start: {whole_at_start:?}"
+    );
     assert!(
       whole == Some(bytes),
       "the text did not read back whole through the store"

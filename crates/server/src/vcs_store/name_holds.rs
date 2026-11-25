@@ -308,6 +308,14 @@ pub(crate) fn apply_recorded_lent(
 /// Format: a counter name in the daemon's status report.
 pub(crate) const LANDED_TEXT_LET_GO_BYTES: &str = "merge.name_hold.landed_let_go_bytes";
 
+/// Counted: a landed text's window a let-go kept because a reader that brought it back reads it still
+/// (`vcs_store::landed_pin`'s `"reader"`). Format: a counter name in the daemon's status report.
+pub(crate) const LANDED_TEXT_PINNED_READER: &str = "merge.name_hold.landed_pinned_reader";
+
+/// Counted: a landed text's window a let-go kept because a home holds it for its region here (`vcs_store::landed_pin`'s
+/// `"homes"`). Format: a counter name in the daemon's status report.
+pub(crate) const LANDED_TEXT_PINNED_HOMES: &str = "merge.name_hold.landed_pinned_homes";
+
 /// Lets go the windows of each of `texts`, a landing's committed texts, once its changeset is durable on the node's
 /// store (main's ruling (B)): each text's entry and its holds stay (the green's, by name), its windows go `Away`, and the
 /// first read brings them back from the node's store. Pinned as any landed window is (`vcs_store::landed_pin`). The
@@ -321,6 +329,17 @@ pub(crate) fn let_go_landed_texts(state: &mut crate::state::ShardState, texts: &
   if texts.is_empty() {
     return 0;
   }
+  // Each window kept counted by the holder that pinned it, so a text left resident says why.
+  let (reader, homes) = (core::cell::Cell::new(0u64), core::cell::Cell::new(0u64));
+  let pinned = |window: &ContentId| {
+    let by = super::landed_pin(window);
+    match by {
+      Some("reader") => reader.set(reader.get().saturating_add(1)),
+      Some(_) => homes.set(homes.get().saturating_add(1)),
+      None => {}
+    }
+    by
+  };
   let freed = super::within_budget(state, 0, |stores| {
     let Some(content) = stores.content_mut() else {
       return 0;
@@ -328,7 +347,7 @@ pub(crate) fn let_go_landed_texts(state: &mut crate::state::ShardState, texts: &
     let mut freed = 0u64;
     for text in texts.iter().map(|text| ContentId(*text)) {
       if content.contains(&text) {
-        let (bytes, _) = content.let_go_object_landed(&text, &super::landed_pin);
+        let (bytes, _) = content.let_go_object_landed(&text, &pinned);
         freed = freed.saturating_add(bytes);
       }
     }
@@ -337,6 +356,8 @@ pub(crate) fn let_go_landed_texts(state: &mut crate::state::ShardState, texts: &
   if freed > 0 {
     state.count(LANDED_TEXT_LET_GO_BYTES, freed);
   }
+  state.count(LANDED_TEXT_PINNED_READER, reader.get());
+  state.count(LANDED_TEXT_PINNED_HOMES, homes.get());
   freed
 }
 

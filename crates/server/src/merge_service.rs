@@ -384,12 +384,18 @@ fn checkpoint_ended(state: &mut ShardState, green: DbVolumeId) {
 /// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
 /// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
 /// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
-/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling).
+/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling). A
+/// first checkpoint's interval is nothing, so it has no deadline to spread over: the quantum a turn, as the hold's share
+/// is (goal 93: an import's first checkpoint folded 8,991 keys in one poll of 495 ms, debug, its deadline passed at its
+/// first turn).
 fn turn_budget_ns(
   left_ns: u64,
   (gap_ns, quantum_ns): (u64, u64),
   (began_ns, interval_ns, now_ns): (u64, u64, u64),
 ) -> u64 {
+  if interval_ns == 0 {
+    return quantum_ns;
+  }
   let deadline = began_ns.saturating_add(interval_ns);
   let remaining = deadline.saturating_sub(now_ns);
   if remaining <= gap_ns {
@@ -5372,7 +5378,8 @@ mod tests {
   /// A-579 (a checkpoint's identity fold paced to end within its doubling interval). Do: ask a turn's budget for 80 ms
   /// of fold left, a turn every 0.5 ms, at several points of a 1 s interval; and past its end; and for almost nothing
   /// left. Expect: the fold spread evenly over the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half
-  /// way), all of it once the deadline has passed, and never less than the quantum.
+  /// way), all of it once the deadline has passed, the quantum for a first checkpoint (its interval nothing, so no
+  /// deadline), and never less than the quantum.
   #[test]
   fn a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline() {
     const MS: u64 = 1_000_000;
@@ -5391,7 +5398,8 @@ mod tests {
       turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 1_000 * MS)),
       left
     );
-    assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), left);
+    // A first checkpoint's interval is nothing: no deadline to spread over, so a quantum a turn.
+    assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), QUANTUM);
     assert_eq!(
       turn_budget_ns(1_000, (gap, QUANTUM), (0, 1_000 * MS, 0)),
       QUANTUM

@@ -174,6 +174,10 @@ pub trait PackSource {
   fn turn(&self) -> impl FnMut() -> bool + 'static {
     || false
   }
+
+  /// What a step of choosing the pack's objects did resolving their ids (A-911,
+  /// [`crate::store::PositionCounts`]), for the owner to count. Nothing by default.
+  fn chose(&mut self, _counts: crate::store::PositionCounts) {}
 }
 
 /// Why upload-pack refused an exchange. Each is answered to the client in words, git's where it has them
@@ -466,7 +470,10 @@ fn request<P: PackSource>(
   let decoded = admission.held_since(before);
   advertise::check(&command, served.repository.format()).map_err(Refused::plain)?;
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
-  command_answer(served, &graph, (command, decoded), packs, admission, turns)
+  let answered = command_answer(served, &graph, (command, decoded), packs, admission, turns);
+  // What its walk did resolving ids, told as a step in turns tells it (A-911).
+  packs.chose(graph.take_position_counts());
+  answered
 }
 
 /// Answers `command`, held to the advertisement already.
