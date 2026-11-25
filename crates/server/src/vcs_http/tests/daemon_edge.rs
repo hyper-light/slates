@@ -2290,6 +2290,56 @@ fn an_imports_files_land_as_chunks_the_clone_decodes() {
   assert!(decoded > 0, "the clone decoded the imported chunks");
 }
 
+/// Main's hg leg at 608930048 (2026-11-25: a stream's turns about 100 ms apart, near the daemon's heartbeat; count the gap
+/// from a turn's yield to its next poll before changing what wakes it). Do: through a two-shard daemon's edge, push one
+/// changeset whose file is twice a request's room, then ask `stream_out`. Expect: the answer streamed in turns, each
+/// reply run's yield counted with its gap to the next poll (`vcs_http.reply_yields` at least the stream's turns,
+/// `reply_yield_gap_ns` and its most moved). Red before: the gap was counted at a request body run's yield, which a
+/// stream (a GET) never takes, so none was counted.
+#[test]
+fn a_streamed_answers_reply_runs_count_their_yield_to_the_next_poll() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let config = crate::DaemonConfig::derive(&crate::daemon::test_profile(), &instance, Some(SHARDS));
+  let room = super::bounds_of(&config).room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|at| b"abcdefgh"[at % 8] | 1)
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let counted = |kind| counted_on(&daemon, REPOSITORY, kind);
+  let before = (
+    counted(crate::vcs_http::REPLY_YIELDS),
+    counted(crate::vcs_store::hg_view::STREAM_TURNS),
+  );
+  let request = format!(
+    "GET /{name}?cmd=stream_out HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  let streamed = typed_exchange(port, &certificate, request.as_bytes());
+  let yields = counted(crate::vcs_http::REPLY_YIELDS) - before.0;
+  let turns = counted(crate::vcs_store::hg_view::STREAM_TURNS) - before.1;
+  let gap = (
+    counted(crate::vcs_http::REPLY_YIELD_GAP_NS),
+    counted(crate::vcs_http::REPLY_YIELD_GAP_MOST_NS),
+  );
+  daemon.stop();
+  assert_hg_answered(&pushed);
+  assert_eq!(streamed.0, 200, "the stream answered");
+  assert!(turns > 0, "the stream took turns");
+  assert!(
+    yields >= turns,
+    "a yield counted for each reply run: {yields} yields, {turns} turns"
+  );
+  assert!(gap.0 > 0 && gap.1 > 0, "the gaps counted: {gap:?}");
+  println!("reply yields {yields} over {turns} turns, gaps {gap:?}");
+}
+
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
 /// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
 /// `Content-Type` and body.
