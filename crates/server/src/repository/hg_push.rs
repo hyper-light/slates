@@ -3420,14 +3420,8 @@ pub(crate) const PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_manifest
 /// report.
 pub(crate) const MOST_PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_manifests_asked_most";
 
-/// Counter: a push's file delta bases found in its cache of its own texts (A-767 C1, main's ruling (b2)). Format: a
-/// counter name in the status report.
-pub(crate) const BASE_HITS: &str = "vcs.hg.push_base_hits";
-/// Counter: a push's file revisions rebuilt from its own deltas to make a base its cache did not hold ((b1)). Format: a
-/// counter name in the status report.
-pub(crate) const BASE_REBUILDS: &str = "vcs.hg.push_base_rebuilds";
-/// Counter: a push's file delta bases read from the node's changeset store: revisions landed before it. Format: a
-/// counter name in the status report.
+/// Counter: a push's file delta bases asked of the node's changeset store: revisions landed before it whose windows were
+/// let go (goal 93, C1 (2): every other base is read from the fork's rows). Format: a counter name in the status report.
 pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
 
 /// Counter: the most runs only a push's fork held where no merge was due (goal 93, the index seal's reland), the most of
@@ -3444,11 +3438,9 @@ pub(crate) const MOST_OWN_RUNS_IN_FLIGHT: &str = "vcs.hg.push_most_own_runs_in_f
 /// so [`MOST_OWN_RUNS`] is not met by sealing nothing. Format: a counter name in the status report.
 pub(crate) const TIERED_MERGES: &str = "vcs.hg.push_tiered_merges";
 
-/// Counts what a push's intake did to find its file delta bases ([`BASE_HITS`], [`BASE_REBUILDS`],
-/// [`BASE_STORE_READS`]) and how its fork's runs were kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
+/// Counts the file delta bases a push's intake asked of the store ([`BASE_STORE_READS`]) and how its fork's runs were
+/// kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
 fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
-  state.count(BASE_HITS, intaken.base_hits);
-  state.count(BASE_REBUILDS, intaken.base_rebuilds);
   state.count(BASE_STORE_READS, intaken.base_store_reads);
   state.count(LOG_TEXTS_ASKED, intaken.log_texts_asked);
   state.count_max(MOST_LOG_TEXTS_ASKED, intaken.log_texts_asked);

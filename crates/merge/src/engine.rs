@@ -1523,6 +1523,26 @@ fn current_bytes(value: &crate::history::Value) -> usize {
 /// except the last of them (the value in effect at `floor`), so lookups at or above the floor are
 /// unchanged. The dropped entries are returned, for the caller to release what they held. Entries are in version
 /// order, as the histories keep them.
+#[cfg(test)]
+thread_local! {
+  /// The paths this thread's folds visited ([`Green::fold_history_before`]): the changes since each fold's last floor,
+  /// never the green, which `fold_tests` counts.
+  pub(crate) static FOLD_PATHS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Folds the history of each of `paths` that `histories` holds below `floor` ([`fold_entries`]).
+fn fold_paths<T>(
+  histories: &mut BTreeMap<String, Vec<(u64, T)>>,
+  paths: &BTreeSet<String>,
+  floor: u64,
+) {
+  for path in paths {
+    if let Some(history) = histories.get_mut(path) {
+      fold_entries(history, floor);
+    }
+  }
+}
+
 fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64) -> Vec<(u64, T)> {
   let below = history
     .iter()
@@ -7572,11 +7592,50 @@ impl Green {
   /// nothing reachable is lost, and a file rewritten many times by small edits no longer keeps a
   /// full copy per edit past what any reader needs. Returns the content and IPC metadata bytes released. Idempotent;
   /// a floor below the current one is a no-op.
+  ///
+  /// Only the paths the change index names at a version from the last floor to the new one, both included, are folded:
+  /// every other path's history holds at most the one entry below the last floor that fold left it, and none from it
+  /// to the new floor, so it folds to itself. The last floor's own version is folded again: a history may hold more
+  /// than one entry at it (one work setting an attribute twice), which that fold kept as the value at its floor. The cost is the changes since the last fold, never the green: a fold of
+  /// every path's history in one step held an import's shard 494 ms a landing at 9,000 files (debug), folding nothing.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
     // A green that owes a push has no history of the owed version to fold (P2): nothing.
     if floor <= self.folded_below || self.owed.is_some() {
       return 0;
     }
+    let touched: BTreeSet<String> = self
+      .changes
+      .range(self.folded_below..=floor)
+      .flat_map(|(_, entries)| entries.iter().map(|entry| entry.path.clone()))
+      .collect();
+    self.fold_paths_before(floor, &touched)
+  }
+
+  /// [`Green::fold_history_before`] over every path any history holds: the fold as a walk of the whole green, the
+  /// oracle the change index's paths are held to (`fold_tests`).
+  #[cfg(test)]
+  pub(crate) fn fold_history_before_every_path(&mut self, floor: u64) -> usize {
+    if floor <= self.folded_below || self.owed.is_some() {
+      return 0;
+    }
+    let every: BTreeSet<String> = self
+      .content_history
+      .keys()
+      .chain(self.special_history.keys())
+      .chain(self.mode_history.keys())
+      .chain(self.symlink_history.keys())
+      .chain(self.hardlink_history.keys())
+      .chain(self.dir_history.keys())
+      .chain(self.xattr_history.keys().map(|(path, _)| path))
+      .cloned()
+      .collect();
+    self.fold_paths_before(floor, &every)
+  }
+
+  /// Folds the histories of `paths` below `floor` ([`Green::fold_history_before`]).
+  fn fold_paths_before(&mut self, floor: u64, paths: &BTreeSet<String>) -> usize {
+    #[cfg(test)]
+    FOLD_PATHS_VISITED.with(|visited| visited.set(visited.get() + paths.len()));
     // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
     // before the history below the floor goes (A-202).
     if self.identity_version < floor {
@@ -7587,32 +7646,33 @@ impl Green {
     let before = self.history_bytes().saturating_add(self.changes_bytes);
     self.release_kept_fixes(floor);
     self.fold_changes_before(previous, floor);
-    self.fold_content_before(floor);
-    self.fold_specials_before(floor);
-    for history in self.mode_history.values_mut() {
-      fold_entries(history, floor);
-    }
-    for history in self.symlink_history.values_mut() {
-      fold_entries(history, floor);
-    }
-    for history in self.hardlink_history.values_mut() {
-      fold_entries(history, floor);
-    }
-    for history in self.xattr_history.values_mut() {
-      fold_entries(history, floor);
-    }
-    for history in self.dir_history.values_mut() {
-      fold_entries(history, floor);
+    self.fold_content_before(floor, paths);
+    self.fold_specials_before(floor, paths);
+    fold_paths(&mut self.mode_history, paths, floor);
+    fold_paths(&mut self.symlink_history, paths, floor);
+    fold_paths(&mut self.hardlink_history, paths, floor);
+    fold_paths(&mut self.dir_history, paths, floor);
+    for path in paths {
+      for (_, history) in self
+        .xattr_history
+        .range_mut((path.clone(), String::new())..)
+        .take_while(|((at, _), _)| at == path)
+      {
+        fold_entries(history, floor);
+      }
     }
     before.saturating_sub(self.history_bytes().saturating_add(self.changes_bytes))
   }
 
   /// Folds the content history below `floor`: the latest value is never folded, so the current values stand, and each
   /// dropped value releases its chunks.
-  fn fold_content_before(&mut self, floor: u64) {
+  fn fold_content_before(&mut self, floor: u64, paths: &BTreeSet<String>) {
     let mut dropped = Vec::new();
     let mut alone = Vec::new();
-    for (path, history) in &mut self.content_history {
+    for path in paths {
+      let Some(history) = self.content_history.get_mut(path) else {
+        continue;
+      };
       let folded = fold_entries(history, floor);
       if !folded.is_empty() && history.len() == 1 {
         alone.push(path.clone());
@@ -7669,9 +7729,12 @@ impl Green {
   }
 
   /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.
-  fn fold_specials_before(&mut self, floor: u64) {
+  fn fold_specials_before(&mut self, floor: u64, paths: &BTreeSet<String>) {
     let mut specials = 0usize;
-    for history in self.special_history.values_mut() {
+    for path in paths {
+      let Some(history) = self.special_history.get_mut(path) else {
+        continue;
+      };
       specials = specials.saturating_add(
         fold_entries(history, floor)
           .iter()
@@ -8145,6 +8208,8 @@ mod node_exclusive_tests;
 #[cfg(test)]
 mod unseen_bytes_tests;
 
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod replaced_node_tests;
 

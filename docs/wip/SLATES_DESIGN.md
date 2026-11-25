@@ -63401,7 +63401,14 @@ task), `crates/server/src/vcs_store/homes.rs`, `crates/server/src/credentials.rs
   stands alone, as on a record's arrival. Counter `merge.replica.lineage_found_refused`, a bug signal: a root not
   installed because its repository already has a lineage without it. Tests (`merge_origin`, macOS arm64, debug):
   `a908_a_restarted_holder_rebuilds_a_branch_by_its_lineage` (red before: `(Later, None)`, the branch refused) and
-  `a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask` (red before: `[Later, Later]`).
+  `a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask` (red before: `[Later, Later]`). End to end, fleet
+  `a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after` (main 01a20182's order): a git fleet
+  over anchors (`anchored_git_fleet`, `GitFleet::restart_warm`); `main` and a branch pushed, b restarted warm once it
+  had branched, c refusing a's records (`Daemon::inject_record_refusal`), a commit pushed on top of the branch. Green 4
+  of 4 (6.9 to 23.5 s), b counting `member_branched` 1 and no mismatch; red with the rebuild's membership step turned
+  off in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). A c stopped instead of refusing left
+  the push refused `retry` 3 of 3: its takeover moved the configuration 7 to 13 within the push, and a put to a home
+  behind its sender's configuration waits for that install (A-902) past the put's budget.
 
 Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin,green_adopt,
 greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS. Part 4: §4.16
@@ -63445,6 +63452,25 @@ greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/
 
 Applied in the same change to: §4.8 (the owner's own hold, with a status line), `crates/db/src/register.rs`,
 `crates/cluster/src/lib.rs`, `crates/server/tests/fleet.rs`, the A-908 entry's owed line, GAPS.
+
+
+### A-910 — A green's fold visits only the paths changed since its last floor (2026-11-24, w-svn for main 01a20182, goal 93; found by timing an import's landing at 9,000 files; §4.16 "delta retention before folding", AUD-16)
+
+- **Why.** An import's landing ended in `fold_to_readers`, whose `Green::fold_history_before` walked every path's history
+  in every dimension (content, specials, mode, symlink, hard link, attributes, directories) on every floor move. The
+  floor moves at every batch an import lands, so each landing paid a walk of the whole green, quadratic over an import
+  of many batches; at 9,000 files it was 494 ms of one step on a debug build, folding nothing.
+- **The change.** The fold visits only the paths the change index names at a version from the last floor to the new
+  one, both included. Every other path's history holds at most the one entry below the last floor that fold left it,
+  and none from it to the new floor, so it folds to itself. The last floor's own version is visited again: a history
+  may hold more than one entry at one version (one work setting an attribute twice), which that fold kept as the value
+  at its floor. The cost is the changes since the last fold, never the green.
+- **The oracle.** `engine::fold_tests`: two greens take the same generated works in every dimension, with the floor
+  moved between them; one folds the index's paths, the other every path (`fold_history_before_every_path`, test only).
+  After every move their histories, recounted history bytes and retained bytes are equal. It found the visit of the
+  last floor's version necessary. A counted test holds a fold's visits to the paths changed since its last floor (2 of
+  a green of 50, where the whole walk visited 50).
+- **Applied in the same change to** `crates/merge/src/engine.rs` and `crates/merge/src/engine/fold_tests.rs`.
 
 ### A-911 — A fetch's walk resolves an id met again from a cache of positions, not from the index (2026-11-24, w-git for main 01a20182, its rulings of that evening; goal 93's clone, clone-again and partial; §4.17.1 "A fetch's answer" rule 1; A-745, A-855; R3)
 
