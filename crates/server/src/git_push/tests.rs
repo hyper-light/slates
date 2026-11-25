@@ -3325,6 +3325,57 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
 /// each record that names objects version 4, naming its names and its pack by the identities the region homed; and
 /// the store made again from those records equal to the live one. Every wait
 /// is on its event (an answer, a channel), none on a fixed time: a loaded machine is the norm.
+/// A-916 (main 01a20182's ruling (b1) of 2026-11-25, t_a724's replay diff diagnosed by instrument). Do: t_a724's two
+/// pushes to `main`, each followed by a fetch's derivation (`git_derive::derive_for_read`), then the store made again
+/// from its records compared with the live one (`assert_made_again_whole`). Expect: equal. Red before: the second
+/// push's commit kept a reach value (`keep_values`) because the fetch had derived the version before it, a value no
+/// code read and the replay, committing with nothing derived between, never made: live [false, true] against rebuilt
+/// [false, false].
+#[test]
+fn a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  crate::test_store::keep_landed(&daemon);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "derived-between");
+    let requests: Vec<Vec<u8>> = chain()
+      .into_iter()
+      .take(2)
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .collect();
+    let task = slates_rt::futures::spawn(async move {
+      let mut answered = true;
+      for request in requests {
+        answered &= homed_drive(repository, &request).await.is_ok();
+        crate::vcs_store::git_derive::derive_for_read(repository).await;
+      }
+      let _ = sent.send((repository, answered));
+    })
+    .expect("the pushes' task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (repository, answered) = got.recv().expect("the pushes answered");
+  let (checked, sent) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let main = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .expect("main");
+    crate::vcs_store::tests::assert_made_again_whole(
+      state,
+      repository,
+      &[crate::vcs_store::green_key(main)],
+    );
+    let _ = checked.send(());
+  });
+  let made_again = sent.recv().is_ok();
+  daemon.stop();
+  assert!(answered, "both pushes answered");
+  assert!(made_again, "the store made again equal to the live one");
+}
+
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
