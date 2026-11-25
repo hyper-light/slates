@@ -642,3 +642,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   The hg stream's 2x, named at r400: slates writes revlog chunks uncompressed ('u', where stock writes zstd) and
   writes split revlogs (.i+.d, where stock keeps them inline). It also serves stream v1, where stock serves v2. Sent to
   w-hg (inbox/w-hg-from-w-interop-stream-2x.md) and main; the fix is w-hg's.
+
+## 2026-11-25: svn HTTPv2 revprop PROPPATCH (main's piece off w-svn's queue): already fixed, nothing landed
+- `stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte` passes on main b2888af84 against stock svn 1.15.0
+  (1 passed, 65.42 s, not skipped; the revprop set/get/list/delete steps match svnserve).
+- Main's report at b61cdf8d1 (E200007, no PROPPATCH route on `!svn/rev/N`) was fixed by d843d2325
+  (2026-11-21 23:46 PST). I told main and w-svn; the debug target is deleted.
+- Next: the A-911 arms A/B record when main sends it.
