@@ -4163,3 +4163,61 @@ fn a_push_of_new_refs_counts_the_creates_its_landing_step_made_and_the_steps_tim
   let all = u64::try_from(NEW_REFS).unwrap();
   assert_eq!((creates, took > 0), (all, true), "all in one step, timed");
 }
+
+/// Main 01a20182's ruling of 2026-11-25 (b), from the readers' code: a git reader that holds no pin reads again after a
+/// let-go between its bring-back and its read, and brings the window back again, so a read-back's let-go there costs a
+/// second fetch, never the answer. Do: push the same line of [`PACED_HISTORY`] commits to two repositories (one pack,
+/// the same windows) and let its windows go by hand; derive the first as a fetch's request does
+/// (`git_derive::derive_for_read`), its windows let go again as it ends; then derive the second with the window its
+/// first bring-back puts back let go once more before the derivation's next turn reads it
+/// (`vcs_share::read_backs::FORCE_LET_GO_AFTER_BRING_BACK`). Expect: each derivation derives its one version; the
+/// second brought one window back once more than the first (the re-bring); and once both end, none of the pack's
+/// windows held.
+#[test]
+fn a_derivation_brings_a_window_let_go_under_it_back_again_and_derives_the_same() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (plain, forced, windows) = crate::daemon::observe_first(&daemon, |state| {
+    let (plain, _) = paced_line_pushed(state, "derive-plain");
+    let (forced, pack) = paced_line_pushed(state, "derive-forced");
+    (plain, forced, let_go_by_hand(state, &pack))
+  });
+  let counts = |daemon: &crate::Daemon| {
+    crate::daemon::observe_first(daemon, |state| {
+      (brought_back_count(state), derive_counts(state).1)
+    })
+  };
+  let before = counts(&daemon);
+  derived_for_read(&daemon, plain);
+  let between = counts(&daemon);
+  let held_between = crate::daemon::observe_first(&daemon, {
+    let windows = windows.clone();
+    move |state| held_of(state, &windows)
+  });
+  crate::daemon::observe_first(&daemon, |_| {
+    crate::vcs_share::read_backs::FORCE_LET_GO_AFTER_BRING_BACK.with(|force| force.set(true));
+  });
+  derived_for_read(&daemon, forced);
+  let after = counts(&daemon);
+  let held_after = crate::daemon::observe_first(&daemon, move |state| held_of(state, &windows));
+  daemon.stop();
+  let (plain_brought, forced_brought) = (between.0 - before.0, after.0 - between.0);
+  assert_eq!(
+    (between.1 - before.1, after.1 - between.1),
+    (1, 1),
+    "each derivation derived its version"
+  );
+  assert!(
+    plain_brought > 0,
+    "the plain derivation brought windows back"
+  );
+  assert_eq!(
+    forced_brought,
+    plain_brought + 1,
+    "the forced one brought the window let go under it back again"
+  );
+  assert_eq!(
+    (held_between, held_after),
+    (0, 0),
+    "the windows let go again"
+  );
+}
