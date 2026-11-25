@@ -638,3 +638,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   at 2ed3eb139; the six-push loop (2 of 9 full pushes refused UnknownDeltaBase, i18n/da.po revs 103 and 105); P7
   again with the landing stage counters; and the void clone, void because main's vmmap paused the daemon and the
   anchor killed it. Nothing of mine is running anywhere.
+- LANDED 8a03eb239: the night's rerun record (loaded). LANDED b2888af84, 2026-11-25: crates/cli/bench/hg_stream_compare.sh.
+  The hg stream's 2x, named at r400: slates writes revlog chunks uncompressed ('u', where stock writes zstd) and
+  writes split revlogs (.i+.d, where stock keeps them inline). It also serves stream v1, where stock serves v2. Sent to
+  w-hg (inbox/w-hg-from-w-interop-stream-2x.md) and main; the fix is w-hg's.
