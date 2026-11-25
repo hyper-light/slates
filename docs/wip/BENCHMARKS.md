@@ -19275,3 +19275,34 @@ What it says:
   24× to 2.1×, and the dump stays about 3×: both w-svn's.
 - **svnsync's row overlapped another round on the box,** so its times are not comparable with the rest of the table.
 
+## A Subversion repository's bytes on the changeset store against FSFS's: git-2000, 9.2 times (goal 93 perf; main 01a20182's order, 2026-11-24)
+
+- **What, and why.** Item 4 of main's note of 11-21 21:50: the storage half of "an order of magnitude faster", taken as a
+  measurement only, bytes and no seconds, one run each. Under Ada's changeset ruling the node's changeset store keeps
+  each revision's changed texts whole (its changeset's Payload with Texts rows); FSFS keeps skip-deltas. No storage
+  change follows from it before Subversion's C and R close, and any change keeps the ruling (deltas derived, never
+  stored).
+- **Machine, date, load, tree.** Adas-MacBook-Pro-2.local (M-series, 18 cores, 128 GB), 2026-11-24 evening PST, load
+  about 40 to 47 (other agents' builds; bytes do not depend on it). slates: main 1227afcb1 with the measurement's
+  harness (this change), release. FSFS: Homebrew's svnadmin 1.15.0 (r1937767).
+- **Dataset.** `~/.cache/main-rounds/data/git-2000.dump`: 458,114,318 bytes, a format-3 dump of git/git's 2,000 newest
+  first-parent commits at f7de81456940.
+- **FSFS command.** `svnadmin create <scratch>/repo && svnadmin load -q <scratch>/repo < git-2000.dump`, then
+  `du -sk` and `du -sk -A` of `db` (scratch under `~/.cache/w-perf/svn-ab`, outside the tree).
+- **slates command.** `SLATES_SVN_IMPORT_DUMP=~/.cache/main-rounds/data/git-2000.dump cargo test --release -p
+  slates-server --test svn_import_storage -- --ignored --nocapture`: an in-process two-shard daemon over a changeset
+  store (its disk a 64 GiB growth cap, never made at it), one Subversion repository, the dump through
+  `import_repository`; the store's directory measured empty, live after the import, and after the daemon and the
+  store's owner stop; the process's resident set and the daemon's per-shard gauges after the import.
+
+| | allocated (`du -sk`), KiB | apparent (`du -sk -A`), KiB |
+|---|---|---|
+| FSFS `db` (format 8, sharded 1000; youngest 2000) | 51,020 (revs 42,020, revprops 8,004) | 40,183 |
+| slates, the repository on the changeset store (after the stop, less the empty store's 520/517) | 468,604 | 452,617 |
+| slates over FSFS | 9.2 times | 11.3 times |
+
+- **Resident (slates).** The test process: 48,128 KiB before the import, 691,504 KiB after. Shard 0's gauges after it:
+  the content arena maps 1,118,306,304 B, 494,387,200 B of its object resident, 489,299,968 B of frees held for a
+  committed image (`arena_deferred_bytes`) and 627,953,664 B free; the content store holds 2,624 B (50,527,383 B of
+  texts let go, 4,817 entries). P7's question (GAPS): what holds the image.
+
