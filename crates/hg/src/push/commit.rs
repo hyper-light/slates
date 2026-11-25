@@ -131,14 +131,37 @@ pub(crate) fn keep_one(
   store: &mut ContentStore,
   log: Log<'_>,
   (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
-  (kept, whole): (Option<ContentId>, Option<u64>),
+  (kept, whole, stored): (Option<ContentId>, Option<u64>, Option<crate::index::Stored>),
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
   let mut puts = Puts::default();
   let one = core::slice::from_ref(arrived);
-  let kept = match log {
-    Log::Changelog => changesets(fork, store, one, &mut puts, admission),
-    Log::Manifest | Log::File(_) => {
+  let kept = match (log, kept, stored) {
+    // A manifest taken a window a step (main's ruling (B)): its row's content kept already, its stored fields told.
+    (Log::Manifest, Some(content), Some(stored)) => {
+      puts.0.push(content);
+      admission
+        .charge_items::<NewRevision>(1)
+        .map_err(Unindexed::from)
+        .and_then(|()| {
+          let row = NewRevision {
+            node: arrived.node,
+            p1: arrived.p1,
+            p2: arrived.p2,
+            link: arrived.link,
+            flags: 0,
+            len: whole.unwrap_or_else(|| to_u64(arrived.text.len())),
+            bytes: content,
+            block: None,
+          };
+          fork
+            .append_stored(store, log, &[(row, stored)])
+            .map(drop)
+            .map_err(Unindexed::from)
+        })
+    }
+    (Log::Changelog, ..) => changesets(fork, store, one, &mut puts, admission),
+    (Log::Manifest | Log::File(_), ..) => {
       let files = matches!(log, Log::File(_));
       revisions(store, (one, kept, whole), &mut puts, admission, files).and_then(|group| {
         fork
