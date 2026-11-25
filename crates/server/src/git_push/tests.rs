@@ -1112,6 +1112,67 @@ fn a_derivations_own_time_is_counted_and_a_call_with_nothing_due_counts_nothing(
   assert_eq!(again, derived, "nothing due, nothing counted");
 }
 
+/// A request creating `main` at a line of [`PACED_HISTORY`] commits, its pack whole.
+fn paced_line_request() -> Vec<u8> {
+  let mut objects = Vec::new();
+  let mut parent = None;
+  for at in 0..PACED_HISTORY {
+    let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
+    objects.extend(made);
+    parent = Some(commit);
+  }
+  let head = parent.unwrap().to_string();
+  let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
+  request(&created, CAPABILITIES, &pack_of_objects(&objects))
+}
+
+/// The shard's derivation counts: versions derived, and derivations begun behind a push.
+fn derived_and_behind(state: &mut ShardState) -> (u64, u64) {
+  use crate::vcs_store::git_derive::{BEHIND, DERIVED};
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (count(DERIVED), count(BEHIND))
+}
+
+/// Waits, a look a while, until `daemon`'s shard has derived at least `at_least` versions: whether it did in time.
+fn derived_by(daemon: &crate::Daemon, at_least: u64) -> bool {
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(daemon, derived_and_behind).0 < at_least {
+    if began.elapsed() > std::time::Duration::from_secs(60) {
+      return false;
+    }
+    std::thread::yield_now();
+  }
+  true
+}
+
+/// Main 01a20182's order of 2026-11-25 (a first clone after git/git's push spent about a third of its wait for its first
+/// pack byte deriving the versions the push left unknown). Do: push a line of [`PACED_HISTORY`] commits as one create,
+/// a step at a time as the edge pushes, so the push ends with the shard lent to it; wait for the shard to derive; then
+/// derive as the first fetch's request does. Expect: a derivation begun behind the push as it ended
+/// (`vcs_store.git_derive.behind`) and the version derived then; and the fetch's own derivation deriving nothing. Red
+/// before: nothing derived until the fetch, which derived the version itself.
+#[test]
+fn a_push_leaves_its_versions_derived_behind_it_so_the_first_fetch_derives_nothing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "derived-behind"));
+  let (created, _) = pushed_in_steps(&daemon, repository, &paced_line_request()).unwrap();
+  let behind_in_time = derived_by(&daemon, 1);
+  let before_fetch = crate::daemon::observe_first(&daemon, derived_and_behind);
+  derived_for_read(&daemon, repository);
+  let after_fetch = crate::daemon::observe_first(&daemon, derived_and_behind);
+  daemon.stop();
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert!(
+    behind_in_time && before_fetch.1 >= 1,
+    "derived behind the push: {before_fetch:?}"
+  );
+  assert_eq!(
+    after_fetch.0, before_fetch.0,
+    "the first fetch derived nothing: {before_fetch:?} → {after_fetch:?}"
+  );
+}
+
 /// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
 /// window marked landed; the commit's own let-go is withdrawn, `vcs_store::LANDED_LET_GO`): the windows.
 fn let_go_by_hand(state: &mut ShardState, pack: &[u8]) -> Vec<slates_vcs::ContentId> {
