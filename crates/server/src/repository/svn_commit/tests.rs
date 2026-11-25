@@ -1836,6 +1836,88 @@ fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is
 /// the text resident (the landing lets them go once its changeset is durable), with the green's one hold and no byte
 /// held by its named blocks. It did not weaken: an entry holds no bytes. The green's file and the session's read bring
 /// the windows back from the node's store.
+/// TSan diag 45557094379 (the svn crash test's successor held a landed text whole at its start, fetched nothing, let
+/// nothing go, no pin; w-hg's sweep, site 4: `named_lacking` skips a text the restored store holds whole). Do: commit a
+/// text, whose landing lets its windows go; bring it back whole and keep that hold, as the successor's restored store
+/// held it; then take what a recovery of the green reads before its replay (`named_found_whole`) and lets go after it
+/// (`let_go_found_whole`). Expect the text among those found whole and resident until then, and no window of it resident
+/// after, its let-go counted. Red before: the recovery let go only what it brought back, and this text stayed in RAM.
+#[test]
+fn a_recovery_lets_go_a_named_landed_text_it_found_whole() {
+  use slates_svn::commit::drive::TextSink;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    "found-whole",
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, green) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let bytes = crate::test_store::noise(200 << 10);
+  let committed = bytes.clone();
+  let named = text(&bytes);
+  let brought = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage(None).unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, named.identity).unwrap();
+      let work = Work {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", Action::Add, NodeKind::Directory),
+            ChangedPath {
+              path: "/trunk/a.bin".to_owned(),
+              action: Action::Add,
+              kind: NodeKind::File,
+              copy_from: None,
+              text: Some(named),
+              properties: None,
+              mergeinfo_modified: false,
+            },
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"found whole".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let landed = super::land_work((&owner(), id), work, &texts).await;
+      assert!(matches!(landed, Some(Ok(_))), "{landed:?}");
+      crate::vcs_store::svn_texts::bring_whole(id, named.identity, named.size).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert!(brought, "the landed text brought back whole");
+  let (found, before, after, counted) = crate::daemon::observe_first(&daemon, move |state| {
+    let found = crate::vcs_store::svn_texts::named_found_whole(state, green);
+    let before = resident(state, (named.identity, named.size));
+    crate::vcs_store::svn_texts::let_go_found_whole(state, &found);
+    let after = resident(state, (named.identity, named.size));
+    let counted = state
+      .refusals
+      .get(crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE)
+      .copied()
+      .unwrap_or(0);
+    (found, before, after, counted)
+  });
+  daemon.stop();
+  assert!(
+    found.contains(&named.identity),
+    "the green names the text and the store holds it whole: {found:?}"
+  );
+  assert!(before, "resident before the recovery's let-go");
+  assert!(
+    !after,
+    "a window of the text still resident after the recovery"
+  );
+  assert!(counted >= 1, "its let-go counted");
+}
+
 #[test]
 fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() {
   use slates_svn::commit::drive::TextSink;
@@ -1966,21 +2048,10 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
 /// 2026-11-23 (A-760 (b) 4d) a landed text's entry stays, held once by the green's name for it, and its windows go
 /// once its changeset is durable on the node's store, so RAM holds nothing of it.
 fn resident(state: &ShardState, (identity, len): (ContentIdentity, u64)) -> bool {
-  let Some(content) = state.vcs_stores.content() else {
-    return false;
-  };
-  let root = slates_vcs::ContentId(identity);
-  let mut at = 0u64;
-  while at < len.max(1) {
-    let Some((window, start, width)) = content.window_holding(&root, len, at) else {
-      return false;
-    };
-    if !content.is_away(&window) {
-      return true;
-    }
-    at = start.saturating_add(width.max(1));
-  }
-  false
+  state
+    .vcs_stores
+    .content()
+    .is_some_and(|content| crate::vcs_store::name_holds::resident(content, identity, len))
 }
 
 /// The content store's holders of the text `identity`: one, the green's, for a text the head names (A-760 (b) 4c).
