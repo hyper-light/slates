@@ -1629,6 +1629,17 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> Found by main's round at 15b4f1061 and cut (2026-11-25, w-perf): with that request hg's 57k clone peaked at 10,416
+> MiB and held 10,013 MiB after it (2ed3eb139: 5.7-6.0 GB), 165.8 s; the status after it named 4,792 mapped blocks of
+> about a chunk each still live (5.07 GB mapped, 4.09 GB resident). The owner read each text of the batch once at its
+> start and took it whole, so the text cache took a text longer than a piece (a manifest, 100-250 KB) for a walk's first
+> piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
+> x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
+> reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). Owed: the batch itself, sized by the fetch's room
+> (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
+> system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
+> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`).
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
