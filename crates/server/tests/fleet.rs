@@ -36422,20 +36422,7 @@ impl GitFleet {
   fn push_to(&self, node: usize, (file, bytes): (&str, &[u8]), branch: &str) -> Result<(), String> {
     let dir = common::target::target_dir();
     let work = dir.path.clone();
-    for args in [
-      vec!["init", "-q", "-b", "main"],
-      vec!["config", "user.email", "fleet@example.invalid"],
-      vec!["config", "user.name", "fleet"],
-    ] {
-      assert!(git_in(&work, &args).status.success());
-    }
-    dir.seed(file, bytes);
-    assert!(git_in(&work, &["add", file]).status.success());
-    assert!(
-      git_in(&work, &["commit", "-q", "-m", file])
-        .status
-        .success()
-    );
+    committed_in(&dir, (file, bytes));
     let port = self.daemons[node]
       .vcs_http_port()
       .expect("the edge listens");
