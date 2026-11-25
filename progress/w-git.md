@@ -787,3 +787,9 @@
   steps, long_steps.{refs,lend,work,settle,count}, phase_ns_most). Learned: arithmetic_side_effects denies bare ops.
   Closed: git_interop PATIENCE line (superseded by 0f40bfea3); incremental fetch (client-side). WAITING: main's next
   git leg's read of the phase counters, then cut the biggest phase.
+- 11-25 ~04:30 PST: derive_behind REVERTED 9be9340af (clone mid-derivation regressed 50 %: behind + fetch yielding a
+  unit each, 721k turns; TSan listing "waited" = old counter counting behind's turns), then REBUILT and LANDED
+  e89adba55: reader-driven hand-off (behind_handed), behind turns a quantum at most, read_turns/behind_turns; reds:
+  fetch mid-derivation (446 -> 2 turns vs alone 1), listing during behind (old count 100->117, read_turns 0->0).
+  Main's "listing red" was w-hg's pre-revert HEAD (confirmed). WAITING: main's diag 10 + git leg with the phase
+  counters (49e4c377a) -> cut the biggest long-step phase.
