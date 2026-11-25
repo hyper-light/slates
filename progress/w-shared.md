@@ -594,3 +594,14 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Next: A-919 (a state log's prefix to a candidate joining past it; red at the state_log level), then B.
 - Reviewed w-perf's image-read-side diff: the counter undercounts buffers inlined by EntryBytes::owned, and the
   scratch bound is broken by the uncapped one-coordinate re-read.
+
+## 2026-11-25: A-919 landed (90cabe801, commits 1347d8d6c and f9a6ae579)
+
+- A newcomer reads a register's ledger prefix from its cohort through the split read (stream 32, moves nothing), with
+  the owner answering from its acceptor, now in control-shard state via OwnerHold.
+- The start rule and continuity are the fold's rules. Reds: the a919 fleet test (933 bytes kept → let go to 0), the
+  start-rule unit test, the chain unit test, and the owner-restart fleet test (ignored as A-921's red).
+- A post-merge flake was the new acceptor unknown to routing (fixed; swept). FencedLedger.tla gained Forget and
+  StartRule; the TLC run is queued in run-requests.md.
+- Next: A-921 (the surviving holder refusing a warm-restarted owner's records), then A-918 B on the same read, then
+  A-914 (c) from main's batch (mode 1: check A-912's homing_budget before the first measured death).

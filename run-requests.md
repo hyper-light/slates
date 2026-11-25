@@ -7609,3 +7609,14 @@ After w-shared's fix, run `cargo test --release --locked -p slates-server --lib 
 ## 2026-11-22 codex-review, A-865 Subversion restart with one released text window
 
 After w-svn's fix, on the Studio and Linux run `cargo test --release --locked -p slates-server --lib a_subversion_restart_replays_ -- --test-threads=1` with the attached regression and control. Both repositories must serve their exact r1 bytes on the first read in both cases. A `ContentMissing` fence or an empty session or green read is red. In the same lanes run `cargo test --release --locked -p slates-server --lib a_cleanly_restarted_import_brings_back_no_named_text` to retain the clean-restart assertion of zero fetches.
+
+## 2026-11-25 w-shared, A-919 FencedLedger's forgetting holder and the start rule, 90cabe801
+
+TLC, in `docs/wip/models/`:
+- `FencedLedger_forget.cfg` (one forget, the start rule on) must hold every invariant.
+- `FencedLedger_forget_norule.cfg` (the rule off) must fail Continuity: a forgotten holder's silence taken as a promise of nothing, a lower epoch's value adopted.
+- Re-run `FencedLedger.cfg`, `FencedLedger_3.cfg` and `FencedLedger_register.cfg` too. They gained `MaxForgets = 0` and `StartRule = TRUE`, which change nothing there: same verdicts as before. The register's config must still fail Continuity.
+The dense spec covers a state log's AdoptedIsPrefix (the chain check makes it the dense case over part indexes).
+Red is a forget config holding with the rule off, or failing with it on.
+
+Also by name, once A-921 lands: `cargo test -p slates-server --test fleet a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact` (macOS arm64, debug). It fails about 1 run in 3 at 90cabe801: that is A-921's red.
