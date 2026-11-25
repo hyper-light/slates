@@ -706,3 +706,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Hypothesis (unmeasured at scale): A-870's family pages, keyed by identity range, are all dirtied by let-goes spread
     over the hash space, so each publication re-encodes (and the checkpoint copies) every away page: churn ~ history x
     publications. Asked main for the 57k run of what_holds (prints churn by site); waiting on it before any cut.
+- 2026-11-25 ~15:30 PST:
+  - (a) read side COMMITTED locally (not landed; w-shared reviewing /Users/adalundhe/.cache/w-perf-logs/image-read-side.diff):
+    EntryBytes inline entries + the encoder's lent read buffer; vcs_store.image.read_allocated_bytes; red
+    a_re_encoded_page_allocates_no_more_than_it_encodes 557,456 -> 217,296 B for 306,607 encoded. 13/13.
+  - (a) second half (page bytes to delta/checkpoint without a copy) needs a vfs API change (HeldPieceRef in
+    checkpoint_log/recover) or a move-out/restore in the server: asked main which, and the vfs owner.
+  - P7 run 3's 88.6 s explained to main: the await-F read 5.83 s, B 5.7 GB, the history one batch.
+  - Waiting: w-shared's review; main's answer on the hand-off; main's 57k churn run (then (b)).
