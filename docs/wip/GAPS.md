@@ -1721,7 +1721,11 @@
 > segment` (the production step's chunk turns counted, none past its copy slice). A made changeset's payload stays raw:
 > its record replays the changegroup itself (`write_made_record`), and no push lands whole any more (every push lands
 > as segments), so a stream compresses only a made changeset's places at stream time (`Streaming::sized` stays for
-> them). Owed: the count pass still reads a chunk place's bytes it could size by its length.
+> them). The count pass sizes a chunk place by its length since (2026-11-25, w-hg): its batch asks only raw places'
+> bytes, which it must compress to size, so a stream reads each chunk once, in its send pass. Held by
+> `a_streams_count_pass_sizes_a_chunk_place_by_its_length_never_reading_it` (the `states` stream from a store keeping
+> each revision as its chunk equals the stream from wholes byte for byte; the chunk bytes asked equal those sent, 907;
+> red: 1,814, each read by both passes).
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
@@ -1830,7 +1834,19 @@
 > At r4000 in process: 3,392 stored deltas, 562 on a parent, 14 wholes, 32 whole from a made text (a delta on neither
 > the one before nor a parent sent); the owner's requests 1,248 to 80, the store wait 1.27 s, `hg verify` clean, every
 > manifest the source's. A pull's base in `::common` is not this walk's: a pull (`Named`) reads each manifest whole to
-> plan its files, so its text is made whatever is sent. Owed: the 32; the 57k churn rerun (main's).
+> plan its files, so its text is made whatever is sent. Main's 57k churn at e51d998bf (2026-11-25): the clone's system
+> churn 9.67 GB (40.89 at fed0b8164), 5.51 GB of it `object_text` under `revision_text` under the view's manifest read
+> and 0.79 GB `revision_text_over`'s chain, none rebuilt: the walk asks the view for each manifest before it sends the
+> stored delta, and a let-go manifest's read began its chain's whole text before finding its windows away (about a
+> manifest a changeset). Nothing of the file walk reads a manifest: a clone walks the file logs by position (A-745).
+> Since (w-hg): `revision_text_over` looks at its revision's own object first and stops where the store holds it with
+> its windows away, and `object_text` makes a text only once its first window is read. Held by
+> `a_views_read_of_a_let_go_manifest_allocates_no_text` (`crates/hg/tests/push_heap.rs`: 103,218 B a read of a let-go
+> 91,200 B manifest, none made; now 74 B). Owed: the 32; the 57k churn rerun (main's). Found beside it, failing on main
+> before this change (the same bytes with it): that binary's `a_pushs_churn_per_changeset_is_its_file_alone` (145,223 B
+> an edit at a 91,200 B manifest, 1.59 manifests, against its 16 KiB bound; 10,284 B when it landed) and
+> `a_cached_file_base_is_read_where_it_lies` (192,642 B a revision of a 160 KiB file, 1.18 files): the push's intake
+> churn main measured (`manifest_step`, `put_window`), owed next.
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
@@ -2949,6 +2965,15 @@
 > daemon's own sweep publishes. Red `an_imports_arena_holds_its_keep_when_the_sweep_publishes_after_its_last_tail` (the
 > import's frees left deferred past its last tail, then a sweep pass): with `give_back_released`'s call taken out, the
 > sweep released 1,048,576 B and left 4,939,776 resident and free against 4,202,496; at 6e002e057, 786,432.
+> **P7 CLOSED (main's after arm, 2026-11-25 08:48-08:49 PST; main b8b3c741d, binary sha 46a0ed338b35; load 18 to 21;
+> three rounds interleaved with the bound arm; record `~/.cache/main-rounds/bench7/p7-after.txt`, `p7a-*.log`).** At
+> the settled reading (deferred 0 every round) the arena's resident free bytes were 14.8, 28.1 and 56.7 MB against
+> keeps (the bound, B) of 53.4, 28.2 and 125.8 MB: within the keep in all three, round 2 by 0.1 MB. The footprint
+> (macOS, `mem.gauge.process.footprint_bytes`) was 35.2 MB before the import, 223.1 MB at its end and 130.8 MB settled
+> in round 1; rounds 2 and 3 settled at 156.5 and 184.6 MB, the settled figure following each round's B, as the keep
+> should. `object_resident` settled at 20.0, 52.3 and 68.6 MB; `arena_free` at 79.8, 84.7 and 111.9 MB, mapped and
+> given back, so not in the footprint. The bound arm's binary has no footprint gauge, so there is no footprint A/B
+> against it, and its RSS across a purge is not comparable on macOS (BENCHMARKS' method note at its head).
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
