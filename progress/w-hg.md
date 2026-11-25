@@ -689,3 +689,9 @@ Waiting: main's route; arena-7 and arena-8.
 - 3e50c0aee (main 1aafd8f8e): main's three write-path items. hg_push work read-back: not a leak (within_budget step lend; guard added). hg_named partial group: fixed (red). record.rs finish error: not a leak (store released whole).
 - Sweep reported to main: svn and git write-path sites routed to their owners; read paths pending w-perf's division ruling.
 - Next: hg stream clone (4.7x stock) and the clone's let-go reads (~1.7x beyond load).
+
+## 2026-11-25: main's ruling (B) landed -- the content store's unlanded pins
+- 123d8c280 (main 4a0c23e20): `ContentStore::pin_unlanded`/`unpin_unlanded`, a count per window in the window table; every let-go refuses `Unlanded` while it is above zero (counted `vcs_store.content.kept_unlanded`); `pinned_away` counts a window found let go as pinned (must stay 0); NotHeld for a pin of nothing; CountExhausted at width. hg push: pins after each slice, unpins at each segment's let-go (`landed_segment`), the rest at the push's end; `taken_whole` unpins over the state it holds (Drop's nested with_state leaked them). Supersedes 7ad0c7931's PUSH_PINS. Reviewed by w-perf.
+- Reviewed w-perf's 142256360 (text_whole; the clone's text-cache walks): OK. Part 2 (batch bound) owed by w-perf; I review.
+- Owed to main: the six-push 57k loop (red: any UnknownDeltaBase, or kept_unlanded 0, or pinned_away > 0). w-svn moves svn onto the store's pins.
+- Next (main's order): stream v2 negotiated (stream2 capability, requires), then zstd compression and inline small revlogs; check crates/cli/bench/hg_stream_compare.sh (w-interop's b2888af84).
