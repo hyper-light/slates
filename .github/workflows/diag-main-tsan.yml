@@ -1,10 +1,9 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-24 17:38 PST): run 3, CI's TSan job at f387b56d3 measured whole. Run 2 (8c0d8fce8) failed at 569 s in
-# slates-rt on spin_kick's injection race (the test thread named an ask after the 1 ms window had closed), before the
-# server step; w-git's 427a27d1f names the ask on the shard's own thread and widens the window to 100 ms. This run says
-# whether the lane is green, whether w-svn's crash test (8c0d8fce8) holds, and whether the step fits 95 minutes with
-# the sweep skipped. The step is copied unchanged but for a limit only a hang reaches. Run only from
-# diag-measurer-main-tsan-* branches, never main.
+# main 01a20182 (2026-11-24 20:02 PST): run 4, CI's TSan job at 09b2f0d3c measured whole. Run 3 (f387b56d3) fit the step (1,929 s) and
+# failed four server tests: the merge-authority test (a family-bit test id, af061de87), t_a614a (its bound now the pace's
+# rule, 6354f521b), the hg parks test (its interval read before the release, f289d786f) and t_c2c (SERVER_SKIPPED in
+# 2cb9633ba). This run says whether the lane is green. The step is copied unchanged but for a limit only a hang reaches.
+# Run only from diag-measurer-main-tsan-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-tsan-*"]
