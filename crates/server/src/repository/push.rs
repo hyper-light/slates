@@ -312,11 +312,17 @@ struct Held {
   made: Vec<DbVolumeId>,
   /// Greens whose retention was secured, and the work a conflict left in the rejected cache, if any.
   secured: Vec<(DbVolumeId, Option<[u8; 32]>)>,
+  /// The increments a prepared create held for its new green ([`prepare_create`]), until its entry names them.
+  increments: Vec<(DbVolumeId, crate::merge_service::HeldIncrement)>,
 }
 
 impl Held {
-  /// Gives back what the push held: each branch made in memory retired, each retention trued up to what was retained.
+  /// Gives back what the push held: each prepared create's increment, each branch made in memory retired, each
+  /// retention trued up to what was retained.
   fn give_back(self, state: &mut ShardState) {
+    for (green, increment) in self.increments {
+      crate::merge_service::release_refused_increment(state, green, increment);
+    }
     for green in self.made {
       crate::merge_service::release_green_retention(state, green);
       super::retire_member(state, green);
@@ -348,7 +354,13 @@ pub(crate) fn push(
   changes: Vec<BranchChange>,
   parts: EntryParts,
 ) -> Result<Appended, AppendRefused> {
-  push_holding(state, (principal, repository), (changes, &[]), parts, None)
+  push_holding(
+    state,
+    (principal, repository),
+    (changes, &[], None),
+    parts,
+    None,
+  )
 }
 
 /// Counter: a version of an import's batch whose recorded apply did not reach its version, the green made again from
@@ -577,7 +589,7 @@ pub(crate) fn push_sealed(
   push_holding(
     state,
     (principal, repository),
-    (changes, &[]),
+    (changes, &[], None),
     parts,
     Some(Stored::Git((sealed, moves))),
   )
@@ -598,7 +610,7 @@ pub(crate) fn push_imported(
   push_holding(
     state,
     (principal, repository),
-    (changes, &[]),
+    (changes, &[], None),
     parts,
     Some(Stored::Imported((index, record))),
   )
@@ -606,18 +618,23 @@ pub(crate) fn push_imported(
 
 /// [`push`] of a Mercurial push (A-680 part 2c): the entry holds the push's record (`slates_hg::import::record`'s
 /// `Source::Push`, the revisions it brought), which a recovery replays into the index after the import's; the landing
-/// puts its fork in the index's place once the entry is appended (`repository::hg_push::land`).
+/// puts its fork in the index's place once the entry is appended (`repository::hg_push::land`). Its creates are taken
+/// from `prepared` where its driver made them ahead of the landing's step ([`PreparedCreates`]).
 pub(crate) fn push_hg(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
-  (changes, ahead): (Vec<BranchChange>, &[crate::held_ahead::HeldAhead]),
+  (changes, ahead, prepared): (
+    Vec<BranchChange>,
+    &[crate::held_ahead::HeldAhead],
+    Option<&mut PreparedCreates>,
+  ),
   parts: EntryParts,
   record: Vec<u8>,
 ) -> Result<Appended, AppendRefused> {
   push_holding(
     state,
     (principal, repository),
-    (changes, ahead),
+    (changes, ahead, prepared),
     parts,
     Some(Stored::Pushed(record)),
   )
@@ -648,7 +665,7 @@ pub(crate) fn push_lfs(
   push_holding(
     state,
     (principal, repository),
-    (Vec::new(), &[]),
+    (Vec::new(), &[], None),
     EntryParts::default(),
     Some(Stored::Lfs(upload)),
   )
@@ -674,7 +691,11 @@ enum Stored<'p, 'u> {
 fn push_holding(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
-  (changes, ahead): (Vec<BranchChange>, &[crate::held_ahead::HeldAhead]),
+  (changes, ahead, prepared): (
+    Vec<BranchChange>,
+    &[crate::held_ahead::HeldAhead],
+    Option<&mut PreparedCreates>,
+  ),
   parts: EntryParts,
   stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
@@ -706,7 +727,13 @@ fn push_holding(
   }
   let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
-  let pushed = push_planned(state, &record, (steps, parts), (&mut held, ahead), stored);
+  let pushed = push_planned(
+    state,
+    &record,
+    (steps, parts),
+    (&mut held, ahead, prepared),
+    stored,
+  );
   if pushed.is_err() {
     held.give_back(state);
   } else {
@@ -994,17 +1021,366 @@ fn plan_delete(
   })
 }
 
+/// Counted most: the greens whose work one push's landing step secured, judged, held and committed (goal 93, the landing
+/// spin: a push of a history with 452 heads made 452 line greens and did each one's work in that one step, past the
+/// watchdog's window). Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_STEP_WORKS: &str = "repository.push.landing_step_works_most";
+
+/// Counter: a create a push's driver prepared ahead of its landing's step that the step's plan did not name as planned
+/// (another name, base or version): prepared again within the step ([`prepare_create`]); zero where nothing moved
+/// between, as the landing turn holds it. Format: a counter name in the daemon's status report.
+pub(crate) const CREATE_MISSES: &str = "repository.push.create_misses";
+
+/// Counter: a slice of a push's creates prepared ahead of its landing's step ([`PreparedCreates::prepare_some`]): more
+/// than one a push shows its new greens were made a slice at a time. Format: a counter name in the daemon's status
+/// report.
+pub(crate) const CREATE_SLICES: &str = "repository.push.create_slices";
+
+/// A create made: its step (the new green's record), what it holds until its entry is recorded, and its verdict, its
+/// work committed into the new green (none for a create with no work, or one whose work was accepted before).
+struct PreparedCreate {
+  /// The create's step.
+  step: Step,
+  /// The new green made and its retention secured, and its increment held.
+  held: Held,
+  /// Its work's verdict, committed.
+  verdict: Option<Verdict>,
+}
+
+impl PreparedCreate {
+  /// Gives back what it holds: its increment, its green retired, its retention trued up.
+  fn give_back(self, state: &mut ShardState) {
+    self.held.give_back(state);
+  }
+}
+
+/// Makes a create (goal 93, the landing spin; main's ruling of 2026-11-24 14:32, w-git's of 14:57): its new green
+/// branched (`make`), its work's retention secured, judged, its increment held and its verdict committed into the green
+/// (`secure`, `judge`, `hold_increments`, `commit`, each over this one step). The green is no reader's until its record
+/// lands (its id is named by no record), so committing before the entry shows nothing: a create's verdict is committed
+/// before the register's guard in memory alone, and nothing durable precedes the entry (its chain entry is appended with
+/// it by `recorded_entry`; a refusal at the guard leaves nothing on disk). The one way a push makes a
+/// create: ahead of its landing's step a slice at a time ([`PreparedCreates`]), or within it. Refused with what it made
+/// given back; a refused change's index is the step's own, 0.
+fn prepare_create(
+  state: &mut ShardState,
+  step: Step,
+  ahead: &[crate::held_ahead::HeldAhead],
+) -> Result<PreparedCreate, AppendRefused> {
+  let mut prepared = PreparedCreate {
+    step,
+    held: Held::default(),
+    verdict: None,
+  };
+  match prepare_into(state, &mut prepared, ahead) {
+    Ok(()) => Ok(prepared),
+    Err(refused) => {
+      prepared.give_back(state);
+      Err(refused)
+    }
+  }
+}
+
+/// [`prepare_create`]'s phases over its one step.
+fn prepare_into(
+  state: &mut ShardState,
+  prepared: &mut PreparedCreate,
+  ahead: &[crate::held_ahead::HeldAhead],
+) -> Result<(), AppendRefused> {
+  let PreparedCreate {
+    step,
+    held,
+    verdict,
+  } = prepared;
+  let steps = core::slice::from_mut(step);
+  make(state, steps, held).map_err(AppendRefused::Changes)?;
+  secure(state, (steps, &[false]), held).map_err(AppendRefused::Changes)?;
+  let verdicts = judge(state, (steps, &[false]), held).map_err(AppendRefused::Changes)?;
+  let increments = hold_increments(state, (steps, &verdicts), ahead)?;
+  let committed = match commit(state, steps, verdicts) {
+    Ok(committed) => committed,
+    Err(refused) => {
+      release_increments(state, steps, increments);
+      return Err(refused);
+    }
+  };
+  let green = steps.first().and_then(Step::work).map(|(green, _)| green);
+  *verdict = match (
+    committed.into_iter().next().flatten(),
+    increments.into_iter().next().flatten(),
+    green,
+  ) {
+    (Some((version, applied, false)), Some(increment), Some(green)) => {
+      held.increments.push((green, increment));
+      let entry = match steps.first().and_then(Step::work) {
+        Some((green, work)) => chain_entry_of(state, (green, work), &applied, increment.inputs),
+        None => Vec::new(),
+      };
+      Some(Verdict::Committed {
+        version,
+        applied,
+        increment,
+        entry,
+      })
+    }
+    (Some((version, _, true)), _, _) => Some(Verdict::Before(version)),
+    _ => None,
+  };
+  Ok(())
+}
+
+/// Each create of `steps` made ([`prepare_create`]): taken from `prepared` by its name, base and version, the step
+/// replaced by the prepared one's (its record's id the one reserved when it was planned), else prepared now, a miss
+/// counted where `prepared` was given. Which steps were made, and each made one's verdict; what each holds moved into
+/// `held`.
+fn creates_made(
+  state: &mut ShardState,
+  steps: &mut [Step],
+  (held, ahead, mut prepared): (
+    &mut Held,
+    &[crate::held_ahead::HeldAhead],
+    Option<&mut PreparedCreates>,
+  ),
+) -> Result<(Vec<bool>, Vec<Option<Verdict>>), AppendRefused> {
+  let mut adopted = vec![false; steps.len()];
+  let mut created: Vec<Option<Verdict>> = (0..steps.len()).map(|_| None).collect();
+  for (index, step) in steps.iter_mut().enumerate() {
+    let Step::Create {
+      name,
+      from,
+      version,
+      ..
+    } = step
+    else {
+      continue;
+    };
+    let found = prepared
+      .as_deref_mut()
+      .and_then(|prepared| prepared.take(name, *from, *version));
+    let made = match found {
+      Some(made) => made,
+      None => {
+        if prepared.is_some() {
+          state.count(CREATE_MISSES, 1);
+        }
+        let planned = core::mem::replace(step, placeholder());
+        prepare_create(state, planned, ahead).map_err(|refused| at_index(refused, index))?
+      }
+    };
+    let PreparedCreate {
+      step: made_step,
+      held: made_held,
+      verdict,
+    } = made;
+    *step = made_step;
+    held.made.extend(made_held.made);
+    held.secured.extend(made_held.secured);
+    held.increments.extend(made_held.increments);
+    if let (Some(adopted), Some(created)) = (adopted.get_mut(index), created.get_mut(index)) {
+      *adopted = true;
+      *created = verdict;
+    }
+  }
+  Ok((adopted, created))
+}
+
+/// A step standing in for one taken out to be made, replaced before anything reads it.
+fn placeholder() -> Step {
+  Step::Delete {
+    name: String::new(),
+    green: DbVolumeId { bytes: [0; 16] },
+    version: 0,
+  }
+}
+
+/// `refused`, a refusal of a create made over its one step, naming the push's change at `index`.
+fn at_index(refused: AppendRefused, index: usize) -> AppendRefused {
+  match refused {
+    AppendRefused::Changes(changes) => AppendRefused::Changes(
+      changes
+        .into_iter()
+        .map(|change| ChangeRefused { index, ..change })
+        .collect(),
+    ),
+    other => other,
+  }
+}
+
+/// A push's creates planned and made ahead of its landing's step, a slice at a time (goal 93, the landing spin; main's
+/// ruling of 2026-11-24 14:32, w-git's written OK of 14:57): each a new green no reader reaches until its record lands,
+/// made by [`prepare_create`] as the step would make it. Planned once, their ids minted as the step's plan mints them
+/// (A-694's offsets) and reserved (`ShardState::family_reserved_through`, as a repository's creation reserves its, A-767
+/// item 7), so nothing minted between the slices takes one; charged to the push's room before the first slice. The
+/// step takes each by its name ([`push_hg`]); what it does not take is given back ([`PreparedCreates::give_back`]).
+/// Tool-neutral: matched by name, base and version alone.
+pub(crate) struct PreparedCreates {
+  /// The creates planned and not yet made, in order.
+  planned: std::collections::VecDeque<Step>,
+  /// The creates made.
+  made: Vec<PreparedCreate>,
+}
+
+impl PreparedCreates {
+  /// Plans the creates of `changes` (each `Create` with its work taken out, its name, base and version left for the
+  /// step's plan), as the step's plan plans them: refused as it would refuse them, each naming its change; their ids
+  /// reserved; and the retention their works reserve on the greens they are made from, summed, charged against `room`:
+  /// past it, refused typed before any is made. The creates, and what they charged.
+  pub(crate) fn plan(
+    state: &mut ShardState,
+    (principal, repository): (&Principal, RepositoryId),
+    changes: &mut [BranchChange],
+    room: u64,
+  ) -> Result<(PreparedCreates, u64), AppendRefused> {
+    let record = state
+      .db
+      .partition()
+      .repositories()
+      .repository(repository)
+      .cloned()
+      .ok_or(AppendRefused::Repository(Refusal::NotFound))?;
+    let mut positions = Vec::new();
+    let mut creates = Vec::new();
+    for (index, change) in changes.iter_mut().enumerate() {
+      if let BranchChange::Create {
+        name,
+        from,
+        version,
+        work,
+      } = change
+      {
+        positions.push(index);
+        creates.push(BranchChange::Create {
+          name: name.clone(),
+          from: *from,
+          version: *version,
+          work: work.take(),
+        });
+      }
+    }
+    let steps = plan(state, &record, principal, creates).map_err(|refused| {
+      AppendRefused::Changes(
+        refused
+          .into_iter()
+          .map(|change| ChangeRefused {
+            index: positions.get(change.index).copied().unwrap_or(change.index),
+            ..change
+          })
+          .collect(),
+      )
+    })?;
+    let mut charged = 0u64;
+    for step in &steps {
+      let (Step::Create { from, .. }, Some((_, work))) = (step, step.work()) else {
+        continue;
+      };
+      let reserved = state.greens.get(from).map_or(0, |engine| {
+        engine
+          .history_reservation(work)
+          .saturating_add(engine.changes_reservation(work))
+      });
+      charged = charged.saturating_add(u64::try_from(reserved).unwrap_or(u64::MAX));
+    }
+    if charged > room {
+      return Err(AppendRefused::Entry(Refusal::BudgetExceeded {
+        available: room,
+      }));
+    }
+    for step in &steps {
+      if let Step::Create { record, .. } = step
+        && let Some(number) = slates_db::register::ObjectId(record.id.bytes).family_number()
+      {
+        state.family_reserved_through = state
+          .family_reserved_through
+          .max(u64::from(number).saturating_add(1));
+      }
+    }
+    Ok((
+      PreparedCreates {
+        planned: steps.into(),
+        made: Vec::new(),
+      },
+      charged,
+    ))
+  }
+
+  /// Makes the next creates ([`prepare_create`]) until the shard's step budget is spent from now, at least one;
+  /// counted. Whether every one is made; refused with what this slice tried given back, the caller giving the rest
+  /// back.
+  pub(crate) fn prepare_some(
+    &mut self,
+    state: &mut ShardState,
+    ahead: &[crate::held_ahead::HeldAhead],
+  ) -> Result<bool, AppendRefused> {
+    let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
+    let deadline = slates_rt::futures::now_ns().saturating_add(budget);
+    state.count(CREATE_SLICES, 1);
+    while let Some(step) = self.planned.pop_front() {
+      self.made.push(prepare_create(state, step, ahead)?);
+      if slates_rt::futures::now_ns() >= deadline {
+        break;
+      }
+    }
+    Ok(self.planned.is_empty())
+  }
+
+  /// The create made for `name` from `from` at `version`, taken; none where none was.
+  fn take(&mut self, name: &str, from: DbVolumeId, version: u64) -> Option<PreparedCreate> {
+    let at = self.made.iter().position(|made| {
+      matches!(&made.step, Step::Create { name: made_name, from: made_from, version: made_version, .. }
+        if made_name == name && *made_from == from && *made_version == version)
+    })?;
+    Some(self.made.swap_remove(at))
+  }
+
+  /// The new greens made so far, for a test.
+  #[cfg(test)]
+  pub(crate) fn made_greens(&self) -> Vec<DbVolumeId> {
+    self
+      .made
+      .iter()
+      .filter_map(|made| match &made.step {
+        Step::Create { record, .. } => Some(record.id),
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// Gives back every create made and not taken: its increment, its green retired, its retention trued up.
+  pub(crate) fn give_back(self, state: &mut ShardState) {
+    for made in self.made {
+      made.give_back(state);
+    }
+  }
+}
+
 /// The push once planned (module docs, items 2 to 4, then the commit): what it held is in `held` until it is recorded.
+/// Each create is made by [`prepare_create`]: taken from `prepared` where its driver prepared it ahead of this step,
+/// else prepared here.
 fn push_planned(
   state: &mut ShardState,
   record: &RepositoryRecord,
   (mut steps, parts): (Vec<Step>, EntryParts),
-  (held, ahead): (&mut Held, &[crate::held_ahead::HeldAhead]),
+  (held, ahead, prepared): (
+    &mut Held,
+    &[crate::held_ahead::HeldAhead],
+    Option<&mut PreparedCreates>,
+  ),
   mut stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
-  make(state, &steps, held).map_err(AppendRefused::Changes)?;
-  secure(state, &steps, held).map_err(AppendRefused::Changes)?;
-  let verdicts = judge(state, &mut steps, held).map_err(AppendRefused::Changes)?;
+  let (adopted, mut created) = creates_made(state, &mut steps, (held, ahead, prepared))?;
+  let works = steps
+    .iter()
+    .zip(&adopted)
+    .filter(|(step, adopted)| step.work().is_some() && !**adopted)
+    .count();
+  state.count_max(LANDING_STEP_WORKS, u64::try_from(works).unwrap_or(u64::MAX));
+  secure(state, (&steps, &adopted), held).map_err(AppendRefused::Changes)?;
+  let mut verdicts = judge(state, (&mut steps, &adopted), held).map_err(AppendRefused::Changes)?;
+  for (verdict, made) in verdicts.iter_mut().zip(created.iter_mut()) {
+    if let Some(made) = made.take() {
+      *verdict = Some(made);
+    }
+  }
   let made: Vec<VolumeRecord> = steps
     .iter()
     .filter_map(|step| match step {
@@ -1162,15 +1538,32 @@ fn apply_planned(
   (entry, made): (RepositoryEntry, Vec<VolumeRecord>),
   (held, ahead): (&mut Held, &[crate::held_ahead::HeldAhead]),
 ) -> Result<Appended, AppendRefused> {
-  let increments = hold_increments(state, (steps, &verdicts), ahead)?;
+  let increments = match hold_increments(state, (steps, &verdicts), ahead) {
+    Ok(increments) => increments,
+    Err(refused) => {
+      // `hold_increments` gave back every increment, the prepared creates' among them.
+      held.increments.clear();
+      return Err(refused);
+    }
+  };
+  // A prepared create's chain entry was encoded with it, ahead of this step.
+  let mut verdicts = verdicts;
+  let mut encoded: Vec<Option<Vec<u8>>> = verdicts
+    .iter_mut()
+    .map(|verdict| match verdict {
+      Some(Verdict::Committed { entry, .. }) => Some(core::mem::take(entry)),
+      _ => None,
+    })
+    .collect();
   let committed = match commit(state, steps, verdicts) {
     Ok(committed) => committed,
     Err(refused) => {
       release_increments(state, steps, increments);
+      held.increments.clear();
       return Err(refused);
     }
   };
-  let entry = recorded_entry(state, entry, steps, &committed, &increments);
+  let entry = recorded_entry(state, entry, (steps, &mut encoded), &committed, &increments);
   let mut ops: Vec<Op> = made
     .into_iter()
     .map(|record| Op::VolumeCreated { record })
@@ -1178,11 +1571,13 @@ fn apply_planned(
   ops.push(Op::RepositoryAdvanced { entry });
   if let Err(refusal) = crate::verbs::publish_held_increments(state) {
     release_increments(state, steps, increments);
+    held.increments.clear();
     return Err(AppendRefused::Entry(refusal));
   }
   record_all(state, ops)?;
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
+  held.increments.clear();
   after(state, steps, &committed, held);
   Ok(answer_committed(steps, &committed, true))
 }
@@ -1229,11 +1624,15 @@ fn make(state: &mut ShardState, steps: &[Step], held: &mut Held) -> Result<(), V
 /// Secures each work's retention on its green before the verdict (A-16), folding first to leave it room.
 fn secure(
   state: &mut ShardState,
-  steps: &[Step],
+  (steps, adopted): (&[Step], &[bool]),
   held: &mut Held,
 ) -> Result<(), Vec<ChangeRefused>> {
   let mut refused = Vec::new();
   for (index, step) in steps.iter().enumerate() {
+    // A prepared create's work was secured ahead of this step ([`prepare_create`]).
+    if adopted.get(index).copied().unwrap_or(false) {
+      continue;
+    }
     let Some((green, work)) = step.work() else {
       continue;
     };
@@ -1274,6 +1673,19 @@ enum Verdict {
   Held(Box<Judged>),
   /// Accepted before as this version.
   Before(u64),
+  /// Accepted and committed into a new green ahead of the entry ([`prepare_create`]): the version it made, what its
+  /// commit applied, its increment held, which the entry names, and its chain entry, encoded as the step would encode it
+  /// ([`chain_entry_of`]).
+  Committed {
+    /// The version made.
+    version: u64,
+    /// What the commit applied.
+    applied: Vec<slates_merge::chain_entry::Applied>,
+    /// Its increment, held.
+    increment: crate::merge_service::HeldIncrement,
+    /// Its chain entry.
+    entry: Vec<u8>,
+  },
 }
 
 /// Counter: the files a push's works named for the objects the content store holds whole rather than carried (A-887,
@@ -1328,12 +1740,17 @@ fn judged_lent(
 /// 01a20182's ruling of 2026-11-22 ~11:50).
 fn judge(
   state: &mut ShardState,
-  steps: &mut [Step],
+  (steps, adopted): (&mut [Step], &[bool]),
   held: &mut Held,
 ) -> Result<Vec<Option<Verdict>>, Vec<ChangeRefused>> {
   let mut verdicts = Vec::new();
   let mut refused = Vec::new();
   for (index, step) in steps.iter_mut().enumerate() {
+    // A prepared create's verdict was judged and committed ahead of this step ([`prepare_create`]).
+    if adopted.get(index).copied().unwrap_or(false) {
+      verdicts.push(None);
+      continue;
+    }
     let Some((green, work)) = step.work_mut() else {
       verdicts.push(None);
       continue;
@@ -1444,11 +1861,16 @@ fn entry(
     }
   }
   for (step, verdict) in steps.iter().zip(verdicts) {
-    if let (Some((green, work)), Some(Verdict::Held(judged))) = (step.work(), verdict) {
+    let made = match verdict {
+      Some(Verdict::Held(judged)) => Some(judged.at().saturating_add(1)),
+      Some(Verdict::Committed { version, .. }) => Some(*version),
+      _ => None,
+    };
+    if let (Some((green, work)), Some(version)) = (step.work(), made) {
       let bound = slates_merge::chain_entry::entry_bound(work);
       entry.versions.push(GreenVersion {
         green,
-        version: judged.at().saturating_add(1),
+        version,
         entry: vec![0; bound],
       });
     }
@@ -1572,6 +1994,13 @@ fn commit(
         }
       }
       (_, Some(Verdict::Before(version))) => Some((version, Vec::new(), true)),
+      // Committed into its new green ahead of this step by its prepared create.
+      (
+        _,
+        Some(Verdict::Committed {
+          version, applied, ..
+        }),
+      ) => Some((version, applied, false)),
       // The deferred update's green owes its push from here (P2), its content its head's until first reached.
       _ => match step {
         Step::Defer { green, push } => match state.greens.defer(green, push.clone()) {
@@ -1613,6 +2042,8 @@ fn hold_increments(
           }
         }
       }
+      // Held already by its prepared create, ahead of this step.
+      (_, Some(Verdict::Committed { increment, .. })) => Some(*increment),
       _ => None,
     };
     increments.push(held);
@@ -1665,26 +2096,26 @@ fn release_increments(
 fn recorded_entry(
   state: &mut ShardState,
   mut entry: RepositoryEntry,
-  steps: &[Step],
+  (steps, encoded): (&[Step], &mut [Option<Vec<u8>>]),
   committed: &Committed,
   increments: &[Option<crate::merge_service::HeldIncrement>],
 ) -> RepositoryEntry {
   let mut versions = Vec::new();
-  for ((step, made), held) in steps.iter().zip(committed).zip(increments) {
+  for (((step, made), held), encoded) in steps
+    .iter()
+    .zip(committed)
+    .zip(increments)
+    .zip(encoded.iter_mut())
+  {
     let (Some((green, work)), Some((version, applied, false)), Some(held)) =
       (step.work(), made, held)
     else {
       continue;
     };
-    let identity = crate::merge_service::record_goes_to_holders(state, green)
-      .then(|| {
-        state
-          .greens
-          .get_mut(&green)
-          .map(|mut engine| engine.head_identity())
-      })
-      .flatten();
-    let bytes = slates_merge::chain_entry::encode(held.inputs, work, applied, None, identity, None);
+    let bytes = match encoded.take() {
+      Some(bytes) => bytes,
+      None => chain_entry_of(state, (green, work), applied, held.inputs),
+    };
     versions.push(GreenVersion {
       green,
       version: *version,
@@ -1701,6 +2132,25 @@ fn recorded_entry(
   }
   entry.versions = versions;
   entry
+}
+
+/// The chain entry of `green`'s version made by `work`, which `applied` (chain entry format 6: its inputs held as
+/// `inputs`), naming the green's head's identity where its record goes to holders.
+fn chain_entry_of(
+  state: &mut ShardState,
+  (green, work): (DbVolumeId, &Increment),
+  applied: &[slates_merge::chain_entry::Applied],
+  inputs: slates_merge::chain_entry::Inputs,
+) -> Vec<u8> {
+  let identity = crate::merge_service::record_goes_to_holders(state, green)
+    .then(|| {
+      state
+        .greens
+        .get_mut(&green)
+        .map(|mut engine| engine.head_identity())
+    })
+    .flatten();
+  slates_merge::chain_entry::encode(inputs, work, applied, None, identity, None)
 }
 
 /// Records `ops` as one log record: in the caller's transaction when one is open, else in one of the push's own, closed

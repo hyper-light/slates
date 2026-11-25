@@ -576,6 +576,115 @@ fn every_refused_change_is_named_and_nothing_is_applied() {
   });
 }
 
+/// Goal 93, the landing spin (main's ruling of 2026-11-24 14:32; w-git's note (c) of 14:57: what a landing does not take
+/// is given back). Do: plan two creates from `main`, each with a work, ahead of a landing (`PreparedCreates::plan`), and
+/// make them a slice at a time; then give them back, as a refused or moved landing does; then push the same two creates.
+/// Expect: two new greens made, each gone once given back and neither named by the repository; the push of the same
+/// creates then lands both.
+#[test]
+fn creates_made_ahead_of_a_landing_and_not_taken_are_given_back() {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
+    let (repo, [main, _], mut store, one) = two_branches(state);
+    let changes = |state: &ShardState, store: &mut Store| -> Vec<BranchChange> {
+      [("made-a", 30u8), ("made-b", 31u8)]
+        .into_iter()
+        .map(|(name, seed)| {
+          let tree = store.put_tree(&[("f", b"one"), (name, name.as_bytes())]);
+          BranchChange::Create {
+            name: name.to_owned(),
+            from: main,
+            version: 1,
+            work: Some(work(
+              state,
+              main,
+              (1, Some(one)),
+              (tree, name.as_bytes()),
+              (&*store, seed),
+            )),
+          }
+        })
+        .collect()
+    };
+    let mut planned = changes(state, &mut store);
+    let (mut creates, charged) =
+      super::PreparedCreates::plan(state, (&owner(), repo), &mut planned, u64::MAX)
+        .expect("planned");
+    assert!(charged > 0, "their retention charged");
+    while !creates.prepare_some(state, &[]).expect("made") {}
+    let made = creates.made_greens();
+    assert_eq!(made.len(), 2, "both made ahead");
+    assert!(made.iter().all(|green| state.greens.contains_key(green)));
+    creates.give_back(state);
+    assert!(
+      made.iter().all(|green| !state.greens.contains_key(green)),
+      "each given back"
+    );
+    assert_eq!(
+      state.db.partition().repositories().branch(repo, "made-a"),
+      None
+    );
+    let again = changes(state, &mut store);
+    let pushed = push(state, &owner(), repo, again, EntryParts::default());
+    assert!(pushed.is_ok(), "{pushed:?}");
+    assert!(
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, "made-a")
+        .is_some()
+    );
+    assert!(
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, "made-b")
+        .is_some()
+    );
+  });
+}
+
+/// Goal 93, the landing spin (main's ruling of 2026-11-24 14:32: the made greens held across slices count against the
+/// push's room, refused typed before any slice past it). Do: plan a create from `main` with a work against a room of 0.
+/// Expect: refused `BudgetExceeded` naming the room, before anything is made: no green made, the name still free.
+#[test]
+fn creates_past_their_pushs_room_are_refused_before_any_is_made() {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
+    let (repo, [main, _], mut store, one) = two_branches(state);
+    let tree = store.put_tree(&[("f", b"one"), ("past", b"past")]);
+    let greens = state.greens.keys().count();
+    let mut planned = vec![BranchChange::Create {
+      name: "past".to_owned(),
+      from: main,
+      version: 1,
+      work: Some(work(
+        state,
+        main,
+        (1, Some(one)),
+        (tree, b"past"),
+        (&store, 40),
+      )),
+    }];
+    let refused = super::PreparedCreates::plan(state, (&owner(), repo), &mut planned, 0).err();
+    assert!(
+      matches!(
+        refused,
+        Some(AppendRefused::Entry(Refusal::BudgetExceeded {
+          available: 0
+        }))
+      ),
+      "{:?}",
+      refused.map(|refused| format!("{refused:?}"))
+    );
+    assert_eq!(state.greens.keys().count(), greens, "no green made");
+    assert_eq!(
+      state.db.partition().repositories().branch(repo, "past"),
+      None
+    );
+  });
+}
+
 fn create(name: &str, from: DbVolumeId, version: u64) -> BranchChange {
   BranchChange::Create {
     name: name.to_owned(),
@@ -1903,7 +2012,7 @@ fn assert_landed_naming_its_hold(
   let pushed = super::push_holding(
     state,
     (&owner(), repo),
-    (vec![change], &[held]),
+    (vec![change], &[held], None),
     EntryParts::default(),
     None,
   );
@@ -1938,7 +2047,11 @@ fn assert_refused_giving_its_hold_back(
   let refused = super::push_holding(
     state,
     (&owner(), repo),
-    (vec![BranchChange::Update { green, work: stale }], &[held]),
+    (
+      vec![BranchChange::Update { green, work: stale }],
+      &[held],
+      None,
+    ),
     EntryParts::default(),
     None,
   );
