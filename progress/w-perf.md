@@ -733,3 +733,8 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - LANDED 2a4cf8846: kept-short runs stay recorded (red: second purge gave back nothing).
   - Next: (b) of the churn ruling: the push's make_chain keep (TextCache::keep's chunks, 80.9% of the push's mapped
     churn at 57k) and the owner's serve (15.3% of the clone's system churn); the clone's hg sites wait for w-hg step 3.
+- 2026-11-25 ~23:00 PST:
+  - LANDED b4aa00ef8: the idle purge walks nothing while no recorded run reaches the discard size (purge_owed,
+    UnitSet::run_reaches); red an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size.
+  - Next: (b) of the churn ruling: TextCache::keep's chunk churn under make_chain (80.9% of the 57k push's mapped
+    churn) and the owner's serve (15.3% of the clone's system churn).
