@@ -55,7 +55,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           printf '%s\n' '#!/bin/sh' 'exec uvx --quiet --from mercurial==7.2.4 hg "$@"' > "$RUNNER_TEMP/bin/hg"
           chmod +x "$RUNNER_TEMP/bin/hg"
-          echo "HG=$RUNNER_TEMP/bin/hg" >> "$GITHUB_ENV"
+          # A Unix path: RUNNER_TEMP is `D:\a\_temp`, whose backslashes bash dropped in the matrix's rows (run 45605246530,
+          # every Windows row exit 127, "D:a_temp/bin/hg: No such file or directory").
+          echo "HG=$(cygpath -u "$RUNNER_TEMP/bin/hg")" >> "$GITHUB_ENV"
           echo "SLATES=$(cygpath -w "$PWD/target/release/slates.exe")" >> "$GITHUB_ENV"
           echo "AWS_LC_SYS_PREBUILT_NASM=0" >> "$GITHUB_ENV"
       - name: Build
