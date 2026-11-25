@@ -37658,8 +37658,13 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// held from a read) and its read counted past tolerance: below where a's hold now begins, a counts as one gone, and the
 /// old holder alone is no quorum, so the newest surviving value is never taken for the committed one (the open edge:
 /// refused typed, the register's candidacy owed). Red without the start rule: a's empty answer named nothing there,
-/// the old holder's prefix adopted on its word alone.
+/// the old holder's prefix adopted on its word alone. The scene is asserted to form (a push after the restart lands, so
+/// the old holder acknowledged a's parts and its green's version, and a part reached the newcomer): about 1 run in 3
+/// it does not, the old holder refusing a's records after its warm restart, which is A-921's red (main 01a20182's
+/// ruling of 2026-11-25). Ignored until A-921: run it by name with `cargo test -p slates-server --test fleet
+/// a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact`.
 #[test]
+#[ignore = "A-921: a warm-restarted owner's records refused by the surviving holder about 1 run in 3; run by name with --ignored"]
 fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
   let _serial = serialize_fleet_tests();
   let mut fleet = anchored_git_fleet_of("restarted-owner-log", &["a", "b", "c", "d"]);
@@ -37732,7 +37737,14 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
      {taken}; pushes {pushed:?}; the newcomer's read past tolerance {refused}, positions held {held:?}"
   );
   assert_eq!(first, Ok(()), "the push before the restart landed");
-  assert!(both_hold && restarted && taken, "the scene formed");
+  assert!(
+    both_hold && restarted && taken,
+    "the fleet formed, a restarted, the death taken over"
+  );
+  assert!(
+    pushed.iter().any(Result::is_ok),
+    "a push after a's warm restart landed (A-921's red: the old holder refused a's records): {pushed:?}"
+  );
   assert!(refused, "the newcomer's read was past tolerance");
   assert_eq!(
     held,

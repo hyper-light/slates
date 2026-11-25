@@ -63801,8 +63801,14 @@ Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc
       met quorum on an old holder's lower-epoch value and adopted it.
   - The newcomer reads `[its position, the refused part's from]` from the other candidates, folds the answers with
     its own at the cohort's quorum (`ledger_positions_chained`), and holds each adopted position in order
-    (`Acceptor::hold_read`). Each part must continue the copy before it (`state_log::judge`). The owner's next
-    shipment continues it.
+    (`Acceptor::hold_read`). Each part must continue the copy before it (`state_log::judge`). The routing view
+    learns the register then, as an accepted record makes it learn one, so each install raises the new acceptor with
+    the others. Without that, one run in six kept its acceptor at the read's generation, and every later part was
+    refused `ForeignGeneration` for good. Swept for a third holder of a new acceptor that skips routing (main's
+    ruling): the production sites are `fleet::hold_checked_record` (routes on accept),
+    `content_holder::restore_held_registers` (routes at restore), `takeover::commit_adopted_at` (the successor's own
+    copy, routed by `record_adoption`'s `track_owner_on_every_shard`) and this one; every other site is a test. The
+    owner's next shipment continues it.
     - **Continuity is the fold's one rule, a parameter** (main's ruling). The fold passes over a position its cohorts
       are ready at with no report: a quorum named nothing there, so nothing committed there. It adopts a reported
       position only if it continues the last adopted, and stops at the first that is not ready or breaks the chain.
@@ -63844,7 +63850,9 @@ Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc
     parts fell back to 0 bytes.
   - Fleet `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins` (a restarted warm before
     the newcomer reads): the read is past tolerance and the newcomer holds nothing. Without the start rule it adopted
-    the old holder's prefix.
+    the old holder's prefix. Its scene fails to form about 1 run in 3: the surviving holder refuses a's records after
+    its warm restart, so no part reaches the newcomer. So it asserts the scene forms and is `#[ignore]`d as A-921's
+    red, run by name, until A-921 lands (main's ruling). The rule's own guard is the unit red above.
   - `slates_db::takeover::tests::an_answer_names_nothing_only_from_the_first_position_it_holds` (main's red: Ready
     with epoch 1 before, past tolerance after), `a_read_lists_what_a_candidate_holds_with_its_start_and_moves_nothing`,
     `a_state_logs_fold_adopts_only_parts_that_continue_the_last` (main's red: the part at 30 past a missing 20 never

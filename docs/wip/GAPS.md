@@ -300,6 +300,13 @@
 >   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
 >   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
 >   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **OPEN, w-shared's next piece (A-921, found by A-919's owner-restart scene; before A-918 B): after an owner's warm
+>   restart and a death, the surviving original holder refuses the owner's later records about 1 run in 3.** The names
+>   log stays acknowledged by the owner alone, the green's next version is owed to the old holder, every push is
+>   refused `unable to commit`, and no part reaches a newcomer. Red:
+>   `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`, `#[ignore]`d until A-921
+>   (`cargo test -p slates-server --test fleet <that name> -- --ignored --exact`). Red first, from the old holder's
+>   refusal counters: which refusal, at what epoch and position. It may be the sibling below showing itself.
 > - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
 >   but the record plane builds it empty, and no image carries it. An owner's warm restart spends one of `f`, unseen,
 >   on every record it counted itself in: commit at {owner, departed}, restart the owner warm, retire the departed,

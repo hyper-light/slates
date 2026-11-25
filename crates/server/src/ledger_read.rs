@@ -55,6 +55,9 @@ pub(crate) const BYTES_HELD: &str = "fleet.ledger_read.bytes_held";
 pub(crate) const PAST_TOLERANCE: &str = "fleet.ledger_read.past_tolerance";
 /// Counter: a read refused as it was served (not a current candidate, or another generation). Format: a counter name.
 pub(crate) const REFUSED: &str = "fleet.ledger_read.refused";
+/// Counter: a register a read held positions of that the routing view refused to learn (its owner not a member), so no
+/// install raises its acceptor. Format: a counter name.
+pub(crate) const UNTRACKED: &str = "fleet.ledger_read.untracked";
 /// Counter: an adopted position that did not continue this node's copy, held no further. Format: a counter name.
 pub(crate) const DISCONTINUOUS: &str = "fleet.ledger_read.discontinuous";
 
@@ -345,6 +348,20 @@ fn hold_adopted(
       );
     }
     held = held.saturating_add(1);
+  }
+  // The routing view learns the register as an accepted record makes it learn one (`fleet::hold_checked_record`), so
+  // each install raises this acceptor's authority with the others'. Unlearned, it stayed at the generation of the read,
+  // and once the takeover's next install moved it, refused every part its owner shipped `ForeignGeneration` for good
+  // (1 run in 6 of the A-919 fleet test, the owner's parts kept at 933 bytes).
+  if held > 0 {
+    let configuration = state.council.configuration().clone();
+    if state
+      .fleet
+      .track_object(register, owner, &configuration)
+      .is_err()
+    {
+      state.count(UNTRACKED, 1);
+    }
   }
   held
 }
