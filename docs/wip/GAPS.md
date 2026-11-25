@@ -3626,10 +3626,11 @@
 > without the bound). Main's measure at 084ffb65d: the one-unit bound cost 40% of the import's time (git-2000 5.90 to
 > 8.28 s best, resident 3.7x lower), 88-95% of it the 179 extra durable flushes (about 23.5 ms each). Cut (main's rulings
 > of 2026-11-25, w-perf): the bound is rent or buy at the daemon's own exchange of memory against time,
-> `clamp(F x M, U, max(U, R))`: `F` the device's durable flush as the shard first timed a batch's changeset landing (the
-> unit until then), `M` the boot profile's memcpy rate (a byte of RAM worth the time to move it, the codec's
-> `byte_worth_from_memcpy`), `U` the store's unit (the floor), `R` the import's admitted room (`vcs_share::room`, the
-> cap: under load toward `U`). Per operation: never the history's length nor the shard's free memory alone. Logged with
+> `clamp(F x M, U, max(U, R / 2))`: `F` the device's durable flush, the least the shard timed a batch's changeset
+> landing (the unit until one has; the span holds what else the shard ran, so contention only inflates it), `M` the boot profile's memcpy rate (a byte of RAM worth the time to move it, the codec's
+> `byte_worth_from_memcpy`), `U` the store's unit (the floor), `R` the import's admitted room (`vcs_share::room`;
+> half of it the cap, since the next revision's texts are put before the cut and an import holds up to twice its bound;
+> under load toward `U`; w-svn's review). Per operation: never the history's length nor the shard's free memory alone. Logged with
 > its inputs once an import ends. Measured (debug, a MacBook, loaded): F 23.5 ms (main's release figure) x M 13.27 GB/s =
 > 312 MB, git-2000 in 2 batches against 180, 415 MB resident against 224 MB (the profile's M read 4.06 GB/s in another
 > run: its swing is the profile's to settle). Relaxing A-767's durable-read rule (a batch written, flushed at the
@@ -3639,7 +3640,8 @@
 > oracle `a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new` (each stage of the second batch's landing
 > killed, the daemon and its store's owner restarted, at one unit and at the derived bound: recovered to the reference's
 > history at 8 before the entry and 16 (one unit) or 64 (derived) after it). Owed: main's release A/B against 084ffb65d
-> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`).
+> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`); `F` timed at the store's own `sync_data` call rather
+> than the landing's await (an owner answer that carries it).
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on

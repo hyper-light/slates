@@ -1196,8 +1196,8 @@ fn an_imports_batches_fall_as_its_durable_flush_buys_more_bytes() {
 
 /// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound capped by the import's admitted room, so a loaded
 /// shard's import keeps its batches small). Do: import [`rewrites`]'s rewrites twice with the flush forced to what copies
-/// [`MANY_UNITS`] units (more than all its texts): once in a room of [`FOUR_UNITS`] units, once with no room but the
-/// largest. Expect both whole, and more batches in the room: it bounds the batch where it is the smaller. Red before: the
+/// [`MANY_UNITS`] units (more than all its texts): once in a room of [`FOUR_UNITS`] units (its half the cap), once with no
+/// room but the largest. Expect both whole, and more batches in the room: it bounds the batch where it is the smaller. Red before: the
 /// room never consulted, as many batches either way.
 #[test]
 fn an_imports_room_bounds_its_batch_where_it_is_smaller() {

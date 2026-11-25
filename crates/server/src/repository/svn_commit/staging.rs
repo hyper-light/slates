@@ -86,11 +86,12 @@ thread_local! {
 /// Derived: the most bytes of texts a batch carries before it lands (goal 93 P7; main's rulings of 2026-11-24 and
 /// 2026-11-25), rent or buy at the daemon's own exchange of memory against time:
 ///
-/// `bound = clamp(F × M, U, max(U, R))`
+/// `bound = clamp(F × M, U, max(U, R / 2))`
 ///
-/// - `F`, the device's durable flush ([`durable_flush_ns`]): what landing a batch costs, timed at the first batch this
-///   shard landed durably (its changeset written and flushed on the node's store, `landing::land_changeset`); until one
-///   has landed, unknown, and the bound is `U`.
+/// - `F`, the device's durable flush ([`durable_flush_ns`]): what landing a batch costs, timed at each batch this shard
+///   lands durably (its changeset written and flushed on the node's store, `landing::land_changeset`), the least so far:
+///   the span includes what else the shard ran while it waited, which only adds, so the least is the closest to the
+///   device's own (w-svn's review). Until one has landed, unknown, and the bound is `U`.
 /// - `M`, the machine's memcpy rate, bytes a second, the boot profile's figure as every derived value takes it
 ///   (`DaemonConfig::memcpy_bytes_per_second`; the profile prices a byte of RAM at the time it takes to move it,
 ///   `CodecPolicy::byte_worth_from_memcpy`). Holding `B` bytes of texts is worth `B / M` of time, so a batch grows while
@@ -98,7 +99,9 @@ thread_local! {
 /// - `U`, the node's changeset store's own unit, one trunk node of its memtable (`vcs_store::hg_import::segment_bytes`:
 ///   the content plane's chunk times SplinterDB's fanout; 512 KiB at a 4 KiB page, 2 MiB at 16 KiB): the floor, P7's
 ///   bound before.
-/// - `R`, the import's admitted room on its shard ([`import_room`]): under load it shrinks the bound toward `U`.
+/// - `R`, the import's admitted room on its shard ([`import_room`]), halved: the next revision's texts are put before
+///   the batch is judged, so an import holds up to twice its bound, which stays within the room (w-svn's review). Under
+///   load it shrinks the bound toward `U`.
 ///
 /// Per operation: it scales with the device's flush and copy, never with the history's length or the shard's free
 /// memory alone. Measured at git-2000 on a MacBook (F 23.5 ms, M 13.27 GB/s): 312 MB, 2 batches against 180 at `U`,
@@ -115,7 +118,7 @@ pub(crate) fn texts_bound(state: &mut ShardState, repository: RepositoryId) -> T
     u64::try_from(u128::from(flush_ns).saturating_mul(u128::from(memcpy)) / NANOS_A_SECOND)
       .unwrap_or(u64::MAX)
   });
-  let bytes = rent_or_buy.clamp(unit, room.max(unit));
+  let bytes = rent_or_buy.clamp(unit, (room / 2).max(unit));
   #[cfg(test)]
   let bytes = TEXTS_BOUND.with(std::cell::Cell::get).unwrap_or(bytes);
   TextsBound {
@@ -141,7 +144,7 @@ pub(crate) struct TextsBound {
   pub(crate) memcpy: u64,
   /// The changeset store's unit, the floor.
   pub(crate) unit: u64,
-  /// The import's admitted room, the cap.
+  /// The import's admitted room, whose half is the cap.
   pub(crate) room: u64,
 }
 
@@ -150,7 +153,7 @@ impl std::fmt::Display for TextsBound {
     match self.flush_ns {
       Some(flush_ns) => write!(
         f,
-        "{} B (a durable flush {flush_ns} ns x memcpy {} B/s, within the unit {} B and the room {} B)",
+        "{} B (a durable flush {flush_ns} ns x memcpy {} B/s, within the unit {} B and half the room {} B)",
         self.bytes, self.memcpy, self.unit, self.room
       ),
       None => write!(
@@ -163,13 +166,13 @@ impl std::fmt::Display for TextsBound {
 }
 
 std::thread_local! {
-  /// The device's durable flush as this shard first measured it ([`durable_flush_ns`]): the first batch's changeset
+  /// The device's durable flush as this shard measured it ([`durable_flush_ns`]): the least of its batches' changesets
   /// written and flushed on the node's store.
   static DURABLE_FLUSH_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// The device's durable flush, nanoseconds ([`texts_bound`]'s `F`): as this shard first timed a batch's changeset landing
-/// durably; none before it has.
+/// The device's durable flush, nanoseconds ([`texts_bound`]'s `F`): the least this shard timed a batch's changeset
+/// landing durably; none before it has.
 fn durable_flush_ns() -> Option<u64> {
   #[cfg(test)]
   if let Some(forced) = FLUSH_NS.with(std::cell::Cell::get) {
@@ -178,12 +181,14 @@ fn durable_flush_ns() -> Option<u64> {
   DURABLE_FLUSH_NS.with(std::cell::Cell::get)
 }
 
-/// Records `flush_ns`, a batch's changeset landed durably, as the device's flush where this shard has none yet.
+/// Records `flush_ns`, a batch's changeset landed durably, as the device's flush where it is the least this shard timed.
 fn flushed_in(flush_ns: u64) {
   DURABLE_FLUSH_NS.with(|measured| {
-    if measured.get().is_none() {
-      measured.set(Some(flush_ns.max(1)));
-    }
+    let least = measured
+      .get()
+      .map_or(flush_ns, |least| least.min(flush_ns))
+      .max(1);
+    measured.set(Some(least));
   });
 }
 
@@ -889,7 +894,7 @@ impl Staging {
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
     let committing = slates_rt::futures::now_ns();
-    // The device's durable flush, as this shard first meets it: the bound's `F` (`texts_bound`).
+    // The device's durable flush, the least this shard meets: the bound's `F` (`texts_bound`).
     if landed.is_ok() {
       flushed_in(committing.saturating_sub(flushing));
     }
