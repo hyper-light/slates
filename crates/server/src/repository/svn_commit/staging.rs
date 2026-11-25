@@ -36,7 +36,7 @@ use slates_svn::index::ContentIdentity;
 use slates_merge::engine::Increment;
 use slates_svn::migration::{CheckStep, Checked};
 
-use super::{Building, Uncommitted, brought, green_of, grown, identity, landing, restore};
+use super::{Building, Uncommitted, brought, green_of, grown, landing, restore};
 use crate::import_batch::ImportBatch;
 use crate::repository::push::EntryParts;
 use crate::state::ShardState;
@@ -571,6 +571,52 @@ fn build_in(
   })
 }
 
+/// A revision's record's identity (`svn_commit::identity`), the record hashed a slice a step, each counted
+/// ([`STAGING_STEPS`]; A-920 piece 4b: 13.4 ms of the build step whole at 9,000 files, debug): each step hashes slices
+/// of half its quantum at the machine's measured BLAKE3 rate (`DaemonConfig::archive_slice_bytes_within`, R3) until the
+/// step's clock passes its quantum, a slice at least. None where the shard's state is gone.
+async fn identified_in(record: &[u8]) -> Option<[u8; 32]> {
+  let mut hasher = blake3::Hasher::new_derive_key(super::IDENTITY_CONTEXT);
+  let mut rest = record;
+  loop {
+    slates_rt::futures::yield_now().await;
+    let done = crate::state::with_state(|state| {
+      state.count(STAGING_STEPS, 1);
+      let deadline = slice_deadline_ns();
+      let slice = state
+        .config
+        .archive_slice_bytes_within(state.config.step_quantum_ns());
+      let slice = usize::try_from(slice).unwrap_or(usize::MAX);
+      hash_some((&mut hasher, &mut rest), slice, &mut || {
+        slates_rt::futures::now_ns() >= deadline
+      })
+    })?;
+    if done {
+      return Some(*hasher.finalize().as_bytes());
+    }
+  }
+}
+
+/// `rest` hashed into `hasher` `slice` bytes at a time (one at least), a slice at least, until `spent`: whether all of
+/// it is, `rest` what remains.
+pub(super) fn hash_some(
+  (hasher, rest): (&mut blake3::Hasher, &mut &[u8]),
+  slice: usize,
+  spent: &mut dyn FnMut() -> bool,
+) -> bool {
+  loop {
+    let (now, later) = rest.split_at(slice.max(1).min(rest.len()));
+    hasher.update(now);
+    *rest = later;
+    if rest.is_empty() {
+      return true;
+    }
+    if spent() {
+      return false;
+    }
+  }
+}
+
 /// `built`, a revision's increment as its build left it, readied for its judge a slice a step: its document put into
 /// canonical order ([`canonical_in`]), then the texts it names read (A-760), a copy slice a step, held as its post-state
 /// is. None where the shard's state is gone.
@@ -867,6 +913,9 @@ pub(crate) struct Staging {
   /// The texts the green's held table holds at the paths the batch changes, as it held them before the batch: let go
   /// once the batch commits (S4 c1, `vcs_store::svn_texts`).
   released: Vec<(ContentIdentity, String)>,
+  /// The paths of `released`, looked up as the held table is followed ([`Staging::fold_some`]): a scan of `released`
+  /// a path cost a batch removing N paths N² (A-920 piece 5: 246 ms at 9,000, debug).
+  released_paths: std::collections::BTreeSet<String>,
   /// The text each path the batch changed holds after it, by path: held once the batch commits.
   holding: std::collections::BTreeMap<String, ContentIdentity>,
   /// The most bytes of texts the batch carries before it lands, read as it began, with its inputs ([`texts_bound`]).
@@ -898,6 +947,7 @@ impl Staging {
           held: 0,
           staged: 0,
           released: Vec::new(),
+          released_paths: std::collections::BTreeSet::new(),
           holding: std::collections::BTreeMap::new(),
           bound,
         }),
@@ -1077,30 +1127,40 @@ impl Staging {
       Ok(checked) => checked,
       Err(refused) => return Some(Err(refused)),
     };
-    let Some(batch) = self.batch.as_mut() else {
-      return Some(Err(Uncommitted::NotHeld));
-    };
-    let built = within_records(repository, lent, |state| {
-      build_in(
-        state,
-        repository,
-        batch,
-        (&checked, plans),
-        identity(&record),
-      )
-    })
-    .await?;
-    let built = match built {
-      Ok(built) => readied_in(built).await?,
-      Err(refused) => Err(refused),
-    };
-    let built = match built {
+    let built = match self
+      .built_in(repository, lent, (&checked, plans, &record))
+      .await?
+    {
       Ok(built) => built,
       Err(refused) => return Some(Err(refused)),
     };
     self
       .staged_in(repository, lent, (checked, record, built))
       .await
+  }
+
+  /// The increment of `checked` built against the batch's scratch member and readied for its judge, a slice a step:
+  /// named by its record `record`'s identity, hashed a slice a step ([`identified_in`], A-920 piece 4b); built
+  /// ([`build_in`]); then its document put in order and the texts it names read ([`readied_in`]). None where the
+  /// shard's state is gone.
+  async fn built_in(
+    &mut self,
+    repository: RepositoryId,
+    lent: u64,
+    (checked, plans, record): (&Checked, restore::CopyPlans, &[u8]),
+  ) -> Option<Result<Increment, Uncommitted>> {
+    let work_identity = identified_in(record).await?;
+    let Some(batch) = self.batch.as_mut() else {
+      return Some(Err(Uncommitted::NotHeld));
+    };
+    let built = within_records(repository, lent, |state| {
+      build_in(state, repository, batch, (checked, plans), work_identity)
+    })
+    .await?;
+    match built {
+      Ok(built) => readied_in(built).await,
+      Err(refused) => Some(Err(refused)),
+    }
   }
 
   /// [`Staging::stage_in`]'s last steps, each a slice of the shard's budget lending the records' room (A-920 piece 1:
@@ -1270,7 +1330,7 @@ impl Staging {
   /// let go the first time the batch reaches it; each path's last text held. Then the record kept.
   fn fold_some(&mut self, recording: &mut Recording, spent: &mut dyn FnMut() -> bool) -> Recorded {
     while let Some((path, identity)) = recording.before.pop_first() {
-      if self.holding.remove(&path).is_none() && !self.released.iter().any(|(_, at)| *at == path) {
+      if self.holding.remove(&path).is_none() && self.released_paths.insert(path.clone()) {
         self.released.push((identity, path));
       }
       if spent() {

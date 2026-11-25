@@ -80,6 +80,12 @@ pub trait Graph {
   fn entry_ids(&self, tree: Self::Node) -> Vec<ObjectId> {
     self.entries(tree).map(|entry| self.id(entry)).collect()
   }
+  /// Before `tree`'s ids are read ([`Graph::entry_ids`]): room a store's reads may keep for the walk's next trees,
+  /// charged to `admission` (main 01a20182's ruling of 2026-11-25: a fetch's tree reads rebuilt every chain from its
+  /// base). By default, nothing.
+  fn opening_tree(&self, tree: Self::Node, admission: &mut Admission) {
+    let _ = (tree, admission);
+  }
   /// The object a tree's entry `id` names, as [`Graph::entries`] resolves it (a store keeps the first it cannot find as
   /// a fault). By default, [`Graph::node`].
   fn entry_node(&self, id: &ObjectId) -> Option<Self::Node> {

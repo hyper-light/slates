@@ -3529,3 +3529,25 @@ fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refus
     );
   });
 }
+
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// A-920 piece 4b (oracle). Do: hash records of up to 4 KiB, the empty one among them, a slice a step
+  /// (`staging::hash_some`, every step spent after its first slice) in slices of 1 to 64 bytes. Expect the record's
+  /// identity (`identity`), byte for byte, in as many steps as it has slices.
+  #[test]
+  fn a_records_identity_hashed_a_slice_a_step_is_its_identity_whole(
+    record in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096),
+    slice in 1usize..64,
+  ) {
+    let mut hasher = blake3::Hasher::new_derive_key(super::IDENTITY_CONTEXT);
+    let mut rest = record.as_slice();
+    let mut steps = 1usize;
+    while !super::staging::hash_some((&mut hasher, &mut rest), slice, &mut || true) {
+      steps += 1;
+    }
+    proptest::prop_assert_eq!(*hasher.finalize().as_bytes(), super::identity(&record));
+    proptest::prop_assert_eq!(steps, record.len().div_ceil(slice).max(1));
+  }
+}

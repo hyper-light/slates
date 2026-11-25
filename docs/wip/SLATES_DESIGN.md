@@ -63591,6 +63591,18 @@ Applied in the same change to: §4.8 (the owner's own hold, with a status line),
 Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/git/src/negotiation/{mod,objects}.rs`,
 `crates/git/src/upload/{answer,mod}.rs`, `crates/server/src/vcs_store/upload.rs` and its tests.
 
+> **The fork's read cache (2026-11-25, w-git for main 01a20182, its order on `open_tree` and its ruling on the shape).**
+> A fetch reads through a fork of its repository (A-745 rule 4), and the fork began with a read cache of no bytes
+> (`packed::Recent`, git's delta base cache), so every tree the walk opened rebuilt its chain from its base: 78 deltas
+> for a 13-tree chain, 0+1+...+12, O(depth²) over a walk; on git/git `open_tree` ran 0.45 to 0.59 ms a unit, about 97 %
+> of a clone's long units, while its parse stayed under 62,061 bytes. Now the walk tells its graph before each tree's
+> ids are read (`Graph::opening_tree`, a no-op by default), and the store widens the fork's cache to its learned chain
+> depth times that tree's length (`Repository::widen_read_cache`), the growth charged to the fetch's admission, as the
+> position cache is; refused room, the cache stays as it is. A chain whose revisions are no longer than the tree
+> being read stays whole for its next revisions; a longer one keeps its newest, the oldest given back first. The fork's release gives the cache back.
+> Counted: `vcs_store.git_upload.tree_deltas` and `tree_deltas_most`. Red: the 13-tree chain's fetch applied 78
+> deltas; now 12, the chain built once (the walk reads the newest first, whose read applies the whole chain).
+
 ### A-912 — A push during a member's death is accepted: no exchange holds a peer's record session across a wait that needs the council's next round, and a push's homing outlasts a death (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 ((i), (1), (a), (b)); found by A-908 part 4's fleet test; amends A-902; A-363, A-724 piece 6, A-727 (d1a), A-907)
 
 - **Why.** A git push made right after a member died was refused `retry` ("the push's objects were not kept by enough
@@ -64112,6 +64124,13 @@ GAPS.
   (`a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent`; a step's unlent reads dropped fails it,
   which no test caught before); and a server batch staging that rename lent `a`'s text once by its judge
   (`a_staged_judge_is_lent_the_named_text_its_verdict_reads`).
+  **4b, the identity.** The work's identity, its record's BLAKE3 hash (`svn_commit::identity`), was 13.4 ms of the
+  build step whole; staging hashes it a slice a step (`staging::identified_in`, `hash_some`), each slice half the
+  step's quantum at the machine's measured BLAKE3 rate (`DaemonConfig::archive_slice_bytes_within`), until the step's
+  clock passes its quantum, a slice at least, before the build (`Staging::built_in`). The build step 25-27 ms →
+  13.6-13.8 ms (its rows, 12.3). Oracle: over records of up to 4 KiB, the empty one among them, in slices of 1 to 64
+  bytes, the identity hashed a slice a step is the identity whole, in as many steps as slices
+  (`a_records_identity_hashed_a_slice_a_step_is_its_identity_whole`).
 - **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
   after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
   tables.** The step that kept a revision applied the records and followed the batch's held table whole
@@ -64124,6 +64143,11 @@ GAPS.
   walks. The records step 29-31 ms → 12.4 ms (the apply). Oracle: the svn import tests, whose shard quantum of a few
   microseconds takes these walks a row a step over the golden dumps, hold the texts each batch lets go and keeps;
   focused set 110 passed. Still whole: a row that adds or replaces a directory walks its tree in one unit.
+  **5a', the released fold** (main's order of 2026-11-25). The held table's fold looked a path up among the batch's
+  released texts by a scan of them (`released.iter().any`), so a batch removing N paths whose texts came from before
+  it cost N²: a revision removing 9,000 files took 246 ms of CPU over its fold's steps, its longest call 70 µs, once
+  its first import landed (`t_a920_a_revision_removing_thousands_of_files_imports_whole`). The released paths are now
+  a set beside the list (`Staging::released_paths`): 7.2-7.6 ms over the same steps, the longest call 10-28 µs.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`

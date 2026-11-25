@@ -448,6 +448,9 @@ impl Asked<'_> {
   }
 }
 
+/// One asked tool id's answer: the version a page held for it, or `None` while no page has.
+type AskedVersion = Option<(Identity, TextRow)>;
+
 /// Writes each version a page's `rows` (keys under `start`, in key order) holds for an asked id into `found` at the
 /// id's place, the asks from `at` on matched as the rows pass them; the last id the page read in `last`. Whether the
 /// page read any row of the path.
@@ -455,7 +458,7 @@ fn found_in_page(
   rows: &mantle_engine::rows::Rows,
   start: &[u8],
   (asked, at): (&Asked<'_>, &mut usize),
-  (found, last): (&mut [Option<(Identity, TextRow)>], &mut Vec<u8>),
+  (found, last): (&mut [AskedVersion], &mut Vec<u8>),
 ) -> Result<bool, StoreError> {
   let mut any = false;
   for (key, value) in rows.iter() {
