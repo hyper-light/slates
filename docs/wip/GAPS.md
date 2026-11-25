@@ -327,6 +327,9 @@
 >     below (a's hold rebuilt empty) or the owner's merge or state-log state after a warm restart. In that run the
 >     newcomer held 1 position: settle it against the start rule (adopted only within tolerance, stopping refused at the
 >     first position past it) and write the assertion as that rule.
+>   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
+>     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
+>     the typed refusal naming its member id.
 >   - **OPEN, the product half (A-921 part 2), w-shared's next:** a, readmitted after its false death, still ran pushes
 >     as the repository's owner (the VCS edges route by the partition holding the repository, never by the
 >     configuration's owner), its records refused `Unauthorized` (38 at each holder) and the push `unable to commit`.
@@ -1910,6 +1913,14 @@
 > parts' sum alone. Found on the way: a gap learned to the request's taking holds the wake itself, so one park kept the
 > owner parked for good; the gap is learned to the request's send, and the owner's start is never one. Owed: the 57k split under the rule (main's); the request count (3,387 at
 > 7a9cb385e) with w-perf.
+> A stream's turns about 100 ms apart, near the daemon's heartbeat (main's hg leg at 608930048: 164 turns in about 15 s
+> of an 18 s stream past its compression and store waits): the gap from a reply run's yield to the connection's next poll
+> is counted where a stream's turns yield (2026-11-25, w-hg: `vcs_http.reply_yields`, `reply_yield_gap_ns`,
+> `_most_ns`). Since a0afa2370 it had been counted at a request body run's yield, which a stream, a GET, never takes, so
+> no measurement showed it. Held by `a_streamed_answers_reply_runs_count_their_yield_to_the_next_poll` (red with the
+> count at the body's yield: none). In process (debug, this MacBook, load about 30): 4 yields over 4 turns, 37 µs of gaps,
+> the longest 26 µs, so the yield is not what paces a turn there. Owed: the 57k's figures with it (main's), then what
+> lies between its turns by the counters beside it (`hg_stream_span_ns` against turns, store waits and writes).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads

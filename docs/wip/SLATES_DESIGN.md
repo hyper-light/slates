@@ -63894,6 +63894,47 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
 `crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
 `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
 
+### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
+
+- **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
+  knew a repository's owner by member id, but not where a client reaches it. Its peers learn its probe and record
+  addresses at discovery (A-277), never its edges, which are its own: the operator binds each where it likes, and a test
+  binds them at port 0.
+- **The change.**
+  - Each node sends each peer one **edges record** over its own authenticated record session (stream 33,
+    `crate::edges`). It goes once a session and again when its edges change, as its epoch announcement rides.
+  - The record carries the node's git HTTP or HTTPS edge and its SSH edge, as a client reaches them. That is the
+    node's advertised host (A-277's reachable name, never a bind address such as `0.0.0.0` or `[::]`), each edge's
+    bound port (never 0), and its scheme.
+  - An HTTPS edge is announced only where its certificate names that host (`rustls::client::verify_server_name`). A
+    node with no reachable host, or none its certificate names, announces no edge. The daemon builds the record once
+    its edges are bound (the ports live on the `Daemon`) and sets it on the control shard. A laptop announces to nobody.
+  - Peers keep each record per anchor, bounded by the members. A departed member's record goes at the reaper's look
+    (`remote_attach::sweep_departed`).
+  - **Only its own** (main's condition 1). A record is held only where its anchor is the authenticated session's
+    anchor. Otherwise it is refused typed (`fleet.edges.refused.foreign`) and nothing is learned, so one member cannot
+    send another's clients elsewhere.
+  - **Bounded parsing** (condition 3). A record is at most 523 bytes, and each host is checked against a DNS name's 253
+    bytes before it is read. An oversized record, a cut, an unknown scheme, a bind address, port 0, trailing bytes and
+    another version are each a typed refusal.
+  - **Where to go:** `edges::owner_edge`, a member's edge of a kind, or the typed refusal naming the member where none
+    was learned (an older peer, a node serving no such edge). That is the one path, the same as a node with no edge.
+- **Why not discovery's `Announcement`** (main's ruling). `slates_wire` refuses trailing bytes and discovery maps any
+  decode error to `Malformed`, so a longer announcement would cost an older peer the whole enrollment exchange. An older
+  peer answers stream 33 empty, as any unknown kind: it learns nothing, and membership is untouched.
+- **Tests** (macOS arm64, debug, 2026-11-25).
+  - Fleet `a925_a_node_learns_its_peers_edges_as_each_bound_them`: three nodes, each with a git HTTP and an SSH edge at
+    port 0. a learned b's edges as b bound them (127.0.0.1:60773 HTTP, :60774 SSH in the run), and a member it holds no
+    record of got the typed refusal naming it.
+  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_damaged_form,
+    a_node_announces_only_edges_a_client_reaches, an_https_edge_is_announced_only_at_a_name_its_certificate_carries,
+    a_record_naming_another_anchor_is_refused_and_teaches_nothing}`.
+  - `fleet::every_request_kind_the_record_session_dispatches_is_its_own`, with streams 32 and 33 added.
+- **Models.** None; the record is per-node fact, never consensus (D-14).
+
+Applied in the same change to: `crates/server/src/{edges,daemon,fleet,state,lib,member_task,remote_attach,config}.rs`,
+`crates/server/tests/fleet.rs`, GAPS.
+
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
 - **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to
@@ -64142,6 +64183,17 @@ GAPS.
   13.6-13.8 ms (its rows, 12.3). Oracle: over records of up to 4 KiB, the empty one among them, in slices of 1 to 64
   bytes, the identity hashed a slice a step is the identity whole, in as many steps as slices
   (`a_records_identity_hashed_a_slice_a_step_is_its_identity_whole`).
+  **4c, the rows.** The build's walk of the revision's rows (12.3 ms of the 13.7-14.1 ms build step after 4b) is taken
+  a row a unit: `Building::begin` sizes the post-state, `Building::step` builds rows until the step's clock passes its
+  quantum, a row at least, and once every row is, finishes (what the revision restores and removes, the run ops moved
+  past the inline bytes, the increment); `build_unordered` is the three carried to their end. Between steps the build
+  holds its own state alone (`BuildState`, `Building::detach`, `attach`), each step lending it the records, the
+  scratch member and the checked revision again; it looked a path's row up in a map of borrowed rows, and now
+  searches the checked revision's rows, which are sorted by path and each path once (`migration::before`). The build
+  step 13.7-14.1 ms → under 5 ms (3 of 4 runs; the fourth under load 35-43). Still whole, in the build's last step:
+  the restores, the removals' ops and the runs. Oracle: the svn import tests, at a test quantum of a few
+  microseconds, build every golden dump's revisions a row about a step; a resumed build that skips a row fails four
+  of them.
 - **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
   after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
   tables.** The step that kept a revision applied the records and followed the batch's held table whole
@@ -64255,7 +64307,24 @@ measured noise of the 100 figure, not a literal.
 > time), one past it refused `Busy` (`StartRefused::NoRoom` to a hook). The owner joins the spawner when it is dropped
 > at the stop, killing it with its group a liveness window later. Red: a spawn after the spawner's death gets its
 > child from a new spawner (`a_dead_spawner_is_restarted_and_a_spawn_asked_after_its_death_gets_its_child`); before,
-> every spawn after it was refused. Owed: the spawner's footprint, measured on a release daemon (main's).
+> every spawn after it was refused.
+>
+> **Fixed (2026-11-25): no wait on a shard.** 2b's restart reaped the dead spawner with a blocking `wait()` on the
+> control shard, and its owner joined the spawner on that shard's thread at the stop. A spawner whose ends closed
+> before the kernel made it waitable (a test binary naming no `spawner_role!()`, whose spawner ends at once, restarted
+> once a window; or an exit the kernel finished late under load) held the shard past its window, and the watchdog ended
+> the process: `reap_map` exit 4, "shard 3 is wedged, unmoved for 1140 ms … in task spawned at spawning.rs:668", and
+> main's watchdog A/B, 1 wedge in 4 rounds before A-924 against 120 at 2b. Now the dead spawner is reaped by a task of
+> its own awaiting its exit watch (`reaped`), so no dead spawner delays the next, and the owner hands its spawner to the
+> daemon's process thread at its drop (`Daemon::stop_parts` joins it, `join_spawner`, once the runtime has ended). Red:
+> a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
+> (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
+>
+> **Its cost** (main's measurements, 2026-11-25). macOS, release daemon at 5c7381734, idle: the spawner's footprint
+> 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no
+> process of the binary left after the stop. Linux (diag 2, debug, 4-core runners), a start's median on the asking
+> thread through the spawner against direct: x86_64 94.3 / 102.7 / 96.1 µs at 100 / 10,000 / 65,527 descriptors
+> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 

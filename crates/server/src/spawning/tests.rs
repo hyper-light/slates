@@ -168,3 +168,130 @@ fn the_spawners_back_off_doubles_its_start_up_to_the_liveness_window() {
     .collect();
   assert_eq!(waits, [0, start_ns, 2 * start_ns, LIVENESS_BUDGET_NS]);
 }
+
+/// Shape: how long [`a_lingering_spawner_role`] lives after it drops its ends: three liveness windows, past the bound a
+/// shard is judged stuck by, so a blocking wait on it would wedge the shard.
+const LINGER_NS: u64 = 3 * LIVENESS_BUDGET_NS;
+
+/// A stand-in for a spawner that ends its conversation and lingers, as `reap_map`'s did under load (its ends closed at
+/// its exit while the kernel took seconds to make it waitable): started as this binary's own test, it drops its ends at
+/// once and leaves its group for its parent's, so its owner's kill of its group misses it, and lives [`LINGER_NS`].
+#[test]
+fn a_lingering_spawner_role() {
+  let Some(ends) = slates_ipc::spawner::ends_from_env() else {
+    return;
+  };
+  drop(ends);
+  // It leads a group of its own (its start's), which `setsid` refuses a leader: it moves into its parent's group
+  // instead, so the kill of its own reaches none.
+  if let Some(parent) = rustix::process::getppid()
+    && let Ok(group) = rustix::process::getpgid(Some(parent))
+  {
+    let _ = rustix::process::setpgid(None, Some(group));
+  }
+  let until = std::time::Instant::now() + std::time::Duration::from_nanos(LINGER_NS);
+  while std::time::Instant::now() < until {
+    std::thread::park_timeout(until.saturating_duration_since(std::time::Instant::now()));
+  }
+  std::process::exit(0);
+}
+
+thread_local! {
+  /// The longest gap between two steps of [`tick`], in nanoseconds.
+  static TICK_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  /// Tells [`tick`] to stop.
+  static TICK_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Shape: the test runtime's timer tick ([`runtime`]'s), what [`tick`] sleeps between its steps.
+const TICK_NS: u64 = 100_000;
+
+/// A task that steps once a timer tick until told to stop or [`TEST_BOUND_NS`] has passed, keeping the longest gap
+/// between its steps: a shard blocked in a wait shows as a gap that long. It sleeps rather than yields, so the shard
+/// still turns to its driver for the descriptors its other tasks wait on.
+async fn tick() {
+  let began = slates_rt::futures::now_ns();
+  let mut last = began;
+  while !TICK_STOP.with(std::cell::Cell::get) && last.saturating_sub(began) < TEST_BOUND_NS {
+    let _ = slates_rt::futures::sleep(TICK_NS).await;
+    let now = slates_rt::futures::now_ns();
+    TICK_MOST.with(|most| most.set(most.get().max(now.saturating_sub(last))));
+    last = now;
+  }
+}
+
+/// Main 01a20182's ruling of 2026-11-25 (A-924 2b's regression: `reap_map`'s test process ended by a daemon's watchdog,
+/// a shard wedged 1,140 ms in the spawner's restart, which reaped the dead spawner with a blocking wait). Do: make this
+/// shard the owner of a spawner that ends its conversation at once and lingers outside its group
+/// ([`a_lingering_spawner_role`]); run a task stepping at every turn; ask for `sh -c 'exit 3'` until the restarted
+/// spawner starts it. Expect: the child started and exited 3, and the shard never held past a liveness window: the dead
+/// spawner reaped by its own task, awaiting its exit, while the shard steps. Red before: the restart waited on the
+/// lingering spawner on the shard, a gap of its [`LINGER_NS`].
+#[test]
+fn a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps() {
+  let (gap, code) = on_a_thread_within(|| reaped_while_stepping());
+  assert_eq!(code, Ok(Some(3)));
+  assert!(
+    gap < LIVENESS_BUDGET_NS,
+    "the shard stepped while the dead spawner was reaped: its longest gap {gap} ns against {LIVENESS_BUDGET_NS}"
+  );
+}
+
+/// `work` run on a runtime of its own on a thread of its own, its answer awaited here for at most twice
+/// [`TEST_BOUND_NS`] of the wall: a shard blocked in a wait cannot fire its own bound's timer, so the test's bound is
+/// kept off the shard, and a shard that never answers fails the test rather than hanging it.
+fn on_a_thread_within<T: Send + 'static>(work: fn() -> T) -> T {
+  let (sent, got) = channel();
+  let _runner = std::thread::spawn(move || {
+    let _ = sent.send(work());
+  });
+  got
+    .recv_timeout(std::time::Duration::from_nanos(
+      TEST_BOUND_NS.saturating_mul(2),
+    ))
+    .expect("the shard answered within twice the test's bound, never held in a wait")
+}
+
+/// [`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`]'s work on its own runtime:
+/// the shard's longest gap between steps, and the child's exit code.
+fn reaped_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
+  on_runtime(async {
+    let here = slates_rt::futures::shard_id().map_or(0, |shard| shard.0);
+    let program = std::env::current_exe().expect("the test binary");
+    let args = [
+      OsStr::new("spawning::tests::a_lingering_spawner_role"),
+      OsStr::new("--exact"),
+      OsStr::new("--nocapture"),
+    ];
+    let slates_ipc::spawner::Started { child, ends } =
+      slates_ipc::spawner::start(&program, &args, 1).expect("the lingering spawner");
+    super::own(child, vec![here], 0, None);
+    for end in ends {
+      let placement = super::Placement {
+        generation: 0,
+        owner: here,
+        bound: super::TEST_SPAWNS_IN_FLIGHT,
+      };
+      super::install(end, placement).expect("its end installed");
+    }
+    TICK_STOP.with(|stop| stop.set(false));
+    TICK_MOST.with(|most| most.set(0));
+    slates_rt::futures::spawn(tick())
+      .and_then(slates_rt::futures::detach)
+      .expect("the ticker");
+    let exiting = [OsStr::new("-c"), OsStr::new("exit 3")];
+    let child = loop {
+      match spawn(&shell(&exiting)).await {
+        Ok(child) => break child,
+        Err(SpawnRefused::SpawnerGone) => slates_rt::futures::yield_now().await,
+        Err(refused) => panic!("refused {refused:?}"),
+      }
+    };
+    let code = child.exit().await.map(|status| status.code());
+    drop(child);
+    TICK_STOP.with(|stop| stop.set(true));
+    super::uninstall();
+    let _ = super::OWNER.with(|owner| owner.try_borrow_mut().ok().map(|mut owner| owner.take()));
+    (TICK_MOST.with(std::cell::Cell::get), code)
+  })
+}

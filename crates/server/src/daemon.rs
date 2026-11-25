@@ -313,6 +313,10 @@ pub struct Daemon {
   vcs_svn_port: Option<u16>,
   /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
   start_beats: u64,
+  /// Where the control shard's owner hands back the daemon's spawner at its drop, joined here once the shards have
+  /// ended (A-924).
+  #[cfg(unix)]
+  spawner_join: std::sync::mpsc::Receiver<slates_ipc::confined_spawn::SpawnedChild>,
 }
 
 /// The version-control servers' SSH edge as a daemon started it (§4.17.2 "Transports" item 2; A-684): the port it
@@ -1117,11 +1121,16 @@ impl Daemon {
     #[cfg(unix)]
     let mut spawner_ends = spawner_ends.into_iter();
     // The control shard owns it (`crate::spawning::own`): the one that restarts it, an end to each shard in this order.
+    // Where the owner hands the spawner back at its drop, for this process thread to join it once the shards have
+    // ended (`stop_parts`), never a shard's thread (a blocking wait there wedged a shard, 2026-11-25).
+    #[cfg(unix)]
+    let (spawner_join_send, spawner_join) = std::sync::mpsc::channel();
     #[cfg(unix)]
     let mut spawner_owner = Some((
       spawner,
       shards.iter().map(|shard| shard.0).collect::<Vec<u16>>(),
       spawner_start_took_ns,
+      spawner_join_send,
     ));
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
@@ -1345,6 +1354,13 @@ impl Daemon {
     // pulse (`Pulse::progress`), which an observer reads directly under CPU load (no shard round-trip)
     // and which outlives the shard as its entry does — no allocation per boot (before 2026-09-14 an atomic
     // was leaked per daemon start). A laptop spawns no coordinator, so it stays zero.
+    // Where a client reaches this node: its advertised host (A-277), which its edges are announced at (A-925).
+    let advertised_host = fleet_transport
+      .as_ref()
+      .map(|transport| match &transport.advertise {
+        crate::deploy::NodeAddress::Ip(address) => address.ip().to_string(),
+        crate::deploy::NodeAddress::Name { host, .. } => host.clone(),
+      });
     if let Some(transport) = fleet_transport {
       runtime.spawn_on(control, async move {
         crate::fleet::run_membership(transport).await;
@@ -1369,7 +1385,7 @@ impl Daemon {
     // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-689, A-695): on the control shard too,
     // every shard keeping its seats for the connections that move to their repository's owner.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
-    Ok(Daemon {
+    let daemon = Daemon {
       stop_watch_send,
       runtime: Some(runtime),
       segment,
@@ -1383,7 +1399,33 @@ impl Daemon {
       vcs_ssh,
       vcs_svn_port,
       start_beats: start_beat.beats,
-    })
+      #[cfg(unix)]
+      spawner_join,
+    };
+    // This node's edges as a client reaches them, set on the control shard for its peers (A-925): none on a laptop,
+    // which announces to nobody.
+    if let Some(host) = advertised_host {
+      let leaf = daemon
+        .config
+        .vcs_http
+        .as_ref()
+        .and_then(|edge| edge.identity.as_ref())
+        .and_then(crate::config::EdgeIdentity::leaf)
+        .map(<[u8]>::to_vec);
+      let http = daemon.vcs_http_port;
+      let ssh = daemon.vcs_ssh.as_ref().map(|edge| edge.port);
+      let set = daemon.observe(daemon.shards.first().copied(), move |s| {
+        let record =
+          crate::edges::local_record(s.origin_anchor, &host, (http, leaf.as_deref()), ssh);
+        s.edges.set_local(record);
+      });
+      if let Err(refused) = set {
+        slates_machine::log_line!(
+          "slates daemon: this node's edges were not set for its peers: {refused:?}"
+        );
+      }
+    }
+    Ok(daemon)
   }
 
   /// The loopback port the NFS transport (§4.6) is serving on, if the listener bound; a client mounts
@@ -2662,6 +2704,21 @@ impl Daemon {
   /// membership commit. A one-shot control-shard observation.
   pub fn council_debug(&self) -> Result<String, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.council.debug_state())
+  }
+
+  /// Test support (A-925): where this node would send a client of a repository `member` owns, as `member`'s edges
+  /// record taught it: its SSH edge (`ssh`) or its git HTTP edge, as `(scheme, host, port)`; or the typed refusal naming
+  /// `member`'s id where none was learned. A one-shot control-shard question.
+  pub fn peer_edge(
+    &self,
+    member: slates_db::HostId,
+    ssh: bool,
+  ) -> Result<Result<(&'static str, String, u16), slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::edges::owner_edge(s, member, ssh)
+        .map(|edge| (edge.scheme.text(), edge.host, edge.port))
+        .map_err(|refused| refused.member)
+    })
   }
 
   /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
@@ -4577,6 +4634,12 @@ impl Daemon {
     {
       slates_machine::log_line!("slates-server: stopping the daemon's shards: {error}");
     }
+    // The spawner the control shard's owner handed back at its drop, joined on this thread now that every shard's end
+    // has closed with its shard (A-924).
+    #[cfg(unix)]
+    while let Ok(spawner) = self.spawner_join.try_recv() {
+      crate::spawning::join_spawner(spawner);
+    }
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
@@ -4872,7 +4935,7 @@ struct ShardHolds {
   spawner: Option<std::os::fd::OwnedFd>,
   /// The spawner itself, the shards it serves in its ends' order, and how long its start took: the control shard's
   /// alone, which owns and restarts it (A-924 piece 2b).
-  spawner_owner: Option<(slates_ipc::confined_spawn::SpawnedChild, Vec<u16>, u64)>,
+  spawner_owner: Option<SpawnerOwner>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -4897,6 +4960,16 @@ struct ShardHolds {
   /// The held Shards streams' DAX sections (A-448).
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
+
+/// The spawner the control shard owns (A-924): the process, the shards it serves in its ends' order, how long its start
+/// took, and where its owner hands it back to be joined.
+#[cfg(unix)]
+type SpawnerOwner = (
+  slates_ipc::confined_spawn::SpawnedChild,
+  Vec<u16>,
+  u64,
+  std::sync::mpsc::Sender<slates_ipc::confined_spawn::SpawnedChild>,
+);
 
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
@@ -5155,13 +5228,13 @@ fn node_seal_recipient(
 /// control shard owns the spawner too, and restarts it on its death (piece 2b).
 #[cfg(unix)]
 fn install_spawner(
-  owner: Option<(slates_ipc::confined_spawn::SpawnedChild, Vec<u16>, u64)>,
+  owner: Option<SpawnerOwner>,
   end: Option<std::os::fd::OwnedFd>,
   config: &DaemonConfig,
   (config_shards, partition): (&[u16], u16),
 ) -> Result<(), ServerError> {
-  if let Some((spawner, served, start_took_ns)) = owner {
-    crate::spawning::own(spawner, served, start_took_ns);
+  if let Some((spawner, served, start_took_ns, join_to)) = owner {
+    crate::spawning::own(spawner, served, start_took_ns, Some(join_to));
   }
   if let Some(end) = end {
     let placement = crate::spawning::Placement {
@@ -5622,6 +5695,7 @@ async fn init_shard(
     last_answers: std::collections::BTreeMap::new(),
     owner_hold: None,
     ledger_reads: crate::ledger_read::LedgerReads::default(),
+    edges: crate::edges::Edges::default(),
     period_stretch_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
