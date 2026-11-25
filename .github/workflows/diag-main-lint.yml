@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 40 (main 01a20182, 2026-11-24 23:18 PST): main at 1fe3a3b05, w-shared's A-913 (ff53bdf83: a holder's record path makes a
+# missing branch source), landed after run 39 was pushed; with main's pending fixes 834cc5115 and 42503c25e.
 # Run 39 (main 01a20182, 2026-11-24 23:14 PST): run 38 found hg intake_tests.rs sites and fleet.rs:37080's mut; main's commits fix
 # them (with 834cc5115). Main past 2ed3eb139.
 # Run 38 (main 01a20182, 2026-11-24 22:30 PST): run 36 found three sites in hg's (B') (b47217878); main's commit fixes them. Main
