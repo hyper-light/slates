@@ -63429,3 +63429,22 @@ greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/
 
 Applied in the same change to: §4.8 (the owner's own hold, with a status line), `crates/db/src/register.rs`,
 `crates/cluster/src/lib.rs`, `crates/server/tests/fleet.rs`, the A-908 entry's owed line, GAPS.
+
+
+### A-910 — A green's fold visits only the paths changed since its last floor (2026-11-24, w-svn for main 01a20182, goal 93; found by timing an import's landing at 9,000 files; §4.16 "delta retention before folding", AUD-16)
+
+- **Why.** An import's landing ended in `fold_to_readers`, whose `Green::fold_history_before` walked every path's history
+  in every dimension (content, specials, mode, symlink, hard link, attributes, directories) on every floor move. The
+  floor moves at every batch an import lands, so each landing paid a walk of the whole green, quadratic over an import
+  of many batches; at 9,000 files it was 494 ms of one step on a debug build, folding nothing.
+- **The change.** The fold visits only the paths the change index names at a version from the last floor to the new
+  one, both included. Every other path's history holds at most the one entry below the last floor that fold left it,
+  and none from it to the new floor, so it folds to itself. The last floor's own version is visited again: a history
+  may hold more than one entry at one version (one work setting an attribute twice), which that fold kept as the value
+  at its floor. The cost is the changes since the last fold, never the green.
+- **The oracle.** `engine::fold_tests`: two greens take the same generated works in every dimension, with the floor
+  moved between them; one folds the index's paths, the other every path (`fold_history_before_every_path`, test only).
+  After every move their histories, recounted history bytes and retained bytes are equal. It found the visit of the
+  last floor's version necessary. A counted test holds a fold's visits to the paths changed since its last floor (2 of
+  a green of 50, where the whole walk visited 50).
+- **Applied in the same change to** `crates/merge/src/engine.rs` and `crates/merge/src/engine/fold_tests.rs`.
