@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 24 (main 01a20182, 2026-11-24 19:10 PST): run 23 found merge_origin.rs install at 11 and an unneeded mut (7106f83ea);
+# main's commit splits install by path.
 # Run 23 (main 01a20182, 2026-11-24 19:03 PST): main at b7e65cc63, w-shared's af061de87 (the merge-authority test's green) and
 # 7106f83ea (a restarted holder rebuilds a lineage by membership), landed after run 22.
 # Run 22 (main 01a20182, 2026-11-24 18:57 PST): main at a7685b09e, w-hg's f289d786f (the hg parks test reads its interval before the
