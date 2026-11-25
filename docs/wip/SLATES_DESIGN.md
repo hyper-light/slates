@@ -64333,6 +64333,14 @@ GAPS.
   10.6 ms → 6.2-6.3 ms (2 runs, load 35-60). Still whole in it: the hold (the verdict, 2.6) and `Reached::of`.
   Oracle: the named-texts history oracle's commits and applies prepare a unit a step; a resumed walk of the places that
   skips a run fails it.
+  **3e, the preparation's turn.** The step a commit's preparation left its sole runs in (7.0-7.3 ms at 9,000 files)
+  named every file a run makes whole (`named_files`) and kept the files whose run makes no other (`alone`), each a
+  walk of every sole run. Each file's name and its run's count of files are now kept as the sole runs are found
+  (`whole_object`, shared with `named_files`), and the files kept are their own phase (`Prep::Alone`), a file a unit.
+  The step 7.0-7.3 ms → under 5 ms (2 runs, load 32-50). Oracle: the named-texts history oracle's deferring green, its
+  commits prepared a unit a step, makes as many files by copying as the judging green's whole commits
+  (`Green::mapped_files_made`, for every version not made in steps first); a resumed `Alone` that skips a file, which
+  moves no bytes differently and so passed every oracle before this count, fails it.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
