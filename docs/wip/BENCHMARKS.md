@@ -19730,3 +19730,25 @@ about as often as B (6.2 % against 6.6 % of probes) and is dead even with B on t
 - **The whole clone** is noise after the pack begins (B 62.1 to 86.7 s, C 71.1 to 91.0 s, A 77.2 to 81.7 s) and judges
   no arm.
 - **The daemon's peak** was alike: A 2,902 to 2,946 MiB, B 2,904 to 2,978, C 2,909 to 2,911.
+
+## The 57k hg clone's memory after its two fixes: the clone adds 27 MiB to a resident 983 MiB, in process (goal 93 perf; w-perf's `what_holds`, main 01a20182's run, 2026-11-25 02:05 to 02:10 PST)
+
+**Fixed, by an in-process measure.** With 7c0ea35a1 (the text cache's walk ended for whole reads) and fffd95f79 (a
+fetch's batch bounded by `copy_slice_bytes`), a clone of the 57k history adds 27 MiB to the daemon's resident set. The
+same clone at 15b4f1061 had peaked at 10,416 MiB (BENCHMARKS, "the night's rerun").
+
+- **Command.** `crates/server/tests/hg_fetch_heap.rs`'s `what_holds` at main d3057763e: release with
+  `line-tables-only`, an in-process daemon, Mercurial's own history (57k changesets, hg-src) pushed then cloned.
+- **Machine and load.** The MacBook, load average 39 to 57.
+
+| point | resident (KiB) | live sampled heap |
+|---|---|---|
+| after the push | 1,006,496 | 150.9 MB |
+| the clone's peak | | 202.4 MB |
+| after the clone | 1,034,192 (+27 MiB) | 144.2 MB |
+
+- **Against the daemon's resident peak through a 57k clone** in the earlier rounds: 5,987 MiB at f8fe97e5e (loaded round
+  2), 5,966 MiB at 2ed3eb139, 10,416 MiB at 15b4f1061.
+- **Caveat.** This is an in-process figure from a test binary, against the earlier rounds' daemon RSS, not yet the same
+  harness. The harness's own hg leg at a build with both fixes follows, and it supersedes this entry when it lands.
+
