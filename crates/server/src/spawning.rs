@@ -610,8 +610,6 @@ struct Owner {
   shards: Vec<u16>,
   /// When the spawner now running started, on the shard's clock.
   started_at_ns: u64,
-  /// How long its start took, measured: what the back-off doubles.
-  start_took_ns: u64,
   /// The spawners that died within a liveness window of their start, in a row.
   deaths_in_a_row: u32,
   /// A restart is under way: further word of the same death is not acted on again.
@@ -628,13 +626,12 @@ fn with_owner<T>(work: impl FnOnce(&mut Owner) -> T) -> Option<T> {
   OWNER.with(|owner| owner.try_borrow_mut().ok()?.as_mut().map(work))
 }
 
-/// Makes this shard the spawner's owner: `child`, serving `shards` an end each in order, whose start took
-/// `start_took_ns`, handed to `join_to` at the owner's drop. The control shard calls it at its start (the daemon's
+/// Makes this shard the spawner's owner: `child`, serving `shards` an end each in order, handed to `join_to` at the
+/// owner's drop. The control shard calls it at its start (the daemon's
 /// start made the spawner).
 pub(crate) fn own(
   child: SpawnedChild,
   shards: Vec<u16>,
-  start_took_ns: u64,
   join_to: Option<std::sync::mpsc::Sender<SpawnedChild>>,
 ) {
   OWNER.with(|owner| {
@@ -645,7 +642,6 @@ pub(crate) fn own(
         generation: 0,
         shards,
         started_at_ns: futures::now_ns(),
-        start_took_ns,
         deaths_in_a_row: 0,
         restarting: false,
       });
@@ -654,19 +650,17 @@ pub(crate) fn own(
 }
 
 /// Derived: how long the owner waits before starting a spawner again after `deaths_in_a_row` deaths that each came
-/// within a liveness window of their start: none after one (a spawner that ran its window and then died is restarted at
-/// once), then the measured length of a start (`start_took_ns`), doubled for each further death (RFC 6298 §5.5's
-/// back-off), never past the daemon's liveness window, so a spawner that cannot stay up is tried once a window.
-pub(crate) fn back_off_ns(deaths_in_a_row: u32, start_took_ns: u64) -> u64 {
+/// within a liveness window of its start: none after one (a spawner that ran its window and then died is restarted at
+/// once), and a whole liveness window after any more, so a spawner that cannot stay up is started at most twice a
+/// window. Until 2026-11-25 the wait doubled a start's measured length, a few milliseconds, and a spawner that ended at
+/// once was started 12 times in a window and a half before the doubling reached the window (main's question on A-924
+/// (c)'s red).
+pub(crate) fn back_off_ns(deaths_in_a_row: u32) -> u64 {
   if deaths_in_a_row <= 1 {
-    return 0;
+    0
+  } else {
+    crate::daemon::LIVENESS_BUDGET_NS
   }
-  let doublings = deaths_in_a_row.saturating_sub(2);
-  let factor = 1u64.checked_shl(doublings).unwrap_or(u64::MAX);
-  start_took_ns
-    .max(1)
-    .saturating_mul(factor)
-    .min(crate::daemon::LIVENESS_BUDGET_NS)
 }
 
 /// Word on the owner's shard that a shard's end of the spawner of `generation` closed: a restart begun once for it, or
@@ -701,8 +695,7 @@ fn spawner_gone(generation: u64) {
 /// sent its new end; a start refused tells every shard so and tries again after a longer back-off.
 async fn restart() {
   loop {
-    let wait_ns =
-      with_owner(|owner| back_off_ns(owner.deaths_in_a_row, owner.start_took_ns)).unwrap_or(0);
+    let wait_ns = with_owner(|owner| back_off_ns(owner.deaths_in_a_row)).unwrap_or(0);
     if wait_ns > 0 {
       let _ = futures::sleep(wait_ns).await;
     }
@@ -716,10 +709,9 @@ async fn restart() {
     {
       count_on_shard(SPAWNER_REAP_REFUSED);
     }
-    let began = futures::now_ns();
     match slates_ipc::spawner::start_here(shards.len()) {
       Ok(started) => {
-        hand_out(started, began, &shards);
+        hand_out(started, &shards);
         count_on_shard(SPAWNER_RESTARTED);
         return;
       }
@@ -731,15 +723,14 @@ async fn restart() {
   }
 }
 
-/// A spawner just started at `began`: kept as the owner's next generation, and an end sent to each of `shards`.
-fn hand_out(started: slates_ipc::spawner::Started, began: u64, shards: &[u16]) {
+/// A spawner just started: kept as the owner's next generation, and an end sent to each of `shards`.
+fn hand_out(started: slates_ipc::spawner::Started, shards: &[u16]) {
   let slates_ipc::spawner::Started { child, ends } = started;
   let now = futures::now_ns();
   let Some(generation) = with_owner(|owner| {
     owner.child = Some(child);
     owner.generation = owner.generation.saturating_add(1);
     owner.started_at_ns = now;
-    owner.start_took_ns = now.saturating_sub(began);
     owner.restarting = false;
     owner.generation
   }) else {
@@ -888,7 +879,7 @@ impl TestSpawner {
   /// [`TestSpawner::installed`], this shard the spawner's owner ([`own`]).
   pub(crate) fn owned() -> TestSpawner {
     let (child, here) = Self::start(TEST_SPAWNS_IN_FLIGHT);
-    own(child, vec![here], 0, None);
+    own(child, vec![here], None);
     TestSpawner { child: None }
   }
 

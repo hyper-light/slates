@@ -340,11 +340,18 @@ impl Inbound {
       [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(STREAMS))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
     let mut buffer = [0u8; READ_BYTES];
+    // Every descriptor received is close-on-exec: Linux's spawn hands a child every descriptor not so marked (macOS's
+    // closes by default), and a child of the spawner's held the streams of the spawn before it (main's diag run
+    // 45672799755: fd 6 in the child's listing on both Linux lanes). Marked at receipt on Linux, just after elsewhere.
+    #[cfg(target_os = "linux")]
+    let flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = RecvFlags::empty();
     let received = match rustix::net::recvmsg(
       end,
       &mut [io::IoSliceMut::new(&mut buffer)],
       &mut control,
-      RecvFlags::empty(),
+      flags,
     ) {
       Ok(received) => received,
       Err(Errno::AGAIN | Errno::INTR) => return Ok(Read::Waiting),
@@ -352,7 +359,11 @@ impl Inbound {
     };
     for message in control.drain() {
       if let RecvAncillaryMessage::ScmRights(carried) = message {
-        self.descriptors.extend(carried);
+        for descriptor in carried {
+          #[cfg(not(target_os = "linux"))]
+          rustix::io::fcntl_setfd(&descriptor, rustix::io::FdFlags::CLOEXEC)?;
+          self.descriptors.push(descriptor);
+        }
       }
     }
     if received.bytes == 0 {
@@ -612,6 +623,12 @@ fn errno_location() -> *mut libc::c_int {
 
 /// Makes the self-pipe and installs `SIGCHLD`'s handler: the pipe's read end, non-blocking.
 fn child_wakes() -> io::Result<OwnedFd> {
+  // Made close-on-exec at once on Linux (`pipe2`); elsewhere marked a call later, which no other thread of the spawner's
+  // can spawn into, since it has none.
+  #[cfg(target_os = "linux")]
+  let (read, write) =
+    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
+  #[cfg(not(target_os = "linux"))]
   let (read, write) = rustix::pipe::pipe().map_err(io::Error::from)?;
   for end in [&read, &write] {
     rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC).map_err(io::Error::from)?;

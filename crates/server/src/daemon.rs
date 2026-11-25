@@ -1104,8 +1104,6 @@ impl Daemon {
     // The daemon's spawner (A-924): started now, before any client's descriptor is open, with an end a shard. Every hook
     // and helper a shard starts is started by it, so a spawn never copies this process's descriptor table.
     #[cfg(unix)]
-    let spawner_began = std::time::Instant::now();
-    #[cfg(unix)]
     let slates_ipc::spawner::Started {
       child: spawner,
       ends: spawner_ends,
@@ -1115,9 +1113,6 @@ impl Daemon {
         code: error.raw_os_error(),
       })
     })?;
-    #[cfg(unix)]
-    let spawner_start_took_ns =
-      u64::try_from(spawner_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
     #[cfg(unix)]
     let mut spawner_ends = spawner_ends.into_iter();
     // The control shard owns it (`crate::spawning::own`): the one that restarts it, an end to each shard in this order.
@@ -1129,7 +1124,6 @@ impl Daemon {
     let mut spawner_owner = Some((
       spawner,
       shards.iter().map(|shard| shard.0).collect::<Vec<u16>>(),
-      spawner_start_took_ns,
       spawner_join_send,
     ));
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
@@ -3963,7 +3957,7 @@ impl Daemon {
       .observe(shard, move |s| {
         // Only a shard with a committed image has dead memory to give back.
         let _ = crate::verbs::publish_shard(s);
-        s.journal.forget_what_was_given_back();
+        s.journal.forget_what_was_given_back(recovery_totals(s));
         s.give_back_rate = GiveBackRate::default();
         s.purge_seen_allocations = s.store.content.arena().allocations();
         if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
@@ -4867,7 +4861,17 @@ fn content_slice(
       len: deltas.1.saturating_sub(deltas.0),
     },
   );
-  match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
+  // The journal's memories whole, as an image before A-926 leaves them: what a log of version 2 takes its marks as.
+  let journal_whole = slates_vfs::checkpoint_log::WrittenExtents::whole(
+    images.1.saturating_sub(images.0),
+    deltas.1.saturating_sub(deltas.0),
+  );
+  match crate::write_log::WriteLog::open(
+    object,
+    (log_start, log_bytes),
+    generation,
+    (config.page, journal_whole),
+  ) {
     Some((log, recovered)) => (images, Some(log), recovered),
     None => (images, None, crate::write_log::Recovered::default()),
   }
@@ -4951,13 +4955,12 @@ struct ShardHolds {
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
-/// The spawner the control shard owns (A-924): the process, the shards it serves in its ends' order, how long its start
-/// took, and where its owner hands it back to be joined.
+/// The spawner the control shard owns (A-924): the process, the shards it serves in its ends' order, and where its owner
+/// hands it back to be joined.
 #[cfg(unix)]
 type SpawnerOwner = (
   slates_ipc::confined_spawn::SpawnedChild,
   Vec<u16>,
-  u64,
   std::sync::mpsc::Sender<slates_ipc::confined_spawn::SpawnedChild>,
 );
 
@@ -5223,8 +5226,8 @@ fn install_spawner(
   config: &DaemonConfig,
   (config_shards, partition): (&[u16], u16),
 ) -> Result<(), ServerError> {
-  if let Some((spawner, served, start_took_ns, join_to)) = owner {
-    crate::spawning::own(spawner, served, start_took_ns, Some(join_to));
+  if let Some((spawner, served, join_to)) = owner {
+    crate::spawning::own(spawner, served, Some(join_to));
   }
   if let Some(end) = end {
     let placement = crate::spawning::Placement {
@@ -6182,6 +6185,16 @@ pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 /// give-back of memory a predecessor may have written (18 GB a shard on a 128 GiB Mac) holds the shard one quantum a
 /// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
 /// next give-back. The bytes given back, and whether any is left.
+/// The shard's recovery memories' lengths: its checkpoint memory's and its delta log's.
+fn recovery_totals(s: &ShardState) -> (usize, usize) {
+  let (slots_start, slots_end) = s.content_range;
+  let (log_start, log_end) = s.delta_range;
+  (
+    slots_end.saturating_sub(slots_start),
+    log_end.saturating_sub(log_start),
+  )
+}
+
 fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
   return_dead_recovery_timed(s, &mut shard_thread_cpu_ns)
 }
@@ -6224,6 +6237,10 @@ fn return_dead_recovery_timed(
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
   );
+  // The marks fall with what was given back, after it (A-926): a crash between leaves them ahead, never behind.
+  if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
+    let _lowered = log.lower_journal_marks(object, s.journal.written());
+  }
   learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
@@ -11350,7 +11367,9 @@ mod tests {
   fn a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock() {
     let seen = audit_on_shard(|state| {
       let _ = crate::verbs::publish_shard(state);
-      state.journal.forget_what_was_given_back();
+      state
+        .journal
+        .forget_what_was_given_back(super::recovery_totals(state));
       state.give_back_rate = super::GiveBackRate::default();
       let quantum = slates_rt::futures::step_budget_ns()
         .unwrap_or(state.config.runtime.step_budget_ns)

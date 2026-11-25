@@ -228,7 +228,12 @@ fn journal_of(files: usize) -> (Vec<u8>, Vec<u8>, usize) {
 /// Recovers a journal (its checkpoint, then its deltas): µs.
 fn replay(slots: &[u8], log: &[u8]) -> u128 {
   let started = Instant::now();
-  let (image, _) = Journal::recover(slots, log).unwrap();
+  let (image, _) = Journal::recover(
+    slots,
+    log,
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(slots, log),
+  )
+  .unwrap();
   let took = started.elapsed().as_micros();
   assert!(image.is_some(), "the journal recovers");
   took
@@ -237,7 +242,12 @@ fn replay(slots: &[u8], log: &[u8]) -> u128 {
 /// Recovers the journal (the checkpoint, no deltas): µs.
 fn decode(slots: &[u8]) -> u128 {
   let started = Instant::now();
-  let (image, _) = Journal::recover(slots, &Vec::<u8>::new()).unwrap();
+  let (image, _) = Journal::recover(
+    slots,
+    &Vec::<u8>::new(),
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(slots, &Vec::<u8>::new()),
+  )
+  .unwrap();
   let took = started.elapsed().as_micros();
   assert!(image.is_some(), "the checkpoint recovers");
   took

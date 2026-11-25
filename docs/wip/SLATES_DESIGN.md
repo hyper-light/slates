@@ -64324,8 +64324,9 @@ measured noise of the 100 figure, not a literal.
 > **Piece 2b built (2026-11-25).** The control shard owns the spawner (`crate::spawning::own`, handed it by the
 > daemon's start with the measured length of that start). A shard whose end closes answers that generation's waiters
 > `SpawnerGone` and tells the owner; the owner restarts once per generation, after a back-off (`back_off_ns`: none
-> after one death, then the measured start's length doubled for each death within a liveness window of its start,
-> capped at the liveness window, RFC 6298 §5.5), and sends each shard its new end (`run_on_waiting`), or tells each
+> after one death, a whole liveness window after each later death within a window of its start, so a spawner that
+> cannot stay up starts at most twice a window; until 2026-11-25 it doubled a start's measured milliseconds, 12 starts
+> in a window and a half), and sends each shard its new end (`run_on_waiting`), or tells each
 > the attempt failed and tries again after a longer back-off. The restart wait is no timer: a spawn asked while a
 > restart is awaited waits for that attempt's answer, which always comes (the new end or the failure); between
 > attempts it is refused at once. Ids keep rising across generations and a handle of a gone generation answers
@@ -64346,6 +64347,13 @@ measured noise of the 100 figure, not a literal.
 > daemon's process thread at its drop (`Daemon::stop_parts` joins it, `join_spawner`, once the runtime has ended). Red:
 > a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
 > (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
+>
+> **Every received descriptor close-on-exec (2026-11-25).** Main's diag run 45672799755 found a child started through
+> the spawner on both Linux lanes holding a descriptor a direct child did not (fd 6). The spawner received the child's
+> streams by `SCM_RIGHTS` without close-on-exec, and Linux's spawn hands a child every descriptor not so marked
+> (macOS's `POSIX_SPAWN_CLOEXEC_DEFAULT` hid it). Now `Inbound::read` receives with `MSG_CMSG_CLOEXEC` on Linux and
+> marks each descriptor just after elsewhere, and the spawner's self-pipe is made with `pipe2(O_CLOEXEC)` on Linux.
+> Red: `a_descriptor_riding_a_request_is_received_close_on_exec` (received without the flag on every platform).
 >
 > **Its cost** (main's measurements, 2026-11-25). macOS, release daemon at 5c7381734, idle: the spawner's footprint
 > 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no
@@ -64411,3 +64419,67 @@ measured noise of the 100 figure, not a literal.
   `encoded_by_family`, the split's encoded bytes); `crates/server/src/vcs_store.rs` (`AWAYS_RENUMBERED`, the restore's
   plumbing); `crates/server/src/vcs_store/homes.rs` and `arena_windows.rs` (the cut readers' head);
   `crates/server/src/verbs.rs`; A-870's owed (b); GAPS.
+
+### A-926 — A shard slice's written memories keep high-water marks a successor reads, so a residency sweep walks what was written, not what may have been (2026-11-25, w-perf for main 01a20182, its rulings of 2026-11-25 on A-826's flaky sweep; amends A-744's split, A-226, A-68's journal and A-63's write log)
+
+- **Why.** `content_ranges`' status sweep failed in main's full server suite: (sweeps, idle slices, armed) (0, 3,348,409,
+  true) at its bound of sixty liveness budgets, passing alone in 29.7 s. No idle slice failed to advance. A fresh
+  1-shard audit daemon's sweep was 12,582,958 pages:
+  - the two checkpoint slots, 5,592,406, with 48 KiB resident;
+  - the delta log, 2,796,203, with 16 KiB;
+  - the write log, 699,051, with 32 KiB;
+  - the segment's log and snapshot regions, 3,495,255.
+
+  The journal and the write log were walked whole because their extents were unknown (`UNKNOWN_EXTENT`, "a predecessor
+  may have written"). Under in-process load (two spinning threads a core) each idle slice walked 4.1 pages against
+  10.6 alone, the live step quantum halved, so a sweep took 55.5 s of its 60 against 23.7 alone. The kernel's per-mapping
+  figures cannot split it: macOS answers per map entry (`mach_vm_region`), Linux per VMA (`/proc/self/smaps`), and the
+  content object is one mapping holding every shard's slice (main withdrew its ruling to skip ranges on the kernel's
+  word when shown this).
+- **The marks.**
+  - **Where:** a block in the last 40 bytes of the shard's write log region: a version word ("MARK", 1), then the
+    high-water mark of each written memory of the slice (`write_log::Marked`: the write log's region, the first and
+    second checkpoint slot, the delta log), bytes from its memory's start. No other offset moves.
+  - **Raised before the write:** the new end, rounded up to a page, is stored before the write that passes the mark,
+    with a release fence between, at the one write boundary each memory has (`WriteLog::append`; every checkpoint and
+    delta write through `verbs::ContentSlots`). A crash leaves the mark ahead of the bytes, never behind.
+  - **Falls after a give-back:** `WriteLog::purge`, and the journal's give-back (`daemon::return_dead_recovery`),
+    once the pages past it are given back.
+  - **Read at the open:** the journal is recovered over the extents (`checkpoint_log::WrittenExtents`, a slot's by its
+    place), and the write log over its own. `UNKNOWN_EXTENT` is gone: an extent is always a length.
+- **The format.** The write log's layout goes to version 3 ("WLOG", 3), its record area stopping before the block.
+  - **Version 2:** has no block, and its records may run to the region's end. It is read as before, every mark whole
+    (the assumption before A-926), until its first clear uncovers its records, writes the block, then the version 3
+    word. A crash between leaves an empty version 2 log, read whole again. Its scrub stops at the new record area,
+    since the block takes the old records' last 40 bytes.
+  - **A fresh slice:** every header word zero (no daemon opened it), so every mark is zero.
+  - **Counted** `content_range.marks.adopted`, `marks.raised` and `marks.appends`.
+  - **What a restart on an old image costs:** one sweep and one give-back of each memory whole, as before A-926, then
+    marks.
+- **Reds:**
+  - `a_version_2_log_filled_to_its_end_is_replayed_whole_then_cleared_into_version_3`: the record in the last 40 bytes
+    replayed byte for byte, every memory whole until the first clear, the append that did not fit refused full, then
+    version 3 with its marks read back. It found the first clear's scrub wiping the block it had written.
+  - `a_crash_after_a_records_bytes_leaves_the_mark_covering_them`: with the raise after the record's bytes, the
+    successor's mark read 8,192 against bytes written to 12,704.
+  - `a_growing_log_raises_its_mark_once_a_page`: one raise each of 4 pages over 116 appends; best of five interleaved
+    rounds 360 ns an append with the marks against 351 without (619 and 619 in another run): the write path's cost
+    unchanged.
+  - `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`: the journal and write log plan 2
+    pages against 8,388,607 whole.
+  - `a_status_requests_sweep_completes_within_its_bound_under_load`.
+  - The journal's give-back oracle (`a_give_back_names_every_dead_written_byte_and_stops_at_the_last`): each restart
+    now opens over the extents its predecessor's marks carry, and every written byte stays inside the written ranges.
+- **Measured** (debug, the MacBook, 2026-11-25): the sweep 3,495,300 pages (12,582,958 before). Alone, 1.6 s over
+  40,988 idle slices (23.7 s, 1,185,392 before). Loaded, two hogs a core, 1.6 s over 40,730 (55.5 s, 3,075,443 before).
+- **Part 2, owed:** the segment's log and snapshot regions (3,495,255 pages, the anchor's format, the register's code)
+  get marks of their own, with their own migration.
+- **Applied in the same change to:**
+  - `crates/vfs/src/checkpoint_log.rs` (`WrittenExtents`, `Journal::over`, `Journal::recover`'s extents, the extents
+    a slot by place);
+  - `crates/vfs/src/recover.rs` (`CommittedSlot::index`, `stale_index`; `slots_of_memory` public);
+  - `crates/server/src/write_log.rs` (the marks block, version 3, the migration);
+  - `crates/server/src/verbs.rs` (`ContentSlots`' raise, `read_journal`'s extents);
+  - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
+  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
+  - A-826's GAPS entry.

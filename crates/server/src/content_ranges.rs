@@ -245,6 +245,17 @@ fn targets(state: &ShardState) -> Plan {
       0,
       (start.saturating_add(log_from), log_written.min(log_len)),
     ));
+    // The slice's marks block at the log region's end (A-926): its page, beside what the log wrote.
+    if let Some((at, len)) = state
+      .write_log
+      .as_ref()
+      .and_then(crate::write_log::WriteLog::marks_block)
+    {
+      targets.push(object(
+        0,
+        (start.saturating_add(log_from).saturating_add(at), len),
+      ));
+    }
     let (images, deltas) = (state.content_range, state.delta_range);
     let [committed, stale, logged] = state.journal.written_ranges(
       images.1.saturating_sub(images.0),
@@ -554,6 +565,17 @@ pub(crate) fn report(state: &mut ShardState, memory: bool) -> Vec<RefusalCount> 
     ] {
       rows.push((format!("{PREFIX}{range}.{figure}"), bytes));
     }
+  }
+  if let Some(log) = state.write_log.as_ref() {
+    // The slice's marks (A-926): how they were found as the write log opened (a version 2 log adopted, its path shown
+    // to have run), the marks raised against the records appended.
+    let (found, raises, appends) = log.marks_counts();
+    rows.push((
+      format!("{PREFIX}marks.adopted"),
+      u64::from(found == crate::write_log::MarksFound::Adopted),
+    ));
+    rows.push((format!("{PREFIX}marks.raised"), raises));
+    rows.push((format!("{PREFIX}marks.appends"), appends));
   }
   rows.push((
     format!("{PREFIX}sweep.completed"),
@@ -868,6 +890,122 @@ mod tests {
   // The watch leaves the shard idle between its looks, which is the condition under test: a look is a task on the shard.
   #[allow(clippy::disallowed_methods)]
   fn a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length() {
+    let (seen, measured, bounds) = status_sweep_watched(0);
+    assert_the_status_sweep_kept_its_bounds(seen, measured, bounds);
+  }
+
+  /// A-826's flake, A-926's red (main's ruling of 2026-11-25): in the full server suite the sweep above found (sweeps, idle
+  /// slices, armed) (0, 3,348,409, true) at its bound, and passed alone in 29.7 s. Its 12,582,958 pages were mostly the
+  /// journal's slots and log and the write log a fresh daemon never wrote, walked whole because their extents were not
+  /// known; under load each idle slice walks fewer pages (4.1 against 10.6 alone, the live step quantum halved). Do: the
+  /// same watch with two threads a core spinning in the process. Expect the same bounds held: a sweep completed within
+  /// sixty liveness budgets on the shard's idle time. Red before A-926: 55.5 s of 60 here, past it at the suite's load.
+  #[test]
+  #[allow(clippy::disallowed_methods)]
+  fn a_status_requests_sweep_completes_within_its_bound_under_load() {
+    let hogs = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) * 2;
+    let (seen, measured, bounds) = status_sweep_watched(hogs);
+    assert_the_status_sweep_kept_its_bounds(seen, measured, bounds);
+  }
+
+  /// A-926 (main's ruling of 2026-11-25: a fresh daemon's sweep walks its written pages, never its unwritten write log
+  /// and journal). Do: on a fresh daemon, read the sweep's plan, then ask the memory report until a sweep completes. Expect
+  /// the plan's content object ranges (the write log, the checkpoint slots, the delta log) no more than the pages the
+  /// slice's marks cover and one page a range, far under those memories whole; and the completed sweep's pages walked no
+  /// more than its plan's, a percent and one step a range. Before A-926: the slots and the delta log whole, 8,388,609 pages of a
+  /// 1-shard audit daemon's 12,582,958, against 4 resident.
+  #[test]
+  fn a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal() {
+    let daemon = crate::daemon::audit_daemon();
+    let planned = crate::daemon::observe_first(&daemon, |state| {
+      let page = state.config.page.max(1);
+      let plan = targets(state);
+      let pages = |range: &dyn Fn(usize) -> bool| -> (usize, usize) {
+        plan
+          .0
+          .iter()
+          .filter(|target| range(target.range()))
+          .fold((0, 0), |(pages, ranges), target| {
+            (pages + target.len().div_ceil(page), ranges + 1)
+          })
+      };
+      let journal = |range: usize| range <= 2;
+      let (content_pages, content_ranges) = pages(&journal);
+      let (all_pages, all_ranges) = pages(&|_| true);
+      let log = state.write_log.as_ref().unwrap();
+      let marks = log.journal_extents();
+      let marked =
+        (log.written_bytes() + marks.slots[0] + marks.slots[1] + marks.log).div_ceil(page);
+      let (images, deltas) = (state.content_range, state.delta_range);
+      let whole = (images.1 - images.0 + deltas.1 - deltas.0) / page;
+      (
+        content_pages,
+        content_ranges,
+        marked,
+        whole,
+        (all_pages, all_ranges),
+      )
+    });
+    let sweeps = first_sweep_within(&daemon, 1_000_000);
+    let walked = crate::daemon::observe_first(&daemon, |state| state.content_sweep.pages);
+    daemon.stop();
+    let (content_pages, content_ranges, marked, whole, (all_pages, all_ranges)) = planned;
+    println!(
+      "content_ranges: the plan's journal and write log {content_pages} pages in {content_ranges} ranges (marked \
+       {marked}, whole {whole}); the sweep walked {walked} pages of a plan of {all_pages}"
+    );
+    assert!(sweeps > 0, "a sweep completed");
+    assert!(
+      content_pages <= marked + content_ranges,
+      "the journal and write log planned {content_pages} pages, past the {marked} marked and a page a range"
+    );
+    assert!(
+      content_pages * 100 < whole,
+      "far under the memories whole: {content_pages} of {whole}"
+    );
+    // The plan read here and the one the sweep made at its start may differ by what moved between (the arena's held
+    // runs, a client's ring): within a percent of it and a step a range.
+    assert!(
+      walked as usize <= all_pages + all_pages / 100 + all_ranges,
+      "the sweep walked {walked} pages, past its plan's {all_pages}"
+    );
+  }
+
+  /// What [`a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`] watches, with `hogs`
+  /// threads spinning in the process while it does: the sweep's (sweeps, idle slices, armed), when the report's kinds
+  /// passed, how long the completed sweep took, the spacing after it, and the bounds held to.
+  #[allow(clippy::disallowed_methods)]
+  #[allow(clippy::type_complexity)]
+  fn status_sweep_watched(
+    hogs: usize,
+  ) -> (
+    (u64, u64, bool),
+    (Option<std::time::Duration>, u64, (u64, bool)),
+    (std::time::Duration, std::time::Duration),
+  ) {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      for _ in 0..hogs {
+        scope.spawn(|| {
+          while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::hint::spin_loop();
+          }
+        });
+      }
+      let watched = status_sweep_watch();
+      stop.store(true, std::sync::atomic::Ordering::Relaxed);
+      watched
+    })
+  }
+
+  /// [`status_sweep_watched`]'s watch.
+  #[allow(clippy::disallowed_methods)]
+  #[allow(clippy::type_complexity)]
+  fn status_sweep_watch() -> (
+    (u64, u64, bool),
+    (Option<std::time::Duration>, u64, (u64, bool)),
+    (std::time::Duration, std::time::Duration),
+  ) {
     /// Shape: the memory report's kinds' bound: swept on idle time within ten liveness budgets.
     const KINDS: std::time::Duration =
       std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
@@ -909,8 +1047,13 @@ mod tests {
       report(state, true);
       (state.content_sweep.spaced, state.content_sweep.running)
     });
+    let pages = crate::daemon::observe_first(&daemon, |state| state.content_sweep.pages);
     daemon.stop();
-    assert_the_status_sweep_kept_its_bounds(seen, (kinds_seen, took_ns, spaced), (WATCH, KINDS));
+    println!(
+      "content_ranges: the watched sweep (sweeps, idle slices, armed) {seen:?} in {:.1} s, {pages} pages walked",
+      started.elapsed().as_secs_f64()
+    );
+    (seen, (kinds_seen, took_ns, spaced), (WATCH, KINDS))
   }
 
   /// What [`a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`] holds its sweep to, from

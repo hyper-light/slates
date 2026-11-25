@@ -567,6 +567,51 @@ struct Channel {
   exited: Option<u32>,
 }
 
+/// What a task's polls ran ([`Polled`]), by the thread's CPU: the longest, all of them, and how many.
+#[derive(Clone, Copy, Debug, Default)]
+struct Polls {
+  /// The longest poll's CPU.
+  most_ns: u64,
+  /// All polls' CPU.
+  total_ns: u64,
+  /// The polls.
+  count: u64,
+}
+
+std::thread_local! {
+  /// The poll [`Polled`] is in on this thread, numbered from 1: what [`Channel::drive_awaiting`] notes at each step's end.
+  static POLL: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// A future whose every poll is timed by the polling thread's CPU ([`Polls`]) and numbered ([`POLL`]): what each of a
+/// task's polls held its shard for, a loaded machine's preemption not counted.
+struct Polled<F> {
+  /// The future.
+  inner: core::pin::Pin<Box<F>>,
+  /// Its polls so far.
+  polls: Polls,
+}
+
+impl<F: core::future::Future> core::future::Future for Polled<F> {
+  type Output = (F::Output, Polls);
+
+  fn poll(
+    mut self: core::pin::Pin<&mut Self>,
+    context: &mut core::task::Context<'_>,
+  ) -> core::task::Poll<Self::Output> {
+    POLL.with(|poll| poll.set(poll.get().saturating_add(1)));
+    let began = crate::vcs_ssh::hg::thread_cpu_ns();
+    let polled = self.inner.as_mut().poll(context);
+    if let (Some(began), Some(now)) = (began, crate::vcs_ssh::hg::thread_cpu_ns()) {
+      let ran = now.saturating_sub(began);
+      self.polls.most_ns = self.polls.most_ns.max(ran);
+      self.polls.total_ns = self.polls.total_ns.saturating_add(ran);
+      self.polls.count = self.polls.count.saturating_add(1);
+    }
+    polled.map(|output| (output, self.polls))
+  }
+}
+
 impl Channel {
   /// Takes everything `command` wrote, standard error first, as a channel with room for all of it does.
   fn take<C: Command>(&mut self, command: &mut C) {
@@ -578,32 +623,60 @@ impl Channel {
   }
 
   /// Drives `command` as the edge does until it waits for input or exits: what it wrote is taken before each step, and a
-  /// refusal's words are sent with its status.
+  /// refusal's words are sent with its status. Each step is polled once: over a lender in memory a step never waits.
   fn drive<C: Command>(&mut self, command: &mut C) {
-    ready(self.drive_awaiting(command));
-  }
-
-  /// [`Channel::drive`] awaiting each step: a step over the daemon's lenders may yield between its slices (A-720: a
-  /// push taken into its fork a slice at a time), which the shard's executor serves as it does on the edge.
-  async fn drive_awaiting<C: Command>(&mut self, command: &mut C) {
     while self.exited.is_none() {
       self.take(command);
-      match command.step(ClientGone::never()).await {
-        Ok(Stepped { consumed, next }) => {
-          self.consumed += consumed;
-          match next {
-            Next::More => {}
-            Next::Input => return,
-            Next::Exited(status) => {
-              self.take(command);
-              self.exited = Some(status);
-            }
+      let stepped = ready(command.step(ClientGone::never()));
+      if !self.settled(command, stepped) {
+        return;
+      }
+    }
+  }
+
+  /// [`Channel::drive`] awaiting each step on a daemon's shard, a step a poll: each step awaited (one over the daemon's
+  /// lenders may yield between its slices, A-720), then a yield, as the daemon's session takes them (`vcs_ssh`'s `step`
+  /// yields after each). Until 2026-11-25 it never yielded, so a clone's whole session was its task's first poll (main's
+  /// watchdog A/B at a95b34dfa, load 54: the shard judged wedged 1,023 ms at this task's poll 1). The steps that ended in
+  /// the poll the step before them ended in, where its task is [`Polled`] ([`POLL`]): none, a step a poll.
+  async fn drive_awaiting<C: Command>(&mut self, command: &mut C) -> u64 {
+    let mut shared = 0u64;
+    let mut last_poll = None;
+    while self.exited.is_none() {
+      self.take(command);
+      let stepped = command.step(ClientGone::never()).await;
+      let poll = POLL.with(core::cell::Cell::get);
+      if poll > 0 && last_poll == Some(poll) {
+        shared += 1;
+      }
+      last_poll = Some(poll);
+      slates_rt::futures::yield_now().await;
+      if !self.settled(command, stepped) {
+        return shared;
+      }
+    }
+    shared
+  }
+
+  /// A step's outcome taken: whether `command` steps on (false once it waits for input).
+  fn settled<C: Command>(&mut self, command: &mut C, stepped: Result<Stepped, Refused>) -> bool {
+    match stepped {
+      Ok(Stepped { consumed, next }) => {
+        self.consumed += consumed;
+        match next {
+          Next::More => true,
+          Next::Input => false,
+          Next::Exited(status) => {
+            self.take(command);
+            self.exited = Some(status);
+            true
           }
         }
-        Err(refused) => {
-          self.stderr.extend(refused.stderr);
-          self.exited = Some(refused.exit_status);
-        }
+      }
+      Err(refused) => {
+        self.stderr.extend(refused.stderr);
+        self.exited = Some(refused.exit_status);
+        true
       }
     }
   }
@@ -1307,8 +1380,55 @@ fn clone_request(head: &Node) -> Vec<u8> {
 /// file's bytes whole: the answer made a turn at a time, each slice within the shard's room, never one request's.
 #[test]
 fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
+  let large = random_file(room() * 2);
+  let ((channel, _), _) = cloned_over_ssh(large, 0);
+  assert_eq!(
+    (String::from_utf8_lossy(&channel.stderr), channel.exited),
+    (String::new().into(), Some(EXIT_STATUS))
+  );
+  assert_file_cloned(&channel, large);
+}
+
+/// Main's watchdog A/B at a95b34dfa (12 burners, load about 54): `a_mercurial_clone_larger_than_a_requests_room_is_answered
+/// _over_ssh`'s session task was judged wedged at its first poll (1,023 ms with no CPU progress, never runnable). Its
+/// loop stepped without yielding, where the daemon's session yields after every step (`vcs_ssh`'s `step`). Do: the same
+/// clone over SSH with two threads spinning a core beside the daemon (as w-perf burns a machine, in process), its task's
+/// polls numbered and timed by the thread's CPU ([`Polled`]). Expect: the clone whole; no two of the session's steps
+/// ended in one poll; the serving steps counted with the longest's CPU (`vcs_store.hg_ssh_steps`,
+/// `vcs_store.hg_ssh_step_most_cpu_ns`). Red with the loop's yield removed: 2 steps sharing a poll (7 polls, the longest
+/// 1,490 us). Measured green (2026-11-25, debug, the MacBook, 36 burners): 13 polls, the longest 0.38 to 0.87 ms, the
+/// first 0.3 ms (2.1 ms cold), each poll's wall time its CPU time: nothing in the first poll comes near a second, so the
+/// A/B's verdict (no CPU progress, never runnable) was its thread blocked in the kernel, not its work. The shard's
+/// quantum (7 to 39 us here, its wake-tracked budget) is below one serving step in a debug build, so a poll is held to
+/// one step, not to the quantum.
+#[test]
+fn a_clone_over_ssh_under_burners_holds_its_shard_a_step_a_poll() {
+  let cores = std::thread::available_parallelism().map_or(1, usize::from);
+  let large = random_file(room() * 2);
+  let ((channel, (polls, shared)), (step_most, steps)) =
+    cloned_over_ssh(large, cores.saturating_mul(2));
+  assert_eq!(
+    channel.exited,
+    Some(EXIT_STATUS),
+    "{:?}",
+    String::from_utf8_lossy(&channel.stderr)
+  );
+  assert_file_cloned(&channel, large);
+  println!(
+    "ssh clone under {} burners: {polls:?}, {shared} steps sharing a poll, {steps} serving, the longest {step_most} ns",
+    cores.saturating_mul(2)
+  );
+  assert!(steps > 1 && step_most > 0, "the serving steps counted");
+  assert_eq!(
+    shared, 0,
+    "a step a poll, never two steps in one: {polls:?}"
+  );
+}
+
+/// `len` bytes of a fixed pseudo-random sequence, which compress not at all: a file held for the test's life.
+fn random_file(len: u64) -> &'static [u8] {
   let mut state = 0x9e37_79b9_7f4a_7c15u64;
-  let large: Vec<u8> = (0..usize::try_from(room() * 2).expect("a size"))
+  let large: Vec<u8> = (0..usize::try_from(len).expect("a size"))
     .map(|_| {
       state = state
         .wrapping_mul(6_364_136_223_846_793_005)
@@ -1316,13 +1436,51 @@ fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
       state.to_be_bytes()[0]
     })
     .collect();
-  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  Box::leak(large.into_boxed_slice())
+}
+
+/// A repository of one changeset whose one file is `large` made on a daemon's shard and cloned over SSH as stock 7.2 asks,
+/// through the daemon's lenders for its owner, `burners` threads spinning beside it meanwhile: the session's channel, its
+/// polls' CPU and its steps sharing a poll, and the longest serving step's CPU on the shard (`vcs_store.hg_ssh_step_most_cpu_ns`) with the
+/// serving steps taken (`vcs_store.hg_ssh_steps`).
+fn cloned_over_ssh(large: &'static [u8], burners: usize) -> ((Channel, (Polls, u64)), (u64, u64)) {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (record, head) = crate::daemon::observe_first(&daemon, move |state| {
     one_file_history(state, "cloned-over-ssh", large)
   });
+  let burning = std::sync::atomic::AtomicBool::new(true);
+  let channel = std::thread::scope(|scope| {
+    for _ in 0..burners {
+      scope.spawn(|| {
+        while burning.load(std::sync::atomic::Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      });
+    }
+    let channel = session_over_ssh(&daemon, record, head);
+    burning.store(false, std::sync::atomic::Ordering::Relaxed);
+    channel
+  });
+  let counted = crate::daemon::observe_first(&daemon, |state| {
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_ssh::hg::STEP_MOST_CPU_NS),
+      count(crate::vcs_ssh::hg::STEPS),
+    )
+  });
+  daemon.stop();
+  (channel.expect("the session served"), counted)
+}
+
+/// The clone session of `head` of `record` over SSH on `daemon`'s first shard, run as its own task: its channel, its
+/// polls' CPU, and its steps that ended in the poll the step before them did.
+fn session_over_ssh(
+  daemon: &crate::Daemon,
+  record: RepositoryRecord,
+  head: Node,
+) -> Result<(Channel, (Polls, u64)), String> {
   let (sent, outcome) = mpsc::sync_channel(1);
-  crate::daemon::observe_first(&daemon, move |_state| {
+  crate::daemon::observe_first(daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
       let session = async {
         let mut services = ToolServices::new(ShardStores, ServedViews, ThisShard, room());
@@ -1341,21 +1499,24 @@ fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
           .input(&clone_request(&head))
           .map_err(|refused| format!("{refused:?}"))?;
         command.input_end();
-        channel.drive_awaiting(&mut command).await;
-        Ok::<Channel, String>(channel)
+        let shared = channel.drive_awaiting(&mut command).await;
+        Ok::<(Channel, u64), String>((channel, shared))
       };
-      let _ = sent.send(session.await);
+      let polled = Polled {
+        inner: Box::pin(session),
+        polls: Polls::default(),
+      };
+      let (served, polls) = polled.await;
+      let _ = sent.send(served.map(|(channel, shared)| (channel, (polls, shared))));
     })
     .expect("the session's task");
     slates_rt::futures::detach(task).expect("detached");
   });
-  let channel = outcome.recv_timeout(PATIENCE).expect("the session ended");
-  daemon.stop();
-  let channel = channel.expect("the session served");
-  assert_eq!(
-    (String::from_utf8_lossy(&channel.stderr), channel.exited),
-    (String::new().into(), Some(EXIT_STATUS))
-  );
+  outcome.recv_timeout(PATIENCE).expect("the session ended")
+}
+
+/// `channel`'s standard output a bundle2 whose changegroup carries `large` whole.
+fn assert_file_cloned(channel: &Channel, large: &[u8]) {
   let bundle =
     slates_hg::bundle2::Bundle2::decode(&channel.stdout, &mut slates_hg::Admission::new(u64::MAX))
       .expect("a bundle2");
