@@ -234,12 +234,13 @@
 > lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
 > (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
 > rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
-> **IN FLIGHT (w-shared, 2026-11-24): a branch made on a repository's successor after its owner died is refused.** With
-> A-908 the successor adopts the lineage (`merge.takeover.lineage_adopted` 1) and makes the branch's green (no longer
-> `ContentUnavailable`, origin/main's red), and the other survivor branches its replica; but the push is refused `unable
-> to commit` (its barrier: the new green's version 1 unplaced, the names log at 6 acknowledged by none, no refusal counted
-> on either survivor), and a push of another new name 2.3 s later `cannot lock ref: it moved since the push read it`. Red
-> test kept off main until the fix.
+> **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
+> `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
+> owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
+> made after a takeover was placed. An owner's hold now fences each object as its holders do (`Acceptor::accept_own`);
+> red first (`a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies`, and `slates-db`'s `a909_` tests).
+> OWED (main): gate 15 (`v3_takeover`) and a lint diag. Not checked: the second new branch's `cannot lock ref` 2.3 s
+> after the refused push; no test makes it.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,

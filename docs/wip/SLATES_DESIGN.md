@@ -6243,6 +6243,27 @@ refused, since one ballot proposes one value a position (A-373; the `Accept` of
 `docs/wip/models/FencedLedger.tla`). What a holder derived from a replaced value, a green's
 replica, is rebuilt below it.
 
+The owner's own hold is a candidate like any other and is fenced as each holder is: for the
+object alone (A-909). A holder keeps an acceptor an object; an owner keeps one acceptor for every
+object it writes, so its check refuses a record below the greater of that acceptor's promise
+(a phase one's or a raised fence's, which binds every object, as a holder's promise for a
+departed host does) and the epoch at which the object's highest position was accepted, never
+another object's epoch. Each model in `docs/wip/models/` (`FencedRegister`, `FencedLedger`,
+`InstallInTurns`) has one register, each acceptor's fence that register's, so the models fence
+per register; the code now matches them. `StaleNeverCommits` is the holders': a deposed owner
+passes its own check for an object it wrote under its old epoch, and the holders, fenced for it
+by the successor's phase one, refuse it, so it stays short of `f + 1` for every `f > 0`. At
+`f = 0` the owner's hold is the object's only holder and no takeover raises another fence, so
+the same check refuses exactly what that object's fence does.
+
+> **Status (2026-11-24, A-909).** `Acceptor::accept_own` is the owner's check, called by
+> `slates_cluster::commit_record_sent_as` (and so `commit_record`). Before, the owner's hold ran
+> the holder's check, whose one fence a successor raised to the takeover's epoch by writing a
+> register it adopted, and then refused its own record of everything it made after. At two
+> survivors such a record was never placed. Database tests: one object's epoch does not fence
+> another; a deposed owner's record is never placed; a raised promise binds every object; the
+> laptop places each object alone. Fleet: a branch made on the successor lands.
+
 Epoch allocation derives from configuration authority, not a simulation's access to unreachable
 holders' internal state. Checked counters refuse exhaustion. Quorum counts exclude duplicate,
 stale, foreign-generation and unauthorized acknowledgements. Configuration changes fence old
@@ -63363,8 +63384,48 @@ task), `crates/server/src/vcs_store/homes.rs`, `crates/server/src/credentials.rs
     the join is noted; a green of no repository judged at once; a branch that disagrees a mismatch and one past its
     source waiting; memberships read from held parts after a start. Focused lib set 100 green.
 - **Owed.** A branch made on a successor after its owner died: no longer refused `ContentUnavailable` (the lineage is
-  adopted), but refused `unable to commit`, a retry `cannot lock ref` (GAPS, in flight). Part 4: a holder's rebuild after
+  adopted), but refused `unable to commit`, a retry `cannot lock ref` (fixed by A-909: the successor's own hold refused
+  the new green's records). Part 4: a holder's rebuild after
   a restart makes a member's replica by its lineage (until then it stands alone, as before).
 
 Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin,green_adopt,
 greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS.
+
+### A-909 — An owner's own hold fences each object as its holders do, so what a successor makes after a takeover is placed (2026-11-24, w-shared for main 01a20182, its ruling of 2026-11-24 (B, at the source); found by A-908's successor test; the sibling of A-903; §4.8, D-16, AC-2.5)
+
+- **Why.** A branch pushed to a repository's successor after its owner died was refused `unable to commit`, every run
+  (three daemons at `f = 1`, one killed). The barrier waited on the new green's versions 0 and 1. The other survivor
+  acknowledged both, so every remote candidate held them, but neither was placed: each record's acknowledgements were
+  that survivor's alone. The successor's own hold had refused them: `StaleEpoch { current: 2 }`, the records written at
+  its host epoch 1. The record plane keeps one owner acceptor for every object the node writes
+  (`fleet::run_record_plane`), and the holder's check it ran fenced at the highest epoch of any record accepted. Writing
+  a register it adopted at the takeover's epoch 2 (A-903's state-log parts, an adopted head, a taken-over green's
+  version) raised that fence for every object. Holders keep an acceptor an object (`holder_records`), so the other
+  survivor took epoch 1. At three survivors two remote acknowledgements hid it; at two, nothing the successor made after
+  a takeover was ever placed (a new green, repository head, catalog or volume) until it restarted.
+- **The change.** `Acceptor::accept_own`, the owner's own check (`slates_cluster::commit_record_sent_as`): the floor is
+  the greater of the acceptor's promise and the epoch of the object's highest accepted position. Authority and position
+  are `Acceptor::check`'s rules. It does not raise the promise. The holders' `accept` is unchanged.
+- **The models.** `FencedRegister`, `FencedLedger` and `InstallInTurns` model one register each, every acceptor's fence
+  that register's: they fence the owner's hold, an acceptor among the holders, per register. The node-wide fence was
+  stricter than the models (it refused more, never less), so it broke liveness, not safety, and the change brings the
+  code to what they model. The specs are unchanged.
+- **A deposed owner.** It writes an object it held under its old epoch and its own check passes (the object's floor is
+  that epoch, as the node-wide fence was). Every holder refuses it, fenced at the takeover's epoch by the successor's
+  phase one, so it stays short of `f + 1` for every `f > 0` (`StaleNeverCommits`, the holders' as before). An owner
+  whose acceptor's fence was raised (`raise_fence`, `prepare`) refuses its own record of every object below it: a promise
+  binds every object.
+- **`f = 0`** (R8, AC-2.5). The same code with `f = 0`. The owner's hold is the object's only holder, so its floor is
+  the object's whole fence, and one node takes nothing over, so no other object's epoch could have fenced it anyway.
+- **Tests** (macOS arm64, debug, 2026-11-24).
+  - Fleet `a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies`: red without `accept_own` at today's
+    main (`unable to commit`, 12.9 s), green (7.3 s).
+  - `slates-db` (4): a second object below the epoch another was written at (red before: `StaleEpoch { current: 2 }`), a
+    deposed owner's record after a takeover never placed, a raised promise refusing every object, and a laptop placing
+    each object alone. Focused: `register` (109), `slates-cluster` `commit` (26), `slates-server` lib `takeover` and
+    `state_log` (39), fleet `a894` and `a908` and the new branch's push (3).
+- **Found, not checked.** The retry A-908's GAPS noted (`cannot lock ref`, a second new branch 2.3 s after the refused
+  push) followed a refused push; no test here makes it.
+
+Applied in the same change to: §4.8 (the owner's own hold, with a status line), `crates/db/src/register.rs`,
+`crates/cluster/src/lib.rs`, `crates/server/tests/fleet.rs`, the A-908 entry's owed line, GAPS.
