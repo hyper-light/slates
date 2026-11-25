@@ -64101,6 +64101,17 @@ GAPS.
   1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds the shard's flush measured by
   an import alone first, not 500 ms: every staging step waits a hold, and the first batch's 151 steps took it past its
   patience (61 s at 150 ms; 3.5-5.3 s at a flush, its await 0.45-1.1 s against `F` 5.6-9.8 ms).
+  **1b, the commit's end** (12.7-13.6 ms at 9,000 files after 4c: `commit_finish` 6.6-7.0, then the batch's
+  `finish_staged` 6.7). `commit_finish` and `record_changes` are now phases of the commit run (`CommitPhase::Emptied`,
+  `Links`, `Changes`), a unit each: the metadata of each emptied path where nothing stands there; the links naming
+  each changed path that was a special, then joined to the changed paths; then each changed path recorded (its last
+  change, its earlier version's entry no longer the last, its bytes), its entry numbered as it is taken from the
+  ordered set, so the version's list is the one `numbered` made, kept once every path is (none for a version that
+  changed nothing). The commit's end step 12.7-13.6 ms → 6.2-6.4 ms (`finish_staged`'s `encoded_len`, 1c). Oracles:
+  the applying oracle's greens, whole and a unit a step, now compare their change index too (each version's entries,
+  each path's last change, their bytes); `changed_since_reports_every_dimension_as_changed_between_does` and
+  `changed_since_reads_the_span_alone_and_folds_with_the_histories` (merge's integration tests) fail where an earlier
+  entry stays marked last, which no lib test caught; a version's list never kept fails 33 lib tests.
 - **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
   (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
   texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:
@@ -64392,3 +64403,67 @@ measured noise of the 100 figure, not a literal.
   `encoded_by_family`, the split's encoded bytes); `crates/server/src/vcs_store.rs` (`AWAYS_RENUMBERED`, the restore's
   plumbing); `crates/server/src/vcs_store/homes.rs` and `arena_windows.rs` (the cut readers' head);
   `crates/server/src/verbs.rs`; A-870's owed (b); GAPS.
+
+### A-926 — A shard slice's written memories keep high-water marks a successor reads, so a residency sweep walks what was written, not what may have been (2026-11-25, w-perf for main 01a20182, its rulings of 2026-11-25 on A-826's flaky sweep; amends A-744's split, A-226, A-68's journal and A-63's write log)
+
+- **Why.** `content_ranges`' status sweep failed in main's full server suite: (sweeps, idle slices, armed) (0, 3,348,409,
+  true) at its bound of sixty liveness budgets, passing alone in 29.7 s. No idle slice failed to advance. A fresh
+  1-shard audit daemon's sweep was 12,582,958 pages:
+  - the two checkpoint slots, 5,592,406, with 48 KiB resident;
+  - the delta log, 2,796,203, with 16 KiB;
+  - the write log, 699,051, with 32 KiB;
+  - the segment's log and snapshot regions, 3,495,255.
+
+  The journal and the write log were walked whole because their extents were unknown (`UNKNOWN_EXTENT`, "a predecessor
+  may have written"). Under in-process load (two spinning threads a core) each idle slice walked 4.1 pages against
+  10.6 alone, the live step quantum halved, so a sweep took 55.5 s of its 60 against 23.7 alone. The kernel's per-mapping
+  figures cannot split it: macOS answers per map entry (`mach_vm_region`), Linux per VMA (`/proc/self/smaps`), and the
+  content object is one mapping holding every shard's slice (main withdrew its ruling to skip ranges on the kernel's
+  word when shown this).
+- **The marks.**
+  - **Where:** a block in the last 40 bytes of the shard's write log region: a version word ("MARK", 1), then the
+    high-water mark of each written memory of the slice (`write_log::Marked`: the write log's region, the first and
+    second checkpoint slot, the delta log), bytes from its memory's start. No other offset moves.
+  - **Raised before the write:** the new end, rounded up to a page, is stored before the write that passes the mark,
+    with a release fence between, at the one write boundary each memory has (`WriteLog::append`; every checkpoint and
+    delta write through `verbs::ContentSlots`). A crash leaves the mark ahead of the bytes, never behind.
+  - **Falls after a give-back:** `WriteLog::purge`, and the journal's give-back (`daemon::return_dead_recovery`),
+    once the pages past it are given back.
+  - **Read at the open:** the journal is recovered over the extents (`checkpoint_log::WrittenExtents`, a slot's by its
+    place), and the write log over its own. `UNKNOWN_EXTENT` is gone: an extent is always a length.
+- **The format.** The write log's layout goes to version 3 ("WLOG", 3), its record area stopping before the block.
+  - **Version 2:** has no block, and its records may run to the region's end. It is read as before, every mark whole
+    (the assumption before A-926), until its first clear uncovers its records, writes the block, then the version 3
+    word. A crash between leaves an empty version 2 log, read whole again. Its scrub stops at the new record area,
+    since the block takes the old records' last 40 bytes.
+  - **A fresh slice:** every header word zero (no daemon opened it), so every mark is zero.
+  - **Counted** `content_range.marks.adopted`, `marks.raised` and `marks.appends`.
+  - **What a restart on an old image costs:** one sweep and one give-back of each memory whole, as before A-926, then
+    marks.
+- **Reds:**
+  - `a_version_2_log_filled_to_its_end_is_replayed_whole_then_cleared_into_version_3`: the record in the last 40 bytes
+    replayed byte for byte, every memory whole until the first clear, the append that did not fit refused full, then
+    version 3 with its marks read back. It found the first clear's scrub wiping the block it had written.
+  - `a_crash_after_a_records_bytes_leaves_the_mark_covering_them`: with the raise after the record's bytes, the
+    successor's mark read 8,192 against bytes written to 12,704.
+  - `a_growing_log_raises_its_mark_once_a_page`: one raise each of 4 pages over 116 appends; best of five interleaved
+    rounds 360 ns an append with the marks against 351 without (619 and 619 in another run): the write path's cost
+    unchanged.
+  - `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`: the journal and write log plan 2
+    pages against 8,388,607 whole.
+  - `a_status_requests_sweep_completes_within_its_bound_under_load`.
+  - The journal's give-back oracle (`a_give_back_names_every_dead_written_byte_and_stops_at_the_last`): each restart
+    now opens over the extents its predecessor's marks carry, and every written byte stays inside the written ranges.
+- **Measured** (debug, the MacBook, 2026-11-25): the sweep 3,495,300 pages (12,582,958 before). Alone, 1.6 s over
+  40,988 idle slices (23.7 s, 1,185,392 before). Loaded, two hogs a core, 1.6 s over 40,730 (55.5 s, 3,075,443 before).
+- **Part 2, owed:** the segment's log and snapshot regions (3,495,255 pages, the anchor's format, the register's code)
+  get marks of their own, with their own migration.
+- **Applied in the same change to:**
+  - `crates/vfs/src/checkpoint_log.rs` (`WrittenExtents`, `Journal::over`, `Journal::recover`'s extents, the extents
+    a slot by place);
+  - `crates/vfs/src/recover.rs` (`CommittedSlot::index`, `stale_index`; `slots_of_memory` public);
+  - `crates/server/src/write_log.rs` (the marks block, version 3, the migration);
+  - `crates/server/src/verbs.rs` (`ContentSlots`' raise, `read_journal`'s extents);
+  - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
+  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
+  - A-826's GAPS entry.

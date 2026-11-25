@@ -98,9 +98,20 @@
 > **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
 > round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
 > (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
-> **Open (w-shared, 2026-11-21): `content_ranges` `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
-> fails some runs** (macOS arm64; local at load 20 alone, kiln r28 on the big Studio at load 2 to 7 in the whole lib;
-> passed in r19): no sweep completes on idle time within 10 s, 200,000+ idle slices counted. Untouched by A-825/A-826.
+> **CLOSED by A-926 part 1 (w-perf, 2026-11-25; opened by w-shared, 2026-11-21): `content_ranges`
+> `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length` failed some runs** (macOS arm64;
+> main's full suite at f954135af: (sweeps, idle slices, armed) (0, 3,348,409, true) at its bound, passing alone in
+> 29.7 s). No slice failed to advance. The sweep was 12,582,958 pages of a fresh 1-shard audit daemon:
+> - 8,388,609 of them its checkpoint slots and delta log, and 699,051 its write log, walked whole since their extents
+>   were unknown (A-744's split assumed a predecessor wrote them);
+> - under in-process load each idle slice walked 4.1 pages against 10.6 alone, so the sweep took 55.5 s of its 60
+>   against 23.7 s.
+>
+> A-926 keeps a high-water mark for each written memory, so a successor knows its extents. Now the sweep is 3,495,300
+> pages, and it completes in 1.6 s both alone (40,988 slices) and loaded (40,730, two hogs a core), held by
+> `a_status_requests_sweep_completes_within_its_bound_under_load` and
+> `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. OWED, A-926 part 2: the segment's log
+> and snapshot regions (3,495,255 pages, the register's format) get marks too.
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
