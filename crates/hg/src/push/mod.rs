@@ -55,6 +55,7 @@
 
 pub(crate) mod chain_read;
 pub mod check;
+pub mod chunked;
 pub mod classify;
 pub mod commit;
 pub mod held;

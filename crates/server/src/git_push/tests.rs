@@ -1246,6 +1246,54 @@ fn fetch_after_tagged_push(
 /// measures; and the fetch no later than the one with nothing behind: no more of its own turns than it, but the
 /// hand-over's ([`PACED_TURNS`]: its first turns meet the task behind waiting until that task's next poll stops it),
 /// and no more than twice its time. Red before: the two yielding to each other, the fetch's turns many times the other's.
+/// The derivation by driver as this shard counted it from its start: [turns, ns, derived] for a reader, for the task
+/// behind, and in all; and the readers that left versions due.
+fn by_driver(state: &mut ShardState) -> ([[u64; 3]; 3], u64) {
+  use crate::vcs_store::git_derive::{
+    BEHIND_TURNS, BY_DRIVER, DERIVED, NS, READ_LEFT_DUE, READ_TURNS, TURNS,
+  };
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (
+    [
+      [count(READ_TURNS), count(BY_DRIVER[0]), count(BY_DRIVER[1])],
+      [
+        count(BEHIND_TURNS),
+        count(BY_DRIVER[2]),
+        count(BY_DRIVER[3]),
+      ],
+      [count(TURNS), count(NS), count(DERIVED)],
+    ],
+    count(READ_LEFT_DUE),
+  )
+}
+
+/// Main 01a20182's order of 2026-11-25 (the clone after a push derived its units at twice the cost, 4,670 of its 5,110
+/// turns the task behind's, and the counters could not say whose time or which side of the hand-over). Do: push
+/// [`tagged_line_request`] as the edge does, a derivation begun behind it, and derive at once as the first fetch does.
+/// Expect: the reader's and the task behind's turns, nanoseconds and versions each sum to the derivation's own
+/// (`vcs_store.git_derive.{read,behind}_{ns,derived}` beside `turns`, `ns`, `derived`), whichever drove how much (the task
+/// behind may finish before the reader begins), and no reader left versions due (`vcs_store.git_derive.read_left_due`). Red before: no split counted.
+#[test]
+fn a_derivations_turns_time_and_versions_are_counted_by_who_drove_them() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let _ = fetch_after_tagged_push(&daemon, "by-driver", true);
+  let (counted, left_due) = crate::daemon::observe_first(&daemon, by_driver);
+  daemon.stop();
+  let [read, behind, all] = counted;
+  eprintln!(
+    "derive by driver [turns, ns, derived]: read {read:?}, behind {behind:?}, all {all:?}; left due {left_due}"
+  );
+  for at in 0..3 {
+    assert_eq!(
+      read[at] + behind[at],
+      all[at],
+      "reader and task behind sum to the whole: {counted:?}"
+    );
+  }
+  assert!(all[2] > 0, "the derivation ran: {counted:?}");
+  assert_eq!(left_due, 0, "no reader left versions due");
+}
+
 #[test]
 fn a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();

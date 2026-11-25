@@ -1534,6 +1534,7 @@ impl Store for Grown {
                       payload: identity,
                       offset: 0,
                       len,
+                      chunk: false,
                     },
                   })
               })
