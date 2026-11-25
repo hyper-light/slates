@@ -373,8 +373,24 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
 }
 
 /// [`held_image`], and whether its paged families are the shard's now (A-870 piece 2: where a change is not yet encoded
-/// they are the last committed cut, [`image_committed`]).
+/// they are the last committed cut, [`image_committed`]): its pages copied, for a caller that keeps them (the tests, a
+/// recovery's comparison); a checkpoint encodes them in place ([`held_image_unpaged`], [`paged_whole`]).
 pub(crate) fn held_image_paged(state: &ShardState) -> (Vec<slates_vfs::recover::HeldPiece>, bool) {
+  let mut pieces = held_image_unpaged(state);
+  let (pages, carried) = paged_whole(&state.image_encoder);
+  pieces.extend(
+    pages
+      .into_iter()
+      .map(|piece| slates_vfs::recover::HeldPiece {
+        key: piece.key,
+        bytes: piece.bytes.to_vec(),
+      }),
+  );
+  (pieces, carried)
+}
+
+/// Every piece the shard holds for others but its paged families' pages ([`held_image_paged`]'s, owned).
+pub(crate) fn held_image_unpaged(state: &ShardState) -> Vec<slates_vfs::recover::HeldPiece> {
   let mut pieces: Vec<slates_vfs::recover::HeldPiece> = whole_pieces(state)
     .into_iter()
     .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
@@ -410,20 +426,65 @@ pub(crate) fn held_image_paged(state: &ShardState) -> (Vec<slates_vfs::recover::
   for (object, held) in &state.merge.checkpoints {
     pieces.push(checkpoint_piece(*object, held));
   }
-  // The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows
-  // kept as chunks (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
-  // records (goal 93 item 2b(b)).
-  // A-870 piece 2: copied from the encoder, the shard's now where every change is encoded, else the last committed cut.
-  let (pages, carried) = state.image_encoder.whole();
-  pieces.extend(
-    pages
-      .into_iter()
-      .map(|((family, page), bytes)| slates_vfs::recover::HeldPiece {
+  pieces
+}
+
+/// The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows kept
+/// as chunks (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed records
+/// (goal 93 item 2b(b)); the encoder's, the shard's now where every change is encoded, else the last committed cut (A-870
+/// piece 2); and whether they are the shard's now. Borrowed from `encoder` (goal 93, main's ruling of 2026-11-25: copied
+/// into a checkpoint's every page, 11% of a 2,000-changeset push's allocations), so they live only while it is held
+/// still.
+pub(crate) fn paged_whole(
+  encoder: &crate::image_pages::Encoder,
+) -> (Vec<slates_vfs::recover::HeldPieceRef<'_>>, bool) {
+  let (pages, carried) = encoder.whole();
+  let pages = pages
+    .into_iter()
+    .map(
+      |((family, page), bytes)| slates_vfs::recover::HeldPieceRef {
         key: page_key(family, page),
-        bytes: bytes.to_vec(),
-      }),
-  );
-  (pieces, carried)
+        bytes,
+      },
+    )
+    .collect();
+  (pages, carried)
+}
+
+/// Test support: what a delta carries, the encoder's cut's pages among its puts, copied ([`held_changes`] leaves them
+/// to the encoding, borrowed, [`paged_cut`]): the delta's pieces as a reader folds them.
+#[cfg(test)]
+pub(crate) fn held_changes_carried(state: &ShardState) -> HeldChanges {
+  let mut changes = held_changes(state);
+  if changes.image_carried {
+    changes
+      .put
+      .extend(paged_cut(&state.image_encoder).into_iter().map(|piece| {
+        slates_vfs::recover::HeldPiece {
+          key: piece.key,
+          bytes: piece.bytes.to_vec(),
+        }
+      }));
+  }
+  changes
+}
+
+/// The pages a delta puts of the encoder's cut, where it carries it ([`HeldChanges::image_carried`]): each page
+/// re-encoded since the last committed cut, borrowed from `encoder` (goal 93, main's ruling of 2026-11-25: copied into
+/// the delta's pieces, 14% of a 2,000-changeset push's allocations). None where the cut is not wholly encoded.
+pub(crate) fn paged_cut(
+  encoder: &crate::image_pages::Encoder,
+) -> Vec<slates_vfs::recover::HeldPieceRef<'_>> {
+  encoder.cut().map_or_else(Vec::new, |cut| {
+    cut
+      .filter_map(|((family, page), bytes)| {
+        bytes.map(|bytes| slates_vfs::recover::HeldPieceRef {
+          key: page_key(family, page),
+          bytes,
+        })
+      })
+      .collect()
+  })
 }
 
 /// The kind of the piece a landed record of the window `identity` is kept under, and its bytes: the identity, then the
@@ -922,7 +983,7 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The repository content store's and homes' entries kept or let go since then, a page each change lies in (A-870
   // piece 1): windows (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
   // records (goal 93 item 2b(b)).
-  let image_carried = image_cut(state, (&mut put, &mut removed));
+  let image_carried = image_cut(state, &mut removed);
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -1320,25 +1381,18 @@ pub(crate) fn image_resumed() -> impl core::future::Future<Output = ()> {
   })
 }
 
-/// What a delta carries of the paged families (A-870 piece 2): the encoder's cut, each page re-encoded since the last
-/// committed one put or removed, and the pieces an image before A-870 kept one an entry removed; nothing where a change
-/// is not yet encoded. Whether it carried the cut.
-fn image_cut(
-  state: &ShardState,
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) -> bool {
+/// What a delta removes of the paged families (A-870 piece 2): the encoder's cut's pages of no entry now, and the pieces
+/// an image before A-870 kept one an entry; nothing where a change is not yet encoded. Whether it carries the cut, whose
+/// pages it puts borrowed from the encoder as it encodes ([`paged_cut`]).
+fn image_cut(state: &ShardState, removed: &mut Vec<PieceKey>) -> bool {
   let Some(cut) = state.image_encoder.cut() else {
     return false;
   };
-  for ((family, page), bytes) in cut {
-    match bytes {
-      Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
-        key: page_key(family, page),
-        bytes: bytes.to_vec(),
-      }),
-      None => removed.push(page_key(family, page)),
-    }
-  }
+  removed.extend(
+    cut
+      .filter(|(_, bytes)| bytes.is_none())
+      .map(|((family, page), _)| page_key(family, page)),
+  );
   removed.extend(state.published_held.legacy.iter().copied());
   true
 }

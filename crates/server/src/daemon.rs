@@ -10617,7 +10617,7 @@ mod tests {
             archive,
           )
           .unwrap();
-        let changes = crate::content_holder::held_changes(state);
+        let changes = crate::content_holder::held_changes_carried(state);
         carried.insert(
           changes
             .put
@@ -10859,7 +10859,7 @@ mod tests {
               state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
-              let changes = crate::content_holder::held_changes(state);
+              let changes = crate::content_holder::held_changes_carried(state);
               for piece in &changes.put {
                 proptest::prop_assert!(
                   !changes.removed.contains(&piece.key),
@@ -11678,7 +11678,7 @@ mod tests {
         .collect();
       // The move, then the delta after it, folded as recovery folds it (`ShardImage::apply`: puts, then removals).
       crate::fleet::reconcile_held_authority(state);
-      let changes = crate::content_holder::held_changes(state);
+      let changes = crate::content_holder::held_changes_carried(state);
       let in_delta = changes.put.len();
       for piece in &changes.put {
         journal.insert(piece.key, piece.bytes.clone());
