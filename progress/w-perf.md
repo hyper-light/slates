@@ -1,5 +1,10 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-24 ~23:30 PST
+- LANDED d41c93388: hg import segment landing pipelined (one in flight, in order, texts on own durable answer; bound
+  two segments < 4x segment_bytes). Red: 0 overlapped, waited ~= landing time. Main runs the 57k A/B.
+- P7 next: svn import's content object climbs to 469 MiB resident with 2 publications; deferred 466 MiB only at the end.
+
 ## 2026-11-24 ~21:30 PST
 - LANDED 1227afcb1: vcs_store.hg_import.segment_land_wait_ns / _max_ns (main reruns the 57k on it: 2,087 segments,
   peak 361 MB at 0d05da26e; the time question rests on the landings' share).
