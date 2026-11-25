@@ -4510,8 +4510,11 @@ fn a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding() {
   let created = pushed(edge, &name, &chained.request);
   let tip = chained.commits.last().expect("a tip").0;
   let turns = || {
-    counted_on(&daemon, REPOSITORY, "vcs_store.git_derive.turns")
-      + counted_on(&daemon, REPOSITORY, "vcs_store.git_encode.turns")
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::vcs_store::git_derive::READ_TURNS,
+    ) + counted_on(&daemon, REPOSITORY, "vcs_store.git_encode.turns")
   };
   let before = turns();
   let listed = uploaded(edge, &name, &ls_refs_all());
@@ -6614,5 +6617,116 @@ fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
   assert!(
     steps > 0 && long.iter().sum::<u64>() <= steps,
     "a long step counted once: {long:?} of {steps}"
+  );
+}
+
+/// Shape: the commits of [`tagged_line_create`]'s line, every second one tagged: a derivation of many versions, so the
+/// one begun behind the push is still under way when a request arrives.
+const LISTED_LINE: usize = 300;
+
+/// Stock git's request creating `main` at a line of [`LISTED_LINE`] commits of one file each and a lightweight tag at every
+/// second commit, `refs/tags/v<n>`.
+fn tagged_line_create() -> Vec<u8> {
+  use slates_git::object_name::Kind;
+  let mut texts: Vec<(Kind, Vec<u8>)> = Vec::new();
+  let mut commits: Vec<ObjectId> = Vec::new();
+  for at in 0..LISTED_LINE {
+    let blob = format!("line {at}\n").into_bytes();
+    let mut tree = b"100644 f\0".to_vec();
+    tree.extend_from_slice(git_name(Kind::Blob, &blob).as_bytes());
+    let parent = commits
+      .last()
+      .map(|parent| format!("parent {parent}\n"))
+      .unwrap_or_default();
+    let commit = format!(
+      "tree {}\n{parent}author A <a@example.com> {} +0000\ncommitter A <a@example.com> {} +0000\n\nline {at}\n",
+      git_name(Kind::Tree, &tree),
+      1_700_000_000 + at,
+      1_700_000_000 + at,
+    )
+    .into_bytes();
+    commits.push(git_name(Kind::Commit, &commit));
+    texts.extend([
+      (Kind::Commit, commit),
+      (Kind::Tree, tree),
+      (Kind::Blob, blob),
+    ]);
+  }
+  let objects: Vec<(Kind, &[u8])> = texts
+    .iter()
+    .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+    .collect();
+  let pack = stored_pack(&objects);
+  let mut request = Vec::new();
+  let head = commits.last().expect("a head");
+  let line = format!("{ZERO} {head} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for at in 0..LISTED_LINE / 2 {
+    let line = format!("{ZERO} {} refs/tags/v{at}", commits[2 * at]);
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  request
+}
+
+/// Shape: how long a listing of a repository's refs may take on a developer's debug build while a derivation runs behind
+/// a push of it, scaled by the lane's slowdown (`crate::test_lane`: a bet on the daemon's speed, not the rule; the rule is
+/// the reader's turns unmoved).
+const LISTING_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The derive turns a request drove and the encoding's, on the repository's shard.
+fn read_driven_turns(daemon: &Daemon) -> u64 {
+  counted_on(daemon, REPOSITORY, crate::vcs_store::git_derive::READ_TURNS)
+    + counted_on(daemon, REPOSITORY, "vcs_store.git_encode.turns")
+}
+
+/// Main 01a20182's ruling of 2026-11-25 (TSan diag 9: a listing after a push read as waiting for the derivation, the
+/// counter moved 4 → 9 by the task deriving behind the push, which a listing never drives). Do: start a store-backed
+/// daemon with its edge; push [`tagged_line_create`] (a derivation of 151 versions begins behind it as it ends); list its
+/// refs over v2 `ls-refs` at once, the derivation still under way. Expect: the listing `200`, naming `main`; no derive or
+/// encoding turn a request drove moved by it (`vcs_store.git_derive.read_turns`, `git_encode.turns`), however far the task
+/// behind got meanwhile; and its answer within [`LISTING_PATIENCE`] times the lane's slowdown, the task behind yielding the
+/// shard each quantum. Red with one count of every derive turn: the task behind's turns moved it.
+#[test]
+fn a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let created = pushed(edge, &name, &tagged_line_create());
+  let before = read_driven_turns(&daemon);
+  let began = std::time::Instant::now();
+  let listed = uploaded(edge, &name, &ls_refs_all());
+  let took = began.elapsed();
+  let after = read_driven_turns(&daemon);
+  let behind = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::git_derive::BEHIND_TURNS,
+  );
+  daemon.stop();
+  eprintln!(
+    "listing: {took:?}, read-driven turns {before} → {after}, the task behind's turns {behind}"
+  );
+  assert_git_pushed(&created);
+  assert_eq!(listed.0, 200);
+  assert!(
+    String::from_utf8_lossy(&listed.1).contains("refs/heads/main"),
+    "the listing names main"
+  );
+  assert!(behind > 0, "a derivation ran behind the push");
+  assert_eq!(
+    after, before,
+    "no derive or encoding turn the listing drove"
+  );
+  let patience = LISTING_PATIENCE
+    .saturating_mul(u32::try_from(crate::test_lane::slowdown()).unwrap_or(u32::MAX));
+  assert!(
+    took <= patience,
+    "the listing answered within {patience:?}: {took:?}"
   );
 }

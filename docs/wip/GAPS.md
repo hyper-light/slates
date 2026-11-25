@@ -373,7 +373,9 @@
 > Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
 > Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
 > (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
-> **OWED (w-git, 2026-11-25, main 01a20182's ruling): a push's versions derived behind it, withdrawn.** Built at
+> **RETURNED (w-git, 2026-11-25, after both reds below went red then green; was: OWED, withdrawn):** a push's versions
+> derived behind it, the task behind handing a reader the derivation and turning a quantum at most (the design's status,
+> "Deriving a push's versions behind it"). Was: Built at
 > 750d2bca3 (`git_derive::derive_behind`), reverted after two failures: a clone arriving mid-derivation ran it in
 > slivers, the task behind and the fetch each yielding to the other at every unit (main's git leg: first pack byte 40.3 →
 > 61.9 s, 721,260 derive turns); and a ref listing after a push waited behind it under ThreadSanitizer (diag 9,
@@ -3725,8 +3727,11 @@
 > oracle `a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new` (each stage of the second batch's landing
 > killed, the daemon and its store's owner restarted, at one unit and at the derived bound: recovered to the reference's
 > history at 8 before the entry and 16 (one unit) or 64 (derived) after it). Owed: main's release A/B against 084ffb65d
-> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`); `F` timed at the store's own `sync_data` call rather
-> than the landing's await (an owner answer that carries it).
+> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`). `F` is the store's own `sync_data` as the commit
+> times it (`Located::flush_ns`, left on the asking thread by the owner's `land` and sliced `commit`,
+> `owner::take_landed_flush_ns`), never the landing's await, which holds the shard's other work and the owner's queue
+> (main's ruling, 2026-11-25): red `an_imports_durable_flush_is_the_stores_own_not_its_await` (a hog holding the shard
+> 500 ms between yields beside the import: `F` from the await 46,015,129,583 ns; the store's own, under half a hold).
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
@@ -4484,6 +4489,11 @@
 >   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
 >     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
 >     its chunk again, on all three edges, counted.
+> - **Linux hg, run 6 (2026-11-25)** (45605246530, `diag-measurer-main-interop-linux-6` at f5b283016, main 387322d5c with
+>   w-hg's d33fc0b64; release slates, stock hg 7.2.4 installed in the job, the r400 cut of hg's history): **30 of 30 on
+>   ubuntu-latest and 30 of 30 on ubuntu-24.04-arm**, the six changeset evolution rows (ad36e5f09) among them.
+>   Windows pending: run 6's windows-latest leg failed every row at exit 127 on the workflow's own wrapper path (bash
+>   dropped `D:\a\_temp`'s backslashes), not slates; ade67baf3 passes it as a Unix path, for run 7.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the

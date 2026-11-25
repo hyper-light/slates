@@ -5987,7 +5987,7 @@ impl Green {
     names: &[(usize, crate::named::Identity)],
   ) {
     let mut run = self.commit_begin(effects, version, post_state, names);
-    while !self.commit_step(&mut run, usize::MAX) {}
+    while !self.commit_step(&mut run, &mut || false) {}
   }
 
   /// A commit's work before any effect is applied ([`Green::commit`]): the mapped files made from the head the verdict
@@ -6021,10 +6021,11 @@ impl Green {
     }
   }
 
-  /// Takes `run` on by at most `units` effects, staged removals or staged files: whether it has ended (its delta pushed
-  /// and its changes recorded).
-  fn commit_step(&mut self, run: &mut CommitRun, units: usize) -> bool {
-    for _ in 0..units.max(1) {
+  /// Takes `run` on an effect, a staged removal or a staged file at a time, at least one, until `spent` says its caller's
+  /// slice is spent: whether it has ended (its delta pushed and its changes recorded). No count of units: a file set
+  /// costs many times a removal, so the caller's clock, not a number, ends the slice.
+  fn commit_step(&mut self, run: &mut CommitRun, spent: &mut dyn FnMut() -> bool) -> bool {
+    loop {
       match run.phase {
         // The effects' places are where the verdict put them: the node moves and links are added after every one.
         CommitPhase::Effects => match run.effects.next() {
@@ -6062,8 +6063,10 @@ impl Green {
         },
         CommitPhase::Ended => return true,
       }
+      if spent() {
+        return false;
+      }
     }
-    false
   }
 
   /// A commit's end: each path emptied takes its metadata with it once nothing stands there, then its delta and changes
@@ -7228,7 +7231,7 @@ impl Green {
     match self.begin_applying(inc, applied) {
       Begun::Answered(version) => version,
       Begun::Applying(mut run) => loop {
-        match self.apply_step(&mut run, inc, applied, usize::MAX) {
+        match self.apply_step(&mut run, inc, applied, &mut || false) {
           ApplyStep::More => {}
           ApplyStep::Done(version) | ApplyStep::Answered(version) => return version,
         }
@@ -7284,8 +7287,8 @@ impl Green {
     }))
   }
 
-  /// Takes `run` on by at most `units` of its work: an effect of the entry made, or one of its commit's ([`Green::
-  /// commit_step`]); its version once it ends, or the head where a text it reads is held by name alone with no bytes lent
+  /// Takes `run` on a unit of its work at a time, at least one, until `spent` says the caller's slice is spent: an effect
+  /// of the entry made, or one of its commit's ([`Green::commit_step`]); its version once it ends, or the head where a text it reads is held by name alone with no bytes lent
   /// it (A-760 (b) 4d: nothing committed, its owner lends the objects [`Green::recorded_unlent`] names and applies the
   /// entry again). `inc` and `applied` are the ones it began with.
   pub fn apply_step(
@@ -7293,12 +7296,12 @@ impl Green {
     run: &mut Applying,
     inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
-    units: usize,
+    spent: &mut dyn FnMut() -> bool,
   ) -> ApplyStep {
     let Some(commit) = run.commit.as_mut() else {
-      return self.apply_effects_step(run, inc, applied, units);
+      return self.apply_effects_step(run, inc, applied, spent);
     };
-    if self.commit_step(commit, units) {
+    if self.commit_step(commit, spent) {
       let version = commit.version;
       self.accepted.insert(run.id, version);
       ApplyStep::Done(version)
@@ -7307,29 +7310,32 @@ impl Green {
     }
   }
 
-  /// [`Green::apply_step`] before its commit: the entry's effects made `units` at a time, each read the head checked for
-  /// a text held by name alone with no bytes lent (`crate::unlent`); once every one is made, its commit begun.
+  /// [`Green::apply_step`] before its commit: the entry's effects made one at a time, at least one, until `spent`, each
+  /// read the head checked for a text held by name alone with no bytes lent (`crate::unlent`); once every one is made,
+  /// its commit begun.
   fn apply_effects_step(
     &mut self,
     run: &mut Applying,
     inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
-    units: usize,
+    spent: &mut dyn FnMut() -> bool,
   ) -> ApplyStep {
     if run.at < applied.len() {
-      let end = run.at.saturating_add(units.max(1)).min(applied.len());
       let copies = copy::EntryCopies::at(applied, &run.copies);
       let ((), unlent) = crate::unlent::scope(|| {
-        for effect in applied.get(run.at..end).unwrap_or_default() {
+        while let Some(effect) = applied.get(run.at) {
           run
             .effects
             .push(self.effect_of(effect, (inc.post(), &copies)));
+          run.at = run.at.saturating_add(1);
+          if spent() {
+            break;
+          }
         }
       });
       if !unlent.is_empty() {
         return ApplyStep::Answered(self.head());
       }
-      run.at = end;
       return ApplyStep::More;
     }
     let mut effects = core::mem::take(&mut run.effects);

@@ -762,6 +762,7 @@ fn sections_of<F: BlockFile>(
     header: crate::log::header_in(file, row.offset, end)?,
     identity: row.identity,
     len: row.len,
+    flush_ns: 0,
   };
   Ok(sections_in(file, &located)?)
 }
