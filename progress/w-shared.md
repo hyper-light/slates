@@ -533,3 +533,17 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   barrier window, across runs. Red: the a912 push test asserting every created branch lands.
 - a894 flakes 1 in 3 at origin/main without A-912; main bisects it (w-svn's 964888c59 / ac3bf0650 suspected).
 - Owed to w-perf: the A-912 hash (sent), before it touches homes.rs.
+
+## 2026-11-24: A-913 landed (1fe3a3b05, commit ff53bdf83)
+
+- The record path (make_origin_replica) makes a missing branch source via make_source; red first with a unit test.
+  A-912's push test asserts no created branch is refused at its barrier; session_lent is asserted in the lane test.
+- Gate 17's release-3 failure is not A-912's: the same holder replica build refuses object bddc5dae… as Missing, also
+  in gate 10's debug-7 (before A-907).
+- Queue (main's order):
+  1. A-912's follow-up (the homing window from the measured silence-to-takeover tail) together with a894 (the
+     adoption-order race under load): one measurement.
+  2. The holder replica build Missing a pushed object. Read w-git's goal 93 item 2b GAPS entry and
+     patches/w-git-replica-red.patch first; log the read point and the homing, then make it deterministic.
+  3. A council session of its own per peer (red: the push test's session_lent == 0; log the held exchange's wait point
+     first).
