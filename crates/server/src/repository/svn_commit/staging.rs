@@ -691,8 +691,10 @@ type ToRecord = Option<Recording>;
 /// A kept revision's records being applied and the batch's held table followed a slice at a time
 /// ([`Staging::record_some`], A-920 piece 5).
 struct Recording {
-  /// The checked revision, until the records apply it.
+  /// The checked revision, until the records' apply of it begins.
   checked: Option<Checked>,
+  /// The records' apply of it, between its steps.
+  applying: Option<slates_svn::migration::Applying>,
   /// Its changed-path rows, which the held table's walks read.
   changes: Vec<slates_svn::index::ChangedPath>,
   /// Its record.
@@ -747,6 +749,7 @@ impl Recording {
     Recording {
       changes: checked.changes().to_vec(),
       checked: Some(checked),
+      applying: None,
       record,
       post,
       phase: RecordPhase::Before(0),
@@ -1344,21 +1347,32 @@ impl Staging {
     }
   }
 
-  /// The records applied with `recording`'s checked revision, counted staged: the phase after, or the step spent.
+  /// The records applied with `recording`'s checked revision a slice at a time until `spent`, a unit at least (A-920
+  /// piece 5b: 12-12.5 ms whole at 9,000 files, debug; `Repository::apply_begin`, `apply_step`), counted staged once
+  /// applied: the phase after, or the step spent.
   fn apply_records(
     &mut self,
     state: &mut ShardState,
     repository: RepositoryId,
     (recording, spent): (&mut Recording, &mut dyn FnMut() -> bool),
   ) -> Result<Recorded, Uncommitted> {
-    let checked = recording.checked.take().ok_or(Uncommitted::NotHeld)?;
-    let applied = state
+    let records = state
       .vcs_stores
       .subversion(repository)
       .and_then(|svn| svn.records.as_mut())
-      .map(|records| records.apply(checked))
       .ok_or(Uncommitted::NotHeld)?;
-    let revision = applied.map_err(Uncommitted::Step)?;
+    let mut applying = match (recording.applying.take(), recording.checked.take()) {
+      (Some(applying), _) => applying,
+      (None, Some(checked)) => records.apply_begin(checked).map_err(Uncommitted::Step)?,
+      (None, None) => return Err(Uncommitted::NotHeld),
+    };
+    let Some(revision) = records
+      .apply_step(&mut applying, spent)
+      .map_err(Uncommitted::Step)?
+    else {
+      recording.applying = Some(applying);
+      return Ok(Recorded::Spent);
+    };
     self.staged = self.staged.saturating_add(1);
     recording.phase = RecordPhase::After(0, revision);
     Ok(Recorded::after(spent))

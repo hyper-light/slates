@@ -210,6 +210,8 @@ pub struct Scratch {
   header: Vec<u8>,
   /// The objects read lately (module docs, "Objects read lately").
   recent: Recent,
+  /// Whether its last read found an entry of its chain among the objects read lately ([`Scratch::found_kept`]).
+  found_kept: bool,
 }
 
 impl Scratch {
@@ -218,6 +220,12 @@ impl Scratch {
   /// order of 2026-11-25: `open_tree` up to 0.59 ms a unit).
   pub fn deltas_applied(&self) -> usize {
     self.chain.len()
+  }
+
+  /// Whether its last read found the object read, or an entry of its chain, among the objects read lately: a hit of the
+  /// read cache, which spared it the rest of the chain.
+  pub fn found_kept(&self) -> bool {
+    self.found_kept
   }
 }
 
@@ -548,11 +556,13 @@ pub fn read(
   out: &mut Vec<u8>,
 ) -> Result<Kind, PackedRefused> {
   scratch.chain.clear();
+  scratch.found_kept = false;
   let mut at = place;
   let (kind, base) = loop {
     if let Some((kind, kept)) = scratch.recent.get(at) {
       scratch.built.clear();
       scratch.built.extend_from_slice(kept);
+      scratch.found_kept = true;
       break (kind, None);
     }
     let (header, data) = header_at(store, at, format, (&mut scratch.header, room))?;

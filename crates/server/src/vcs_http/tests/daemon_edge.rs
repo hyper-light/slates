@@ -7200,3 +7200,149 @@ fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
     "the chain built once over the walk: {deltas} deltas against {TREE_CHAIN}"
   );
 }
+
+/// Shape: the directories [`spread_chained_create`]'s every commit changes, each its own chain of tree revisions.
+const SPREAD_DIRS: usize = 8;
+/// Shape: the commits past the first in [`spread_chained_create`]'s line: each directory's chain runs that deep.
+const SPREAD_DEPTH: usize = 12;
+
+/// Stock git's request creating `main` at the last of `depth + 1` commits, each a child of the one before, whose root
+/// names `dirs` directories, each commit adding one small file to every one of them. So every directory's tree and the
+/// root's change in every commit, and the pack holds each one's first revision whole and every later revision as an
+/// offset delta against that directory's (or the root's) revision before it, as `git pack-objects` chains a project's
+/// directories. A walk reading the newest commit first meets every directory's chain in turn, interleaved, as a real
+/// clone's walk does. The request, the last commit, and the trees it holds.
+fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize) {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::Kind;
+  let mut blobs: Vec<Vec<u8>> = Vec::new();
+  let mut dir_trees: Vec<Vec<Vec<u8>>> = vec![Vec::new(); dirs];
+  let mut dir_tree: Vec<Vec<u8>> = vec![Vec::new(); dirs];
+  let mut roots: Vec<Vec<u8>> = Vec::new();
+  for k in 0..=depth {
+    let mut root = Vec::new();
+    for d in 0..dirs {
+      let blob = format!("dir {d} file {k}\n").into_bytes();
+      dir_tree[d].extend_from_slice(format!("100644 f{k:03}\0").as_bytes());
+      dir_tree[d].extend_from_slice(git_name(Kind::Blob, &blob).as_bytes());
+      blobs.push(blob);
+      dir_trees[d].push(dir_tree[d].clone());
+      root.extend_from_slice(format!("40000 d{d:03}\0").as_bytes());
+      root.extend_from_slice(git_name(Kind::Tree, &dir_tree[d]).as_bytes());
+    }
+    roots.push(root);
+  }
+  let mut commits: Vec<Vec<u8>> = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  for root in &roots {
+    let parent_line = parent
+      .map(|id| format!("parent {id}\n"))
+      .unwrap_or_default();
+    let commit = format!(
+      "tree {}\n{parent_line}author A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\nspread\n",
+      git_name(Kind::Tree, root)
+    )
+    .into_bytes();
+    parent = Some(git_name(Kind::Commit, &commit));
+    commits.push(commit);
+  }
+  let trees = dirs
+    .saturating_add(1)
+    .saturating_mul(depth.saturating_add(1));
+  let count = u32::try_from(blobs.len() + trees + commits.len()).expect("a count");
+  let mut pack = Vec::new();
+  let mut writer = slates_git::pack::Writer::new(GitFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut put = |representation: Representation, data: &[u8], size: usize, at: &mut u64| {
+    let header = Header {
+      representation,
+      size: u64::try_from(size).expect("a size"),
+    };
+    let zlib = stored_zlib(data);
+    let began = *at;
+    entry::write(header, began, &mut writer).expect("the entry's header");
+    slates_git::out::Out::put(&mut writer, &zlib);
+    *at = began
+      + entry::written_len(header, began).expect("the header's length")
+      + u64::try_from(zlib.len()).expect("a length");
+    began
+  };
+  for blob in &blobs {
+    put(Representation::Whole(Kind::Blob), blob, blob.len(), &mut at);
+  }
+  for revisions in dir_trees.iter().chain(std::iter::once(&roots)) {
+    let mut base = put(
+      Representation::Whole(Kind::Tree),
+      &revisions[0],
+      revisions[0].len(),
+      &mut at,
+    );
+    for k in 1..revisions.len() {
+      let delta = slates_git::store::delta_of(&revisions[k - 1], &revisions[k]).expect("a delta");
+      base = put(
+        Representation::OfsDelta { base },
+        &delta,
+        delta.len(),
+        &mut at,
+      );
+    }
+  }
+  for commit in &commits {
+    put(
+      Representation::Whole(Kind::Commit),
+      commit,
+      commit.len(),
+      &mut at,
+    );
+  }
+  writer.finish().expect("the trailer");
+  let tip = parent.expect("a commit");
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {tip} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  (request, tip, trees)
+}
+
+/// Main 01a20182's reading of 2026-11-25: on git/git the fetch's read cache cut chain rebuilds by 2.1 % (2,047,136
+/// deltas against 2,004,133), where a one-directory fixture cut 85 %, so what the cache does on a real walk must be
+/// counted before its rule changes. Do: push [`spread_chained_create`] of [`SPREAD_DIRS`] directories [`SPREAD_DEPTH`]
+/// revisions deep; fetch its last commit. Expect: `200`, the pack whole; the read cache's work counted: widened at least
+/// once, never refused, its budget past zero, its hits and the deltas applied reported beside the trees read, so the
+/// budget's rule can be judged on a walk whose chains interleave. (Its hits there are the next piece's red.)
+#[test]
+fn a_fetchs_read_cache_counts_its_hits_widening_and_budget() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip, trees) = spread_chained_create(SPREAD_DIRS, SPREAD_DEPTH);
+  let pushed_pack_objects = {
+    let (_, commands_end) = packets_from(&request, 0);
+    ids_in(&request[commands_end..]).len()
+  };
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let read = |counter| counted_on(&daemon, REPOSITORY, counter);
+  let (hits, widened, refused, budget, deltas) = (
+    read(crate::vcs_store::upload::READ_CACHE_HITS),
+    read(crate::vcs_store::upload::READ_CACHE_WIDENED),
+    read(crate::vcs_store::upload::READ_CACHE_REFUSED),
+    read(crate::vcs_store::upload::READ_CACHE_BUDGET_MOST),
+    read(crate::vcs_store::upload::TREE_DELTAS),
+  );
+  daemon.stop();
+  eprintln!(
+    "read cache over {trees} tree reads: {hits} hits, widened {widened}, refused {refused}, budget {budget} B, {deltas} deltas applied"
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
+  assert!(widened >= 1, "the read cache widened: {widened}");
+  assert_eq!(refused, 0, "never refused room");
+  assert!(budget > 0, "its budget counted: {budget}");
+}
