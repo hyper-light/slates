@@ -182,6 +182,59 @@ pub(crate) const COMPRESS_SEND_PLAIN_BYTES: &str = "vcs_store.hg_stream_compress
 pub(crate) const COMPRESS_SEND_STORED_BYTES: &str =
   "vcs_store.hg_stream_compress_send_stored_bytes";
 
+/// Counter: the nanoseconds a fetch's streamed answer spent inside its turns, summed (main's hg leg at 608930048: a
+/// 57k stream's 164 turns about 100 ms apart, its compression 1.6 s of 18 s; what a turn does, against what is between
+/// turns). Format: a counter name in the status report.
+pub(crate) const STREAM_TURN_NS: &str = "vcs_store.hg_stream_turn_ns";
+/// Counter: the nanoseconds the writes of a fetch's streamed answer took, each to its peer taking its last byte, summed.
+/// Format: a counter name in the status report.
+pub(crate) const STREAM_WRITE_NS: &str = "vcs_store.hg_stream_write_ns";
+/// Counter: the longest one such write took, kept as a maximum. Format: a counter name in the status report.
+pub(crate) const STREAM_WRITE_MOST_NS: &str = "vcs_store.hg_stream_write_most_ns";
+/// Counter: the writes that found the socket full and waited for the peer. Format: a counter name in the status report.
+pub(crate) const STREAM_WRITE_WAITS: &str = "vcs_store.hg_stream_write_waits";
+
+/// Counter: the nanoseconds a fetch's streamed answers took on the server, each from its beginning to its last turn,
+/// summed: against [`STREAM_TURN_NS`], [`STORE_WAIT_NS`] and [`STREAM_WRITE_NS`], what lies between its turns. Format: a
+/// counter name in the status report.
+pub(crate) const STREAM_SPAN_NS: &str = "vcs_store.hg_stream_span_ns";
+
+/// Counts a fetch's streamed answer's span ([`STREAM_SPAN_NS`]); nothing off a shard.
+pub(crate) fn stream_spanned(ns: u64) {
+  let _ = crate::state::with_state(|state| state.count(STREAM_SPAN_NS, ns));
+}
+
+/// Counter: the steps a fetch's streamed answer took in its turns, summed (each an index entry, a data chunk, a count
+/// of a log, a file's head): against [`STREAM_TURN_NS`], a step's cost. Format: a counter name in the status report.
+pub(crate) const STREAM_STEPS: &str = "vcs_store.hg_stream_steps";
+/// Counter: the turns of a fetch's streamed answer that stopped at the pace's ceiling, no one waiting on the shard: a
+/// turn as long as the ceiling allows, its work, not a wait. Format: a counter name in the status report.
+pub(crate) const STREAM_TURNS_AT_CEILING: &str = "vcs_store.hg_stream_turns_at_ceiling";
+
+/// Counts how long one turn of a fetch's streamed answer took ([`STREAM_TURN_NS`]), its steps ([`STREAM_STEPS`]) and
+/// whether its pace stopped it at the ceiling ([`STREAM_TURNS_AT_CEILING`]); nothing off a shard.
+pub(crate) fn turn_lasted(ns: u64, report: &slates_pace::Report) {
+  let _ = crate::state::with_state(|state| {
+    state.count(STREAM_TURN_NS, ns);
+    state.count(STREAM_STEPS, report.units);
+    if report.stop == Some(slates_pace::Stop::Ceiling) {
+      state.count(STREAM_TURNS_AT_CEILING, 1);
+    }
+  });
+}
+
+/// Counts one write of a fetch's streamed answer: how long its peer took it ([`STREAM_WRITE_NS`], the most), and whether
+/// it waited for the peer ([`STREAM_WRITE_WAITS`]); nothing off a shard.
+pub(crate) fn write_taken(ns: u64, waited: bool) {
+  let _ = crate::state::with_state(|state| {
+    state.count(STREAM_WRITE_NS, ns);
+    state.count_max(STREAM_WRITE_MOST_NS, ns);
+    if waited {
+      state.count(STREAM_WRITE_WAITS, 1);
+    }
+  });
+}
+
 /// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it, and the chunks its thread
 /// compressed since the last turn ([`COMPRESS_COUNT_NS`] and its siblings); nothing off a shard.
 pub(crate) fn turn_taken() {
@@ -252,10 +305,12 @@ where
       return false;
     };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
+    let owner = slates_store::owner::take_read_waits();
     let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
     let _ = lender.lend(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
+      count_owner_waits(state, &owner);
       state.count(TEXT_REQUESTS, asks.requests);
       state.count_max(TEXT_COPIED_MOST_BYTES, asks.most_copied);
       if tags {
@@ -270,6 +325,53 @@ where
     });
   }
   true
+}
+
+/// Counter: the requests a fetch's store asks ([`STORE_ASKS`]) made of the node's changeset store's owner, each one
+/// trip to the owner's thread and back (goal 93, main's order of 2026-11-25: the clone's store wait split by part; the
+/// parts below sum to [`OWNER_TOTAL_NS`], and [`STORE_WAIT_NS`] past it is the asking shard's own work between its
+/// requests). Format: a counter name in the status report.
+pub(crate) const OWNER_REQUESTS: &str = "vcs_store.hg_owner_requests";
+
+/// Counter: the nanoseconds those requests waited, each from its send to its answer's taking on the asking task.
+/// Format: a counter name in the status report.
+pub(crate) const OWNER_TOTAL_NS: &str = "vcs_store.hg_owner_total_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the nanoseconds queued behind other requests the owner was serving when each was
+/// sent (another repository's landing and its flush, another fetch's asks). Format: a counter name in the status report.
+pub(crate) const OWNER_BEHIND_NS: &str = "vcs_store.hg_owner_behind_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the owner thread's wake from waiting for work to taking the request. Format: a
+/// counter name in the status report.
+pub(crate) const OWNER_WAKE_NS: &str = "vcs_store.hg_owner_wake_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the owner's service but its log reads: making texts from their chains, reading the
+/// engine's rows, copying the answer. Format: a counter name in the status report.
+pub(crate) const OWNER_SERVE_NS: &str = "vcs_store.hg_owner_serve_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], the changeset log's reads within the owner's service (`ChangesetLog::read_ns`).
+/// Format: a counter name in the status report.
+pub(crate) const OWNER_DISK_NS: &str = "vcs_store.hg_owner_disk_ns";
+
+/// Counter: of [`OWNER_TOTAL_NS`], from the owner's answer to the asking task's taking it: the hop back to the asking
+/// shard and that shard's own turn. Format: a counter name in the status report.
+pub(crate) const OWNER_BACK_NS: &str = "vcs_store.hg_owner_back_ns";
+
+/// Counter: the longest one request's whole wait ([`OWNER_TOTAL_NS`]'s), kept as a maximum. Format: a counter name in
+/// the status report.
+pub(crate) const OWNER_MOST_NS: &str = "vcs_store.hg_owner_most_ns";
+
+/// Counts what a want's requests of the store's owner waited on, split by part ([`OWNER_REQUESTS`] and the counters
+/// after it).
+fn count_owner_waits(state: &mut ShardState, owner: &slates_store::owner::AskWaits) {
+  state.count(OWNER_REQUESTS, owner.asks);
+  state.count(OWNER_TOTAL_NS, owner.total_ns);
+  state.count(OWNER_BEHIND_NS, owner.behind_ns);
+  state.count(OWNER_WAKE_NS, owner.wake_ns);
+  state.count(OWNER_SERVE_NS, owner.serve_ns);
+  state.count(OWNER_DISK_NS, owner.disk_ns);
+  state.count(OWNER_BACK_NS, owner.back_ns);
+  state.count_max(OWNER_MOST_NS, owner.most_ns);
 }
 
 /// Counter: the requests a fetch's texts made of the node's changeset store's owner, each the texts of one want made

@@ -1347,6 +1347,21 @@ pub struct ShardState {
   /// The window a push's homing in the region runs within, as the control shard last derived it
   /// (`crate::fleet::homing_window`, A-912) and fanned to every shard with the failover delay; 0 before the first.
   pub(crate) homing_window_ns: u64,
+  /// Whether the homing window was last derived from the learned silence to a takeover install (A-914), so its source
+  /// is logged once as it changes (`fleet::note_homing_window_source`).
+  pub(crate) homing_window_learned: bool,
+  /// Each host's fencing epoch in the regional configuration this node last installed, as the control shard last read
+  /// it (A-914, `takeover::note_takeover_installs`): a host whose epoch rose since was taken over by the install between.
+  /// `None` before the first read. Bounded by the configuration's epochs.
+  pub(crate) takeover_epochs_seen:
+    Option<BTreeMap<slates_db::HostId, slates_db::register::HostEpoch>>,
+  /// Each regional member's latest answer to this node's detector, on the plane's clock, as the control shard last read
+  /// it (A-914): kept past the detector's own report, which forgets a dead peer once its death stands, so a takeover
+  /// installed later still knows where its host's silence began. Bounded by the members.
+  pub(crate) last_answers: BTreeMap<slates_db::HostId, u64>,
+  /// Test support (A-914): the nanoseconds each coordinator period waits before it runs
+  /// (`Daemon::inject_period_stretch`), 0 in production.
+  pub(crate) period_stretch_ns: u64,
   /// Test support: while `Some`, the control shard publishes this as its failover delay in place of its estimate, so a
   /// test can hold a wait's bound below a path's floor, or short enough to watch a give-up (`Daemon::inject_failover`).
   /// `None` in every deployment.

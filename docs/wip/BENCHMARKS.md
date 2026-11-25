@@ -19730,3 +19730,75 @@ about as often as B (6.2 % against 6.6 % of probes) and is dead even with B on t
 - **The whole clone** is noise after the pack begins (B 62.1 to 86.7 s, C 71.1 to 91.0 s, A 77.2 to 81.7 s) and judges
   no arm.
 - **The daemon's peak** was alike: A 2,902 to 2,946 MiB, B 2,904 to 2,978, C 2,909 to 2,911.
+
+## The 57k hg clone's memory after its two fixes: the clone adds 27 MiB to a resident 983 MiB, in process (goal 93 perf; w-perf's `what_holds`, main 01a20182's run, 2026-11-25 02:05 to 02:10 PST)
+
+**Fixed, by an in-process measure.** With 7c0ea35a1 (the text cache's walk ended for whole reads) and fffd95f79 (a
+fetch's batch bounded by `copy_slice_bytes`), a clone of the 57k history adds 27 MiB to the daemon's resident set. The
+same clone at 15b4f1061 had peaked at 10,416 MiB (BENCHMARKS, "the night's rerun").
+
+- **Command.** `crates/server/tests/hg_fetch_heap.rs`'s `what_holds` at main d3057763e: release with
+  `line-tables-only`, an in-process daemon, Mercurial's own history (57k changesets, hg-src) pushed then cloned.
+- **Machine and load.** The MacBook, load average 39 to 57.
+
+| point | resident (KiB) | live sampled heap |
+|---|---|---|
+| after the push | 1,006,496 | 150.9 MB |
+| the clone's peak | | 202.4 MB |
+| after the clone | 1,034,192 (+27 MiB) | 144.2 MB |
+
+- **Against the daemon's resident peak through a 57k clone** in the earlier rounds: 5,987 MiB at f8fe97e5e (loaded round
+  2), 5,966 MiB at 2ed3eb139, 10,416 MiB at 15b4f1061.
+- **Caveat.** This is an in-process figure from a test binary, against the earlier rounds' daemon RSS, not yet the same
+  harness. **Superseded** by the harness's own hg leg at 608930048 ("The 57k hg push A/B ... and the hg leg", below):
+  the daemon at 863 MiB after a clone and a stream.
+
+## The 57k hg push A/B: rule (B) closes UnknownDeltaBase at the same speed; and the hg leg at 608930048, the daemon at 863 MiB (goal 93 perf; main 01a20182's runs, 2026-11-25 02:38 to about 03:40 PST)
+
+**Verdicts.** (1) Rule (B) with w-hg's quadratic fix (8ec5fb287) lands. The 57k push was refused `UnknownDeltaBase` in 0
+of 6 runs, against 1 of 3 for A in the same rounds and 2 of 9 earlier that night, at A's speed (best 95.224 s against
+93.936). (2) Through the in-tree harness the daemon ends a 57k push, clone and stream at 863 MiB, against 5,659 to
+10,013 MiB in the rounds before. That confirms the memory fix in the harness itself and supersedes the in-process
+entry above. Slates' hg stream now sends stock's bytes (73.7 MB against 74.1) but takes 13.5 times stock's time.
+
+### (1) The push A/B
+
+- **Command.** `hg_push_loop2` at `RUNS=1`, Mercurial's own history (57k changesets) pushed into a fresh daemon each run.
+  Interleaved A, B, B in each of three rounds. Files: `~/.cache/main-rounds/hg-push-ab/`.
+- **Machine and load.** The MacBook, load average 36 to 48: loaded points, compared only with each other.
+- **The arms.** A: 15b4f1061, before rule (B). B: 608930048, rule (B) with 8ec5fb287.
+
+| round | A (s) | B (s) | B (s) |
+|---|---|---|---|
+| 1 | 69.796, **refused** `UnknownDeltaBase` | 109.605 | 115.228 |
+| 2 | 108.205 | 98.884 | 104.148 |
+| 3 | 93.936 | 95.224 | 101.539 |
+
+- **Medians.** B 102.844 s over its 6 runs, best 95.224. A 101.071 s over its 2 that landed, best 93.936. Even.
+- **B's counters, run by run.**
+  - `kept_unlanded`: 99, 74, 61, 94, 95, 95.
+  - `pinned_away`: 0 in every run.
+  - The longest pin slice: 3,571 to 7,611.
+  - The daemon's resident set after the push: 689 to 730 MiB.
+
+### (2) The hg leg at 608930048, stock then slates
+
+- **Command.** The in-tree harness at 67ec37368, its hg leg, one run each, stock `hg serve` then slates. Files:
+  `~/.cache/main-rounds/interop-speed-mac-5/hg-1/`. Load about 30 to 35.
+
+| step | stock (s) | slates (s) | slates / stock |
+|---|---|---|---|
+| push | 55.838 | 92.397 | 1.65x |
+| clone | 28.533 | 174.367 | 6.11x |
+| stream clone | 1.333 | 18.008 | 13.51x |
+
+- **The stream's size.** Stock sent 4,284 files and 74.1 MB; slates sent 4,280 files and 73.7 MB (0.999x and 0.995x),
+  with 70fa2080f's chunks compressed as stock's and small logs inline. It was 8,454 files and 144 MB at 15b4f1061.
+- **The stream's compression, per the counters.** Count pass 0.791 s, send pass 0.794 s: 1.585 s, 8.8 % of the 18.0 s
+  stream. 136.1 MB plain stored as 62.5 MB (0.459). That is the per-stream cost w-hg's piece (b) removes by keeping
+  each chunk compressed from the push.
+- **The daemon's resident set.** 726 MiB after the push and 863 MiB at the end.
+- **Open, with w-hg.**
+  - The stream's time: 164 turns at about 100 ms each.
+  - The clone's time: 117,848 changeset store asks at about 1 ms each.
+

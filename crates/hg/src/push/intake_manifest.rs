@@ -47,10 +47,15 @@ enum Base {
     /// Its chain.
     chain: Chain,
   },
-  /// A manifest let go once landed, its text asked of the store and not yet given.
+  /// A manifest whose chain is not at hand: the topmost link of it let go once landed asked of the store, its text not
+  /// yet given.
   Asked {
     /// Its node.
     node: Node,
+    /// The link asked of the store: the manifest itself where it was let go, else the revision of its chain (number and
+    /// node) whose text the chain above is read over (w-interop's matrix at 29221d5ab: a manifest this push kept, a
+    /// delta on a landed one let go, was asked of the store itself, which keeps no row of it).
+    from: (u32, Node),
   },
   /// A manifest's text the store gave, held in the content store as one object for this revision's steps.
   Given {
@@ -68,7 +73,7 @@ impl Base {
   fn node(&self) -> Node {
     match self {
       Base::Null => NULL_NODE,
-      Base::Chain { node, .. } | Base::Asked { node } | Base::Given { node, .. } => *node,
+      Base::Chain { node, .. } | Base::Asked { node, .. } | Base::Given { node, .. } => *node,
     }
   }
 
@@ -288,10 +293,13 @@ impl Taker {
     if asked {
       self.base_asked = None;
     }
+    // Not at hand: the topmost link let go is asked of the store, which keeps a landed revision's text and none of one
+    // this push kept; the manifest itself where every link is held (a chain read before failed, `Out::Again`).
+    let from = Chain::let_go_link(&self.fork, store, rev).unwrap_or((rev, node));
     Some(
       match Chain::of(&self.fork, store, rev).filter(|_| at_hand && !asked) {
         Some(chain) => (Base::Chain { node, chain }, len),
-        None => (Base::Asked { node }, len),
+        None => (Base::Asked { node, from }, len),
       },
     )
   }
@@ -564,19 +572,23 @@ impl Taker {
     store: &mut ContentStore,
     admission: &Admission,
   ) -> Result<Option<Stepped>, Refused> {
-    let Base::Asked { node } = *base else {
+    let Base::Asked {
+      node,
+      from: (from_rev, from),
+    } = *base
+    else {
       return Ok(None);
     };
     let asked = self
       .asked
       .take()
-      .filter(|asked| asked.node == node && asked.path == super::MANIFEST_PATH);
+      .filter(|asked| asked.node == from && asked.path == super::MANIFEST_PATH);
     let Some(asked) = asked else {
       self.asked = Some(StoreAsk {
         path: super::MANIFEST_PATH.to_vec(),
-        node,
+        node: from,
         want: Some(crate::render::Want::Rows {
-          logs: vec![(super::MANIFEST_PATH.to_vec(), vec![node])],
+          logs: vec![(super::MANIFEST_PATH.to_vec(), vec![from])],
         }),
         most: admission.left(),
         text: None,
@@ -598,9 +610,23 @@ impl Taker {
       .map_err(|refused| Refused::Unindexed(Unindexed::from(refused)))?;
     let len = to_u64(text.len());
     self.spares.give(text);
+    let chain = if from == node {
+      Some(Chain::whole(object, len))
+    } else {
+      // The link's text given, the rows above it read over it from the fork, which holds each (kept by this push, or
+      // landed and held).
+      self
+        .fork
+        .rev(store, Log::Manifest, &node)
+        .and_then(|rev| Chain::over(&self.fork, store, (from_rev, (object, len)), rev))
+    };
+    let Some(chain) = chain else {
+      let _ = store.release(&object);
+      return Err(unread_of(node, from));
+    };
     *base = Base::Given {
       node,
-      chain: Chain::whole(object, len),
+      chain,
       object,
     };
     Ok(Some(Stepped::More))

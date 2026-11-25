@@ -34,6 +34,8 @@ use slates_mem::large::LargeMapped;
 const CHANGESETS: u64 = 2_000;
 /// Shape: the bytes allocated between samples, a thread's own: at the 57k clone's 5.6 GB about 1,400 live samples.
 const SAMPLE: u64 = 4 << 20;
+/// Shape: the frames in slates' crates a site is named by, innermost first.
+const SITE_FRAMES: usize = 3;
 /// Shape: the live sites printed, the largest first.
 const LISTED: usize = 20;
 
@@ -95,47 +97,40 @@ std::thread_local! {
   static SINCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A backtrace's site: its innermost three frames outside the allocator, the standard library and this test.
+/// A backtrace's site: its innermost [`SITE_FRAMES`] frames in slates' own crates, each its function and its file and
+/// line, the sampler's own file and the allocator's passed over (std, core and alloc lie outside `crates/`). By the
+/// frames' files, not their names: built with line tables alone, a frame names its function bare (`allocated`,
+/// `{closure#1}`), so a name says nothing of where it lies (main's 57k run at d3057763e: every site the sampler itself).
 fn site(trace: &str) -> String {
-  let skip = |name: &str| {
-    [
-      "std::", "core::", "alloc::", "<alloc::", "<core::", "<std::", "__rust", "__rdl",
-    ]
+  let mut frames: Vec<(String, Option<String>)> = Vec::new();
+  for line in trace.lines().map(str::trim) {
+    if let Some(at) = line.strip_prefix("at ") {
+      if let Some(frame) = frames.last_mut() {
+        frame.1 = Some(at.to_owned());
+      }
+    } else if let Some((number, name)) = line.split_once(": ")
+      && number.chars().all(|c| c.is_ascii_digit())
+    {
+      let name = name.rsplit_once("::h").map_or(name, |(head, _)| head);
+      frames.push((name.to_owned(), None));
+    }
+  }
+  let ours: Vec<String> = frames
     .iter()
-    .any(|prefix| name.starts_with(prefix))
-      || [
-        "slates_mem::large",
-        "hg_fetch_heap::",
-        "backtrace",
-        "GlobalAlloc",
-        "to_vec",
-        "ConvertVec",
-        "RawVec",
-      ]
-      .iter()
-      .any(|part| name.contains(part))
-  };
-  let short = |name: &str| {
-    name
-      .rsplit_once("::h")
-      .map_or(name, |(head, _)| head)
-      .to_owned()
-  };
-  let frames: Vec<String> = trace
-    .lines()
-    .map(str::trim)
-    .filter_map(|line| {
-      let (number, name) = line.split_once(": ")?;
-      number.chars().all(|c| c.is_ascii_digit()).then_some(name)
+    .filter_map(|(name, at)| {
+      let at = at.as_deref()?;
+      let (_, within) = at.split_once("/crates/")?;
+      let passed = within.starts_with("server/tests/hg_fetch_heap.rs")
+        || within.starts_with("mem/src/large.rs");
+      let line = within.rsplit_once(':').map_or(within, |(head, _)| head);
+      (!passed).then(|| format!("{name} (crates/{line})"))
     })
-    .filter(|name| !skip(name))
-    .take(3)
-    .map(short)
+    .take(SITE_FRAMES)
     .collect();
-  if frames.is_empty() {
-    "(no frame)".to_owned()
+  if ours.is_empty() {
+    "(no frame in crates/)".to_owned()
   } else {
-    frames.join(" <- ")
+    ours.join(" <- ")
   }
 }
 
@@ -329,11 +324,7 @@ fn source(served: &common::hg::Served) -> String {
 }
 
 /// Prints the live sites and the daemon's nonzero memory gauges, `when`.
-fn print_held(
-  when: &str,
-  (listed, total): &Listed,
-  rows: &BTreeMap<String, u64>,
-) {
+fn print_held(when: &str, (listed, total): &Listed, rows: &BTreeMap<String, u64>) {
   println!("hg_fetch_heap: {when}: live sampled {total} B");
   for (site, bytes) in listed.iter().take(LISTED) {
     println!(

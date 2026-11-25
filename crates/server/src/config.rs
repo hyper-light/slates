@@ -959,6 +959,21 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("snapshot_bytes_per_partition", &snapshot_bytes));
+    // The quantum the slices below are sized by at boot, and the time one slice may take (R3: every derived value logged
+    // with its inputs; a slice's bytes are judged against its time, main's export measurement of 2026-11-25). A shard's
+    // live quantum follows its online wake estimate from there (`DaemonConfig::step_quantum_ns`).
+    let step_quantum_ns: Derived<u64> = derived!(
+      runtime.step_budget_ns,
+      "the runtime's step budget, the quantum a shard starts with (its live one follows its online wake estimate)",
+      ["rt.step_budget_ns"]
+    );
+    derivations.push(note("step_quantum_ns", &step_quantum_ns));
+    let copy_slice_ns: Derived<u64> = derived!(
+      runtime.step_budget_ns.saturating_mul(COPY_SLICE_PERMILLE) / PERMILLE,
+      "step_quantum_ns × COPY_SLICE_PERMILLE / 1000: the time one slice of copied or digested bytes may take",
+      ["rt.step_budget_ns"]
+    );
+    derivations.push(note("copy_slice_ns", &copy_slice_ns));
     // The boot value, for the record: a shard sizes each slice by its live quantum, which follows its
     // online wake estimate (`DaemonConfig::archive_slice_bytes`).
     let archive_slice_bytes: Derived<u64> = derived!(

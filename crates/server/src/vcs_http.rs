@@ -251,6 +251,12 @@ impl<'s> ClientGone<'s> {
 
 /// A service's exchange for one request: it takes the request's body a run at a time and gives its reply a run at a time,
 /// each run handed on before the next is asked (the engine writes before it reads again).
+/// Counter: the nanoseconds from a reply run's yield to the connection's next poll, summed over the edge's replies (main's
+/// hg leg at 608930048: a stream's turns about 100 ms apart). Format: a counter name in the status report.
+pub(crate) const REPLY_YIELD_GAP_NS: &str = "vcs_http.reply_yield_gap_ns";
+/// Counter: the longest such gap, kept as a maximum. Format: a counter name in the status report.
+pub(crate) const REPLY_YIELD_GAP_MOST_NS: &str = "vcs_http.reply_yield_gap_most_ns";
+
 pub(crate) trait Exchange {
   /// Takes one run of the request's body, its framing and coding removed.
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
@@ -1317,7 +1323,15 @@ impl<S: Site> Parts<S> {
         connection.fail(status);
       }
     }
+    // Main's hg leg at 608930048 (2026-11-25): a stream's turns about 100 ms apart; the gap from this yield to the reply's
+    // next poll counted, before any change to what wakes it.
+    let yielded = now_ns();
     yield_now().await;
+    let gap = now_ns().saturating_sub(yielded);
+    let _ = crate::state::with_state(|state| {
+      state.count(REPLY_YIELD_GAP_NS, gap);
+      state.count_max(REPLY_YIELD_GAP_MOST_NS, gap);
+    });
     Flow::Go
   }
 
