@@ -759,3 +759,15 @@
   shard + SPIN_NS 100 ms + INJECTED_IN_WINDOW; 20/20 at load 72). Reviewed w-hg's prepared creates (landed fda5613a1).
   Rule learned: delete only my own folders. WAITING: TSan diag 3 (f387b56d3); the full bench's git leg (clone sample,
   landing counters) -> derive's thin spread, clone-again's gather.
+- 23:35 (11-24/25): LANDED a4aa0ebc4 A-911 (fetch walk's PositionCache: direct-mapped, sized from one sent commit's
+  ids × 8, charged to admission, zero slots = same code; (b) one lookup after id_at; red 2,400 → 383 lookups). Bench
+  round 2: clone 113 → 66 s, clone-again 121 → 64, partial 82 → 45, first pack 60-84 → 29-44 s; clone counted 48.7 M
+  hits / 11.4 M lookups. 658cc5d04 t_a614a bound = the pace's rule (+ git_derive.turns_yielded). 427a27d1f spin_kick.
+  ed71ac0be landing_step_{creates,ns}_most (non-atomic git push = a ref a step). 6d6a285a8 write-path bring-backs let go
+  at their end (BroughtBack; derive, green build, replica build); reds: derivation (a64f385b1), green build
+  (4fc2892c7). Replica build's red: unreachable while LANDED_LET_GO false; a holder's build reads a let-go window as
+  Missing -> GAPS precondition of item 2b's re-lift (0a690a148), red kept at patches/w-git-replica-red.patch here.
+  w-perf's re-bring test (b) landed f57e255d7 on my freed git_push/tests.rs. Incremental fetch CLOSED (BENCHMARKS):
+  slates' server ~75 ms of 0.95 s; the rest is the client's 1,027-ref work + HTTP helper. NOW: A-911's miss counter
+  (vcs_store.git_upload.position_cache_conflicts; red 0 -> green 292 of 383 lookups conflicts), landing; then main's
+  A/B: set-associative vs wider window.
