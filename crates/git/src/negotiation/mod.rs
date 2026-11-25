@@ -269,6 +269,77 @@ pub struct Counters {
   pub entries_most: u64,
 }
 
+/// The kind of a negotiation's unit (main 01a20182's order of 2026-11-25: 82 % of a clone's steps past the quantum were its
+/// choosing, the slowest 9.6 ms; which unit runs past it). Marked as each unit begins ([`last_unit`]), so an owner timing
+/// the units between its `spent` asks can tell them apart without the negotiation keeping a clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitKind {
+  /// A unit of `ready`'s search, and the cut's or the selection's begun after it.
+  Ready,
+  /// A unit of the cut's walk, and the selection begun after it.
+  Cut,
+  /// A tree marked held.
+  Mark,
+  /// A tree opened: its ids read.
+  OpenTree,
+  /// A tree's entry taken.
+  TakeEntry,
+  /// A `sparse:oid` walk's entry.
+  Frame,
+  /// The commit walk's step.
+  Commits,
+  /// An edge's tree marked held.
+  Edges,
+  /// The haves' trees and blobs marked held.
+  Haves,
+  /// A sent commit's root tree begun.
+  Choose,
+  /// A want no run answers.
+  Wants,
+  /// A run's version joined to what the runs carry (`include-tag`).
+  Carried,
+  /// A tag ref looked at (`include-tag`).
+  Tags,
+  /// Nothing left: the selection's end.
+  Done,
+}
+
+impl UnitKind {
+  /// Every kind, in order.
+  pub const ALL: [UnitKind; 14] = [
+    UnitKind::Ready,
+    UnitKind::Cut,
+    UnitKind::Mark,
+    UnitKind::OpenTree,
+    UnitKind::TakeEntry,
+    UnitKind::Frame,
+    UnitKind::Commits,
+    UnitKind::Edges,
+    UnitKind::Haves,
+    UnitKind::Choose,
+    UnitKind::Wants,
+    UnitKind::Carried,
+    UnitKind::Tags,
+    UnitKind::Done,
+  ];
+}
+
+thread_local! {
+  /// The kind of the unit this thread's negotiation began last ([`last_unit`]).
+  static LAST_UNIT: core::cell::Cell<UnitKind> = const { core::cell::Cell::new(UnitKind::Done) };
+}
+
+/// The kind of the unit this thread's negotiation began last: an owner timing its units between `spent` asks reads it
+/// at each ask.
+pub fn last_unit() -> UnitKind {
+  LAST_UNIT.with(core::cell::Cell::get)
+}
+
+/// Marks a unit of `kind` begun on this thread.
+pub(super) fn begin_unit(kind: UnitKind) {
+  LAST_UNIT.with(|last| last.set(kind));
+}
+
 /// What a negotiation answered, and how.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome<G, N> {
@@ -647,6 +718,11 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
     admission: &mut Admission,
     spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Outcome<G, N>>, Refusal> {
+    match &self.phase {
+      Phase::Ready(..) => begin_unit(UnitKind::Ready),
+      Phase::Cut(..) => begin_unit(UnitKind::Cut),
+      _ => {}
+    }
     match core::mem::replace(&mut self.phase, Phase::Done) {
       Phase::Ready(mut readying, decided) => {
         let found = readying.unit(
