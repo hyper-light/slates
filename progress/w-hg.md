@@ -695,3 +695,6 @@ Waiting: main's route; arena-7 and arena-8.
 - Reviewed w-perf's 142256360 (text_whole; the clone's text-cache walks): OK. Part 2 (batch bound) owed by w-perf; I review.
 - Owed to main: the six-push 57k loop (red: any UnknownDeltaBase, or kept_unlanded 0, or pinned_away > 0). w-svn moves svn onto the store's pins.
 - Next (main's order): stream v2 negotiated (stream2 capability, requires), then zstd compression and inline small revlogs; check crates/cli/bench/hg_stream_compare.sh (w-interop's b2888af84).
+- 1540f62d5 (main 50c31d6d9): stream v2 -- `bundle2` lists `stream=v2`; `getbundle` `stream=1` answers one STREAM2 part (Streaming framed as `_emit2`, counted first; phaseroots for a non-publishing repository). Three red tests. Run request to main: hg_interop stock stream-clone test (now asserts stream2 negotiated).
+- Split (main): w-interop owns the encoding (zstd chunks, inline revlogs, requires); I recommended (a) compress at stream time now, (b) store keeps stock's chunk form later as my piece. Review w-interop's diff at the Streaming seam when sent.
+- Waiting: main's six-push 57k loop at 4a0c23e20 (B); w-perf's batch-bound part 2 for review.
