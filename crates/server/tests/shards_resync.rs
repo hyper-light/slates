@@ -471,3 +471,8 @@ fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_rele
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

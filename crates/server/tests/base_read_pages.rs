@@ -159,3 +159,8 @@ fn the_retired_whole_file_read_is_refused_naming_the_paged_read() {
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

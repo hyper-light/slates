@@ -3193,3 +3193,8 @@ fn the_simulator_holds_what_it_was_given_room_for() {
   );
   assert_eq!(sim.detach(mounted.attachment), Ok(()));
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

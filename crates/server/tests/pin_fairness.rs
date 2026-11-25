@@ -238,3 +238,8 @@ fn a_pin_of_a_large_base_never_holds_its_shard() {
     "the snapshot after the pin is a complete base: {green:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

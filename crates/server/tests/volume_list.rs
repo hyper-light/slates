@@ -250,3 +250,8 @@ fn the_longest_name_a_create_carries_is_listed() {
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

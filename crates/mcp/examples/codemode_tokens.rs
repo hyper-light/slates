@@ -147,6 +147,12 @@ fn report(label: &str, cost: &Cost, elapsed: Duration, found: usize) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+  // The daemon's spawner (A-924): this binary started as one serves before anything else runs, or a daemon it starts
+  // in process would start this binary again, whole, as its spawner.
+  #[cfg(unix)]
+  if let Some(served) = slates_ipc::spawner::serve_from_env() {
+    std::process::exit(i32::from(served.is_err()));
+  }
   let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: PROBE_BUDGET,

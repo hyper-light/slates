@@ -712,3 +712,8 @@ fn a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads
     second.transcript()
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

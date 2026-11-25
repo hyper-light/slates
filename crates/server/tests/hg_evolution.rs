@@ -330,3 +330,8 @@ fn a_non_publishing_repository_keeps_drafts_and_hides_a_rewritten_one() {
     "the amend's marker: {markers}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

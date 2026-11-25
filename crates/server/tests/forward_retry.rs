@@ -214,3 +214,8 @@ fn a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room() {
      window of {idle_window_ns} ns against a hold of {HOLD:?})"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

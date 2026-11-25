@@ -134,3 +134,8 @@ fn a_consumer_of_the_channels_own_account_attests_and_holds_only_what_is_shared_
   drop(owner);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

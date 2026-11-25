@@ -15051,3 +15051,8 @@ fn an_anchors_vcs_ssh_edge_names_its_host_key_and_a_restart_keeps_port_and_key()
     "the restarted daemon serves the edge on the port its anchor holds, with the key it holds"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

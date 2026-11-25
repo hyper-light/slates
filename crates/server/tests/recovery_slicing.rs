@@ -342,3 +342,8 @@ fn a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_
     greens.len()
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

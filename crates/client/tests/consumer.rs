@@ -511,3 +511,8 @@ fn assert_served_as_the_consumer_after_the_restart(
   );
   assert_eq!(workload.consumer(), Some(consumer));
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

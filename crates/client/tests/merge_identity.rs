@@ -114,3 +114,8 @@ fn the_heads_own_bytes_accept_at_a_version_of_their_own(client: &mut Client, gre
     b"ZZZZaaaa".to_vec()
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();
