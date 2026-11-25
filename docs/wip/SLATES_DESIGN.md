@@ -63904,3 +63904,17 @@ GAPS.
 - **Piece 0, the reservation once.** `ImportBatch::stage` computed the work's reservation for its room check
   (`reservation_of`), and `judge_staged` walked the same work at the same head again; the first result is passed
   through, the scratch member unchanged between but for the texts lent it. The judge step 262-265 ms → 227-228 ms.
+- **Piece 1, the scratch commit.** The accepted verdict is committed into the scratch member on A-917's run machinery
+  (`Green::begin_committing`, `committing_step` over `Prep` and `commit_step`, without the replay-reads check, which
+  the verdict made), `ImportBatch::stage_begin` judging and `stage_step` committing a slice until the step's clock
+  passes its quantum, a unit at least; `stage` is the two carried to their end. Staging's steps
+  (`Staging::staged_in`, `staging_step`) each do what their slice holds: the judge, the commit's slices, then the
+  records' apply in the step the commit ends in where its slice is not spent, else in one of their own, so a revision
+  that fits a slice stages in one step. A step with no commit begun is refused, never "more". At 9,000 files the judge
+  step 227-228 ms → 89-92 ms (the reservation 29, the verdict 57 and the commit's first unit), the commit's steps
+  under the quantum but two whole parts, the preparation's turn from its sole runs (`named_files`, `alone`: 6.8 ms) and
+  the commit's end (`commit_finish` 6.6 ms with the batch's keep, 12.9-13.6 ms in all), and the records' step 29-30 ms;
+  the record check (101-105 ms) and the build (51-53 ms) unchanged. Oracle: over generated works, a verdict committed
+  a unit a step equals the verdict committed whole (`a_verdict_committed_a_unit_a_step_is_the_verdict_committed_whole`,
+  1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds 150 ms, not 500: every staging
+  step waits a hold, and the first batch's 151 steps took it past its patience; 150 ms is still 20 times a flush.

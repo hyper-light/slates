@@ -1291,9 +1291,11 @@ fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
   );
 }
 
-/// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush, under the
-/// shard's watchdog window.
-const HOG_NS: u64 = 500_000_000;
+/// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush (6.7 ms on
+/// the Studio), under the shard's watchdog window. Every step of the import's staging waits a hold, and a revision's
+/// scratch commit is a slice a step (A-920 piece 1): at 500 ms the first batch's 151 staging steps took the test past
+/// its patience.
+const HOG_NS: u64 = 150_000_000;
 /// Shape: the contended-flush test's look at the import, between its waits.
 const LOOK_NS: u64 = 10_000_000;
 
