@@ -64124,6 +64124,18 @@ GAPS.
   (`a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent`; a step's unlent reads dropped fails it,
   which no test caught before); and a server batch staging that rename lent `a`'s text once by its judge
   (`a_staged_judge_is_lent_the_named_text_its_verdict_reads`).
+- **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
+  after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
+  tables.** The step that kept a revision applied the records and followed the batch's held table whole
+  (`Staging::recorded_in`); now `Staging::record_some` takes a `Recording` on in phases, each until the step's clock
+  passes its quantum, a unit at least, and stopping between phases where it is spent: the texts its rows let go
+  (`svn_texts::released_by`, a row a unit, before the records apply it), the records' apply (whole, 5b), the texts
+  its rows hold (`svn_texts::held_by`, a row a unit), then the held table followed a path a unit and the record kept.
+  Each walk gathers into an ordered map, so each path is kept once, its last row's, and the folds run in the order
+  `once_a_path` gave them; `released_before` and `held_after`, which a single commit takes whole, are the same rows'
+  walks. The records step 29-31 ms → 12.4 ms (the apply). Oracle: the svn import tests, whose shard quantum of a few
+  microseconds takes these walks a row a step over the golden dumps, hold the texts each batch lets go and keeps;
+  focused set 110 passed. Still whole: a row that adds or replaces a directory walks its tree in one unit.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
