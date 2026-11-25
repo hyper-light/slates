@@ -19242,6 +19242,100 @@ What moved, and why (from the commits between the rounds' builds):
 - **Clone-again is steady at r940** (64.0 to 65.0 s, its first pack bytes at 52.9 to 53.9 s, run 1 included), where earlier
   rounds' run 1 was slow like a first clone.
 
+## LOADED: slates against every stock server on the MacBook while the fleet's agents ran (goal 93 perf; main 01a20182's round, 2026-11-25 02:39 to 04:55 UTC, main ed71ac0be)
+
+**A loaded point, not the order-of-magnitude record.** The big Studio was offline, so Ada chose to run the round on
+the MacBook with the fleet's agents running throughout. Load ran 33 to 76 on 18 cores, peaking at 193 for a minute.
+Load slowed stock's single-process servers far more than slates: stock `git daemon`'s clone took 43 to 64 s here
+against 10.6 s on the quiet Studio, while slates' clone took 113 to 140 s against 118 to 149 s there. So the ratios
+below are narrower than the Studio's for that reason, not because slates got faster. Read them as how each server
+holds up on a busy machine.
+
+- **Machine:** Mac17,6, Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1.
+- **Builds and versions:** slates 0.1.0 at ed71ac0be, release. git 2.50.1; Mercurial 7.2.4 (Homebrew); svn and
+  svnserve 1.15.0; Apache 2.4.66 with Xcode's `git-http-backend`.
+- **Datasets:** git/git bare at 77904e546de3 (8 branches, 1,019 tags, 425,179 objects pushed); git-2000.dump of
+  f7de81456940 (458,114,318 bytes); Mercurial at 57035:a933409955d2. The git dataset is newer than rounds 2 to 6's
+  f7de81456940, so compare ratios, not seconds.
+- **Command:** `interop_speed.sh`, one tool per invocation through a local copy with a LEGS filter
+  (`~/slates-work/main-ship/interop_speed_legs.sh`), since the shell caps a command at 2 h. git ran as three invocations
+  of RUNS=1, in order (best of three); svn ran RUNS=3 once. The record is in
+  `~/.cache/main-rounds/interop-speed-mac-1/{git-1,git-2,git-3,svn-1}/` on the MacBook, with slates' clone profiles in
+  `git-2-samples` and `git-3-samples`.
+- **Checks:** refs (1,027) and objects (425,179) identical on all three git servers in every part. Each svn checkout
+  had 4,872 files identical to git's tree, and each log named 2,000 revisions, on both servers.
+
+The load each git part ran under (1-minute averages: at its start, at its end, and the highest sampled every 5 s):
+
+| part | UTC start | load at start | load at end | highest |
+|---|---|---|---|---|
+| git run 1 | 02:39:55 | 48.75 | 70.06 | 193.19 |
+| git run 2 | 03:07:32 | 71.06 | 33.17 | 101.06 |
+| git run 3 | 03:34:14 | 39.94 | 36.71 | 60.76 |
+| svn runs 1-3 | 04:38:38 | 57.35 | 36.26 | 103.59 |
+
+Seconds, wall clock at the client, every run shown (git runs 1 to 3 are the three parts above):
+
+| git | git daemon 1-3 | best | git http-backend 1-3 | best | slates 1-3 | best | slates against best stock | round 2 (Studio) |
+|---|---|---|---|---|---|---|---|---|
+| push, every branch and tag | 74.658 87.912 64.524 | 64.524 | 85.946 58.427 91.318 | 58.427 | 101.801 50.002 74.052 | 50.002 | 1.17× faster | 7.6× slower |
+| clone `--mirror` | 43.356 63.625 63.591 | 43.356 | 112.965 60.916 79.752 | 60.916 | 140.119 124.515 113.063 | 113.063 | 2.61× slower | 14.2× slower |
+| clone again | 108.364 60.326 40.579 | 40.579 | 135.373 102.713 93.752 | 93.752 | 140.897 120.546 149.713 | 120.546 | 2.97× slower | 8.8× slower |
+| one-commit push | 0.896 1.084 5.058 | 0.896 | 3.061 2.251 6.475 | 2.251 | 0.385 0.819 1.165 | 0.385 | 2.33× faster | 1.6× faster |
+| fetch of it | 0.478 0.956 1.494 | 0.478 | 1.077 7.051 6.439 | 1.077 | 1.522 1.823 1.828 | 1.522 | 3.18× slower | 1.2× slower |
+| clone `--depth 1` | 7.755 5.294 6.480 | 5.294 | 7.550 6.230 7.715 | 6.230 | 2.900 1.665 1.990 | 1.665 | 3.18× faster | 2.0× slower |
+| clone `--filter=blob:none` | 31.587 29.775 35.724 | 29.775 | 39.897 50.918 45.248 | 39.897 | 115.303 105.841 81.851 | 81.851 | 2.75× slower | 11.7× slower |
+
+Slates' first bytes in git, seconds after each step began (the first packet is the ref advertisement):
+
+| slates step | first packet, runs 1-3 | first pack bytes, runs 1-3 | its total |
+|---|---|---|---|
+| clone `--mirror` | 0.201 0.197 0.178 | 70.093 68.992 71.142 | 140.119 124.515 113.063 |
+| clone again | 0.326 0.180 0.231 | 65.165 60.003 82.288 | 140.897 120.546 149.713 |
+| clone `--filter=blob:none` | 0.130 0.237 0.239 | 65.382 83.830 67.081 | 115.303 105.841 81.851 |
+
+| Subversion | svnserve 1-3 | best | slates 1-3 | best | slates against stock | round 3 (Studio) |
+|---|---|---|---|---|---|---|
+| fill from the dump: stock `svnadmin load` (once), slates `repository import` | 369.674 | 369.674 | 11.619 9.322 6.928 | 6.928 | 53.4× faster (two different operations) | 30.8× faster |
+| checkout of trunk | 84.173 25.314 12.058 | 12.058 | 23.193 12.473 14.670 | 12.473 | 1.03× slower | 1.08× faster |
+| `log -q`, whole history | 0.855 1.466 0.973 | 0.855 | 0.341 0.205 0.180 | 0.180 | 4.75× faster | 2.94× faster |
+| one-file commit | 13.381 13.567 8.511 | 8.511 | 7.440 5.859 5.577 | 5.577 | 1.53× faster | 1.01× faster |
+| update to it | 0.967 0.893 0.929 | 0.893 | 0.942 1.005 1.028 | 0.942 | 1.05× slower | 1.12× slower |
+| update across 1,000 revisions | 13.987 11.966 6.009 | 6.009 | 16.031 3.011 6.043 | 3.011 | 2.00× faster | 1.06× faster |
+
+Mercurial: **pending.** Stock pushed in 66.0 s, cloned in 42.4 and stream-cloned in 6.061. Slates pushed in 96.3 s, and
+its clone was stopped after 30 minutes. That is the regression w-hg found: a let-go text read by a store scan from the
+log's start. The hg leg reruns after its fix.
+
+| server kind | peak resident | most CPU |
+|---|---|---|
+| slates daemon, git leg | 2,899 to 2,906 MiB | 199 to 244 s a part |
+| slates daemon, svn leg | 680 MiB | 7 s |
+| slates anchor | 40 to 43 MiB | 1 to 2 s |
+| git daemon | 7 to 11 MiB | 0 s (its forked `upload-pack`s are not counted) |
+| httpd with git-http-backend | 23 to 24 MiB | 1 to 2 s |
+| svnserve | 37 MiB | 1 s |
+
+What it says against the 10× goal: **nothing new; it measures load, not speed.**
+- **git:** on a busy machine slates holds its time while stock's grows. Slates' whole-history git steps (push 50 to
+  102 s, clone 113 to 140 s) are about what they are on the quiet Studio. Stock's grew three to six times (clone 43 to
+  113 s against 10.6). So slates' ratios shrink (clone 2.6× against round 2's 14.2×), and on push and the shallow clone
+  slates is ahead.
+- **svn:** keeps its quiet-machine standing, at parity or faster on every client step.
+- **Where slates stands on a quiet machine** is the Studio's record (round 3 for svn and hg; r940 for git). Slates is
+  still 6 to 14 times slower than stock on whole-history git transfers there.
+- **Slates' clone still waits before the pack:** its first pack bytes come 60 to 84 s into each clone, faster than on
+  the Studio (102 to 112 s), on the M5's faster cores.
+
+Outliers, explained where the logs can:
+- **Stock's first svn checkout, 84.2 s against 25.3 and 12.1:** run 1 began at load 57 with a peak of 103.6 in this leg.
+  The later checkouts ran as the load fell (36.3 at the end).
+- **git run 1, under the round's highest load (1-minute 193.19):** stock's clone-again took 108.4 s against 40.6 in run 3,
+  http-backend's clone 113.0 against 60.9 in run 2, and slates' push 101.8 against 50.0 in run 2.
+- **The fetch and shallow pattern of rounds 3 to 5 does not show:** slates' fetch was 1.52 to 1.83 s in every run, and its
+  shallow clone 1.67 to 2.90 s. Under this load the runs cannot tell whether r940's fix holds; the quiet Studio showed
+  it did.
+
 ## The svn use test over HTTP with git-2000: green, every verb timed against stock svnserve (goal 93; main 01a20182's round, 2026-11-24, a0c46b705)
 
 `a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve` over HTTPv2 (`SLATES_SVN_USE_ROUTE=http`) with
