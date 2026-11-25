@@ -712,7 +712,7 @@ fn many_revisions(revisions: usize) -> Vec<u8> {
 /// A format-2 dump of `revisions` revisions after revision 0: revision 1 adds file `f` of `size` bytes, and each later
 /// one rewrites it whole with `size` other bytes, so every version supersedes the whole file before it: a batch whose
 /// versions' retention grows by the file's size a revision, while its bytes in flight stay one file's.
-fn rewrites(revisions: usize, size: usize) -> Vec<u8> {
+pub(crate) fn rewrites(revisions: usize, size: usize) -> Vec<u8> {
   let props = |entries: &[(&str, &str)]| {
     let mut section = String::new();
     for (name, value) in entries {
@@ -1046,9 +1046,9 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
 
 /// Shape: the texts-bound red's rewritten file's bytes, and how many rewrites: each rewrite under the batch's texts
 /// bound (`staging::texts_bound`, 2 MiB on a 16 KiB page), together many times it.
-const BOUNDED_REWRITE_BYTES: usize = 256 << 10;
+pub(crate) const BOUNDED_REWRITE_BYTES: usize = 256 << 10;
 /// Shape: see [`BOUNDED_REWRITE_BYTES`].
-const BOUNDED_REWRITES: usize = 64;
+pub(crate) const BOUNDED_REWRITES: usize = 64;
 
 /// The bytes of windows the shard's content store holds (`mem.gauge.vcs_content.stored_bytes`).
 fn stored_windows(state: &ShardState) -> u64 {
@@ -1101,6 +1101,10 @@ async fn rewrites_imported(
 #[test]
 fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
   let (bounded, unbounded, flushed, (bound, at_end)) = stored(|| async move {
+    // At one unit (`staging::texts_bound`'s floor): the room forced to it, whatever the device's flush.
+    let unit = on(|state| crate::vcs_store::hg_import::segment_bytes(state) as u64);
+    let room = &crate::repository::svn_commit::staging::IMPORT_ROOM;
+    room.with(|room| room.set(Some(unit)));
     let bounded = rewrites_imported("bounded", false).await;
     let flushed = on(|state| {
       use crate::repository::svn_commit::staging::{FLUSHED_TEXTS, LAND_BATCHES, LAND_FLUSH_NS};
@@ -1111,12 +1115,8 @@ fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
       )
     });
     let unbounded = rewrites_imported("unbounded", true).await;
-    let ends = on(|state| {
-      (
-        crate::repository::svn_commit::staging::texts_bound(state),
-        stored_windows(state),
-      )
-    });
+    room.with(|room| room.set(None));
+    let ends = on(|state| (unit, stored_windows(state)));
     (bounded, unbounded, flushed, ends)
   });
   let youngest = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
@@ -1135,6 +1135,89 @@ fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
   assert!(
     bounded.2 == unbounded.2,
     "the same history with and without the texts bound"
+  );
+}
+
+/// The batches an import of [`rewrites`]'s rewrites into a new repository `name` landed, its texts bound derived from a
+/// durable flush forced to what copies `flush_units` of the changeset store's unit at the profile's memcpy rate, and its
+/// admitted room forced to `room_units` units (`staging::FLUSH_NS`, `staging::IMPORT_ROOM`; none, no room but the
+/// largest): with the youngest revision it reached.
+async fn batches_at(
+  name: &str,
+  (flush_units, room_units): (u64, Option<u64>),
+) -> (u64, Result<u64, LoadFailed>) {
+  use crate::repository::svn_commit::staging::{FLUSH_NS, IMPORT_ROOM, LAND_BATCHES};
+  let (unit, memcpy) = on(|state| {
+    (
+      crate::vcs_store::hg_import::segment_bytes(state) as u64,
+      state.config.memcpy_bytes_per_second.max(1),
+    )
+  });
+  let flush_ns =
+    u64::try_from(u128::from(flush_units * unit) * 1_000_000_000 / u128::from(memcpy)).unwrap();
+  FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
+  IMPORT_ROOM.with(|room| room.set(Some(room_units.map_or(u64::MAX, |units| units * unit))));
+  let before = on(|state| count(state, LAND_BATCHES));
+  let (youngest, _, _) = rewrites_imported(name, false).await;
+  let landed = on(|state| count(state, LAND_BATCHES)) - before;
+  FLUSH_NS.with(|forced| forced.set(None));
+  IMPORT_ROOM.with(|room| room.set(None));
+  (landed, youngest)
+}
+
+/// Shape: the bound's flush, in units the profile copies in it, the rent-or-buy reds compare: one, a few, many.
+const ONE_UNIT: u64 = 1;
+/// Shape: see [`ONE_UNIT`].
+const FOUR_UNITS: u64 = 4;
+/// Shape: see [`ONE_UNIT`].
+const MANY_UNITS: u64 = 64;
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: a batch's texts bound rent or buy, `clamp(F x M, U, R)`, so the 40% P7's
+/// one-unit bound cost in durable flushes is bought back with the profile's own price of a byte). Do: import
+/// [`rewrites`]'s rewrites three times, the device's durable flush forced to what the profile's memcpy rate copies of one
+/// unit, then of [`FOUR_UNITS`], the room past either. Expect every import whole, and fewer batches as the flush rises:
+/// at four units fewer than at one. Red before: the bound one unit whatever the flush, as many batches either way.
+#[test]
+fn an_imports_batches_fall_as_its_durable_flush_buys_more_bytes() {
+  let ((one, one_youngest), (four, four_youngest)) = stored(|| async move {
+    (
+      batches_at("one-unit", (ONE_UNIT, None)).await,
+      batches_at("four-units", (FOUR_UNITS, None)).await,
+    )
+  });
+  let youngest = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!((one_youngest, four_youngest), (Ok(youngest), Ok(youngest)));
+  println!("svn_import: batches at a flush of one unit {one}, of four units {four}");
+  assert!(
+    four < one,
+    "fewer batches as the flush buys more bytes: {four} at four units, {one} at one"
+  );
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound capped by the import's admitted room, so a loaded
+/// shard's import keeps its batches small). Do: import [`rewrites`]'s rewrites twice with the flush forced to what copies
+/// [`MANY_UNITS`] units (more than all its texts): once in a room of [`FOUR_UNITS`] units (its half the cap), once with no
+/// room but the largest. Expect both whole, and more batches in the room: it bounds the batch where it is the smaller. Red before: the
+/// room never consulted, as many batches either way.
+#[test]
+fn an_imports_room_bounds_its_batch_where_it_is_smaller() {
+  let ((capped, capped_youngest), (free, free_youngest)) = stored(|| async move {
+    (
+      batches_at("capped", (MANY_UNITS, Some(FOUR_UNITS))).await,
+      batches_at("free", (MANY_UNITS, None)).await,
+    )
+  });
+  let youngest = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(
+    (capped_youngest, free_youngest),
+    (Ok(youngest), Ok(youngest))
+  );
+  println!(
+    "svn_import: batches at a flush of {MANY_UNITS} units in a room of four {capped}, in no room {free}"
+  );
+  assert!(
+    capped > free,
+    "the room of four units cuts more batches: {capped} in it, {free} without"
   );
 }
 

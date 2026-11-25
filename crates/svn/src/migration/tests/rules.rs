@@ -376,7 +376,7 @@ const MEASURED_WINDOWS: usize = 200;
 /// a time, timing each call. Expect nothing: print each format's call count, median, p99 and maximum, which the
 /// benchmark compares with the daemon's copy slice.
 #[test]
-#[ignore = "a measurement, run in release: cargo test --release -p slates-svn --lib -- --ignored export_call_times --nocapture"]
+#[ignore = "a measurement, run in release: [SLATES_SVN_EXPORT_PIECE=<daemon's svn_text_piece_bytes>] cargo test --release -p slates-svn --lib -- --ignored export_call_times --nocapture"]
 fn export_call_times() {
   use crate::migration::{Exporter, Exporting};
   use crate::svndiff::WINDOW_LIMIT;
@@ -397,8 +397,18 @@ fn export_call_times() {
     .node(&Node::change("big").text(&noisy(3, length)));
   let mut source = created();
   import_whole(&mut source, &dump.bytes()).unwrap();
+  // The text piece a daemon sizes by its measured MD5+SHA-1 rate (`svn_text_piece_bytes` in its start log), where
+  // `SLATES_SVN_EXPORT_PIECE` names one: format 2's call is one piece's digests, so its time is that piece's; else the
+  // exporter's own 100 KB piece, as measured on 2026-11-20 (BENCHMARKS).
+  let piece = std::env::var("SLATES_SVN_EXPORT_PIECE")
+    .ok()
+    .and_then(|bytes| bytes.parse::<usize>().ok())
+    .and_then(std::num::NonZeroUsize::new);
   for format in [Format::Two, Format::Three] {
     let mut exporter = Exporter::new(&source, 0, 2, format).unwrap();
+    if let Some(piece) = piece {
+      exporter = exporter.with_text_piece(piece);
+    }
     let mut out = Vec::new();
     let mut times = Vec::new();
     loop {

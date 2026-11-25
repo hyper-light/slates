@@ -6574,3 +6574,45 @@ fn an_lfs_object_uploaded_to_the_href_its_batch_hands_out_is_kept_and_downloaded
   let got = got.expect("a download href");
   assert_eq!((got.0, got.1 == object), (200, true), "the download");
 }
+
+/// The phases of a fetch's steps as the repository's shard counted them: the steps past the quantum by their longest
+/// phase, and each phase's longest.
+fn step_phases(daemon: &Daemon) -> ([u64; 5], [u64; 5]) {
+  let by = |names: [&'static str; 5]| names.map(|name| counted_on(daemon, REPOSITORY, name));
+  (
+    by(crate::vcs_store::upload::LONG_STEPS_BY_PHASE),
+    by(crate::vcs_store::upload::PHASE_NS_MOST),
+  )
+}
+
+/// Main 01a20182's order of 2026-11-25 (78 to 87 % of a clone's polls still past the step quantum once the walk took a
+/// tree's entries one a unit; which part of a fetch's step runs long). Do: start a two-shard store-backed daemon with its
+/// edge; push a create of `main` at a commit of one [`LET_GO_FILE`]-byte file; clone it over the edge. Expect: the clone
+/// `200`; each phase of its steps timed (the answer's own step the longest of some, above nothing); and the steps past
+/// the quantum counted each under one phase (`vcs_store.git_upload.long_steps.{refs,lend,work,settle,count}`), no more of
+/// them than the fetch's steps. Red before: no phase counted.
+#[test]
+fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(LET_GO_FILE);
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let steps_counted = || counted_on(&daemon, REPOSITORY, crate::vcs_store::upload::STEPS);
+  let steps_before = steps_counted();
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  let steps = steps_counted().saturating_sub(steps_before);
+  let (long, most) = step_phases(&daemon);
+  daemon.stop();
+  eprintln!("fetch steps by phase: long {long:?}, longest ns {most:?}, of {steps} steps");
+  assert_eq!(fetched.0, 200);
+  assert!(most[2] > 0, "the answer's own step timed: {most:?}");
+  assert!(
+    steps > 0 && long.iter().sum::<u64>() <= steps,
+    "a long step counted once: {long:?} of {steps}"
+  );
+}

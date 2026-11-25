@@ -1178,6 +1178,15 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+>   The matrix's row BUILT (2026-11-25, w-interop; main's order): `ci/interop/hg-matrix.sh` makes a non-publishing
+>   repository of its own (`evo-repository`) and runs stock hg with `experimental.evolution = all`: drafts pushed then
+>   one amended and pushed, the server telling `1 new obsolescence markers` (`evo-amend-push`); a draft rebased onto the
+>   amend and pushed (`evo-rebase-push`); a clone holding the 2 markers and exactly the successors, all draft, none of
+>   the drafts they obsolete (`evo-clone`), verifying clean (`evo-verify`); and a marker made on the clone's side pushed
+>   and pulled back by the first client, its 3 markers and 3 obsolete changesets (`evo-markers-back`). Locally against
+>   stock hg 7.2.4 at 29221d5ab (debug, the r400 cut of hg's history as the source): the six rows 6 of 6. The same run's
+>   `merge-push` and `rebase-push` were refused `UnknownDeltaBase { log: Manifests }` (the store answered no text for a
+>   manifest an earlier push landed), sent to w-hg as found.
 >   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
 >   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
 >   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
@@ -3662,8 +3671,25 @@
 > `repository.svn_import.flushed_texts`): derived, an import holds at most twice the larger of that unit and its
 > largest revision's texts. Held by `an_imports_texts_are_held_a_batch_at_a_time_within_their_bound` (red: 16,777,216
 > B held after a turn against a 2 MiB bound, 64 rewrites one batch; the oracle, the same history exported with and
-> without the bound). Owed: main's measure of git-2000's import (time and peak); its batches' landings pipelined, as
-> hg's segments are, if their flushes cost real time.
+> without the bound). Main's measure at 084ffb65d: the one-unit bound cost 40% of the import's time (git-2000 5.90 to
+> 8.28 s best, resident 3.7x lower), 88-95% of it the 179 extra durable flushes (about 23.5 ms each). Cut (main's rulings
+> of 2026-11-25, w-perf): the bound is rent or buy at the daemon's own exchange of memory against time,
+> `clamp(F x M, U, max(U, R / 2))`: `F` the device's durable flush, the least the shard timed a batch's changeset
+> landing (the unit until one has; the span holds what else the shard ran, so contention only inflates it), `M` the boot profile's memcpy rate (a byte of RAM worth the time to move it, the codec's
+> `byte_worth_from_memcpy`), `U` the store's unit (the floor), `R` the import's admitted room (`vcs_share::room`;
+> half of it the cap, since the next revision's texts are put before the cut and an import holds up to twice its bound;
+> under load toward `U`; w-svn's review). Per operation: never the history's length nor the shard's free memory alone. Logged with
+> its inputs once an import ends. Measured (debug, a MacBook, loaded): F 23.5 ms (main's release figure) x M 13.27 GB/s =
+> 312 MB, git-2000 in 2 batches against 180, 415 MB resident against 224 MB (the profile's M read 4.06 GB/s in another
+> run: its swing is the profile's to settle). Relaxing A-767's durable-read rule (a batch written, flushed at the
+> acknowledgement) was ruled out: a reader would serve what a power loss takes back. Reds:
+> `an_imports_batches_fall_as_its_durable_flush_buys_more_bytes` (8 batches at one unit, 3 at four; red: 8 either way),
+> `an_imports_room_bounds_its_batch_where_it_is_smaller` (2 in a room of four units, 1 without; red: 1 either way); the
+> oracle `a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new` (each stage of the second batch's landing
+> killed, the daemon and its store's owner restarted, at one unit and at the derived bound: recovered to the reference's
+> history at 8 before the entry and 16 (one unit) or 64 (derived) after it). Owed: main's release A/B against 084ffb65d
+> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`); `F` timed at the store's own `sync_data` call rather
+> than the landing's await (an owner answer that carries it).
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
