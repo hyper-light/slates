@@ -2184,3 +2184,137 @@ fn a_replay_over_a_moved_index_reads_its_manifests_let_go_from_the_changeset_sto
     Some(expected)
   );
 }
+
+/// The entries a manifest's delta wrote and its check's refusal, found as its text streams a `piece` at a time
+/// (`manifest::Checking` and `delta::Written`): what a manifest taken a window a step reads.
+fn streamed_entries(
+  text: &[u8],
+  revision: &crate::changegroup::Revision<'_>,
+  piece: usize,
+) -> Result<Vec<(Vec<u8>, Node)>, crate::manifest::Refusal> {
+  let every = revision.is_full_text() || revision.base == crate::NULL_NODE;
+  let mut checking = crate::manifest::Checking::default();
+  let mut written = crate::delta::Written::default();
+  let mut found = Vec::new();
+  for chunk in text.chunks(piece.max(1)) {
+    checking.update(chunk, &mut |range, entry| {
+      if every || written.touches(revision.data, range).unwrap() {
+        found.push((entry.path.to_vec(), entry.node));
+      }
+      Ok(())
+    })?;
+  }
+  checking.finish()?;
+  Ok(found)
+}
+
+/// Goal 93, C1 (2) (main's ruling (B) of 2026-11-24: a manifest taken a window a step; its check and its written entries
+/// found as it streams). Do: over manifests and their deltas (line diffs adding, changing and removing entries at the
+/// front, middle and end; a whole text; an empty manifest; hostile texts: unended, unsorted, a bad line), read each text
+/// fed 1, 7, 64 bytes and whole at a time. Expect the entries the delta wrote, every piece size, equal to those the
+/// whole-text reader finds (`written_entries`), and every refusal `manifest::decode`'s.
+#[test]
+fn a_manifest_read_as_it_streams_finds_what_its_whole_text_finds() {
+  use crate::changegroup::Revision;
+  let line = |path: &str, seed: u8| {
+    let mut out = path.as_bytes().to_vec();
+    out.push(0);
+    out.extend(core::iter::repeat_n(
+      b"0123456789abcdef"[usize::from(seed % 16)],
+      40,
+    ));
+    out.push(b'\n');
+    out
+  };
+  let manifest = |entries: &[(&str, u8)]| -> Vec<u8> {
+    entries
+      .iter()
+      .flat_map(|(path, seed)| line(path, *seed))
+      .collect()
+  };
+  let base = manifest(&[("a", 1), ("b/c", 2), ("d", 3), ("e/f/g", 4), ("z", 5)]);
+  let texts = [
+    manifest(&[("a", 9), ("b/c", 2), ("d", 3), ("e/f/g", 4), ("z", 5)]),
+    manifest(&[
+      ("a", 1),
+      ("b/c", 2),
+      ("c", 7),
+      ("d", 3),
+      ("e/f/g", 4),
+      ("z", 5),
+    ]),
+    manifest(&[("a", 1), ("b/c", 2), ("e/f/g", 4), ("z", 5)]),
+    manifest(&[
+      ("a", 1),
+      ("b/c", 2),
+      ("d", 3),
+      ("e/f/g", 4),
+      ("z", 6),
+      ("zz", 8),
+    ]),
+    manifest(&[("0", 1), ("a", 1), ("b/c", 3), ("d", 3), ("z", 5)]),
+    Vec::new(),
+  ];
+  let node = [7; 20];
+  for text in &texts {
+    let mut delta = Vec::new();
+    crate::delta::encode_lines(&base, text, &mut delta).unwrap();
+    let mut whole = Vec::new();
+    crate::delta::encode_full_text(text, &mut whole).unwrap();
+    for (data, base_node) in [(&delta, [1; 20]), (&whole, crate::NULL_NODE)] {
+      let revision = Revision {
+        node,
+        p1: [1; 20],
+        p2: crate::NULL_NODE,
+        base: base_node,
+        link: node,
+        flags: 0,
+        info: None,
+        protocol_flags: 0,
+        data,
+        sidedata: None,
+      };
+      let expected = super::written_entries(text, &revision).unwrap();
+      for piece in [1, 7, 64, text.len().max(1)] {
+        assert_eq!(
+          streamed_entries(text, &revision, piece),
+          Ok(expected.clone()),
+          "a piece of {piece}"
+        );
+      }
+    }
+  }
+  let mut unsorted = manifest(&[("b", 1)]);
+  unsorted.extend(line("a", 2));
+  let mut unended = manifest(&[("a", 1)]);
+  unended.pop();
+  let hostile = [
+    unsorted,
+    unended,
+    b"not a manifest line\n".to_vec(),
+    b"\n".to_vec(),
+  ];
+  let revision = Revision {
+    node,
+    p1: crate::NULL_NODE,
+    p2: crate::NULL_NODE,
+    base: crate::NULL_NODE,
+    link: node,
+    flags: 0,
+    info: None,
+    protocol_flags: 0,
+    data: &[],
+    sidedata: None,
+  };
+  for text in &hostile {
+    let expected = crate::manifest::decode(text).err();
+    assert!(expected.is_some(), "a hostile text refused whole");
+    for piece in [1, 7, 64, text.len().max(1)] {
+      assert_eq!(
+        streamed_entries(text, &revision, piece).err(),
+        expected,
+        "a piece of {piece}"
+      );
+    }
+  }
+}
