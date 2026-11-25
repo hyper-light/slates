@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 31 (main 01a20182, 2026-11-24 20:32 PST): run 30 found hg delta.rs:501 patched_by_fills panicking in a Result fn
+# (f754c36f6); main's commit returns its refusal beside the fill.
 # Run 30 (main 01a20182, 2026-11-24 20:20 PST): run 29 (past the hg fix) found merge engine.rs:1522's stranded doc and
 # fold_tests.rs:66's counter loop (949ca8619); main's commit fixes both. Main at 4f48e9717 (w-shared's test fix).
 # Run 29 (main 01a20182, 2026-11-24 20:11 PST): runs 26-28 found hg delta.rs BaseRead without is_empty (f754c36f6), which hid
