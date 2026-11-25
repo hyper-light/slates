@@ -634,7 +634,7 @@ Waiting: main's route; arena-7 and arena-8.
 - Sweep 16186398b: the hg and git push assertions in daemon_edge judge the body. None was passing on status alone.
 - Held, not landed:
   - ~/.cache/w-hg-made-reds.patch: the four hg_made commit-alone reds. They land with w-svn's commit_held guard.
-- Open, waiting on main: manifest-chain reach. A push's first manifest is a delta against the repository's tip, so a stale re-base or the record writer may rebuild through let-go texts. Before P5.
+- CLOSED by b47217878 (main 5a773a49a), (B'): manifest-chain reach. One rule (`push::manifest_row`) rests a row on the fork's last manifest; the live intake reads that base's windows and asks the store where let go (Stepped::Store); the replay and stale re-base read it over given/brought-back texts (`revision_text_over`), held by a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store, a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands, a_restarts_replay_lets_go_the_texts_it_brought_back. The let-go of a window a kept revision still names is (B)'s, 4a0c23e20.
 - Then: P5 (switch on the let-go, main's red, asks per push counted), then C1 (2), the intake keeping no whole text.
 - Then: stream 9.2x and push 5.8x slower than stock; pending-last 51% of intake time.
 
