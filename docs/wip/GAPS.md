@@ -302,13 +302,28 @@
 >   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
 >   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
 >   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
-> - **OPEN, w-shared's next piece (A-921, found by A-919's owner-restart scene; before A-918 B): after an owner's warm
->   restart and a death, the surviving original holder refuses the owner's later records about 1 run in 3.** The names
->   log stays acknowledged by the owner alone, the green's next version is owed to the old holder, every push is
->   refused `unable to commit`, and no part reaches a newcomer. Red:
->   `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`, `#[ignore]`d until A-921
->   (`cargo test -p slates-server --test fleet <that name> -- --ignored --exact`). Red first, from the old holder's
->   refusal counters: which refusal, at what epoch and position. It may be the sibling below showing itself.
+> - **A-921 (found by A-919's owner-restart scene; main 01a20182's rulings of 2026-11-25).** About 1 run in 3 to 5,
+>   a's warm restart outlasted detection (1.40 to 1.79 s of silence to the takeover installed): a was taken over,
+>   refuted at incarnation 1, and readmitted. A silence past detection is a death by design, and the false-death path
+>   is typed. Three landings, in main's order:
+>   - **FIXED, the test's settling (A-921 part 1):** `restart_warm` returns once the node is settled (a council member
+>     at every node, named by no kept retirement); the owner-restart test asserts a was not taken over (its fencing
+>     epoch unchanged at every other node) before it stops anyone, and forms the scene afresh, at most three times,
+>     where it was. Still `#[ignore]`d, for the second mode below.
+>   - **OPEN, A-921's second mode (after part 2):** about 1 run in 6, a not taken over by its restart, the old holder
+>     still acknowledged neither a's green's v2 nor its names-log part, every push refused `unable to commit`. Red first
+>     with the old holder's refusal counters printed (which refusal, at what epoch and position); it may be the sibling
+>     below (a's hold rebuilt empty) or the owner's merge or state-log state after a warm restart. In that run the
+>     newcomer held 1 position: settle it against the start rule (adopted only within tolerance, stopping refused at the
+>     first position past it) and write the assertion as that rule.
+>   - **OPEN, the product half (A-921 part 2), w-shared's next:** a, readmitted after its false death, still ran pushes
+>     as the repository's owner (the VCS edges route by the partition holding the repository, never by the
+>     configuration's owner), its records refused `Unauthorized` (38 at each holder) and the push `unable to commit`.
+>     Red (written, held for its fix): `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`.
+>     Fix: every protocol's first request routed by owner, git over HTTP answered 307 to the owner, each other client's
+>     handling of a redirect measured, and a typed refusal naming the owner where it does not follow.
+>   - **OPEN, A-922:** a node whose authority over a repository moved forgets its partition's copy, sliced and bounded,
+>     as `forget_owned_by` does for volumes (AUD-08).
 > - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
 >   but the record plane builds it empty, and no image carries it. An owner's warm restart spends one of `f`, unseen,
 >   on every record it counted itself in: commit at {owner, departed}, restart the owner warm, retire the departed,
@@ -2904,8 +2919,19 @@
 > 2026-11-25: kept runs recorded made every idle pass walk them, an idle daemon's CPU and wakeups growing with
 > fragmentation): a mark that makes a run that long owes the next walk (`UnitSet::run_reaches`, a scan bounded by the
 > discard size), a walk's start clears it (`an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size`:
-> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). OWED: a
-> grown region's never-used space, should the arm show it.
+> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). A grown
+> region's never-used space is not resident (measured: a fresh shared region reads `mincore` 0), so that owed line is
+> withdrawn (main). On macOS a purge's discard is `MADV_FREE_REUSABLE`, and `mincore` and the process's resident size
+> keep counting a reusable page until the kernel takes it; only the physical footprint drops (measured,
+> `crates/mem/tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, resident size 38 flat, `mincore` 32
+> before and after). `object_resident_bytes` now reads `mincore` less the pages a region holds marked reusable, the
+> pages the process still owns (`Region::residency_in_use`; main's ruling of 2026-11-25): red
+> `a_purged_shared_region_reads_its_purged_pages_out_of_its_residency`, 32 MiB read resident after the purge; now 0.
+> A memory status now names the process's resident size (`mem.gauge.process.resident_bytes`) and, on macOS, its
+> physical footprint beside it (`mem.gauge.process.footprint_bytes`, `Facts::footprint_now`); `svn_import_storage`
+> prints both in both readings, and BENCHMARKS' method note says why RSS across a purge on macOS compares nothing
+> (`the_control_shards_memory_status_names_the_processs_resident_and_on_macos_its_footprint`: red, no such rows). P7's
+> after arm is judged on the footprint on macOS against the bound arm's, at the settled reading (main).
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);

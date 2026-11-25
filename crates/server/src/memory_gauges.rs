@@ -29,6 +29,15 @@
 //!   `fsmblks` already among them, so not added again), measuring that kept memory where elsewhere it is the remainder;
 //!   `malloc_mapped_bytes`, its blocks mapped each on its own (`hblkhd`); `malloc_arena_bytes`, what its arenas hold from
 //!   the OS (`arena`).
+//!
+//!   And the process's resident size, `process.resident_bytes`, with on macOS its physical footprint beside it,
+//!   `process.footprint_bytes` (goal 93 P7, main's ruling of 2026-11-25; `Facts::footprint_now`). On macOS a purge's
+//!   discard marks pages reusable (A-110): they leave the footprint at once and stay in the resident size until the
+//!   kernel takes them (`slates-mem`'s `tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, resident
+//!   size 38 flat), so a give-back there is judged by the footprint, never by the resident size. On Linux the resident
+//!   size is honest: the content object's discard is `MADV_REMOVE`, which punches a hole in the shared object, so its
+//!   pages leave at once (`a_deleted_files_memory_goes_back_to_the_os` in `tests/recovery.rs`: the object's allocated
+//!   bytes fall by the deleted file's); there is no footprint row.
 
 use crate::state::ShardState;
 use slates_ipc::protocol::RefusalCount;
@@ -56,6 +65,14 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
         heap.mapped_resident,
       ),
       ("mem.gauge.process.mapped_untracked", heap.untracked),
+      (
+        "mem.gauge.process.resident_bytes",
+        slates_machine::facts::Facts::resident_now().unwrap_or(0),
+      ),
+      (
+        "mem.gauge.process.footprint_bytes",
+        slates_machine::facts::Facts::footprint_now().unwrap_or(0),
+      ),
     ]);
     #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
     {
@@ -456,6 +473,31 @@ mod tests {
       );
     } else {
       assert!(malloc.is_empty(), "{malloc:?}");
+    }
+  }
+
+  /// The memory status's `process.resident_bytes` and `process.footprint_bytes` (goal 93 P7, main's ruling of
+  /// 2026-11-25). Do: read the control shard's gauges. Expect the process's resident size on every OS, and on macOS its
+  /// physical footprint beside it, the one reading a purge's reusable pages leave at once
+  /// (`crates/mem/tests/macos_residency.rs`); elsewhere no footprint row (the resident size is the honest reading there).
+  #[test]
+  fn the_control_shards_memory_status_names_the_processs_resident_and_on_macos_its_footprint() {
+    let rows = crate::daemon::audit_on_shard(|state| super::rows(state, true));
+    let reading = |kind: &str| {
+      rows
+        .iter()
+        .find(|row| row.kind == kind)
+        .map(|row| row.count)
+    };
+    assert!(
+      reading("mem.gauge.process.resident_bytes").is_some_and(|bytes| bytes > 0),
+      "{rows:?}"
+    );
+    let footprint = reading("mem.gauge.process.footprint_bytes");
+    if cfg!(target_os = "macos") {
+      assert!(footprint.is_some_and(|bytes| bytes > 0), "{rows:?}");
+    } else {
+      assert!(footprint.is_none(), "{rows:?}");
     }
   }
 }

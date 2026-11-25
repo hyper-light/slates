@@ -5,6 +5,19 @@ measurement reported. A number without those three is not a benchmark and does n
 Format: environment line, the command, the reading with its interval, and what it means for the
 design (Part 6 of `SLATES_DESIGN.md`).
 
+**Method note: memory given back on macOS is read in the footprint, never the resident size (goal 93 P7, main's ruling
+of 2026-11-25).** A purge on macOS marks pages `MADV_FREE_REUSABLE` (A-110). The pages leave the process's physical
+footprint (`phys_footprint`, what memory pressure and jetsam count) at once. `ps`'s RSS (`resident_size`) and
+`mincore` keep counting them until the kernel takes them, which an idle machine may never do. Measured on the M5 Max,
+2026-11-25: 32 MiB written into a shared region, then freed and purged. The footprint went from 33 MiB to 1. The
+resident size stayed at 38 MiB and `mincore` at 32 before and after (`cargo test -p slates-mem --test macos_residency
+-- --ignored --nocapture`). So an RSS compared across a purge on macOS measures nothing. Compare
+`mem.gauge.process.footprint_bytes` from a memory status, or the footprint `svn_import_storage` prints, and compare
+`mem.gauge.content.object_resident_bytes`, which reads out the pages marked reusable. On Linux the resident size is
+honest: the content object's discard is `MADV_REMOVE`, which punches a hole in the shared object, so the pages leave
+at once (`a_deleted_files_memory_goes_back_to_the_os`, `crates/server/tests/recovery.rs`). Readings of RSS on macOS
+before this date that span a purge (P7's arms among them) are not comparable with each other on memory given back.
+
 ## Phase 0 baseline: the machine profile (2026-09-04)
 
 Environment: Apple M5 Max (6 "Super" cores with 16 MiB L2, 12 "Performance" cores with 8 MiB L2),

@@ -329,6 +329,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
           core::mem::take(&mut self.chosen.objects).into_positions(),
         ));
       }
+      super::ask_next(self.unit_kind());
       if spent() {
         return Ok(None);
       }
