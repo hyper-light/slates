@@ -520,6 +520,17 @@ impl Bases for IndexBases<'_> {
   }
 }
 
+/// What [`Repository::widen_read_cache`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Widening {
+  /// The cache already kept enough: nothing charged.
+  Enough,
+  /// It was widened, the growth charged.
+  Grown,
+  /// Its admission had no room for the growth: it stays as it is.
+  Refused,
+}
+
 /// What a repository holds outside the content store ([`Repository::held`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryHeld {
@@ -568,6 +579,8 @@ pub struct Repository {
   /// The deltas its last read of a stored object applied (`Scratch::deltas_applied`; none for one held whole): what a
   /// tree's open costs in the store, read by the fetch's walk ([`Repository::last_read_deltas`]).
   last_deltas: std::cell::Cell<u64>,
+  /// Whether its last read of a stored object found an entry of its chain kept ([`Repository::last_read_found_kept`]).
+  last_found_kept: std::cell::Cell<bool>,
   /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
   /// none, and its owner brings the piece back and takes the step again.
   waiting: Cell<Option<packed::Waited>>,
@@ -620,6 +633,7 @@ impl Repository {
       packs: BTreeMap::new(),
       reading: RefCell::new(Scratch::default()),
       last_deltas: std::cell::Cell::new(0),
+      last_found_kept: std::cell::Cell::new(false),
       waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
@@ -674,21 +688,21 @@ impl Repository {
   /// each revision no longer than the tree being read, stays whole for the walk's next revisions; the growth alone
   /// charged to `admission`, a fetch's own (main 01a20182's ruling of 2026-11-25: a fork a fetch reads through kept no
   /// cache, so every tree read rebuilt its chain from its base, 78 deltas for a 13-tree chain). Refused room, it stays as
-  /// it is: whether it was widened or needed no more.
-  pub fn widen_read_cache(&self, len: u64, admission: &mut Admission) -> bool {
+  /// it is.
+  pub fn widen_read_cache(&self, len: u64, admission: &mut Admission) -> Widening {
     let wanted = self.learned_depth().saturating_mul(len);
     let mut reading = self.reading.borrow_mut();
     let have = to_u64(reading.recent().budget());
     if wanted <= have {
-      return true;
+      return Widening::Enough;
     }
     if admission.charge(wanted.saturating_sub(have)).is_err() {
-      return false;
+      return Widening::Refused;
     }
     reading
       .recent()
       .set_budget(usize::try_from(wanted).unwrap_or(usize::MAX));
-    true
+    Widening::Grown
   }
 
   /// The bytes its reads keep of the objects read lately (`packed::Recent`, git's delta base cache).
@@ -770,6 +784,7 @@ impl Repository {
     len: u64,
   ) -> Option<Cow<'s, [u8]>> {
     self.last_deltas.set(0);
+    self.last_found_kept.set(false);
     match stored {
       StoredAt::Whole(content) => stored_bytes(store, content, len),
       StoredAt::InPack(place) => {
@@ -790,6 +805,7 @@ impl Repository {
         self
           .last_deltas
           .set(u64::try_from(reading.deltas_applied()).unwrap_or(u64::MAX));
+        self.last_found_kept.set(reading.found_kept());
         read.ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
@@ -891,6 +907,17 @@ impl Repository {
   /// kept lately (`packed::Scratch::deltas_applied`).
   pub fn last_read_deltas(&self) -> u64 {
     self.last_deltas.get()
+  }
+
+  /// Whether its last read of a stored object found the object, or an entry of its chain, among the objects read lately
+  /// (`packed::Scratch::found_kept`): a hit of its read cache.
+  pub fn last_read_found_kept(&self) -> bool {
+    self.last_found_kept.get()
+  }
+
+  /// The most bytes its reads keep of the objects read lately now (`packed::Recent`'s budget).
+  pub fn read_cache_budget(&self) -> u64 {
+    to_u64(self.reading.borrow_mut().recent().budget())
   }
 
   /// The tail and runs of its index its lookups have visited since the index's merge rule last took them.
@@ -2080,6 +2107,7 @@ impl Repository {
       packs: self.packs.clone(),
       reading: RefCell::new(Scratch::default()),
       last_deltas: std::cell::Cell::new(0),
+      last_found_kept: std::cell::Cell::new(false),
       waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
