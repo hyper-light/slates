@@ -1000,12 +1000,14 @@ pub enum Before {
   Absent,
 }
 
-/// Where the node at `path` stood before the revision whose rows are `changes`, by path, changed it ([`Before`]), as
+/// Where the node at `path` stood before the revision whose rows are `changes`, sorted by path and each path once (a
+/// checked revision's, `Checked::changes`), changed it ([`Before`]), each ancestor's row found by a search of them, as
 /// a dump's transaction reads its own tree (`Transaction::lookup`): beneath the deepest ancestor the rows add or replace, nowhere without a
 /// copy source and beneath the source with one; nowhere beneath a deleted ancestor; else at the path itself.
-pub fn before(changes: &BTreeMap<&str, &ChangedPath>, path: &str) -> Before {
+pub fn before(changes: &[ChangedPath], path: &str) -> Before {
   for (ancestor, rest) in ancestors_deepest_first(path) {
-    let Some(row) = changes.get(ancestor) else {
+    let found = changes.binary_search_by(|row| row.path.as_str().cmp(ancestor));
+    let Some(row) = found.ok().and_then(|at| changes.get(at)) else {
       continue;
     };
     match (row.action, &row.copy_from) {

@@ -64142,6 +64142,17 @@ GAPS.
   13.6-13.8 ms (its rows, 12.3). Oracle: over records of up to 4 KiB, the empty one among them, in slices of 1 to 64
   bytes, the identity hashed a slice a step is the identity whole, in as many steps as slices
   (`a_records_identity_hashed_a_slice_a_step_is_its_identity_whole`).
+  **4c, the rows.** The build's walk of the revision's rows (12.3 ms of the 13.7-14.1 ms build step after 4b) is taken
+  a row a unit: `Building::begin` sizes the post-state, `Building::step` builds rows until the step's clock passes its
+  quantum, a row at least, and once every row is, finishes (what the revision restores and removes, the run ops moved
+  past the inline bytes, the increment); `build_unordered` is the three carried to their end. Between steps the build
+  holds its own state alone (`BuildState`, `Building::detach`, `attach`), each step lending it the records, the
+  scratch member and the checked revision again; it looked a path's row up in a map of borrowed rows, and now
+  searches the checked revision's rows, which are sorted by path and each path once (`migration::before`). The build
+  step 13.7-14.1 ms → under 5 ms (3 of 4 runs; the fourth under load 35-43). Still whole, in the build's last step:
+  the restores, the removals' ops and the runs. Oracle: the svn import tests, at a test quantum of a few
+  microseconds, build every golden dump's revisions a row about a step; a resumed build that skips a row fails four
+  of them.
 - **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
   after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
   tables.** The step that kept a revision applied the records and followed the batch's held table whole
