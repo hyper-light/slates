@@ -783,6 +783,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - 11-25 later: A-920 4b 264f39d58 (identity hashed a slice a step; build 25-27 -> 13.7 ms); released fold set 9db584614 (removal of 9,000: fold 246 -> 7.4 ms total). Steps now: check 17 (encode 4, fresh 9, sort 4, stored 1.6), build rows 13.7, commit end 13, apply 12, judge last 10, prep 7. Next per main.
 - 11-25 later: A-920 piece 2b 2010de0e9 (check phases: names, fresh, stored a unit a step; check 17 -> <5 ms; golden oracle with CHECK_A_UNIT_A_STEP). Steps now: build rows 14, commit end 13, apply 12, judge last 10, prep 7, rest <5. Next: build rows walk.
 - 11-25 later: A-920 piece 4c bbeadb2c6 (build rows a slice a step; BuildState detach/attach; before() binary-searches sorted rows; build 14 -> <5 ms). Steps now: commit end 13, apply 12, judge last 10, prep 7, rest <5. Next: commit end (commit_finish 6.6 + finish_staged/keep_staged).
+- 11-25 later: A-920 piece 1b 794bedd20 (commit end: Emptied/Links/Changes phases; 13 -> 6.3 ms). Engine-commit changes need `-p slates-merge --test engine --test changed_since_cost` in focused set. Steps now: apply 12.3, judge last 10, prep 7, commit end 6.3 (encoded_len, 1c). Next: records apply (svn Repository::apply).
 ## 2026-11-24 ~05:00: A-899 virtio-fs serves a work, 7416cae15
 - virtiofs attach ensure_slot; pass lends GreenTree via mounted_work::source/lend (one lend); A-898 park now reached.
 - Integration case a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered (in-process seam, unix).
