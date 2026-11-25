@@ -3327,6 +3327,12 @@
 > **A-724 piece 2a (2026-11-21, w-multirepo, A-844): the working set's miss-ratio curve built, not yet fed.**
 > `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
+> A re-read of the key read last counted in place (w-perf, 2026-11-24, main 01a20182's item, w-git's guard): the curve was
+> about a fifth of a git clone's object-choosing walk (`Curve::read` 2,906 and its key map's insert 1,749 of 23,095 work
+> samples), the walk re-reading a few table windows so every read went through the map. Such a read is now counted at
+> its own length and touches neither the map nor the tree, answering as moving it would; held by
+> `a_reread_of_the_key_read_last_inserts_nothing_and_answers_as_before` (`Curve::key_inserts`; red: 2,529 inserts for
+> 1,766 runs; every answer equal to the moving reference's to the last bit). Open: the walk's own re-reads measured again.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
 > rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
 > at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot.
