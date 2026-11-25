@@ -1007,8 +1007,8 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
     let (svn, _green) = subversion("wide-revision").await;
     let (loaded, _turns) = imported(svn, dump).await;
     let tail_slices = on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
-    let staging_steps = 4u64;
-    let _unused = on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
+    let staging_steps =
+      on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
     let shard = slates_rt::registry::current_shard().expect("on a shard");
     let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
       .expect("the shard's entry");

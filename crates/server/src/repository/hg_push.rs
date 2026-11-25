@@ -1527,20 +1527,15 @@ async fn landed_after_builds(
   let mut last_plan: Option<Vec<WorkKey>> = None;
   let mut committing = Committing::default();
   loop {
-    // A fork another landing made stale while its segments landed is re-based before its works are planned over it.
-    if let Err(outcome) = committing.fresh(repository, &mut forked).await? {
-      give_back(forked);
-      return Some(outcome);
-    }
-    let (plan, (mut built, named), ahead) = match works_held_ahead(
+    let held = fresh_works_held_ahead(
       repository,
       (principal, name),
       unbundle,
-      forked.as_ref(),
+      (&mut committing, &mut forked),
       room,
     )
-    .await?
-    {
+    .await?;
+    let (plan, (mut built, named), ahead) = match held {
       Ok(prepared) => prepared,
       Err(outcome) => {
         give_back(forked);
@@ -1747,14 +1742,19 @@ fn uses_of(plan: &[WorkKey]) -> BTreeMap<WorkKey, usize> {
 
 /// Gives a push's fork back where its landing will not take it.
 fn give_back(forked: Option<Forked>) {
+  if forked.is_some() {
+    let _ = crate::state::with_state(|state| give_back_in(state, forked));
+  }
+}
+
+/// [`give_back`] on a shard whose state the caller holds already (a nested `with_state` would answer nothing).
+fn give_back_in(state: &mut ShardState, forked: Option<Forked>) {
   let Some(forked) = forked else {
     return;
   };
-  let _ = crate::state::with_state(|state| {
-    if release_index(state, forked.fork).is_err() {
-      state.count(vcs_store::RELEASE_REFUSED, 1);
-    }
-  });
+  if release_index(state, forked.fork).is_err() {
+    state.count(vcs_store::RELEASE_REFUSED, 1);
+  }
 }
 
 /// Counter: a push's work built a unit a turn before its landing (A-767 C1, the push spin; main's ruling (1)). Format: a
@@ -1762,6 +1762,29 @@ fn give_back(forked: Option<Forked>) {
 pub(crate) const WORKS_BUILT: &str = "vcs.hg.push_works_built";
 /// Counter: the turns a push's works took to build. Format: a counter name in the status report.
 pub(crate) const WORK_TURNS: &str = "vcs.hg.push_work_turns";
+
+/// [`landed_after_builds`]' try, before its judge: a fork another landing made stale while its segments landed re-based
+/// first ([`Committing::fresh`]), then its works built and held ahead over it ([`works_held_ahead`]). The push's refusal
+/// where either refused it; `None` where the store went away.
+async fn fresh_works_held_ahead(
+  repository: RepositoryId,
+  (principal, name): (&Principal, [u8; 32]),
+  unbundle: &Unbundle,
+  (committing, forked): (&mut Committing, &mut Option<Forked>),
+  room: &Admission,
+) -> Option<Result<(Vec<WorkKey>, BuiltWorks, Vec<crate::held_ahead::HeldAhead>), PushOutcome>> {
+  if let Err(outcome) = committing.fresh(repository, forked).await? {
+    return Some(Err(outcome));
+  }
+  works_held_ahead(
+    repository,
+    (principal, name),
+    unbundle,
+    forked.as_ref(),
+    room,
+  )
+  .await
+}
 
 /// A landing try's works and their increments, held ahead of its step. The works first, a unit a turn (main's ruling
 /// (1)): the landing's one step takes them, never builds them. Their increments held in the content store next, a unit
@@ -3397,14 +3420,8 @@ pub(crate) const PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_manifest
 /// report.
 pub(crate) const MOST_PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_manifests_asked_most";
 
-/// Counter: a push's file delta bases found in its cache of its own texts (A-767 C1, main's ruling (b2)). Format: a
-/// counter name in the status report.
-pub(crate) const BASE_HITS: &str = "vcs.hg.push_base_hits";
-/// Counter: a push's file revisions rebuilt from its own deltas to make a base its cache did not hold ((b1)). Format: a
-/// counter name in the status report.
-pub(crate) const BASE_REBUILDS: &str = "vcs.hg.push_base_rebuilds";
-/// Counter: a push's file delta bases read from the node's changeset store: revisions landed before it. Format: a
-/// counter name in the status report.
+/// Counter: a push's file delta bases asked of the node's changeset store: revisions landed before it whose windows were
+/// let go (goal 93, C1 (2): every other base is read from the fork's rows). Format: a counter name in the status report.
 pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
 
 /// Counter: the most runs only a push's fork held where no merge was due (goal 93, the index seal's reland), the most of
@@ -3421,11 +3438,9 @@ pub(crate) const MOST_OWN_RUNS_IN_FLIGHT: &str = "vcs.hg.push_most_own_runs_in_f
 /// so [`MOST_OWN_RUNS`] is not met by sealing nothing. Format: a counter name in the status report.
 pub(crate) const TIERED_MERGES: &str = "vcs.hg.push_tiered_merges";
 
-/// Counts what a push's intake did to find its file delta bases ([`BASE_HITS`], [`BASE_REBUILDS`],
-/// [`BASE_STORE_READS`]) and how its fork's runs were kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
+/// Counts the file delta bases a push's intake asked of the store ([`BASE_STORE_READS`]) and how its fork's runs were
+/// kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
 fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
-  state.count(BASE_HITS, intaken.base_hits);
-  state.count(BASE_REBUILDS, intaken.base_rebuilds);
   state.count(BASE_STORE_READS, intaken.base_store_reads);
   state.count(LOG_TEXTS_ASKED, intaken.log_texts_asked);
   state.count_max(MOST_LOG_TEXTS_ASKED, intaken.log_texts_asked);
@@ -3653,8 +3668,9 @@ pub(crate) fn land_in(
       settled_whole(state, run, accepted);
       outcome
     }
-    // Built from the plan its landing judges, it misses no work.
-    Landing::Unbuilt(_) => {
+    // Built from the plan its landing judges, it misses no work; were it to, its fork goes back as a refusal's does.
+    Landing::Unbuilt(back) => {
+      give_back_in(state, *back);
       settled_whole(state, run, false);
       None
     }

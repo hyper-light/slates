@@ -1029,41 +1029,74 @@ const PACED_TURNS: u64 = 8;
 /// A-614 amended, paced (main's report of 2026-11-21, r52: a clone of git/git's branches took 465 s, its derivation of 8
 /// versions 3,024,021 turns, each paying the shard's lend, its settle and a yield). Do: push a line of [`PACED_HISTORY`]
 /// commits as one create, then turn the repository's derivation until it is idle, nobody else waiting on the shard.
-/// Expect: the one version derived, in at most [`PACED_TURNS`] turns besides one per step's ceiling of the derivation's
-/// wall time: a derivation runs while nobody waits to the step's ceiling (A-783), never a few units a turn, so its turns
-/// follow its time, whatever the machine's load (a loaded host's ceiling-long turns do less each; main's ruling of
-/// 2026-11-21 08:20, the rule stated rather than the machine's speed). Red before the change: hundreds of turns.
+/// Expect: the one version derived, in at most [`PACED_TURNS`] turns besides one per span of the derivation's wall time
+/// (the step's ceiling less a quantum, what a turn runs to) and one per turn that yielded to a waiter (counted): a
+/// derivation runs while nobody waits (A-783), never a few units a turn, so its turns follow its time, whatever the
+/// machine's load (a loaded host's long turns do less each; main's ruling of 2026-11-21 08:20, the rule stated rather
+/// than the machine's speed). Red before the change: hundreds of turns. Main's TSan lane (run 45527257702) failed the
+/// older bound, ceilings alone: 19 turns over 962,882,161 ns at a 100,000,000 ns ceiling.
 #[test]
 fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects() {
-  use crate::vcs_store::git_derive::{DERIVED, TURNS, derive_for_read};
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let count = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
-  let (repository, before) = crate::daemon::observe_first(&daemon, move |state| {
-    let repository = git_repository(state, "paced");
-    let mut objects = Vec::new();
-    let mut parent = None;
-    for at in 0..PACED_HISTORY {
-      let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
-      objects.extend(made);
-      parent = Some(commit);
-    }
-    let head = parent.unwrap().to_string();
-    let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
-    let pack = pack_of_objects(&objects);
-    let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
-    assert_eq!(reasons(&received), [b"ok".to_vec()]);
-    (repository, (count(state, TURNS), count(state, DERIVED)))
-  });
-  // The derivation runs as a fetch's does, a task of the shard; this thread waits on a channel, not on the shard, so
-  // nobody else waits there.
+  let (repository, before) = crate::daemon::observe_first(&daemon, push_paced_line);
+  let paced = derived_for_read(&daemon, repository);
+  let after = crate::daemon::observe_first(&daemon, derive_counts);
+  daemon.stop();
+  assert_paced(&paced, (before, after));
+}
+
+/// The derivation's counters: its turns, the versions it derived and the turns that yielded to a waiter.
+type DeriveCounts = (u64, u64, u64);
+
+/// The shard's [`DeriveCounts`] now.
+fn derive_counts(state: &mut ShardState) -> DeriveCounts {
+  use crate::vcs_store::git_derive::{DERIVED, TURNS, TURNS_YIELDED};
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (count(TURNS), count(DERIVED), count(TURNS_YIELDED))
+}
+
+/// A line of [`PACED_HISTORY`] commits pushed as one create to a new repository: the repository and the counts before
+/// its derivation.
+fn push_paced_line(state: &mut ShardState) -> (RepositoryId, DeriveCounts) {
+  let repository = git_repository(state, "paced");
+  let mut objects = Vec::new();
+  let mut parent = None;
+  for at in 0..PACED_HISTORY {
+    let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
+    objects.extend(made);
+    parent = Some(commit);
+  }
+  let head = parent.unwrap().to_string();
+  let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
+  let received = pushed(
+    state,
+    repository,
+    &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
+  );
+  assert_eq!(reasons(&received), [b"ok".to_vec()]);
+  (repository, derive_counts(state))
+}
+
+/// What a derivation's pace allowed: its wall time, the step's ceiling and quantum.
+type Paced = (u64, u64, u64);
+
+/// `repository`'s derivation run as a fetch runs it, a task of the shard, this thread waiting on a channel so nobody else
+/// waits there: how long it took, and the ceiling and quantum its turns ran under.
+fn derived_for_read(daemon: &crate::Daemon, repository: RepositoryId) -> Paced {
   let (done, finished) = std::sync::mpsc::channel();
-  let ceiling_ns = crate::daemon::observe_first(&daemon, |state| {
-    slates_rt::futures::step_ceiling_ns().unwrap_or_else(|| state.config.step_quantum_ns())
+  let (ceiling_ns, quantum_ns) = crate::daemon::observe_first(daemon, |state| {
+    let quantum = state.config.step_quantum_ns();
+    (
+      slates_rt::futures::step_ceiling_ns()
+        .unwrap_or(quantum)
+        .max(quantum),
+      quantum,
+    )
   });
   let began = std::time::Instant::now();
-  crate::daemon::observe_first(&daemon, move |_| {
+  crate::daemon::observe_first(daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
-      derive_for_read(repository).await;
+      crate::vcs_store::git_derive::derive_for_read(repository).await;
       let _ = done.send(());
     })
     .unwrap();
@@ -1071,16 +1104,25 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   });
   finished.recv().unwrap();
   let took_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-  let after = crate::daemon::observe_first(&daemon, move |state| {
-    (count(state, TURNS), count(state, DERIVED))
-  });
-  daemon.stop();
-  let (turns, derived) = (after.0 - before.0, after.1 - before.1);
+  (took_ns, ceiling_ns, quantum_ns)
+}
+
+/// The pace's rule (A-783, `git_derive::paced`): a turn runs to its ceiling less a quantum unless someone else waits on
+/// the shard, so the turns are the work's time over that span, those that yielded to a waiter (counted), and
+/// [`PACED_TURNS`] besides; never the history's objects. The bound is the rule, judged at any machine's speed: a slow
+/// lane's turns are fewer of its longer time, never a scaled count (`crate::test_lane`: a bound the daemon keeps is
+/// never scaled).
+fn assert_paced(
+  (took_ns, ceiling_ns, quantum_ns): &Paced,
+  (before, after): (DeriveCounts, DeriveCounts),
+) {
+  let (turns, derived, yielded) = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
   assert_eq!(derived, 1);
-  let filled = took_ns.div_ceil(ceiling_ns.max(1));
+  let span = ceiling_ns.saturating_sub(*quantum_ns).max(1);
+  let filled = took_ns.div_ceil(span);
   assert!(
-    turns <= PACED_TURNS + filled,
-    "{turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling"
+    turns <= PACED_TURNS + filled + yielded,
+    "{turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling and a {quantum_ns} ns quantum, {yielded} yielded"
   );
 }
 

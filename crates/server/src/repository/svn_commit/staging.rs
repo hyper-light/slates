@@ -195,6 +195,22 @@ fn slice_deadline_ns() -> u64 {
   slates_rt::futures::now_ns().saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0))
 }
 
+/// Brings green `green`'s identity to its head a key at a time (`Green::fold_identity_step`) until the shard's clock
+/// passes `deadline_ns`, at least one: whether no key is left (so for a green the shard does not hold).
+fn identity_some(state: &mut ShardState, green: DbVolumeId, deadline_ns: u64) -> bool {
+  let Some(mut engine) = state.greens.get_mut(&green) else {
+    return true;
+  };
+  loop {
+    if engine.fold_identity_step(1) {
+      return true;
+    }
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      return false;
+    }
+  }
+}
+
 /// Gives back the landing's hold of each of `put` from `at`, and lets its windows go, until the shard's clock passes
 /// `deadline_ns`, at least one: durable on the node's store since the changeset landed, RAM holds nothing of the batch's
 /// texts, the green's holds keep their entries (A-760 (b) 4d, main's (B)). `at` moved past those given back; whether
@@ -409,29 +425,13 @@ impl Staging {
     } = deferred;
     // A stored text a row names that the content store let go, and the texts its copies set back, are brought back
     // whole for the increment, and given back once it is built.
-    let brought_texts = match super::bring_stored(repository, &revision.record.changes).await? {
+    let BroughtForStaging {
+      texts: brought_texts,
+      plans,
+      restoring,
+    } = match brought_for_staging(repository, &revision).await? {
       Ok(brought) => brought,
       Err(refused) => {
-        self.put.extend(put);
-        self.carried.extend(carried);
-        return Some(Err(refused));
-      }
-    };
-    let plans = match restore::plan(repository, &revision.record.changes).await? {
-      Ok(plans) => plans,
-      Err(refused) => {
-        let _ = crate::state::with_state(|state| super::release_texts(state, None, &brought_texts));
-        self.put.extend(put);
-        self.carried.extend(carried);
-        return Some(Err(refused));
-      }
-    };
-    let restoring = match super::bring_texts(repository, restore::texts_of(&plans).into_iter())
-      .await?
-    {
-      Ok(restoring) => restoring,
-      Err(refused) => {
-        let _ = crate::state::with_state(|state| super::release_texts(state, None, &brought_texts));
         self.put.extend(put);
         self.carried.extend(carried);
         return Some(Err(refused));
@@ -682,6 +682,14 @@ impl Staging {
   /// given back and let go; then its landing turn given back. None where the shard's state is gone.
   async fn land_tail(&mut self, cause: Flush) -> Option<()> {
     let green = self.green;
+    // The green's identity brought to its head a slice of the shard's budget a step, counted, before the fold reads it
+    // (A-910; goal 93: the fold brought 9,000 changed keys' identity to the head in one step of 482 ms, debug).
+    while !crate::state::with_state(|state| {
+      state.count(TAIL_SLICES, 1);
+      identity_some(state, green, slice_deadline_ns())
+    })? {
+      slates_rt::futures::yield_now().await;
+    }
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, cause);
@@ -733,6 +741,47 @@ impl Staging {
     }
     if let Some(turn) = self.turn.take() {
       turn.give_back(state);
+    }
+  }
+}
+
+/// What a revision's staging brings back whole before it stages ([`brought_for_staging`]).
+struct BroughtForStaging {
+  /// The stored texts its rows name that the content store had let go.
+  texts: Vec<ContentIdentity>,
+  /// Its copies' restore plans.
+  plans: restore::CopyPlans,
+  /// The texts those plans set back.
+  restoring: Vec<ContentIdentity>,
+}
+
+/// What staging `revision` brings back whole first ([`Staging::stage_deferred`]): the stored texts its rows name that the
+/// content store let go, its copies' restore plans, and the texts those plans set back, in that order. A refusal gives
+/// back what was brought before it; `None` where the store went away.
+async fn brought_for_staging(
+  repository: RepositoryId,
+  revision: &Revision,
+) -> Option<Result<BroughtForStaging, Uncommitted>> {
+  let texts = match super::bring_stored(repository, &revision.record.changes).await? {
+    Ok(brought) => brought,
+    Err(refused) => return Some(Err(refused)),
+  };
+  let plans = match restore::plan(repository, &revision.record.changes).await? {
+    Ok(plans) => plans,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| super::release_texts(state, None, &texts));
+      return Some(Err(refused));
+    }
+  };
+  match super::bring_texts(repository, restore::texts_of(&plans).into_iter()).await? {
+    Ok(restoring) => Some(Ok(BroughtForStaging {
+      texts,
+      plans,
+      restoring,
+    })),
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| super::release_texts(state, None, &texts));
+      Some(Err(refused))
     }
   }
 }

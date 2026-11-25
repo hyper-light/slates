@@ -229,18 +229,24 @@
 > A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
 > format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
 > Nothing is built on either answer.
-> **BUILT, part 4 owed (A-908, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
+> **BUILT (A-908 with part 4, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
 > green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
 > lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
-> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
-> rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
+> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. Part 4: a holder's rebuild
+> after a warm restart makes a member by its lineage too (a root founds it, a branch is branched from its source, a
+> missing source rebuilt first a level an ask); red first in `merge_origin` (the branch had been refused as a mismatch).
+> End to end (fleet, `a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after`): b restarted
+> warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
+> rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
+> b7e65cc63, part 4 in) held: 40 of 40, release and debug.
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
 > made after a takeover was placed. An owner's hold now fences each object as its holders do (`Acceptor::accept_own`);
 > red first (`a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies`, and `slates-db`'s `a909_` tests).
-> OWED (main): gate 15 (`v3_takeover`) and a lint diag. Not checked: the second new branch's `cannot lock ref` 2.3 s
-> after the refused push; no test makes it.
+> Gate 15 (`v3_takeover` at f387b56d3) held: 40 of 40, release and debug; OWED (main): TSan diag 3 and a lint diag.
+> UNOBSERVED since A-909: the second new branch's `cannot lock
+> ref` 2.3 s after a refused push; no test makes it, and it is not chased by reading (main's ruling).
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1524,6 +1530,35 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> C1 (2), first piece BUILT (main's order of 2026-11-24 16:10; main's r618 reading: a long revision rebuilt into one
+> buffer, the 57k intake's pending steps 51% of its time): a push's file revision is taken a window a step and never
+> whole. Its text is made from its delta over its base by `delta::Patching`, the base read in ranges (`delta::BaseRead`)
+> from the fork's row: its metadata block framed before its bytes, read through the content store's windows
+> (`ContentStore::run_at`), the push's own earlier revisions among them. A landed base whose windows were let go is asked
+> of the changeset store, brought back (`push::held::bring_back_file`) and read the same way. Each window made is hashed
+> into the node's check and the identity, its metadata block read off its front, and its bytes put through the streamed
+> put; the base's identity is the text kept last's, else hashed a window a step (`push::intake`'s `patched`). It
+> replaces rulings (b1) and (b2) for files: the chain rebuild from the push's own deltas, the push's cache of its own
+> texts and the file text kept last are gone. Held by
+> `a_long_revision_is_rebuilt_holding_no_more_than_two_windows_of_text` (a new `Intaken::most_text_held`; a 3.5-window
+> file and a delta at a 4 KiB window: red 43,025 bytes held at once, now at most 8,192),
+> `a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows` (nothing rebuilt or asked; a let-go base asked
+> once) and `a_delta_patched_a_slice_at_a_time_makes_the_same_text` (`Patching` against `apply`, every fill size and
+> refusal). Owed: the manifests a window at a time (kept as a delta against the one before, `Taker::last`, and
+> `read_of` parsing every entry), then the changesets; a let-go base's answer still arrives from the store whole, held
+> for the step that brings it back; and the base's identity hashed by reading the base a second time.
+> R, the import's peak (w-perf, 2026-11-24, main's order of 15:21). Measured at 15e739357, Mercurial's own history
+> (57,036 changesets) imported on an in-process daemon (`hg_import_memory`, ignored, run by name with
+> `SLATES_HG_IMPORT_SOURCE`): peak RSS 1,076,144 KiB, from D's 5.73 GB. Named by the per-shard gauges: the content
+> object's high-water, set by one segment's file texts held whole until it landed (744 MB used before the first file
+> segment's cut, 628 MB let go at its landing). A segment was cut by its changegroup's bytes alone (`segment_bytes`, 2
+> MiB here), and a text runs to hundreds of times its delta. Now it is cut too once the whole file texts it keeps reach
+> the same bound (`Emitter::due`): the import holds under twice the segment's bound of file texts, counted
+> `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`; held by
+> `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` (red: 46,162,339 bytes held after one turn,
+> 8,950 at the end, a 2 MiB bound). Owed: main's rerun of the 57k (segments, peak, time against 15e739357); the
+> changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
+> manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
@@ -3312,6 +3347,12 @@
 > **A-724 piece 2a (2026-11-21, w-multirepo, A-844): the working set's miss-ratio curve built, not yet fed.**
 > `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
+> A re-read of the key read last counted in place (w-perf, 2026-11-24, main 01a20182's item, w-git's guard): the curve was
+> about a fifth of a git clone's object-choosing walk (`Curve::read` 2,906 and its key map's insert 1,749 of 23,095 work
+> samples), the walk re-reading a few table windows so every read went through the map. Such a read is now counted at
+> its own length and touches neither the map nor the tree, answering as moving it would; held by
+> `a_reread_of_the_key_read_last_inserts_nothing_and_answers_as_before` (`Curve::key_inserts`; red: 2,529 inserts for
+> 1,766 runs; every answer equal to the moving reference's to the last bit). Open: the walk's own re-reads measured again.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
 > rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
 > at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot.
@@ -3345,6 +3386,15 @@
 > `hg_push::unbundle`); the anchor kills the daemon, and stock hg reads `bad HTTP status line: ''` (SSH: `stream ended
 > unexpectedly`). One 64 MiB file, or 16 MiB changed in place, passes.
 >
+> **Goal 93 perf, Subversion's bytes on the store against FSFS's (2026-11-24, w-perf; main 01a20182's order, item 4 of
+> the note of 11-21 21:50, "an order of magnitude faster" after C and R).** Measured, bytes only (BENCHMARKS, "A
+> Subversion repository's bytes on the changeset store against FSFS's"): git-2000's 2,000 revisions take 468,604 KiB
+> allocated (452,617 apparent) on the node's changeset store against stock FSFS's 51,020 (40,183), 9.2 and 11.3 times.
+> Under Ada's changeset ruling each revision's changed texts are kept whole (its changeset's Payload and Texts rows),
+> where FSFS keeps skip-deltas; deltas are derived, never stored (A-842). Owed: nothing before Subversion's C and R
+> close; any change keeps the ruling. Found beside it, P7's (where a Subversion import's memory is): of 691,504 KiB
+> resident after the import, the content arena's frees held for a committed image (`arena_deferred_bytes`) were
+> 489,299,968 B, the store's own content 2,624 B.
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
@@ -4747,7 +4797,9 @@
 >   `vcs_store.hg_intake_base_asks`) and the recovery's and rebuild's piece replays (`PieceStep::Store`,
 >   `hg_view::answer_wants_over` over the disk alone, since a recovery holds the state). A whole replay cannot wait,
 >   so it is refused typed (`record::Refused::StoreWanted`): no register-held push record remains since e6c3f10cd.
->   The daemon counts each push's `vcs.hg.push_base_hits`, `_rebuilds` and `_store_reads`.
+>   The daemon counts each push's `vcs.hg.push_base_hits`, `_rebuilds` and `_store_reads`. Superseded 2026-11-24 by C1
+>   (2)'s first piece: file bases are read from the fork's rows a window at a time; the cache, the rebuild and their two
+>   counters are gone, and `vcs.hg.push_base_store_reads` counts only a let-go base asked of the store.
 > - Held by `push::intake::tests::a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store`
 >   (one file's four revisions, two deltas against a revision before the last: with the cache 2 hits and nothing
 >   rebuilt; with none every base rebuilt and the rows equal; a later push's base landed before, read from the store

@@ -80,6 +80,11 @@ impl Served {
     client.set_repository_policy("project", &policy).unwrap();
   }
 
+  /// A client of the daemon serving, as the test's principal.
+  pub(crate) fn client(&self) -> slates_client::Client {
+    connect(&self.instance)
+  }
+
   /// The daemon serving.
   pub(crate) fn daemon(&self) -> &Daemon {
     self
@@ -113,6 +118,19 @@ impl Served {
     self.owner = Some(owner);
   }
 
+  /// Stops the daemon, its anchor and the store's owner, as [`Served::stop`] does, then hands `measure` the test's
+  /// directory while it still stands: the store's files as the stopped owner left them.
+  pub(crate) fn stop_measuring<T>(mut self, measure: impl FnOnce(&str) -> T) -> T {
+    if let Some(daemon) = self.daemon.take() {
+      daemon.stop();
+    }
+    drop(self.anchor.take());
+    if let Some(owner) = self.owner.take() {
+      owner.stop().unwrap();
+    }
+    measure(self.base())
+  }
+
   /// Stops the daemon, then its anchor, then the store's owner.
   pub(crate) fn stop(mut self) {
     if let Some(daemon) = self.daemon.take() {
@@ -127,6 +145,11 @@ impl Served {
 
 /// The store's owner over the store directory under `base`, made the first time.
 fn start_owner(base: &str) -> StoreOwner {
+  start_owner_sized(base, SIZING)
+}
+
+/// [`start_owner`] with the store sized `sizing`.
+fn start_owner_sized(base: &str, sizing: Sizing) -> StoreOwner {
   let store_dir = format!("{base}/store");
   // The store's directory inside the fixture's own, in the build output (`common::target`).
   #[allow(clippy::disallowed_methods)]
@@ -139,7 +162,7 @@ fn start_owner(base: &str) -> StoreOwner {
   };
   StoreOwner::start(
     StoreRoot::open(&store_dir, &grant).unwrap(),
-    SIZING,
+    sizing,
     WAITING,
   )
   .unwrap()
@@ -169,9 +192,14 @@ fn hgrc(port: u16, (token, extra): &(String, String)) -> String {
 
 /// Starts a daemon named after `name` serving `project` (module docs), its hgrc the token's `[auth]` and `extra`.
 pub(crate) fn serve(name: &str, extra: &str) -> Served {
+  serve_sized(name, extra, SIZING)
+}
+
+/// [`serve`] over a store sized `sizing`: a measurement's, whose history is past the tests' store.
+pub(crate) fn serve_sized(name: &str, extra: &str, sizing: Sizing) -> Served {
   let scratch = target_dir();
   let base = scratch.path.clone();
-  let owner = start_owner(&base);
+  let owner = start_owner_sized(&base, sizing);
   let profile = super::machine_profile();
   let instance = format!("{name}-{}", std::process::id());
   let config = daemon_config(&profile, &instance, &owner);
