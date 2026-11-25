@@ -29,7 +29,7 @@
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_ipc::protocol::Refusal;
 use slates_merge::chain_entry::Applied;
-use slates_merge::engine::{Green, Increment, Outcome};
+use slates_merge::engine::{CommitStep, Green, Increment, Outcome};
 
 use crate::greens::Preview;
 use crate::repository::push::{AppendRefused, EntryParts};
@@ -39,6 +39,9 @@ use crate::state::ShardState;
 pub(crate) const STAGED: &str = "repository.import_batch.staged";
 /// Counter: an import's batch committed as one entry. Format: a counter name.
 pub(crate) const COMMITTED: &str = "repository.import_batch.committed";
+/// Counter: the times a staged verdict's commit, checking its reads (A-920 piece 3a), met named texts the scratch member
+/// held by name alone and was lent them from the content plane. Format: a counter name.
+pub(crate) const STAGE_COMMIT_LENT: &str = "repository.import_batch.commit_lent";
 
 /// One revision's work staged in a batch: the work as the green numbers it, what its verdict resolved it to, the head
 /// identity at its version where its record goes to holders, and the retention its verdict reserved.
@@ -93,6 +96,19 @@ struct Pending {
   head: u64,
   /// Whether its record goes to holders.
   holders: bool,
+  /// The named texts its commit's check of its reads asked for and was lent (A-920 piece 3a): one asked again is
+  /// refused, never lent twice.
+  asked: std::collections::BTreeSet<slates_merge::named::Identity>,
+}
+
+/// What a step of a pending verdict's commit left ([`ImportBatch::stage_step`]).
+enum Stepped {
+  /// More of it is left.
+  More,
+  /// Its check of its reads met these named texts unlent.
+  Lend(std::collections::BTreeSet<slates_merge::named::Identity>),
+  /// Committed: its verdict.
+  Committed(StagedVerdict),
 }
 
 /// What [`finish_staged`] needs of a pending verdict ([`Pending`]).
@@ -299,6 +315,7 @@ impl ImportBatch {
             verdict,
             head,
             holders,
+            asked: std::collections::BTreeSet::new(),
           });
           return Ok(None);
         }
@@ -341,27 +358,66 @@ impl ImportBatch {
       return Some(Err(StageRefused::Unavailable));
     };
     let stepped = state.greens.with_preview_mut(preview, |engine| {
-      let committed = engine.committing_step(&mut pending.committing, spent)?;
-      let staged = finish_staged(
-        engine,
-        &pending.work,
-        (&pending.verdict, pending.holders),
-        committed,
-      );
-      engine.let_named_bytes_go();
-      Some(staged)
+      match engine.committing_step(&mut pending.committing, spent) {
+        CommitStep::More => Stepped::More,
+        CommitStep::Lend(unlent) => Stepped::Lend(unlent),
+        CommitStep::Committed(version, applied) => {
+          let staged = finish_staged(
+            engine,
+            &pending.work,
+            (&pending.verdict, pending.holders),
+            (version, applied),
+          );
+          engine.let_named_bytes_go();
+          Stepped::Committed(staged)
+        }
+      }
     });
     match stepped {
       Err(_) => Some(Err(StageRefused::Unavailable)),
-      Ok(None) => {
+      Ok(Stepped::More) => {
         self.pending = Some(pending);
         None
       }
-      Ok(Some(staged)) => {
+      Ok(Stepped::Lend(unlent)) => self.lend_pending(state, pending, unlent),
+      Ok(Stepped::Committed(staged)) => {
         let Pending { work, head, .. } = pending;
         Some(self.keep_staged(state, work, (Ok(staged), head)))
       }
     }
+  }
+
+  /// Lends the scratch member the named texts `unlent` that `pending`'s commit met unlent, read from the content plane
+  /// (A-920 piece 3a: its reads checked by its commit, a slice at a time), and keeps it pending: none while it goes
+  /// on; refused where a text was asked for again once lent (counted, as a judge's second miss is) or is not read.
+  fn lend_pending(
+    &mut self,
+    state: &mut ShardState,
+    mut pending: Pending,
+    unlent: std::collections::BTreeSet<slates_merge::named::Identity>,
+  ) -> Option<Result<u64, StageRefused>> {
+    if !unlent.is_disjoint(&pending.asked) {
+      state.count(crate::vcs_store::name_holds::NAME_LEND_MISSED, 1);
+      return Some(Err(StageRefused::Unavailable));
+    }
+    let Some(preview) = self.preview.as_ref() else {
+      return Some(Err(StageRefused::Unavailable));
+    };
+    let Ok(lent) = crate::vcs_store::name_holds::read_from_plane(state, &unlent, None) else {
+      return Some(Err(StageRefused::Unavailable));
+    };
+    let given = state.greens.with_preview_mut(preview, |engine| {
+      for (identity, bytes) in lent {
+        engine.lend(identity, bytes);
+      }
+    });
+    if given.is_err() {
+      return Some(Err(StageRefused::Unavailable));
+    }
+    state.count(STAGE_COMMIT_LENT, 1);
+    pending.asked.extend(unlent);
+    self.pending = Some(pending);
+    None
   }
 
   /// Keeps `work`, its verdict `judged` at the batch's head `head`: the version it is in the green's numbering; refused
@@ -515,7 +571,8 @@ fn judge_staged(
   // unchanged since, but for the texts lent it, so not walked again (A-920: 29 ms a walk at 9,000 files, debug).
   // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
   // Judged and held first, so an accepted verdict's chain entry is sized before anything of it applies (A-895).
-  let judgment = engine.judge_named(work);
+  // Its commit's reads checked by its commit, a slice at a time (A-920 piece 3a: 15 ms of the judge at 9,000 files).
+  let judgment = engine.judge_named_reads_later(work);
   if let (Some(left), slates_merge::engine::Judgment::Accepted(held)) = (chain_left, &judgment) {
     let entry = slates_merge::chain_entry::encoded_len(work, held.applied(), holders);
     if entry > left {

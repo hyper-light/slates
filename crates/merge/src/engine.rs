@@ -551,6 +551,9 @@ pub struct Judged {
   runs: crate::named::RunTable,
   /// Its files made so far, a slice a step before the commit ([`Green::make_step`], A-760).
   making: Making,
+  /// Whether its judge checked the reads its commit makes ([`Green::commit_reads`]); else its commit checks them a
+  /// slice at a time ([`Green::judge_named_reads_later`], A-920 piece 3a).
+  reads_checked: bool,
 }
 
 pub use crate::dims::NameHold;
@@ -2283,6 +2286,18 @@ pub enum ApplyStep {
   /// met them: its owner lends them (`Green::lend`) and takes it on again, which makes that slice again. What the owner
   /// learned by walking every effect first (`Green::recorded_unlent`), met a slice at a time instead.
   Lend(BTreeSet<crate::named::Identity>),
+}
+
+/// What a step of [`Green::committing_step`] left.
+#[derive(Debug)]
+pub enum CommitStep {
+  /// More of the commit is left.
+  More,
+  /// The commit waits for these texts, held by name alone with no bytes lent, met by its check of its reads, and has
+  /// undone the slice that met them: its owner lends them (`Green::lend`) and takes it on again (as [`ApplyStep::Lend`]).
+  Lend(BTreeSet<crate::named::Identity>),
+  /// Committed: its version, and what the chain records of it.
+  Committed(u64, Vec<crate::chain_entry::Applied>),
 }
 
 /// A recorded version being applied a slice at a time ([`Green::begin_applying`]; its contract is there): the places of
@@ -6879,7 +6894,7 @@ impl Green {
     {
       return Err(PositionRefused::NotRecorded { version });
     }
-    let mut judgment = self.hold_unlent(inc, computed);
+    let mut judgment = self.hold_unlent(inc, computed, true);
     if let Judgment::Accepted(held) = &mut judgment {
       held.read = inc.named.read.0.clone();
     }
@@ -6898,7 +6913,7 @@ impl Green {
   /// green never made), unavailable; anything else is the verdict this green computes at its head ([`Green::compute`],
   /// A-658), held in a [`Judged`] for [`Green::commit_judged`]. The owner judging is the owner computing: one verdict.
   pub fn judge(&mut self, inc: &Increment) -> Judgment {
-    let mut judgment = self.judge_held(inc);
+    let mut judgment = self.judge_held(inc, true);
     if let Judgment::Accepted(held) = &mut judgment {
       held.read = inc.named.read.0.clone();
     }
@@ -6908,15 +6923,28 @@ impl Green {
   /// [`Green::judge`] taking the work's named runs' bytes into the verdict held (A-760), so the commit makes a whole
   /// text's file of its buffer with no copy; [`Green::judge`] copies them, leaving the work as it was.
   pub fn judge_named(&mut self, inc: &mut Increment) -> Judgment {
-    let mut judgment = self.judge_held(inc);
+    let mut judgment = self.judge_held(inc, true);
     if let Judgment::Accepted(held) = &mut judgment {
       held.read = core::mem::take(&mut inc.named.read.0);
     }
     judgment
   }
 
-  /// [`Green::judge`]'s verdict, held without the named runs' bytes, which its callers give it.
-  fn judge_held(&mut self, inc: &Increment) -> Judgment {
+  /// [`Green::judge_named`] leaving the check of the reads its commit makes ([`Green::commit_reads`]) to that commit,
+  /// which makes it a slice at a time and asks its owner to lend what it meets unlent ([`Green::committing_step`],
+  /// [`CommitStep::Lend`]; A-920 piece 3a: 15 ms of a judge of 9,000 files, debug). The verdict is
+  /// [`Green::judge_named`]'s; only where its check is made differs.
+  pub fn judge_named_reads_later(&mut self, inc: &mut Increment) -> Judgment {
+    let mut judgment = self.judge_held(inc, false);
+    if let Judgment::Accepted(held) = &mut judgment {
+      held.read = core::mem::take(&mut inc.named.read.0);
+    }
+    judgment
+  }
+
+  /// [`Green::judge`]'s verdict, held without the named runs' bytes, which its callers give it; its commit's reads
+  /// checked where `check_reads`.
+  fn judge_held(&mut self, inc: &Increment, check_reads: bool) -> Judgment {
     // The cache answers a conflict it holds before anything is judged, unless the same increment was accepted since,
     // which the computation answers first (a submit's order since A-635).
     if !self.accepted.contains_key(&inc.id)
@@ -6927,7 +6955,7 @@ impl Green {
       };
     }
     match self.compute(inc) {
-      Ok(computed) => self.hold_unlent(inc, computed),
+      Ok(computed) => self.hold_unlent(inc, computed, check_reads),
       Err(ComputeRefused::BaseUnavailable { base, floor }) => {
         Judgment::BaseUnavailable { base, floor }
       }
@@ -6945,8 +6973,9 @@ impl Green {
   /// [`Green::hold_computed`], refused [`Judgment::ContentUnread`] where bringing the verdict to the head or committing
   /// it reads a file held by name alone with no bytes lent it (A-760 (b) 4d, `crate::unlent`): nothing is held or
   /// cached of it, so the owner lends the objects ([`Green::unlent_reads`]) and judges again.
-  fn hold_unlent(&mut self, inc: &Increment, computed: Computed) -> Judgment {
-    let (judgment, unlent) = crate::unlent::scope(|| self.hold_computed(inc, computed));
+  fn hold_unlent(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
+    let (judgment, unlent) =
+      crate::unlent::scope(|| self.hold_computed(inc, computed, check_reads));
     match (unlent.first(), judgment) {
       (None, judgment) => judgment,
       (Some(identity), judgment) => {
@@ -6964,8 +6993,8 @@ impl Green {
   /// A verdict computed at or before this green's head, held by its owner (A-635, A-658): answered as a submit answers it
   /// (an increment accepted before its version, a conflict the cache holds its windows, a base below the checkpoint
   /// unknown), else brought to the head ([`Green::at_head`]) and held there, a conflict kept in the rejected-result
-  /// cache as a submit keeps one.
-  fn hold_computed(&mut self, inc: &Increment, computed: Computed) -> Judgment {
+  /// cache as a submit keeps one. Its commit's reads checked where `check_reads` ([`Green::commit_reads`]).
+  fn hold_computed(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
     if let Some(version) = self.accepted.get(&inc.id) {
       return Judgment::AcceptedBefore { version: *version };
     }
@@ -6986,7 +7015,9 @@ impl Green {
     };
     match position::verdict(units) {
       Ok(effects) => {
-        self.commit_reads(&effects, inc.post());
+        if check_reads {
+          self.commit_reads(&effects, inc.post());
+        }
         let applied = effects.iter().map(Effect::applied).collect();
         Judgment::Accepted(Judged {
           id: inc.id,
@@ -6997,6 +7028,7 @@ impl Green {
           read: Vec::new(),
           runs: inc.named.runs.clone(),
           making: Making::default(),
+          reads_checked: check_reads,
         })
       }
       Err(windows) => {
@@ -7221,8 +7253,11 @@ impl Green {
   fn commit_held(&mut self, judged: Judged) -> (u64, Vec<crate::chain_entry::Applied>) {
     let mut committing = self.begin_committing(judged);
     loop {
-      if let Some(committed) = self.committing_step(&mut committing, &mut || false) {
-        return committed;
+      // Its reads checked by its judge ([`Green::judge`]), its commit meets nothing unlent.
+      if let CommitStep::Committed(version, applied) =
+        self.committing_step(&mut committing, &mut || false)
+      {
+        return (version, applied);
       }
     }
   }
@@ -7230,7 +7265,8 @@ impl Green {
   /// Begins committing `judged`, a verdict held at this green's head, a slice at a time ([`Green::committing_step`]):
   /// what [`Green::commit_held`] is, run to its end (A-920 piece 1; A-917's run). Its files a run makes whole found first
   /// where [`Green::make_step`] has not found them, then each mapped file made, then the commit's effects, removals and
-  /// files a unit each. Its reads were checked by its judge.
+  /// files a unit each. Its reads are checked between, a slice at a time, where its judge did not check them
+  /// ([`Green::judge_named_reads_later`]).
   ///
   /// **Contract.** As [`Green::begin_applying`]'s: between its begin and its end nothing reads the green or changes it.
   /// An import batch's scratch member keeps it (read by nothing until the batch lands, its landing turn held); a run
@@ -7244,10 +7280,17 @@ impl Green {
       read,
       runs,
       making,
+      reads_checked,
       ..
     } = judged;
+    // Its files' runs found already ([`Green::make_step`]): its reads checked from there where its judge did not.
     let prep = match (making.wholes, making.names) {
-      (Some(wholes), Some(names)) => Prep::Mapped {
+      (Some(wholes), Some(names)) if reads_checked => Prep::Mapped {
+        names,
+        wholes,
+        at: 0,
+      },
+      (Some(wholes), Some(names)) => Prep::Reads {
         names,
         wholes,
         at: 0,
@@ -7262,7 +7305,7 @@ impl Green {
         effects,
         prep,
         read,
-        check_reads: false,
+        check_reads: !reads_checked,
         commit: None,
       },
       post_state,
@@ -7271,12 +7314,13 @@ impl Green {
     }
   }
 
-  /// Takes `committing` on a unit at a time, at least one, until `spent`: its version and what it applied once it ends.
+  /// Takes `committing` on a unit at a time, at least one, until `spent`: whether it goes on, waits for texts to be
+  /// lent (its reads checked here, [`Green::judge_named_reads_later`]), or ended, its version and what it applied.
   pub fn committing_step(
     &mut self,
     committing: &mut Committing,
     spent: &mut dyn FnMut() -> bool,
-  ) -> Option<(u64, Vec<crate::chain_entry::Applied>)> {
+  ) -> CommitStep {
     let Committing {
       run,
       post_state,
@@ -7284,15 +7328,17 @@ impl Green {
       applied,
     } = committing;
     let Some(commit) = run.commit.as_mut() else {
-      let _ = self.prepare_step(run, (post_state, runs), spent);
-      return None;
+      return match self.prepare_step(run, (post_state, runs), spent) {
+        ApplyStep::Lend(unlent) => CommitStep::Lend(unlent),
+        _ => CommitStep::More,
+      };
     };
     if !self.commit_step(commit, spent) {
-      return None;
+      return CommitStep::More;
     }
     let version = commit.version;
     self.accepted.insert(run.id, version);
-    Some((version, core::mem::take(applied)))
+    CommitStep::Committed(version, core::mem::take(applied))
   }
 
   /// The files whose bytes are exactly one named run's, each with that run (A-760). Those whose run makes no other file

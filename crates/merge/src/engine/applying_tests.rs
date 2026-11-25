@@ -113,7 +113,9 @@ fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<
   let mut committing = green.begin_committing(held);
   loop {
     // Spent after every unit: one unit a step.
-    if let Some((version, _)) = green.committing_step(&mut committing, &mut || true) {
+    if let super::CommitStep::Committed(version, _) =
+      green.committing_step(&mut committing, &mut || true)
+    {
       return Some(version);
     }
   }
