@@ -12,6 +12,16 @@
 //! holds, moved into the request, so the owner writes them without a copy. The channel's capacity is the requests the
 //! daemon lets wait at once; past it a request is refused `Busy`, the push's own refusal.
 //!
+//! **What an ask waits on** (goal 93, main's order of 2026-11-25: hg's 57k clone waited 121.35 s on 6,232 store asks,
+//! the bulk of the clone). Every request carries when its asker sent it, on the host's one monotonic clock
+//! (`slates_machine::clock::monotonic_ns`), and the owner sends back how it served it ([`Served`]) before its answer:
+//! queued behind other work the owner was serving, or the owner's own wake from waiting for work; its service, and the
+//! changeset log's reads within it. The asking task adds the hop back, so each ask's wait splits into parts that sum to
+//! it to the nanosecond. A fetch's reads (texts, a text's slice, rows by tool, places) are summed on the asking thread
+//! ([`take_read_waits`]), which the server counts after each want. Measured in-process (debug, a 2,000-changeset clone,
+//! this MacBook): 4,015 requests, 1.42 ms each, 85.5% of it the owner's wake from its blocking receive, 12.2% its
+//! service, 1.8% the hop back, 0.4% its log reads.
+//!
 //! **A sliced landing** ([`StoreHandle::begin`], then [`SlicedLanding`]'s `section`, `part` and `commit`) lands a
 //! changeset too large to hold whole (an import, a large pack) one bounded part a request: each part is written where
 //! it belongs in the open record and let go, so the RAM it takes is a part, never the changeset; the record is visible
@@ -161,6 +171,162 @@ enum Request {
   },
 }
 
+/// A request as the owner receives it: when its asker sent it ([`slates_machine::clock::monotonic_ns`], one clock for
+/// every thread of the host) and where its service's timing goes back ([`Served`]), none for the daemon's own stop.
+struct Asked {
+  sent_ns: u64,
+  timed: Option<Sender<Served>>,
+  request: Request,
+}
+
+impl fmt::Debug for Asked {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Asked")
+      .field("sent_ns", &self.sent_ns)
+      .field("request", &self.request)
+      .finish_non_exhaustive()
+  }
+}
+
+impl Asked {
+  /// `request` with no asker waiting on its timing (the daemon's stop, a dropped landing's wake).
+  fn untimed(request: Request) -> Self {
+    Asked {
+      sent_ns: 0,
+      timed: None,
+      request,
+    }
+  }
+}
+
+/// How the owner served one request (goal 93, main's order of 2026-11-25: hg's 57k clone waited 121.35 s on 6,232 store
+/// asks, about 19 ms an ask, the bulk of its 165.8 s): sent back before its answer, so its asker splits its wait.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Served {
+  /// Queued behind other requests the owner was serving when it was sent.
+  behind_ns: u64,
+  /// The owner's own wake: sent while the owner waited for work, until it took the request.
+  wake_ns: u64,
+  /// The owner's service, from taking it to answering (its disk reads among it).
+  serve_ns: u64,
+  /// The changeset log's reads within the service ([`crate::log::ChangesetLog::read_ns`]).
+  disk_ns: u64,
+  /// When it was answered.
+  done_ns: u64,
+}
+
+/// What a handle's asks of the owner waited on, all told since it was last taken ([`StoreHandle::take_waits`]): each
+/// ask's wait split into its parts, which sum to its whole (goal 93, main's order of 2026-11-25).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AskWaits {
+  /// The asks answered.
+  pub asks: u64,
+  /// Their whole waits, from the send to the answer's arrival on the asking task.
+  pub total_ns: u64,
+  /// Queued behind other requests the owner was serving.
+  pub behind_ns: u64,
+  /// The owner's wake from waiting for work.
+  pub wake_ns: u64,
+  /// The owner's service but its disk reads: making texts, reading the engine's rows, copying.
+  pub serve_ns: u64,
+  /// The changeset log's reads within the service.
+  pub disk_ns: u64,
+  /// From the owner's answer to the asking task's taking it: the hop back and the asking shard's own turn.
+  pub back_ns: u64,
+  /// The longest whole wait.
+  pub most_ns: u64,
+}
+
+impl AskWaits {
+  /// One ask more: sent at `sent_ns`, served as `served` says, taken at `taken_ns`.
+  fn add(&mut self, served: &Served, (sent_ns, taken_ns): (u64, u64)) {
+    let total = taken_ns.saturating_sub(sent_ns);
+    self.asks = self.asks.saturating_add(1);
+    self.total_ns = self.total_ns.saturating_add(total);
+    self.behind_ns = self.behind_ns.saturating_add(served.behind_ns);
+    self.wake_ns = self.wake_ns.saturating_add(served.wake_ns);
+    self.serve_ns = self
+      .serve_ns
+      .saturating_add(served.serve_ns.saturating_sub(served.disk_ns));
+    self.disk_ns = self.disk_ns.saturating_add(served.disk_ns);
+    self.back_ns = self
+      .back_ns
+      .saturating_add(taken_ns.saturating_sub(served.done_ns));
+    self.most_ns = self.most_ns.max(total);
+  }
+}
+
+std::thread_local! {
+  /// What this thread's reads of the owner waited on since last taken ([`take_read_waits`]): a fetch's asks (texts, a
+  /// text's slice, rows by tool, places), which the asking shard's tasks make on its thread alone. The shard's state
+  /// lives the same way (`slates-server`'s `state`); a task never moves between shards.
+  static READ_WAITS: core::cell::Cell<AskWaits> = const { core::cell::Cell::new(AskWaits {
+    asks: 0,
+    total_ns: 0,
+    behind_ns: 0,
+    wake_ns: 0,
+    serve_ns: 0,
+    disk_ns: 0,
+    back_ns: 0,
+    most_ns: 0,
+  }) };
+}
+
+/// What this thread's reads of the owner (a fetch's asks: texts, a text's slice, rows by tool, places) waited on since
+/// last taken, each split into its parts ([`AskWaits`]); none left after (goal 93, main's order of 2026-11-25).
+pub fn take_read_waits() -> AskWaits {
+  READ_WAITS.with(core::cell::Cell::take)
+}
+
+/// The owner's timing of the request it serves ([`Served`]), sent before its answer.
+struct Timer {
+  timed: Option<Sender<Served>>,
+  behind_ns: u64,
+  wake_ns: u64,
+  dequeued_ns: u64,
+  disk_before: u64,
+}
+
+impl Timer {
+  /// The timing of a request sent at `sent_ns`, taken at `dequeued_ns` by an owner that began waiting for work at
+  /// `idle_ns`: sent after it, its wait was the owner's wake; before, it queued behind the owner's other work.
+  fn of(
+    asked: (u64, Option<Sender<Served>>),
+    (idle_ns, dequeued_ns): (u64, u64),
+    store: &Store,
+  ) -> Self {
+    let (sent_ns, timed) = asked;
+    let waited = dequeued_ns.saturating_sub(sent_ns);
+    let (behind_ns, wake_ns) = if sent_ns >= idle_ns {
+      (0, waited)
+    } else {
+      (waited, 0)
+    };
+    Timer {
+      timed,
+      behind_ns,
+      wake_ns,
+      dequeued_ns,
+      disk_before: store.log().read_ns(),
+    }
+  }
+
+  /// Answers `value` on `answer`, its timing sent first so the asker finds it with the answer.
+  fn reply<T>(&mut self, store: &Store, answer: &Sender<T>, value: T) {
+    if let Some(timed) = self.timed.take() {
+      let done_ns = slates_machine::clock::monotonic_ns();
+      let _ = timed.try_send(Served {
+        behind_ns: self.behind_ns,
+        wake_ns: self.wake_ns,
+        serve_ns: done_ns.saturating_sub(self.dequeued_ns),
+        disk_ns: store.log().read_ns().saturating_sub(self.disk_before),
+        done_ns,
+      });
+    }
+    let _ = answer.try_send(value);
+  }
+}
+
 /// Why a request to the owner did not get its answer.
 #[derive(Debug)]
 pub enum OwnerError {
@@ -198,7 +364,7 @@ pub struct StoreOwner {
 /// A shard's way to the owner; clone one for each shard.
 #[derive(Debug, Clone)]
 pub struct StoreHandle {
-  requests: Sender<Request>,
+  requests: Sender<Asked>,
   /// The id of the standing grant the store's directory was opened under ([`crate::store::grant_id`]): what a
   /// landing's header names.
   grant: u64,
@@ -341,7 +507,11 @@ impl StoreOwner {
   /// `NotOnShard` when asked on a shard (it would block one); `Gone` when the owner's thread did not end cleanly; the
   /// store's refusal of its open or its checkpoint.
   pub fn stop(self) -> Result<(), OwnerError> {
-    match self.handle.requests.blocking_send(Request::Stop) {
+    match self
+      .handle
+      .requests
+      .blocking_send(Asked::untimed(Request::Stop))
+    {
       // Sent, or the owner is gone already: either way the join ends.
       Ok(()) | Err(SyncError::Closed(_)) => {}
       Err(SyncError::NotOnShardThread(_) | SyncError::Full(_)) => {
@@ -363,9 +533,9 @@ fn unopened<T>(reason: &str) -> Result<T, StoreError> {
 
 /// Answers every request with [`StoreError::Unopened`] naming `reason`, until every handle is gone: the owner of a store
 /// that could not be opened.
-fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
-  while let Ok(request) = incoming.blocking_recv() {
-    match request {
+fn refuse_all(incoming: &mut ChannelReceiver<Asked>, reason: &str) {
+  while let Ok(asked) = incoming.blocking_recv() {
+    match asked.request {
       Request::Begin { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Section { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Part { answer, .. } => drop(answer.try_send(unopened(reason))),
@@ -394,7 +564,7 @@ fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
 fn serve(
   root: StoreRoot,
   sizing: Sizing,
-  mut incoming: ChannelReceiver<Request>,
+  mut incoming: ChannelReceiver<Asked>,
   waiting: usize,
 ) -> Result<(), StoreError> {
   let at = root.target().key.clone();
@@ -425,24 +595,34 @@ fn serve(
   };
   loop {
     landings.let_go_if_dropped(&mut store);
-    let request = match landings.next_held() {
-      Some(request) => request,
+    // From here the owner waits for work: a request sent after it waited on the owner's wake, one before on its work.
+    let idle_ns = slates_machine::clock::monotonic_ns();
+    let asked = match landings.next_held() {
+      Some(asked) => asked,
       None => match incoming.blocking_recv() {
-        Ok(request) => request,
+        Ok(asked) => asked,
         Err(_) => break,
       },
     };
+    let dequeued_ns = slates_machine::clock::monotonic_ns();
     landings.let_go_if_dropped(&mut store);
-    let Some(request) = landings.hold_while_open(request) else {
+    let Some(Asked {
+      sent_ns,
+      timed,
+      request,
+    }) = landings.hold_while_open(asked)
+    else {
       continue;
     };
+    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns), &store);
     match request {
       Request::Begin {
         header,
         alive,
         answer,
       } => {
-        let _ = answer.try_send(landings.begin(&mut store, header, alive));
+        let answered = landings.begin(&mut store, header, alive);
+        timer.reply(&store, &answer, answered);
       }
       Request::Section {
         landing,
@@ -453,7 +633,8 @@ fn serve(
         let step = landings
           .check(landing)
           .and_then(|()| store.landing_section(kind, len));
-        let _ = answer.try_send(landings.failed_lets_go(&mut store, step));
+        let answered = landings.failed_lets_go(&mut store, step);
+        timer.reply(&store, &answer, answered);
       }
       Request::Part {
         landing,
@@ -471,7 +652,8 @@ fn serve(
           bytes.clear();
           bytes
         });
-        let _ = answer.try_send(given);
+        let answered = given;
+        timer.reply(&store, &answer, answered);
       }
       Request::Commit { landing, answer } => {
         // A commit that fails lets the record go (`commit_open` took it); a stranger's commit touches nothing.
@@ -479,7 +661,8 @@ fn serve(
           landings.open = None;
           store.commit_landing()
         });
-        let _ = answer.try_send(committed);
+        let answered = committed;
+        timer.reply(&store, &answer, answered);
       }
       // The daemon's stop: the loop ends here, and the open landing is let go and the checkpoint written below.
       Request::Stop => break,
@@ -493,7 +676,8 @@ fn serve(
           .iter()
           .map(|(kind, bytes)| (*kind, Contents::Bytes(bytes)))
           .collect();
-        let _ = answer.try_send(store.land(header, &sections, &staging));
+        let answered = store.land(header, &sections, &staging);
+        timer.reply(&store, &answer, answered);
       }
       Request::Piece {
         identity,
@@ -504,7 +688,8 @@ fn serve(
         let read = store
           .piece(&staging, &identity, len, offset)
           .map(|piece| piece.map(std::borrow::Cow::into_owned));
-        let _ = answer.try_send(read);
+        let answered = read;
+        timer.reply(&store, &answer, answered);
       }
       Request::Changesets {
         repository,
@@ -512,10 +697,12 @@ fn serve(
         limit,
         answer,
       } => {
-        let _ = answer.try_send(store.changesets(repository, from, limit));
+        let answered = store.changesets(repository, from, limit);
+        timer.reply(&store, &answer, answered);
       }
       Request::Sections { row, answer } => {
-        let _ = answer.try_send(sections_of(&store, &row));
+        let answered = sections_of(&store, &row);
+        timer.reply(&store, &answer, answered);
       }
       Request::Text {
         repository,
@@ -529,7 +716,8 @@ fn serve(
         let read = store
           .text_slice(&staging, repository, (&identity, offset, most), &mut texts)
           .map(|text| text.map(<[u8]>::to_vec));
-        let _ = answer.try_send(read);
+        let answered = read;
+        timer.reply(&store, &answer, answered);
       }
       Request::Texts {
         repository,
@@ -537,25 +725,28 @@ fn serve(
         most,
         answer,
       } => {
-        let _ = answer.try_send(texts_made(
+        let answered = texts_made(
           (&mut store, &staging, &mut texts),
           repository,
           (&identities, most),
-        ));
+        );
+        timer.reply(&store, &answer, answered);
       }
       Request::TextRow {
         repository,
         identity,
         answer,
       } => {
-        let _ = answer.try_send(store.text_row(repository, &identity));
+        let answered = store.text_row(repository, &identity);
+        timer.reply(&store, &answer, answered);
       }
       Request::Forget {
         repository,
         sequence,
         answer,
       } => {
-        let _ = answer.try_send(store.forget(repository, sequence));
+        let answered = store.forget(repository, sequence);
+        timer.reply(&store, &answer, answered);
       }
       Request::PathTexts {
         repository,
@@ -564,7 +755,8 @@ fn serve(
         limit,
         answer,
       } => {
-        let _ = answer.try_send(store.path_texts(repository, &path, from, limit));
+        let answered = store.path_texts(repository, &path, from, limit);
+        timer.reply(&store, &answer, answered);
       }
       Request::TextsByTool {
         repository,
@@ -575,17 +767,20 @@ fn serve(
           .iter()
           .map(|(path, tool_ids)| store.texts_by_tools(repository, path, tool_ids))
           .collect();
-        let _ = answer.try_send(found);
+        let answered = found;
+        timer.reply(&store, &answer, answered);
       }
       Request::Places { places, answer } => {
-        let _ = answer.try_send(store.places_bytes(&staging, &places));
+        let answered = store.places_bytes(&staging, &places);
+        timer.reply(&store, &answer, answered);
       }
       Request::Read {
         offset,
         len,
         answer,
       } => {
-        let _ = answer.try_send(store.read(offset, len));
+        let answered = store.read(offset, len);
+        timer.reply(&store, &answer, answered);
       }
     }
   }
@@ -604,7 +799,7 @@ struct Landings {
   /// The open landing: its number and the liveness channel whose sender its client holds.
   open: Option<(u64, ChannelReceiver<()>)>,
   /// Landings (whole or sliced) that arrived while one was open, in order.
-  held: VecDeque<Request>,
+  held: VecDeque<Asked>,
   /// The most held at once: the request channel's own capacity, so the owner's queue is bounded as the channel is.
   waiting: usize,
   /// The next landing's number.
@@ -625,7 +820,7 @@ impl Landings {
   }
 
   /// The oldest held landing, once none is open.
-  fn next_held(&mut self) -> Option<Request> {
+  fn next_held(&mut self) -> Option<Asked> {
     if self.open.is_some() {
       return None;
     }
@@ -634,15 +829,16 @@ impl Landings {
 
   /// `request`, to serve now; or `None` when it is a landing that must wait for the open one: held, or, when the
   /// queue is full, answered [`StoreError::Held`] (its asker's [`OwnerError::Busy`]).
-  fn hold_while_open(&mut self, request: Request) -> Option<Request> {
-    if self.open.is_none() || !matches!(request, Request::Land { .. } | Request::Begin { .. }) {
-      return Some(request);
+  fn hold_while_open(&mut self, asked: Asked) -> Option<Asked> {
+    if self.open.is_none() || !matches!(asked.request, Request::Land { .. } | Request::Begin { .. })
+    {
+      return Some(asked);
     }
     if self.held.len() < self.waiting {
-      self.held.push_back(request);
+      self.held.push_back(asked);
       return None;
     }
-    match request {
+    match asked.request {
       Request::Land { answer, .. } => {
         let _ = answer.try_send(Err(StoreError::Held));
       }
@@ -716,19 +912,44 @@ impl StoreHandle {
     self.grant
   }
 
-  /// Sends `request` and waits for its answer on `answers`, as a task.
+  /// Sends `request` and waits for its answer on `answers`, as a task: a fetch's read's wait split into its parts and
+  /// added to this thread's ([`take_read_waits`]).
   async fn ask<T>(
     &self,
     request: Request,
     mut answers: ChannelReceiver<Result<T, StoreError>>,
   ) -> Result<T, OwnerError> {
-    match self.requests.try_send(request) {
+    let read = matches!(
+      request,
+      Request::Texts { .. }
+        | Request::Text { .. }
+        | Request::TextsByTool { .. }
+        | Request::Places { .. }
+    );
+    let (timed, mut timings) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    let sent_ns = slates_machine::clock::monotonic_ns();
+    let asked = Asked {
+      sent_ns,
+      timed: Some(timed),
+      request,
+    };
+    match self.requests.try_send(asked) {
       Ok(()) => {}
       Err(SyncError::Full(_)) => return Err(OwnerError::Busy),
       Err(SyncError::Closed(_)) => return Err(OwnerError::Gone),
       Err(SyncError::NotOnShardThread(_)) => return Err(OwnerError::NotOnShard),
     }
-    match answers.recv().await {
+    let answer = answers.recv().await;
+    let taken_ns = slates_machine::clock::monotonic_ns();
+    // Sent before the answer, so it is here whenever the answer is.
+    if read && let Ok(Some(served)) = timings.try_recv() {
+      READ_WAITS.with(|waits| {
+        let mut sum = waits.get();
+        sum.add(&served, (sent_ns, taken_ns));
+        waits.set(sum);
+      });
+    }
+    match answer {
       Ok(Err(StoreError::Held)) => Err(OwnerError::Busy),
       Ok(answer) => answer.map_err(OwnerError::Store),
       Err(SyncError::NotOnShardThread(())) => Err(OwnerError::NotOnShard),
@@ -1046,7 +1267,10 @@ impl Drop for SlicedLanding {
       drop(alive);
       // Wakes the owner to see the landing let go. Refused only when its queue is full, and then it has requests to
       // serve, and looks at the landing before each.
-      let _ = self.handle.requests.try_send(Request::Dropped);
+      let _ = self
+        .handle
+        .requests
+        .try_send(Asked::untimed(Request::Dropped));
     }
   }
 }

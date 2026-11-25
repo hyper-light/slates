@@ -477,7 +477,7 @@ impl Live {
   fn new() -> Live {
     Live {
       content: empty_content(),
-      store: GitStore::new(FORMAT, WINDOW),
+      store: GitStore::new(FORMAT),
       records: Vec::new(),
       heads: BTreeMap::new(),
       greens: BTreeMap::new(),
@@ -615,7 +615,7 @@ impl Live {
   /// The store made again from the records alone, as a recovery makes it.
   fn recovered(&self) -> Result<Live, ReplayRefused> {
     let mut content = empty_content();
-    let mut store = GitStore::new(FORMAT, WINDOW);
+    let mut store = GitStore::new(FORMAT);
     for record in &self.records {
       self.fetched_into(&mut content, record);
       replay_git(&mut content, &mut store, record)?;
@@ -651,20 +651,15 @@ impl Live {
   }
 }
 
-/// What a test compares of a version: D(k), its head, its root tree and its derived value.
-type VersionFacts = (
-  Option<Positions>,
-  Option<ObjectId>,
-  Option<ObjectId>,
-  Option<ContentId>,
-);
+/// What a test compares of a version: D(k), its head and its root tree.
+type VersionFacts = (Option<Positions>, Option<ObjectId>, Option<ObjectId>);
 
 /// What a test compares of a ref: each version's facts, its reached set, and its green's version at each.
 type RefFacts = (Vec<VersionFacts>, Option<Positions>, Vec<u64>);
 
 /// Everything a store holds that a reader can ask (the module docs' "the store after a recovery equals the store
-/// before"): every position's id and row, every ref's versions and reached set, every derived value, every content the
-/// content store holds with its holders, and the deepest chain the store learned from its pushes' packs.
+/// before"): every position's id and row, every ref's versions and reached set as the store serves them, every content
+/// the content store holds with its holders, and the deepest chain the store learned from its pushes' packs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Facts {
   rows: Vec<(ObjectId, Option<ObjectRow>)>,
@@ -704,17 +699,10 @@ fn facts(content: &ContentStore, store: &GitStore, greens: &[u64]) -> Facts {
 fn ref_facts(content: &ContentStore, store: &GitStore, green: u64) -> RefFacts {
   let versions = (0..store.repository.versions(green))
     .map(|at| {
-      let version = u64::try_from(at).expect("a version");
-      let value = store
-        .derivations
-        .value(content, &store.reach, &store.repository, (green, version))
-        .ok()
-        .flatten();
       (
         store.repository.brought(content, green, at).ok(),
         store.repository.head(content, green, at),
         store.repository.tree(content, green, at),
-        value,
       )
     })
     .collect();
@@ -1238,7 +1226,7 @@ fn t_a767_c5_a_version_5_record_replays_from_its_names_and_pack_by_identity_and_
   );
   let mut content = empty_content();
   live.fetched_into(&mut content, &v5);
-  let mut store = GitStore::new(FORMAT, WINDOW);
+  let mut store = GitStore::new(FORMAT);
   replay_git(&mut content, &mut store, &v5).expect("replayed from its names and pack");
   assert!(
     content.holders(&identity) >= 1,
@@ -1258,7 +1246,7 @@ fn t_a767_c5_a_version_5_record_replays_from_its_names_and_pack_by_identity_and_
   };
   assert_eq!(made.facts(), before, "the same store as the live one");
   let mut bare = empty_content();
-  let mut store = GitStore::new(FORMAT, WINDOW);
+  let mut store = GitStore::new(FORMAT);
   assert!(matches!(
     replay_git(&mut bare, &mut store, &v5),
     Err(ReplayRefused::Names(
@@ -1618,6 +1606,11 @@ pub(crate) fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u
     .collect()
 }
 
+/// Repository `repository`'s derivation turned to its end on this shard, in this step: every version's sets known.
+fn derive_settled(state: &mut ShardState, repository: RepositoryId) {
+  while super::git_derive::turn(state, repository) == super::git_derive::Turned::More {}
+}
+
 /// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one,
 /// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused.
 pub(crate) fn assert_made_again_whole(
@@ -1629,6 +1622,10 @@ pub(crate) fn assert_made_again_whole(
   // compared (`settle_rebuild`), so the live store is compared settled too: otherwise a build under way holds what it
   // has put so far and the two differ in holders and contents while their rows and refs agree.
   super::paths::whole_build::settle(state);
+  // So are its derivations: a version admitted with no walk has its sets derived when first read, into the repository's
+  // memo, never recorded (a fetch's read, or the derivation behind a push), which the store made again derives when it is
+  // asked; each side is derived whole first (A-916).
+  derive_settled(state, repository);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
@@ -1638,6 +1635,7 @@ pub(crate) fn assert_made_again_whole(
   super::rebuild(state, repository);
   super::settle_rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
+  derive_settled(state, repository);
   let made = {
     let (content, store) = state
       .vcs_stores

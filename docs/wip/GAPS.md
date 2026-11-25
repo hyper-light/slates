@@ -1178,6 +1178,15 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+>   The matrix's row BUILT (2026-11-25, w-interop; main's order): `ci/interop/hg-matrix.sh` makes a non-publishing
+>   repository of its own (`evo-repository`) and runs stock hg with `experimental.evolution = all`: drafts pushed then
+>   one amended and pushed, the server telling `1 new obsolescence markers` (`evo-amend-push`); a draft rebased onto the
+>   amend and pushed (`evo-rebase-push`); a clone holding the 2 markers and exactly the successors, all draft, none of
+>   the drafts they obsolete (`evo-clone`), verifying clean (`evo-verify`); and a marker made on the clone's side pushed
+>   and pulled back by the first client, its 3 markers and 3 obsolete changesets (`evo-markers-back`). Locally against
+>   stock hg 7.2.4 at 29221d5ab (debug, the r400 cut of hg's history as the source): the six rows 6 of 6. The same run's
+>   `merge-push` and `rebase-push` were refused `UnknownDeltaBase { log: Manifests }` (the store answered no text for a
+>   manifest an earlier push landed), sent to w-hg as found.
 >   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
 >   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
 >   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
@@ -1639,7 +1648,15 @@
 > does (`ContentStore::pin_unlanded`/`unpin_unlanded`, refused `LetGoRefused::Unlanded`, counted
 > `vcs_store.content.kept_unlanded`; the count's width refused typed, `ContentRefused::CountExhausted`, never wrapped; a
 > pin of nothing refused `NotHeld`; a window found let go as it is pinned counted `vcs_store.content.pinned_away`, a bug
-> signal that must stay 0; an unpin comes before its holder releases the object). A
+> signal that must stay 0; an unpin comes before its holder releases the object; the count is the live process's alone,
+> never in the shard image, so a restart after a crash with texts pinned finds every count at 0, since no pinning push or
+> import outlives the process: `a_windows_unlanded_count_is_never_carried_across_a_restart`, through the daemon's own
+> restore, red with the restore carrying a count). Found by main's 57k push at 2dd25afe6 and fixed (2026-11-25): the
+> push's pins looked at every kept-but-unlanded revision after every slice (each skipped by a lookup once pinned), so
+> their work was the push's slices times its kept revisions (615,194 slices; 5 min 13 s of the daemon's CPU 10 minutes
+> in, against 93.5 s for the whole push before (B)); now each slice looks at the revisions kept since the last
+> (`Intake::kept_newest`, `kept_total`), counted `hg_push.pin_revisions_slice_most` and `hg_push.pin_windows_slice_most`
+> (red: 37,777 looks for 192 kept revisions, now 192). A
 > push pins each revision as its intake keeps it (`slates_hg::push::pins::Counted` over `Intake::kept_contents`, after
 > each slice), unpins a segment's own just before that segment's let-go (`landed_segment`; never at its taking, since its
 > record is written over turns before it lands), and the rest however the push ends (`Taking`'s drop). `landed_pin` asks
@@ -1662,6 +1679,15 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
+> 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
+> nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
+> as `vcs_store.hg_owner_{requests,total_ns,behind_ns,wake_ns,serve_ns,disk_ns,back_ns,most_ns}`. In-process (debug,
+> a 2,000-changeset `debugbuilddag` history, this MacBook, `hg_clone_store_wait`): the clone 17.2 s, its store wait
+> 5.77 s over 4,015 requests: the owner's wake from its blocking receive 85.5% (about 1.2 ms a request), its service
+> 12.2%, the hop back 1.8%, its log reads 0.4%, queued behind other work 0.1%. Owed: the 57k clone's split on a release
+> build (main's), then the cut it names (the owner spinning before it parks over a measured inter-arrival, or a fetch
+> keeping its next ask in flight).
 > Found by main's round at 15b4f1061 and cut (2026-11-25, w-perf): with that request hg's 57k clone peaked at 10,416
 > MiB and held 10,013 MiB after it (2ed3eb139: 5.7-6.0 GB), 165.8 s; the status after it named 4,792 mapped blocks of
 > about a chunk each still live (5.07 GB mapped, 4.09 GB resident). The owner read each text of the batch once at its
@@ -2019,6 +2045,11 @@
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
 > **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). Part 3 BUILT (A-647 part 3, g302, 2026-11-19): the git store keeps each version's two sets as its value alone, put as it commits and held by the version's record, and serves every version's D(k) and reached set from it (an older version's reached set too), the chains' copies dropped; a value names its sets' bytes as an object of any length (format 2), so a set of more runs than one window holds is kept (macOS arm64, Mac Studio, slates-git's store-building modules 185 of 185, slates-server's `vcs_store` 13 and its git service and pushes 14; red first, 5 of 86 failing). Part 4 BUILT (A-647 part 4, g294 from g302's draft, 2026-11-19): each of a version's sets a tree of derived nodes over fixed blocks of positions shaped by the store's window (format 3), so a version's value adds only the nodes on the paths to the blocks its D(k) touches, never its reached set again; over 801 versions of a ref pushed by turns and then merged with 400 older roots in a 256-byte window, the most a version added fell from 7,740 bytes (format 2) to 938 against its bound of 4,352, and 1,077,340 bytes in all to 378,007 (macOS arm64, Mac Studio: red 6 of 7; green slates-git's store-building modules 208 of 208, slates-server's `vcs_store`, git services and pushes 46 of 46, and 52 of 52 as it landed over main 5206419b). Queries by API, part 1 BUILT (A-666, g302, 2026-11-19): `slates-vcs`'s `derived::ancestry`, a type whose value holds Mononoke's commit-graph fields (generation, first-parent and skip-tree skew jumps by Myers' rule, run bottom, skip-tree parent: a dominator), and is-ancestor, the merge bases (git's `--all` set) and bisect's midpoint answered from the values, logarithmic along runs and linear only in the merges a question opens; held to a naive walk over generated histories, to Myers' bound and to the immediate dominator (`research/ancestry-queries.md`). Part 2 BUILT (A-666 part 2, g302, 2026-11-19): `slates-vcs`'s `derived::history`, a type whose value names a version's path map and a history tree of each path's node (Mononoke's unodes), a path keeping the node of the first parent it is TREESAME to (git's default mode exactly; a directory compared by its files, a removal a node), renames and copies as the works recorded them (`PathSources`; a copy from an older version read through `DerivedType::inputs`), and `log <path>` and `--follow` reading at most one node more than the versions they list; held to git's walk over generated histories (`research/path-history.md`; Windows x86_64, jupiter, 65 of 65; the macOS run owed). Part 3 BUILT (A-666 part 3, g302, 2026-11-19): `slates-vcs`'s `derived::blame`, a type whose value keeps each file's blame (runs of lines, each naming its introducing version, the file's path there and its first line there), kept from the first parent whose file holds the same content, else made from the parents' blames, the recorded rename's or copy's source, and one diff with each (Myers' linear-space diff), never a diff of the history; a line both parents of a merge changed attributed by the merge's recorded content (D-27); a question reads the path's trie nodes and the file's spans; held to blame recomputed by replaying every version, each derivation's lines read to the replay's (`research/path-history.md` §6; Windows x86_64, jupiter, 75 of 75; the macOS run owed). OWED: A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position (BUILT, A-658 parts 1 and 2, g305, 2026-11-19: `Green::compute` and `Green::rebase` pure over the versions a work is judged over, a `Computed` holding nothing of the green that computed it and naming its head, typed refusals `BaseUnavailable`/`BaseAhead`, a base past the owner's head no longer judged as if at the head; the owner's `Green::judge_computed` taking a computed verdict by position, judging again only the units whose paths the change index names since or that read the links naming a file one of whose links changed since (A-669, A-670), a content edit from where its ops stood, typed refusals `OtherWork`/`Ahead`/`NotRecorded`, the counter `judged_again`; part 3a BUILT (2026-11-19, g305): a computed verdict's wire form, `Computed::encode` and the owner's `Green::computed_from` against the increment it judged (effects as chain entry records, windows, placements, digest; the oracle takes every held verdict through it); the fleet's route, a holder computing on its replica and the owner appending, BUILT (3b, A-697 part c, in force since A-697 part f, 2026-11-20); OWED: a push taking verdicts computed elsewhere (3c), meaning a push served on a holder, its works built against the holder's replica and its verdicts committed by position at the owner. Main's ruling, 2026-11-20 18:30 PST: (3c) waits for the repository's store replicated to holders, which is A-767's changeset store (w-store) and its server wiring, and is built on it once that wiring is on main. Rejected the same day: committing the owner's own push verdicts by position (git's receive-pack judges and appends in one step, so it would move a computation within that step with no measurable effect); a rename's edits placed as an edit's are); a blame's spans shared between versions by identity, git's other simplification modes as types, and the server's verbs over A-666's types (each repository's values on its owner shard, A-662; a `PathSources` over each green's versions), with corrected commit dates where a history has them and questions cut into the shard's slices; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+>
+> **A-916 (w-git, 2026-11-25):** git's reach sets have no value under "values offered between tiers by identity" now:
+> the owner's second copy of them in `slates_vcs::Derivations` (A-647 part 2's) was a dead write and is deleted; the
+> sets live in the version's record, or the repository's memo when derived on read (`Repository::value_of`). A tier
+> sharing git's reach sets would offer from those, or keep them as a type's values again with a reader that asks.
 >
 > **A-664 (2026-11-19, g308; §4.17.1 "A push is a work" items 3 and 4; §4.17.2 piece 13; §4.17.3 decision 7 and piece
 > 6): the commits the server makes.** Part 2 BUILT (main 78a670256): `slates-git`'s `derived` module makes a version's git objects as
@@ -2607,8 +2638,15 @@
 > `every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte` (stock's own zstd chunks re-encoded byte for
 > byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean, the
 > compression counters moving). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
-> piece (b) removes by keeping each chunk in its stored form from arrival; and the changelog's header, which 7.2 writes
-> without generaldelta (`changelog.py` clears it on a new changelog) where slates sets it.
+> piece (b) removes by keeping each chunk in its stored form from arrival; and with it `Streaming::sized`, each log's
+> chunk lengths kept from the count to the send (4 bytes a revision, a few MB at the 57k's million revisions: the walk
+> holding more than its place, w-hg's review), which (b) deletes, the lengths then the places'. CLOSED (2026-11-25, w-interop; main's order):
+> the changelog's header, which 7.2 writes without generaldelta (`changelog.py` clears it on a new changelog) where
+> slates set it: now `0x00000001`, each changelog delta against the revision before and its entry's base its chain's
+> start; a store whose changelog holds a delta against another revision serves no stream (`1\n`, the client clones).
+> Red: `a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does` (the changelog's header `0x00020001`); held by
+> `a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_start`; by use, `hg_stream_compare.sh`'s
+> headers at r400 (2026-11-25 10:08 UTC): 98 of 98 revlogs' headers stock's (`00000001` x1, `00030001` x97).
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
