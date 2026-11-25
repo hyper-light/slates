@@ -133,7 +133,9 @@ fn compose_base(
   if let Some(replica) = state
     .merge
     .replicas
-    .get(&slates_db::register::ObjectId(green.bytes))
+    .lend(&crate::merge_service::replica_key(
+      slates_db::register::ObjectId(green.bytes),
+    ))
   {
     return Some(replica.base_for(base_version, journal));
   }
@@ -356,7 +358,9 @@ fn copy_step(
       if let Some(replica) = state
         .merge
         .replicas
-        .get(&slates_db::register::ObjectId(green.bytes))
+        .lend(&crate::merge_service::replica_key(
+          slates_db::register::ObjectId(green.bytes),
+        ))
       {
         let content = replica.content_ref_at(&copy.base_path, base_version)?;
         let bytes = crate::vcs_store::named_objects::bytes_of(&copy.base_path, content).ok()?;
@@ -387,10 +391,12 @@ fn with_base<R>(
   if let Some(replica) = state
     .merge
     .replicas
-    .get(&slates_db::register::ObjectId(green.bytes))
+    .lend(&crate::merge_service::replica_key(
+      slates_db::register::ObjectId(green.bytes),
+    ))
   {
     return f(crate::work_files::Base {
-      green: Some(replica),
+      green: Some(&replica),
       green_id: None,
       fetched: None,
       version,

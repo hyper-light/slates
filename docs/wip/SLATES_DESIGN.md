@@ -11837,6 +11837,16 @@ the replica owing, a turn at a time (`crate::replica_build`). While it builds, s
 `ReplicaBuilding { object, sequence, slices_done }` on the shipment's own channel (`ContentMessage`, kind 10), the
 build's turns done so far, which only rise: the owner keeps the latest a holder, and a push's barrier reads it rising
 as progress. A takeover adopts the replica store as it stands, so it is warm.
+A holder keeps its replicas by the owner's own type, `crate::greens::Greens`, each keyed by its green's id
+(`merge_service::replica_key`; A-908 part 1), and a repository's greens there are one lineage as on their owner (A-908
+part 2): a green's version 0 is made as its owner made the green, from its membership as the names log the holder holds
+records it (`LoggedChange::Joined`, indexed as each names-log part is accepted). A lineage's root founds the lineage
+(`Greens::found`); a branch is branched from its source's replica at the version it was made at (`Greens::branch`: lent,
+nothing copied), a source that owes its push made first through A-886's door, and the branch's record refused
+`OUT_OF_ORDER` while its source is behind; a family green whose join no part held here records yet waits `OUT_OF_ORDER`,
+since the owner owes its names log to every holder of its greens (one placement: a family's ids share their line key).
+At a takeover the successor adopts a lineage whole, its members' engines with it, once every member's replica is at its
+adopted version (`green_adopt::take_engine`).
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -63315,3 +63325,46 @@ Applied in the same change to: `crates/anchor/src/{layout,segment}.rs`, `crates/
 Applied in the same change to: `crates/cluster/src/lib.rs` (`Stragglers`' drop, `ReplyTx::send`,
 `on_orphaned_session`), `crates/server/src/fleet.rs` (`settled_stragglers`, `orphaned_session`, `HOME_STREAM` on its own
 task), `crates/server/src/vcs_store/homes.rs`, `crates/server/src/credentials.rs`, `crates/server/src/daemon.rs`, GAPS.
+
+### A-908 — A holder replicates a branched green by its lineage, as its owner made the branch; a successor adopts a lineage whole (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 12:36 to 15:00; found writing A-907's test; A-575, A-636 part 2b-2, A-886, A-333)
+
+- **Why.** A push that made a branch in a fleet was refused `unable to commit`, every run: both holders counted
+  `merge.recompute_mismatch` on the new green's version 0. A branch's green is made at a version of its source
+  (`Lineage::branch`, A-575), so its version 0 is that state, while a holder recomputed every version 0 as an empty green
+  and kept each replica alone. And a successor installed every adopted green alone, so a branch made there after a
+  takeover was refused `ContentUnavailable` (`Greens::branch` needs a lineage's member).
+- **The change.**
+  - A holder keeps its replicas by the owner's own type, `crate::greens::Greens` (part 1). It reads each green's
+    membership from the names-log parts it holds (`merge_service::membership`, indexed at acceptance and read once
+    from the held parts after a start), not from a new merge-record field: a format change would leave a window in
+    a rolling upgrade (GAPS, for Ada).
+  - Version 0 by membership (`make_origin_replica`): a root founds its lineage; a branch is branched from its
+    source's replica, a source owing its push made first (`replica_build::wanted`); refused `OUT_OF_ORDER` while the
+    source is behind (counted `merge.replica.branch_source_behind`) or, for a family green, while no held part
+    records its join (`merge.replica.member_unknown`). A green of no repository is the empty start, as before.
+  - The proof the join comes: a family's repository, its registers and every green minted to join it rank by their
+    family's line key (`ObjectId::line_key`, A-636 part 2b-2), so a holder of a green's records is a candidate of
+    its names log, which the owner owes it until held. No cap is needed; the wait is the record plane's delivery.
+  - Nothing grows while a version 0 waits: `OUT_OF_ORDER` leaves the record with its sender; the index holds one
+    entry a member of a names log held here, dropped at its `Left`. A destroyed repository's greens are destroyed
+    in its transaction (A-843), each dropping its owner's pending records, so none is retried after.
+  - Adoption (A-333): a lineage's member takes its lineage whole to the successor's owner shard
+    (`AdoptedEngine::Lineage`, `Greens::take_lineage`, `put_lineage`) once every member's replica is at its adopted
+    version, waiting as a building replica does meanwhile; the members that went with it are adopted as installed
+    (`AdoptedEngine::InLineage`). A replica rebuilt alone after a restart is taken alone, as before.
+  - Counters: `merge.replica.member_founded`, `member_branched`, `branch_source_behind`, `member_unknown`;
+    `merge.takeover.lineage_adopted`, `lineage_waits_for_members`, `lineage_refused`.
+- **Tests** (macOS arm64, debug, 2026-11-24).
+  - Fleet `a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`: red at origin/main (`unable to commit`), green
+    (7.0 s).
+  - `slates-db` `a908_a_repositorys_names_log_and_its_greens_share_one_placement`: formed and change-in-flight
+    configurations, every owner; an id of no family placed apart (the control).
+  - `merge_service` (5): a root founded and a branch branched; a version 0 before its join waits and is branched once
+    the join is noted; a green of no repository judged at once; a branch that disagrees a mismatch and one past its
+    source waiting; memberships read from held parts after a start. Focused lib set 100 green.
+- **Owed.** A branch made on a successor after its owner died: no longer refused `ContentUnavailable` (the lineage is
+  adopted), but refused `unable to commit`, a retry `cannot lock ref` (GAPS, in flight). Part 4: a holder's rebuild after
+  a restart makes a member's replica by its lineage (until then it stands alone, as before).
+
+Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin,green_adopt,
+greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS.

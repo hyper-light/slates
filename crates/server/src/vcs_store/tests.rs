@@ -2483,16 +2483,45 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
 /// counter, 128 by the test's clock).
 #[test]
 fn t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_one_walk() {
+  assert_let_go_sliced(&let_go_of_a_pack_of(131));
+}
+
+/// Main 01a20182's flake of 2026-11-24 13:36 (w-hg: 1 run in 3 at ffad3c6ae, "the listing and many slices: 3"). How many
+/// slices 131 windows take is this machine's speed against its own quantum, so a bare count was a constant the machine
+/// decided. Do: let go a landed pack of 3 windows, as the 131-window test does. Expect: the same rules held, with no
+/// count of slices assumed: nothing let go in the step that owed it, the listing a slice of its own and at least one
+/// more, every slice but the last ended only because its next window would not fit its quantum, and the whole pack let
+/// go. Red with the old assertion (`counted >= 4`): 2 slices.
+#[test]
+fn t_goal93_a_small_landed_packs_let_go_holds_the_same_rules_whatever_its_slices() {
+  assert_let_go_sliced(&let_go_of_a_pack_of(3));
+}
+
+/// What [`let_go_of_a_pack_of`] saw: the bytes let go in the step that owed it; each slice's record; the slices counted
+/// and those judged past the quantum; the bytes freed, the windows still pinned and the pack's length; whether the pack
+/// is held whole after; and the pack's windows.
+type LetGoSeen = (
+  u64,
+  Vec<super::SliceTrace>,
+  (u64, u64),
+  (u64, u64, u64),
+  bool,
+  usize,
+);
+
+/// On an audit shard, a landed pack of `windows` windows put in a git repository's content store and its let-go owed,
+/// then the repository gone idle (`git_encode::give_back_idle`, as a push's end runs it) and the shard's let-go queue
+/// turned a slice at a time (`let_go_turn`) to its end, each slice's own record kept (`SliceTrace`).
+fn let_go_of_a_pack_of(windows: usize) -> LetGoSeen {
   use super::{
     LANDED_LET_GO_BYTES, LANDED_PINNED, LET_GO_PAST_QUANTUM, LET_GO_SLICES, LET_GO_TRACE,
   };
-  let seen = crate::test_store::audit_on_stored_shard("let-go-sliced", |state| {
+  crate::test_store::audit_on_stored_shard("let-go-sliced", move |state| {
     let id = crate::git_push::tests::git_repository(state, "let-go-sliced");
     let window = state
       .vcs_stores
       .content()
       .map_or(1 << 18, ContentStore::window);
-    let windows = 131;
     let bytes: Vec<u8> = (0..windows * window)
       .map(|at| u8::try_from((at / 7) % 251).unwrap())
       .collect();
@@ -2532,34 +2561,79 @@ fn t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_
       ),
       (freed(state) - before.0, count(state, LANDED_PINNED), len),
       whole_after,
+      windows,
     )
-  });
-  let (in_the_step, trace, (counted, past), (freed, pinned, len), whole_after) = seen;
-  let windows: usize = trace.iter().map(|slice| slice.windows.len()).sum();
+  })
+}
+
+/// The let-go's rules (goal 93 item 2b; module docs of `vcs_store`'s let-go), judged by each slice's own record, never a
+/// count of slices this machine's speed decides: nothing let go in the step that owed it; the listing a slice of its own
+/// (no window) and at least one slice after it; every slice recorded and each judged past the quantum counted; within a
+/// slice, each window after the first taken only where the slice's elapsed and its longest window so far still fit its
+/// quantum; every slice but the last ended only because its next window would not have fit; the slices' windows the
+/// pack's, each once; and the whole pack let go.
+fn assert_let_go_sliced(seen: &LetGoSeen) {
+  let (in_the_step, trace, (counted, past), (freed, pinned, len), whole_after, windows) = seen;
+  let taken: usize = trace.iter().map(|slice| slice.windows.len()).sum();
   eprintln!(
-    "let-go: {counted} slices, {past} past the quantum, {windows} windows, freed {freed} of {len} bytes"
+    "let-go: {counted} slices, {past} past the quantum, {taken} windows, freed {freed} of {len} bytes"
   );
   assert_eq!(
-    in_the_step, 0,
+    *in_the_step, 0,
     "nothing let go within the step that owes it"
   );
-  assert!(counted >= 4, "the listing and many slices: {counted}");
   assert_eq!(
-    counted,
+    *counted,
     u64::try_from(trace.len()).unwrap(),
     "every slice recorded"
   );
-  for slice in &trace {
+  assert!(*counted >= 2, "the listing and a slice after it: {counted}");
+  assert!(
+    trace[0].windows.is_empty(),
+    "the listing a slice of its own: {:?}",
+    trace[0]
+  );
+  assert_eq!(taken, *windows, "every window let go once");
+  assert_slices_fit_their_quantum(trace);
+  assert_whole_pack_let_go(trace, (*past, (*freed, *pinned, *len), *whole_after));
+}
+
+/// [`assert_let_go_sliced`]'s slices after the listing: each lets a window go; each window after a slice's first was
+/// taken only where the slice's elapsed and its longest window so far still fit its quantum; and every slice but the
+/// last ended only because its next window would not have fit.
+fn assert_slices_fit_their_quantum(trace: &[super::SliceTrace]) {
+  let letting: Vec<_> = trace.iter().skip(1).collect();
+  for (at, slice) in letting.iter().enumerate() {
+    assert!(
+      !slice.windows.is_empty(),
+      "a slice after the listing lets a window go: {slice:?}"
+    );
     let mut longest = 0;
-    for pair in slice.windows.windows(2) {
-      let (begun, ended) = pair[0];
+    for (index, (begun, ended)) in slice.windows.iter().enumerate() {
       longest = longest.max(ended - begun);
-      assert!(
-        ended + longest <= slice.quantum_ns,
-        "a window taken past the quantum by the slice's own measure: {slice:?}"
-      );
+      let fits = ended + longest <= slice.quantum_ns;
+      let last_of_slice = index + 1 == slice.windows.len();
+      if !last_of_slice {
+        assert!(
+          fits,
+          "a window taken past the quantum by the slice's own measure: {slice:?}"
+        );
+      } else if at + 1 < letting.len() {
+        assert!(
+          !fits,
+          "a slice ended before its quantum with windows left: {slice:?}"
+        );
+      }
     }
   }
+}
+
+/// [`assert_let_go_sliced`]'s end: each slice judged past the quantum counted (`past`), and the whole pack let go, none
+/// of it pinned and none held whole.
+fn assert_whole_pack_let_go(
+  trace: &[super::SliceTrace],
+  (past, (freed, pinned, len), whole_after): (u64, (u64, u64, u64), bool),
+) {
   let judged_past = trace.iter().filter(|slice| slice.past).count();
   assert_eq!(
     past,

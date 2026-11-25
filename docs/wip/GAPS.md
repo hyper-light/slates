@@ -204,7 +204,8 @@
 > 2. **The repository placed at its name's first-ranked member** at creation, a lookup ranking the name over the
 >    members. Joins and leaves move the rank, and after a takeover the successor is ranked by the id the edge lacks.
 > 3. **A location round by name** to every member. Main ruled it out (no location round).
-> **CLOSED BY CHANGE, gate 10 owed (A-902, w-shared, 2026-11-24): a fresh fleet's first push refused `HomedShort` by a
+> **CLOSED (A-902 with A-894, A-903 and A-907, w-shared, 2026-11-24; gate 12: 40 of 40, its NotAHome refusals gone):
+> a fresh fleet's first push refused `HomedShort` by a
 > home answering `NotAHome` before it had installed its sender's configuration** (gate 8 2 of 40, gate 9 3 of 40, each
 > 0.83 to 1.89 ms into a 2 s homing). A put now carries its sender's configuration version (home wire 0x84), and a home
 > behind it (that version newer than its own, or the sender not among its members) waits for its own install within the
@@ -212,21 +213,33 @@
 > (main): gate 10 at the landing, 0 of 40 to close. Noted (w-git): a sender since removed from the region is waited
 > for too, bounded by the put's budget and counted `install_wait_elapsed`; a sender the receiver's configuration once
 > held and dropped could be answered at once, if a gate shows it.
-> **FIXED BY CHANGE, gate 12 owed (A-907, w-shared, 2026-11-24): gate 10 failed 31 of 31 at A-902.** A-902's slow
+> **CLOSED (A-907, w-shared, 2026-11-24; gate 12, 45482482443 at a551b0a88: 40 of 40, release 4.9-8.9 s and debug
+> 7.1-13.9 s a run, ubuntu-latest at load under 3): gate 10 failed 31 of 31 at A-902.** A-902's slow
 > home outlasted the healer's round. The healer, the homes' exchange and credentials' exchange dropped their
 > stragglers, so the peer's session stayed lent for good, and the council's appends and the takeover's pages to it went
 > unsent. Now every straggler ends on its link: settled by its caller, or handed back when dropped. A home message is
 > served on its own task. Red first (`a907_...`).
-> **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
-> creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
-> (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
-> both count `merge.recompute_mismatch` and refuse the new green at version 0 ("the recomputed identity does not match the
-> record"). A branch's green is made at a version of its source (`Lineage::branch`, A-575), so its version 0 is the
-> source's state there, while a holder recomputes every version 0 as an empty green (`merge_service::recompute`) and the
-> record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
-> `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
-> makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
-> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing).
+> **OPEN, FOR ADA (w-shared, 2026-11-24; main 01a20182's ruling of 14:54): must a rolling upgrade keep NoLoss across a
+> merge-record format change?** A holder refuses a merge record of another format whole (`MergeRecordValue::decode_record`,
+> `RecordRefused::Version`, counted `merge.record.version_refused`; CLAUDE.md §2 item 7: no second decode path). After an
+> upgrade it therefore cannot rebuild a replica from the old-format records it holds (`merge_origin::rebuild_replica_through`
+> finds nothing), and the owner reships only versions not yet placed. Until each green's next version places at f + 1 in
+> the new format, its acknowledged versions are held only on the owner's own chain, and an owner lost for good in that
+> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 4: A-255, A-288,
+> A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
+> format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
+> Nothing is built on either answer.
+> **BUILT, part 4 owed (A-908, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
+> green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
+> lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
+> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
+> rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
+> **IN FLIGHT (w-shared, 2026-11-24): a branch made on a repository's successor after its owner died is refused.** With
+> A-908 the successor adopts the lineage (`merge.takeover.lineage_adopted` 1) and makes the branch's green (no longer
+> `ContentUnavailable`, origin/main's red), and the other survivor branches its replica; but the push is refused `unable
+> to commit` (its barrier: the new green's version 1 unplaced, the names log at 6 acknowledged by none, no refusal counted
+> on either survivor), and a push of another new name 2.3 s later `cannot lock ref: it moved since the push read it`. Red
+> test kept off main until the fix.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1695,7 +1708,26 @@
 > (`a_push_refused_while_answered_is_still_answered_on_band_three`, red at the shard fenced for the third lend after
 > the body: "side-band false", failed empty; green after); and `Unlanded` names where it fell short
 > (`git_push::Unlanded`: names not put, homing untaken, pack not held, homed short of f + 1, no landing, landing
-> untaken, store refused), in the log and in the client's words. OPEN: which of them gate 6 names, and its fix.
+> untaken, store refused), in the log and in the client's words. NAMED (gates 7 to 9): `HomedShort`, a remote home
+> answering `Refused(NotAHome)` 0.83-1.89 ms in, right after formation, its installed configuration behind the sender's;
+> FIXED by w-shared's A-902 (d48863ddb: the put carries the sender's configuration version, and a home behind it waits
+> for its own install within the put's budget).
+>
+> A git push of many new refs makes every new green in its landing's one step, OWED (w-git, 2026-11-24, main's order of
+> 15:06): git/git's whole history creates about 1,027 refs, mostly tags, each a Create whose make, secure, judge, hold
+> and commit run in the step that appends the entry, the cost w-hg measured for Mercurial's heads (452 heads held a
+> shard 3.5 s, watchdog exit). The way is w-hg's prepared-creates seam in `repository/push.rs` (agreed in writing
+> 2026-11-24: `prepare_create`, `PreparedCreates` handed to `push_planned`, prepared in slices under the landing turn
+> before the step, ids reserved ahead): git's driver hands its Creates in as Mercurial's does, once that lands.
+>
+> One push's reading spread over several shards, NOT IN THE DESIGN (for Ada; w-git, 2026-11-24, main's order of 09:50):
+> stock git's `index-pack` resolves one pack's deltas over threads; slates reads one push on one shard. §4.17.1 item 2
+> ("one repository's greens serialize on its owner shard") and §4.17.5 "Giant repositories" ("An intake's decoding,
+> hashing and checks run on the shard its connection arrived at ... so one hot repository uses every core") spread many
+> pushes, never one. Measured on the big Studio over git/git, best of 5 (main's git legs): r870 at 21b8b5311, slates
+> 80.872 s against stock 10.797 s; r940 at 0ebf10cf4 (one SHA-1 an object, not two), slates 69.016 s against 10.815 s,
+> its time one SHA-1, one BLAKE3 and zlib an object on one shard. Intake off the owner (§4.17.5 piece 5) is A-905,
+> w-shared's, and moves a push's reading off the owner, not across shards.
 > Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
@@ -4061,7 +4093,10 @@
 >   - commit-edit, propset, switch and merge were refused `E160004: Corrupt` at their commits;
 >   - delete, revert and status failed after them, on the edit left behind.
 >   - w-svn reproduced it on the MacBook and found the cause: an edit's delta base was a landed text let go (A-760 4c and
->     4d), and nothing brought it back. The fix is w-svn's, in progress; run 5 follows it.
+>     4d), and nothing brought it back.
+>   - **Fixed, 33 of 33 again on both routes:** run 5 (45495209005, at 92516ced4, ubuntu-latest). w-svn's c0ca9df03 makes
+>     a commit's text delta whose base the content store let go wait while its edge brings the base back whole, then take
+>     its chunk again, on all three edges, counted.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
@@ -4601,8 +4636,14 @@
 > record's room, each held to its node (`node::compute`) before it is kept, counted `vcs_store.hg_replay_unknown_asked`
 > (`slates_hg` `a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store`; the hg twin with its store
 > gone). Subversion owed nothing: its rebuild's task reads its records back (the earlier `Unlanded` was a test's
-> one-step settle). Owed (w-hg's review): what a successor's replay puts back stays held, marked landed by nothing, so
-> nothing lets it go, as P5 lets a landed push's go; to be let go once the rebuild ends, as `hg_run`'s let-go does. (c) a Mercurial
+> one-step settle). What a replay keeps from texts the changeset store gave (a successor's never known here, a
+> restart's let go once landed, a manifest kept again over them) is let go again once the replay ends: every replay,
+> one rule (main's rulings of 13:12 and 13:22), through P5's landed let-go (`hg_run::let_go_committed`), counted
+> `vcs_store.hg_brought_back_let_go`, equal to the texts asked
+> (`a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands`, `a_restarts_replay_lets_go_the_texts_it_brought_back`;
+> w-perf, w-hg's review note (c)). Not owed by the other tools (main's ruling of 13:22): a git rebuild keeps the pack it reads whole
+> (`put_changeset`), as a live commit keeps its landed pack while `LANDED_LET_GO` is held (whether a landed pack goes
+> at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
@@ -13761,6 +13802,22 @@ its slack, since for a page grain the congruent address is the reservation's bas
 population by its **median**, which a handful of merges cannot move and a grain changed from the page to the
 huge page would move all sixty-four of. **A sum cannot tell a merge from a regression; an order statistic
 can.**
+
+### 8a-tsan-sweep. One sweep held the TSan lane for hours, and one Subversion test fails under it (2026-11-24, open)
+
+Main's TSan step (62 minutes, three times diag 45315777446's 20 min 38 s) timed out on main run 45461883678 at
+62.6 minutes. Diag 45411303175 (7d6874639, ubuntu-latest, its step held to 300 minutes) took 234 minutes. Its log's
+timestamps put 3 h 26 min of that in one test, `content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`
+(14:34 to 18:00), where the rest of the server's library took 16 min 15 s. The sweep runs on one shard, so it has no
+second thread for ThreadSanitizer to watch, while every byte it holds to is read through the shared object's atomics
+(A-171), each intercepted. The lane now leaves it out (`SERVER_SKIPPED` in `xtask/src/tsan.rs`, with that reason;
+it runs in every other lane), and the step's limit is three times the measured pass without it: 31 min 41 s,
+95 minutes.
+
+Open (w-svn): the same diag's one failure in 1,306 library tests,
+`daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (daemon.rs:9662,
+`seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
+fixed or explained.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

@@ -85,7 +85,9 @@ use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
-use crate::vcs_store::svn_view::{FetchedPiece, SvnHold, hold_in, lend_held_in, lend_in};
+use crate::vcs_store::svn_view::{
+  BroughtBases, FetchedPiece, SvnHold, hold_in, lend_held_in, lend_in,
+};
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -745,6 +747,9 @@ struct Conversation {
   /// it: given back when the drive waits for another, when the read's answer ends, before the conversation moves to
   /// another shard, or with the conversation.
   fetched: Option<FetchedPiece>,
+  /// The bases its commit's drive waited for and the conversation brought back (`Due::Text`), held for the commit's life:
+  /// given back once no commit is under way, or with the conversation.
+  brought: BroughtBases,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -789,6 +794,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     commits: 0,
     held: None,
     fetched: None,
+    brought: BroughtBases::default(),
   };
   go_on(stream, conversation, seat).await;
 }
@@ -941,6 +947,19 @@ async fn follow(
       land(stream, conversation, *work, out).await
     }
   };
+  // A refusal the commit's drive answered, named in the daemon's log: the client is told Subversion's words alone.
+  if let Some(refused) = conversation.connection.take_drive_refused() {
+    slates_machine::log_line!(
+      "slates-server: a Subversion commit's drive refused over svn://: {refused}"
+    );
+  }
+  // The bases a commit brought back are its own: given back once none is under way (landed, refused or aborted).
+  if matches!(
+    conversation.connection.waiting(),
+    slates_svn::serve::Waiting::Command | slates_svn::serve::Waiting::Ended
+  ) {
+    conversation.brought.give_back();
+  }
   written(stream, went, out).await
 }
 
@@ -1555,6 +1574,16 @@ async fn answer_hook(
         |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, transaction, &tokens),
       )
       .await
+    }
+    // A delta's base let go (A-760 (b) 4d): brought back whole for the drive, which takes its chunk again.
+    Due::Text { identity } => {
+      let Some(id) = conversation.opened.as_ref().map(|opened| opened.id) else {
+        return false;
+      };
+      HookAnswer {
+        verdict: Some(conversation.brought.bring(id, *identity).await),
+        ..HookAnswer::default()
+      }
     }
   };
   let Some(answer) = ran.verdict else {

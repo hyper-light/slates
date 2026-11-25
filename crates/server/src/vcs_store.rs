@@ -487,6 +487,10 @@ pub(crate) struct HgStore {
   /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
   /// register's references at recovery.
   pub(crate) landed: u64,
+  /// The revisions its replays kept from texts the node's changeset store gave them (let go once landed, or never known
+  /// here: a takeover's successor's, A-636 part 2c-2), let go again once the replay ends ([`replay_ended`]), as a landed
+  /// push's are (goal 93, C1 (1) P5).
+  pub(crate) brought_back: Vec<slates_hg::filerev::FileContents>,
 }
 
 /// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
@@ -3708,9 +3712,11 @@ fn hg_piece_in(
       Ok(Progress::Wanted(range)) => return Ok(PieceStep::Wanted(replay, range)),
       Ok(Progress::Store) => return Ok(PieceStep::Store(replay)),
       Ok(Progress::Done) => {
+        let brought_back = replay.take_brought_back();
         let replayed = replay
           .finish(&mut store.index, content)
           .map_err(ReplayRefused::Mercurial)?;
+        store.brought_back.extend(brought_back);
         return replayed_hg(store, &replayed).map(|_| PieceStep::Done);
       }
       Err(refused) => {
@@ -4083,9 +4089,11 @@ fn hg_step_in(
     Ok(true) if replay.asking() => Ok(HgStep::Asked(replay)),
     Ok(true) => Ok(HgStep::Stepped(Some(replay))),
     Ok(false) => {
+      let brought_back = replay.take_brought_back();
       let replayed = replay
         .finish(&mut store.index, content)
         .map_err(ReplayRefused::Mercurial)?;
+      store.brought_back.extend(brought_back);
       replayed_hg(store, &replayed).map(|_| HgStep::Stepped(None))
     }
     Err(refused) => {
@@ -4277,11 +4285,52 @@ fn svn_texts_inline(revision: &slates_svn::commit::revision::Revision) -> bool {
     })
 }
 
-/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]). A
-/// Subversion repository's stored texts are not held again: they are its changesets' on the node's store, read through
-/// it (C2 stage B part 2 (b)).
+/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]); a
+/// Mercurial store's revisions its replays kept from texts the node's changeset store gave noted for a home and let go,
+/// a turn at a time, as a landed push's are ([`let_go_brought_back`]). A Subversion repository's stored texts are not
+/// held again: they are its changesets' on the node's store, read through it (C2 stage B part 2 (b)). A git store's
+/// rebuild holds what its records name, as its live store does: nothing brought back to let go.
 fn replay_ended(state: &mut ShardState, id: RepositoryId) {
   index_upkeep::built(state, id);
+  let brought_back = match state.vcs_stores.entries.get_mut(&id) {
+    Some(RepositoryStore::Mercurial(store)) => core::mem::take(&mut store.brought_back),
+    _ => return,
+  };
+  if brought_back.is_empty() {
+    return;
+  }
+  let letting = let_go_brought_back(id, brought_back);
+  if slates_rt::futures::spawn_detached(letting).is_err() {
+    state.count(HG_BROUGHT_BACK_UNLET, 1);
+  }
+}
+
+/// Counter: the revisions a Mercurial replay kept from texts the node's changeset store gave (let go once landed, or
+/// never known here: a takeover's successor's, A-636 part 2c-2) and let go again once the replay ended, through the
+/// landed let-go (`hg_run::let_go_committed`; main 01a20182's ruling of 2026-11-24 13:12). Format: a counter name in the
+/// status report.
+pub(crate) const HG_BROUGHT_BACK_LET_GO: &str = "vcs_store.hg_brought_back_let_go";
+/// Counter: the bytes those revisions' let-go freed. Format: a counter name.
+pub(crate) const HG_BROUGHT_BACK_BYTES_LET_GO: &str = "vcs_store.hg_brought_back_bytes_let_go";
+/// Counter: their windows kept, a home holding them here. Format: a counter name.
+pub(crate) const HG_BROUGHT_BACK_PINNED: &str = "vcs_store.hg_brought_back_pinned";
+/// Counter: a replay's brought-back revisions with no task to let them go: they stay held. Format: a counter name.
+pub(crate) const HG_BROUGHT_BACK_UNLET: &str = "vcs_store.hg_brought_back_unlet";
+
+/// Lets go of repository `id`'s `brought_back` revisions ([`HgStore::brought_back`]), a turn at a time, then counts
+/// them ([`HG_BROUGHT_BACK_LET_GO`]).
+async fn let_go_brought_back(
+  id: RepositoryId,
+  brought_back: Vec<slates_hg::filerev::FileContents>,
+) {
+  let revisions = u64::try_from(brought_back.len()).unwrap_or(u64::MAX);
+  crate::repository::hg_run::let_go_committed(
+    id,
+    brought_back,
+    (HG_BROUGHT_BACK_BYTES_LET_GO, HG_BROUGHT_BACK_PINNED),
+  )
+  .await;
+  let _ = crate::state::with_state(|state| state.count(HG_BROUGHT_BACK_LET_GO, revisions));
 }
 
 /// The outcome of one record's replay, counted; a refused one leaves repository `id`'s store unserved, given back, with
@@ -5358,7 +5407,7 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
   }
   crate::state::with_state(|state| {
     state.vcs_stores.rebuilding.remove(&id);
-    index_upkeep::built(state, id);
+    replay_ended(state, id);
     state.vcs_stores.index_changed(id);
     release_aside(state, aside);
   })

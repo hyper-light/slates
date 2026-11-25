@@ -2253,8 +2253,9 @@ pub(crate) fn hold_checked_record(
 /// ([`crate::tombstone::on_held`]).
 fn after_held_record(state: &mut ShardState, record: &Record) {
   // A state log's part is a ledger position of a repository's own state: nothing to compact, no content to judge, and
-  // never a tombstone (A-636 part 2b).
+  // never a tombstone (A-636 part 2b). A names-log part's lineage memberships are noted for the greens' replicas (A-908).
   if let RegisterClass::State(_) = record.object.class() {
+    crate::merge_service::note_names_part(state, &record.value);
     return;
   }
   if crate::catalog::is_single_value(&record.value)
@@ -5517,7 +5518,10 @@ async fn materialize_green(
 /// installed after. The green is then no longer pending.
 async fn served_already(origin: u16, (object, target): (ObjectId, u16)) -> bool {
   let replica_gone = state::with_state(|s| {
-    !s.merge.replicas.contains_key(&object) && !s.merge.seeding.contains(&object)
+    !s.merge
+      .replicas
+      .contains_key(&crate::merge_service::replica_key(object))
+      && !s.merge.seeding.contains(&object)
   })
   .unwrap_or(false);
   if !replica_gone {
@@ -5637,9 +5641,22 @@ fn handed_green(
   };
   // Version 0's inputs manifest, as the ledger names it: what the adoption records of the origin.
   let origin = crate::merge_origin::ledger_value(state, object, 0).map(|zero| zero.inputs);
-  let (Some(origin), Some(engine)) = (origin, crate::green_adopt::take_engine(state, object))
-  else {
+  let Some(origin) = origin else {
     return Err(GreenWait::Chain);
+  };
+  // A lineage's member waits, as one whose replica is building, until every member of its lineage is at its adopted
+  // version (A-908, `green_adopt::take_engine`): no attempt is spent on it.
+  let Some(engine) = crate::green_adopt::take_engine(state, object) else {
+    let member = state
+      .merge
+      .replicas
+      .lineage_of(&crate::merge_service::replica_key(object))
+      .is_some();
+    return Err(if member {
+      GreenWait::Building
+    } else {
+      GreenWait::Chain
+    });
   };
   Ok(crate::green_adopt::AdoptedGreen {
     name: adopted.name.clone(),
@@ -10618,24 +10635,27 @@ impl Fanned {
   /// as its routing names it, else the green's creator): a change since the last fanned list is a new generation. An
   /// unchanged list, a period's usual case, is compared in place and copies nothing.
   fn observe_holding(&mut self, state: &ShardState) {
-    let now = state.merge.replicas.keys().map(|object| {
-      (
-        *object,
-        state
-          .fleet
-          .object_owner(*object)
-          .unwrap_or_else(|| object.creator()),
-      )
-    });
+    let now = || {
+      state.merge.replicas.keys().map(|green| {
+        let object = ObjectId(green.bytes);
+        (
+          object,
+          state
+            .fleet
+            .object_owner(object)
+            .unwrap_or_else(|| object.creator()),
+        )
+      })
+    };
     if self
       .holding
       .iter()
       .map(|(object, owner)| (*object, *owner))
-      .eq(now.clone())
+      .eq(now())
     {
       return;
     }
-    self.holding = now.collect();
+    self.holding = now().collect();
     self.holding_generation = self.holding_generation.saturating_add(1);
   }
 
@@ -13691,9 +13711,10 @@ mod tests {
   fn a_replica_taken_reaches_the_other_shards_with_its_owner_once() {
     crate::daemon::audit_on_shard(|s| {
       let green = ObjectId::new(HostId(7), 1);
-      s.merge
-        .replicas
-        .insert(green, slates_merge::engine::Green::new());
+      s.merge.replicas.insert(
+        crate::merge_service::replica_key(green),
+        slates_merge::engine::Green::new(),
+      );
       let mut fanned = std::mem::take(&mut s.fanned);
       fanned.observe_holding(s);
       s.fanned = fanned;

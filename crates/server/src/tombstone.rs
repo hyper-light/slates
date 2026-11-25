@@ -81,7 +81,10 @@ pub(crate) fn on_held(state: &mut ShardState, object: ObjectId, value: Tombstone
     let count = state.refusals.entry(TOMBSTONE_RELEASED).or_insert(0);
     *count = count.saturating_add(1);
   }
-  state.merge.replicas.remove(&object);
+  state
+    .merge
+    .replicas
+    .drop_any(&crate::merge_service::replica_key(object));
   // Its durable checkpoint goes with it (A-404).
   crate::merge_service::forget_checkpoint(state, object);
   state.pending_materializations.remove(&object);
