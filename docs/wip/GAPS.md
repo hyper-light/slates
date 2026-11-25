@@ -1670,6 +1670,15 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
+> 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
+> nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
+> as `vcs_store.hg_owner_{requests,total_ns,behind_ns,wake_ns,serve_ns,disk_ns,back_ns,most_ns}`. In-process (debug,
+> a 2,000-changeset `debugbuilddag` history, this MacBook, `hg_clone_store_wait`): the clone 17.2 s, its store wait
+> 5.77 s over 4,015 requests: the owner's wake from its blocking receive 85.5% (about 1.2 ms a request), its service
+> 12.2%, the hop back 1.8%, its log reads 0.4%, queued behind other work 0.1%. Owed: the 57k clone's split on a release
+> build (main's), then the cut it names (the owner spinning before it parks over a measured inter-arrival, or a fetch
+> keeping its next ask in flight).
 > Found by main's round at 15b4f1061 and cut (2026-11-25, w-perf): with that request hg's 57k clone peaked at 10,416
 > MiB and held 10,013 MiB after it (2ed3eb139: 5.7-6.0 GB), 165.8 s; the status after it named 4,792 mapped blocks of
 > about a chunk each still live (5.07 GB mapped, 4.09 GB resident). The owner read each text of the batch once at its
@@ -2620,8 +2629,15 @@
 > `every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte` (stock's own zstd chunks re-encoded byte for
 > byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean, the
 > compression counters moving). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
-> piece (b) removes by keeping each chunk in its stored form from arrival; and the changelog's header, which 7.2 writes
-> without generaldelta (`changelog.py` clears it on a new changelog) where slates sets it.
+> piece (b) removes by keeping each chunk in its stored form from arrival; and with it `Streaming::sized`, each log's
+> chunk lengths kept from the count to the send (4 bytes a revision, a few MB at the 57k's million revisions: the walk
+> holding more than its place, w-hg's review), which (b) deletes, the lengths then the places'. CLOSED (2026-11-25, w-interop; main's order):
+> the changelog's header, which 7.2 writes without generaldelta (`changelog.py` clears it on a new changelog) where
+> slates set it: now `0x00000001`, each changelog delta against the revision before and its entry's base its chain's
+> start; a store whose changelog holds a delta against another revision serves no stream (`1\n`, the client clones).
+> Red: `a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does` (the changelog's header `0x00020001`); held by
+> `a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_start`; by use, `hg_stream_compare.sh`'s
+> headers at r400 (2026-11-25 10:08 UTC): 98 of 98 revlogs' headers stock's (`00000001` x1, `00030001` x97).
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
