@@ -605,3 +605,13 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   StartRule; the TLC run is queued in run-requests.md.
 - Next: A-921 (the surviving holder refusing a warm-restarted owner's records), then A-918 B on the same read, then
   A-914 (c) from main's batch (mode 1: check A-912's homing_budget before the first measured death).
+
+## 2026-11-25: A-921 part 1 landed (26073e283, commit f8928da7f)
+
+- restart_warm waits until the node is settled (Daemon::council_host_standing). The owner-restart scene re-forms, at
+  most three times, where a was taken over by its warm restart (1.40 to 1.79 s of silence).
+- The test stays ignored for the second mode (about 1 in 6: the old holder refused a's v2 and its names-log part
+  though a wasn't taken over).
+- Next (main's order): A-921 part 2, the edge routing by owner with git over HTTP answered 307. Its red is parked at
+  ~/slates-work/w-shared-scratch/a914/a921_product_test.rs. Then the second mode (red first, counters printed, "held 1"
+  settled against the rule), then A-922, then A-918 B.
