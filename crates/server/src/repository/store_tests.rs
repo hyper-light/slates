@@ -973,14 +973,19 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
   }
 }
 
-/// The texts the daemon's recovery brought back for its Subversion greens' named runs (A-760's pre-pass).
+/// The named texts the daemon's recovery accounted for in its Subversion greens: brought back before the replay (A-760's
+/// pre-pass), or found held whole and let go after it (`svn_texts::let_go_found_whole`). Since the recovery makes the
+/// content store before it judges what is lacking (TSan diags 5 and 7), a text the image restored whole is found, not
+/// fetched again; before, with no store made yet, every named text read as lacking and was brought back.
 fn brought_back(daemon: &Daemon) -> u64 {
   crate::daemon::observe_first(daemon, |state| {
-    state
-      .refusals
-      .get(crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK)
-      .copied()
-      .unwrap_or(0)
+    [
+      crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK,
+      crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE,
+    ]
+    .into_iter()
+    .map(|name| state.refusals.get(name).copied().unwrap_or(0))
+    .sum()
   })
 }
 

@@ -439,6 +439,9 @@ struct Cutting {
   open: Option<Open>,
   /// The segments cut and not yet taken, oldest first.
   ready: VecDeque<PushSegment>,
+  /// The revisions' contents kept so far, all told, taken or not: what a push's pins count from
+  /// ([`Intake::kept_newest`]).
+  kept_total: u64,
 }
 
 impl Cutting {
@@ -457,7 +460,10 @@ impl Cutting {
       charged: 0,
       contents: Vec::new(),
     });
-    open.contents.extend(contents);
+    if let Some(contents) = contents {
+      open.contents.push(contents);
+      self.kept_total = self.kept_total.saturating_add(1);
+    }
     open.slice.end = open.slice.end.max(kept.place.end);
     match open.ranges.last_mut() {
       Some((last, _, end)) if *last == log && *end == rev => *end = rev.saturating_add(1),
@@ -944,6 +950,7 @@ impl Intake {
       bound: bound.max(1),
       open: None,
       ready: VecDeque::new(),
+      kept_total: 0,
     });
     self
   }
@@ -964,6 +971,40 @@ impl Intake {
             .flat_map(|segment| segment.contents.iter()),
         )
     })
+  }
+
+  /// The revisions' contents kept so far, all told, taken in a segment or not: none where the intake cuts no segments.
+  pub fn kept_total(&self) -> u64 {
+    self
+      .taker
+      .cutting
+      .as_ref()
+      .map_or(0, |cutting| cutting.kept_total)
+  }
+
+  /// The contents of the `count` revisions kept last, newest first, among those not yet taken in a segment: what a slice
+  /// kept since a pin last looked, in time of its own count (main's 57k push at 2dd25afe6: every kept revision looked at
+  /// after every slice, its CPU the push's revisions times its slices).
+  pub fn kept_newest(&self, count: u64) -> impl Iterator<Item = &FileContents> + '_ {
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    self
+      .taker
+      .cutting
+      .iter()
+      .flat_map(|cutting| {
+        cutting
+          .open
+          .iter()
+          .flat_map(|open| open.contents.iter().rev())
+          .chain(
+            cutting
+              .ready
+              .iter()
+              .rev()
+              .flat_map(|segment| segment.contents.iter().rev()),
+          )
+      })
+      .take(count)
   }
 
   /// The next segment cut, oldest first; none while the one being cut is short of its bound.

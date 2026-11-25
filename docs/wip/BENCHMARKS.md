@@ -19526,8 +19526,8 @@ not recur here, and the turn spread follows the load.
 `position_cache_conflicts` is an upper bound (a8ca56a4f's doc). The runtime's long steps against all its steps, per
 step's fetch: 293,850 of 298,815, then 332,411 against 281,158, then 194,387 of 198,505. Nearly every step of a clone's
 serve runs long, which is w-git's next piece. Slates' clone (68.7 s) and clone-again (59.1 s) are within loaded round 2's
-range at f8fe97e5e (65.8 and 63.9 s best). The A/B of A-911's arms (four-way, four times) is a separate record, to
-follow.
+range at f8fe97e5e (65.8 and 63.9 s best). The A/B of A-911's arms is its own record: "A-911's position cache, three
+arms" below (three arms, three rounds, as main ran it).
 
 ## The svn use test over HTTP with git-2000: green, every verb timed against stock svnserve (goal 93; main 01a20182's round, 2026-11-24, a0c46b705)
 
@@ -19682,3 +19682,51 @@ What it says:
   Slates' whole answer was in at 03.116 (curl: the connection left intact), and the helper exited at 03.352. The gap to
   `git daemon` is the HTTP helper's process and its exchange, which stock's HTTP server pays the same.
 
+## A-911's position cache, three arms: 4-way set-associative lands, 4x the slots measured and rejected (goal 93 perf; main 01a20182's A/B, 2026-11-25 00:35 to 01:31 PST)
+
+**Verdict.** B, 4-way set-associative at A's slots and charge, lands (d9af8b94f): position lookups 65 % fewer, the
+clone's median first pack byte 7.4 s sooner. C, direct-mapped at 4x the slots, is **measured and rejected**: it misses
+about as often as B (6.2 % against 6.6 % of probes) and is dead even with B on time, at 4x the charge per answer.
+
+- **Command.** The in-tree harness at 67ec37368 (`crates/cli/bench/git_scale.sh`), slates alone, a git/git clone set,
+  release builds of each arm. Three rounds, the arms rotated (A B C, then B C A, then C A B). Files:
+  `~/.cache/main-rounds/a911-ab/`.
+- **Machine and load.** The MacBook (adas-macbook-pro-2), loaded: load average 21 to 40 through the rounds. Round 1's A
+  overlapped one of main's compiles. These are loaded points, compared only with each other.
+- **The arms**, distinct by sha:
+  - A: main at 15b4f1061, the cache direct-mapped, 8 slots an id.
+  - B: 11128da63, 4-way set-associative, the same slots and charge.
+  - C: 0c8e7d496, direct-mapped, 32 slots an id (4x).
+
+**The cache, per clone** (each identical in every round):
+
+| arm | `git_upload.position_lookups` | `position_cache_hits` | probes (both) | missed |
+|---|---|---|---|---|
+| A | 11,438,922 | 48,667,293 | 60,106,215 | 19.0 % |
+| B | 3,963,393 (−65.4 %) | 56,142,822 | 60,106,215 | 6.6 % |
+| C | 3,717,726 (−67.5 %) | 56,388,489 | 60,106,215 | 6.2 % |
+
+**Seconds to the first pack byte, and the whole clone** (each run in round order, then the median and the best of 3):
+
+| arm | step | round 1 | round 2 | round 3 | median | best |
+|---|---|---|---|---|---|---|
+| A | clone | 49.311 | 45.796 | 43.313 | 45.796 | 43.313 |
+| B | clone | 37.609 | 40.852 | 38.428 | **38.428** | 37.609 |
+| C | clone | 34.389 | 41.237 | 39.179 | 39.179 | 34.389 |
+| A | clone again | 34.561 | 34.003 | 30.528 | 34.003 | 30.528 |
+| B | clone again | 26.501 | 26.650 | 24.637 | **26.501** | 24.637 |
+| C | clone again | 24.159 | 25.790 | 27.348 | 25.790 | 24.159 |
+| A | partial | 28.350 | 28.342 | 29.233 | 28.350 | 28.342 |
+| B | partial | 22.745 | 22.823 | 22.583 | **22.745** | 22.583 |
+| C | partial | 21.793 | 21.379 | 21.989 | 21.793 | 21.379 |
+| A | whole clone | 81.663 | 79.410 | 77.219 | 79.410 | 77.219 |
+| B | whole clone | 83.841 | 62.083 | 86.706 | 83.841 | 62.083 |
+| C | whole clone | 71.148 | 74.823 | 90.969 | 74.823 | 71.148 |
+
+- **B against A**, by the median first pack byte: −7.368 s on the clone, −7.502 s again, −5.605 s partial; at A's
+  charge. The first pack byte is the measure here: the cache serves the walk before it.
+- **C against B**: +0.751 s, −0.711 s and −0.952 s, either side of zero within each arm's own spread (B's clone
+  37.6 to 40.9 s, C's 34.4 to 41.2 s). A dead-even A/B does not land, and C costs 4x the slots per answer.
+- **The whole clone** is noise after the pack begins (B 62.1 to 86.7 s, C 71.1 to 91.0 s, A 77.2 to 81.7 s) and judges
+  no arm.
+- **The daemon's peak** was alike: A 2,902 to 2,946 MiB, B 2,904 to 2,978, C 2,909 to 2,911.

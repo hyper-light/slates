@@ -1639,7 +1639,15 @@
 > does (`ContentStore::pin_unlanded`/`unpin_unlanded`, refused `LetGoRefused::Unlanded`, counted
 > `vcs_store.content.kept_unlanded`; the count's width refused typed, `ContentRefused::CountExhausted`, never wrapped; a
 > pin of nothing refused `NotHeld`; a window found let go as it is pinned counted `vcs_store.content.pinned_away`, a bug
-> signal that must stay 0; an unpin comes before its holder releases the object). A
+> signal that must stay 0; an unpin comes before its holder releases the object; the count is the live process's alone,
+> never in the shard image, so a restart after a crash with texts pinned finds every count at 0, since no pinning push or
+> import outlives the process: `a_windows_unlanded_count_is_never_carried_across_a_restart`, through the daemon's own
+> restore, red with the restore carrying a count). Found by main's 57k push at 2dd25afe6 and fixed (2026-11-25): the
+> push's pins looked at every kept-but-unlanded revision after every slice (each skipped by a lookup once pinned), so
+> their work was the push's slices times its kept revisions (615,194 slices; 5 min 13 s of the daemon's CPU 10 minutes
+> in, against 93.5 s for the whole push before (B)); now each slice looks at the revisions kept since the last
+> (`Intake::kept_newest`, `kept_total`), counted `hg_push.pin_revisions_slice_most` and `hg_push.pin_windows_slice_most`
+> (red: 37,777 looks for 192 kept revisions, now 192). A
 > push pins each revision as its intake keeps it (`slates_hg::push::pins::Counted` over `Intake::kept_contents`, after
 > each slice), unpins a segment's own just before that segment's let-go (`landed_segment`; never at its taking, since its
 > record is written over turns before it lands), and the rest however the push ends (`Taking`'s drop). `landed_pin` asks
@@ -1669,10 +1677,29 @@
 > piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
 > x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
 > reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
-> read whole against one chunk and a text, 1,246,184; now 1,048,576). Owed: the batch itself, sized by the fetch's room
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
-> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`).
+> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
+> (main's ruling of 2026-11-25, w-perf): a want of texts holds at most a step's copy budget
+> (`slates_hg::serve::getbundle::Store::text_bytes_a_step`, the daemon's `copy_slice_bytes`: memcpy rate x step quantum
+> x the copy share, 94,797 B on main's bench), one text at least; the owner copies at most that a request, a text past it
+> in slices across requests (`StoreHandle::text_slice`, `Store::text_slice`, its read's reach told to the text cache so
+> the slice that reaches the text's end ends its walk). Counted `vcs_store.hg_text_copied_most_bytes` (the most one
+> request copied). Reds: `a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes` (a clone of `divergent` walked by its
+> links: two wants of three texts, 236 and 215 B, against a 172 B step; now four of at most 152 B),
+> `a_text_past_a_step_is_copied_a_step_a_request` (one request copying 11,290 B against a 1,024 B step; now 12 of at
+> most 1,024), and `a_text_read_in_slices_past_a_piece_leaves_no_walk_in_flight` (a slice's reach taken for a piece's:
+> bound 6,291,456 B; now 1,048,576). The request count is what the rule makes: about one a manifest at 57k (about
+> 57,000; 3,062 before, over 100,000 before 9a5587e78), main's to measure. A replay's base asks (recovery's and the
+> rebuild's, `hg_view::answer_wants_over`) are held to the same rule, each caller naming its replaying shard's step, and
+> counted alike (`vcs_store.hg_text_requests`, `vcs_store.hg_text_copied_most_bytes`); red
+> `a_replays_ask_past_a_step_is_copied_a_step_a_request` (one request copying 10,990 B against a 1,024 B step; now 11
+> of at most 1,024). The step bounds a request's copy, not what the shard holds: a want past it is one text, held whole
+> as the changegroup sends it. A sliced read that stops before its text's end (past the want's room, or the owner's
+> refusal) leaves that text's walk in flight in the owner's cache until its walks past `reads` push it out: bounded,
+> the shape 7c0ea35a1 closed for every read (w-hg's review). Owed: the 418 GB of fresh pages
+> `mem.large.returned_bytes` counted by the 15b4f1061 clone's end, split between push and clone.
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
@@ -2000,6 +2027,11 @@
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
 > **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). Part 3 BUILT (A-647 part 3, g302, 2026-11-19): the git store keeps each version's two sets as its value alone, put as it commits and held by the version's record, and serves every version's D(k) and reached set from it (an older version's reached set too), the chains' copies dropped; a value names its sets' bytes as an object of any length (format 2), so a set of more runs than one window holds is kept (macOS arm64, Mac Studio, slates-git's store-building modules 185 of 185, slates-server's `vcs_store` 13 and its git service and pushes 14; red first, 5 of 86 failing). Part 4 BUILT (A-647 part 4, g294 from g302's draft, 2026-11-19): each of a version's sets a tree of derived nodes over fixed blocks of positions shaped by the store's window (format 3), so a version's value adds only the nodes on the paths to the blocks its D(k) touches, never its reached set again; over 801 versions of a ref pushed by turns and then merged with 400 older roots in a 256-byte window, the most a version added fell from 7,740 bytes (format 2) to 938 against its bound of 4,352, and 1,077,340 bytes in all to 378,007 (macOS arm64, Mac Studio: red 6 of 7; green slates-git's store-building modules 208 of 208, slates-server's `vcs_store`, git services and pushes 46 of 46, and 52 of 52 as it landed over main 5206419b). Queries by API, part 1 BUILT (A-666, g302, 2026-11-19): `slates-vcs`'s `derived::ancestry`, a type whose value holds Mononoke's commit-graph fields (generation, first-parent and skip-tree skew jumps by Myers' rule, run bottom, skip-tree parent: a dominator), and is-ancestor, the merge bases (git's `--all` set) and bisect's midpoint answered from the values, logarithmic along runs and linear only in the merges a question opens; held to a naive walk over generated histories, to Myers' bound and to the immediate dominator (`research/ancestry-queries.md`). Part 2 BUILT (A-666 part 2, g302, 2026-11-19): `slates-vcs`'s `derived::history`, a type whose value names a version's path map and a history tree of each path's node (Mononoke's unodes), a path keeping the node of the first parent it is TREESAME to (git's default mode exactly; a directory compared by its files, a removal a node), renames and copies as the works recorded them (`PathSources`; a copy from an older version read through `DerivedType::inputs`), and `log <path>` and `--follow` reading at most one node more than the versions they list; held to git's walk over generated histories (`research/path-history.md`; Windows x86_64, jupiter, 65 of 65; the macOS run owed). Part 3 BUILT (A-666 part 3, g302, 2026-11-19): `slates-vcs`'s `derived::blame`, a type whose value keeps each file's blame (runs of lines, each naming its introducing version, the file's path there and its first line there), kept from the first parent whose file holds the same content, else made from the parents' blames, the recorded rename's or copy's source, and one diff with each (Myers' linear-space diff), never a diff of the history; a line both parents of a merge changed attributed by the merge's recorded content (D-27); a question reads the path's trie nodes and the file's spans; held to blame recomputed by replaying every version, each derivation's lines read to the replay's (`research/path-history.md` §6; Windows x86_64, jupiter, 75 of 75; the macOS run owed). OWED: A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position (BUILT, A-658 parts 1 and 2, g305, 2026-11-19: `Green::compute` and `Green::rebase` pure over the versions a work is judged over, a `Computed` holding nothing of the green that computed it and naming its head, typed refusals `BaseUnavailable`/`BaseAhead`, a base past the owner's head no longer judged as if at the head; the owner's `Green::judge_computed` taking a computed verdict by position, judging again only the units whose paths the change index names since or that read the links naming a file one of whose links changed since (A-669, A-670), a content edit from where its ops stood, typed refusals `OtherWork`/`Ahead`/`NotRecorded`, the counter `judged_again`; part 3a BUILT (2026-11-19, g305): a computed verdict's wire form, `Computed::encode` and the owner's `Green::computed_from` against the increment it judged (effects as chain entry records, windows, placements, digest; the oracle takes every held verdict through it); the fleet's route, a holder computing on its replica and the owner appending, BUILT (3b, A-697 part c, in force since A-697 part f, 2026-11-20); OWED: a push taking verdicts computed elsewhere (3c), meaning a push served on a holder, its works built against the holder's replica and its verdicts committed by position at the owner. Main's ruling, 2026-11-20 18:30 PST: (3c) waits for the repository's store replicated to holders, which is A-767's changeset store (w-store) and its server wiring, and is built on it once that wiring is on main. Rejected the same day: committing the owner's own push verdicts by position (git's receive-pack judges and appends in one step, so it would move a computation within that step with no measurable effect); a rename's edits placed as an edit's are); a blame's spans shared between versions by identity, git's other simplification modes as types, and the server's verbs over A-666's types (each repository's values on its owner shard, A-662; a `PathSources` over each green's versions), with corrected commit dates where a history has them and questions cut into the shard's slices; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+>
+> **A-916 (w-git, 2026-11-25):** git's reach sets have no value under "values offered between tiers by identity" now:
+> the owner's second copy of them in `slates_vcs::Derivations` (A-647 part 2's) was a dead write and is deleted; the
+> sets live in the version's record, or the repository's memo when derived on read (`Repository::value_of`). A tier
+> sharing git's reach sets would offer from those, or keep them as a type's values again with a reader that asks.
 >
 > **A-664 (2026-11-19, g308; §4.17.1 "A push is a work" items 3 and 4; §4.17.2 piece 13; §4.17.3 decision 7 and piece
 > 6): the commits the server makes.** Part 2 BUILT (main 78a670256): `slates-git`'s `derived` module makes a version's git objects as
@@ -2576,6 +2608,20 @@
 > with the change off). Markers travel as the `OBSMARKERS` part the client asks beside the stream, not as an `obsstore`
 > file; no cache file is sent (each is optional to 7.2's client). Owed: stock `hg clone --stream` negotiating `stream2`
 > by use (`crates/cli/bench/hg_stream_compare.sh`), then the bytes (zstd chunks) and the files (small revlogs inline).
+> BUILT (2026-11-25, w-interop; main 01a20182's ruling (a)): every chunk a stream or a rendering writes is stored as 7.2
+> stores it (`slates_hg::revlog_chunk`: zstd at level 3 from 50 bytes where shorter, a leading NUL raw, else `u`; its
+> `decode` every kind 7.2 reads), every log but the changelog inline under 131,072 bytes of chunks (`_maxinline`;
+> `changelog.py`'s `may_inline=False`), and `revlog-compression-zstd` in `.hg/requires` and the stream's requirements.
+> A stream compresses twice, a count pass sizing each chunk for the head and a send pass writing it, held to the count's
+> length (`vcs_store.hg_stream_compress_count_ns`, `_send_ns`, `_send_plain_bytes`, `_send_stored_bytes`). By use at r400
+> of hg's history (debug, 2026-11-25 09:39 UTC): 99 files and 466 KB streamed against stock `hg serve`'s 102 and 470 KB
+> (0.97x and 0.99x; 195 files and 813 KB at b2888af84), each class's bytes and every chunk kind's count stock's. Held by
+> `a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does` (red: no `revlog-compression-zstd`, every chunk `u`),
+> `every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte` (stock's own zstd chunks re-encoded byte for
+> byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean, the
+> compression counters moving). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
+> piece (b) removes by keeping each chunk in its stored form from arrival; and the changelog's header, which 7.2 writes
+> without generaldelta (`changelog.py` clears it on a new changelog) where slates sets it.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

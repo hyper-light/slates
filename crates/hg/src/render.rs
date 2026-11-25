@@ -3,24 +3,29 @@
 //! `stream_out` and a `stream2` part send (parts 2 and 3), and what stock `hg verify` reads back as a whole repository.
 //!
 //! **The shape.** `.hg/requires` names a store 7.2 makes by default without `share-safe`: `dotencode`, `fncache`,
-//! `generaldelta`, `revlogv1`, `sparserevlog` and `store`. Every log is a revlog version 1 with generaldelta, split (an
-//! index file of 64-byte entries and a data file), never inline but where the data file would be empty (every text
-//! empty): that log is inline, its index file alone, as 7.2 keeps it, since a client lists in its fncache the files it
-//! was sent and a split log missing its data file there fails `hg verify` (hg-src's `mercurial/__init__.py`). Each revision is stored whole (its delta base itself, a full snapshot, which `sparserevlog` allows), its chunk
-//! as 7.2's `revlog.compress` stores what it does not compress: `u` and the text, or the text itself when it is empty or
-//! begins with a NUL. Its entry holds the chunk's offset, the revision's flags, the chunk's and the text's lengths, the
-//! base, the link (a changeset's own number), the parents' numbers (-1 for none) and the node, all big-endian, the
-//! first four bytes the header (version 1 with the generaldelta flag). The file logs are named by the dotencode
-//! encoding ([`crate::store::encode_path`]) and listed in `store/fncache`, both files each, as 7.2's opener lists every
-//! data file it writes. `store/phaseroots` holds each phase root (`<phase> <node>`), `.hg/bookmarks` each bookmark (`<node>
+//! `generaldelta`, `revlog-compression-zstd`, `revlogv1`, `sparserevlog` and `store`. Every log is a revlog version 1
+//! with generaldelta, inline (its index file alone, each entry followed by its chunk) or split (an index file of 64-byte
+//! entries and a data file) exactly where 7.2 keeps it so ([`crate::revlog_chunk::inline`]: any log but the changelog
+//! whose chunks hold under 131,072 bytes is inline). A client lists in its fncache the files it was sent, so a split
+//! log's data file is always sent, and an inline log's never exists (a split log missing its data file there fails `hg
+//! verify`, hg-src's `mercurial/__init__.py`). Each revision is stored whole (its delta base itself, a full snapshot,
+//! which `sparserevlog` allows), its chunk as 7.2's `revlog.compress` stores it with its default zstd engine
+//! ([`crate::revlog_chunk::chunk`]: one zstd frame where shorter, the text itself where it begins with a NUL, else `u`
+//! and the text; none for an empty text). Its entry holds the chunk's offset among the chunks, the revision's flags,
+//! the chunk's and the text's lengths, the base, the link (a changeset's own number), the parents' numbers (-1 for
+//! none) and the node, all big-endian, the first four bytes the header (version 1 with the generaldelta flag, and the
+//! inline flag where inline). The file logs are named by the dotencode encoding ([`crate::store::encode_path`]) and
+//! listed in `store/fncache`, each file it has, as 7.2's opener lists every data file it writes. `store/phaseroots` holds each phase root (`<phase> <node>`), `.hg/bookmarks` each bookmark (`<node>
 //! <name>`), and `store/obsstore` the markers after their format's version byte, when there are any.
 //!
 //! **Bounded.** Every byte rendered is charged to the caller's admission first; a revision the index cannot give back
 //! whole is refused by its log and number.
 //!
-//! **Not compressed, on purpose for now.** A stream clone sends the files as they are, so a rendered store is as large
-//! as its texts; compressing each chunk (7.2's zlib or zstd) and storing deltas are a later part's, with the learned
-//! choice the wire's compression makes (§4.17.3).
+//! **Compressed as stock's** (goal 93 perf, main's ruling of 2026-11-25): a stream clone sends the files as they are,
+//! and at r400 of Mercurial's history slates' uncompressed, always split logs streamed 1.94x stock's bytes and 1.97x
+//! its files (`crates/cli/bench/hg_stream_compare.sh`). Each chunk is compressed as the stream writes it, a count pass
+//! and a send pass ([`Streaming`]), until the changeset store keeps each revision's chunk as 7.2 stores it from its
+//! arrival (w-hg's piece (b)), which [`crate::revlog_chunk`] serves alike.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -31,6 +36,7 @@ use crate::index::{HgIndex, Log, NONE};
 use crate::node::CollisionAttack;
 use crate::phases::PhaseHead;
 use crate::read::to_u64;
+use crate::revlog_chunk::{self, ChunkRefused, Pass};
 use crate::store::{encode_dir, encode_path};
 use crate::{Admission, NODE_LEN, Node, PastAdmission};
 
@@ -40,15 +46,17 @@ const STORE: &[u8] = b".hg/store/";
 const DATA: &[u8] = b"data/";
 /// Format: the requirements a rendered store needs of a stream clone's client, as `streamreqs` lists them (7.2's
 /// `streamed_requirements`: the store's formats among `.hg/requires`, sorted and joined by commas).
-pub const STREAM_REQUIREMENTS: &[u8] = b"generaldelta,revlogv1,sparserevlog";
+pub const STREAM_REQUIREMENTS: &[u8] =
+  b"generaldelta,revlog-compression-zstd,revlogv1,sparserevlog";
 /// Format: `.hg/requires`, sorted as 7.2 writes it.
-const REQUIRES: &[u8] = b"dotencode\nfncache\ngeneraldelta\nrevlogv1\nsparserevlog\nstore\n";
+const REQUIRES: &[u8] =
+  b"dotencode\nfncache\ngeneraldelta\nrevlog-compression-zstd\nrevlogv1\nsparserevlog\nstore\n";
 /// Format: the most bytes a count takes as decimal text (`u64::MAX`'s 20 digits).
 const DECIMAL_BYTES: u64 = 20;
 /// Format: the index header: revlog version 1 with generaldelta (`FLAG_GENERALDELTA`, bit 17), big-endian.
 const HEADER: [u8; 4] = [0, 2, 0, 1];
-/// Format: the index header of a log whose every chunk is empty: [`HEADER`] with the inline flag (`FLAG_INLINE_DATA`,
-/// bit 16), as 7.2 keeps such a log (its data, none, inside the index file). Module docs, "The shape".
+/// Format: the index header of an inline log: [`HEADER`] with the inline flag (`FLAG_INLINE_DATA`, bit 16), its chunks
+/// inside the index file. Module docs, "The shape".
 const INLINE_HEADER: [u8; 4] = [0, 3, 0, 1];
 /// Format: a version 1 index entry's bytes: the node's field is 32 bytes, its last 12 zero.
 const ENTRY_BYTES: usize = 64;
@@ -56,8 +64,6 @@ const ENTRY_BYTES: usize = 64;
 const NODE_PADDING: [u8; 12] = [0; 12];
 /// Format: the bits of an index entry's first field the flags take, below the offset (`offset << 16 | flags`).
 const FLAGS_BITS: u32 = 16;
-/// Format: the chunk header of a text stored as it is (`revlog.compress`'s `u`).
-const UNCOMPRESSED: u8 = b'u';
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
 const OBSSTORE: &[u8] = b"obsstore";
 /// Format: a `stream2` file's source byte for the store (7.2's `_srcstore`).
@@ -91,11 +97,19 @@ pub enum Refused {
   TooLong,
   /// Past the caller's admission.
   Past(PastAdmission),
+  /// A chunk could not be compressed ([`crate::revlog_chunk`]).
+  Chunk(ChunkRefused),
 }
 
 impl From<PastAdmission> for Refused {
   fn from(past: PastAdmission) -> Self {
     Refused::Past(past)
+  }
+}
+
+impl From<ChunkRefused> for Refused {
+  fn from(refused: ChunkRefused) -> Self {
+    Refused::Chunk(refused)
   }
 }
 
@@ -142,9 +156,9 @@ pub fn render(
   Ok(files)
 }
 
-/// Every log as a split revlog, each file by its store path before encoding (`data/<path>.i`, `00manifest.d`), in the
-/// order 7.2's `store.walk` lists them for a stream: the file logs by path, then the manifest log, then the changelog,
-/// each index file before its data file (stream clones part 2's `stream_out` sends them so).
+/// Every log as a revlog, each file by its store path before encoding (`data/<path>.i`, `00manifest.d`), in the order
+/// 7.2's `store.walk` lists them for a stream: the file logs by path, then the manifest log, then the changelog, each
+/// index file before its data file, which only a split log has (stream clones part 2's `stream_out` sends them so).
 pub fn revlogs(
   index: &HgIndex,
   store: &ContentStore,
@@ -162,7 +176,9 @@ pub fn revlogs(
   for (log, radix) in logs {
     let (index_file, data) = revlog(index, store, log, admission)?;
     files.push(([radix.as_slice(), b".i"].concat(), index_file));
-    files.push(([radix.as_slice(), b".d"].concat(), data));
+    if let Some(data) = data {
+      files.push(([radix.as_slice(), b".d"].concat(), data));
+    }
   }
   Ok(files)
 }
@@ -196,15 +212,20 @@ fn lines<'l>(
   Ok((path.to_vec(), out))
 }
 
-/// One log rendered as a split revlog: its index file and its data file (module docs).
+/// Whether `log` may be inline (any but the changelog: 7.2's `changelog.py` opens it `may_inline=False`).
+fn may_inline(log: Log<'_>) -> bool {
+  log != Log::Changelog
+}
+
+/// One log rendered as a revlog (module docs): its index file, and its data file where it is split.
 fn revlog(
   index: &HgIndex,
   store: &ContentStore,
   log: Log<'_>,
   admission: &mut Admission,
-) -> Result<(Vec<u8>, Vec<u8>), Refused> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), Refused> {
   let count = index.len(store, log);
-  let (mut entries, mut data) = (Vec::new(), Vec::new());
+  let (mut entries, mut data, mut ends) = (Vec::new(), Vec::new(), Vec::new());
   for rev in 0..count {
     let unreadable = || Refused::Unreadable {
       log: match log {
@@ -217,24 +238,18 @@ fn revlog(
     let (parents, link) = numbers(index, store, log, rev).ok_or_else(unreadable)?;
     let kept = kept(index, store, log, rev).ok_or_else(unreadable)?;
     let mut text = Vec::new();
+    // A chunk is at most its text and one header byte ([`revlog_chunk::chunk`]).
     admission.charge(kept.len.saturating_add(to_u64(ENTRY_BYTES + 1)))?;
     if write_text(&mut text, store, &kept) != kept.len {
       return Err(unreadable());
     }
     let offset = to_u64(data.len());
-    // The `u` that marks a chunk stored as it is, on every chunk but an empty one: 7.2's reader strips it whatever
-    // follows, and the stream marks its chunks alike ([`Streaming`]).
-    let stored = if text.is_empty() {
-      0
-    } else {
-      data.push(UNCOMPRESSED);
-      1
-    };
-    data.extend_from_slice(&text);
+    let chunk = revlog_chunk::chunk(&text, Pass::Send, &mut data)?;
+    ends.push(data.len());
     let entry = Entry {
       offset,
       flags: kept.flags,
-      chunk: text.len().saturating_add(stored),
+      chunk: usize::try_from(chunk).map_err(|_| Refused::TooLong)?,
       text: text.len(),
       base: rev,
       link,
@@ -243,14 +258,22 @@ fn revlog(
     };
     entry.write(&mut entries)?;
   }
+  let inline = revlog_chunk::inline(may_inline(log), to_u64(data.len()));
   if let Some(header) = entries.get_mut(..HEADER.len()) {
-    header.copy_from_slice(if data.is_empty() {
-      &INLINE_HEADER
-    } else {
-      &HEADER
-    });
+    header.copy_from_slice(if inline { &INLINE_HEADER } else { &HEADER });
   }
-  Ok((entries, data))
+  if !inline {
+    return Ok((entries, Some(data)));
+  }
+  // Inline: each entry, then its chunk.
+  let mut joined = Vec::with_capacity(entries.len().saturating_add(data.len()));
+  let mut begun = 0;
+  for (entry, end) in entries.chunks(ENTRY_BYTES).zip(ends) {
+    joined.extend_from_slice(entry);
+    joined.extend_from_slice(data.get(begun..end).ok_or(Refused::TooLong)?);
+    begun = end;
+  }
+  Ok((joined, None))
 }
 
 /// One log of the walk a stream makes (A-745): a file log by its path, the manifest log, then the changelog.
@@ -298,8 +321,9 @@ impl Walked {
 enum Stage {
   /// Not begun: the first log the walk writes is found.
   Start,
-  /// Counting the files and their bytes, which the answer's head names first: the log next.
-  Counting(Walked),
+  /// Counting the files and their bytes, which the answer's head names first: the log being sized and its next
+  /// revision.
+  Counting(Walked, u32),
   /// The head: `0`, then the files' count and bytes; or `1`, no stream served.
   Head,
   /// A log's index file: its next revision, and its data file's bytes before it.
@@ -474,13 +498,17 @@ struct StoredLog {
 /// `stream_out`'s answer made a step at a time (A-745; §4.17.1 "A fetch's answer"), each revision sent as the changeset
 /// store keeps it (goal 93 perf; main's ruling of 2026-11-21 00:30): its stored edit against its stored base, read in
 /// place, or its whole where the store keeps one, never a text made whole (a stream of Mercurial's history was 4.3 GiB of
-/// whole texts where `hg serve` copies an 84 MB store). The answer names its files' count and bytes first, so a first
-/// walk counts them from each log's rows (an entry 64 bytes, a chunk its stored bytes and the `u` that marks a chunk
-/// stored as it is, which 7.2's reader strips whatever follows); then each log in [`revlogs`]' order is written, its
-/// index file's entries a row a step (each entry's base the revision of the log that first holds its base's text), then
-/// its data file's chunks, a batch a step. A log whose revision the store does not keep (an imported repository's,
+/// whole texts where `hg serve` copies an 84 MB store), each chunk stored as 7.2 stores it ([`crate::revlog_chunk`]). The
+/// answer names its files' count and bytes first, so a first walk, the count pass, reads each log's chunks a batch at a
+/// time and sizes each one compressed (an entry 64 bytes, a chunk its stored length), which decides whether the log is
+/// inline ([`revlog_chunk::inline`]); then each log in [`revlogs`]' order is written, the send pass, its index file's
+/// entries a row a step (each entry's base the revision of the log that first holds its base's text), each followed by
+/// its chunk where the log is inline, then a split log's data file's chunks, a batch a step, each compressed again and
+/// held to the length the count gave it (one compressor, the same bytes: a chunk that differs is refused as unreadable
+/// rather than sent past what the head named). A log whose revision the store does not keep (an imported repository's,
 /// before its import lands as changesets) serves no stream: the answer is `1\n`, 7.2's "operation forbidden by
-/// server", and the client clones. What the walk holds: its place, two counts, a batch of logs' rows and a batch of
+/// server", and the client clones. What the walk holds: its place, two counts, each log's chunk lengths from the count
+/// to the send (4 bytes a revision, less than the index's own row of it), a batch of logs' rows and a batch of
 /// chunks, each as much as the room the last step was given holds (one log, one chunk at least); a chunk batch runs on
 /// into the logs held after the one being written, so the store is asked by the stream's bytes, never once a log.
 /// The store's rows and chunks are asked for by [`Streaming::wants`] and given back before the next step
@@ -511,6 +539,24 @@ pub struct Streaming {
   gathering: Option<Gathering>,
   /// How each file it sends is framed: `stream_out`'s, or a `stream2` part's.
   framing: Framing,
+  /// The logs the count sized and the send has not ended, in the walk's order.
+  sized: VecDeque<SizedLog>,
+  /// The chunk lengths of the log the count is sizing, so far.
+  sizing: Vec<u32>,
+}
+
+/// A log the count pass sized, for the send pass: each revision's stored chunk length, their sum, and whether the log is
+/// inline.
+#[derive(Debug)]
+struct SizedLog {
+  /// The log.
+  log: Walked,
+  /// Each revision's stored chunk length, in order.
+  chunks: Vec<u32>,
+  /// Their sum: the data file's size, or the chunks' share of an inline index file.
+  data: u64,
+  /// Whether its chunks follow its entries in its index file.
+  inline: bool,
 }
 
 /// How a stream frames the files it sends.
@@ -572,6 +618,8 @@ impl Default for Streaming {
       room_hint: 0,
       gathering: None,
       framing: Framing::V1,
+      sized: VecDeque::new(),
+      sizing: Vec::new(),
     }
   }
 }
@@ -589,7 +637,7 @@ impl Streaming {
   /// Where its count stands: counting until every log is counted; then the files and bytes it sends, or unserved.
   pub fn counted(&self) -> Counted {
     match self.stage {
-      Stage::Start | Stage::Counting(_) => Counted::Counting,
+      Stage::Start | Stage::Counting(..) => Counted::Counting,
       _ if self.not_served => Counted::Unserved,
       _ => Counted::Served {
         files: self.counted.0,
@@ -662,8 +710,8 @@ impl Streaming {
     self.room_hint = admission.left();
     let stage = self.stage.clone();
     self.stage = match stage {
-      Stage::Start => first_log(index, store).map_or(Stage::Head, Stage::Counting),
-      Stage::Counting(log) => self.count(index, store, log)?,
+      Stage::Start => first_log(index, store).map_or(Stage::Head, |log| Stage::Counting(log, 0)),
+      Stage::Counting(log, rev) => self.count(index, store, (log, rev))?,
       Stage::Head => self.head(index, store, admission, out)?,
       Stage::Index(log, rev, offset) => {
         self.index_entry(index, store, (log, rev, offset), admission, out)?
@@ -741,36 +789,100 @@ impl Streaming {
     Ok(false)
   }
 
-  /// One log of the count, once its rows are held: its index file and data file counted; then the next log, or the head.
+  /// One step of the count, once the log's rows are held: its next revision's chunk sized compressed (its stored bytes
+  /// asked for a batch at a time); past its last, the log counted, inline as one file of its entries and chunks or split
+  /// as its index file and (where it holds any) its data file, then the next log, or the head.
   fn count(
     &mut self,
     index: &HgIndex,
     store: &ContentStore,
-    log: Walked,
+    (log, rev): (Walked, u32),
   ) -> Result<Stage, Refused> {
     if !self.rows_held(index, store, &log)? {
-      return Ok(Stage::Counting(log));
+      return Ok(Stage::Counting(log, rev));
     }
     if self.not_served {
       return Ok(Stage::Head);
     }
-    let stored = self.held.front().ok_or(Refused::TooLong)?;
-    let entries = to_u64(stored.revisions.len()).saturating_mul(to_u64(ENTRY_BYTES));
-    let data = stored.revisions.iter().try_fold(0_u64, |data, row| {
-      sent_len(row).map(|sent| data.saturating_add(sent))
-    });
-    // A place too short for the trivial hunk it must hold: the store's row is not one a stream can send.
-    let data = data.ok_or(Refused::Unreadable {
-      log: unreadable_name(&log),
-      rev: 0,
-    })?;
-    for bytes in [entries, data] {
+    let (seq, count) = self.front_log()?;
+    if rev < count {
+      let Some(plain) = self.chunk_at(seq, rev)? else {
+        return Ok(Stage::Counting(log, rev));
+      };
+      let length = revlog_chunk::chunk_len(&plain, Pass::Count)?;
+      if rev == 0 {
+        self.sizing.clear();
+      }
+      self
+        .sizing
+        .push(u32::try_from(length).map_err(|_| Refused::TooLong)?);
+      return Ok(Stage::Counting(log, rev.saturating_add(1)));
+    }
+    let chunks = core::mem::take(&mut self.sizing);
+    let data = chunks
+      .iter()
+      .map(|length| u64::from(*length))
+      .fold(0_u64, u64::saturating_add);
+    let inline = revlog_chunk::inline(may_inline(log.log()), data);
+    let entries = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
+    let files = if inline {
+      [entries.saturating_add(data), 0]
+    } else {
+      [entries, data]
+    };
+    for bytes in files {
       if bytes > 0 {
         self.counted.0 = self.counted.0.saturating_add(1);
         self.counted.1 = self.counted.1.saturating_add(bytes);
       }
     }
-    Ok(next_log(&log, index, store).map_or(Stage::Head, Stage::Counting))
+    let next = next_log(&log, index, store);
+    self.sized.push_back(SizedLog {
+      log,
+      chunks,
+      data,
+      inline,
+    });
+    Ok(next.map_or(Stage::Head, |next| Stage::Counting(next, 0)))
+  }
+
+  /// The number and revision count of the log whose rows are held first.
+  fn front_log(&self) -> Result<(u64, u32), Refused> {
+    let stored = self.held.front().ok_or(Refused::TooLong)?;
+    let count = u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)?;
+    Ok((stored.seq, count))
+  }
+
+  /// Revision `rev`'s stored bytes in the log numbered `seq` (its delta or its whole, as the store keeps it), when the
+  /// batch given holds it next; else none, a batch from it on asked for, running into the logs held after this one: as
+  /// many places as fit the room the last step was given, at least one.
+  fn chunk_at(&mut self, seq: u64, rev: u32) -> Result<Option<Vec<u8>>, Refused> {
+    if self
+      .chunks
+      .front()
+      .is_some_and(|(at_seq, at_rev, _)| (*at_seq, *at_rev) == (seq, rev))
+    {
+      return Ok(self.chunks.pop_front().map(|(_, _, chunk)| chunk));
+    }
+    self.chunks.clear();
+    let (mut places, mut tags, mut bytes) = (Vec::new(), Vec::new(), 0_u64);
+    'logs: for held in &self.held {
+      let from = if held.seq == seq { rev } else { 0 };
+      for (at, row) in (0_u32..)
+        .zip(&held.revisions)
+        .skip(usize::try_from(from).map_err(|_| Refused::TooLong)?)
+      {
+        if !places.is_empty() && bytes.saturating_add(row.place.len) > self.room_hint {
+          break 'logs;
+        }
+        bytes = bytes.saturating_add(row.place.len);
+        places.push(row.place);
+        tags.push((held.seq, at));
+      }
+    }
+    self.want = Some(Want::Chunks { places });
+    self.wanted_chunks = tags;
+    Ok(None)
   }
 
   /// The answer's head: `0` and the counts, or `1` where a revision the store does not keep was met.
@@ -804,7 +916,8 @@ impl Streaming {
     Ok(first_log(index, store).map_or(Stage::Done, |log| Stage::Index(log, 0, 0)))
   }
 
-  /// The index file's next entry (its line first, at its first), or the index file's end and the data file next.
+  /// The index file's next entry (its line first, at its first), followed by its chunk where the log is inline; or the
+  /// index file's end ([`Streaming::index_end`]).
   fn index_entry(
     &mut self,
     index: &HgIndex,
@@ -816,30 +929,104 @@ impl Streaming {
     if !self.rows_held(index, store, &log)? {
       return Ok(Stage::Index(log, rev, offset));
     }
-    // The log's length is its held rows' count: asked of the index, each entry took a search of the log's keys.
-    let count = self.held.front().map_or(Ok(0), |stored| {
-      u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)
-    })?;
-    if rev >= count {
-      if offset == 0 {
-        return Ok(
-          next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)),
-        );
-      }
-      let name = [log.radix().as_slice(), b".d"].concat();
-      file_head(self.framing, (&name, offset), admission, out)?;
-      return Ok(Stage::Data(log, 0));
-    }
     let unreadable = || Refused::Unreadable {
       log: unreadable_name(&log),
       rev,
     };
+    // The log's length is its held rows' count: asked of the index, each entry took a search of the log's keys.
+    let (seq, count) = self.front_log()?;
+    let (inline, data, length) = self.sized_at(&log, rev)?;
+    if rev >= count {
+      return self.index_end(index, store, (log, inline, data), admission, out);
+    }
+    let length = u64::from(length.ok_or_else(unreadable)?);
+    // An inline log's chunk is had before anything is written, so a step that must ask the store writes nothing.
+    let plain = if inline {
+      self.chunk_at(seq, rev)?
+    } else {
+      None
+    };
+    if inline && plain.is_none() {
+      return Ok(Stage::Index(log, rev, offset));
+    }
     if rev == 0 {
       let name = [log.radix().as_slice(), b".i"].concat();
-      let size = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
-      file_head(self.framing, (&name, size), admission, out)?;
+      let entries = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
+      let chunks = plain.as_ref().map_or(0, |_| data);
+      file_head(
+        self.framing,
+        (&name, entries.saturating_add(chunks)),
+        admission,
+        out,
+      )?;
     }
-    admission.charge(to_u64(ENTRY_BYTES))?;
+    admission.charge(to_u64(ENTRY_BYTES).saturating_add(plain.as_ref().map_or(0, |_| length)))?;
+    let entry = self.entry_of(index, store, (&log, rev, offset), length)?;
+    let at = out.len();
+    entry.write(out)?;
+    if rev == 0 {
+      put_header(out, at, inline);
+    }
+    if let Some(plain) = plain
+      && revlog_chunk::chunk(&plain, Pass::Send, out)? != length
+    {
+      return Err(unreadable());
+    }
+    Ok(Stage::Index(
+      log,
+      rev.saturating_add(1),
+      offset.saturating_add(length),
+    ))
+  }
+
+  /// What the count gave `log`: whether it is inline, its chunks' bytes, and revision `rev`'s chunk length (none past
+  /// its last); refused unreadable where the count sized another log.
+  fn sized_at(&self, log: &Walked, rev: u32) -> Result<(bool, u64, Option<u32>), Refused> {
+    let sized = self
+      .sized
+      .front()
+      .filter(|sized| sized.log == *log)
+      .ok_or_else(|| Refused::Unreadable {
+        log: unreadable_name(log),
+        rev,
+      })?;
+    let at = usize::try_from(rev).map_err(|_| Refused::TooLong)?;
+    Ok((sized.inline, sized.data, sized.chunks.get(at).copied()))
+  }
+
+  /// The index file's end: an inline log (or one with no chunk to send) ends there and the next log begins; a split log's
+  /// data file is next, its line first.
+  fn index_end(
+    &mut self,
+    index: &HgIndex,
+    store: &ContentStore,
+    (log, inline, data): (Walked, bool, u64),
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Stage, Refused> {
+    if inline || data == 0 {
+      self.sized.pop_front();
+      return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
+    }
+    let name = [log.radix().as_slice(), b".d"].concat();
+    file_head(self.framing, (&name, data), admission, out)?;
+    Ok(Stage::Data(log, 0))
+  }
+
+  /// Revision `rev`'s entry in `log`, its chunk `length` bytes at `offset` among the chunks: its row's base as the
+  /// revision of the log that first holds its base's text, its parents, link, node and flags from the index. A
+  /// revision against the null base is refused unreadable unless its place holds its text whole.
+  fn entry_of(
+    &self,
+    index: &HgIndex,
+    store: &ContentStore,
+    (log, rev, offset): (&Walked, u32, u64),
+    length: u64,
+  ) -> Result<Entry, Refused> {
+    let unreadable = || Refused::Unreadable {
+      log: unreadable_name(log),
+      rev,
+    };
     let stored = self.held.front().ok_or_else(unreadable)?;
     let row = stored
       .revisions
@@ -867,38 +1054,23 @@ impl Streaming {
       }
     };
     // A revision against the null base is sent as its text alone, which its place holds (a whole kept raw, A-767 C1).
-    let whole_text = row.place.len == text;
-    let chunk = sent_len(row)
-      .filter(|_| based || whole_text)
-      .ok_or_else(unreadable)?;
-    let entry = Entry {
+    if !based && row.place.len != text {
+      return Err(unreadable());
+    }
+    Ok(Entry {
       offset,
       flags,
-      chunk: usize::try_from(chunk).map_err(|_| Refused::TooLong)?,
+      chunk: usize::try_from(length).map_err(|_| Refused::TooLong)?,
       text: usize::try_from(text).map_err(|_| Refused::TooLong)?,
       base,
       link,
       parents,
       node,
-    };
-    let at = out.len();
-    entry.write(out)?;
-    if rev == 0
-      && let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len()))
-    {
-      // Once a log, at its first entry: inline where no revision has a chunk to send.
-      let no_data = stored.revisions.iter().all(|row| sent_len(row) == Some(0));
-      header.copy_from_slice(if no_data { &INLINE_HEADER } else { &HEADER });
-    }
-    Ok(Stage::Index(
-      log,
-      rev.saturating_add(1),
-      offset.saturating_add(chunk),
-    ))
+    })
   }
 
-  /// The data file's next chunk, its stored bytes as they lie (asked for a batch at a time), or the log's end and the
-  /// next log's index file.
+  /// A split log's data file's next chunk, its stored bytes (asked for a batch at a time) compressed to the length the
+  /// count gave it, or the log's end and the next log's index file.
   fn data_chunk(
     &mut self,
     index: &HgIndex,
@@ -911,49 +1083,33 @@ impl Streaming {
       log: unreadable_name(&log),
       rev,
     };
-    let stored = self.held.front().ok_or_else(unreadable)?;
-    let count = u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)?;
+    let (seq, count) = self.front_log()?;
     if rev >= count {
       // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
+      self.sized.pop_front();
       return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
     }
-    let seq = stored.seq;
-    if self
-      .chunks
+    let length = self
+      .sized
       .front()
-      .is_none_or(|(at_seq, at_rev, _)| (*at_seq, *at_rev) != (seq, rev))
-    {
-      // A batch from this revision on, running into the logs held after this one: as many places as fit the room the
-      // last step was given, at least one.
-      self.chunks.clear();
-      let (mut places, mut tags, mut bytes) = (Vec::new(), Vec::new(), 0_u64);
-      'logs: for held in &self.held {
-        let from = if held.seq == seq { rev } else { 0 };
-        for (at, row) in (0_u32..)
-          .zip(&held.revisions)
-          .skip(usize::try_from(from).map_err(|_| Refused::TooLong)?)
-        {
-          if !places.is_empty() && bytes.saturating_add(row.place.len) > self.room_hint {
-            break 'logs;
-          }
-          bytes = bytes.saturating_add(row.place.len);
-          places.push(row.place);
-          tags.push((held.seq, at));
-        }
-      }
-      self.want = Some(Want::Chunks { places });
-      self.wanted_chunks = tags;
+      .filter(|sized| sized.log == log)
+      .and_then(|sized| sized.chunks.get(usize::try_from(rev).ok()?).copied())
+      .ok_or_else(unreadable)?;
+    let Some(plain) = self.chunk_at(seq, rev)? else {
       return Ok(Stage::Data(log, rev));
-    }
-    // A whole's chunk is its raw text and an edit's its delta (A-767 C1): either is sent as it lies.
-    let (_, _, chunk) = self.chunks.pop_front().ok_or_else(unreadable)?;
-    let sent = chunk.as_slice();
-    admission.charge(chunk_len(to_u64(sent.len())))?;
-    if !sent.is_empty() {
-      out.push(UNCOMPRESSED);
-      out.extend_from_slice(sent);
+    };
+    admission.charge(u64::from(length))?;
+    if revlog_chunk::chunk(&plain, Pass::Send, out)? != u64::from(length) {
+      return Err(unreadable());
     }
     Ok(Stage::Data(log, rev.saturating_add(1)))
+  }
+}
+
+/// Writes a log's header over the first four bytes of its first entry, written at `at`: inline or split.
+fn put_header(out: &mut [u8], at: usize, inline: bool) {
+  if let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len())) {
+    header.copy_from_slice(if inline { &INLINE_HEADER } else { &HEADER });
   }
 }
 
@@ -1016,22 +1172,6 @@ fn unreadable_name(log: &Walked) -> Vec<u8> {
     Walked::File(path) => path.clone(),
     Walked::Manifest => vec![0],
     Walked::Changelog => Vec::new(),
-  }
-}
-
-/// A stored revision's chunk length as a stream sends it ([`chunk_len`]): its stored delta's, or for a whole its text's,
-/// which its place holds (A-767 C1).
-fn sent_len(row: &StoredRevision) -> Option<u64> {
-  Some(chunk_len(row.place.len))
-}
-
-/// A chunk's length in its data file: its stored bytes and the `u` that marks a chunk stored as it is (7.2's reader
-/// strips it whatever follows), none for an empty chunk.
-fn chunk_len(stored: u64) -> u64 {
-  if stored == 0 {
-    0
-  } else {
-    stored.saturating_add(1)
   }
 }
 

@@ -435,7 +435,13 @@ fn a_views_manifest_read_is_one_text() {
     publishing: true,
     markers: &[],
   };
-  let view = Indexed::new(&index, &store, state, &mut Admission::new(u64::MAX)).unwrap();
+  let view = Indexed::new(
+    &index,
+    &store,
+    state,
+    (u64::MAX, &mut Admission::new(u64::MAX)),
+  )
+  .unwrap();
   let nodes: Vec<Node> = (0..index.len(&store, Log::Manifest))
     .filter_map(|rev| {
       index
