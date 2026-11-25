@@ -58,8 +58,8 @@ mod tests;
 pub use export::{Exporter, Exporting};
 pub use import::{Importer, Importing};
 pub use records::{
-  Before, Checked, Properties, Repository, RevisionReplay, Room, TextReading, TextSource,
-  WithTexts, before,
+  Before, CheckStep, Checked, Checking, Properties, Repository, RevisionReplay, Room, TextReading,
+  TextSource, WithTexts, before,
 };
 pub use standalone::{Checked as StandaloneChecked, Standalone};
 
