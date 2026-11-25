@@ -316,35 +316,20 @@ pub(crate) const LANDED_TEXT_PINNED_READER: &str = "merge.name_hold.landed_pinne
 /// `"homes"`). Format: a counter name in the daemon's status report.
 pub(crate) const LANDED_TEXT_PINNED_HOMES: &str = "merge.name_hold.landed_pinned_homes";
 
-/// Counted: a landed text's window a let-go kept because a text put for a revision not landed yet holds it too
-/// ([`keeping_unlanded`]). Format: a counter name in the daemon's status report.
-pub(crate) const LANDED_TEXT_PINNED_UNLANDED: &str = "merge.name_hold.landed_pinned_unlanded";
-
-/// Runs `land`, a batch's landing while the import holds `texts` put for the next revision, not landed yet, with every
-/// window those texts hold kept by any landed text's let-go meanwhile ([`let_go_landed_texts`]). Windows are named by
-/// their bytes, so a revision that keeps a file's first bytes (an append) holds the very windows the landed revision
-/// before it does; let go as landed, the later revision could not read its own text, and its staging was refused
-/// `Unstored` (TSan diag 45557094379: a Linux runner's texts bound cut between two revisions of one file). None where
-/// the shard's state is gone.
-pub(crate) async fn keeping_unlanded<T>(
-  texts: Vec<[u8; 32]>,
-  land: impl core::future::Future<Output = Option<T>>,
-) -> Option<T> {
-  crate::state::with_state(|state| state.vcs_stores.svn_unlanded = texts)?;
-  let landed = land.await;
-  let _ = crate::state::with_state(|state| state.vcs_stores.svn_unlanded.clear());
-  landed
-}
-
-/// The windows the texts [`keeping_unlanded`] names hold, in `content`.
-fn unlanded_windows(
-  content: &ContentStore,
-  texts: &[[u8; 32]],
-) -> std::collections::BTreeSet<ContentId> {
-  texts
-    .iter()
-    .flat_map(|text| content.object_windows(&ContentId(*text)))
-    .collect()
+/// Unpins each of `texts`, an import's texts pinned as it sealed them (`svn_import::texts`, `ContentStore::pin_unlanded`;
+/// main's ruling (B) of 2026-11-24), once each: their batch landed, or their write ended. Called before the holds they
+/// came with are given back, as the store asks (a freed window takes its count with it).
+pub(crate) fn unpin_texts(state: &mut crate::state::ShardState, texts: &[[u8; 32]]) {
+  if texts.is_empty() {
+    return;
+  }
+  super::within_budget(state, 0, |stores| {
+    if let Some(content) = stores.content_mut() {
+      for text in texts {
+        content.unpin_unlanded(&ContentId(*text));
+      }
+    }
+  });
 }
 
 /// Lets go the windows of each of `texts`, a landing's committed texts, once its changeset is durable on the node's
@@ -362,19 +347,7 @@ pub(crate) fn let_go_landed_texts(state: &mut crate::state::ShardState, texts: &
   }
   // Each window kept counted by the holder that pinned it, so a text left resident says why.
   let (reader, homes) = (core::cell::Cell::new(0u64), core::cell::Cell::new(0u64));
-  let unlanded_kept = core::cell::Cell::new(0u64);
-  let unlanded = match (
-    state.vcs_stores.svn_unlanded.is_empty(),
-    state.vcs_stores.content(),
-  ) {
-    (false, Some(content)) => unlanded_windows(content, &state.vcs_stores.svn_unlanded),
-    _ => std::collections::BTreeSet::new(),
-  };
   let pinned = |window: &ContentId| {
-    if unlanded.contains(window) {
-      unlanded_kept.set(unlanded_kept.get().saturating_add(1));
-      return Some("unlanded");
-    }
     let by = super::landed_pin(window);
     match by {
       Some("reader") => reader.set(reader.get().saturating_add(1)),
@@ -401,7 +374,6 @@ pub(crate) fn let_go_landed_texts(state: &mut crate::state::ShardState, texts: &
   }
   state.count(LANDED_TEXT_PINNED_READER, reader.get());
   state.count(LANDED_TEXT_PINNED_HOMES, homes.get());
-  state.count(LANDED_TEXT_PINNED_UNLANDED, unlanded_kept.get());
   freed
 }
 
