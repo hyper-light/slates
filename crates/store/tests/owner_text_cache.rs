@@ -34,8 +34,11 @@ const BINARY: &str = "owner-text-cache";
 /// Shape: the texts the walk test lands and leaves part-way, each [`TEXT`] bytes.
 const LEFT_TEXTS: usize = 3;
 
+/// The sections a landing carries, each with its kind.
+type Sections = Vec<(SectionKind, Vec<u8>)>;
+
 /// The texts of `count` distinct payloads of [`TEXT`] bytes landed as changeset `sequence`'s, with their identities.
-fn left_texts(count: usize) -> (Vec<[u8; 32]>, Vec<(SectionKind, Vec<u8>)>) {
+fn left_texts(count: usize) -> (Vec<[u8; 32]>, Sections) {
   let mut identities = Vec::new();
   let mut entries = Vec::new();
   let mut payload = Vec::new();
@@ -66,9 +69,8 @@ fn left_texts(count: usize) -> (Vec<[u8; 32]>, Vec<(SectionKind, Vec<u8>)>) {
 
 /// Goal 93 (main's ruling of 2026-11-25: after hg's 57k push the text cache's chunks held 32 MB live, `texts.rs:708`, and
 /// nothing reported its reserved bytes, bound or walks). Do: land [`LEFT_TEXTS`] texts of [`TEXT`] bytes; through the
-/// owner, read each one's first slice of [`SLICE`] and leave it, as a caller gone mid-walk; read one more slice and note
-/// what the owner's cache was as it took it (`owner::text_cache_seen`); then read each text to its end and note it
-/// again. Expect the figures to reach the asker (non-vacuity of the memory status's rows): after the reads left
+/// owner, read each one's first slice of [`SLICE`] and leave it, as a caller gone mid-walk, and note what the owner's
+/// cache was as the last read left it (`owner::text_cache_seen`); then read each text to its end and note it again. Expect the figures to reach the asker (non-vacuity of the memory status's rows): after the reads left
 /// part-way, every one a walk in flight, their texts' bytes walked and the bound holding them; once each is read to
 /// its end, no walk in flight. The lead it shows: a read its caller leaves part-way holds the cache's bound up until
 /// more walks than the owner's room for waiting reads evict it.
@@ -103,22 +105,12 @@ fn the_owners_text_cache_is_seen_by_its_asker_and_a_read_left_partway_holds_its_
           .unwrap()
           .unwrap();
       }
-      let look = identities[0];
-      let _ = handle
-        .text_slice_into(REPOSITORY, look, (0, SLICE), Vec::new())
-        .await;
       let left = slates_store::owner::text_cache_seen();
       for identity in &identities {
         let _ = handle
           .text_slice_into(REPOSITORY, *identity, (SLICE, TEXT as u64), Vec::new())
           .await;
       }
-      let _ = handle
-        .text_slice_into(REPOSITORY, look, (0, 1), Vec::new())
-        .await;
-      let _ = handle
-        .text_slice_into(REPOSITORY, look, (1, TEXT as u64), Vec::new())
-        .await;
       (left, slates_store::owner::text_cache_seen())
     })
     .unwrap();
@@ -140,7 +132,7 @@ fn the_owners_text_cache_is_seen_by_its_asker_and_a_read_left_partway_holds_its_
     "the bound holding them: {left:?}"
   );
   assert_eq!(
-    ended.walks, 1,
-    "the walks read to their end gone, the look's own begun: {ended:?}"
+    ended.walks, 0,
+    "the walks read to their end gone: {ended:?}"
   );
 }

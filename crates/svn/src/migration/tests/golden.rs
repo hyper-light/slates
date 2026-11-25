@@ -513,3 +513,22 @@ fn every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_wh
     assert_eq!(u64::try_from(committed), Ok(index.youngest()), "{dumps:?}");
   }
 }
+
+/// A-920 piece 2b (golden). Do: import every dump `svnadmin` wrote (`full.dump`, `deltas.dump`, and `part1.dump` then
+/// `part2.dump`) with every commit's check taken a unit a step (`records::CHECK_A_UNIT_A_STEP`), as a staging step
+/// whose slice is always spent takes it. Expect each to hold the history `full.dump` makes imported whole, and to
+/// export as `full.dump` byte for byte.
+#[test]
+fn every_dump_svnadmin_wrote_imports_alike_with_every_check_a_unit_a_step() {
+  let whole = history(&imported(&["full.dump"]));
+  let sliced = &crate::migration::records::CHECK_A_UNIT_A_STEP;
+  sliced.with(|sliced| sliced.set(true));
+  for dumps in [
+    &["full.dump"][..],
+    &["deltas.dump"],
+    &["part1.dump", "part2.dump"],
+  ] {
+    holds_the_full_history(&format!("{dumps:?}"), &imported(dumps), &whole);
+  }
+  sliced.with(|sliced| sliced.set(false));
+}
