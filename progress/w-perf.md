@@ -1,5 +1,12 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~16:30 PST
+- LANDED 1c74dada9: hg_fetch_heap prints encoded_bytes.<family> and the gauges after the push.
+- LANDED 6a55f46e7: the text cache's figures taken at the reply (they were a request behind).
+- LANDED 317f5720e: A-926 part 1, high-water marks for the write log, slots and delta log; the sweep 12.58 M -> 3.50 M
+  pages, 55.5 s -> 1.6 s loaded; A-826's flaky sweep closed.
+- OWED: A-926 part 2 (the segment's log and snapshot regions); item 3 (the 35.7 MB keep) and the append rule wait on
+  main's 57k rerun.
 ## 2026-11-25 ~14:30 PST
 - LANDED 3f61d5429: A-923's entry names the replay path that read hg's named files back with old aways refused.
 - LANDED f954135af: the owner's text cache in memory status (store.text_cache_{reserved_bytes,bound_bytes,walks,
