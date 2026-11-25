@@ -779,3 +779,4 @@
   Answered: git has no hg 57k-push let-go shape (LANDED_LET_GO false; landed_let_go_may waits intakes_live).
   PARKED agents/w-git-derive-behind 0552aca75 (derive a push's versions behind it; red/green done; t_a724 replay diff
   in a reach value open). WAITING: main's A/B verdict, the 57k read of tree_parse_bytes_most/long steps, git_derive.ns.
+- 11-25: CLOSED the 11-23 line "git_interop's per-step PATIENCE from the work (needs main's ratio over stock)": superseded by PATIENCE by progress, 0f40bfea3 (merge 719a296e1).
