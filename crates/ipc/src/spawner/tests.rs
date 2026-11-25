@@ -426,9 +426,15 @@ fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
   );
   // Not on arm Linux, whose direct spawn grows too gently for the bound (284 to 333 µs a spawn from 100 to 10,000
   // descriptors on ubuntu-24.04-arm, main's diag run 45666757721), where x86_64's grew 2.75 times.
+  // Its bound is drawn from the median at 100 and its own spread below it, which no one slow spawn widens: drawn from the
+  // most, one direct spawn of 6.79 ms at 100 (its median 1.54) lifted it past a least of 4.9 ms at 100,000 (MacBook,
+  // 2026-11-25, beside the crate's other tests).
+  let steady = |least: usize, median: usize| {
+    figure(0, median) + figure(0, median).saturating_sub(figure(0, least))
+  };
   #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))]
   assert!(
-    figure(last, 4) > bound(4, 6),
+    figure(last, 4) > steady(4, 5),
     "the direct spawn's cost grows with the descriptors, so the measure can see growth: {printed}"
   );
 }
