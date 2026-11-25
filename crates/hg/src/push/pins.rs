@@ -1,177 +1,109 @@
 //! A push's kept-but-unlanded revisions pin the windows they name against a landed segment's let-go (goal 93; main's
-//! ruling of 2026-11-24, w-perf's design: the write path's form of the rule a named or home read already follows).
+//! ruling (B) of 2026-11-24: one rule at the one let-go every path uses, `ContentStore::pin_unlanded`; w-perf's design
+//! for the push's side).
 //!
-//! **Why.** A push lands as a run of segment changesets, each let go once durable: its texts' windows let go whatever
-//! their holders (`let_go_object_landed`), since a landed window is brought back by its record. A window is shared by
-//! content, so a window a landed revision A shares with a revision B the push kept and has not landed yet (an unchanged
-//! run of a `.po` file between revisions) went with A's let-go, while B's segment is not on the node's store: a revision
-//! C whose base is B then found B's window away and asked the store for B, which keeps no row of it, and the push was
-//! refused `UnknownDeltaBase` (main's 57k push at 2ed3eb139, `i18n/da.po`). The windowed intake (C1 (2)) reads a base's
-//! windows where it once held the base whole, which exposed it.
+//! **Why.** A push lands as a run of segment changesets, each let go once durable by `let_go_object_landed`, whatever a
+//! window's holders. A window is shared by content, so one a landed revision A shared with a revision B the push had kept
+//! and not landed (an unchanged run of a `.po` file between revisions) went with A's let-go while B was on no store: a
+//! revision C on B then found B's window away and asked the store for B, which keeps no row of it, and the push was
+//! refused `UnknownDeltaBase` (main's 57k push at 2ed3eb139, `i18n/da.po`). The windowed intake (C1 (2)) exposed it,
+//! reading a base's windows where it once held the base whole.
 //!
-//! **How.** [`Pins`] counts each window the push's kept-but-unlanded revisions name, a multiset; a let-go asks
-//! [`Pins::holds`] of each window and keeps one held (counted [`Pins::skipped`]). A push's [`Counted`] adds the windows of
-//! each revision as the intake keeps it ([`Counted::count_kept`], over `Intake::kept_contents`), takes a segment's own
-//! out just before that segment's let-go ([`Counted::count_out`]), and gives back the rest at the push's end, whatever
-//! it was ([`Counted::release`]); a window a later revision still names keeps its count, and goes with that one's
-//! landing.
+//! **How.** The content store keeps, beside each window, how many unlanded objects name it, and no let-go takes a window
+//! while any does (`ContentStore::pin_unlanded`, `LetGoRefused::Unlanded`, counted `kept_unlanded`). A push's
+//! [`Counted`] pins each revision's objects as the intake keeps it ([`Counted::count_kept`], over
+//! `Intake::kept_contents`), unpins a segment's own just before that segment's let-go ([`Counted::count_out`]: never at
+//! its taking, since its record is written over turns before it lands), and gives back the rest however the push ends
+//! ([`Counted::release`]). A window a later revision still names keeps its count, and goes with that one's landing.
 //!
-//! **Bounded.** The windows of the revisions kept and not landed: never more than the content store holds windows, its
-//! budget over its window ([`Pins::for_store`]); a count past that is refused typed ([`PinsFull`]), never grown.
+//! **Bounded.** A window's count is the store's (its width refused typed, `CountExhausted`); the ledger holds the push's
+//! kept-but-unlanded revisions, the open segment and those cut and not landed.
 
 use std::collections::BTreeMap;
 
-use slates_vcs::{ContentId, ContentStore};
+use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
 use crate::Node;
 use crate::filerev::FileContents;
 
-/// Why a pin was refused: the windows it would count pass the bound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PinsFull {
-  /// The most windows counted at once.
-  pub most: usize,
-}
+/// One revision a push pinned: its log's path and the objects it pinned.
+type Pinned = (Vec<u8>, Vec<ContentId>);
 
-/// Windows pinned by revisions kept and not landed, each with how many name it (module docs).
+/// What one push pinned in the content store, by revision, so it unpins exactly what it pinned (module docs).
 #[derive(Debug, Default)]
-pub struct Pins {
-  /// Each window, and how many revisions' contents name it.
-  counts: BTreeMap<ContentId, u32>,
-  /// The most windows counted at once.
-  most: usize,
-  /// The windows a let-go kept because a count held them: the non-vacuity counter.
-  skipped: core::cell::Cell<u64>,
+pub struct Counted {
+  /// Each revision pinned, by node: its log's path and its objects (a node's revisions in two logs kept apart).
+  counted: BTreeMap<Node, Vec<Pinned>>,
 }
 
-impl Pins {
-  /// Pins of at most `most` windows.
-  pub fn within(most: usize) -> Pins {
-    Pins {
-      most,
-      ..Pins::default()
-    }
-  }
-
-  /// Pins bounded by what `store` can hold: its budget over its window.
-  pub fn for_store(store: &ContentStore) -> Pins {
-    let window = u64::try_from(store.window().max(1)).unwrap_or(u64::MAX);
-    let most = usize::try_from(store.budget() / window).unwrap_or(usize::MAX);
-    Pins::within(most.max(1))
-  }
-
-  /// Counts `windows` in, each once more: refused, nothing counted, where they would pass the bound.
-  pub fn count_in(&mut self, windows: &[ContentId]) -> Result<(), PinsFull> {
-    let new = windows
-      .iter()
-      .filter(|window| !self.counts.contains_key(window))
-      .count();
-    if self.counts.len().saturating_add(new) > self.most {
-      return Err(PinsFull { most: self.most });
-    }
-    for window in windows {
-      let count = self.counts.entry(*window).or_insert(0);
-      *count = count.saturating_add(1);
+impl Counted {
+  /// Pins the objects of each of `kept` (the intake's kept and not yet taken) it has not pinned: refused typed where a
+  /// window's count would pass its width, what it pinned before kept.
+  pub fn count_kept<'k>(
+    &mut self,
+    store: &mut ContentStore,
+    kept: impl Iterator<Item = &'k FileContents>,
+  ) -> Result<(), ContentRefused> {
+    for contents in kept {
+      let pinned = self
+        .counted
+        .get(&contents.node)
+        .is_some_and(|revisions| revisions.iter().any(|(path, _)| *path == contents.path));
+      if pinned {
+        continue;
+      }
+      let objects: Vec<ContentId> = contents.identities().copied().collect();
+      for (at, object) in objects.iter().enumerate() {
+        if let Err(refused) = store.pin_unlanded(object) {
+          for done in objects.get(..at).unwrap_or_default() {
+            store.unpin_unlanded(done);
+          }
+          return Err(refused);
+        }
+      }
+      self
+        .counted
+        .entry(contents.node)
+        .or_default()
+        .push((contents.path.clone(), objects));
     }
     Ok(())
   }
 
-  /// Counts `windows` out, each once less, a window no longer named forgotten.
-  pub fn count_out(&mut self, windows: &[ContentId]) {
-    for window in windows {
-      if let Some(count) = self.counts.get_mut(window) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-          self.counts.remove(window);
+  /// Unpins the objects of `segment`'s revisions, just before its let-go: theirs alone, a window a revision pinned later
+  /// still names kept.
+  pub fn count_out(&mut self, store: &mut ContentStore, segment: &[FileContents]) {
+    for contents in segment {
+      let Some(revisions) = self.counted.get_mut(&contents.node) else {
+        continue;
+      };
+      if let Some(at) = revisions
+        .iter()
+        .position(|(path, _)| *path == contents.path)
+      {
+        let (_, objects) = revisions.swap_remove(at);
+        for object in &objects {
+          store.unpin_unlanded(object);
+        }
+      }
+      if revisions.is_empty() {
+        self.counted.remove(&contents.node);
+      }
+    }
+  }
+
+  /// Unpins everything it pinned: the push's end, landed, refused or dropped.
+  pub fn release(&mut self, store: &mut ContentStore) {
+    for (_, revisions) in core::mem::take(&mut self.counted) {
+      for (_, objects) in revisions {
+        for object in &objects {
+          store.unpin_unlanded(object);
         }
       }
     }
   }
 
-  /// Whether a revision kept and not landed names `window`: a let-go keeps it, counted.
-  pub fn holds(&self, window: &ContentId) -> bool {
-    let held = self.counts.contains_key(window);
-    if held {
-      self.skipped.set(self.skipped.get().saturating_add(1));
-    }
-    held
-  }
-
-  /// The windows a let-go kept because a count held them.
-  pub fn skipped(&self) -> u64 {
-    self.skipped.get()
-  }
-
-  /// The windows counted now.
-  pub fn len(&self) -> usize {
-    self.counts.len()
-  }
-
-  /// Whether none is counted.
-  pub fn is_empty(&self) -> bool {
-    self.counts.is_empty()
-  }
-}
-
-/// The windows `contents`' objects are cut into in `store`, let go or not.
-pub fn windows_of(store: &ContentStore, contents: &FileContents) -> Vec<ContentId> {
-  contents
-    .identities()
-    .flat_map(|identity| store.object_layout(identity))
-    .map(|(window, _)| window)
-    .collect()
-}
-
-/// What one push counted into [`Pins`], by revision, so it takes out exactly what it put in (module docs).
-#[derive(Debug, Default)]
-pub struct Counted {
-  /// Each revision counted, by its log's path and node, with the windows it counted.
-  counted: BTreeMap<(Vec<u8>, Node), Vec<ContentId>>,
-}
-
-impl Counted {
-  /// Counts in the windows of each of `kept` (the intake's kept and not yet taken) it has not counted: refused typed
-  /// past the bound, what it counted before kept.
-  pub fn count_kept<'k>(
-    &mut self,
-    (pins, store): (&mut Pins, &ContentStore),
-    kept: impl Iterator<Item = &'k FileContents>,
-  ) -> Result<(), PinsFull> {
-    for contents in kept {
-      let key = (contents.path.clone(), contents.node);
-      if self.counted.contains_key(&key) {
-        continue;
-      }
-      let windows = windows_of(store, contents);
-      pins.count_in(&windows)?;
-      self.counted.insert(key, windows);
-    }
-    Ok(())
-  }
-
-  /// Counts out the windows of `segment`'s revisions, before its let-go runs: theirs alone, a window a revision counted
-  /// later still names kept.
-  pub fn count_out(&mut self, pins: &mut Pins, segment: &[FileContents]) {
-    for contents in segment {
-      if let Some(windows) = self.counted.remove(&(contents.path.clone(), contents.node)) {
-        pins.count_out(&windows);
-      }
-    }
-  }
-
-  /// Gives back everything it counted: the push's end, landed, refused or dropped.
-  pub fn release(&mut self, pins: &mut Pins) {
-    for (_, windows) in core::mem::take(&mut self.counted) {
-      pins.count_out(&windows);
-    }
-  }
-
-  /// The revisions it counts now.
-  pub fn len(&self) -> usize {
-    self.counted.len()
-  }
-
-  /// Whether it counts none.
+  /// Whether it pins none.
   pub fn is_empty(&self) -> bool {
     self.counted.is_empty()
   }

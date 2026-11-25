@@ -2621,7 +2621,7 @@ pub(crate) fn store_blocking(
     };
     let sequence = header.sequence;
     let ok = crate::test_store::land_blocking(disk, header, parts);
-    landed_segment(state, (&mut run, &segment), sequence, ok)
+    landed_segment(state, (&mut run, &segment), (sequence, ok), None)
   });
   let reference = run.reference(forked.room);
   if let Err(outcome) = landed {
@@ -2689,8 +2689,8 @@ pub(crate) fn land_stored(
 fn landed_segment(
   state: &mut ShardState,
   (run, segment): (&mut super::hg_run::Run, &PushSegment),
-  sequence: u64,
-  ok: bool,
+  (sequence, ok): (u64, bool),
+  counted: Option<&mut slates_hg::push::pins::Counted>,
 ) -> Result<(), PushOutcome> {
   if !ok {
     state.count(super::hg_run::SEGMENTS_UNLANDED, 1);
@@ -2702,18 +2702,22 @@ fn landed_segment(
   // entries kept, each brought back by the read that meets it (`hg_run`, "Let go"). What the push held just before,
   // its admission and its texts resident, is its high-water's sample.
   let kept = super::hg_run::contents_bytes(state, &segment.contents);
+  // Durable now: its own revisions unpinned just before its let-go, never at its taking (its record is written over
+  // turns before it lands; w-perf's review), a window a later kept revision names keeping that one's pin.
+  if let Some(counted) = counted {
+    vcs_store::within_budget(state, 0, |stores| {
+      stores
+        .content_mut()
+        .map(|content| counted.count_out(content, &segment.contents))
+    });
+  }
   // An elective change: none while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
   // progress rule); the texts then stay until the run commits, whose let-go waits for the pause to end.
-  let skips = super::hg_run::push_pin_skips();
   let freed = if crate::content_holder::image_paused(state) {
     0
   } else {
     super::hg_run::let_go_landed(state, None, &segment.contents)
   };
-  state.count(
-    super::hg_run::PUSH_PIN_SKIPS,
-    super::hg_run::push_pin_skips().saturating_sub(skips),
-  );
   let (held, texts) = run.texts_landed((kept, freed));
   state.count_max(PUSH_HELD_HIGH_BYTES, held);
   state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
@@ -2771,8 +2775,8 @@ pub(crate) struct Taking {
   generation: u64,
   /// An intake step's measured cost, across its slices (A-783's paced turn).
   costs: vcs_store::TurnCosts,
-  /// The windows its kept-but-unlanded revisions pin on its shard (`hg_run::PUSH_PINS`), counted after each slice, a
-  /// segment's counted out as it lands, the rest given back however the push ends.
+  /// What its kept-but-unlanded revisions pin unlanded in its shard's content store (`ContentStore::pin_unlanded`),
+  /// pinned after each slice, a segment's unpinned just before its let-go, the rest given back however the push ends.
   counted: slates_hg::push::pins::Counted,
 }
 
@@ -2808,11 +2812,10 @@ impl Taking {
       };
       // What the slice kept pins the windows it names until its own segment lands (goal 93, main's ruling of
       // 2026-11-24): a pin past the bound refused typed, never grown.
-      let pinned = super::hg_run::pins_count_kept(content, counted, intake.kept_contents())
-        .map_err(|_| {
-          IntakeRefused::Unindexed(slates_hg::push::commit::Unindexed::from(
-            slates_vcs::ContentRefused::CountExhausted,
-          ))
+      let pinned = counted
+        .count_kept(content, intake.kept_contents())
+        .map_err(|refused| {
+          IntakeRefused::Unindexed(slates_hg::push::commit::Unindexed::from(refused))
         });
       Some(pinned.and(stepped))
     });
@@ -2861,16 +2864,30 @@ impl Taking {
 
   /// Gives the fork back over `state`, counted where its release is refused.
   fn abandon_in(mut self, state: &mut ShardState) {
+    self.unpinned_in(state);
     if let Some(intake) = self.intake.take() {
       abandon(state, intake);
     }
+  }
+
+  /// Gives back what its kept revisions pin (`ContentStore::unpin_unlanded`) over `state`, which a caller holding the
+  /// shard's state passes before the taking drops: there its drop cannot borrow the state again, and the pins would stay.
+  fn unpinned_in(&mut self, state: &mut ShardState) {
+    let counted = &mut self.counted;
+    vcs_store::within_budget(state, 0, |stores| {
+      stores.content_mut().map(|content| counted.release(content))
+    })
+    .unwrap_or_default();
   }
 }
 
 impl Drop for Taking {
   fn drop(&mut self) {
-    // However the push ended: its pins given back on the shard that counted them.
-    super::hg_run::pins_release(&mut self.counted);
+    // However the push ended: its pins given back on the shard that holds its store (none left where its caller gave
+    // them back over the state it held, `unpinned_in`).
+    if !self.counted.is_empty() {
+      crate::state::with_state(|state| self.unpinned_in(state)).unwrap_or_default();
+    }
     if let Some(intake) = self.intake.take() {
       // Dropped mid-intake (its connection ended): given back on the shard that holds its store.
       crate::state::with_state(|state| abandon(state, intake)).unwrap_or_default();
@@ -3071,8 +3088,6 @@ async fn segments_landed(
 ) -> Option<Result<(), PushOutcome>> {
   while let Some(segment) = taking.take_segment() {
     run.admission_held(admitted.saturating_sub(room.left()));
-    // Its own revisions' pins out before its let-go; a window a later kept revision names keeps its count.
-    super::hg_run::pins_count_out(&mut taking.counted, &segment.contents);
     if let Err(outcome) = segment_landed(repository, taking, &segment, run).await? {
       return Some(Err(outcome));
     }
@@ -3088,15 +3103,22 @@ async fn segments_landed(
 /// where it could not be made or the store refused it; none where the store went away.
 async fn segment_landed(
   repository: RepositoryId,
-  taking: &Taking,
+  taking: &mut Taking,
   segment: &PushSegment,
   run: &mut super::hg_run::Run,
 ) -> Option<Result<(), PushOutcome>> {
   // A-740: a shard stuck landing a segment names it.
   let _doing = slates_rt::futures::doing("hg_push::segment");
-  let (intake, (_, payload)) = (taking.intake.as_ref()?, taking.changegroup.as_ref()?);
+  let Taking {
+    intake,
+    changegroup,
+    room,
+    counted,
+    ..
+  } = taking;
+  let (intake, (_, payload)) = (intake.as_ref()?, changegroup.as_ref()?);
   let unlanded = || Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
-  let Ok(mut writer) = intake.record_writer(segment, taking.room) else {
+  let Ok(mut writer) = intake.record_writer(segment, *room) else {
     return unlanded();
   };
   let mut costs = vcs_store::TurnCosts::ZERO;
@@ -3120,7 +3142,9 @@ async fn segment_landed(
   };
   let sequence = header.sequence;
   let ok = disk.land(header, parts).await.is_ok();
-  crate::state::with_state(|state| landed_segment(state, (run, segment), sequence, ok))
+  crate::state::with_state(|state| {
+    landed_segment(state, (run, segment), (sequence, ok), Some(counted))
+  })
 }
 
 /// Counter: the turns a push's segment records were written in, a turn's steps under the shard's paced turn each
@@ -3535,12 +3559,26 @@ fn taken_whole(
   let mut segments = Vec::new();
   loop {
     let sliced = taking.slice(state, lend, room);
-    segments.extend(recorded_segments(state, &mut taking)?);
+    let Some(recorded) = recorded_segments(state, &mut taking) else {
+      taking.abandon_in(state);
+      return None;
+    };
+    segments.extend(recorded);
     match sliced {
       Some(Ok(Stepped::More)) => {}
       Some(Ok(Stepped::Done)) => {
         taking.cut_rest();
-        segments.extend(recorded_segments(state, &mut taking)?);
+        let Some(recorded) = recorded_segments(state, &mut taking) else {
+          taking.abandon_in(state);
+          return None;
+        };
+        segments.extend(recorded);
+        // Its caller holds the shard's state, so the taking's drop could not give its pins back. Unpinned before their
+        // landing: a made changeset's (`hg_made::prepared`) intake and record are made in this one step, so nothing
+        // reads its texts while they are unpinned and not durable (its `disk.land` awaits after); once landed, a window
+        // let go meanwhile is brought back from the store. A reader of a made text before its landing would need pins
+        // kept to the landing's let-go, as a push's segments keep them (GAPS).
+        taking.unpinned_in(state);
         let mut forked = taking.finish()?;
         forked.segments = segments;
         return Some(Ok(forked));

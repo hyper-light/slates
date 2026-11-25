@@ -181,9 +181,18 @@ pub(crate) const CONTENT_LET_GO: &str = "vcs_store.content.let_go";
 /// name.
 pub(crate) const CONTENT_BROUGHT_BACK: &str = "vcs_store.content.brought_back";
 
-/// The shard's content store's figures for its status report, each named ([`CONTENT_READS`] and the four after it); none
+/// Figure: windows a let-go kept because an unlanded object named them (`ContentCounters::kept_unlanded`; goal 93, main's
+/// ruling (B) of 2026-11-24: a push's kept-but-unlanded revisions pin their windows, `ContentStore::pin_unlanded`).
+/// Format: a counter name.
+pub(crate) const CONTENT_KEPT_UNLANDED: &str = "vcs_store.content.kept_unlanded";
+
+/// Figure: windows found let go as their unlanded holder pinned them (`ContentCounters::pinned_away`; ruling (B)): that
+/// holder's bytes gone before it landed, a bug signal that must stay 0. Format: a counter name.
+pub(crate) const CONTENT_PINNED_AWAY: &str = "vcs_store.content.pinned_away";
+
+/// The shard's content store's figures for its status report, each named ([`CONTENT_READS`] and the six after it); none
 /// where the shard made no content store.
-pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 5] {
+pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 7] {
   let (reads, counters) = stores
     .content()
     .map_or((0, ContentCounters::default()), |content| {
@@ -195,6 +204,8 @@ pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 5] {
     (CONTENT_FREED, counters.freed),
     (CONTENT_LET_GO, counters.let_go),
     (CONTENT_BROUGHT_BACK, counters.brought_back),
+    (CONTENT_KEPT_UNLANDED, counters.kept_unlanded),
+    (CONTENT_PINNED_AWAY, counters.pinned_away),
   ]
 }
 /// Counter (A-727 slice a3): repository windows a recovery took back from the shard image, their chunks claimed.
@@ -3013,11 +3024,6 @@ pub(crate) fn landed_pin(window: &slates_vcs::ContentId) -> Option<&'static str>
   // landed note: until 2026-11-24 the note was asked first, so a read-pinned window with a note was let go mid-read.
   if named_objects::read_pinned(window) {
     return Some("reader");
-  }
-  // A push's kept-but-unlanded revision names it (goal 93, main's ruling of 2026-11-24): kept until that revision's own
-  // segment lands, which a landed one's let-go would otherwise take while it is on no store.
-  if crate::repository::hg_run::push_pinned(window) {
-    return Some("push");
   }
   // A window whose home recorded what brings it back (its place in a landed pack, or its Mercurial file revision) is
   // brought back by that record (goal 93 item 2b(b)).

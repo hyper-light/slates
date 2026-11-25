@@ -2644,13 +2644,13 @@ fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
 }
 
 /// Takes `payload` cut into segments, each segment landed (its windows let go as a durable segment's are, by
-/// `let_go_object_landed`) once revision `held` is kept, so it lands while `held` sits kept and not landed; counting the
-/// push's kept revisions into `pins` when given and consulting them at each let-go. What it came to, and the windows the
-/// pins kept.
+/// `let_go_object_landed` with no pin of its own) once revision `held` is kept, so it lands while `held` sits kept and not
+/// landed; where `pinned`, the push's kept revisions pinned unlanded in the store as the server pins them
+/// (`push::pins::Counted`), a segment's own unpinned just before its let-go. What it came to.
 fn taken_landing_after(
   payload: &[u8],
   store: &mut ContentStore,
-  (held, pins): (Node, Option<&mut crate::push::pins::Pins>),
+  (held, pinned): (Node, bool),
 ) -> Result<(), Refused> {
   let mut index = HgIndex::new();
   let mut intake = Intake::begin(
@@ -2662,14 +2662,14 @@ fn taken_landing_after(
   .unwrap()
   .cutting(SEGMENT_BYTES);
   let mut counted = crate::push::pins::Counted::default();
-  let mut pins = pins;
   let mut taken: Vec<super::PushSegment> = Vec::new();
-  loop {
-    let stepped = intake.step(payload, store, &mut room())?;
-    if let Some(pins) = pins.as_deref_mut() {
-      counted
-        .count_kept((pins, store), intake.kept_contents())
-        .unwrap();
+  let outcome = loop {
+    let stepped = match intake.step(payload, store, &mut room()) {
+      Ok(stepped) => stepped,
+      Err(refused) => break Err(refused),
+    };
+    if pinned {
+      counted.count_kept(store, intake.kept_contents()).unwrap();
     }
     while let Some(segment) = intake.take_segment() {
       taken.push(segment);
@@ -2677,18 +2677,12 @@ fn taken_landing_after(
     // Landed only once `held` is kept: its segment's let-go runs while it sits kept and not landed.
     if intake.kept_contents().any(|kept| kept.node == held) {
       for segment in taken.drain(..) {
-        if let Some(pins) = pins.as_deref_mut() {
-          counted.count_out(pins, &segment.contents);
+        if pinned {
+          counted.count_out(store, &segment.contents);
         }
         for contents in &segment.contents {
           for identity in contents.identities() {
-            let pinned = |window: &slates_vcs::ContentId| {
-              pins
-                .as_deref()
-                .is_some_and(|pins| pins.holds(window))
-                .then_some("push")
-            };
-            store.let_go_object_landed(identity, &pinned);
+            store.let_go_object_landed(identity, &|_| None);
           }
         }
       }
@@ -2696,15 +2690,19 @@ fn taken_landing_after(
     match stepped {
       Stepped::Store => intake.answer_from_fork(store),
       stepped if more(&stepped) => {}
-      _ => break,
+      _ => break Ok(()),
     }
+  };
+  counted.release(store);
+  assert!(counted.is_empty(), "nothing left pinned after the push");
+  match outcome {
+    Ok(()) => {
+      let (fork, _) = intake.finish().ok().unwrap();
+      fork.release(store).unwrap();
+      Ok(())
+    }
+    Err(refused) => Err(refused),
   }
-  if let Some(pins) = pins {
-    counted.release(pins);
-  }
-  let (fork, _) = intake.finish().ok().unwrap();
-  fork.release(store).unwrap();
-  Ok(())
 }
 
 /// Main's ruling of 2026-11-24 (the 57k push at 2ed3eb139 refused `UnknownDeltaBase` on `i18n/da.po`; w-perf's scene,
@@ -2712,7 +2710,7 @@ fn taken_landing_after(
 /// window and changing its tail, C a delta on B; land A's segment while B sits kept and not landed (its windows let go as
 /// a durable segment's are), once without the push's pins and once with them. Expect, without them, the push refused
 /// `UnknownDeltaBase` for B (the window B shares with A gone with A's let-go, and B on no store); with them, the push taken
-/// whole, the shared window kept (`Pins::skipped` moved), and nothing left counted after.
+/// whole, the shared window kept (the store's `kept_unlanded` moved), and nothing left pinned after.
 #[test]
 fn a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares() {
   let window: Vec<u8> = (0..WINDOW)
@@ -2725,7 +2723,7 @@ fn a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares() {
   let (payload, pushed) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
   let b_node = pushed.2[1].0;
   let mut store = store();
-  let refused = taken_landing_after(&payload, &mut store, (b_node, None)).err();
+  let refused = taken_landing_after(&payload, &mut store, (b_node, false)).err();
   assert!(
     matches!(
       refused,
@@ -2734,15 +2732,18 @@ fn a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares() {
     "without the pins, the push refused for B: {refused:?}"
   );
   let mut store = self::store();
-  let mut pins = crate::push::pins::Pins::for_store(&store);
-  let taken = taken_landing_after(&payload, &mut store, (b_node, Some(&mut pins)));
+  let taken = taken_landing_after(&payload, &mut store, (b_node, true));
   assert!(
     taken.is_ok(),
     "with the pins, the push taken whole: {taken:?}"
   );
   assert!(
-    pins.skipped() > 0,
+    store.counters().kept_unlanded > 0,
     "a window the push still named kept from the let-go"
   );
-  assert!(pins.is_empty(), "nothing left counted after the push");
+  assert_eq!(
+    store.counters().pinned_away,
+    0,
+    "no kept revision's window found let go as it was pinned"
+  );
 }
