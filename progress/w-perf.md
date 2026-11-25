@@ -692,3 +692,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - LANDED 3a2561406 (in 93d7dca13): hg_fetch_heap names sites by the frames' crates/ files (line-tables builds).
   - main's what_holds at d3057763e: the 57k clone added 27 MiB (was 5.7-6.0 GB, 10.4 GB at 15b4f1061).
   - Next (main's order): the churn by site -- 64 GB of system allocation churn, 418 GB of fresh mapped pages.
+- 2026-11-25 ~12:00 PST:
+  - LANDED 476cbb69c: P7's F is the store's own sync_data (Located::flush_ns, owner::take_landed_flush_ns), red
+    an_imports_durable_flush_is_the_stores_own_not_its_await (46 s from the await under a hog; 6.68 ms now); the
+    cut-import oracle pins F at the derived bound (one cut across its kills). Focused svn 105/105 on the landed tree
+    (rerun after a merge I pushed before rerunning -- my slip, reported).
+  - Next: the churn by site (64 GB of system allocation churn, 418 GB fresh mapped pages), with the fixed sampler.
