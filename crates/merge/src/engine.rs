@@ -2274,7 +2274,35 @@ pub struct Applying {
   copies: Vec<usize>,
   effects: Vec<Effect>,
   at: usize,
+  /// The commit's preparation, once every effect is made: a phase at a time, each a slice of the effects at a time.
+  prep: Prep,
+  /// The named runs' buffers, read for this apply (A-760), taken from the increment as the preparation begins.
+  read: Vec<Vec<u8>>,
   commit: Option<CommitRun>,
+}
+
+/// Where an [`Applying`] run's commit preparation is: each phase an effect at a time ([`Green::apply_step`]).
+enum Prep {
+  /// The entry's effects still being made.
+  Effects,
+  /// Each effect's sole run ([`Green::sole_run_of`]) found, by the runs' places.
+  Sole {
+    places: BTreeMap<(u64, u64), usize>,
+    sole: Vec<(usize, usize)>,
+    at: usize,
+  },
+  /// Each effect's read of a text held by name alone checked ([`Green::note_unlent_read`]).
+  Reads {
+    names: Vec<(usize, crate::named::Identity)>,
+    wholes: Vec<(usize, usize)>,
+    at: usize,
+  },
+  /// Each mapped file made ([`Green::make_mapped_one`]).
+  Mapped {
+    names: Vec<(usize, crate::named::Identity)>,
+    wholes: Vec<(usize, usize)>,
+    at: usize,
+  },
 }
 
 impl core::fmt::Debug for Applying {
@@ -5929,14 +5957,19 @@ impl Green {
   fn commit_reads(&self, effects: &[Effect], post: crate::named::Post<'_>) {
     let wholes = alone(self.sole_runs(effects, post));
     for (place, effect) in effects.iter().enumerate() {
-      if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
-        effect
-        && !holds_place(&wholes, place)
-        && let Some(Content::Named(identity)) = self.content.get(path)
-        && keeps_base(identity.len, ops)
-      {
-        crate::unlent::note(identity);
-      }
+      self.note_unlent_read((place, effect), &wholes);
+    }
+  }
+
+  /// [`Green::commit_reads`]'s each effect: notes the unlent named file its making reads, unless a run makes it whole.
+  fn note_unlent_read(&self, (place, effect): (usize, &Effect), wholes: &[(usize, usize)]) {
+    if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
+      effect
+      && !holds_place(wholes, place)
+      && let Some(Content::Named(identity)) = self.content.get(path)
+      && keeps_base(identity.len, ops)
+    {
+      crate::unlent::note(identity);
     }
   }
 
@@ -5953,32 +5986,41 @@ impl Green {
     wholes: &[(usize, usize)],
   ) {
     for (place, effect) in effects.iter_mut().enumerate() {
-      if holds_place(wholes, place) {
-        continue;
-      }
-      if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
-        let made = match source {
-          // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
-          ContentSource::Created(declared) => apply(&[], declared, post_state),
-          // A named base the ops replace whole is made over with its length alone; any other unlent one reads as none,
-          // noted: the verdict is refused (`crate::unlent`).
-          ContentSource::Mapped | ContentSource::Copied(..) => {
-            match self.content.get(path.as_str()) {
-              Some(Content::Named(identity)) if !keeps_base(identity.len, ops) => {
-                apply_over((&[], identity.len), ops, post_state)
-              }
-              _ => apply(self.head_bytes(path).unwrap_or_default(), ops, post_state),
-            }
-          }
-        };
-        *bytes = Some(made);
-        self
-          .mapped_files_made
-          .set(self.mapped_files_made.get().saturating_add(1));
-      }
+      self.make_mapped_one((place, effect), post_state, wholes);
     }
   }
 
+  /// [`Green::make_mapped`]'s each effect: its file made, unless a run makes it whole or it is made already.
+  fn make_mapped_one(
+    &self,
+    (place, effect): (usize, &mut Effect),
+    post_state: crate::named::Post<'_>,
+    wholes: &[(usize, usize)],
+  ) {
+    if holds_place(wholes, place) {
+      return;
+    }
+    if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
+      let made = match source {
+        // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
+        ContentSource::Created(declared) => apply(&[], declared, post_state),
+        // A named base the ops replace whole is made over with its length alone; any other unlent one reads as none,
+        // noted: the verdict is refused (`crate::unlent`).
+        ContentSource::Mapped | ContentSource::Copied(..) => {
+          match self.content.get(path.as_str()) {
+            Some(Content::Named(identity)) if !keeps_base(identity.len, ops) => {
+              apply_over((&[], identity.len), ops, post_state)
+            }
+            _ => apply(self.head_bytes(path).unwrap_or_default(), ops, post_state),
+          }
+        }
+      };
+      *bytes = Some(made);
+      self
+        .mapped_files_made
+        .set(self.mapped_files_made.get().saturating_add(1));
+    }
+  }
   ///
   /// `names` are the effects' places whose files are named for the object they are the whole of
   /// ([`named_files`]). One run of [`Green::commit_begin`] and [`Green::commit_step`] carried to its end, the one path a
@@ -7206,19 +7248,24 @@ impl Green {
     let places = post.run_places();
     let mut wanted: Vec<(usize, usize)> = Vec::new();
     for (place, effect) in effects.iter().enumerate() {
-      let Effect::SetContent(path, None, ops, source) = effect else {
-        continue;
-      };
-      let (base_len, ops) = match source {
-        ContentSource::Created(declared) => (0, declared.as_slice()),
-        ContentSource::Mapped => (self.content.len_of(path).unwrap_or(0), ops.as_slice()),
-        ContentSource::Copied(..) => continue,
-      };
-      if let Some(run) = sole_run(base_len, ops, &places) {
+      if let Some(run) = self.sole_run_of(effect, &places) {
         wanted.push((place, run));
       }
     }
     wanted
+  }
+
+  /// The one run `effect` takes whole, where its file is made of that run alone ([`Green::sole_runs`]'s each effect).
+  fn sole_run_of(&self, effect: &Effect, places: &BTreeMap<(u64, u64), usize>) -> Option<usize> {
+    let Effect::SetContent(path, None, ops, source) = effect else {
+      return None;
+    };
+    let (base_len, ops) = match source {
+      ContentSource::Created(declared) => (0, declared.as_slice()),
+      ContentSource::Mapped => (self.content.len_of(path).unwrap_or(0), ops.as_slice()),
+      ContentSource::Copied(..) => return None,
+    };
+    sole_run(base_len, ops, places)
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -7289,6 +7336,8 @@ impl Green {
       copies,
       effects: Vec::with_capacity(applied.len()),
       at: 0,
+      prep: Prep::Effects,
+      read: Vec::new(),
       commit: None,
     }))
   }
@@ -7348,36 +7397,107 @@ impl Green {
       }
       return ApplyStep::More;
     }
-    let mut effects = core::mem::take(&mut run.effects);
-    let ((), unlent) = crate::unlent::scope(|| self.commit_reads(&effects, inc.post()));
-    if !unlent.is_empty() {
-      run.effects = effects;
-      return ApplyStep::Lend(unlent);
+    self.prepare_step(run, inc, spent)
+  }
+
+  /// [`Green::apply_step`] once every effect is made: the commit's preparation a phase at a time, each an effect at a
+  /// time until `spent` (A-917's owed phases, cut 3: it was one call of 30 ms at 9,000 files, debug): each effect's sole
+  /// run, then each one's read of a text held by name alone checked (a slice that meets one undone, and the texts asked
+  /// for, [`ApplyStep::Lend`]), then each mapped file made; then the commit begun ([`Green::commit_begin`]).
+  fn prepare_step(
+    &mut self,
+    run: &mut Applying,
+    inc: &mut Increment,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> ApplyStep {
+    loop {
+      match &mut run.prep {
+        Prep::Effects => {
+          // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a
+          // judged verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer
+          // is in place.
+          run.read = core::mem::take(&mut inc.named.read.0);
+          let post = crate::named::Post::of(&inc.post_state, &run.read, &inc.named.runs);
+          let places = if post.runs.is_empty() && post.declared.is_empty() {
+            BTreeMap::new()
+          } else {
+            post.run_places()
+          };
+          run.prep = Prep::Sole {
+            places,
+            sole: Vec::new(),
+            at: 0,
+          };
+        }
+        Prep::Sole { places, sole, at } => {
+          if !places.is_empty() {
+            while let Some(effect) = run.effects.get(*at) {
+              if let Some(found) = self.sole_run_of(effect, places) {
+                sole.push((*at, found));
+              }
+              *at = at.saturating_add(1);
+              if run.effects.get(*at).is_some() && spent() {
+                return ApplyStep::More;
+              }
+            }
+          }
+          let sole = core::mem::take(sole);
+          let names = named_files(&sole, &inc.named.runs);
+          let wholes = alone(sole);
+          run.prep = Prep::Reads {
+            names,
+            wholes,
+            at: 0,
+          };
+        }
+        Prep::Reads { names, wholes, at } => {
+          let from = *at;
+          let ((), unlent) = crate::unlent::scope(|| {
+            while let Some(effect) = run.effects.get(*at) {
+              self.note_unlent_read((*at, effect), wholes);
+              *at = at.saturating_add(1);
+              if spent() {
+                break;
+              }
+            }
+          });
+          if !unlent.is_empty() {
+            // The slice undone, to be checked again once its texts are lent.
+            *at = from;
+            return ApplyStep::Lend(unlent);
+          }
+          if run.effects.get(*at).is_some() {
+            return ApplyStep::More;
+          }
+          run.prep = Prep::Mapped {
+            names: core::mem::take(names),
+            wholes: core::mem::take(wholes),
+            at: 0,
+          };
+        }
+        Prep::Mapped { names, wholes, at } => {
+          let post = crate::named::Post::of(&inc.post_state, &run.read, &inc.named.runs);
+          while let Some(effect) = run.effects.get_mut(*at) {
+            self.make_mapped_one((*at, effect), post, wholes);
+            *at = at.saturating_add(1);
+            if run.effects.get(*at).is_some() && spent() {
+              return ApplyStep::More;
+            }
+          }
+          let mut effects = core::mem::take(&mut run.effects);
+          move_whole_runs(&mut effects, &mut run.read, wholes);
+          let version = self.head().saturating_add(1);
+          let names = core::mem::take(names);
+          run.commit = Some(self.commit_begin(
+            effects,
+            version,
+            crate::named::Post::of(&inc.post_state, &run.read, &inc.named.runs),
+            &names,
+          ));
+          return ApplyStep::More;
+        }
+      }
     }
-    // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
-    // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
-    let mut read = core::mem::take(&mut inc.named.read.0);
-    let runs = &inc.named.runs;
-    let sole = self.sole_runs(
-      &effects,
-      crate::named::Post::of(&inc.post_state, &read, runs),
-    );
-    let names = named_files(&sole, runs);
-    let wholes = alone(sole);
-    self.make_mapped(
-      &mut effects,
-      crate::named::Post::of(&inc.post_state, &read, runs),
-      &wholes,
-    );
-    move_whole_runs(&mut effects, &mut read, &wholes);
-    let version = self.head().saturating_add(1);
-    run.commit = Some(self.commit_begin(
-      effects,
-      version,
-      crate::named::Post::of(&inc.post_state, &read, runs),
-      &names,
-    ));
-    ApplyStep::More
   }
 
   /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked

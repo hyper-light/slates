@@ -622,6 +622,11 @@ impl RecordedBatch {
     if !self.staged.is_empty() || self.applying.is_some() {
       return None;
     }
+    // The green's retention settled and its chain checkpointed in a slice of their own, never the tail of the last
+    // version's (its checkpoint's paced step took 45 ms of a debug build's slice at 9,000 files).
+    if taken > 0 {
+      return None;
+    }
     let _ = crate::merge_service::settle_green_retention(state, self.green);
     crate::merge_service::checkpoint_green(state, self.green);
     Some(std::mem::take(&mut self.made))
