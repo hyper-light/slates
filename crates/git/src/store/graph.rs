@@ -16,12 +16,23 @@
 //! ref's green. Every ref's head is a tip; the refs under `refs/tags/` whose head is an annotated tag are the tags
 //! `include-tag` reads.
 //!
+//! **Positions met again** (A-911; goal 93, main 01a20182's sample of a partial clone: 22,771 of 23,095 samples under
+//! [`StoreGraph::named`], clone-again's 71,056,607 content reads for 425,179 objects). A tree's entries are named by
+//! id, and each becomes a position through the index, a lookup across its runs. A walk opens each tree once, but a
+//! tree's versions repeat most of its entries: a root tree's unchanged entries are met again in every commit's root.
+//! So the ids met are resolved through a [`PositionCache`], exact and of a fixed size, owned by the answer across its
+//! steps and lent to each step's graph: a direct-mapped table of (id, position) slots, sized from the work as the walk
+//! meets it (the entries one sent commit's trees resolve, the root tree's first), so its cost is the walk's working
+//! set, never an entry an object (§4.17.1 "A fetch's answer" rule 1). Charged to the answer's admission as it grows;
+//! with no room it stays as it is, down to no slots, where every lookup misses: the same code, the walk as slow as
+//! before, never refused for it.
+//!
 //! **Faults.** The trait reads cannot fail, and a store whose index and content agree never fails them. Where one does
 //! (a position with no row, a tree or tag git's parser refuses), the read answers nothing and the first fault is kept
 //! ([`StoreGraph::fault`]); the service refuses an answer made while one was kept, so a broken store never yields a
 //! wrong pack.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 
 use slates_vcs::ContentStore;
@@ -70,6 +81,122 @@ pub struct StoreGraph<'r> {
   refs: &'r [NamedRef<'r>],
   /// The first read that failed, if any.
   fault: Cell<Option<GraphFault>>,
+  /// The positions of ids met lately (module docs, **Positions met again**): none of its own unless lent one.
+  positions: RefCell<PositionCache>,
+}
+
+/// Derived: the slots a [`PositionCache`] gives each id one sent commit resolves, at least. A direct-mapped table of `m`
+/// slots holding `n` keys loses about `1 − e^(−n/m)` of them to a slot another took (each key's slot is uniform: an id
+/// is a uniform hash); at a load of at most 1/8 that is under 12 % of the ids met again, and the slots, rounded up to a
+/// power of two, hold the load between 1/16 and 1/8.
+const SLOTS_AN_ID: u64 = 8;
+
+/// The positions of the ids a walk met lately (A-911, module docs **Positions met again**): exact, direct-mapped, an id
+/// in the slot its first bytes name. Sized from the work, as the walk meets it: the most ids one sent commit's trees
+/// resolved, times [`SLOTS_AN_ID`], to a power of two. It costs `slots × size_of::<Slot>()` (48 bytes a slot), charged
+/// to the answer's admission as it grows, so at tens of thousands of concurrent fetches its memory is bounded by theirs:
+/// an answer whose room cannot take the next size keeps the size it has, none at first, and is counted
+/// ([`PositionCounts::unroomed`]).
+#[derive(Debug, Default)]
+pub struct PositionCache {
+  /// The slots: an id and its position, or none.
+  slots: Vec<Option<(ObjectId, u64)>>,
+  /// The ids resolved since the walk's last sent commit began.
+  met: u64,
+  /// The most ids one sent commit resolved.
+  most: u64,
+  /// Whether a size the work asked for was refused room (counted once an answer).
+  unroomed: bool,
+  /// What it did since it was last asked.
+  counts: PositionCounts,
+}
+
+/// What a [`PositionCache`] did: the ids it resolved through the index (a lookup each), those it answered itself, and
+/// whether a size the work asked was refused room.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PositionCounts {
+  /// Ids resolved through the index.
+  pub lookups: u64,
+  /// Ids the cache answered.
+  pub hits: u64,
+  /// Answers whose cache was refused the room its work asked (one an answer).
+  pub unroomed: u64,
+}
+
+impl PositionCache {
+  /// The slot `id` lives in: its first bytes, under the slots' mask. With no slots, none.
+  fn slot_of(&self, id: &ObjectId) -> usize {
+    let mut first = [0u8; 8];
+    for (to, from) in first.iter_mut().zip(id.as_bytes()) {
+      *to = *from;
+    }
+    let mask = self.slots.len().wrapping_sub(1);
+    usize::try_from(u64::from_le_bytes(first)).unwrap_or(usize::MAX) & mask
+  }
+
+  /// The position of `id`: the slot's, where it holds `id`, else `resolve`'s, kept in its slot.
+  fn position(&mut self, id: &ObjectId, resolve: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    self.met = self.met.saturating_add(1);
+    let at = self.slot_of(id);
+    if let Some(Some((held, position))) = self.slots.get(at)
+      && held == id
+    {
+      self.counts.hits = self.counts.hits.saturating_add(1);
+      return Some(*position);
+    }
+    self.counts.lookups = self.counts.lookups.saturating_add(1);
+    let position = resolve()?;
+    if let Some(slot) = self.slots.get_mut(at) {
+      *slot = Some((*id, position));
+    }
+    Some(position)
+  }
+
+  /// A sent commit's trees begin: the ids the last one resolved measured, and the cache grown to what that asks.
+  fn commit_begun(&mut self, admission: &mut Admission) {
+    self.most = self.most.max(self.met);
+    self.met = 0;
+    self.grow_within(admission);
+  }
+
+  /// Grows to the size the work has asked so far, charged to `admission`; refused room, it keeps its size, counted once.
+  fn grow_within(&mut self, admission: &mut Admission) {
+    let asked = self
+      .most
+      .saturating_mul(SLOTS_AN_ID)
+      .checked_next_power_of_two();
+    let Some(asked) = asked.and_then(|slots| usize::try_from(slots).ok()) else {
+      return;
+    };
+    let have = self.slots.len();
+    if asked <= have {
+      return;
+    }
+    let more = u64::try_from(asked - have)
+      .unwrap_or(u64::MAX)
+      .saturating_mul(
+        u64::try_from(core::mem::size_of::<Option<(ObjectId, u64)>>()).unwrap_or(u64::MAX),
+      );
+    if admission.charge(more).is_err() {
+      if !self.unroomed {
+        self.unroomed = true;
+        self.counts.unroomed = self.counts.unroomed.saturating_add(1);
+      }
+      return;
+    }
+    let held = core::mem::replace(&mut self.slots, vec![None; asked]);
+    for (id, position) in held.into_iter().flatten() {
+      let at = self.slot_of(&id);
+      if let Some(slot) = self.slots.get_mut(at) {
+        *slot = Some((id, position));
+      }
+    }
+  }
+
+  /// What it did since this was last asked.
+  pub fn take_counts(&mut self) -> PositionCounts {
+    core::mem::take(&mut self.counts)
+  }
 }
 
 impl<'r> StoreGraph<'r> {
@@ -85,7 +212,24 @@ impl<'r> StoreGraph<'r> {
       null: ObjectId::null(repository.format()),
       refs,
       fault: Cell::new(None),
+      positions: RefCell::new(PositionCache::default()),
     }
+  }
+
+  /// This graph, resolving ids through `positions` (module docs, **Positions met again**).
+  pub fn with_positions(mut self, positions: PositionCache) -> StoreGraph<'r> {
+    self.positions = RefCell::new(positions);
+    self
+  }
+
+  /// What its cache of positions did since this was last asked (A-911).
+  pub fn take_position_counts(&self) -> PositionCounts {
+    self.positions.borrow_mut().take_counts()
+  }
+
+  /// The positions it resolved through, to keep for the answer's next step.
+  pub fn into_positions(self) -> PositionCache {
+    self.positions.into_inner()
   }
 
   /// The first read that failed, if any: an answer made while one did is refused.
@@ -117,13 +261,24 @@ impl<'r> StoreGraph<'r> {
     found
   }
 
+  /// The id of the object at `position`, and its row and content, read once each (A-911 (b): its id's row was read
+  /// twice); a fault where either is missing.
+  fn indexed_at(&self, position: u64) -> Option<(ObjectId, (ObjectRow, slates_vcs::ContentId))> {
+    let found = self.repository.id_at(self.store, position).and_then(|id| {
+      self
+        .repository
+        .indexed(self.store, &id)
+        .map(|indexed| (id, indexed))
+    });
+    if found.is_none() {
+      self.failed(GraphFault::NoRow { position });
+    }
+    found
+  }
+
   /// The objects the object at `position` names, read from its bytes: a tree's entries or a tag's object.
   fn named(&self, position: u64) -> Vec<u64> {
-    let Some((id, _)) = self.row(position) else {
-      return Vec::new();
-    };
-    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
-      self.failed(GraphFault::NoRow { position });
+    let Some((id, (row, content))) = self.indexed_at(position) else {
       return Vec::new();
     };
     let kind = row.kind;
@@ -148,11 +303,7 @@ impl<'r> StoreGraph<'r> {
   /// The entries of the tree at `position`, each with its name, read from its bytes: none when it is no tree or the
   /// store cannot read it (kept as a fault).
   fn named_entries_of(&self, position: u64) -> Vec<(u64, Vec<u8>)> {
-    let Some((id, _)) = self.row(position) else {
-      return Vec::new();
-    };
-    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
-      self.failed(GraphFault::NoRow { position });
+    let Some((id, (row, content))) = self.indexed_at(position) else {
       return Vec::new();
     };
     if row.kind != Kind::Tree {
@@ -250,10 +401,12 @@ impl<'r> StoreGraph<'r> {
 
   /// The position of `id`, a fault when the store does not hold it.
   fn position_of(&self, id: &ObjectId) -> Option<u64> {
-    let position = self
-      .repository
-      .object(self.store, id)
-      .map(|row| row.position);
+    let position = self.positions.borrow_mut().position(id, || {
+      self
+        .repository
+        .object(self.store, id)
+        .map(|row| row.position)
+    });
     if position.is_none() {
       self.failed(GraphFault::Store(StoreRefused::Missing { id: *id }));
     }
@@ -337,6 +490,10 @@ impl Graph for StoreGraph<'_> {
 
   fn entries(&self, tree: u64) -> impl Iterator<Item = u64> {
     self.named(tree).into_iter()
+  }
+
+  fn commit_begun(&self, admission: &mut Admission) {
+    self.positions.borrow_mut().commit_begun(admission);
   }
 
   fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {

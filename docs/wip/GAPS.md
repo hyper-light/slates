@@ -1563,10 +1563,16 @@
 > object's high-water, set by one segment's file texts held whole until it landed (744 MB used before the first file
 > segment's cut, 628 MB let go at its landing). A segment was cut by its changegroup's bytes alone (`segment_bytes`, 2
 > MiB here), and a text runs to hundreds of times its delta. Now it is cut too once the whole file texts it keeps reach
-> the same bound (`Emitter::due`): the import holds under twice the segment's bound of file texts, counted
-> `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`; held by
-> `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` (red: 46,162,339 bytes held after one turn,
-> 8,950 at the end, a 2 MiB bound). Owed: main's rerun of the 57k (segments, peak, time against 15e739357); the
+> the same bound (`Emitter::due`), counted `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`
+> (0d05da26e). Main's 57k rerun at it: 2,087 segments (2,062 by texts), peak sampled 361,024 KiB; at 1227afcb1 the
+> landings' own wait was 20.3 s, about 18 % of the import (`segment_land_wait_ns`, 9.7 ms a landing), each awaited
+> before the next turn. Since then a segment's landing runs beside the next turns (`hg_import::step`, one in flight,
+> the next handed over once it answered, landings in order, texts let go on each one's own durable answer), counted
+> `segments_landed_overlapped` and the wait held against `segment_land_ns`. Derived bound: two segments' file texts,
+> the one in flight and the one being written, each under the bound plus the text that crosses it: under four times
+> the bound. Held by `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` on the production step
+> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Owed:
+> main's interleaved A/B of 0d05da26e^, 1227afcb1 and the pipelined landing over the 57k; the
 > changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
 > manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
 > - a clone's file revisions served from the Texts rows.
@@ -3357,6 +3363,12 @@
 > **A-724 piece 2a (2026-11-21, w-multirepo, A-844): the working set's miss-ratio curve built, not yet fed.**
 > `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
+> A re-read of the key read last counted in place (w-perf, 2026-11-24, main 01a20182's item, w-git's guard): the curve was
+> about a fifth of a git clone's object-choosing walk (`Curve::read` 2,906 and its key map's insert 1,749 of 23,095 work
+> samples), the walk re-reading a few table windows so every read went through the map. Such a read is now counted at
+> its own length and touches neither the map nor the tree, answering as moving it would; held by
+> `a_reread_of_the_key_read_last_inserts_nothing_and_answers_as_before` (`Curve::key_inserts`; red: 2,529 inserts for
+> 1,766 runs; every answer equal to the moving reference's to the last bit). Open: the walk's own re-reads measured again.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
 > rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
 > at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot.
@@ -3390,6 +3402,15 @@
 > `hg_push::unbundle`); the anchor kills the daemon, and stock hg reads `bad HTTP status line: ''` (SSH: `stream ended
 > unexpectedly`). One 64 MiB file, or 16 MiB changed in place, passes.
 >
+> **Goal 93 perf, Subversion's bytes on the store against FSFS's (2026-11-24, w-perf; main 01a20182's order, item 4 of
+> the note of 11-21 21:50, "an order of magnitude faster" after C and R).** Measured, bytes only (BENCHMARKS, "A
+> Subversion repository's bytes on the changeset store against FSFS's"): git-2000's 2,000 revisions take 468,604 KiB
+> allocated (452,617 apparent) on the node's changeset store against stock FSFS's 51,020 (40,183), 9.2 and 11.3 times.
+> Under Ada's changeset ruling each revision's changed texts are kept whole (its changeset's Payload and Texts rows),
+> where FSFS keeps skip-deltas; deltas are derived, never stored (A-842). Owed: nothing before Subversion's C and R
+> close; any change keeps the ruling. Found beside it, P7's (where a Subversion import's memory is): of 691,504 KiB
+> resident after the import, the content arena's frees held for a committed image (`arena_deferred_bytes`) were
+> 489,299,968 B, the store's own content 2,624 B.
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on

@@ -2259,23 +2259,74 @@ mod tests {
     )
   }
 
-  /// A-908 part 4, §4.16 "Apply on holders": a restarted holder rebuilds a branch by its lineage, as it first made it. Do:
-  /// give a holder with no replicas the records of a root (versions 0 and 1) and of a branch made at the root's version 1
-  /// (versions 0 and 1), their increments, and the names-log part joining both, as a warm restart leaves it; rebuild the
-  /// branch, as its next record arriving asks. Expect the branch installed at version 1 with the owner's identity, the
-  /// root rebuilt first and founding the lineage, the branch its member, counted founded and branched. Red before:
-  /// version 0 rebuilt as an empty green, a mismatch, the branch refused on the holder for good.
-  #[test]
-  fn a908_a_restarted_holder_rebuilds_a_branch_by_its_lineage() {
-    let first = creating("main-1", b"one", 1, 0);
-    let second = creating("branch-1", b"two", 2, 0);
-    let (roots, branches) = lineage_identities(&first, &second);
-    let (rebuilt, lineages, refused, counts) = crate::daemon::audit_on_shard(move |state| {
+  /// Shape: a test's bound on a rebuild of a few units ending on a loaded machine, which is the norm here.
+  const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+  /// A kept one-shard audit daemon whose step quantum is the least the runtime takes, so each slice of a build runs one
+  /// unit and a rebuild spans several turns, as on a loaded machine (w-hg's runs at load 38 to 47: the test asked within
+  /// one observation, where no turn after the first could run, and 4 of 5 read `Later`).
+  fn one_unit_slices() -> crate::daemon::Daemon {
+    crate::daemon::audit_daemon_configured(|config| config.runtime.step_budget_ns = 1)
+  }
+
+  /// Asks `daemon`'s holder for `object`'s replica as a record of it arriving does (`merge_service::record_standing`): its
+  /// head where it has one, else a rebuild ([`rebuild_replica`]). One ask a turn, each once the build the last began has
+  /// ended (within [`REBUILD_WAIT`]), until one answers installed or `asks` were made: every answer.
+  fn rebuild_asks(daemon: &crate::daemon::Daemon, object: ObjectId, asks: usize) -> Vec<Rebuild> {
+    let mut answers = Vec::new();
+    for _ in 0..asks {
+      let answer = crate::daemon::observe_first(daemon, move |state| {
+        let key = crate::merge_service::replica_key(object);
+        match state
+          .merge
+          .replicas
+          .lend(&key)
+          .map(|replica| replica.reached())
+        {
+          Some(head) => Rebuild::Installed(head),
+          None => rebuild_replica(state, object),
+        }
+      });
+      answers.push(answer);
+      if matches!(answer, Rebuild::Installed(_)) {
+        break;
+      }
+      let began = std::time::Instant::now();
+      while !crate::daemon::observe_first(daemon, |state| state.merge.seeding.is_empty())
+        && began.elapsed() < REBUILD_WAIT
+      {
+        std::thread::yield_now();
+      }
+    }
+    answers
+  }
+
+  /// Gives `daemon`'s holder, with no replicas, what a warm restart leaves of a root and a branch made at its version 1
+  /// (and of `twig`, a branch made at the branch's version 0, where named): the names-log part joining them, their
+  /// records, and the increments of versions 1, as [`lineage_identities`] reached them.
+  fn hold_restarted_lineage(
+    daemon: &crate::daemon::Daemon,
+    (first, second): (Increment, Increment),
+    (roots, branches): ([[u8; 32]; 2], [[u8; 32]; 2]),
+    twig: Option<ObjectId>,
+  ) {
+    crate::daemon::observe_first(daemon, move |state| {
       let repository = slates_db::catalog::RepositoryId {
         bytes: family(1, 1).0,
       };
       let (root, branch) = (family(1, 2), family(2, 3));
-      note_joins(state, repository, &branch_joins(root, branch));
+      let mut joins = branch_joins(root, branch).to_vec();
+      if let Some(twig) = twig {
+        joins.push((
+          twig,
+          slates_db::catalog::MemberOrigin::Branch {
+            from: DbVolumeId { bytes: branch.0 },
+            version: 0,
+          },
+        ));
+        accept_records(state, twig, &[(0, None, branches[0])]);
+      }
+      note_joins(state, repository, &joins);
       let first_inputs = hold_encoded(state, root, &first.encode());
       let second_inputs = hold_encoded(state, branch, &second.encode());
       accept_records(
@@ -2291,37 +2342,78 @@ mod tests {
           (1, Some(second_inputs), branches[1]),
         ],
       );
-      let rebuilt = rebuild_replica(state, branch);
+    });
+  }
+
+  /// What `daemon`'s holder shows of `greens`: each one's lineage, and its counters `names`.
+  fn lineage_seen<const N: usize, const C: usize>(
+    daemon: &crate::daemon::Daemon,
+    greens: [ObjectId; N],
+    names: [&'static str; C],
+  ) -> ([Option<slates_db::catalog::RepositoryId>; N], [u64; C]) {
+    crate::daemon::observe_first(daemon, move |state| {
+      (
+        greens.map(|green| {
+          state
+            .merge
+            .replicas
+            .lineage_of(&crate::merge_service::replica_key(green))
+        }),
+        names.map(|name| count_of(state, name)),
+      )
+    })
+  }
+
+  /// A-908 part 4, §4.16 "Apply on holders": a restarted holder rebuilds a branch by its lineage, as it first made it. Do:
+  /// give a holder with no replicas the records of a root (versions 0 and 1) and of a branch made at the root's version 1
+  /// (versions 0 and 1), their increments, and the names-log part joining both, as a warm restart leaves it; ask for the
+  /// branch as its next records arriving would, a slice a unit ([`one_unit_slices`]), until it answers. Expect the branch
+  /// installed at version 1 with the owner's identity within the lineage's members and one asks, the root rebuilt
+  /// first and founding the lineage, the branch its member, counted founded and branched, not refused. Red before part
+  /// 4: version 0 rebuilt as an empty green, a mismatch, the branch refused on the holder for good.
+  #[test]
+  fn a908_a_restarted_holder_rebuilds_a_branch_by_its_lineage() {
+    let (first, second) = (
+      creating("main-1", b"one", 1, 0),
+      creating("branch-1", b"two", 2, 0),
+    );
+    let identities = lineage_identities(&first, &second);
+    let daemon = one_unit_slices();
+    hold_restarted_lineage(&daemon, (first, second), identities, None);
+    let (root, branch) = (family(1, 2), family(2, 3));
+    let asks = rebuild_asks(&daemon, branch, 3);
+    let identity = crate::daemon::observe_first(&daemon, move |state| {
+      let key = crate::merge_service::replica_key(branch);
       let identity = state
         .merge
         .replicas
-        .lend_mut(&crate::merge_service::replica_key(branch))
+        .lend_mut(&key)
         .map(|mut replica| replica.head_identity());
-      let lineages = [root, branch].map(|green| {
-        state
-          .merge
-          .replicas
-          .lineage_of(&crate::merge_service::replica_key(green))
-      });
-      let counts = [
-        count_of(state, crate::merge_service::MEMBER_FOUNDED),
-        count_of(state, crate::merge_service::MEMBER_BRANCHED),
-      ];
-      (
-        (rebuilt, identity),
-        (lineages, repository),
-        state.merge.refused.contains(&branch),
-        counts,
-      )
+      (identity, state.merge.refused.contains(&branch))
     });
-    assert_eq!(rebuilt, (Rebuild::Installed(1), Some(branches[1])));
-    let (lineages, repository) = lineages;
-    assert_eq!(
-      lineages,
-      [Some(repository), Some(repository)],
-      "one lineage"
+    let (lineages, counts) = lineage_seen(
+      &daemon,
+      [root, branch],
+      [
+        crate::merge_service::MEMBER_FOUNDED,
+        crate::merge_service::MEMBER_BRANCHED,
+      ],
     );
-    assert!(!refused, "the branch is not refused");
+    daemon.stop();
+    assert_eq!(
+      asks.last(),
+      Some(&Rebuild::Installed(1)),
+      "installed within its asks: {asks:?}"
+    );
+    assert_eq!(
+      identity,
+      (Some(identities.1[1]), false),
+      "the owner's identity, not refused"
+    );
+    let repository = slates_db::catalog::RepositoryId {
+      bytes: family(1, 1).0,
+    };
+    assert_eq!(lineages, [Some(repository); 2], "one lineage");
     assert_eq!(counts, [1, 1], "founded, branched");
   }
 
@@ -2343,60 +2435,40 @@ mod tests {
   }
 
   /// A-908 part 4: a branch of a branch whose sources are both missing is rebuilt a level an ask, never by recursion. Do:
-  /// as above, with a second branch made at the first branch's version 0, and rebuild the second branch twice, as its
-  /// records arriving twice ask. Expect the first ask `Later` (the root rebuilt, the first branch not yet), counted
-  /// `branch_source_behind`, and the second installed, the three one lineage.
+  /// as above, with a second branch made at the first branch's version 0, and ask for the second branch until it
+  /// answers. Expect the first ask `Later` (the root rebuilt, the first branch not yet), counted `branch_source_behind`,
+  /// the last installed at version 0 within the lineage's members and one asks, the three one lineage.
   #[test]
   fn a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask() {
-    let first = creating("main-1", b"one", 1, 0);
-    let second = creating("branch-1", b"two", 2, 0);
-    let (roots, branches) = lineage_identities(&first, &second);
-    let (asks, behind, lineages) = crate::daemon::audit_on_shard(move |state| {
-      let repository = slates_db::catalog::RepositoryId {
-        bytes: family(1, 1).0,
-      };
-      let (root, branch, twig) = (family(1, 2), family(2, 3), family(3, 4));
-      let mut joins = branch_joins(root, branch).to_vec();
-      joins.push((
-        twig,
-        slates_db::catalog::MemberOrigin::Branch {
-          from: DbVolumeId { bytes: branch.0 },
-          version: 0,
-        },
-      ));
-      note_joins(state, repository, &joins);
-      let first_inputs = hold_encoded(state, root, &first.encode());
-      let second_inputs = hold_encoded(state, branch, &second.encode());
-      accept_records(
-        state,
-        root,
-        &[(0, None, roots[0]), (1, Some(first_inputs), roots[1])],
-      );
-      accept_records(
-        state,
-        branch,
-        &[
-          (0, None, branches[0]),
-          (1, Some(second_inputs), branches[1]),
-        ],
-      );
-      accept_records(state, twig, &[(0, None, branches[0])]);
-      let asks = [rebuild_replica(state, twig), rebuild_replica(state, twig)];
-      let lineages = [root, branch, twig].map(|green| {
-        state
-          .merge
-          .replicas
-          .lineage_of(&crate::merge_service::replica_key(green))
-      });
-      (
-        asks,
-        count_of(state, crate::merge_service::BRANCH_SOURCE_BEHIND),
-        (lineages, repository),
-      )
-    });
-    assert_eq!(asks, [Rebuild::Later, Rebuild::Installed(0)]);
-    assert_eq!(behind, 1, "the first ask waited on its source");
-    let (lineages, repository) = lineages;
+    let (first, second) = (
+      creating("main-1", b"one", 1, 0),
+      creating("branch-1", b"two", 2, 0),
+    );
+    let identities = lineage_identities(&first, &second);
+    let (root, branch, twig) = (family(1, 2), family(2, 3), family(3, 4));
+    let daemon = one_unit_slices();
+    hold_restarted_lineage(&daemon, (first, second), identities, Some(twig));
+    let asks = rebuild_asks(&daemon, twig, 4);
+    let (lineages, [behind]) = lineage_seen(
+      &daemon,
+      [root, branch, twig],
+      [crate::merge_service::BRANCH_SOURCE_BEHIND],
+    );
+    daemon.stop();
+    assert_eq!(
+      asks.first(),
+      Some(&Rebuild::Later),
+      "the first ask waits on its sources: {asks:?}"
+    );
+    assert_eq!(
+      asks.last(),
+      Some(&Rebuild::Installed(0)),
+      "installed within its asks: {asks:?}"
+    );
+    assert!(behind >= 1, "an ask waited on its source");
+    let repository = slates_db::catalog::RepositoryId {
+      bytes: family(1, 1).0,
+    };
     assert_eq!(lineages, [Some(repository); 3], "one lineage");
   }
 

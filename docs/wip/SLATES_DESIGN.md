@@ -63452,3 +63452,52 @@ greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/
 
 Applied in the same change to: §4.8 (the owner's own hold, with a status line), `crates/db/src/register.rs`,
 `crates/cluster/src/lib.rs`, `crates/server/tests/fleet.rs`, the A-908 entry's owed line, GAPS.
+
+
+### A-910 — A green's fold visits only the paths changed since its last floor (2026-11-24, w-svn for main 01a20182, goal 93; found by timing an import's landing at 9,000 files; §4.16 "delta retention before folding", AUD-16)
+
+- **Why.** An import's landing ended in `fold_to_readers`, whose `Green::fold_history_before` walked every path's history
+  in every dimension (content, specials, mode, symlink, hard link, attributes, directories) on every floor move. The
+  floor moves at every batch an import lands, so each landing paid a walk of the whole green, quadratic over an import
+  of many batches; at 9,000 files it was 494 ms of one step on a debug build, folding nothing.
+- **The change.** The fold visits only the paths the change index names at a version from the last floor to the new
+  one, both included. Every other path's history holds at most the one entry below the last floor that fold left it,
+  and none from it to the new floor, so it folds to itself. The last floor's own version is visited again: a history
+  may hold more than one entry at one version (one work setting an attribute twice), which that fold kept as the value
+  at its floor. The cost is the changes since the last fold, never the green.
+- **The oracle.** `engine::fold_tests`: two greens take the same generated works in every dimension, with the floor
+  moved between them; one folds the index's paths, the other every path (`fold_history_before_every_path`, test only).
+  After every move their histories, recounted history bytes and retained bytes are equal. It found the visit of the
+  last floor's version necessary. A counted test holds a fold's visits to the paths changed since its last floor (2 of
+  a green of 50, where the whole walk visited 50).
+- **Applied in the same change to** `crates/merge/src/engine.rs` and `crates/merge/src/engine/fold_tests.rs`.
+
+### A-911 — A fetch's walk resolves an id met again from a cache of positions, not from the index (2026-11-24, w-git for main 01a20182, its rulings of that evening; goal 93's clone, clone-again and partial; §4.17.1 "A fetch's answer" rule 1; A-745, A-855; R3)
+
+- **What was there.** Choosing a pack's objects (`negotiation::objects::Selecting`) opens each tree once, but every entry
+  of it is resolved from id to position through the repository's index (`StoreGraph::named` → `position_of` →
+  `Index::get` across the runs, each table window read through `ContentStore::get`). A tree's versions repeat most of its
+  entries, so the same ids were looked up in every version. Main's samples of slates' partial clone and clone-again on
+  this Mac (40 s each, before the first pack byte): 22,771 of 23,095 and most of 28,736 work samples under
+  `StoreGraph::named`; clone-again's 71,056,607 content reads for 425,179 objects; ~65 s before `PACK`, the client sent
+  a keepalive every 5 s meanwhile.
+- **The change.** The answer keeps a `PositionCache` across its steps, lent to each step's graph: exact (id, position)
+  slots, direct-mapped by the id's first bytes (ids are uniform hashes). Its size comes from the work as the walk meets
+  it: at each sent commit the most ids one commit's trees resolved, times 8 slots an id (`SLOTS_AN_ID`, derived: a
+  direct-mapped table at load at most 1/8 loses under 12 % of its keys to collisions), to a power of two. Each growth
+  is charged to the answer's admission (48 bytes a slot), so concurrent fetches' memory stays bounded by theirs; with no
+  room it keeps its size, down to no slots, every lookup missing: the same code, counted once an answer
+  (`vcs_store.git_upload.position_cache_unroomed`), never a refusal. Also (b): `named` and `named_entries_of` read a
+  tree's id and its row with one lookup after `id_at`, not two.
+- **Why not a memo of every id.** Rule 1 holds a fetch's working set to a bit or a word an object; an exact id map is
+  ~28 bytes an object, and a word-a-slot table cannot check a hit (`id_at` is itself an index lookup). The cache's size
+  is one commit's working set, not the repository's objects.
+- **Evidence.** `vcs_store::upload::tests::a911_the_walk_resolves_each_id_met_again_once_not_in_every_trees_version`: a
+  line of 40 commits over a root tree of 60 files, one changed a commit, fetched under `filter tree:5` (no run of
+  versions answers it, so the walk chooses): red with no slots, 2,400 lookups for 179 objects; green, 383 lookups and
+  2,017 hits, the pack whole. Counted: `vcs_store.git_upload.position_lookups`, `position_cache_hits`. The time saved
+  is main's to measure.
+
+Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/git/src/negotiation/{mod,objects}.rs`,
+`crates/git/src/upload/{answer,mod}.rs`, `crates/server/src/vcs_store/upload.rs` and its tests.
+

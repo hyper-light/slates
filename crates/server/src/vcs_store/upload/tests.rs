@@ -1200,3 +1200,98 @@ fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
   );
   assert_eq!(left, 0);
 }
+
+/// Shape: the commits of [`a911_the_walk_resolves_each_id_met_again_once_not_in_every_trees_version`]'s line: enough
+/// that its trees' entries over all versions far outnumber its objects.
+const LINE_COMMITS: usize = 40;
+
+/// Shape: the files of that line's root tree, one changed a commit: a tree whose versions repeat most of its entries.
+const LINE_FILES: usize = 60;
+
+/// A git repository `name` whose `main` is a line of [`LINE_COMMITS`] commits, each a root tree of [`LINE_FILES`] files
+/// with one file changed from the commit before: the repository, its head, and its distinct objects.
+fn pushed_line(state: &mut ShardState, name: &str) -> (RepositoryId, ObjectId, usize) {
+  let (id, root) = repository(state, name, VcsTool::Git);
+  let mut files: Vec<(Vec<u8>, Vec<u8>)> = (0..LINE_FILES)
+    .map(|at| {
+      (
+        format!("file-{at:03}").into_bytes(),
+        format!("{at} at 0\n").into_bytes(),
+      )
+    })
+    .collect();
+  let mut distinct = std::collections::BTreeSet::new();
+  let (mut parent, mut base): (Option<ObjectId>, Option<ObjectId>) = (None, None);
+  for commit in 0..LINE_COMMITS {
+    let changed = commit % LINE_FILES;
+    files[changed].1 = format!("{changed} at {commit}\n").into_bytes();
+    let parents: Vec<ObjectId> = parent.into_iter().collect();
+    let date = FIRST_DATE + u64::try_from(commit).unwrap();
+    let (objects, head) = commit_of(&files, &parents, date);
+    distinct.extend(objects.iter().map(|(_, id, _)| *id));
+    let tree = tree_of(&objects);
+    push_through(state, (id, root), &objects, (base, head, tree));
+    (parent, base) = (Some(head), Some(tree));
+  }
+  (id, parent.expect("a head"), distinct.len())
+}
+
+/// Shape: a `tree:<depth>` filter's depth past every object of [`pushed_line`]'s line (its blobs are at depth 1), so the
+/// filter sends everything yet is no per-object filter: no run of versions answers its want, and the walk chooses each
+/// object (`slates_git::negotiation::Filter::is_per_object`; the bench's clones meet the same walk through wants no run
+/// answers).
+const PAST_THE_LINE: u64 = 5;
+
+/// A `fetch` request for `want` under `filter tree:<depth>`, with no progress.
+fn fetch_under_depth(want: ObjectId, depth: u64) -> Vec<u8> {
+  let arguments = [
+    format!("want {want}"),
+    format!("filter tree:{depth}"),
+    "no-progress".to_owned(),
+    "done".to_owned(),
+  ];
+  request("fetch", &arguments)
+}
+
+/// The shard's counts of a fetch's position lookups and its cache's hits now.
+fn position_counts(state: &ShardState) -> (u64, u64) {
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (
+    count(super::POSITION_LOOKUPS),
+    count(super::POSITION_CACHE_HITS),
+  )
+}
+
+/// A-911 (main 01a20182, 2026-11-24: a partial clone's walk before its pack spent 22,771 of 23,095 samples resolving
+/// tree entries to positions through the index, again in every version of a tree). Do: push a line of [`LINE_COMMITS`]
+/// commits whose root tree of [`LINE_FILES`] files changes one file a commit, then fetch its head whole under a depth
+/// filter past the line (so the walk, not a run of versions, chooses its objects), the shard's counts read around it. Expect: the walk met every entry of every version (lookups and the cache's hits together at
+/// least commits × files, so it is the walk this measures); but resolved through the index only about once an object
+/// met (at most three times the line's distinct objects), not once an entry of every version; and the pack whole.
+#[test]
+fn a911_the_walk_resolves_each_id_met_again_once_not_in_every_trees_version() {
+  let (distinct, (lookups, hits), sent) =
+    crate::test_store::audit_on_stored_shard("a911-line", |state| {
+      let (id, head, distinct) = pushed_line(state, "a911-line");
+      let before = position_counts(state);
+      let asked = fetch_under_depth(head, PAST_THE_LINE);
+      let (answer, _) = fetched_with_counters(state, (id, &owner()), &asked);
+      let after = position_counts(state);
+      let sent = ids_in(&pack_of(&answer)).len();
+      (distinct, (after.0 - before.0, after.1 - before.1), sent)
+    });
+  let met = u64::try_from(LINE_COMMITS * LINE_FILES).unwrap();
+  let distinct_objects = u64::try_from(distinct).unwrap();
+  eprintln!(
+    "a911: {lookups} lookups, {hits} hits, {distinct} distinct objects, {sent} sent, {met} entries met"
+  );
+  assert_eq!(sent, distinct, "the pack whole");
+  assert!(
+    lookups + hits >= met,
+    "the walk met every entry: {lookups} + {hits} of {met}"
+  );
+  assert!(
+    lookups <= 3 * distinct_objects,
+    "resolved about once an object, not an entry a version: {lookups} lookups for {distinct} objects"
+  );
+}
