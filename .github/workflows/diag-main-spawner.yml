@@ -1,4 +1,5 @@
 name: diag-main-spawner
+# Run 2 (main 01a20182, 2026-11-25 10:10 PST): at main with A-924 piece 2a and the role fixes (held count from the hard limit).
 # Run 1 (main 01a20182, 2026-11-25 10:05 PST): A-924 piece 1's spawn-cost red on both Linux runners, at main 31f16d02f.
 # It prints each descriptor count's least, median and most spawn time on the asking thread, through the spawner and
 # direct. The direct column is the Linux posix_spawn-against-descriptors figure the design rests on (glibc's
