@@ -1,5 +1,12 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~05:00 PST
+- LANDED 2ed3eb139: home read is one pinned task (bring-back to read); cadence grace rule removed. Red NotHeld unpinned.
+- LANDED 084ffb65d: svn batch landing per-stage counters (flush, commit, apply, tail) for main's P7 rerun.
+- LANDED f57e255d7: git re-bring proof (derivation fetches a let-go window again, same derived count).
+- Flagged: P7 bound exposes svn Unstored on Linux geometry (w-svn fixing in landing.rs, top priority).
+- Waiting: main's P7 per-stage sums (picks svn cut), hg clone peak vs 5,987 MiB at 2ed3eb139.
+
 ## 2026-11-25 ~03:30 PST
 - LANDED f72985f75: 57k hg import A/B in BENCHMARKS (pipelined 77.49 s best vs 83.05 / 91.20, half the peak).
 - LANDED 4d255fa9d: read-path cold trigger (vcs_share::read_backs): read-backs attributed by the store holding their
