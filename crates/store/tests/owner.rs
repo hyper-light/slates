@@ -617,3 +617,51 @@ fn a_stop_with_a_handle_still_held_ends_the_owner_and_the_handle_is_refused_gone
   assert_eq!(listed, 1, "the changeset landed before the stop");
   owner.stop().unwrap();
 }
+
+/// Goal 93 (main's order of 2026-11-25: hg's 57k clone waited 121.35 s on 6,232 store asks, the bulk of the clone, its
+/// parts unknown). Do: from a shard's task, land a changeset, then read its payload back by places, a batch an ask, as a
+/// stream does; take the thread's read waits twice. Expect: every read ask counted, the landing not; each part (queued
+/// behind other work, the owner's wake, its service, its disk reads, the hop back) summing to the whole wait, nanosecond
+/// for nanosecond; the disk's share moved by the reads (non-vacuity); none left after the take.
+#[test]
+fn a_reads_wait_on_the_owner_is_split_into_parts_that_sum_to_it() {
+  let dir = scratch("waits");
+  let payload: Vec<u8> = (0..200_000u32).map(|at| (at % 251) as u8).collect();
+  let identity = *blake3::hash(&payload).as_bytes();
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let runtime = runtime();
+  let (read, waits, left) = runtime
+    .block_on(async move {
+      handle
+        .land(header(1), vec![(SectionKind::Payload, payload)])
+        .await
+        .unwrap();
+      let mut read = Vec::new();
+      for offset in (0..200_000u64).step_by(50_000) {
+        let place = slates_store::texts::Place {
+          payload: identity,
+          offset,
+          len: 50_000,
+        };
+        read.extend(handle.places(vec![place]).await.unwrap().concat());
+      }
+      (
+        read,
+        slates_store::owner::take_read_waits(),
+        slates_store::owner::take_read_waits(),
+      )
+    })
+    .unwrap();
+  owner.stop().unwrap();
+  assert_eq!(read.len(), 200_000, "the payload read back");
+  assert_eq!(waits.asks, 4, "every read counted, the landing not");
+  let parts = waits.behind_ns + waits.wake_ns + waits.serve_ns + waits.disk_ns + waits.back_ns;
+  assert_eq!(
+    parts, waits.total_ns,
+    "the parts sum to the whole: {waits:?}"
+  );
+  assert!(waits.disk_ns > 0, "the reads' disk time counted: {waits:?}");
+  assert!(waits.most_ns > 0 && waits.most_ns <= waits.total_ns);
+  assert_eq!(left.asks, 0, "none left after the take");
+}
