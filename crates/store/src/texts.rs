@@ -432,6 +432,55 @@ pub struct TextRow {
   pub form: Form,
 }
 
+/// The ids a [`Store::texts_by_tools`] ask names, with their places among them in key order.
+struct Asked<'a> {
+  /// The ids, as asked.
+  tool_ids: &'a [Vec<u8>],
+  /// Their places, in the ids' key order.
+  order: &'a [usize],
+}
+
+impl Asked<'_> {
+  /// The `at`th id in key order.
+  fn id(&self, at: usize) -> Option<&[u8]> {
+    let place = *self.order.get(at)?;
+    self.tool_ids.get(place).map(Vec::as_slice)
+  }
+}
+
+/// Writes each version a page's `rows` (keys under `start`, in key order) holds for an asked id into `found` at the
+/// id's place, the asks from `at` on matched as the rows pass them; the last id the page read in `last`. Whether the
+/// page read any row of the path.
+fn found_in_page(
+  rows: &mantle_engine::rows::Rows,
+  start: &[u8],
+  (asked, at): (&Asked<'_>, &mut usize),
+  (found, last): (&mut [Option<(Identity, TextRow)>], &mut Vec<u8>),
+) -> Result<bool, StoreError> {
+  let mut any = false;
+  for (key, value) in rows.iter() {
+    let Some(tool_id) = key.strip_prefix(start) else {
+      continue;
+    };
+    while asked.id(*at).is_some_and(|id| id < tool_id) {
+      *at = at.saturating_add(1);
+    }
+    if asked.id(*at) == Some(tool_id) {
+      let version = decode_tool_value(value)?;
+      while asked.id(*at) == Some(tool_id) {
+        if let Some(slot) = asked.order.get(*at).and_then(|place| found.get_mut(*place)) {
+          *slot = Some(version);
+        }
+        *at = at.saturating_add(1);
+      }
+    }
+    last.clear();
+    last.extend_from_slice(tool_id);
+    any = true;
+  }
+  Ok(any)
+}
+
 /// What a [`TextCache`] holds, as a memory status reports it (goal 93, main's ruling of 2026-11-25: after hg's 57k push
 /// the cache's chunks held 32 MB live, and nothing reported why): the bytes its chunks reserve, its bound, and the
 /// walks in flight that hold the bound up, with their texts' bytes.
@@ -1310,25 +1359,23 @@ impl Store {
     let hash = *blake3::hash(path).as_bytes();
     let start = history_key(repository, &hash, (from, 0));
     let end = history_key(repository, &hash, (u64::MAX, u32::MAX));
-    let mut out = mantle_engine::rows::Rows::default();
-    let mut next = Vec::new();
-    self
-      .rows_mut()
-      .scan(&start, Some(&end), limit, &mut out, &mut next)?;
-    let mut found = Vec::with_capacity(limit.min(out.len()));
-    for (key, value) in out.iter() {
-      let sequence = key
-        .get(
-          HISTORY_KEY_BYTES.saturating_sub(LONG + ORDINAL)
-            ..HISTORY_KEY_BYTES.saturating_sub(ORDINAL),
-        )
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_be_bytes)
-        .ok_or(StoreError::BadRow)?;
-      let identity: Identity = value.try_into().map_err(|_| StoreError::BadRow)?;
-      found.push((sequence, identity));
-    }
-    Ok(found)
+    let (found, _) = self.scan_rows((&start, Some(&end), limit), |out, _| {
+      let mut found = Vec::with_capacity(limit.min(out.len()));
+      for (key, value) in out.iter() {
+        let sequence = key
+          .get(
+            HISTORY_KEY_BYTES.saturating_sub(LONG + ORDINAL)
+              ..HISTORY_KEY_BYTES.saturating_sub(ORDINAL),
+          )
+          .and_then(|bytes| bytes.try_into().ok())
+          .map(u64::from_be_bytes)
+          .ok_or(StoreError::BadRow)?;
+        let identity: Identity = value.try_into().map_err(|_| StoreError::BadRow)?;
+        found.push((sequence, identity));
+      }
+      Ok::<_, StoreError>(found)
+    })?;
+    found
   }
 
   /// The versions of `path` in repository `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as
@@ -1352,45 +1399,37 @@ impl Store {
     let hash = *blake3::hash(path).as_bytes();
     let start = tool_key(repository, &hash, &[]);
     let end = prefix_end(&start);
-    let wanted: std::collections::BTreeSet<&[u8]> = tool_ids.iter().map(Vec::as_slice).collect();
-    let mut kept: std::collections::BTreeMap<Vec<u8>, (Identity, TextRow)> =
-      std::collections::BTreeMap::new();
-    let mut next = Vec::new();
-    // The asked ids not yet passed, in key order: the first is where the next scan begins.
-    let mut left = wanted.iter().copied().peekable();
-    while let Some(first) = left.peek().copied() {
+    // The asked ids in key order, as their places among `tool_ids`, and each found version written into its answer's
+    // place as a page's rows pass it: no map of the asks or of what was found, and no row's id copied (goal 93, main's
+    // ruling of 2026-11-25: hg's 57k clone's churn held the asks' set, a map of the found and two copies of each row's
+    // id, beside the scan's own buffers, which the store now keeps).
+    let mut order: Vec<usize> = (0..tool_ids.len()).collect();
+    order.sort_by(|a, b| tool_ids.get(*a).cmp(&tool_ids.get(*b)));
+    let mut found: Vec<Option<(Identity, TextRow)>> = vec![None; tool_ids.len()];
+    let asked = Asked {
+      tool_ids,
+      order: &order,
+    };
+    let mut last: Vec<u8> = Vec::new();
+    // The asks before `at` (in key order) are passed: found, or held by no row; the next scan begins at the one at it.
+    let mut at = 0usize;
+    while let Some(first) = asked.id(at) {
       let from = tool_key(repository, &hash, first);
-      let page = left.clone().count().max(1);
-      let mut out = mantle_engine::rows::Rows::default();
+      let page = order.len().saturating_sub(at).max(1);
       self.tool_read();
-      let more = self
-        .rows_mut()
-        .scan(&from, end.as_deref(), page, &mut out, &mut next)?;
-      let mut last: Option<Vec<u8>> = None;
-      for (key, value) in out.iter() {
-        let Some(tool_id) = key.strip_prefix(start.as_slice()) else {
-          continue;
-        };
-        if wanted.contains(tool_id) {
-          kept.insert(tool_id.to_vec(), decode_tool_value(value)?);
-        }
-        last = Some(tool_id.to_vec());
-      }
-      if !more {
+      let (read, more) = self.scan_rows((&from, end.as_deref(), page), |rows, _| {
+        found_in_page(rows, &start, (&asked, &mut at), (&mut found, &mut last))
+      })?;
+      // A row that did not decode refuses the ask, whether rows are left or not.
+      let any = read?;
+      if !more || !any {
         break;
       }
-      // Every asked id at or before the last row read is passed: found, or held by no row.
-      match last {
-        Some(last) => while left.next_if(|id| *id <= last.as_slice()).is_some() {},
-        None => break,
+      while asked.id(at).is_some_and(|id| id <= last.as_slice()) {
+        at = at.saturating_add(1);
       }
     }
-    Ok(
-      tool_ids
-        .iter()
-        .map(|tool_id| kept.get(tool_id).copied())
-        .collect(),
-    )
+    Ok(found)
   }
 
   /// The bytes at `place` in the log (an edit or a whole as its `T` row names it), read whole: what a stream sends as a
