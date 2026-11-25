@@ -313,9 +313,6 @@ pub struct Daemon {
   vcs_svn_port: Option<u16>,
   /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
   start_beats: u64,
-  /// The daemon's spawner (A-924), joined once the shards have ended and their ends closed with them.
-  #[cfg(unix)]
-  spawner: Option<slates_ipc::confined_spawn::SpawnedChild>,
 }
 
 /// The version-control servers' SSH edge as a daemon started it (§4.17.2 "Transports" item 2; A-684): the port it
@@ -1103,6 +1100,8 @@ impl Daemon {
     // The daemon's spawner (A-924): started now, before any client's descriptor is open, with an end a shard. Every hook
     // and helper a shard starts is started by it, so a spawn never copies this process's descriptor table.
     #[cfg(unix)]
+    let spawner_began = std::time::Instant::now();
+    #[cfg(unix)]
     let slates_ipc::spawner::Started {
       child: spawner,
       ends: spawner_ends,
@@ -1113,7 +1112,17 @@ impl Daemon {
       })
     })?;
     #[cfg(unix)]
+    let spawner_start_took_ns =
+      u64::try_from(spawner_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    #[cfg(unix)]
     let mut spawner_ends = spawner_ends.into_iter();
+    // The control shard owns it (`crate::spawning::own`): the one that restarts it, an end to each shard in this order.
+    #[cfg(unix)]
+    let mut spawner_owner = Some((
+      spawner,
+      shards.iter().map(|shard| shard.0).collect::<Vec<u16>>(),
+      spawner_start_took_ns,
+    ));
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
@@ -1202,6 +1211,11 @@ impl Daemon {
       let holds = ShardHolds {
         stop_watch,
         spawner: spawner_ends.next(),
+        spawner_owner: if index == 0 {
+          spawner_owner.take()
+        } else {
+          None
+        },
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1369,8 +1383,6 @@ impl Daemon {
       vcs_ssh,
       vcs_svn_port,
       start_beats: start_beat.beats,
-      #[cfg(unix)]
-      spawner: Some(spawner),
     })
   }
 
@@ -4565,11 +4577,6 @@ impl Daemon {
     {
       slates_machine::log_line!("slates-server: stopping the daemon's shards: {error}");
     }
-    // The spawner, once every shard's end closed with its shard: it kills what it still holds and exits (A-924).
-    #[cfg(unix)]
-    if let Some(spawner) = self.spawner.take() {
-      join_spawner(spawner, log_window_ns);
-    }
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
@@ -4587,31 +4594,6 @@ impl Daemon {
 impl Drop for Daemon {
   fn drop(&mut self) {
     self.stop_parts();
-  }
-}
-
-/// Joins the daemon's spawner (A-924) after its shards ended, which closed every end it serves: it kills the groups it
-/// still holds and exits. One still running a window later (the shards' own, `window_ns`) is killed with its group and
-/// then waited for, so a stop never waits on it without end.
-#[cfg(unix)]
-fn join_spawner(mut spawner: slates_ipc::confined_spawn::SpawnedChild, window_ns: u64) {
-  if matches!(spawner.try_wait(), Ok(Some(_))) {
-    return;
-  }
-  if let Ok(watch) = slates_ipc::exit_watch::ExitWatch::on(spawner.id())
-    && let Some(readiness) = watch.readiness()
-    && let Ok(window) =
-      rustix::event::Timespec::try_from(std::time::Duration::from_nanos(window_ns))
-  {
-    let mut fds = [rustix::event::PollFd::new(
-      &readiness,
-      rustix::event::PollFlags::IN,
-    )];
-    let _ = rustix::event::poll(&mut fds, Some(&window));
-  }
-  if !matches!(spawner.try_wait(), Ok(Some(_))) {
-    spawner.kill_group();
-    let _ = spawner.wait();
   }
 }
 
@@ -4878,6 +4860,9 @@ struct ShardHolds {
   stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// This shard's end of the daemon's spawner (A-924).
   spawner: Option<std::os::fd::OwnedFd>,
+  /// The spawner itself, the shards it serves in its ends' order, and how long its start took: the control shard's
+  /// alone, which owns and restarts it (A-924 piece 2b).
+  spawner_owner: Option<(slates_ipc::confined_spawn::SpawnedChild, Vec<u16>, u64)>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -5177,10 +5162,20 @@ async fn init_shard(
   let inherited_dax = holds.dax;
   #[cfg(unix)]
   let stop_watch_install = holds.stop_watch;
-  // This shard's conversation with the daemon's spawner (A-924), before anything on the shard can start a hook.
+  // This shard's conversation with the daemon's spawner (A-924), before anything on the shard can start a hook; the
+  // control shard owns the spawner too, and restarts it on its death (piece 2b).
+  #[cfg(unix)]
+  if let Some((spawner, served, start_took_ns)) = holds.spawner_owner {
+    crate::spawning::own(spawner, served, start_took_ns);
+  }
   #[cfg(unix)]
   if let Some(end) = holds.spawner {
-    crate::spawning::install(end).map_err(ServerError::Runtime)?;
+    let placement = crate::spawning::Placement {
+      generation: 0,
+      owner: config_shards.first().copied().unwrap_or(partition),
+      bound: config.runtime.tasks_per_shard,
+    };
+    crate::spawning::install(end, placement).map_err(ServerError::Runtime)?;
   }
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
