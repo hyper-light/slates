@@ -91,7 +91,18 @@ thread_local! {
 /// read, before its staging asks whether the batch is due: so an import holds at most twice the larger of this bound and
 /// its largest revision's texts, never a history's (git-2000 held 426 MiB in one batch before).
 pub(crate) fn texts_bound(state: &ShardState) -> u64 {
+  #[cfg(test)]
+  if let Some(bound) = TEXTS_BOUND.with(std::cell::Cell::get) {
+    return bound;
+  }
   u64::try_from(crate::vcs_store::hg_import::segment_bytes(state)).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's texts bound in place of the derived one ([`texts_bound`]): another host's, whose page, and so whose
+  /// changeset store's unit, differs from this one's (a Linux runner's 4 KiB page makes it 512 KiB, a Mac's 16 KiB 2 MiB).
+  pub(crate) static TEXTS_BOUND: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -194,6 +205,11 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
+  /// The texts it put, each held and not landed yet.
+  pub(crate) fn put(&self) -> &[ContentIdentity] {
+    &self.put
+  }
+
   /// Why the batch before had no room for it.
   pub(crate) fn cause(&self) -> Flush {
     self.cause

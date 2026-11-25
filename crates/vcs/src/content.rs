@@ -1439,8 +1439,10 @@ impl ContentStore {
     (freed, pinned)
   }
 
-  /// The windows of the object `identity` names, in order: itself where it is one window.
-  fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
+  /// The windows of the object `identity` names, in order: itself where it is one window ([`ContentStore::windows`]
+  /// walked down its lists). What a let-go of a landed object takes, and what an owner keeps from one
+  /// (`slates-server`'s texts put for a revision not landed yet, whose windows a landed text may share).
+  pub fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
     let mut windows = Vec::new();
     let mut walk = self.windows(identity);
     while let Some(window) = walk.next_window() {
