@@ -24,10 +24,13 @@
 //!
 //! **Spinning before it parks** (main's ruling of 2026-11-25: hg's 57k clone, 812,896 requests, waited 144.82 s of
 //! 167.27 s on the owner's wake, about 178 µs a request). A fetch asks again as soon as its shard has taken the last
-//! answer, so the owner, waiting for work, spins through the gap before it parks: for the gap it has learned (RFC 6298's
-//! smoothed mean and four mean deviations, [`Gaps`]), at most the machine's measured wake (`spin_before_park_ns`, which
-//! the daemon passes), so it spins only while asks arrive back to back. Counted, a request at a time: met spinning,
-//! met parked, and the nanoseconds spun ([`AskWaits`]).
+//! answer, so the owner, waiting for work, may spin through the gap rather than park. It does by rent or buy: it learns
+//! the gaps (RFC 6298's smoothed mean and four mean deviations, [`Gaps`]) and what a park's wake costs it where it runs
+//! ([`Wake`], seeded by the machine's profiled wake, `spin_before_park_ns`, which the daemon passes), and spins, at most a
+//! wake's cost, only where the next ask is predicted within it; else it parks at once (main's ruling on the 57k split at
+//! 7a9cb385e: asks 12.7 ms apart, a wake 1.36 ms; spinning to the profile's cap there met 52 asks and parked for
+//! 3,237). Until then the spin was the predicted gap capped at the profile's wake, which spun on gaps longer than any
+//! wake. Counted, a request at a time: met spinning, met parked, and the nanoseconds spun ([`AskWaits`]).
 //!
 //! **A sliced landing** ([`StoreHandle::begin`], then [`SlicedLanding`]'s `section`, `part` and `commit`) lands a
 //! changeset too large to hold whole (an import, a large pack) one bounded part a request: each part is written where
@@ -542,18 +545,19 @@ impl fmt::Debug for Request {
 
 impl StoreOwner {
   /// Opens the store in `root` on a thread of its own (the store recovers there before the first request is served),
-  /// with room for `waiting` requests at once; waiting for work, it spins at most `spin_cap_ns` (the machine's
-  /// `spin_before_park_ns`: a wake's measured cost) before it parks ([`Gaps`]).
+  /// with room for `waiting` requests at once; waiting for work, it spins only where the next request is predicted
+  /// within a park's wake, which it learns as it runs from `wake_seed_ns` (the machine's `spin_before_park_ns`; 0 where
+  /// none is known: no spin until a wake is measured) ([`Gaps`], [`Wake`]).
   pub fn start(
     root: StoreRoot,
     sizing: Sizing,
-    (waiting, spin_cap_ns): (usize, u64),
+    (waiting, wake_seed_ns): (usize, u64),
   ) -> Result<Self, OwnerError> {
     let grant = crate::store::grant_id(root.grant().target.device, root.grant().target.inode);
     let (requests, incoming) = sync::channel(waiting).map_err(|_| OwnerError::Busy)?;
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-store".to_owned()),
-      move || serve(root, sizing, incoming, (waiting, spin_cap_ns)),
+      move || serve(root, sizing, incoming, (waiting, wake_seed_ns)),
     )
     .map_err(|_| OwnerError::Gone)?;
     Ok(Self {
@@ -639,13 +643,47 @@ impl Gaps {
     }
   }
 
-  /// How long to spin before parking: the mean and four deviations, at most `cap_ns`; none before a gap is learned.
-  fn window(&self, cap_ns: u64) -> u64 {
-    self.mean_ns.map_or(0, |mean| {
-      mean
-        .saturating_add(self.deviation_ns.saturating_mul(DEVIATION_WEIGHT))
-        .min(cap_ns)
-    })
+  /// The next gap predicted: the mean and four deviations (a retransmission timeout's); none before a gap is learned.
+  fn predicted(&self) -> Option<u64> {
+    self
+      .mean_ns
+      .map(|mean| mean.saturating_add(self.deviation_ns.saturating_mul(DEVIATION_WEIGHT)))
+  }
+
+  /// How long to spin before parking, by rent or buy (main's ruling of 2026-11-25 on the 57k split at 7a9cb385e: asks
+  /// 12.7 ms apart against a wake of 1.36 ms, where spinning to a cap would burn about 4.4 s of the owner's CPU for
+  /// nothing): spin, at most as long as a park's wake costs, only where the next ask is predicted within that wake;
+  /// else park at once. None before a gap is learned.
+  fn window(&self, wake: &Wake) -> u64 {
+    match self.predicted() {
+      Some(predicted) if predicted <= wake.mean_ns => wake.mean_ns,
+      _ => 0,
+    }
+  }
+}
+
+/// What a park's wake costs the owner, learned from the requests it met parked (from the later of the request's send and
+/// the park, to its taking), smoothed as [`Gaps`] smooths a gap (gain 1/8): measured where it runs, under the load it runs
+/// in, never one machine's figure (the 57k split at 7a9cb385e: about 1.36 ms a wake under load 24, against the idle
+/// probe's 9.4 us). Seeded, until the first wake is measured, by the machine's profiled wake (`spin_before_park_ns`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Wake {
+  /// The smoothed wake.
+  mean_ns: u64,
+}
+
+impl Wake {
+  /// A wake seeded at `seed_ns`.
+  fn seeded(seed_ns: u64) -> Wake {
+    Wake { mean_ns: seed_ns }
+  }
+
+  /// One wake more.
+  fn learn(&mut self, wake_ns: u64) {
+    self.mean_ns = self
+      .mean_ns
+      .saturating_sub(self.mean_ns >> MEAN_GAIN_SHIFT)
+      .saturating_add(wake_ns >> MEAN_GAIN_SHIFT);
   }
 }
 
@@ -706,9 +744,10 @@ fn serve(
   root: StoreRoot,
   sizing: Sizing,
   mut incoming: ChannelReceiver<Asked>,
-  (waiting, spin_cap_ns): (usize, u64),
+  (waiting, wake_seed_ns): (usize, u64),
 ) -> Result<(), StoreError> {
   let mut gaps = Gaps::default();
+  let mut wake = Wake::seeded(wake_seed_ns);
   let at = root.target().key.clone();
   let mut store = match Store::open(root, sizing) {
     Ok(store) => store,
@@ -741,7 +780,7 @@ fn serve(
     let idle_ns = slates_machine::clock::monotonic_ns();
     let (asked, met) = match landings.next_held() {
       Some(asked) => (asked, Met::Queued),
-      None => match waited_for(&mut incoming, gaps.window(spin_cap_ns)) {
+      None => match waited_for(&mut incoming, gaps.window(&wake)) {
         Some(waited) => waited,
         None => break,
       },
@@ -749,6 +788,11 @@ fn serve(
     let dequeued_ns = slates_machine::clock::monotonic_ns();
     if met != Met::Queued {
       gaps.learn(dequeued_ns.saturating_sub(idle_ns));
+    }
+    // A timed request met parked carries what the park's wake cost: from the later of its send and the park.
+    if let (Met::Parked(spun), true) = (met, asked.timed.is_some()) {
+      let parked_ns = idle_ns.saturating_add(spun).max(asked.sent_ns);
+      wake.learn(dequeued_ns.saturating_sub(parked_ns));
     }
     landings.let_go_if_dropped(&mut store);
     let Some(Asked {

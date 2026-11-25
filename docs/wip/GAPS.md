@@ -1885,9 +1885,16 @@
 > (64 reads back to back: with no spin 64 parks, the red; with a 2 ms cap 61 met spinning, 3 parked while the window was
 > learned). Main's 57k split at b4aa00ef8 (release, load ~34) showed no spin: 461,484 parks, 0 hits, because the
 > measurement's daemon (`crates/server/tests/common/hg.rs`) started its owner with a cap of 0; a daemon takes the
-> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Owed: the
-> split again with the real cap (main's), whether a probe's wake (about 9 µs) or the owner's loaded one (about 183 µs a
-> request there) should cap it, then the request count (593,413 at b4aa00ef8) with w-perf.
+> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Main's split
+> with the real cap at 7a9cb385e: asks 12.7 ms apart, a park's wake 1.36 ms; 52 met spinning, 3,237 parked. Main's ruling
+> then: rent or buy, never a cap. Since (w-hg): the owner learns what a park's wake costs it where it runs (`Wake`: from
+> the later of a request's send and the park to its taking, gain 1/8, seeded by the profile's wake), and spins, at most
+> that wake, only where the next gap is predicted within it; else it parks at once. Held by
+> `reads_further_apart_than_a_wake_park_at_once` (16 reads 20 ms apart, the wake seeded at 2 ms: every read parked,
+> none spun; red under the capped rule: 40.56 ms spun, none met) and `back_to_back_reads_are_met_spinning_not_parked`
+> (seeded at 2 ms: 64 of 64 met spinning). Unseeded on an idle MacBook the owner parks back to back: its wake, about 8 µs,
+> is shorter than the asker's turnaround. Owed: the 57k split under the rule (main's); the request count (3,387 at
+> 7a9cb385e) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
