@@ -232,7 +232,7 @@ impl ImportBatch {
         for (identity, bytes) in std::mem::take(&mut lent) {
           engine.lend(identity, bytes);
         }
-        let judged = judge_staged(engine, &mut work, (head, holders), chain_left);
+        let judged = judge_staged(engine, &mut work, (head, holders), (chain_left, reservation));
         engine.let_named_bytes_go();
         judged
       });
@@ -388,16 +388,15 @@ fn judge_staged(
   engine: &mut Green,
   work: &mut Increment,
   (head, holders): (u64, bool),
-  chain_left: Option<usize>,
+  (chain_left, reserved): (Option<usize>, usize),
 ) -> Judging {
   // The scratch member counts its versions from 0: the work's base, read there, and each copy's source version
   // (a Subversion copy names the head it copies from, w-svn's C2 stage C) moved into its numbering for the verdict.
   let offset = head.saturating_sub(engine.head());
   work.base = engine.head();
   in_numbering(work, |version| version.checked_sub(offset));
-  let reserved = engine
-    .history_reservation(work)
-    .saturating_add(engine.changes_reservation(work));
+  // `reserved` is what the batch's room check computed of this work at this head (`reservation_of`): the scratch member
+  // unchanged since, but for the texts lent it, so not walked again (A-920: 29 ms a walk at 9,000 files, debug).
   // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
   // Judged and held first, so an accepted verdict's chain entry is sized before anything of it applies (A-895).
   let judgment = engine.judge_named(work);
