@@ -1322,3 +1322,33 @@ fn a911_a_miss_into_a_slot_another_id_holds_is_counted_a_conflict() {
     "a conflict is a lookup: {conflicts} of {lookups}"
   );
 }
+
+/// [`pushed_line`]'s line, as repository `name` on a fresh audit shard, fetched whole under a depth filter past it: the
+/// most entries one unit of its walk took, and the longest tree one unit parsed, as the shard counted them most.
+fn line_walk_most(name: &'static str) -> (u64, u64) {
+  crate::test_store::audit_on_stored_shard(name, move |state| {
+    let (id, head, _) = pushed_line(state, name);
+    let asked = fetch_under_depth(head, PAST_THE_LINE);
+    let _ = fetched_with_counters(state, (id, &owner()), &asked);
+    let most = |counter: &str| state.refusals.get(counter).copied().unwrap_or(0);
+    (
+      most(super::UNIT_ENTRIES_MOST),
+      most(super::TREE_PARSE_BYTES_MOST),
+    )
+  })
+}
+
+/// The bounded-work rule in a fetch's walk (main 01a20182's order of 2026-11-25: 280,392 polls past the step quantum in
+/// one clone of git/git, the walk opening a tree whole in one unit). Do: fetch [`pushed_line`]'s line, its root tree
+/// [`LINE_FILES`] entries, whole under a depth filter past it. Expect: no unit of the walk took more than one entry
+/// before asking whether its step was spent (a tree's entries taken one a unit, as the `sparse:oid` walk takes them),
+/// and the trees it parsed counted (so it is the walk this measures). Red before: one unit took the root's 60.
+#[test]
+fn a_fetchs_walk_takes_one_entry_a_unit_never_a_tree_whole() {
+  let (entries_most, tree_bytes_most) = line_walk_most("one-entry-a-unit");
+  eprintln!(
+    "walk: {entries_most} entries a unit at most, the longest tree {tree_bytes_most} bytes"
+  );
+  assert!(tree_bytes_most > 0, "trees parsed: {tree_bytes_most} bytes");
+  assert_eq!(entries_most, 1, "one entry a unit, never a tree whole");
+}
