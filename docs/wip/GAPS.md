@@ -1799,16 +1799,29 @@
 > hg-src's r4000 in process (`hg_clone_store_wait`, debug), stock `hg verify` clean on the clone and its 4,001
 > changesets' manifests the source's: 3,392 sent as stored deltas, 14 stored wholes, 594 whole from a made text (their
 > stored delta the client's own base, a merge's p1); the owner's requests 4,846 to 1,248, the store wait 1.96 s to
-> 1.49 s. Owed: the 594, which versions 02 and 03 could send against any manifest sent earlier (main's condition named
-> the one before); the 57k churn rerun (main's).
+> 1.49 s. The 594 since sent on the parent the client holds (2026-11-25, w-hg; main's ruling, the rule's exact form):
+> a stored delta whose base is a parent's text, that parent a manifest before it a missing changeset links (so sent
+> earlier in this changegroup), goes as that delta, the parents' rows asked in the same want as the batch's, kept only
+> for the batch (no set growing with the repository). Counted `_stored_parent_delta`. Held by
+> `a_clone_sends_a_let_go_manifest_on_its_first_parent_sent_earlier` (two lines over the stock tip, each manifest kept
+> on its first parent; red with the rule off: the stand-in refused a text made whole) and
+> `a_clone_whose_first_manifest_batch_is_the_root_alone_sends_it` (an empty parents log asked beside the root's was
+> taken for a lost row: refused "a manifest revision", as were the daemon-edge and ssh clones past a request's room).
+> At r4000 in process: 3,392 stored deltas, 562 on a parent, 14 wholes, 32 whole from a made text (a delta on neither
+> the one before nor a parent sent); the owner's requests 1,248 to 80, the store wait 1.27 s, `hg verify` clean, every
+> manifest the source's. A pull's base in `::common` is not this walk's: a pull (`Named`) reads each manifest whole to
+> plan its files, so its text is made whatever is sent. Owed: the 32; the 57k churn rerun (main's).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
 > smoothed mean and four mean deviations), at most the machine's measured wake (`spin_before_park_ns`), then parks.
 > Counted `vcs_store.hg_owner_spin_hits`, `_parks`, `_spin_ns`. Held by `back_to_back_reads_are_met_spinning_not_parked`
 > (64 reads back to back: with no spin 64 parks, the red; with a 2 ms cap 61 met spinning, 3 parked while the window was
-> learned). Owed: the 57k clone's split after it (main's), then the request count (812,896, about 14 a changeset under
-> the step bound) with w-perf.
+> learned). Main's 57k split at b4aa00ef8 (release, load ~34) showed no spin: 461,484 parks, 0 hits, because the
+> measurement's daemon (`crates/server/tests/common/hg.rs`) started its owner with a cap of 0; a daemon takes the
+> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Owed: the
+> split again with the real cap (main's), whether a probe's wake (about 9 µs) or the owner's loaded one (about 183 µs a
+> request there) should cap it, then the request count (593,413 at b4aa00ef8) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
