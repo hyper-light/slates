@@ -802,3 +802,13 @@
   the tip painting (own unit kind), then measure what open_tree spends (parse vs store read) before slicing it.
   HOLD: derive changes until main's interleaved A/B (b4aa00ef8 clone 65 s first byte vs 38–40 s; suspects 59a168795
   vs w-perf arena 2e85f9d61/259674f36/1a446416c).
+- 11-25 ~11:30 PST: LANDED 56b45bba6 (merge 97507cb3a) tips stage: Selecting begins with Stage::Tips, one wanted/had tip
+  painted a unit (UnitKind::Tips, KINDS = 15); the selection-beginning unit now asks its pace (timed as `cut`). Red:
+  600-commit line + 500 tags, the cut's last step read 500 → ≤ 2. MISSED the kinds-table test (my filter was
+  daemon_edge a_fetch*): fixed e51d998bf, table typed [_; KINDS]. LESSON: run all of vcs_http::daemon_edge before
+  landing anything touching the unit kinds. LANDED c8a96cc84 (merge 261703f94): fetch keepalive tests (HTTP + SSH) hold
+  their shard to one quantum a step (KEPT_ALIVE_CEILING_NS = 0); red 3/6 parallel (w-hg: every time alone after
+  56b45bba6, the step no longer returning at the selection's start); green 6/6. NOW (main's order): the four SSH
+  seat/client-gone tests (A-594/A-730, authors gone, mine now) + w-hg's git_hooks pair under 8 burners, full output
+  kept; suspected test premises (fixed 2 s pause vs a measured first RTO; g90's fixed 100 ms before close). THEN
+  open_tree: deltas-applied counters per tree read (most, sum) for main's leg, before slicing.
