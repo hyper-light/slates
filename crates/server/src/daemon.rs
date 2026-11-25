@@ -3906,7 +3906,7 @@ impl Daemon {
       .observe(shard, move |s| {
         // Only a shard with a committed image has dead memory to give back.
         let _ = crate::verbs::publish_shard(s);
-        s.journal.forget_what_was_given_back();
+        s.journal.forget_what_was_given_back(recovery_totals(s));
         s.give_back_rate = GiveBackRate::default();
         s.purge_seen_allocations = s.store.content.arena().allocations();
         if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
@@ -4804,7 +4804,17 @@ fn content_slice(
       len: deltas.1.saturating_sub(deltas.0),
     },
   );
-  match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
+  // The journal's memories whole, as an image before A-926 leaves them: what a log of version 2 takes its marks as.
+  let journal_whole = slates_vfs::checkpoint_log::WrittenExtents::whole(
+    images.1.saturating_sub(images.0),
+    deltas.1.saturating_sub(deltas.0),
+  );
+  match crate::write_log::WriteLog::open(
+    object,
+    (log_start, log_bytes),
+    generation,
+    (config.page, journal_whole),
+  ) {
     Some((log, recovered)) => (images, Some(log), recovered),
     None => (images, None, crate::write_log::Recovered::default()),
   }
@@ -6108,6 +6118,16 @@ pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 /// give-back of memory a predecessor may have written (18 GB a shard on a 128 GiB Mac) holds the shard one quantum a
 /// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
 /// next give-back. The bytes given back, and whether any is left.
+/// The shard's recovery memories' lengths: its checkpoint memory's and its delta log's.
+fn recovery_totals(s: &ShardState) -> (usize, usize) {
+  let (slots_start, slots_end) = s.content_range;
+  let (log_start, log_end) = s.delta_range;
+  (
+    slots_end.saturating_sub(slots_start),
+    log_end.saturating_sub(log_start),
+  )
+}
+
 fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
   return_dead_recovery_timed(s, &mut shard_thread_cpu_ns)
 }
@@ -6150,6 +6170,10 @@ fn return_dead_recovery_timed(
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
   );
+  // The marks fall with what was given back, after it (A-926): a crash between leaves them ahead, never behind.
+  if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
+    let _lowered = log.lower_journal_marks(object, s.journal.written());
+  }
   learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
@@ -11276,7 +11300,9 @@ mod tests {
   fn a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock() {
     let seen = audit_on_shard(|state| {
       let _ = crate::verbs::publish_shard(state);
-      state.journal.forget_what_was_given_back();
+      state
+        .journal
+        .forget_what_was_given_back(super::recovery_totals(state));
       state.give_back_rate = super::GiveBackRate::default();
       let quantum = slates_rt::futures::step_budget_ns()
         .unwrap_or(state.config.runtime.step_budget_ns)
