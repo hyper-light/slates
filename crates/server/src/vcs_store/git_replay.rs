@@ -165,8 +165,8 @@ impl Outside for Site<'_> {
 pub(crate) enum Stepped {
   /// More turns remain.
   More(Box<GitReplay>),
-  /// The record is replayed: the derived values not kept, as [`super::commit_moves`] answers them.
-  Done(u64),
+  /// The record is replayed.
+  Done,
 }
 
 /// How much a turn may take: its deadline on the shard's clock, and the pack's bytes one read takes.
@@ -245,7 +245,7 @@ impl GitReplay {
     loop {
       match self.unit((content, store), turn.chunk) {
         Ok(None) => {}
-        Ok(Some(moves)) => return self.finish(content, store, moves).map(Stepped::Done),
+        Ok(Some(moves)) => return self.finish(content, store, moves).map(|()| Stepped::Done),
         Err(refused) => return Err(self.abandon(content).err().unwrap_or(refused)),
       }
       if now() >= turn.deadline_ns {
@@ -474,13 +474,13 @@ impl GitReplay {
     content: &mut ContentStore,
     store: &mut GitStore,
     moves: Vec<Move>,
-  ) -> Result<u64, ReplayRefused> {
+  ) -> Result<(), ReplayRefused> {
     let ended = self.end(content, store, &moves);
     // A committed push holds nothing, so this gives back only what a refused end held.
     let given = self.abandon(content);
-    let unkept = ended?;
+    ended?;
     given?;
-    Ok(unkept)
+    Ok(())
   }
 
   /// One unit of the moves' admission: a unit of the admission under way, the move it admitted kept; or the next
@@ -537,7 +537,7 @@ impl GitReplay {
     content: &mut ContentStore,
     store: &mut GitStore,
     moves: &[Move],
-  ) -> Result<u64, ReplayRefused> {
+  ) -> Result<(), ReplayRefused> {
     commit_moves(content, store, &mut self.push, (moves, &self.moves)).map_err(ReplayRefused::Git)
   }
 
