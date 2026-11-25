@@ -19922,3 +19922,23 @@ of e89adba55 against its parent queued. This entry makes no closing claim on `de
 - **What moved.** The clone's first pack byte is 14.8 s later, the derivation's units running at 21.8 against 11.8 ms
   each. The partial clone is 19.5 s sooner and the clone-again about even, both at different loads.
 
+**Follow-up: `derive_behind` (e89adba55) A/B, two interleaved rounds. It stays.** At best the two arms are even: the
+first pack byte came at 38.39 s in both. A is the steadier, and the derivation doubling seen at eedfd23e1 is not
+reproduced. The clone's whole time differs for reasons beyond the derivation: other changes sit between the two arms'
+commits, so this makes no claim on it.
+
+- **Command.** `~/slates-work/main-ship/derive-ab.sh`, 2026-11-25 05:51 to 06:14 PST on the MacBook, load average 21 to
+  34, two rounds interleaved. Record: `~/.cache/main-rounds/derive-ab/summary.txt`.
+- **The arms.**
+  - A: main ae4557eba, with `derive_behind`.
+  - C: 44db3dc17, the inline form before it.
+
+| arm | push (s) | clone (s) | its first pack bytes (s) | clone again (s) | derivation, 1,027 units (s) | a unit (ms) |
+|---|---|---|---|---|---|---|
+| A | 52.653 / 53.365 | 64.301 / 85.851 | 38.390 / 39.825 | 58.488 / 50.263 | 14.20 / 14.80 | 13.83 / 14.41 |
+| C | 49.352 / 53.093 | 78.839 / 112.240 | 38.389 / 67.616 | 62.372 / 64.339 | 13.65 / 24.99 | 13.29 / 24.33 |
+
+- **The derivation.** A's units took 13.8 to 14.4 ms in both rounds, so the 21.8 ms of the eedfd23e1 run above is
+  not reproduced with `derive_behind`. C's took 13.3 ms in one round and 24.3 ms in the other: without it, a unit's time
+  also doubled at this load.
+

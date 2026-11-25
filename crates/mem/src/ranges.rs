@@ -85,6 +85,36 @@ impl UnitSet {
     self.set_units(first, last, true);
   }
 
+  /// Whether the run of recorded units around `start .. end` (recorded) spans at least `len` bytes, read outward from it
+  /// no further than that: whether a mark made a run an idle purge gives back (`ChunkArena::purge`, main's ruling of
+  /// 2026-11-25), at a cost bounded by `len`, not by the run.
+  pub(crate) fn run_reaches(&self, start: usize, end: usize, len: usize) -> bool {
+    let (first, last) = self.units_of(start, end);
+    let need = len.div_ceil(self.unit).max(1);
+    let mut span = last.saturating_sub(first);
+    let mut left = first;
+    while span < need && left > 0 && self.is_set(left.saturating_sub(1)) {
+      left = left.saturating_sub(1);
+      span = span.saturating_add(1);
+    }
+    let mut right = last;
+    while span < need && right < self.units && self.is_set(right) {
+      right = right.saturating_add(1);
+      span = span.saturating_add(1);
+    }
+    span >= need
+  }
+
+  /// Whether unit `unit` is recorded.
+  fn is_set(&self, unit: usize) -> bool {
+    let word = unit.checked_div(WORD_BITS).unwrap_or(0);
+    let bit = unit.checked_rem(WORD_BITS).unwrap_or(0);
+    self
+      .words
+      .get(word)
+      .is_some_and(|word| (word >> bit) & 1 == 1)
+  }
+
   /// Takes every unit `start .. end` touches out of the set: the bytes of the units that were recorded.
   pub(crate) fn take(&mut self, start: usize, end: usize) -> usize {
     let (first, last) = self.units_of(start, end);
