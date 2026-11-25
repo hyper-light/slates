@@ -63591,6 +63591,18 @@ Applied in the same change to: §4.8 (the owner's own hold, with a status line),
 Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/git/src/negotiation/{mod,objects}.rs`,
 `crates/git/src/upload/{answer,mod}.rs`, `crates/server/src/vcs_store/upload.rs` and its tests.
 
+> **The fork's read cache (2026-11-25, w-git for main 01a20182, its order on `open_tree` and its ruling on the shape).**
+> A fetch reads through a fork of its repository (A-745 rule 4), and the fork began with a read cache of no bytes
+> (`packed::Recent`, git's delta base cache), so every tree the walk opened rebuilt its chain from its base: 78 deltas
+> for a 13-tree chain, 0+1+...+12, O(depth²) over a walk; on git/git `open_tree` ran 0.45 to 0.59 ms a unit, about 97 %
+> of a clone's long units, while its parse stayed under 62,061 bytes. Now the walk tells its graph before each tree's
+> ids are read (`Graph::opening_tree`, a no-op by default), and the store widens the fork's cache to its learned chain
+> depth times that tree's length (`Repository::widen_read_cache`), the growth charged to the fetch's admission, as the
+> position cache is; refused room, the cache stays as it is. A chain whose revisions are no longer than the tree
+> being read stays whole for its next revisions; a longer one keeps its newest, the oldest given back first. The fork's release gives the cache back.
+> Counted: `vcs_store.git_upload.tree_deltas` and `tree_deltas_most`. Red: the 13-tree chain's fetch applied 78
+> deltas; now 12, the chain built once (the walk reads the newest first, whose read applies the whole chain).
+
 ### A-912 — A push during a member's death is accepted: no exchange holds a peer's record session across a wait that needs the council's next round, and a push's homing outlasts a death (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 ((i), (1), (a), (b)); found by A-908 part 4's fleet test; amends A-902; A-363, A-724 piece 6, A-727 (d1a), A-907)
 
 - **Why.** A git push made right after a member died was refused `retry` ("the push's objects were not kept by enough

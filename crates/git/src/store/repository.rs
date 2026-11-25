@@ -669,6 +669,28 @@ impl Repository {
     self.depth.limit()
   }
 
+  /// Widens what its reads keep of the objects read lately (`packed::Recent`, git's delta base cache) for a tree of `len`
+  /// bytes about to be read: to its learned chain depth ([`Repository::learned_depth`]) times `len`, so the tree's chain,
+  /// each revision no longer than the tree being read, stays whole for the walk's next revisions; the growth alone
+  /// charged to `admission`, a fetch's own (main 01a20182's ruling of 2026-11-25: a fork a fetch reads through kept no
+  /// cache, so every tree read rebuilt its chain from its base, 78 deltas for a 13-tree chain). Refused room, it stays as
+  /// it is: whether it was widened or needed no more.
+  pub fn widen_read_cache(&self, len: u64, admission: &mut Admission) -> bool {
+    let wanted = self.learned_depth().saturating_mul(len);
+    let mut reading = self.reading.borrow_mut();
+    let have = to_u64(reading.recent().budget());
+    if wanted <= have {
+      return true;
+    }
+    if admission.charge(wanted.saturating_sub(have)).is_err() {
+      return false;
+    }
+    reading
+      .recent()
+      .set_budget(usize::try_from(wanted).unwrap_or(usize::MAX));
+    true
+  }
+
   /// The bytes its reads keep of the objects read lately (`packed::Recent`, git's delta base cache).
   pub fn recent_bytes(&self) -> u64 {
     to_u64(self.reading.borrow_mut().recent().bytes())
@@ -2088,6 +2110,8 @@ impl Repository {
   /// Gives back everything the repository holds: its rows' holds, their tables, its versions' values and their charge.
   /// It goes on past a refusal and answers the first.
   pub fn release(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
+    // The objects its reads kept (a fetch's fork widens its cache as its walk opens trees): given back with it.
+    self.reading.borrow_mut().recent().release(store);
     let mut first = self.index.release(store).map_err(StoreRefused::from);
     for kept in self.chains.values().flat_map(Chain::kept) {
       first = first.and(
