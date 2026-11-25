@@ -11,8 +11,8 @@
 //!
 //! **How.** The content store keeps, beside each window, how many unlanded objects name it, and no let-go takes a window
 //! while any does (`ContentStore::pin_unlanded`, `LetGoRefused::Unlanded`, counted `kept_unlanded`). A push's
-//! [`Counted`] pins each revision's objects as the intake keeps it ([`Counted::count_kept`], over
-//! `Intake::kept_contents`), unpins a segment's own just before that segment's let-go ([`Counted::count_out`]: never at
+//! [`Counted`] pins each revision's objects as the intake keeps it ([`Counted::count_kept`], over the revisions kept
+//! since its last look, `Intake::kept_newest`), unpins a segment's own just before that segment's let-go ([`Counted::count_out`]: never at
 //! its taking, since its record is written over turns before it lands), and gives back the rest however the push ends
 //! ([`Counted::release`]). A window a later revision still names keeps its count, and goes with that one's landing.
 //!
@@ -25,6 +25,7 @@ use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
 use crate::Node;
 use crate::filerev::FileContents;
+use crate::push::intake::Intake;
 
 /// One revision a push pinned: its log's path and the objects it pinned.
 type Pinned = (Vec<u8>, Vec<ContentId>);
@@ -34,17 +35,37 @@ type Pinned = (Vec<u8>, Vec<ContentId>);
 pub struct Counted {
   /// Each revision pinned, by node: its log's path and its objects (a node's revisions in two logs kept apart).
   counted: BTreeMap<Node, Vec<Pinned>>,
+  /// The kept revisions [`Counted::count_kept`] has looked at, all told: its work, which must grow with the push's
+  /// revisions, never with its slices times its kept ones (main's 57k push at 2dd25afe6).
+  visited: u64,
+  /// The intake's revisions kept that it has looked at ([`Intake::kept_total`]): the next look starts after them.
+  seen: u64,
+}
+
+/// What one [`Counted::count_kept`] did: the kept revisions it looked at, and the windows it pinned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinLook {
+  /// The kept revisions looked at: those kept since the last look.
+  pub revisions: u64,
+  /// The windows pinned.
+  pub windows: u64,
 }
 
 impl Counted {
-  /// Pins the objects of each of `kept` (the intake's kept and not yet taken) it has not pinned: refused typed where a
-  /// window's count would pass its width, what it pinned before kept.
-  pub fn count_kept<'k>(
+  /// Pins the objects of each revision `intake` kept since the last look ([`Intake::kept_newest`]; asked before the
+  /// slice's segments are taken), each once: refused typed where a window's count would pass its width, what it pinned
+  /// before kept. Its work is the slice's new revisions, never every kept one (main's 57k push at 2dd25afe6). What it
+  /// looked at and pinned.
+  pub fn count_kept(
     &mut self,
     store: &mut ContentStore,
-    kept: impl Iterator<Item = &'k FileContents>,
-  ) -> Result<(), ContentRefused> {
-    for contents in kept {
+    intake: &Intake,
+  ) -> Result<PinLook, ContentRefused> {
+    let total = intake.kept_total();
+    let mut look = PinLook::default();
+    for contents in intake.kept_newest(total.saturating_sub(self.seen)) {
+      self.visited = self.visited.saturating_add(1);
+      look.revisions = look.revisions.saturating_add(1);
       let pinned = self
         .counted
         .get(&contents.node)
@@ -54,11 +75,18 @@ impl Counted {
       }
       let objects: Vec<ContentId> = contents.identities().copied().collect();
       for (at, object) in objects.iter().enumerate() {
-        if let Err(refused) = store.pin_unlanded(object) {
-          for done in objects.get(..at).unwrap_or_default() {
-            store.unpin_unlanded(done);
+        match store.pin_unlanded(object) {
+          Ok(windows) => {
+            look.windows = look
+              .windows
+              .saturating_add(u64::try_from(windows).unwrap_or(u64::MAX));
           }
-          return Err(refused);
+          Err(refused) => {
+            for done in objects.get(..at).unwrap_or_default() {
+              store.unpin_unlanded(done);
+            }
+            return Err(refused);
+          }
         }
       }
       self
@@ -67,7 +95,8 @@ impl Counted {
         .or_default()
         .push((contents.path.clone(), objects));
     }
-    Ok(())
+    self.seen = total;
+    Ok(look)
   }
 
   /// Unpins the objects of `segment`'s revisions, just before its let-go: theirs alone, a window a revision pinned later
@@ -106,5 +135,10 @@ impl Counted {
   /// Whether it pins none.
   pub fn is_empty(&self) -> bool {
     self.counted.is_empty()
+  }
+
+  /// The kept revisions it has looked at, all told.
+  pub fn visited(&self) -> u64 {
+    self.visited
   }
 }

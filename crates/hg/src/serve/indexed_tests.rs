@@ -1647,7 +1647,8 @@ const MANY_LOGS: u64 = 64;
 /// the serving shard idle half the stream, waiting on one store ask a log, both passes, about 12,000 of them, each a turn
 /// with its view made afresh). Do: build a repository of one changeset and [`MANY_LOGS`] file logs of one revision
 /// each; stream it whole, in a room that holds it, from a store that counts its asks. Expect the store asked for rows
-/// once a pass (the count, then the writing) and for chunks once, whatever the logs; and the same bytes as the stream
+/// once a pass (the count, then the writing) and for chunks once a pass too (the count sizes each chunk compressed,
+/// main's ruling of 2026-11-25), whatever the logs; and the same bytes as the stream
 /// made a step at a time in a room that holds one log's rows or one chunk (which asks more).
 #[test]
 fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
@@ -1727,7 +1728,7 @@ fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
       counted.chunks
     ),
     // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written.
-    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 1),
+    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 2),
     "(index files, row asks, chunk asks)"
   );
 }
@@ -2611,7 +2612,7 @@ fn stream2_params_name(part: &crate::bundle2::Part<'_>, files: &[(u8, Vec<u8>, V
   assert_eq!(part.param(b"bytecount"), Some(bytes.to_string().as_bytes()));
   assert_eq!(
     part.param(b"requirements"),
-    Some(&b"generaldelta%2Crevlogv1%2Csparserevlog"[..])
+    Some(&b"generaldelta%2Crevlog-compression-zstd%2Crevlogv1%2Csparserevlog"[..])
   );
 }
 

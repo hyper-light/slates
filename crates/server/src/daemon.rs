@@ -988,6 +988,9 @@ impl Daemon {
     slates_seal::install();
     // A dispatch's session whose stragglers were dropped goes back to its link, never to nobody (A-907).
     slates_cluster::on_orphaned_session(crate::fleet::orphaned_session);
+    // An hg stream's chunk compression is timed on the shard's clock (goal 93 perf, `vcs_store.hg_stream_compress_*`);
+    // a second daemon in this process finds it installed.
+    slates_hg::revlog_chunk::install_clock(slates_rt::futures::now_ns);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
