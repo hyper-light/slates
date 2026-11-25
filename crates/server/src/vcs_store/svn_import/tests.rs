@@ -1291,9 +1291,6 @@ fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
   );
 }
 
-/// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush, under the
-/// shard's watchdog window.
-const HOG_NS: u64 = 500_000_000;
 /// Shape: the contended-flush test's look at the import, between its waits.
 const LOOK_NS: u64 = 10_000_000;
 
@@ -1302,12 +1299,12 @@ std::thread_local! {
   static HOGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Holds the shard [`HOG_NS`] at a time without yielding, then yields, until [`HOGGING`] is cleared: what else a shard
+/// Holds the shard `hold_ns` at a time without yielding, then yields, until [`HOGGING`] is cleared: what else a shard
 /// runs while a landing awaits the store, so the landing resumes late.
-async fn hog() {
+async fn hog(hold_ns: u64) {
   while HOGGING.with(std::cell::Cell::get) {
     let began = slates_rt::futures::now_ns();
-    while slates_rt::futures::now_ns().saturating_sub(began) < HOG_NS {
+    while slates_rt::futures::now_ns().saturating_sub(began) < hold_ns {
       std::hint::spin_loop();
     }
     slates_rt::futures::yield_now().await;
@@ -1316,9 +1313,9 @@ async fn hog() {
 
 /// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
 /// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
-/// overstates it, enlarging the bound past rent or buy). Do: on a shard whose measured flush is forgotten, run a hog that
-/// holds it [`HOG_NS`] between yields, and import `full.dump` beside it, so every answer its batch's landing awaits
-/// resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
+/// overstates it, enlarging the bound past rent or buy). Do: import `full.dump` alone and take the shard's measured
+/// flush as the hold; on the shard, that flush forgotten, run a hog that holds it a hold between yields, and import
+/// `full.dump` again beside it, so every answer its batch's landing awaits resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
 /// awaited it), then stop the hog. Expect the import whole, and `F` under the await it is part of: the store's own
 /// flush, whatever else the shard ran, judged against the batch's own await rather than a time, so a loaded machine's
 /// slow flush is no failure. Red before: `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
@@ -1327,11 +1324,19 @@ fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
   use crate::repository::svn_commit::staging::{
     LANDING_AWAITED_NS, durable_flush_ns, forget_durable_flush,
   };
-  let (flush_ns, awaited, youngest) = stored(|| async move {
+  let (flush_ns, awaited, youngest, hold_ns) = stored(|| async move {
+    // Derived: the hold is the device's flush as this shard measures it alone: the hogged landing's await then holds
+    // its flush and at least a hold, so `F`, the flush alone, is under it, and `F` read as the await is equal to it;
+    // every step of the import waits a hold, so a hold of a flush keeps the test's time near the import's own, far
+    // under the shard's watchdog window.
+    let (calm, _) = subversion("calm").await;
+    forget_durable_flush();
+    let _ = imported(calm, FULL).await;
+    let hold_ns = durable_flush_ns().expect("the shard's flush measured alone");
     let (svn, _) = subversion("contended").await;
     forget_durable_flush();
     HOGGING.with(|hogging| hogging.set(true));
-    let hogging = slates_rt::futures::spawn(hog()).expect("the hog's task");
+    let hogging = slates_rt::futures::spawn(hog(hold_ns)).expect("the hog's task");
     slates_rt::futures::detach(hogging).expect("detached");
     let importing = slates_rt::futures::spawn(async move {
       let _ = imported(svn, FULL).await;
@@ -1349,10 +1354,10 @@ fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
       slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
       youngest = history(svn).await.map_or(0, |(youngest, _)| youngest);
     }
-    (flush_ns, awaited, youngest)
+    (flush_ns, awaited, youngest, hold_ns)
   });
   println!(
-    "svn_import: F {flush_ns:?} ns, the landing awaited {awaited} ns, the shard held {HOG_NS} ns at a time"
+    "svn_import: F {flush_ns:?} ns, the landing awaited {awaited} ns, the shard held {hold_ns} ns at a time"
   );
   assert_eq!(youngest, FULL_LAST, "the import whole");
   let flush_ns = flush_ns.expect("a flush measured");

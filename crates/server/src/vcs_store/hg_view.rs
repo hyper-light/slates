@@ -266,6 +266,18 @@ pub(crate) fn turn_taken() {
     if chunks.decode_most > 0 {
       state.count_max(DECOMPRESS_BYTES_MOST, chunks.decode_most);
     }
+    let paths = slates_hg::serve::getbundle::take_manifest_paths();
+    for (name, by) in [
+      (MANIFEST_AT_HAND_DELTA, paths.at_hand_delta),
+      (MANIFEST_AT_HAND_WHOLE, paths.at_hand_whole),
+      (MANIFEST_STORED_DELTA, paths.stored_delta),
+      (MANIFEST_STORED_WHOLE, paths.stored_whole),
+      (MANIFEST_STORED_FALLBACK, paths.stored_fallback),
+    ] {
+      if by > 0 {
+        state.count(name, by);
+      }
+    }
   });
 }
 
@@ -717,13 +729,39 @@ pub(crate) fn lend_held_in<R>(
     let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
     let read = generation.register.state();
     let view = Indexed::new(index, content, read, (text_bytes_a_step(state), room)).ok()?;
-    Some(step(&view, room))
+    let stepped = step(&view, room);
+    Some((stepped, view.lends()))
   });
-  if made.is_none() {
+  let Some((made, lends)) = made else {
     crate::fleet::count_refusal_in(state, UNMADE);
+    return None;
+  };
+  if lends.rebuilt > 0 {
+    state.count(MANIFESTS_REBUILT, lends.rebuilt);
   }
-  made
+  Some(made)
 }
+
+/// Counter: the manifests a fetch's walk sent at hand as the delta their rows keep on the one it sent before
+/// (`slates_hg::serve::getbundle::ManifestPaths`; main's ruling of 2026-11-25). Format: a counter name in the status
+/// report.
+pub(crate) const MANIFEST_AT_HAND_DELTA: &str = "vcs_store.hg_fetch_manifest_at_hand_delta";
+/// Counter: the manifests sent at hand whole (lent, or rebuilt from their chains). Format: a counter name in the status
+/// report.
+pub(crate) const MANIFEST_AT_HAND_WHOLE: &str = "vcs_store.hg_fetch_manifest_at_hand_whole";
+/// Counter: the manifests let go sent as the delta the changeset store keeps on the one sent before: no text made.
+/// Format: a counter name in the status report.
+pub(crate) const MANIFEST_STORED_DELTA: &str = "vcs_store.hg_fetch_manifest_stored_delta";
+/// Counter: the manifests let go sent as the whole the changeset store keeps. Format: a counter name in the status report.
+pub(crate) const MANIFEST_STORED_WHOLE: &str = "vcs_store.hg_fetch_manifest_stored_whole";
+/// Counter: the manifests let go sent whole from a text the store made, their stored delta resting on another manifest.
+/// Format: a counter name in the status report.
+pub(crate) const MANIFEST_STORED_FALLBACK: &str = "vcs_store.hg_fetch_manifest_stored_fallback";
+
+/// Counter: the manifests a fetch's streamed answer sent whole, rebuilt from their chains where it could not send the
+/// delta its row keeps (`slates_hg::serve::indexed::Lends::rebuilt`; main's churn at fed0b8164: `object_text` under
+/// `revision_text`, 30.7% of a 57k clone's 40.89 GB). Format: a counter name in the status report.
+pub(crate) const MANIFESTS_REBUILT: &str = "vcs_store.hg_fetch_manifests_rebuilt";
 
 /// Whether repository `id`'s Mercurial store is held here with no import filling it.
 fn held(state: &ShardState, id: RepositoryId) -> bool {

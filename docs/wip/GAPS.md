@@ -1802,6 +1802,20 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> A clone's let-go manifests sent as the changeset store keeps them (2026-11-25, w-hg; main's ruling on main's churn at
+> fed0b8164, 40.89 GB a 57k clone, and on its measure here: at hg-src's r4000 every one of 6,391 manifest visits made
+> its text whole on the store's owner, 79.2% of the store wait, none sent as a delta, none rebuilt): read a batch ahead
+> as a file revision is, each sent as its stored delta where it rests on the manifest sent just before it (versions 02
+> and 03), its stored whole against the null base, and whole from a made text only where its delta rests on another.
+> Counted `vcs_store.hg_fetch_manifest_at_hand_delta`, `_at_hand_whole`, `_stored_delta`, `_stored_whole`,
+> `_stored_fallback`, and `hg_fetch_manifests_rebuilt`. Held by `a_clone_sends_each_let_go_manifest_as_its_stored_delta_
+> on_the_one_before` (a pushed line let go; the stand-in store makes no text whole, which it refuses: red with the
+> stored send off; every manifest the changegroup carries, applied on the base it names, the repository's text) and, at
+> hg-src's r4000 in process (`hg_clone_store_wait`, debug), stock `hg verify` clean on the clone and its 4,001
+> changesets' manifests the source's: 3,392 sent as stored deltas, 14 stored wholes, 594 whole from a made text (their
+> stored delta the client's own base, a merge's p1); the owner's requests 4,846 to 1,248, the store wait 1.96 s to
+> 1.49 s. Owed: the 594, which versions 02 and 03 could send against any manifest sent earlier (main's condition named
+> the one before); the 57k churn rerun (main's).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
@@ -2892,8 +2906,14 @@
 > 2026-11-25: kept runs recorded made every idle pass walk them, an idle daemon's CPU and wakeups growing with
 > fragmentation): a mark that makes a run that long owes the next walk (`UnitSet::run_reaches`, a scan bounded by the
 > discard size), a walk's start clears it (`an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size`:
-> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). OWED: a
-> grown region's never-used space, should the arm show it.
+> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). A grown
+> region's never-used space is not resident (measured: a fresh shared region reads `mincore` 0), so that owed line is
+> withdrawn (main). On macOS a purge's discard is `MADV_FREE_REUSABLE`, and `mincore` and the process's resident size
+> keep counting a reusable page until the kernel takes it; only the physical footprint drops (measured,
+> `crates/mem/tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, resident size 38 flat, `mincore` 32
+> before and after). `object_resident_bytes` now reads `mincore` less the pages a region holds marked reusable, the
+> pages the process still owns (`Region::residency_in_use`; main's ruling of 2026-11-25): red
+> `a_purged_shared_region_reads_its_purged_pages_out_of_its_residency`, 32 MiB read resident after the purge; now 0.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
