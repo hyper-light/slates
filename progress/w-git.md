@@ -820,3 +820,9 @@
   amendments.tsv. NEXT (piece 2): daemon starts/owns/restarts the spawner at role start, an end a shard, derived
   back-off / in-flight / restart wait; hook_driver + run_helper ask it; footprint measured. THEN: SSH close + seats
   (8a-hook-exit's same episodes), then open_tree delta counters. Spawn timer: ~/.cache/w-git-spawnbench.
+- 11-25 ~17:30 PST: LANDED A-924 piece 2a 1a2aabbe4 (merge 1b261785f): Daemon::start starts the spawner (start_here,
+  `spawner_role --exact --nocapture`; slates main serves first; test binaries spawner_role!()), an end a shard,
+  joined at stop; crate::spawning (one conversation task a shard; slots; one spawn in flight; abandoned asker's child
+  killed); hook_driver + run_helper through it (ExitWatch/waitid/reaper gone); SpawnerGone typed. Red: hook's parent
+  is the spawner. Linux diag fixes: SPAWN-HELD under hard 65,536; flat judged by least (median flaked 1/4).
+  NEXT: piece 2b (restart w/ derived back-off, in-flight bound, restart wait; footprint). THEN SSH close+seats, open_tree.
