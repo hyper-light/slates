@@ -634,3 +634,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   matches by --instance; hg skips incrementals after a failed fill or clone; hg stream counters and transfer lines; git
   position-cache counters.
 - Stopped 2026-11-24 my two stray waiters on the big Studio (70406/70413 and 71816/71822).
+- NEXT (main's order, 2026-11-25): one BENCHMARKS change for tonight's rerun once main sends its numbers: the hg leg
+  at 2ed3eb139; the six-push loop (2 of 9 full pushes refused UnknownDeltaBase, i18n/da.po revs 103 and 105); P7
+  again with the landing stage counters; and the void clone, void because main's vmmap paused the daemon and the
+  anchor killed it. Nothing of mine is running anywhere.
