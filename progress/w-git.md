@@ -826,3 +826,9 @@
   killed); hook_driver + run_helper through it (ExitWatch/waitid/reaper gone); SpawnerGone typed. Red: hook's parent
   is the spawner. Linux diag fixes: SPAWN-HELD under hard 65,536; flat judged by least (median flaked 1/4).
   NEXT: piece 2b (restart w/ derived back-off, in-flight bound, restart wait; footprint). THEN SSH close+seats, open_tree.
+- 11-25 ~19:30 PST: LANDED A-924 piece 2b 50cd41890 (merge 5ce5e0b5f): control shard owns the spawner
+  (spawning::own), restart once per generation after back_off_ns (none after 1, start×2^(n-2), cap liveness),
+  ends by run_on_waiting, failed start → shards told + retry; spawn during restart waits the attempt's answer (no
+  timer); ids monotonic, old-generation handles SpawnerGone; in-flight bound tasks_per_shard → Busy (NoRoom).
+  Red: owned spawner killed → next spawn's child from a new spawner. OWED (main's): footprint on a release daemon.
+  NEXT: SSH close + seats, then open_tree delta counters.
