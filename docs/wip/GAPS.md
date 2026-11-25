@@ -356,6 +356,14 @@
 > Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
 > Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
 > (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
+> **OWED (w-git, 2026-11-25, main 01a20182's ruling): a push's versions derived behind it, withdrawn.** Built at
+> 750d2bca3 (`git_derive::derive_behind`), reverted after two failures: a clone arriving mid-derivation ran it in
+> slivers, the task behind and the fetch each yielding to the other at every unit (main's git leg: first pack byte 40.3 →
+> 61.9 s, 721,260 derive turns); and a ref listing after a push waited behind it under ThreadSanitizer (diag 9,
+> `a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding`, 9 against 4). It returns with two reds: a fetch
+> arriving mid-derivation no later to its first pack byte than one with nothing behind; a listing after a push waiting
+> for no derivation, under slow scheduling too. The design's status says the same ("Deriving a push's versions behind
+> it").
 > **PRECONDITION OF THE NEXT LIFT (w-git, 2026-11-25, main 01a20182's ruling): a holder's replica build reads a let-go
 > window as missing.** Found writing the red for main's ruling of 2026-11-24 (a write path's bring-back lets go at its
 > owner's end, a64f385b1). Scene (a three-node `f = 1` fleet, git repository on a): push `main`; push two new branches,
