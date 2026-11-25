@@ -43,6 +43,23 @@ impl Paged for u64 {
   }
 }
 
+impl Paged for crate::content::AwayAt {
+  /// Format: its let-go number (A-923).
+  fn coordinate(&self) -> u64 {
+    self.number
+  }
+
+  fn keys_in(lo: u64, hi: u64) -> core::ops::RangeInclusive<crate::content::AwayAt> {
+    crate::content::AwayAt {
+      number: lo,
+      identity: ContentId([0u8; crate::content::IDENTITY_BYTES]),
+    }..=crate::content::AwayAt {
+      number: hi,
+      identity: ContentId([u8::MAX; crate::content::IDENTITY_BYTES]),
+    }
+  }
+}
+
 impl Paged for ContentId {
   /// Format: an identity's first eight bytes read big-endian (A-870 piece 1).
   fn coordinate(&self) -> u64 {

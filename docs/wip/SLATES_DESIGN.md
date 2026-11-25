@@ -64187,3 +64187,62 @@ measured noise of the 100 figure, not a literal.
 > at the stop, killing it with its group a liveness window later. Red: a spawn after the spawner's death gets its
 > child from a new spawner (`a_dead_spawner_is_restarted_and_a_spawn_asked_after_its_death_gets_its_child`); before,
 > every spawn after it was refused. Owed: the spawner's footprint, measured on a release daemon (main's).
+
+### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
+
+- **Why.** At 57k a push's system allocations were 26.55 GB (main e51d998bf, 08:11 to 08:33 PST). The Aways family's
+  cut reads (`Preimages::overlay_within` over `(ContentId, u64)`) were 1.92 GB, and `encode_page` 2.39 GB across
+  families. An away's coordinate was its identity's first eight bytes, a hash. A push's let-gos therefore landed one to
+  a page, and every publication read and re-encoded each page a let-go or a bring-back touched. As history grew, that
+  became every page of the family.
+- **The key.** Each window let go takes the content store's next let-go number (`ContentStore::next_away`, never
+  reused). The number is the Aways family's coordinate (`AwayAt { number, identity }`, `Paged::coordinate`). The store
+  keeps the aways by number (`aways_by_number`) and records the numbers whose pages changed (`away_changes`). A push's
+  let-gos fill the family's tail page. A bring-back or a free touches only its own number's page. Red
+  `a_pushs_let_goes_re_encode_the_aways_pages_they_fill_not_every_page_of_the_aways_held`: 20 let-goes over 1,500 held
+  aways re-encoded 47,887 bytes of the family before, 3,701 now, against a bound of two pages and the let-goes' own
+  entries (9,732). `the_aways_lie_in_let_go_order_and_keep_their_numbers_across_a_restore` holds that a restore keeps
+  each away's number, refuses a number taken twice, and starts the next let-go past every number restored.
+- **The format.** An away's piece (kind 21) is its identity, its length and its let-go number. A restore must put each
+  away at the number its page recorded. Otherwise an unchanged page's piece and a re-encoded page disagree on where a
+  window lies, and an away can be named twice or a brought-back one kept as let go.
+- **An image written before A-923** carries kind 15: an identity and a length, no number. Main ruled it a migration,
+  not a shim. Kind 15 is read only at restore and never written. Each such away is taken back as let go, numbered after
+  every numbered away in the image's order (`ContentStore::restore_away_renumbered`). It is noted changed at its new
+  number and at its old coordinate, so the shard's next publication writes it in kind 21's form and empties its old page.
+  Counted `vcs_store.image.aways_renumbered`.
+- **Why not refuse them.** A refused away leaves its window absent. A list naming it is refused at the restore. An
+  object brought back by its bytes (`bring_back_object`, a Mercurial named file's read) finds nothing to bring back and
+  stays unread: measured at the store. At the daemon, with the old form refused, the texts still read back byte-equal,
+  by paths that are no guarantee. Subversion's whole-text read (`svn_texts::bring_whole`) puts a text's pieces, which
+  makes an absent window again. Mercurial's named files `a` and `b` came back through the recovery's segment replay
+  (`vcs_store::replay_answered`, A-636 part 2c-2). It asks the node's store for each text its records name that the
+  content store never knew, and puts it back, then lets it go (`vcs_store.hg_replay_unknown_asked` 6,
+  `vcs_store.hg_brought_back_let_go` 6, beside `vcs_store.nodes_unrestored` 6 for the refused aways' lists). That path
+  serves only texts a replayed segment names, and was made for a takeover's successor whose store never held them. The
+  bring-back by bytes a named file's later read takes (`slates_hg::push::held::bring_back_file`, then
+  `ContentStore::bring_back_object`) finds nothing to bring back where the window is absent. The reds
+  (`a_restart_on_an_image_written_before_a923_numbers_its_aways_and_reads_every_text_whole`,
+  `a_restart_on_an_image_written_before_a923_reads_every_named_pushed_file`) hold every old away renumbered, every text
+  read back, and the successor's first publication carrying no kind-15 entry.
+- **What a restart on an old image costs.** One pass over its old aways at the restore, each a map insert. The next
+  publication re-encodes the pages they lay in and the pages their numbers fill. No text is read from the node's store
+  for it.
+- **The reader goes** once every daemon has published since A-923. Images live in RAM alone, so none can carry kind 15
+  after that. The two restart reds and the test switch `content_holder::AWAYS_BEFORE_A923` go with it (GAPS).
+- **The read cap** (main's ruling: a capped read holding past its cap is a correctness bug). Every capped cut read
+  (`lists_at_cut`, `names_at_cut`, `aways_at_cut`, `pieces_at_cut`, `region_held_at_cut`, `landed_at_cut`) counted an
+  entry's bytes without the head its page spends on it (`image_pages::ENTRY_HEAD`, its key and length). A read held
+  past its cap by the heads: 1.9 times the cap for the aways, whose entries are 48 bytes against a 28-byte head. With
+  the aways' dense numbers, a split then encoded all of it in one step (14,814 bytes against the three-page bound of
+  12,288). Each read now takes `(cap, head)` and counts both. Red
+  `a_capped_cut_read_holds_its_cap_counting_each_entrys_head` (the lists held past their cap with no head counted).
+- **Measured and rejected.** Halving a split page toward its stop in one split, rather than once a turn: dead even once
+  the reads count their heads (68,712 bytes discarded and 100 turns, with and without it), so it is not in.
+- **Applied in the same change to:** `crates/vcs/src/content.rs` (`AwayAt`, `AWAY_BYTES`, `Kept::Away`'s number,
+  `aways_by_number`, `next_away`, `away_changes`, `restore_away`, `restore_away_renumbered`, the cut readers' head);
+  `crates/vcs/src/preimage.rs` (`Paged for AwayAt`); `crates/server/src/content_holder.rs` (kinds 21 and 15, the
+  Aways family's coordinates, `IMAGE_FAMILY_ENCODED_BYTES`); `crates/server/src/image_pages.rs` (`Turned`'s
+  `encoded_by_family`, the split's encoded bytes); `crates/server/src/vcs_store.rs` (`AWAYS_RENUMBERED`, the restore's
+  plumbing); `crates/server/src/vcs_store/homes.rs` and `arena_windows.rs` (the cut readers' head);
+  `crates/server/src/verbs.rs`; A-870's owed (b); GAPS.

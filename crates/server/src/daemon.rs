@@ -9410,10 +9410,10 @@ mod tests {
     );
   }
 
-  /// What a restart must keep of the repository content store whole (A-767 C1 step 2b): its windows let go with their
-  /// lengths, its lists and its names, each in order.
+  /// What a restart must keep of the repository content store whole (A-767 C1 step 2b): its windows let go at their
+  /// let-go numbers with their lengths (A-923), its lists and its names, each in order.
   type StoreWhole = (
-    Vec<(slates_vcs::ContentId, u64)>,
+    Vec<(slates_vcs::AwayAt, u64)>,
     Vec<slates_vcs::ContentId>,
     Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
   );
@@ -9904,6 +9904,211 @@ mod tests {
     assert!(
       whole == Some(bytes),
       "the text did not read back whole through the store"
+    );
+  }
+
+  /// Lands one Subversion work adding `/a.txt` of `bytes` on `daemon`'s first shard (`svn_commit::land_work`): the
+  /// repository and the text.
+  fn landed_svn_text(
+    daemon: &super::Daemon,
+    bytes: &[u8],
+  ) -> (slates_db::catalog::RepositoryId, slates_svn::index::Text) {
+    use slates_svn::commit::drive::TextSink;
+    let text = slates_svn::commit::drive::text_of(bytes).unwrap();
+    let (sent, got) = std::sync::mpsc::channel();
+    let put = bytes.to_vec();
+    daemon
+      .observe(daemon.shards.first().copied(), move |_state| {
+        let task = slates_rt::futures::spawn(async move {
+          let (repository, _) = crate::repository::svn_commit::tests::subversion("old-aways").await;
+          let texts = slates_svn::commit::drive::HeldTexts::new();
+          let staged = texts.stage(None).unwrap();
+          texts.append(staged, &put).unwrap();
+          texts.seal(staged, text.identity).unwrap();
+          let work = slates_svn::commit::drive::Work {
+            head: 0,
+            record: slates_svn::index::RevisionRecord {
+              transaction: "0-1".to_owned(),
+              changes: vec![slates_svn::index::ChangedPath {
+                path: "/a.txt".to_owned(),
+                action: slates_svn::index::Action::Add,
+                kind: slates_svn::index::NodeKind::File,
+                copy_from: None,
+                text: Some(text),
+                properties: None,
+                mergeinfo_modified: false,
+              }],
+            },
+            lock_entries: Vec::new(),
+            revision_properties: vec![(b"svn:author".to_vec(), b"alice".to_vec())],
+            texts: std::iter::once(text.identity).collect(),
+            property_lists: std::collections::BTreeMap::new(),
+            locks: slates_svn::lock::CommitLocks::default(),
+          };
+          let owner = crate::repository::svn_commit::tests::owner();
+          let landed =
+            crate::repository::svn_commit::land_work((&owner, repository), work, &texts).await;
+          let _ = sent.send((repository, landed.map(|landed| landed.is_ok())));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, landed) = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the landing answered");
+    assert_eq!(landed, Some(true), "the work landed");
+    (repository, text)
+  }
+
+  /// The text `identity` (`len` bytes) of `repository` read back whole through the node's store on `daemon`'s first
+  /// shard, as a reader that needs it whole does (`svn_texts::bring_whole`), then given back.
+  fn svn_text_read_whole(
+    daemon: &super::Daemon,
+    repository: slates_db::catalog::RepositoryId,
+    (identity, len): ([u8; 32], u64),
+  ) -> Option<Vec<u8>> {
+    let (sent, got) = std::sync::mpsc::channel();
+    daemon
+      .observe(daemon.shards.first().copied(), move |_state| {
+        let task = slates_rt::futures::spawn(async move {
+          let brought = crate::vcs_store::svn_texts::bring_whole(repository, identity, len).await;
+          let whole = crate::state::with_state(|state| {
+            let whole = crate::vcs_store::lent_state(state, |state| {
+              let store = state.vcs_stores.content()?;
+              store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
+            });
+            crate::repository::svn_commit::release_texts(state, None, &[identity]);
+            whole
+          })
+          .flatten();
+          let _ = sent.send(whole.filter(|_| brought));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the read answered")
+  }
+
+  /// The windows the first shard's content store keeps let go, and whether any is held twice or let go while held: an
+  /// identity named at two let-go numbers, or one let go whose bytes the store holds.
+  fn aways_and_doubles(daemon: &super::Daemon) -> (usize, bool) {
+    daemon
+      .observe(daemon.shards.first().copied(), |state| {
+        let Some(content) = state.vcs_stores.content() else {
+          return (0, false);
+        };
+        let aways: Vec<slates_vcs::AwayAt> = content.aways().map(|(at, _)| at).collect();
+        let identities: std::collections::BTreeSet<slates_vcs::ContentId> =
+          aways.iter().map(|at| at.identity).collect();
+        let doubled = identities.len() != aways.len()
+          || identities
+            .iter()
+            .any(|identity| !content.is_away(identity) || content.holds_whole(identity));
+        (aways.len(), doubled)
+      })
+      .unwrap()
+  }
+
+  /// The entries of the form before A-923 in the committed image of `daemon`'s first shard, once it publishes.
+  fn aways_before_a923_published(daemon: &super::Daemon) -> usize {
+    daemon.publish_every_shard().unwrap();
+    daemon
+      .observe(daemon.shards.first().copied(), |state| {
+        crate::verbs::committed_held(state).map_or(0, |held| {
+          crate::content_holder::aways_before_a923_among(&crate::content_holder::paged_entries_of(
+            &held,
+          ))
+        })
+      })
+      .unwrap()
+  }
+
+  /// A-923 (main's rulings of 2026-11-25: the image's away entries carry their let-go numbers; an image written before
+  /// them is migrated at its restore, never refused, since a refused away loses a text read back by its bytes). Do: on a
+  /// daemon over a retained anchor segment holding a changeset store, its image's Aways family written in the form before
+  /// A-923, land a Subversion work, let its text's windows go and publish; stop; start a successor over the same segment
+  /// and store; read the text whole through the node's store; publish the successor's image. Expect: the image held
+  /// windows let go, every one taken back numbered (`vcs_store::AWAYS_RENUMBERED`), no replay refused, no window let go
+  /// twice or while held, the text the same bytes, and the successor's first publication carrying no entry of the old
+  /// form. Red with the old form refused: none renumbered.
+  #[test]
+  fn a_restart_on_an_image_written_before_a923_numbers_its_aways_and_reads_every_text_whole() {
+    use slates_anchor::AnchorSegment;
+    let profile = test_profile();
+    let instance = format!("a923-old-aways-{}", std::process::id());
+    let mut store = crate::test_store::TestStore::start("a923-old-aways");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let bytes: Vec<u8> = (0..3 * 65_536 + 17)
+      .map(|at: u32| (at % 251) as u8)
+      .collect();
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let (repository, text) = landed_svn_text(&first, &bytes);
+    let identity = text.identity;
+    let held_away = first
+      .observe(first.shards.first().copied(), move |state| {
+        crate::vcs_store::name_holds::let_go_landed_texts(state, &[identity]);
+        crate::content_holder::write_aways_before_a923(state)
+      })
+      .unwrap();
+    let old_form = aways_before_a923_published(&first);
+    first.stop();
+    config.vcs_disk = None;
+    store.restart_owner();
+    config.vcs_disk = Some(store.handle());
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let counted = |state: &mut crate::state::ShardState| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        count(crate::vcs_store::AWAYS_RENUMBERED),
+        count(crate::vcs_store::REPLAY_REFUSED),
+      )
+    };
+    let (renumbered, refused) = second.observe(shard, counted).unwrap();
+    let (_, doubled) = aways_and_doubles(&second);
+    let whole = svn_text_read_whole(&second, repository, (identity, text.size));
+    let left_old = aways_before_a923_published(&second);
+    second.stop();
+    drop(segment);
+    println!(
+      "a923: {held_away} windows let go, {old_form} written in the old form, {renumbered} renumbered at the restart, \
+       {left_old} of the old form after its first publication"
+    );
+    assert!(held_away > 0, "the first daemon let the text's windows go");
+    assert_eq!(old_form, held_away, "every away written in the old form");
+    assert_eq!(
+      renumbered, held_away as u64,
+      "every old away taken back numbered"
+    );
+    assert_eq!(refused, 0, "no replay refused");
+    assert!(!doubled, "no window let go twice or while held");
+    assert!(
+      whole == Some(bytes),
+      "the text read back whole through the store"
+    );
+    assert_eq!(
+      left_old, 0,
+      "the successor's first publication in the new form"
     );
   }
 
