@@ -627,3 +627,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   counter list, records each clone's first packet and first pack bytes, and with SAMPLE=1 profiles one more slates push
   and clone (macOS sample, 30 s from 10 s in) apart from the timed runs. This is for w-git's clone and w-svn's A-900
   check. Waiting: main's git leg at 21b8b5311, and r865.
+- LANDED 2026-11-24/25 (docs): BENCHMARKS rounds 3 (r811), 4 (r870), 5-6 (r935/r940), the svn use git-2000 green
+  (a0c46b705), and two loaded MacBook rounds (ed71ac0be, f8fe97e5e; loaded points, slates against itself). GAPS:
+  Linux svn 26/33 (A-760 let-go base) then 33/33 with c0ca9df03; macOS hg P5 results.
+- LANDED 21b8b5311, 9f3c3ad80: git harness counters, first bytes, SAMPLE=1 profiles. LANDED 67ec37368: the sampler
+  matches by --instance; hg skips incrementals after a failed fill or clone; hg stream counters and transfer lines; git
+  position-cache counters.
+- Stopped 2026-11-24 my two stray waiters on the big Studio (70406/70413 and 71816/71822).
