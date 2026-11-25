@@ -1102,7 +1102,14 @@ async fn rewrites_imported(
 fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
   let (bounded, unbounded, flushed, (bound, at_end)) = stored(|| async move {
     let bounded = rewrites_imported("bounded", false).await;
-    let flushed = on(|state| count(state, crate::repository::svn_commit::staging::FLUSHED_TEXTS));
+    let flushed = on(|state| {
+      use crate::repository::svn_commit::staging::{FLUSHED_TEXTS, LAND_BATCHES, LAND_FLUSH_NS};
+      (
+        count(state, FLUSHED_TEXTS),
+        count(state, LAND_BATCHES),
+        count(state, LAND_FLUSH_NS),
+      )
+    });
     let unbounded = rewrites_imported("unbounded", true).await;
     let ends = on(|state| {
       (
@@ -1119,7 +1126,12 @@ fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
     "held at most {} bytes of windows after a turn, {at_end} at the end, the bound {bound}",
     bounded.1
   );
+  let (flushed, landed, flush_ns) = flushed;
   assert!(flushed > 0, "batches landed for their texts");
+  assert!(
+    landed > flushed && flush_ns > 0,
+    "each batch's stages timed (`repository.svn_import.land_batches` {landed}, `land_flush_ns` {flush_ns})"
+  );
   assert!(
     bounded.2 == unbounded.2,
     "the same history with and without the texts bound"
