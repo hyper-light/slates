@@ -1206,6 +1206,7 @@ impl WholeTexts<'_> {
           payload: identity,
           offset: 0,
           len,
+          chunk: false,
         },
       }));
     }
@@ -1330,6 +1331,7 @@ impl ChangelogDeltas<'_> {
         payload,
         offset: 0,
         len,
+        chunk: false,
       };
     }
     Some(())
@@ -1653,6 +1655,7 @@ impl Deltas<'_> {
               payload: place,
               offset: 0,
               len,
+              chunk: false,
             },
           }
         }

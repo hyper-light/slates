@@ -1669,9 +1669,21 @@
 > the decoder's memory charged apart, its bytes held to the text's length), counted `TextCache::decoded` and
 > `decoded_most`. Held by `a_texts_chunked_and_raw_rows_make_the_same_bytes`, `a_raw_text_beginning_with_a_chunk_types_
 > byte_reads_as_it_is` and `a_chunked_text_with_no_decoder_installed_is_refused` (`slates-store` tests `chunk_form`,
-> `chunk_form_undecoded`). No writer yet writes a chunk: owed, the push's and the import's landings writing chunks
-> (record v+1, step 2), a fetch's file section decoding them (step 3), the stream copying them (step 4, `Streaming::sized`
-> gone with it), each sliced under the step budget.
+> `chunk_form_undecoded`).
+> Steps 2 to 4 BUILT as one wave (2026-11-25, w-hg): a push's segment lands its payload as stock's revlog chunks, made as
+> it lands a turn's steps at a time (`slates_hg::push::chunked`: zstd's streaming context, each frame's size pledged, so
+> each chunk is the one-shot chunk byte for byte at every step size; a step compressing at most the shard's copy slice;
+> counted `vcs.hg.segment_compress_bytes_most`, `_plain_bytes`, `_stored_bytes`, `_ns`, `segment_chunk_turns`), each
+> `Texts` entry held as a chunk there. The segment's record names its rows by identity and never reads the payload, so no
+> record changes. A fetch's file section decodes a chunk on its shard, one a step within the step's room
+> (`revlog_chunk::decode_counted`; `vcs_store.hg_fetch_decompress_ns`, `_plain_bytes`, `_bytes_most`), a text made whole
+> coming back decoded by the store; a stream copies a chunk as it lies, sized by its length, compressing only a raw
+> place. Held by `a_segments_chunks_made_a_step_at_a_time_are_the_one_shot_chunks` (hg) and
+> `a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes` (server: the push chunked within the copy
+> slice, the stream compressing nothing again, the clone decoding the file's chunk). Owed: an import's landings and a
+> whole push's or made changeset's payload (the changegroup its record replays) still land raw, so a stream compresses
+> those at stream time (`Streaming::sized` stays for them); the count pass still reads a chunk place's bytes it could size
+> by its length.
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain

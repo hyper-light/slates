@@ -514,22 +514,21 @@ pub(crate) type SegmentChangeset = (StoreHandle, Header, Vec<Part>);
 
 /// `segment` of a push to `repository` as a changeset at the repository's next sequence, its owner shard's to allocate
 /// (module docs): its `Record` `written` (by `hg_push`'s record turns over the intake's fork, a turn's steps at a
-/// time), its `Payload` its slice of `payload`, its `Texts` its texts. None where the node holds no store; refused where
-/// the slice is not the payload's.
+/// time), its `Payload` its kept revisions' deltas as stock's revlog chunks (`chunks`, made a step at a time as it lands;
+/// goal 93, main's ruling (b)), its `Texts` its texts, each held as a chunk there. None where the node holds no store;
+/// refused where the chunks are not one a kept revision.
 pub(crate) fn segment_changeset(
   state: &mut ShardState,
   repository: RepositoryId,
-  (segment, payload): (&PushSegment, &[u8]),
-  written: Vec<u8>,
+  segment: &PushSegment,
+  (written, (chunks, places)): (Vec<u8>, Chunks),
 ) -> Option<Result<SegmentChangeset, record::WriteRefused>> {
   let disk = state.vcs_disk.clone()?;
-  let start = usize::try_from(segment.slice.start).unwrap_or(usize::MAX);
-  let end = usize::try_from(segment.slice.end).unwrap_or(usize::MAX);
-  let Some(slice) = payload.get(start..end) else {
+  if places.len() != segment.texts.len() {
     return Some(Err(record::WriteRefused::Allocation));
-  };
-  let slice = slice.to_vec();
-  let identity = *blake3::hash(&slice).as_bytes();
+  }
+  let identity = *blake3::hash(&chunks).as_bytes();
+  let texts = texts_section(&segment.texts, (identity, Some(&places)));
   let sequence = state.vcs_stores.next_changeset(repository)?;
   let header = Header {
     tool: Tool::Mercurial,
@@ -543,29 +542,45 @@ pub(crate) fn segment_changeset(
   };
   let parts = vec![
     (SectionKind::Record, written),
-    (SectionKind::Payload, slice),
-    (SectionKind::Texts, texts_section(&segment.texts, identity)),
+    (SectionKind::Payload, chunks),
+    (SectionKind::Texts, texts),
   ];
   Some(Ok((disk, header, parts)))
 }
 
+/// A segment's payload as stock's revlog chunks and each kept revision's chunk's range in it
+/// (`slates_hg::push::chunked`; goal 93, main's ruling (b)).
+pub(crate) type Chunks = (Vec<u8>, Vec<core::ops::Range<u64>>);
+
 /// A changeset's `Texts` section: each kept revision's text, base and place in the changeset's payload, named by
-/// `payload`, its identity (w-perf's Texts section, A-645 on A-767).
-pub(crate) fn texts_section(texts: &[KeptText], payload: [u8; 32]) -> Vec<u8> {
+/// `payload`, its identity (w-perf's Texts section, A-645 on A-767): where `chunks` names each revision's chunk's range
+/// (a segment's payload made into chunks, ruling (b)), there, held as a chunk; else its delta's place in the
+/// changegroup, raw (a whole push's or a made changeset's payload, the changegroup its record replays).
+pub(crate) fn texts_section(
+  texts: &[KeptText],
+  (payload, chunks): ([u8; 32], Option<&[core::ops::Range<u64>]>),
+) -> Vec<u8> {
   let entries: Vec<slates_store::texts::TextEntry> = texts
     .iter()
-    .map(|kept| slates_store::texts::TextEntry {
-      path: kept.path.clone(),
-      tool_id: kept.node.to_vec(),
-      text: kept.identity,
-      len: kept.len,
-      base: kept.base,
-      place: slates_store::texts::Place {
-        payload,
-        offset: kept.place.start,
-        len: kept.place.end.saturating_sub(kept.place.start),
-      },
-      form: slates_store::texts::Form::Raw,
+    .enumerate()
+    .map(|(at, kept)| {
+      let (place, form) = match chunks.and_then(|chunks| chunks.get(at)) {
+        Some(chunk) => (chunk.clone(), slates_store::texts::Form::Chunk),
+        None => (kept.place.clone(), slates_store::texts::Form::Raw),
+      };
+      slates_store::texts::TextEntry {
+        path: kept.path.clone(),
+        tool_id: kept.node.to_vec(),
+        text: kept.identity,
+        len: kept.len,
+        base: kept.base,
+        place: slates_store::texts::Place {
+          payload,
+          offset: place.start,
+          len: place.end.saturating_sub(place.start),
+        },
+        form,
+      }
     })
     .collect();
   slates_store::texts::encode(&entries)

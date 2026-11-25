@@ -836,6 +836,22 @@ fn stream_asked(
   Ok(Some(Box::new(crate::render::Streaming::v2())))
 }
 
+/// The bytes `stored` read at `place`, as the delta or whole it holds: as they are, or, where the place holds a revlog
+/// chunk (goal 93, main's ruling (b): content kept once, as stock's chunks), decoded on this shard within `most`, the
+/// step's room, which the caller charges them to; one chunk a step, counted (`revlog_chunk::decode_counted`).
+fn plain_of(
+  place: &crate::render::StoredPlace,
+  stored: Vec<u8>,
+  most: u64,
+) -> Result<Vec<u8>, Refusal> {
+  if !place.chunk {
+    return Ok(stored);
+  }
+  crate::revlog_chunk::decode_counted(&stored, most).ok_or(Refusal::Store {
+    what: "a file revision's stored chunk",
+  })
+}
+
 /// A boolean argument as 7.2 reads one: `default` where absent, false for `0` or nothing, true otherwise.
 fn flag(value: Option<&[u8]>, default: bool) -> bool {
   value.map_or(default, |value| !value.is_empty() && value != FALSE)
@@ -1692,7 +1708,7 @@ impl Walk {
     else {
       return Ok(Some(here));
     };
-    let chunk = chunk.unwrap_or_default();
+    let chunk = plain_of(&row.place, chunk.unwrap_or_default(), room.left())?;
     let FileEntry { parents, flags, .. } =
       store.file_entry(&found, &node).ok_or(Refusal::Store {
         what: "a file revision",
@@ -1995,13 +2011,19 @@ impl Pull {
         what: "a file revision",
       });
     };
-    let text = self
+    let row = self
       .rows
       .get(&(path.clone(), planned.node))
-      .map(|row| row.text)
+      .copied()
       .ok_or(Refusal::Store {
         what: "a file revision the changeset store keeps no row of",
       })?;
+    let text = row.text;
+    // A stored delta as its place holds it (a chunk decoded); a text made whole came back made.
+    let data = match send {
+      Sending::Stored { .. } => plain_of(&row.place, data, room.left())?,
+      Sending::Whole { .. } => data,
+    };
     if !self.open {
       changegroup::put_name(&path, out).map_err(|_| unencodable("a path"))?;
       self.open = true;

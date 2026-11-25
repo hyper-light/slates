@@ -696,6 +696,7 @@ pub(crate) fn answer_wants_blocking(
                                     payload: row.place.payload,
                                     offset: row.place.offset,
                                     len: row.place.len,
+                                    chunk: row.form == slates_store::texts::Form::Chunk,
                                   },
                                 })
                               })

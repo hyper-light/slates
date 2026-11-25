@@ -178,6 +178,7 @@ impl Store for Served {
                     kept.text.len() + before.map_or(0, |_| delta::HUNK_HEADER_LEN),
                   )
                   .unwrap(),
+                  chunk: false,
                 },
               })
             });

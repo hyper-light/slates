@@ -84,6 +84,7 @@ fn read_tags(history: &History, most: u64) -> (TagsRead, usize) {
                     payload: identity,
                     offset: 0,
                     len: 0,
+                    chunk: false,
                   },
                 })
               })

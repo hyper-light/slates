@@ -311,6 +311,7 @@ impl<'a> Indexed<'a> {
                   payload: identity,
                   offset: 0,
                   len,
+                  chunk: false,
                 },
               }
             }));
