@@ -1092,16 +1092,20 @@ fn a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole() {
 enum CutAt {
   /// Each batch one unit of the changeset store (`staging::texts_bound`'s floor; the room forced to it).
   OneUnit,
-  /// The derived rent-or-buy bound: a shard's first batch one unit, its later ones what its measured flush buys.
+  /// The derived rent-or-buy bound, its flush forced to what copies [`DERIVED_UNITS`] units at the profile's memcpy
+  /// rate: a measured flush differs daemon to daemon, and the oracle compares one cut across its kills.
   Derived,
 }
+
+/// Shape: the units the oracle's derived bound buys: a batch of several units, fewer batches than the import's texts.
+const DERIVED_UNITS: u64 = 6;
 
 /// What repository `repository` recovered to after its import of [`rewrites`]'s rewrites was killed at `stage` of its
 /// second batch's landing, cut at `cut` (`staging::KILL_AT_STAGE`), the daemon and the store's owner stopped and started
 /// again: its youngest revision, and whether its history, exported whole, is byte for byte that of a reference import of
 /// the same dump's first revisions as far as that youngest.
 fn killed_at(stage: super::svn_commit::staging::LandStage, cut: CutAt) -> (u64, bool) {
-  use super::svn_commit::staging::{IMPORT_ROOM, KILL_AT_STAGE};
+  use super::svn_commit::staging::{FLUSH_NS, IMPORT_ROOM, KILL_AT_STAGE};
   use crate::vcs_store::svn_import::tests::{
     BOUNDED_REWRITE_BYTES, BOUNDED_REWRITES, history, imported, rewrites,
   };
@@ -1112,9 +1116,14 @@ fn killed_at(stage: super::svn_commit::staging::LandStage, cut: CutAt) -> (u64, 
   daemon.bootstrap(true).unwrap();
   let repository = created_subversion(&daemon, "cut");
   crate::daemon::observe_first(&daemon, move |state| {
-    if cut == CutAt::OneUnit {
-      let unit = crate::vcs_store::hg_import::segment_bytes(state) as u64;
-      IMPORT_ROOM.with(|room| room.set(Some(unit)));
+    let unit = crate::vcs_store::hg_import::segment_bytes(state) as u64;
+    match cut {
+      CutAt::OneUnit => IMPORT_ROOM.with(|room| room.set(Some(unit))),
+      CutAt::Derived => {
+        let memcpy = u128::from(state.config.memcpy_bytes_per_second.max(1));
+        let flush_ns = u128::from(DERIVED_UNITS * unit) * 1_000_000_000 / memcpy;
+        FLUSH_NS.with(|flush| flush.set(Some(u64::try_from(flush_ns).unwrap().max(1))));
+      }
     }
     // The second batch's landing: one batch passes the stage first.
     KILL_AT_STAGE.with(|kill| kill.set(Some((stage, 1))));

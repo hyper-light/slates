@@ -200,6 +200,22 @@ pub fn decode(
   crate::revlog::decode_chunk(stored, rev, admission)
 }
 
+/// `stored`, a chunk as a revlog keeps it, decoded into at most `most` bytes: its decoder's own memory charged apart
+/// ([`crate::compression`]'s `decoder_held`), so `most` bounds what it makes; none where it does not decode or makes
+/// more. The changeset store's reader of a text held as a chunk (goal 93, main's ruling (b) of 2026-11-25), installed by
+/// the daemon (`slates_store::texts::install_chunk_decoder`).
+pub fn decode_within(stored: &[u8], most: u64) -> Option<Vec<u8>> {
+  let engine = match stored.first() {
+    Some(&crate::revlog::ZLIB) => crate::compression::Engine::Zlib,
+    Some(&crate::revlog::ZSTD) => crate::compression::Engine::Zstd,
+    _ => crate::compression::Engine::Uncompressed,
+  };
+  let held = crate::compression::decoder_held(engine, stored).ok()?;
+  let mut admission = crate::Admission::new(most.saturating_add(held));
+  let plain = decode(stored, 0, &mut admission).ok()?;
+  (u64::try_from(plain.len()).ok()? <= most).then_some(plain)
+}
+
 /// Whether a revlog whose chunks hold `data` bytes is inline (the module doc): one that may be (any but a changelog)
 /// under 7.2's [`MAX_INLINE_DATA`].
 pub fn inline(may_inline: bool, data: u64) -> bool {

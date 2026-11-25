@@ -220,6 +220,7 @@ fn main() {
             offset: *offset,
             len: *len,
           },
+          form: slates_store::texts::Form::Raw,
         }
       })
       .collect();

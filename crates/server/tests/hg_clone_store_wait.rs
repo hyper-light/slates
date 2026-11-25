@@ -145,3 +145,85 @@ fn what_a_whole_mercurial_clone_waits_on_when_it_asks_the_store() {
     "the parts sum to the whole"
   );
 }
+
+/// Format: the counters of a streamed answer's turns and what lies between them.
+const STREAM_COUNTERS: [&str; 13] = [
+  "vcs_store.hg_stream_span_ns",
+  "vcs_store.hg_stream_steps",
+  "vcs_store.hg_stream_turns_at_ceiling",
+  "vcs_store.hg_stream_turns",
+  "vcs_store.hg_stream_turn_ns",
+  "vcs_store.hg_stream_write_ns",
+  "vcs_store.hg_stream_write_most_ns",
+  "vcs_store.hg_stream_write_waits",
+  "vcs_http.reply_yield_gap_ns",
+  "vcs_http.reply_yield_gap_most_ns",
+  "vcs_store.hg_stream_store_asks",
+  "vcs_store.hg_stream_store_wait_ns",
+  "vcs_store.hg_stream_compress_send_ns",
+];
+
+/// Each of `names` summed over the daemon's shards.
+fn summed(served: &common::hg::Served, names: &[&'static str]) -> BTreeMap<&'static str, u64> {
+  let report = served.client().daemon_memory_status().unwrap();
+  names
+    .iter()
+    .map(|name| {
+      let sum = report
+        .shards
+        .iter()
+        .flat_map(|shard| &shard.refusals)
+        .filter(|row| row.kind == *name)
+        .map(|row| row.count)
+        .sum::<u64>();
+      (*name, sum)
+    })
+    .collect()
+}
+
+/// Main's hg leg at 608930048 (2026-11-25: the 57k stream 18.0 s against stock's 1.3 s, its 164 turns about 100 ms
+/// apart). Do: push a history to an in-process daemon with stock `hg`, then stream-clone it, reading the stream's turn
+/// counters before and after. Expect: the clone succeeds. Prints the stream's wall time, its turns, the time inside them,
+/// its writes (and those that waited for the peer) and the yields between them.
+#[test]
+#[ignore = "a measurement (the hg stream's turns): run by name, with SLATES_HG_PUSH_SOURCE for a real history"]
+fn what_a_mercurial_stream_clone_waits_on_between_its_turns() {
+  if !common::hg::has_hg() {
+    eprintln!("SKIPPED: no `hg` on PATH");
+    return;
+  }
+  let served = common::hg::serve("hg-stream-turns", "");
+  let url = served.url.clone();
+  let source = source(&served);
+  let pushed = served
+    .hg(".")
+    .args(["-R", &source, "push", "-q", "--new-branch", "-f", &url])
+    .output()
+    .unwrap();
+  assert!(pushed.status.code().is_some_and(|code| code <= 1), "push");
+  let before = summed(&served, &STREAM_COUNTERS);
+  let began = std::time::Instant::now();
+  let cloned = served
+    .hg(".")
+    .args(["clone", "-q", "-U", "--stream", &url, "streamed"])
+    .output()
+    .unwrap();
+  let took = began.elapsed();
+  let after = summed(&served, &STREAM_COUNTERS);
+  served.stop();
+  assert!(
+    cloned.status.success(),
+    "stream clone: {}",
+    String::from_utf8_lossy(&cloned.stderr)
+  );
+  println!(
+    "hg_stream_turns: source {source}: the stream took {:.3} s",
+    took.as_secs_f64()
+  );
+  for name in STREAM_COUNTERS {
+    println!(
+      "hg_stream_turns: {name} +{}",
+      after[name].saturating_sub(before[name])
+    );
+  }
+}
