@@ -9652,15 +9652,29 @@ mod tests {
         })
         .ok()
     };
+    // Settled: recovered with nothing of the text resident, or a replay refused. A recovery goes on after the daemon's
+    // start returns and lets go what it read last, so a slow lane can read the repository recovered with the text still
+    // resident (main's TSan diag 45411303175: `(true, 0, true)` at the first recovered read); a let-go that never came
+    // still fails, at the lane's patience.
+    let patience = u32::try_from(600 * crate::test_lane::slowdown()).unwrap_or(u32::MAX);
     let deadline =
-      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(patience);
+    let settled = |seen: &(bool, u64, bool)| (seen.0 && !seen.2) || seen.1 > 0;
     let mut seen = read();
-    while std::time::Instant::now() < deadline
-      && !seen.as_ref().is_some_and(|seen| seen.0 || seen.1 > 0)
-    {
+    while std::time::Instant::now() < deadline && !seen.as_ref().is_some_and(settled) {
       std::thread::park_timeout(std::time::Duration::from_millis(50));
       seen = read();
     }
+    // What the successor brought back and let go, so a failure in a slow lane says which side of the let-go it read.
+    let counted = second
+      .observe(shard, |state| {
+        [
+          crate::vcs_store::svn_texts::PIECE_FETCHED,
+          crate::vcs_store::name_holds::LANDED_TEXT_LET_GO_BYTES,
+        ]
+        .map(|name| (name, state.refusals.get(name).copied().unwrap_or(0)))
+      })
+      .ok();
     // The text read back whole through the node's store, as a reader that needs it whole does, then given back.
     let (sent, got) = std::sync::mpsc::channel();
     let len = text.size;
@@ -9688,7 +9702,7 @@ mod tests {
       .expect("the read answered");
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, 0, false)));
+    assert_eq!(seen, Some((true, 0, false)), "{counted:?}");
     assert!(
       whole == Some(bytes),
       "the text did not read back whole through the store"
