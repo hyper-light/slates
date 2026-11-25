@@ -1,5 +1,17 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~09:00 PST
+- LANDED 50b991d7f: (a) Region::residency_in_use; object_resident_bytes = mincore minus pages marked reusable (macOS).
+  Red macos_residency: 32 MiB read resident after a purge, now 0.
+- LANDED b2b4e00a7: (b) process.resident_bytes + process.footprint_bytes (macOS phys_footprint) in status;
+  svn_import_storage prints footprint; BENCHMARKS method note (judge give-back on footprint on macOS, never RSS).
+- LANDED 6e002e057: (c) a publication releasing deferred frees gives back past the arena's keep in the same step.
+  Red 6,021,120 B vs keep 4,227,072, now <= 4,186,112.
+- LANDED b8b3c741d: flake red (sweep publishes after the last tail): 4,939,776 B vs 4,202,496 pre-(c), 786,432 at (c).
+- Reviewed w-svn's d02143977 (HOG hold derived): sound.
+- Main runs P7's after arm on footprint. Next: (b) of the churn ruling (Aways by let-go order); asked main whether
+  the churn evidence is in.
+
 ## 2026-11-25 ~05:00 PST
 - LANDED 2ed3eb139: home read is one pinned task (bring-back to read); cadence grace rule removed. Red NotHeld unpinned.
 - LANDED 084ffb65d: svn batch landing per-stage counters (flush, commit, apply, tail) for main's P7 rerun.
