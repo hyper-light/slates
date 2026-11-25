@@ -1442,17 +1442,16 @@ impl ChunkArena {
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
   }
 
-  /// What of the arena's regions is in RAM, each read from the kernel's page table ([`crate::resident::of_range`], the
-  /// reader the large path's `mapped_resident` uses), no byte touched: the memory status's
+  /// What of the arena's regions is in RAM and the process's still: each read from the kernel's page table
+  /// ([`crate::resident::of_range`], the reader the large path's `mapped_resident` uses), no byte touched, less the pages
+  /// the region holds marked reusable (macOS: `mincore` counts them until the kernel takes them, though they left the
+  /// process's footprint; [`Region::residency_in_use`], goal 93 P7). The memory status's
   /// `mem.gauge.content.object_resident_bytes` (main 01a20182's ruling of 2026-11-23). A walk of every region's pages, so
   /// only a memory status asks; a region the OS refuses to read is left out.
   pub fn residency(&self) -> crate::resident::Residency {
     let mut found = crate::resident::Residency::default();
     for slot in self.held() {
-      let bytes = slot.region.bytes();
-      if let Ok(residency) =
-        crate::resident::of_range(bytes.as_ptr(), bytes.len(), slot.region.page())
-      {
+      if let Ok(residency) = slot.region.residency_in_use() {
         found = found.plus(residency);
       }
     }

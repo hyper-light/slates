@@ -21623,6 +21623,12 @@ Status: built 2026-10-06. Windows was owed (A-105) and is built by A-205.
   - A recovery's claim forgets the record without a call. No mark can be on a claimed block: marks go only on free
     blocks; a block leaves the free lists only through an allocation, which clears it; and an image names only blocks
     live at its commit (A-64's deferred frees).
+- What reads residency (goal 93 P7, main's ruling of 2026-11-25): a marked page stays in `mincore`'s count and in the
+  process's resident size until the kernel takes it; only the physical footprint drops (measured,
+  `crates/mem/tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, `mincore` 32 before and after). So
+  the arena's residency (`mem.gauge.content.object_resident_bytes`) is `Region::residency_in_use`: `mincore` less the
+  pages the region records as marked, the pages the process still owns. On macOS a resident size compared across a
+  purge says nothing; the footprint does.
 - The purge, on every platform: it gave back every free block of the arena whenever anything had been freed, including
   never-touched ones. That had three costs:
   - on Linux, a `madvise` over the whole free arena after each free, and a count (`content.purged_bytes`) that counted

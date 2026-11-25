@@ -2859,8 +2859,14 @@
 > 2026-11-25: kept runs recorded made every idle pass walk them, an idle daemon's CPU and wakeups growing with
 > fragmentation): a mark that makes a run that long owes the next walk (`UnitSet::run_reaches`, a scan bounded by the
 > discard size), a walk's start clears it (`an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size`:
-> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). OWED: a
-> grown region's never-used space, should the arm show it.
+> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). A grown
+> region's never-used space is not resident (measured: a fresh shared region reads `mincore` 0), so that owed line is
+> withdrawn (main). On macOS a purge's discard is `MADV_FREE_REUSABLE`, and `mincore` and the process's resident size
+> keep counting a reusable page until the kernel takes it; only the physical footprint drops (measured,
+> `crates/mem/tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, resident size 38 flat, `mincore` 32
+> before and after). `object_resident_bytes` now reads `mincore` less the pages a region holds marked reusable, the
+> pages the process still owns (`Region::residency_in_use`; main's ruling of 2026-11-25): red
+> `a_purged_shared_region_reads_its_purged_pages_out_of_its_residency`, 32 MiB read resident after the purge; now 0.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
