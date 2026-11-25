@@ -569,27 +569,7 @@ fn family_entries(
       }));
       more
     }
-    Family::Lists => {
-      let content = content?;
-      let (lists, more) = match cap {
-        Some(cap) => content.lists_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
-        None => (
-          content
-            .lists_in(lo, hi)
-            .map(|(identity, bytes)| (identity, Box::from(bytes)))
-            .collect(),
-          None,
-        ),
-      };
-      out.extend(lists.into_iter().map(|(identity, bytes)| {
-        (
-          coordinate_of(&identity),
-          vcs_node_key(KIND_VCS_LIST, &identity),
-          EntryBytes::of(&[identity.0.as_slice(), &bytes]),
-        )
-      }));
-      more
-    }
+    Family::Lists => list_entries(content?, ((lo, hi), cap), out),
     Family::Names => {
       let content = content?;
       let (names, more) = match cap {
@@ -605,36 +585,7 @@ fn family_entries(
       }));
       more
     }
-    Family::Aways => {
-      let content = content?;
-      let (aways, more) = match cap {
-        Some(cap) => content.aways_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
-        None => (content.aways_in(lo, hi).collect(), None),
-      };
-      #[cfg(test)]
-      if AWAYS_BEFORE_A923.with(core::cell::Cell::get) {
-        out.extend(aways.into_iter().map(|(at, len)| {
-          (
-            at.number,
-            vcs_node_key(KIND_VCS_AWAY_RETIRED, &at.identity),
-            EntryBytes::of(&[at.identity.0.as_slice(), &len.to_le_bytes()]),
-          )
-        }));
-        return more;
-      }
-      out.extend(aways.into_iter().map(|(at, len)| {
-        (
-          at.number,
-          vcs_node_key(KIND_VCS_AWAY, &at.identity),
-          EntryBytes::of(&[
-            at.identity.0.as_slice(),
-            &len.to_le_bytes(),
-            &at.number.to_le_bytes(),
-          ]),
-        )
-      }));
-      more
-    }
+    Family::Aways => away_entries(content?, ((lo, hi), cap), out),
     Family::RegionHolds => {
       let (holds, more) = match cap {
         Some(cap) => homes::region_held_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
@@ -669,6 +620,69 @@ fn family_entries(
       more
     }
   }
+}
+
+/// [`family_entries`] of the content store's lists.
+fn list_entries(
+  content: &slates_vcs::ContentStore,
+  ((lo, hi), cap): ((u64, u64), Option<usize>),
+  out: &mut Vec<crate::image_pages::Entry>,
+) -> Option<u64> {
+  use crate::image_pages::EntryBytes;
+  let (lists, more) = match cap {
+    Some(cap) => content.lists_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
+    None => (
+      content
+        .lists_in(lo, hi)
+        .map(|(identity, bytes)| (identity, Box::from(bytes)))
+        .collect(),
+      None,
+    ),
+  };
+  out.extend(lists.into_iter().map(|(identity, bytes)| {
+    (
+      coordinate_of(&identity),
+      vcs_node_key(KIND_VCS_LIST, &identity),
+      EntryBytes::of(&[identity.0.as_slice(), &bytes]),
+    )
+  }));
+  more
+}
+
+/// [`family_entries`] of the content store's windows let go, each at its let-go number (A-923).
+fn away_entries(
+  content: &slates_vcs::ContentStore,
+  ((lo, hi), cap): ((u64, u64), Option<usize>),
+  out: &mut Vec<crate::image_pages::Entry>,
+) -> Option<u64> {
+  use crate::image_pages::EntryBytes;
+  let (aways, more) = match cap {
+    Some(cap) => content.aways_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
+    None => (content.aways_in(lo, hi).collect(), None),
+  };
+  #[cfg(test)]
+  if AWAYS_BEFORE_A923.with(core::cell::Cell::get) {
+    out.extend(aways.into_iter().map(|(at, len)| {
+      (
+        at.number,
+        vcs_node_key(KIND_VCS_AWAY_RETIRED, &at.identity),
+        EntryBytes::of(&[at.identity.0.as_slice(), &len.to_le_bytes()]),
+      )
+    }));
+    return more;
+  }
+  out.extend(aways.into_iter().map(|(at, len)| {
+    (
+      at.number,
+      vcs_node_key(KIND_VCS_AWAY, &at.identity),
+      EntryBytes::of(&[
+        at.identity.0.as_slice(),
+        &len.to_le_bytes(),
+        &at.number.to_le_bytes(),
+      ]),
+    )
+  }));
+  more
 }
 
 /// The coordinates of `family`'s entries kept or let go since the last committed publication: the pages a delta
