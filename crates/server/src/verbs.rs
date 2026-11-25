@@ -19984,7 +19984,13 @@ fn restore_held_image(
     crate::vcs_store::restore_windows(
       state,
       &held.windows,
-      (&held.lists, &held.names, &held.region_holds, &held.aways),
+      (
+        &held.lists,
+        &held.names,
+        &held.region_holds,
+        &held.aways,
+        &held.aways_unnumbered,
+      ),
     );
     // Where the windows landed packs carried lie on the node's store, as its homes recorded (goal 93 item 2b(b)).
     crate::vcs_store::homes::restore_landed(&held.landed);

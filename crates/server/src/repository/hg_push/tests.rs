@@ -1337,6 +1337,72 @@ fn named_restart_daemon(
   (daemon, green)
 }
 
+/// A-923 (main's rulings of 2026-11-25: an image written before the aways carried their let-go numbers is migrated at
+/// its restore, since a refused away loses a Mercurial named file, brought back by its bytes). Do: on a daemon over a
+/// segment and a store, rebuild the fixtures' repository as one push, its root green holding `b` by its object's name and
+/// that object let go; write the image's Aways family in the form before A-923 and publish; stop the daemon and the
+/// store's owner, start both again over the same segment and store; read every file the green names through its name.
+/// Expect: aways written in the old form, every one taken back numbered (`vcs_store::AWAYS_RENUMBERED`), and every
+/// named file read back as the push held it, `b` `b\n`. Red with the old form refused: `b` unread, its windows absent.
+#[test]
+fn a_restart_on_an_image_written_before_a923_reads_every_named_pushed_file() {
+  let instance = format!("vcs-store-hg-a923-{}", std::process::id());
+  let mut store = crate::test_store::TestStore::start("hg-a923");
+  let anchor = crate::repository::store_tests::anchor_of(&instance);
+  let (daemon, green) = named_restart_daemon(&instance, &anchor, &store);
+  let (old, named) = crate::daemon::observe_first(&daemon, move |state| {
+    let named: Vec<String> = state
+      .greens
+      .get(&green)
+      .map(|engine| {
+        engine
+          .files()
+          .filter(|(_, content)| matches!(content, slates_merge::engine::Content::Named(_)))
+          .map(|(path, _)| path)
+          .collect()
+      })
+      .unwrap_or_default();
+    (crate::content_holder::write_aways_before_a923(state), named)
+  });
+  daemon.publish_every_shard().unwrap();
+  daemon.stop();
+  store.restart_owner();
+  let daemon =
+    crate::repository::store_tests::daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let renumbered = crate::daemon::observe_first(&daemon, |state| {
+    state
+      .refusals
+      .get(crate::vcs_store::AWAYS_RENUMBERED)
+      .copied()
+      .unwrap_or(0)
+  });
+  let paths = named.clone();
+  let files = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut files = Vec::new();
+      for path in &paths {
+        files.push(crate::vcs_store::named_objects::read_file_brought(green, path).await);
+      }
+      files
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  println!("a923 hg: {old} aways in the old form, {renumbered} renumbered, named {named:?}");
+  assert!(old > 0, "the image held windows let go");
+  assert!(named.iter().any(|path| path == "b"), "`b` named: {named:?}");
+  for (path, file) in named.iter().zip(&files) {
+    assert!(file.is_some(), "`{path}` read back through its name");
+  }
+  let b = named
+    .iter()
+    .position(|path| path == "b")
+    .and_then(|at| files[at].clone());
+  assert_eq!(b.as_deref(), Some(&b"b\n"[..]), "`b` as the push held it");
+  assert_eq!(renumbered, old as u64, "every old away taken back numbered");
+}
+
 /// A-887 (main 01a20182's ruling of 2026-11-24 02:17, A-760's replay: a run its apply names whole is never read). Do: on
 /// a daemon over a segment and a store, rebuild the fixtures' repository as one push, its root green holding `b` by its
 /// object's name and that object let go; stop the daemon and the store's owner, start both again over the same segment

@@ -401,8 +401,23 @@
 > w-shared's review). The encoder's pages are handed to a delta and a checkpoint borrowed, never copied
 > (`slates_vfs::recover::HeldPieceRef`, encoded byte for byte as a `HeldPiece`, held by the golden vector
 > `a_borrowed_held_piece_encodes_byte_for_byte_as_an_owned_one` and `check_publication`; a delta's borrow ends with
-> its encoding, a checkpoint's encoder taken out of the state for its stream and put back as it ends). OWED: (b), the
-> away windows keyed by let-go order, should the 57k churn show the Aways family leading and growing with history.
+> its encoding, a checkpoint's encoder taken out of the state for its stream and put back as it ends). (b) DONE as
+> A-923 (w-perf; main's churn ruling of 2026-11-25: at 57k the Aways family's cut reads, `overlay_within`, were 1.92 GB
+> and `encode_page` 2.39 GB of a push's 26.55 GB of system allocations): each window let go takes the store's next
+> let-go number, the family's coordinate, so a push's let-gos fill the family's tail page; red
+> `a_pushs_let_goes_re_encode_the_aways_pages_they_fill_not_every_page_of_the_aways_held` (20 let-goes over 1,500 held
+> aways: 47,887 bytes of the family re-encoded, now 3,701; bound 9,732). Counted by family,
+> `vcs_store.image.encoded_bytes.<family>`. The image's away entry carries the number (piece kind 21); an image written
+> before A-923 (kind 15, no number) is migrated at its restore, never refused: each old away taken back numbered after
+> the numbered ones, its old and new pages re-encoded by the next publication (`vcs_store.image.aways_renumbered`;
+> reds `a_restart_on_an_image_written_before_a923_numbers_its_aways_and_reads_every_text_whole`, Subversion, and
+> `a_restart_on_an_image_written_before_a923_reads_every_named_pushed_file`, Mercurial: with the old form refused, none
+> renumbered; at the store, a refused away leaves an object brought back by its bytes unreadable). OWED: the kind-15
+> reader removed once every daemon has published since A-923 (images live in RAM alone, so none can carry the kind
+> then), with the two restart reds and `content_holder::AWAYS_BEFORE_A923`. Found beside it and fixed in the same
+> change: every capped cut read (lists, names, windows let go, windows, region holds, landed records) counted entries
+> without the page head each costs, so it held past its cap, 1.9 times it for the aways (a split's step encoded 14,814
+> bytes against a three-page bound of 12,288); red `a_capped_cut_read_holds_its_cap_counting_each_entrys_head`.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through

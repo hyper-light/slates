@@ -215,6 +215,9 @@ pub(crate) const WINDOWS_UNHELD: &str = "vcs_store.windows_unheld";
 pub(crate) const NODES_RESTORED: &str = "vcs_store.nodes_restored";
 /// Counter (A-727 slice a3b): lists and names of the shard image a recovery could not take back.
 pub(crate) const NODES_UNRESTORED: &str = "vcs_store.nodes_unrestored";
+/// Counter (A-923): windows let go a shard image carried in the form before their let-go numbers, taken back numbered
+/// at its restore (`ContentStore::restore_away_renumbered`).
+pub(crate) const AWAYS_RENUMBERED: &str = "vcs_store.image.aways_renumbered";
 /// Counter (A-724 piece 8c): region holds of the shard image a recovery held again.
 pub(crate) const REGION_HOLDS_RESTORED: &str = "vcs_store.region_holds_restored";
 /// Counter (goal 93 item 2b; main 01a20182's ruling of 2026-11-22 07:33): region holds of the shard image a recovery
@@ -315,9 +318,15 @@ pub(crate) struct VcsStores {
   restored_nodes: Option<RestoredNodes>,
   /// A recovery's windows let go of the content store, each with its length (A-767 C1 step 2b), taken in before the
   /// lists when the store is made.
-  restored_aways: Vec<(slates_vcs::ContentId, u64)>,
+  restored_aways: Vec<(slates_vcs::AwayAt, u64)>,
+  /// A recovery's windows let go in the form before A-923, with no let-go number, taken in numbered after
+  /// [`VcsStores::restored_aways`].
+  restored_aways_unnumbered: Vec<(slates_vcs::ContentId, u64)>,
   /// What the content store took back of them: restored, refused (counted by the recovery).
   nodes_restored: (u64, u64),
+  /// Of [`VcsStores::restored_aways_unnumbered`], those taken back numbered (counted by the recovery,
+  /// [`AWAYS_RENUMBERED`]).
+  aways_renumbered: u64,
   /// A recovery's region holds (A-724 piece 8c), held again when the content store is made over the restored windows.
   restored_region: Vec<(slates_vcs::ContentId, Vec<slates_cluster::homes::HomeOwner>)>,
   /// What the content store took back of them: held, and the ones it could not take (counted and logged by the
@@ -1652,9 +1661,19 @@ impl VcsStores {
       // A recovery's windows let go, then its lists and names (a3b), over the windows the storage handed back: counted
       // by the owner. The windows let go first, since a list holds the nodes it names.
       let aways = std::mem::take(&mut self.restored_aways);
-      let (mut offered, mut refused) = (u64::try_from(aways.len()).unwrap_or(u64::MAX), 0u64);
+      let unnumbered = std::mem::take(&mut self.restored_aways_unnumbered);
+      let unnumbered_offered = u64::try_from(unnumbered.len()).unwrap_or(u64::MAX);
+      let (mut offered, mut refused) = (
+        u64::try_from(aways.len())
+          .unwrap_or(u64::MAX)
+          .saturating_add(unnumbered_offered),
+        0u64,
+      );
       if let Some(content) = self.content.as_mut() {
         refused = content.restore_away(aways);
+        let left_out = content.restore_away_renumbered(unnumbered);
+        refused = refused.saturating_add(left_out);
+        self.aways_renumbered = unnumbered_offered.saturating_sub(left_out);
       }
       if let (Some((lists, names)), Some(content)) =
         (self.restored_nodes.take(), self.content.as_mut())
@@ -4423,6 +4442,7 @@ pub(crate) type NodesToRestore<'a> = (
   &'a [(slates_vcs::ContentId, Vec<u8>)],
   &'a [(slates_vcs::ContentId, slates_vcs::ContentId)],
   &'a [(slates_vcs::ContentId, Vec<slates_cluster::homes::HomeOwner>)],
+  &'a [(slates_vcs::AwayAt, u64)],
   &'a [(slates_vcs::ContentId, u64)],
 );
 
@@ -4432,7 +4452,7 @@ pub(crate) type NodesToRestore<'a> = (
 pub(crate) fn restore_windows(
   state: &mut ShardState,
   pieces: &[(u64, Vec<u8>)],
-  (lists, names, region, aways): NodesToRestore<'_>,
+  (lists, names, region, aways, unnumbered): NodesToRestore<'_>,
 ) {
   if state.vcs_stores.content.is_some() {
     return;
@@ -4441,6 +4461,7 @@ pub(crate) fn restore_windows(
   state.vcs_stores.restored_region = region.to_vec();
   // The windows let go are taken in before the lists that name them, when the content store is made (A-767 C1 step 2b).
   state.vcs_stores.restored_aways = aways.to_vec();
+  state.vcs_stores.restored_aways_unnumbered = unnumbered.to_vec();
   // The lists and names are taken in when the content store is made over the windows (`VcsStores::content_made`).
   if !lists.is_empty() || !names.is_empty() {
     state.vcs_stores.restored_nodes = Some((lists.to_vec(), names.to_vec()));
@@ -4464,6 +4485,8 @@ fn release_unheld_windows(state: &mut ShardState) {
   let (restored, refused) = std::mem::take(&mut state.vcs_stores.nodes_restored);
   state.count(NODES_RESTORED, restored);
   state.count(NODES_UNRESTORED, refused);
+  let renumbered = std::mem::take(&mut state.vcs_stores.aways_renumbered);
+  state.count(AWAYS_RENUMBERED, renumbered);
   count_region_restored(state);
   // The free decision: the replayed greens' holds on their named objects taken first (A-760 (b) 4d), so no window a
   // green names is freed as unheld.
