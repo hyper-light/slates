@@ -561,13 +561,69 @@ pub(crate) fn hold_in(
   })
 }
 
-/// Runs `step` over the generation `hold` holds, counted as [`lend_on`] counts a step; none when its fork is gone.
+/// Counters: a fetch's steps past the shard's step quantum on its clock, each counted under the phase of the step that
+/// took longest (main 01a20182's order of 2026-11-25: 78 to 87 % of a clone's polls past the quantum once the walk took a
+/// tree's entries one a unit, the encoding's units past their budget only 187 to 1,105 of them): the served refs and the
+/// pack source made (refs), the stores lent (lend), the answer's own step (work), the lend settled (settle), and the
+/// step's writes and usage counted after (count). Format: counter names.
+pub(crate) const LONG_STEPS_BY_PHASE: [&str; 5] = [
+  "vcs_store.git_upload.long_steps.refs",
+  "vcs_store.git_upload.long_steps.lend",
+  "vcs_store.git_upload.long_steps.work",
+  "vcs_store.git_upload.long_steps.settle",
+  "vcs_store.git_upload.long_steps.count",
+];
+
+/// Counter: a fetch's steps over its generation's fork, each one ([`lend_held_in`]): what [`LONG_STEPS_BY_PHASE`]'s counts
+/// are a share of. Format: a counter name.
+pub(crate) const STEPS: &str = "vcs_store.git_upload.steps";
+
+/// Counted most: the longest each phase of a fetch's step took, in nanoseconds, in [`LONG_STEPS_BY_PHASE`]'s order.
+/// Format: counter names.
+pub(crate) const PHASE_NS_MOST: [&str; 5] = [
+  "vcs_store.git_upload.phase_ns_most.refs",
+  "vcs_store.git_upload.phase_ns_most.lend",
+  "vcs_store.git_upload.phase_ns_most.work",
+  "vcs_store.git_upload.phase_ns_most.settle",
+  "vcs_store.git_upload.phase_ns_most.count",
+];
+
+/// Counts the phases of one fetch step from their bounds on the shard's clock, `bounds` the step's start then each
+/// phase's end: each phase's longest kept, and the step, where it ran past `quantum_ns`, counted long under its longest
+/// phase ([`LONG_STEPS_BY_PHASE`]).
+fn count_phases(state: &mut ShardState, bounds: [u64; 6], quantum_ns: u64) {
+  let mut phases = [0_u64; 5];
+  for (at, phase) in phases.iter_mut().enumerate() {
+    let (Some(start), Some(end)) = (bounds.get(at), bounds.get(at.saturating_add(1))) else {
+      continue;
+    };
+    *phase = end.saturating_sub(*start);
+  }
+  state.count(STEPS, 1);
+  for (name, took) in PHASE_NS_MOST.iter().zip(phases) {
+    state.count_max(name, took);
+  }
+  let (Some(first), Some(last)) = (bounds.first(), bounds.last()) else {
+    return;
+  };
+  if last.saturating_sub(*first) <= quantum_ns {
+    return;
+  }
+  let longest = (0..phases.len()).max_by_key(|at| phases.get(*at).copied().unwrap_or(0));
+  if let Some(name) = longest.and_then(|at| LONG_STEPS_BY_PHASE.get(at)) {
+    state.count(name, 1);
+  }
+}
+
+/// Runs `step` over the generation `hold` holds, counted as [`lend_on`] counts a step; none when its fork is gone. Its
+/// phases timed and a step past the quantum counted by its longest ([`count_phases`]).
 fn lend_held_in<R>(
   state: &mut ShardState,
   hold: &GitGeneration,
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
 ) -> Option<R> {
-  let began = slates_rt::futures::now_ns();
+  let now = slates_rt::futures::now_ns;
+  let began = now();
   let refs: Vec<NamedRef<'_>> = hold
     .refs
     .iter()
@@ -577,8 +633,11 @@ fn lend_held_in<R>(
     })
     .collect();
   let mut packs = ShardPacks::of(state);
+  let made = now();
+  let (mut lent_at, mut worked) = (made, made);
   let lent = super::observed(state, hold.id, |state| {
     super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      lent_at = now();
       let fork = stores
         .git_forks
         .get(&hold.id)?
@@ -590,16 +649,33 @@ fn lend_held_in<R>(
         refs: &refs,
         head: &hold.head,
       };
-      Some(step(&served, &mut packs))
+      let answered = Some(step(&served, &mut packs));
+      worked = now();
+      answered
     })
   });
+  let settled = now().max(worked);
   packs.count_on(state);
   if lent.is_some() {
-    let now = slates_rt::futures::now_ns();
+    let now = now();
     state
       .vcs_usage
       .stepped(&hold.id, Work::Fetch, (now.saturating_sub(began), 0), now);
   }
+  let counted = now();
+  let quantum_ns = state.config.step_quantum_ns();
+  count_phases(
+    state,
+    [
+      began,
+      made,
+      lent_at.max(made),
+      worked.max(lent_at),
+      settled,
+      counted,
+    ],
+    quantum_ns,
+  );
   lent
 }
 
