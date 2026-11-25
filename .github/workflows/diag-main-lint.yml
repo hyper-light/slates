@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 15 (main 01a20182, 2026-11-24 16:05 PST): main at 02bd0ec94, w-shared's A-908 steps 1-3 (merge_service, replica_build,
+# fleet tests), landed after run 14.
 # Run 14 (main 01a20182, 2026-11-24 15:26 PST): main CI 45507135789 (77c0fe495) found the let-go test's assert_let_go_sliced
 # at 16; main's commit splits it.
 # Run 13 (main 01a20182, 2026-11-24 15:00 PST): run 12 found the svn SSH step at 12; main's commit settles its bookkeeping
