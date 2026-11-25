@@ -1885,9 +1885,20 @@
 > (64 reads back to back: with no spin 64 parks, the red; with a 2 ms cap 61 met spinning, 3 parked while the window was
 > learned). Main's 57k split at b4aa00ef8 (release, load ~34) showed no spin: 461,484 parks, 0 hits, because the
 > measurement's daemon (`crates/server/tests/common/hg.rs`) started its owner with a cap of 0; a daemon takes the
-> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Owed: the
-> split again with the real cap (main's), whether a probe's wake (about 9 µs) or the owner's loaded one (about 183 µs a
-> request there) should cap it, then the request count (593,413 at b4aa00ef8) with w-perf.
+> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Main's split
+> with the real cap at 7a9cb385e: asks 12.7 ms apart, a park's wake 1.36 ms; 52 met spinning, 3,237 parked. Main's ruling
+> then: rent or buy, never a cap. Since (w-hg): the owner learns what a park's wake costs it where it runs (`Wake`: from
+> the later of a request's send and the park to its taking, gain 1/8, seeded by the profile's wake), and spins, at most
+> that wake, only where the next gap is predicted within it; else it parks at once. Held by
+> `reads_further_apart_than_a_wake_park_at_once` (16 reads 20 ms apart, the wake seeded at 2 ms: every read parked,
+> none spun; red under the capped rule: 40.56 ms spun, none met), and over fixed histories by `owner/tests.rs`
+> (`a_gap_predicted_past_the_wake_parks_at_once`, red under the capped rule; within the wake spun for at most it; a wake
+> cheaper than the gap parks; the learned wake displaces the seed; a burst after an idle gap spun again). Back to back the
+> owner spins where its asker's gap is within the wake (64 of 64 on the MacBook at load 30, five runs of eight) and parks
+> where the asker is descheduled as long as a wake (the rest): the machine decides, so that test holds the count and the
+> parts' sum alone. Found on the way: a gap learned to the request's taking holds the wake itself, so one park kept the
+> owner parked for good; the gap is learned to the request's send, and the owner's start is never one. Owed: the 57k split under the rule (main's); the request count (3,387 at
+> 7a9cb385e) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
