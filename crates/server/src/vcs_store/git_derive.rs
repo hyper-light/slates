@@ -280,6 +280,9 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 /// under way between turns, one a repository): it picks up where the task stopped, never derives a version again, and
 /// waits no longer than it would have alone. None begun where every version is known, or one already derives it;
 /// counted [`BEHIND`].
+/// It pays where the gap between a push and its first fetch covers the derivation: on git/git about 14 s of it (main
+/// 01a20182's A/B of 2026-11-25: 1,027 versions in 14.2-14.8 s); a fetch a few seconds after still derives most of it
+/// itself (about 90 % there), handed the derivation at no cost against deriving alone.
 pub(crate) fn derive_behind(state: &mut ShardState, id: RepositoryId) {
   let due = state
     .vcs_stores

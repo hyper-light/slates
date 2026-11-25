@@ -569,7 +569,9 @@ pub(crate) async fn texts_made(
     asks.asked(copied);
     return Some((MadeTexts::Made(made), asks));
   }
-  // Past a step: each text copied a step's slice a request, to its end (an empty slice, or one short of the step).
+  // Past a step: each text copied a step's slice a request, to its end (an empty slice, or one short of the step), each
+  // slice appended by the owner to the text's own buffer, handed to it and back a request (goal 93, main's churn ruling
+  // of 2026-11-25: each slice a buffer of its own, copied again into the text, 6.2 GB of hg's 57k clone).
   let mut made = Vec::new();
   made.try_reserve_exact(texts.len()).ok()?;
   let mut total = 0_u64;
@@ -577,17 +579,16 @@ pub(crate) async fn texts_made(
     let mut text = Vec::new();
     loop {
       let at = u64::try_from(text.len()).ok()?;
-      let slice = disk
-        .text_slice(repository, *identity, (at, step))
+      text = disk
+        .text_slice_into(repository, *identity, (at, step), text)
         .await
         .ok()??;
-      let len = u64::try_from(slice.len()).ok()?;
+      let len = u64::try_from(text.len()).ok()?.saturating_sub(at);
       asks.asked(len);
       total = total.saturating_add(len);
       if total > most {
         return Some((MadeTexts::Past, asks));
       }
-      text.extend_from_slice(&slice);
       if len < step {
         break;
       }

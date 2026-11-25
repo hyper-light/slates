@@ -1318,15 +1318,20 @@ async fn hog() {
 
 /// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
 /// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
-/// overstates it, enlarging the bound past rent or buy). Do: on a shard that has landed nothing, run a hog that holds it
-/// [`HOG_NS`] between yields, and import `full.dump` beside it, so every answer its batch's landing awaits resumes late;
-/// read the shard's `F` once the batch lands, then stop the hog. Expect the import whole, and `F` the store's own flush:
-/// under half a hold. Red before: `F` the landing's await, a hold or more.
+/// overstates it, enlarging the bound past rent or buy). Do: on a shard whose measured flush is forgotten, run a hog that
+/// holds it [`HOG_NS`] between yields, and import `full.dump` beside it, so every answer its batch's landing awaits
+/// resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
+/// awaited it), then stop the hog. Expect the import whole, and `F` under the await it is part of: the store's own
+/// flush, whatever else the shard ran, judged against the batch's own await rather than a time, so a loaded machine's
+/// slow flush is no failure. Red before: `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
 #[test]
 fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
-  use crate::repository::svn_commit::staging::durable_flush_ns;
-  let (flush_ns, youngest) = stored(|| async move {
+  use crate::repository::svn_commit::staging::{
+    LANDING_AWAITED_NS, durable_flush_ns, forget_durable_flush,
+  };
+  let (flush_ns, awaited, youngest) = stored(|| async move {
     let (svn, _) = subversion("contended").await;
+    forget_durable_flush();
     HOGGING.with(|hogging| hogging.set(true));
     let hogging = slates_rt::futures::spawn(hog()).expect("the hog's task");
     slates_rt::futures::detach(hogging).expect("detached");
@@ -1339,20 +1344,23 @@ fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
       slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
     }
     let flush_ns = durable_flush_ns();
+    let awaited = LANDING_AWAITED_NS.with(std::cell::Cell::get).unwrap_or(0);
     HOGGING.with(|hogging| hogging.set(false));
     let mut youngest = 0;
     while youngest < FULL_LAST {
       slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
       youngest = history(svn).await.map_or(0, |(youngest, _)| youngest);
     }
-    (flush_ns, youngest)
+    (flush_ns, awaited, youngest)
   });
-  println!("svn_import: F {flush_ns:?} ns, the shard held {HOG_NS} ns at a time");
+  println!(
+    "svn_import: F {flush_ns:?} ns, the landing awaited {awaited} ns, the shard held {HOG_NS} ns at a time"
+  );
   assert_eq!(youngest, FULL_LAST, "the import whole");
   let flush_ns = flush_ns.expect("a flush measured");
   assert!(
-    flush_ns < HOG_NS / 2,
-    "F {flush_ns} ns, the store's own flush, not the landing's await behind a {HOG_NS} ns hold"
+    flush_ns < awaited,
+    "F {flush_ns} ns, the store's own flush, not the landing's await of {awaited} ns"
   );
 }
 

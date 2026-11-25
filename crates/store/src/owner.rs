@@ -142,6 +142,8 @@ enum Request {
     offset: u64,
     /// The most bytes the answer copies: a piece ([`PIECE_BYTES`]) or a caller's step ([`StoreHandle::text_slice`]).
     most: u64,
+    /// The asker's buffer, the slice appended to it and the buffer answered ([`StoreHandle::text_slice_into`]).
+    into: Vec<u8>,
     answer: Sender<Result<Option<Vec<u8>>, StoreError>>,
   },
   Texts {
@@ -852,13 +854,20 @@ fn serve(
         identity,
         offset,
         most,
+        into,
         answer,
       } => {
-        // As far as `most` reaches from `offset` (a piece, as `piece` answers, or a caller's step): a caller walks
-        // slices of any length.
+        // As far as `most` reaches from `offset` (a piece, as `piece` answers, or a caller's step), appended to the
+        // asker's buffer: a caller walks slices of any length into one buffer, no slice a buffer of its own.
         let read = store
           .text_slice(&staging, repository, (&identity, offset, most), &mut texts)
-          .map(|text| text.map(<[u8]>::to_vec));
+          .map(|text| {
+            text.map(|slice| {
+              let mut into = into;
+              into.extend_from_slice(slice);
+              into
+            })
+          });
         let answered = read;
         timer.reply(&store, &answer, answered);
       }
@@ -1233,6 +1242,21 @@ impl StoreHandle {
     identity: Identity,
     (offset, most): (u64, u64),
   ) -> Result<Option<Vec<u8>>, OwnerError> {
+    self
+      .text_slice_into(repository, identity, (offset, most), Vec::new())
+      .await
+  }
+
+  /// [`StoreHandle::text_slice`], its bytes appended to `into` and `into` answered: a text read in slices is assembled
+  /// in the asker's one buffer (goal 93, main's churn ruling of 2026-11-25). None as `text_slice` answers none, `into`
+  /// given up.
+  pub async fn text_slice_into(
+    &self,
+    repository: u128,
+    identity: Identity,
+    (offset, most): (u64, u64),
+    into: Vec<u8>,
+  ) -> Result<Option<Vec<u8>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
       .ask(
@@ -1241,6 +1265,7 @@ impl StoreHandle {
           identity,
           offset,
           most,
+          into,
           answer,
         },
         answers,

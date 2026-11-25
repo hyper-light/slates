@@ -293,12 +293,30 @@
 > - **(i) FIXED (A-918 (i)):** the holder answers typed, `ContentMessage::Behind { reached }` (kind 11), where it
 >   counted `OUT_OF_ORDER` and answered nothing; the owner records it on the pending version (`merge.behind.heard`)
 >   and the barrier's log names it.
-> - **(iii) OPEN (A-919):** a candidate joining a state log's placement past parts every earlier candidate held is
->   shipped the log's prefix (state_log's own owed transfer); a repository green's v0 on a fresh candidate needs its
->   join from it.
-> - **B OPEN (A-918):** on `Behind`, the newcomer rebuilds the green through a takeover successor's own path
->   (`adopt_ledger_positions`, `rebuild_through`) from a live holder, paced and bounded as replica builds are; one
->   mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
+> - **(iii) FIXED (A-919):** a candidate joining a state log's placement past parts every earlier one held reads the
+>   prefix from its cohort, the owner among them, under the start rule, and continues. Red: a's parts stayed at 933
+>   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0. OWED (main): the TLC run of
+>   `FencedLedger_forget.cfg` (must hold) and `FencedLedger_forget_norule.cfg` (must fail Continuity), with the three
+>   older configurations (verdicts unchanged); the model is written, its run is not yet made.
+> - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
+>   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
+>   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
+>   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **OPEN, w-shared's next piece (A-921, found by A-919's owner-restart scene; before A-918 B): after an owner's warm
+>   restart and a death, the surviving original holder refuses the owner's later records about 1 run in 3.** The names
+>   log stays acknowledged by the owner alone, the green's next version is owed to the old holder, every push is
+>   refused `unable to commit`, and no part reaches a newcomer. Red:
+>   `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`, `#[ignore]`d until A-921
+>   (`cargo test -p slates-server --test fleet <that name> -- --ignored --exact`). Red first, from the old holder's
+>   refusal counters: which refusal, at what epoch and position. It may be the sibling below showing itself.
+> - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
+>   but the record plane builds it empty, and no image carries it. An owner's warm restart spends one of `f`, unseen,
+>   on every record it counted itself in: commit at {owner, departed}, restart the owner warm, retire the departed,
+>   and the record is gone after one failure anyone saw. Traced from the code, not observed. Root fix: publish and
+>   recover the owner's hold as a holder's is.
+> - **B OPEN (A-918):** on `Behind`, the newcomer reads the green's chain through A-919's read (the same read a
+>   takeover's successor makes), folds it under the start rule, and rebuilds its replica from it, paced and bounded
+>   as replica builds are; one mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
 >   it holds no per-version records or inputs. Then the red goes green, a914 asserts its second push lands, and
 >   GAP-A9-7's ledger-prefix transfer and AUD-14's new candidate set close.
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
@@ -1793,7 +1811,15 @@
 > piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
 > x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
 > reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
-> read whole against one chunk and a text, 1,246,184; now 1,048,576). The batch itself was sized by the fetch's room
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). The cache's chunks churned: each a fresh mapping
+> of the allocator's floor, faulted in and unmapped as the oldest went (hg's 57k push mapped 4.5 GB of them, 80.9% of
+> its mapped churn; a fresh 1 MiB chunk 240 us against 85 us kept). Now the chunk the room was made from is laid again
+> when it is an ordinary one of the length wanted, held for no longer than that call so the bound holds
+> (`TextCache::chunks_mapped`; `a_cache_lays_its_next_chunk_in_the_one_it_gives_back`: red, 7 chunks mapped fresh for
+> 400 texts through a two-chunk cache; now 2). A text the owner answers in slices is assembled in the asker's buffer,
+> handed to the owner and back a request, no slice a buffer of its own (`StoreHandle::text_slice_into`; hg's 57k clone
+> allocated 6.2 GB in those answers, 15.3% of its system churn; `owner_slices_heap`: red, 331,464 bytes allocated for a
+> 307,200-byte text read in 64 KiB slices; now 24,264). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
@@ -2834,8 +2860,25 @@
 > pages kept past it are pages no batch of the import refills. Counted `repository.svn_import.purged_past_bound_bytes`.
 > Red `an_imports_arena_keeps_no_more_resident_free_than_its_bound` (16 MiB of rewrites at a bound of two units,
 > published each turn): 6,250,496 bytes resident and free as the import ended against a keep of 4,202,496; now
-> 2,449,408, 3,801,088 given back. OWED: main's fourth P7 arm; the deferred frees of the import's last batch wait for the
-> next publication and the idle purge, as any shard's do.
+> 2,449,408, 3,801,088 given back. Main's fourth P7 arm (2b977b986): the recorded resident free within the bound each
+> round; the last batches' deferred frees (A-64) and free space the purge does not record ended above it, and the
+> resident free gauge read above the arena's mapped bytes in the other arms (116.7 MB against 33.6). That gauge's drift
+> fixed (w-perf; main's ruling of 2026-11-25): a region shrunk back to the pool took its recorded freed blocks out of
+> the arena but not out of the count, and a recovery's commit (`settle`) counted blocks it released unscrubbed, which no
+> region records; the count is now what the regions record, held by
+> `the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink` (an arena growing from a pool, a seeded
+> mix of allocate, free, captured free, commit live, purge and shrink; red at step 59). The storage test reads the gauges
+> again once a publication has released the import's deferred frees (main's claim: deferred 0 and free within the
+> keep by then). The purge's kept-short runs (shorter than the discard size) stay recorded now (main's ruling of
+> 2026-11-25): taken out of the record with their pages resident, no later purge or coalesce saw them again, free space a
+> long-lived daemon lost without bound; recorded, a later free beside one joins it into a run a purge gives back
+> (`a_run_kept_short_stays_recorded_so_a_later_free_beside_it_goes_back`: red, the second purge gave back nothing; now
+> the joined two pages). An idle purge walks nothing while no recorded run reaches the discard size (main's ruling of
+> 2026-11-25: kept runs recorded made every idle pass walk them, an idle daemon's CPU and wakeups growing with
+> fragmentation): a mark that makes a run that long owes the next walk (`UnitSet::run_reaches`, a scan bounded by the
+> discard size), a walk's start clears it (`an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size`:
+> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). OWED: a
+> grown region's never-used space, should the arm show it.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
@@ -4553,6 +4596,11 @@
 >   ubuntu-latest and 30 of 30 on ubuntu-24.04-arm**, the six changeset evolution rows (ad36e5f09) among them.
 >   Windows pending: run 6's windows-latest leg failed every row at exit 127 on the workflow's own wrapper path (bash
 >   dropped `D:\a\_temp`'s backslashes), not slates; ade67baf3 passes it as a Unix path, for run 7.
+> - **Windows hg, CLOSED by use (2026-11-25):** run 8 (45624253901, `diag-measurer-main-interop-linux-8` at 8143c35a6,
+>   with 0e73ff11d) passed the hg matrix on windows-latest, ubuntu-latest and ubuntu-24.04-arm, the evolution rows
+>   included. Run 7 (45612515778) had passed 24 of 30 on Windows: `evo-repository` pasted the binary's Windows path into
+>   its shell's command, which took its backslashes, and the five rows after it failed on the missing repository;
+>   0e73ff11d passes the path through the environment.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the

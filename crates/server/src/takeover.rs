@@ -2534,9 +2534,8 @@ fn ledger_question(
     .collect();
   let mut answers = BTreeMap::new();
   if gate_open(state, departed) {
-    let own = state
-      .holder_records
-      .get(&object)
+    let held = state.holder_records.get(&object);
+    let own = held
       .map(|acceptor| acceptor.positions_between(object, from, to))
       .unwrap_or_default();
     answers.insert(
@@ -2547,6 +2546,8 @@ fn ledger_question(
           .map(|accepted| (accepted.sequence, accepted))
           .collect(),
         covered_to: to,
+        // The successor answering itself is held to the start rule as any member is (A-919).
+        held_from: held.and_then(|acceptor| acceptor.held_from(object)),
       },
     );
   }
@@ -2619,6 +2620,7 @@ pub(crate) async fn adopt_ledger_positions(
             host,
             LedgerAnswered {
               covered_to: promise.next.unwrap_or(to),
+              held_from: promise.held_from,
               positions: promise
                 .positions
                 .into_iter()
