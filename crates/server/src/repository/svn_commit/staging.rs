@@ -611,7 +611,114 @@ async fn canonical_in(doc: slates_merge::ops_doc::OpsDoc) -> Option<slates_merge
 
 /// A revision's records waiting to be applied once its verdict is committed ([`Staging::staged_in`]): its check, its
 /// encoded record, and the bytes its increment adds ([`post_bytes`]); taken when they are applied.
-type ToRecord = Option<(Checked, Vec<u8>, u64)>;
+type ToRecord = Option<Recording>;
+
+/// A kept revision's records being applied and the batch's held table followed a slice at a time
+/// ([`Staging::record_some`], A-920 piece 5).
+struct Recording {
+  /// The checked revision, until the records apply it.
+  checked: Option<Checked>,
+  /// Its changed-path rows, which the held table's walks read.
+  changes: Vec<slates_svn::index::ChangedPath>,
+  /// Its record.
+  record: Vec<u8>,
+  /// The post-state bytes its increment holds.
+  post: u64,
+  /// Where it stands.
+  phase: RecordPhase,
+  /// The texts it lets go, each path once (its last row's), found before the records apply it.
+  before: std::collections::BTreeMap<String, ContentIdentity>,
+  /// The texts it holds, each path once, found once they do.
+  after: std::collections::BTreeMap<String, ContentIdentity>,
+}
+
+/// Where a [`Recording`] stands.
+#[derive(Clone, Copy)]
+enum RecordPhase {
+  /// The texts its rows let go, found from this row.
+  Before(usize),
+  /// The records to apply.
+  Apply,
+  /// The texts its rows hold at its revision, found from this row.
+  After(usize, u64),
+  /// The held table to follow.
+  Fold,
+}
+
+/// How far a phase of [`Staging::record_some`] came.
+enum Recorded {
+  /// Its phase ended and the step goes on.
+  More,
+  /// The step is spent.
+  Spent,
+  /// The record kept: the revision staged.
+  Kept,
+}
+
+impl Recorded {
+  /// A phase ended: the step goes on unless `spent`.
+  fn after(spent: &mut dyn FnMut() -> bool) -> Recorded {
+    if spent() {
+      Recorded::Spent
+    } else {
+      Recorded::More
+    }
+  }
+}
+
+impl Recording {
+  /// `checked`'s recording, `record` its record and `post` its increment's post-state bytes: nothing found yet.
+  fn new((checked, record, post): (Checked, Vec<u8>, u64)) -> Recording {
+    Recording {
+      changes: checked.changes().to_vec(),
+      checked: Some(checked),
+      record,
+      post,
+      phase: RecordPhase::Before(0),
+      before: std::collections::BTreeMap::new(),
+      after: std::collections::BTreeMap::new(),
+    }
+  }
+
+  /// The phase's walk of the rows from `at`, over `records` at `revision`, a row a unit until `spent`: the texts each
+  /// lets go (before the records apply it) or holds (after), each path once, its last row's.
+  fn walk(
+    &mut self,
+    (records, revision, mut at): (&slates_svn::migration::Repository, u64, usize),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Recorded {
+    let applied = matches!(self.phase, RecordPhase::After(..));
+    let mut found = Vec::new();
+    while let Some(change) = self.changes.get(at) {
+      if applied {
+        crate::vcs_store::svn_texts::held_by(records, change, revision, &mut found);
+      } else {
+        crate::vcs_store::svn_texts::released_by(records, change, revision, &mut found);
+      }
+      let into = if applied {
+        &mut self.after
+      } else {
+        &mut self.before
+      };
+      into.extend(found.drain(..).map(|(identity, path)| (path, identity)));
+      at = at.saturating_add(1);
+      if at < self.changes.len() && spent() {
+        self.phase = if applied {
+          RecordPhase::After(at, revision)
+        } else {
+          RecordPhase::Before(at)
+        };
+        return Recorded::Spent;
+      }
+    }
+    self.phase = if applied {
+      RecordPhase::Fold
+    } else {
+      RecordPhase::Apply
+    };
+    Recorded::after(spent)
+  }
+}
 
 /// Where a revision's staging stands between its steps ([`Staging::staged_in`]).
 enum StagingAt {
@@ -1009,7 +1116,7 @@ impl Staging {
     let growth = grown(&checked);
     let post = post_bytes(&built);
     let mut at = StagingAt::Judging(Box::new(built));
-    let mut recording = Some((checked, record, post));
+    let mut recording = Some(Recording::new((checked, record, post)));
     loop {
       let stepped = within_records(repository, lent, |state| {
         self.staging_step(state, (repository, growth), (&mut at, &mut recording))
@@ -1050,8 +1157,12 @@ impl Staging {
         Ok(None)
       }
       JudgedIn::Kept => {
-        let recorded = recording.take().ok_or(Uncommitted::NotHeld)?;
-        self.recorded_in(state, repository, recorded).map(Some)
+        let recording = recording.as_mut().ok_or(Uncommitted::NotHeld)?;
+        let recorded = self.record_some(state, repository, (recording, deadline))?;
+        if recorded.is_none() {
+          *at = StagingAt::Recording;
+        }
+        Ok(recorded)
       }
     }
   }
@@ -1091,22 +1202,58 @@ impl Staging {
     }
   }
 
-  /// [`Staging::stage_in`]'s last step, within the records' lent room: the records applied, the held table followed,
-  /// the record kept, its increment kept in the batch already.
-  fn recorded_in(
+  /// [`Staging::stage_in`]'s last steps, within the records' lent room, until the shard's clock passes `deadline`, a
+  /// unit at least (A-920 piece 5: 31 ms at 9,000 files, debug, one call): the texts the revision lets go found a row a
+  /// unit, the records applied, the texts it holds found a row a unit, then the held table followed a path a unit and
+  /// the record kept. None while more remains.
+  fn record_some(
     &mut self,
     state: &mut ShardState,
     repository: RepositoryId,
-    (checked, record, post): (Checked, Vec<u8>, u64),
-  ) -> Result<StagedIn, Uncommitted> {
-    let changes = checked.changes().to_vec();
-    let before = state
-      .vcs_stores
-      .subversion_records(repository)
-      .map(|records| {
-        crate::vcs_store::svn_texts::released_before(records, &changes, records.youngest())
-      })
-      .unwrap_or_default();
+    (recording, deadline): (&mut Recording, u64),
+  ) -> Result<Option<StagedIn>, Uncommitted> {
+    let mut spent = || slates_rt::futures::now_ns() >= deadline;
+    loop {
+      match self.record_phase(state, repository, (recording, &mut spent))? {
+        Recorded::More => {}
+        Recorded::Spent => return Ok(None),
+        Recorded::Kept => return Ok(Some(StagedIn::Staged)),
+      }
+    }
+  }
+
+  /// One phase of [`Staging::record_some`], as far as `spent` lets it go.
+  fn record_phase(
+    &mut self,
+    state: &mut ShardState,
+    repository: RepositoryId,
+    (recording, spent): (&mut Recording, &mut dyn FnMut() -> bool),
+  ) -> Result<Recorded, Uncommitted> {
+    let records = || {
+      state
+        .vcs_stores
+        .subversion_records(repository)
+        .ok_or(Uncommitted::NotHeld)
+    };
+    match recording.phase {
+      RecordPhase::Before(at) => {
+        let records = records()?;
+        Ok(recording.walk((records, records.youngest(), at), spent))
+      }
+      RecordPhase::Apply => self.apply_records(state, repository, (recording, spent)),
+      RecordPhase::After(at, revision) => Ok(recording.walk((records()?, revision, at), spent)),
+      RecordPhase::Fold => Ok(self.fold_some(recording, spent)),
+    }
+  }
+
+  /// The records applied with `recording`'s checked revision, counted staged: the phase after, or the step spent.
+  fn apply_records(
+    &mut self,
+    state: &mut ShardState,
+    repository: RepositoryId,
+    (recording, spent): (&mut Recording, &mut dyn FnMut() -> bool),
+  ) -> Result<Recorded, Uncommitted> {
+    let checked = recording.checked.take().ok_or(Uncommitted::NotHeld)?;
     let applied = state
       .vcs_stores
       .subversion(repository)
@@ -1115,24 +1262,30 @@ impl Staging {
       .ok_or(Uncommitted::NotHeld)?;
     let revision = applied.map_err(Uncommitted::Step)?;
     self.staged = self.staged.saturating_add(1);
-    let after = state
-      .vcs_stores
-      .subversion_records(repository)
-      .map(|records| crate::vcs_store::svn_texts::held_after(records, &changes, revision))
-      .unwrap_or_default();
-    // The held table follows the batch's net effect: a path's text from before the batch let go the first time the
-    // batch reaches it; each path's last text held.
-    for (identity, path) in before {
+    recording.phase = RecordPhase::After(0, revision);
+    Ok(Recorded::after(spent))
+  }
+
+  /// The held table following the batch's net effect, a path a unit until `spent`: a path's text from before the batch
+  /// let go the first time the batch reaches it; each path's last text held. Then the record kept.
+  fn fold_some(&mut self, recording: &mut Recording, spent: &mut dyn FnMut() -> bool) -> Recorded {
+    while let Some((path, identity)) = recording.before.pop_first() {
       if self.holding.remove(&path).is_none() && !self.released.iter().any(|(_, at)| *at == path) {
         self.released.push((identity, path));
       }
+      if spent() {
+        return Recorded::Spent;
+      }
     }
-    for (identity, path) in after {
+    while let Some((path, identity)) = recording.after.pop_first() {
       self.holding.insert(path, identity);
+      if spent() {
+        return Recorded::Spent;
+      }
     }
-    self.records.push(record);
-    self.held = self.held.saturating_add(post);
-    Ok(StagedIn::Staged)
+    self.records.push(core::mem::take(&mut recording.record));
+    self.held = self.held.saturating_add(recording.post);
+    Recorded::Kept
   }
 
   /// Lands the batch (module docs) for `cause`, counted: one changeset, then one register entry by `principal`, its
