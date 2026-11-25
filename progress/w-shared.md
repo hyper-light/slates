@@ -556,3 +556,20 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Red first: a915 fleet test (hold_state_log_shipping) plus two unit tests.
 - Queue: A-914 (homing window from the measured takeover tail), then the holder replica build Missing a pushed object,
   then a council session of its own per peer.
+
+## 2026-11-25: A-914 (a) built, held for main's ruling
+
+- Each member samples a death's silence when it installs the TakeOver (a host's epoch rose since the last coordinator
+  period), from that host's last answer to its detector. The last answers are kept each period, since the detector
+  forgets a dead peer before a loaded council takes it over.
+- The homing window uses the learned tail when present. Counters: failover.silence_sampled, silence_longest_ns,
+  silence_unmeasured, fleet.homing_window.learned.
+- 7 runs, coordinator period +300 ms, deaths of d then c, 4-node f=1:
+  - silence to install 3.99 to 5.24 s;
+  - first death's estimate window 3.3 to 3.8 s, push refused retry 4 of 7 (the red);
+  - second death learned 16.9 to 18.7 s, push Ok 4 of 7: 2 refused at the barrier (the placement stall, A-912's
+    sibling) and 1 short at homing (cause unknown).
+- My planned red failed: the estimate had already grown to about 16 s by the second death. Proposed to main: the test
+  asserts the learned source, and the barrier sibling is asked about. The barrier floor at the homing window didn't
+  help, so I reverted it.
+- Asked main for gate 17 release-3 and gate 10 debug-7's logs for the replica build Missing.
