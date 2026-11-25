@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 27 (main 01a20182, 2026-11-24 19:54 PST): main at 8894c0096, w-perf's svn storage measurement (75005ae26) and the miss-ratio
+# curve's re-read guard (567932413), landed after run 26.
 # Run 26 (main 01a20182, 2026-11-24 19:51 PST): main at 0283123dc, w-hg's C1 (2) first piece (4885954fa, f754c36f6) and w-shared's
 # warm-restart fleet test (7e04a16c3), landed after run 25.
 # Run 25 (main 01a20182, 2026-11-24 19:34 PST): main at 1227afcb1, w-git's t_a614a bound (6354f521b) and w-perf's landing-wait
