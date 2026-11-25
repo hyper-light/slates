@@ -1537,10 +1537,8 @@ impl ContentStore {
     (freed, pinned)
   }
 
-  /// The windows of the object `identity` names, in order: itself where it is one window ([`ContentStore::windows`]
-  /// walked down its lists). What a let-go of a landed object takes, and what an owner keeps from one
-  /// (`slates-server`'s texts put for a revision not landed yet, whose windows a landed text may share).
-  pub fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
+  /// The windows of the object `identity` names, in order: itself where it is one window.
+  fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
     let mut windows = Vec::new();
     let mut walk = self.windows(identity);
     while let Some(window) = walk.next_window() {
@@ -3491,6 +3489,54 @@ mod tests {
       store.is_away(&shared_id),
       "the shared window let go once unpinned"
     );
+  }
+
+  /// Goal 93, ruling (B), w-svn's question through main (2026-11-25): a window's unlanded count is the live process's
+  /// alone, never carried across a restart, since the push or import that pinned it does not outlive the process and
+  /// nothing would unpin it after. Do: put an object of two windows, let one go, and pin it unlanded; carry what a shard
+  /// image carries of the store (its windows kept by the storage, its windows let go, its lists and names) into a fresh
+  /// store through the restore the daemon makes its store with (`with_storage`, `restore_away`, `restore_nodes`); hold
+  /// the object again, as a replayed row does, and let it go as a landed segment's let-go does. Expect: before the
+  /// restart, the pinned window kept (non-vacuity); after it, every window let go, none kept and no let-go refused
+  /// `Unlanded` (`kept_unlanded` unmoved).
+  #[test]
+  fn a_windows_unlanded_count_is_never_carried_across_a_restart() {
+    let window = 4096usize;
+    let mut before = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 2);
+    let object = before.put_object(&bytes).unwrap();
+    let_go_each(&mut before, &[ContentId::of(bytes.get(window..).unwrap())]);
+    assert_eq!(before.pin_unlanded(&object), Ok(2));
+    let mut storage = RestoredWindows::default();
+    for (identity, held) in &before.entries {
+      if let (Form::Window, Some(kept)) = (held.form, before.bytes_of(identity)) {
+        let stored = storage.inner.put(&kept).unwrap();
+        storage.kept.push((*identity, stored, kept.len()));
+      }
+    }
+    let aways: Vec<(ContentId, u64)> = before.aways().collect();
+    let lists: Vec<(ContentId, Vec<u8>)> = before
+      .lists()
+      .map(|(identity, bytes)| (identity, bytes.to_vec()))
+      .collect();
+    let names: Vec<(ContentId, ContentId)> = before.names().collect();
+    let (_, kept) = before.let_go_object_landed(&object, &|_| None);
+    assert_eq!(kept, 1, "before the restart, the pinned window kept");
+    let mut after = ContentStore::with_storage(1 << 22, window, Box::new(storage)).unwrap();
+    assert_eq!(after.restore_away(aways), 0);
+    assert_eq!(after.restore_nodes(lists, names), 0);
+    after.hold(&object).unwrap();
+    let (freed, kept) = after.let_go_object_landed(&object, &|_| None);
+    assert!(
+      freed > 0 && kept == 0,
+      "after it, nothing kept: {freed} {kept}"
+    );
+    assert_eq!(
+      after.counters().kept_unlanded,
+      0,
+      "no let-go refused Unlanded"
+    );
+    assert!(after.is_away(&ContentId::of(bytes.get(..window).unwrap())));
   }
 
   /// Goal 93, ruling (B), w-perf's review: a pin that finds its object's bytes already gone is a named bug signal, and a

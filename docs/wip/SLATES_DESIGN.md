@@ -13554,12 +13554,18 @@ engine: the verdict, rebase, position mapping, the register).
 > **Status (2026-11-19, A-647 part 2: D(k) as derived data, A-645).** A version's D(k) and its reached set are a type of
 > `slates-vcs`'s derived data (`store::ReachSets`, `crates/git/src/store/reach.rs`): a pure function of the version's
 > record and its parents' values, version `k - 1`'s and that of the version a remade set was taken from, which each
-> version now records (`Followed`). Its derivation is the admission's own walks over the committed index, and the owner
-> keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). Since A-647 part 3
+> version now records (`Followed`). Its derivation is the admission's own walks over the committed index. ~~The owner
+> keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`).~~ **Struck (A-916,
+> 2026-11-25):** that second copy, kept under (type, version) in the server's `slates_vcs::Derivations`
+> (`vcs_store::keep_values`), was read by nothing (its only uses its keep and its release) and is deleted with its
+> fields; found by t_a724's replay oracle, which a fetch's derivation between two pushes made differ (the live store's
+> commit kept the copy, the replay's, committing with nothing derived between, could not). Since A-647 part 3
 > the store keeps the sets as the values alone: its commit puts each version's sets, as its admission walked them, as
 > the version's value, held by the version's record, and it serves every version's D(k) and reached set from it
 > (`Repository::brought`, `Repository::reached`), an older version's reached set as well as the newest's; the chains'
-> copies are gone. Since A-647 part 4 each set is a tree of derived nodes over fixed blocks of positions, shaped by the
+> copies are gone. **(A-916:)** a version admitted with no walk (A-614 amended) has no value in its record: its sets
+> are derived when first read (`git_derive`) into the repository's memo, which serves them the same way
+> (`Repository::value_of`: the record's value, else the memo's). Since A-647 part 4 each set is a tree of derived nodes over fixed blocks of positions, shaped by the
 > store's window (format 3): a block's runs kept relative to it and a range the set holds whole one node a level, so
 > the same set is the same root on every tier, no set is too large to keep, and a version's value adds to the store
 > only the nodes on the paths to the blocks its D(k) touches, never its reached set again.
@@ -15185,6 +15191,17 @@ Status (A-706, stream clones part 1): `slates_hg::render` renders the index whol
 text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
 deltas, the rendering appended as versions commit and `stream2` are later parts; `stream_out` (A-712) sends the
 rendered revlogs as 7.2's version 1 stream, refused `1\n` while a changeset is secret.
+Status (2026-11-25, stream clones part 3: `stream2`): `bundle2` lists `stream=v2` while a stream is served, and a
+`getbundle` asking `stream=1` is answered one `STREAM2` part (its counts and requirements mandatory, its payload the
+same rendering framed as `_emit2` frames it, a non-publishing repository's `phaseroots` after the revlogs), refused
+before anything is written for a client naming no common version or a store serving no stream.
+Status (2026-11-25, chunks as stock's): each chunk is stored as 7.2's `revlog.compress` stores it with its default zstd
+engine, and every log but the changelog is inline while its chunks hold under 131,072 bytes (`slates_hg::revlog_chunk`,
+the one codec the stream and, next, the changeset store's intake share); `revlog-compression-zstd` is required. A
+stream compresses at its time, a count pass and a send pass, until the store keeps each chunk in that form from its
+arrival. At r400 of hg's history the stream is 99 files and 466 KB against stock's 102 and 470 KB (before: 195 and
+813 KB). Still owed: the deltas the pinned writer would choose, and the changelog written without generaldelta as 7.2
+writes a new one.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -63743,3 +63760,22 @@ GAPS.
 Applied in the same change to: §4.16 "Apply on holders", the A-894 entry, `crates/server/src/{live_ship,state_log,
 merge_service,merge_origin,green_adopt,fleet,state,daemon,repository,takeover}.rs`, `crates/server/tests/fleet.rs`,
 GAPS.
+
+### A-916 — The git store's second copy of a version's reach sets is deleted: a dead write (2026-11-25, w-git for main 01a20182, its ruling (b1); A-647 parts 2-3 amended above)
+
+- **Found.** t_a724's replay oracle (`vcs_store::tests::assert_made_again_whole`) differed once a push's versions were
+  derived behind it: by instrument on main's base, a fetch's derivation between two pushes left the live store keeping a
+  reach value for the second version ([false, true] by version) that the store made again from its records did not
+  ([false, false]), even after deriving whole.
+- **Why.** `keep_values` kept, at a commit, the moved green's newest reach value under (type, version) in
+  `slates_vcs::Derivations` where the admission had walked the sets, which it does only when the version before is
+  known. The replay commits with nothing derived between, so it kept none; and deriving fills the repository's memo,
+  never `Derivations`. No code read the copy: its only uses were its keep and its release. The value itself is the
+  version record's, or the memo's, and the store serves from those (`Repository::value_of`).
+- **Change.** Deleted: `keep_values`, `GitStore::derivations` and `GitStore::reach`, Mercurial's `HgStore::derivations`
+  (never written), their releases, the `vcs_store.value_unkept` counter and the replay plumbing that carried it; the test
+  oracle compares the sets as the store serves them. `slates_vcs::derived` stays: A-664's `Trees`, `Commits` and the
+  path map are its types in production (`vcs_store::paths`, `vcs_store::commits`).
+- **Evidence.** `git_push::tests::a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again`: red
+  on main (the oracle differing), green with the write gone.
+

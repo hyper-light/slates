@@ -658,6 +658,14 @@ const INTAKE_SLICES_AT_MOST: u64 = 3;
 
 /// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
 const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+/// Format: the daemon's counters of a stream's chunk compression (`vcs_store::hg_view::COMPRESS_*` in `slates-server`,
+/// goal 93 perf, main's ruling of 2026-11-25): the count pass's and the send pass's nanoseconds, the send pass's plain
+/// bytes.
+const COMPRESS_COUNTERS: [&str; 3] = [
+  "vcs_store.hg_stream_compress_count_ns",
+  "vcs_store.hg_stream_compress_send_ns",
+  "vcs_store.hg_stream_compress_send_plain_bytes",
+];
 
 /// Format: the daemon's counter of the asks a fetch's answer made of the changeset store, each a batch of rows or of
 /// chunks (`crate::vcs_store::hg_view::STORE_ASKS` in `slates-server`): a stream's, and since A-767 C1 step 1a a plain
@@ -672,14 +680,23 @@ const STREAM_TURNS_AT_MOST: u64 = 6;
 /// Format: stock 7.2's line as a stream clone begins (`mercurial/streamclone.py`, `maybeperformlegacystreamclone`).
 const STREAMING_LINE: &str = "streaming all changes";
 
+/// Format: stock 7.2's debug line naming a bundle2 stream clone's part as it reads it (`bundle2-input-part: "STREAM2"`,
+/// the type as sent, upper-case for a mandatory part), lower-cased.
+const STREAM2_PART: &str = "\"stream2\"";
+
+/// Format: stock 7.2's debug line where it asks the legacy stream (`sending stream_out command`).
+const STREAM_OUT_ASKED: &str = "sending stream_out command";
+
 /// Goal 93 perf (main's ruling of 2026-11-21 02:31) and A-767 C1 step 3. A stream clone sends each revision as the
 /// changeset store keeps it, and since C1 step 3 an import lands on the store as segment changesets, each revision its
 /// revlog's own delta, as a push's does; so an imported repository streams as a pushed one does (before, it listed no
 /// stream capability and stock 7.2 cloned it plainly with its warning). Do: over the HTTP edge, import a two-changeset
 /// history (an empty file among its files) into one repository (`slates repository import`) and push the same history
-/// into another; `hg clone --stream` each. Expect both clones to stream, with no warning, each holding the source's
+/// into another; `hg clone --stream` each. Expect both clones to stream as bundle2's `stream2` part (stream clones part
+/// 3; never the legacy `stream_out`), with no warning, each holding the source's
 /// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
-/// client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking at most
+/// client's fncache, two warnings on hg-src's prefix; since 2026-11-25 every chunk compressed as 7.2's and small logs
+/// inline, the compression's counters moving for the pushed one); and the pushed one's stream taking at most
 /// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Then a plain
 /// `hg clone` of the pushed one (A-767 C1 step 1a): expect it to hold the source's changesets and verify, its file
 /// revisions read from the changeset store ([`STORE_ASKS`] counted). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or
@@ -742,10 +759,18 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
     let (code, out, err) = hg_in(
       &hg,
       &scratch.path,
-      &with_config(&["clone", "--stream", "-U", &url, &clone], &config),
+      &with_config(
+        &["clone", "--stream", "--debug", "-U", &url, &clone],
+        &config,
+      ),
     );
     assert_eq!(code, 0, "clone --stream of {name}: {out}{err}");
     let said = format!("{out}{err}");
+    // Stream clones part 3: 7.2's client takes the stream as bundle2's `stream2` part, never `stream_out`.
+    assert!(
+      said.to_ascii_lowercase().contains(STREAM2_PART) && !said.contains(STREAM_OUT_ASKED),
+      "clone --stream of {name} negotiated stream2: {said}"
+    );
     let (verified, verify_out, verify_err) = hg_in(&hg, &clone, &["verify"]);
     let verify_said = format!("{verify_out}{verify_err}");
     (
@@ -765,8 +790,18 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
   );
   let imported = clone_stream("imported");
   let turns_before = counter(&instance, STREAM_TURNS);
+  let compress_before = COMPRESS_COUNTERS.map(|name| counter(&instance, name));
   let pushed = clone_stream("pushed");
   let turns = counter(&instance, STREAM_TURNS).saturating_sub(turns_before);
+  let compressed = COMPRESS_COUNTERS.map(|name| counter(&instance, name));
+  // Each chunk was compressed as 7.2 stores it, both passes timed: every counter moved.
+  assert!(
+    compressed
+      .iter()
+      .zip(compress_before)
+      .all(|(after, before)| *after > before),
+    "{COMPRESS_COUNTERS:?}: {compress_before:?} then {compressed:?}"
+  );
   assert_eq!(
     (imported, pushed),
     ((false, true, true, Ok(())), (false, true, true, Ok(()))),

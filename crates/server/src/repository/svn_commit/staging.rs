@@ -198,6 +198,8 @@ pub(crate) struct Deferred {
   revision: Revision,
   /// The texts it put into the content store, one hold each.
   put: Vec<ContentIdentity>,
+  /// Those of `put` its import's sink pinned unlanded (`svn_import::texts`), unpinned before their holds go.
+  pinned: Vec<ContentIdentity>,
   /// What its changeset carries of them.
   carried: Vec<landing::LandedText>,
   /// Why the batch before had no room for it: what that batch lands for.
@@ -205,11 +207,6 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
-  /// The texts it put, each held and not landed yet.
-  pub(crate) fn put(&self) -> &[ContentIdentity] {
-    &self.put
-  }
-
   /// Why the batch before had no room for it.
   pub(crate) fn cause(&self) -> Flush {
     self.cause
@@ -217,6 +214,7 @@ impl Deferred {
 
   /// Gives its texts' holds back: the import refused before it was staged.
   pub(crate) fn give_back(self, state: &mut ShardState) {
+    crate::vcs_store::name_holds::unpin_texts(state, &self.pinned);
     super::release_texts(state, None, &self.put);
   }
 }
@@ -353,6 +351,9 @@ pub(crate) struct Staging {
   records: Vec<Vec<u8>>,
   /// The texts the batch put into the content store, one hold each, given back once it lands or is abandoned.
   put: Vec<ContentIdentity>,
+  /// Those of `put` the import's sink pinned unlanded (`svn_import::texts`): unpinned once the batch's changeset is
+  /// durable (its texts landed), or as the batch is abandoned before.
+  pinned: Vec<ContentIdentity>,
   /// What the changeset carries of them: a path and a length each.
   carried: Vec<landing::LandedText>,
   /// The staged increments' post-state bytes: the batch's holding beside the content store's own charge.
@@ -385,6 +386,7 @@ impl Staging {
           green,
           records: Vec::new(),
           put: Vec::new(),
+          pinned: Vec::new(),
           carried: Vec::new(),
           held: 0,
           staged: 0,
@@ -476,6 +478,7 @@ impl Staging {
     let deferred = Deferred {
       revision,
       put: storing.put,
+      pinned: storing.pinned,
       carried,
       cause: Flush::End,
     };
@@ -494,6 +497,7 @@ impl Staging {
     let Deferred {
       revision,
       put,
+      pinned,
       carried,
       ..
     } = deferred;
@@ -507,6 +511,7 @@ impl Staging {
       Ok(brought) => brought,
       Err(refused) => {
         self.put.extend(put);
+        self.pinned.extend(pinned);
         self.carried.extend(carried);
         return Some(Err(refused));
       }
@@ -526,17 +531,20 @@ impl Staging {
     match staged {
       Ok(StagedIn::Staged) => {
         self.put.extend(put);
+        self.pinned.extend(pinned);
         self.carried.extend(carried);
         Some(Ok(None))
       }
       Ok(StagedIn::PastRoom(cause)) => Some(Ok(Some(Deferred {
         revision: kept,
         put,
+        pinned,
         carried,
         cause,
       }))),
       Err(refused) => {
         self.put.extend(put);
+        self.pinned.extend(pinned);
         self.carried.extend(carried);
         Some(Err(refused))
       }
@@ -719,6 +727,13 @@ impl Staging {
     #[cfg(test)]
     kill_before_entry_where_set().await;
     let recorded = crate::state::with_state(|state| {
+      // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
+      // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
+      // after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
+      // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`).
+      if landed.is_ok() {
+        crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
+      }
       landed.and_then(|()| {
         if landing::next_sequence(state, repository) != sequence {
           state.count(super::DIVERGED, 1);
@@ -820,6 +835,7 @@ impl Staging {
     if let Some(batch) = self.batch.take() {
       batch.abandon(state);
     }
+    crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
     super::release_texts(state, None, &self.put);
     self.put.clear();
     if self.staged > 0 {

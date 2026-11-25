@@ -142,6 +142,9 @@ impl Store for Served {
   fn rows_a_step(&self) -> u64 {
     self.rows_a_step.unwrap_or(u64::MAX)
   }
+  fn text_bytes_a_step(&self) -> u64 {
+    u64::MAX
+  }
 
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
   /// plain BLAKE3 of its text, its place named by that identity, its chunk its raw text (a whole) or its delta; none where its text is
@@ -528,6 +531,7 @@ fn asked<'a>(arguments: &Arguments<'a>) -> Asked<'a> {
     bookmarks: arguments.entry(b"bookmarks"),
     obsmarkers: arguments.entry(b"obsmarkers"),
     listkeys: arguments.entry(b"listkeys"),
+    stream: arguments.entry(b"stream"),
   }
 }
 
@@ -1784,6 +1788,7 @@ proptest! {
       bookmarks: maybe(4, 5),
       obsmarkers: maybe(8, 6),
       listkeys: maybe(16, 7),
+      stream: None,
     };
     let mut out = Vec::new();
     if getbundle(&cloned(), &asked, &mut Admission::new(1 << 20), &mut out).is_ok() {

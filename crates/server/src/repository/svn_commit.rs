@@ -611,6 +611,7 @@ async fn stage_texts(
         Ok(storing)
       }
       Err(refused) => {
+        crate::vcs_store::name_holds::unpin_texts(state, &imported);
         release_texts(state, None, &imported);
         Err(refused)
       }
@@ -665,10 +666,12 @@ fn hand_over(
       .is_none_or(|records| records.holds(&identity));
     if revision.stored.contains_key(&identity) && !held && put.insert(identity) {
       storing.put.push(identity);
+      storing.pinned.push(identity);
     } else {
       spare.push(identity);
     }
   }
+  crate::vcs_store::name_holds::unpin_texts(state, &spare);
   release_texts(state, None, &spare);
 }
 
@@ -793,6 +796,8 @@ pub(crate) struct Storing {
   current: Option<(ContentIdentity, u64, slates_vcs::Writing, u64)>,
   /// The texts put whole, each holding one count of the store.
   put: Vec<ContentIdentity>,
+  /// Those of `put` an import's sink put and pinned unlanded (`svn_import::texts`), unpinned before their holds go.
+  pub(crate) pinned: Vec<ContentIdentity>,
 }
 
 /// What `work` brings that the repository's records do not hold: its texts to put ([`store_step`]).
@@ -984,7 +989,13 @@ fn store_refused(refused: &slates_vcs::ContentRefused) -> Uncommitted {
 
 /// Gives back every text `storing` put whole and the one it was putting: a landing that ended, committed or refused.
 pub(crate) fn release_stored(state: &mut ShardState, storing: Storing) {
-  let Storing { current, put, .. } = storing;
+  let Storing {
+    current,
+    put,
+    pinned,
+    ..
+  } = storing;
+  crate::vcs_store::name_holds::unpin_texts(state, &pinned);
   release_texts(state, current.map(|(_, _, writing, _)| writing), &put);
 }
 

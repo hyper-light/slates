@@ -1081,6 +1081,98 @@ fn paced_line_pushed(state: &mut ShardState, name: &str) -> (RepositoryId, Vec<u
   (repository, pack)
 }
 
+/// The derivation's time and turns as this shard counted them.
+fn derive_time(state: &mut ShardState) -> (u64, u64) {
+  use crate::vcs_store::git_derive::{NS, TURNS};
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (count(NS), count(TURNS))
+}
+
+/// Main 01a20182's order of 2026-11-25 (a first clone's first pack byte spends about a third of its time deriving its
+/// tags, told so far only by difference). Do: push a line of [`PACED_HISTORY`] commits and derive it as a fetch's
+/// request does; then derive it again, nothing left due. Expect: the derivation's time counted
+/// (`vcs_store.git_derive.ns`) with its turns; and the second, which turns no derivation, counts neither time nor a turn
+/// (every encoding turn asks first: counted, 63,153 such asks in one clone read as a derivation spinning). Red before:
+/// no time counted, and the second counted a turn.
+#[test]
+fn a_derivations_own_time_is_counted_and_a_call_with_nothing_due_counts_nothing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, _) =
+    crate::daemon::observe_first(&daemon, |state| paced_line_pushed(state, "derive-time"));
+  let before = crate::daemon::observe_first(&daemon, derive_time);
+  derived_for_read(&daemon, repository);
+  let derived = crate::daemon::observe_first(&daemon, derive_time);
+  derived_for_read(&daemon, repository);
+  let again = crate::daemon::observe_first(&daemon, derive_time);
+  daemon.stop();
+  assert!(
+    derived.0 > before.0 && derived.1 > before.1,
+    "time and turns counted: {before:?} → {derived:?}"
+  );
+  assert_eq!(again, derived, "nothing due, nothing counted");
+}
+
+/// A request creating `main` at a line of [`PACED_HISTORY`] commits, its pack whole.
+fn paced_line_request() -> Vec<u8> {
+  let mut objects = Vec::new();
+  let mut parent = None;
+  for at in 0..PACED_HISTORY {
+    let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
+    objects.extend(made);
+    parent = Some(commit);
+  }
+  let head = parent.unwrap().to_string();
+  let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
+  request(&created, CAPABILITIES, &pack_of_objects(&objects))
+}
+
+/// The shard's derivation counts: versions derived, and derivations begun behind a push.
+fn derived_and_behind(state: &mut ShardState) -> (u64, u64) {
+  use crate::vcs_store::git_derive::{BEHIND, DERIVED};
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (count(DERIVED), count(BEHIND))
+}
+
+/// Waits, a look a while, until `daemon`'s shard has derived at least `at_least` versions: whether it did in time.
+fn derived_by(daemon: &crate::Daemon, at_least: u64) -> bool {
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(daemon, derived_and_behind).0 < at_least {
+    if began.elapsed() > std::time::Duration::from_secs(60) {
+      return false;
+    }
+    std::thread::yield_now();
+  }
+  true
+}
+
+/// Main 01a20182's order of 2026-11-25 (a first clone after git/git's push spent about a third of its wait for its first
+/// pack byte deriving the versions the push left unknown). Do: push a line of [`PACED_HISTORY`] commits as one create,
+/// a step at a time as the edge pushes, so the push ends with the shard lent to it; wait for the shard to derive; then
+/// derive as the first fetch's request does. Expect: a derivation begun behind the push as it ended
+/// (`vcs_store.git_derive.behind`) and the version derived then; and the fetch's own derivation deriving nothing. Red
+/// before: nothing derived until the fetch, which derived the version itself.
+#[test]
+fn a_push_leaves_its_versions_derived_behind_it_so_the_first_fetch_derives_nothing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "derived-behind"));
+  let (created, _) = pushed_in_steps(&daemon, repository, &paced_line_request()).unwrap();
+  let behind_in_time = derived_by(&daemon, 1);
+  let before_fetch = crate::daemon::observe_first(&daemon, derived_and_behind);
+  derived_for_read(&daemon, repository);
+  let after_fetch = crate::daemon::observe_first(&daemon, derived_and_behind);
+  daemon.stop();
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert!(
+    behind_in_time && before_fetch.1 >= 1,
+    "derived behind the push: {before_fetch:?}"
+  );
+  assert_eq!(
+    after_fetch.0, before_fetch.0,
+    "the first fetch derived nothing: {before_fetch:?} → {after_fetch:?}"
+  );
+}
+
 /// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
 /// window marked landed; the commit's own let-go is withdrawn, `vcs_store::LANDED_LET_GO`): the windows.
 fn let_go_by_hand(state: &mut ShardState, pack: &[u8]) -> Vec<slates_vcs::ContentId> {
@@ -3294,6 +3386,57 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
 /// each record that names objects version 4, naming its names and its pack by the identities the region homed; and
 /// the store made again from those records equal to the live one. Every wait
 /// is on its event (an answer, a channel), none on a fixed time: a loaded machine is the norm.
+/// A-916 (main 01a20182's ruling (b1) of 2026-11-25, t_a724's replay diff diagnosed by instrument). Do: t_a724's two
+/// pushes to `main`, each followed by a fetch's derivation (`git_derive::derive_for_read`), then the store made again
+/// from its records compared with the live one (`assert_made_again_whole`). Expect: equal. Red before: the second
+/// push's commit kept a reach value (`keep_values`) because the fetch had derived the version before it, a value no
+/// code read and the replay, committing with nothing derived between, never made: live [false, true] against rebuilt
+/// [false, false].
+#[test]
+fn a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  crate::test_store::keep_landed(&daemon);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "derived-between");
+    let requests: Vec<Vec<u8>> = chain()
+      .into_iter()
+      .take(2)
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .collect();
+    let task = slates_rt::futures::spawn(async move {
+      let mut answered = true;
+      for request in requests {
+        answered &= homed_drive(repository, &request).await.is_ok();
+        crate::vcs_store::git_derive::derive_for_read(repository).await;
+      }
+      let _ = sent.send((repository, answered));
+    })
+    .expect("the pushes' task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (repository, answered) = got.recv().expect("the pushes answered");
+  let (checked, sent) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let main = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .expect("main");
+    crate::vcs_store::tests::assert_made_again_whole(
+      state,
+      repository,
+      &[crate::vcs_store::green_key(main)],
+    );
+    let _ = checked.send(());
+  });
+  let made_again = sent.recv().is_ok();
+  daemon.stop();
+  assert!(answered, "both pushes answered");
+  assert!(made_again, "the store made again equal to the live one");
+}
+
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);

@@ -386,7 +386,7 @@ pub(crate) fn land_answered_blocking(
 }
 
 /// Shape: one shard, a few tasks: [`land_blocking`]'s waiting thread's runtime.
-fn waiting_runtime() -> slates_rt::runtime::LocalRuntime {
+pub(crate) fn waiting_runtime() -> slates_rt::runtime::LocalRuntime {
   slates_rt::runtime::LocalRuntime::new(&slates_rt::runtime::RuntimeConfig {
     shards: 1,
     tasks_per_shard: 8,
@@ -721,7 +721,8 @@ pub(crate) fn answer_wants_blocking(
                     .map(slates_hg::serve::getbundle::Given::Chunks)
                 }
                 Want::Texts { texts, most } => {
-                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, most)
+                  // A test's synchronous answer copies a want in one request: its step the want's own bytes.
+                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, (most, most))
                     .await
                     .map(|(made, _)| match made {
                       crate::vcs_store::hg_view::MadeTexts::Made(made) => {

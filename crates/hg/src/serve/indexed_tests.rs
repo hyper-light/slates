@@ -29,6 +29,9 @@ use proptest::prelude::*;
 
 /// The window the tests' stores are made with: room for a few rows a table, and longer than every fixture's text.
 const WINDOW: usize = 1 << 12;
+/// Shape: a fetch's texts asked a want with no step bound but the room's, past every fixture's texts
+/// ([`Store::text_bytes_a_step`]); the step's own test sets one.
+const UNSTEPPED: u64 = u64::MAX;
 
 /// A store with room for every history the tests make, many times over.
 fn store() -> ContentStore {
@@ -218,7 +221,13 @@ fn check_answers(name: &str, view: &Indexed<'_>) {
 fn the_states_repositories_are_served_as_7_2_serves_them() {
   for name in ["states", "states-store"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (UNSTEPPED, &mut room()),
+    )
+    .unwrap();
     check_served(name, &view, &imported, &store);
     check_left_out(name, &view, &imported, &store);
     check_answers(name, &view);
@@ -251,7 +260,13 @@ fn bookmark_lines<'a>(marks: impl Iterator<Item = (&'a [u8], Node)>) -> Vec<Stri
 fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
   let name = "divergent";
   let (imported, store) = imported(name);
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   assert_eq!(
     bookmark_lines(view.bookmarks()),
     listed("divergent-bookmarks.txt")
@@ -282,7 +297,13 @@ fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
 fn a_hidden_draft_root_is_listed_as_7_2_lists_it() {
   let name = "amended-root";
   let (imported, store) = imported(name);
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   check_served(name, &view, &imported, &store);
   check_left_out(name, &view, &imported, &store);
   check_answers(name, &view);
@@ -322,9 +343,14 @@ fn texts_of(
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_in_place() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   assert_eq!(
     view.lends(),
     Lends {
@@ -459,7 +485,7 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     publishing: true,
     markers: &[],
   };
-  let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
+  let view = Indexed::new(&index, &store, no_state, (UNSTEPPED, &mut room())).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
   assert_eq!(
     short,
@@ -774,7 +800,7 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     publishing,
     markers: &[],
   };
-  Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
+  Indexed::new(&built.index, &built.store, state, (UNSTEPPED, &mut room())).unwrap()
 }
 
 /// A history from per-revision choices: a first parent among the three before it (or none), a second now and then, a
@@ -1006,7 +1032,7 @@ fn a_root_the_changelog_lacks_is_dropped_and_counted() {
     roots: &roots,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   check_served("states", &view, &imported, &store);
   assert_eq!(view.census().dropped_roots, 1);
 }
@@ -1055,7 +1081,7 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     publishing: false,
     markers: &[],
   };
-  let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
+  let refused = Indexed::new(&built.index, &built.store, state, (UNSTEPPED, &mut room())).err();
   assert_eq!(
     refused,
     Some(Refusal::Store {
@@ -1074,7 +1100,7 @@ fn a_view_past_its_room_is_refused() {
       &imported.index,
       &store,
       state_of(&imported),
-      &mut Admission::new(room),
+      (UNSTEPPED, &mut Admission::new(room)),
     )
     .map(|_| ())
   };
@@ -1208,7 +1234,13 @@ fn whole_texts<'s>(
 fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   use super::super::stream::stream_out;
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   let mut answer = Vec::new();
   stream_out(
     &view,
@@ -1229,7 +1261,7 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
     roots: &public,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let mut answer = Vec::new();
   stream_out(
     &view,
@@ -1279,9 +1311,14 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   let mut walked = 0;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-      .unwrap()
-      .answering_from_its_texts();
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (UNSTEPPED, &mut room()),
+    )
+    .unwrap()
+    .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1316,7 +1353,7 @@ fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
       roots: &public,
       ..state_of(&imported)
     };
-    let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
     let mut whole = Vec::new();
     stream_out(
       &view,
@@ -1381,9 +1418,14 @@ fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
   let mut deltas = 0usize;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-      .unwrap()
-      .answering_from_its_texts();
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (UNSTEPPED, &mut room()),
+    )
+    .unwrap()
+    .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1518,7 +1560,7 @@ fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
     roots: &public,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let mut whole = Vec::new();
   stream_out(
     &view,
@@ -1605,7 +1647,8 @@ const MANY_LOGS: u64 = 64;
 /// the serving shard idle half the stream, waiting on one store ask a log, both passes, about 12,000 of them, each a turn
 /// with its view made afresh). Do: build a repository of one changeset and [`MANY_LOGS`] file logs of one revision
 /// each; stream it whole, in a room that holds it, from a store that counts its asks. Expect the store asked for rows
-/// once a pass (the count, then the writing) and for chunks once, whatever the logs; and the same bytes as the stream
+/// once a pass (the count, then the writing) and for chunks once a pass too (the count sizes each chunk compressed,
+/// main's ruling of 2026-11-25), whatever the logs; and the same bytes as the stream
 /// made a step at a time in a room that holds one log's rows or one chunk (which asks more).
 #[test]
 fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
@@ -1685,7 +1728,7 @@ fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
       counted.chunks
     ),
     // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written.
-    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 1),
+    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 2),
     "(index files, row asks, chunk asks)"
   );
 }
@@ -1703,9 +1746,14 @@ fn a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_roun
   use super::super::lookup::{TagsRead, lookup};
   use crate::render::Want;
   let (imported, store) = imported("hidden-tag");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
   let mut asks = Vec::new();
   while let Some(want) = tags.wants().cloned() {
@@ -1740,7 +1788,13 @@ fn a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_roun
 fn a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup() {
   use super::super::lookup::{TagsRead, lookup};
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
   let tags = TagsRead::begin(&view, &mut room()).unwrap();
   assert_eq!(tags.wants(), None);
   let mut out = Vec::new();
@@ -1759,10 +1813,21 @@ fn a_batch_of_lookups_reads_the_tags_once() {
   use super::super::session::{Batch, BatchStep, Transport};
   use crate::render::StoreWants;
   let (imported, store) = imported("hidden-tag");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
-  let answering = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap();
+  let answering = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   let mut batch = Batch::begin(b"lookup key=seen;lookup key=nope", &mut room()).unwrap();
   let mut waits = 0;
   let mut asks = 0;
@@ -1850,9 +1915,14 @@ fn a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step() {
 #[test]
 fn a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_from_its_texts();
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_from_its_texts();
   let lent = |view: &Indexed<'_>| {
     let lends = view.lends();
     lends.in_place + lends.copied
@@ -2172,9 +2242,14 @@ fn clone_and_pull(
   store: &ContentStore,
   saved: BTreeMap<(Vec<u8>, Node), Vec<u8>>,
 ) -> (Sent, Sent, u64) {
-  let view = Indexed::new(&imported.index, store, state_of(imported), &mut room())
-    .unwrap()
-    .answering_log_texts(saved);
+  let view = Indexed::new(
+    &imported.index,
+    store,
+    state_of(imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_log_texts(saved);
   let clone = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
   let common = hex(&view.node(0).unwrap());
   let pulled = pull::outgoing(&view, b"", common.as_bytes(), &mut room()).unwrap();
@@ -2235,6 +2310,58 @@ fn a_fetch_reads_a_changelog_or_manifest_text_let_go_from_the_changeset_store() 
   assert!(answered > 0, "texts answered by the changeset store");
 }
 
+/// Goal 93 (main's ruling of 2026-11-25: a fetch's batch of let-go changelog and manifest texts sized by what one step
+/// copies, not by the fetch's room; at hg's 57k clone a room's batch held gigabytes of texts at once, the system
+/// allocator keeping 5.25 GB of them after). Do: over `divergent` (every changeset served, so a clone is walked by its
+/// links as a clone of hg's own history is), save every changeset's and manifest's text and let go every object those
+/// rows name; clone through a view whose fetch asks at most `step` bytes of texts a want, `step` twice the longest such
+/// text, walked a step at a time, the tests' store answering from what was saved; and clone again with no step but the
+/// room's. Expect: the same changegroup both times; with the step, every want of texts holding at most `step` bytes, or
+/// one text alone, and more than one want made. Red before: one want of a whole log's texts, as many as the room held.
+#[test]
+fn a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes() {
+  let (imported, mut store) = imported("divergent");
+  let (saved, objects) = log_texts_and_objects(&imported.index, &store);
+  let longest = saved.values().map(Vec::len).max().unwrap() as u64;
+  let step = 2 * longest;
+  let freed: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(freed > 0, "the log texts let go");
+  let clone_within = |step: u64| {
+    let view = Indexed::new(
+      &imported.index,
+      &store,
+      state_of(&imported),
+      (step, &mut room()),
+    )
+    .unwrap()
+    .answering_log_texts(saved.clone());
+    let clone = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
+    let mut walk =
+      super::super::getbundle::Walk::begin(&view, &clone, Version::V03, &mut room()).unwrap();
+    let mut out = Vec::new();
+    while walk.step(&view, &mut room(), &mut out).unwrap() {}
+    (out, view.texts_asked())
+  };
+  let (unstepped, whole) = clone_within(UNSTEPPED);
+  let (stepped, asked) = clone_within(step);
+  assert_eq!(stepped, unstepped, "the same changegroup within the step");
+  let total: u64 = saved.values().map(|text| text.len() as u64).sum();
+  println!(
+    "indexed: {} log texts, {total} B, longest {longest} B, step {step} B: wants {asked:?} (the room's {whole:?})",
+    saved.len()
+  );
+  assert!(asked.len() > 1, "more than one want of texts: {asked:?}");
+  assert!(
+    asked
+      .iter()
+      .all(|(texts, bytes)| *bytes <= step || *texts == 1),
+    "every want of texts within {step} B or one text alone: {asked:?}"
+  );
+}
+
 /// Goal 93, C1 (1) P2 (lookup's half). Do: over `hidden-tag` (a visible head whose `.hgtags` tags the root `seen`), save
 /// every changeset's and manifest's text; let go every object those rows name; read the heads' `.hgtags` through a view
 /// whose changeset store answers those logs' texts from what was saved, and look up `seen`. Expect: objects let go; the
@@ -2252,9 +2379,14 @@ fn a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store() {
     .map(|object| store.let_go_object(object))
     .sum();
   assert!(let_go > 0, "objects let go");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
-    .unwrap()
-    .answering_log_texts(saved);
+  let view = Indexed::new(
+    &imported.index,
+    &store,
+    state_of(&imported),
+    (UNSTEPPED, &mut room()),
+  )
+  .unwrap()
+  .answering_log_texts(saved);
   let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
   let mut asks = Vec::new();
   while let Some(want) = tags.wants().cloned() {
@@ -2288,4 +2420,231 @@ fn a_lookup_reads_a_heads_manifest_let_go_from_the_changeset_store() {
     String::from_utf8(out).unwrap(),
     "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n"
   );
+}
+
+/// A `stream2` part's payload read back (7.2's `consumev2`): each file's source, name and bytes.
+fn stream2_files(mut payload: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+  let uvarint = |rest: &mut &[u8]| {
+    let (mut value, mut shift) = (0_u64, 0_u32);
+    loop {
+      let (byte, tail) = rest.split_first().unwrap();
+      *rest = tail;
+      value |= u64::from(byte & 0x7f) << shift;
+      if byte & 0x80 == 0 {
+        return usize::try_from(value).unwrap();
+      }
+      shift += 7;
+    }
+  };
+  let mut files = Vec::new();
+  while let Some((source, tail)) = payload.split_first() {
+    payload = tail;
+    let (name_len, size) = (uvarint(&mut payload), uvarint(&mut payload));
+    let (name, tail) = payload.split_at(name_len);
+    let (bytes, tail) = tail.split_at(size);
+    files.push((*source, name.to_vec(), bytes.to_vec()));
+    payload = tail;
+  }
+  files
+}
+
+/// `getbundle`'s answer to `asked`, its store wants answered by `source` between steps, as an edge answers them.
+fn answered_getbundle(
+  view: &Indexed<'_>,
+  asked: &super::super::getbundle::Asked<'_>,
+  source: &mut impl crate::render::StoredSource,
+) -> Result<Vec<u8>, Refusal> {
+  use super::super::getbundle::{Answering, Given};
+  let mut answering = Answering::begin(view, asked, &mut room())?;
+  let mut out = Vec::new();
+  loop {
+    match answering.wants().cloned() {
+      Some(crate::render::Want::Rows { logs }) => {
+        answering.give(Given::Rows(source.rows(&logs).unwrap()));
+      }
+      Some(crate::render::Want::Chunks { places }) => {
+        answering.give(Given::Chunks(source.chunks(&places).unwrap()));
+      }
+      Some(crate::render::Want::Texts { .. }) => panic!("a stream reads no text whole"),
+      None => {}
+    }
+    if !answering.step(view, &mut room(), &mut out)? {
+      return Ok(out);
+    }
+  }
+}
+
+/// The `states` repository imported, its secret roots dropped as `keep_secret` says, served as a view.
+fn states_view(keep_secret: bool) -> (Imported, ContentStore, Vec<PhaseHead>) {
+  let (imported, store) = imported("states");
+  let roots: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| keep_secret || root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  (imported, store, roots)
+}
+
+/// A client's `getbundle` asking a stream clone (7.2's `_pullbundle2` streaming: `cg=0`, `stream=1`), its bundle2
+/// capabilities `blob`.
+fn stream_asked(bundlecaps: &[u8]) -> super::super::getbundle::Asked<'_> {
+  super::super::getbundle::Asked {
+    bundlecaps,
+    cg: Some(b"0"),
+    stream: Some(b"1"),
+    ..super::super::getbundle::Asked::default()
+  }
+}
+
+/// A `getbundle` capability list: `HG20`, then the bundle2 capability blob `blob`, quoted.
+fn stream_caps(blob: &[u8]) -> Vec<u8> {
+  let mut caps = b"HG20,bundle2=".to_vec();
+  crate::quote::quote(blob, b"", &mut caps);
+  caps
+}
+
+/// Stream clones part 3 (main 01a20182's order of 2026-11-25: w-interop's comparison found 7.2's client falling back to
+/// `stream_out` against slates, where stock serves a `stream2` part). Do: ask `capabilities` over SSH of the `states`
+/// repository with its secret changeset and without it. Expect `bundle2`'s blob to list `stream=v2` only while a stream
+/// is served, beside `streamreqs`.
+#[test]
+fn bundle2_lists_stream_v2_only_while_a_stream_is_served() {
+  for keep_secret in [true, false] {
+    let (imported, store, roots) = states_view(keep_secret);
+    let state = State {
+      roots: &roots,
+      ..state_of(&imported)
+    };
+    let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let _ = super::super::session::serve(
+      &view,
+      b"capabilities\n",
+      &mut room(),
+      &mut stdout,
+      &mut stderr,
+    );
+    let line = stdout.splitn(2, |byte| *byte == b'\n').nth(1).unwrap();
+    let listed = crate::capabilities::decode(line);
+    let quoted = listed.get(b"bundle2").flatten().unwrap();
+    let mut blob = Vec::new();
+    crate::quote::unquote(quoted, &mut blob);
+    let lists_v2 = blob
+      .split(|byte| *byte == b'\n')
+      .any(|cap| cap == b"stream=v2");
+    assert_eq!(lists_v2, !keep_secret, "secret kept: {keep_secret}");
+    assert_eq!(listed.get(b"streamreqs").is_some(), !keep_secret);
+  }
+}
+
+/// Stream clones part 3 (7.2's `addpartbundlestream2`, version `v2`). Do: ask a `getbundle` stream clone of the
+/// `states` repository, its secret root dropped, from a client listing `stream=v2`, the repository publishing and not.
+/// Expect one `STREAM2` part, its mandatory `bytecount`, `filecount` and quoted `requirements` naming what its payload
+/// carries; the payload every non-empty revlog of `render::revlogs` in its order, each from the store (`s`), named by
+/// its store path before encoding, its bytes byte for byte; then, not publishing, `phaseroots` with each draft root
+/// sorted (7.2's `_writeroots`), which its client takes for its phases; no changegroup beside it.
+#[test]
+fn a_stream_clone_over_bundle2_sends_the_rendered_revlogs_as_a_stream2_part() {
+  for publishing in [true, false] {
+    stream2_of_states(publishing);
+  }
+}
+
+/// [`a_stream_clone_over_bundle2_sends_the_rendered_revlogs_as_a_stream2_part`] of a repository `publishing` or not.
+fn stream2_of_states(publishing: bool) {
+  let (imported, store, roots) = states_view(false);
+  let state = State {
+    roots: &roots,
+    publishing,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let caps = stream_caps(b"HG20\nbookmarks\nchangegroup=01,02,03\nstream=v2");
+  let answer = answered_getbundle(
+    &view,
+    &stream_asked(&caps),
+    &mut whole_texts(&imported.index, &store),
+  )
+  .unwrap();
+  let bundle = crate::bundle2::Bundle2::decode(&answer, &mut room()).unwrap();
+  let parts: Vec<_> = bundle.top_level().collect();
+  assert_eq!(parts.len(), 1, "the stream alone");
+  let (index, part) = parts[0];
+  assert_eq!(part.kind, b"STREAM2");
+  assert_eq!(part.mandatory_params, 3);
+  let payload = bundle.payload_bytes(index, &mut room()).unwrap();
+  let files = stream2_files(&payload);
+  let mut expected: Vec<(u8, Vec<u8>, Vec<u8>)> =
+    crate::render::revlogs(&imported.index, &store, &mut room())
+      .unwrap()
+      .into_iter()
+      .filter(|(_, bytes)| !bytes.is_empty())
+      .map(|(name, bytes)| (b's', name, bytes))
+      .collect();
+  if !publishing {
+    let mut drafts: Vec<Node> = view.draft_roots().collect();
+    assert!(!drafts.is_empty(), "a draft root to send (non-vacuity)");
+    drafts.sort_unstable();
+    let mut lines = Vec::new();
+    for root in &drafts {
+      lines.extend_from_slice(b"1 ");
+      crate::pushkey::encode_hex(root, &mut lines);
+      lines.push(b'\n');
+    }
+    expected.push((b's', b"phaseroots".to_vec(), lines));
+  }
+  assert_eq!(files, expected, "publishing: {publishing}");
+  assert!(
+    files.iter().any(|(_, name, _)| name == b"00changelog.i"),
+    "the changelog sent (non-vacuity)"
+  );
+  stream2_params_name(part, &files);
+}
+
+/// `part`'s parameters name `files`: their count, their bytes, and the rendered store's requirements, quoted.
+fn stream2_params_name(part: &crate::bundle2::Part<'_>, files: &[(u8, Vec<u8>, Vec<u8>)]) {
+  let bytes: usize = files.iter().map(|(_, _, bytes)| bytes.len()).sum();
+  assert_eq!(
+    part.param(b"filecount"),
+    Some(files.len().to_string().as_bytes())
+  );
+  assert_eq!(part.param(b"bytecount"), Some(bytes.to_string().as_bytes()));
+  assert_eq!(
+    part.param(b"requirements"),
+    Some(&b"generaldelta%2Crevlog-compression-zstd%2Crevlogv1%2Csparserevlog"[..])
+  );
+}
+
+/// Stream clones part 3, hostile asks (7.2's `addpartbundlestream2` aborts). Do: ask a stream clone from a client that
+/// lists no stream version, and one of the `states` repository with its secret changeset. Expect each refused before
+/// anything is written: no common stream version; no stream served.
+#[test]
+fn a_stream_clone_over_bundle2_is_refused_without_a_common_version_or_a_served_stream() {
+  let (imported, store, roots) = states_view(false);
+  let state = State {
+    roots: &roots,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let old = stream_caps(b"HG20\nchangegroup=01,02,03");
+  let refused = answered_getbundle(
+    &view,
+    &stream_asked(&old),
+    &mut whole_texts(&imported.index, &store),
+  );
+  assert!(matches!(refused, Err(Refusal::NoCommonExchange { .. })));
+  let (imported, store, roots) = states_view(true);
+  let state = State {
+    roots: &roots,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let caps = stream_caps(b"HG20\nchangegroup=01,02,03\nstream=v2");
+  let refused = answered_getbundle(
+    &view,
+    &stream_asked(&caps),
+    &mut whole_texts(&imported.index, &store),
+  );
+  assert!(matches!(refused, Err(Refusal::Store { .. })));
 }

@@ -2,7 +2,10 @@
 //! `exchange.getbundlechunks` writes for a client's arguments, assembled through this crate's codecs over a [`Store`],
 //! the served view with the revisions it names.
 //!
-//! **The parts**, in 7.2's order (`getbundle2partsorder`), each only where asked: `CHANGEGROUP` (the highest version
+//! **The parts**, in 7.2's order (`getbundle2partsorder`), each only where asked: `STREAM2` (a stream clone, `stream=1`:
+//! the repository's revlogs as their files, [`crate::render::Streaming`] framed as 7.2's `generatev2` frames them, its
+//! counts and requirements its mandatory parameters, then a non-publishing repository's `phaseroots`; no changegroup
+//! beside it, as 7.2's client asks `cg=0` with it), `CHANGEGROUP` (the highest version
 //! the client's bundle2 capabilities list among `02` and `03`, its `version` mandatory and `nbchanges` advisory; none
 //! when nothing is missing, or when the client named no bundle2 capability at all), `BOOKMARKS` (`listbinbookmarks`;
 //! none when there are none), a `LISTKEYS` part for each namespace asked, `OBSMARKERS` (the markers relevant to the
@@ -62,8 +65,8 @@ use crate::obsmarkers::{self, Format};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
 use crate::{
-  Admission, NULL_NODE, Node, PastAdmission, bookmarks, changeset, delta, manifest, phases,
-  pushkey, quote,
+  Admission, NODE_LEN, NULL_NODE, Node, PastAdmission, bookmarks, changeset, delta, manifest,
+  phases, pushkey, quote,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,6 +80,13 @@ pub trait Store: Repository {
   /// step, so no step decides or holds more however long the history (goal 93: a clone's file section asked the whole
   /// history's rows in one batch and decided them in one 2 s step, CI 45117277400).
   fn rows_a_step(&self) -> u64;
+
+  /// Derived: the most bytes of texts one want of a fetch asks the changeset store to make and copy at once, one text at
+  /// least: the step's copy budget (the daemon's `copy_slice_bytes`, the machine's measured memcpy rate over the copy
+  /// share of its step quantum), so the store's owner copies no more for one request, a text past it in slices, and the
+  /// walk holds no more texts a batch however long the history (goal 93, main's ruling of 2026-11-25: a batch sized by
+  /// the fetch's room held gigabytes of hg's 57k clone's texts at once).
+  fn text_bytes_a_step(&self) -> u64;
 
   /// A changeset's text; `None` past the view, or where the store does not hold it whole.
   fn changeset_text(
@@ -274,7 +284,9 @@ impl LogTexts {
   /// Asks the changeset store for the texts of `nodes` of `log` in one want of rows and one of texts (goal 93: a clone
   /// after P5 asked a row and a text a revision, two store asks a changeset and two a manifest, each a scan of the log's
   /// rows; main's interop bench: hg's 57k clone past 13.5 minutes). The first is the one its unit waits for; the rest
-  /// are the units' after it, as many as `most` bytes hold beside it. What the last batch was given and its units did not
+  /// are the units' after it, as many as `most` bytes hold beside it: the least of the walk's room and a step's bytes
+  /// ([`Store::text_bytes_a_step`]), so a batch is what one step copies, never the room's gigabytes (goal 93, main's
+  /// ruling of 2026-11-25). What the last batch was given and its units did not
   /// take is let go. Refused where the store gave nothing for the last one asked, or the log holds no row of the first.
   fn ask_batch(
     &mut self,
@@ -461,6 +473,8 @@ pub struct Asked<'a> {
   pub obsmarkers: Option<&'a [u8]>,
   /// The pushkey namespaces to list, every comma-separated item one, an empty one too (7.2's `csv`).
   pub listkeys: Option<&'a [u8]>,
+  /// Whether to send the repository's files as a stream clone (a `stream2` part; not unless true).
+  pub stream: Option<&'a [u8]>,
 }
 
 /// Format: the bundle capability that carries the bundle2 ones (`bundle2=<quoted blob>`).
@@ -468,6 +482,21 @@ const BUNDLE2_CAPABILITY: &[u8] = b"bundle2=";
 
 /// Format: what a bundle capability starts with when the client asks for a bundle2 answer (`bundle2requested`).
 const BUNDLE2_REQUESTED: &[u8] = b"HG2";
+
+/// Format: the bundle2 capability naming the stream clone versions a side reads (7.2's `stream`).
+pub(crate) const STREAM: &[u8] = b"stream";
+
+/// Format: the stream clone version served (7.2's `v2`, a `stream2` part).
+pub(crate) const STREAM_VERSION: &[u8] = b"v2";
+
+/// Format: a stream clone's part type, as mandatory parts are written: upper-case.
+const STREAM2: &[u8] = b"STREAM2";
+
+/// Format: the store file of a non-publishing repository's phase roots, as a stream names it.
+const PHASEROOTS: &[u8] = b"phaseroots";
+
+/// Format: a draft root's line before its node (`phases.draft`'s number and a space).
+const DRAFT_ROOT: &[u8] = b"1 ";
 
 /// Format: the changegroup versions served, oldest first (§4.17.3 "Changegroup versions").
 const SERVED_VERSIONS: [&[u8]; 2] = [b"02", b"03"];
@@ -526,8 +555,13 @@ pub fn getbundle(
 /// ([`pull::Ranges`]) and its place in the changegroup ([`Walk`]); never a revision's text past its step.
 #[derive(Debug)]
 pub struct Answering {
-  /// The stream's head and the changegroup part's header, until the first step writes them.
+  /// The stream's head and the changegroup part's header, until the first step writes them; a stream clone's
+  /// `stream2` part's header follows its head once its files are counted.
   head: Option<Vec<u8>>,
+  /// A stream clone's files ([`crate::render::Streaming`] framed as a `stream2` part's payload), while they are sent.
+  stream: Option<Box<crate::render::Streaming>>,
+  /// A stream clone's `phaseroots`, sent after its revlogs where the repository is not publishing.
+  phaseroots: Option<Vec<u8>>,
   /// The changegroup, while one is sent.
   walk: Option<Walk>,
   /// The parts after the changegroup and the stream's end, until the last step writes them.
@@ -537,6 +571,9 @@ pub struct Answering {
 impl Answering {
   /// What the answer's next step asks of the changeset store, if anything (its changegroup's file section, [`Walk`]).
   pub fn wants(&self) -> Option<&crate::render::Want> {
+    if let Some(stream) = &self.stream {
+      return stream.wants();
+    }
     self.walk.as_ref()?.wants()
   }
 
@@ -547,6 +584,15 @@ impl Answering {
 
   /// The changeset store's answer to [`Answering::wants`].
   pub fn give(&mut self, given: Given) {
+    if let Some(stream) = &mut self.stream {
+      match given {
+        Given::Rows(rows) => stream.give_rows(rows),
+        Given::Chunks(chunks) => stream.give_chunks(chunks),
+        // A stream reads no changeset's or manifest's text whole.
+        Given::Texts(_) | Given::TextsPast => {}
+      }
+      return;
+    }
     if let Some(walk) = &mut self.walk {
       walk.give(given);
     }
@@ -562,7 +608,16 @@ impl Answering {
     let mut unquoted = Vec::new();
     let caps = bundle2_capabilities(asked.bundlecaps, admission, &mut unquoted)?;
     let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
-    let changegroup = changegroup_part(&outgoing, asked.cg, &caps)?;
+    let stream = stream_asked(store, asked.stream, &caps)?;
+    let phaseroots = match stream {
+      Some(_) => stream_phaseroots(store, admission)?,
+      None => None,
+    };
+    // A stream clone carries every changeset; 7.2's client asks it with `cg=0`, and none is sent beside it.
+    let changegroup = match stream {
+      Some(_) => None,
+      None => changegroup_part(&outgoing, asked.cg, &caps)?,
+    };
     let mut parts = Vec::new();
     if flag(asked.bookmarks, false) {
       parts.extend(bookmarks_part(store, &caps, admission)?);
@@ -582,6 +637,8 @@ impl Answering {
         crate::bundle2::put_part_header(&header, &mut head).map_err(|_| unencodable("a part"))?;
         1
       }
+      // The `stream2` part's header, written once its files are counted (its parameters name them).
+      None if stream.is_some() => 1,
       None => 0,
     };
     let tail = frame_after(&parts, first, admission)?;
@@ -597,6 +654,8 @@ impl Answering {
     };
     Ok(Answering {
       head: Some(head),
+      stream,
+      phaseroots,
       walk,
       tail: Some(tail),
     })
@@ -610,6 +669,15 @@ impl Answering {
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
+    if let Some(stream) = &mut self.stream {
+      let streaming = (&mut **stream, &mut self.head, &mut self.phaseroots);
+      return streamed_step(streaming, store, room, out).map(|more| {
+        if !more {
+          self.stream = None;
+        }
+        true
+      });
+    }
     if let Some(head) = self.head.take() {
       out.extend_from_slice(&head);
       return Ok(true);
@@ -631,6 +699,141 @@ impl Answering {
     }
     Ok(false)
   }
+}
+
+/// A stream clone's step (7.2's `addpartbundlestream2`, version `v2`): while its files are counted, a step that writes
+/// nothing; then the stream's head and the `stream2` part's header, its counts and the requirements its client must
+/// hold as mandatory parameters; then its files a step at a time, each step's bytes one payload chunk; then the part's
+/// end. Whether it has more to write. A store that keeps no row of a revision the stream must send is refused before
+/// anything is written (7.2 serves no stream of a store it cannot read; `stream_out` answers `1`).
+fn streamed_step(
+  (stream, head, phaseroots): (
+    &mut crate::render::Streaming,
+    &mut Option<Vec<u8>>,
+    &mut Option<Vec<u8>>,
+  ),
+  store: &impl Store,
+  room: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<bool, Refusal> {
+  let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
+  if let Some(written) = head.as_mut() {
+    match stream.counted() {
+      crate::render::Counted::Counting => {
+        let mut nothing = Vec::new();
+        stream
+          .step(index, content, room, &mut nothing)
+          .map_err(super::stream::revlog_refused)?;
+        return Ok(true);
+      }
+      crate::render::Counted::Unserved => return Err(Refusal::Store { what: "a revlog" }),
+      crate::render::Counted::Served { files, bytes } => {
+        let (files, bytes) = match phaseroots.as_ref() {
+          Some(roots) => (
+            files.saturating_add(1),
+            bytes.saturating_add(to_u64(roots.len())),
+          ),
+          None => (files, bytes),
+        };
+        let built = stream_part(files, bytes);
+        crate::bundle2::put_part_header(&built_part(&built, 0), written)
+          .map_err(|_| unencodable("a part"))?;
+        room.charge(to_u64(written.len()))?;
+        out.append(written);
+        *head = None;
+        return Ok(true);
+      }
+    }
+  }
+  let mut chunk = Vec::new();
+  let more = stream
+    .step(index, content, room, &mut chunk)
+    .map_err(super::stream::revlog_refused)?;
+  if !more && let Some(roots) = phaseroots.take() {
+    crate::render::file_entry(PHASEROOTS, to_u64(roots.len()), room, &mut chunk)
+      .map_err(super::stream::revlog_refused)?;
+    chunk.extend_from_slice(&roots);
+  }
+  if !chunk.is_empty() {
+    crate::bundle2::put_payload_chunk(out, &chunk).map_err(|_| unencodable("a chunk"))?;
+  }
+  if !more {
+    crate::bundle2::put_payload_chunk(out, &[]).map_err(|_| unencodable("a chunk"))?;
+  }
+  Ok(more)
+}
+
+/// A stream clone's `phaseroots` where the repository is not publishing (7.2's `_walkstreamfullstorefiles`, after the
+/// revlogs; its client takes the stream's phases for its own and asks none): each draft root, sorted, as 7.2's
+/// `_writeroots` writes it (`1 <hex node>`); none for a publishing repository, whose every changeset is public, nor
+/// where no changeset is draft. A
+/// secret changeset serves no stream ([`stream_asked`]). Its bytes charged to `admission`.
+fn stream_phaseroots(
+  store: &impl Store,
+  admission: &mut Admission,
+) -> Result<Option<Vec<u8>>, Refusal> {
+  if store.publishing() {
+    return Ok(None);
+  }
+  let mut roots: Vec<Node> = store.draft_roots().collect();
+  if roots.is_empty() {
+    return Ok(None);
+  }
+  roots.sort_unstable();
+  // Format: the phase's digit, a space, the node's hex and a line end.
+  let line = to_u64(NODE_LEN.saturating_mul(2).saturating_add(3));
+  admission.charge(to_u64(roots.len()).saturating_mul(line))?;
+  let mut bytes = Vec::new();
+  for root in &roots {
+    bytes.extend_from_slice(DRAFT_ROOT);
+    crate::pushkey::encode_hex(root, &mut bytes);
+    bytes.push(NEWLINE);
+  }
+  Ok(Some(bytes))
+}
+
+/// The `stream2` part of a stream sending `files` files of `bytes` bytes, its payload sent apart: its counts and the
+/// requirements its client must hold (7.2's `_formatrequirementsspec`: sorted, joined by commas, quoted), all
+/// mandatory.
+fn stream_part(files: u64, bytes: u64) -> Built {
+  let mut requirements = Vec::new();
+  quote::quote(
+    crate::render::STREAM_REQUIREMENTS,
+    quote::PATH_SAFE,
+    &mut requirements,
+  );
+  Built {
+    kind: STREAM2,
+    mandatory: vec![
+      (&b"bytecount"[..], bytes.to_string().into_bytes()),
+      (&b"filecount"[..], files.to_string().into_bytes()),
+      (&b"requirements"[..], requirements),
+    ],
+    advisory: Vec::new(),
+    payload: Vec::new(),
+  }
+}
+
+/// A stream clone where `stream` asks one (7.2's `addpartbundlestream2`): refused where the store serves none (a secret
+/// changeset; 7.2's "stream data requested but server does not allow this feature") or the client's bundle2
+/// capabilities list no stream version served here (7.2's "no common supported version").
+fn stream_asked(
+  store: &impl Store,
+  stream: Option<&[u8]>,
+  caps: &Bundle2Capabilities<'_>,
+) -> Result<Option<Box<crate::render::Streaming>>, Refusal> {
+  if !flag(stream, false) {
+    return Ok(None);
+  }
+  if !store.streams() || store.revlogs().is_none() {
+    return Err(Refusal::Store { what: "a stream" });
+  }
+  if !offers(caps, STREAM, Some(STREAM_VERSION)) {
+    return Err(Refusal::NoCommonExchange {
+      what: "stream clone versions",
+    });
+  }
+  Ok(Some(Box::new(crate::render::Streaming::v2())))
 }
 
 /// A boolean argument as 7.2 reads one: `default` where absent, false for `0` or nothing, true otherwise.
@@ -1328,14 +1531,15 @@ impl Walk {
           Cow::Owned(text)
         }
         None => {
-          // This changeset's text and the next missing ones', as the room holds them, in one batch.
+          // This changeset's text and the next missing ones', as a step's bytes and the room hold them, in one batch.
           let missing = &self.missing;
           let mut ahead =
             core::iter::successors(Some(rev), |at| missing.next_from(at.saturating_add(1)))
               .map_while(|at| store.node(at));
+          let most = room.left().min(store.text_bytes_a_step());
           self
             .logs
-            .ask_batch(store, WholeLog::Changelog, (&mut ahead, room.left()))?;
+            .ask_batch(store, WholeLog::Changelog, (&mut ahead, most))?;
           return Ok(Some(At::Changelog(from)));
         }
       },
@@ -1397,16 +1601,18 @@ impl Walk {
       )?;
     } else {
       let Some(text) = self.logs.take(&linked.node) else {
-        // This manifest's text and those of the next ones a missing changeset links, as the room holds them, in one
-        // batch.
+        // This manifest's text and those of the next ones a missing changeset links, as a step's bytes and the room
+        // hold them, in one batch.
         let missing = &self.missing;
         let mut ahead = (position..)
           .map_while(|at| store.manifest_linked(at))
           .filter(|linked| linked.link.is_some_and(|link| missing.contains(link)))
           .map(|linked| linked.node);
-        self
-          .logs
-          .ask_batch(store, WholeLog::Manifest, (&mut ahead, room.left()))?;
+        self.logs.ask_batch(
+          store,
+          WholeLog::Manifest,
+          (&mut ahead, room.left().min(store.text_bytes_a_step())),
+        )?;
         return Ok(Some(At::Manifests(position, sent)));
       };
       let entry = store.manifest_entry(&linked.node).ok_or_else(no_manifest)?;

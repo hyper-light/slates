@@ -636,7 +636,8 @@ fn string_answer<'a>(
 }
 
 /// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`]; over HTTP [`SERVED_HTTP`],
-/// `httpheader`'s value the transport's; over either, `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`].
+/// `httpheader`'s value the transport's; over either, `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`], with
+/// `stream=v2` while a stream is served (a stream clone over bundle2, a `stream2` part of `getbundle`'s answer).
 fn advertised(
   (transport, streams): (Transport, bool),
   admission: &mut Admission,
@@ -651,8 +652,16 @@ fn advertised(
     names.push(STREAMREQS);
     names.sort_unstable();
   }
+  let mut bundle2 = BUNDLE2_SERVED.to_vec();
+  if streams {
+    // 7.2's `getrepocaps` lists the stream clone versions it serves while it serves a stream (`stream=v2`), last by name.
+    bundle2.push((
+      super::getbundle::STREAM,
+      &[super::getbundle::STREAM_VERSION],
+    ));
+  }
   let mut blob = Vec::new();
-  capabilities::encode_bundle2(&BUNDLE2_SERVED, &mut blob);
+  capabilities::encode_bundle2(&bundle2, &mut blob);
   let mut quoted = Vec::new();
   capabilities::encode_bundle2_value(&blob, &mut quoted);
   let header_line = Decimal::unsigned(header_line);
@@ -973,6 +982,7 @@ pub(crate) fn getbundle_asked<'a>(arguments: &Arguments<'a>) -> Asked<'a> {
     bookmarks: arguments.entry(b"bookmarks"),
     obsmarkers: arguments.entry(b"obsmarkers"),
     listkeys: arguments.entry(b"listkeys"),
+    stream: arguments.entry(b"stream"),
   }
 }
 
