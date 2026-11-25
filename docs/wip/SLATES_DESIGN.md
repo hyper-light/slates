@@ -11866,6 +11866,10 @@ records it (`LoggedChange::Joined`, indexed as each names-log part is accepted).
 nothing copied), a source that owes its push made first through A-886's door, and the branch's record refused
 `OUT_OF_ORDER` while its source is behind; a family green whose join no part held here records yet waits `OUT_OF_ORDER`,
 since the owner owes its names log to every holder of its greens (one placement: a family's ids share their line key).
+Nothing acknowledged rests on a join only its owner held (A-915): a repository's creation answers once its root's join
+is at `f + 1` as well as its record, so a successor's adoption, which holds the names log its takeover gathered from a
+quorum, finds every acknowledged green's join; one whose join it does not find was never acknowledged a member, and its
+adoption is refused (`merge.takeover.adopted_unjoined`) and given up typed, never waited for.
 At a takeover the successor adopts a lineage whole, its members' engines with it, once every member's replica is at its
 adopted version (`green_adopt::take_engine`).
 A holder restarted warm keeps its records, not its replicas, and rebuilds a replica as it first made it (A-908 part 4,
@@ -63282,6 +63286,10 @@ Applied in the same change to: §4.10 "Content homed by identity" (piece 6's ser
   for its record's `f + 1`.
 - **Rejected.** Waiting in the creation's task on A-886's push barrier: it re-asks at the record plane's poll, and a
   creation's resend would run it again instead of joining it. And a second hold beside the destroy's.
+- **Amended by A-915** (2026-11-24): the creation's hold waits for its names log's parts (its root's join) and its
+  greens' versions at `f + 1` as well as its record, one wait through a push's own barrier
+  (`state_log::names_committed`, `live_ship::placement_done`); the join's wait overlaps the record's (held 52 to 100
+  ms against 63.8 ms here).
 - **Test** (macOS arm64, debug). `slates-server --test fleet
   a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_served_by_a_survivor`: `git_fleet`
   checks, with no wait, that another node holds the record as the creation answers, and that the answer was held.
@@ -63636,3 +63644,54 @@ lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,
     short under load (5 of 10 at about 48 on 18 cores, at the homing): A-912's follow-up, owed (GAPS).
 - **Applied in the same change to** §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
+
+- **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to
+  74 and 3 of 120 in gates 16 to 18 since A-908 part 4 (160 of 160 in gates 12 to 15 before it): its successor never
+  served the repository, "a taken-over green … was not materialized after 36 attempts … waiting on its adoption".
+  Logged on the successor, every attempt: "rebuild <the root green>: member unknown", then "adoption rebuild … through
+  v0: Later", 36 of each. A-894's creation answered once its record was at `f + 1`; the names-log part carrying the
+  root's join shipped after, and an owner killed between left no survivor the join. A-908 part 4's rebuild waits
+  `Later` for an unknown join, which its owner owes; with the owner dead, forever. Before part 4 the rebuild built the
+  green alone.
+- **The change.**
+  - The creation's hold (`live_ship::defer_until_placed`, `PlacementOf::Repository`) is resolved by one check,
+    `live_ship::placement_done`: its record region-placed, and `state_log::names_committed` (a push's own barrier: its
+    names log's parts held at `f + 1`, its greens' versions placed). It is checked again as a names-log part or a
+    green's version is acknowledged (`live_ship::resolve_held_creations`), with no timer. At `f = 0` both are true at
+    once: the same code.
+  - A successor's adoption asks `merge_origin::rebuild_adopted_through`, which answers a family green whose join no
+    held part records `Unjoined`: its adoption is refused (`Engine::Refused`), its attempts count, and it is given up
+    typed (`NotRecovered`) within the failover delay's worth of periods, counted `merge.takeover.adopted_unjoined`. A
+    green's records arriving still wait for the join (`rebuild_replica_through`, `Later`): its owner owes it.
+- **The unacknowledged creation.** An owner killed while its creation waits for its join leaves the creation
+  unacknowledged (the client's call fails with the connection). The survivors hold its record. A client's retry of the
+  creation at a survivor answers typed, one of two ways. Before the successor adopts the record, the name is free
+  there: the retry makes the repository afresh, and the adopted record, never acknowledged, is refused at its rebuild
+  (`AlreadyExists`) and dropped, its adoption settled. Once the successor adopts it, the record's name is reserved on
+  the shard its partition routes to until its rebuild (`ShardState::adopted_names`, set by
+  `takeover::reserve_adopted_name`, let go in `takeover::rebuild_repository`): the retry is refused `AlreadyExists`
+  naming it, and its rebuild stands it, empty, as a create whose answer was lost. Before A-915 a retry in that window
+  made a second repository of the name, and the adopted one's rebuild was then refused against it. Either way the name
+  names one repository after.
+- **Measured** (macOS arm64, debug, 2026-11-24): a894's creation held 52 to 100 ms for its record's and its join's
+  `f + 1`, against 63.8 ms (A-894) for the record alone: the join's wait overlaps the record's.
+- **Tests.**
+  - Fleet `a915_a_creation_is_unacknowledged_while_its_roots_join_is_held_off_the_other_members` (a hook holds the
+    owner's state logs' shipping, `Daemon::hold_state_log_shipping`, so the kill falls between the record and the join
+    every run): the creation unanswered over 20 periods, then the owner killed; the client's retry at a survivor
+    answered typed; every survivor's adoption settled (rebuilt, or refused and dropped); a creation of the name again
+    naming the repository the retry left it to (`AlreadyExists`, one family with the root the retry made). Red in a
+    scratch copy without the change: the creation answered in the watch, and the retry at a survivor created another
+    repository beside the adopted one.
+  - `merge_origin::tests::a915_an_adoption_of_a_green_whose_join_is_unknown_is_refused_while_its_records_wait`.
+  - `repository::tests::a915_a_creation_of_a_name_taken_over_and_not_yet_rebuilt_is_refused_naming_it`: the reservation
+    path alone (in the fleet test the retry came before the adoption in every run seen).
+  - a894, its own flake's scene, green.
+- **Models.** None of `docs/wip/models/` models a creation's answer, the names log or an adoption's wait; no spec
+  changed.
+
+Applied in the same change to: §4.16 "Apply on holders", the A-894 entry, `crates/server/src/{live_ship,state_log,
+merge_service,merge_origin,green_adopt,fleet,state,daemon,repository,takeover}.rs`, `crates/server/tests/fleet.rs`,
+GAPS.

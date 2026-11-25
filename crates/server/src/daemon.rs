@@ -1750,6 +1750,15 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-915): while `held`, no shard of this node ships the state logs' parts it owes, so a repository's
+  /// creation here keeps its names-log part (its root's join) off the other members. `Ok` once set on every shard.
+  pub fn hold_state_log_shipping(&self, held: bool) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      self.observe(Some(*shard), move |s| s.state_log_ship_held = held)?;
+    }
+    Ok(())
+  }
+
   /// Test support (A-727 (d1a-3)): holds every rebuild of a repository this node took over while `held`
   /// (`fleet::hold_repository_rebuilds`), so a test orders a resolution pass before a rebuild.
   pub fn hold_repository_rebuilds(&self, held: bool) -> Result<(), ObserveError> {
@@ -5347,6 +5356,7 @@ async fn init_shard(
     callbacks: crate::callback::Callbacks::default(),
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
     council_rounds: crate::fleet::CouncilRounds::default(),
+    state_log_ship_held: false,
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
     member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
@@ -5494,6 +5504,7 @@ async fn init_shard(
     svn_views: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
+    adopted_names: std::collections::BTreeMap::new(),
   };
   slices
     .piece_done("the secrets, failover and the shard's state")

@@ -87,9 +87,8 @@ impl Positions {
     if end <= start {
       return Positions::new();
     }
-    Positions {
-      form: Form::Runs(vec![(start, end)]),
-    }
+    // Settled as every made set is: one position is a list's 8 bytes, never a run's 16 (the sweep after r870's union).
+    Positions::of_runs(vec![(start, end)])
   }
 
   /// The set of runs `runs`, ascending and apart, in its cheapest form.
@@ -121,6 +120,13 @@ impl Positions {
       Form::List(list) => WORD_BYTES.saturating_mul(crate::to_u64(list.len())),
       Form::Bits { words, .. } => WORD_BYTES.saturating_mul(crate::to_u64(words.len())),
     }
+  }
+
+  /// This set, settled in its cheapest form ([`Positions::settle`]).
+  fn settled(&self) -> Positions {
+    let mut set = self.clone();
+    set.settle();
+    set
   }
 
   /// Puts the set in its cheapest form (module docs): the runs, the list or the bit table, whichever costs fewest bytes,
@@ -314,8 +320,10 @@ impl Positions {
           (mine.0.min(theirs.0), mine.1.max(theirs.1)),
           |mine, theirs| mine | theirs,
         ),
-        (Some(_), None) => self.clone(),
-        (None, _) => other.clone(),
+        // The one side that holds anything, in its cheapest form: a table kept as it came can cost more than its
+        // positions do (r870's property test: a 3-word table of two positions, 24 bytes against a list's 16).
+        (Some(_), None) => self.settled(),
+        (None, _) => other.settled(),
       };
     }
     let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -865,7 +873,7 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+    #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("positions.proptest-regressions")).unwrap())]
 
     /// Gate r870 (main 01a20182, 2026-11-24: a clone of git/git spent about 100 s before its first pack byte in its
     /// derivation's set work, position by position). Do: draw two sets over a few hundred words, runs and scattered
@@ -930,6 +938,24 @@ mod tests {
   /// per-object handle it replaced) and no more than 16 a run.
   fn within_bound(set: &Positions) -> bool {
     set.bytes() <= 8 * set.len().max(1) && set.bytes() <= 16 * crate::to_u64(set.runs()).max(1)
+  }
+
+  /// r870's property test's minimal failure (found 2026-11-25): a set kept as a bit table of two positions three words
+  /// apart (24 bytes, where their list is 16), combined with an empty set. Expect: the union and the difference, either
+  /// way round, the two positions in their cheapest form, within the bound. Red before: the union kept the table as it
+  /// came (`Bits { start: 0, words: [131072, 0, 1] }`, 24 bytes).
+  #[test]
+  fn r870_a_table_combined_with_nothing_comes_back_in_its_cheapest_form() {
+    let table = as_table(&BTreeSet::from([17, 128]));
+    let empty = Positions::new();
+    for got in [
+      table.union(&empty),
+      empty.union(&table),
+      table.difference(&empty),
+    ] {
+      assert_eq!(got.iter().collect::<Vec<_>>(), [17, 128]);
+      assert!(within_bound(&got), "{got:?}: {} bytes", got.bytes());
+    }
   }
 
   proptest! {

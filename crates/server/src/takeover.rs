@@ -2746,6 +2746,7 @@ fn adopt_own(
   } else if let Some(repository) = crate::catalog::repository_of(&record.value) {
     // A repository's record (A-636 part 2c-1): kept for its rebuild from it and its state logs (part 2c-2), never
     // queued as a volume or a green.
+    reserve_adopted_name(state, object, &repository);
     state
       .pending_repositories
       .insert(object, (record.sequence, repository));
@@ -2855,6 +2856,28 @@ pub(crate) fn held_parts(
   .collect()
 }
 
+/// Reserves an adopted repository's name on the shard its partition routes to (A-915, `ShardState::adopted_names`),
+/// where a creation of the name runs and its rebuild will: directly when that is this shard, else as a task there,
+/// counted where refused (the reservation is then missing, as it was before A-915).
+fn reserve_adopted_name(
+  state: &mut ShardState,
+  object: ObjectId,
+  repository: &slates_db::catalog::RepositoryRecord,
+) {
+  let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+  let Some(target) = state.shards.get(usize::from(partition)).copied() else {
+    return;
+  };
+  let (name, id) = (repository.name.clone(), repository.id);
+  if target == state.shard {
+    state.adopted_names.insert(name, id);
+  } else {
+    crate::xshard::run_on_counted(state.shard, target, move |s| {
+      s.adopted_names.insert(name, id);
+    });
+  }
+}
+
 /// Rebuilds a repository taken over on the shard its id routes to (A-636 part 2c-2): keeps the parts of its state logs
 /// held whole by A-636 part 1's rule, each green's log judged by its head here ([`slates_db::repository::whole_parts`]),
 /// records it whole from its adopted record and those parts (`Op::RepositoryRebuilt`), and makes its store from the
@@ -2866,6 +2889,10 @@ pub(crate) fn rebuild_repository(
   record: slates_db::catalog::RepositoryRecord,
   parts: Vec<slates_db::catalog::StateLogRecord>,
 ) -> bool {
+  // Its name's reservation goes as the rebuild runs, recorded or refused (A-915).
+  if state.adopted_names.get(&record.name) == Some(&record.id) {
+    state.adopted_names.remove(&record.name);
+  }
   if state
     .db
     .partition()

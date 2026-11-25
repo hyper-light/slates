@@ -74,6 +74,17 @@ pub trait Graph {
 
   /// The object `id` names, when the store holds it.
   fn node(&self, id: &ObjectId) -> Option<Self::Node>;
+  /// The ids `tree`'s entries name, in the tree's order (main 01a20182's order of 2026-11-25: a walk takes a tree's
+  /// entries one a unit, so it reads their ids once and resolves each in its own unit, [`Graph::entry_node`]). By
+  /// default, [`Graph::entries`] named again.
+  fn entry_ids(&self, tree: Self::Node) -> Vec<ObjectId> {
+    self.entries(tree).map(|entry| self.id(entry)).collect()
+  }
+  /// The object a tree's entry `id` names, as [`Graph::entries`] resolves it (a store keeps the first it cannot find as
+  /// a fault). By default, [`Graph::node`].
+  fn entry_node(&self, id: &ObjectId) -> Option<Self::Node> {
+    self.node(id)
+  }
   /// The name of `node`.
   fn id(&self, node: Self::Node) -> ObjectId;
   /// What kind of object `node` is.
@@ -252,6 +263,10 @@ pub struct Counters {
   pub searched: u64,
   /// Trees the object enumeration opened.
   pub trees: u64,
+  /// The most entries one unit of the object enumeration took, resolved, judged and chosen before the walk asked
+  /// whether its step was spent (main 01a20182's order of 2026-11-25: a unit past the step quantum is the bounded-work
+  /// rule's bug signal, and a tree opened whole in one unit was one).
+  pub entries_most: u64,
 }
 
 /// What a negotiation answered, and how.

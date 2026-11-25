@@ -973,6 +973,9 @@ pub struct ShardState {
   /// The council's rounds that passed through this node, and the tasks waiting for the next (`crate::fleet::CouncilRounds`,
   /// A-912; the control shard's).
   pub(crate) council_rounds: crate::fleet::CouncilRounds,
+  /// Test support (A-915): while set, this shard ships none of the state logs' parts it owes
+  /// (`Daemon::hold_state_log_shipping`), so a test holds a creation's names-log part off the other members.
+  pub(crate) state_log_ship_held: bool,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
@@ -1459,6 +1462,11 @@ pub struct ShardState {
   /// (part 2c-2). Bounded by the repositories this node owns, at most a partition's volume capacity a partition; empty
   /// on a laptop.
   pub pending_repositories: BTreeMap<ObjectId, (u64, slates_db::catalog::RepositoryRecord)>,
+  /// On the shard a repository's partition routes to: the names of repositories this node took over and has not yet
+  /// rebuilt (A-915), each with its id, so a creation of the name meanwhile is refused `AlreadyExists` naming it rather
+  /// than made a second repository of the name, whose record the rebuild would then meet. Set as the takeover adopts
+  /// the record ([`ShardState::pending_repositories`]), let go as the rebuild runs. Bounded by those.
+  pub(crate) adopted_names: BTreeMap<String, slates_db::catalog::RepositoryId>,
   /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), each with the tombstone's
   /// sequence and the attempts to record it: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where
   /// the record plane ships the tombstone's remaining stages. Never materialized. One given up on past the failover

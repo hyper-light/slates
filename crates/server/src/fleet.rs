@@ -2653,6 +2653,9 @@ fn owed_state_log_parts(
   local: HostId,
 ) -> Vec<Head> {
   let mut heads = Vec::new();
+  if state.state_log_ship_held {
+    return heads;
+  }
   for (register, parts, acked) in state.state_logs.owed() {
     let placement = config.place(register);
     // Written at the greater of the host's epoch and the epoch the log was adopted under, as `owed_record` writes a
