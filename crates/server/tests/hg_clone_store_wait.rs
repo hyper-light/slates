@@ -9,6 +9,8 @@
 //! naming a Mercurial repository, it pushes that one. `#[ignore]`d: a measurement, run by name.
 #![allow(
   clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
   clippy::print_stdout,
   clippy::print_stderr,
   clippy::disallowed_methods,
