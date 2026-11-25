@@ -808,7 +808,7 @@ pub(crate) fn advance_replica(state: &mut ShardState, object: ObjectId, through:
   let Some(replica) = state
     .merge
     .replicas
-    .remove(&crate::merge_service::replica_key(object))
+    .take_any(&crate::merge_service::replica_key(object))
   else {
     return Rebuild::Nothing;
   };
@@ -817,7 +817,7 @@ pub(crate) fn advance_replica(state: &mut ShardState, object: ObjectId, through:
     state
       .merge
       .replicas
-      .insert(crate::merge_service::replica_key(object), replica);
+      .put_back_any(&crate::merge_service::replica_key(object), replica);
     return Rebuild::Installed(head);
   }
   build(state, ReplicaSeed::advance(object, replica, through));
@@ -845,7 +845,7 @@ pub(crate) fn rewind_replica(state: &mut ShardState, object: ObjectId, version: 
   state
     .merge
     .replicas
-    .remove(&crate::merge_service::replica_key(object));
+    .drop_any(&crate::merge_service::replica_key(object));
   state.count(REPLICA_REWOUND, 1);
   match version.checked_sub(1) {
     Some(before) => rebuild_replica_through(state, object, before),
@@ -1258,7 +1258,7 @@ impl ReplicaSeed {
       state
         .merge
         .replicas
-        .remove(&crate::merge_service::replica_key(self.object));
+        .drop_any(&crate::merge_service::replica_key(self.object));
       slates_machine::log_line!(
         "slates-server: merge record for green {} version {}: the rebuilt identity does not match the record; the green is refused on this holder",
         hex(&self.object.0),
@@ -1387,22 +1387,39 @@ impl ReplicaSeed {
     mut step: Box<ChainStep>,
   ) -> Result<Option<()>, &'static str> {
     let Some((identity, mut gather)) = step.reading.take() else {
-      let value = ledger_value(state, self.object, step.version).ok_or(REPLICA_RECORDS_SHORT)?;
-      let manifest = value.inputs.ok_or(INPUTS_UNDECODABLE)?;
-      step.reading = Some((value.identity, Gather::of(state, self.object, manifest)?));
+      let Some(value) = ledger_value(state, self.object, step.version) else {
+        return self.chain_failed(state, step, REPLICA_RECORDS_SHORT);
+      };
+      let Some(manifest) = value.inputs else {
+        return self.chain_failed(state, step, INPUTS_UNDECODABLE);
+      };
+      let gather = match Gather::of(state, self.object, manifest) {
+        Ok(gather) => gather,
+        Err(reason) => return self.chain_failed(state, step, reason),
+      };
+      step.reading = Some((value.identity, gather));
       self.stage = SeedStage::Chain(step);
       return Ok(None);
     };
-    let Some(bytes) = gather.step(state, self.object)? else {
-      step.reading = Some((identity, gather));
-      self.stage = SeedStage::Chain(step);
-      return Ok(None);
+    let bytes = match gather.step(state, self.object) {
+      Ok(Some(bytes)) => bytes,
+      Ok(None) => {
+        step.reading = Some((identity, gather));
+        self.stage = SeedStage::Chain(step);
+        return Ok(None);
+      }
+      Err(reason) => return self.chain_failed(state, step, reason),
     };
     // An increment judged afresh, or a deferred push's record deferring the replica (P2), as the record's recomputation
     // applies them.
-    crate::merge_service::apply_inputs(&mut step.replica, &bytes, step.version)?;
+    if let Err(reason) = crate::merge_service::apply_inputs(&mut step.replica, &bytes, step.version)
+    {
+      return self.chain_failed(state, step, reason);
+    }
     self.held = Some(gather.manifest);
-    self.check(state, &mut step.replica, identity)?;
+    if let Err(reason) = self.check(state, &mut step.replica, identity) {
+      return self.chain_failed(state, step, reason);
+    }
     if let Some(value) = ledger_value(state, self.object, step.version) {
       // The version's provenance (A-321), as its record carries it: an adopted replica answers it as its owner judged it.
       if let Some(signature) = value.signature {
@@ -1431,6 +1448,23 @@ impl ReplicaSeed {
     Ok(None)
   }
 
+  /// Ends a chain step refused `reason` (A-908): a lineage's member taken out of its lineage for this build goes back to
+  /// it, so the lineage is never left lent ([`crate::greens::Greens::put_back_any`]); a replica standing alone is dropped
+  /// with the build, as before, and rebuilt from the ledger at the next ask. A mismatch then refuses the green, dropping
+  /// the member from its lineage ([`ReplicaSeed::fail`]).
+  fn chain_failed(
+    &mut self,
+    state: &mut ShardState,
+    step: Box<ChainStep>,
+    reason: &'static str,
+  ) -> Result<Option<()>, &'static str> {
+    let key = crate::merge_service::replica_key(self.object);
+    if state.merge.replicas.lineage_of(&key).is_some() {
+      state.merge.replicas.put_back_any(&key, step.replica);
+    }
+    Err(reason)
+  }
+
   /// Whether `replica`'s head is `identity` on a green this holder still backs. A green whose newest inputs the build
   /// read are no longer held was forgotten meanwhile (a tombstone or a takeover's reclaim forgot everything held for it
   /// and dropped its replica while this build was past reading the hold): unheld, and never refused, so it is checked
@@ -1457,7 +1491,15 @@ impl ReplicaSeed {
   /// replica whose head is no longer its ledger's record there — replaced by a higher epoch's value while this build ran
   /// (A-373) — is not installed: counted, and built again by the green's next record or adoption.
   fn install(&self, state: &mut ShardState, mut replica: Green) {
+    let key = crate::merge_service::replica_key(self.object);
+    // A lineage's member was taken out of its lineage for this build (A-908): it goes back whatever the outcome, and is
+    // dropped from the lineage where a standing-alone replica would not be installed.
+    let member = state.merge.replicas.lineage_of(&key).is_some();
     if state.merge.refused.contains(&self.object) {
+      if member {
+        state.merge.replicas.put_back_any(&key, replica);
+        state.merge.replicas.drop_any(&key);
+      }
       return;
     }
     let head = replica.reached();
@@ -1465,17 +1507,16 @@ impl ReplicaSeed {
       .is_some_and(|value| value.identity != replica.head_identity())
     {
       state.count(REPLICA_SUPERSEDED, 1);
+      if member {
+        state.merge.replicas.put_back_any(&key, replica);
+        state.merge.replicas.drop_any(&key);
+      }
       return;
     }
-    if !state
-      .merge
-      .replicas
-      .contains_key(&crate::merge_service::replica_key(self.object))
-    {
-      state
-        .merge
-        .replicas
-        .insert(crate::merge_service::replica_key(self.object), replica);
+    if member {
+      state.merge.replicas.put_back_any(&key, replica);
+    } else if !state.merge.replicas.contains_key(&key) {
+      state.merge.replicas.insert(key, replica);
     }
     // What waited for this replica on this holder: a submit's settling (A-697 part d), a recovered work's replay (e).
     crate::work_home::replica_reached(state, self.object);
@@ -2337,7 +2378,7 @@ mod tests {
       state
         .merge
         .replicas
-        .remove(&crate::merge_service::replica_key(object));
+        .drop_any(&crate::merge_service::replica_key(object));
       let mut seed = ReplicaSeed::rebuild(object, None, zero, 1);
       // Two units: version 0 built, then version 1's record read and its inputs' gathering begun.
       let _ = seed.step(state);
@@ -2862,7 +2903,7 @@ mod tests {
       state
         .merge
         .replicas
-        .remove(&crate::merge_service::replica_key(object));
+        .drop_any(&crate::merge_service::replica_key(object));
       let mut seed = ReplicaSeed::rebuild(object, None, zero, 3);
       let _ = seed_to_end(state, &mut seed);
       (acked, positions, held, released, replica_at(state, object))

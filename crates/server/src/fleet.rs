@@ -2253,8 +2253,9 @@ pub(crate) fn hold_checked_record(
 /// ([`crate::tombstone::on_held`]).
 fn after_held_record(state: &mut ShardState, record: &Record) {
   // A state log's part is a ledger position of a repository's own state: nothing to compact, no content to judge, and
-  // never a tombstone (A-636 part 2b).
+  // never a tombstone (A-636 part 2b). A names-log part's lineage memberships are noted for the greens' replicas (A-908).
   if let RegisterClass::State(_) = record.object.class() {
+    crate::merge_service::note_names_part(state, &record.value);
     return;
   }
   if crate::catalog::is_single_value(&record.value)
@@ -5640,9 +5641,22 @@ fn handed_green(
   };
   // Version 0's inputs manifest, as the ledger names it: what the adoption records of the origin.
   let origin = crate::merge_origin::ledger_value(state, object, 0).map(|zero| zero.inputs);
-  let (Some(origin), Some(engine)) = (origin, crate::green_adopt::take_engine(state, object))
-  else {
+  let Some(origin) = origin else {
     return Err(GreenWait::Chain);
+  };
+  // A lineage's member waits, as one whose replica is building, until every member of its lineage is at its adopted
+  // version (A-908, `green_adopt::take_engine`): no attempt is spent on it.
+  let Some(engine) = crate::green_adopt::take_engine(state, object) else {
+    let member = state
+      .merge
+      .replicas
+      .lineage_of(&crate::merge_service::replica_key(object))
+      .is_some();
+    return Err(if member {
+      GreenWait::Building
+    } else {
+      GreenWait::Chain
+    });
   };
   Ok(crate::green_adopt::AdoptedGreen {
     name: adopted.name.clone(),
