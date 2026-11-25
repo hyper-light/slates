@@ -235,7 +235,10 @@
 > (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. Part 4: a holder's rebuild
 > after a warm restart makes a member by its lineage too (a root founds it, a branch is branched from its source, a
 > missing source rebuilt first a level an ask); red first in `merge_origin` (the branch had been refused as a mismatch).
-> Not run: a fleet test restarting a holder warm between a branch's versions (main's to ask for).
+> End to end (fleet, `a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after`): b restarted
+> warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
+> rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
+> b7e65cc63, part 4 in) held: 40 of 40, release and debug.
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it

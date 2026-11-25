@@ -36219,12 +36219,15 @@ struct GitFleet {
   repository: [u8; 16],
   token: String,
   _stores: Vec<NodeStore>,
-  _lease: PortLease,
+  /// The serve ports' lease of a fleet started by [`git_fleet`]; an anchored one's lease is its [`AnchoredFleet`]'s.
+  _lease: Option<PortLease>,
+  /// The anchors a fleet started by [`anchored_git_fleet`] runs over, so a node can be restarted warm
+  /// ([`GitFleet::restart_warm`]); its daemons are stopped before it is dropped ([`GitFleet::stop`]).
+  anchored: Option<AnchoredFleet>,
 }
 
 /// [`GitFleet`] named `name`.
 fn git_fleet(name: &str) -> GitFleet {
-  use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, Principal, VcsTool};
   let names = ["a", "b", "c"];
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> = names
@@ -36264,6 +36267,54 @@ fn git_fleet(name: &str) -> GitFleet {
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert_fleet_forms(&daemons, &hosts, &names);
+  founded_git_fleet(name, (daemons, hosts), stores, (Some(lease), None))
+}
+
+/// [`git_fleet`] over anchors that outlive their daemons ([`AnchoredFleet`]), so a node can be stopped and started warm
+/// over its anchor ([`GitFleet::restart_warm`]): its records and the inputs it held kept, its replicas rebuilt from them.
+/// Each node's changeset store outlives its daemon as its anchor does.
+fn anchored_git_fleet(name: &str) -> GitFleet {
+  let names: Vec<String> = ["a", "b", "c"]
+    .iter()
+    .map(|node| format!("{name}-{node}"))
+    .collect();
+  let names: Vec<&str> = names.iter().map(String::as_str).collect();
+  let mut anchored = AnchoredFleet::new(name, &names);
+  let stores: Vec<NodeStore> = (0..names.len())
+    .map(|_| node_store(GIT_STORE_SIZING.disk))
+    .collect();
+  for (config, store) in anchored.configs.iter_mut().zip(&stores) {
+    config.vcs_http = Some(slates_server::config::VcsHttpConfig {
+      address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+      identity: None,
+    });
+    config.vcs_disk = Some(store.owner.handle());
+  }
+  let daemons: Vec<Daemon> = (0..names.len()).map(|node| anchored.start(node)).collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(
+    &daemons,
+    &anchored.seeds,
+    &Default::default(),
+    Quorum { f: 1 },
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  founded_git_fleet(name, (daemons, hosts), stores, (None, Some(anchored)))
+}
+
+/// The [`GitFleet`] of `daemons`, formed: its repository `project` made on the first, held by another node as its
+/// creation answers (A-894), and a token enrolled for this uid.
+fn founded_git_fleet(
+  name: &str,
+  (daemons, hosts): (Vec<Daemon>, Vec<HostId>),
+  stores: Vec<NodeStore>,
+  (lease, anchored): (Option<PortLease>, Option<AnchoredFleet>),
+) -> GitFleet {
+  use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, Principal, VcsTool};
   let mut client = common::client::connect(daemons[0].instance());
   let repository = client
     .create_repository(&slates_client::RepositorySpec {
@@ -36326,6 +36377,7 @@ fn git_fleet(name: &str) -> GitFleet {
     token,
     _stores: stores,
     _lease: lease,
+    anchored,
   }
 }
 
@@ -36398,19 +36450,34 @@ impl GitFleet {
   /// Clones the repository through node `node`'s edge, commits `bytes` as `file` on top of `main`, and pushes `main` back
   /// through the same edge: a fast-forward of the green the earlier pushes moved. git's stderr where it failed.
   fn push_on_top(&self, node: usize, (file, bytes): (&str, &[u8])) -> Result<(), String> {
+    self.push_on_top_of(node, (file, bytes), "main")
+  }
+
+  /// [`GitFleet::push_on_top`] of branch `branch`: cloned at it, `bytes` committed as `file` on top, and pushed back to
+  /// it, a fast-forward of the branch's own green.
+  fn push_on_top_of(
+    &self,
+    node: usize,
+    (file, bytes): (&str, &[u8]),
+    branch: &str,
+  ) -> Result<(), String> {
     let dir = common::target::target_dir();
     let port = self.daemons[node]
       .vcs_http_port()
       .expect("the edge listens");
     let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
     let url = format!("http://127.0.0.1:{port}/project");
-    let cloned = git_in(&dir.path, &["-c", &header, "clone", "-q", &url, "copy"]);
+    let cloned = git_in(
+      &dir.path,
+      &["-c", &header, "clone", "-q", "-b", branch, &url, "copy"],
+    );
     if !cloned.status.success() {
       return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
     }
     commit_in(&dir, "copy", (file, bytes));
     let work = format!("{}/copy", dir.path);
-    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, "main"]);
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
     if pushed.status.success() {
       Ok(())
     } else {
@@ -36435,6 +36502,28 @@ impl GitFleet {
     } else {
       Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
     }
+  }
+
+  /// Stops node `node` and starts it warm over its anchor (an [`anchored_git_fleet`] only): whether every other node
+  /// counts it alive again, by the member id it reports, within the placement deadline.
+  fn restart_warm(&mut self, node: usize) -> bool {
+    let Some(anchored) = self.anchored.as_mut() else {
+      return false;
+    };
+    self.daemons.remove(node).stop();
+    self.daemons.insert(node, anchored.start(node));
+    let Ok(member) = self.daemons[node].member_identity() else {
+      return false;
+    };
+    let observed: Vec<&Daemon> = self.daemons.iter().collect();
+    poll_until(&observed, PLACEMENT_DEADLINE, || {
+      Ok(observed.iter().enumerate().all(|(at, daemon)| {
+        at == node
+          || daemon
+            .fleet_members()
+            .is_ok_and(|members| members.contains(&member))
+      }))
+    })
   }
 
   fn stop(self) {
@@ -36933,6 +37022,70 @@ fn a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies() {
     branched,
     Some(Ok(())),
     "the successor took the new branch's push"
+  );
+}
+
+/// A-908 part 4, end to end (main 01a20182's order of 2026-11-24): a holder restarted warm between a branch's versions
+/// serves the branch after. Do: on a three-node `f = 1` git fleet over anchors that outlive their daemons, push `main`
+/// and a new branch `after` through the owner a; restart b warm (its records and held inputs kept, its replicas not);
+/// make c refuse a's records (`Daemon::inject_record_refusal`), so a's next version of the branch needs b's
+/// acknowledgement; push a commit on top of `after`. Expect it to land, b counting the branch's replica made by its
+/// lineage (`merge.replica.member_branched`) and no mismatch, c counting its refusals. Red before part 4: b rebuilt the
+/// branch's version 0 as an empty green, a mismatch (`merge.recompute_mismatch`), the branch refused on b for good, so
+/// the push was short of `f + 1`.
+#[test]
+fn a908_a_holder_restarted_warm_between_a_branchs_versions_serves_the_branch_after() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet("branch-restart");
+  let first = fleet.push(0, ("first.txt", b"main before the restart\n"));
+  let branched = fleet.push_to(0, ("branch.txt", b"the branch's first version\n"), "after");
+  // The push is answered once the branch is placed at f + 1, which a and c can make alone, so b's own branch is waited
+  // for: the restart must come between versions b holds (one run of three read 0 before this wait).
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let held_before = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    refusal_count(&fleet.daemons[1], "merge.replica.member_branched").map(|branched| branched >= 1)
+  });
+  drop(observed);
+  let rejoined = fleet.restart_warm(1);
+  // c refuses a's records from here, as a holder that never received them would, so a's next version needs b's
+  // acknowledgement. A c stopped instead set off its takeover's configuration changes (7 to 13 within one push), and a
+  // put to a home behind its sender's configuration waits for that install (A-902), so the push was refused `retry`.
+  let refusing = fleet.daemons[2].inject_record_refusal(&[fleet.hosts[0]]);
+  let after = fleet.push_on_top_of(0, ("next.txt", b"the branch's next version\n"), "after");
+  let counts = ["merge.replica.member_branched", "merge.recompute_mismatch"]
+    .map(|name| refusal_count(&fleet.daemons[1], name).unwrap_or(0));
+  let refused = refusal_count(&fleet.daemons[2], "fleet.record.refused_by_fault").unwrap_or(0);
+  fleet.stop();
+  eprintln!(
+    "branch across a holder's warm restart: b branched before {held_before}, after the restart {counts:?} \
+     (branched, mismatched)"
+  );
+  assert_eq!(
+    (first, branched),
+    (Ok(()), Ok(())),
+    "main and the branch landed"
+  );
+  assert!(
+    held_before,
+    "b branched the branch's replica before its restart"
+  );
+  assert!(
+    rejoined,
+    "the other nodes count b alive after its warm restart"
+  );
+  assert!(
+    refusing.is_ok() && refused >= 1,
+    "c refused a's records ({refused})"
+  );
+  assert_eq!(
+    after,
+    Ok(()),
+    "the branch's next version landed on a and b alone"
+  );
+  assert_eq!(
+    counts,
+    [1, 0],
+    "b rebuilt the branch by its lineage, no mismatch"
   );
 }
 
