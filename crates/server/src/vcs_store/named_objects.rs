@@ -193,6 +193,13 @@ pub(crate) struct ReadPin {
   windows: Vec<ContentId>,
 }
 
+/// Pins `windows` as a reader's own ([`ReadPin`]): a home's read that brings an object's let-go windows back holds them
+/// until it has read them, so no let-go lands between a window's bring-back and its read (`homes::read`; main 01a20182's
+/// ruling of 2026-11-25). Bounded by the object's own windows: one pin a window it lies in, dropped as the read ends.
+pub(crate) fn pin_windows(windows: Vec<ContentId>) -> ReadPin {
+  ReadPin::of(windows)
+}
+
 impl ReadPin {
   /// `windows` kept.
   fn of(windows: Vec<ContentId>) -> ReadPin {

@@ -3441,12 +3441,16 @@
 > division bounds (`vcs_share::read_backs`; §4.17.5's status). Each window attributed at the one bring-back step to the
 > repository whose store holds its object (`VcsStores::subversion_storing`, `VcsStores::git_holding_pack`: a scan of the
 > shard's git stores' packs, `O(repositories × packs)`, only on a bring-back; a home's landed note), let go past its
-> grant at each division (`grants::current_at`), coldest first, never pinned, never younger than a cadence; one no
-> store claims let go at the division. Counted `vcs_share.read_backs_attributed_{text,pack,hg}`, `_unattributed`,
+> grant at each division (`grants::current_at`), coldest first, never a pinned window; one no store claims let go at
+> the division. A home's read is one task holding its object's windows from their bring-back to its read
+> (`homes::read_brought_back`, `named_objects::pin_windows`; red `a_homes_read_holds_its_windows_from_their_bring_back_
+> to_its_read`: `NotHeld` with the cold trigger forced between them, unpinned); a git reader brings a let-go window
+> back again. Counted `vcs_share.read_backs_attributed_{text,pack,hg}`, `_unattributed`,
 > `_let_go`, `_unattributed_let_go`, `_pinned_kept`, `_past_bound`. Held by
 > `what_a_read_brings_back_is_let_go_past_its_repositorys_grant` (red: 1,048,576 B of sixteen read-back texts resident
 > against a 196,608 B grant; the hot text kept, the cold let go), `a_pinned_read_back_is_never_let_go_however_cold`,
-> `a_read_back_no_store_claims_is_let_go_once_unpinned` and
+> `a_read_back_no_store_claims_is_let_go_once_unpinned`, `a_homes_mercurial_window_is_attributed_to_its_revisions_
+> repository` (the hg clone's read-backs, w-interop's round 2 peak of 5,987 MiB in the hg leg) and
 > `a_packs_window_is_attributed_to_the_repository_whose_store_holds_it` (24 repositories, the scan's time printed).
 > Open: a pack-to-repository index, should the scan ever show beside the store read it follows; a restart's image no
 > longer holding a let-go window (recovery reads it back through the node's store, with the read-through).
