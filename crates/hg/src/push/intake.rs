@@ -11,15 +11,18 @@
 //! a changeset the fork holds), and then kept: its text put into the content store once and its row appended to the
 //! fork ([`super::commit::keep_one`]). A file revision's text is made a window a step and never whole ([`patched`]: its
 //! base read from the fork's rows a window at a time, each window made hashed, read and put as it is made; goal 93,
-//! C1 (2)); a changeset's or a manifest's is rebuilt whole (the step [`rebuilt`]: the text before it in its group where
-//! its delta names that one, as 7.2's revision cache serves it, else the base's text read back from the fork). The fork holds
+//! C1 (2)); so is a manifest's ([`manifesting`]: its base read over its chain, its entries read as it streams, its row kept
+//! by [`super::manifest_row`]'s rule, the client's delta or its diff against the manifest the fork holds last, main's
+//! ruling (B')); a changeset's is rebuilt whole (the step [`rebuilt`]: the text before it in its group where its delta
+//! names that one, as 7.2's revision cache serves it, else the base's text read back from the fork). The fork holds
 //! the repository's revisions and the push's, so a later revision's parents and base are found there. After the logs,
 //! each new changeset's manifest is held to be present, then each new manifest's changed files, a manifest a step.
 //!
 //! **Bounded.** What a file revision's step holds of its text is two windows, the one it makes and the one of its base
-//! it hashes, whatever the file (`Intaken::most_text_held`). A changeset's or a manifest's step holds its delta, the
-//! base's text and the rebuilt text, charged to a copy of the push's admission, since it is let go when the step ends;
-//! only the text before it is kept to the next step (owed: the manifests a window at a time, C1 (2)'s next piece). What
+//! it hashes, whatever the file; a manifest's, those and its diff's (a window and a line of each text and of its run),
+//! and its base's chain's deltas (`Intaken::most_text_held`, `Intaken::most_chain_held`). A changeset's step holds its
+//! delta, the base's text and the rebuilt text, charged to a copy of the push's admission, since it is let go when the
+//! step ends; only the text before it is kept to the next step (owed: changesets a window at a time). What
 //! the intake keeps across steps is per revision and fixed in size (a node, a changeset's manifest, a manifest's first
 //! parent), charged to the admission itself. The texts are kept in the content store, charged to its budget as every
 //! store's are, never held by the intake. So its working set is one revision's texts, whatever the push's size. The
@@ -120,6 +123,12 @@ pub struct Intaken {
   /// and memory are to grow with what it brings, not with the history under it): a delta base it did not hold as the
   /// text kept last. A new manifest's files are checked from the lines its delta wrote, rebuilding nothing.
   pub rebuilt: u64,
+  /// The most delta bytes of a manifest base's chain loaded while it was read (goal 93, C1 (2), main's ruling (B)): at
+  /// most the base's own length, A-729's chain bound.
+  pub most_chain_held: u64,
+  /// The bytes of the manifests kept whole, charged to the push's admission until it lands: those whose delta's base is
+  /// not the row before them (a merge's), or whose chain passed its bound (main's ruling (B), condition 3).
+  pub manifests_kept_whole_bytes: u64,
   /// The file delta bases asked of the node's changeset store between steps: a revision landed before the push whose
   /// windows were let go, brought back to be read.
   pub base_store_reads: u64,
@@ -407,6 +416,11 @@ struct Taker {
   pending: Option<Box<Pending>>,
   /// A file revision being taken a window a step, its text never whole ([`patched`]).
   patched: Option<Box<patched::Patched>>,
+  /// A manifest being taken a window a step, its text never whole ([`manifesting`]).
+  manifesting: Option<Box<manifesting::Manifesting>>,
+  /// The base of the manifest begun again because a window of its chain could not be read: asked of the store at its
+  /// next begin ([`manifesting`]).
+  base_asked: Option<Node>,
   /// The merge of the fork's newest runs the size-tiered rule named, a table a step until it ends
   /// ([`Taker::merge_step`]).
   merging: Option<Merge>,
@@ -686,6 +700,23 @@ struct StoreAsk {
   refused: Option<Refused>,
 }
 
+/// What a revision taken a window a step hands its keep ([`Taker::keep_taken`]) in place of what its whole text would
+/// tell: its bytes' or text's object kept already, its identity hashed, its whole length, a manifest row's stored fields
+/// (main's ruling (B): its client's delta, or its text whole), and what reading it found. Default for a whole text.
+#[derive(Default)]
+struct Streamed {
+  /// The object kept already: a file revision's bytes, a manifest's delta or text.
+  kept: Option<ContentId>,
+  /// Its identity, hashed as it streamed.
+  identity: Option<[u8; 32]>,
+  /// Its whole length, where the text handed is not it.
+  len: Option<u64>,
+  /// A manifest row's delta base, delta length and chain, where its content is kept already.
+  stored: Option<crate::index::Stored>,
+  /// What reading it found as it streamed.
+  read: Option<ReadAs>,
+}
+
 /// What reading a revision's text as its log's reader reads it found ([`Taker::read_of`]), noted once it is kept
 /// ([`Taker::apply_read`]).
 enum ReadAs {
@@ -898,6 +929,8 @@ impl Intake {
         logs_given: Vec::new(),
         pending: None,
         patched: None,
+        manifesting: None,
+        base_asked: None,
         merging: None,
         cutting: None,
       },
@@ -962,6 +995,9 @@ impl Intake {
     if taker.patched.is_some() {
       return taker.advance_patched((frame, payload), store, admission);
     }
+    if taker.manifesting.is_some() {
+      return taker.advance_manifest((frame, payload), store, admission);
+    }
     if let Some(stepped) = taker.merge_step(store)? {
       return Ok(stepped);
     }
@@ -983,8 +1019,7 @@ impl Intake {
           Ok(next) => next,
           Err(wanted) => return Ok(Stepped::Wanted(wanted.range)),
         };
-        let after = Stage::Files { file: 0, at: 0 };
-        taker.take_or(next, Log::Manifest, (store, admission), after)
+        taker.manifest_stage((frame, payload), (next, at), (store, admission))
       }
       Stage::Files { file, at } => taker.file_step((frame, payload), (file, at), store, admission),
       Stage::ManifestsPresent(at) => taker.manifest_present(at, store),
@@ -1004,7 +1039,10 @@ impl Intake {
   /// `manifests-present`, `files-present`, `done`). What a caller timing its steps reads to tell which unit a long one
   /// took.
   pub fn unit(&self) -> &'static str {
-    if self.taker.pending.is_some() || self.taker.patched.is_some() {
+    if self.taker.pending.is_some()
+      || self.taker.patched.is_some()
+      || self.taker.manifesting.is_some()
+    {
       return "pending";
     }
     if self.taker.merging.is_some() {
@@ -1040,11 +1078,39 @@ impl Intake {
     {
       store.abandon_object(writing);
     }
+    // A revision taken a window a step gives back its object being put, and a manifest the base the store gave it.
+    if let Some(patched) = self.taker.patched.take() {
+      patched::give_back(store, *patched);
+    }
+    if let Some(manifesting) = self.taker.manifesting.take() {
+      manifesting::give_back(store, *manifesting);
+    }
     self.taker.fork.release(store)
   }
 }
 
 impl Taker {
+  /// Takes manifest `next`, at `at` of its group, a window a step ([`manifesting`]); or moves to the files where the
+  /// group has no more.
+  fn manifest_stage<S: Source + ?Sized>(
+    &mut self,
+    (frame, payload): (&Frame, &S),
+    (next, at): (Option<(Revision<'_>, Range<u64>)>, usize),
+    (store, admission): (&mut ContentStore, &mut Admission),
+  ) -> Result<Stepped, Refused> {
+    let Some((revision, place)) = next else {
+      self.enter(Stage::Files { file: 0, at: 0 });
+      return Ok(Stepped::More);
+    };
+    let after = Stage::Manifests(at.saturating_add(1));
+    if self.begin_manifest((&revision, place), (at, after), (store, admission))? {
+      self.stage = after;
+      return Ok(Stepped::More);
+    }
+    // Its first window made in this same step, so a manifest of one window is taken in one step as before.
+    self.advance_manifest((frame, payload), store, admission)
+  }
+
   /// Takes `next` of `log`, or moves to `after` where its group has no more.
   fn take_or(
     &mut self,
@@ -1377,7 +1443,7 @@ impl Taker {
       log,
       revision,
       (text, base, place),
-      (None, None, None),
+      Streamed::default(),
       (store, admission),
     )?;
     Ok(true)
@@ -1517,7 +1583,11 @@ impl Taker {
       log,
       &revision,
       (text, base, place),
-      (kept, Some(identity), None),
+      Streamed {
+        kept,
+        identity: Some(identity),
+        ..Streamed::default()
+      },
       (store, admission),
     )?;
     self.stage = after;
@@ -1533,14 +1603,33 @@ impl Taker {
     log: Log<'_>,
     revision: &Revision<'_>,
     (text, base, place): (Vec<u8>, Option<[u8; 32]>, Range<u64>),
-    (kept, identity, whole): (Option<ContentId>, Option<[u8; 32]>, Option<u64>),
+    streamed: Streamed,
     (store, admission): (&mut ContentStore, &mut Admission),
   ) -> Result<(), Refused> {
+    let Streamed {
+      kept,
+      identity,
+      len: whole,
+      stored,
+      read,
+    } = streamed;
     // Every charge first, to a trial of the admission, then the keep, then every note and the trial taken: a refusal
     // anywhere leaves the intake where it was and the admission unspent, so the step is taken again whole once its room
     // has grown (main 01a20182's ruling of 2026-11-22 03:03: an intake past its admission waits, never refused).
     let mut trial = *admission;
-    let read = self.read_of(log, revision, &text, store, &mut trial)?;
+    let read = match read {
+      // Read as it streamed ([`patched`]'s manifests): what noting it holds charged here, as `awaited_of` charges it.
+      Some(read) => {
+        if let ReadAs::Manifest { awaited } = &read {
+          trial.charge_items::<(Vec<u8>, Node)>(awaited.len())?;
+          for (path, _) in awaited {
+            trial.charge(to_u64(path.len()))?;
+          }
+        }
+        read
+      }
+      None => self.read_of(log, revision, &text, store, &mut trial)?,
+    };
     let logged = self.logged_of(log, store, &mut trial)?;
     let path = match log {
       Log::Changelog => CHANGELOG_PATH,
@@ -1580,7 +1669,7 @@ impl Taker {
       store,
       log,
       (&arrived, previous),
-      (kept, whole),
+      (kept, whole, stored),
       &mut room,
     )?;
     *admission = trial;
@@ -1637,8 +1726,9 @@ impl Taker {
       self.spares.give(text);
     }
     match log {
-      Log::File(_) => self.spares.give(arrived.text),
-      _ => self.last = Some((revision.node, arrived.text)),
+      Log::Changelog => self.last = Some((revision.node, arrived.text)),
+      // A file revision's and a manifest's later bases are read from the fork's rows ([`patched`]).
+      _ => self.spares.give(arrived.text),
     }
     Ok(())
   }
@@ -2097,17 +2187,6 @@ impl Rebase {
         .ok_or(Unindexed::Index(crate::index::Refused::MissingLink {
           node,
         }))?;
-      // A manifest kept as a delta against the stale fork's previous one (A-729) is appended again by its text, which
-      // the fork keeps as its own delta against its previous one.
-      let rebuilt = if row.base == crate::index::NONE {
-        None
-      } else {
-        let text = self
-          .stale
-          .revision_text_over(store, log, rev, &self.given)
-          .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
-        Some(store.put_object(&text)?)
-      };
       let again = crate::index::NewRevision {
         node,
         p1: kept.p1,
@@ -2115,31 +2194,43 @@ impl Rebase {
         link: kept.link.unwrap_or(NULL_NODE),
         flags: kept.flags,
         len: kept.len,
-        bytes: rebuilt.unwrap_or(row.bytes),
+        bytes: row.bytes,
         block: row.block,
       };
-      // The fork keeps it as its own delta against the manifest it holds last, whose text the store may have given.
-      let held_last = self
-        .fork
-        .len(store, log)
-        .checked_sub(1)
-        .and_then(|last| self.fork.revision(store, log, last))
-        .map(|row| row.node);
-      let previous = held_last.and_then(|held_last| {
+      // Kept by the intake's own rule (`push::manifest_row`, main's ruling (B')), so a re-based fork's rows are a fresh
+      // intake's: as stored where its delta rests on the manifest the fork holds last and the chain allows; else its text
+      // rebuilt over the stale fork's chain and kept as its diff against that last one, or whole.
+      // A file revision is appended as stored: its bytes and block, whole.
+      if log != Log::Manifest {
         self
-          .given
-          .iter()
-          .find(|(node, _)| *node == held_last)
-          .map(|(node, text)| (node, text.as_slice()))
-      });
-      let appended = self
-        .fork
-        .append_revisions_after(store, log, &[again], (previous, &[]))
-        .map(drop);
-      if let Some(put) = rebuilt {
-        store.release(&put)?;
+          .fork
+          .append_stored(store, log, &[(again, super::manifest_row::WHOLE)])?;
+        self.intaken.kept = self.intaken.kept.saturating_add(1);
+        return Ok(());
       }
-      appended?;
+      let last = super::manifest_row::last(&self.fork, store);
+      let base = (row.base != crate::index::NONE)
+        .then(|| {
+          self
+            .stale
+            .revision(store, log, row.base)
+            .map(|base| base.node)
+        })
+        .flatten();
+      let as_sent = base
+        .and_then(|base| super::manifest_row::as_sent(last.as_ref(), &base, row.stored, kept.len));
+      match as_sent {
+        Some(stored) => {
+          self.fork.append_stored(store, log, &[(again, stored)])?;
+        }
+        None => {
+          let text = self
+            .stale
+            .revision_text_over(store, log, rev, &self.given)
+            .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+          super::manifest_row::kept_from_text(&mut self.fork, store, (again, &text), &self.given)?;
+        }
+      }
     }
     self.intaken.kept = self.intaken.kept.saturating_add(1);
     Ok(())
@@ -2280,6 +2371,9 @@ fn log_of(log: Log<'_>) -> LogOf {
 
 #[path = "intake_patched.rs"]
 mod patched;
+
+#[path = "intake_manifest.rs"]
+mod manifesting;
 
 #[cfg(test)]
 #[path = "intake_tests.rs"]

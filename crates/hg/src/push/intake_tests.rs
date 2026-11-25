@@ -801,19 +801,11 @@ fn a_pushs_changeset_replays_from_its_payload_a_piece_at_a_time() {
   }
 }
 
-/// The revisions of `decoded` whose delta's base is neither the null node nor the revision before it in its group: the
-/// bases an intake does not hold as the text it kept last, so must read back from the fork.
+/// The changesets of `decoded` whose delta's base is neither the null node nor the changeset before it: the bases an
+/// intake does not hold as the text it kept last, so rebuilds from the fork (a manifest's and a file revision's are read
+/// over the fork's rows a window at a time since C1 (2), never rebuilt whole).
 fn bases_not_kept_last(decoded: &crate::changegroup::Changegroup<'_>) -> u64 {
-  let mut groups = vec![
-    decoded.group(&decoded.changelog),
-    decoded.group(&decoded.manifests),
-  ];
-  groups.extend(
-    decoded
-      .files
-      .iter()
-      .map(|group| decoded.group(&group.revisions)),
-  );
+  let groups = vec![decoded.group(&decoded.changelog)];
   groups
     .iter()
     .map(|group| {
@@ -833,9 +825,9 @@ fn bases_not_kept_last(decoded: &crate::changegroup::Changegroup<'_>) -> u64 {
 /// Main's ruling of 2026-11-21 05:12 (c), red first (w-perf's profile of hg-src's first push, base 94c1696bb: 57% of the
 /// shard's time in checking each new manifest's files, which rebuilt the manifest's text and its first parent's from
 /// their chains, two whole texts a manifest, the push's memory 5.8 GiB at its end). Do: take stock 7.2's bundle through
-/// the intake. Expect a whole text rebuilt from the fork's chains only for a delta whose base is not the text kept just
-/// before it in its group; none to check a new manifest's files, which reads the lines its delta wrote (14 rebuilt
-/// before, two a manifest).
+/// the intake. Expect a whole text rebuilt from the fork's chains only for a changeset delta whose base is not the text
+/// kept just before it (a manifest's and a file revision's base read over the fork's rows a window at a time since C1
+/// (2)); none to check a new manifest's files, which reads the lines its delta wrote (14 rebuilt before, two a manifest).
 #[test]
 fn a_pushs_intake_rebuilds_a_text_only_for_a_base_it_does_not_hold() {
   let part = stock();
@@ -1019,7 +1011,8 @@ fn taken_counting(
 /// the fourth each a delta against a revision before the one kept last (a merge's base, as generaldelta sends one); then
 /// let the first revision's bytes go, as a landing does, and push a fifth revision as a delta against it. Expect every
 /// text read back as it was pushed; the first push's bases read from the fork, nothing rebuilt and nothing asked; and
-/// the let-go base asked of the store once, brought back and read.
+/// the let-go base asked of the store once, brought back, read, and let go again once its revision is taken (red before:
+/// held for good, a landed base's bytes back in memory a push).
 #[test]
 fn a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows() {
   let texts: [(&[u8], Option<usize>); 4] = [
@@ -1066,6 +1059,11 @@ fn a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows() {
     (landed.kept, landed.base_store_reads, landed_asks),
     (3, 1, 1),
     "the let-go base asked of the store once"
+  );
+  assert_eq!(
+    store.object_bytes(&row.bytes, u64::try_from(first_text.len()).unwrap()),
+    None,
+    "the base brought back for its revision let go again after it"
   );
 }
 
@@ -2317,4 +2315,332 @@ fn a_manifest_read_as_it_streams_finds_what_its_whole_text_finds() {
       );
     }
   }
+}
+
+/// A push of `commits` into an empty repository, each its parents' places among those before it (a merge's two) and the
+/// text of file `f` it makes, beside `padding` files `p/NNN` the first commit brings and none changes, so every manifest
+/// is long and each differs from its first parent's by `f`'s line: the changegroup in version 03, as stock 7.2 sends a
+/// generaldelta repository's (each changeset and padding file whole; each manifest and each revision of `f` a delta
+/// against its first parent's, the first whole), and each commit's manifest's text in order.
+fn dag_push(commits: &[([Option<usize>; 2], &[u8])], padding: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+  use crate::changegroup::{self as cg, Revision, Version};
+  use crate::{NULL_NODE, delta, node};
+  let hex = |node: &Node| {
+    let mut out = Vec::new();
+    crate::pushkey::encode_hex(node, &mut out);
+    out
+  };
+  let pads: Vec<(Vec<u8>, Vec<u8>, Node)> = (0..padding)
+    .map(|at| {
+      let path = format!("p/{at:04}").into_bytes();
+      let text = format!("padding file {at}\n").into_bytes();
+      let file = node::compute(&NULL_NODE, &NULL_NODE, &text).unwrap();
+      (path, text, file)
+    })
+    .collect();
+  let mut made: Vec<(Node, Node, Node, Vec<u8>, Vec<u8>)> = Vec::new();
+  let mut out = Vec::new();
+  let (mut manifests, mut files) = (Vec::new(), Vec::new());
+  for (at, (parents, text)) in commits.iter().enumerate() {
+    let of = |parent: Option<usize>| parent.and_then(|parent| made.get(parent));
+    let (first, second) = (of(parents[0]), of(parents[1]));
+    let node_of = |made: Option<&(Node, Node, Node, Vec<u8>, Vec<u8>)>, pick: usize| {
+      made.map_or(NULL_NODE, |made| [made.0, made.1, made.2][pick])
+    };
+    let file = node::compute(&node_of(first, 2), &node_of(second, 2), text).unwrap();
+    let mut manifest_text = [&b"f\0"[..], &hex(&file), b"\n"].concat();
+    for (path, _, pad) in &pads {
+      manifest_text.extend_from_slice(&[&path[..], b"\0", &hex(pad), b"\n"].concat());
+    }
+    let manifest = node::compute(&node_of(first, 1), &node_of(second, 1), &manifest_text).unwrap();
+    let changeset_text = [
+      &hex(&manifest)[..],
+      format!("\ntest\n0 0\nf\n\ncommit {at}").as_bytes(),
+    ]
+    .concat();
+    let changeset =
+      node::compute(&node_of(first, 0), &node_of(second, 0), &changeset_text).unwrap();
+    let whole = Revision {
+      node: changeset,
+      p1: node_of(first, 0),
+      p2: node_of(second, 0),
+      base: NULL_NODE,
+      link: changeset,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: &changeset_text,
+      sidedata: None,
+    };
+    cg::put_revision_whole(&whole, Version::V03, &mut out).unwrap();
+    let based = |pick: usize, text: &[u8]| -> (Node, Vec<u8>) {
+      match first {
+        None => {
+          let mut data = Vec::new();
+          delta::encode_full_text(text, &mut data).unwrap();
+          (NULL_NODE, data)
+        }
+        Some(first) => {
+          let base_text = if pick == 1 { &first.3 } else { &first.4 };
+          let mut data = Vec::new();
+          delta::encode_lines(base_text, text, &mut data).unwrap();
+          ([first.0, first.1, first.2][pick], data)
+        }
+      }
+    };
+    let (manifest_base, manifest_data) = based(1, &manifest_text);
+    manifests.push((
+      manifest,
+      node_of(first, 1),
+      node_of(second, 1),
+      manifest_base,
+      manifest_data,
+      changeset,
+    ));
+    let (file_base, file_data) = based(2, text);
+    files.push((
+      file,
+      node_of(first, 2),
+      node_of(second, 2),
+      file_base,
+      file_data,
+      changeset,
+    ));
+    made.push((changeset, manifest, file, manifest_text, text.to_vec()));
+  }
+  cg::put_end(&mut out);
+  let put = |(node, p1, p2, base, data, link): &(Node, Node, Node, Node, Vec<u8>, Node),
+             out: &mut Vec<u8>| {
+    let revision = Revision {
+      node: *node,
+      p1: *p1,
+      p2: *p2,
+      base: *base,
+      link: *link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data,
+      sidedata: None,
+    };
+    cg::put_revision(&revision, Version::V03, out).unwrap();
+  };
+  for manifest in &manifests {
+    put(manifest, &mut out);
+  }
+  cg::put_end(&mut out);
+  cg::put_end(&mut out);
+  cg::put_name(b"f", &mut out).unwrap();
+  for file in &files {
+    put(file, &mut out);
+  }
+  cg::put_end(&mut out);
+  let first_changeset = made.first().map_or(NULL_NODE, |made| made.0);
+  for (path, text, pad) in &pads {
+    cg::put_name(path, &mut out).unwrap();
+    let mut data = Vec::new();
+    delta::encode_full_text(text, &mut data).unwrap();
+    put(
+      &(*pad, NULL_NODE, NULL_NODE, NULL_NODE, data, first_changeset),
+      &mut out,
+    );
+    cg::put_end(&mut out);
+  }
+  cg::put_end(&mut out);
+  (out, made.into_iter().map(|made| made.3).collect())
+}
+
+/// Goal 93, C1 (2) (main's ruling (B): a manifest base read in ranges over its chain, never whole). Do: push eight
+/// commits on a line, each changing file `f` beside 40 padding files, so each manifest is kept as a delta against the
+/// one before it ([`dag_push`]); read
+/// every manifest of the fork through its chain (`chain_read::Chain`) front to back in pieces of 1, 7 and 64 bytes,
+/// and again in pieces with gaps skipped between them. Expect each text the index's own (`HgIndex::revision_text`), and
+/// each skipped read the same bytes at the same places; at least one chain more than its whole text.
+#[test]
+fn a_manifest_chain_read_in_ranges_is_its_text() {
+  use crate::delta::BaseRead;
+  use crate::push::chain_read::{Chain, Reading};
+  use crate::read::to_u64;
+  let commits: Vec<([Option<usize>; 2], Vec<u8>)> = (0..8)
+    .map(|at: usize| {
+      (
+        [at.checked_sub(1), None],
+        format!("f at {at}\n").into_bytes(),
+      )
+    })
+    .collect();
+  let commits: Vec<([Option<usize>; 2], &[u8])> = commits
+    .iter()
+    .map(|(parents, text)| (*parents, text.as_slice()))
+    .collect();
+  let (payload, _) = dag_push(&commits, 40);
+  let mut store = store();
+  let (fork, _, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
+  let mut longest_chain = 0usize;
+  for rev in 0..fork.len(&store, Log::Manifest) {
+    let rev = u32::try_from(rev).unwrap();
+    let text = fork.revision_text(&store, Log::Manifest, rev).unwrap();
+    let chain = Chain::of(&fork, &store, rev).unwrap();
+    assert_eq!(chain.len(), to_u64(text.len()));
+    longest_chain = longest_chain.max(usize::from(chain.held() > 0));
+    for piece in [1usize, 7, 64] {
+      let mut cursor = crate::push::chain_read::Cursor::default();
+      let mut reading = Reading {
+        chain: &chain,
+        cursor: &mut cursor,
+        store: &store,
+      };
+      let mut read = Vec::new();
+      let mut at = 0u64;
+      while at < reading.len() {
+        let n = usize::try_from(reading.len() - at).unwrap().min(piece);
+        reading.read_into(at, n, &mut read).unwrap();
+        at += to_u64(n);
+      }
+      assert_eq!(read, text, "manifest {rev} in pieces of {piece}");
+      let mut cursor = crate::push::chain_read::Cursor::default();
+      let mut reading = Reading {
+        chain: &chain,
+        cursor: &mut cursor,
+        store: &store,
+      };
+      let mut at = 0u64;
+      while at < reading.len() {
+        let n = usize::try_from(reading.len() - at).unwrap().min(piece);
+        let mut got = Vec::new();
+        reading.read_into(at, n, &mut got).unwrap();
+        let from = usize::try_from(at).unwrap();
+        assert_eq!(got, text[from..from + n], "manifest {rev} at {at}");
+        at += to_u64(n) * 2;
+      }
+    }
+  }
+  assert_eq!(
+    longest_chain, 1,
+    "a manifest kept as a delta over its chain"
+  );
+}
+
+/// Each manifest's text the fork reads back, in log order.
+fn manifest_texts(fork: &HgIndex, store: &ContentStore) -> Vec<Vec<u8>> {
+  (0..fork.len(store, Log::Manifest))
+    .map(|rev| {
+      fork
+        .revision_text(store, Log::Manifest, u32::try_from(rev).unwrap())
+        .unwrap()
+    })
+    .collect()
+}
+
+/// Goal 93, C1 (2) (main's ruling (B') of 2026-11-24, its red and oracle 1). Do: push 12 commits on a line, each changing
+/// file `f` beside 300 padding files, so each manifest is several of the tests' windows long (4 KiB), sent as a delta
+/// against the one before. Expect every manifest's text read back as it was made, and the text the intake held at once
+/// within four windows and three lines (the window it makes, the one it hashes, and its diff's base and run: a window and
+/// a line each). Red before: each manifest rebuilt whole beside its base's text and the text kept last.
+#[test]
+fn a_line_of_long_manifests_is_taken_within_the_window_bound() {
+  let commits: Vec<([Option<usize>; 2], Vec<u8>)> = (0..12)
+    .map(|at: usize| {
+      (
+        [at.checked_sub(1), None],
+        format!("f at {at}\n").into_bytes(),
+      )
+    })
+    .collect();
+  let commits: Vec<([Option<usize>; 2], &[u8])> = commits
+    .iter()
+    .map(|(parents, text)| (*parents, text.as_slice()))
+    .collect();
+  let (payload, texts) = dag_push(&commits, 300);
+  let window = 1 << 12;
+  assert!(texts[0].len() > 3 * window, "a manifest of several windows");
+  let mut store = ContentStore::new(1 << 30, window).unwrap();
+  let (fork, intaken, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
+  assert_eq!(
+    manifest_texts(&fork, &store),
+    texts,
+    "each manifest as made"
+  );
+  let line = texts[0]
+    .split(|byte| *byte == b'\n')
+    .map(<[u8]>::len)
+    .max()
+    .unwrap()
+    + 1;
+  let bound = u64::try_from(4 * window + 3 * line).unwrap();
+  assert!(
+    intaken.most_text_held <= bound,
+    "held {} of text at once, past {bound}",
+    intaken.most_text_held
+  );
+  assert_eq!(
+    intaken.manifests_kept_whole_bytes,
+    u64::try_from(texts[0].len()).unwrap(),
+    "only the first kept whole"
+  );
+}
+
+/// Goal 93, C1 (2) (main's ruling (B'), oracle 1, merges): a merge's manifest is a delta against its first parent's,
+/// which is not the manifest the fork holds last, so its row is its diff against that last one. Do: push two branches
+/// off a root, each changing `f` beside 40 padding files, merged twice; then replay the push's segment records into
+/// another index. Expect every manifest's text read back as it was made, the merges kept as diffs (nothing kept whole but
+/// the root), and the replay's rows the fork's, row for row.
+#[test]
+fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
+  let commits: [([Option<usize>; 2], &[u8]); 8] = [
+    ([None, None], b"root\n"),
+    ([Some(0), None], b"left 1\n"),
+    ([Some(0), None], b"right 1\n"),
+    ([Some(1), Some(2)], b"merged 1\n"),
+    ([Some(1), None], b"left 2\n"),
+    ([Some(2), None], b"right 2\n"),
+    ([Some(5), Some(4)], b"merged 2\n"),
+    ([Some(6), Some(3)], b"merged both\n"),
+  ];
+  let (payload, texts) = dag_push(&commits, 40);
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (crate::changegroup::Version::V03, &payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut records = Vec::new();
+  loop {
+    let stepped = taking.step(&payload, &mut store, &mut admission).unwrap();
+    while let Some(segment) = taking.take_segment() {
+      records.push(whole_record(&mut taking, &segment, 1 << 20, &store));
+    }
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  while let Some(segment) = taking.take_segment() {
+    records.push(whole_record(&mut taking, &segment, 1 << 20, &store));
+  }
+  let (mut fork, intaken) = finished(taking);
+  assert_eq!(
+    manifest_texts(&fork, &store),
+    texts,
+    "each manifest as made"
+  );
+  assert_eq!(
+    intaken.manifests_kept_whole_bytes,
+    u64::try_from(texts[0].len()).unwrap(),
+    "nothing kept whole but the root"
+  );
+  let mut replayed = HgIndex::new();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  assert_eq!(rows(&mut replayed, &store), rows(&mut fork, &store));
+  replayed.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
 }

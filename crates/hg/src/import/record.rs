@@ -2591,37 +2591,34 @@ impl Revisions {
     appended
   }
 
-  /// Appends `row` to `log` of the fork, which keeps a manifest as its own delta against the one it holds last, read from
-  /// the text the store gave for it where its object was let go once landed (goal 93, C1 (1)).
+  /// Appends `row`, a manifest whose row names its whole text, to `log` of the fork as the push's intake keeps a manifest
+  /// it re-keeps (`push::manifest_row`, main's ruling (B'): its diff against the manifest the fork holds last, where the
+  /// chain allows, else whole), so a replay makes the live push's rows: its text its own given by the store where its
+  /// object was let go once landed (goal 93, C1 (1)), the last row's read over the texts the store gave.
   fn append_over_given(
     &mut self,
     store: &mut ContentStore,
     log: Log<'_>,
     row: NewRevision,
   ) -> Result<Vec<u32>, crate::index::Refused> {
-    let held_last = self
-      .fork
-      .len(store, log)
-      .checked_sub(1)
-      .and_then(|last| self.fork.revision(store, log, last))
-      .map(|row| row.node);
-    let previous = held_last.and_then(|held_last| {
-      self
-        .given_manifests
-        .iter()
-        .find(|(node, _)| *node == held_last)
-        .map(|(node, text)| (node, text.as_slice()))
-    });
-    // Its own text where the store gave it (a whole manifest whose object was let go).
-    let own: Vec<(Node, &[u8])> = self
+    let unread = crate::index::Refused::Unread { rev: NONE };
+    if log != Log::Manifest {
+      return Err(unread);
+    }
+    let own = self
       .given_manifests
       .iter()
-      .filter(|(node, _)| *node == row.node)
-      .map(|(node, text)| (*node, text.as_slice()))
-      .collect();
-    self
-      .fork
-      .append_revisions_after(store, log, &[row], (previous, &own))
+      .find(|(node, _)| *node == row.node)
+      .map(|(_, text)| text.clone());
+    let text = own
+      .or_else(|| store.object_bytes(&row.bytes, row.len))
+      .ok_or(unread)?;
+    crate::push::manifest_row::kept_from_text(
+      &mut self.fork,
+      store,
+      (row, &text),
+      &self.given_manifests,
+    )
   }
 
   /// A group read whole: counted, and the next group's head next.
