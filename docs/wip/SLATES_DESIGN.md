@@ -64048,3 +64048,17 @@ GAPS.
   1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds the shard's flush measured by
   an import alone first, not 500 ms: every staging step waits a hold, and the first batch's 151 steps took it past its
   patience (61 s at 150 ms; 3.5-5.3 s at a flush, its await 0.45-1.1 s against `F` 5.6-9.8 ms).
+- **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
+  (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
+  texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:
+  `Index::plan_begin` sorts the rows and makes the new root, `plan_step` applies rows until the step's clock passes its
+  quantum, a row at least, its builder held between steps without the index (`Builder::detach`, `attach`) and refused
+  out of date where a revision was appended since the plan began; `plan` is the two carried to their end.
+  `Repository::check_begin` and `check_step` carry the rest of the check beside it, and staging's check
+  (`staging::checked_in`, `check_slice`) checks as far as each step's slice holds. The record check step 101-106 ms →
+  17 ms (the encoding, the fresh texts, the sort and the stored filter, whole), its rows' steps under the quantum but
+  the last, the plan's finish (4.4 ms). Oracles: over the naive-filesystem oracle's generated histories, and over
+  every revision of every dump `svnadmin` wrote, a record planned a row a step is the record planned whole, the plans
+  and the indexes after each alike (`a_record_planned_a_row_a_step_is_the_record_planned_whole`,
+  `every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole`; a builder taken up without its
+  next node number fails both); a plan's step after an append is refused out of date.

@@ -34,9 +34,9 @@ use slates_svn::commit::revision::Revision;
 use slates_svn::index::ContentIdentity;
 
 use slates_merge::engine::Increment;
-use slates_svn::migration::Checked;
+use slates_svn::migration::{CheckStep, Checked};
 
-use super::{Building, Uncommitted, brought, checked, green_of, grown, identity, landing, restore};
+use super::{Building, Uncommitted, brought, green_of, grown, identity, landing, restore};
 use crate::import_batch::ImportBatch;
 use crate::repository::push::EntryParts;
 use crate::state::ShardState;
@@ -581,6 +581,63 @@ enum StagingAt {
   Recording,
 }
 
+/// [`Staging::stage_in`]'s record check, a slice a step each lending the records' room (A-920 piece 2: the index's
+/// plan of a revision's rows one call of 87 ms at 9,000 files, debug): the record encoded and every other check made in
+/// the first, then the rows planned as far as each step's slice holds, so a revision that fits a slice is checked in
+/// one step. The landing turn keeps every other commit out between steps, and the index refuses a plan's step once a
+/// revision was committed since it began. None where the shard's state is gone.
+async fn checked_in(
+  repository: RepositoryId,
+  lent: u64,
+  revision: Revision,
+) -> Option<Result<(Checked, Vec<u8>), Uncommitted>> {
+  let mut at = CheckAt::Begin(revision);
+  let mut record = Vec::new();
+  loop {
+    let stepped = within_records(repository, lent, |state| {
+      check_slice(state, repository, (at, &mut record))
+    })
+    .await?;
+    match stepped {
+      Ok(CheckStep::Checked(checked)) => return Some(Ok((checked, record))),
+      Ok(CheckStep::More(more)) => at = CheckAt::Going(more),
+      Err(refused) => return Some(Err(refused)),
+    }
+  }
+}
+
+/// One of [`checked_in`]'s steps, from `at`, until the shard's clock passes its quantum: begun, the revision's record
+/// encoded into `record`.
+fn check_slice(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (at, record): (CheckAt, &mut Vec<u8>),
+) -> Result<CheckStep, Uncommitted> {
+  let records = state
+    .vcs_stores
+    .subversion_records(repository)
+    .ok_or(Uncommitted::NotHeld)?;
+  let deadline = slice_deadline_ns();
+  let checking = match at {
+    CheckAt::Begin(revision) => {
+      *record = slates_svn::commit::record::Record::revision_bytes(&revision);
+      records.check_begin(revision).map_err(Uncommitted::Step)?
+    }
+    CheckAt::Going(checking) => *checking,
+  };
+  records
+    .check_step(checking, &mut || slates_rt::futures::now_ns() >= deadline)
+    .map_err(Uncommitted::Step)
+}
+
+/// Where a revision's record check stands between its steps ([`checked_in`]).
+enum CheckAt {
+  /// Not begun.
+  Begin(Revision),
+  /// Begun, its rows planned in part.
+  Going(Box<slates_svn::migration::Checking>),
+}
+
 /// What a revision's judge or commit step left ([`Staging::judged_in`], [`Staging::commit_in`]).
 enum JudgedIn {
   /// Kept in the batch, its commit ended.
@@ -867,11 +924,7 @@ impl Staging {
     (revision, plans): (Revision, restore::CopyPlans),
   ) -> Option<Result<StagedIn, Uncommitted>> {
     let lent = brought(&revision);
-    let checked = within_records(repository, lent, |state| {
-      checked(state, repository, revision, None)
-    })
-    .await?;
-    let (checked, record) = match checked {
+    let (checked, record) = match checked_in(repository, lent, revision).await? {
       Ok(checked) => checked,
       Err(refused) => return Some(Err(refused)),
     };
