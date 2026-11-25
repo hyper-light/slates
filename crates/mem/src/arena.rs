@@ -464,6 +464,18 @@ impl ChunkArena {
     done
   }
 
+  /// [`ChunkArena::purge`] while more than `keep_bytes` of free blocks stay resident: a busy arena's give-back past what
+  /// its work refills (goal 93, main's ruling of 2026-11-25: A-742's rule, freed memory returns to the OS, applied to the
+  /// content plane while the shard is never idle; a Subversion import's let-go texts stayed resident as free pages, 204
+  /// MB of a 438 MB daemon, the idle purge never reached). Nothing while within it; else one slice of `max_blocks`
+  /// blocks, which may pass below `keep_bytes` by at most that slice.
+  pub fn purge_past(&mut self, keep_bytes: usize, max_blocks: usize) -> Purged {
+    if self.resident_free <= keep_bytes {
+      return Purged::default();
+    }
+    self.purge(max_blocks)
+  }
+
   /// Sets the pool this arena grows from (A-98).
   pub fn set_source(&mut self, source: Box<dyn ExtentSource>) {
     self.source = Some(source);
