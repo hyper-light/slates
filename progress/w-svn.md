@@ -165,7 +165,9 @@
   repo: git archive HEAD -> ~/slates-work/w-svn-ship (git init, one commit) and kiln run with cwd there, on
   adas-mac-studio.local-2 (has svn 1.15.0; no GitHub key).
 - Asked main: is svn's byte store for the intake w-perf's S4 slice 2 (A-716)? Format 2 piece slicing needs a measured
-  MD5+SHA-1 rate (like archive_slice_bytes' BLAKE3 rate): waiting on main's ordering.
+  MD5+SHA-1 rate (like archive_slice_bytes' BLAKE3 rate): waiting on main's ordering. CLOSED (11-25): landed as item 2,
+  63ab25b9f (svn_digest_bytes_per_second, svn_text_piece_bytes, Exporter::with_text_piece), used by svn_export.rs's
+  exporter; the release measurement is main's round.
 
 ## INTAKE (main's order 1, Ada: perf gaps fixed upfront) -- in progress
 - Agreed with w-perf (slates-work-89): stage/append/seal/discard in slates-merge (LANDED e9b70d6d4, commit 6487601b2);
@@ -793,3 +795,4 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - 19:45 landed 09b2f0d3c: A-910 incremental fold + oracle (949ca8619), staging_steps stub reverted + TSan skip (2cb9633ba), tail identity sliced + texts_carried by lookup (2f340066f). Earlier: drive-refusal logs 1174cb060, TSan crash test 8c0d8fce8, slicing 2a 30195b30e. Import max step still ~490 ms = checkpoint task's first-turn identity fold (A-579 turn_budget_ns: interval 0 -> all at once); asked main. Next: piece 3 (Applying), 2b.
 - 22:30 landed: 964888c59 first checkpoint's identity a quantum a turn (zero interval only; 2 reds); 1af90f6e4 pace test waiter mid-step (84a property); ac3bf0650 landed-pin counters by kind + crash test evidence message. All-verbs diffs at 3e910809f: comparator's, fixed on main (c94252e87, 71c2f07a7), 0 diffs at a61f1dfd4. TSan crash leak: no native red (images don't restore a window whole); fix waits on a failure showing whole-at-start. Import max ~480 ms = pace ceiling with no waiter, by design. Next: piece 3 (Applying), then 2b.
 - 11-25: landed 085f6dfad (site 4: recovery lets go named texts found whole) + d50169633 (resident honest for one-window objects); d3539309d (Unstored on Linux texts bound: shared windows; cut oracle); f8fd11504 (sites 2,3 measured and fixed; site 1 and step refusals measured clean); a55d7cfa6 (svn on rule (B): pin at seal, unpin at landing/every end; scoped pin retired; between-batches red). HTTPv2 revprop PROPPATCH: CLOSED (fixed by d843d2325, w-interop green at b2888af84). All-verbs diffs at 3e910809f: comparator's, closed. P7 flush cut: w-perf's. w-balance admission: go given (inbox). Next: piece 3 (patch ~/.cache/w-svn/piece3-commit-run.patch), then 2b.
+- 11-25 later: d2383560f (unpin at durable landing; w-perf's store_tests red); 47eb329ab (TSan crash test: store made before judging, every named run counted; native red via PUBLICATIONS_LEFT); 3cc90d154 (brought/found split). MD5/SHA-1 item closed (63ab25b9f). Next: piece 3 (patches ~/.cache/w-svn/piece3-applying-engine.patch; applying_tests.rs to rewrite from session).
