@@ -1713,10 +1713,15 @@
 > coming back decoded by the store; a stream copies a chunk as it lies, sized by its length, compressing only a raw
 > place. Held by `a_segments_chunks_made_a_step_at_a_time_are_the_one_shot_chunks` (hg) and
 > `a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes` (server: the push chunked within the copy
-> slice, the stream compressing nothing again, the clone decoding the file's chunk). Owed: an import's landings and a
-> whole push's or made changeset's payload (the changegroup its record replays) still land raw, so a stream compresses
-> those at stream time (`Streaming::sized` stays for them); the count pass still reads a chunk place's bytes it could size
-> by its length.
+> slice, the stream compressing nothing again, the clone decoding the file's chunk). An import's landings chunked too
+> (2026-11-25, w-hg; main's order): its segment's record names its rows by identity as a push segment's does, so its
+> payload is made into chunks between the import's turns (`hg_push::chunked_paced`, the same paced steps and counters)
+> and its `Texts` entries held as chunks. Held by `an_imports_files_land_as_chunks_the_clone_decodes` (red: nothing
+> chunked at the import, the clone decoding nothing) and `an_imports_file_texts_held_between_landings_are_bounded_by_its_
+> segment` (the production step's chunk turns counted, none past its copy slice). A made changeset's payload stays raw:
+> its record replays the changegroup itself (`write_made_record`), and no push lands whole any more (every push lands
+> as segments), so a stream compresses only a made changeset's places at stream time (`Streaming::sized` stays for
+> them). Owed: the count pass still reads a chunk place's bytes it could size by its length.
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
