@@ -109,6 +109,8 @@ pub(crate) struct Importing {
   staging: Option<Staging>,
   /// Its batches landed, by cause ([`Batches`]).
   batches: Batches,
+  /// The texts bound its last landed batch was cut at, with its inputs (`staging::texts_bound`): logged as it ends.
+  bound: Option<crate::repository::svn_commit::staging::TextsBound>,
   /// The texts the import put into the content store for the revision it reads ([`texts`]).
   texts: texts::ImportTexts,
   /// The texts the owed record's revision brought, each holding one count of the content store: handed to its landing.
@@ -241,9 +243,14 @@ impl Batches {
 
 /// Counts a batch of repository `id`'s import landed for `cause` ([`Batches`]); nothing where no import of it is under
 /// way.
-pub(crate) fn batch_landed(state: &mut ShardState, id: RepositoryId, cause: Flush) {
+pub(crate) fn batch_landed(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (cause, bound): (Flush, crate::repository::svn_commit::staging::TextsBound),
+) {
   if let Some(importing) = state.vcs_stores.svn_imports.get_mut(&id) {
     importing.batches.add(cause);
+    importing.bound = Some(bound);
   }
 }
 
@@ -301,6 +308,7 @@ pub(crate) fn begin(
     base_owed: None,
     staging: None,
     batches: Batches::default(),
+    bound: None,
     texts: texts::ImportTexts::default(),
     owed_texts: Vec::new(),
     flush_end: false,
@@ -858,7 +866,7 @@ fn done(state: &ShardState, id: RepositoryId, importing: &Importing) -> Result<L
   let batches = importing.batches;
   slates_machine::log_line!(
     "slates-server: partition {}: a Subversion import ended at revision {youngest}, {} revisions in {} turns; its \
-     batches landed for admission {}, sections {}, retention {}, chain {}, texts {}, end {}",
+     batches landed for admission {}, sections {}, retention {}, chain {}, texts {}, end {}; its texts bound {}",
     state.partition,
     importing.revisions,
     importing.turns,
@@ -867,7 +875,11 @@ fn done(state: &ShardState, id: RepositoryId, importing: &Importing) -> Result<L
     batches.retention,
     batches.chain,
     batches.texts,
-    batches.end
+    batches.end,
+    importing.bound.map_or_else(
+      || "unread (no batch landed)".to_owned(),
+      |bound| bound.to_string()
+    )
   );
   Ok(Loaded {
     revisions: importing.revisions,

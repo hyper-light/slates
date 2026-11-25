@@ -194,8 +194,10 @@ pub struct Header {
   pub sections: u16,
 }
 
-/// A committed record: where it is, its header, its identity and its length.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A committed record: where it is, its header, its identity and its length; and, as its commit returns it, how long
+/// that commit's flush took. Two are equal where they name the same record, whatever its commit's flush took (a record
+/// read back carries none).
+#[derive(Clone, Copy, Debug)]
 pub struct Located {
   /// The record's first byte in the log.
   pub offset: u64,
@@ -205,7 +207,19 @@ pub struct Located {
   pub identity: [u8; IDENTITY],
   /// Its whole length, trailer included.
   pub len: u64,
+  /// The nanoseconds its commit's flush took (`sync_data`, on the host's monotonic clock): the device's own durable
+  /// write, no queue and no write before it; zero for a record read back from the log.
+  pub flush_ns: u64,
 }
+
+impl PartialEq for Located {
+  fn eq(&self, other: &Self) -> bool {
+    (self.offset, self.header, self.identity, self.len)
+      == (other.offset, other.header, other.identity, other.len)
+  }
+}
+
+impl Eq for Located {}
 
 impl Located {
   /// Where the next record begins.
@@ -269,6 +283,9 @@ pub struct ChangesetLog<F: BlockFile> {
   /// The record being appended, if one is: its state lives here, not in a borrow, so a record appended a slice at a
   /// time over many requests leaves the log readable between them (the owner's sliced landing).
   open: Option<OpenRecord>,
+  /// The nanoseconds its reads of committed records have taken, all told ([`ChangesetLog::read_ns`]): the disk's share
+  /// of a store request's service (goal 93, main's order of 2026-11-25: a clone's store wait split by part).
+  read_ns: core::cell::Cell<u64>,
 }
 
 /// A record being appended: its header, where it starts and where its next byte goes, its identity so far, the sections
@@ -300,6 +317,7 @@ impl<F: BlockFile> ChangesetLog<F> {
       file,
       end,
       open: None,
+      read_ns: core::cell::Cell::new(0),
     })
   }
 
@@ -436,13 +454,16 @@ impl<F: BlockFile> ChangesetLog<F> {
     let mut trailer = [0u8; TRAILER_BYTES];
     encode_trailer(&identity, len, &mut trailer);
     self.file.write_all_at(&trailer, record.at)?;
+    let flushing = slates_machine::clock::monotonic_ns();
     self.file.sync_data()?;
+    let flush_ns = slates_machine::clock::monotonic_ns().saturating_sub(flushing);
     self.end = past;
     Ok(Located {
       offset: record.start,
       header: record.header,
       identity,
       len,
+      flush_ns,
     })
   }
 
@@ -467,8 +488,17 @@ impl<F: BlockFile> ChangesetLog<F> {
     if past > self.end {
       return Err(LogError::Corrupt("a read past the committed records"));
     }
-    self.file.read_exact_at(buf, offset)?;
+    let began = slates_machine::clock::monotonic_ns();
+    let read = self.file.read_exact_at(buf, offset);
+    let took = slates_machine::clock::monotonic_ns().saturating_sub(began);
+    self.read_ns.set(self.read_ns.get().saturating_add(took));
+    read?;
     Ok(())
+  }
+
+  /// The nanoseconds its reads of committed records have taken so far ([`ChangesetLog::read_at`]).
+  pub fn read_ns(&self) -> u64 {
+    self.read_ns.get()
   }
 }
 
@@ -668,6 +698,7 @@ fn verify_at<F: BlockFile>(
     header,
     identity: recorded,
     len: record_len,
+    flush_ns: 0,
   }))
 }
 

@@ -2801,3 +2801,227 @@ fn a_pushs_pins_look_at_each_kept_revision_once_whatever_its_steps() {
 
 /// Shape: the revisions of [`a_pushs_pins_look_at_each_kept_revision_once_whatever_its_steps`]'s push.
 const PIN_REVISIONS: usize = 64;
+
+/// w-interop's matrix at 29221d5ab (stock 7.2.4's merge-push and rebase-push refused `UnknownDeltaBase { log: Manifests }`
+/// on the manifest of a changeset the same push carried before the merge; main's order of 2026-11-25). Do: over the
+/// stock bundle's repository, push a changeset its manifest a client's delta (so the repository's tip manifest is kept
+/// as a delta, as a pushed repository's is); let go every changeset's and manifest's object of that repository, as its
+/// landing does; push two more in one changegroup, each manifest a client's delta on the one before, its asks answered
+/// as the server answers them, from the changeset store alone. Expect: both taken, the second's manifest read over the
+/// first's (kept by this push, a delta on the let-go tip's), the chain's let-go link asked of the store. Red before:
+/// refused `UnknownDeltaBase` for the first's manifest on itself: it was asked of the store, which keeps no row of a
+/// revision the push has not landed.
+#[test]
+fn a_pushs_manifest_reads_one_the_same_push_kept_over_a_let_go_chain() {
+  let mut store = store();
+  let mut empty = HgIndex::new();
+  let (stock_repository, _, _) = intake(&stock(), &mut empty, &mut store, &mut room()).unwrap();
+  let made_over = |index: &HgIndex, store: &ContentStore, parent: Node, path: &[u8]| {
+    let authored = crate::push::made::Authored {
+      user: b"Client <c@example.com>",
+      seconds: 1,
+      branch: b"default",
+      message: b"a line",
+    };
+    crate::push::made::made(
+      &crate::push::held::IndexHeld::new(index, store),
+      parent,
+      &[crate::push::made::Change {
+        path,
+        after: Some((path, crate::manifest::Flag::Regular)),
+        copied_from: None,
+      }],
+      &authored,
+      &mut room(),
+    )
+    .unwrap()
+  };
+  let tip = |index: &HgIndex, store: &ContentStore| {
+    let len = index.len(store, Log::Changelog);
+    index.changeset(store, len - 1).unwrap().node
+  };
+  let tip_text = |index: &HgIndex, store: &ContentStore| {
+    let rev = index.len(store, Log::Manifest) - 1;
+    let row = index.revision(store, Log::Manifest, rev).unwrap();
+    (
+      row.node,
+      index.revision_text(store, Log::Manifest, rev).unwrap(),
+    )
+  };
+  let mut base = stock_repository;
+  let first = made_over(&base, &store, tip(&base, &store), b"first.txt");
+  let (node, text) = tip_text(&base, &store);
+  let mut repository = taken_as_sent(
+    &mut base,
+    &mut store,
+    &manifests_as_deltas(&first, (node, &text)),
+  );
+  let second = made_over(&repository, &store, first.changesets[0].node, b"second.txt");
+  let on_second = {
+    let (node, text) = tip_text(&repository, &store);
+    let payload = manifests_as_deltas(&second, (node, &text));
+    // A fork of the repository (an intake never changes its index): the third made over the second.
+    taken_as_sent(&mut repository, &mut store, &payload)
+  };
+  let third = made_over(&on_second, &store, second.changesets[0].node, b"third.txt");
+  let both = crate::push::verify::Verified::of(
+    [second.changesets.clone(), third.changesets.clone()].concat(),
+    [second.manifests.clone(), third.manifests.clone()].concat(),
+    [second.files.clone(), third.files.clone()].concat(),
+  );
+  let (node, text) = tip_text(&repository, &store);
+  let payload = manifests_as_deltas(&both, (node, &text));
+  let saved = saved_and_let_go_logs(&repository, &mut store);
+  let (taken, asked) = taken_from_the_store_alone(&mut repository, &mut store, (&payload, &saved));
+  let (fork, intaken) =
+    taken.unwrap_or_else(|refused| panic!("both changesets taken: {refused:?}"));
+  for node in [second.changesets[0].node, third.changesets[0].node] {
+    assert!(
+      fork.rev(&store, Log::Changelog, &node).is_some(),
+      "{node:?} taken"
+    );
+  }
+  assert!(
+    asked > 0 && intaken.log_texts_asked > 0,
+    "the let-go link asked of the store"
+  );
+}
+
+/// `payload` taken into a fork of `index` whole, every ask of the store answered from the fork: the fork.
+fn taken_as_sent(index: &mut HgIndex, store: &mut ContentStore, payload: &[u8]) -> HgIndex {
+  let mut taking = Intake::begin(
+    (crate::push::made::CHANGEGROUP_VERSION, payload),
+    index,
+    store,
+    &mut room(),
+  )
+  .unwrap();
+  loop {
+    match taking.step(payload, store, &mut room()).unwrap() {
+      Stepped::Store => taking.answer_from_fork(store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  finished(taking).0
+}
+
+/// `payload` taken into a fork of `index`, each ask of a log's text answered as the server answers it, from the changeset
+/// store alone (`saved`: the landed revisions' texts, by log path and node), another ask from the fork: the fork and what
+/// was taken, or the refusal; and the log texts asked.
+fn taken_from_the_store_alone(
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  (payload, saved): (&[u8], &std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>>),
+) -> (Result<(HgIndex, Intaken), Refused>, u64) {
+  let mut taking = Intake::begin(
+    (crate::push::made::CHANGEGROUP_VERSION, payload),
+    index,
+    store,
+    &mut room(),
+  )
+  .unwrap();
+  let mut asked = 0_u64;
+  let mut admission = room();
+  loop {
+    match taking.step(payload, store, &mut admission) {
+      Ok(Stepped::Store) => match taking.asked_text() {
+        Some(text) => {
+          asked += 1;
+          taking.answer_text(saved.get(&text).cloned());
+        }
+        None => taking.answer_from_fork(store),
+      },
+      Ok(stepped) if more(&stepped) => {}
+      Ok(_) => return (Ok(finished(taking)), asked),
+      Err(refused) => return (Err(refused), asked),
+    }
+  }
+}
+
+/// `verified`'s changegroup as a client sends a line of them (7.2's packer, generaldelta): its changesets and files whole,
+/// each manifest a delta against the one before (the first against `tip`, the repository's, whose text is given), one
+/// hunk replacing the whole base.
+fn manifests_as_deltas(verified: &crate::push::verify::Verified, tip: (Node, &[u8])) -> Vec<u8> {
+  use crate::changegroup::{self as cg, Revision};
+  let version = crate::push::made::CHANGEGROUP_VERSION;
+  let revision = |arrived: &crate::push::verify::Arrived, base: Node, data: &[u8]| -> Vec<u8> {
+    let mut out = Vec::new();
+    let revision = Revision {
+      node: arrived.node,
+      p1: arrived.p1,
+      p2: arrived.p2,
+      base,
+      link: arrived.link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data,
+      sidedata: None,
+    };
+    if base == crate::NULL_NODE {
+      cg::put_revision_whole(&revision, version, &mut out).unwrap();
+    } else {
+      cg::put_revision(&revision, version, &mut out).unwrap();
+    }
+    out
+  };
+  let mut out = Vec::new();
+  for arrived in &verified.changesets {
+    out.extend(revision(arrived, crate::NULL_NODE, &arrived.text));
+  }
+  cg::put_end(&mut out);
+  let (mut base, mut base_len) = (tip.0, tip.1.len());
+  for arrived in &verified.manifests {
+    let mut delta = Vec::new();
+    for field in [0, base_len, arrived.text.len()] {
+      delta.extend_from_slice(&u32::try_from(field).unwrap().to_be_bytes());
+    }
+    delta.extend_from_slice(&arrived.text);
+    out.extend(revision(arrived, base, &delta));
+    (base, base_len) = (arrived.node, arrived.text.len());
+  }
+  cg::put_end(&mut out);
+  cg::put_end(&mut out);
+  for (path, revisions) in &verified.files {
+    cg::put_name(path, &mut out).unwrap();
+    for arrived in revisions {
+      out.extend(revision(arrived, crate::NULL_NODE, &arrived.text));
+    }
+    cg::put_end(&mut out);
+  }
+  cg::put_end(&mut out);
+  out
+}
+
+/// Every changeset's and manifest's text of `repository` saved by (log path, node), and the objects their rows name let
+/// go: what the changeset store would answer of them once landed.
+fn saved_and_let_go_logs(
+  repository: &HgIndex,
+  store: &mut ContentStore,
+) -> std::collections::BTreeMap<(Vec<u8>, Node), Vec<u8>> {
+  let mut saved = std::collections::BTreeMap::new();
+  let mut objects = Vec::new();
+  for rev in 0..repository.len(store, Log::Changelog) {
+    let row = repository.changeset(store, rev).unwrap();
+    saved.insert(
+      (super::CHANGELOG_PATH.to_vec(), row.node),
+      store.object_bytes(&row.text, row.len).unwrap(),
+    );
+    objects.push(row.text);
+  }
+  for rev in 0..repository.len(store, Log::Manifest) {
+    let row = repository.revision(store, Log::Manifest, rev).unwrap();
+    saved.insert(
+      (super::MANIFEST_PATH.to_vec(), row.node),
+      repository.revision_text(store, Log::Manifest, rev).unwrap(),
+    );
+    objects.push(row.bytes);
+  }
+  let let_go: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(let_go > 0, "objects let go");
+  saved
+}

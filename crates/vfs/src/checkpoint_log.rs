@@ -113,7 +113,10 @@ impl ShardDelta {
     at: usize,
     volumes: usize,
     removed: &mut [[u8; 16]],
-    (held_put, held_removed): (&mut [HeldPiece], &mut [[u8; HELD_PIECE_KEY_BYTES]]),
+    (held_put, held_removed): (
+      &mut [crate::recover::HeldPieceRef<'_>],
+      &mut [[u8; HELD_PIECE_KEY_BYTES]],
+    ),
     replies: Option<&[HeldReply]>,
     (calls, calls_removed): (&mut [HeldCall], &mut [[u8; HELD_CALL_KEY_BYTES]]),
     (nfs_replies, nfs_states): (Option<&mut [HeldNfsReply]>, Option<&mut [HeldNfsStates]>),
@@ -239,14 +242,10 @@ impl ShardDelta {
 /// writes its `held_put` and `held_removed`.
 fn encode_held(
   out: &mut Vec<u8>,
-  held_put: &mut [HeldPiece],
+  held_put: &mut [crate::recover::HeldPieceRef<'_>],
   held_removed: &mut [[u8; HELD_PIECE_KEY_BYTES]],
 ) {
-  held_put.sort_unstable_by_key(|piece| piece.key);
-  slates_wire::codec::encode_len(held_put.len(), out);
-  for piece in held_put.iter() {
-    piece.encode(out);
-  }
+  crate::recover::encode_held_pieces(held_put, out);
   held_removed.sort_unstable();
   slates_wire::codec::encode_len(held_removed.len(), out);
   for key in held_removed.iter() {

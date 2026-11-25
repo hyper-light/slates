@@ -10,7 +10,9 @@
 # - the stream's own file list, from hg's debug output, and any file a stream sent twice;
 # - `hg debugrevlog` of each clone's changelog, manifest and the source's largest filelog: revisions whole and as
 #   deltas, and the chunks' kinds (`0x28` zstd, `0x78` zlib, `0x00` a raw delta, `u` uncompressed);
-# - which protocol each stream used (v2, a bundle2 "stream2" part; v1, the `stream_out` command).
+# - which protocol each stream used (v2, a bundle2 "stream2" part; v1, the `stream_out` command);
+# - each revlog's header (its first four bytes: the version, and the inline and generaldelta flags), and any that
+#   differs from stock's.
 #
 # Usage: hg_stream_compare.sh SLATES SOURCE WORK
 #   SLATES  a `slates` binary (debug serves; the comparison is of what is sent, not how fast)
@@ -163,6 +165,22 @@ common = [(slates[p] - stock[p], p) for p in set(stock) & set(slates)]
 print("== the files in both whose sizes differ most (slates minus stock, bytes)")
 for diff, path in sorted(common, reverse=True)[:15]:
     if diff: print(f"  {diff:+12} {path} (stock {stock[path]}, slates {slates[path]})")
+def headers(server):
+    found = {}
+    for path in store(server):
+        if path.endswith(".i"):
+            try:
+                with open(os.path.join(work, f"{server}-clone", ".hg", "store", path), "rb") as index:
+                    found[path] = index.read(4).hex()
+            except OSError:
+                pass
+    return found
+stock_headers, slates_headers = headers("stock"), headers("slates")
+differ = sorted(p for p in set(stock_headers) & set(slates_headers) if stock_headers[p] != slates_headers[p])
+for server, found in (("stock", stock_headers), ("slates", slates_headers)):
+    print(f"== {server}'s revlog headers: " + ", ".join(f"{h} x{c}" for h, c in sorted(collections.Counter(found.values()).items())))
+print(f"== revlog headers that differ from stock's: {len(differ)}")
+for path in differ[:15]: print(f"  {path}: stock {stock_headers[path]}, slates {slates_headers[path]}")
 for server in ("stock", "slates"):
     names = streamed(server)
     twice = [n for n, c in collections.Counter(names).items() if c > 1]

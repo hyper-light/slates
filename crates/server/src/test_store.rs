@@ -54,7 +54,7 @@ impl TestStore {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the store's directory");
     let dir = dir.canonicalize().expect("the store's directory");
-    let owner = StoreOwner::start(root(&dir), sizing, WAITING).expect("the store's owner");
+    let owner = StoreOwner::start(root(&dir), sizing, (WAITING, 0)).expect("the store's owner");
     TestStore {
       owner: Some(owner),
       dir,
@@ -87,7 +87,7 @@ impl TestStore {
   pub(crate) fn restart_owner(&mut self) {
     self.stop_owner();
     self.owner =
-      Some(StoreOwner::start(root(&self.dir), SIZING, WAITING).expect("the store's owner"));
+      Some(StoreOwner::start(root(&self.dir), SIZING, (WAITING, 0)).expect("the store's owner"));
   }
 }
 

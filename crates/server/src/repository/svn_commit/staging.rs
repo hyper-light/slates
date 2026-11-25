@@ -83,23 +83,132 @@ thread_local! {
   pub(crate) static TEXTS_UNBOUNDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Derived: the most bytes of texts a batch carries before it lands (goal 93 P7, main 01a20182's ruling of 2026-11-24):
-/// the node's changeset store's own unit, one trunk node of its memtable (`vcs_store::hg_import::segment_bytes`: the
-/// content plane's chunk times SplinterDB's fanout), the bytes a Mercurial import's segment is cut at, unless one
-/// revision's texts alone are more, which stays one revision since a revision is staged whole. A batch's texts are given
-/// back only once it lands (`give_back_put_some`), and the next revision's are put into the content store as the dump is
-/// read, before its staging asks whether the batch is due: so an import holds at most twice the larger of this bound and
-/// its largest revision's texts, never a history's (git-2000 held 426 MiB in one batch before).
-pub(crate) fn texts_bound(state: &ShardState) -> u64 {
+/// Derived: the most bytes of texts a batch carries before it lands (goal 93 P7; main's rulings of 2026-11-24 and
+/// 2026-11-25), rent or buy at the daemon's own exchange of memory against time:
+///
+/// `bound = clamp(F × M, U, max(U, R / 2))`
+///
+/// - `F`, the device's durable flush ([`durable_flush_ns`]): what landing a batch costs, the store's own `sync_data` as
+///   each batch this shard lands durably took it (`slates_store::owner::take_landed_flush_ns`; the landing's await holds
+///   the owner's queue and the writes before the flush, which would overstate it, main's ruling of 2026-11-25), the
+///   least so far (w-svn's review). Until one has landed, unknown, and the bound is `U`.
+/// - `M`, the machine's memcpy rate, bytes a second, the boot profile's figure as every derived value takes it
+///   (`DaemonConfig::memcpy_bytes_per_second`; the profile prices a byte of RAM at the time it takes to move it,
+///   `CodecPolicy::byte_worth_from_memcpy`). Holding `B` bytes of texts is worth `B / M` of time, so a batch grows while
+///   holding its bytes costs less than the flush it saves: `B < F × M`. Its swing across samples is the profile's.
+/// - `U`, the node's changeset store's own unit, one trunk node of its memtable (`vcs_store::hg_import::segment_bytes`:
+///   the content plane's chunk times SplinterDB's fanout; 512 KiB at a 4 KiB page, 2 MiB at 16 KiB): the floor, P7's
+///   bound before.
+/// - `R`, the import's admitted room on its shard ([`import_room`]), halved: the next revision's texts are put before
+///   the batch is judged, so an import holds up to twice its bound, which stays within the room (w-svn's review). Under
+///   load it shrinks the bound toward `U`.
+///
+/// Per operation: it scales with the device's flush and copy, never with the history's length or the shard's free
+/// memory alone. Measured at git-2000 on a MacBook (F 23.5 ms, M 13.27 GB/s): 312 MB, 2 batches against 180 at `U`,
+/// 415 MB resident against 224 MB (debug; main's release rows in BENCHMARKS). One revision's texts past the bound stay one
+/// revision, since a revision is staged whole; a batch's texts are given back only once it lands, and the next
+/// revision's are put as the dump is read, so an import holds at most twice the larger of the bound and its largest
+/// revision's texts.
+pub(crate) fn texts_bound(state: &mut ShardState, repository: RepositoryId) -> TextsBound {
+  let unit = u64::try_from(crate::vcs_store::hg_import::segment_bytes(state)).unwrap_or(u64::MAX);
+  let room = import_room(state, repository);
+  let flush_ns = durable_flush_ns();
+  let memcpy = state.config.memcpy_bytes_per_second;
+  let rent_or_buy = flush_ns.map_or(unit, |flush_ns| {
+    u64::try_from(u128::from(flush_ns).saturating_mul(u128::from(memcpy)) / NANOS_A_SECOND)
+      .unwrap_or(u64::MAX)
+  });
+  let bytes = rent_or_buy.clamp(unit, (room / 2).max(unit));
   #[cfg(test)]
-  if let Some(bound) = TEXTS_BOUND.with(std::cell::Cell::get) {
-    return bound;
+  let bytes = TEXTS_BOUND.with(std::cell::Cell::get).unwrap_or(bytes);
+  TextsBound {
+    bytes,
+    flush_ns,
+    memcpy,
+    unit,
+    room,
   }
-  u64::try_from(crate::vcs_store::hg_import::segment_bytes(state)).unwrap_or(u64::MAX)
+}
+
+/// Format: nanoseconds in a second, for a rate in bytes a second.
+const NANOS_A_SECOND: u128 = 1_000_000_000;
+
+/// A batch's texts bound ([`texts_bound`]) with the inputs it was derived from, logged once an import ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TextsBound {
+  /// The bound, bytes of texts.
+  pub(crate) bytes: u64,
+  /// The device's durable flush, nanoseconds; none before this shard landed a batch.
+  pub(crate) flush_ns: Option<u64>,
+  /// The boot profile's memcpy rate, bytes a second.
+  pub(crate) memcpy: u64,
+  /// The changeset store's unit, the floor.
+  pub(crate) unit: u64,
+  /// The import's admitted room, whose half is the cap.
+  pub(crate) room: u64,
+}
+
+impl std::fmt::Display for TextsBound {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self.flush_ns {
+      Some(flush_ns) => write!(
+        f,
+        "{} B (a durable flush {flush_ns} ns x memcpy {} B/s, within the unit {} B and half the room {} B)",
+        self.bytes, self.memcpy, self.unit, self.room
+      ),
+      None => write!(
+        f,
+        "{} B (the unit {} B: no durable flush measured yet; memcpy {} B/s, room {} B)",
+        self.bytes, self.unit, self.memcpy, self.room
+      ),
+    }
+  }
+}
+
+std::thread_local! {
+  /// The device's durable flush as this shard measured it ([`durable_flush_ns`]): the least of its batches' changesets
+  /// written and flushed on the node's store.
+  static DURABLE_FLUSH_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The device's durable flush, nanoseconds ([`texts_bound`]'s `F`): the least the store's own flush took for a batch
+/// this shard landed; none before it has.
+pub(crate) fn durable_flush_ns() -> Option<u64> {
+  #[cfg(test)]
+  if let Some(forced) = FLUSH_NS.with(std::cell::Cell::get) {
+    return Some(forced);
+  }
+  DURABLE_FLUSH_NS.with(std::cell::Cell::get)
+}
+
+/// Records `flush_ns`, the store's flush of a batch's changeset, as the device's where it is the least this shard met.
+fn flushed_in(flush_ns: u64) {
+  DURABLE_FLUSH_NS.with(|measured| {
+    let least = measured
+      .get()
+      .map_or(flush_ns, |least| least.min(flush_ns))
+      .max(1);
+    measured.set(Some(least));
+  });
+}
+
+/// The room repository `repository`'s import is admitted on its shard now (`vcs_share::room`): alone there, what the
+/// shard admits; beside other works, its claim's share of the shard's capacity as the room divides it.
+fn import_room(state: &mut ShardState, repository: RepositoryId) -> u64 {
+  #[cfg(test)]
+  if let Some(room) = IMPORT_ROOM.with(std::cell::Cell::get) {
+    return room;
+  }
+  crate::vcs_share::room(state, repository).bytes
 }
 
 #[cfg(test)]
 thread_local! {
+  /// A test's admitted room for an import in place of the shard's ([`import_room`]): a cut import's batches at a room
+  /// it chooses, as a loaded shard's would be.
+  pub(crate) static IMPORT_ROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+  /// A test's durable flush in place of the device's ([`durable_flush_ns`]): the bound's `F` at a figure it chooses.
+  pub(crate) static FLUSH_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
   /// A test's texts bound in place of the derived one ([`texts_bound`]): another host's, whose page, and so whose
   /// changeset store's unit, differs from this one's (a Linux runner's 4 KiB page makes it 512 KiB, a Mac's 16 KiB 2 MiB).
   pub(crate) static TEXTS_BOUND: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -136,6 +245,61 @@ async fn kill_before_entry_where_set() {
   if KILL_BEFORE_ENTRY.with(std::cell::Cell::get) {
     KILL_BEFORE_ENTRY.with(|kill| kill.set(false));
     // A kill: nothing after it runs, as after a `kill -9` between the changeset and its entry.
+    std::future::pending::<()>().await;
+  }
+}
+
+/// A stage of a batch's landing ([`Staging::land`]) a test may kill it at ([`KILL_AT_STAGE`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LandStage {
+  /// Before its changeset is written on the node's store.
+  BeforeChangeset,
+  /// Its changeset durable, before its entry is appended.
+  BeforeEntry,
+  /// Its entry appended, before its versions are applied to the green.
+  BeforeApply,
+  /// Its versions applied, before its tail (the green's fold, its texts followed, given back and let go).
+  BeforeTail,
+  /// Landed whole, before the import goes on.
+  Landed,
+}
+
+/// Every stage of [`LandStage`], in a landing's order.
+#[cfg(test)]
+pub(crate) const LAND_STAGES: [LandStage; 5] = [
+  LandStage::BeforeChangeset,
+  LandStage::BeforeEntry,
+  LandStage::BeforeApply,
+  LandStage::BeforeTail,
+  LandStage::Landed,
+];
+
+#[cfg(test)]
+thread_local! {
+  /// A test's kill of a batch's landing at a stage, once as many batches as it names have passed that stage (the cut
+  /// import's crash oracle, main's ruling of 2026-11-25): nothing after it runs, as after a `kill -9`; it clears itself
+  /// as it fires.
+  pub(crate) static KILL_AT_STAGE: std::cell::Cell<Option<(LandStage, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The kill [`KILL_AT_STAGE`] sets, at `stage` in [`Staging::land`]: once its batches have passed, it clears itself and
+/// never returns.
+#[cfg(test)]
+async fn kill_at_stage_where_set(stage: LandStage) {
+  let fires = KILL_AT_STAGE.with(|kill| match kill.get() {
+    Some((at, 0)) if at == stage => {
+      kill.set(None);
+      true
+    }
+    Some((at, passing)) if at == stage => {
+      kill.set(Some((at, passing - 1)));
+      false
+    }
+    _ => false,
+  });
+  if fires {
+    // A kill: nothing after it runs, as after a `kill -9` at this stage.
     std::future::pending::<()>().await;
   }
 }
@@ -365,6 +529,8 @@ pub(crate) struct Staging {
   released: Vec<(ContentIdentity, String)>,
   /// The text each path the batch changed holds after it, by path: held once the batch commits.
   holding: std::collections::BTreeMap<String, ContentIdentity>,
+  /// The most bytes of texts the batch carries before it lands, read as it began, with its inputs ([`texts_bound`]).
+  bound: TextsBound,
 }
 
 impl Staging {
@@ -373,6 +539,7 @@ impl Staging {
   pub(crate) async fn begin(repository: RepositoryId) -> Option<Result<Staging, Uncommitted>> {
     let turn = landing::turn(repository).await?;
     crate::state::with_state(|state| {
+      let bound = texts_bound(state, repository);
       let begun = green_of(state, repository).and_then(|green| {
         ImportBatch::begin(state, green)
           .map(|batch| (green, batch))
@@ -392,6 +559,7 @@ impl Staging {
           staged: 0,
           released: Vec::new(),
           holding: std::collections::BTreeMap::new(),
+          bound,
         }),
         Err(refused) => {
           turn.give_back(state);
@@ -418,7 +586,7 @@ impl Staging {
   /// revision past the bound alone is one batch.
   /// Whether the texts the batch carries and `revision`'s would pass the batch's bound ([`texts_bound`]); never in a
   /// test that unbounds them ([`TEXTS_UNBOUNDED`]).
-  fn texts_past_bound(&self, state: &ShardState, revision: &Revision) -> bool {
+  fn texts_past_bound(&self, revision: &Revision) -> bool {
     #[cfg(test)]
     if TEXTS_UNBOUNDED.with(std::cell::Cell::get) {
       return false;
@@ -427,7 +595,7 @@ impl Staging {
       .carried
       .iter()
       .fold(0u64, |total, text| total.saturating_add(text.len));
-    carried.saturating_add(stored_bytes(revision)) > texts_bound(state)
+    carried.saturating_add(stored_bytes(revision)) > self.bound.bytes
   }
 
   pub(crate) fn due_before(&self, state: &ShardState, revision: &Revision) -> Option<Flush> {
@@ -437,7 +605,7 @@ impl Staging {
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
     }
-    if self.texts_past_bound(state, revision) {
+    if self.texts_past_bound(revision) {
       return Some(Flush::Texts);
     }
     let charge = admission_charge(revision);
@@ -720,12 +888,23 @@ impl Staging {
     let revisions = records.len();
     // The changeset, every text the batch's entry names in its Payload, is durable before the entry is appended: so a
     // named text outlives every entry naming it (A-760; `vcs_store::svn_texts::bring_back_named` relies on it).
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::BeforeChangeset).await;
     let flushing = slates_rt::futures::now_ns();
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
     let committing = slates_rt::futures::now_ns();
+    // The device's durable flush, the least this shard meets: the bound's `F` (`texts_bound`), as the store's own
+    // `sync_data` took it, never the landing's await, which holds the owner's queue and the writes before it.
+    if landed.is_ok()
+      && let Some(flush_ns) = slates_store::owner::take_landed_flush_ns()
+    {
+      flushed_in(flush_ns);
+    }
     #[cfg(test)]
     kill_before_entry_where_set().await;
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::BeforeEntry).await;
     let recorded = crate::state::with_state(|state| {
       // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
       // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
@@ -761,9 +940,13 @@ impl Staging {
     };
     // The batch is the register's now: its versions applied to the green a slice a turn (`RecordedBatch`), the
     // landing turn and the import's read gate held until the last; a kill between slices recovers from the record.
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::BeforeApply).await;
     let applying = slates_rt::futures::now_ns();
     apply_slices(&mut recorded).await?;
     slates_rt::futures::yield_now().await;
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::BeforeTail).await;
     let tailing = slates_rt::futures::now_ns();
     self.land_tail(cause).await?;
     let ended = slates_rt::futures::now_ns();
@@ -774,6 +957,8 @@ impl Staging {
       state.count(LAND_APPLY_NS, tailing.saturating_sub(applying));
       state.count(LAND_TAIL_NS, ended.saturating_sub(tailing));
     })?;
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::Landed).await;
     Some(Ok(revisions))
   }
 
@@ -793,7 +978,7 @@ impl Staging {
     }
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
-      crate::vcs_store::svn_import::batch_landed(state, self.repository, cause);
+      crate::vcs_store::svn_import::batch_landed(state, self.repository, (cause, self.bound));
       crate::merge_service::checkpoint_green(state, green);
       super::fold_to_readers(state, green);
     })?;

@@ -247,6 +247,7 @@ async fn land_sliced(
         offset,
         len,
       },
+      form: slates_store::texts::Form::Raw,
     })
     .collect();
   let sections = std::iter::once((SectionKind::Texts, slates_store::texts::encode(&entries)))

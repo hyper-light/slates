@@ -34,6 +34,11 @@ use slates_mem::large::LargeMapped;
 const CHANGESETS: u64 = 2_000;
 /// Shape: the bytes allocated between samples, a thread's own: at the 57k clone's 5.6 GB about 1,400 live samples.
 const SAMPLE: u64 = 4 << 20;
+/// Shape: the bytes allocated on the mapped path (blocks of at least `slates_mem::large::floor`, each a fresh mapping
+/// whose pages are faulted in) between that path's samples, a thread's own: fewer, larger blocks than the system path's.
+const MAPPED_SAMPLE: u64 = 64 << 20;
+/// Shape: the frames in slates' crates a site is named by, innermost first.
+const SITE_FRAMES: usize = 3;
 /// Shape: the live sites printed, the largest first.
 const LISTED: usize = 20;
 
@@ -41,6 +46,18 @@ const LISTED: usize = 20;
 static ON: AtomicBool = AtomicBool::new(false);
 /// The sampled heap: the allocations still live and the largest moment since [`Live::peak`] was last reset.
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+/// The churn since it was last taken ([`take_churn`]), by site: the system path's bytes allocated, and the mapped path's,
+/// each sample standing for the bytes its path allocated since the last, kept whether freed or not.
+static CHURN: Mutex<Option<Churn>> = Mutex::new(None);
+
+/// What [`CHURN`] tallies: the system path's and the mapped path's bytes allocated, by site.
+#[derive(Default)]
+struct Churn {
+  /// Blocks under the mapped floor (the system allocator's), by site.
+  system: BTreeMap<String, u64>,
+  /// Blocks at or past it (each a fresh mapping), by site.
+  mapped: BTreeMap<String, u64>,
+}
 
 /// The sampled allocations still live, their sum, and the live heap by site at its peak.
 #[derive(Default)]
@@ -93,49 +110,61 @@ std::thread_local! {
   static GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// This thread's bytes allocated since its last sample.
   static SINCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  /// This thread's bytes allocated on the mapped path since its last sample of that path.
+  static MAPPED_SINCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A backtrace's site: its innermost three frames outside the allocator, the standard library and this test.
+/// A backtrace's site: its innermost [`SITE_FRAMES`] frames outside the standard library (slates' crates and its
+/// dependencies), each its function and its file and line, the sampler's own file and the allocator's passed over. By the
+/// frames' files, not their names: built with line tables alone, a frame names its function bare (`allocated`,
+/// `{closure#1}`), so a name says nothing of where it lies (main's 57k run at d3057763e: every site the sampler itself).
 fn site(trace: &str) -> String {
-  let skip = |name: &str| {
-    [
-      "std::", "core::", "alloc::", "<alloc::", "<core::", "<std::", "__rust", "__rdl",
-    ]
+  let mut frames: Vec<(String, Option<String>)> = Vec::new();
+  for line in trace.lines().map(str::trim) {
+    if let Some(at) = line.strip_prefix("at ") {
+      if let Some(frame) = frames.last_mut() {
+        frame.1 = Some(at.to_owned());
+      }
+    } else if let Some((number, name)) = line.split_once(": ")
+      && number.chars().all(|c| c.is_ascii_digit())
+    {
+      let name = name.rsplit_once("::h").map_or(name, |(head, _)| head);
+      frames.push((name.to_owned(), None));
+    }
+  }
+  let ours: Vec<String> = frames
     .iter()
-    .any(|prefix| name.starts_with(prefix))
-      || [
-        "slates_mem::large",
-        "hg_fetch_heap::",
-        "backtrace",
-        "GlobalAlloc",
-        "to_vec",
-        "ConvertVec",
-        "RawVec",
-      ]
-      .iter()
-      .any(|part| name.contains(part))
-  };
-  let short = |name: &str| {
-    name
-      .rsplit_once("::h")
-      .map_or(name, |(head, _)| head)
-      .to_owned()
-  };
-  let frames: Vec<String> = trace
-    .lines()
-    .map(str::trim)
-    .filter_map(|line| {
-      let (number, name) = line.split_once(": ")?;
-      number.chars().all(|c| c.is_ascii_digit()).then_some(name)
+    .filter_map(|(name, at)| {
+      let at = at.as_deref()?;
+      // The standard library's frames (std, core, alloc) are passed over; a dependency's (vendor/, a registry's) are
+      // kept, since a future's own allocations may lie wholly in one (main's 57k run: a site the runtime's poll alone).
+      if at.contains("/rustc/") || at.contains("/library/") {
+        return None;
+      }
+      let within = at
+        .split_once("/crates/")
+        .map(|(_, within)| format!("crates/{within}"))
+        .or_else(|| {
+          at.split_once("/vendor/")
+            .map(|(_, within)| format!("vendor/{within}"))
+        })
+        .or_else(|| {
+          at.split_once("/registry/src/")
+            .map(|(_, within)| format!("registry/{within}"))
+        })
+        .unwrap_or_else(|| at.to_owned());
+      let passed = within.contains("tests/hg_fetch_heap.rs") || within.contains("mem/src/large.rs");
+      let line = within
+        .rsplit_once(':')
+        .map_or(within.as_str(), |(head, _)| head);
+      (!passed).then(|| format!("{name} ({line})"))
     })
-    .filter(|name| !skip(name))
-    .take(3)
-    .map(short)
+    .take(SITE_FRAMES)
     .collect();
-  if frames.is_empty() {
-    "(no frame)".to_owned()
+  if ours.is_empty() {
+    "(no frame outside the standard library)".to_owned()
   } else {
-    frames.join(" <- ")
+    ours.join(" <- ")
   }
 }
 
@@ -155,6 +184,9 @@ fn allocated(ptr: *mut u8, size: usize) {
   if ptr.is_null() || !ON.load(Ordering::Relaxed) || GUARD.with(std::cell::Cell::get) {
     return;
   }
+  if size >= slates_mem::large::floor() {
+    mapped_allocated(size);
+  }
   let since = SINCE.with(|since| {
     let now = since.get().saturating_add(size as u64);
     since.set(now);
@@ -166,12 +198,58 @@ fn allocated(ptr: *mut u8, size: usize) {
   let _ = guarded(|| {
     SINCE.with(|since| since.set(0));
     let key = site(&std::backtrace::Backtrace::force_capture().to_string());
+    if size < slates_mem::large::floor()
+      && let Ok(mut churn) = CHURN.lock()
+    {
+      *churn
+        .get_or_insert_with(Churn::default)
+        .system
+        .entry(key.clone())
+        .or_insert(0) += since;
+    }
     if let Ok(mut live) = LIVE.lock() {
       live
         .get_or_insert_with(Live::default)
         .insert(ptr as usize, (key, since));
     }
   });
+}
+
+/// Notes `size` bytes allocated on the mapped path: tallied by site ([`CHURN`]) once this thread has allocated
+/// [`MAPPED_SAMPLE`] bytes there since its last sample of it.
+fn mapped_allocated(size: usize) {
+  let since = MAPPED_SINCE.with(|since| {
+    let now = since.get().saturating_add(size as u64);
+    since.set(now);
+    now
+  });
+  if since < MAPPED_SAMPLE {
+    return;
+  }
+  let _ = guarded(|| {
+    MAPPED_SINCE.with(|since| since.set(0));
+    let key = site(&std::backtrace::Backtrace::force_capture().to_string());
+    if let Ok(mut churn) = CHURN.lock() {
+      *churn
+        .get_or_insert_with(Churn::default)
+        .mapped
+        .entry(key)
+        .or_insert(0) += since;
+    }
+  });
+}
+
+/// The churn since it was last taken, the system path's and the mapped path's, by site; taken, it starts again.
+fn take_churn() -> (Listed, Listed) {
+  let churn = guarded(|| {
+    CHURN
+      .lock()
+      .ok()
+      .and_then(|mut churn| churn.take())
+      .unwrap_or_default()
+  })
+  .unwrap_or_default();
+  (listed(churn.system), listed(churn.mapped))
 }
 
 /// Forgets the allocation at `ptr`, if it was sampled.
@@ -328,12 +406,22 @@ fn source(served: &common::hg::Served) -> String {
   format!("{}/source", served.base())
 }
 
+/// Prints the churn's sites, `when`: the system path's and the mapped path's bytes allocated, the largest first.
+fn print_churn(when: &str, (system, mapped): &(Listed, Listed)) {
+  for (path, (listed, total)) in [("system", system), ("mapped", mapped)] {
+    println!("hg_fetch_heap: {when}: {path} churn sampled {total} B");
+    for (site, bytes) in listed.iter().take(LISTED) {
+      println!(
+        "hg_fetch_heap: {when}: {path}   {:>5.1}% {:>14} B  {site}",
+        *bytes as f64 * 100.0 / (*total).max(1) as f64,
+        bytes
+      );
+    }
+  }
+}
+
 /// Prints the live sites and the daemon's nonzero memory gauges, `when`.
-fn print_held(
-  when: &str,
-  (listed, total): &Listed,
-  rows: &BTreeMap<String, u64>,
-) {
+fn print_held(when: &str, (listed, total): &Listed, rows: &BTreeMap<String, u64>) {
   println!("hg_fetch_heap: {when}: live sampled {total} B");
   for (site, bytes) in listed.iter().take(LISTED) {
     println!(
@@ -353,8 +441,9 @@ fn print_held(
 /// changeset store, its HTTP edge on loopback; with the live-heap sampler on, push a history to it with stock `hg`
 /// (Mercurial's own where `SLATES_HG_PUSH_SOURCE` names it, else a [`CHANGESETS`]-changeset `debugbuilddag` history),
 /// then clone it whole. Expect: the push and the clone succeed. Prints the process's resident set after the push and
-/// after the clone, and the live sampled heap by site (the [`LISTED`] largest) after the push, at the clone's peak and as
-/// the clone ends, with the daemon's memory gauges then.
+/// after the clone; the live sampled heap by site (the [`LISTED`] largest) after the push, at the clone's peak and as
+/// the clone ends, with the daemon's memory gauges then; and each one's churn by site, the system path's and the mapped
+/// path's apart (main's order of 2026-11-25: 64 GB of system allocations and 418 GB of fresh mapped pages at 57k).
 #[test]
 #[ignore = "a measurement (the hg fetch's memory): run by name, with SLATES_HG_PUSH_SOURCE for Mercurial's own history"]
 fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
@@ -377,6 +466,7 @@ fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
     String::from_utf8_lossy(&pushed.stderr)
   );
   let (after_push, _) = live_now_and_at_peak();
+  let push_churn = take_churn();
   let before = resident_kib();
   reset_peak();
   let cloned = served
@@ -385,6 +475,7 @@ fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
     .output()
     .unwrap();
   let (after_clone, clone_peak) = live_now_and_at_peak();
+  let clone_churn = take_churn();
   ON.store(false, Ordering::Relaxed);
   let after = resident_kib();
   let rows = gauges(&served);
@@ -395,6 +486,8 @@ fn what_holds_a_daemons_memory_once_a_whole_mercurial_history_is_fetched() {
   print_held("after the push", &after_push, &BTreeMap::new());
   print_held("at the clone's peak", &clone_peak, &BTreeMap::new());
   print_held("as the clone ends", &after_clone, &rows);
+  print_churn("the push", &push_churn);
+  print_churn("the clone", &clone_churn);
   assert!(
     cloned.status.success(),
     "clone: {}",

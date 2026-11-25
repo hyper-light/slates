@@ -22479,9 +22479,21 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // A-870 piece 2: the paged families' changes taken and a turn of their encoding run, at most a slice.
   crate::content_holder::image_drain(state);
   let _ = crate::content_holder::image_turn(state);
-  let (mut held, image_carried) = crate::content_holder::held_image_paged(state);
+  let held = crate::content_holder::held_image_unpaged(state);
   let whole = crate::content_holder::whole_of(&held);
   let owned = crate::content_holder::owned_of(&held);
+  // The paged families' pages encoded in place from the encoder (goal 93, main's ruling of 2026-11-25: copied into
+  // every checkpoint before): the encoder is taken out of the shard's state for the stream, which reads it nowhere, and
+  // put back as the stream ends, the pages borrowed from it dropped first. Until it is back the shard's encoder is an
+  // empty stand-in: nothing in the loop below may read or write `state.image_encoder` (a mark, `image_committed`, a
+  // turn), or it would be lost with the stand-in when the encoder is put back (w-shared's review).
+  let encoder = core::mem::take(&mut state.image_encoder);
+  let (pages, image_carried) = crate::content_holder::paged_whole(&encoder);
+  let mut pieces: Vec<slates_vfs::recover::HeldPieceRef<'_>> = held
+    .iter()
+    .map(slates_vfs::recover::HeldPiece::as_ref)
+    .chain(pages)
+    .collect();
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
@@ -22506,7 +22518,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       state,
       &handles,
       (&skipped, &carried),
-      &mut held,
+      &mut pieces,
       (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
     ) {
       Ok(Streamed::Uncaptured(id, e)) => {
@@ -22518,6 +22530,8 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       Err(e) => break Err(e),
     }
   };
+  drop(pieces);
+  state.image_encoder = encoder;
   // Publish unaffected volumes even when another cannot be captured. Callers must check the touched volume against
   // the returned coverage; an omitted volume never receives a stable acknowledgement, and recovery refuses it instead
   // of rebuilding empty (§4.8, AUD-05).
@@ -22647,7 +22661,7 @@ fn stream_checkpoint(
   state: &mut ShardState,
   handles: &[Handle<VolumeSlot>],
   (skipped, carried): LeftOutVolumes<'_>,
-  held: &mut Vec<slates_vfs::recover::HeldPiece>,
+  held: &mut [slates_vfs::recover::HeldPieceRef<'_>],
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -22891,16 +22905,34 @@ fn publish_delta_into(
   // The held connections' byte states (A-231), whole in every delta: a READ changes them without a publication of its
   // own, so a delta carries them as of its own moment.
   let mut nfs_states = crate::nfs_writeback::carry(state);
-  slates_vfs::checkpoint_log::ShardDelta::encode_finish(
-    encoded,
-    count_at,
-    count,
-    &mut removed,
-    (&mut held.put, &mut held.removed),
-    Some(&pending_replies(state)),
-    (&mut calls, &mut calls_removed),
-    (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
-  )?;
+  let replies = pending_replies(state);
+  // The encoder's re-encoded pages put borrowed beside the owned pieces (goal 93, main's ruling of 2026-11-25: copied
+  // into the delta before), the borrow ending with the encoding, before the publication touches the state again.
+  let carried = {
+    let mut put: Vec<slates_vfs::recover::HeldPieceRef<'_>> = held
+      .put
+      .iter()
+      .map(slates_vfs::recover::HeldPiece::as_ref)
+      .collect();
+    if held.image_carried {
+      put.extend(crate::content_holder::paged_cut(&state.image_encoder));
+    }
+    let carried = put
+      .iter()
+      .map(|piece| piece.bytes.len())
+      .fold(0usize, usize::saturating_add);
+    slates_vfs::checkpoint_log::ShardDelta::encode_finish(
+      encoded,
+      count_at,
+      count,
+      &mut removed,
+      (&mut put, &mut held.removed),
+      Some(&replies),
+      (&mut calls, &mut calls_removed),
+      (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
+    )?;
+    carried
+  };
   let (start, end) = state.delta_range;
   match state.content.as_ref() {
     None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
@@ -22940,11 +22972,6 @@ fn publish_delta_into(
     }
   }
   state.published_keys = present;
-  let carried = held
-    .put
-    .iter()
-    .map(|piece| piece.bytes.len())
-    .fold(0usize, usize::saturating_add);
   if carried > 0 {
     state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }

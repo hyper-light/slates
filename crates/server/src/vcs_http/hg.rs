@@ -527,6 +527,9 @@ pub(crate) struct HgExchange<S: HgStores> {
   past_room: bool,
   /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
   costs: crate::vcs_store::TurnCosts,
+  /// When a streamed answer began, until it ends: its span counted then
+  /// ([`crate::vcs_store::hg_view::STREAM_SPAN_NS`]).
+  streamed_since: Option<u64>,
 }
 
 impl<S: HgStores> HgExchange<S> {
@@ -576,11 +579,19 @@ impl<S: HgStores> HgExchange<S> {
       request_room: room,
       past_room: false,
       costs: crate::vcs_store::TurnCosts::ZERO,
+      streamed_since: None,
     })
   }
 }
 
 impl<S: HgStores> Exchange for HgExchange<S> {
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    // Main's hg leg at 608930048 (2026-11-25): a stream's turns ran about 100 ms apart; each write of its turns counted.
+    if self.answered.is_some() || self.generation.is_some() {
+      crate::vcs_store::hg_view::write_taken(sent.ns, sent.waited);
+    }
+  }
+
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     if self.past_room {
       return Ok(());
@@ -648,6 +659,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     if let Made::Streamed(_) = made {
+      self.streamed_since = Some(slates_rt::futures::now_ns());
       // Taken in the turn the answer began, with no wait between, so every later turn reads what this one read.
       let mut held = Admission::new(self.request_room);
       self.generation = Some(
@@ -699,6 +711,11 @@ impl<S: HgStores> Exchange for HgExchange<S> {
           self.answered = Some(Made::Streamed(streamed));
         } else {
           self.generation = None;
+          if let Some(since) = self.streamed_since.take() {
+            crate::vcs_store::hg_view::stream_spanned(
+              slates_rt::futures::now_ns().saturating_sub(since),
+            );
+          }
         }
         Ok(more)
       }
@@ -749,8 +766,10 @@ impl<S: HgStores> HgExchange<S> {
           }
         }
       });
-    paced.close(slates_rt::futures::now_ns(), costs);
+    let ended = slates_rt::futures::now_ns();
+    let report = paced.close(ended, costs);
     crate::vcs_store::hg_view::turn_taken();
+    crate::vcs_store::hg_view::turn_lasted(ended.saturating_sub(start), &report);
     // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
     self.stores.wrote(
       generation,

@@ -474,6 +474,7 @@ pub(crate) fn append_versions(
     first: at(0),
     staged: staged.into(),
     made: Vec::new(),
+    applying: None,
   })
 }
 
@@ -501,12 +502,31 @@ pub(crate) struct RecordedBatch {
   staged: std::collections::VecDeque<crate::import_batch::Staged>,
   /// The versions applied.
   made: Vec<u64>,
+  /// The version being applied a slice at a time, its named texts read, then its run ([`InVersion`]), carried from one
+  /// slice to the next until it ends.
+  applying: Option<InVersion>,
+}
+
+/// The version a recorded batch is applying, carried from one slice to the next ([`RecordedBatch::apply_slice`]).
+enum InVersion {
+  /// Its named texts being read again from the content store a copy slice a step (`svn_commit::read_named_slice`).
+  Reading(crate::import_batch::Staged, u64),
+  /// Its run under way (`slates_merge::engine::Applying`).
+  Running(
+    crate::import_batch::Staged,
+    u64,
+    Box<slates_merge::engine::Applying>,
+  ),
 }
 
 impl RecordedBatch {
-  /// Applies the next versions until the shard's step budget is spent from now, at least one, each as its entry records
-  /// it (`Green::apply_recorded`, what a recovery replays) with its merge record enqueued; counted. The versions made
-  /// once every one is applied (the green's retention settled and its chain checkpointed then), none while more remain.
+  /// Applies the next versions until the shard's step budget is spent from now, each as its entry records it
+  /// (`Green::apply_recorded`'s run, what a recovery replays, taken a unit at a time until the slice's budget is spent: goal 93 piece
+  /// 3, a version of 9,000 files was one apply of 120 ms on a debug build), with its merge record enqueued; counted. A
+  /// version's run goes on at the next slice where the budget ends inside it: nothing may read the green until the
+  /// batch's last version ends (the run's contract, `Green::begin_applying`), as nothing does while an import lands. The
+  /// versions made once every one is applied (the green's retention settled and its chain checkpointed then), none while
+  /// more remain.
   pub(crate) fn apply_slice(&mut self, state: &mut ShardState) -> Option<Vec<u64>> {
     let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
     let deadline = slates_rt::futures::now_ns().saturating_add(budget);
@@ -518,51 +538,152 @@ impl RecordedBatch {
     let most = usize::MAX;
     state.count(BATCH_APPLY_SLICES, 1);
     let mut taken = 0usize;
-    while let Some(mut step) = self.staged.pop_front() {
-      let version = self.first;
-      self.first = version.saturating_add(1);
-      // A version naming its texts (A-760) had its runs' buffers taken by the scratch member's verdict: they are read
-      // again from the content store, which holds them until the batch's landing ends (`svn_commit::staging`). One read
-      // in place of the copy the post-state was; adopting the scratch member's files is w-svn's piece (c).
-      let read = crate::repository::svn_commit::read_named(state, &mut step.increment).is_ok();
-      // The named texts its apply reads that the green holds by name alone lent it first (A-760 (b) 4d).
-      let applied = if read {
-        crate::vcs_store::name_holds::apply_recorded_lent(
-          state,
-          self.green,
-          (&mut step.increment, &step.applied),
-        )
-      } else {
-        None
+    let spent = || slates_rt::futures::now_ns() >= deadline;
+    while taken < most {
+      let ended = match self.applying.take() {
+        None => {
+          let Some(step) = self.staged.pop_front() else {
+            break;
+          };
+          let version = self.first;
+          self.first = version.saturating_add(1);
+          self.applying = Some(InVersion::Reading(step, version));
+          false
+        }
+        Some(InVersion::Reading(mut step, version)) => {
+          let mut read = Ok(false);
+          while read == Ok(false) {
+            read = crate::repository::svn_commit::read_named_slice(state, &mut step.increment);
+            if spent() {
+              break;
+            }
+          }
+          match read {
+            Ok(true) => self.begin_version(state, (step, version)),
+            Ok(false) => {
+              self.applying = Some(InVersion::Reading(step, version));
+              false
+            }
+            Err(_) => {
+              self.version_ended(state, (step, version), None);
+              true
+            }
+          }
+        }
+        Some(InVersion::Running(mut step, version, mut run)) => {
+          let stepped = state.greens.get_mut(&self.green).map(|mut engine| {
+            engine.apply_step(&mut run, &mut step.increment, &step.applied, &mut || {
+              spent()
+            })
+          });
+          state.count(BATCH_APPLY_STEPS, 1);
+          match stepped {
+            Some(slates_merge::engine::ApplyStep::More) => {
+              self.applying = Some(InVersion::Running(step, version, run));
+              false
+            }
+            Some(
+              slates_merge::engine::ApplyStep::Done(answered)
+              | slates_merge::engine::ApplyStep::Answered(answered),
+            ) => {
+              self.version_ended(state, (step, version), Some(answered));
+              true
+            }
+            None => {
+              self.version_ended(state, (step, version), None);
+              true
+            }
+          }
+        }
       };
-      if applied != Some(version) {
-        // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
-        state.count(BATCH_APPLY_REFUSED, 1);
-        crate::verbs::reconcile_unpublished_effects(state);
+      if ended {
+        taken = taken.saturating_add(1);
       }
-      crate::merge_service::enqueue_record(
-        state,
-        self.green,
-        version,
-        step.increment.id,
-        step.increment.base,
-        step.increment.evidence,
-        (None, None),
-      );
-      self.made.push(version);
-      taken = taken.saturating_add(1);
-      if taken >= most || slates_rt::futures::now_ns() >= deadline {
+      if spent() {
         break;
       }
     }
-    if !self.staged.is_empty() {
+    if !self.staged.is_empty() || self.applying.is_some() {
       return None;
     }
     let _ = crate::merge_service::settle_green_retention(state, self.green);
     crate::merge_service::checkpoint_green(state, self.green);
     Some(std::mem::take(&mut self.made))
   }
+
+  /// Begins applying `step` as `version`, its named texts read ([`InVersion::Reading`]): those its apply reads that the
+  /// green holds by name alone lent it (A-760 (b) 4d), then its run begun (`Green::begin_applying`) and carried in
+  /// `applying`. A version answered at once, or one whose texts cannot be lent, ends here
+  /// ([`RecordedBatch::version_ended`]): whether it did.
+  fn begin_version(
+    &mut self,
+    state: &mut ShardState,
+    (mut step, version): (crate::import_batch::Staged, u64),
+  ) -> bool {
+    let lent = crate::vcs_store::name_holds::lend_recorded(
+      state,
+      self.green,
+      (&step.increment, &step.applied),
+    )
+    .is_some();
+    let begun = lent
+      .then(|| {
+        state
+          .greens
+          .get_mut(&self.green)
+          .map(|mut engine| engine.begin_applying(&mut step.increment, &step.applied))
+      })
+      .flatten();
+    match begun {
+      Some(slates_merge::engine::Begun::Applying(run)) => {
+        self.applying = Some(InVersion::Running(step, version, run));
+        false
+      }
+      Some(slates_merge::engine::Begun::Answered(answered)) => {
+        self.version_ended(state, (step, version), Some(answered));
+        true
+      }
+      None => {
+        self.version_ended(state, (step, version), None);
+        true
+      }
+    }
+  }
+
+  /// Ends `step`'s apply as `version`, its run answered `answered` (none where it never began): the bytes lent it given
+  /// back, a version not applied as judged counted and the green made again from its chain, which holds every version,
+  /// and its merge record enqueued.
+  fn version_ended(
+    &mut self,
+    state: &mut ShardState,
+    (step, version): (crate::import_batch::Staged, u64),
+    answered: Option<u64>,
+  ) {
+    if let Some(mut engine) = state.greens.get_mut(&self.green) {
+      engine.let_named_bytes_go();
+    }
+    if answered != Some(version) {
+      // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
+      state.count(BATCH_APPLY_REFUSED, 1);
+      crate::verbs::reconcile_unpublished_effects(state);
+    }
+    crate::merge_service::enqueue_record(
+      state,
+      self.green,
+      version,
+      step.increment.id,
+      step.increment.base,
+      step.increment.evidence,
+      (None, None),
+    );
+    self.made.push(version);
+  }
 }
+
+/// Counter: a call of a recorded batch's version's run ([`RecordedBatch::apply_slice`], units until the slice's budget
+/// is spent): more than one a version shows its apply went on across slices. Format: a counter name in the daemon's
+/// status report.
+pub(crate) const BATCH_APPLY_STEPS: &str = "repository.import_batch.apply_steps";
 
 /// One move of a git push's store (A-662): the green it names, a new branch's by its name, and its new head, none to
 /// delete it.

@@ -901,15 +901,24 @@ fn a_recovered_subversion_green_keeps_no_version_its_readers_do_not_name() {
 /// Since A-760 the batch's entries name their texts, which the killed daemon's content store took with it: the
 /// successor brings them back from the node's store before the green's replay (`svn_texts::bring_back_named`, counted,
 /// the non-vacuity of this case). Red before it: the green fenced, `ContentMissing { version: 1 }`.
+///
+/// Both recovery paths at every boundary (main's ruling of 2026-11-25): as killed, the image holds the batch's texts
+/// whole and the successor finds them whole and lets them go after its replay; and again with every named text's windows
+/// let go and published before the stop, so the successor brings each back from the node's store first.
 #[test]
 fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history() {
   use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
   /// Shape: the versions a slice of the recorded apply takes here, so `full.dump`'s 13 make five slices.
   const SLICE_VERSIONS: usize = 3;
   let slices = FULL_LAST.div_ceil(u64::try_from(SLICE_VERSIONS).unwrap());
-  for kill_at in 0..usize::try_from(slices).unwrap() {
-    let instance = format!("vcs-store-svn-killed-{}-{kill_at}", std::process::id());
-    let mut store = TestStore::start(&format!("svn-killed-{kill_at}"));
+  let boundaries =
+    (0..usize::try_from(slices).unwrap()).flat_map(|kill_at| [(kill_at, false), (kill_at, true)]);
+  for (kill_at, release) in boundaries {
+    let instance = format!(
+      "vcs-store-svn-killed-{}-{kill_at}-{release}",
+      std::process::id()
+    );
+    let mut store = TestStore::start(&format!("svn-killed-{kill_at}-{release}"));
     let anchor = anchor_of(&instance);
     let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
     daemon.bootstrap(true).unwrap();
@@ -935,11 +944,26 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
       );
       std::thread::yield_now();
     }
+    if release {
+      // Every text the green names let go, its changeset durable, and the image published with them away.
+      crate::daemon::observe_first(&daemon, move |state| {
+        let green = super::svn_commit::green_of(state, repository).unwrap();
+        let named = crate::vcs_store::svn_texts::named_found_whole(state, green);
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          if let Some(content) = stores.content_mut() {
+            for text in &named {
+              let _ = content.let_go_object_landed(&slates_vcs::ContentId(*text), &|_| None);
+            }
+          }
+        });
+        crate::verbs::publish_shard(state).expect("the image published");
+      });
+    }
     daemon.stop();
     store.restart_owner();
     let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
     let folded = green_folded(&daemon, repository);
-    let brought = brought_back(&daemon);
+    let (brought, found) = brought_back(&daemon);
     let resumed = crate::test_store::run_on_first(
       &daemon,
       move || async move {
@@ -966,26 +990,41 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
       exported == Some((FULL_LAST, FULL.to_vec())),
       "killed at {kill_at}: full.dump"
     );
-    assert!(
-      brought > 0,
-      "killed at {kill_at}: no named text brought back"
+    // As killed, the image restored every named text whole: none is brought back, each is found whole and let go once
+    // the green is replayed. Let go before the stop, each the replay reads lacks and is brought back; one no replay reads
+    // (a new file's whole text) is neither brought back nor found whole.
+    let expected = if release {
+      (FULL_NAMED_READ, 0)
+    } else {
+      (0, FULL_NAMED)
+    };
+    assert_eq!(
+      (brought, found),
+      expected,
+      "killed at {kill_at}, released {release}: named texts brought back, found whole"
     );
   }
 }
 
-/// The named texts the daemon's recovery accounted for in its Subversion greens: brought back before the replay (A-760's
-/// pre-pass), or found held whole and let go after it (`svn_texts::let_go_found_whole`). Since the recovery makes the
-/// content store before it judges what is lacking (TSan diags 5 and 7), a text the image restored whole is found, not
-/// fetched again; before, with no store made yet, every named text read as lacking and was brought back.
-fn brought_back(daemon: &Daemon) -> u64 {
+/// Shape: the named texts `full.dump`'s history leaves its green's recovery (its checkpoint and chain), as measured.
+const FULL_NAMED: u64 = 13;
+
+/// Shape: those of [`FULL_NAMED`] its replay reads, as measured: the rest are runs an entry's apply names whole, which no
+/// replay reads (A-887, `Increment::replay_reads`).
+const FULL_NAMED_READ: u64 = 7;
+
+/// The named texts the daemon's recovery accounted for in its Subversion greens, each way apart: brought back before the
+/// replay (A-760's pre-pass), and found held whole and let go after it (`svn_texts::let_go_found_whole`). Since the
+/// recovery makes the content store before it judges what is lacking (TSan diags 5 and 7), a text the image restored
+/// whole is found, not fetched again; before, with no store made yet, every named text read as lacking and was brought
+/// back. Apart, so a recovery fetching again what the image restored whole shows (main's ruling of 2026-11-25).
+fn brought_back(daemon: &Daemon) -> (u64, u64) {
   crate::daemon::observe_first(daemon, |state| {
-    [
-      crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK,
-      crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE,
-    ]
-    .into_iter()
-    .map(|name| state.refusals.get(name).copied().unwrap_or(0))
-    .sum()
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK),
+      count(crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE),
+    )
   })
 }
 
@@ -1039,9 +1078,150 @@ fn a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole() {
     std::time::Duration::from_secs(60),
   );
   daemon.stop();
-  assert_eq!(brought, 0, "a text brought back that no entry named");
+  assert_eq!(
+    brought,
+    (0, 0),
+    "a text brought back or let go that no entry named"
+  );
   assert_eq!(resumed, Ok((FULL_LAST, FULL_LAST)), "landed again");
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
+}
+
+/// The cut import's oracle at one bound: the regimes its batches are cut at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CutAt {
+  /// Each batch one unit of the changeset store (`staging::texts_bound`'s floor; the room forced to it).
+  OneUnit,
+  /// The derived rent-or-buy bound, its flush forced to what copies [`DERIVED_UNITS`] units at the profile's memcpy
+  /// rate: a measured flush differs daemon to daemon, and the oracle compares one cut across its kills.
+  Derived,
+}
+
+/// Shape: the units the oracle's derived bound buys: a batch of several units, fewer batches than the import's texts.
+const DERIVED_UNITS: u64 = 6;
+
+/// What repository `repository` recovered to after its import of [`rewrites`]'s rewrites was killed at `stage` of its
+/// second batch's landing, cut at `cut` (`staging::KILL_AT_STAGE`), the daemon and the store's owner stopped and started
+/// again: its youngest revision, and whether its history, exported whole, is byte for byte that of a reference import of
+/// the same dump's first revisions as far as that youngest.
+fn killed_at(stage: super::svn_commit::staging::LandStage, cut: CutAt) -> (u64, bool) {
+  use super::svn_commit::staging::{FLUSH_NS, IMPORT_ROOM, KILL_AT_STAGE};
+  use crate::vcs_store::svn_import::tests::{
+    BOUNDED_REWRITE_BYTES, BOUNDED_REWRITES, history, imported, rewrites,
+  };
+  let instance = format!("vcs-store-svn-cut-{stage:?}-{cut:?}-{}", std::process::id());
+  let mut store = TestStore::start(&format!("svn-cut-{stage:?}-{cut:?}"));
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "cut");
+  crate::daemon::observe_first(&daemon, move |state| {
+    let unit = crate::vcs_store::hg_import::segment_bytes(state) as u64;
+    match cut {
+      CutAt::OneUnit => IMPORT_ROOM.with(|room| room.set(Some(unit))),
+      CutAt::Derived => {
+        let memcpy = u128::from(state.config.memcpy_bytes_per_second.max(1));
+        let flush_ns = u128::from(DERIVED_UNITS * unit) * 1_000_000_000 / memcpy;
+        FLUSH_NS.with(|flush| flush.set(Some(u64::try_from(flush_ns).unwrap().max(1))));
+      }
+    }
+    // The second batch's landing: one batch passes the stage first.
+    KILL_AT_STAGE.with(|kill| kill.set(Some((stage, 1))));
+    let task = slates_rt::futures::spawn(async move {
+      let _ = imported(
+        repository,
+        &rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+      )
+      .await;
+    })
+    .expect("the import's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+  while crate::daemon::observe_first(&daemon, |_state| KILL_AT_STAGE.with(std::cell::Cell::get))
+    .is_some()
+  {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the kill at {stage:?} never fired"
+    );
+    std::thread::yield_now();
+  }
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let wait = std::time::Duration::from_secs(120);
+  let recovered = crate::test_store::run_on_first(&daemon, move || history(repository), wait)
+    .expect("the recovered history");
+  let reference = created_subversion(&daemon, "reference");
+  let youngest = recovered.0;
+  let referenced = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let prefix = rewrites(usize::try_from(youngest).unwrap(), BOUNDED_REWRITE_BYTES);
+      let _ = imported(reference, &prefix).await;
+      history(reference).await
+    },
+    wait,
+  );
+  daemon.stop();
+  (
+    youngest,
+    referenced.is_some_and(|referenced| referenced.1 == recovered.1),
+  )
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: the cut import's crash oracle, at the derived rent-or-buy bound and at a
+/// forced one unit, so both regimes are proven). Do: for each regime and each stage of a batch's landing
+/// (`staging::LAND_STAGES`: before its changeset, before its entry, before its apply, before its tail, landed), import
+/// [`crate::vcs_store::svn_import::tests::rewrites`]'s rewrites, killing the second batch's landing at that stage; stop
+/// the daemon and the store's owner, start both again, and read the repository's history. Expect, in each regime: the
+/// history a reference import of the same dump's first revisions makes, byte for byte, at whatever youngest it recovered
+/// to; the two kills before the entry recovering the batch before (old), the three after it the batch itself (new); and
+/// old before new.
+#[test]
+fn a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new() {
+  use super::svn_commit::staging::{LAND_STAGES, LandStage};
+  for cut in [CutAt::OneUnit, CutAt::Derived] {
+    let recovered: Vec<(LandStage, u64, bool)> = LAND_STAGES
+      .iter()
+      .map(|stage| {
+        let (youngest, same) = killed_at(*stage, cut);
+        (*stage, youngest, same)
+      })
+      .collect();
+    println!(
+      "store_tests: a cut import at {cut:?} killed at each stage recovered to {recovered:?}"
+    );
+    assert!(
+      recovered.iter().all(|(_, _, same)| *same),
+      "every recovery the reference's history at its youngest ({cut:?}): {recovered:?}"
+    );
+    let at = |stage: LandStage| {
+      recovered
+        .iter()
+        .find(|(at, ..)| *at == stage)
+        .map(|(_, youngest, _)| *youngest)
+    };
+    let old = at(LandStage::BeforeChangeset);
+    let new = at(LandStage::BeforeApply);
+    assert_eq!(
+      at(LandStage::BeforeEntry),
+      old,
+      "before its entry, the batch before ({cut:?})"
+    );
+    assert_eq!(
+      at(LandStage::BeforeTail),
+      new,
+      "after its entry, the batch itself ({cut:?})"
+    );
+    assert_eq!(
+      at(LandStage::Landed),
+      new,
+      "landed, the batch itself ({cut:?})"
+    );
+    assert!(old < new, "old {old:?} before new {new:?} ({cut:?})");
+  }
 }
 
 /// How many distinct objects repository `repository`'s green's checkpoint names its files by (A-869), once the
@@ -1117,9 +1297,11 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   );
   daemon.stop();
   assert!(named > 0, "the checkpoint names no file");
+  // A clean stop's image restores every text the checkpoint names whole: none is brought back, each is found whole.
   assert_eq!(
-    brought, named,
-    "what was brought back is what the checkpoint names"
+    brought,
+    (0, named),
+    "named texts brought back, found whole: the checkpoint's"
   );
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
@@ -1181,7 +1363,12 @@ fn a_region_held_window_is_restored_beside_the_named_texts_brought_back() {
   });
   let folded = green_folded(&daemon, repository);
   daemon.stop();
-  assert!(brought > 0, "the pre-pass brought nothing back");
+  // The pre-pass made the store, which took in the image's windows and region holds: every named text found whole.
+  assert_eq!(
+    brought,
+    (0, FULL_NAMED),
+    "named texts brought back, found whole"
+  );
   assert_eq!(region, (1, true), "the region's window after the restart");
   assert_eq!(folded, Some((FULL_LAST, FULL_LAST)), "recovered and folded");
 }
@@ -1423,7 +1610,7 @@ fn restart_with_two_named_texts(release_window: bool) {
   assert_eq!(
     reads.as_slice(),
     expected.as_slice(),
-    "first reads after reboot, {brought} named texts fetched"
+    "first reads after reboot, {brought:?} named texts brought back, found whole"
   );
 }
 

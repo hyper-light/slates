@@ -242,7 +242,11 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   let store = options
     .vcs_store
     .as_deref()
-    .map(|dir| start_store(std::path::Path::new(dir), &config))
+    .map(|dir| {
+      // The owner spins at most a wake's measured cost before it parks (goal 93, main's ruling of 2026-11-25).
+      let spin_cap_ns = profile.derived().spin_before_park_ns.get();
+      start_store(std::path::Path::new(dir), &config, spin_cap_ns)
+    })
     .transpose()?;
   config.vcs_view_root = store.as_ref().map(|(_, views)| *views);
   let store = store.map(|(owner, _)| owner);
@@ -305,10 +309,12 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
 }
 
 /// Opens the node's version-control store in `dir` under the standing grant the operator gave by naming it (`--vcs-store
-/// DIR`; A-767 item 7, R10's CLI surface), sized from this daemon's own derivations, and starts its owner thread.
+/// DIR`; A-767 item 7, R10's CLI surface), sized from this daemon's own derivations, and starts its owner thread, which
+/// spins at most `spin_cap_ns` waiting for work before it parks.
 fn start_store(
   dir: &std::path::Path,
   config: &DaemonConfig,
+  spin_cap_ns: u64,
 ) -> Result<
   (
     slates_store::owner::StoreOwner,
@@ -343,7 +349,7 @@ fn start_store(
   let waiting = config
     .clients_per_shard
     .saturating_mul(usize::from(config.runtime.shards).max(1));
-  let owner = slates_store::owner::StoreOwner::start(root, sizing, waiting)
+  let owner = slates_store::owner::StoreOwner::start(root, sizing, (waiting, spin_cap_ns))
     .map_err(|e| failed("vcs store", e))?;
   Ok((owner, views))
 }
@@ -403,7 +409,7 @@ mod store_sizing_tests {
       profile.facts.memory.limit = None;
       let config = super::DaemonConfig::derive(&profile, "sizing", Some(2));
       let dir = store_directory(name);
-      let (owner, _views) = super::start_store(&dir, &config).unwrap();
+      let (owner, _views) = super::start_store(&dir, &config, 0).unwrap();
       let handle = owner.handle();
       let runtime = slates_rt::runtime::LocalRuntime::new(&config.runtime).unwrap();
       let landed = runtime

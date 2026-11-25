@@ -134,8 +134,77 @@ pub(crate) type FamilyPage = (Family, Page);
 pub(crate) type Entry = (
   u64,
   [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
-  Vec<u8>,
+  EntryBytes,
 );
+
+/// Format: the most bytes an entry keeps inline ([`EntryBytes::Inline`]): two content identities, a name's (an object's
+/// and its root's), past a window let go's (an identity and its length) and a lone region hold's.
+pub(crate) const INLINE_ENTRY_BYTES: usize = 2 * 32;
+
+/// An entry's bytes (goal 93, main's ruling of 2026-11-25 on the image's publication churn: a page's entries were read
+/// a heap buffer each, 7.7% of a 2,000-changeset push's allocations for the windows let go alone): inline where they fit
+/// [`INLINE_ENTRY_BYTES`], so the numerous small entries allocate nothing; else the buffer they were read into (a
+/// window's piece, a list's bytes, a hold's owners), moved, never copied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EntryBytes {
+  /// Bytes that fit inline: their length, and the bytes.
+  Inline {
+    /// How many of `bytes` are the entry's.
+    len: u8,
+    /// The bytes, the first `len` the entry's.
+    bytes: [u8; INLINE_ENTRY_BYTES],
+  },
+  /// Bytes in a buffer of their own.
+  Owned(Vec<u8>),
+}
+
+impl EntryBytes {
+  /// The bytes of `parts` one after another: inline where they fit, else gathered into a buffer.
+  pub(crate) fn of(parts: &[&[u8]]) -> EntryBytes {
+    let len = parts
+      .iter()
+      .fold(0usize, |len, part| len.saturating_add(part.len()));
+    if let Ok(short) = u8::try_from(len)
+      && len <= INLINE_ENTRY_BYTES
+    {
+      let mut bytes = [0u8; INLINE_ENTRY_BYTES];
+      let mut at = 0usize;
+      for part in parts {
+        if let Some(into) = bytes.get_mut(at..at.saturating_add(part.len())) {
+          into.copy_from_slice(part);
+        }
+        at = at.saturating_add(part.len());
+      }
+      return EntryBytes::Inline { len: short, bytes };
+    }
+    EntryBytes::Owned(parts.concat())
+  }
+
+  /// The bytes of `buffer`, moved in: its allocation was made, so it is kept and counted (w-shared's review: copied
+  /// inline and dropped, it was made and went uncounted).
+  pub(crate) fn owned(buffer: Vec<u8>) -> EntryBytes {
+    EntryBytes::Owned(buffer)
+  }
+
+  /// The heap bytes it holds of its own: none inline.
+  fn heap_bytes(&self) -> usize {
+    match self {
+      EntryBytes::Inline { .. } => 0,
+      EntryBytes::Owned(buffer) => buffer.capacity(),
+    }
+  }
+}
+
+impl core::ops::Deref for EntryBytes {
+  type Target = [u8];
+
+  fn deref(&self) -> &[u8] {
+    match self {
+      EntryBytes::Inline { len, bytes } => bytes.get(..usize::from(*len)).unwrap_or(&[]),
+      EntryBytes::Owned(buffer) => buffer,
+    }
+  }
+}
 
 /// Format: the bytes a page piece spends on an entry beyond its bytes: its key and its length.
 const ENTRY_HEAD: usize = slates_vfs::recover::HELD_PIECE_KEY_BYTES + size_of::<u32>();
@@ -385,6 +454,10 @@ pub(crate) struct Encoder {
   /// The pages first dirtied while paused, not yet re-encoded: the never-paused changes' own (puts, bring-backs), whose
   /// encoding a turn counts apart ([`Turned::imposed`]). Bound: the dirty pages.
   dirtied_paused: BTreeSet<(Family, Page)>,
+  /// The buffer a turn's reads fill, lent to each and kept between turns: grown to the most a capped read holds, about
+  /// twice a page's bytes in entries ([`Encoder::read_cap`]); a page of one coordinate read whole may grow it past that
+  /// for its turn, which shrinks it back before it is kept.
+  scratch: Vec<Entry>,
 }
 
 /// An image cut in flight (F2): the pages dirty at its moment not yet re-encoded, and its
@@ -416,12 +489,27 @@ pub(crate) struct Turned {
   pub(crate) split: u64,
   /// The bytes those reads read and did not keep, read again later.
   pub(crate) discarded: u64,
+  /// The heap bytes its reads allocated: their buffer's growth and the entries' own buffers (goal 93, main's ruling of
+  /// 2026-11-25: against `bytes`, what re-encoding a page costs beyond the page).
+  pub(crate) allocated: u64,
 }
 
-/// A family's entries over a range of coordinates at the cut, read until their bytes pass a cap, and where the read
+/// A family's entries over a range of coordinates at the cut, read until their bytes pass a cap into the buffer it is
+/// lent (cleared; the encoder's, kept across reads, so a read allocates nothing once it has grown), and where the read
 /// stopped short of the range ([`Encoder::turn`]'s `entries`).
 pub(crate) type FamilyReader<'a> =
-  &'a dyn Fn(Family, (u64, u64), usize) -> (Vec<Entry>, Option<u64>);
+  &'a dyn Fn(Family, (u64, u64), usize, &mut Vec<Entry>) -> Option<u64>;
+
+/// The heap bytes a read into `held` allocated, its buffer's capacity `capacity` before and `grown_to` after: a buffer
+/// grown is allocated whole at its new capacity; and each entry's own buffer ([`EntryBytes::Owned`]).
+fn read_allocated(held: &[Entry], capacity: usize, grown_to: usize) -> usize {
+  let grown = if grown_to == capacity { 0 } else { grown_to };
+  grown.saturating_mul(size_of::<Entry>()).saturating_add(
+    held.iter().fold(0usize, |sum, (_, _, bytes)| {
+      sum.saturating_add(bytes.heap_bytes())
+    }),
+  )
+}
 
 impl Encoder {
   /// The encoder of a recovered image's `pages` (each family's page and its piece's bytes): its committed cut.
@@ -518,12 +606,24 @@ impl Encoder {
     let mut imposed = 0usize;
     let mut split_at_stop = (0u64, 0usize);
     let cap = Self::read_cap(page_bytes);
+    // Taken here and put back below, unconditionally: the loop between leaves only by `break` and `continue`.
+    let mut held = core::mem::take(&mut self.scratch);
+    let mut capped_most = held.capacity();
+    let mut allocated = 0usize;
+    let mut read = |held: &mut Vec<Entry>, (family, page): (Family, Page), cap: usize| {
+      held.clear();
+      let capacity = held.capacity();
+      let stopped = entries(family, (page.start, page.last()), cap, held);
+      allocated = allocated.saturating_add(read_allocated(held, capacity, held.capacity()));
+      stopped
+    };
     while spent < limit {
       let Some((family, page)) = self.cut.as_mut().and_then(|cut| cut.remaining.pop_first()) else {
         break;
       };
       let spent_before = spent;
-      let (held, stopped) = entries(family, (page.start, page.last()), cap);
+      let stopped = read(&mut held, (family, page), cap);
+      capped_most = capped_most.max(held.capacity());
       if let Some(stop) = stopped.filter(|_| page.halves().is_some()) {
         // The read visited a cap's bytes at least, kept or passed over.
         let read = bytes_of(&held).max(cap);
@@ -539,11 +639,9 @@ impl Encoder {
         continue;
       }
       // A page of one coordinate is read whole: its entries share their first eight bytes, so it cannot split.
-      let held = if stopped.is_some() {
-        entries(family, (page.start, page.last()), usize::MAX).0
-      } else {
-        held
-      };
+      if stopped.is_some() {
+        read(&mut held, (family, page), usize::MAX);
+      }
       encoded.push((family, page));
       let planned = if bytes_of(&held) > page_bytes.saturating_mul(2) {
         // Its own piece removed, its halves put.
@@ -579,6 +677,11 @@ impl Encoder {
         imposed = imposed.saturating_add(spent.saturating_sub(spent_before));
       }
     }
+    // A whole read of a page of one coordinate may have grown the buffer past a capped read's: shrunk back, so what
+    // is kept is a capped read's at most.
+    held.clear();
+    held.shrink_to(capped_most);
+    self.scratch = held;
     Turned {
       bytes: u64::try_from(spent).unwrap_or(u64::MAX),
       caught_up: self.complete(),
@@ -586,7 +689,14 @@ impl Encoder {
       imposed: u64::try_from(imposed).unwrap_or(u64::MAX),
       split: split_at_stop.0,
       discarded: u64::try_from(split_at_stop.1).unwrap_or(u64::MAX),
+      allocated: u64::try_from(allocated).unwrap_or(u64::MAX),
     }
+  }
+
+  /// The capacity, in entries, of the buffer the encoder keeps for its reads ([`Encoder::scratch`]).
+  #[cfg(test)]
+  fn scratch_capacity(&self) -> usize {
+    self.scratch.capacity()
   }
 
   /// The most bytes a turn reads of one page: twice the page size, the most a page holds before it splits
@@ -791,7 +901,7 @@ mod tests {
   fn entry(coordinate: u64, len: usize) -> Entry {
     let mut key = [0u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
     key[1..9].copy_from_slice(&coordinate.to_be_bytes());
-    (coordinate, key, vec![7u8; len])
+    (coordinate, key, EntryBytes::owned(vec![7u8; len]))
   }
 
   /// The plan's own half of `pages_cover_their_coordinates_and_hold_at_most_the_page_size`, in round `round`: the
@@ -894,7 +1004,7 @@ mod tests {
       back,
       entries
         .iter()
-        .map(|(_, key, bytes)| (*key, bytes.clone()))
+        .map(|(_, key, bytes)| (*key, bytes.to_vec()))
         .collect::<Vec<_>>()
     );
     for cut in 0..bytes.len() {
@@ -1064,7 +1174,7 @@ mod tests {
           let _ = let_go_and_note(state, (ENTRIES + 1, ENTRIES));
         }
         encode_up(state);
-        let changes = crate::content_holder::held_changes(state);
+        let changes = crate::content_holder::held_changes_carried(state);
         assert!(
           changes.image_carried,
           "{step}: the delta carries the encoder's cut"
@@ -1361,7 +1471,10 @@ mod tests {
     let mut encoded = Vec::new();
     let turned = encoder.turn(
       (4096, 4096),
-      &|_, _, _| (vec![entry(coordinate, 10)], None),
+      &|_, _, _, out| {
+        out.push(entry(coordinate, 10));
+        None
+      },
       &mut encoded,
     );
     assert!(turned.caught_up, "the cut's one page encoded");
@@ -1369,6 +1482,95 @@ mod tests {
     assert_eq!(
       copied, 0,
       "the mark and the turn copied {copied} directory pages"
+    );
+  }
+
+  /// Goal 93 (main's ruling of 2026-11-25 on the image's publication churn: at 2,000 changesets about 65% of a push's
+  /// allocations were its publications, a re-encoded page read a buffer of entries and a heap buffer an entry). Do: on a
+  /// shard whose pages are small, put [`ENTRIES`] objects, carry them, and publish; let every tenth go landed (its
+  /// windows' pages and its aways' dirtied); encode the cut whole. Expect the heap bytes its reads allocated
+  /// (`vcs_store.image.read_allocated_bytes`) at most the bytes it encoded (`vcs_store.image.encoded_bytes`): the windows'
+  /// pieces each a buffer of their own, read out of the arena, and nothing beside them, the entries inline and their
+  /// buffer the encoder's, grown once. Red before: a buffer an entry and a buffer a read, past the bytes encoded.
+  #[test]
+  fn a_re_encoded_page_allocates_no_more_than_it_encodes() {
+    const PAGE: usize = 4096;
+    let (allocated, encoded) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let ids = put_objects(state, (0, ENTRIES));
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let counted = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      let spread: Vec<slates_vcs::ContentId> = ids.iter().step_by(10).copied().collect();
+      let_go(state, &spread);
+      let allocated = counted(state, crate::content_holder::IMAGE_READ_ALLOCATED_BYTES);
+      let encoded = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES);
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      let allocated = counted(state, crate::content_holder::IMAGE_READ_ALLOCATED_BYTES) - allocated;
+      let encoded = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES) - encoded;
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (allocated, encoded)
+    });
+    println!(
+      "image_pages: a cut of let-goes encoded {encoded} B, its reads allocated {allocated} B"
+    );
+    assert!(encoded > 0, "pages re-encoded");
+    assert!(
+      allocated <= encoded,
+      "the reads allocated {allocated} B for {encoded} B encoded"
+    );
+  }
+
+  /// Shape: the entries a page of one coordinate holds in the scratch-bound test: far past what a capped read takes.
+  const ONE_COORDINATE_ENTRIES: usize = 4_096;
+
+  /// Goal 93 (w-shared's review of the encoder's lent buffer, main's ruling of 2026-11-25: its bound must hold). Do: on
+  /// an encoder whose one page is a page of one coordinate, its family's [`ONE_COORDINATE_ENTRIES`] entries all there,
+  /// dirty that coordinate and turn once at a small page: the capped read stops at its cap, so the page is read whole,
+  /// past the cap. Expect the page encoded whole, and the buffer the encoder keeps after the turn no larger than a capped
+  /// read's (a cap's bytes in entries and the one crossing it, the vector's own doubling aside). Red before: it kept
+  /// the whole read's room, every entry of the coordinate's.
+  #[test]
+  fn a_whole_read_of_a_page_of_one_coordinate_leaves_the_encoders_buffer_a_capped_reads() {
+    const PAGE: usize = 1024;
+    const ENTRY: usize = 40;
+    let coordinate = 77u64;
+    let page = Page {
+      depth: DEEPEST,
+      start: coordinate,
+    };
+    let mut encoder = Encoder::restored(vec![((Family::Aways, page), Vec::new())]);
+    encoder.mark(Family::Aways, [coordinate]);
+    assert!(encoder.begin(1).is_some(), "a cut of the page begun");
+    let mut encoded = Vec::new();
+    let turned = encoder.turn(
+      (usize::MAX, PAGE),
+      &|_, _, cap, out| {
+        let mut read = 0usize;
+        for _ in 0..ONE_COORDINATE_ENTRIES {
+          if read > cap {
+            return Some(coordinate);
+          }
+          out.push(entry(coordinate, ENTRY));
+          read += ENTRY_HEAD + ENTRY;
+        }
+        None
+      },
+      &mut encoded,
+    );
+    let capped = Encoder::read_cap(PAGE) / (ENTRY_HEAD + ENTRY) + 1;
+    let kept = encoder.scratch_capacity();
+    println!(
+      "image_pages: a page of one coordinate, {ONE_COORDINATE_ENTRIES} entries, read whole: the buffer kept {kept} entries' room (a capped read {capped})"
+    );
+    assert!(turned.caught_up, "the page encoded whole");
+    assert!(
+      kept <= 2 * capped,
+      "the buffer kept {kept} entries' room, past a capped read's {capped}"
     );
   }
 

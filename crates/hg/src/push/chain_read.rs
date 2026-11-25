@@ -12,6 +12,7 @@
 
 use slates_vcs::{ContentId, ContentStore};
 
+use crate::Node;
 use crate::delta::{BaseRead, Filled, Patching};
 use crate::index::{HgIndex, Log, NONE};
 use crate::read::to_u64;
@@ -42,6 +43,51 @@ impl Chain {
       }
       deltas.push((store.object_bytes(&row.bytes, row.stored)?, row.len));
       if row.base >= at {
+        return None;
+      }
+      at = row.base;
+    }
+  }
+
+  /// The chain of the manifest row `rev` of `index` read over `root`, the whole text (its object and length) of revision
+  /// `from` of its chain, given by the changeset store where that one was let go once landed (w-interop's matrix at
+  /// 29221d5ab: a merge's manifest read over one the same push kept, a delta on the let-go tip's): the rows above `from`
+  /// its deltas. None where a row or a delta's object above it is not held whole, or `from` is not in its chain.
+  pub(crate) fn over(
+    index: &HgIndex,
+    store: &ContentStore,
+    (from, root): (u32, (ContentId, u64)),
+    rev: u32,
+  ) -> Option<Chain> {
+    let mut deltas = Vec::new();
+    let mut at = rev;
+    while at != from {
+      let row = index.revision(store, Log::Manifest, at)?;
+      if row.base == NONE || row.base >= at {
+        return None;
+      }
+      deltas.push((store.object_bytes(&row.bytes, row.stored)?, row.len));
+      at = row.base;
+    }
+    deltas.reverse();
+    Some(Chain { root, deltas })
+  }
+
+  /// The topmost revision of manifest row `rev`'s chain (`rev` itself first) whose object `store` does not hold whole: what
+  /// the changeset store is asked for where the chain is not at hand, a landed revision let go; none where every link is
+  /// held whole.
+  pub(crate) fn let_go_link(
+    index: &HgIndex,
+    store: &ContentStore,
+    rev: u32,
+  ) -> Option<(u32, Node)> {
+    let mut at = rev;
+    loop {
+      let row = index.revision(store, Log::Manifest, at)?;
+      if !store.holds_whole(&row.bytes) {
+        return Some((at, row.node));
+      }
+      if row.base == NONE || row.base >= at {
         return None;
       }
       at = row.base;

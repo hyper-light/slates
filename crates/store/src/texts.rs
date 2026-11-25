@@ -20,6 +20,14 @@
 //! present) and the base's identity (32) when present; the place's payload identity (32), offset and length (`u64`
 //! each). Decoding refuses, typed ([`TextsRefused`]), never a panic: every count and length checked against the bytes
 //! that remain before anything is allocated, a mark of no kind, and bytes after the last entry.
+//!
+//! **A place's form** (goal 93, main's ruling (b) of 2026-11-25: content kept once, on arrival, in the form a stream
+//! sends it). Marks 2 and 3 are 0 and 1 for a place holding a Mercurial revlog chunk ([`Form::Chunk`]) rather than the
+//! bytes as they are; no store before wrote them, so every row and section written before reads as it was. The form is
+//! named by the mark, never by the place's first byte, which for a raw text may be any byte a chunk's type is (`u`, `x`,
+//! `(`, NUL). A chunk is read through the process's chunk decoder, which the store cannot build and its daemon installs
+//! ([`install_chunk_decoder`], Mercurial's own reader), within its text's length ([`StoreError::Undecodable`] past it);
+//! with none installed it is refused [`StoreError::NoChunkDecoder`], never read as raw.
 
 use std::fmt;
 
@@ -30,10 +38,15 @@ use crate::store::{Store, StoreError};
 const LONG: usize = 8;
 /// Format: the bytes of an identity.
 const IDENTITY: usize = 32;
-/// Format: the mark of an absent base.
+/// Format: the mark of an absent base, the place holding its bytes as they are.
 const ABSENT: u8 = 0;
-/// Format: the mark of a present base.
+/// Format: the mark of a present base, the place holding its bytes as they are.
 const PRESENT: u8 = 1;
+/// Format: the mark of an absent base, the place holding a revlog chunk ([`Form::Chunk`]; goal 93, main's ruling (b) of
+/// 2026-11-25). A mark no store before it wrote, so a row or a section written before reads as it was.
+const ABSENT_CHUNK: u8 = 2;
+/// Format: the mark of a present base, the place holding a revlog chunk ([`ABSENT_CHUNK`]'s).
+const PRESENT_CHUNK: u8 = 3;
 /// Shape: the most a coalesced read of places reads, as a multiple of the bytes its places ask ([`Store::places_bytes`]):
 /// the gaps between them (in a changegroup, each chunk's header before its delta) at most as many bytes as the places,
 /// so one read stands for many and never reads more than double what was asked.
@@ -55,6 +68,54 @@ pub struct Place {
   pub len: u64,
 }
 
+/// How a place holds a text's whole or its edit (goal 93, main's ruling (b) of 2026-11-25: content kept once, on arrival,
+/// in the form a stream sends it). Named by the mark its entry and its row carry ([`ABSENT_CHUNK`]), never guessed from
+/// its bytes: a raw text may begin with any byte a chunk's type is (`u`, `x`, `(`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Form {
+  /// The bytes as they are: every place before the ruling, and Subversion's and git's.
+  #[default]
+  Raw,
+  /// A Mercurial revlog chunk, its type its first byte (`u` stored as it is, a NUL the bytes as they are, `x` zlib, `(`
+  /// zstd), read through the process's chunk decoder ([`install_chunk_decoder`]).
+  Chunk,
+}
+
+/// The mark of a base and a form.
+fn mark_of(base: bool, form: Form) -> u8 {
+  match (base, form) {
+    (false, Form::Raw) => ABSENT,
+    (true, Form::Raw) => PRESENT,
+    (false, Form::Chunk) => ABSENT_CHUNK,
+    (true, Form::Chunk) => PRESENT_CHUNK,
+  }
+}
+
+/// The base's presence and the form a mark names; none for a mark of no kind.
+fn of_mark(mark: u8) -> Option<(bool, Form)> {
+  match mark {
+    ABSENT => Some((false, Form::Raw)),
+    PRESENT => Some((true, Form::Raw)),
+    ABSENT_CHUNK => Some((false, Form::Chunk)),
+    PRESENT_CHUNK => Some((true, Form::Chunk)),
+    _ => None,
+  }
+}
+
+/// A revlog chunk's decoder: `stored`, a chunk as a revlog keeps it, made into the bytes it holds, at most `most` of
+/// them; none where it does not decode or makes more. The store cannot build one (its tool's codec lives in the tool's
+/// crate), so its caller installs one ([`install_chunk_decoder`]), the pattern of `slates-ipc`'s seal.
+pub type ChunkDecoder = fn(stored: &[u8], most: u64) -> Option<Vec<u8>>;
+
+/// The process's chunk decoder, once installed.
+static CHUNK_DECODER: std::sync::OnceLock<ChunkDecoder> = std::sync::OnceLock::new();
+
+/// Installs the process's chunk decoder (once; a later install is refused, false). With none installed, a place held as a
+/// chunk is refused [`StoreError::NoChunkDecoder`], never read as raw.
+pub fn install_chunk_decoder(decoder: ChunkDecoder) -> bool {
+  CHUNK_DECODER.set(decoder).is_ok()
+}
+
 /// One version a changeset kept of one path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEntry {
@@ -70,6 +131,8 @@ pub struct TextEntry {
   pub base: Option<Identity>,
   /// Where the edit or the whole lies.
   pub place: Place,
+  /// How the place holds it.
+  pub form: Form,
 }
 
 /// Why a `Texts` section, or an edit, was refused.
@@ -120,12 +183,9 @@ pub fn encode(entries: &[TextEntry]) -> Vec<u8> {
     put_bytes(&mut out, &entry.tool_id);
     out.extend_from_slice(&entry.text);
     put_long(&mut out, entry.len);
-    match &entry.base {
-      Some(base) => {
-        out.push(PRESENT);
-        out.extend_from_slice(base);
-      }
-      None => out.push(ABSENT),
+    out.push(mark_of(entry.base.is_some(), entry.form));
+    if let Some(base) = &entry.base {
+      out.extend_from_slice(base);
     }
     out.extend_from_slice(&entry.place.payload);
     put_long(&mut out, entry.place.offset);
@@ -153,10 +213,12 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<TextEntry>, TextsRefused> {
     let tool_id = reader.bytes()?.to_vec();
     let text = reader.identity()?;
     let len = reader.long()?;
-    let base = match reader.byte()? {
-      ABSENT => None,
-      PRESENT => Some(reader.identity()?),
-      byte => return Err(TextsRefused::Mark(byte)),
+    let mark = reader.byte()?;
+    let (present, form) = of_mark(mark).ok_or(TextsRefused::Mark(mark))?;
+    let base = if present {
+      Some(reader.identity()?)
+    } else {
+      None
     };
     let place = Place {
       payload: reader.identity()?,
@@ -170,6 +232,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<TextEntry>, TextsRefused> {
       len,
       base,
       place,
+      form,
     });
   }
   if !reader.rest.is_empty() {
@@ -365,6 +428,8 @@ pub struct TextRow {
   pub base: Option<Identity>,
   /// Where the edit or the whole lies.
   pub place: Place,
+  /// How the place holds it.
+  pub form: Form,
 }
 
 /// Whole texts made from their chains, by identity, the least lately read out first, bounded in bytes; and what the
@@ -433,6 +498,11 @@ pub struct TextCache {
   pub edits: u64,
   /// Places read from the log or the staging.
   pub places: u64,
+  /// The places read that held a revlog chunk and were decoded ([`Form::Chunk`]).
+  pub decoded: u64,
+  /// The most bytes one decode made: a read's decompression, bounded by its text's length (goal 93, main's ruling (b),
+  /// its condition (1): counted most a read).
+  pub decoded_most: u64,
   /// The changesets those places lie in, each recorded as a chain's place is read from it ([`Store::make_chain`]).
   pub changesets: std::collections::BTreeSet<u64>,
 }
@@ -480,6 +550,8 @@ impl TextCache {
       let_go: 0,
       edits: 0,
       places: 0,
+      decoded: 0,
+      decoded_most: 0,
       changesets: std::collections::BTreeSet::new(),
     }
   }
@@ -779,16 +851,8 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
 fn put_row_value(value: &mut Vec<u8>, sequence: u64, entry: &TextEntry) {
   value.extend_from_slice(&sequence.to_le_bytes());
   value.extend_from_slice(&entry.len.to_le_bytes());
-  match entry.base {
-    Some(base) => {
-      value.push(PRESENT);
-      value.extend_from_slice(&base);
-    }
-    None => {
-      value.push(ABSENT);
-      value.extend_from_slice(&[0; IDENTITY]);
-    }
-  }
+  value.push(mark_of(entry.base.is_some(), entry.form));
+  value.extend_from_slice(&entry.base.unwrap_or([0; IDENTITY]));
   value.extend_from_slice(&entry.place.payload);
   value.extend_from_slice(&entry.place.offset.to_le_bytes());
   value.extend_from_slice(&entry.place.len.to_le_bytes());
@@ -1021,17 +1085,45 @@ fn decode_row(value: &[u8]) -> Option<TextRow> {
     offset: reader.long().ok()?,
     len: reader.long().ok()?,
   };
-  let base = match mark {
-    ABSENT => None,
-    PRESENT => Some(base),
-    _ => return None,
-  };
+  let (present, form) = of_mark(mark)?;
+  let base = present.then_some(base);
   reader.rest.is_empty().then_some(TextRow {
     sequence,
     len,
     base,
     place,
+    form,
   })
+}
+
+/// The bytes `stored`, read at `row`'s place, as its text's whole or edit: as they are for a raw place; a revlog chunk
+/// decoded through the process's chunk decoder, at most what `row` can make of a base `base_len` bytes long (a whole its
+/// length; an edit its text's length and a hunk's head for each of the base's bytes and one more, the most hunks an edit
+/// of it holds), counted.
+///
+/// # Errors
+/// [`StoreError::NoChunkDecoder`] where none is installed; [`StoreError::Undecodable`] where the chunk does not decode
+/// within that bound.
+fn plain_of(
+  stored: Vec<u8>,
+  row: &TextRow,
+  base_len: u64,
+  cache: &mut TextCache,
+) -> Result<Vec<u8>, StoreError> {
+  if row.form == Form::Raw {
+    return Ok(stored);
+  }
+  let decoder = CHUNK_DECODER.get().ok_or(StoreError::NoChunkDecoder)?;
+  let most = match row.base {
+    None => row.len,
+    Some(_) => row
+      .len
+      .saturating_add(to_u64(HUNK_HEAD).saturating_mul(base_len.saturating_add(1))),
+  };
+  let plain = decoder(&stored, most).ok_or(StoreError::Undecodable)?;
+  cache.decoded = cache.decoded.saturating_add(1);
+  cache.decoded_most = cache.decoded_most.max(to_u64(plain.len()));
+  Ok(plain)
 }
 
 impl Store {
@@ -1407,6 +1499,7 @@ impl Store {
     }
     while let Some((identity, row)) = chain.pop() {
       let bytes = self.read_place(staging, &row.place, cache)?;
+      let bytes = plain_of(bytes, &row, to_u64(base.len()), cache)?;
       cache.changesets.insert(row.sequence);
       match row.base {
         None => {

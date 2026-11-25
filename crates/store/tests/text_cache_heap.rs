@@ -99,6 +99,7 @@ fn land_chain(store: &mut Store) -> Vec<[u8; 32]> {
         offset: 0,
         len: payload.len() as u64,
       },
+      form: slates_store::texts::Form::Raw,
     }]);
     store
       .land(
@@ -332,6 +333,7 @@ fn land_big(store: &mut Store, sequence: u64) -> [u8; 32] {
       offset: 0,
       len: text.len() as u64,
     },
+    form: slates_store::texts::Form::Raw,
   }]);
   store
     .land(
@@ -437,6 +439,7 @@ fn land_whole_texts(store: &mut Store, sequence: u64) -> Vec<[u8; 32]> {
           offset: 0,
           len: text.len() as u64,
         },
+        form: slates_store::texts::Form::Raw,
       }]);
       let at = sequence + nth;
       store

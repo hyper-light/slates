@@ -107,6 +107,7 @@ fn land_history(store: &mut Store, changesets: u64) -> History {
         offset: 0,
         len: payload.len() as u64,
       },
+      form: slates_store::texts::Form::Raw,
     };
     let section = texts::encode(&[entry]);
     store
@@ -224,6 +225,7 @@ fn a_text_that_comes_back_keeps_its_first_row_and_no_chain_loops() {
         offset: 0,
         len: payload.len() as u64,
       },
+      form: slates_store::texts::Form::Raw,
     };
     let section = texts::encode(&[entry]);
     store
@@ -300,6 +302,7 @@ fn a_changeset_holding_several_versions_of_a_path_lists_them_all() {
       len: 16,
       base: None,
       place: place(0, first.len()),
+      form: slates_store::texts::Form::Raw,
     },
     TextEntry {
       path: b"f".to_vec(),
@@ -308,6 +311,7 @@ fn a_changeset_holding_several_versions_of_a_path_lists_them_all() {
       len: 16,
       base: Some(ids[0]),
       place: place(first.len(), edit_two.len()),
+      form: slates_store::texts::Form::Raw,
     },
     TextEntry {
       path: b"f".to_vec(),
@@ -316,6 +320,7 @@ fn a_changeset_holding_several_versions_of_a_path_lists_them_all() {
       len: 16,
       base: Some(ids[1]),
       place: place(first.len() + edit_two.len(), edit_three.len()),
+      form: slates_store::texts::Form::Raw,
     },
   ];
   let section = texts::encode(&entries);
@@ -402,6 +407,7 @@ fn a_batch_of_places_in_order_in_one_payload_is_read_in_one_read() {
       len: version.len() as u64,
       base: None,
       place: *place,
+      form: slates_store::texts::Form::Raw,
     })
     .collect();
   let section = texts::encode(&entries);
@@ -464,6 +470,7 @@ fn a_logs_versions_by_tool_id_are_read_in_one_scan() {
           offset,
           len: text.len() as u64,
         },
+        form: slates_store::texts::Form::Raw,
       };
       offset += text.len() as u64;
       entry
@@ -573,6 +580,7 @@ fn land_texts(store: &mut Store, sequence: u64, payload: &[u8], entries: &[(&str
         offset: 0,
         len: payload.len() as u64,
       },
+      form: slates_store::texts::Form::Raw,
     })
     .collect();
   let section = texts::encode(&entries);

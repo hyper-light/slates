@@ -103,6 +103,47 @@ impl RunningDuration {
   }
 }
 
+/// The largest of the most recent durations folded in, over a window of at most `capacity` of them (A-914): what a
+/// stretch of slow periods reached lately, which a running tail forgets only gradually and an all-time maximum never
+/// forgets (one laptop sleep, `SIGSTOP` or debugger pause would hold it for good). The caller sets the window's length
+/// from its own rate ([`RecentMax::set_capacity`]); bounded by it.
+#[derive(Debug, Default)]
+pub struct RecentMax {
+  capacity: usize,
+  recent: std::collections::VecDeque<u64>,
+}
+
+impl RecentMax {
+  /// Folds one completed duration in, the oldest let go past the window.
+  pub fn on_sample(&mut self, duration_ns: u64) {
+    if self.capacity == 0 {
+      return;
+    }
+    while self.recent.len() >= self.capacity {
+      let _ = self.recent.pop_front();
+    }
+    self.recent.push_back(duration_ns);
+  }
+
+  /// Sets the window to the latest `capacity` durations, the older let go now.
+  pub fn set_capacity(&mut self, capacity: usize) {
+    self.capacity = capacity;
+    while self.recent.len() > capacity {
+      let _ = self.recent.pop_front();
+    }
+  }
+
+  /// The largest duration in the window, `None` while it holds none.
+  pub fn max_ns(&self) -> Option<u64> {
+    self.recent.iter().copied().max()
+  }
+
+  /// The window's length now, in durations.
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+}
+
 /// One term of the estimate: its value now, and how many measurements stand behind it (zero: a prior).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Term {
@@ -276,6 +317,11 @@ impl FailoverEstimate {
 #[derive(Debug)]
 pub struct Failover {
   periods: RunningDuration,
+  /// The coordinator's latest periods, their largest kept over a recent window (A-914).
+  recent_periods: RecentMax,
+  /// Each death's silence to its takeover install as this node measured it (A-914): from the departed host's last
+  /// answer to this node's detector to this node's install of its takeover.
+  silences: RunningDuration,
   last_period_began_ns: Option<u64>,
   recovery: Recovery,
   detection: Option<Term>,
@@ -297,6 +343,8 @@ impl Failover {
   pub fn new() -> Failover {
     Failover {
       periods: RunningDuration::new(),
+      recent_periods: RecentMax::default(),
+      silences: RunningDuration::new(),
       last_period_began_ns: None,
       recovery: Recovery::new(),
       detection: None,
@@ -328,8 +376,38 @@ impl Failover {
       && let Some(length) = now_ns.checked_sub(last)
     {
       self.periods.on_sample(length);
+      self.recent_periods.on_sample(length);
     }
     self.last_period_began_ns = Some(now_ns);
+  }
+
+  /// Sets the window the coordinator's recent periods are kept over to the latest `periods` of them (A-914).
+  pub fn set_recent_window(&mut self, periods: usize) {
+    self.recent_periods.set_capacity(periods);
+  }
+
+  /// The largest coordinator period in the recent window, `None` before one was timed (A-914).
+  pub fn recent_period_max_ns(&self) -> Option<u64> {
+    self.recent_periods.max_ns()
+  }
+
+  /// The window the coordinator's recent periods are kept over, in periods (A-914).
+  pub fn recent_window(&self) -> usize {
+    self.recent_periods.capacity()
+  }
+
+  /// Folds one death's silence to its takeover install in (A-914): `silence_ns` from the departed host's last answer to
+  /// this node's detector to this node's install of its takeover.
+  pub fn silence_to_install(&mut self, silence_ns: u64) {
+    self.silences.on_sample(silence_ns);
+  }
+
+  /// The learned silence to a takeover install (A-914): its running tail and the deaths behind it; `None` before one.
+  pub fn silence_tail(&self) -> Option<Term> {
+    self.silences.tail_ns().map(|ns| Term {
+      ns,
+      samples: self.silences.samples(),
+    })
   }
 
   /// The coordinator period's tail as measured between its periods ([`Failover::period_began`]), `None` before two were
@@ -385,6 +463,44 @@ impl Failover {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-914: the recent maximum keeps only the latest window of durations, so one slow stretch is forgotten once the window
+  /// passes it, and a shorter window lets the older go at once.
+  #[test]
+  fn a_recent_maximum_forgets_a_slow_stretch_once_its_window_passes() {
+    let mut recent = RecentMax::default();
+    recent.on_sample(7);
+    assert_eq!(recent.max_ns(), None, "no window, nothing kept");
+    recent.set_capacity(3);
+    for duration in [5, 900, 4, 6] {
+      recent.on_sample(duration);
+    }
+    assert_eq!(recent.max_ns(), Some(900), "the slow one is in the window");
+    recent.on_sample(3);
+    recent.on_sample(2);
+    assert_eq!(recent.max_ns(), Some(6), "past the window, it is forgotten");
+    recent.set_capacity(1);
+    assert_eq!(
+      recent.max_ns(),
+      Some(2),
+      "a shorter window keeps the latest"
+    );
+  }
+
+  /// A-914: the learned silence to a takeover install is none before a death, and the deaths folded in after.
+  #[test]
+  fn the_learned_silence_is_none_before_a_death_and_counts_its_deaths_after() {
+    let mut failover = Failover::new();
+    assert!(failover.silence_tail().is_none());
+    failover.silence_to_install(4_000_000_000);
+    failover.silence_to_install(5_000_000_000);
+    let tail = failover.silence_tail().unwrap();
+    assert_eq!(tail.samples, 2);
+    assert!(
+      tail.ns >= 5_000_000_000,
+      "a tail at least the longest: {tail:?}"
+    );
+  }
   use crate::timing::PathRtt;
 
   /// Format: a coordinator period of a tenth of a second, the daemon's heartbeat on any machine whose recovery budget is
