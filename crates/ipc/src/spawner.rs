@@ -403,25 +403,24 @@ impl Inbound {
   }
 }
 
-/// What is owed to be written on an end, the descriptors riding its first byte not yet sent.
+/// What is owed to be written on an end: frames in order, each with the descriptors that ride its first byte, sent
+/// with that byte and never with another frame's.
 #[derive(Debug, Default)]
 pub struct Outbound {
-  bytes: Vec<u8>,
-  descriptors: Vec<OwnedFd>,
+  frames: std::collections::VecDeque<(Vec<u8>, Vec<OwnedFd>)>,
 }
 
 impl Outbound {
-  /// Owes `bytes`, `descriptors` riding their first byte.
+  /// Owes `bytes` after what is owed already, `descriptors` riding their first byte.
   pub fn owe(&mut self, bytes: &[u8], descriptors: Vec<OwnedFd>) {
-    if !descriptors.is_empty() && self.bytes.is_empty() {
-      self.descriptors = descriptors;
+    if !bytes.is_empty() {
+      self.frames.push_back((bytes.to_vec(), descriptors));
     }
-    self.bytes.extend_from_slice(bytes);
   }
 
   /// Whether anything is owed.
   pub fn is_empty(&self) -> bool {
-    self.bytes.is_empty()
+    self.frames.is_empty()
   }
 
   /// Writes what `end` takes now.
@@ -429,13 +428,15 @@ impl Outbound {
   /// # Errors
   /// The operating system's refusal of the write, but for its being full now.
   pub fn flush(&mut self, end: BorrowedFd<'_>) -> Result<(), Errno> {
-    while !self.bytes.is_empty() {
-      let sent = send(end, &self.bytes, &self.descriptors);
-      match sent {
+    while let Some((bytes, descriptors)) = self.frames.front_mut() {
+      match send(end, bytes, descriptors) {
         Ok(0) | Err(Errno::AGAIN | Errno::INTR) => return Ok(()),
         Ok(taken) => {
-          self.descriptors.clear();
-          self.bytes.drain(..taken.min(self.bytes.len()));
+          descriptors.clear();
+          bytes.drain(..taken.min(bytes.len()));
+          if bytes.is_empty() {
+            self.frames.pop_front();
+          }
         }
         Err(error) => return Err(error),
       }
@@ -508,6 +509,45 @@ pub fn start(program: &Path, args: &[&OsStr], ends: usize) -> io::Result<Started
     handed: &handed,
   })?;
   Ok(Started { child, ends: ours })
+}
+
+/// Format: the test a test binary runs as the spawner ([`spawner_role!`] defines it at the binary's root), named so
+/// libtest runs it alone (`--exact`); the `slates` binary serves before it reads any argument, so the same arguments
+/// start either.
+pub const ROLE_TEST: &str = "spawner_role";
+
+/// The arguments the spawner is started with ([`start_here`]): [`ROLE_TEST`] alone, its output not captured.
+pub fn role_args() -> [&'static OsStr; 3] {
+  [
+    OsStr::new(ROLE_TEST),
+    OsStr::new("--exact"),
+    OsStr::new("--nocapture"),
+  ]
+}
+
+/// Starts the spawner as this process's own executable ([`role_args`]), with `ends` ends.
+///
+/// # Errors
+/// The executable's path unreadable, or [`start`]'s refusal.
+pub fn start_here(ends: usize) -> io::Result<Started> {
+  let program = std::env::current_exe()?;
+  start(&program, &role_args(), ends)
+}
+
+/// Defines a test binary's [`ROLE_TEST`] at its root: it serves as the spawner when the binary was started as one, and
+/// does nothing otherwise. A test binary whose daemon or hooks spawn children names it once; one that does not has its
+/// spawns refused typed (the spawner it starts runs no test and ends at once).
+#[macro_export]
+macro_rules! spawner_role {
+  () => {
+    /// The spawner's role in this test binary (A-924; `slates_ipc::spawner::ROLE_TEST`).
+    #[test]
+    fn spawner_role() {
+      if let Some(served) = $crate::spawner::serve_from_env() {
+        std::process::exit(i32::from(served.is_err()));
+      }
+    }
+  };
 }
 
 /// Serves as the spawner when this process was started as one ([`ENDS_VARIABLE`] set): what serving ended with; none

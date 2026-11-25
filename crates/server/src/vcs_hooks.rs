@@ -1055,7 +1055,7 @@ fn svn_hook_failed(point: HookPoint, status: ExitStatus, words: &Words) -> SvnEr
 /// written nothing, and is reported as that exit.
 fn svn_unstartable(point: HookPoint, program: &str, cause: StartRefused) -> Vec<SvnError> {
   match cause {
-    StartRefused::NoRoom => vec![
+    StartRefused::NoRoom | StartRefused::SpawnerGone => vec![
       SvnError {
         code: SVN_ERR_REPOS_BAD_ARGS,
         message: format!("Failed to start '{program}' hook"),
@@ -1353,6 +1353,8 @@ pub(crate) enum StartRefused {
   NoRoom,
   /// Another failure, by the operating system's number.
   Other(i32),
+  /// The daemon's spawner was not there to start it or to answer its end (A-924): it never started, or it went.
+  SpawnerGone,
 }
 
 /// What a hook wrote: kept up to a cap its caller derives (the connection's share of the shard's admittable memory,

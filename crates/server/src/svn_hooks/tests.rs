@@ -209,6 +209,7 @@ fn ran(policy: RepositoryPolicy, input: HookInput) -> SvnHookRan {
   let view: PathBuf = program.parent().expect("its directory").to_path_buf();
   runtime
     .spawn(async move {
+      let _spawner = crate::spawning::TestSpawner::installed();
       let site = SvnHookSite {
         policy: &policy,
         view_root: &view,

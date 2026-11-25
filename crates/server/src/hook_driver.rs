@@ -14,24 +14,24 @@
 //!
 //! **The run.** One task of the shard drives the runner: it feeds standard input as the pipe takes it (a hook that
 //! closes its input early is no failure: git stops feeding at a write error too), reads the words as they arrive, and
-//! awaits the hook's exit through the shard's driver (`slates_ipc::exit_watch::ExitWatch`: `NOTE_EXIT` on a kqueue of
-//! its own on macOS, a pidfd on Linux), the runner's deadline on the shard's wheel, and its client leaving, whichever
-//! comes first, and does what the runner answers: wait, kill the hook's process group, or take the outcome. Nothing
-//! is polled: every wait is an event.
+//! awaits the hook's exit as the daemon's spawner answers it (A-924, `crate::spawning`: the spawner is the hook's
+//! parent, and reads its status as it exits), the runner's deadline on the shard's wheel, and its client leaving,
+//! whichever comes first, and does what the runner answers: wait, kill the hook's process group, or take the outcome.
+//! Nothing is polled: every wait is an event. The spawner's death ends the run typed: the hook's group killed, its
+//! outcome `Unstartable { cause: SpawnerGone }`.
 //!
 //! **The deadline.** The bound is the one the hook's times learned (A-597): none before its first finished run, when
 //! its client leaving is its only end; the run's lesson (a finished length, or a cut at the bound) is carried back to
 //! the caller, which teaches the hook's times on the shard, since a task cannot hold them across its awaits.
 //!
-//! **No orphan.** The hook's process is owned until it is reaped: the run returns only after its exit was read and the
-//! child waited for; a run whose task is dropped first (its push gone) kills the hook's process group and leaves the
-//! child to a reaper task of the shard, which waits on its exit watch until it is reaped. A process the hook starts and
-//! moves out of its group escapes the group's kill; holding those too is the launcher's namespace's (§4.6).
+//! **No orphan.** The hook's process is owned until it is let go: the spawner reaps it only once the run releases it
+//! (A-924), so its pid and group name it until then; a run whose task is dropped first (its push gone) kills the hook's
+//! process group and releases it, and the spawner reaps it as it exits. A process the hook starts and moves out of its
+//! group escapes the group's kill; holding those too is the launcher's namespace's (§4.6).
 //!
 //! **Platforms.** Unix (Linux and macOS) here; Windows starts a hook through `slates_ipc::win_spawn` and ends its
 //! descendants with a job object, owed as A-622's Windows part, so this module is built on Unix alone.
 
-use slates_ipc::confined_spawn::SpawnedChild as Child;
 use std::future::Future;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -39,8 +39,9 @@ use std::path::Path;
 use std::pin::{Pin, pin};
 use std::task::Poll;
 
-use slates_ipc::exit_watch::ExitWatch;
 use slates_rt::futures;
+
+use crate::spawning::{SpawnRefused, Spawned as Child};
 
 use crate::vcs_hooks::{
   EnvValue, Event, ExitStatus as HookExit, HookDirectory, HookInput, HookRun, Lesson, Outcome,
@@ -75,11 +76,6 @@ pub(crate) struct Ended {
   pub(crate) standard_output: Option<Words>,
 }
 
-/// Counter: hooks whose process the run's task was dropped before reaping, killed and left to a reaper task.
-const HOOK_REAP_HANDED: &str = "hook.reap_handed";
-/// Counter: hooks killed and reaped where no reaper task could be started, waited for on the shard at once.
-const HOOK_REAP_WAITED: &str = "hook.reap_waited";
-
 /// Runs one hook to its outcome on this shard (the module doc), held to `bound_ns` (its hook's learned bound, none
 /// before its first finished run) and ended when `client_gone` resolves; the hook is reaped before this returns.
 /// Answers the outcome, the run's lesson for its hook's times, and the standard output its point reads.
@@ -89,7 +85,7 @@ pub(crate) async fn run(
   client_gone: impl Future<Output = ()>,
 ) -> Ended {
   let mut lesson = Lesson::default();
-  let mut hook = match Hook::spawn(launch) {
+  let mut hook = match Hook::spawn(launch).await {
     Ok(hook) => hook,
     Err(cause) => {
       return Ended {
@@ -129,6 +125,14 @@ pub(crate) async fn run(
         let happened = hook
           .next(wake_at_ns, client_gone.as_mut(), &mut client_left)
           .await;
+        if matches!(happened, Happened::SpawnerGone) {
+          hook.kill_group();
+          return Ended {
+            outcome: HookRun::unstartable(StartRefused::SpawnerGone),
+            lesson,
+            standard_output: None,
+          };
+        }
         step = match &happened {
           Happened::Output(bytes) => run.on(Event::Output(bytes), &mut lesson),
           Happened::OutputEnded => run.on(Event::OutputEnded, &mut lesson),
@@ -141,6 +145,7 @@ pub(crate) async fn run(
           ),
           Happened::Timer { now_ns } => run.on(Event::Timer { now_ns: *now_ns }, &mut lesson),
           Happened::ClientLeft => run.on(Event::ClientLeft, &mut lesson),
+          Happened::SpawnerGone => Step::Wait { wake_at_ns: None },
         };
       }
     }
@@ -168,6 +173,8 @@ enum Happened {
   },
   /// The client left (or the shard refused a wait it needed, which ends the run as a client's leaving does).
   ClientLeft,
+  /// The daemon's spawner went before it answered the hook's exit (A-924): the run ends typed.
+  SpawnerGone,
 }
 
 /// Which wait answered first.
@@ -189,14 +196,13 @@ enum Woke {
   Refused,
 }
 
-/// A started hook: its child, owned until reaped, and the ends of its pipes this side holds. Its exit is read without
-/// reaping it (`waitid` with `WNOWAIT`), so its process-group id stays reserved by its unreaped leader until the run
-/// ends, and killing the group then cannot reach a group another process formed under a reused id.
+/// A started hook: its child, owned until let go, and the ends of its pipes this side holds. The spawner answers its exit
+/// without reaping it (A-924: `waitid` with `WNOWAIT`, reaped only once released), so its process-group id stays
+/// reserved by its unreaped leader until the run ends, and killing the group then cannot reach a group another process
+/// formed under a reused id.
 struct Hook {
-  /// The child, `None` once reaped.
+  /// The child, `None` once let go.
   child: Option<Child>,
-  /// The watch on its exit.
-  exit: ExitWatch,
   /// Its standard input's write end, non-blocking, until all of it is written or the hook closed its end.
   input: Option<OwnedFd>,
   /// What of its standard input is left to write.
@@ -209,17 +215,16 @@ struct Hook {
   standard_output: Option<Words>,
   /// How many bytes of its standard output are kept, its run's cap on words.
   cap: usize,
-  /// Whether its watch has reported its exit (which a watch reports once).
-  exit_seen: bool,
-  /// Whether its exit status was read (the child still unreaped).
+  /// Whether its exit was answered (the child still unreaped).
   exited: bool,
   /// One read's room: the machine's page.
   buffer: Vec<u8>,
 }
 
 impl Hook {
-  /// Starts the hook (the module doc): `StartRefused` by the operating system's cause.
-  fn spawn(launch: Launch<'_>) -> Result<Self, StartRefused> {
+  /// Starts the hook through the daemon's spawner (the module doc): `StartRefused` by the operating system's cause, or
+  /// the spawner's absence.
+  async fn spawn(launch: Launch<'_>) -> Result<Self, StartRefused> {
     use slates_ipc::confined_spawn::{ChildStream, Environment, Spawn};
     let (words_read, words_write) = std::io::pipe().map_err(|error| start_refused(&error))?;
     let (input_read, input_write) = std::io::pipe().map_err(|error| start_refused(&error))?;
@@ -255,7 +260,7 @@ impl Hook {
     };
     // Every child the daemon starts is handed only its three streams (`slates_ipc::confined_spawn`, main 01a20182's
     // ruling of 2026-11-22): no pipe another thread was making as it spawned reaches it.
-    let spawned = slates_ipc::confined_spawn::spawn(&Spawn {
+    let spawned = crate::spawning::spawn(&Spawn {
       program: launch.program,
       args: &args,
       // A Subversion hook starts with its hooks-env section alone, never the server's environment (A-623,
@@ -275,7 +280,8 @@ impl Hook {
       stdout,
       stderr: ChildStream::Fd(words_write.as_fd()),
       handed: &[],
-    });
+    })
+    .await;
     // A test's foreign holder of the words stream (`HOLD_WORDS_ABROAD`): a plain `std::process::Command` child given the
     // write end, as a spawn by anyone else in the process lands in the window between a macOS pipe and its close-on-exec.
     #[cfg(test)]
@@ -303,19 +309,10 @@ impl Hook {
       drop(write);
       read
     });
-    let mut child = spawned.map_err(|error| start_refused(&error))?;
+    let child = spawned.map_err(|refused| spawn_refused(refused))?;
     let input = Some(OwnedFd::from(input_write));
     let words = OwnedFd::from(words_read);
     let output = output_read.map(OwnedFd::from);
-    let exit = match ExitWatch::on(child.id()) {
-      Ok(exit) => exit,
-      Err(_) => {
-        // Its exit cannot be awaited: killed with its group at once, and waited for (`SIGKILL` makes the wait short).
-        child.kill_group();
-        let _ = child.wait();
-        return Err(StartRefused::NoRoom);
-      }
-    };
     let ready = [input.as_ref(), Some(&words), output.as_ref()]
       .into_iter()
       .flatten()
@@ -323,14 +320,12 @@ impl Hook {
     let standard_output = output.as_ref().map(|_| Words::default());
     let mut hook = Self {
       child: Some(child),
-      exit,
       input,
       pending: launch.input.stdin.clone(),
       words: Some(words),
       output,
       standard_output,
       cap: launch.words_cap,
-      exit_seen: false,
       exited: false,
       buffer: vec![0; rustix::param::page_size()],
     };
@@ -387,14 +382,8 @@ impl Hook {
     let words = self.words.as_ref().map(|fd| fd.as_raw_fd());
     let output = self.output.as_ref().map(|fd| fd.as_raw_fd());
     let input = self.input.as_ref().map(|fd| fd.as_raw_fd());
-    let exit = (!self.exit_seen)
-      .then(|| self.exit.readiness().map(|fd| fd.as_raw_fd()))
-      .flatten();
-    // The watch fired but the status is not readable yet: macOS posts a process's exit note a moment before it can be
-    // waited for (seen: the note and the words' end at 51 ms, `waitid` none, and nothing left to wake the run, which waited
-    // on no deadline until its client gave up). The run yields to the shard once and reads again, until the status is
-    // there; the gap is the kernel's own few microseconds of the exit.
-    let exit_pending = self.exit_seen && !self.exited;
+    // The spawner answers the exit with its status (A-924), so no gap between a note and a readable status is left.
+    let exit = self.child.as_ref().filter(|_| !self.exited);
     let mut words = pin!(async move {
       match words {
         Some(fd) => slates_rt::readiness::readable(fd).await,
@@ -415,9 +404,8 @@ impl Hook {
     });
     let mut exit = pin!(async move {
       match exit {
-        Some(fd) => slates_rt::readiness::readable(fd).await,
-        None if exit_pending => {
-          futures::yield_now().await;
+        Some(child) => {
+          let _answered = child.exit().await;
           Ok(())
         }
         None => std::future::pending().await,
@@ -522,36 +510,19 @@ impl Hook {
     Some(Happened::OutputEnded)
   }
 
-  /// The hook's exit, once it has exited: its status read without reaping it (the struct's doc); none before, and none
-  /// twice. Asked of the kernel at every wake, its watch or not: a hook that exits before its watch is registered is a
-  /// zombie the watch takes and never fires for (seen on macOS: a refusing hook's words ended at 51 ms and its run waited
-  /// on the watch until the test's bound, 1 of 20 runs of `hooks_spawned_at_once_each_end_at_their_own_exit`), so the
-  /// watch only wakes the run, and the status is what says it exited. A status not yet readable is read again at the
-  /// run's next wake (its words' end, which an exit brings, or its deadline or its client).
+  /// The hook's exit, once the spawner has answered it (the struct's doc): none before, and none twice; the spawner's
+  /// death, once, as [`Happened::SpawnerGone`].
   fn read_exit(&mut self) -> Option<Happened> {
     if self.exited {
       return None;
     }
-    if !self.exit_seen {
-      self.exit_seen = self.exit.exited();
-    }
-    let pid = self
-      .child
-      .as_ref()
-      .and_then(|child| i32::try_from(child.id()).ok())
-      .and_then(rustix::process::Pid::from_raw)?;
-    let options = rustix::process::WaitIdOptions::EXITED
-      | rustix::process::WaitIdOptions::NOWAIT
-      | rustix::process::WaitIdOptions::NOHANG;
-    let status = rustix::process::waitid(rustix::process::WaitId::Pid(pid), options).ok()??;
+    let exited = self.child.as_ref()?.exited()?;
     self.exited = true;
-    let status = match (status.exit_status(), status.terminating_signal()) {
-      (_, Some(signal)) => HookExit::Signal(signal),
-      (Some(code), None) => HookExit::Code(code),
-      (None, None) => HookExit::Code(status.raw_signo()),
+    let Ok(status) = exited else {
+      return Some(Happened::SpawnerGone);
     };
     Some(Happened::Exited {
-      status,
+      status: hook_exit(status),
       at_ns: futures::now_ns(),
     })
   }
@@ -563,40 +534,33 @@ impl Hook {
     }
   }
 
-  /// Reaps the child when its exit was read; otherwise leaves it to `Drop`, which kills and reaps it.
+  /// Lets the child go once its exit was answered (the spawner reaps it); otherwise leaves it to `Drop`, which kills its
+  /// group first.
   fn reap(&mut self) {
-    if let Some(child) = self.child.as_mut()
-      && let Ok(Some(_)) = child.try_wait()
-    {
+    if self.exited {
       self.child = None;
     }
   }
 }
 
 impl Drop for Hook {
-  /// A hook not yet reaped (its run's task dropped first, or ended with leftovers): its group killed, and its child
-  /// reaped by a reaper task of the shard, or waited for here when none can be started.
+  /// A hook not yet let go (its run's task dropped first, or ended with leftovers): its group killed while it may still
+  /// run, then let go, and the spawner reaps it as it exits (A-924).
   fn drop(&mut self) {
-    let Some(mut child) = self.child.take() else {
+    let Some(child) = self.child.take() else {
       return;
     };
-    if let Ok(Some(_)) = child.try_wait() {
-      return;
-    }
-    child.kill_group();
-    let exit = ExitWatch::on(child.id()).ok();
-    let handed = futures::spawn(reap_killed(child, exit)).and_then(futures::detach);
-    match handed {
-      Ok(()) => count(HOOK_REAP_HANDED),
-      Err(_) => count(HOOK_REAP_WAITED),
+    if !self.exited && child.exited().is_none() {
+      child.kill_group();
     }
   }
 }
 
-/// Runs `program` with `args` as a helper of this shard (A-645 (a): the daemon's own `slates mount` of a view), its
-/// standard streams the null device, in a process group of its own, and awaits its exit through the shard's driver
-/// (`ExitWatch`) for at most `bound_ns`: whether it exited successfully. A helper still running at the bound is killed
-/// with its group and reaped. Refused in words where it could not be started or waited for.
+/// Runs `program` with `args` as a helper of this shard (A-645 (a): the daemon's own `slates mount` of a view) through
+/// the daemon's spawner (A-924), its standard streams the null device, in a process group of its own, and awaits its
+/// exit as the spawner answers it for at most `bound_ns`: whether it exited successfully. A helper still running at the
+/// bound is killed with its group and let go (the spawner reaps it). Refused in words where it could not be started or
+/// its spawner went.
 pub(crate) async fn run_helper(
   program: &Path,
   args: &[&str],
@@ -604,7 +568,7 @@ pub(crate) async fn run_helper(
 ) -> Result<bool, String> {
   use slates_ipc::confined_spawn::{ChildStream, Environment, Spawn};
   let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
-  let mut child = slates_ipc::confined_spawn::spawn(&Spawn {
+  let child = crate::spawning::spawn(&Spawn {
     program,
     args: &args,
     environment: Environment::Inherited,
@@ -616,58 +580,37 @@ pub(crate) async fn run_helper(
     stderr: ChildStream::Null,
     handed: &[],
   })
-  .map_err(|error| format!("could not be started: {error}"))?;
-  let exit = ExitWatch::on(child.id()).ok();
-  let waited = futures::within(bound_ns, async {
-    loop {
-      match child.try_wait() {
-        Ok(Some(status)) => return Some(status.success()),
-        Ok(None) => {}
-        Err(_) => return None,
-      }
-      let ready = exit
-        .as_ref()
-        .and_then(|exit| exit.readiness().map(|fd| fd.as_raw_fd()));
-      match ready {
-        Some(fd) if slates_rt::readiness::readable(fd).await.is_ok() => {}
-        _ => return child.wait().ok().map(|status| status.success()),
-      }
+  .await
+  .map_err(|refused| format!("could not be started: {refused:?}"))?;
+  match futures::within(bound_ns, child.exit()).await {
+    Ok(Some(Ok(status))) => Ok(status.success()),
+    Ok(Some(Err(refused))) => {
+      child.kill_group();
+      Err(format!("could not be waited for: {refused:?}"))
     }
-  })
-  .await;
-  match waited {
-    Ok(Some(Some(success))) => Ok(success),
-    Ok(Some(None)) => Err("could not be waited for".to_owned()),
     Ok(None) | Err(_) => {
       child.kill_group();
-      let _ = child.wait();
       Err("ran past its bound and was killed".to_owned())
     }
   }
 }
 
-/// Counts `counter` on this shard, when there is one.
-fn count(counter: &'static str) {
-  let _ = crate::state::with_state_counted(|state| state.count(counter, 1));
+/// The hook's exit in the runner's terms, as the spawner answered it.
+fn hook_exit(status: std::process::ExitStatus) -> HookExit {
+  use std::os::unix::process::ExitStatusExt;
+  match (status.signal(), status.code()) {
+    (Some(signal), _) => HookExit::Signal(signal),
+    (None, Some(code)) => HookExit::Code(code),
+    (None, None) => HookExit::Code(status.into_raw()),
+  }
 }
 
-/// Waits for a killed hook's exit and reaps it.
-async fn reap_killed(mut child: Child, exit: Option<ExitWatch>) {
-  loop {
-    if let Ok(Some(_)) = child.try_wait() {
-      return;
-    }
-    let ready = exit
-      .as_ref()
-      .and_then(|exit| exit.readiness().map(|fd| fd.as_raw_fd()));
-    match ready {
-      Some(fd) if slates_rt::readiness::readable(fd).await.is_ok() => {}
-      // No watch to wait on: the group was sent `SIGKILL`, so the child's wait is short.
-      _ => {
-        let _ = child.wait();
-        return;
-      }
-    }
+/// Why a hook could not be started through the spawner, in the runner's terms.
+fn spawn_refused(refused: SpawnRefused) -> StartRefused {
+  match refused {
+    SpawnRefused::NoSpawner | SpawnRefused::SpawnerGone => StartRefused::SpawnerGone,
+    SpawnRefused::Unrequestable => StartRefused::Other(rustix::io::Errno::TOOBIG.raw_os_error()),
+    SpawnRefused::Os(number) => start_refused(&std::io::Error::from_raw_os_error(number)),
   }
 }
 
@@ -781,6 +724,10 @@ mod tests {
         eprintln!("{TAG}cwd={}", std::env::current_dir().unwrap().display());
         std::process::exit(0);
       }
+      "parent" => {
+        eprintln!("{TAG}parent={}", std::os::unix::process::parent_id());
+        std::process::exit(0);
+      }
       "token" => {
         use std::io::Write;
         print!("{TAG}opaquelocktoken:from-the-hook");
@@ -892,6 +839,7 @@ mod tests {
     let program = program.map_or(binary, PathBuf::from);
     runtime
       .spawn(async move {
+        let _spawner = crate::spawning::TestSpawner::installed();
         let launch = Launch {
           program: &program,
           input: &hook,
@@ -953,6 +901,48 @@ mod tests {
       );
       lesson
     })
+  }
+
+  /// A-924 piece 2a (main's ruling of 2026-11-25: a hook spawn cost its shard about 0.1 ms per 1,000 of the daemon's
+  /// open descriptors). Do: on a runtime whose shard holds a spawner's end, run a hook that writes its parent's pid.
+  /// Expect: the hook accepted, its parent the spawner, not this process. Red before: the shard spawned the hook
+  /// itself, so its parent was this process.
+  #[test]
+  fn a_hook_is_started_by_the_shards_spawner_not_by_the_shard() {
+    let runtime = runtime();
+    let (sent, got) = channel();
+    let (program, view) = program_and_view();
+    runtime
+      .spawn(async move {
+        let spawner = crate::spawning::TestSpawner::installed();
+        let hook = input(HookPoint::GitPostReceive, "parent", &[], Vec::new());
+        let launch = Launch {
+          program: &program,
+          input: &hook,
+          view_root: &view,
+          words_cap: CAP,
+        };
+        let ran =
+          slates_rt::futures::within(TEST_BOUND_NS, run(launch, None, std::future::pending()))
+            .await;
+        let _ = sent.send((spawner.pid(), ran.ok().flatten().map(|ended| ended.outcome)));
+      })
+      .expect("the run's task");
+    runtime.run_until_idle();
+    let (spawner, outcome) = got.recv().expect("the run answered");
+    let outcome = outcome.expect("the run ended within the test's bound");
+    let said = text(&outcome);
+    let parent: Option<u32> = said
+      .lines()
+      .find_map(|line| line.split(&format!("{TAG}parent=")).nth(1))
+      .and_then(|pid| pid.trim().parse().ok());
+    assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+    assert_eq!(
+      parent,
+      Some(spawner),
+      "the hook's parent is the spawner, not this process ({}): {said}",
+      std::process::id()
+    );
   }
 
   /// A hook's words, as text.

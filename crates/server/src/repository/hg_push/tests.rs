@@ -2600,6 +2600,7 @@ mod hooks {
       .to_path_buf();
     runtime
       .spawn(async move {
+        let _spawner = crate::spawning::TestSpawner::installed();
         let mut gone = core::future::pending::<()>();
         let running = run_hooks((&hooks, &[]), (&view, CAP, Some(PART)), &mut gone);
         let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;

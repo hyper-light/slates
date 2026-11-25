@@ -1301,6 +1301,7 @@ fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, 
   let (sent, got) = std::sync::mpsc::channel();
   runtime
     .spawn(async move {
+      let _spawner = crate::spawning::TestSpawner::installed();
       let bound = 10 * crate::daemon::LIVENESS_BUDGET_NS;
       let ran =
         slates_rt::futures::within(bound, drive_awaiting(&mut command, &[MKDIR_CLIENT])).await;

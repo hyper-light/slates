@@ -496,6 +496,7 @@ fn ran(
   let (presented, policy, input) = (presented.clone(), policy.clone(), as_role(input));
   runtime
     .spawn(async move {
+      let _spawner = crate::spawning::TestSpawner::installed();
       let site = GitHookSite {
         policy: &policy,
         view: &presented,
