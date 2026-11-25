@@ -19880,6 +19880,24 @@ entry makes no closing claim until it is explained.
   `object_resident` 198 and 183 MB, `arena_free` 175 and 161 MB. w-perf is fixing it, and main's rerun adds the fix as
   a fourth arm.
 
+**The fourth arm: the arena's purge (2b977b986, with ac8fa0cf0).** It does not yet bring the arena's free space within
+its keep at this scale: free over its bound 1.4 to 2.8 with the purge, 2.5 to 3.0 without. That is open with w-perf.
+
+- **Command.** `~/slates-work/main-ship/p7-fourth-arm.sh`, the same test and dataset, three rounds interleaved,
+  2026-11-25 05:35 to 05:38 PST, load average 20 to 32. Record: `~/.cache/main-rounds/bench7/p7-fourth.txt`.
+- **Compare within a run.** Each round's bound is its own measure. In this run memcpy measured 4.3 to 9.5 GB/s under a
+  build's load, so the bounds came out smaller than in the first run. Compare a round's free space against that round's
+  bound, never against the first run's.
+
+| arm | wall, rounds 1 / 2 / 3 (s) | median | resident (MiB) | `arena_free` at the end (MB) | its bound (MB) | free / bound |
+|---|---|---|---|---|---|---|
+| purge, 2b977b986 | 11.29 / 9.00 / 9.18 | 9.18 | 242 / 250 / 295 | 53.8 / 54.5 / 145.9 | 19.0 / 38.0 / 54.9 | 2.83 / 1.43 / 2.66 |
+| bound, eedfd23e1 | 9.81 / 11.40 / 15.54 | 11.40 | 258 / 257 / 241 | 75.0 / 73.7 / 52.2 | 25.4 / 29.8 / 20.2 | 2.95 / 2.47 / 2.58 |
+| unit, 084ffb65d | 12.90 / 12.65 / 27.92 | 12.90 | 189 / 179 / 189 | | | |
+| before, a387b13c3 | 12.00 / 10.15 / 12.08 | 12.00 | 683 to 684 | | | |
+
+- **Wall** is not separated at this load: the unit arm alone spans 12.65 to 27.92 s.
+
 ## The git leg at eedfd23e1, one loaded run: the clone's first pack byte 14.8 s later than at 2dd25afe6, the derivation's units slower (goal 93 perf; main 01a20182's bench7, 2026-11-25 04:53 to 04:59 PST)
 
 **A loaded point, no verdict.** At eedfd23e1 the clone's first pack byte came at 55.112 s, against 40.3 s at 2dd25afe6.
@@ -19903,4 +19921,24 @@ of e89adba55 against its parent queued. This entry makes no closing claim on `de
 - **The daemon's peak** was 2,978 MiB.
 - **What moved.** The clone's first pack byte is 14.8 s later, the derivation's units running at 21.8 against 11.8 ms
   each. The partial clone is 19.5 s sooner and the clone-again about even, both at different loads.
+
+**Follow-up: `derive_behind` (e89adba55) A/B, two interleaved rounds. It stays.** At best the two arms are even: the
+first pack byte came at 38.39 s in both. A is the steadier, and the derivation doubling seen at eedfd23e1 is not
+reproduced. The clone's whole time differs for reasons beyond the derivation: other changes sit between the two arms'
+commits, so this makes no claim on it.
+
+- **Command.** `~/slates-work/main-ship/derive-ab.sh`, 2026-11-25 05:51 to 06:14 PST on the MacBook, load average 21 to
+  34, two rounds interleaved. Record: `~/.cache/main-rounds/derive-ab/summary.txt`.
+- **The arms.**
+  - A: main ae4557eba, with `derive_behind`.
+  - C: 44db3dc17, the inline form before it.
+
+| arm | push (s) | clone (s) | its first pack bytes (s) | clone again (s) | derivation, 1,027 units (s) | a unit (ms) |
+|---|---|---|---|---|---|---|
+| A | 52.653 / 53.365 | 64.301 / 85.851 | 38.390 / 39.825 | 58.488 / 50.263 | 14.20 / 14.80 | 13.83 / 14.41 |
+| C | 49.352 / 53.093 | 78.839 / 112.240 | 38.389 / 67.616 | 62.372 / 64.339 | 13.65 / 24.99 | 13.29 / 24.33 |
+
+- **The derivation.** A's units took 13.8 to 14.4 ms in both rounds, so the 21.8 ms of the eedfd23e1 run above is
+  not reproduced with `derive_behind`. C's took 13.3 ms in one round and 24.3 ms in the other: without it, a unit's time
+  also doubled at this load.
 

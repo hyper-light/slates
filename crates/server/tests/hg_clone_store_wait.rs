@@ -9,6 +9,8 @@
 //! naming a Mercurial repository, it pushes that one. `#[ignore]`d: a measurement, run by name.
 #![allow(
   clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
   clippy::print_stdout,
   clippy::print_stderr,
   clippy::disallowed_methods,
@@ -23,7 +25,13 @@ use std::collections::BTreeMap;
 const CHANGESETS: u64 = 2_000;
 
 /// Format: the counters of a fetch's store asks, the owner's split of them after the first two.
-const COUNTERS: [&str; 15] = [
+const COUNTERS: [&str; 21] = [
+  "vcs_store.hg_fetch_manifest_at_hand_delta",
+  "vcs_store.hg_fetch_manifest_at_hand_whole",
+  "vcs_store.hg_fetch_manifest_stored_delta",
+  "vcs_store.hg_fetch_manifest_stored_whole",
+  "vcs_store.hg_fetch_manifest_stored_fallback",
+  "vcs_store.hg_fetch_manifests_rebuilt",
   "vcs_store.hg_owner_spin_hits",
   "vcs_store.hg_owner_parks",
   "vcs_store.hg_owner_spin_ns",
@@ -116,12 +124,13 @@ fn what_a_whole_mercurial_clone_waits_on_when_it_asks_the_store() {
     .unwrap();
   let took = began.elapsed();
   let after = counters(&served);
-  served.stop();
   assert!(
     cloned.status.success(),
     "clone: {}",
     String::from_utf8_lossy(&cloned.stderr)
   );
+  assert_the_clone_is_the_sources(&served, &source);
+  served.stop();
   let moved = |name: &str| after[name].saturating_sub(before[name]);
   println!(
     "hg_clone_store_wait: source {source}: the clone took {:.3} s",
@@ -146,6 +155,46 @@ fn what_a_whole_mercurial_clone_waits_on_when_it_asks_the_store() {
     parts,
     moved("vcs_store.hg_owner_total_ns"),
     "the parts sum to the whole"
+  );
+}
+
+/// The clone in `served`'s directory is `source` (main's ruling of 2026-11-25, its condition 2: a clone sent cheaper
+/// must be the same clone): stock `hg verify` clean on it, which checks every manifest's text against its node, and
+/// every changeset's manifest node the source's.
+fn assert_the_clone_is_the_sources(served: &common::hg::Served, source: &str) {
+  let verified = served.hg("cloned").args(["verify", "-q"]).output().unwrap();
+  assert!(
+    verified.status.success(),
+    "hg verify: {}{}",
+    String::from_utf8_lossy(&verified.stdout),
+    String::from_utf8_lossy(&verified.stderr)
+  );
+  let manifests = |repository: &str| {
+    served
+      .hg(".")
+      .args([
+        "-R",
+        repository,
+        "log",
+        "-r",
+        "all()",
+        "-T",
+        "{node} {manifest}\\n",
+      ])
+      .output()
+      .unwrap()
+      .stdout
+  };
+  let theirs = manifests(source);
+  let ours = manifests(&format!("{}/cloned", served.base()));
+  assert!(!theirs.is_empty(), "the source's manifests listed");
+  assert!(ours == theirs, "every changeset's manifest the source's");
+  println!(
+    "hg_clone_store_wait: the clone verified, its {} changesets' manifests the source's",
+    theirs
+      .split(|byte| *byte == b'\n')
+      .filter(|line| !line.is_empty())
+      .count()
   );
 }
 

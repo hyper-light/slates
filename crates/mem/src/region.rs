@@ -134,6 +134,25 @@ impl Region {
     crate::resident::of_range(self.base(), self.len(), self.page)
   }
 
+  /// [`Region::residency`] less the pages this region records as marked reusable (A-110, macOS) that the kernel still
+  /// counts: a discarded page there stays in `mincore`'s count and the process's resident size until the kernel takes
+  /// it, though it left the process's physical footprint when it was marked (goal 93 P7, main's ruling of 2026-11-25:
+  /// `crates/mem/tests/macos_residency.rs`, 32 MiB given back, the footprint 33 MiB to 1, `mincore` 32 before and
+  /// after). So what this reads is the pages the process still owns. Where a discard punches a hole (Linux) or leaves
+  /// the working set (Windows), no page is held marked and this is [`Region::residency`].
+  pub fn residency_in_use(&self) -> Result<crate::resident::Residency, MemError> {
+    let mut found = self.residency()?;
+    let len = self.len();
+    let mut at = 0usize;
+    while let Some((first, reach)) = self.reusable.next_run_from(at, len) {
+      if let Ok(marked) = self.residency_of(first, reach.saturating_sub(first)) {
+        found.resident = found.resident.saturating_sub(marked.resident);
+      }
+      at = reach;
+    }
+    Ok(found)
+  }
+
   /// [`Region::residency`] of `len` bytes at `offset`; refused `OutOfRange` past the region's end.
   pub fn residency_of(
     &self,

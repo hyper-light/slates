@@ -96,10 +96,63 @@ fn a_subversion_imports_bytes_on_the_store_are_measured_against_fsfs() {
     rows: gauges(&mut client),
     store: (before, du_kib(&store)),
   };
+  let settled = settled_reading(&mut client);
   let after = served.stop_measuring(|base| du_kib(&format!("{base}/store")));
   println!("svn_import_storage: dump {dump}: {imported:?}");
   print_measured(&measured, after);
+  print_settled(&settled);
   assert!(imported.is_ok(), "the import answered: {imported:?}");
+}
+
+/// Shape: the longest the second reading waits for the import's deferred frees to be released by a publication.
+const SETTLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Shape: the second reading's look at the daemon's gauges, between its waits.
+const SETTLE_LOOK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The gauges' sum over the shards for `kind` (`mem.gauge.<kind>`), in `rows`.
+fn summed(rows: &BTreeMap<String, u64>, kind: &str) -> u64 {
+  rows
+    .iter()
+    .filter(|(name, _)| name.ends_with(&format!(":mem.gauge.{kind}")))
+    .map(|(_, value)| *value)
+    .sum()
+}
+
+/// The daemon's gauges again once a publication has released the import's deferred frees (main's ruling of 2026-11-25,
+/// goal 93 P7: deferred frees a published image names are A-64's rule, so the claim is read one publication after the
+/// import ends): read until `content.arena_deferred_bytes` is zero or [`SETTLE_PATIENCE`] passes, with the time waited.
+fn settled_reading(
+  client: &mut slates_client::Client,
+) -> (std::time::Duration, BTreeMap<String, u64>) {
+  let began = std::time::Instant::now();
+  loop {
+    let rows = gauges(client);
+    if summed(&rows, "content.arena_deferred_bytes") == 0 || began.elapsed() >= SETTLE_PATIENCE {
+      return (began.elapsed(), rows);
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SETTLE_LOOK);
+  }
+}
+
+/// Prints the second reading's arena gauges and the import's purge counters, and the time it waited.
+fn print_settled((waited, rows): &(std::time::Duration, BTreeMap<String, u64>)) {
+  println!(
+    "svn_import_storage: settled after {} ms",
+    waited.as_millis()
+  );
+  for kind in [
+    "content.arena_deferred_bytes",
+    "content.arena_free_bytes",
+    "content.arena_resident_free_bytes",
+    "content.arena_mapped_bytes",
+    "content.object_resident_bytes",
+  ] {
+    println!(
+      "svn_import_storage: settled {kind} = {}",
+      summed(rows, kind)
+    );
+  }
 }
 
 /// The Subversion repository the dump is imported into.
@@ -149,5 +202,11 @@ fn print_measured(measured: &Measured, after: (u64, u64)) {
   listed.sort_by(|a, b| b.1.cmp(a.1));
   for (name, value) in listed.into_iter().take(LISTED) {
     println!("svn_import_storage: after the import {name} = {value}");
+  }
+  // The import's own memory counters, whatever their size (goal 93 P7: what its batches gave back, main's ask).
+  for (name, value) in &measured.rows {
+    if name.contains(":repository.svn_import.purged") || name.contains(":content.purge") {
+      println!("svn_import_storage: after the import {name} = {value}");
+    }
   }
 }

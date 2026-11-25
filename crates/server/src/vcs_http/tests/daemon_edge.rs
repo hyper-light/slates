@@ -2151,6 +2151,103 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
   );
 }
 
+/// Goal 93, main's ruling (b) (content kept once, on arrival, as stock's revlog chunks). Do: through a two-shard daemon's
+/// edge, push one changeset whose file is twice a request's room and compresses (every byte odd); stream-clone it; clone
+/// it. Expect: the push's segment made into chunks as it landed, no step compressing past the copy slice it was given;
+/// the stream sending the file's chunk byte for byte with nothing compressed again (its count and send passes' zstd at
+/// zero); the clone's changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the
+/// decoded bytes at least the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at
+/// arrival.
+#[test]
+fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let config = crate::DaemonConfig::derive(&crate::daemon::test_profile(), &instance, Some(SHARDS));
+  let room = super::bounds_of(&config).room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|at| b"abcdefgh"[at % 8] | 1)
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let chunked = (
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_push::COMPRESS_PLAIN_BYTES,
+    ),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_push::COMPRESS_BYTES_MOST,
+    ),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_push::COMPRESS_PAST_BUDGET_MOST,
+    ),
+  );
+  let request = format!(
+    "GET /{name}?cmd=stream_out HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  let streamed = typed_exchange(port, &certificate, request.as_bytes());
+  let recompressed = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::COMPRESS_COUNT_NS,
+  ) + counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::COMPRESS_SEND_NS,
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  let cloned = hg_getbundle(edge, &name, &tip);
+  let decoded = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::DECOMPRESS_PLAIN_BYTES,
+  );
+  daemon.stop();
+  assert_hg_answered(&pushed);
+  assert!(
+    chunked.0 >= large.len() as u64,
+    "the push's file made into a chunk: {chunked:?}"
+  );
+  assert!(
+    chunked.1 > 0 && chunked.2 == 0,
+    "steps of compression, none past the copy slice it was given: {chunked:?}"
+  );
+  let mut chunk = Vec::new();
+  slates_hg::revlog_chunk::chunk(large, slates_hg::revlog_chunk::Pass::Send, &mut chunk)
+    .expect("the file's chunk");
+  assert!(
+    streamed
+      .2
+      .windows(chunk.len().min(64))
+      .any(|window| window == &chunk[..64]),
+    "the stream carries the file's chunk"
+  );
+  assert_eq!(recompressed, 0, "the stream compressed nothing again");
+  assert!(
+    decoded >= large.len() as u64,
+    "the clone decoded the file's chunk: {decoded}"
+  );
+  let stream = cloned
+    .2
+    .strip_prefix(b"\x04none")
+    .expect("an uncompressed answer");
+  assert!(
+    stream.windows(64).any(|window| window == &large[..64]),
+    "the clone carries the file's bytes"
+  );
+}
+
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
 /// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
 /// `Content-Type` and body.
@@ -5707,7 +5804,7 @@ fn assert_the_pushes_file_texts_let_go(work_texts: u64, files_after: (usize, usi
 
 /// What a daemon's fetches have read of the changeset store so far: the changelog's and manifests' texts read whole
 /// (`vcs_store.hg_pull_log_texts`) and the store's asks (`vcs_store.hg_stream_store_asks`).
-fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64, u64) {
+fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64, u64, u64) {
   (
     counted_on(
       daemon,
@@ -5716,19 +5813,39 @@ fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64, u64) {
     ),
     counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::STORE_ASKS),
     counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::TEXT_REQUESTS),
+    counted_on(
+      daemon,
+      REPOSITORY,
+      crate::vcs_store::hg_view::MANIFEST_STORED_DELTA,
+    ) + counted_on(
+      daemon,
+      REPOSITORY,
+      crate::vcs_store::hg_view::MANIFEST_STORED_WHOLE,
+    ),
   )
 }
 
 /// Goal 93 (main's interop bench at ed71ac0be: `hg clone` of the 57k history after P5 ran 13.5 minutes, stock's 42.4 s;
 /// the daemon's sample a store scan a text). A clone of the whole line, its changelog's and manifests' texts let go,
-/// reads each of the line's changesets and manifests once, and asks the store in batches: a want of rows and one of texts
-/// (a file's, its chunks) for each of the changelog, the manifests and the files, within the fetch's room, each want's
-/// texts made by one request of the store's owner (`vcs_store.hg_text_requests`). Red before: 30 asks, a want of a row
-/// and one of its text for every changeset and manifest; then a request of the owner a text.
-fn assert_clone_reads_its_texts_in_batches(before: (u64, u64, u64), after: (u64, u64, u64)) {
+/// reads each of the line's changesets once, and sends each manifest as the changeset store keeps it, no text made
+/// (main's ruling of 2026-11-25: a let-go manifest sent as its stored delta on the one before, or its stored whole),
+/// asking the store in batches: a want of rows and one of texts or chunks for each of the changelog, the manifests and
+/// the files, within the fetch's room, each want's texts made by one request of the store's owner
+/// (`vcs_store.hg_text_requests`). Red before: 30 asks, a want of a row and one of its text for every changeset and
+/// manifest; then a request of the owner a text.
+fn assert_clone_reads_its_texts_in_batches(
+  before: (u64, u64, u64, u64),
+  after: (u64, u64, u64, u64),
+) {
   let texts = after.0.saturating_sub(before.0);
   let asks = after.1.saturating_sub(before.1);
   let requests = after.2.saturating_sub(before.2);
+  let stored = after.3.saturating_sub(before.3);
+  assert_eq!(
+    stored,
+    u64::try_from(LET_GO_LINE).unwrap(),
+    "each manifest sent as the store keeps it"
+  );
   println!(
     "a clone of {LET_GO_LINE} changesets read {texts} log texts in {asks} store asks, {requests} owner requests"
   );
@@ -5738,8 +5855,8 @@ fn assert_clone_reads_its_texts_in_batches(before: (u64, u64, u64), after: (u64,
   );
   assert_eq!(
     texts,
-    2 * u64::try_from(LET_GO_LINE).unwrap(),
-    "each changeset's and manifest's text read once"
+    u64::try_from(LET_GO_LINE).unwrap(),
+    "each changeset's text read once, no manifest's"
   );
   assert!(
     asks <= 6,
@@ -6621,7 +6738,17 @@ fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
   let steps = steps_counted().saturating_sub(steps_before);
   let (long, most) = step_phases(&daemon);
   let (long_work, work_most) = work_stages(&daemon);
+  let units = |names: [&'static str; 14]| names.map(|name| counted_on(&daemon, REPOSITORY, name));
+  let (long_units, unit_most) = (
+    units(crate::vcs_store::upload::LONG_UNITS),
+    units(crate::vcs_store::upload::UNIT_NS_MOST),
+  );
   daemon.stop();
+  eprintln!("choosing units by kind: long {long_units:?}, longest ns {unit_most:?}");
+  assert!(
+    unit_most.iter().any(|most| *most > 0),
+    "the choosing's units timed by kind: {unit_most:?}"
+  );
   eprintln!("work by stage (choose, begin, write): long {long_work:?}, longest ns {work_most:?}");
   assert!(work_most[2] > 0, "the pack's writes timed: {work_most:?}");
   assert!(
@@ -6747,4 +6874,32 @@ fn a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it() {
     took <= patience,
     "the listing answered within {patience:?}: {took:?}"
   );
+}
+
+/// The choosing units' counters name the negotiation's kinds in its order (`slates_git::negotiation::UnitKind::ALL`), so a
+/// unit's time is counted under its own kind.
+#[test]
+fn the_choosing_units_counters_follow_the_negotiations_kinds() {
+  use slates_git::negotiation::UnitKind;
+  let named = [
+    (UnitKind::Ready, "ready"),
+    (UnitKind::Cut, "cut"),
+    (UnitKind::Mark, "mark"),
+    (UnitKind::OpenTree, "open_tree"),
+    (UnitKind::TakeEntry, "take_entry"),
+    (UnitKind::Frame, "frame"),
+    (UnitKind::Commits, "commits"),
+    (UnitKind::Edges, "edges"),
+    (UnitKind::Haves, "haves"),
+    (UnitKind::Choose, "choose"),
+    (UnitKind::Wants, "wants"),
+    (UnitKind::Carried, "carried"),
+    (UnitKind::Tags, "tags"),
+    (UnitKind::Done, "done"),
+  ];
+  for (at, (kind, name)) in named.iter().enumerate() {
+    assert_eq!(UnitKind::ALL[at], *kind);
+    assert!(crate::vcs_store::upload::LONG_UNITS[at].ends_with(&format!(".{name}")));
+    assert!(crate::vcs_store::upload::UNIT_NS_MOST[at].ends_with(&format!(".{name}")));
+  }
 }

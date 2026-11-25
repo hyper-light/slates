@@ -43,6 +43,14 @@
 //! a one-changeset pull of Mercurial's history took 4.2 s here that way (goal 93 perf), so slates takes the slow path,
 //! which may resend a manifest the client holds (an empty changeset's, reused), which its `addgroup` drops.
 //!
+//! **Manifests let go** (main's ruling of 2026-11-25: a 57k clone made every let-go manifest whole on the store's
+//! owner, 79% of its store wait at hg-src's r4000, then gathered, encoded and copied it whole). A manifest the content
+//! store no longer holds is read as the changeset store keeps it, a batch of rows and of stored deltas or wholes ahead
+//! of its steps, as a file revision is: sent as its stored delta where that rests on the manifest sent just before it in
+//! this changegroup (versions 02 and 03 name each delta's base, and the client holds what was sent before; 01 is never
+//! served), its stored whole against the null base, and whole from a text the store makes only where its delta rests on
+//! another (a merge's, the client's own base). Counted a manifest at a time ([`ManifestPaths`]).
+//!
 //! **Texts lent** (A-680). The store lends each text in place where it holds it in one piece and copies it otherwise,
 //! the copy charged to the request's admission before it is made ([`Store`]). Each missing changeset's text is lent
 //! once and kept in its entry, whose list of paths the files are read from; each manifest is lent once, checked whole,
@@ -836,6 +844,88 @@ fn stream_asked(
   Ok(Some(Box::new(crate::render::Streaming::v2())))
 }
 
+/// The bytes `stored` read at `place`, as the delta or whole it holds: as they are, or, where the place holds a revlog
+/// chunk (goal 93, main's ruling (b): content kept once, as stock's chunks), decoded on this shard within `most`, the
+/// step's room, which the caller charges them to; one chunk a step, counted (`revlog_chunk::decode_counted`).
+fn plain_of(
+  place: &crate::render::StoredPlace,
+  stored: Vec<u8>,
+  most: u64,
+) -> Result<Vec<u8>, Refusal> {
+  if !place.chunk {
+    return Ok(stored);
+  }
+  crate::revlog_chunk::decode_counted(&stored, most).ok_or(Refusal::Store {
+    what: "a file revision's stored chunk",
+  })
+}
+
+/// How a fetch's walk sent a manifest (main's churn at fed0b8164: a 57k clone's manifests made whole; main's ruling of
+/// 2026-11-25: send the delta the store keeps): a thread's counts drained by its server a turn at a time
+/// ([`take_manifest_paths`]).
+#[derive(Clone, Copy, Debug)]
+enum ManifestPath {
+  /// At hand: as the delta its row keeps on the manifest sent before it.
+  AtHandDelta,
+  /// At hand: whole (the first sent, a whole row, or a delta on another), lent or rebuilt.
+  AtHandWhole,
+  /// Let go: as the delta the changeset store keeps on the manifest sent before it.
+  StoredDelta,
+  /// Let go: as the whole the changeset store keeps.
+  StoredWhole,
+  /// Let go: whole, its text made by the store, its stored delta resting on another manifest.
+  StoredFallback,
+}
+
+/// How a fetch's walk sent each manifest, on this thread since the last [`take_manifest_paths`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManifestPaths {
+  /// At hand, as its delta.
+  pub at_hand_delta: u64,
+  /// At hand, whole.
+  pub at_hand_whole: u64,
+  /// Let go, as the delta the store keeps.
+  pub stored_delta: u64,
+  /// Let go, as the whole the store keeps.
+  pub stored_whole: u64,
+  /// Let go, whole from a text the store made.
+  pub stored_fallback: u64,
+}
+
+std::thread_local! {
+  /// This thread's [`ManifestPaths`].
+  static MANIFEST_PATHS: core::cell::Cell<ManifestPaths> = const {
+    core::cell::Cell::new(ManifestPaths {
+      at_hand_delta: 0,
+      at_hand_whole: 0,
+      stored_delta: 0,
+      stored_whole: 0,
+      stored_fallback: 0,
+    })
+  };
+}
+
+/// Counts one manifest's path.
+fn count_manifest_path(path: ManifestPath) {
+  MANIFEST_PATHS.with(|paths| {
+    let mut now = paths.get();
+    let at = match path {
+      ManifestPath::AtHandDelta => &mut now.at_hand_delta,
+      ManifestPath::AtHandWhole => &mut now.at_hand_whole,
+      ManifestPath::StoredDelta => &mut now.stored_delta,
+      ManifestPath::StoredWhole => &mut now.stored_whole,
+      ManifestPath::StoredFallback => &mut now.stored_fallback,
+    };
+    *at = at.saturating_add(1);
+    paths.set(now);
+  });
+}
+
+/// This thread's manifest paths since the last call, begun again at zero.
+pub fn take_manifest_paths() -> ManifestPaths {
+  MANIFEST_PATHS.with(|paths| paths.replace(ManifestPaths::default()))
+}
+
 /// A boolean argument as 7.2 reads one: `default` where absent, false for `0` or nothing, true otherwise.
 fn flag(value: Option<&[u8]>, default: bool) -> bool {
   value.map_or(default, |value| !value.is_empty() && value != FALSE)
@@ -1185,6 +1275,14 @@ pub struct Walk {
   /// A fetch the links cannot walk, walked by the changesets that name each revision ([`Named`]), until its file
   /// section ([`Walk::pull`]).
   named: Option<Named>,
+  /// The manifests read from the changeset store ahead of their steps where they are not at hand, each sent as its
+  /// stored delta on the manifest sent before it ([`Walk::manifest`]; main's ruling of 2026-11-25).
+  manifests: Files,
+  /// The manifest this answer sent last, by its text's identity and node, where the store's row named it: what a
+  /// stored delta must rest on to be sent as it is.
+  manifest_last: Option<([u8; 32], Node)>,
+  /// The manifest whose stored delta rests on another than the one sent before: sent whole, its text asked.
+  manifest_whole: Option<u64>,
   /// The file revisions read from the changeset store ahead of their steps ([`Ahead`]).
   files: Files,
   /// A pull's file section, once its changelog and manifests are written ([`Pull`]).
@@ -1224,6 +1322,50 @@ struct Files {
 }
 
 impl Files {
+  /// The changeset store's answer to its [`Files::want`]: rows ask the chunks of as many of their revisions as the room
+  /// the asking step was given holds, at once; chunks are kept for their revisions.
+  fn give(&mut self, given: Given) {
+    let files = self;
+    let room = files.room;
+    files.want = None;
+    match given {
+      Given::Rows(rows) => {
+        let asked = core::mem::take(&mut files.asked);
+        if rows.len() != asked.len() {
+          files.unkept = true;
+        }
+        for ((path, revisions), rows) in asked.into_iter().zip(rows) {
+          if rows.len() != revisions.len() {
+            files.unkept = true;
+          }
+          for ((position, node), row) in revisions.into_iter().zip(rows) {
+            match row {
+              Some(row) => files.ahead.push_back(Ahead {
+                path: path.clone(),
+                position,
+                node,
+                row,
+                chunk: None,
+              }),
+              None => files.unkept = true,
+            }
+          }
+        }
+        if !files.unkept {
+          files.ask_chunks(room);
+        }
+      }
+      Given::Chunks(chunks) => {
+        let asked = core::mem::take(&mut files.chunks_asked);
+        for (ahead, chunk) in files.ahead.iter_mut().take(asked).zip(chunks) {
+          ahead.chunk = Some(chunk);
+        }
+      }
+      // A clone walked by its links sends every base before its delta: it asks no whole text.
+      Given::Texts(_) | Given::TextsPast => files.unkept = true,
+    }
+  }
+
   /// Asks the store for the chunks of the revisions read ahead that lack theirs, as many as `room`'s bytes hold (one
   /// at least).
   fn ask_chunks(&mut self, room: u64) {
@@ -1297,6 +1439,9 @@ impl Walk {
       version,
       at: Some(At::Changelog(0)),
       named: None,
+      manifests: Files::default(),
+      manifest_last: None,
+      manifest_whole: None,
       files: Files::default(),
       pull: None,
       logs: LogTexts::default(),
@@ -1412,7 +1557,7 @@ impl Walk {
     }
     match &self.pull {
       Some(pull) => pull.want.as_ref(),
-      None => self.files.want.as_ref(),
+      None => self.manifests.want.as_ref().or(self.files.want.as_ref()),
     }
   }
 
@@ -1422,16 +1567,29 @@ impl Walk {
     self.logs.want.is_some()
   }
 
-  /// Whether every text a unit asked (`LogTexts`) is answered now, by a store that answers at once (a whole answer's,
-  /// [`Store::stored_now`]); false where it answers only between steps (the daemon's), its edge asking before the next.
+  /// Whether every text a unit asked (`LogTexts`) and every manifest's row and chunk read ahead is answered now, by a
+  /// store that answers at once (a whole answer's, [`Store::stored_now`]); false where it answers only between steps
+  /// (the daemon's), its edge asking before the next.
   fn logs_answered_now(&mut self, store: &impl Store) -> bool {
-    while let Some(want) = self.logs.want.clone() {
+    loop {
+      // A log's text first, then the manifests' rows and chunks read ahead ([`Walk::stored_manifest`]).
+      let want = self
+        .logs
+        .want
+        .clone()
+        .or_else(|| self.manifests.want.clone());
+      let Some(want) = want else {
+        return true;
+      };
       let Some(given) = store.stored_now(&want) else {
         return false;
       };
-      self.logs.give(given);
+      if self.logs.want.is_some() {
+        self.logs.give(given);
+      } else {
+        self.manifests.give(given);
+      }
     }
-    true
   }
 
   /// The changelog's and the manifests' texts this walk asked of the changeset store, their windows let go ([`LogTexts`]).
@@ -1450,44 +1608,11 @@ impl Walk {
       pull.give(given);
       return;
     }
-    let files = &mut self.files;
-    let room = files.room;
-    files.want = None;
-    match given {
-      Given::Rows(rows) => {
-        let asked = core::mem::take(&mut files.asked);
-        if rows.len() != asked.len() {
-          files.unkept = true;
-        }
-        for ((path, revisions), rows) in asked.into_iter().zip(rows) {
-          if rows.len() != revisions.len() {
-            files.unkept = true;
-          }
-          for ((position, node), row) in revisions.into_iter().zip(rows) {
-            match row {
-              Some(row) => files.ahead.push_back(Ahead {
-                path: path.clone(),
-                position,
-                node,
-                row,
-                chunk: None,
-              }),
-              None => files.unkept = true,
-            }
-          }
-        }
-        if !files.unkept {
-          files.ask_chunks(room);
-        }
-      }
-      Given::Chunks(chunks) => {
-        let asked = core::mem::take(&mut files.chunks_asked);
-        for (ahead, chunk) in files.ahead.iter_mut().take(asked).zip(chunks) {
-          ahead.chunk = Some(chunk);
-        }
-      }
-      // A clone walked by its links sends every base before its delta: it asks no whole text.
-      Given::Texts(_) | Given::TextsPast => files.unkept = true,
+    // The manifest log's reads first: the walk is in its manifests until its file section begins.
+    if self.manifests.want.is_some() {
+      self.manifests.give(given);
+    } else {
+      self.files.give(given);
     }
   }
 
@@ -1552,9 +1677,11 @@ impl Walk {
     Ok(Some(At::Changelog(rev.saturating_add(1))))
   }
 
-  /// The manifest at `position` where a missing changeset links it, or the manifest group's end: sent as the delta the
-  /// store keeps where its base is `sent`, the manifest this answer sent last ([`Store::manifest_delta`]), else whole,
-  /// its text asked of the changeset store where it is not at hand ([`LogTexts`]) and the same place taken again.
+  /// The manifest at `position` where a missing changeset links it, or the manifest group's end. At hand: sent as the
+  /// delta the index keeps where its base is `sent`, the manifest this answer sent last ([`Store::manifest_delta`]), else
+  /// whole. Let go once landed: sent as the changeset store keeps it ([`Walk::stored_manifest`]), read ahead a batch at a
+  /// time, no text made; whole through the store's text ([`LogTexts`]) only where its stored delta rests on another
+  /// manifest than the one sent before it. Each way counted ([`ManifestPaths`]).
   fn manifest(
     &mut self,
     store: &impl Store,
@@ -1586,6 +1713,8 @@ impl Walk {
       None => None,
     };
     if let Some((base, parents, flags, delta)) = stored {
+      count_manifest_path(ManifestPath::AtHandDelta);
+      self.manifest_last = self.read_ahead_text(position, linked.node);
       self.put_delta(
         (linked.node, parents, link, flags),
         (base, &delta),
@@ -1593,41 +1722,162 @@ impl Walk {
         out,
       )?;
     } else if let Some(logged) = store.manifest(&linked.node, room)? {
+      count_manifest_path(ManifestPath::AtHandWhole);
+      self.manifest_last = self.read_ahead_text(position, linked.node);
       self.put(
         (linked.node, logged.parents, link, logged.flags),
         &logged.text,
         room,
         out,
       )?;
-    } else {
-      let Some(text) = self.logs.take(&linked.node) else {
-        // This manifest's text and those of the next ones a missing changeset links, as a step's bytes and the room
-        // hold them, in one batch.
-        let missing = &self.missing;
-        let mut ahead = (position..)
-          .map_while(|at| store.manifest_linked(at))
-          .filter(|linked| linked.link.is_some_and(|link| missing.contains(link)))
-          .map(|linked| linked.node);
-        self.logs.ask_batch(
-          store,
-          WholeLog::Manifest,
-          (&mut ahead, room.left().min(store.text_bytes_a_step())),
-        )?;
-        return Ok(Some(At::Manifests(position, sent)));
-      };
-      let entry = store.manifest_entry(&linked.node).ok_or_else(no_manifest)?;
-      room.charge(to_u64(text.len()))?;
-      self.put(
-        (linked.node, entry.parents, link, entry.flags),
-        &text,
-        room,
-        out,
-      )?;
+    } else if !self.stored_manifest(store, (position, linked.node, link), room, out)? {
+      return Ok(Some(At::Manifests(position, sent)));
     }
     Ok(Some(At::Manifests(
       following,
       Some((position, linked.node)),
     )))
+  }
+
+  /// The manifest at `position` (`node`, linked to `link`) the content store no longer holds, sent as the changeset store
+  /// keeps it: its row and its stored delta or whole read ahead a batch at a time ([`Files`], as a file revision is), the
+  /// delta sent against the manifest sent just before it where it rests on that one's text, a whole against the null
+  /// base, a chunk decoded on the shard ([`plain_of`]). A delta resting on another manifest goes whole, its text made by
+  /// the store ([`LogTexts`]). Whether it was sent; false where this step asked the store and the same place is taken
+  /// again.
+  ///
+  /// The base rule (main's ruling of 2026-11-25, its condition 1): versions 02 and 03 name each delta's base by node,
+  /// and the client holds every manifest sent before in this changegroup, so the one sent just before is a base it
+  /// holds; version 01, whose base is always the revision before, is never served (A-619 part 2).
+  fn stored_manifest(
+    &mut self,
+    store: &impl Store,
+    (position, node, link): (u64, Node, Node),
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    if self.manifest_whole != Some(position) {
+      if core::mem::take(&mut self.manifests.unkept) {
+        return Err(no_manifest());
+      }
+      if self
+        .manifests
+        .ahead
+        .front()
+        .is_none_or(|ahead| ahead.position != position)
+      {
+        self.manifests.ahead.clear();
+        self.manifests.chunks_asked = 0;
+        self.ask_manifest_rows(store, position, room.left());
+        return Ok(false);
+      }
+      if self
+        .manifests
+        .ahead
+        .front()
+        .is_some_and(|ahead| ahead.chunk.is_none())
+      {
+        self.manifests.ask_chunks(room.left());
+        return Ok(false);
+      }
+      let Some(Ahead { row, chunk, .. }) = self.manifests.ahead.pop_front() else {
+        return Ok(false);
+      };
+      let last = self
+        .manifest_last
+        .filter(|(text, _)| Some(*text) == row.base);
+      if row.base.is_none() || last.is_some() {
+        let plain = plain_of(&row.place, chunk.unwrap_or_default(), room.left())?;
+        let entry = store.manifest_entry(&node).ok_or_else(no_manifest)?;
+        match last {
+          Some((_, base)) => {
+            count_manifest_path(ManifestPath::StoredDelta);
+            self.put_delta(
+              (node, entry.parents, link, entry.flags),
+              (base, &plain),
+              room,
+              out,
+            )?;
+          }
+          None => {
+            count_manifest_path(ManifestPath::StoredWhole);
+            self.put((node, entry.parents, link, entry.flags), &plain, room, out)?;
+          }
+        }
+        self.manifest_last = Some((row.text, node));
+        return Ok(true);
+      }
+      // Resting on another manifest than the one sent before: whole, its text made by the store.
+      self.manifest_whole = Some(position);
+      self.manifest_last = Some((row.text, node));
+    }
+    let Some(text) = self.logs.take(&node) else {
+      let one = core::iter::once(node);
+      self.logs.ask_batch(
+        store,
+        WholeLog::Manifest,
+        (
+          &mut one.into_iter(),
+          room.left().min(store.text_bytes_a_step()),
+        ),
+      )?;
+      return Ok(false);
+    };
+    self.manifest_whole = None;
+    count_manifest_path(ManifestPath::StoredFallback);
+    let entry = store.manifest_entry(&node).ok_or_else(no_manifest)?;
+    room.charge(to_u64(text.len()))?;
+    self.put((node, entry.parents, link, entry.flags), &text, room, out)?;
+    Ok(true)
+  }
+
+  /// The text identity and node of the manifest at `position` sent at hand, where its stored row was read ahead (one at
+  /// hand among let-go ones: an empty diff's window is never let go): taken, so a let-go manifest after it may rest on
+  /// it; none where its row was not read.
+  fn read_ahead_text(&mut self, position: u64, node: Node) -> Option<([u8; 32], Node)> {
+    let ahead = self
+      .manifests
+      .ahead
+      .front()
+      .filter(|ahead| ahead.position == position)?;
+    let text = ahead.row.text;
+    if ahead.chunk.is_none() {
+      self.manifests.chunks_asked = self.manifests.chunks_asked.saturating_sub(1);
+    }
+    self.manifests.ahead.pop_front();
+    Some((text, node))
+  }
+
+  /// Asks the store for the rows of the manifests from `position` on that a missing changeset links, as many as `room`
+  /// holds (one at least), scanning a step's rows at most ([`Store::rows_a_step`]).
+  fn ask_manifest_rows(&mut self, store: &impl Store, position: u64, room: u64) {
+    let most = usize::try_from(
+      room
+        .checked_div(to_u64(core::mem::size_of::<Ahead>()).max(1))
+        .unwrap_or(room),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    let rows = store.rows_a_step().max(1);
+    let mut revisions = Vec::new();
+    let (mut at, mut scanned) = (position, 0_u64);
+    while revisions.len() < most && scanned < rows {
+      let Some(linked) = store.manifest_linked(at) else {
+        break;
+      };
+      scanned = scanned.saturating_add(1);
+      if linked.link.is_some_and(|link| self.missing.contains(link)) {
+        revisions.push((at, linked.node));
+      }
+      at = at.saturating_add(1);
+    }
+    let path = crate::push::intake::MANIFEST_PATH.to_vec();
+    let nodes = revisions.iter().map(|(_, node)| *node).collect();
+    self.manifests.asked = vec![(path.clone(), revisions)];
+    self.manifests.room = room;
+    self.manifests.want = Some(crate::render::Want::Rows {
+      logs: vec![(path, nodes)],
+    });
   }
 
   /// The file revision at or after `from` where a missing changeset links it (its group's name first where it opens
@@ -1692,7 +1942,7 @@ impl Walk {
     else {
       return Ok(Some(here));
     };
-    let chunk = chunk.unwrap_or_default();
+    let chunk = plain_of(&row.place, chunk.unwrap_or_default(), room.left())?;
     let FileEntry { parents, flags, .. } =
       store.file_entry(&found, &node).ok_or(Refusal::Store {
         what: "a file revision",
@@ -1995,13 +2245,19 @@ impl Pull {
         what: "a file revision",
       });
     };
-    let text = self
+    let row = self
       .rows
       .get(&(path.clone(), planned.node))
-      .map(|row| row.text)
+      .copied()
       .ok_or(Refusal::Store {
         what: "a file revision the changeset store keeps no row of",
       })?;
+    let text = row.text;
+    // A stored delta as its place holds it (a chunk decoded); a text made whole came back made.
+    let data = match send {
+      Sending::Stored { .. } => plain_of(&row.place, data, room.left())?,
+      Sending::Whole { .. } => data,
+    };
     if !self.open {
       changegroup::put_name(&path, out).map_err(|_| unencodable("a path"))?;
       self.open = true;

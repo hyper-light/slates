@@ -75,6 +75,31 @@ pub(crate) struct ImportBatch {
   chain_room: usize,
   /// What the staged versions' chain entries take of it.
   entries: usize,
+  /// The work whose accepted verdict is being committed into the scratch member a slice at a time
+  /// ([`ImportBatch::stage_step`]): kept once its commit ends.
+  pending: Option<Pending>,
+}
+
+/// A work judged and accepted into the scratch member, its verdict being committed a slice at a time (A-920 piece 1).
+struct Pending {
+  /// The work, in the green's numbering.
+  work: Increment,
+  /// Its verdict's commit under way (`Green::begin_committing`).
+  committing: slates_merge::engine::Committing,
+  /// What its verdict needs once committed: the scratch member's offset from the green's numbering, what it reserved,
+  /// and whether it changed nothing.
+  verdict: PendingVerdict,
+  /// The batch's head as it was judged, in the green's numbering.
+  head: u64,
+  /// Whether its record goes to holders.
+  holders: bool,
+}
+
+/// What [`finish_staged`] needs of a pending verdict ([`Pending`]).
+struct PendingVerdict {
+  offset: u64,
+  reserved: usize,
+  identical: bool,
 }
 
 /// Why a revision's work could not be staged.
@@ -144,6 +169,7 @@ impl ImportBatch {
       base,
       preview: Some(preview),
       staged: Vec::new(),
+      pending: None,
       room: cap.saturating_sub(charged),
       reserved: 0,
       chain_room,
@@ -195,11 +221,29 @@ impl ImportBatch {
 
   /// Judges `work`, based at the batch's head in the green's numbering, into the scratch member, and keeps it: the
   /// version it is in the green's numbering. Refused, nothing kept, where it is not based at the head or not accepted.
+  /// [`ImportBatch::stage_begin`] and [`ImportBatch::stage_step`] carried to their end.
   pub(crate) fn stage(
     &mut self,
     state: &mut ShardState,
-    mut work: Increment,
+    work: Increment,
   ) -> Result<u64, StageRefused> {
+    if let Some(version) = self.stage_begin(state, work)? {
+      return Ok(version);
+    }
+    loop {
+      if let Some(staged) = self.stage_step(state, &mut || false) {
+        return staged;
+      }
+    }
+  }
+
+  /// Begins staging `work` ([`ImportBatch::stage`]): judged into the scratch member; kept at once where nothing of it is
+  /// to commit (its version), else its verdict's commit begun and taken on by [`ImportBatch::stage_step`] (none).
+  pub(crate) fn stage_begin(
+    &mut self,
+    state: &mut ShardState,
+    mut work: Increment,
+  ) -> Result<Option<u64>, StageRefused> {
     let head = self.head();
     if work.base != head {
       return Err(StageRefused::NotAtHead { head });
@@ -232,12 +276,32 @@ impl ImportBatch {
         for (identity, bytes) in std::mem::take(&mut lent) {
           engine.lend(identity, bytes);
         }
-        let judged = judge_staged(engine, &mut work, (head, holders), chain_left);
-        engine.let_named_bytes_go();
+        let judged = judge_staged(
+          engine,
+          &mut work,
+          (head, holders),
+          (chain_left, reservation),
+        );
+        // What was lent for the verdict stays lent for its commit, which may make files over those texts.
+        if !matches!(judged, Judging::Committing(_)) {
+          engine.let_named_bytes_go();
+        }
         judged
       });
       let unlent = match judged {
         Ok(Judging::Judged(staged)) => break Ok(staged),
+        Ok(Judging::Committing(begun)) => {
+          let (committing, verdict) = *begun;
+          work.base = head;
+          self.pending = Some(Pending {
+            work,
+            committing,
+            verdict,
+            head,
+            holders,
+          });
+          return Ok(None);
+        }
         Ok(Judging::PastChain { entry }) => {
           return Err(StageRefused::PastChainRoom {
             entries: self.entries,
@@ -257,9 +321,59 @@ impl ImportBatch {
       state.count(crate::vcs_store::name_holds::NAME_LENT_VERDICTS, 1);
       judged_again = true;
     };
+    let judged = judged.map_err(|_| StageRefused::Unavailable);
+    self.keep_staged(state, work, (judged, head)).map(Some)
+  }
+
+  /// Takes the commit [`ImportBatch::stage_begin`] began on a unit at a time, at least one, until `spent`: the version
+  /// it kept once the commit ends, as [`ImportBatch::stage`] answers; none while more remains. The texts lent for its
+  /// verdict are given back once it ends.
+  pub(crate) fn stage_step(
+    &mut self,
+    state: &mut ShardState,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<u64, StageRefused>> {
+    // A step with no commit begun is refused, never "more": its caller steps until an end.
+    let Some(mut pending) = self.pending.take() else {
+      return Some(Err(StageRefused::Unavailable));
+    };
+    let Some(preview) = self.preview.as_ref() else {
+      return Some(Err(StageRefused::Unavailable));
+    };
+    let stepped = state.greens.with_preview_mut(preview, |engine| {
+      let committed = engine.committing_step(&mut pending.committing, spent)?;
+      let staged = finish_staged(
+        engine,
+        &pending.work,
+        (&pending.verdict, pending.holders),
+        committed,
+      );
+      engine.let_named_bytes_go();
+      Some(staged)
+    });
+    match stepped {
+      Err(_) => Some(Err(StageRefused::Unavailable)),
+      Ok(None) => {
+        self.pending = Some(pending);
+        None
+      }
+      Ok(Some(staged)) => {
+        let Pending { work, head, .. } = pending;
+        Some(self.keep_staged(state, work, (Ok(staged), head)))
+      }
+    }
+  }
+
+  /// Keeps `work`, its verdict `judged` at the batch's head `head`: the version it is in the green's numbering; refused
+  /// where the verdict did not accept it.
+  fn keep_staged(
+    &mut self,
+    state: &mut ShardState,
+    mut work: Increment,
+    (judged, head): (Result<StagedVerdict, StageRefused>, u64),
+  ) -> Result<u64, StageRefused> {
     work.base = head;
-    let (outcome, applied, identity, reserved, entry) =
-      judged.map_err(|_| StageRefused::Unavailable)?;
+    let (outcome, applied, identity, reserved, entry) = judged?;
     let (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) = (&outcome, applied)
     else {
       return Err(StageRefused::NotAccepted(outcome));
@@ -363,6 +477,8 @@ enum Judging {
   },
   /// Refused naming every named text the verdict read that the member holds by name alone with none lent.
   Unlent(std::collections::BTreeSet<slates_merge::named::Identity>),
+  /// Accepted, its commit begun, to be taken on a slice at a time ([`ImportBatch::stage_step`]).
+  Committing(Box<(slates_merge::engine::Committing, PendingVerdict)>),
 }
 
 /// The history and change bytes `work`, based at the batch's head `head` (in the green's numbering), would reserve in
@@ -388,16 +504,15 @@ fn judge_staged(
   engine: &mut Green,
   work: &mut Increment,
   (head, holders): (u64, bool),
-  chain_left: Option<usize>,
+  (chain_left, reserved): (Option<usize>, usize),
 ) -> Judging {
   // The scratch member counts its versions from 0: the work's base, read there, and each copy's source version
   // (a Subversion copy names the head it copies from, w-svn's C2 stage C) moved into its numbering for the verdict.
   let offset = head.saturating_sub(engine.head());
   work.base = engine.head();
   in_numbering(work, |version| version.checked_sub(offset));
-  let reserved = engine
-    .history_reservation(work)
-    .saturating_add(engine.changes_reservation(work));
+  // `reserved` is what the batch's room check computed of this work at this head (`reservation_of`): the scratch member
+  // unchanged since, but for the texts lent it, so not walked again (A-920: 29 ms a walk at 9,000 files, debug).
   // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
   // Judged and held first, so an accepted verdict's chain entry is sized before anything of it applies (A-895).
   let judgment = engine.judge_named(work);
@@ -407,6 +522,17 @@ fn judge_staged(
       in_numbering(work, |version| version.checked_add(offset));
       return Judging::PastChain { entry };
     }
+  }
+  // Accepted: committed into the scratch member a slice at a time from here (A-920 piece 1); the work back in the green's
+  // numbering now, since the commit holds what it needs of it.
+  if let slates_merge::engine::Judgment::Accepted(held) = judgment {
+    in_numbering(work, |version| version.checked_add(offset));
+    let verdict = PendingVerdict {
+      offset,
+      reserved,
+      identical: held.applied().is_empty(),
+    };
+    return Judging::Committing(Box::new((engine.begin_committing(held), verdict)));
   }
   let (outcome, mut applied) = engine.commit_judgment(judgment);
   let unlent = match outcome {
@@ -434,4 +560,28 @@ fn judge_staged(
     slates_merge::chain_entry::encoded_len(work, applied, holders)
   });
   Judging::Judged((outcome, applied, identity, reserved, entry))
+}
+
+/// What a pending verdict ([`Pending`]) staged once its commit into the scratch member `engine` ended as `version`,
+/// `applied`: as [`judge_staged`] answers an accepted work, its verdict's copies moved back into the green's numbering
+/// and its chain entry sized.
+fn finish_staged(
+  engine: &mut Green,
+  work: &Increment,
+  (verdict, holders): (&PendingVerdict, bool),
+  (version, mut applied): (u64, Vec<Applied>),
+) -> StagedVerdict {
+  let outcome = if verdict.identical {
+    Outcome::Identical { version }
+  } else {
+    Outcome::Accepted { version }
+  };
+  let identity = holders.then(|| engine.head_identity());
+  for step in &mut applied {
+    if let Applied::CopyTree { version, .. } = step {
+      *version = version.saturating_add(verdict.offset);
+    }
+  }
+  let entry = slates_merge::chain_entry::encoded_len(work, &applied, holders);
+  (outcome, Some(applied), identity, verdict.reserved, entry)
 }

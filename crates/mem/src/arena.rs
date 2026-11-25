@@ -218,6 +218,10 @@ pub struct ChunkArena {
   room_lost: u64,
   /// Where an unfinished purge resumes: the region id and the byte within it.
   purge_cursor: Option<(u16, usize)>,
+  /// Whether a recorded run may reach the discard size since the last walk began: set by a mark that made one
+  /// ([`UnitSet::run_reaches`]), cleared as a walk begins. A purge with none owed and no walk under way walks nothing,
+  /// so short runs kept recorded cost an idle shard nothing (main's ruling of 2026-11-25).
+  purge_owed: bool,
   /// Allocations so far, monotone: a caller that sees it unchanged across an interval knows the arena was idle.
   allocations: u64,
   /// Bytes whose reusable mark an allocation cleared before handing them out (A-110, macOS), monotone: the counter a
@@ -241,6 +245,8 @@ pub struct Purged {
   /// ([`ChunkArena::discarding_from`]): taken out of [`ChunkArena::resident_free_bytes`], yet in RAM until reused (the
   /// memory status's `content.purge_kept_short_bytes`, main 01a20182's ruling of 2026-11-23 on arena-12's 753 MiB).
   pub kept_short: usize,
+  /// Runs this call walked: none where no recorded run reaches the discard size (main's ruling of 2026-11-25).
+  pub visited: usize,
 }
 
 /// One resident free run `(first, reach)` of `slot` through the idle purge (A-105): taken out of the resident set and,
@@ -251,12 +257,15 @@ fn purge_run(
   (first, reach): (usize, usize),
   discard_from: usize,
 ) -> (usize, usize) {
-  slot.dirty.take(first, reach);
   let len = reach.saturating_sub(first);
-  // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
+  // A range shorter than the discard size stays resident, keeping it costing less than faulting it back, and stays
+  // recorded: a later free beside it joins it into a run a later purge gives back (goal 93, main's ruling of
+  // 2026-11-25: taken out of the record, its pages were lost to every later purge and coalesce, a long-lived daemon's
+  // free space left resident without bound).
   if len < discard_from {
     return (0, len);
   }
+  slot.dirty.take(first, reach);
   if slot.region.discard(first, len) {
     (len, 0)
   } else {
@@ -298,6 +307,7 @@ impl ChunkArena {
       resident_free: 0,
       room_lost: 0,
       purge_cursor: None,
+      purge_owed: false,
       allocations: 0,
       reused: 0,
       published: false,
@@ -408,8 +418,12 @@ impl ChunkArena {
     // Nothing to do only when no walk is under way and no region records a resident free unit: the sets are what the
     // walk visits, so they answer, not the count, which a walk that stopped between calls once left at zero with
     // freed blocks still recorded (A-205's give-back on Windows, main CI 42184319025: every later purge returned here).
-    if self.purge_cursor.is_none() && self.held().all(|slot| slot.dirty.is_empty()) {
+    if self.purge_cursor.is_none() && !self.purge_owed {
       return Purged::default();
+    }
+    // A walk begins: a mark from here on owes the next one, whatever this one passes.
+    if self.purge_cursor.is_none() {
+      self.purge_owed = false;
     }
     let discard_from = self.discard_from;
     let mut done = Purged::default();
@@ -440,11 +454,15 @@ impl ChunkArena {
           self.resident_free = self.resident_free.saturating_sub(drained);
           self.purge_cursor = Some((region, first));
           done.more = true;
+          done.visited = visited;
           return done;
         }
         visited = visited.saturating_add(1);
         let (discarded, kept_short) = purge_run(slot, (first, reach), discard_from);
-        drained = drained.saturating_add(reach.saturating_sub(first));
+        // A run kept short stays recorded, so it stays counted.
+        if kept_short == 0 {
+          drained = drained.saturating_add(reach.saturating_sub(first));
+        }
         done.bytes = done.bytes.saturating_add(discarded);
         done.kept_short = done.kept_short.saturating_add(kept_short);
         at = reach;
@@ -461,6 +479,7 @@ impl ChunkArena {
       .held()
       .map(|slot| slot.dirty.recorded_bytes())
       .fold(0usize, usize::saturating_add);
+    done.visited = visited;
     done
   }
 
@@ -817,6 +836,11 @@ impl ChunkArena {
     while self.position.last().is_some_and(Option::is_none) {
       self.position.pop();
     }
+    // Its freed blocks go with it, out of the resident free count (goal 93 P7: left counted, the count read 116.7 MB
+    // against 33.6 MB mapped once its regions had gone back to the pool).
+    self.resident_free = self
+      .resident_free
+      .saturating_sub(removed.dirty.recorded_bytes());
     Ok(removed.region)
   }
 
@@ -1060,6 +1084,8 @@ impl ChunkArena {
       return Err(foreign(ExtentRefusal::OtherArena));
     }
     let mut self_resident = 0usize;
+    let discard_from = self.discard_from;
+    let mut owed = false;
     let slot = self
       .slot_mut(extent.region)
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
@@ -1069,16 +1095,16 @@ impl ChunkArena {
     if !deferred {
       if scrubbed {
         release_block(&mut slot.region, extent.offset(), extent.len(), locked);
-        slot.dirty.mark(
-          extent.offset(),
-          extent.offset().saturating_add(extent.len()),
-        );
+        let end = extent.offset().saturating_add(extent.len());
+        slot.dirty.mark(extent.offset(), end);
+        owed = slot.dirty.run_reaches(extent.offset(), end, discard_from);
         self_resident = extent.len();
       } else if locked {
         slot.region.unlock_range(extent.offset(), extent.len());
       }
     }
     let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.purge_owed |= owed;
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     self.resident_free = self.resident_free.saturating_add(self_resident);
     self.forget(extent.region, extent.offset(), extent.len());
@@ -1105,6 +1131,7 @@ impl ChunkArena {
       });
     }
     let granule = self.granule.max(1);
+    let discard_from = self.discard_from;
     let Some(slot) = self.slot_mut(extent.region) else {
       return Err(MemError::ForeignExtent {
         offset: extent.offset(),
@@ -1128,6 +1155,7 @@ impl ChunkArena {
       );
     }
     slot.dirty.mark(tail_from, end);
+    let owed = slot.dirty.run_reaches(tail_from, end, discard_from);
     // The head's owner, and what of its ask the trim cut: the kept prefix is all it holds now.
     let at = extent.offset().checked_div(granule).unwrap_or(0);
     let owner = slot.heads.get(at).copied().and_then(Owner::of_code);
@@ -1137,6 +1165,7 @@ impl ChunkArena {
       before.saturating_sub(*asked)
     });
     let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.purge_owed |= owed;
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     self.resident_free = self.resident_free.saturating_add(released);
     if let Some(owner) = owner
@@ -1345,6 +1374,8 @@ impl ChunkArena {
   /// cannot name.
   pub fn commit_capture(&mut self) {
     let mut released_total = 0usize;
+    let discard_from = self.discard_from;
+    let mut owed = false;
     for slot in self.slots.iter_mut() {
       let before = slot.buddy.free_bytes();
       let Slot {
@@ -1356,10 +1387,12 @@ impl ChunkArena {
       buddy.commit_capture_releasing(|offset, len, locked| {
         release_block(region, offset, len, locked);
         dirty.mark(offset, offset.saturating_add(len));
+        owed |= dirty.run_reaches(offset, offset.saturating_add(len), discard_from);
       });
       released_total =
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
+    self.purge_owed |= owed;
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
     self.resident_free = self.resident_free.saturating_add(released_total);
   }
@@ -1367,6 +1400,8 @@ impl ChunkArena {
   /// The publication of the last [`ChunkArena::capture`] did not commit: frees what only it could have named.
   pub fn abandon_capture(&mut self) {
     let mut released_total = 0usize;
+    let discard_from = self.discard_from;
+    let mut owed = false;
     for slot in self.slots.iter_mut() {
       let before = slot.buddy.free_bytes();
       let Slot {
@@ -1378,10 +1413,12 @@ impl ChunkArena {
       buddy.abandon_capture_releasing(|offset, len, locked| {
         release_block(region, offset, len, locked);
         dirty.mark(offset, offset.saturating_add(len));
+        owed |= dirty.run_reaches(offset, offset.saturating_add(len), discard_from);
       });
       released_total =
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
+    self.purge_owed |= owed;
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
     self.resident_free = self.resident_free.saturating_add(released_total);
   }
@@ -1391,7 +1428,9 @@ impl ChunkArena {
     self.settle(Buddy::commit_live);
   }
 
-  /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total.
+  /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total. Those blocks go
+  /// back unscrubbed, so no region records them as freed and resident, and the resident free count does not count them
+  /// (goal 93 P7: it did, bytes no purge walks).
   fn settle(&mut self, step: fn(&mut Buddy)) {
     let mut released_total = 0usize;
     for slot in self.slots.iter_mut() {
@@ -1401,20 +1440,18 @@ impl ChunkArena {
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
-    self.resident_free = self.resident_free.saturating_add(released_total);
   }
 
-  /// What of the arena's regions is in RAM, each read from the kernel's page table ([`crate::resident::of_range`], the
-  /// reader the large path's `mapped_resident` uses), no byte touched: the memory status's
+  /// What of the arena's regions is in RAM and the process's still: each read from the kernel's page table
+  /// ([`crate::resident::of_range`], the reader the large path's `mapped_resident` uses), no byte touched, less the pages
+  /// the region holds marked reusable (macOS: `mincore` counts them until the kernel takes them, though they left the
+  /// process's footprint; [`Region::residency_in_use`], goal 93 P7). The memory status's
   /// `mem.gauge.content.object_resident_bytes` (main 01a20182's ruling of 2026-11-23). A walk of every region's pages, so
   /// only a memory status asks; a region the OS refuses to read is left out.
   pub fn residency(&self) -> crate::resident::Residency {
     let mut found = crate::resident::Residency::default();
     for slot in self.held() {
-      let bytes = slot.region.bytes();
-      if let Ok(residency) =
-        crate::resident::of_range(bytes.as_ptr(), bytes.len(), slot.region.page())
-      {
+      if let Ok(residency) = slot.region.residency_in_use() {
         found = found.plus(residency);
       }
     }
@@ -1805,15 +1842,71 @@ mod tests {
   }
 
   /// The memory status's short-run path (main 01a20182's ruling of 2026-11-23: arena-12's content object held 753 MiB
-  /// resident against 183 MB used). Do: in an arena discarding from four pages, write three one-page blocks, free the
-  /// middle one (a run shorter than the discard size between two live blocks), and purge to the end. Expect: the purge
-  /// counts the page kept short and gives nothing back, the arena's resident-free count drops to none, and the
-  /// region's pages in RAM do not fall: the freed page stays resident, which only the kept-short count tells.
+  /// resident against 183 MB used). Do: in an arena discarding from four pages, write three one-page blocks and a
+  /// four-page block, free the middle one-page block (a run shorter than the discard size between two live blocks) and
+  /// the four-page block (a run that owes a walk), and purge to the end. Expect: the walk gives the four pages back and
+  /// counts the page kept short; the arena's resident-free count keeps that page (still recorded, so a later free beside
+  /// it can join it; main's ruling of 2026-11-25); and the region's pages in RAM fall by the four pages at most.
   #[test]
   #[cfg_attr(miri, ignore)] // Miri models no mincore
   fn a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short() {
     let p = page();
     let mut arena = ChunkArena::new(p).discarding_from(4 * p);
+    arena
+      .add_region(Region::map(p * 8, p, false).unwrap())
+      .unwrap();
+    let blocks: Vec<Extent> = (0..3)
+      .map(|_| arena.alloc(p, Owner::Volume).unwrap())
+      .collect();
+    let long = arena.alloc(4 * p, Owner::Volume).unwrap();
+    for block in blocks.iter().chain([&long]) {
+      arena.bytes_mut(*block).unwrap().fill(0xAB);
+    }
+    arena.free(blocks[1]).unwrap();
+    arena.free(long).unwrap();
+    let resident_before = arena.residency().resident;
+    let done = purge_whole(&mut arena);
+    assert_eq!(done.kept_short, p, "the short run counted kept: {done:?}");
+    assert_eq!(done.bytes, 4 * p, "the long run given back: {done:?}");
+    assert_eq!(
+      arena.resident_free_bytes(),
+      p,
+      "the kept page still counted resident and free"
+    );
+    let resident_after = arena.residency().resident;
+    assert!(
+      resident_after >= 3 * p as u64
+        && resident_before.saturating_sub(resident_after) <= 4 * p as u64,
+      "the freed short page stays in RAM: {resident_before} then {resident_after}"
+    );
+  }
+
+  /// Purges to the end: the bytes given back, the bytes kept short and the runs walked, all told.
+  fn purge_whole(arena: &mut ChunkArena) -> Purged {
+    let mut done = Purged::default();
+    loop {
+      let purged = arena.purge(1);
+      done.bytes += purged.bytes;
+      done.kept_short += purged.kept_short;
+      done.visited += purged.visited;
+      if !purged.more {
+        return done;
+      }
+    }
+  }
+
+  /// Goal 93 (main's ruling of 2026-11-25: a run a purge kept short left the record with its pages resident, so no
+  /// later purge or coalesce ever saw it again, free space a long-lived daemon lost without bound). Do: at a discard size
+  /// of two pages, allocate three one-page blocks and write them; free the middle one and purge to the end; then free
+  /// the first, beside it, and purge to the end again. Expect the first purge to give nothing back and keep the page
+  /// counted resident and free; the second to give back the two pages the free joined to it, nothing left resident free.
+  /// Red before: the kept page left the record, so the second purge found the first page alone, short again, and gave
+  /// nothing back.
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no madvise
+  fn a_run_kept_short_stays_recorded_so_a_later_free_beside_it_goes_back() {
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(2 * p);
     arena
       .add_region(Region::map(p * 4, p, false).unwrap())
       .unwrap();
@@ -1824,24 +1917,59 @@ mod tests {
       arena.bytes_mut(*block).unwrap().fill(0xAB);
     }
     arena.free(blocks[1]).unwrap();
-    let resident_before = arena.residency().resident;
-    let mut done = Purged::default();
-    loop {
-      let purged = arena.purge(1);
-      done.bytes += purged.bytes;
-      done.kept_short += purged.kept_short;
-      if !purged.more {
-        break;
-      }
-    }
-    assert_eq!(done.kept_short, p, "the short run counted kept: {done:?}");
-    assert_eq!(done.bytes, 0, "nothing given back: {done:?}");
-    assert_eq!(arena.resident_free_bytes(), 0);
-    let resident_after = arena.residency().resident;
-    assert!(
-      resident_after >= resident_before && resident_after >= 3 * p as u64,
-      "the freed page stays in RAM: {resident_before} then {resident_after}"
+    let first = purge_whole(&mut arena);
+    assert_eq!(first.bytes, 0, "kept: {first:?}");
+    assert_eq!(
+      arena.resident_free_bytes(),
+      p,
+      "the kept page still counted resident and free"
     );
+    arena.free(blocks[0]).unwrap();
+    let second = purge_whole(&mut arena);
+    assert_eq!(second.bytes, 2 * p, "the joined run given back: {second:?}");
+    assert_eq!(
+      arena.resident_free_bytes(),
+      0,
+      "nothing left resident and free"
+    );
+  }
+
+  /// Goal 93 (main's ruling of 2026-11-25: with short runs kept recorded, an idle daemon walked them at every idle pass
+  /// for as long as they lived, its idle CPU and wakeups growing with fragmentation). Do: at a discard size of two pages,
+  /// allocate three one-page blocks and write them; free the middle one and purge to the end, twice; then free the
+  /// first, beside it, and purge again. Expect the two passes to walk nothing, no recorded run reaching the discard size,
+  /// the short run kept recorded; and the third, the free having joined a run that long, to give back both pages. Red
+  /// before: every pass walked the short run again.
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no madvise
+  fn an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size() {
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(2 * p);
+    arena
+      .add_region(Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let blocks: Vec<Extent> = (0..3)
+      .map(|_| arena.alloc(p, Owner::Volume).unwrap())
+      .collect();
+    for block in &blocks {
+      arena.bytes_mut(*block).unwrap().fill(0xAB);
+    }
+    arena.free(blocks[1]).unwrap();
+    for pass in 0..2 {
+      let idle = purge_whole(&mut arena);
+      assert_eq!(
+        idle.visited, 0,
+        "pass {pass}: nothing walked, no run long enough: {idle:?}"
+      );
+    }
+    assert_eq!(
+      arena.resident_free_bytes(),
+      p,
+      "the short run kept recorded"
+    );
+    arena.free(blocks[0]).unwrap();
+    let third = purge_whole(&mut arena);
+    assert_eq!(third.bytes, 2 * p, "the joined run given back: {third:?}");
   }
 
   #[test]
@@ -2143,6 +2271,94 @@ mod tests {
     fn available(&self) -> usize {
       self.free.iter().map(|(_, region)| region.len()).sum()
     }
+  }
+
+  /// Goal 93 P7 (main's ruling of 2026-11-25: P7's verdict rests on the arena's gauges, and
+  /// `mem.gauge.content.arena_resident_free_bytes` read 116.7 MB against 33.6 MB mapped in the one-unit arm). Do: on an
+  /// arena growing from a pool of regions, take a seeded mix of steps (allocate, growing from the pool when refused; free;
+  /// free under a capture, then commit or abandon it; commit the live blocks; purge a block; shrink to what is held) and
+  /// read the resident free count after each. Expect it always the bytes the regions record as freed and resident (what
+  /// the purge walks), and never above the free bytes nor the capacity. Red before: a region shrunk away with freed
+  /// blocks recorded left them counted, past the capacity once every region went; and a recovery's commit counted bytes
+  /// no region recorded.
+  #[test]
+  fn the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena.set_source(Box::new(TestPool {
+      free: (1..=6u16)
+        .map(|id| (id, Region::map(p * 16, p, false).unwrap()))
+        .collect(),
+    }));
+    arena.published = true;
+    let mut live: Vec<Extent> = Vec::new();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state
+    };
+    let (mut shrunk, mut committed_live) = (0usize, 0usize);
+    for step in 0..3_000u32 {
+      let pick = |live: &Vec<Extent>, at: u64| (at as usize) % live.len();
+      match next() % 8 {
+        0..=2 => {
+          let len = p * (1 + (next() % 4) as usize);
+          match arena.alloc(len, Owner::Volume) {
+            Ok(extent) => live.push(extent),
+            Err(_) => {
+              arena.grow(len);
+              if let Ok(extent) = arena.alloc(len, Owner::Volume) {
+                live.push(extent);
+              }
+            }
+          }
+        }
+        3 | 4 if !live.is_empty() => {
+          let at = pick(&live, next());
+          arena.free(live.swap_remove(at)).unwrap();
+        }
+        5 if !live.is_empty() => {
+          arena.capture();
+          let at = pick(&live, next());
+          arena.free(live.swap_remove(at)).unwrap();
+          if next() % 2 == 0 {
+            arena.commit_capture();
+          } else {
+            arena.abandon_capture();
+          }
+        }
+        6 => {
+          arena.purge(1);
+        }
+        7 => {
+          if next() % 4 == 0 {
+            arena.commit_live();
+            committed_live += 1;
+          } else {
+            shrunk += arena.shrink(0);
+          }
+        }
+        _ => {}
+      }
+      let recorded: usize = arena.held().map(|slot| slot.dirty.recorded_bytes()).sum();
+      let counted = arena.resident_free_bytes();
+      assert_eq!(
+        counted, recorded,
+        "step {step}: the count is what the regions record"
+      );
+      assert!(
+        counted <= arena.free_bytes() && counted <= arena.capacity(),
+        "step {step}: {counted} resident free, past the free {} or the capacity {}",
+        arena.free_bytes(),
+        arena.capacity()
+      );
+    }
+    assert!(
+      shrunk > 0 && committed_live > 0,
+      "the mix shrank ({shrunk}) and committed live ({committed_live})"
+    );
   }
 
   fn pooled(p: usize, ids: &[u16]) -> ChunkArena {

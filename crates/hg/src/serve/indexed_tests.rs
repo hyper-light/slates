@@ -355,7 +355,8 @@ fn a_clone_over_the_view_carries_its_changesets_each_text_lent_in_place() {
     view.lends(),
     Lends {
       in_place: 2,
-      copied: 0
+      copied: 0,
+      rebuilt: 0,
     }
   );
   let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
@@ -391,11 +392,14 @@ fn a_clone_over_the_view_carries_its_changesets_each_text_lent_in_place() {
   // Each changeset's text lent once and each manifest's twice: once as the changeset naming it is sent, its files
   // planned, and once as it is sent in its log's order, a step each (main 01a20182's order of 2026-11-22 10:40: a
   // lent text is the step's, never kept past it).
+  // The two copied are manifests rebuilt from their chains (`Lends::rebuilt`), each sent whole where its delta rests on
+  // another than the one sent before.
   assert_eq!(
     view.lends(),
     Lends {
       in_place: 12,
-      copied: 2
+      copied: 2,
+      rebuilt: 2,
     }
   );
 }
@@ -501,7 +505,8 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     view.lends(),
     Lends {
       in_place: 0,
-      copied: 2
+      copied: 2,
+      rebuilt: 0,
     }
   );
   assert_eq!(view.file_entry(b"g", &f_node), None);
@@ -1206,6 +1211,7 @@ impl WholeTexts<'_> {
           payload: identity,
           offset: 0,
           len,
+          chunk: false,
         },
       }));
     }
@@ -1330,6 +1336,7 @@ impl ChangelogDeltas<'_> {
         payload,
         offset: 0,
         len,
+        chunk: false,
       };
     }
     Some(())
@@ -1653,6 +1660,7 @@ impl Deltas<'_> {
               payload: place,
               offset: 0,
               len,
+              chunk: false,
             },
           }
         }
@@ -2591,7 +2599,12 @@ fn answered_getbundle(
       Some(crate::render::Want::Chunks { places }) => {
         answering.give(Given::Chunks(source.chunks(&places).unwrap()));
       }
-      Some(crate::render::Want::Texts { .. }) => panic!("a stream reads no text whole"),
+      // A stream and a clone of stored deltas read no text whole: a want of one is this stand-in's refusal.
+      Some(crate::render::Want::Texts { .. }) => {
+        return Err(Refusal::Store {
+          what: "a text whole, which this stand-in does not make",
+        });
+      }
       None => {}
     }
     if !answering.step(view, &mut room(), &mut out)? {
@@ -2773,4 +2786,278 @@ fn a_stream_clone_over_bundle2_is_refused_without_a_common_version_or_a_served_s
     &mut whole_texts(&imported.index, &store),
   );
   assert!(matches!(refused, Err(Refusal::Store { .. })));
+}
+
+/// A repository of the stock bundle and `count` changesets made over it in a line, each pushed through the intake as a
+/// client's push of one (its manifest kept as the push keeps one: a diff on the manifest before it, A-729): the index.
+fn a_pushed_line(store: &mut ContentStore, count: usize) -> HgIndex {
+  use crate::push::intake::{Intake, Stepped};
+  use crate::push::made::{Authored, CHANGEGROUP_VERSION, Change, changegroup, made};
+  let bundle = crate::bundle2::Bundle2::decode(crate::fixtures::CG03, &mut room()).unwrap();
+  let stock = crate::push::read(&bundle, &mut room())
+    .unwrap()
+    .changegroup()
+    .unwrap()
+    .1
+    .clone();
+  let take = |index: &mut HgIndex,
+              store: &mut ContentStore,
+              (version, payload): (crate::changegroup::Version, &[u8])| {
+    let mut intake = Intake::begin((version, payload), index, store, &mut room()).unwrap();
+    loop {
+      match intake.step(payload, store, &mut room()).unwrap() {
+        Stepped::Store => intake.answer_from_fork(store),
+        Stepped::More => {}
+        _ => break,
+      }
+    }
+    intake.finish().ok().unwrap().0
+  };
+  let mut index = take(&mut HgIndex::new(), store, (stock.version, &stock.payload));
+  for at in 0..count {
+    let tip = index
+      .changeset(store, index.len(store, Log::Changelog) - 1)
+      .unwrap()
+      .node;
+    let path = format!("line/{at:04}.txt");
+    let text = format!("revision {at} of the line\n");
+    let authored = Authored {
+      user: b"Client <c@example.com>",
+      seconds: 1,
+      branch: b"default",
+      message: b"a line",
+    };
+    let verified = made(
+      &crate::push::held::IndexHeld::new(&index, store),
+      tip,
+      &[Change {
+        path: path.as_bytes(),
+        after: Some((text.as_bytes(), crate::manifest::Flag::Regular)),
+        copied_from: None,
+      }],
+      &authored,
+      &mut room(),
+    )
+    .unwrap();
+    let payload = changegroup(&verified, &mut room()).unwrap();
+    index = take(&mut index, store, (CHANGEGROUP_VERSION, &payload));
+  }
+  index
+}
+
+/// Main's churn at fed0b8164 (2026-11-25: a 57k clone's system churn 40.89 GB, 30.7% of it manifests rebuilt whole from
+/// their chains, `object_text` under `revision_text`). Do: push a line of changesets over the stock bundle's repository,
+/// each manifest kept as a diff on the one before; clone it whole (`getbundle`, nothing common). Expect: every manifest
+/// sent as the delta its row keeps on the one sent before it, none rebuilt from its chain (`Lends::rebuilt`), the
+/// changegroup carrying every manifest (non-vacuity: the line's manifests are deltas).
+#[test]
+fn a_clone_sends_each_manifest_kept_as_a_delta_as_that_delta_never_rebuilt() {
+  let mut store = store();
+  let index = a_pushed_line(&mut store, 12);
+  let deltas = (0..index.len(&store, Log::Manifest))
+    .filter(|rev| index.revision(&store, Log::Manifest, *rev).unwrap().base != crate::index::NONE)
+    .count();
+  assert!(
+    deltas >= 12,
+    "the line's manifests kept as deltas: {deltas}"
+  );
+  let state = State {
+    roots: &[],
+    bookmarks: &[],
+    publishing: true,
+    markers: &[],
+  };
+  let view = Indexed::new(&index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let caps = stream_caps(b"HG20\nchangegroup=01,02,03");
+  let asked = super::super::getbundle::Asked {
+    bundlecaps: &caps,
+    ..super::super::getbundle::Asked::default()
+  };
+  let answer = answered_getbundle(&view, &asked, &mut whole_texts(&index, &store)).unwrap();
+  assert!(!answer.is_empty());
+  assert_eq!(
+    view.lends().rebuilt,
+    0,
+    "no manifest rebuilt whole: {:?}",
+    view.lends()
+  );
+}
+
+/// A changeset store as it keeps a pushed repository's manifests (stand-in): each manifest's row its text's identity, its
+/// delta's base (the text of the row before it, as the push keeps a manifest, A-729) or none for a whole, and its place,
+/// the stored delta or whole as the index holds it; nothing else.
+struct StoredManifests<'s> {
+  rows: BTreeMap<Node, crate::render::StoredRevision>,
+  places: BTreeMap<[u8; 32], Vec<u8>>,
+  /// Every other log's revisions, whole ([`WholeTexts`]).
+  files: WholeTexts<'s>,
+}
+
+/// A [`StoredManifests`]' manifests: each row by node and each place's bytes.
+type StoredRows = (
+  BTreeMap<Node, crate::render::StoredRevision>,
+  BTreeMap<[u8; 32], Vec<u8>>,
+);
+
+impl StoredManifests<'_> {
+  /// The manifests of `index`, read before their objects are let go.
+  fn rows_of(index: &HgIndex, store: &ContentStore) -> StoredRows {
+    let mut rows = BTreeMap::new();
+    let mut places = BTreeMap::new();
+    for rev in 0..index.len(store, Log::Manifest) {
+      let row = index.revision(store, Log::Manifest, rev).unwrap();
+      let text = index.revision_text(store, Log::Manifest, rev).unwrap();
+      let (base, bytes) = if row.base == crate::index::NONE {
+        (None, text.clone())
+      } else {
+        let base = index.revision_text(store, Log::Manifest, row.base).unwrap();
+        (
+          Some(*blake3::hash(&base).as_bytes()),
+          store.object_bytes(&row.bytes, row.stored).unwrap(),
+        )
+      };
+      let payload = *blake3::hash(&bytes).as_bytes();
+      let len = bytes.len() as u64;
+      places.insert(payload, bytes);
+      rows.insert(
+        row.node,
+        crate::render::StoredRevision {
+          text: *blake3::hash(&text).as_bytes(),
+          base,
+          place: crate::render::StoredPlace {
+            payload,
+            offset: 0,
+            len,
+            chunk: false,
+          },
+        },
+      );
+    }
+    (rows, places)
+  }
+}
+
+impl crate::render::StoredSource for StoredManifests<'_> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    let mut rows = Vec::new();
+    for (path, nodes) in logs {
+      if path.as_slice() == crate::push::intake::MANIFEST_PATH {
+        rows.push(
+          nodes
+            .iter()
+            .map(|node| self.rows.get(node).copied())
+            .collect(),
+        );
+      } else {
+        rows.extend(self.files.rows(&[(path.clone(), nodes.clone())])?);
+      }
+    }
+    Some(rows)
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    places
+      .iter()
+      .map(|place| match self.places.get(&place.payload) {
+        Some(bytes) => Some(bytes.clone()),
+        None => self.files.chunks(core::slice::from_ref(place))?.pop(),
+      })
+      .collect()
+  }
+}
+
+/// Each revision of `revisions` in `changegroup` made whole, its delta applied to the text of the base it names (one
+/// sent before it, or none), its node checked against its text: by node.
+fn texts_by_base(
+  changegroup: &Changegroup<'_>,
+  revisions: &core::ops::Range<usize>,
+) -> BTreeMap<Node, Vec<u8>> {
+  let mut texts: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+  for revision in changegroup.group(revisions) {
+    let base = texts.get(&revision.base).cloned().unwrap_or_default();
+    let text = delta::apply(&base, revision.data, &mut room()).unwrap();
+    assert_eq!(
+      node::compute(&revision.p1, &revision.p2, &text),
+      Ok(revision.node)
+    );
+    texts.insert(revision.node, text);
+  }
+  texts
+}
+
+/// Main's ruling of 2026-11-25 (the read-path cut: a clone's let-go manifests sent as the changeset store keeps them,
+/// never made whole; its conditions 1 and 2). Do: push a line of changesets over the stock bundle's repository, each
+/// manifest kept as a diff on the one before; let go every manifest's object; clone it whole (`getbundle`, nothing
+/// common), the store's asks answered as a changeset store keeps the manifests (`StoredManifests`), which makes no text
+/// whole. Expect: all but the first let-go manifest sent as its stored delta on the manifest sent before it, none whole
+/// from a text the store made (no want of a text at all); and every manifest the changegroup carries, each applied on the
+/// base it names, the repository's own text, its node holding. Red before: each let-go manifest asked whole of the store.
+#[test]
+fn a_clone_sends_each_let_go_manifest_as_its_stored_delta_on_the_one_before() {
+  let mut store = store();
+  let index = a_pushed_line(&mut store, 12);
+  let saved: BTreeMap<Node, Vec<u8>> = (0..index.len(&store, Log::Manifest))
+    .map(|rev| {
+      let node = index.revision(&store, Log::Manifest, rev).unwrap().node;
+      (
+        node,
+        index.revision_text(&store, Log::Manifest, rev).unwrap(),
+      )
+    })
+    .collect();
+  let (rows, places) = StoredManifests::rows_of(&index, &store);
+  let objects: Vec<ContentId> = (0..index.len(&store, Log::Manifest))
+    .map(|rev| index.revision(&store, Log::Manifest, rev).unwrap().bytes)
+    .collect();
+  let freed: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(freed > 0, "the manifests let go");
+  let state = State {
+    roots: &[],
+    bookmarks: &[],
+    publishing: true,
+    markers: &[],
+  };
+  let view = Indexed::new(&index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut source = StoredManifests {
+    rows,
+    places,
+    files: whole_texts(&index, &store),
+  };
+  let caps = stream_caps(b"HG20\nchangegroup=01,02,03");
+  let asked = super::super::getbundle::Asked {
+    bundlecaps: &caps,
+    ..super::super::getbundle::Asked::default()
+  };
+  let _ = super::super::getbundle::take_manifest_paths();
+  let answer = answered_getbundle(&view, &asked, &mut source).unwrap();
+  let paths = super::super::getbundle::take_manifest_paths();
+  assert!(
+    paths.stored_delta >= 12,
+    "the line's manifests sent as stored deltas: {paths:?}"
+  );
+  assert_eq!(paths.stored_fallback, 0, "none made whole: {paths:?}");
+  assert_manifests_carried(&answer, &saved);
+}
+
+/// The changegroup in `answer` carries every manifest of `saved`, each made from the base it names its text there.
+fn assert_manifests_carried(answer: &[u8], saved: &BTreeMap<Node, Vec<u8>>) {
+  let bundle = crate::bundle2::Bundle2::decode(answer, &mut room()).unwrap();
+  let (index, part) = bundle
+    .top_level()
+    .find(|(_, part)| part.is(b"changegroup"))
+    .unwrap();
+  let version = Version::from_part_param(part.param(b"version")).unwrap();
+  let payload = bundle.payload_bytes(index, &mut room()).unwrap();
+  let packed = Changegroup::decode(&payload, version, &mut room()).unwrap();
+  let carried = texts_by_base(&packed, &packed.manifests);
+  assert_eq!(carried.len(), saved.len(), "every manifest carried");
+  for (node, text) in saved {
+    assert_eq!(carried.get(node), Some(text), "manifest {node:?}'s text");
+  }
 }
