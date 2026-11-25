@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 32 (main 01a20182, 2026-11-24 21:12 PST): main at a387b13c3 (run 31's fixes landed), with w-git's A-911 (8c943afb1), w-hg's
+# clone fix (4f9438625, 105609857), w-perf's pipelined landing (d41c93388) and w-shared's test fix (fcb77e918).
 # Run 31 (main 01a20182, 2026-11-24 20:32 PST): run 30 found hg delta.rs:501 patched_by_fills panicking in a Result fn
 # (f754c36f6); main's commit returns its refusal beside the fill.
 # Run 30 (main 01a20182, 2026-11-24 20:20 PST): run 29 (past the hg fix) found merge engine.rs:1522's stranded doc and
