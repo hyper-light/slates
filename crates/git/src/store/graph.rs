@@ -87,9 +87,10 @@ pub struct StoreGraph<'r> {
 
 /// Derived: the slots a [`PositionCache`] gives each id one sent commit resolves, at least. A direct-mapped table of `m`
 /// slots holding `n` keys loses about `1 − e^(−n/m)` of them to a slot another took (each key's slot is uniform: an id
-/// is a uniform hash); at a load of at most 1/8 that is under 12 % of the ids met again, and the slots, rounded up to a
-/// power of two, hold the load between 1/16 and 1/8.
-const SLOTS_AN_ID: u64 = 8;
+/// is a uniform hash); at a load of at most 1/32 that is about 3 % of the ids met again (1/8's was 12 %), and the slots,
+/// rounded up to a power of two, hold the load between 1/64 and 1/32: four times the slots and bytes of 1/8, for the
+/// conflicts direct-mapped keeps (A-911's counter: 292 of a 40-commit line's 383 misses at 1/8).
+const SLOTS_AN_ID: u64 = 32;
 
 /// The positions of the ids a walk met lately (A-911, module docs **Positions met again**): exact, direct-mapped, an id
 /// in the slot its first bytes name. Sized from the work, as the walk meets it: the most ids one sent commit's trees
