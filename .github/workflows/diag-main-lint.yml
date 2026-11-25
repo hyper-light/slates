@@ -1,4 +1,7 @@
 name: diag-main-lint
+# Run 46 (main 01a20182, 2026-11-25 05:47 PST): main at ae4557eba, main's lint fix 85d220c50 for run 45's four sites and the
+# five more clippy found locally (staging land/land_tail, push apply_slice, hg_clone_store_wait's allows, fleet's two),
+# with A-919's and w-svn's landings since.
 # Run 45 (main 01a20182, 2026-11-25 05:00 PST): main at 9e213f94f, the landings after run 44: w-perf's churn (a) with
 # HeldPieceRef (97d7f37cf, 7edf532ec, a966f1de1), w-hg's owner spin (f01ea12dd), A-918 (i) Behind (1d2d21f21), the fetch
 # work split (2eec91f9b), the revlog-chunk place (367b2bea6), derive_behind again (e89adba55), svn's sliced apply
