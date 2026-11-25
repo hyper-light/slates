@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 50 (main 01a20182, 2026-11-25 10:00 PST): main at a0b1d570d, main's fix of run 49's three sites (staging's boxed
+# judging state and ToRecord, hg indexed_tests' u64::from), with A-924 piece 1's ipc fix (31f16d02f) and w-hg's push half.
 # Run 49 (main 01a20182, 2026-11-25 09:45 PST): main at 4c4849a5b, w-svn's lint 48 fix (01b1c6e3b + 2148a634c: CheckStep's
 # Checked boxed) with A-920 piece 4a, the propfind test (4c4849a5b), w-hg's 35b155312 and w-git's GAPS since run 48.
 # Run 48 (main 01a20182, 2026-11-25 08:36 PST): main at 8c0c4ae9d, main's arena fix for run 47's two sites (slates-mem
