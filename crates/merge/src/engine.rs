@@ -2337,16 +2337,18 @@ pub struct Applying {
 }
 
 impl Prep {
-  /// The preparation's first phase over `post`: its runs' places, found once (none where it names no run).
+  /// The preparation's first phase over `post`: its runs' places, found a run at a time ([`Prep::Places`]; none where
+  /// it names no run).
   fn sole(post: crate::named::Post<'_>) -> Prep {
-    let places = if post.runs.is_empty() && post.declared.is_empty() {
-      BTreeMap::new()
-    } else {
-      post.run_places()
-    };
-    Prep::Sole {
-      places,
-      sole: Vec::new(),
+    if post.runs.is_empty() && post.declared.is_empty() {
+      return Prep::Sole {
+        places: BTreeMap::new(),
+        sole: Vec::new(),
+        at: 0,
+      };
+    }
+    Prep::Places {
+      places: BTreeMap::new(),
       at: 0,
     }
   }
@@ -2356,6 +2358,12 @@ impl Prep {
 enum Prep {
   /// The entry's effects still being made.
   Effects,
+  /// The runs' places found, a run a unit, from the next ([`crate::named::Post::run_place`]; A-920 piece 3d: 4.1 ms
+  /// whole at 9,000 runs, debug, the import judge's last step).
+  Places {
+    places: BTreeMap<(u64, u64), usize>,
+    at: usize,
+  },
   /// Each effect's sole run ([`Green::sole_run_of`]) found, by the runs' places.
   Sole {
     places: BTreeMap<(u64, u64), usize>,
@@ -7326,6 +7334,21 @@ impl Green {
       match &mut run.prep {
         // Begun by its owner ([`Prep::sole`]); never met here.
         Prep::Effects => return ApplyStep::More,
+        Prep::Places { places, at } => {
+          let post = crate::named::Post::of(post_state, &run.read, runs);
+          while let Some(place) = post.run_place(*at) {
+            places.entry(place).or_insert(*at);
+            *at = at.saturating_add(1);
+            if post.run_place(*at).is_some() && spent() {
+              return ApplyStep::More;
+            }
+          }
+          run.prep = Prep::Sole {
+            places: core::mem::take(places),
+            sole: Vec::new(),
+            at: 0,
+          };
+        }
         Prep::Sole { places, sole, at } => {
           if !places.is_empty() {
             while let Some(effect) = run.effects.get(*at) {
