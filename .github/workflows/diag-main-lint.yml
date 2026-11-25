@@ -1,4 +1,8 @@
 name: diag-main-lint
+# Run 44 (main 01a20182, 2026-11-25 02:32 PST): main at 0cd27990e: run 43's hg_fetch_heap type fixed (e8e33fe6f), with arm B
+# (d9af8b94f), stored chunks (5114fd09e), A-916 (92b74ac50), derive_behind (608930048), the pin quadratic (8ec5fb287),
+# the unlanded-count restart test (fc163e79b), the replay sweep (7f5ad8a37), the crash-test fix (47eb329ab), the
+# look-ahead let-go (0cd27990e), all after run 43.
 # Run 43 (main 01a20182, 2026-11-25 01:15 PST): main at 5b28c312e: the content-store unlanded rule (123d8c280) with svn on it
 # (a55d7cfa6), A-915 (17548d18b), w-git's walk a unit an entry (86b057be4) and derive_ns (2dd25afe6), hg stream v2
 # (1540f62d5), w-perf's text cache walk (142256360), w-svn's bring-back give-backs (f8fd11504), main's sweep test
