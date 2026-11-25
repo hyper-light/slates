@@ -27,6 +27,12 @@
 //! with no room it stays as it is, down to no slots, where every lookup misses: the same code, the walk as slow as
 //! before, never refused for it.
 //!
+//! **A tree read in one unit.** A walk takes a tree's entries one a unit (`negotiation::objects`), but reads the tree's
+//! ids in one: its bytes parsed whole ([`StoreGraph::entry_ids`]). That parse is not sliced: on git/git's clone its
+//! largest tree is 62,061 bytes, under the step quantum's bytes (~94,797 at the bench machine's copy rate; main 01a20182's
+//! git leg at 2dd25afe6, 2026-11-25). The longest tree a fetch parsed is counted
+//! (`vcs_store.git_upload.tree_parse_bytes_most`), so a repository whose tree passes the quantum shows it.
+//!
 //! **Faults.** The trait reads cannot fail, and a store whose index and content agree never fails them. Where one does
 //! (a position with no row, a tree or tag git's parser refuses), the read answers nothing and the first fault is kept
 //! ([`StoreGraph::fault`]); the service refuses an answer made while one was kept, so a broken store never yields a
