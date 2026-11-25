@@ -38,6 +38,10 @@ use crate::state::ShardState;
 
 /// Counter: a version's sets derived and kept. Format: a counter name.
 pub(crate) const DERIVED: &str = "vcs_store.git_derive.derived";
+/// Counter: the nanoseconds a derivation's turns took on the shard's clock, each turn that turned one (main 01a20182's
+/// order of 2026-11-25: what a first clone's first pack byte spends deriving its tags, measured rather than told by
+/// difference). Format: a counter name.
+pub(crate) const NS: &str = "vcs_store.git_derive.ns";
 /// Counter: a derivation's turns: those that turned one, never a call that found nothing to derive (every encoding turn
 /// asks first). Format: a counter name.
 pub(crate) const TURNS: &str = "vcs_store.git_derive.turns";
@@ -74,6 +78,7 @@ pub(crate) enum Turned {
 /// One turn of repository `id`'s derivation (the module doc), within the shard's quantum on its clock.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   let quantum_ns = state.config.step_quantum_ns();
+  let began = slates_rt::futures::now_ns();
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
   let Some((turned, derived, refused)) =
     super::lent_state(state, |state| turn_lent(state, id, quantum_ns))
@@ -83,6 +88,7 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
     return Turned::Idle;
   };
   state.count(TURNS, 1);
+  state.count(NS, slates_rt::futures::now_ns().saturating_sub(began));
   if YIELDED.with(|yielded| yielded.replace(false)) {
     state.count(TURNS_YIELDED, 1);
   }
