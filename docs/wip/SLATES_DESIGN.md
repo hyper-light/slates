@@ -63783,3 +63783,50 @@ GAPS.
 - **Evidence.** `git_push::tests::a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again`: red
   on main (the oracle differing), green with the write gone.
 
+### Deriving a push's versions behind it: built, withdrawn (2026-11-25, w-git for main 01a20182; status)
+
+- **Built** (750d2bca3): `git_derive::derive_behind`, a task of the shard turning `derive_for_read` as a git push ended,
+  so the first fetch after it found its versions derived (git/git's first clone had spent 12.15 s of its 40.34 s first
+  pack byte deriving the 1,027 versions its push left unknown, `vcs_store.git_derive.ns`).
+- **Withdrawn** (main 01a20182's ruling, the revert after it): two failures. (1) A clone arriving mid-derivation ran the
+  shared derivation in slivers: the task behind and the fetch's own `derive_for_read` both runnable, `paced` stops a
+  turn where someone else waits, so each yielded to the other at every unit (main's git leg: 721,260 turns and 22.69 s
+  for 877 versions, against 338 turns and 12.15 s for 1,027 with nothing behind; the first pack byte 40.3 → 61.9 s).
+  (2) `vcs_http::daemon_edge::tests::a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding` failed under
+  ThreadSanitizer (diag 9, run 45595905963): a listing after the push waited behind the derivation.
+- **Owed before it returns:** a fetch arriving while the derivation behind is under way reaches its first pack byte no
+  later than one with nothing behind (held by turns and nanoseconds); and a ref listing after a push waits for no
+  derivation, held under slow scheduling (the wait may borrow `test_lane::slowdown`, a bet on speed, not the rule). A
+  start on the first: the reader marks the repository read-driven and the task behind stops before its next turn
+  (`agents/w-git-derive-behind-2`, 014f477de, not landed).
+
+### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
+
+- **Why.** An import's batch applies each recorded version to its green (`RecordedBatch::apply_slice`), a version in one
+  call of `Green::apply_recorded`: at a revision of 9,000 files that was one call of about 120 ms of a debug build's
+  shard (its effects made 14 ms, mapped files 15, effects applied 21, files set 63), the apply's longest slice 196 ms.
+  The call is linear in the version's files, so a larger revision holds its shard longer, without bound.
+- **The change.** `Green::begin_applying(inc, applied)` begins a run (`Applying`), or answers at once where
+  `apply_recorded` did (a green owing a push, an increment accepted already, a run not read); `Green::apply_step(run, inc,
+  applied, units)` takes it on by `units`: the entry's effects made a slice at a time (each slice's reads checked for a
+  text held by name alone with no bytes lent, `crate::unlent`), then the commit's preparation, then its effects applied,
+  its files removed and its files set a unit each (`Green::commit_begin`, `Green::commit_step`, `CommitRun`). One path:
+  `apply_recorded` is the run with no bound on its units, and `Green::commit`, every verdict's commit, is the commit's
+  run carried to its end. The server's batch takes `repository::push::APPLY_UNITS` units a call and reads the shard's clock between
+  calls, carrying a version's run from one slice to the next.
+- **The contract.** Between a run's begin and its end no reader may read the green and nothing else may change it: its
+  histories hold the version's values before its head names the version. An import's batch keeps it (no session is
+  served while it imports, its landing turn held) and so does a recovery's replay (not served until rebuilt). A run
+  dropped before its end leaves the green part applied; its owner makes the green again from its chain, which holds the
+  version, as a kill between a batch's slices recovers today.
+- **The oracle.** `engine::applying_tests`: generated works in every dimension, submitted to a green, each committed
+  version replayed into one green whole and one a unit a step; after every version the two and the submitter read alike
+  (histories, recounted bytes, head, head identity). A counted test holds a version of 200 files to more steps than its
+  files; the 9,000-file import asserts its version took more than one call (`repository.import_batch.apply_steps`).
+- **Measured** (9,000 files, debug, load about 58): the apply's longest slice 196 ms before, 71 ms after.
+- **Owed.** Three phases are still whole within a slice: the named read at a version's begin (`svn_commit::read_named`,
+  where `read_named_slice` exists), the lend's walk of every effect (`Green::recorded_unlent`), and the commit's
+  preparation (`Green::commit_reads`, `sole_runs`, `make_mapped`, `commit_begin`'s node moves and copies). Each is linear
+  in a version's files; they are the next slices.
+- **Applied in the same change to** `crates/merge/src/engine.rs`, `engine/copy.rs`, `engine/applying_tests.rs`,
+  `crates/server/src/repository/push.rs`, `vcs_store/name_holds.rs` and the import's wide-revision test.

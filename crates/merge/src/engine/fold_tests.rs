@@ -10,12 +10,12 @@ use super::replaced_node_tests::Work;
 use crate::ops_doc::OpKind;
 
 /// Shape: the paths the generated works change: files, links and a directory among them by what each step makes.
-const PATHS: [&str; 5] = ["a", "b", "c", "d", "e"];
+pub(super) const PATHS: [&str; 5] = ["a", "b", "c", "d", "e"];
 
 /// `work` with `path` changed as `how` names, `mark` its bytes or mode: a file made or removed, its mode, an attribute
 /// set or removed, a symbolic or a hard link made, a FIFO made, a directory made or removed. A change the green
 /// refuses is refused alike on both twins.
-fn change(work: Work, path: &str, how: u8, mark: u8) -> Work {
+pub(super) fn change(work: Work, path: &str, how: u8, mark: u8) -> Work {
   match how % 10 {
     0 => work.create(path, &[mark; 3]),
     1 => work.op(OpKind::Unlink, path, (0, 0, u64::MAX)),
@@ -31,7 +31,7 @@ fn change(work: Work, path: &str, how: u8, mark: u8) -> Work {
 }
 
 /// Every history the fold touches, and what the green counts of them: what the twins must agree on.
-fn folded_state(green: &Green) -> String {
+pub(super) fn folded_state(green: &Green) -> String {
   format!(
     "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{} {} {:?}",
     green.content_history,
