@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 42 (main 01a20182, 2026-11-25 00:04 PST): main at 4892d3cf9: w-svn's Unstored fix (d3539309d), w-git's A-911 miss counter
+# (15b4f1061), w-interop's harness fixes (67ec37368), w-hg's texts request (9a5587e78), landed after run 41.
 # Run 41 (main 01a20182, 2026-11-24 23:21 PST): run 39 found daemon_edge.rs:5529 at cognitive complexity 12/10 (3e50c0aee's
 # asserts); main's commit 2bb4affd3 moves two assert groups into helpers. Run 40 (A-913) cancelled for this one, which has it.
 # Run 40 (main 01a20182, 2026-11-24 23:18 PST): main at 1fe3a3b05, w-shared's A-913 (ff53bdf83: a holder's record path makes a
