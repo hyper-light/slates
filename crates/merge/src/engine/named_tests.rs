@@ -292,6 +292,61 @@ fn a_named_texts_file_is_its_name_alone() {
   holds_its_name_alone(&mut green, (object, &plane), &bytes);
 }
 
+/// A-920 piece 3c (a verdict computed a slice at a time reads what it read whole). Do: commit a named work creating
+/// `a` from a plane's object, so the green holds `a` by the object's name alone with none of it lent; judge a work
+/// renaming `a` to `b`, whose verdict reads `a`'s bytes, whole and a unit a step; lend the object and judge it again a
+/// unit a step. Expect both judges before the lend refused `ContentUnread` naming the object, the sliced one in more
+/// than one step; the one after it accepted.
+#[test]
+fn a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent() {
+  let bytes = vec![b'r'; 1 << 12];
+  let mut plane = Plane::default();
+  let object = plane.put(bytes.clone());
+  let mut create = named_create("a", object);
+  while !create.read_step(&plane, 1 << 20).unwrap() {}
+  let mut green = Green::new();
+  let super::Judgment::Accepted(judged) = green.judge_named(&mut create) else {
+    panic!("the create not accepted");
+  };
+  assert_eq!(
+    green.commit_judged(judged).map(|(version, _)| version),
+    Ok(1)
+  );
+  green.let_named_bytes_go();
+  let journal = [
+    VolumeOp::Rename {
+      from: "a".to_owned(),
+      to: "b".to_owned(),
+    },
+    VolumeOp::Create {
+      path: "c".to_owned(),
+    },
+  ];
+  let (doc, _) = compose_volume_planned(
+    &Base::of_files(vec![("a".to_owned(), object.len)]),
+    &journal,
+  )
+  .unwrap();
+  let rename = Increment {
+    id: [8; 32],
+    base: 1,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  let unread = super::Judgment::ContentUnread { identity: object };
+  let whole = green.judge_named_reads_later(&mut rename.clone());
+  assert_eq!(format!("{whole:?}"), format!("{unread:?}"));
+  let (sliced, steps) =
+    super::applying_tests::judged_a_unit_a_step(&mut green, &mut rename.clone());
+  assert_eq!(format!("{sliced:?}"), format!("{unread:?}"));
+  assert!(steps > 1, "judged in {steps} step");
+  assert!(green.lend(object, bytes) > 0, "a block took the object");
+  let (lent, _) = super::applying_tests::judged_a_unit_a_step(&mut green, &mut rename.clone());
+  assert!(matches!(lent, super::Judgment::Accepted(_)), "{lent:?}");
+}
+
 /// `green`'s file `big` is `object`'s name alone (A-760 (b) 4d): no byte held, one hold of the object taken, its bytes
 /// (`bytes`) the plane's; the hold given back before the green goes.
 fn holds_its_name_alone(green: &mut Green, (object, plane): (Identity, &Plane), bytes: &[u8]) {
@@ -1042,15 +1097,15 @@ fn judge_lending_by(
   panic!("a judge refused again with its objects lent");
 }
 
-/// `work` judged on `green` leaving its commit's reads to its commit ([`Green::judge_named_reads_later`]), lent as its
-/// judge refuses, then committed a unit a step, each text the commit's check asks for lent as it asks, then let go: the
+/// `work` judged on `green` a unit a step leaving its commit's reads to its commit ([`Green::begin_judging`], as
+/// [`Green::judge_named_reads_later`] judges; A-920 piece 3c), lent as its judge refuses, then committed a unit a step, each text the commit's check asks for lent as it asks, then let go: the
 /// version it committed, none where it was not accepted. No text is asked for again once lent.
 fn committed_reads_later(
   green: &mut Green,
   work: &mut Increment,
   (plane, census): (&Plane, &mut NameCensus),
 ) -> Option<u64> {
-  let judgment = judge_lending_by(green, (work, plane), census, Green::judge_named_reads_later);
+  let judgment = judge_lending_by(green, (work, plane), census, judged_a_unit_a_step);
   let super::Judgment::Accepted(judged) = judgment else {
     return None;
   };
@@ -1071,6 +1126,11 @@ fn committed_reads_later(
       }
     }
   }
+}
+
+/// `work` judged on `green` a unit a step ([`super::applying_tests::judged_a_unit_a_step`]): the judgment.
+fn judged_a_unit_a_step(green: &mut Green, work: &mut Increment) -> super::Judgment {
+  super::applying_tests::judged_a_unit_a_step(green, work).0
 }
 
 /// `applied` applied to `green` for `work` as its entry records it, a unit a step (`Green::apply_step`), each named text
