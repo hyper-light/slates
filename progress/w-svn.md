@@ -773,6 +773,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   awaits bring_back (server: bring_back_reads, Send) and re-serves first; second miss answered (away_again).
 - Owed (main): Linux guest over a work on an svn green, crates/server/tests/virtiofs.rs.
 - NEXT (main's order 02:25): 4 lend items (borrow read-only lends; no Green::default per lend); 5 speed.
+- 11-25 later: A-920 (2b sliced staging, main 01a20182 ruling): piece 0 2d6ede61a (reservation once; judge step 262 -> 227 ms) + docs f8a812d15; piece 1 0214fa210 (scratch commit on A-917 run; judge step 227 -> 89-92 ms CPU at 9,000; whole left: prep sole->mapped 6.8 ms, commit end+keep 13 ms, records step 30 ms; hog test HOG_NS 150 ms). Next: piece 2 record check (101 ms), 3 judge, 4 build, 5 held tables+apply; then apply whole parts; fmt3 p99.
 ## 2026-11-24 ~05:00: A-899 virtio-fs serves a work, 7416cae15
 - virtiofs attach ensure_slot; pass lends GreenTree via mounted_work::source/lend (one lend); A-898 park now reached.
 - Integration case a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered (in-process seam, unix).
