@@ -1624,10 +1624,7 @@ impl ReplicaSeed {
     // dropped from the lineage where a standing-alone replica would not be installed.
     let member = state.merge.replicas.lineage_of(&key).is_some();
     if state.merge.refused.contains(&self.object) {
-      if member {
-        state.merge.replicas.put_back_any(&key, replica);
-        state.merge.replicas.drop_any(&key);
-      }
+      put_back_and_drop_member(state, &key, replica, member);
       return;
     }
     let head = replica.reached();
@@ -1635,37 +1632,46 @@ impl ReplicaSeed {
       .is_some_and(|value| value.identity != replica.head_identity())
     {
       state.count(REPLICA_SUPERSEDED, 1);
-      if member {
-        state.merge.replicas.put_back_any(&key, replica);
-        state.merge.replicas.drop_any(&key);
-      }
+      put_back_and_drop_member(state, &key, replica, member);
       return;
     }
     if member {
       state.merge.replicas.put_back_any(&key, replica);
-    } else if !state.merge.replicas.contains_key(&key) {
-      match self.lineage {
-        Some(repository) => {
-          if state
-            .merge
-            .replicas
-            .found(repository, key, replica)
-            .is_err()
-          {
-            // The repository has a lineage here without this root: nothing a holder makes leaves one (a branch is made
-            // only from a member), so counted as the bug it would be, and the replica not installed.
-            state.count(LINEAGE_FOUND_REFUSED, 1);
-            return;
-          }
-          state.count(crate::merge_service::MEMBER_FOUNDED, 1);
-        }
-        None => {
-          state.merge.replicas.insert(key, replica);
-        }
-      }
+    } else if !state.merge.replicas.contains_key(&key) && !self.install_alone(state, key, replica) {
+      return;
     }
     // What waited for this replica on this holder: a submit's settling (A-697 part d), a recovered work's replay (e).
     crate::work_home::replica_reached(state, self.object);
+    self.count_installed(state);
+  }
+
+  /// Installs `replica` where none of the green stands: a lineage's root founds its lineage (A-908), any other green
+  /// stands alone. False where the repository already has a lineage here without this root: nothing a holder makes
+  /// leaves one (a branch is made only from a member), so it is counted as the bug it would be, and the replica not
+  /// installed.
+  fn install_alone(&self, state: &mut ShardState, key: DbVolumeId, replica: Green) -> bool {
+    match self.lineage {
+      Some(repository) => {
+        if state
+          .merge
+          .replicas
+          .found(repository, key, replica)
+          .is_err()
+        {
+          state.count(LINEAGE_FOUND_REFUSED, 1);
+          return false;
+        }
+        state.count(crate::merge_service::MEMBER_FOUNDED, 1);
+      }
+      None => {
+        state.merge.replicas.insert(key, replica);
+      }
+    }
+    true
+  }
+
+  /// Counts what an installed replica was: seeded from a manifest, advanced from a version, or rebuilt.
+  fn count_installed(&self, state: &mut ShardState) {
     if self.manifest.is_some() {
       state.count(REPLICA_SEEDED, 1);
     }
@@ -1674,6 +1680,20 @@ impl ReplicaSeed {
       None if self.through > 0 => state.count(REPLICA_REBUILT, 1),
       None => {}
     }
+  }
+}
+
+/// A lineage's member taken out of its lineage for a build that is not installed (A-908): put back, then dropped from
+/// the lineage, as a standing-alone replica would not be installed. A replica of no lineage is simply dropped.
+fn put_back_and_drop_member(
+  state: &mut ShardState,
+  key: &DbVolumeId,
+  replica: Green,
+  member: bool,
+) {
+  if member {
+    state.merge.replicas.put_back_any(key, replica);
+    state.merge.replicas.drop_any(key);
   }
 }
 
@@ -2217,7 +2237,7 @@ mod tests {
     );
     let mut owner = crate::greens::Greens::default();
     assert!(owner.found(repository, root, Green::new()).is_ok());
-    let mut identity = |owner: &mut crate::greens::Greens, id: &DbVolumeId| {
+    let identity = |owner: &mut crate::greens::Greens, id: &DbVolumeId| {
       owner
         .lend_mut(id)
         .map(|mut green| green.head_identity())

@@ -42,6 +42,10 @@ pub(crate) const DERIVED: &str = "vcs_store.git_derive.derived";
 pub(crate) const TURNS: &str = "vcs_store.git_derive.turns";
 /// Counter: a derivation refused (the content store's room, a damaged record), dropped. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_derive.refused";
+/// Counter: a derivation's turns that ended early because someone else waited on the shard (A-783's pace: it runs to the
+/// step's ceiling only while nobody waits). Read beside [`TURNS`], what tells turns the work's time took from turns its
+/// shard's other work asked for. Format: a counter name.
+pub(crate) const TURNS_YIELDED: &str = "vcs_store.git_derive.turns_yielded";
 
 /// The derivations under way, one a repository (the module doc's bounds).
 #[derive(Default)]
@@ -73,6 +77,9 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   let (turned, derived, refused) =
     super::lent_state(state, |state| turn_lent(state, id, quantum_ns));
   state.count(TURNS, 1);
+  if YIELDED.with(|yielded| yielded.replace(false)) {
+    state.count(TURNS_YIELDED, 1);
+  }
   if derived > 0 {
     state.count(DERIVED, derived);
   }
@@ -125,6 +132,12 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
   answer
 }
 
+thread_local! {
+  /// Whether this shard's turn under way ended early because someone else waited ([`TURNS_YIELDED`]), read and cleared
+  /// by [`turn`] once its lend ends.
+  static YIELDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
 /// Turns of `deriving` while nobody else waits on the shard, to the step's ceiling (A-783's pace, the module doc), each
 /// version kept as it comes: what came of it, and the versions kept.
 fn paced(
@@ -138,8 +151,11 @@ fn paced(
     .unwrap_or(quantum_ns)
     .max(quantum_ns);
   let go_on = || {
-    !slates_rt::futures::others_waiting()
-      && slates_rt::futures::now_ns().saturating_sub(began) < ceiling.saturating_sub(quantum_ns)
+    if slates_rt::futures::others_waiting() {
+      YIELDED.with(|yielded| yielded.set(true));
+      return false;
+    }
+    slates_rt::futures::now_ns().saturating_sub(began) < ceiling.saturating_sub(quantum_ns)
   };
   let mut clock = ShardClock;
   let mut derived = 0u64;
