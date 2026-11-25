@@ -450,14 +450,17 @@ async fn bring_texts(
 }
 
 /// The texts of `work` that `put` names (those its landing put whole into the content store), each once, at the first
-/// path a row sets it at, with its length: what its changeset carries (C2 stage B).
+/// path a row sets it at, with its length: what its changeset carries (C2 stage B). Each text looked up, not searched
+/// for among every one put and carried (goal 93: 327 ms of one step for a revision of 9,000 texts, debug).
 fn texts_carried(changes: &[ChangedPath], put: &[ContentIdentity]) -> Vec<landing::LandedText> {
   let mut carried: Vec<landing::LandedText> = Vec::with_capacity(put.len());
+  let put: BTreeSet<&ContentIdentity> = put.iter().collect();
+  let mut seen: BTreeSet<ContentIdentity> = BTreeSet::new();
   for change in changes {
     let Some(text) = change.text else {
       continue;
     };
-    if put.contains(&text.identity) && !carried.iter().any(|kept| kept.identity == text.identity) {
+    if put.contains(&text.identity) && seen.insert(text.identity) {
       carried.push(landing::LandedText {
         path: change.path.as_bytes().to_vec(),
         identity: text.identity,
