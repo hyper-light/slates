@@ -328,7 +328,7 @@ async fn landed_work(
     Err(refused) => {
       let _ = crate::state::with_state(|state| {
         release_stored(state, storing);
-        release_texts(state, None, &brought);
+        crate::vcs_store::name_holds::give_back_brought(state, &brought);
       });
       return Some(Err(refused));
     }
@@ -441,7 +441,11 @@ async fn bring_texts(
   let mut brought = Vec::with_capacity(wanted.len());
   for (identity, len) in wanted {
     if !crate::vcs_store::svn_texts::bring_whole(repository, identity, len).await {
-      let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+      // Given back and let go again, as a whole commit's give-back lets them go: each is a landed text (w-hg's sweep,
+      // site 2: a bring-back refused part way left what it brought resident).
+      let _ = crate::state::with_state(|state| {
+        crate::vcs_store::name_holds::give_back_brought(state, &brought);
+      });
       return Some(Err(Uncommitted::Unstored));
     }
     brought.push(identity);
@@ -535,7 +539,9 @@ pub(crate) async fn land_revision(
   let (storing, carried) = match stage_texts(repository, &mut revision, Vec::new()).await? {
     Ok(staged) => staged,
     Err(refused) => {
-      let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+      let _ = crate::state::with_state(|state| {
+        crate::vcs_store::name_holds::give_back_brought(state, &brought);
+      });
       return Some(Err(refused));
     }
   };
@@ -552,7 +558,7 @@ pub(crate) async fn land_revision(
     Err(refused) => {
       let _ = crate::state::with_state(|state| {
         give_back(state);
-        release_texts(state, None, &brought);
+        crate::vcs_store::name_holds::give_back_brought(state, &brought);
       });
       return Some(Err(refused));
     }
