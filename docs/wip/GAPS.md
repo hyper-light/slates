@@ -295,7 +295,9 @@
 >   and the barrier's log names it.
 > - **(iii) FIXED (A-919):** a candidate joining a state log's placement past parts every earlier one held reads the
 >   prefix from its cohort, the owner among them, under the start rule, and continues. Red: a's parts stayed at 933
->   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0.
+>   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0. OWED (main): the TLC run of
+>   `FencedLedger_forget.cfg` (must hold) and `FencedLedger_forget_norule.cfg` (must fail Continuity), with the three
+>   older configurations (verdicts unchanged); the model is written, its run is not yet made.
 > - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
 >   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
 >   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
