@@ -1834,7 +1834,19 @@
 > At r4000 in process: 3,392 stored deltas, 562 on a parent, 14 wholes, 32 whole from a made text (a delta on neither
 > the one before nor a parent sent); the owner's requests 1,248 to 80, the store wait 1.27 s, `hg verify` clean, every
 > manifest the source's. A pull's base in `::common` is not this walk's: a pull (`Named`) reads each manifest whole to
-> plan its files, so its text is made whatever is sent. Owed: the 32; the 57k churn rerun (main's).
+> plan its files, so its text is made whatever is sent. Main's 57k churn at e51d998bf (2026-11-25): the clone's system
+> churn 9.67 GB (40.89 at fed0b8164), 5.51 GB of it `object_text` under `revision_text` under the view's manifest read
+> and 0.79 GB `revision_text_over`'s chain, none rebuilt: the walk asks the view for each manifest before it sends the
+> stored delta, and a let-go manifest's read began its chain's whole text before finding its windows away (about a
+> manifest a changeset). Nothing of the file walk reads a manifest: a clone walks the file logs by position (A-745).
+> Since (w-hg): `revision_text_over` looks at its revision's own object first and stops where the store holds it with
+> its windows away, and `object_text` makes a text only once its first window is read. Held by
+> `a_views_read_of_a_let_go_manifest_allocates_no_text` (`crates/hg/tests/push_heap.rs`: 103,218 B a read of a let-go
+> 91,200 B manifest, none made; now 74 B). Owed: the 32; the 57k churn rerun (main's). Found beside it, failing on main
+> before this change (the same bytes with it): that binary's `a_pushs_churn_per_changeset_is_its_file_alone` (145,223 B
+> an edit at a 91,200 B manifest, 1.59 manifests, against its 16 KiB bound; 10,284 B when it landed) and
+> `a_cached_file_base_is_read_where_it_lies` (192,642 B a revision of a 160 KiB file, 1.18 files): the push's intake
+> churn main measured (`manifest_step`, `put_window`), owed next.
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
