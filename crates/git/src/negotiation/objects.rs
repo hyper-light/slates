@@ -335,6 +335,27 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     }
   }
 
+  /// The kind of the unit [`Selecting::unit`] does next.
+  fn unit_kind(&self) -> super::UnitKind {
+    use super::UnitKind;
+    if !self.mark.is_empty() {
+      return UnitKind::Mark;
+    }
+    if self.chosen.walking() {
+      return self.chosen.walk_kind();
+    }
+    match self.stage {
+      Stage::Commits => UnitKind::Commits,
+      Stage::Edges { .. } => UnitKind::Edges,
+      Stage::Haves => UnitKind::Haves,
+      Stage::Choose { .. } => UnitKind::Choose,
+      Stage::Wants { .. } => UnitKind::Wants,
+      Stage::Carried { .. } => UnitKind::Carried,
+      Stage::Tags { .. } => UnitKind::Tags,
+      Stage::Done => UnitKind::Done,
+    }
+  }
+
   /// One unit: a stack's next entry where a walk is under way, else the stage's next; whether the selection is done.
   fn unit<S: Graph<Node = N, Green = G>>(
     &mut self,
@@ -342,6 +363,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<bool, Refusal> {
+    super::begin_unit(self.unit_kind());
     if let Some(node) = self.mark.pop() {
       self.mark_one(graph, node, admission)?;
       return Ok(false);
@@ -550,6 +572,17 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
   /// Whether a tree walk is under way.
   fn walking(&self) -> bool {
     self.taking.is_some() || !self.open.is_empty() || !self.frames.is_empty()
+  }
+
+  /// The kind of the walk's next unit: an entry of the tree being taken, a tree to open, or a `sparse:oid` frame's entry.
+  fn walk_kind(&self) -> super::UnitKind {
+    if self.taking.is_some() {
+      super::UnitKind::TakeEntry
+    } else if !self.open.is_empty() {
+      super::UnitKind::OpenTree
+    } else {
+      super::UnitKind::Frame
+    }
   }
 
   /// One entry of the walk under way: the next tree to open, or the `sparse:oid` walk's next entry.

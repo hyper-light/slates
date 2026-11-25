@@ -2578,7 +2578,7 @@ pub(crate) fn changeset_landing(
   };
   // Each kept revision's text, base and place, for the derived per-path reads (w-perf's Texts section, A-645 on
   // A-767; fa5fd0023): its place is in this changeset's payload, named by the same identity the reference names.
-  let texts = super::hg_run::texts_section(&forked.intaken.texts, name.identity);
+  let texts = super::hg_run::texts_section(&forked.intaken.texts, (name.identity, None));
   let header = slates_store::log::Header {
     tool: slates_store::log::Tool::Mercurial,
     repository: u128::from_be_bytes(repository.bytes),
@@ -2619,12 +2619,10 @@ pub(crate) fn store_blocking(
   let mut run = super::hg_run::Run::new(repository);
   let segments = core::mem::take(&mut forked.segments);
   let landed = segments.into_iter().try_for_each(|(segment, record)| {
-    let changeset = super::hg_run::segment_changeset(
-      state,
-      repository,
-      (&segment, &forked.changegroup.1),
-      record,
-    );
+    let Some(chunks) = chunked_whole(&segment, &forked.changegroup.1) else {
+      return Err(unlanded());
+    };
+    let changeset = super::hg_run::segment_changeset(state, repository, &segment, (record, chunks));
     let Some(Ok((disk, header, parts))) = changeset else {
       return Err(unlanded());
     };
@@ -3154,8 +3152,25 @@ async fn segment_landed(
   let Some(written) = writer.finish() else {
     return unlanded();
   };
+  // Its payload as stock's revlog chunks, made once as it lands, a turn's steps at a time (goal 93, main's ruling (b)).
+  let Some(slice) = segment_slice(segment, payload) else {
+    return unlanded();
+  };
+  let Ok(mut chunked) = slates_hg::push::chunked::Chunked::begin(segment.texts.len()) else {
+    return unlanded();
+  };
+  loop {
+    match crate::state::with_state(|state| {
+      chunk_turn(state, &mut chunked, (&segment.texts, slice), &mut costs)
+    })? {
+      Ok(true) => slates_rt::futures::yield_now().await,
+      Ok(false) => break,
+      Err(_) => return unlanded(),
+    }
+  }
+  let chunks = chunked.finish();
   let changeset = crate::state::with_state(|state| {
-    super::hg_run::segment_changeset(state, repository, (segment, payload), written)
+    super::hg_run::segment_changeset(state, repository, segment, (written, chunks))
   })?;
   let Some(Ok((disk, header, parts))) = changeset else {
     return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
@@ -3165,6 +3180,74 @@ async fn segment_landed(
   crate::state::with_state(|state| {
     landed_segment(state, (run, segment), (sequence, ok), Some(counted))
   })
+}
+
+/// Counter: the turns a push's segment payloads were made into stock's revlog chunks in ([`chunk_turn`]; goal 93, main's
+/// ruling (b)). Format: a counter name in the status report.
+pub(crate) const SEGMENT_CHUNK_TURNS: &str = "vcs.hg.segment_chunk_turns";
+/// Counter: the most plain bytes one step of that chunking compressed, kept as a maximum: held to the shard's copy slice
+/// (main's ruling (b), its condition (1)). Format: a counter name in the status report.
+pub(crate) const COMPRESS_BYTES_MOST: &str = "vcs.hg.segment_compress_bytes_most";
+/// Counter: the most bytes one step of that chunking compressed past the copy slice it was given, kept as a maximum:
+/// zero but where a step's first unit is a short text longer than its slice. Format: a counter name in the status report.
+pub(crate) const COMPRESS_PAST_BUDGET_MOST: &str = "vcs.hg.segment_compress_past_budget_most";
+/// Counter: the plain bytes of the deltas made into chunks. Format: a counter name in the status report.
+pub(crate) const COMPRESS_PLAIN_BYTES: &str = "vcs.hg.segment_compress_plain_bytes";
+/// Counter: the bytes their chunks took: against [`COMPRESS_PLAIN_BYTES`], what keeping them as chunks saves. Format: a
+/// counter name in the status report.
+pub(crate) const COMPRESS_STORED_BYTES: &str = "vcs.hg.segment_compress_stored_bytes";
+/// Counter: the nanoseconds that chunking took, on the shard's clock. Format: a counter name in the status report.
+pub(crate) const COMPRESS_NS: &str = "vcs.hg.segment_compress_ns";
+
+/// `segment`'s bytes of `payload`, the changegroup as received; none where its slice is not the payload's.
+fn segment_slice<'p>(segment: &PushSegment, payload: &'p [u8]) -> Option<&'p [u8]> {
+  let start = usize::try_from(segment.slice.start).ok()?;
+  let end = usize::try_from(segment.slice.end).ok()?;
+  payload.get(start..end)
+}
+
+/// One turn of `chunked`, a segment's payload made into chunks: its steps while the shard's paced turn has room, each
+/// compressing at most the shard's copy slice (`copy_slice_bytes`); whether more follow, or zstd's refusal. Counted
+/// ([`SEGMENT_CHUNK_TURNS`] and after it).
+fn chunk_turn(
+  state: &mut ShardState,
+  chunked: &mut slates_hg::push::chunked::Chunked,
+  (texts, slice): (&[slates_hg::push::intake::KeptText], &[u8]),
+  costs: &mut vcs_store::TurnCosts,
+) -> Result<bool, slates_hg::revlog_chunk::ChunkRefused> {
+  let quantum = vcs_store::hg_import::quantum_of(state);
+  let budget = state.config.copy_slice_bytes().max(1);
+  let began = slates_rt::futures::now_ns();
+  let mut paced = vcs_store::paced_turn(quantum, began);
+  let (plain_before, stored_before) = chunked.bytes();
+  let stepped = loop {
+    if !paced.more(vcs_store::ANSWER_STEP, costs) {
+      break Ok(true);
+    }
+    match chunked.step((texts, slice), budget) {
+      Ok(true) => {}
+      other => break other,
+    }
+  };
+  let ended = slates_rt::futures::now_ns();
+  paced.close(ended, costs);
+  let (plain, stored) = chunked.bytes();
+  state.count(SEGMENT_CHUNK_TURNS, 1);
+  state.count_max(COMPRESS_BYTES_MOST, chunked.most_step());
+  state.count_max(COMPRESS_PAST_BUDGET_MOST, chunked.most_past());
+  state.count(COMPRESS_PLAIN_BYTES, plain.saturating_sub(plain_before));
+  state.count(COMPRESS_STORED_BYTES, stored.saturating_sub(stored_before));
+  state.count(COMPRESS_NS, ended.saturating_sub(began));
+  stepped
+}
+
+/// `segment`'s payload made into chunks whole, every step at once: a test's landing, whose caller holds the shard.
+#[cfg(test)]
+fn chunked_whole(segment: &PushSegment, payload: &[u8]) -> Option<super::hg_run::Chunks> {
+  let slice = segment_slice(segment, payload)?;
+  let mut chunked = slates_hg::push::chunked::Chunked::begin(segment.texts.len()).ok()?;
+  while chunked.step((&segment.texts, slice), u64::MAX).ok()? {}
+  Some(chunked.finish())
 }
 
 /// Counter: the turns a push's segment records were written in, a turn's steps under the shard's paced turn each

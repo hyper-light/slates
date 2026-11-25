@@ -75,6 +75,11 @@ pub struct ChunkCounts {
   pub count: PassCounts,
   /// A stream's send pass and a rendering.
   pub send: PassCounts,
+  /// Chunks a fetch decoded on its shard ([`decode_counted`]; goal 93, main's ruling (b): a stored chunk made into the
+  /// delta a changegroup sends): its `plain_bytes` what they made.
+  pub decode: PassCounts,
+  /// The most bytes one of those decodes made (main's ruling (b), its condition (1)).
+  pub decode_most: u64,
 }
 
 /// Why a chunk could not be made.
@@ -149,6 +154,13 @@ thread_local! {
         stored_bytes: 0,
         ns: 0,
       },
+      decode: PassCounts {
+        chunks: 0,
+        plain_bytes: 0,
+        stored_bytes: 0,
+        ns: 0,
+      },
+      decode_most: 0,
     })
   };
 }
@@ -214,6 +226,24 @@ pub fn decode_within(stored: &[u8], most: u64) -> Option<Vec<u8>> {
   let mut admission = crate::Admission::new(most.saturating_add(held));
   let plain = decode(stored, 0, &mut admission).ok()?;
   (u64::try_from(plain.len()).ok()? <= most).then_some(plain)
+}
+
+/// [`decode_within`] on a fetch's shard, counted on this thread ([`ChunkCounts::decode`], [`ChunkCounts::decode_most`]):
+/// a stored chunk a fetch sends as its delta.
+pub fn decode_counted(stored: &[u8], most: u64) -> Option<Vec<u8>> {
+  let start = now_ns();
+  let plain = decode_within(stored, most)?;
+  let spent = now_ns().saturating_sub(start);
+  COUNTS.with(|counts| {
+    let mut now = counts.get();
+    now.decode.chunks = now.decode.chunks.saturating_add(1);
+    now.decode.plain_bytes = now.decode.plain_bytes.saturating_add(to_u64(plain.len()));
+    now.decode.stored_bytes = now.decode.stored_bytes.saturating_add(to_u64(stored.len()));
+    now.decode.ns = now.decode.ns.saturating_add(spent);
+    now.decode_most = now.decode_most.max(to_u64(plain.len()));
+    counts.set(now);
+  });
+  Some(plain)
 }
 
 /// Whether a revlog whose chunks hold `data` bytes is inline (the module doc): one that may be (any but a changelog)

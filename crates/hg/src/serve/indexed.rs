@@ -113,6 +113,9 @@ pub struct Lends {
   pub in_place: u64,
   /// Texts copied: longer than a window, or a file revision's block and bytes put back together.
   pub copied: u64,
+  /// Manifests rebuilt whole from their chains (each its chain's root copied and its deltas applied): what a fetch
+  /// sends whole of a manifest it could send as its stored delta (main's churn at fed0b8164: 30.7% of a 57k clone's).
+  pub rebuilt: u64,
 }
 
 /// A served changeset from the first that is not public on: its changelog revision and its phase.
@@ -311,6 +314,7 @@ impl<'a> Indexed<'a> {
                   payload: identity,
                   offset: 0,
                   len,
+                  chunk: false,
                 },
               }
             }));
@@ -434,6 +438,9 @@ impl<'a> Indexed<'a> {
         let rebuilt = self.index.revision_text(self.store, log, rev);
         if rebuilt.is_some() {
           count_lend(&self.lends, false);
+          let mut now = self.lends.get();
+          now.rebuilt = now.rebuilt.saturating_add(1);
+          self.lends.set(now);
         }
         rebuilt.map(Cow::Owned)
       }

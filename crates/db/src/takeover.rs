@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::register::{
   Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise,
-  LEDGER_PROMISE_HEADER_BYTES, LedgerPrepare, LedgerPromise, Lineage, OBJECT_BYTES, ObjectId,
-  Prepare, Quorum, RegionalConfiguration, RegisterError,
+  LEDGER_PROMISE_HEADER_BYTES, LEDGER_READ_EPOCH, LedgerPrepare, LedgerPromise, LedgerRead,
+  Lineage, OBJECT_BYTES, ObjectId, Prepare, Quorum, RegionalConfiguration, RegisterError,
 };
 
 /// Which answers count as a member's promise of an object.
@@ -436,6 +436,7 @@ pub fn answer_ledger(
     positions: Vec::new(),
     next: None,
     fenced: None,
+    held_from: None,
   };
   let Some(acceptor) = acceptors.acceptor_mut(&prepare.object) else {
     return Some(promise);
@@ -466,17 +467,68 @@ pub fn answer_ledger(
     }
     Err(_) => return None,
   }
+  list_positions(
+    acceptor,
+    (prepare.object, prepare.from, prepare.to),
+    budget,
+    &mut promise,
+  );
+  Some(promise)
+}
+
+/// Lists every position `acceptor` holds of `object` in `from..to` into `answer`, ascending, until `budget` bytes (at
+/// least one position listed; where it stopped is `next`), and where its holding begins (`held_from`, the start rule):
+/// a read's whole answer, and a takeover's after its promise (A-919, main 01a20182's ruling: the question split).
+fn list_positions(
+  acceptor: &Acceptor,
+  (object, from, to): (ObjectId, u64, u64),
+  budget: usize,
+  answer: &mut LedgerPromise,
+) {
+  answer.held_from = acceptor.held_from(object);
   let mut used = LEDGER_PROMISE_HEADER_BYTES;
-  for accepted in acceptor.positions_between(prepare.object, prepare.from, prepare.to) {
+  for accepted in acceptor.positions_between(object, from, to) {
     let size = LedgerPromise::position_bytes(&accepted);
-    if !promise.positions.is_empty() && used.saturating_add(size) > budget {
-      promise.next = Some(accepted.sequence);
+    if !answer.positions.is_empty() && used.saturating_add(size) > budget {
+      answer.next = Some(accepted.sequence);
       break;
     }
     used = used.saturating_add(size);
-    promise.positions.push(accepted);
+    answer.positions.push(accepted);
   }
-  Some(promise)
+}
+
+/// `holder`'s answer to a current candidate's read of a ledger (A-919, [`LedgerRead`]): what its `acceptor` holds of the
+/// range, paged by `budget` as a takeover's answer is ([`list_positions`]), its holding's start beside it; `None` (it
+/// holds none of the ledger) answers the range covered with nothing held, which the start rule counts as no promise.
+/// Moves nothing: no authority installed, no fence raised. The caller authorizes the asker (a current candidate of the
+/// ledger, under the generation this holder has installed).
+pub fn read_ledger(
+  holder: HostId,
+  acceptor: Option<&Acceptor>,
+  read: &LedgerRead,
+  budget: usize,
+) -> LedgerPromise {
+  let mut answer = LedgerPromise {
+    holder,
+    departed: read.asker,
+    epoch: LEDGER_READ_EPOCH,
+    generation: read.generation,
+    object: read.object,
+    positions: Vec::new(),
+    next: None,
+    fenced: None,
+    held_from: None,
+  };
+  if let Some(acceptor) = acceptor {
+    list_positions(
+      acceptor,
+      (read.object, read.from, read.to),
+      budget,
+      &mut answer,
+    );
+  }
+  answer
 }
 
 /// Whether `promise` has answered any object yet, so a budget never leaves a question with no answer at all.
@@ -493,6 +545,10 @@ pub struct LedgerAnswered {
   pub positions: BTreeMap<u64, Accepted>,
   /// The position past the last its answer covers.
   pub covered_to: u64,
+  /// The lowest position its acceptor holds of the ledger, `None` for none (A-919, main 01a20182's start rule): its
+  /// answer names nothing only from here; below it, it covers nothing and only its reports count, and it counts toward
+  /// a cohort's size, not its promises, as a member gone does (A-309).
+  pub held_from: Option<u64>,
 }
 
 /// What phase one adopts of a ledger's range, position by position (A-364; §4.8 "For each ledger position ... adopts the
@@ -511,18 +567,47 @@ pub struct LedgerAdoption {
 
 /// The positions of a ledger's range `from..to` phase one adopts from `answers` (A-364), each member's answer counted per
 /// position as [`readiness`] counts a page's promise of an object under [`CountingRule::NamedAnswer`]: a member promised a
-/// position when it reported it, or when its answer covers it and lists nothing there. At each position, in order, once
-/// its cohorts (settled and current, members by `is_member`, under `quorum`) are ready, the value accepted under the
-/// highest epoch among the reports is adopted. The first position not ready, or ready with no report, ends the
-/// adoption: positions are adopted in order, since the merge plane ships a ledger's next position only once the last is
-/// placed, so a hole below a later position is never a committed prefix. Modelled by `docs/wip/models/FencedLedger.tla`
-/// (`PerPositionLog`), whose Continuity and AdoptedIsPrefix hold, and fail under the register's rule.
+/// position when it reported it, or when its answer covers it, lists nothing there and its holding begins at or below
+/// it (A-919's start rule). A green's merge chain is dense: each adopted position is the one after the last, the first
+/// the range's start ([`ledger_positions_chained`] with that chain). So a position ready with no report, passed over,
+/// ends the adoption at the next report, which does not continue it: exactly the positions the dense rule adopted
+/// before A-919, the merge plane shipping a ledger's next position only once the last is placed. Modelled by
+/// `docs/wip/models/FencedLedger.tla` (`PerPositionLog`), whose Continuity and AdoptedIsPrefix hold, and fail under the
+/// register's rule.
 pub fn ledger_positions(
+  cohorts: (&[Vec<HostId>], &[Vec<HostId>]),
+  is_member: impl Fn(HostId) -> bool,
+  quorum: Quorum,
+  (from, to): (u64, u64),
+  answers: &BTreeMap<HostId, LedgerAnswered>,
+) -> LedgerAdoption {
+  ledger_positions_chained(
+    cohorts,
+    is_member,
+    quorum,
+    (from, to),
+    answers,
+    |last: Option<&Accepted>, next: &Accepted| {
+      next.sequence == last.map_or(from, |last| last.sequence.saturating_add(1))
+    },
+  )
+}
+
+/// The one fold of a ledger's range (A-919, main 01a20182's ruling of 2026-11-25: continuity a parameter, never a
+/// variant). In order, at each position: not ready ends the adoption there; ready with no report holds no committed
+/// value (a committed one is held by a quorum, which every ready one meets) and is passed over; ready with a report
+/// adopts the value accepted under the highest epoch only where it `continues` the last adopted (the first: the
+/// chain's start, the caller's to say), else the adoption ends there, since a report past a missing link is never the
+/// committed prefix. A green's chain continues at the next position ([`ledger_positions`]); a state log's where a part's
+/// `from` is the last part's position, so a part past a missing one is a stray, never adopted. What is adopted is a
+/// prefix of the chain either way: AdoptedIsPrefix over the chain's links.
+pub fn ledger_positions_chained(
   (cohorts, current): (&[Vec<HostId>], &[Vec<HostId>]),
   is_member: impl Fn(HostId) -> bool,
   quorum: Quorum,
   (from, to): (u64, u64),
   answers: &BTreeMap<HostId, LedgerAnswered>,
+  continues: impl Fn(Option<&Accepted>, &Accepted) -> bool,
 ) -> LedgerAdoption {
   let mut adoption = LedgerAdoption::default();
   let no_complete = BTreeSet::new();
@@ -539,10 +624,21 @@ pub fn ledger_positions(
     let named_nothing: BTreeSet<HostId> = answers
       .iter()
       .filter(|(_, answered)| {
-        answered.covered_to > position && !answered.positions.contains_key(&position)
+        answered.covered_to > position
+          && !answered.positions.contains_key(&position)
+          && answered.held_from.is_some_and(|from| from <= position)
       })
       .map(|(host, _)| *host)
       .collect();
+    // A member that answered holding nothing at or below this position knows nothing of it (an owner's hold rebuilt
+    // empty at a restart, a candidate that joined past it): counted as one gone, toward the size, not the promises.
+    let below_start = |host: HostId| {
+      answers.get(&host).is_some_and(|answered| {
+        !answered.positions.contains_key(&position)
+          && answered.held_from.is_none_or(|from| position < from)
+      })
+    };
+    let is_member_here = |host: HostId| is_member(host) && !below_start(host);
     let heard = Heard {
       reports: &reports,
       complete: &no_complete,
@@ -552,7 +648,7 @@ pub fn ledger_positions(
     let verdict = readiness(
       cohorts,
       current,
-      &is_member,
+      is_member_here,
       quorum,
       &heard,
       CountingRule::NamedAnswer,
@@ -560,11 +656,16 @@ pub fn ledger_positions(
     let newest = reports
       .into_values()
       .reduce(|best, next| if next.epoch > best.epoch { next } else { best });
+    let past = matches!(verdict, Readiness::ReadyPastTolerance { .. });
     match (verdict, newest) {
-      (Readiness::Ready, Some(newest)) => adoption.adopted.push(newest),
-      (Readiness::ReadyPastTolerance { .. }, Some(newest)) => {
-        adoption.past_tolerance = true;
+      (Readiness::Ready | Readiness::ReadyPastTolerance { .. }, Some(newest))
+        if continues(adoption.adopted.last(), &newest) =>
+      {
+        adoption.past_tolerance |= past;
         adoption.adopted.push(newest);
+      }
+      (Readiness::Ready | Readiness::ReadyPastTolerance { .. }, None) => {
+        adoption.past_tolerance |= past;
       }
       _ => {
         adoption.stopped_at = Some(position);
@@ -606,6 +707,7 @@ mod tests {
         })
         .collect(),
       covered_to,
+      held_from: Some(0),
     }
   }
 
@@ -650,8 +752,10 @@ mod tests {
       (a, answered(&[(4, 2, 40)], 5)),
       (b, answered(&[], 5)),
     ]));
+    // A-919: the empty position 3 is passed over and the report at 4, which does not continue the chain, ends the
+    // adoption there: nothing adopted, as before.
     assert!(
-      hole.adopted.is_empty() && hole.stopped_at == Some(3),
+      hole.adopted.is_empty() && hole.stopped_at == Some(4),
       "{hole:?}"
     );
     let paged = adopt(BTreeMap::from([
@@ -669,6 +773,157 @@ mod tests {
       ),
       (vec![3], Some(4)),
       "a position one member's answer did not reach waits for it"
+    );
+  }
+
+  /// A-919 (main 01a20182's ruling of 2026-11-25: continuity one rule, a parameter). Do: a state log's parts at 10 (from
+  /// 0) and 30 (from 20), both members reporting both and naming nothing at 20; fold 0 to 31 with a part's continuity
+  /// (its `from` the last part's position; the first, from 0). Expect the part at 10 adopted, positions ready and empty
+  /// passed over, and the fold stopped at 30, a stray past the missing part at 20, never adopted.
+  #[test]
+  fn a_state_logs_fold_adopts_only_parts_that_continue_the_last() {
+    let (owner, a, b) = (HostId(9), HostId(1), HostId(2));
+    let cohorts = vec![vec![owner, a, b]];
+    let is_member = |host: HostId| host != owner;
+    let part = |sequence: u64, from: u8| (sequence, 1, from);
+    let answers = BTreeMap::from([
+      (a, answered(&[part(10, 0), part(30, 20)], 31)),
+      (b, answered(&[part(10, 0), part(30, 20)], 31)),
+    ]);
+    // The value's one byte stands for the part's `from`.
+    let continues = |last: Option<&Accepted>, next: &Accepted| {
+      next.value.first().copied().map(u64::from) == Some(last.map_or(0, |last| last.sequence))
+    };
+    let adoption = ledger_positions_chained(
+      (&cohorts, &[]),
+      is_member,
+      Quorum { f: 1 },
+      (0, 31),
+      &answers,
+      continues,
+    );
+    assert_eq!(
+      (
+        adoption
+          .adopted
+          .iter()
+          .map(|accepted| accepted.sequence)
+          .collect::<Vec<_>>(),
+        adoption.stopped_at
+      ),
+      (vec![10], Some(30))
+    );
+  }
+
+  /// one position with the next to ask; and the acceptor's authority and fence as they were (a read moves nothing).
+  #[test]
+  fn a_read_lists_what_a_candidate_holds_with_its_start_and_moves_nothing() {
+    let object = ObjectId::new(HostId(1), 4);
+    let mut acceptor = Acceptor::new(
+      HostId(2),
+      Authority {
+        generation: 7,
+        owner: HostId(1),
+      },
+    );
+    for sequence in 2..=4 {
+      acceptor
+        .accept(&crate::register::Record {
+          owner: HostId(1),
+          object,
+          sequence,
+          epoch: HostEpoch(1),
+          generation: 7,
+          value: vec![u8::try_from(sequence).unwrap_or(u8::MAX)],
+        })
+        .unwrap();
+    }
+    let (authority, fence) = (acceptor.authority(), acceptor.fence());
+    let read = LedgerRead {
+      asker: HostId(3),
+      generation: 7,
+      object,
+      from: 0,
+      to: 5,
+    };
+    let whole = read_ledger(HostId(2), Some(&acceptor), &read, usize::MAX);
+    assert!(read.answers(&whole), "bound to the read: {whole:?}");
+    assert_eq!(
+      (
+        whole
+          .positions
+          .iter()
+          .map(|accepted| accepted.sequence)
+          .collect::<Vec<_>>(),
+        whole.held_from,
+        whole.next
+      ),
+      (vec![2, 3, 4], Some(2), None)
+    );
+    let paged = read_ledger(
+      HostId(2),
+      Some(&acceptor),
+      &read,
+      LEDGER_PROMISE_HEADER_BYTES,
+    );
+    assert_eq!((paged.positions.len(), paged.next), (1, Some(3)));
+    assert_eq!(
+      (acceptor.authority(), acceptor.fence()),
+      (authority, fence),
+      "nothing moved"
+    );
+    let none = read_ledger(HostId(2), None, &read, usize::MAX);
+    assert!(
+      none.positions.is_empty() && none.held_from.is_none(),
+      "{none:?}"
+    );
+    assert_eq!(LedgerRead::decode(&read.encode()), Ok(read.clone()));
+    assert!(LedgerRead::decode(&read.encode()[1..]).is_err());
+    let mut other = whole;
+    other.epoch = HostEpoch(1);
+    assert!(!read.answers(&other), "a promise is no read's answer");
+  }
+
+  /// A-919 (main 01a20182's start rule of 2026-11-25). Do: a cohort of the owner, an old holder and the departed at `f =
+  /// 1`; position 3 committed at epoch 2 on the owner and the departed, the old holder still at epoch 1 there; the
+  /// owner's hold rebuilt at a restart, so it holds from 5 and answers the range naming nothing below. Expect position 3
+  /// counted past tolerance (the owner counted as one gone there, the cohort short), never Ready on the old holder's
+  /// epoch 1 with the owner's silence as a promise. Red before: Ready, epoch 1 adopted as within tolerance.
+  #[test]
+  fn an_answer_names_nothing_only_from_the_first_position_it_holds() {
+    let (departed, owner, old) = (HostId(9), HostId(1), HostId(2));
+    let cohorts = vec![vec![departed, owner, old]];
+    let is_member = |host: HostId| host != departed;
+    let quorum = Quorum { f: 1 };
+    let mut restarted = answered(&[(5, 2, 50)], 6);
+    restarted.held_from = Some(5);
+    let adoption = ledger_positions(
+      (&cohorts, &[]),
+      is_member,
+      quorum,
+      (3, 4),
+      &BTreeMap::from([(owner, restarted), (old, answered(&[(3, 1, 31)], 6))]),
+    );
+    assert!(
+      adoption.past_tolerance,
+      "the owner's silence below its start is no promise: {adoption:?}"
+    );
+    let mut whole = answered(&[(3, 2, 30)], 6);
+    whole.held_from = Some(0);
+    let within = ledger_positions(
+      (&cohorts, &[]),
+      is_member,
+      quorum,
+      (3, 4),
+      &BTreeMap::from([(owner, whole), (old, answered(&[(3, 1, 31)], 6))]),
+    );
+    assert_eq!(
+      (
+        within.adopted.first().map(|accepted| accepted.epoch.0),
+        within.past_tolerance
+      ),
+      (Some(2), false),
+      "an owner holding from the start answers within tolerance, the committed epoch adopted"
     );
   }
 
