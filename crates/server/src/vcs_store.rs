@@ -1057,6 +1057,18 @@ impl VcsStores {
     }
   }
 
+  /// The git repository whose store here holds pack `pack`, where one does: whose cache a window of it a read brought
+  /// back is (`vcs_share::read_backs`, §4.17.5 "The cold trigger"). A scan of this shard's git stores' packs,
+  /// `O(repositories × packs)`, asked only on a bring-back, which has already waited on the node's store.
+  pub(crate) fn git_holding_pack(&self, pack: &slates_vcs::ContentId) -> Option<RepositoryId> {
+    self.entries.iter().find_map(|(id, entry)| match entry {
+      RepositoryStore::Git(store) if store.repository.packs().any(|(held, _)| held == *pack) => {
+        Some(*id)
+      }
+      _ => None,
+    })
+  }
+
   /// The Subversion repository whose records keep the text `identity` stored on the node's store (C2 stage B), where
   /// one held here does: whose changesets a let-go window of it is read back from (A-760 (b) 4d).
   pub(crate) fn subversion_storing(&self, identity: &[u8; 32]) -> Option<RepositoryId> {

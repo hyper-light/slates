@@ -20271,6 +20271,9 @@ async fn rebuild_green_record(
     .cloned();
   // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
   // once it is replayed.
+  // The landed texts it names that the restored store holds whole, read before anything is brought back: let go once it
+  // is replayed, as what is brought back is (TSan diag 45557094379).
+  let found_whole = crate::vcs_store::svn_texts::named_found_whole(state, record.id);
   let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
   // A Mercurial green's named bases its replay reads, by the revisions its checkpoint's and chain's changesets name
   // (A-887), let go again once it is replayed: a landed text's bytes are the node's store's.
@@ -20280,6 +20283,7 @@ async fn rebuild_green_record(
     None => rebuild_green_sliced(state, record, slices).await,
   };
   crate::vcs_store::name_holds::give_back_brought(state, &brought);
+  crate::vcs_store::svn_texts::let_go_found_whole(state, &found_whole);
   crate::vcs_store::name_holds::let_go_landed_texts(state, &brought_hg);
   for version in versions {
     crate::merge_service::enqueue_recovered_record(state, record.id, version);

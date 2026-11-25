@@ -193,6 +193,13 @@ pub(crate) struct ReadPin {
   windows: Vec<ContentId>,
 }
 
+/// Pins `windows` as a reader's own ([`ReadPin`]): a home's read that brings an object's let-go windows back holds them
+/// until it has read them, so no let-go lands between a window's bring-back and its read (`homes::read`; main 01a20182's
+/// ruling of 2026-11-25). Bounded by the object's own windows: one pin a window it lies in, dropped as the read ends.
+pub(crate) fn pin_windows(windows: Vec<ContentId>) -> ReadPin {
+  ReadPin::of(windows)
+}
+
 impl ReadPin {
   /// `windows` kept.
   fn of(windows: Vec<ContentId>) -> ReadPin {
@@ -523,15 +530,26 @@ async fn bring_back_text_window(
     at = at.saturating_add(u64::try_from(taken.len()).unwrap_or(u64::MAX));
   }
   crate::state::with_state(|state| {
-    super::within_budget(state, width, |stores| {
+    let brought = super::within_budget(state, width, |stores| {
       let content = stores.content_mut().ok_or(ReadThroughRefused::NoStore)?;
       if !content.is_away(&window) {
-        return Ok(());
+        return Ok(false);
       }
       content
         .bring_back(&window, &bytes)
+        .map(|()| true)
         .map_err(ReadThroughRefused::Refused)
-    })
+    });
+    // A read-back, its repository's to cache within its grant (`vcs_share::read_backs`, §4.17.5 "The cold trigger").
+    if let Ok(true) = brought {
+      crate::vcs_share::read_backs::brought_back(
+        state,
+        window,
+        width,
+        crate::vcs_share::read_backs::Holder::Text(repository),
+      );
+    }
+    brought.map(drop)
   })
   .ok_or(ReadThroughRefused::NoStore)?
 }
