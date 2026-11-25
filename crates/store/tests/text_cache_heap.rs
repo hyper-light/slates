@@ -561,3 +561,43 @@ fn a_text_read_in_slices_past_a_piece_leaves_no_walk_in_flight() {
     "bound {largest_bound} or reserved {largest_reserved} past one chunk and a text, {most}, with every text read to its end"
   );
 }
+
+/// Goal 93 (main's churn ruling of 2026-11-25: hg's 57k push mapped 4.5 GB of the text cache's chunks, 80.9% of its
+/// mapped churn, each a fresh mapping faulted in and unmapped as the oldest went; measured 2026-11-23, a fresh 1 MiB
+/// chunk 240 us against 85 us kept and refilled, `a_fresh_chunk_against_a_kept_one`). Do: land the chain; on a cache
+/// bounded to two chunks, read every version on a cold cache, so the cache lays many chunks and gives the oldest back as
+/// it goes. Expect every version's bytes as landed; texts let go at the bound (the cache cycled); and the chunks mapped
+/// fresh no more than the two the bound holds: each later chunk laid in the one just given back. Red before: a fresh
+/// mapping for every chunk laid.
+#[test]
+fn a_cache_lays_its_next_chunk_in_the_one_it_gives_back() {
+  let dir = scratch("chunk-reuse");
+  let mut store = open(&dir);
+  let identities = land_chain(&mut store);
+  let staging = Staging::new(0);
+  let chunk = slates_mem::large::floor() as u64;
+  let mut cache = TextCache::new(2 * chunk);
+  for identity in &identities {
+    let bytes = store
+      .text_at(&staging, 1, identity, 0, &mut cache)
+      .unwrap()
+      .unwrap();
+    assert_eq!(
+      *blake3::hash(bytes).as_bytes(),
+      *identity,
+      "a version's bytes as landed"
+    );
+  }
+  println!(
+    "text_cache_heap: {} versions of {TEXT} B through a two-chunk cache: {} chunks mapped fresh, {} texts let go",
+    identities.len(),
+    cache.chunks_mapped,
+    cache.let_go
+  );
+  assert!(cache.let_go > 0, "the cache gave texts back at its bound");
+  assert!(
+    cache.chunks_mapped <= 2,
+    "{} chunks mapped fresh through a two-chunk bound",
+    cache.chunks_mapped
+  );
+}

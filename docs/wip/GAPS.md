@@ -1809,7 +1809,15 @@
 > piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
 > x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
 > reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
-> read whole against one chunk and a text, 1,246,184; now 1,048,576). The batch itself was sized by the fetch's room
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). The cache's chunks churned: each a fresh mapping
+> of the allocator's floor, faulted in and unmapped as the oldest went (hg's 57k push mapped 4.5 GB of them, 80.9% of
+> its mapped churn; a fresh 1 MiB chunk 240 us against 85 us kept). Now the chunk the room was made from is laid again
+> when it is an ordinary one of the length wanted, held for no longer than that call so the bound holds
+> (`TextCache::chunks_mapped`; `a_cache_lays_its_next_chunk_in_the_one_it_gives_back`: red, 7 chunks mapped fresh for
+> 400 texts through a two-chunk cache; now 2). A text the owner answers in slices is assembled in the asker's buffer,
+> handed to the owner and back a request, no slice a buffer of its own (`StoreHandle::text_slice_into`; hg's 57k clone
+> allocated 6.2 GB in those answers, 15.3% of its system churn; `owner_slices_heap`: red, 331,464 bytes allocated for a
+> 307,200-byte text read in 64 KiB slices; now 24,264). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
@@ -2850,8 +2858,25 @@
 > pages kept past it are pages no batch of the import refills. Counted `repository.svn_import.purged_past_bound_bytes`.
 > Red `an_imports_arena_keeps_no_more_resident_free_than_its_bound` (16 MiB of rewrites at a bound of two units,
 > published each turn): 6,250,496 bytes resident and free as the import ended against a keep of 4,202,496; now
-> 2,449,408, 3,801,088 given back. OWED: main's fourth P7 arm; the deferred frees of the import's last batch wait for the
-> next publication and the idle purge, as any shard's do.
+> 2,449,408, 3,801,088 given back. Main's fourth P7 arm (2b977b986): the recorded resident free within the bound each
+> round; the last batches' deferred frees (A-64) and free space the purge does not record ended above it, and the
+> resident free gauge read above the arena's mapped bytes in the other arms (116.7 MB against 33.6). That gauge's drift
+> fixed (w-perf; main's ruling of 2026-11-25): a region shrunk back to the pool took its recorded freed blocks out of
+> the arena but not out of the count, and a recovery's commit (`settle`) counted blocks it released unscrubbed, which no
+> region records; the count is now what the regions record, held by
+> `the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink` (an arena growing from a pool, a seeded
+> mix of allocate, free, captured free, commit live, purge and shrink; red at step 59). The storage test reads the gauges
+> again once a publication has released the import's deferred frees (main's claim: deferred 0 and free within the
+> keep by then). The purge's kept-short runs (shorter than the discard size) stay recorded now (main's ruling of
+> 2026-11-25): taken out of the record with their pages resident, no later purge or coalesce saw them again, free space a
+> long-lived daemon lost without bound; recorded, a later free beside one joins it into a run a purge gives back
+> (`a_run_kept_short_stays_recorded_so_a_later_free_beside_it_goes_back`: red, the second purge gave back nothing; now
+> the joined two pages). An idle purge walks nothing while no recorded run reaches the discard size (main's ruling of
+> 2026-11-25: kept runs recorded made every idle pass walk them, an idle daemon's CPU and wakeups growing with
+> fragmentation): a mark that makes a run that long owes the next walk (`UnitSet::run_reaches`, a scan bounded by the
+> discard size), a walk's start clears it (`an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size`:
+> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). OWED: a
+> grown region's never-used space, should the arm show it.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
@@ -4569,6 +4594,11 @@
 >   ubuntu-latest and 30 of 30 on ubuntu-24.04-arm**, the six changeset evolution rows (ad36e5f09) among them.
 >   Windows pending: run 6's windows-latest leg failed every row at exit 127 on the workflow's own wrapper path (bash
 >   dropped `D:\a\_temp`'s backslashes), not slates; ade67baf3 passes it as a Unix path, for run 7.
+> - **Windows hg, CLOSED by use (2026-11-25):** run 8 (45624253901, `diag-measurer-main-interop-linux-8` at 8143c35a6,
+>   with 0e73ff11d) passed the hg matrix on windows-latest, ubuntu-latest and ubuntu-24.04-arm, the evolution rows
+>   included. Run 7 (45612515778) had passed 24 of 30 on Windows: `evo-repository` pasted the binary's Windows path into
+>   its shell's command, which took its backslashes, and the five rows after it failed on the missing repository;
+>   0e73ff11d passes the path through the environment.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
