@@ -1742,14 +1742,16 @@ fn uses_of(plan: &[WorkKey]) -> BTreeMap<WorkKey, usize> {
 
 /// Gives a push's fork back where its landing will not take it.
 fn give_back(forked: Option<Forked>) {
-  let Some(forked) = forked else {
-    return;
-  };
-  let _ = crate::state::with_state(|state| give_back_in(state, forked));
+  if forked.is_some() {
+    let _ = crate::state::with_state(|state| give_back_in(state, forked));
+  }
 }
 
 /// [`give_back`] on a shard whose state the caller holds already (a nested `with_state` would answer nothing).
-fn give_back_in(state: &mut ShardState, forked: Forked) {
+fn give_back_in(state: &mut ShardState, forked: Option<Forked>) {
+  let Some(forked) = forked else {
+    return;
+  };
   if release_index(state, forked.fork).is_err() {
     state.count(vcs_store::RELEASE_REFUSED, 1);
   }
@@ -3676,9 +3678,7 @@ pub(crate) fn land_in(
     }
     // Built from the plan its landing judges, it misses no work; were it to, its fork goes back as a refusal's does.
     Landing::Unbuilt(back) => {
-      if let Some(forked) = *back {
-        give_back_in(state, forked);
-      }
+      give_back_in(state, *back);
       settled_whole(state, run, false);
       None
     }
