@@ -1506,7 +1506,7 @@ fn sent_chunk_bytes(answer: &[u8]) -> u64 {
         return 0;
       }
       let log = crate::revlog::Revlog::open(bytes, &[], &mut room()).unwrap();
-      let entries = u64::try_from(log.len()).unwrap() * 64;
+      let entries = u64::from(log.len()) * 64;
       if log.outline().inline() {
         u64::try_from(bytes.len()).unwrap() - entries
       } else {
