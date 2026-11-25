@@ -1,8 +1,8 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 22:26 PST): gate 17 at 040a3a69b, w-shared's A-912 (040a3a69b: the coordinator's home exchanges on one
-# lane, a home behind answering Behind at once with the sender's re-ask on the council round, and a homing budget derived
-# from detection and the takeover's churn). Gate 16 (b7e65cc63) passed 40 of 40. Twenty release then twenty debug runs,
-# stopped after the first three if all three fail. Run only from diag-measurer-main-v3-* branches.
+# main 01a20182 (2026-11-24 23:14 PST): gate 18 at 1fe3a3b05, w-shared's A-913 (1fe3a3b05: a holder's record path makes a missing
+# branch source). Gate 17 (040a3a69b, A-912) passed 39 of 40; its one failure (release 3, "no survivor served the
+# repository") is the older replica-build Missing seen in gate 10 debug-7, its own piece. Twenty release then twenty
+# debug runs, stopped after the first three if all three fail. Run only from diag-measurer-main-v3-* branches.
 on:
   push:
     branches: ["diag-measurer-main-v3-*"]
@@ -12,13 +12,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 17 at 040a3a69b)
+    name: v3_takeover (gate 18 at 1fe3a3b05)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 040a3a69bad2f49ec8f139e3a294a6a3015842f9
+          ref: 1fe3a3b053e79620a347594188dc598bdc07ad78
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -49,7 +49,7 @@ jobs:
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 17: $pass of $ran passed"
+          echo "== gate 18: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -59,5 +59,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate17
+          name: v3-gate18
           path: ${{ runner.temp }}/*.log
