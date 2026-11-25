@@ -609,10 +609,14 @@ async fn canonical_in(doc: slates_merge::ops_doc::OpsDoc) -> Option<slates_merge
   }
 }
 
+/// A revision's records waiting to be applied once its verdict is committed ([`Staging::staged_in`]): its check, its
+/// encoded record, and the bytes its increment adds ([`post_bytes`]); taken when they are applied.
+type ToRecord = Option<(Checked, Vec<u8>, u64)>;
+
 /// Where a revision's staging stands between its steps ([`Staging::staged_in`]).
 enum StagingAt {
-  /// Built, to be judged.
-  Judging(Increment),
+  /// Built, to be judged (boxed: an increment is far larger than the other states).
+  Judging(Box<Increment>),
   /// Its verdict being committed into the scratch member.
   Committing,
   /// Kept in the batch, the records to apply.
@@ -1004,7 +1008,7 @@ impl Staging {
   ) -> Option<Result<StagedIn, Uncommitted>> {
     let growth = grown(&checked);
     let post = post_bytes(&built);
-    let mut at = StagingAt::Judging(built);
+    let mut at = StagingAt::Judging(Box::new(built));
     let mut recording = Some((checked, record, post));
     loop {
       let stepped = within_records(repository, lent, |state| {
@@ -1024,12 +1028,12 @@ impl Staging {
     &mut self,
     state: &mut ShardState,
     (repository, growth): (RepositoryId, u64),
-    (at, recording): (&mut StagingAt, &mut Option<(Checked, Vec<u8>, u64)>),
+    (at, recording): (&mut StagingAt, &mut ToRecord),
   ) -> Result<Option<StagedIn>, Uncommitted> {
     let deadline = slice_deadline_ns();
     let (judged, recording_now) = match std::mem::replace(at, StagingAt::Committing) {
       StagingAt::Judging(built) => (
-        self.judged_in(state, (repository, growth, deadline), built)?,
+        self.judged_in(state, (repository, growth, deadline), *built)?,
         false,
       ),
       StagingAt::Committing => (

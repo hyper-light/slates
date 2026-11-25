@@ -274,6 +274,7 @@ impl Hook {
       stdin: ChildStream::Fd(input_read.as_fd()),
       stdout,
       stderr: ChildStream::Fd(words_write.as_fd()),
+      handed: &[],
     });
     // A test's foreign holder of the words stream (`HOLD_WORDS_ABROAD`): a plain `std::process::Command` child given the
     // write end, as a spawn by anyone else in the process lands in the window between a macOS pipe and its close-on-exec.
@@ -613,6 +614,7 @@ pub(crate) async fn run_helper(
     stdin: ChildStream::Null,
     stdout: ChildStream::Null,
     stderr: ChildStream::Null,
+    handed: &[],
   })
   .map_err(|error| format!("could not be started: {error}"))?;
   let exit = ExitWatch::on(child.id()).ok();

@@ -21,7 +21,7 @@ use std::ops::Range;
 
 use slates_vcs::{ContentId, ContentStore, Writing};
 
-use super::{Frame, Refused, Stage, Stepped, StoreAsk, Taker, log_of, to_u64};
+use super::{Frame, Refused, Spares, Stage, Stepped, StoreAsk, Taker, log_of, to_u64};
 use crate::delta::{self, BaseRead, Filled, Patching};
 use crate::filerev::MARKER;
 use crate::framing::Source;
@@ -395,7 +395,7 @@ impl Taker {
             patched.framing = Framing::Block(head);
           } else {
             patched.framing = Framing::Bytes(Vec::new());
-            put_bytes(&mut patched.writing, store, &head)?;
+            put_bytes((&mut patched.writing, &mut self.spares), store, &head)?;
           }
         }
         Framing::Block(block) => {
@@ -419,11 +419,11 @@ impl Taker {
           })?;
           let framing = core::mem::take(block);
           patched.framing = Framing::Bytes(framing);
-          put_bytes(&mut patched.writing, store, &bytes)?;
+          put_bytes((&mut patched.writing, &mut self.spares), store, &bytes)?;
           return Ok(());
         }
         Framing::Bytes(_) => {
-          put_bytes(&mut patched.writing, store, rest)?;
+          put_bytes((&mut patched.writing, &mut self.spares), store, rest)?;
           return Ok(());
         }
       }
@@ -581,7 +581,10 @@ impl Taker {
     };
     let kept = match writing {
       Some(mut writing) => match store.finish_object(&mut writing) {
-        Ok(kept) => Some(kept),
+        Ok(kept) => {
+          self.spares.give(writing.take_buffer());
+          Some(kept)
+        }
         Err(refused) => {
           store.abandon_object(writing);
           return Err(Refused::Unindexed(super::Unindexed::from(refused)));
@@ -641,16 +644,20 @@ struct Unread {
   node: Node,
 }
 
-/// Puts `bytes`, a file revision's bytes, through the store's streamed put, its object begun at the first.
+/// Puts `bytes`, a file revision's bytes, through the store's streamed put, its object begun at the first over a buffer
+/// the push let go ([`Spares`], given back once the object is kept: [`Taker::patched_kept`]). Until 2026-11-25 each
+/// object began its window's buffer empty and grew it by doubling to the file's length, a file's text and more a
+/// revision (bisected to 4885954fa: 14,007 B to 184,743 B a revision of a 160 KiB file; main's 57k push, 4.12 GB in
+/// `put_window` under this put).
 fn put_bytes(
-  writing: &mut Option<Writing>,
+  (writing, spares): (&mut Option<Writing>, &mut Spares),
   store: &mut ContentStore,
   bytes: &[u8],
 ) -> Result<(), Refused> {
   if bytes.is_empty() {
     return Ok(());
   }
-  let writing = writing.get_or_insert_with(|| store.begin_object());
+  let writing = writing.get_or_insert_with(|| store.begin_object_reusing(None, spares.take()));
   store
     .put_window(writing, bytes)
     .map_err(|refused| Refused::Unindexed(super::Unindexed::from(refused)))
