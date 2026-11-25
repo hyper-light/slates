@@ -82,6 +82,11 @@ impl Base {
 }
 
 /// How a manifest's row keeps its content.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "one Keeping a manifest revision, made once and moved into the revision's own state, never held in a \
+            collection: boxing the diff's state would allocate per manifest to shrink a value that is never stored"
+)]
 enum Keeping {
   /// The client's delta itself, against the row the fork holds last: put a window a step from the changegroup.
   Delta {
@@ -225,7 +230,7 @@ impl Taker {
     })?;
     // A whole is kept as its raw text (the store's contract, A-767 C1): its place past the one hunk it arrived in.
     let place = if revision.base == NULL_NODE {
-      let start = delta::whole_text_start(revision.data).ok_or_else(|| Unverified::NotWhole {
+      let start = delta::whole_text_start(revision.data).ok_or(Unverified::NotWhole {
         log: LogOf::Manifests,
         node: revision.node,
       })?;

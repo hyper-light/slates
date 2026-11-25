@@ -1253,13 +1253,33 @@ fn fetch_under_depth(want: ObjectId, depth: u64) -> Vec<u8> {
   request("fetch", &arguments)
 }
 
-/// The shard's counts of a fetch's position lookups and its cache's hits now.
-fn position_counts(state: &ShardState) -> (u64, u64) {
+/// A fetch's counts of its walk's ids: resolved through the index, answered by its cache, and of the first those whose
+/// slot held another id.
+type PositionCounted = (u64, u64, u64);
+
+/// The shard's [`PositionCounted`] now.
+fn position_counts(state: &ShardState) -> PositionCounted {
   let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
   (
     count(super::POSITION_LOOKUPS),
     count(super::POSITION_CACHE_HITS),
+    count(super::POSITION_CACHE_CONFLICTS),
   )
+}
+
+/// [`pushed_line`]'s line, as repository `name` on an audit shard, fetched whole under a depth filter past it: its
+/// distinct objects, what the fetch counted ([`PositionCounted`]), and the objects its pack sent.
+fn line_fetched(name: &'static str) -> (usize, PositionCounted, usize) {
+  crate::test_store::audit_on_stored_shard(name, move |state| {
+    let (id, head, distinct) = pushed_line(state, name);
+    let before = position_counts(state);
+    let asked = fetch_under_depth(head, PAST_THE_LINE);
+    let (answer, _) = fetched_with_counters(state, (id, &owner()), &asked);
+    let after = position_counts(state);
+    let sent = ids_in(&pack_of(&answer)).len();
+    let counted = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+    (distinct, counted, sent)
+  })
 }
 
 /// A-911 (main 01a20182, 2026-11-24: a partial clone's walk before its pack spent 22,771 of 23,095 samples resolving
@@ -1270,16 +1290,7 @@ fn position_counts(state: &ShardState) -> (u64, u64) {
 /// met (at most three times the line's distinct objects), not once an entry of every version; and the pack whole.
 #[test]
 fn a911_the_walk_resolves_each_id_met_again_once_not_in_every_trees_version() {
-  let (distinct, (lookups, hits), sent) =
-    crate::test_store::audit_on_stored_shard("a911-line", |state| {
-      let (id, head, distinct) = pushed_line(state, "a911-line");
-      let before = position_counts(state);
-      let asked = fetch_under_depth(head, PAST_THE_LINE);
-      let (answer, _) = fetched_with_counters(state, (id, &owner()), &asked);
-      let after = position_counts(state);
-      let sent = ids_in(&pack_of(&answer)).len();
-      (distinct, (after.0 - before.0, after.1 - before.1), sent)
-    });
+  let (distinct, (lookups, hits, _), sent) = line_fetched("a911-line");
   let met = u64::try_from(LINE_COMMITS * LINE_FILES).unwrap();
   let distinct_objects = u64::try_from(distinct).unwrap();
   eprintln!(
@@ -1293,5 +1304,21 @@ fn a911_the_walk_resolves_each_id_met_again_once_not_in_every_trees_version() {
   assert!(
     lookups <= 3 * distinct_objects,
     "resolved about once an object, not an entry a version: {lookups} lookups for {distinct} objects"
+  );
+}
+
+/// A-911's miss counter (main 01a20182's order of 2026-11-25: whether a fetch's misses are ids its direct-mapped cache
+/// put out of a slot another took, or ids met past what it holds, decides between more ways a slot and a wider window).
+/// Do: fetch [`pushed_line`]'s line whole under a depth filter past it, as the A-911 test does. Expect: of the ids
+/// resolved through the index, some counted conflicts (60 ids a commit in 512 slots: about one in nine shares its slot,
+/// and those two put each other out every commit), never more than the lookups. Red before: none counted.
+#[test]
+fn a911_a_miss_into_a_slot_another_id_holds_is_counted_a_conflict() {
+  let (_, (lookups, _, conflicts), _) = line_fetched("a911-conflicts");
+  eprintln!("a911: {lookups} lookups, {conflicts} of them conflicts");
+  assert!(conflicts > 0, "conflicts counted: {conflicts} of {lookups}");
+  assert!(
+    conflicts <= lookups,
+    "a conflict is a lookup: {conflicts} of {lookups}"
   );
 }

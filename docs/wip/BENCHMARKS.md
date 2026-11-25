@@ -19548,3 +19548,28 @@ What it says:
   s), the Mercurial import's pattern before its pipelining: each of the 180 batches' flushes awaited in turn. Owed: the
   batches' landings pipelined, as the Mercurial import's segments are (main's ruling).
 
+## The git incremental fetch, traced: no server time left to cut (goal 93 perf; main 01a20182's round 2 on the MacBook, binary f8fe97e5e, 2026-11-25; w-git's reading)
+
+**Closed.** The loaded round put slates' incremental fetch at 3.2 times stock's best (1.522 s against `git daemon`'s
+0.478). Traced, that gap is HTTP's own client-side cost: over the same transport slates is the faster server.
+
+- **Command.** The git leg's incremental fetch (`git -C <mirror> fetch -q` of a 1,027-ref mirror after one pushed
+  commit), run once against each server under `GIT_TRACE`, `GIT_TRACE_PACKET`, `GIT_TRACE_CURL` (headers redacted) and
+  `GIT_TRACE_PERFORMANCE`. Traces: `~/.cache/main-rounds/interop-speed-mac-2/git-1/work/logs/git/trace.ifetch-*-1`.
+  MacBook (M5 Max, 18 cores), loaded; the tracing's own writes add to each run.
+- **Each server's time, request by request** (from the request's last byte sent to its answer's last byte received):
+
+| request | slates (HTTP) | stock `git-http-backend` |
+|---|---|---|
+| `info/refs` | ~17 ms | ~106 ms |
+| `ls-refs` (1,027 refs) | 31 ms | 75 ms |
+| `fetch` (one commit's pack) | 27 ms | 184 ms |
+| **server, all requests** | **~75 ms** | **~365 ms** |
+
+- **The whole fetch** (`GIT_TRACE_PERFORMANCE`): slates 0.949 s (its `remote-http` helper 0.786 s); stock over HTTP
+  1.113 s (0.983 s); stock `git daemon` 0.602 s, with no helper.
+- **Where the rest goes: the client.** Between `ls-refs` and `fetch` the client works ~470 ms on the 1,027-ref mirror
+  (474 ms against slates, 462 against stock HTTP); then it spawns `unpack-objects` and finishes the helper, under load.
+  Slates' whole answer was in at 03.116 (curl: the connection left intact), and the helper exited at 03.352. The gap to
+  `git daemon` is the HTTP helper's process and its exchange, which stock's HTTP server pays the same.
+

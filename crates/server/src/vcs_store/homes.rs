@@ -549,18 +549,15 @@ pub(crate) async fn read(
   let bytes = match at_home().await {
     Some(Ok(bytes)) => bytes,
     // A window let go where a landed pack or revision carried it, or a home that did not answer in time: brought back on
-    // its home from the node's store by its record, then read again (goal 93 item 2b(b)).
-    Some(Err(HomeReadRefused::NotHeld)) | None => {
-      crate::xshard::task_in_shard_time(
-        origin,
-        target,
-        move || bring_back_landed(identity),
-        budget_ns,
-      )
-      .await
-      .ok_or(HomeReadRefused::Unanswered)??;
-      at_home().await.ok_or(HomeReadRefused::Unanswered)??
-    }
+    // its home from the node's store by its record and read there, as one task holding its windows (goal 93 item 2b(b)).
+    Some(Err(HomeReadRefused::NotHeld)) | None => crate::xshard::task_in_shard_time(
+      origin,
+      target,
+      move || read_brought_back(identity),
+      budget_ns,
+    )
+    .await
+    .ok_or(HomeReadRefused::Unanswered)??,
     Some(Err(refused)) => return Err(refused),
   };
   // A home answers the bytes it keeps under the identity, which its store named by their hash; checked again here, so a
@@ -1044,6 +1041,36 @@ pub(crate) fn record_landed_here(
 pub(crate) const LANDED_HOME_LET_GO_BYTES: &str = "vcs_store.homes.landed_let_go_bytes";
 /// Format: the status counter of windows a home brought back from the node's store by their record.
 pub(crate) const LANDED_BROUGHT_BACK: &str = "vcs_store.homes.landed_brought_back";
+
+/// The object `identity` read on its home once its let-go windows are brought back, as one task (main 01a20182's ruling
+/// of 2026-11-25): every window of it away pinned first (`named_objects::pin_windows`), then brought back
+/// ([`bring_back_landed`]), then read ([`read_here`]), the pins dropped as it ends. So nothing lets a window go between
+/// its bring-back and its read: a home's read reads once and does not try again, and a read-back's let-go
+/// (`vcs_share::read_backs`) passes over a pinned window.
+async fn read_brought_back(identity: ContentId) -> Result<Vec<u8>, HomeReadRefused> {
+  let away: Vec<ContentId> = crate::state::with_state(|state| {
+    state.vcs_stores.content().map_or_else(Vec::new, |content| {
+      let mut away: Vec<ContentId> = content
+        .object_layout(&identity)
+        .into_iter()
+        .map(|(window, _)| window)
+        .filter(|window| content.is_away(window))
+        .collect();
+      away.sort_unstable();
+      away.dedup();
+      away
+    })
+  })
+  .unwrap_or_default();
+  let _pins = crate::vcs_store::named_objects::pin_windows(away);
+  bring_back_landed(identity).await?;
+  crate::state::with_state(|state| {
+    #[cfg(test)]
+    crate::vcs_share::read_backs::cold_trigger_where_forced(state);
+    read_here(state, &identity)
+  })
+  .ok_or(HomeReadRefused::Unanswered)?
+}
 
 /// Brings back the window or object `identity` this shard holds, each of its windows let go read where its record says
 /// it lies on the node's store ([`Landed`]): a landed pack's window ([`LandedAt`]) a piece at a time off the shard's
