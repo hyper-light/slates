@@ -104,6 +104,8 @@ pub mod landing;
 mod landing_entries;
 pub mod lease;
 mod lease_wait;
+// A candidate a death brought in reads a register's ledger it lacks from its cohort (A-919).
+mod ledger_read;
 mod lfs;
 mod live_hold;
 mod live_ship;

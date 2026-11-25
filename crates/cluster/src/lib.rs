@@ -932,6 +932,27 @@ pub struct Committed {
   pub answers: Vec<(HostId, Vec<u8>)>,
 }
 
+/// The owner's own hold of a record it commits (§4.8 "the owner among them"; A-909's `Acceptor::accept_own`): taken once,
+/// as the commit begins and before it sends anything, so a commit future holds no borrow of it across an await (A-919,
+/// main 01a20182's ruling of 2026-11-25: the owner's acceptor lives in its control shard's state, borrowed briefly, and
+/// a ledger read answers from it between a commit's steps). Whether the owner holds the record.
+pub trait OwnerHold {
+  /// Holds `record` in the owner's acceptor: whether it was held.
+  fn hold_own(self, record: &Record) -> bool;
+}
+
+impl OwnerHold for &mut Acceptor {
+  fn hold_own(self, record: &Record) -> bool {
+    self.accept_own(record).is_ok()
+  }
+}
+
+impl<F: FnOnce(&Record) -> bool> OwnerHold for F {
+  fn hold_own(self, record: &Record) -> bool {
+    self(record)
+  }
+}
+
 /// Commits `record` across its `candidates` (§4.8 "records are sent to all candidates; committed at
 /// `f + 1`"). The owner (`owner`) holds it locally through `owner_acceptor`; the `remote_holders` (a
 /// connected [`Endpoint`] per remaining candidate) are each shipped the record concurrently — one task
@@ -949,7 +970,7 @@ pub struct Committed {
 /// measured RTT budget); nothing here is a hidden constant.
 pub async fn commit_record(
   owner: HostId,
-  owner_acceptor: &mut Acceptor,
+  owner_acceptor: impl OwnerHold,
   placement: &Placement,
   record: &Record,
   quorum: Quorum,
@@ -977,7 +998,7 @@ pub async fn commit_record(
 pub async fn commit_record_on(
   stream: u64,
   owner: HostId,
-  owner_acceptor: &mut Acceptor,
+  owner_acceptor: impl OwnerHold,
   placement: &Placement,
   record: &Record,
   quorum: Quorum,
@@ -1005,7 +1026,7 @@ pub async fn commit_record_on(
 pub async fn commit_record_sent_as(
   stream: u64,
   owner: HostId,
-  owner_acceptor: &mut Acceptor,
+  owner_acceptor: impl OwnerHold,
   placement: &Placement,
   record: &Record,
   sent: Vec<u8>,
@@ -1016,7 +1037,7 @@ pub async fn commit_record_sent_as(
   let mut acked: Vec<HostId> = Vec::new();
   // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them"), fenced for this object
   // alone as each holder fences it (A-909): one acceptor holds every object this owner writes.
-  if owner_acceptor.accept_own(record).is_ok() && placement.candidates.contains(&owner) {
+  if owner_acceptor.hold_own(record) && placement.candidates.contains(&owner) {
     acked.push(owner);
   }
 
@@ -1142,7 +1163,7 @@ pub async fn commit_record_sent_as(
 pub async fn commit_under_configuration(
   configuration: &Configuration,
   record: &Record,
-  owner_acceptor: &mut Acceptor,
+  owner_acceptor: impl OwnerHold,
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Committed {
