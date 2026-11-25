@@ -1,9 +1,8 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-24 20:02 PST): run 4, CI's TSan job at 09b2f0d3c measured whole. Run 3 (f387b56d3) fit the step (1,929 s) and
-# failed four server tests: the merge-authority test (a family-bit test id, af061de87), t_a614a (its bound now the pace's
-# rule, 6354f521b), the hg parks test (its interval read before the release, f289d786f) and t_c2c (SERVER_SKIPPED in
-# 2cb9633ba). This run says whether the lane is green. The step is copied unchanged but for a limit only a hang reaches.
-# Run only from diag-measurer-main-tsan-* branches, never main.
+# main 01a20182 (2026-11-24 21:57 PST): run 5, CI's TSan job at ac3bf0650 measured whole. Run 4 (09b2f0d3c) failed two A-908 tests (their
+# fix fcb77e918 landed after it) and w-svn's crash test, whose failure message now names the path (ac3bf0650: pieces
+# fetched, named texts brought back, let-go bytes, pins by kind, whole at the first look). The step is copied unchanged
+# but for a limit only a hang reaches. Run only from diag-measurer-main-tsan-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-tsan-*"]
