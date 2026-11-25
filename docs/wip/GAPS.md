@@ -3678,8 +3678,11 @@
 > oracle `a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new` (each stage of the second batch's landing
 > killed, the daemon and its store's owner restarted, at one unit and at the derived bound: recovered to the reference's
 > history at 8 before the entry and 16 (one unit) or 64 (derived) after it). Owed: main's release A/B against 084ffb65d
-> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`); `F` timed at the store's own `sync_data` call rather
-> than the landing's await (an owner answer that carries it).
+> and a387b13c3 (wall, resident, `land_batches`, `land_flush_ns`). `F` is the store's own `sync_data` as the commit
+> times it (`Located::flush_ns`, left on the asking thread by the owner's `land` and sliced `commit`,
+> `owner::take_landed_flush_ns`), never the landing's await, which holds the shard's other work and the owner's queue
+> (main's ruling, 2026-11-25): red `an_imports_durable_flush_is_the_stores_own_not_its_await` (a hog holding the shard
+> 500 ms between yields beside the import: `F` from the await 46,015,129,583 ns; the store's own, under half a hold).
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on

@@ -1221,6 +1221,69 @@ fn an_imports_room_bounds_its_batch_where_it_is_smaller() {
   );
 }
 
+/// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush, under the
+/// shard's watchdog window.
+const HOG_NS: u64 = 500_000_000;
+/// Shape: the contended-flush test's look at the import, between its waits.
+const LOOK_NS: u64 = 10_000_000;
+
+std::thread_local! {
+  /// Whether the contended-flush test's hog still holds its shard.
+  static HOGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds the shard [`HOG_NS`] at a time without yielding, then yields, until [`HOGGING`] is cleared: what else a shard
+/// runs while a landing awaits the store, so the landing resumes late.
+async fn hog() {
+  while HOGGING.with(std::cell::Cell::get) {
+    let began = slates_rt::futures::now_ns();
+    while slates_rt::futures::now_ns().saturating_sub(began) < HOG_NS {
+      std::hint::spin_loop();
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
+/// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
+/// overstates it, enlarging the bound past rent or buy). Do: on a shard that has landed nothing, run a hog that holds it
+/// [`HOG_NS`] between yields, and import `full.dump` beside it, so every answer its batch's landing awaits resumes late;
+/// read the shard's `F` once the batch lands, then stop the hog. Expect the import whole, and `F` the store's own flush:
+/// under half a hold. Red before: `F` the landing's await, a hold or more.
+#[test]
+fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
+  use crate::repository::svn_commit::staging::durable_flush_ns;
+  let (flush_ns, youngest) = stored(|| async move {
+    let (svn, _) = subversion("contended").await;
+    HOGGING.with(|hogging| hogging.set(true));
+    let hogging = slates_rt::futures::spawn(hog()).expect("the hog's task");
+    slates_rt::futures::detach(hogging).expect("detached");
+    let importing = slates_rt::futures::spawn(async move {
+      let _ = imported(svn, FULL).await;
+    })
+    .expect("the import's task");
+    slates_rt::futures::detach(importing).expect("detached");
+    while durable_flush_ns().is_none() {
+      slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
+    }
+    let flush_ns = durable_flush_ns();
+    HOGGING.with(|hogging| hogging.set(false));
+    let mut youngest = 0;
+    while youngest < FULL_LAST {
+      slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
+      youngest = history(svn).await.map_or(0, |(youngest, _)| youngest);
+    }
+    (flush_ns, youngest)
+  });
+  println!("svn_import: F {flush_ns:?} ns, the shard held {HOG_NS} ns at a time");
+  assert_eq!(youngest, FULL_LAST, "the import whole");
+  let flush_ns = flush_ns.expect("a flush measured");
+  assert!(
+    flush_ns < HOG_NS / 2,
+    "F {flush_ns} ns, the store's own flush, not the landing's await behind a {HOG_NS} ns hold"
+  );
+}
+
 /// Shape: the appends oracle's revisions, its file's first text, and each append: every text the one before with more
 /// bytes after it, so consecutive revisions hold the same opening windows (windows are named by their bytes).
 const APPEND_REVISIONS: usize = 12;

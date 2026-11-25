@@ -278,6 +278,24 @@ pub fn take_read_waits() -> AskWaits {
   READ_WAITS.with(core::cell::Cell::take)
 }
 
+std::thread_local! {
+  /// The flush of the last changeset this thread's asks landed ([`StoreHandle::land`], [`SlicedLanding::commit`]):
+  /// the store's own `sync_data` (`Located::flush_ns`), none since it was last taken.
+  static LANDED_FLUSH_NS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+
+/// The device's durable flush as the last changeset this thread's asks landed took it, the store's own `sync_data`
+/// without the owner's queue or the hop back (goal 93 P7, main's ruling of 2026-11-25: the import's rent-or-buy bound
+/// prices a batch against it); none since it was last taken.
+pub fn take_landed_flush_ns() -> Option<u64> {
+  LANDED_FLUSH_NS.with(core::cell::Cell::take)
+}
+
+/// Notes `located`'s flush as the last this thread's asks landed ([`take_landed_flush_ns`]).
+fn landed_flush(located: &Located) {
+  LANDED_FLUSH_NS.with(|flush| flush.set(Some(located.flush_ns)));
+}
+
 /// The owner's timing of the request it serves ([`Served`]), sent before its answer.
 struct Timer {
   timed: Option<Sender<Served>>,
@@ -983,7 +1001,7 @@ impl StoreHandle {
   /// applied; answered once it is durable.
   pub async fn land(&self, header: Header, parts: Vec<Part>) -> Result<Located, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
-    self
+    let landed = self
       .ask(
         Request::Land {
           header,
@@ -992,7 +1010,11 @@ impl StoreHandle {
         },
         answers,
       )
-      .await
+      .await;
+    if let Ok(located) = &landed {
+      landed_flush(located);
+    }
+    landed
   }
 
   /// The landed content `identity` (of `len` bytes) from `offset`, as far as one piece reaches ([`Store::piece`]).
@@ -1257,6 +1279,9 @@ impl SlicedLanding {
     let committed = self.handle.ask(request, answers).await;
     // Committed or refused, the owner let the record go: the drop has nothing to wake it for.
     self.alive = None;
+    if let Ok(located) = &committed {
+      landed_flush(located);
+    }
     committed
   }
 }
