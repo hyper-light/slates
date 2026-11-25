@@ -7113,9 +7113,12 @@ fn tree_chained_create(depth: usize) -> (Vec<u8>, ObjectId) {
 /// [`tree_chained_create`] of [`TREE_CHAIN`], its trees an offset-delta chain in the pack the store keeps; fetch its
 /// last commit. Expect: `200`, the pack whole; the fetch's tree reads counted applying deltas going up their chains
 /// (`vcs_store.git_upload.tree_deltas` past zero, `tree_deltas_most` at least one), so a clone's `open_tree` can be read
-/// against what its reads apply. Red before: no such count.
+/// against what its reads apply; and the chain built once over the whole walk, at most [`TREE_CHAIN`] deltas, each tree
+/// after the first read found in the read cache (the walk reads the newest first, so that first read applies the whole
+/// chain). Red before the fetch's read cache: 78 deltas, 0+1+...+12, every tree's chain rebuilt from its base, since the
+/// fork a fetch reads through kept no cache.
 #[test]
-fn a_fetchs_tree_reads_count_the_deltas_they_apply() {
+fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
@@ -7142,4 +7145,8 @@ fn a_fetchs_tree_reads_count_the_deltas_they_apply() {
   assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
   assert!(deltas > 0, "the tree reads applied deltas: {deltas}");
   assert!(most >= 1, "one tree read applied at least one: {most}");
+  assert!(
+    deltas <= u64::try_from(TREE_CHAIN).expect("a count"),
+    "the chain built once over the walk: {deltas} deltas against {TREE_CHAIN}"
+  );
 }

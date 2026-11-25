@@ -495,6 +495,11 @@ impl Recent {
     self.charged
   }
 
+  /// The most bytes it keeps.
+  pub fn budget(&self) -> usize {
+    self.budget
+  }
+
   /// Holds what is kept to `budget` bytes from now on, the oldest given back to fit.
   pub fn set_budget(&mut self, budget: usize) {
     self.budget = budget;

@@ -585,6 +585,12 @@ impl Graph for StoreGraph<'_> {
     self.positions.borrow_mut().commit_begun(admission);
   }
 
+  fn opening_tree(&self, tree: u64, admission: &mut Admission) {
+    if let Some((_, row)) = self.row(tree) {
+      let _ = self.repository.widen_read_cache(row.len, admission);
+    }
+  }
+
   fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {
     self.named_entries_of(tree).into_iter()
   }
