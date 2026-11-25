@@ -775,6 +775,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - NEXT (main's order 02:25): 4 lend items (borrow read-only lends; no Green::default per lend); 5 speed.
 - 11-25 later: A-920 (2b sliced staging, main 01a20182 ruling): piece 0 2d6ede61a (reservation once; judge step 262 -> 227 ms) + docs f8a812d15; piece 1 0214fa210 (scratch commit on A-917 run; judge step 227 -> 89-92 ms CPU at 9,000; whole left: prep sole->mapped 6.8 ms, commit end+keep 13 ms, records step 30 ms; hog test HOG_NS 150 ms). Next: piece 2 record check (101 ms), 3 judge, 4 build, 5 held tables+apply; then apply whole parts; fmt3 p99.
 - 11-25 later: A-920 piece 2 5c5783cdd (record check plans rows a slice a step; check step 101-106 -> 17 ms CPU at 9,000; golden + generated oracles). Hog hold derived from measured flush d02143977 (w-perf told by inbox). Next: piece 3 judge (57 ms, reservation as a walk over the ops), 4 build 51, 5 records 30, commit whole parts.
+- 11-25 later: A-920 piece 3a 052803462 (judge leaves commit_reads to the commit's sliced Prep::Reads; CommitStep::Lend; judge step 89-92 -> 77 ms). Doc wrap 0dca2c89a. Next: 3b reservation walk (history 19.6 + changes 10.9 ms; keys must be owned, paths not assumed interned), 3c resolve 11.6 + decide_units 24.5.
 ## 2026-11-24 ~05:00: A-899 virtio-fs serves a work, 7416cae15
 - virtiofs attach ensure_slot; pass lends GreenTree via mounted_work::source/lend (one lend); A-898 park now reached.
 - Integration case a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered (in-process seam, unix).
