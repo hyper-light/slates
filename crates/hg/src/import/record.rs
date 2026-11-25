@@ -1479,6 +1479,9 @@ struct Revisions {
   unheld: Option<Refused>,
   /// How many of the ask under way's texts are for identities the store never knew ([`Replay::asked_unknown`]).
   asked_unknown: u64,
+  /// The revisions kept from texts the node's changeset store gave, by their log's path, node and objects as the fork
+  /// keeps them ([`Replay::take_brought_back`]).
+  brought_back: Vec<crate::filerev::FileContents>,
 }
 
 /// A record replayed a unit at a time (A-732: a recovery of a large repository's record in one step spun its shard past
@@ -1706,6 +1709,17 @@ impl Replay {
     match &self.kind {
       Kind::Revisions(revisions) if revisions.asked.is_some() => revisions.asked_unknown,
       _ => 0,
+    }
+  }
+
+  /// The revisions the replay kept from texts the node's changeset store gave it (let go once landed, or never known
+  /// here: A-636 part 2c-2), by their log's path (`\0changelog`, `\0manifest`, a file's tracked path), node and the
+  /// objects the fork keeps them as, taken: what its owner lets go again once the store it made stands, as an import's
+  /// or a push's landed texts are (goal 93, C1 (1) P5), else they stay held. Taken before [`Replay::finish`].
+  pub fn take_brought_back(&mut self) -> Vec<crate::filerev::FileContents> {
+    match &mut self.kind {
+      Kind::Revisions(revisions) => core::mem::take(&mut revisions.brought_back),
+      _ => Vec::new(),
     }
   }
 
@@ -1944,6 +1958,7 @@ impl Revisions {
       given_rows: Vec::new(),
       unheld: None,
       asked_unknown: 0,
+      brought_back: Vec::new(),
     })
   }
 
@@ -2138,14 +2153,21 @@ impl Revisions {
       // row's object, which no delta replaces.
       let put = store.put_object(&text).map_err(content)?;
       row.bytes = put;
-      self.given_manifests.push((row.node, text));
+      let node = row.node;
+      self.given_manifests.push((node, text));
       let appended = self.append_over_given(store, log, row);
       drop(store.release(&put));
-      settle::<Infallible>(
-        radix,
-        rev,
-        &appended.map_err(ImportRefused::<Infallible>::Index)?,
-      )?;
+      let numbers = appended.map_err(ImportRefused::<Infallible>::Index)?;
+      settle::<Infallible>(radix, rev, &numbers)?;
+      // The object the fork keeps it as: whole, or its own delta against the manifest before it.
+      if let Some(kept) = self.fork.revision(store, log, rev) {
+        self.brought_back.push(crate::filerev::FileContents {
+          path: crate::push::intake::MANIFEST_PATH.to_vec(),
+          node,
+          bytes: kept.bytes,
+          block: None,
+        });
+      }
       return Ok(());
     }
     let split = filerev::split(&text).map_err(|_| unheld())?;
@@ -2165,6 +2187,7 @@ impl Revisions {
     .transpose();
     let whole =
       matches!(base, Base::Number(NONE)) || matches!(base, Base::Node(node) if node == NULL_NODE);
+    let node = row.node;
     let kept = block.and_then(|block| {
       if whole && (put != row.bytes || block != row.block) {
         return Err(unheld());
@@ -2174,12 +2197,22 @@ impl Revisions {
       self
         .fork
         .append_stored(store, log, &[(row, (NONE, 0, 0))])
+        .map(|numbers| (numbers, block))
         .map_err(|refused| Refused::Import(ImportRefused::Index(refused)))
     });
     for put in &puts {
       drop(store.release(put));
     }
-    settle::<Infallible>(radix, rev, &kept?)?;
+    let (numbers, block) = kept?;
+    settle::<Infallible>(radix, rev, &numbers)?;
+    if let Log::File(path) = log {
+      self.brought_back.push(crate::filerev::FileContents {
+        path: path.to_vec(),
+        node,
+        bytes: put,
+        block,
+      });
+    }
     Ok(())
   }
 
@@ -2371,6 +2404,7 @@ impl Revisions {
       if held {
         return Ok(());
       }
+      let mut given = false;
       let text = match store.object_bytes(&text_id, len) {
         Some(text) => text,
         // Let go once landed (goal 93, C1 (1)): the text the store gave, held to its identity, else asked.
@@ -2384,6 +2418,7 @@ impl Revisions {
             if slates_vcs::ContentId::of(&text) != text_id {
               return Err(unheld());
             }
+            given = true;
             text
           }
           // Let go once landed, or never known here (A-636 part 2c-2: a takeover's successor makes the store again over a
@@ -2404,7 +2439,16 @@ impl Revisions {
         flags,
         text: &text,
       };
-      return replay_changeset(&mut self.fork, store, (rev, &read), self.room);
+      replay_changeset(&mut self.fork, store, (rev, &read), self.room)?;
+      if given {
+        self.brought_back.push(crate::filerev::FileContents {
+          path: crate::push::intake::CHANGELOG_PATH.to_vec(),
+          node,
+          bytes: text_id,
+          block: None,
+        });
+      }
+      return Ok(());
     }
     let StoredRow {
       link,
@@ -2474,6 +2518,20 @@ impl Revisions {
     }
     .map_err(ImportRefused::<Infallible>::Index)?;
     settle::<Infallible>(radix, rev, &numbers)?;
+    // A manifest kept again over texts the store gave (its own, let go once landed, or its base's): the object the fork
+    // now keeps it as was put by this replay, and goes again with what it brought back.
+    if again
+      && log == Log::Manifest
+      && !self.given_manifests.is_empty()
+      && let Some(kept) = self.fork.revision(store, log, rev)
+    {
+      self.brought_back.push(crate::filerev::FileContents {
+        path: crate::push::intake::MANIFEST_PATH.to_vec(),
+        node,
+        bytes: kept.bytes,
+        block: None,
+      });
+    }
     Ok(())
   }
 

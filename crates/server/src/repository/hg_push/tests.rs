@@ -1081,6 +1081,160 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
   assert_ne!(node_after, node, "a changeset made of it");
 }
 
+/// A-636 part 2c-2's let-go (main 01a20182's ruling of 2026-11-24 13:12, w-hg's review note (c)): what a takeover's
+/// successor's rebuild brings back from the node's changeset store goes once the rebuild lands, as a landed push's texts
+/// go (goal 93, C1 (1) P5), through the same let-go. Do: on a store-backed daemon whose landings let go (no
+/// `keep_landed`), rebuild the fixtures' repository as one push; leave it awaiting its rebuild, its store and texts gone
+/// (`test_store::awaiting_rebuild`); rebuild it as its successor does (`test_store::rebuilt_after_takeover`) and wait for
+/// the store to stand and its let-go to end. Expect: texts asked for identities the store never knew
+/// (`vcs_store.hg_replay_unknown_asked`), as many revisions let go again (`vcs_store.hg_brought_back_let_go`), and none
+/// of the rebuilt index's changelog, manifest or file objects held whole after (the empty window aside, never let go).
+/// Failing first: every one the rebuild brought back held, nothing let go.
+#[test]
+fn a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let record = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "let-go-rebuild");
+    let mut parts = state.db.take_state_log_records();
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    parts.extend(state.db.take_state_log_records());
+    (
+      crate::test_store::awaiting_rebuild(state, hg.repository, true),
+      parts,
+    )
+  });
+  let repository = record.0.id;
+  let (unknown, let_go, held) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::repository::svn_commit::tests::on;
+      let count =
+        |name: &'static str| on(move |state| state.refusals.get(name).copied().unwrap_or(0));
+      on(|state| crate::test_store::rebuilt_after_takeover(state, record));
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(NAMED_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      while on(|state| state.vcs_stores.rebuilding(repository))
+        || count(crate::vcs_store::HG_BROUGHT_BACK_LET_GO) == 0
+      {
+        if slates_rt::futures::now_ns() >= deadline {
+          break;
+        }
+        slates_rt::futures::yield_now().await;
+      }
+      let held = on(|state| held_whole(state, repository));
+      (
+        count(crate::vcs_store::HG_REPLAY_UNKNOWN_ASKED),
+        count(crate::vcs_store::HG_BROUGHT_BACK_LET_GO),
+        held,
+      )
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  assert!(
+    unknown > 0,
+    "the rebuild asked for texts its store never knew"
+  );
+  assert_eq!(let_go, unknown, "every revision it brought back let go");
+  assert_eq!(held, Vec::<(Vec<u8>, u32)>::new(), "nothing held whole");
+}
+
+/// Every replay lets go what it brought back (main 01a20182's ruling of 2026-11-24 13:22): a restart's, which asks the
+/// node's changeset store for the texts its predecessor let go once landed (goal 93, C1 (1) P5), as a successor's asks
+/// for those it never knew. Do: on a daemon over a segment and a store whose landings let go, rebuild the fixtures'
+/// repository as one push and wait until its changelog's texts are let go, then publish the shard's image; stop the
+/// daemon and the store's owner, start both again over the same segment and store, and wait for the recovery's let-go
+/// to end. Expect: the replay asked for texts (`vcs_store.hg_replay_texts_asked` and `vcs_store.hg_replay_unknown_asked`), as many revisions let go again
+/// (`vcs_store.hg_brought_back_let_go`), and none of the index's changelog, manifest or file objects held whole after.
+/// Failing first: every text the replay brought back held, nothing let go.
+#[test]
+fn a_restarts_replay_lets_go_the_texts_it_brought_back() {
+  use crate::repository::store_tests::{anchor_of, daemon_over};
+  let instance = format!("vcs-store-hg-let-go-{}", std::process::id());
+  let mut store = crate::test_store::TestStore::start("hg-let-go-restart");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "let-go-restart");
+    let _ = rebuild(state, &mut hg, (&[1], 1));
+    hg.repository
+  });
+  let landed_held = |daemon: &crate::Daemon| {
+    crate::daemon::observe_first(daemon, move |state| {
+      held_whole(state, repository)
+        .into_iter()
+        .filter(|(path, _)| path.as_slice() == slates_hg::push::intake::CHANGELOG_PATH)
+        .count()
+    })
+  };
+  let began = std::time::Instant::now();
+  while landed_held(&daemon) > 0 {
+    assert!(
+      began.elapsed() < NAMED_PATIENCE,
+      "the push's texts never let go"
+    );
+  }
+  // The let-go carried by the shard's image, so the restart finds the texts away, as a period's publication leaves them.
+  crate::daemon::observe_first(&daemon, |state| {
+    crate::verbs::publish_shard(state).unwrap();
+  });
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let count = |daemon: &crate::Daemon, name: &'static str| {
+    crate::daemon::observe_first(daemon, move |state| {
+      state.refusals.get(name).copied().unwrap_or(0)
+    })
+  };
+  let began = std::time::Instant::now();
+  while count(&daemon, crate::vcs_store::HG_BROUGHT_BACK_LET_GO) == 0
+    && began.elapsed() < NAMED_PATIENCE
+  {}
+  let asked = count(&daemon, crate::vcs_store::HG_REPLAY_TEXTS_ASKED)
+    + count(&daemon, crate::vcs_store::HG_REPLAY_UNKNOWN_ASKED);
+  let let_go = count(&daemon, crate::vcs_store::HG_BROUGHT_BACK_LET_GO);
+  let held = crate::daemon::observe_first(&daemon, move |state| held_whole(state, repository));
+  daemon.stop();
+  assert!(asked > 0, "the replay asked for the texts let go");
+  assert_eq!(let_go, asked, "every revision it brought back let go");
+  assert_eq!(held, Vec::<(Vec<u8>, u32)>::new(), "nothing held whole");
+}
+
+/// Repository `repository`'s changelog, manifest and file objects its content store holds whole, the empty window aside
+/// (never let go): each by its log's path and number.
+fn held_whole(state: &mut ShardState, repository: RepositoryId) -> Vec<(Vec<u8>, u32)> {
+  use slates_hg::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
+  let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let (content, store) = lent.stores.mercurial(repository).expect("the store");
+  let content: &slates_vcs::ContentStore = content;
+  let index = &store.index;
+  let whole = |id: &slates_vcs::ContentId| {
+    content.len_of(id).is_some_and(|len| len > 0) && content.holds_whole(id)
+  };
+  let mut held = Vec::new();
+  for rev in 0..index.len(content, Log::Changelog) {
+    if index
+      .changeset(content, rev)
+      .is_some_and(|row| whole(&row.text))
+    {
+      held.push((CHANGELOG_PATH.to_vec(), rev));
+    }
+  }
+  let paths: Vec<Vec<u8>> = index.file_logs(content).map(<[u8]>::to_vec).collect();
+  let logs = std::iter::once((MANIFEST_PATH.to_vec(), Log::Manifest))
+    .chain(paths.iter().map(|path| (path.clone(), Log::File(path))));
+  for (path, log) in logs {
+    for rev in 0..index.len(content, log) {
+      let row = index.revision(content, log, rev);
+      if row.is_some_and(|row| whole(&row.bytes) || row.block.as_ref().is_some_and(whole)) {
+        held.push((path.clone(), rev));
+      }
+    }
+  }
+  held
+}
+
 /// A work over green `green` named `name`, `x` inserted at offset 1 of `b`: the work.
 async fn edited_work(green: DbVolumeId, name: &str) -> slates_ipc::protocol::VolumeId {
   use crate::repository::svn_commit::tests::on;

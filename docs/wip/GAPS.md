@@ -229,19 +229,17 @@
 > A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
 > format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
 > Nothing is built on either answer.
-> **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
-> creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
-> (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
-> both count `merge.recompute_mismatch` and refuse the new green at version 0 ("the recomputed identity does not match the
-> record"). A branch's green is made at a version of its source (`Lineage::branch`, A-575), so its version 0 is the
-> source's state there, while a holder recomputes every version 0 as an empty green (`merge_service::recompute`) and the
-> record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
-> `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
-> makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
-> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing). A-908, main's
-> ruling of 12:42: part 1 BUILT, the holder's replicas kept by the owner's own type (`crate::greens::Greens`), each
-> standing alone; part 2 owed: version 0's record names its membership, a holder founds and branches lineages,
-> adoption moves a lineage whole, and a branch is rebuilt by branching its source.
+> **BUILT, part 4 owed (A-908, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
+> green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
+> lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
+> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
+> rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
+> **IN FLIGHT (w-shared, 2026-11-24): a branch made on a repository's successor after its owner died is refused.** With
+> A-908 the successor adopts the lineage (`merge.takeover.lineage_adopted` 1) and makes the branch's green (no longer
+> `ContentUnavailable`, origin/main's red), and the other survivor branches its replica; but the push is refused `unable
+> to commit` (its barrier: the new green's version 1 unplaced, the names log at 6 acknowledged by none, no refusal counted
+> on either survivor), and a push of another new name 2.3 s later `cannot lock ref: it moved since the push read it`. Red
+> test kept off main until the fix.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -4619,8 +4617,14 @@
 > record's room, each held to its node (`node::compute`) before it is kept, counted `vcs_store.hg_replay_unknown_asked`
 > (`slates_hg` `a_record_replayed_where_its_content_was_never_kept_asks_the_changeset_store`; the hg twin with its store
 > gone). Subversion owed nothing: its rebuild's task reads its records back (the earlier `Unlanded` was a test's
-> one-step settle). Owed (w-hg's review): what a successor's replay puts back stays held, marked landed by nothing, so
-> nothing lets it go, as P5 lets a landed push's go; to be let go once the rebuild ends, as `hg_run`'s let-go does. (c) a Mercurial
+> one-step settle). What a replay keeps from texts the changeset store gave (a successor's never known here, a
+> restart's let go once landed, a manifest kept again over them) is let go again once the replay ends: every replay,
+> one rule (main's rulings of 13:12 and 13:22), through P5's landed let-go (`hg_run::let_go_committed`), counted
+> `vcs_store.hg_brought_back_let_go`, equal to the texts asked
+> (`a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands`, `a_restarts_replay_lets_go_the_texts_it_brought_back`;
+> w-perf, w-hg's review note (c)). Not owed by the other tools (main's ruling of 13:22): a git rebuild keeps the pack it reads whole
+> (`put_changeset`), as a live commit keeps its landed pack while `LANDED_LET_GO` is held (whether a landed pack goes
+> at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

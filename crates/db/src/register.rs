@@ -8834,4 +8834,47 @@ mod tests {
       "the promotion chain r0 -> r1 -> r2 resolves to the surviving region"
     );
   }
+
+  /// A-908's proof (main 01a20182's ruling of 2026-11-24 14:54): a holder of a green's merge records holds its
+  /// repository's names log too, so the join a holder waits for always comes to it. Do: for a formed configuration and
+  /// one with a change in flight, place every owner's view of a repository's names-log register (its id in the state
+  /// class) and of greens of its family minted by other creators under other numbers; and, as a control, an id of no
+  /// family. Expect one placement, candidates and joint cohorts both, for the register and every green of the family,
+  /// for every owner; the control placed elsewhere for some owner (so equality is not vacuous). Red with `line_key`
+  /// replaced by `placement_key` in [`rendezvous_weight`]: the family's ids rank apart.
+  #[test]
+  fn a908_a_repositorys_names_log_and_its_greens_share_one_placement() {
+    let members: Vec<HostId> = (1..=7).map(HostId).collect();
+    let formed = RegionalConfiguration::formed(
+      members.clone(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      // Every member in each neighbourhood, so each object's copyset is one of many: a placement that differs by key.
+      7,
+      false,
+    );
+    let (in_flight, ..) = change_in_flight();
+    let family = |creator: u64, number: u32| {
+      ObjectId::family(HostId(creator), 0, 7, number).expect("a family id")
+    };
+    let names_log = family(1, 1).in_class(RegisterClass::State(crate::catalog::StateLog::Names));
+    let greens = [family(1, 2), family(4, 9), family(6, 31)];
+    let mut apart = false;
+    for regional in [&formed, &in_flight] {
+      for &owner in &regional.members {
+        let configuration = regional.configuration_for(owner).unwrap();
+        let log = configuration.place(names_log);
+        for green in greens {
+          let placed = configuration.place(green);
+          assert_eq!(
+            (&placed.candidates, &placed.joint),
+            (&log.candidates, &log.joint),
+            "owner {owner:?}, green {green:?}"
+          );
+        }
+        apart |= configuration.place(ObjectId::new(HostId(3), 77)).candidates != log.candidates;
+      }
+    }
+    assert!(apart, "an id of no family is placed by its own key");
+  }
 }

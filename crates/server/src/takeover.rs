@@ -864,7 +864,7 @@ pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state
     .merge
     .replicas
-    .remove(&crate::merge_service::replica_key(object));
+    .drop_any(&crate::merge_service::replica_key(object));
   // Its durable checkpoint goes with it (A-404).
   crate::merge_service::forget_checkpoint(state, object);
 }
