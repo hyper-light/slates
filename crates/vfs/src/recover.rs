@@ -739,6 +739,47 @@ pub struct HeldPiece {
   pub bytes: Vec<u8>,
 }
 
+impl HeldPiece {
+  /// This piece as a [`HeldPieceRef`], its bytes borrowed.
+  pub fn as_ref(&self) -> HeldPieceRef<'_> {
+    HeldPieceRef {
+      key: self.key,
+      bytes: &self.bytes,
+    }
+  }
+}
+
+/// A held piece whose bytes are borrowed (goal 93, main's ruling of 2026-11-25 on a shard image's publication churn): what
+/// a publication encodes in place of a [`HeldPiece`] where its owner keeps the bytes (the server's image encoder keeps
+/// each page it re-encoded for the next checkpoint, and copied each into a `HeldPiece` to publish it). Encoded byte for
+/// byte as a `HeldPiece` is (its key, then its bytes' length and the bytes), so a reader decodes `HeldPiece`s and no
+/// format changes; it lives only for the encoding call that takes it, so its owner's bytes cannot change under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldPieceRef<'a> {
+  /// The piece's key.
+  pub key: [u8; HELD_PIECE_KEY_BYTES],
+  /// The piece's bytes.
+  pub bytes: &'a [u8],
+}
+
+impl HeldPieceRef<'_> {
+  /// Writes the piece as [`HeldPiece`]'s `Wire::encode` writes it.
+  pub fn encode(&self, out: &mut Vec<u8>) {
+    self.key.encode(out);
+    slates_wire::codec::encode_len(self.bytes.len(), out);
+    out.extend_from_slice(self.bytes);
+  }
+}
+
+/// Writes `held`, in key order, as a `Vec<HeldPiece>` of the same pieces is encoded: their count, then each piece.
+pub fn encode_held_pieces(held: &mut [HeldPieceRef<'_>], out: &mut Vec<u8>) {
+  held.sort_by_key(|piece| piece.key);
+  slates_wire::codec::encode_len(held.len(), out);
+  for piece in held.iter() {
+    piece.encode(out);
+  }
+}
+
 /// Format: the bytes of a held call record's key: an NFSv4.1 session id (16 bytes) and its slot (a big-endian word).
 pub const HELD_CALL_KEY_BYTES: usize = 16 + size_of::<u32>();
 
@@ -777,7 +818,7 @@ impl ShardImage {
   /// .with_nfs_replies(nfs).with_nfs_states(states)`'s `encode` writes them after the volumes.
   pub fn encode_finish(
     out: &mut Vec<u8>,
-    held: &mut Vec<HeldPiece>,
+    held: &mut [HeldPieceRef<'_>],
     (replies, calls, nfs_replies, nfs_states): (
       &mut Vec<HeldReply>,
       &mut Vec<HeldCall>,
@@ -785,8 +826,7 @@ impl ShardImage {
       &mut Vec<HeldNfsStates>,
     ),
   ) {
-    held.sort_by_key(|piece| piece.key);
-    held.encode(out);
+    encode_held_pieces(held, out);
     replies.sort_by_key(|reply| reply.attachment);
     replies.encode(out);
     calls.sort_by_key(|call| call.key);

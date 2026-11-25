@@ -4084,7 +4084,12 @@ fn a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered() {
     extent_bytes: 128 << 10,
     fanout: 8,
   };
-  let owner = StoreOwner::start(StoreRoot::open(&store_dir, &grant).unwrap(), sizing, 64).unwrap();
+  let owner = StoreOwner::start(
+    StoreRoot::open(&store_dir, &grant).unwrap(),
+    sizing,
+    (64, 0),
+  )
+  .unwrap();
   let profile = common::machine_profile();
   let instance = format!("virtiofs-let-go-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(1));

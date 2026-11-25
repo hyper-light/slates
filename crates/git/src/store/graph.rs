@@ -158,7 +158,12 @@ impl PositionCache {
       *to = *from;
     }
     let ways = WAYS.min(self.slots.len()).max(1);
-    let mask = self.slots.len().checked_div(ways).unwrap_or(0).wrapping_sub(1);
+    let mask = self
+      .slots
+      .len()
+      .checked_div(ways)
+      .unwrap_or(0)
+      .wrapping_sub(1);
     let set = usize::try_from(u64::from_le_bytes(first)).unwrap_or(usize::MAX) & mask;
     let start = set.saturating_mul(ways);
     start..start.saturating_add(ways)

@@ -235,6 +235,16 @@ pub(crate) fn write_taken(ns: u64, waited: bool) {
   });
 }
 
+/// Counter: the nanoseconds a fetch spent decoding the stored chunks it sent as deltas (goal 93, main's ruling (b):
+/// content kept as stock's chunks, a pull's changegroup sending them plain; `slates_hg::revlog_chunk::decode_counted`).
+/// Format: a counter name in the status report.
+pub(crate) const DECOMPRESS_NS: &str = "vcs_store.hg_fetch_decompress_ns";
+/// Counter: the bytes those decodes made. Format: a counter name in the status report.
+pub(crate) const DECOMPRESS_PLAIN_BYTES: &str = "vcs_store.hg_fetch_decompress_plain_bytes";
+/// Counter: the most bytes one decode made, kept as a maximum (main's ruling (b), its condition (1): held to a step's
+/// room). Format: a counter name in the status report.
+pub(crate) const DECOMPRESS_BYTES_MOST: &str = "vcs_store.hg_fetch_decompress_bytes_most";
+
 /// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it, and the chunks its thread
 /// compressed since the last turn ([`COMPRESS_COUNT_NS`] and its siblings); nothing off a shard.
 pub(crate) fn turn_taken() {
@@ -246,10 +256,15 @@ pub(crate) fn turn_taken() {
       (COMPRESS_SEND_NS, chunks.send.ns),
       (COMPRESS_SEND_PLAIN_BYTES, chunks.send.plain_bytes),
       (COMPRESS_SEND_STORED_BYTES, chunks.send.stored_bytes),
+      (DECOMPRESS_NS, chunks.decode.ns),
+      (DECOMPRESS_PLAIN_BYTES, chunks.decode.plain_bytes),
     ] {
       if by > 0 {
         state.count(name, by);
       }
+    }
+    if chunks.decode_most > 0 {
+      state.count_max(DECOMPRESS_BYTES_MOST, chunks.decode_most);
     }
   });
 }
@@ -361,6 +376,15 @@ pub(crate) const OWNER_BACK_NS: &str = "vcs_store.hg_owner_back_ns";
 /// the status report.
 pub(crate) const OWNER_MOST_NS: &str = "vcs_store.hg_owner_most_ns";
 
+/// Counter: the requests the store's owner met spinning, no wake (`slates_store::owner::StoreOwner::start`'s spin;
+/// main's ruling of 2026-11-25, the 57k clone's wait 86.6% the owner's wake). Format: a counter name in the status report.
+pub(crate) const OWNER_SPIN_HITS: &str = "vcs_store.hg_owner_spin_hits";
+/// Counter: the requests the owner met parked, woken for them. Format: a counter name in the status report.
+pub(crate) const OWNER_PARKS: &str = "vcs_store.hg_owner_parks";
+/// Counter: the nanoseconds the owner spun waiting for those requests, hits and misses: the spin's price. Format: a
+/// counter name in the status report.
+pub(crate) const OWNER_SPIN_NS: &str = "vcs_store.hg_owner_spin_ns";
+
 /// Counts what a want's requests of the store's owner waited on, split by part ([`OWNER_REQUESTS`] and the counters
 /// after it).
 fn count_owner_waits(state: &mut ShardState, owner: &slates_store::owner::AskWaits) {
@@ -372,6 +396,9 @@ fn count_owner_waits(state: &mut ShardState, owner: &slates_store::owner::AskWai
   state.count(OWNER_DISK_NS, owner.disk_ns);
   state.count(OWNER_BACK_NS, owner.back_ns);
   state.count_max(OWNER_MOST_NS, owner.most_ns);
+  state.count(OWNER_SPIN_HITS, owner.spin_hits);
+  state.count(OWNER_PARKS, owner.parks);
+  state.count(OWNER_SPIN_NS, owner.spin_ns);
 }
 
 /// Counter: the requests a fetch's texts made of the node's changeset store's owner, each the texts of one want made
@@ -445,6 +472,7 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
                     payload: row.place.payload,
                     offset: row.place.offset,
                     len: row.place.len,
+                    chunk: row.form == slates_store::texts::Form::Chunk,
                   },
                 })
               })

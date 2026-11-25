@@ -63975,9 +63975,37 @@ GAPS.
   (histories, recounted bytes, head, head identity). A counted test holds a version of 200 files to more steps than its
   files; the 9,000-file import asserts its version took more than one call (`repository.import_batch.apply_steps`).
 - **Measured** (9,000 files, debug, load about 58): the apply's longest slice 196 ms before, 71 ms after.
-- **Owed.** Three phases are still whole within a slice: the named read at a version's begin (`svn_commit::read_named`,
-  where `read_named_slice` exists), the lend's walk of every effect (`Green::recorded_unlent`), and the commit's
-  preparation (`Green::commit_reads`, `sole_runs`, `make_mapped`, `commit_begin`'s node moves and copies). Each is linear
-  in a version's files; they are the next slices.
+- **The three whole phases, cut (main's ruling (a) of 2026-11-25).** (1) The run takes units until its caller's slice is
+  spent, with no count of units, and the batch reads a version's named texts a copy slice a step before it begins it
+  (`InVersion::Reading`): 71 → 29-39 ms. (2) The run asks its owner to lend the texts it meets, a slice at a time
+  (`ApplyStep::Lend`, the slice made again once lent), so no walk of every effect learns them first: the named-texts
+  oracle replays a unit a step and asks for exactly what the walk names. (3) The commit's preparation is phases of
+  its own (`Prep`: each effect's sole run, its read checked, its mapped file made), and the batch's retention settle
+  and checkpoint take a slice apart from its last version's. By each slice's CPU time on its thread (wall time at load
+  30-60 measured the host as much): the apply's own longest slice 29-77 ms before the cuts, 7.3-7.7 ms after. The slice
+  of the retention and checkpoint alone is 0.3 ms, or up to 47 ms where the checkpoint's paced step runs to its ceiling
+  with no one waiting (A-579's design, ended within a quantum by a waiter's arrival).
+- **Still whole** (each linear in a version's files, about 4 ms of the 7 at 9,000): `Green::begin_applying`'s check that
+  every run the replay reads is read (`replay_reads`, `unread_among`), and the preparation's transitions (the runs'
+  places, `alone`, `named_files`, `commit_begin`'s node moves, links and changed set).
 - **Applied in the same change to** `crates/merge/src/engine.rs`, `engine/copy.rs`, `engine/applying_tests.rs`,
   `crates/server/src/repository/push.rs`, `vcs_store/name_holds.rs` and the import's wide-revision test.
+
+### A-920 — An import revision's staging is taken a slice at a time (2026-11-25, w-svn for main 01a20182, goal 93's slicing 2b; on A-917's run machinery)
+
+- **Why.** A revision's staging (`svn_commit::staging::Staging::stage_in`) was three whole steps at 9,000 files on a debug
+  build, by each step's CPU time on its shard's thread: the record check 101-105 ms, the build 51-55 ms and the judge
+  step 262-265 ms, the longest step an import had left once A-917 cut the apply to 7 ms. The judge step was the work's
+  retention reservation, twice (29 ms each), its verdict (`Green::judge_named`, 57 ms: `compute` 40, `commit_reads` 16),
+  the verdict's commit into the batch's scratch member (`commit_judgment`, 110 ms), the records' apply (12.5 ms) and the
+  held tables (17 ms). Each is linear in the revision's files.
+- **The order** (main's ruling of 2026-11-25): the reservation once; the scratch commit on A-917's `commit_begin` and
+  `commit_step`; the record check; the judge, with the reservation as a walk over the ops; the build; the held tables and
+  the records' apply. Each lands alone with its step's CPU before and after.
+- **The contracts.** The scratch member is read by nothing until the batch lands (the batch holds it, the landing turn
+  keeps every other commit out), and a drop midway abandons the batch with its scratch member. The records are unchanged
+  under the held turn. The green is unchanged between a judge's begin and its verdict; the judge's one write (the
+  rejected cache, the hold) is its last step's.
+- **Piece 0, the reservation once.** `ImportBatch::stage` computed the work's reservation for its room check
+  (`reservation_of`), and `judge_staged` walked the same work at the same head again; the first result is passed
+  through, the scratch member unchanged between but for the texts lent it. The judge step 262-265 ms → 227-228 ms.

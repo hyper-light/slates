@@ -6079,6 +6079,15 @@ fn return_dead_recovery_timed(
   (returned, more)
 }
 
+/// The free blocks one step of a give-back walks (A-226): an archive slice's bytes over the discard size, one at least.
+pub(crate) fn purge_slice_blocks(s: &ShardState) -> usize {
+  usize::try_from(s.config.archive_slice_bytes())
+    .unwrap_or(usize::MAX)
+    .checked_div(s.config.discard_from_bytes.max(1))
+    .unwrap_or(0)
+    .max(1)
+}
+
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
 /// content arena allocated nothing since the last sweep pass (`crate::idle_sweep`), its free blocks are purged a slice at a time, yielding
 /// between slices so a request that arrives meanwhile is served first. Decay-based, as jemalloc purges dirty pages after
@@ -6104,11 +6113,7 @@ async fn purge_if_idle() -> GiveBack {
         return None;
       }
       s.count(TICKS_IDLE, 1);
-      let slice_blocks = usize::try_from(s.config.archive_slice_bytes())
-        .unwrap_or(usize::MAX)
-        .checked_div(s.config.discard_from_bytes.max(1))
-        .unwrap_or(0)
-        .max(1);
+      let slice_blocks = purge_slice_blocks(s);
       let purged = s.store.content.arena_mut().purge(slice_blocks);
       let (log, recovery_left) = if purged.more {
         (0, false)
@@ -10630,7 +10635,7 @@ mod tests {
             archive,
           )
           .unwrap();
-        let changes = crate::content_holder::held_changes(state);
+        let changes = crate::content_holder::held_changes_carried(state);
         carried.insert(
           changes
             .put
@@ -10872,7 +10877,7 @@ mod tests {
               state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
-              let changes = crate::content_holder::held_changes(state);
+              let changes = crate::content_holder::held_changes_carried(state);
               for piece in &changes.put {
                 proptest::prop_assert!(
                   !changes.removed.contains(&piece.key),
@@ -11691,7 +11696,7 @@ mod tests {
         .collect();
       // The move, then the delta after it, folded as recovery folds it (`ShardImage::apply`: puts, then removals).
       crate::fleet::reconcile_held_authority(state);
-      let changes = crate::content_holder::held_changes(state);
+      let changes = crate::content_holder::held_changes_carried(state);
       let in_delta = changes.put.len();
       for piece in &changes.put {
         journal.insert(piece.key, piece.bytes.clone());

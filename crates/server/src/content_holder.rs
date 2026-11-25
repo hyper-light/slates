@@ -295,21 +295,6 @@ fn vcs_node_key(kind: u8, identity: &slates_vcs::ContentId) -> PieceKey {
   piece_key(kind, object, position)
 }
 
-/// A list's piece bytes: its identity, then its bytes.
-fn vcs_list_bytes(identity: &slates_vcs::ContentId, bytes: &[u8]) -> Vec<u8> {
-  [identity.0.as_slice(), bytes].concat()
-}
-
-/// A window let go's piece bytes: its identity, then its length.
-fn vcs_away_bytes(identity: &slates_vcs::ContentId, len: u64) -> Vec<u8> {
-  [identity.0.as_slice(), &len.to_le_bytes()].concat()
-}
-
-/// A name's piece bytes: the object's identity, then its root.
-fn vcs_name_bytes(identity: &slates_vcs::ContentId, root: &slates_vcs::ContentId) -> Vec<u8> {
-  [identity.0.as_slice(), root.0.as_slice()].concat()
-}
-
 /// A held piece's key: what [`slates_vfs::recover::HELD_PIECE_KEY_BYTES`] says.
 type PieceKey = [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
 
@@ -388,8 +373,24 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
 }
 
 /// [`held_image`], and whether its paged families are the shard's now (A-870 piece 2: where a change is not yet encoded
-/// they are the last committed cut, [`image_committed`]).
+/// they are the last committed cut, [`image_committed`]): its pages copied, for a caller that keeps them (the tests, a
+/// recovery's comparison); a checkpoint encodes them in place ([`held_image_unpaged`], [`paged_whole`]).
 pub(crate) fn held_image_paged(state: &ShardState) -> (Vec<slates_vfs::recover::HeldPiece>, bool) {
+  let mut pieces = held_image_unpaged(state);
+  let (pages, carried) = paged_whole(&state.image_encoder);
+  pieces.extend(
+    pages
+      .into_iter()
+      .map(|piece| slates_vfs::recover::HeldPiece {
+        key: piece.key,
+        bytes: piece.bytes.to_vec(),
+      }),
+  );
+  (pieces, carried)
+}
+
+/// Every piece the shard holds for others but its paged families' pages ([`held_image_paged`]'s, owned).
+pub(crate) fn held_image_unpaged(state: &ShardState) -> Vec<slates_vfs::recover::HeldPiece> {
   let mut pieces: Vec<slates_vfs::recover::HeldPiece> = whole_pieces(state)
     .into_iter()
     .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
@@ -425,20 +426,65 @@ pub(crate) fn held_image_paged(state: &ShardState) -> (Vec<slates_vfs::recover::
   for (object, held) in &state.merge.checkpoints {
     pieces.push(checkpoint_piece(*object, held));
   }
-  // The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows
-  // kept as chunks (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
-  // records (goal 93 item 2b(b)).
-  // A-870 piece 2: copied from the encoder, the shard's now where every change is encoded, else the last committed cut.
-  let (pages, carried) = state.image_encoder.whole();
-  pieces.extend(
-    pages
-      .into_iter()
-      .map(|((family, page), bytes)| slates_vfs::recover::HeldPiece {
+  pieces
+}
+
+/// The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows kept
+/// as chunks (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed records
+/// (goal 93 item 2b(b)); the encoder's, the shard's now where every change is encoded, else the last committed cut (A-870
+/// piece 2); and whether they are the shard's now. Borrowed from `encoder` (goal 93, main's ruling of 2026-11-25: copied
+/// into a checkpoint's every page, 11% of a 2,000-changeset push's allocations), so they live only while it is held
+/// still.
+pub(crate) fn paged_whole(
+  encoder: &crate::image_pages::Encoder,
+) -> (Vec<slates_vfs::recover::HeldPieceRef<'_>>, bool) {
+  let (pages, carried) = encoder.whole();
+  let pages = pages
+    .into_iter()
+    .map(
+      |((family, page), bytes)| slates_vfs::recover::HeldPieceRef {
         key: page_key(family, page),
-        bytes: bytes.to_vec(),
-      }),
-  );
-  (pieces, carried)
+        bytes,
+      },
+    )
+    .collect();
+  (pages, carried)
+}
+
+/// Test support: what a delta carries, the encoder's cut's pages among its puts, copied ([`held_changes`] leaves them
+/// to the encoding, borrowed, [`paged_cut`]): the delta's pieces as a reader folds them.
+#[cfg(test)]
+pub(crate) fn held_changes_carried(state: &ShardState) -> HeldChanges {
+  let mut changes = held_changes(state);
+  if changes.image_carried {
+    changes
+      .put
+      .extend(paged_cut(&state.image_encoder).into_iter().map(|piece| {
+        slates_vfs::recover::HeldPiece {
+          key: piece.key,
+          bytes: piece.bytes.to_vec(),
+        }
+      }));
+  }
+  changes
+}
+
+/// The pages a delta puts of the encoder's cut, where it carries it ([`HeldChanges::image_carried`]): each page
+/// re-encoded since the last committed cut, borrowed from `encoder` (goal 93, main's ruling of 2026-11-25: copied into
+/// the delta's pieces, 14% of a 2,000-changeset push's allocations). None where the cut is not wholly encoded.
+pub(crate) fn paged_cut(
+  encoder: &crate::image_pages::Encoder,
+) -> Vec<slates_vfs::recover::HeldPieceRef<'_>> {
+  encoder.cut().map_or_else(Vec::new, |cut| {
+    cut
+      .filter_map(|((family, page), bytes)| {
+        bytes.map(|bytes| slates_vfs::recover::HeldPieceRef {
+          key: page_key(family, page),
+          bytes,
+        })
+      })
+      .collect()
+  })
 }
 
 /// The kind of the piece a landed record of the window `identity` is kept under, and its bytes: the identity, then the
@@ -475,38 +521,39 @@ thread_local! {
 }
 
 /// `family`'s entries whose coordinates lie in `lo..=hi` at the cut in flight, in coordinate order, each as the piece it
-/// would be alone (A-870 piece 1): read through the stores' pre-images (F2), so a page is the cut's moment whatever
-/// changed after it, and only until the entries it visits pass `cap` bytes (where it stopped short of the range, the
-/// coordinate it stopped at: a page a gap left can hold the family's every entry). Where no cut froze the range, the entries now. The entries now whatever
-/// the cut, all of them, where `cap` is none (test support: the oracle's look at the shard).
+/// would be alone (A-870 piece 1), into `out` (the encoder's buffer, lent cleared; goal 93, main's ruling of
+/// 2026-11-25: a read made a buffer of entries and a heap buffer an entry, about a third of a push's allocations at 2,000
+/// changesets): read through the stores' pre-images (F2), so a page is the cut's moment whatever changed after it, and
+/// only until the entries it visits pass `cap` bytes (where it stopped short of the range, the coordinate it stopped at:
+/// a page a gap left can hold the family's every entry). Where no cut froze the range, the entries now. The entries now
+/// whatever the cut, all of them, where `cap` is none (test support: the oracle's look at the shard).
 fn family_entries(
   state: &ShardState,
   family: crate::image_pages::Family,
-  (lo, hi): (u64, u64),
-  cap: Option<usize>,
-) -> (Vec<crate::image_pages::Entry>, Option<u64>) {
-  use crate::image_pages::Family;
+  ((lo, hi), cap): ((u64, u64), Option<usize>),
+  out: &mut Vec<crate::image_pages::Entry>,
+) -> Option<u64> {
+  use crate::image_pages::{EntryBytes, Family};
   use crate::vcs_store::homes;
   let content = state.vcs_stores.content();
   match family {
     Family::Windows => {
-      let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) else {
-        return (Vec::new(), None);
-      };
+      let windows = crate::vcs_store::chunk_windows(&state.vcs_stores)?;
       let (pieces, more) = match cap {
         Some(cap) => windows.pieces_at_cut((lo, hi), cap),
         None => (windows.pieces_in(lo, hi), None),
       };
-      let read = pieces
-        .into_iter()
-        .map(|(handle, bytes)| (handle, piece_key(KIND_VCS_WINDOW, [0; 16], handle), bytes))
-        .collect();
-      (read, more)
+      out.extend(pieces.into_iter().map(|(handle, bytes)| {
+        (
+          handle,
+          piece_key(KIND_VCS_WINDOW, [0; 16], handle),
+          EntryBytes::owned(bytes),
+        )
+      }));
+      more
     }
     Family::Lists => {
-      let Some(content) = content else {
-        return (Vec::new(), None);
-      };
+      let content = content?;
       let (lists, more) = match cap {
         Some(cap) => content.lists_at_cut((lo, hi), cap),
         None => (
@@ -517,96 +564,77 @@ fn family_entries(
           None,
         ),
       };
-      let read = lists
-        .into_iter()
-        .map(|(identity, bytes)| {
-          (
-            coordinate_of(&identity),
-            vcs_node_key(KIND_VCS_LIST, &identity),
-            vcs_list_bytes(&identity, &bytes),
-          )
-        })
-        .collect();
-      (read, more)
+      out.extend(lists.into_iter().map(|(identity, bytes)| {
+        (
+          coordinate_of(&identity),
+          vcs_node_key(KIND_VCS_LIST, &identity),
+          EntryBytes::of(&[identity.0.as_slice(), &bytes]),
+        )
+      }));
+      more
     }
     Family::Names => {
-      let Some(content) = content else {
-        return (Vec::new(), None);
-      };
+      let content = content?;
       let (names, more) = match cap {
         Some(cap) => content.names_at_cut((lo, hi), cap),
         None => (content.names_in(lo, hi).collect(), None),
       };
-      let read = names
-        .into_iter()
-        .map(|(identity, root)| {
-          (
-            coordinate_of(&identity),
-            vcs_node_key(KIND_VCS_NAME, &identity),
-            vcs_name_bytes(&identity, &root),
-          )
-        })
-        .collect();
-      (read, more)
+      out.extend(names.into_iter().map(|(identity, root)| {
+        (
+          coordinate_of(&identity),
+          vcs_node_key(KIND_VCS_NAME, &identity),
+          EntryBytes::of(&[identity.0.as_slice(), root.0.as_slice()]),
+        )
+      }));
+      more
     }
     Family::Aways => {
-      let Some(content) = content else {
-        return (Vec::new(), None);
-      };
+      let content = content?;
       let (aways, more) = match cap {
         Some(cap) => content.aways_at_cut((lo, hi), cap),
         None => (content.aways_in(lo, hi).collect(), None),
       };
-      let read = aways
-        .into_iter()
-        .map(|(identity, len)| {
-          (
-            coordinate_of(&identity),
-            vcs_node_key(KIND_VCS_AWAY, &identity),
-            vcs_away_bytes(&identity, len),
-          )
-        })
-        .collect();
-      (read, more)
+      out.extend(aways.into_iter().map(|(identity, len)| {
+        (
+          coordinate_of(&identity),
+          vcs_node_key(KIND_VCS_AWAY, &identity),
+          EntryBytes::of(&[identity.0.as_slice(), &len.to_le_bytes()]),
+        )
+      }));
+      more
     }
     Family::RegionHolds => {
       let (holds, more) = match cap {
         Some(cap) => homes::region_held_at_cut((lo, hi), cap),
         None => (homes::region_held_in(lo, hi), None),
       };
-      let read = holds
-        .into_iter()
-        .map(|(identity, owners)| {
-          let mut bytes = identity.0.to_vec();
-          for owner in &owners {
-            owner.encode_into(&mut bytes);
-          }
-          (
-            coordinate_of(&identity),
-            vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
-            bytes,
-          )
-        })
-        .collect();
-      (read, more)
+      out.extend(holds.into_iter().map(|(identity, owners)| {
+        let mut bytes = identity.0.to_vec();
+        for owner in &owners {
+          owner.encode_into(&mut bytes);
+        }
+        (
+          coordinate_of(&identity),
+          vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
+          EntryBytes::owned(bytes),
+        )
+      }));
+      more
     }
     Family::Landed => {
       let (records, more) = match cap {
         Some(cap) => homes::landed_at_cut((lo, hi), cap),
         None => (homes::landed_in(lo, hi), None),
       };
-      let read = records
-        .into_iter()
-        .map(|(identity, landed)| {
-          let (kind, bytes) = landed_kind(&identity, &landed);
-          (
-            coordinate_of(&identity),
-            vcs_node_key(kind, &identity),
-            bytes,
-          )
-        })
-        .collect();
-      (read, more)
+      out.extend(records.into_iter().map(|(identity, landed)| {
+        let (kind, bytes) = landed_kind(&identity, &landed);
+        (
+          coordinate_of(&identity),
+          vcs_node_key(kind, &identity),
+          EntryBytes::owned(bytes),
+        )
+      }));
+      more
     }
   }
 }
@@ -955,7 +983,7 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The repository content store's and homes' entries kept or let go since then, a page each change lies in (A-870
   // piece 1): windows (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
   // records (goal 93 item 2b(b)).
-  let image_carried = image_cut(state, (&mut put, &mut removed));
+  let image_carried = image_cut(state, &mut removed);
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -1110,6 +1138,10 @@ pub(crate) const IMAGE_LONGEST_SPLIT_DISCARD: &str = "vcs_store.image.longest_sp
 pub(crate) const IMAGE_TURNS: &str = "vcs_store.image.encode_turns";
 /// Format: the status counter of the bytes the encoder's turns spent: encoded, and read by a split.
 pub(crate) const IMAGE_ENCODED_BYTES: &str = "vcs_store.image.encoded_bytes";
+/// Format: the status counter of the heap bytes the encoder's reads allocated beside the pages they encoded (goal 93,
+/// main's ruling of 2026-11-25): the entries' buffer as it grew, and the entries' own buffers, against
+/// [`IMAGE_ENCODED_BYTES`].
+pub(crate) const IMAGE_READ_ALLOCATED_BYTES: &str = "vcs_store.image.read_allocated_bytes";
 /// Format: the status counter of the most bytes one encoder turn encoded.
 pub(crate) const IMAGE_LONGEST_TURN_BYTES: &str = "vcs_store.image.longest_turn_bytes";
 /// Format: the status counter of the encoder's turns while paused.
@@ -1295,7 +1327,7 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
   let mut encoded = Vec::new();
   let turned = encoder.turn(
     (limit, limit),
-    &|family, range, cap| family_entries(state, family, range, Some(cap)),
+    &|family, range, cap, out| family_entries(state, family, (range, Some(cap)), out),
     &mut encoded,
   );
   state.image_encoder = encoder;
@@ -1304,6 +1336,7 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
   }
   state.count(IMAGE_TURNS, 1);
   state.count(IMAGE_ENCODED_BYTES, turned.bytes);
+  state.count(IMAGE_READ_ALLOCATED_BYTES, turned.allocated);
   state.count_max(IMAGE_LONGEST_TURN_BYTES, turned.bytes);
   state.count(IMAGE_PAGES_SPLIT, turned.split);
   state.count(IMAGE_SPLIT_DISCARDED_BYTES, turned.discarded);
@@ -1348,25 +1381,18 @@ pub(crate) fn image_resumed() -> impl core::future::Future<Output = ()> {
   })
 }
 
-/// What a delta carries of the paged families (A-870 piece 2): the encoder's cut, each page re-encoded since the last
-/// committed one put or removed, and the pieces an image before A-870 kept one an entry removed; nothing where a change
-/// is not yet encoded. Whether it carried the cut.
-fn image_cut(
-  state: &ShardState,
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) -> bool {
+/// What a delta removes of the paged families (A-870 piece 2): the encoder's cut's pages of no entry now, and the pieces
+/// an image before A-870 kept one an entry; nothing where a change is not yet encoded. Whether it carries the cut, whose
+/// pages it puts borrowed from the encoder as it encodes ([`paged_cut`]).
+fn image_cut(state: &ShardState, removed: &mut Vec<PieceKey>) -> bool {
   let Some(cut) = state.image_encoder.cut() else {
     return false;
   };
-  for ((family, page), bytes) in cut {
-    match bytes {
-      Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
-        key: page_key(family, page),
-        bytes: bytes.to_vec(),
-      }),
-      None => removed.push(page_key(family, page)),
-    }
-  }
+  removed.extend(
+    cut
+      .filter(|(_, bytes)| bytes.is_none())
+      .map(|((family, page), _)| page_key(family, page)),
+  );
   removed.extend(state.published_held.legacy.iter().copied());
   true
 }
@@ -1647,10 +1673,11 @@ pub(crate) fn paged_entries_placed(
   crate::image_pages::Family::ALL
     .into_iter()
     .flat_map(|family| {
-      family_entries(state, family, (0, u64::MAX), None)
-        .0
+      let mut entries = Vec::new();
+      family_entries(state, family, ((0, u64::MAX), None), &mut entries);
+      entries
         .into_iter()
-        .map(move |(coordinate, key, bytes)| (family, coordinate, key, bytes))
+        .map(move |(coordinate, key, bytes)| (family, coordinate, key, bytes.to_vec()))
     })
     .collect()
 }

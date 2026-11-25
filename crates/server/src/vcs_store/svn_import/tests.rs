@@ -1230,6 +1230,67 @@ fn an_imports_room_bounds_its_batch_where_it_is_smaller() {
   );
 }
 
+/// Shape: the bound, in units of the changeset store, the arena give-back test imports at: a batch of a few units, far
+/// fewer than the import's texts.
+const GIVE_BACK_UNITS: u64 = 2;
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: A-742's rule, freed memory returns to the OS, for the content arena under an
+/// import; at git-2000 the bound arm's daemon held 268 MB of the arena resident, 204 MB of it free pages the idle purge
+/// never reached, against 2.3 MB of live texts). Do: import [`rewrites`]'s rewrites (16 MiB of texts) at a bound of
+/// [`GIVE_BACK_UNITS`] units (its flush forced, `staging::FLUSH_NS`), publishing the shard after each turn as its period
+/// would (so a landed batch's let-go windows, deferred while a published image names them, are released); read the
+/// content arena's resident free bytes as the import ends, as `slates status` reports them
+/// (`mem.gauge.content.arena_resident_free_bytes`). Expect the import whole, and the resident free bytes within the
+/// bound and one give-back slice (`daemon::purge_slice_blocks` blocks of the discard size), what a next batch refills;
+/// counted `repository.svn_import.purged_past_bound_bytes`. Red before: every released batch's texts still resident.
+#[test]
+fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
+  use crate::repository::svn_commit::staging::{FLUSH_NS, PURGED_PAST_BOUND};
+  let (youngest, resident_free, keep, purged) = stored(|| async move {
+    let (svn, _) = subversion("given-back").await;
+    let (unit, memcpy) = on(|state| {
+      (
+        crate::vcs_store::hg_import::segment_bytes(state) as u64,
+        state.config.memcpy_bytes_per_second.max(1),
+      )
+    });
+    let flush_ns =
+      u64::try_from(u128::from(GIVE_BACK_UNITS * unit) * 1_000_000_000 / u128::from(memcpy))
+        .unwrap();
+    FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
+    let (loaded, _) = imported_sampling(
+      svn,
+      rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+      &mut || {
+        on(|state| {
+          let _ = crate::verbs::publish_shard(state);
+        });
+      },
+    )
+    .await;
+    FLUSH_NS.with(|forced| forced.set(None));
+    on(|state| {
+      let slice =
+        crate::daemon::purge_slice_blocks(state) as u64 * state.config.discard_from_bytes as u64;
+      (
+        loaded.map(|loaded| loaded.youngest),
+        state.store.content.arena().resident_free_bytes() as u64,
+        GIVE_BACK_UNITS * unit + slice,
+        count(state, PURGED_PAST_BOUND),
+      )
+    })
+  });
+  let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(youngest, Ok(expected), "the import whole");
+  println!(
+    "svn_import: the arena resident free {resident_free} B as the import ended (keep {keep} B), {purged} B given back"
+  );
+  assert!(
+    resident_free <= keep,
+    "{resident_free} B resident and free in the arena, past the bound and a slice, {keep} B"
+  );
+}
+
 /// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush, under the
 /// shard's watchdog window.
 const HOG_NS: u64 = 500_000_000;

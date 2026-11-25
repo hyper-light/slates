@@ -797,6 +797,7 @@ fn a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each() {
       payload: [0; 32],
       offset: 0,
       len: 0,
+      chunk: false,
     };
     building.give_rows(vec![vec![Some(StoredRevision {
       text: [1; 32],

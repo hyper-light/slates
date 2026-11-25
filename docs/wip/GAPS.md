@@ -364,6 +364,21 @@
 > for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
 > piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
 > the step budget (the volumes' images paged too only if past it).
+> **Publication churn (goal 93, w-perf; main's ruling of 2026-11-25 (a), w-shared's go):** at 2,000 changesets about
+> 65% of a push's system allocations were its publications (`crates/server/tests/hg_fetch_heap.rs`'s churn by site): a
+> delta re-encodes only the pages its changes lie in, but a re-encoded page was read a buffer of entries and a heap
+> buffer an entry, then copied into the delta's or checkpoint's piece. Now a page's entries are read into the encoder's
+> buffer, lent and kept (`FamilyReader`), each entry's bytes inline where they fit two identities (`EntryBytes`):
+> counted `vcs_store.image.read_allocated_bytes` beside `encoded_bytes`; red
+> `a_re_encoded_page_allocates_no_more_than_it_encodes` (a cut of 300 let-goes over small pages: 557,456 bytes
+> allocated for 306,607 encoded; now 229,392, the windows' pieces read out of the arena and every buffer moved in
+> counted); the buffer kept a capped read's after a page of one coordinate is read whole
+> (`a_whole_read_of_a_page_of_one_coordinate_leaves_the_encoders_buffer_a_capped_reads`: 4,096 entries' room, now 32;
+> w-shared's review). The encoder's pages are handed to a delta and a checkpoint borrowed, never copied
+> (`slates_vfs::recover::HeldPieceRef`, encoded byte for byte as a `HeldPiece`, held by the golden vector
+> `a_borrowed_held_piece_encodes_byte_for_byte_as_an_owned_one` and `check_publication`; a delta's borrow ends with
+> its encoding, a checkpoint's encoder taken out of the state for its stream and put back as it ends). OWED: (b), the
+> away windows keyed by let-go order, should the 57k churn show the Aways family leading and growing with history.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -1663,9 +1678,21 @@
 > the decoder's memory charged apart, its bytes held to the text's length), counted `TextCache::decoded` and
 > `decoded_most`. Held by `a_texts_chunked_and_raw_rows_make_the_same_bytes`, `a_raw_text_beginning_with_a_chunk_types_
 > byte_reads_as_it_is` and `a_chunked_text_with_no_decoder_installed_is_refused` (`slates-store` tests `chunk_form`,
-> `chunk_form_undecoded`). No writer yet writes a chunk: owed, the push's and the import's landings writing chunks
-> (record v+1, step 2), a fetch's file section decoding them (step 3), the stream copying them (step 4, `Streaming::sized`
-> gone with it), each sliced under the step budget.
+> `chunk_form_undecoded`).
+> Steps 2 to 4 BUILT as one wave (2026-11-25, w-hg): a push's segment lands its payload as stock's revlog chunks, made as
+> it lands a turn's steps at a time (`slates_hg::push::chunked`: zstd's streaming context, each frame's size pledged, so
+> each chunk is the one-shot chunk byte for byte at every step size; a step compressing at most the shard's copy slice;
+> counted `vcs.hg.segment_compress_bytes_most`, `_plain_bytes`, `_stored_bytes`, `_ns`, `segment_chunk_turns`), each
+> `Texts` entry held as a chunk there. The segment's record names its rows by identity and never reads the payload, so no
+> record changes. A fetch's file section decodes a chunk on its shard, one a step within the step's room
+> (`revlog_chunk::decode_counted`; `vcs_store.hg_fetch_decompress_ns`, `_plain_bytes`, `_bytes_most`), a text made whole
+> coming back decoded by the store; a stream copies a chunk as it lies, sized by its length, compressing only a raw
+> place. Held by `a_segments_chunks_made_a_step_at_a_time_are_the_one_shot_chunks` (hg) and
+> `a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes` (server: the push chunked within the copy
+> slice, the stream compressing nothing again, the clone decoding the file's chunk). Owed: an import's landings and a
+> whole push's or made changeset's payload (the changegroup its record replays) still land raw, so a stream compresses
+> those at stream time (`Streaming::sized` stays for them); the count pass still reads a chunk place's bytes it could size
+> by its length.
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
@@ -1751,6 +1778,14 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
+> 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
+> 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
+> smoothed mean and four mean deviations), at most the machine's measured wake (`spin_before_park_ns`), then parks.
+> Counted `vcs_store.hg_owner_spin_hits`, `_parks`, `_spin_ns`. Held by `back_to_back_reads_are_met_spinning_not_parked`
+> (64 reads back to back: with no spin 64 parks, the red; with a 2 ms cap 61 met spinning, 3 parked while the window was
+> learned). Owed: the 57k clone's split after it (main's), then the request count (812,896, about 14 a changeset under
+> the step bound) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
@@ -2800,6 +2835,16 @@
 > call: A-420's measure and guard). Windows' residency BUILT (2026-11-23, w-win for main 01a20182): `QueryWorkingSetEx`,
 > a page of entries a call, a page in RAM when it is in the working set, no written bit; it had been a typed refusal, so
 > `large::heap`'s `mapped_resident` read 0 there (CI run 45176536354, both Windows lanes).
+> The content arena under an import (goal 93 P7, w-perf; main's ruling of 2026-11-25): an import never leaves its shard
+> idle, so the idle purge (A-105) never ran under it, and git-2000's let-go texts stayed resident as free pages (bound
+> arm, round 1: `object_resident` 268 MB, `arena_resident_free` 204 MB, `arena_deferred` 73 MB, 2.3 MB of live texts).
+> Now each batch's tail gives back the arena's resident free pages past the batch's own bound, an idle purge's slice a
+> step (`ChunkArena::purge_past`, `daemon::purge_slice_blocks`): a batch takes at most its bound before it lands, so
+> pages kept past it are pages no batch of the import refills. Counted `repository.svn_import.purged_past_bound_bytes`.
+> Red `an_imports_arena_keeps_no_more_resident_free_than_its_bound` (16 MiB of rewrites at a bound of two units,
+> published each turn): 6,250,496 bytes resident and free as the import ended against a keep of 4,202,496; now
+> 2,449,408, 3,801,088 given back. OWED: main's fourth P7 arm; the deferred frees of the import's last batch wait for the
+> next publication and the idle purge, as any shard's do.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
