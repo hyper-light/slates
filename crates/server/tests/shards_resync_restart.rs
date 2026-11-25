@@ -744,3 +744,8 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
   drop(segment);
   drop(anchor);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

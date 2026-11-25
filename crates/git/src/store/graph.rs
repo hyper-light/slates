@@ -152,6 +152,14 @@ pub struct PositionCounts {
   pub tree_deltas_most: u64,
   /// The deltas the walk's tree reads applied, summed.
   pub tree_deltas: u64,
+  /// The walk's tree reads that found the tree, or an entry of its chain, kept by the read cache.
+  pub read_cache_hits: u64,
+  /// The times the walk widened the read cache before a tree's read (`Repository::widen_read_cache`).
+  pub read_cache_widened: u64,
+  /// The times its admission refused the read cache the room a tree's read asked.
+  pub read_cache_refused: u64,
+  /// The most bytes the read cache was allowed to keep.
+  pub read_cache_budget_most: u64,
 }
 
 impl PositionCache {
@@ -364,6 +372,9 @@ impl<'r> StoreGraph<'r> {
         let mut positions = self.positions.borrow_mut();
         positions.counts.tree_deltas_most = positions.counts.tree_deltas_most.max(deltas);
         positions.counts.tree_deltas = positions.counts.tree_deltas.saturating_add(deltas);
+        if self.repository.last_read_found_kept() {
+          positions.counts.read_cache_hits = positions.counts.read_cache_hits.saturating_add(1);
+        }
         named
       }
       Kind::Tag => self
@@ -586,9 +597,23 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn opening_tree(&self, tree: u64, admission: &mut Admission) {
-    if let Some((_, row)) = self.row(tree) {
-      let _ = self.repository.widen_read_cache(row.len, admission);
+    let Some((_, row)) = self.row(tree) else {
+      return;
+    };
+    let widening = self.repository.widen_read_cache(row.len, admission);
+    let budget = self.repository.read_cache_budget();
+    let mut positions = self.positions.borrow_mut();
+    let counts = &mut positions.counts;
+    match widening {
+      super::Widening::Grown => {
+        counts.read_cache_widened = counts.read_cache_widened.saturating_add(1);
+      }
+      super::Widening::Refused => {
+        counts.read_cache_refused = counts.read_cache_refused.saturating_add(1);
+      }
+      super::Widening::Enough => {}
     }
+    counts.read_cache_budget_most = counts.read_cache_budget_most.max(budget);
   }
 
   fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {

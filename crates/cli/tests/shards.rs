@@ -989,3 +989,8 @@ fn kill_hard(pid: u32) {
   unsafe { CloseHandle(process) };
   assert_ne!(ended, 0, "kill the daemon");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

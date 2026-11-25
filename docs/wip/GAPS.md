@@ -98,9 +98,20 @@
 > **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
 > round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
 > (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
-> **Open (w-shared, 2026-11-21): `content_ranges` `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
-> fails some runs** (macOS arm64; local at load 20 alone, kiln r28 on the big Studio at load 2 to 7 in the whole lib;
-> passed in r19): no sweep completes on idle time within 10 s, 200,000+ idle slices counted. Untouched by A-825/A-826.
+> **CLOSED by A-926 part 1 (w-perf, 2026-11-25; opened by w-shared, 2026-11-21): `content_ranges`
+> `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length` failed some runs** (macOS arm64;
+> main's full suite at f954135af: (sweeps, idle slices, armed) (0, 3,348,409, true) at its bound, passing alone in
+> 29.7 s). No slice failed to advance. The sweep was 12,582,958 pages of a fresh 1-shard audit daemon:
+> - 8,388,609 of them its checkpoint slots and delta log, and 699,051 its write log, walked whole since their extents
+>   were unknown (A-744's split assumed a predecessor wrote them);
+> - under in-process load each idle slice walked 4.1 pages against 10.6 alone, so the sweep took 55.5 s of its 60
+>   against 23.7 s.
+>
+> A-926 keeps a high-water mark for each written memory, so a successor knows its extents. Now the sweep is 3,495,300
+> pages, and it completes in 1.6 s both alone (40,988 slices) and loaded (40,730, two hogs a core), held by
+> `a_status_requests_sweep_completes_within_its_bound_under_load` and
+> `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. OWED, A-926 part 2: the segment's log
+> and snapshot regions (3,495,255 pages, the register's format) get marks too.
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
@@ -1913,6 +1924,18 @@
 > count at the body's yield: none). In process (debug, this MacBook, load about 30): 4 yields over 4 turns, 37 µs of gaps,
 > the longest 26 µs, so the yield is not what paces a turn there. Owed: the 57k's figures with it (main's), then what
 > lies between its turns by the counters beside it (`hg_stream_span_ns` against turns, store waits and writes).
+> An hg-over-SSH clone's session judged wedged at its first poll (main's watchdog A/B at a95b34dfa, 12 burners, load
+> about 54: 1,023 ms with no CPU progress, never runnable, in `a_mercurial_clone_larger_than_a_requests_room_is_answered_
+> over_ssh`'s task). That test's loop stepped its command without yielding, where the daemon's session yields after
+> every step (`vcs_ssh`'s `step`); it now yields too (2026-11-25, w-hg). Each SSH hg serving step is counted with its
+> thread CPU (`vcs_store.hg_ssh_steps`, `_step_most_cpu_ns`). Held by `a_clone_over_ssh_under_burners_holds_its_shard_a_
+> step_a_poll` (two spinners a core in process; the task's polls numbered and timed: no two steps in one poll; red with
+> the yield removed, 2 steps sharing one). Measured: the first poll 0.3 ms of CPU (2.1 ms cold), its wall time its CPU,
+> so the A/B's second was the thread blocked in the kernel (a cold page-in of the store's windows on that hour's
+> near-full disk is the likeliest, not shown), not the session's work. w-git's `an_ssh_clone_past_many_windows_is_
+> answered_whole` and `a_rekey_during_a_blocked_write_sends_no_byte_twice` run through the production edge and its
+> yields, so not this cause. Owed: the blocked first poll's call, if the A/B meets it again (the watchdog's log names
+> the poll, not the call).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads

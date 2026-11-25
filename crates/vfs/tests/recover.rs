@@ -2555,8 +2555,12 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     Some(&encoded[..]),
     "the streamed image bytes"
   );
-  let (recovered, _) =
-    slates_vfs::checkpoint_log::Journal::recover(&slots, &Vec::<u8>::new()).unwrap();
+  let (recovered, _) = slates_vfs::checkpoint_log::Journal::recover(
+    &slots,
+    &Vec::<u8>::new(),
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&slots, &Vec::<u8>::new()),
+  )
+  .unwrap();
   assert_eq!(
     recovered,
     Some(expected),
@@ -2618,8 +2622,12 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     Some(&VfsError::NoSpace),
     "the refusal is the stream's"
   );
-  let (recovered, _) =
-    slates_vfs::checkpoint_log::Journal::recover(&slots, &Vec::<u8>::new()).unwrap();
+  let (recovered, _) = slates_vfs::checkpoint_log::Journal::recover(
+    &slots,
+    &Vec::<u8>::new(),
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&slots, &Vec::<u8>::new()),
+  )
+  .unwrap();
   assert_eq!(recovered.as_ref(), Some(&small_image), "after a refusal");
 
   let mut stage = Vec::new();
@@ -2629,8 +2637,12 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     stream.buf().extend_from_slice(key);
     vol.encode_image_into(&store, None, &mut stream).unwrap();
   }
-  let (recovered, _) =
-    slates_vfs::checkpoint_log::Journal::recover(&slots, &Vec::<u8>::new()).unwrap();
+  let (recovered, _) = slates_vfs::checkpoint_log::Journal::recover(
+    &slots,
+    &Vec::<u8>::new(),
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&slots, &Vec::<u8>::new()),
+  )
+  .unwrap();
   assert_eq!(
     recovered.as_ref(),
     Some(&small_image),

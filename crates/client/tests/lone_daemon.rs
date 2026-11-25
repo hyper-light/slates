@@ -987,3 +987,8 @@ fn a_lone_daemon_whose_log_stalls_lives_on_and_serves() {
     "no end line: {said:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

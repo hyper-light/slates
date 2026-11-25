@@ -735,3 +735,8 @@ fn versions_out_of_order_and_a_head_the_replay_does_not_hold_fail() {
   assert!(found.named[1].starts_with("the green's head of dir/file-2 differs"));
   assert_eq!(found, reference::oracle(&submits, &base, &head));
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

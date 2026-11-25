@@ -147,3 +147,8 @@ fn a_kept_windows_record_keeps_what_the_window_alone_names() {
   }
   assert!(windows.hand_back(&mut chunks));
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

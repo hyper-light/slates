@@ -543,16 +543,27 @@ async fn within_records<T>(
   })
 }
 
-/// The increment of `checked`, its copies restored by `plans`, built against `batch`'s scratch member at its head and
-/// named `work_identity`: refused `Diverged` where the records moved past the batch's head.
-fn build_in(
+/// Where a revision's build stands between its steps ([`build_some_in`]).
+enum BuildAt {
+  /// Not begun: the restores of its copies.
+  Begin(restore::CopyPlans),
+  /// Begun.
+  Going(Box<super::BuildState>),
+  /// Taken by the step under way.
+  Taken,
+}
+
+/// One step of `checked`'s increment's build against the batch's scratch member (A-920 piece 4c: its rows 12.3 ms at
+/// 9,000 files whole, debug): begun where `at` has not, then its rows built a row a unit until the step's clock passes
+/// its quantum, a row at least; the increment once built, identified by `work_identity`. Refused where the records no
+/// longer stand at the batch's head.
+fn build_some_in(
   state: &mut ShardState,
-  repository: RepositoryId,
-  batch: &mut ImportBatch,
-  (checked, plans): (&Checked, restore::CopyPlans),
-  work_identity: [u8; 32],
-) -> Result<Increment, Uncommitted> {
+  (repository, batch): (RepositoryId, &mut ImportBatch),
+  (checked, at, work_identity): (&Checked, &mut BuildAt, [u8; 32]),
+) -> Result<Option<Increment>, Uncommitted> {
   let head = batch.head();
+  let deadline = slice_deadline_ns();
   crate::vcs_store::lent_state(state, |state| {
     let ShardState {
       greens, vcs_stores, ..
@@ -565,7 +576,25 @@ fn build_in(
     }
     batch
       .with_engine_in(greens, |engine| {
-        Building::new(records, engine, (checked, plans)).build_unordered(head, work_identity)
+        let building = match core::mem::replace(at, BuildAt::Taken) {
+          BuildAt::Begin(plans) => Building::begin(records, engine, (checked, plans))?,
+          BuildAt::Going(building) => *building,
+          BuildAt::Taken => return Err(Uncommitted::NotHeld),
+        };
+        let mut spent = || slates_rt::futures::now_ns() >= deadline;
+        let built = Building::step(
+          (records, engine, checked),
+          building,
+          &mut spent,
+          (head, work_identity),
+        )?;
+        Ok(match built {
+          super::BuildStep::More(building) => {
+            *at = BuildAt::Going(building);
+            None
+          }
+          super::BuildStep::Built(built) => Some(built),
+        })
       })
       .ok_or(Uncommitted::NotHeld)?
   })
@@ -662,8 +691,10 @@ type ToRecord = Option<Recording>;
 /// A kept revision's records being applied and the batch's held table followed a slice at a time
 /// ([`Staging::record_some`], A-920 piece 5).
 struct Recording {
-  /// The checked revision, until the records apply it.
+  /// The checked revision, until the records' apply of it begins.
   checked: Option<Checked>,
+  /// The records' apply of it, between its steps.
+  applying: Option<slates_svn::migration::Applying>,
   /// Its changed-path rows, which the held table's walks read.
   changes: Vec<slates_svn::index::ChangedPath>,
   /// Its record.
@@ -718,6 +749,7 @@ impl Recording {
     Recording {
       changes: checked.changes().to_vec(),
       checked: Some(checked),
+      applying: None,
       record,
       post,
       phase: RecordPhase::Before(0),
@@ -1141,7 +1173,7 @@ impl Staging {
 
   /// The increment of `checked` built against the batch's scratch member and readied for its judge, a slice a step:
   /// named by its record `record`'s identity, hashed a slice a step ([`identified_in`], A-920 piece 4b); built
-  /// ([`build_in`]); then its document put in order and the texts it names read ([`readied_in`]). None where the
+  /// ([`build_some_in`]); then its document put in order and the texts it names read ([`readied_in`]). None where the
   /// shard's state is gone.
   async fn built_in(
     &mut self,
@@ -1150,17 +1182,26 @@ impl Staging {
     (checked, plans, record): (&Checked, restore::CopyPlans, &[u8]),
   ) -> Option<Result<Increment, Uncommitted>> {
     let work_identity = identified_in(record).await?;
-    let Some(batch) = self.batch.as_mut() else {
-      return Some(Err(Uncommitted::NotHeld));
+    let mut at = BuildAt::Begin(plans);
+    let built = loop {
+      let Some(batch) = self.batch.as_mut() else {
+        return Some(Err(Uncommitted::NotHeld));
+      };
+      let stepped = within_records(repository, lent, |state| {
+        build_some_in(
+          state,
+          (repository, batch),
+          (checked, &mut at, work_identity),
+        )
+      })
+      .await?;
+      match stepped {
+        Ok(Some(built)) => break built,
+        Ok(None) => {}
+        Err(refused) => return Some(Err(refused)),
+      }
     };
-    let built = within_records(repository, lent, |state| {
-      build_in(state, repository, batch, (checked, plans), work_identity)
-    })
-    .await?;
-    match built {
-      Ok(built) => readied_in(built).await,
-      Err(refused) => Some(Err(refused)),
-    }
+    readied_in(built).await
   }
 
   /// [`Staging::stage_in`]'s last steps, each a slice of the shard's budget lending the records' room (A-920 piece 1:
@@ -1306,21 +1347,32 @@ impl Staging {
     }
   }
 
-  /// The records applied with `recording`'s checked revision, counted staged: the phase after, or the step spent.
+  /// The records applied with `recording`'s checked revision a slice at a time until `spent`, a unit at least (A-920
+  /// piece 5b: 12-12.5 ms whole at 9,000 files, debug; `Repository::apply_begin`, `apply_step`), counted staged once
+  /// applied: the phase after, or the step spent.
   fn apply_records(
     &mut self,
     state: &mut ShardState,
     repository: RepositoryId,
     (recording, spent): (&mut Recording, &mut dyn FnMut() -> bool),
   ) -> Result<Recorded, Uncommitted> {
-    let checked = recording.checked.take().ok_or(Uncommitted::NotHeld)?;
-    let applied = state
+    let records = state
       .vcs_stores
       .subversion(repository)
       .and_then(|svn| svn.records.as_mut())
-      .map(|records| records.apply(checked))
       .ok_or(Uncommitted::NotHeld)?;
-    let revision = applied.map_err(Uncommitted::Step)?;
+    let mut applying = match (recording.applying.take(), recording.checked.take()) {
+      (Some(applying), _) => applying,
+      (None, Some(checked)) => records.apply_begin(checked).map_err(Uncommitted::Step)?,
+      (None, None) => return Err(Uncommitted::NotHeld),
+    };
+    let Some(revision) = records
+      .apply_step(&mut applying, spent)
+      .map_err(Uncommitted::Step)?
+    else {
+      recording.applying = Some(applying);
+      return Ok(Recorded::Spent);
+    };
     self.staged = self.staged.saturating_add(1);
     recording.phase = RecordPhase::After(0, revision);
     Ok(Recorded::after(spent))

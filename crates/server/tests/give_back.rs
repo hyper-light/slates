@@ -196,3 +196,8 @@ fn a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_b
   daemon.stop();
   drop(anchor);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -590,3 +590,8 @@ fn a_granted_landing_never_holds_its_shard_while_it_is_planned() {
     "no probe waited for half the landing or more ({longest:?} of {took:?})"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

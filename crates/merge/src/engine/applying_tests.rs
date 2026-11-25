@@ -33,13 +33,16 @@ fn applied_a_unit_a_step(
 }
 
 /// Everything a reader of `green` reads that a version's apply changes: its histories ([`folded_state`]), its head and
-/// the head's identity.
+/// the head's identity, and its change index (each version's entries, each path's last change, their bytes).
 fn read_whole(green: &mut Green) -> String {
   format!(
-    "{} {:?}\n{}",
+    "{} {:?}\n{}\n{:?}\n{:?} {}",
     green.head(),
     green.head_identity(),
-    folded_state(green)
+    folded_state(green),
+    green.changes,
+    green.latest_change,
+    green.changes_bytes,
   )
 }
 
@@ -151,6 +154,38 @@ fn committed(green: &mut Green, judgment: Judgment) -> Option<u64> {
   green.commit_judged(held).ok().map(|(version, _)| version)
 }
 
+/// The change index's rule (§4.16 `changed_since`, A-264), on its own: every path a version changed has exactly one
+/// entry marked last, at the version `latest_change` names for it; every entry marked last is that path's
+/// `latest_change`; and every path an entry names has a `latest_change`. Where it fails, how.
+fn change_index_holds(green: &Green) -> Result<(), String> {
+  let mut marked: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
+  for (version, entries) in &green.changes {
+    for entry in entries {
+      if !green.latest_change.contains_key(&entry.path) {
+        return Err(format!("{} at {version} has no latest change", entry.path));
+      }
+      if entry.last {
+        marked
+          .entry(entry.path.as_str())
+          .or_default()
+          .push(*version);
+      }
+    }
+  }
+  for (path, latest) in &green.latest_change {
+    let last = marked
+      .get(path.as_str())
+      .map(Vec::as_slice)
+      .unwrap_or_default();
+    if last != [*latest] {
+      return Err(format!(
+        "{path}: latest change {latest}, marked last at {last:?}"
+      ));
+    }
+  }
+  Ok(())
+}
+
 fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<u64> {
   let Judgment::Accepted(held) = green.judge(inc) else {
     return None;
@@ -195,6 +230,32 @@ proptest! {
         prop_assert_eq!(committed, None);
       }
       prop_assert_eq!(read_whole(&mut sliced), read_whole(&mut whole));
+    }
+  }
+
+  /// A-920 piece 1b (the change index's rule, stated on its own; main's order of 2026-11-25). Do: make every path on a
+  /// green, then submit generated works of every kind and renames changing them again, each committed a unit a step.
+  /// Expect after every one that each changed path has exactly one entry marked last, at the version its last change
+  /// names, and no entry names a path without a last change.
+  #[test]
+  fn only_a_paths_newest_change_is_marked_last(
+    steps in prop::collection::vec(
+      (prop::collection::vec((0usize..5, any::<u8>()), 1..5), any::<u8>()),
+      1..16,
+    ),
+  ) {
+    let mut green = Green::new();
+    // Every path made first, so the generated works change paths that hold entries already.
+    let made = PATHS.iter().fold(Work::default(), |work, path| work.create(path, b"made"));
+    prop_assert!(committed_a_unit_a_step(&mut green, &made.at(0, 0)).is_some(), "the paths made");
+    for (id, (changes, mark)) in (1u64..).zip(&steps) {
+      let mut work = Work::default();
+      for (index, how) in changes {
+        work = reserved_change(work, PATHS[*index], *how, *mark);
+      }
+      let inc = work.at(green.head(), id);
+      let _ = committed_a_unit_a_step(&mut green, &inc);
+      change_index_holds(&green).map_err(TestCaseError::fail)?;
     }
   }
 

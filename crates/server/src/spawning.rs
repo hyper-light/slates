@@ -201,6 +201,19 @@ fn report_gone() {
 
 /// Counter: a shard's report of its spawner's end closing that could not reach the owner's shard (A-924).
 const SPAWNER_REPORT_REFUSED: &str = "spawner.report_refused";
+/// Counter: the spawners the owner started again after a death (A-924): none while the spawner serves. A test binary that
+/// names no `spawner_role!()`, or a host whose `main` does not serve first, starts a spawner that ends at once, which
+/// this counts once a window.
+pub(crate) const SPAWNER_RESTARTED: &str = "spawner.restarted";
+
+/// Counter: a dead spawner whose reaping task the shard could not start: left a zombie until the daemon's process ends
+/// (A-924).
+const SPAWNER_REAP_REFUSED: &str = "spawner.reap_refused";
+
+/// Counts `counter` on this shard, when there is one.
+fn count_on_shard(counter: &'static str) {
+  let _ = crate::state::with_state_counted(|state| state.count(counter, 1));
+}
 
 /// The conversation task (the module doc): steps the conversation, then waits for the end or a kick.
 async fn converse() {
@@ -587,14 +600,16 @@ impl Drop for Spawned {
 /// The spawner's owner, on the control shard: the process, its generation, the shards it serves, and what its back-off
 /// is drawn from.
 struct Owner {
-  child: SpawnedChild,
+  /// The spawner running now; none while a restart replaces it.
+  child: Option<SpawnedChild>,
+  /// Where the owner hands its spawner at its drop, to be joined on the daemon's process thread once the shards have
+  /// ended (`Daemon::stop_parts`), never on a shard's; none for a test's runtime, which joins it itself.
+  join_to: Option<std::sync::mpsc::Sender<SpawnedChild>>,
   generation: u64,
   /// The shards an end each goes to, in the order the spawner's ends are made.
   shards: Vec<u16>,
   /// When the spawner now running started, on the shard's clock.
   started_at_ns: u64,
-  /// How long its start took, measured: what the back-off doubles.
-  start_took_ns: u64,
   /// The spawners that died within a liveness window of their start, in a row.
   deaths_in_a_row: u32,
   /// A restart is under way: further word of the same death is not acted on again.
@@ -611,17 +626,22 @@ fn with_owner<T>(work: impl FnOnce(&mut Owner) -> T) -> Option<T> {
   OWNER.with(|owner| owner.try_borrow_mut().ok()?.as_mut().map(work))
 }
 
-/// Makes this shard the spawner's owner: `child`, serving `shards` an end each in order, whose start took
-/// `start_took_ns`. The control shard calls it at its start (the daemon's start made the spawner).
-pub(crate) fn own(child: SpawnedChild, shards: Vec<u16>, start_took_ns: u64) {
+/// Makes this shard the spawner's owner: `child`, serving `shards` an end each in order, handed to `join_to` at the
+/// owner's drop. The control shard calls it at its start (the daemon's
+/// start made the spawner).
+pub(crate) fn own(
+  child: SpawnedChild,
+  shards: Vec<u16>,
+  join_to: Option<std::sync::mpsc::Sender<SpawnedChild>>,
+) {
   OWNER.with(|owner| {
     if let Ok(mut owner) = owner.try_borrow_mut() {
       *owner = Some(Owner {
-        child,
+        child: Some(child),
+        join_to,
         generation: 0,
         shards,
         started_at_ns: futures::now_ns(),
-        start_took_ns,
         deaths_in_a_row: 0,
         restarting: false,
       });
@@ -630,19 +650,17 @@ pub(crate) fn own(child: SpawnedChild, shards: Vec<u16>, start_took_ns: u64) {
 }
 
 /// Derived: how long the owner waits before starting a spawner again after `deaths_in_a_row` deaths that each came
-/// within a liveness window of their start: none after one (a spawner that ran its window and then died is restarted at
-/// once), then the measured length of a start (`start_took_ns`), doubled for each further death (RFC 6298 §5.5's
-/// back-off), never past the daemon's liveness window, so a spawner that cannot stay up is tried once a window.
-pub(crate) fn back_off_ns(deaths_in_a_row: u32, start_took_ns: u64) -> u64 {
+/// within a liveness window of its start: none after one (a spawner that ran its window and then died is restarted at
+/// once), and a whole liveness window after any more, so a spawner that cannot stay up is started at most twice a
+/// window. Until 2026-11-25 the wait doubled a start's measured length, a few milliseconds, and a spawner that ended at
+/// once was started 12 times in a window and a half before the doubling reached the window (main's question on A-924
+/// (c)'s red).
+pub(crate) fn back_off_ns(deaths_in_a_row: u32) -> u64 {
   if deaths_in_a_row <= 1 {
-    return 0;
+    0
+  } else {
+    crate::daemon::LIVENESS_BUDGET_NS
   }
-  let doublings = deaths_in_a_row.saturating_sub(2);
-  let factor = 1u64.checked_shl(doublings).unwrap_or(u64::MAX);
-  start_took_ns
-    .max(1)
-    .saturating_mul(factor)
-    .min(crate::daemon::LIVENESS_BUDGET_NS)
 }
 
 /// Word on the owner's shard that a shard's end of the spawner of `generation` closed: a restart begun once for it, or
@@ -677,21 +695,24 @@ fn spawner_gone(generation: u64) {
 /// sent its new end; a start refused tells every shard so and tries again after a longer back-off.
 async fn restart() {
   loop {
-    let wait_ns =
-      with_owner(|owner| back_off_ns(owner.deaths_in_a_row, owner.start_took_ns)).unwrap_or(0);
+    let wait_ns = with_owner(|owner| back_off_ns(owner.deaths_in_a_row)).unwrap_or(0);
     if wait_ns > 0 {
       let _ = futures::sleep(wait_ns).await;
     }
-    let Some(shards) = with_owner(|owner| {
-      reap_dead(&mut owner.child);
-      owner.shards.clone()
-    }) else {
+    let Some((dead, shards)) = with_owner(|owner| (owner.child.take(), owner.shards.clone()))
+    else {
       return;
     };
-    let began = futures::now_ns();
+    // Reaped by a task of its own, so a dead spawner slow to end (outside the group its kill reaches) delays no new one.
+    if let Some(dead) = dead
+      && let Err(_refused) = futures::spawn(reaped(dead)).and_then(futures::detach)
+    {
+      count_on_shard(SPAWNER_REAP_REFUSED);
+    }
     match slates_ipc::spawner::start_here(shards.len()) {
       Ok(started) => {
-        hand_out(started, began, &shards);
+        hand_out(started, &shards);
+        count_on_shard(SPAWNER_RESTARTED);
         return;
       }
       Err(_) => {
@@ -702,15 +723,14 @@ async fn restart() {
   }
 }
 
-/// A spawner just started at `began`: kept as the owner's next generation, and an end sent to each of `shards`.
-fn hand_out(started: slates_ipc::spawner::Started, began: u64, shards: &[u16]) {
+/// A spawner just started: kept as the owner's next generation, and an end sent to each of `shards`.
+fn hand_out(started: slates_ipc::spawner::Started, shards: &[u16]) {
   let slates_ipc::spawner::Started { child, ends } = started;
   let now = futures::now_ns();
   let Some(generation) = with_owner(|owner| {
-    owner.child = child;
+    owner.child = Some(child);
     owner.generation = owner.generation.saturating_add(1);
     owner.started_at_ns = now;
-    owner.start_took_ns = now.saturating_sub(began);
     owner.restarting = false;
     owner.generation
   }) else {
@@ -744,37 +764,74 @@ fn tell_every_shard_failed() {
   }
 }
 
-/// Reaps a spawner whose end closed: killed with its group first if it still runs (an end it closed itself, a frame
-/// it refused), then waited for, which a killed process answers at once.
-fn reap_dead(child: &mut SpawnedChild) {
+/// Reaps a spawner whose end closed, never waiting on the shard (a blocking wait here wedged a shard past its liveness
+/// window under load, and its watchdog ended the daemon, `reap_map` on 2026-11-25): killed with its group first if it
+/// still runs (an end it closed itself, a frame it refused), then its exit awaited on its exit watch, a status not yet
+/// readable after the watch's note read again at the shard's next turn.
+async fn reaped(mut child: SpawnedChild) {
   if matches!(child.try_wait(), Ok(Some(_))) {
     return;
   }
   child.kill_group();
-  let _ = child.wait();
+  let watch = slates_ipc::exit_watch::ExitWatch::on(child.id()).ok();
+  loop {
+    if !matches!(child.try_wait(), Ok(None)) {
+      return;
+    }
+    let readiness = watch
+      .as_ref()
+      .filter(|watch| !watch.exited())
+      .and_then(|watch| watch.readiness().map(|fd| fd.as_raw_fd()));
+    match readiness {
+      Some(fd) => {
+        if slates_rt::readiness::readable(fd).await.is_err() {
+          futures::yield_now().await;
+        }
+      }
+      None => futures::yield_now().await,
+    }
+  }
+}
+
+/// Joins `child`, a spawner whose ends have closed, off every shard: it kills what it still holds and exits; one still
+/// running a liveness window later is killed with its group, then waited for, so a stop never waits on it without end.
+pub(crate) fn join_spawner(mut child: SpawnedChild) {
+  if matches!(child.try_wait(), Ok(Some(_))) {
+    return;
+  }
+  if let Ok(watch) = slates_ipc::exit_watch::ExitWatch::on(child.id())
+    && let Some(readiness) = watch.readiness()
+    && let Ok(window) = rustix::event::Timespec::try_from(std::time::Duration::from_nanos(
+      crate::daemon::LIVENESS_BUDGET_NS,
+    ))
+  {
+    let mut fds = [rustix::event::PollFd::new(
+      &readiness,
+      rustix::event::PollFlags::IN,
+    )];
+    let _ = rustix::event::poll(&mut fds, Some(&window));
+  }
+  if !matches!(child.try_wait(), Ok(Some(_))) {
+    child.kill_group();
+    let _ = child.wait();
+  }
 }
 
 impl Drop for Owner {
-  /// The daemon's stop: once every shard's end has closed with its shard, the spawner kills what it still holds and
-  /// exits. One still running a liveness window later is killed with its group, then waited for, so the stop never
-  /// waits on it without end.
+  /// The daemon's stop: the spawner handed to the daemon's process thread, which joins it once every shard's end has
+  /// closed with its shard ([`join_spawner`]); a test's runtime, with no daemon, joins it here, off any daemon's shard.
   fn drop(&mut self) {
-    if matches!(self.child.try_wait(), Ok(Some(_))) {
+    let Some(child) = self.child.take() else {
       return;
+    };
+    match self.join_to.as_ref() {
+      Some(join_to) => {
+        if let Err(unsent) = join_to.send(child) {
+          join_spawner(unsent.0);
+        }
+      }
+      None => join_spawner(child),
     }
-    if let Ok(watch) = slates_ipc::exit_watch::ExitWatch::on(self.child.id())
-      && let Some(readiness) = watch.readiness()
-      && let Ok(window) = rustix::event::Timespec::try_from(std::time::Duration::from_nanos(
-        crate::daemon::LIVENESS_BUDGET_NS,
-      ))
-    {
-      let mut fds = [rustix::event::PollFd::new(
-        &readiness,
-        rustix::event::PollFlags::IN,
-      )];
-      let _ = rustix::event::poll(&mut fds, Some(&window));
-    }
-    reap_dead(&mut self.child);
   }
 }
 
@@ -822,7 +879,7 @@ impl TestSpawner {
   /// [`TestSpawner::installed`], this shard the spawner's owner ([`own`]).
   pub(crate) fn owned() -> TestSpawner {
     let (child, here) = Self::start(TEST_SPAWNS_IN_FLIGHT);
-    own(child, vec![here], 0);
+    own(child, vec![here], None);
     TestSpawner { child: None }
   }
 
@@ -846,7 +903,7 @@ impl TestSpawner {
   pub(crate) fn pid(&self) -> u32 {
     match &self.child {
       Some(child) => child.id(),
-      None => with_owner(|owner| owner.child.id()).unwrap_or(0),
+      None => with_owner(|owner| owner.child.as_ref().map_or(0, SpawnedChild::id)).unwrap_or(0),
     }
   }
 

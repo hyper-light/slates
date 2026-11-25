@@ -4250,3 +4250,8 @@ fn a_create_waiting_for_a_teardown_that_does_not_go_on_is_refused_at_its_bound()
     "the same create admitted once the teardown went on: {after:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();
