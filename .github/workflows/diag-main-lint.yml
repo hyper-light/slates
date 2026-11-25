@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 25 (main 01a20182, 2026-11-24 19:34 PST): main at 1227afcb1, w-git's t_a614a bound (6354f521b) and w-perf's landing-wait
+# counter (ceaf8f1f2), landed after run 24.
 # Run 24 (main 01a20182, 2026-11-24 19:10 PST): run 23 found merge_origin.rs install at 11 and an unneeded mut (7106f83ea);
 # main's commit splits install by path.
 # Run 23 (main 01a20182, 2026-11-24 19:03 PST): main at b7e65cc63, w-shared's af061de87 (the merge-authority test's green) and
