@@ -547,7 +547,14 @@ slates-db = 0
 #   `close_inherited_on_exec`, `fcntl(F_SETFD)`, which no safe wrapper offers for a number no owner holds), and the Linux
 #   claim's hand-off no longer adopts a duplicate of the region's descriptor (`rendezvous.rs`, `from_raw_fd`): it sends
 #   the region's own, borrowed.
-slates-ipc = 179
+# 2026-11-25 (+7, A-924, w-git): the spawner (`spawner.rs`) reads `ARG_MAX` for a frame's cap (`sysconf`, which rustix
+#   does not expose), adopts the ends its starter placed at numbers 3 and up
+#   (`from_raw_fd`, no other owner in a process that has opened nothing yet); its `SIGCHLD` handler writes one byte to
+#   its self-pipe with `errno` kept (`libc::write`, and `__error` on macOS or `__errno_location` on Linux, one block on
+#   each, paired `#[cfg]`), and is installed with `sigaction`; rustix offers no handler or `errno` location. And
+#   `confined_spawn.rs` hands a child descriptors past its streams (`posix_spawn_file_actions_adddup2`, the spawner's
+#   ends), which libc exposes without a safe wrapper.
+slates-ipc = 186
 # 2026-11-23 (+10, A-875, w-interop, compiled only for Windows): the Node SDK's completion pipe (`completion_pipe.rs`),
 #   since Node adopts no Windows socket by descriptor: the pipe made (`CreateNamedPipeW`, its handle adopted), its
 #   connect's manual-reset event made and adopted (`CreateEventW`) and reset before each connect (`ResetEvent`), the
