@@ -358,6 +358,12 @@ pub struct ContentCounters {
   pub let_go: u64,
   /// Windows let go and brought back ([`ContentStore::bring_back`], or a put of the same bytes).
   pub brought_back: u64,
+  /// Windows a let-go kept because an unlanded holder names them ([`ContentStore::pin_unlanded`]): the rule's
+  /// non-vacuity counter.
+  pub kept_unlanded: u64,
+  /// Windows found let go as their unlanded holder pinned them ([`ContentStore::pin_unlanded`]): its bytes gone before
+  /// it landed, the very fault the pin exists against, so a named bug signal and never a later unknown base.
+  pub pinned_away: u64,
 }
 
 /// What a put did: the content's identity, and whether its bytes were stored new or were held already.
@@ -378,6 +384,9 @@ struct Held {
   /// Whether a landed changeset on the node's store holds its bytes ([`ContentStore::mark_landed`]): only such a
   /// window may be let go.
   landed: bool,
+  /// How many objects that no landed changeset holds yet name it ([`ContentStore::pin_unlanded`]): while any does, no
+  /// let-go takes it, whatever its holders.
+  unlanded: u32,
   /// The store's read count at its last read ([`ContentStore::last_read`]): the coldest is let go first.
   last_read: core::cell::Cell<u64>,
 }
@@ -513,6 +522,9 @@ pub enum LetGoRefused {
   /// would free nothing, and a shard image carries no window let go of no length ([`ContentStore::restore_away`]), so
   /// one let go would be lost at a restart while a row still names it. It stays held.
   Empty,
+  /// An object no landed changeset holds yet names it ([`ContentStore::pin_unlanded`]): letting it go would lose bytes
+  /// that object still needs and no node's store keeps for it. It stays held.
+  Unlanded,
 }
 
 /// A byte count as the store keeps it.
@@ -812,6 +824,7 @@ impl ContentStore {
         form,
         holders: 1,
         landed: false,
+        unlanded: 0,
         last_read: core::cell::Cell::new(0),
       },
     );
@@ -1350,6 +1363,79 @@ impl ContentStore {
     }
   }
 
+  /// Pins every window of the object `identity` names (its layout, let go or not) for an unlanded holder of it: an object
+  /// a write kept that no landed changeset on the node's store holds yet (goal 93, main's ruling (B) of 2026-11-24: a
+  /// landed segment's let-go took a window a later, unlanded revision of the same push shared by content, and that one's
+  /// next reader found it away and asked a store that keeps no row of it). While pinned, no let-go takes the window,
+  /// whatever its holders ([`LetGoRefused::Unlanded`]); its holder unpins it once it lands, or however its write ends
+  /// ([`ContentStore::unpin_unlanded`]). The windows pinned.
+  ///
+  /// A window found let go as it is pinned is pinned all the same (a put brings it back with its count) and counted
+  /// `pinned_away`: its unlanded holder's bytes were already gone, the fault the pin exists against.
+  ///
+  /// # Errors
+  /// `NotHeld` where the store holds no such object or a window of it: nothing pinned. `CountExhausted` where a
+  /// window's count would pass its width: nothing pinned.
+  pub fn pin_unlanded(&mut self, identity: &ContentId) -> Result<usize, ContentRefused> {
+    if !self.contains(identity) {
+      return Err(ContentRefused::NotHeld);
+    }
+    let windows: Vec<ContentId> = self
+      .object_layout(identity)
+      .into_iter()
+      .map(|(window, _)| self.resolve(&window))
+      .collect();
+    let mut refused = None;
+    for window in &windows {
+      match self.entries.get(window) {
+        None => refused = Some(ContentRefused::NotHeld),
+        Some(held) if held.unlanded == u32::MAX => {
+          refused = refused.or(Some(ContentRefused::CountExhausted));
+        }
+        Some(_) => {}
+      }
+    }
+    if let Some(refused) = refused {
+      return Err(refused);
+    }
+    let mut pinned = 0usize;
+    let mut away = 0u64;
+    for window in &windows {
+      if let Some(held) = self.entries.get_mut(window)
+        && held.form == Form::Window
+      {
+        held.unlanded = held.unlanded.saturating_add(1);
+        pinned = pinned.saturating_add(1);
+        if matches!(held.kept, Kept::Away { .. }) {
+          away = away.saturating_add(1);
+        }
+      }
+    }
+    self.counters.pinned_away = self.counters.pinned_away.saturating_add(away);
+    Ok(pinned)
+  }
+
+  /// Unpins every window of the object `identity` names, once each, as [`ContentStore::pin_unlanded`] pinned them: its
+  /// unlanded holder landed, or its write ended. A window no longer pinned may be let go again.
+  ///
+  /// Precondition: unpin before the holder releases the object. A pinned window freed (its last holder released) takes
+  /// its count with it and a window put again starts at none, so an unpin after the release would find no count, or
+  /// take a later pinner's.
+  pub fn unpin_unlanded(&mut self, identity: &ContentId) {
+    let windows: Vec<ContentId> = self
+      .object_layout(identity)
+      .into_iter()
+      .map(|(window, _)| self.resolve(&window))
+      .collect();
+    for window in &windows {
+      if let Some(held) = self.entries.get_mut(window)
+        && held.form == Form::Window
+      {
+        held.unlanded = held.unlanded.saturating_sub(1);
+      }
+    }
+  }
+
   /// Lets go the bytes of the window `identity` names, past its repository's memory grant (A-724 piece 4, §4.17.5
   /// "The cold trigger"): only a window a landed changeset holds ([`ContentStore::mark_landed`]) and one holder alone
   /// keeps, so content another repository holds is never let go here. Its entry stays (its holders, form and length),
@@ -1374,6 +1460,10 @@ impl ContentStore {
     }
     if len == 0 {
       return Err(LetGoRefused::Empty);
+    }
+    if held.unlanded > 0 {
+      self.counters.kept_unlanded = self.counters.kept_unlanded.saturating_add(1);
+      return Err(LetGoRefused::Unlanded);
     }
     if held.holders > 1 {
       return Err(LetGoRefused::Shared);
@@ -1412,6 +1502,11 @@ impl ContentStore {
     if len == 0 {
       return Err(LetGoRefused::Empty);
     }
+    // Whatever its holders, never a window an unlanded object names (goal 93, main's ruling (B) of 2026-11-24).
+    if held.unlanded > 0 {
+      self.counters.kept_unlanded = self.counters.kept_unlanded.saturating_add(1);
+      return Err(LetGoRefused::Unlanded);
+    }
     if let Some(by) = pinned_by {
       return Err(LetGoRefused::Pinned { by });
     }
@@ -1419,7 +1514,8 @@ impl ContentStore {
   }
 
   /// Every window of the object `identity` names marked landed and let go ([`ContentStore::let_go_landed`]), each but
-  /// those `pinned_by` names a pinning holder of: the bytes freed and the windows kept pinned.
+  /// those `pinned_by` names a pinning holder of and those an unlanded object names ([`ContentStore::pin_unlanded`]): the
+  /// bytes freed and the windows kept.
   pub fn let_go_object_landed(
     &mut self,
     identity: &ContentId,
@@ -1432,17 +1528,17 @@ impl ContentStore {
       }
       match self.let_go_landed(&window, pinned_by(&window)) {
         Ok(bytes) => freed = freed.saturating_add(bytes),
-        Err(LetGoRefused::Pinned { .. }) => pinned = pinned.saturating_add(1),
+        Err(LetGoRefused::Pinned { .. } | LetGoRefused::Unlanded) => {
+          pinned = pinned.saturating_add(1)
+        }
         Err(_) => {}
       }
     }
     (freed, pinned)
   }
 
-  /// The windows of the object `identity` names, in order: itself where it is one window ([`ContentStore::windows`]
-  /// walked down its lists). What a let-go of a landed object takes, and what an owner keeps from one
-  /// (`slates-server`'s texts put for a revision not landed yet, whose windows a landed text may share).
-  pub fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
+  /// The windows of the object `identity` names, in order: itself where it is one window.
+  fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
     let mut windows = Vec::new();
     let mut walk = self.windows(identity);
     while let Some(window) = walk.next_window() {
@@ -1626,6 +1722,7 @@ impl ContentStore {
           form: Form::Window,
           holders: 0,
           landed: false,
+          unlanded: 0,
           last_read: core::cell::Cell::new(0),
         },
       );
@@ -1912,6 +2009,7 @@ impl ContentStore {
           form: Form::Window,
           holders: 0,
           landed: true,
+          unlanded: 0,
           last_read: core::cell::Cell::new(0),
         },
       );
@@ -1950,6 +2048,7 @@ impl ContentStore {
           form: Form::List,
           holders: 0,
           landed: false,
+          unlanded: 0,
           last_read: core::cell::Cell::new(0),
         },
       );
@@ -3351,6 +3450,67 @@ mod tests {
   /// `len` bytes of a pattern that repeats every 251, so no two windows of a test's object are alike.
   fn patterned(len: usize) -> Vec<u8> {
     (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect()
+  }
+
+  /// Goal 93, main's ruling (B) of 2026-11-24 (one rule at the one let-go every path uses: a landed object's let-go never
+  /// takes a window an unlanded object names). Do: put a landed object A of two windows and an unlanded object B whose
+  /// first window is A's; pin B unlanded; let A go as a landed segment's let-go does (whatever its holders), and as the
+  /// cold trigger does; then unpin B and let A go again. Expect, pinned: A's second window let go, the shared one kept,
+  /// counted (`kept_unlanded`), every let-go of it refused `Unlanded`; unpinned: the shared window let go.
+  #[test]
+  fn a_window_an_unlanded_object_names_is_never_let_go_until_it_is_unpinned() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let shared = patterned(window);
+    let a_bytes = [&shared[..], &patterned(window)[1..], b"a"].concat();
+    let b_bytes = [&shared[..], b"the rest of b".as_slice()].concat();
+    let a = store.put_object(&a_bytes).unwrap();
+    let b = store.put_object(&b_bytes).unwrap();
+    let shared_id = ContentId::of(&shared);
+    let a_second = ContentId::of(a_bytes.get(window..window * 2).unwrap());
+    assert_eq!(store.pin_unlanded(&b), Ok(2), "B's two windows pinned");
+    let before = store.counters().kept_unlanded;
+    let (freed, kept) = store.let_go_object_landed(&a, &|_| None);
+    assert!(
+      freed > 0 && kept == 1,
+      "A's own window let go, the shared one kept: {freed} {kept}"
+    );
+    assert!(store.is_away(&a_second), "A's own window let go");
+    assert!(!store.is_away(&shared_id), "the window B names kept");
+    assert_eq!(store.let_go(&shared_id), Err(LetGoRefused::Unlanded));
+    assert!(
+      store.counters().kept_unlanded > before,
+      "the kept window counted"
+    );
+    store.unpin_unlanded(&b);
+    let (freed, _) = store.let_go_object_landed(&a, &|_| None);
+    assert!(freed > 0, "unpinned, the shared window let go");
+    assert!(
+      store.is_away(&shared_id),
+      "the shared window let go once unpinned"
+    );
+  }
+
+  /// Goal 93, ruling (B), w-perf's review: a pin that finds its object's bytes already gone is a named bug signal, and a
+  /// pin of nothing is refused. Do: let one window of a two-window object go, then pin the object; pin an object the store
+  /// never held. Expect: the object pinned whole, the away window counted (`pinned_away` 1), and a put of its bytes
+  /// bringing it back still pinned (its let-go refused `Unlanded`); the unheld object refused `NotHeld`, nothing pinned.
+  #[test]
+  fn a_pin_that_finds_a_window_let_go_counts_it_and_a_pin_of_nothing_is_refused() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 2);
+    let object = store.put_object(&bytes).unwrap();
+    let second = ContentId::of(bytes.get(window..).unwrap());
+    let_go_each(&mut store, &[second]);
+    assert_eq!(store.pin_unlanded(&object), Ok(2), "both windows pinned");
+    assert_eq!(store.counters().pinned_away, 1, "the away window counted");
+    store.put(bytes.get(window..).unwrap()).unwrap();
+    assert!(!store.is_away(&second), "the put brought it back");
+    assert_eq!(store.let_go(&second), Err(LetGoRefused::Unlanded));
+    let never = ContentId::of(b"never held");
+    assert_eq!(store.pin_unlanded(&never), Err(ContentRefused::NotHeld));
+    assert_eq!(store.counters().pinned_away, 1, "nothing more pinned");
   }
 
   /// A-767 C1 step 2a (a push's work reading a text an import let go). Do: put an object of three windows and a part,

@@ -948,6 +948,24 @@ impl Intake {
     self
   }
 
+  /// The contents of every revision kept and not yet taken in a segment: the one being cut's, then those of the segments
+  /// cut and not taken, oldest first (goal 93: what a push pins against a landed segment's let-go, `super::pins`). Empty
+  /// where the intake cuts no segments.
+  pub fn kept_contents(&self) -> impl Iterator<Item = &FileContents> + '_ {
+    self.taker.cutting.iter().flat_map(|cutting| {
+      cutting
+        .open
+        .iter()
+        .flat_map(|open| open.contents.iter())
+        .chain(
+          cutting
+            .ready
+            .iter()
+            .flat_map(|segment| segment.contents.iter()),
+        )
+    })
+  }
+
   /// The next segment cut, oldest first; none while the one being cut is short of its bound.
   pub fn take_segment(&mut self) -> Option<PushSegment> {
     self.taker.cutting.as_mut()?.ready.pop_front()

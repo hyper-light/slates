@@ -29,6 +29,8 @@
 //! (`ImportBatch::chain_room`): a revision whose entry would take it past is handed to the next batch whole
 //! ([`Flush::Chain`], A-895).
 
+use std::collections::BTreeSet;
+
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_svn::commit::revision::Revision;
 use slates_svn::index::ContentIdentity;
@@ -198,6 +200,8 @@ pub(crate) struct Deferred {
   revision: Revision,
   /// The texts it put into the content store, one hold each.
   put: Vec<ContentIdentity>,
+  /// Those of `put` its import's sink pinned unlanded (`svn_import::texts`), unpinned before their holds go.
+  pinned: Vec<ContentIdentity>,
   /// What its changeset carries of them.
   carried: Vec<landing::LandedText>,
   /// Why the batch before had no room for it: what that batch lands for.
@@ -205,11 +209,6 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
-  /// The texts it put, each held and not landed yet.
-  pub(crate) fn put(&self) -> &[ContentIdentity] {
-    &self.put
-  }
-
   /// Why the batch before had no room for it.
   pub(crate) fn cause(&self) -> Flush {
     self.cause
@@ -217,6 +216,7 @@ impl Deferred {
 
   /// Gives its texts' holds back: the import refused before it was staged.
   pub(crate) fn give_back(self, state: &mut ShardState) {
+    crate::vcs_store::name_holds::unpin_texts(state, &self.pinned);
     super::release_texts(state, None, &self.put);
   }
 }
@@ -272,12 +272,17 @@ fn identity_some(state: &mut ShardState, green: DbVolumeId, deadline_ns: u64) ->
 /// every one is.
 fn give_back_put_some(
   state: &mut ShardState,
-  put: &[ContentIdentity],
+  (put, pinned): (&[ContentIdentity], &mut BTreeSet<ContentIdentity>),
   (at, deadline_ns): (&mut usize, u64),
 ) -> bool {
   while let Some(text) = put.get(*at) {
     *at = at.saturating_add(1);
     let one = core::slice::from_ref(text);
+    // Landed now: unpinned before its hold goes (the store's precondition), so its let-go may take what no unlanded
+    // text still names.
+    if pinned.remove(text) {
+      crate::vcs_store::name_holds::unpin_texts(state, one);
+    }
     super::release_texts(state, None, one);
     crate::vcs_store::name_holds::let_go_landed_texts(state, one);
     if slates_rt::futures::now_ns() >= deadline_ns {
@@ -353,6 +358,9 @@ pub(crate) struct Staging {
   records: Vec<Vec<u8>>,
   /// The texts the batch put into the content store, one hold each, given back once it lands or is abandoned.
   put: Vec<ContentIdentity>,
+  /// Those of `put` the import's sink pinned unlanded (`svn_import::texts`): unpinned at the batch's landing, each just
+  /// before its hold goes, or as it is abandoned.
+  pinned: Vec<ContentIdentity>,
   /// What the changeset carries of them: a path and a length each.
   carried: Vec<landing::LandedText>,
   /// The staged increments' post-state bytes: the batch's holding beside the content store's own charge.
@@ -385,6 +393,7 @@ impl Staging {
           green,
           records: Vec::new(),
           put: Vec::new(),
+          pinned: Vec::new(),
           carried: Vec::new(),
           held: 0,
           staged: 0,
@@ -476,6 +485,7 @@ impl Staging {
     let deferred = Deferred {
       revision,
       put: storing.put,
+      pinned: storing.pinned,
       carried,
       cause: Flush::End,
     };
@@ -494,6 +504,7 @@ impl Staging {
     let Deferred {
       revision,
       put,
+      pinned,
       carried,
       ..
     } = deferred;
@@ -507,6 +518,7 @@ impl Staging {
       Ok(brought) => brought,
       Err(refused) => {
         self.put.extend(put);
+        self.pinned.extend(pinned);
         self.carried.extend(carried);
         return Some(Err(refused));
       }
@@ -526,17 +538,20 @@ impl Staging {
     match staged {
       Ok(StagedIn::Staged) => {
         self.put.extend(put);
+        self.pinned.extend(pinned);
         self.carried.extend(carried);
         Some(Ok(None))
       }
       Ok(StagedIn::PastRoom(cause)) => Some(Ok(Some(Deferred {
         revision: kept,
         put,
+        pinned,
         carried,
         cause,
       }))),
       Err(refused) => {
         self.put.extend(put);
+        self.pinned.extend(pinned);
         self.carried.extend(carried);
         Some(Err(refused))
       }
@@ -799,9 +814,15 @@ impl Staging {
       slates_rt::futures::yield_now().await;
     }
     let mut at = 0usize;
+    let mut pinned: BTreeSet<ContentIdentity> =
+      std::mem::take(&mut self.pinned).into_iter().collect();
     while !crate::state::with_state(|state| {
       state.count(TAIL_SLICES, 1);
-      give_back_put_some(state, &self.put, (&mut at, slice_deadline_ns()))
+      give_back_put_some(
+        state,
+        (&self.put, &mut pinned),
+        (&mut at, slice_deadline_ns()),
+      )
     })? {
       slates_rt::futures::yield_now().await;
     }
@@ -820,6 +841,7 @@ impl Staging {
     if let Some(batch) = self.batch.take() {
       batch.abandon(state);
     }
+    crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
     super::release_texts(state, None, &self.put);
     self.put.clear();
     if self.staged > 0 {

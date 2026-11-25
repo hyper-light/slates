@@ -60,6 +60,16 @@ const FLAGS_BITS: u32 = 16;
 const UNCOMPRESSED: u8 = b'u';
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
 const OBSSTORE: &[u8] = b"obsstore";
+/// Format: a `stream2` file's source byte for the store (7.2's `_srcstore`).
+const STORE_SOURCE: u8 = b's';
+/// Format: the most bytes an unsigned varint of a `u64` takes (64 bits at seven a byte, rounded up).
+const UVARINT_BYTES: u64 = 10;
+/// Format: the bits of a varint's byte that carry the value.
+const UVARINT_LOW: u64 = 0x7f;
+/// Format: the bits a varint's byte carries.
+const UVARINT_SHIFT: u32 = 7;
+/// Format: the bit of a varint's byte that says another follows.
+const UVARINT_MORE: u8 = 0x80;
 
 /// One rendered file: its path from the repository's root, and its bytes.
 pub type File = (Vec<u8>, Vec<u8>);
@@ -499,6 +509,37 @@ pub struct Streaming {
   room_hint: u64,
   /// The rows' ask being gathered, a window of nodes a step ([`Streaming::rows_held`]).
   gathering: Option<Gathering>,
+  /// How each file it sends is framed: `stream_out`'s, or a `stream2` part's.
+  framing: Framing,
+}
+
+/// How a stream frames the files it sends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Framing {
+  /// `stream_out`'s (7.2's `generatev1`): a head of `0` and the counts, then each file's line, its store path through
+  /// `encodedir`, a NUL, its size and a line end, before its bytes.
+  #[default]
+  V1,
+  /// A `stream2` part's payload (7.2's `generatev2` and `_emit2`): no head, since the part's parameters carry the counts;
+  /// each file its source (`s`, the store), its name's length and its size as unsigned varints, and its store path
+  /// before encoding (the client's store opener encodes it and lists it in its fncache), before its bytes.
+  V2,
+}
+
+/// Where a stream's count stands ([`Streaming::counted`]): what a `stream2` part's parameters name before its payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Counted {
+  /// Still counting.
+  Counting,
+  /// A revision the store does not keep was met: no stream is served.
+  Unserved,
+  /// Counted: the files it sends and their bytes.
+  Served {
+    /// The files.
+    files: u64,
+    /// Their bytes.
+    bytes: u64,
+  },
 }
 
 /// A [`Want::Rows`] being gathered (main 01a20182's order of 2026-11-22 10:40: a stream of a 57,054-changeset history
@@ -530,11 +571,33 @@ impl Default for Streaming {
       not_served: false,
       room_hint: 0,
       gathering: None,
+      framing: Framing::V1,
     }
   }
 }
 
 impl Streaming {
+  /// A stream framed as a `stream2` part's payload ([`Framing::V2`]): its steps count first and write nothing until
+  /// [`Streaming::counted`] answers, then send each file.
+  pub fn v2() -> Self {
+    Streaming {
+      framing: Framing::V2,
+      ..Streaming::default()
+    }
+  }
+
+  /// Where its count stands: counting until every log is counted; then the files and bytes it sends, or unserved.
+  pub fn counted(&self) -> Counted {
+    match self.stage {
+      Stage::Start | Stage::Counting(_) => Counted::Counting,
+      _ if self.not_served => Counted::Unserved,
+      _ => Counted::Served {
+        files: self.counted.0,
+        bytes: self.counted.1,
+      },
+    }
+  }
+
   /// What the next step needs of the changeset store, if anything: given back by [`Streaming::give_rows`] or
   /// [`Streaming::give_chunks`] before the next step.
   pub fn wants(&self) -> Option<&Want> {
@@ -718,6 +781,13 @@ impl Streaming {
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
+    if self.framing == Framing::V2 {
+      // A `stream2` part's counts are its parameters, written by its caller once [`Streaming::counted`] answers.
+      if self.not_served {
+        return Ok(Stage::Done);
+      }
+      return Ok(first_log(index, store).map_or(Stage::Done, |log| Stage::Index(log, 0, 0)));
+    }
     if self.not_served {
       // Format: 7.2's "operation forbidden by server", two bytes.
       admission.charge(2)?;
@@ -757,7 +827,7 @@ impl Streaming {
         );
       }
       let name = [log.radix().as_slice(), b".d"].concat();
-      file_line(&name, offset, admission, out)?;
+      file_head(self.framing, (&name, offset), admission, out)?;
       return Ok(Stage::Data(log, 0));
     }
     let unreadable = || Refused::Unreadable {
@@ -767,7 +837,7 @@ impl Streaming {
     if rev == 0 {
       let name = [log.radix().as_slice(), b".i"].concat();
       let size = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
-      file_line(&name, size, admission, out)?;
+      file_head(self.framing, (&name, size), admission, out)?;
     }
     admission.charge(to_u64(ENTRY_BYTES))?;
     let stored = self.held.front().ok_or_else(unreadable)?;
@@ -962,6 +1032,54 @@ fn chunk_len(stored: u64) -> u64 {
     0
   } else {
     stored.saturating_add(1)
+  }
+}
+
+/// A file's head in the answer, framed as `framing` frames it, before its bytes.
+fn file_head(
+  framing: Framing,
+  (name, size): (&[u8], u64),
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
+  match framing {
+    Framing::V1 => file_line(name, size, admission, out),
+    Framing::V2 => file_entry(name, size, admission, out),
+  }
+}
+
+/// A file's head in a `stream2` part's payload (7.2's `_emit2`): its source, the store (`s`); its name's length and its
+/// size, each an unsigned varint; then its store path before encoding.
+pub(crate) fn file_entry(
+  name: &[u8],
+  size: u64,
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
+  // Format: the source's byte, two varints of at most `UVARINT_BYTES` each, and the name.
+  admission.charge(
+    to_u64(name.len())
+      .saturating_add(UVARINT_BYTES.saturating_mul(2))
+      .saturating_add(1),
+  )?;
+  out.push(STORE_SOURCE);
+  put_uvarint(to_u64(name.len()), out);
+  put_uvarint(size, out);
+  out.extend_from_slice(name);
+  Ok(())
+}
+
+/// Appends `value` as an unsigned varint (7.2's `util.uvarintencode`): seven bits a byte, least significant first, the
+/// high bit set on every byte but the last.
+pub(crate) fn put_uvarint(mut value: u64, out: &mut Vec<u8>) {
+  loop {
+    let low = u8::try_from(value & UVARINT_LOW).unwrap_or(0);
+    value >>= UVARINT_SHIFT;
+    if value == 0 {
+      out.push(low);
+      return;
+    }
+    out.push(low | UVARINT_MORE);
   }
 }
 

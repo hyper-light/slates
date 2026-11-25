@@ -471,8 +471,10 @@ fn request<P: PackSource>(
   advertise::check(&command, served.repository.format()).map_err(Refused::plain)?;
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
   let answered = command_answer(served, &graph, (command, decoded), packs, admission, turns);
-  // What its walk did resolving ids, told as a step in turns tells it (A-911).
-  packs.chose(graph.take_position_counts());
+  // What its walk did resolving ids, told as a step in turns tells it (A-911), with its longest unit's entries.
+  let mut counts = graph.take_position_counts();
+  counts.entries_most = answered.as_ref().map_or(0, Answer::entries_most);
+  packs.chose(counts);
   answered
 }
 

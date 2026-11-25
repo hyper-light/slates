@@ -1086,6 +1086,37 @@ impl Store {
     Ok(whole.get(start..))
   }
 
+  /// The text `text` of repository `repository` whole, as [`Store::text_at`] makes and lends it, for a caller that takes
+  /// it whole in one read (the owner's batch of a fetch's texts, `owner::StoreHandle::texts`). None for a text no landed
+  /// changeset kept.
+  ///
+  /// The read is its walk's end, so the cache keeps no walk of it in flight (goal 93, main's round at 15b4f1061: read
+  /// at its start through [`Store::text_at`] and taken whole, a text longer than a piece stayed a walk no later piece
+  /// ended, and the cache's bound grew by each, to 4,792 chunks still live after hg's 57k clone).
+  ///
+  /// # Errors
+  /// As [`Store::text_at`].
+  pub fn text_whole<'c>(
+    &mut self,
+    staging: &Staging,
+    repository: u128,
+    text: &Identity,
+    cache: &'c mut TextCache,
+  ) -> Result<Option<&'c [u8]>, StoreError> {
+    if cache.get(text).is_none() && !self.make(staging, repository, text, cache)? {
+      return Ok(None);
+    }
+    let len = to_u64(
+      cache
+        .lent(text)
+        .map(<[u8]>::len)
+        .ok_or(StoreError::BadRow)?,
+    );
+    // Read from its end: the walk, if any piece began one, ends here, and none begins.
+    cache.read(*text, len, len);
+    cache.lent(text).map(Some).ok_or(StoreError::BadRow)
+  }
+
   /// A path's history in repository `repository`: each changeset that kept a version of `path` from sequence `from` on,
   /// at most `limit`, in order, with the text it kept.
   ///

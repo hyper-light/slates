@@ -119,12 +119,18 @@ pub struct PositionCounts {
   pub lookups: u64,
   /// Ids the cache answered.
   pub hits: u64,
-  /// Of the ids resolved through the index, those whose slot held another id (a direct-mapped conflict, the id put out
-  /// of it to take it); the rest met an empty slot (an id not met lately, or never). What decides between more ways a
-  /// slot and a wider window (main 01a20182's order of 2026-11-25).
+  /// Of the ids resolved through the index, those whose slot held another id, which this one then put out. An upper
+  /// bound on the ids lost to another's slot, not their count: an id met the first time also finds its slot taken once
+  /// the cache is warm (A-911's 40-commit line: 59 of 157 lookups counted at 4 ways or at 32 slots an id, where nearly
+  /// every miss is a first meeting). The A/B of more ways against more slots reads lookups and time.
   pub conflicts: u64,
   /// Answers whose cache was refused the room its work asked (one an answer).
   pub unroomed: u64,
+  /// The most entries one unit of the answer's walk took (`negotiation::Counters::entries_most`), told with these.
+  pub entries_most: u64,
+  /// The longest tree the walk read and parsed in one unit, in bytes: what a unit reading a tree whole costs, a tree's
+  /// size being its user's (main 01a20182's order of 2026-11-25: read on a whole clone against the step quantum's bytes).
+  pub tree_bytes_most: u64,
 }
 
 impl PositionCache {
@@ -285,10 +291,24 @@ impl<'r> StoreGraph<'r> {
 
   /// The objects the object at `position` names, read from its bytes: a tree's entries or a tag's object.
   fn named(&self, position: u64) -> Vec<u64> {
+    self
+      .ids_named(position)
+      .iter()
+      .filter_map(|id| self.position_of(id))
+      .collect()
+  }
+
+  /// The ids the object at `position` names, read from its bytes: a tree's entries or a tag's object (the tree's
+  /// bytes counted, [`PositionCounts::tree_bytes_most`]); none, a fault kept, where it cannot be read.
+  fn ids_named(&self, position: u64) -> Vec<ObjectId> {
     let Some((id, (row, content))) = self.indexed_at(position) else {
       return Vec::new();
     };
     let kind = row.kind;
+    if kind == Kind::Tree {
+      let mut positions = self.positions.borrow_mut();
+      positions.counts.tree_bytes_most = positions.counts.tree_bytes_most.max(row.len);
+    }
     let place = Place::Indexed { row, content };
     let named = match kind {
       Kind::Tree => self.repository.tree_references(self.store, &id, &place),
@@ -299,7 +319,7 @@ impl<'r> StoreGraph<'r> {
       Kind::Commit | Kind::Blob => Ok(Vec::new()),
     };
     match named {
-      Ok(ids) => ids.iter().filter_map(|id| self.position_of(id)).collect(),
+      Ok(ids) => ids,
       Err(refused) => {
         self.failed(GraphFault::Store(refused));
         Vec::new()
@@ -497,6 +517,14 @@ impl Graph for StoreGraph<'_> {
 
   fn entries(&self, tree: u64) -> impl Iterator<Item = u64> {
     self.named(tree).into_iter()
+  }
+
+  fn entry_ids(&self, tree: u64) -> Vec<ObjectId> {
+    self.ids_named(tree)
+  }
+
+  fn entry_node(&self, id: &ObjectId) -> Option<u64> {
+    self.position_of(id)
   }
 
   fn commit_begun(&self, admission: &mut Admission) {

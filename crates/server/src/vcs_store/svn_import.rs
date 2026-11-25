@@ -606,8 +606,11 @@ async fn owed_landed(
   staging: &mut Option<Staging>,
 ) -> Option<Result<bool, LoadFailed>> {
   if !matches!(record, Some(Record::Revision(_))) && !texts.is_empty() {
-    // Only a revision brings texts; any others are given back.
-    crate::state::with_state(|state| svn_commit::release_texts(state, None, &texts))?;
+    // Only a revision brings texts; any others are unpinned and given back.
+    crate::state::with_state(|state| {
+      crate::vcs_store::name_holds::unpin_texts(state, &texts);
+      svn_commit::release_texts(state, None, &texts);
+    })?;
   }
   Some(match (record, flush) {
     (Some(Record::Revision(revision)), _) => {
@@ -719,10 +722,13 @@ async fn stage_owed(
     Vec<slates_svn::index::ContentIdentity>,
   ),
 ) -> Option<Result<(), Uncommitted>> {
-  let mut batch = match batch_for((principal, id), staging, (&revision, &texts)).await? {
+  let mut batch = match batch_for((principal, id), staging, &revision).await? {
     Ok(batch) => batch,
     Err(refused) => {
-      crate::state::with_state(|state| svn_commit::release_texts(state, None, &texts))?;
+      crate::state::with_state(|state| {
+        crate::vcs_store::name_holds::unpin_texts(state, &texts);
+        svn_commit::release_texts(state, None, &texts);
+      })?;
       return Some(Err(refused));
     }
   };
@@ -740,27 +746,20 @@ async fn stage_owed(
 }
 
 /// The batch `revision` stages in: `staging`'s, landed first where the revision is due after it
-/// (`Staging::due_before`), its `texts` put already and kept through that landing ([`name_holds::keeping_unlanded`]),
-/// or a new one where none is under way. Refused, nothing of the revision's is given back here.
-///
-/// [`name_holds::keeping_unlanded`]: crate::vcs_store::name_holds::keeping_unlanded
+/// (`Staging::due_before`), or a new one where none is under way. The revision's texts, put already, stay pinned against
+/// that landing's let-go, as the sink pinned them (`svn_import::texts`). Refused, nothing of the revision's is given
+/// back here.
 async fn batch_for(
   (principal, id): (&Principal, RepositoryId),
   staging: &mut Option<Staging>,
-  (revision, texts): (
-    &slates_svn::commit::revision::Revision,
-    &[slates_svn::index::ContentIdentity],
-  ),
+  revision: &slates_svn::commit::revision::Revision,
 ) -> Option<Result<Staging, Uncommitted>> {
   let due = staging.as_ref().and_then(|batch| {
     crate::state::with_state(|state| batch.due_before(state, revision)).flatten()
   });
-  // The revision's texts are put already: the batch's landing keeps every window they hold (`keeping_unlanded`).
-  let unlanded: Vec<[u8; 32]> = texts.to_vec();
   if let Some(cause) = due
     && let Some(batch) = staging.take()
-    && let Err(refused) =
-      crate::vcs_store::name_holds::keeping_unlanded(unlanded, batch.land(principal, cause)).await?
+    && let Err(refused) = batch.land(principal, cause).await?
   {
     return Some(Err(refused));
   }
@@ -777,13 +776,7 @@ async fn staged_in_the_next(
   staging: &mut Option<Staging>,
   (batch, deferred): (Staging, svn_commit::staging::Deferred),
 ) -> Option<Result<(), Uncommitted>> {
-  let unlanded = deferred.put().to_vec();
-  if let Err(refused) = crate::vcs_store::name_holds::keeping_unlanded(
-    unlanded,
-    batch.land(principal, deferred.cause()),
-  )
-  .await?
-  {
+  if let Err(refused) = batch.land(principal, deferred.cause()).await? {
     crate::state::with_state(|state| deferred.give_back(state))?;
     return Some(Err(refused));
   }
@@ -892,6 +885,7 @@ fn end(state: &mut ShardState, mut importing: Importing) {
   }
   // The texts the import put and no landing took are given back.
   let owed = std::mem::take(&mut importing.owed_texts);
+  crate::vcs_store::name_holds::unpin_texts(state, &owed);
   svn_commit::release_texts(state, None, &owed);
   crate::vcs_store::within_budget(state, 0, |stores| {
     if let Some(store) = stores.content_mut() {

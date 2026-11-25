@@ -1063,7 +1063,7 @@ fn texts_made(
   }
   let mut total = 0u64;
   for identity in identities {
-    let Some(text) = store.text_at(staging, repository, identity, 0, cache)? else {
+    let Some(text) = store.text_whole(staging, repository, identity, cache)? else {
       return Ok(MadeTexts::Missing);
     };
     total = total.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
