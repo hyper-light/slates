@@ -1,8 +1,8 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-25 00:04 PST): run 6, CI's TSan job at 4892d3cf9, with w-svn's Unstored fix d3539309d (the import's next
-# revision's texts pinned around a cut's landing; run 5's a_replay_fetches_each_piece_of_a_stored_text_once failed on it)
-# and the crash test's let-go fix 085f6dfad. The step is copied unchanged but for a limit only a hang reaches. Run only
-# from diag-measurer-main-tsan-* branches, never main.
+# main 01a20182 (2026-11-25 00:39 PST): run 7, CI's TSan job at ee1861c82: run 6's one failure, the status sweep test past its sixty
+# liveness budgets under the clock interceptor, now held to progress alone under slates_tsan (46e718f71); with w-perf's
+# text cache walk fix (7c0ea35a1). The step is copied unchanged but for a limit only a hang reaches. Run only from
+# diag-measurer-main-tsan-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-tsan-*"]
