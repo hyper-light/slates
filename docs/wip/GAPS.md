@@ -1912,7 +1912,14 @@
 > 400 texts through a two-chunk cache; now 2). A text the owner answers in slices is assembled in the asker's buffer,
 > handed to the owner and back a request, no slice a buffer of its own (`StoreHandle::text_slice_into`; hg's 57k clone
 > allocated 6.2 GB in those answers, 15.3% of its system churn; `owner_slices_heap`: red, 331,464 bytes allocated for a
-> 307,200-byte text read in 64 KiB slices; now 24,264). The batch itself was sized by the fetch's room
+> 307,200-byte text read in 64 KiB slices; now 24,264). After the push at e51d998bf the cache's chunks held 32.0 MB
+> live (`texts.rs:708`), the same bytes through the clone, and nothing reported why: a memory status now names the
+> owner's text cache as the owner took the shard's last read (`mem.gauge.store.text_cache_reserved_bytes`,
+> `_bound_bytes`, `_walks`, `_walk_bytes`; `owner::text_cache_seen`, carried on each read's timing). The lead,
+> shown by `the_owners_text_cache_is_seen_by_its_asker_and_a_read_left_partway_holds_its_bound`: a read left part-way
+> stays a walk in flight and holds the bound (3 reads of 300 KB left: 3 walks, 921,600 bytes walked, bound 2 MiB) until
+> it ends or more walks than the owner's room evict it. OWED: main's next 57k run reads the gauges; if the walks hold
+> the 32 MB, a walk left part-way is let go by a rule main rules on. The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut

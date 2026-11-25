@@ -127,6 +127,30 @@ fn reserved_change(work: Work, path: &str, how: u8, mark: u8) -> Work {
   change(work, path, how, mark)
 }
 
+/// `inc` judged on `green` a unit a step ([`Green::begin_judging`], [`Green::judging_step`], every step spent once
+/// its first unit is taken): the judgment, and the steps it took.
+pub(super) fn judged_a_unit_a_step(
+  green: &mut Green,
+  inc: &mut super::Increment,
+) -> (Judgment, usize) {
+  let mut judging = green.begin_judging(inc);
+  let mut steps = 0;
+  loop {
+    steps += 1;
+    if let Some(judgment) = green.judging_step(inc, &mut judging, &mut || true) {
+      return (judgment, steps);
+    }
+  }
+}
+
+/// `judgment`'s verdict committed on `green` where it accepted the work ([`Green::commit_judged`]): the version.
+fn committed(green: &mut Green, judgment: Judgment) -> Option<u64> {
+  let Judgment::Accepted(held) = judgment else {
+    return None;
+  };
+  green.commit_judged(held).ok().map(|(version, _)| version)
+}
+
 fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<u64> {
   let Judgment::Accepted(held) = green.judge(inc) else {
     return None;
@@ -196,6 +220,37 @@ proptest! {
         let whole = green.history_reservation(&inc).saturating_add(green.changes_reservation(&inc));
         prop_assert_eq!(reserved_a_unit_a_step(&green, &inc), whole);
         let _ = green.submit_resolved(&inc);
+      }
+    }
+  }
+
+  /// A-920 piece 3c (oracle). Do: give two greens the same generated works (creates, removals, modes, attributes,
+  /// links, nodes, directories and renames on random paths), each judged twice, one green judging whole
+  /// (`judge_named_reads_later`), the other a unit a step, and commit what each accepts. Expect the same judgment
+  /// every time, an accepted, a conflict cached or an answer the cache gives alike, more than one step for a first
+  /// judge of a work of more than one op (a second is answered at once), and the two greens alike after every judge.
+  #[test]
+  fn a_work_judged_a_unit_a_step_is_the_work_judged_whole(
+    steps in prop::collection::vec(
+      (prop::collection::vec((0usize..5, any::<u8>()), 1..5), any::<u8>()),
+      1..16,
+    ),
+  ) {
+    let (mut whole, mut sliced) = (Green::new(), Green::new());
+    for (id, (changes, mark)) in (0u64..).zip(&steps) {
+      let mut work = Work::default();
+      for (index, how) in changes {
+        work = reserved_change(work, PATHS[*index], *how, *mark);
+      }
+      let inc = work.at(whole.head(), id);
+      for round in 0..2 {
+        let judged_whole = whole.judge_named_reads_later(&mut inc.clone());
+        let (judged_sliced, taken) = judged_a_unit_a_step(&mut sliced, &mut inc.clone());
+        prop_assert_eq!(format!("{judged_sliced:?}"), format!("{judged_whole:?}"));
+        let first_of_many = round == 0 && inc.doc.ops.len() > 1;
+        prop_assert!(!first_of_many || taken > 1, "{} ops judged in {} step", inc.doc.ops.len(), taken);
+        prop_assert_eq!(committed(&mut sliced, judged_sliced), committed(&mut whole, judged_whole));
+        prop_assert_eq!(read_whole(&mut sliced), read_whole(&mut whole));
       }
     }
   }

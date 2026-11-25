@@ -62,7 +62,7 @@ use crate::log::Section;
 use crate::log::{Header, Located, SectionKind};
 use crate::staging::{Identity, Staging};
 use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
-use crate::texts::{Place, TextCache, TextRow};
+use crate::texts::{Place, TextCache, TextCacheFigures, TextRow};
 
 /// A landed changeset's section as a replay reads it: its kind, where its bytes are in the log and their length, and
 /// the bytes themselves when they fit one read piece ([`PIECE_BYTES`]: a record, a small `Texts`); a longer section is
@@ -224,6 +224,8 @@ struct Served {
   done_ns: u64,
   /// How the owner, waiting for work, met it: spinning (a hit), parked, or neither (it was queued).
   met: Met,
+  /// The owner's text cache as it took the request ([`text_cache_seen`]).
+  texts: TextCacheFigures,
 }
 
 /// How the owner met a request while it waited for work (goal 93, main's ruling of 2026-11-25: the 57k clone's store
@@ -323,6 +325,23 @@ pub fn take_read_waits() -> AskWaits {
 }
 
 std::thread_local! {
+  /// The owner's text cache as it took this thread's last read ([`text_cache_seen`]).
+  static TEXT_CACHE_SEEN: core::cell::Cell<TextCacheFigures> = const { core::cell::Cell::new(TextCacheFigures {
+    reserved: 0,
+    bound: 0,
+    walks: 0,
+    walk_bytes: 0,
+  }) };
+}
+
+/// The owner's text cache (its reserved bytes, its bound, its walks in flight) as the owner took this thread's last
+/// read: what the asking shard's memory status reports of it, the owner's state crossing to no other thread (goal 93,
+/// main's ruling of 2026-11-25: the 32 MB the cache's chunks held after hg's 57k push, with nothing to say why).
+pub fn text_cache_seen() -> TextCacheFigures {
+  TEXT_CACHE_SEEN.with(core::cell::Cell::get)
+}
+
+std::thread_local! {
   /// The flush of the last changeset this thread's asks landed ([`StoreHandle::land`], [`SlicedLanding::commit`]):
   /// the store's own `sync_data` (`Located::flush_ns`), none since it was last taken.
   static LANDED_FLUSH_NS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
@@ -348,6 +367,7 @@ struct Timer {
   dequeued_ns: u64,
   disk_before: u64,
   met: Met,
+  texts: TextCacheFigures,
 }
 
 impl Timer {
@@ -356,7 +376,7 @@ impl Timer {
   fn of(
     asked: (u64, Option<Sender<Served>>),
     (idle_ns, dequeued_ns, met): (u64, u64, Met),
-    store: &Store,
+    (store, texts): (&Store, TextCacheFigures),
   ) -> Self {
     let (sent_ns, timed) = asked;
     let waited = dequeued_ns.saturating_sub(sent_ns);
@@ -372,6 +392,7 @@ impl Timer {
       dequeued_ns,
       disk_before: store.log().read_ns(),
       met,
+      texts,
     }
   }
 
@@ -386,6 +407,7 @@ impl Timer {
         disk_ns: store.log().read_ns().saturating_sub(self.disk_before),
         done_ns,
         met: self.met,
+        texts: self.texts,
       });
     }
     let _ = answer.try_send(value);
@@ -759,7 +781,11 @@ fn serve(
     else {
       continue;
     };
-    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns, met), &store);
+    let mut timer = Timer::of(
+      (sent_ns, timed),
+      (idle_ns, dequeued_ns, met),
+      (&store, texts.figures()),
+    );
     match request {
       Request::Begin {
         header,
@@ -1100,6 +1126,7 @@ impl StoreHandle {
         sum.add(&served, (sent_ns, taken_ns));
         waits.set(sum);
       });
+      TEXT_CACHE_SEEN.with(|seen| seen.set(served.texts));
     }
     match answer {
       Ok(Err(StoreError::Held)) => Err(OwnerError::Busy),
