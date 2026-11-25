@@ -57,6 +57,21 @@ pub(crate) const FLUSHED_RETENTION: &str = "repository.svn_import.flushed_retent
 pub(crate) const FLUSHED_CHAIN: &str = "repository.svn_import.flushed_chain";
 /// Counter: a batch landed at the import's end, or before a record that moves no version. Format: a counter name.
 pub(crate) const FLUSHED_END: &str = "repository.svn_import.flushed_end";
+/// Counter: a batch landed to its end ([`Staging::land`]): what its stages' times below are summed over (main 01a20182's
+/// ruling of 2026-11-25: where an import's per-batch time goes, before any pipelining). Format: a counter name.
+pub(crate) const LAND_BATCHES: &str = "repository.svn_import.land_batches";
+/// Counter: the nanoseconds batches' changesets took to land durable on the node's store (`landing::land_changeset`,
+/// one flush each), summed. Format: a counter name.
+pub(crate) const LAND_FLUSH_NS: &str = "repository.svn_import.land_flush_ns";
+/// Counter: the nanoseconds batches' entries took to commit to the register (the reference admitted, the batch
+/// committed), summed. Format: a counter name.
+pub(crate) const LAND_COMMIT_NS: &str = "repository.svn_import.land_commit_ns";
+/// Counter: the nanoseconds batches' versions took to apply to the green, a slice a turn (`apply_slices`), summed.
+/// Format: a counter name.
+pub(crate) const LAND_APPLY_NS: &str = "repository.svn_import.land_apply_ns";
+/// Counter: the nanoseconds batches' tails took (`Staging::land_tail`: the green checkpointed and folded, its held table
+/// followed, its texts given back and let go, its landing turn given back), summed. Format: a counter name.
+pub(crate) const LAND_TAIL_NS: &str = "repository.svn_import.land_tail_ns";
 /// Counter: a batch landed because the texts it carries and the next revision's would pass the batch's bound
 /// ([`texts_bound`]; goal 93 P7, main 01a20182's ruling of 2026-11-24). Format: a counter name.
 pub(crate) const FLUSHED_TEXTS: &str = "repository.svn_import.flushed_texts";
@@ -76,7 +91,18 @@ thread_local! {
 /// read, before its staging asks whether the batch is due: so an import holds at most twice the larger of this bound and
 /// its largest revision's texts, never a history's (git-2000 held 426 MiB in one batch before).
 pub(crate) fn texts_bound(state: &ShardState) -> u64 {
+  #[cfg(test)]
+  if let Some(bound) = TEXTS_BOUND.with(std::cell::Cell::get) {
+    return bound;
+  }
   u64::try_from(crate::vcs_store::hg_import::segment_bytes(state)).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's texts bound in place of the derived one ([`texts_bound`]): another host's, whose page, and so whose
+  /// changeset store's unit, differs from this one's (a Linux runner's 4 KiB page makes it 512 KiB, a Mac's 16 KiB 2 MiB).
+  pub(crate) static TEXTS_BOUND: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -179,6 +205,11 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
+  /// The texts it put, each held and not landed yet.
+  pub(crate) fn put(&self) -> &[ContentIdentity] {
+    &self.put
+  }
+
   /// Why the batch before had no room for it.
   pub(crate) fn cause(&self) -> Flush {
     self.cause
@@ -681,8 +712,10 @@ impl Staging {
     let revisions = records.len();
     // The changeset, every text the batch's entry names in its Payload, is durable before the entry is appended: so a
     // named text outlives every entry naming it (A-760; `vcs_store::svn_texts::bring_back_named` relies on it).
+    let flushing = slates_rt::futures::now_ns();
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
+    let committing = slates_rt::futures::now_ns();
     #[cfg(test)]
     kill_before_entry_where_set().await;
     let recorded = crate::state::with_state(|state| {
@@ -713,9 +746,19 @@ impl Staging {
     };
     // The batch is the register's now: its versions applied to the green a slice a turn (`RecordedBatch`), the
     // landing turn and the import's read gate held until the last; a kill between slices recovers from the record.
+    let applying = slates_rt::futures::now_ns();
     apply_slices(&mut recorded).await?;
     slates_rt::futures::yield_now().await;
+    let tailing = slates_rt::futures::now_ns();
     self.land_tail(cause).await?;
+    let ended = slates_rt::futures::now_ns();
+    crate::state::with_state(|state| {
+      state.count(LAND_BATCHES, 1);
+      state.count(LAND_FLUSH_NS, committing.saturating_sub(flushing));
+      state.count(LAND_COMMIT_NS, applying.saturating_sub(committing));
+      state.count(LAND_APPLY_NS, tailing.saturating_sub(applying));
+      state.count(LAND_TAIL_NS, ended.saturating_sub(tailing));
+    })?;
     Some(Ok(revisions))
   }
 

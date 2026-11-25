@@ -1441,6 +1441,9 @@ fn a_replay_fetches_each_piece_of_a_stored_text_once() {
     LISTENER,
     move || async move {
       use crate::vcs_store::svn_import::tests::{imported, subversion};
+      // A Linux runner's texts bound (its 4 KiB page): revision 1's batch lands before revision 2 stages, and revision 2's
+      // text holds revision 1's first windows, as TSan diag 45557094379 met it (`Unstored` at revision 2, one landed).
+      crate::repository::svn_commit::staging::TEXTS_BOUND.with(|bound| bound.set(Some(512 << 10)));
       let (id, _) = subversion(&made).await;
       imported(id, dump).await.0.map(|loaded| loaded.youngest)
     },

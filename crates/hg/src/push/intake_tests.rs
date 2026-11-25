@@ -801,11 +801,14 @@ fn a_pushs_changeset_replays_from_its_payload_a_piece_at_a_time() {
   }
 }
 
+/// A changeset a test made: its node, its two parents, its manifest text and its changelog entry.
+type Made = (Node, Node, Node, Vec<u8>, Vec<u8>);
+
 /// The changesets of `decoded` whose delta's base is neither the null node nor the changeset before it: the bases an
 /// intake does not hold as the text it kept last, so rebuilds from the fork (a manifest's and a file revision's are read
 /// over the fork's rows a window at a time since C1 (2), never rebuilt whole).
 fn bases_not_kept_last(decoded: &crate::changegroup::Changegroup<'_>) -> u64 {
-  let groups = vec![decoded.group(&decoded.changelog)];
+  let groups = [decoded.group(&decoded.changelog)];
   groups
     .iter()
     .map(|group| {
@@ -2338,13 +2341,13 @@ fn dag_push(commits: &[([Option<usize>; 2], &[u8])], padding: usize) -> (Vec<u8>
       (path, text, file)
     })
     .collect();
-  let mut made: Vec<(Node, Node, Node, Vec<u8>, Vec<u8>)> = Vec::new();
+  let mut made: Vec<Made> = Vec::new();
   let mut out = Vec::new();
   let (mut manifests, mut files) = (Vec::new(), Vec::new());
   for (at, (parents, text)) in commits.iter().enumerate() {
     let of = |parent: Option<usize>| parent.and_then(|parent| made.get(parent));
     let (first, second) = (of(parents[0]), of(parents[1]));
-    let node_of = |made: Option<&(Node, Node, Node, Vec<u8>, Vec<u8>)>, pick: usize| {
+    let node_of = |made: Option<&Made>, pick: usize| {
       made.map_or(NULL_NODE, |made| [made.0, made.1, made.2][pick])
     };
     let file = node::compute(&node_of(first, 2), &node_of(second, 2), text).unwrap();
@@ -2478,7 +2481,6 @@ fn a_manifest_chain_read_in_ranges_is_its_text() {
   let (fork, _, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store);
   let mut longest_chain = 0usize;
   for rev in 0..fork.len(&store, Log::Manifest) {
-    let rev = u32::try_from(rev).unwrap();
     let text = fork.revision_text(&store, Log::Manifest, rev).unwrap();
     let chain = Chain::of(&fork, &store, rev).unwrap();
     assert_eq!(chain.len(), to_u64(text.len()));
@@ -2524,11 +2526,7 @@ fn a_manifest_chain_read_in_ranges_is_its_text() {
 /// Each manifest's text the fork reads back, in log order.
 fn manifest_texts(fork: &HgIndex, store: &ContentStore) -> Vec<Vec<u8>> {
   (0..fork.len(store, Log::Manifest))
-    .map(|rev| {
-      fork
-        .revision_text(store, Log::Manifest, u32::try_from(rev).unwrap())
-        .unwrap()
-    })
+    .map(|rev| fork.revision_text(store, Log::Manifest, rev).unwrap())
     .collect()
 }
 
@@ -2613,7 +2611,7 @@ fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
   loop {
     let stepped = taking.step(&payload, &mut store, &mut admission).unwrap();
     while let Some(segment) = taking.take_segment() {
-      records.push(whole_record(&mut taking, &segment, 1 << 20, &store));
+      records.push(whole_record(&taking, &segment, 1 << 20, &store));
     }
     match stepped {
       Stepped::Store => taking.answer_from_fork(&store),
@@ -2623,7 +2621,7 @@ fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
   }
   taking.cut_rest();
   while let Some(segment) = taking.take_segment() {
-    records.push(whole_record(&mut taking, &segment, 1 << 20, &store));
+    records.push(whole_record(&taking, &segment, 1 << 20, &store));
   }
   let (mut fork, intaken) = finished(taking);
   assert_eq!(
@@ -2643,4 +2641,109 @@ fn a_merge_heavy_push_keeps_its_manifests_as_diffs_and_replays_to_its_rows() {
   assert_eq!(rows(&mut replayed, &store), rows(&mut fork, &store));
   replayed.release(&mut store).unwrap();
   fork.release(&mut store).unwrap();
+}
+
+/// Takes `payload` cut into segments, each segment landed (its windows let go as a durable segment's are, by
+/// `let_go_object_landed` with no pin of its own) once revision `held` is kept, so it lands while `held` sits kept and not
+/// landed; where `pinned`, the push's kept revisions pinned unlanded in the store as the server pins them
+/// (`push::pins::Counted`), a segment's own unpinned just before its let-go. What it came to.
+fn taken_landing_after(
+  payload: &[u8],
+  store: &mut ContentStore,
+  (held, pinned): (Node, bool),
+) -> Result<(), Refused> {
+  let mut index = HgIndex::new();
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, payload),
+    &mut index,
+    store,
+    &mut room(),
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut counted = crate::push::pins::Counted::default();
+  let mut taken: Vec<super::PushSegment> = Vec::new();
+  let outcome = loop {
+    let stepped = match intake.step(payload, store, &mut room()) {
+      Ok(stepped) => stepped,
+      Err(refused) => break Err(refused),
+    };
+    if pinned {
+      counted.count_kept(store, intake.kept_contents()).unwrap();
+    }
+    while let Some(segment) = intake.take_segment() {
+      taken.push(segment);
+    }
+    // Landed only once `held` is kept: its segment's let-go runs while it sits kept and not landed.
+    if intake.kept_contents().any(|kept| kept.node == held) {
+      for segment in taken.drain(..) {
+        if pinned {
+          counted.count_out(store, &segment.contents);
+        }
+        for contents in &segment.contents {
+          for identity in contents.identities() {
+            store.let_go_object_landed(identity, &|_| None);
+          }
+        }
+      }
+    }
+    match stepped {
+      Stepped::Store => intake.answer_from_fork(store),
+      stepped if more(&stepped) => {}
+      _ => break Ok(()),
+    }
+  };
+  counted.release(store);
+  assert!(counted.is_empty(), "nothing left pinned after the push");
+  match outcome {
+    Ok(()) => {
+      let (fork, _) = intake.finish().ok().unwrap();
+      fork.release(store).unwrap();
+      Ok(())
+    }
+    Err(refused) => Err(refused),
+  }
+}
+
+/// Main's ruling of 2026-11-24 (the 57k push at 2ed3eb139 refused `UnknownDeltaBase` on `i18n/da.po`; w-perf's scene,
+/// red first). Do: push three revisions of one file cut into segments: A over a window long, B a delta keeping A's first
+/// window and changing its tail, C a delta on B; land A's segment while B sits kept and not landed (its windows let go as
+/// a durable segment's are), once without the push's pins and once with them. Expect, without them, the push refused
+/// `UnknownDeltaBase` for B (the window B shares with A gone with A's let-go, and B on no store); with them, the push taken
+/// whole, the shared window kept (the store's `kept_unlanded` moved), and nothing left pinned after.
+#[test]
+fn a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares() {
+  let window: Vec<u8> = (0..WINDOW)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let a = [&window[..], b"\nthe tail of a\n"].concat();
+  let b = [&window[..], b"\nthe tail of b, changed\n"].concat();
+  let c = [&window[..], b"\nthe tail of c, changed again\n"].concat();
+  let texts: [(&[u8], Option<usize>); 3] = [(&a, None), (&b, Some(0)), (&c, Some(1))];
+  let (payload, pushed) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let b_node = pushed.2[1].0;
+  let mut store = store();
+  let refused = taken_landing_after(&payload, &mut store, (b_node, false)).err();
+  assert!(
+    matches!(
+      refused,
+      Some(Refused::Unverified(Unverified::UnknownDeltaBase { node, base, .. })) if node == b_node && base == b_node
+    ),
+    "without the pins, the push refused for B: {refused:?}"
+  );
+  let mut store = self::store();
+  let taken = taken_landing_after(&payload, &mut store, (b_node, true));
+  assert!(
+    taken.is_ok(),
+    "with the pins, the push taken whole: {taken:?}"
+  );
+  assert!(
+    store.counters().kept_unlanded > 0,
+    "a window the push still named kept from the let-go"
+  );
+  assert_eq!(
+    store.counters().pinned_away,
+    0,
+    "no kept revision's window found let go as it was pinned"
+  );
 }

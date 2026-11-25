@@ -61,6 +61,7 @@ pub mod held;
 pub mod intake;
 pub mod made;
 pub(crate) mod manifest_row;
+pub mod pins;
 pub mod reply;
 pub mod tree;
 pub mod verify;

@@ -119,6 +119,11 @@ pub struct PositionCounts {
   pub lookups: u64,
   /// Ids the cache answered.
   pub hits: u64,
+  /// Of the ids resolved through the index, those whose slot held another id, which this one then put out. An upper
+  /// bound on the ids lost to another's slot, not their count: an id met the first time also finds its slot taken once
+  /// the cache is warm (A-911's 40-commit line: 59 of 157 lookups counted at 4 ways or at 32 slots an id, where nearly
+  /// every miss is a first meeting). The A/B of more ways against more slots reads lookups and time.
+  pub conflicts: u64,
   /// Answers whose cache was refused the room its work asked (one an answer).
   pub unroomed: u64,
 }
@@ -145,6 +150,9 @@ impl PositionCache {
       return Some(*position);
     }
     self.counts.lookups = self.counts.lookups.saturating_add(1);
+    if matches!(self.slots.get(at), Some(Some(_))) {
+      self.counts.conflicts = self.counts.conflicts.saturating_add(1);
+    }
     let position = resolve()?;
     if let Some(slot) = self.slots.get_mut(at) {
       *slot = Some((*id, position));

@@ -411,3 +411,98 @@ fn a_walk_in_flight_keeps_its_text_through_other_reads() {
     cache.reserved_bytes()
   );
 }
+
+/// Shape: the distinct texts of several pieces the whole-read test lands, each [`BIG_TEXT`] bytes: past a chunk and a
+/// text together, so walks left in flight show past the bound.
+const WHOLE_TEXTS: u64 = 24;
+
+/// Lands [`WHOLE_TEXTS`] more changesets of repository 1 from `sequence` on, each a whole text of [`BIG_TEXT`] bytes of
+/// its own on its own path, as a history's manifests are: their identities, in order.
+fn land_whole_texts(store: &mut Store, sequence: u64) -> Vec<[u8; 32]> {
+  let staging = Staging::new(1 << 20);
+  (0..WHOLE_TEXTS)
+    .map(|nth| {
+      let text: Vec<u8> = (0..BIG_TEXT)
+        .map(|at| ((at as u64 + nth) % 239) as u8)
+        .collect();
+      let identity = *blake3::hash(&text).as_bytes();
+      let section = texts::encode(&[TextEntry {
+        path: format!("manifest-{nth}").into_bytes(),
+        tool_id: Vec::new(),
+        text: identity,
+        len: text.len() as u64,
+        base: None,
+        place: Place {
+          payload: identity,
+          offset: 0,
+          len: text.len() as u64,
+        },
+      }]);
+      let at = sequence + nth;
+      store
+        .land(
+          Header {
+            tool: Tool::Mercurial,
+            repository: 1,
+            sequence: at,
+            judged_over: at - 1,
+            grant: 1,
+            work: at,
+            time_ns: at,
+            sections: 0,
+          },
+          &[
+            (SectionKind::Record, Contents::Bytes(b"heads")),
+            (SectionKind::Payload, Contents::Bytes(&text)),
+            (SectionKind::Texts, Contents::Bytes(&section)),
+          ],
+          &staging,
+        )
+        .unwrap();
+      identity
+    })
+    .collect()
+}
+
+/// Goal 93 (main's round at 15b4f1061: hg's 57k clone peaked at 10,416 MiB and held 10,013 MiB after it, 4,792 mapped
+/// blocks of about a chunk each still live; at 2ed3eb139 it peaked at 5.7-6.0 GB). Since 9a5587e78 the owner makes a
+/// fetch's batch of texts whole in one request, each read once at its start and taken whole, so for a text longer than
+/// a piece (a manifest of Mercurial's history, 100-250 KB) the cache took that read for a walk's first piece, kept it in
+/// flight with no later piece ever to end it, and grew its bound by the text, up to the owner's room for waiting reads
+/// (`clients_per_shard` x shards). Do: land the chain and [`WHOLE_TEXTS`] distinct texts of several pieces; on a cache
+/// made for [`MANY_READS`] reads at once, read each whole ([`Store::text_whole`]) as the owner's batch does. Expect:
+/// every text's bytes as landed, whole; and the cache's bound and reserved bytes never past one chunk and a text, since a
+/// text read whole leaves no walk in flight. Failing first: the bound grown by every text read whole, about 4.7 MB here.
+#[test]
+fn a_text_read_whole_leaves_no_walk_in_flight() {
+  let dir = scratch("whole");
+  let mut store = open(&dir);
+  land_chain(&mut store);
+  let wholes = land_whole_texts(&mut store, VERSIONS + 1);
+  let staging = Staging::new(0);
+  let mut cache = TextCache::for_reads(MANY_READS);
+  let most = slates_mem::large::floor() as u64 + BIG_TEXT as u64;
+  let (mut largest_bound, mut largest_reserved) = (0, 0);
+  for identity in &wholes {
+    let bytes = store
+      .text_whole(&staging, 1, identity, &mut cache)
+      .unwrap()
+      .unwrap();
+    assert_eq!(bytes.len(), BIG_TEXT, "the text whole");
+    assert_eq!(
+      *blake3::hash(bytes).as_bytes(),
+      *identity,
+      "a text's bytes as landed"
+    );
+    largest_bound = largest_bound.max(cache.bound());
+    largest_reserved = largest_reserved.max(cache.reserved_bytes());
+  }
+  println!(
+    "text_cache_heap: {WHOLE_TEXTS} texts of {BIG_TEXT} B read whole: bound at most {largest_bound}, reserved at most \
+     {largest_reserved} (at most {most})"
+  );
+  assert!(
+    largest_bound <= most && largest_reserved <= most,
+    "bound {largest_bound} or reserved {largest_reserved} past one chunk and a text, {most}, with every text read whole"
+  );
+}
