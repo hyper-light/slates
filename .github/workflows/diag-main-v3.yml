@@ -1,7 +1,7 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-24 16:04 PST): gate 14 at 02bd0ec94, w-shared's A-908 steps 1-3 (a holder replicates a branched green
-# by its lineage; memberships from names-log parts), which changes how a successor adopts a family. Gate 13 (6eae8b2a4)
-# passed 40 of 40. Twenty release then twenty debug runs, stopped after the first three if all three fail. Run only from
+# main 01a20182 (2026-11-24 17:38 PST): gate 15 at f387b56d3, w-shared's A-909 (c9262f763: an owner's own hold fences each
+# object as its holders do, so what a successor makes after a takeover places). Gate 14 (02bd0ec94, A-908) passed 40 of
+# 40. Twenty release then twenty debug runs, stopped after the first three if all three fail. Run only from
 # diag-measurer-main-v3-* branches.
 on:
   push:
@@ -12,13 +12,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 14 at 02bd0ec94)
+    name: v3_takeover (gate 15 at f387b56d3)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 02bd0ec941a250315a7dba2d932c16cc0fb095f1
+          ref: f387b56d327f3290a8db187e5160f2fcc4c968d9
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -49,7 +49,7 @@ jobs:
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 14: $pass of $ran passed"
+          echo "== gate 15: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -59,5 +59,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate14
+          name: v3-gate15
           path: ${{ runner.temp }}/*.log
