@@ -304,18 +304,20 @@ const STREAM2_SRC_STORE: u8 = b's';
 const UVARINT_MAX_BYTES: u64 = 10;
 
 /// Where a streamed `stream_out` or `STREAM2` stands (A-745).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Kept `Copy` (the active log lives in [`Streaming::current`]) so advancing one revision never
+/// clones a file path `Vec<u8>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
   /// Not begun: the first log the walk writes is found.
   Start,
-  /// Counting the files and their bytes, which the answer's head names first: the log next.
-  Counting(Walked),
+  /// Counting the files and their bytes, which the answer's head names first: the log in `current`.
+  Counting,
   /// The head: `0`, then the files' count and bytes; or `1`, no stream served (or `STREAM2` part header in V2).
   Head,
   /// A log's index file: its next revision, and its data file's bytes before it.
-  Index(Walked, u32, u64),
+  Index(u32, u64),
   /// A log's data file: its next revision.
-  Data(Walked, u32),
+  Data(u32),
   /// Extra store files emitted after the revlogs in `STREAM2` (such as `phaseroots`), indexed by position.
   Extra(usize),
   /// Ended.
@@ -501,6 +503,8 @@ pub struct Streaming {
   extra: Vec<(Vec<u8>, Vec<u8>)>,
   /// Where it stands.
   stage: Stage,
+  /// The log currently walked in `Stage::Counting`, `Stage::Index`, or `Stage::Data`.
+  current: Option<Walked>,
   /// The files counted, and their bytes.
   counted: (u64, u64),
   /// What it asks of the store before its next step.
@@ -549,6 +553,7 @@ impl Default for Streaming {
       format: WireFormat::V1,
       extra: Vec::new(),
       stage: Stage::Start,
+      current: None,
       counted: (0, 0),
       want: None,
       wanted_logs: Vec::new(),
@@ -660,8 +665,7 @@ impl Streaming {
       return Ok(true);
     }
     self.room_hint = admission.left();
-    let stage = self.stage.clone();
-    self.stage = match stage {
+    self.stage = match self.stage {
       Stage::Start => {
         if self.format == WireFormat::V2 {
           for (_, bytes) in &self.extra {
@@ -671,14 +675,17 @@ impl Streaming {
             }
           }
         }
-        first_log(index, store).map_or(Stage::Head, Stage::Counting)
+        self.current = first_log(index, store);
+        if self.current.is_some() {
+          Stage::Counting
+        } else {
+          Stage::Head
+        }
       }
-      Stage::Counting(log) => self.count(index, store, log)?,
+      Stage::Counting => self.count(index, store)?,
       Stage::Head => self.head(index, store, admission, out)?,
-      Stage::Index(log, rev, offset) => {
-        self.index_entry(index, store, (log, rev, offset), admission, out)?
-      }
-      Stage::Data(log, rev) => self.data_chunk(index, store, (log, rev), admission, out)?,
+      Stage::Index(rev, offset) => self.index_entry(index, store, (rev, offset), admission, out)?,
+      Stage::Data(rev) => self.data_chunk(index, store, rev, admission, out)?,
       Stage::Extra(at) => self.extra_file(at, admission, out)?,
       Stage::Done => return Ok(false),
     };
@@ -773,28 +780,36 @@ impl Streaming {
   }
 
   /// One log of the count, once its rows are held: its index file and data file counted; then the next log, or the head.
-  fn count(
-    &mut self,
-    index: &HgIndex,
-    store: &ContentStore,
-    log: Walked,
-  ) -> Result<Stage, Refused> {
-    if !self.rows_held(index, store, &log, true)? {
-      return Ok(Stage::Counting(log));
+  fn count(&mut self, index: &HgIndex, store: &ContentStore) -> Result<Stage, Refused> {
+    let log = self.current.take().ok_or(Refused::TooLong)?;
+    let held = match self.rows_held(index, store, &log, true) {
+      Ok(held) => held,
+      Err(err) => {
+        self.current = Some(log);
+        return Err(err);
+      }
+    };
+    if !held {
+      self.current = Some(log);
+      return Ok(Stage::Counting);
     }
     if self.not_served {
       return Ok(Stage::Head);
     }
-    let stored = self.held.get(self.held_at).ok_or(Refused::TooLong)?;
+    let Some(stored) = self.held.get(self.held_at) else {
+      self.current = Some(log);
+      return Err(Refused::TooLong);
+    };
     let entries = to_u64(stored.revisions.len()).saturating_mul(to_u64(ENTRY_BYTES));
     let data = stored.revisions.iter().try_fold(0_u64, |data, row| {
       sent_len(row).map(|sent| data.saturating_add(sent))
     });
     // A place too short for the trivial hunk it must hold: the store's row is not one a stream can send.
-    let data = data.ok_or(Refused::Unreadable {
-      log: unreadable_name(&log),
-      rev: 0,
-    })?;
+    let Some(data) = data else {
+      let name = unreadable_name(&log);
+      self.current = Some(log);
+      return Err(Refused::Unreadable { log: name, rev: 0 });
+    };
     for bytes in [entries, data] {
       if bytes > 0 {
         self.counted.0 = self.counted.0.saturating_add(1);
@@ -802,7 +817,12 @@ impl Streaming {
       }
     }
     self.held_at = self.held_at.saturating_add(1);
-    Ok(next_log(&log, index, store).map_or(Stage::Head, Stage::Counting))
+    self.current = next_log(&log, index, store);
+    Ok(if self.current.is_some() {
+      Stage::Counting
+    } else {
+      Stage::Head
+    })
   }
 
   /// The answer's head: in V1, `0` and the counts, or `1` where a revision the store does not keep
@@ -820,10 +840,12 @@ impl Streaming {
       if self.not_served {
         return Ok(Stage::Done);
       }
-      return Ok(first_log(index, store).map_or_else(
-        || next_extra(self.format, &self.extra, 0),
-        |log| Stage::Index(log, 0, 0),
-      ));
+      self.current = first_log(index, store);
+      return Ok(if self.current.is_some() {
+        Stage::Index(0, 0)
+      } else {
+        next_extra(self.format, &self.extra, 0)
+      });
     }
     if self.not_served {
       // Format: 7.2's "operation forbidden by server", two bytes.
@@ -838,7 +860,12 @@ impl Streaming {
     out.push(b' ');
     out.extend_from_slice(crate::decimal::Decimal::unsigned(self.counted.1).as_bytes());
     out.push(b'\n');
-    Ok(first_log(index, store).map_or(Stage::Done, |log| Stage::Index(log, 0, 0)))
+    self.current = first_log(index, store);
+    Ok(if self.current.is_some() {
+      Stage::Index(0, 0)
+    } else {
+      Stage::Done
+    })
   }
 
   /// Emits one extra store file (such as `phaseroots`) in `STREAM2` format.
@@ -864,30 +891,48 @@ impl Streaming {
     &mut self,
     index: &HgIndex,
     store: &ContentStore,
-    (log, rev, offset): (Walked, u32, u64),
+    (rev, offset): (u32, u64),
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
-    if !self.rows_held(index, store, &log, false)? {
-      return Ok(Stage::Index(log, rev, offset));
+    let log = self.current.take().ok_or(Refused::TooLong)?;
+    let held = match self.rows_held(index, store, &log, false) {
+      Ok(held) => held,
+      Err(err) => {
+        self.current = Some(log);
+        return Err(err);
+      }
+    };
+    if !held {
+      self.current = Some(log);
+      return Ok(Stage::Index(rev, offset));
     }
+    self.current = Some(log);
     // The log's length is its held rows' count: asked of the index, each entry took a search of the log's keys.
     let count = self.held.front().map_or(Ok(0), |stored| {
       u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)
     })?;
     if rev >= count {
+      let Some(log) = self.current.as_ref() else {
+        return Err(Refused::TooLong);
+      };
       if offset == 0 {
-        return Ok(next_log(&log, index, store).map_or_else(
-          || next_extra(self.format, &self.extra, 0),
-          |next| Stage::Index(next, 0, 0),
-        ));
+        self.current = next_log(log, index, store);
+        return Ok(if self.current.is_some() {
+          Stage::Index(0, 0)
+        } else {
+          next_extra(self.format, &self.extra, 0)
+        });
       }
       let name = [log.radix().as_slice(), b".d"].concat();
       entry_head(self.format, &name, offset, admission, out)?;
-      return Ok(Stage::Data(log, 0));
+      return Ok(Stage::Data(0));
     }
+    let Some(log) = self.current.as_ref() else {
+      return Err(Refused::TooLong);
+    };
     let unreadable = || Refused::Unreadable {
-      log: unreadable_name(&log),
+      log: unreadable_name(log),
       rev,
     };
     if rev == 0 {
@@ -961,7 +1006,6 @@ impl Streaming {
       });
     }
     Ok(Stage::Index(
-      log,
       rev.saturating_add(1),
       offset.saturating_add(chunk),
     ))
@@ -973,22 +1017,27 @@ impl Streaming {
     &mut self,
     index: &HgIndex,
     store: &ContentStore,
-    (log, rev): (Walked, u32),
+    rev: u32,
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
+    let Some(log) = self.current.as_ref() else {
+      return Err(Refused::TooLong);
+    };
     let unreadable = || Refused::Unreadable {
-      log: unreadable_name(&log),
+      log: unreadable_name(log),
       rev,
     };
     let stored = self.held.front().ok_or_else(unreadable)?;
     let count = u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)?;
     if rev >= count {
       // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
-      return Ok(next_log(&log, index, store).map_or_else(
-        || next_extra(self.format, &self.extra, 0),
-        |next| Stage::Index(next, 0, 0),
-      ));
+      self.current = next_log(log, index, store);
+      return Ok(if self.current.is_some() {
+        Stage::Index(0, 0)
+      } else {
+        next_extra(self.format, &self.extra, 0)
+      });
     }
     let seq = stored.seq;
     if self
@@ -1016,7 +1065,7 @@ impl Streaming {
       }
       self.want = Some(Want::Chunks { places });
       self.wanted_chunks = tags;
-      return Ok(Stage::Data(log, rev));
+      return Ok(Stage::Data(rev));
     }
     // A whole's chunk is its raw text and an edit's its delta (A-767 C1): either is sent as it lies.
     let (_, _, chunk) = self.chunks.pop_front().ok_or_else(unreadable)?;
@@ -1026,7 +1075,7 @@ impl Streaming {
       out.push(UNCOMPRESSED);
       out.extend_from_slice(sent);
     }
-    Ok(Stage::Data(log, rev.saturating_add(1)))
+    Ok(Stage::Data(rev.saturating_add(1)))
   }
 }
 

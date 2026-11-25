@@ -315,6 +315,16 @@ pub enum SmallParents {
   Spilled(Vec<u64>),
 }
 
+impl SmallParents {
+  /// The commit's first parent position, if it has any parents.
+  pub fn first(&self) -> Option<u64> {
+    match self {
+      SmallParents::Inline { items, len } => (*len > 0).then(|| items.first().copied()).flatten(),
+      SmallParents::Spilled(parents) => parents.first().copied(),
+    }
+  }
+}
+
 impl Default for SmallParents {
   fn default() -> SmallParents {
     SmallParents::Inline {
@@ -420,11 +430,28 @@ pub fn decode_commit_header(payload: &[u8]) -> Option<(u64, u64, u64)> {
   Some((fields.word()?, fields.word()?, fields.word()?))
 }
 
+/// Decodes `(tree, generation, parents)` from a commit object row payload in one pass without
+/// allocating for 0-, 1-, or 2-parent commits. Returns `None` for non-commit rows or truncated
+/// payloads.
+pub fn decode_commit_walk(payload: &[u8]) -> Option<(u64, u64, SmallParents)> {
+  let mut fields = commit_fields(payload)?;
+  let tree = fields.word()?;
+  let _date = fields.word()?;
+  let generation = fields.word()?;
+  let parents = decode_small_parents(&mut fields)?;
+  Some((tree, generation, parents))
+}
+
 /// Decodes only the parent positions from a commit object row payload into a zero-allocation
 /// [`SmallParents`]. Returns `None` for non-commit rows or truncated payloads.
 pub fn decode_commit_parents(payload: &[u8]) -> Option<SmallParents> {
   let mut fields = commit_fields(payload)?;
   fields.take(COMMIT_HEADER_BYTES)?;
+  decode_small_parents(&mut fields)
+}
+
+/// Decodes a commit row's parent count and parent positions into [`SmallParents`].
+fn decode_small_parents(fields: &mut Fields<'_>) -> Option<SmallParents> {
   let count = usize::try_from(fields.count()?).ok()?;
   if fields.bytes.len() != count.checked_mul(WORD_BYTES)? {
     return None;

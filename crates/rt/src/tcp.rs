@@ -100,6 +100,18 @@ impl TcpListener {
     Ok(TcpListener { socket })
   }
 
+  /// Binds a non-blocking listening socket to `addr` configured for multi-shard parallel accept:
+  /// enables `SO_REUSEPORT` on Linux so sibling shards can bind independent listening sockets on the
+  /// same port (`share_for_shard`), and behaves identically to [`TcpListener::bind`] on macOS and
+  /// Windows (where shards share one listener handle via [`TcpListener::try_clone`]).
+  pub fn bind_shared(addr: SocketAddrV4, backlog: i32) -> Result<TcpListener, RtError> {
+    let socket = netsys::stream_socket()?;
+    netsys::set_reuseport(&socket)?;
+    netsys::bind(&socket, addr)?;
+    netsys::listen(&socket, backlog)?;
+    Ok(TcpListener { socket })
+  }
+
   /// Adopts an already-bound, listening socket — a listener a supervisor bound and handed over so its port
   /// survives a daemon restart (§4.6, "One TCP loopback listener held by the anchor"). It must name a bound,
   /// listening INET stream socket; it is made non-blocking (the driver waits on it) and kept from the adopting
@@ -139,6 +151,23 @@ impl TcpListener {
     Ok(TcpListener {
       socket: netsys::clone_listener(&self.socket)?,
     })
+  }
+
+  /// Produces a listening socket for a sibling shard of a multi-shard server bound with [`TcpListener::bind_shared`]:
+  /// on Linux, binds an independent `SO_REUSEPORT` listener on the same local address with `backlog` so the kernel
+  /// hashes incoming connections across per-shard accept queues with zero cross-shard lock contention; on macOS and
+  /// Windows, duplicates the existing listener handle via [`TcpListener::try_clone`].
+  pub fn share_for_shard(&self, backlog: i32) -> Result<TcpListener, RtError> {
+    #[cfg(target_os = "linux")]
+    {
+      let addr = self.local_addr()?;
+      TcpListener::bind_shared(addr, backlog)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+      let _ = backlog;
+      self.try_clone()
+    }
   }
 
   /// Accepts one pending connection without waiting: `Ok(None)` when the accept queue is empty (`EAGAIN`).

@@ -344,11 +344,16 @@ fn start_store(
     .free_bytes()
     .map_err(|e| failed("vcs store free space", e))?;
   let sizing = store_sizing(config, disk);
-  // A request a client seat may have waiting at once: every shard's seats.
-  let waiting = config
-    .clients_per_shard
-    .saturating_mul(usize::from(config.runtime.shards).max(1));
-  let owner = slates_store::owner::StoreOwner::start(root, sizing, waiting)
+  // A request a client seat may have waiting at once: every shard's seats for the channel and read cache,
+  // and every shard's admitted VCS connections for async read waiters so bursty concurrent fetches queue
+  // cleanly instead of failing Busy mid-stream.
+  let shards = usize::from(config.runtime.shards).max(1);
+  let waiting = config.clients_per_shard.saturating_mul(shards);
+  let waiters = config
+    .vcs_connections_per_shard()
+    .get()
+    .saturating_mul(shards);
+  let owner = slates_store::owner::StoreOwner::start_with_waiters(root, sizing, waiting, waiters)
     .map_err(|e| failed("vcs store", e))?;
   Ok((owner, views))
 }

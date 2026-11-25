@@ -125,6 +125,9 @@ const STREAM: &[u8] = b":";
 /// `is_ntfs_dotgit`: `.git` or `git~1`, either case, then only spaces and dots up to the end, a separator of either
 /// platform or a `:`.
 fn is_ntfs_git(name: &[u8]) -> bool {
+  if !matches!(name.first(), Some(b'.' | b'g' | b'G')) {
+    return false;
+  }
   strip_prefix_folded(name, b".git")
     .or_else(|| strip_prefix_folded(name, b"git~1"))
     .is_some_and(|rest| only_spaces_and_dots(rest, DOTGIT_ENDS))
@@ -143,6 +146,20 @@ const REGULAR_SHORT_NAME_LAST: u8 = b'4';
 /// characters, `~` and 1 to 4), or a fall-back short name (`prefix`'s characters, `~`, and a number from 1 that does
 /// not begin with 0); then only spaces and dots up to the end or a `:`.
 fn is_ntfs_dot(name: &[u8], dotgit_name: &[u8], prefix: &[u8; SHORT_NAME_PREFIX]) -> bool {
+  let Some(&first) = name.first() else {
+    return false;
+  };
+  if first != b'.'
+    && first != b'~'
+    && dotgit_name
+      .first()
+      .is_none_or(|byte| !first.eq_ignore_ascii_case(byte))
+    && prefix
+      .first()
+      .is_none_or(|byte| !first.eq_ignore_ascii_case(byte))
+  {
+    return false;
+  }
   if let Some(rest) = name
     .strip_prefix(b".")
     .and_then(|rest| strip_prefix_folded(rest, dotgit_name))

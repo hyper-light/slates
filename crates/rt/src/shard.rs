@@ -533,18 +533,18 @@ impl ShardContext {
     // word minted for that shard can never name a task of this one (registry slot reuse, §4.3).
     let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
     // A task's handle is packed into a wake word of 24 generation bits: a slot retires at that limit
-    // rather than issue a generation the word would truncate into an alias (AUD-29-11).
+    // rather than issue a generation the word would truncate into an alias (AUD-29-11). Reserve one
+    // base-page segment so initial task spawns and R9 provisioning never hit the system allocator,
+    // while additional segments grow lazily on demand up to `config.tasks_per_shard` (matching
+    // `Wheel::growing` and `LocalQueue::new`, avoiding 60+ MiB of idle eager preallocation per daemon
+    // when VCS edges raise the converged connection cap).
     let mut arena = Slab::with_generation_base(
       config.tasks_per_shard.min(config.segment_tasks()),
       config.tasks_per_shard,
       generation_base,
     )
     .with_generation_limit(Encoded::TASK_GENERATION_LIMIT);
-    arena.reserve_segments(
-      config
-        .tasks_per_shard
-        .div_ceil(config.segment_tasks().max(1)),
-    );
+    arena.reserve_segments(usize::from(config.tasks_per_shard > 0));
     let timers = Wheel::growing(
       config.timer_tick_ns,
       config.timers_per_shard.min(config.segment_tasks()).max(1),

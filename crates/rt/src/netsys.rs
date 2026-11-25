@@ -544,6 +544,22 @@ mod imp {
     })
   }
 
+  /// Enables `SO_REUSEPORT` on Linux so every shard of a multi-shard server can bind its own listening socket on
+  /// the same port with an independent kernel accept queue and zero cross-shard accept contention (Linux 3.9+
+  /// `socket(7)`). Off Linux, TCP `SO_REUSEPORT` does not load-balance across sockets, so those platforms share
+  /// one listening socket via [`clone_listener`] instead.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn set_reuseport(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
+      .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
+  }
+
+  /// No-op off Linux (see the Linux arm).
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn set_reuseport(_socket: &Socket) -> Result<(), RtError> {
+    Ok(())
+  }
+
   pub(crate) fn listen(socket: &Socket, backlog: i32) -> Result<(), RtError> {
     rustix::net::listen(&socket.fd, backlog).map_err(|e| refused("listen", e))
   }
@@ -1470,6 +1486,12 @@ mod imp {
     exclusive_socket(SOCK_STREAM, IPPROTO_TCP, "WSASocketW(STREAM)")
   }
 
+  /// No-op on Windows: listeners are bound exclusively (`SO_EXCLUSIVEADDRUSE`) and shared across shards via
+  /// [`clone_listener`] (`WSADuplicateSocketW`).
+  pub(crate) fn set_reuseport(_socket: &Socket) -> Result<(), RtError> {
+    Ok(())
+  }
+
   pub(crate) fn listen(socket: &Socket, backlog: i32) -> Result<(), RtError> {
     // SAFETY: a listen on a bound socket this value owns.
     if unsafe { ws_listen(socket.socket, backlog) } == SOCKET_ERROR {
@@ -1925,8 +1947,8 @@ pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
 pub(crate) use imp::{
   accept, adopt_listener, adopt_stream, broken_pipe, bytes_handed, clone_listener, connect,
   connected, discard, established, into_owned, invalid, listen, make_sends_whole, peek, read,
-  reserve_buffers, round_trip, set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes,
-  would_block, write, write_vectored,
+  reserve_buffers, round_trip, set_nodelay, set_reuseport, shutdown, shutdown_write, stream_socket,
+  want_bytes, would_block, write, write_vectored,
 };
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,

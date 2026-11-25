@@ -236,17 +236,39 @@ impl WriteLog {
   /// The log of `bytes` at `start` in `object`, continued from what the previous daemon left when its stamp is
   /// `image_generation` (the writes since that publication, still owed), else emptied and stamped with it; with what
   /// it holds to replay. `None` when `bytes` cannot hold the header.
+  #[cfg(test)]
   pub(crate) fn open(
     object: &mut SparseObject,
     start: usize,
     bytes: usize,
     image_generation: u64,
   ) -> Option<(WriteLog, Recovered)> {
+    Self::open_with_freshness(object, start, bytes, image_generation, false)
+  }
+
+  /// Like [`WriteLog::open`], knowing whether no predecessor daemon ever ran over `object`: when `fresh`
+  /// and the header is all zero, no untouched record pages need idle give-back (`written = 0`).
+  pub(crate) fn open_with_freshness(
+    object: &mut SparseObject,
+    start: usize,
+    bytes: usize,
+    image_generation: u64,
+    fresh: bool,
+  ) -> Option<(WriteLog, Recovered)> {
     let capacity = bytes.checked_sub(HEADER_BYTES)?;
+    let virgin = fresh
+      && image_generation == 0
+      && start.checked_add(AT_STAMP).and_then(|at| word(object, at)) == Some(0)
+      && start.checked_add(AT_USED).and_then(|at| word(object, at)) == Some(0)
+      && start
+        .checked_add(AT_OVERFLOW)
+        .and_then(|at| word(object, at))
+        == Some(0)
+      && start.checked_add(AT_LAYOUT).and_then(|at| word(object, at)) == Some(0);
     let mut log = WriteLog {
       start,
       capacity,
-      written: capacity,
+      written: if virgin { 0 } else { capacity },
       used: 0,
       stamp: image_generation,
       overflowed: false,

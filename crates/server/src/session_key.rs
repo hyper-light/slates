@@ -35,16 +35,18 @@ const CONTEXT: &[u8] = b"slates/client-session/v1";
 pub const SESSION_KEY_BYTES: usize = slates_ipc::region::SESSION_KEY_BYTES;
 
 /// Publishes a fresh session secret into `segment` unless a daemon before this one under its anchor already did.
-pub fn adopt_or_mint(segment: &mut AnchorSegment) -> Result<(), ServerError> {
+/// Returns `Ok(true)` when minted fresh (no predecessor daemon ever started on this segment) and `Ok(false)` when
+/// adopted from a predecessor.
+pub fn adopt_or_mint(segment: &mut AnchorSegment) -> Result<bool, ServerError> {
   if segment.session_secret()?.is_some() {
-    return Ok(());
+    return Ok(false);
   }
   let mut secret = [0u8; SESSION_SECRET_BYTES];
   slates_transport::handshake::secure_random(&mut secret)
     .map_err(|e| ServerError::SessionSecret(e.to_string()))?;
   segment.publish_session_secret(&secret)?;
   secret.fill(0);
-  Ok(())
+  Ok(true)
 }
 
 /// The session secret `segment` holds; refused when none was published, which [`adopt_or_mint`] at start rules out.

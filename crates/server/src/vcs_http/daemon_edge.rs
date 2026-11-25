@@ -260,7 +260,7 @@ pub(crate) fn start(
         )));
       }
     };
-    let shard_listener = listener.try_clone().ok();
+    let shard_listener = listener.share_for_shard(bounds.backlog()).ok();
     per_shard.push((shard, shard_listener, shard_identity));
   }
   per_shard.push((control, Some(listener), identity));
@@ -312,7 +312,7 @@ pub(crate) fn bounds_of(config: &DaemonConfig) -> Bounds {
 /// one a supervising anchor binds once and holds for every daemon it starts
 /// (`crate::daemon::bind_vcs_http_listener`), so both queue alike.
 pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpListener, RtError> {
-  TcpListener::bind(address, bounds_of(config).backlog())
+  TcpListener::bind_shared(address, bounds_of(config).backlog())
 }
 
 #[cfg(test)]

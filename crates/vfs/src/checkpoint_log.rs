@@ -401,6 +401,22 @@ pub struct DeadRanges {
 }
 
 impl Journal {
+  /// A journal over a newly created content object no predecessor daemon ever wrote to: every region's
+  /// written extent starts at zero so the first idle sweep does not `madvise` gigabytes of untouched
+  /// virtual address space.
+  pub fn fresh() -> Self {
+    Journal {
+      committed: None,
+      generation: 0,
+      tail: 0,
+      checkpoint_bytes: 0,
+      logged_bytes: 0,
+      committed_written: 0,
+      stale_written: 0,
+      log_written: 0,
+    }
+  }
+
   /// What no restart reads and was written since it was last given back (A-117, A-226), for checkpoint memory
   /// `checkpoint_total` and log memory `log_total` bytes long; `None` before the first checkpoint commits. A restart
   /// takes the newer CRC-valid slot, then the log's frames from its start while each is CRC-valid and names that
@@ -471,12 +487,9 @@ impl Journal {
       checkpoint_bytes: bytes,
       logged_bytes: 0,
       committed_written: bytes.max(self.stale_written),
-      stale_written: if self.committed.is_some() {
-        self.committed_written
-      } else {
-        // Nothing was committed, so neither slot's earlier writes are known: the other slot is given back whole.
-        UNKNOWN_EXTENT
-      },
+      // `Journal::default` seeds `committed_written = UNKNOWN_EXTENT` (predecessor may have written the other
+      // slot, so it is given back whole); `Journal::fresh` seeds `0` (virgin segment never written).
+      stale_written: self.committed_written,
       log_written: self.log_written,
     }
   }

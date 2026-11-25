@@ -1209,8 +1209,8 @@ impl AnchorSegment {
     )
   }
 
-  /// Sums the available bytes across all pool extents in one batched relaxed pass over the
-  /// resolved pool word run, committing the run once rather than per extent.
+  /// Sums the available bytes across all active pool extents in one batched relaxed pass over the
+  /// resolved pool word run, skipping unused slots beyond `parts.len()` per partition.
   pub fn pool_available_bytes(
     &self,
     parts: &[(usize, usize)],
@@ -1219,28 +1219,33 @@ impl AnchorSegment {
     claimable: impl Fn(u16) -> bool,
   ) -> usize {
     let per_partition = crate::layout::POOL_EXTENTS_PER_PARTITION;
-    let count = self.pool_extents();
+    let groups = usize::from(self.geometry.partitions);
+    let active = parts.len().min(per_partition);
     let hold_word = u64::from(hold_owner).saturating_add(1);
     self
       .object
-      .run_u64_fold_relaxed(self.pool_run, count, 0_usize, |total, id, word| {
-        let part = id.checked_rem(per_partition).unwrap_or(0);
-        let Some(&(_, len)) = parts.get(part) else {
-          return total;
-        };
-        let free = word == 0 || (hold_open && word == hold_word);
-        if !free {
-          return total;
-        }
-        let Ok(id_u16) = u16::try_from(id) else {
-          return total;
-        };
-        if claimable(id_u16) {
-          total.saturating_add(len)
-        } else {
-          total
-        }
-      })
+      .run_u64_groups_fold_relaxed(
+        self.pool_run,
+        (groups, per_partition, active),
+        0_usize,
+        |total, id, part, word| {
+          let free = word == 0 || (hold_open && word == hold_word);
+          if !free {
+            return total;
+          }
+          let Some(&(_, len)) = parts.get(part) else {
+            return total;
+          };
+          let Ok(id_u16) = u16::try_from(id) else {
+            return total;
+          };
+          if claimable(id_u16) {
+            total.saturating_add(len)
+          } else {
+            total
+          }
+        },
+      )
       .unwrap_or(0)
   }
 

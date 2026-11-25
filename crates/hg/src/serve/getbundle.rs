@@ -303,6 +303,9 @@ struct Stream2State {
   streaming: Box<crate::render::Streaming>,
   /// Whether the `HG20` stream head and `STREAM2` part header have been emitted.
   head_written: bool,
+  /// Reusable chunk staging buffer so `step_stream2` batches up to one content window per bundle2
+  /// payload chunk instead of allocating a `Vec` and 4-byte chunk header per revlog revision.
+  scratch: Vec<u8>,
 }
 
 /// A `getbundle`'s answer made a slice at a time (A-745; §4.17.1 "A fetch's answer"): what [`getbundle`] writes whole,
@@ -322,6 +325,11 @@ pub struct Answering {
 }
 
 impl Answering {
+  /// Whether this answer is streaming a `STREAM2` bundle2 clone (`stream=1`).
+  pub fn is_stream2(&self) -> bool {
+    self.stream2.is_some()
+  }
+
   /// What the answer's next step asks of the changeset store, if anything (a `STREAM2` part or
   /// a changegroup's file section, [`Walk`]).
   pub fn wants(&self) -> Option<&crate::render::Want> {
@@ -471,13 +479,29 @@ impl Answering {
       }
       return Ok(true);
     }
-    let mut chunk = Vec::new();
-    let more = stream2
-      .streaming
-      .step(index, content, room, &mut chunk)
-      .map_err(super::stream::revlog_refused)?;
-    if !chunk.is_empty() {
-      crate::bundle2::put_payload_chunk(out, &chunk).map_err(|_| unencodable("a chunk"))?;
+    stream2.scratch.clear();
+    let target = content.window().max(1);
+    let mut more = true;
+    while stream2.scratch.len() < target {
+      match stream2
+        .streaming
+        .step(index, content, room, &mut stream2.scratch)
+      {
+        Ok(next) => {
+          more = next;
+          if !more || stream2.streaming.wants().is_some() {
+            break;
+          }
+        }
+        Err(crate::render::Refused::Past(_)) if !stream2.scratch.is_empty() => {
+          break;
+        }
+        Err(refused) => return Err(super::stream::revlog_refused(refused)),
+      }
+    }
+    if !stream2.scratch.is_empty() {
+      crate::bundle2::put_payload_chunk(out, &stream2.scratch)
+        .map_err(|_| unencodable("a chunk"))?;
     }
     if !more {
       crate::bundle2::put_payload_chunk(out, &[]).map_err(|_| unencodable("a chunk"))?;
@@ -527,6 +551,7 @@ fn stream2_state(
   Ok(Some(Stream2State {
     streaming: Box::new(crate::render::Streaming::v2(extra)),
     head_written: false,
+    scratch: Vec::new(),
   }))
 }
 

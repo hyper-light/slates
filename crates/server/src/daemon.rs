@@ -634,7 +634,7 @@ pub(crate) fn held_or_bound_listener(
       }
     }
     Some(Err(error)) => Err(format!("the anchor's listener was not adopted: {error}")),
-    None => TcpListener::bind(address, backlog)
+    None => TcpListener::bind_shared(address, backlog)
       .map_err(|error| format!("{address} did not bind: {error}")),
   }
 }
@@ -1027,7 +1027,7 @@ impl Daemon {
     let region_names = region_name_key(&issuer_secret);
     // The client session secret (`crate::session_key`): adopted from the daemon before this one under the anchor, or
     // made and published by the first, so a client's session key still opens its session after a restart.
-    crate::session_key::adopt_or_mint(&mut segment)?;
+    let fresh_segment = crate::session_key::adopt_or_mint(&mut segment)?;
     // A full crash dump an administrator's setting would write of this daemon (A-239): read and logged once at start.
     let _ = crate::local_dumps::full();
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
@@ -1192,7 +1192,7 @@ impl Daemon {
           config,
           env,
           identity,
-          (partition, sealing, learning),
+          (partition, sealing, learning, fresh_segment),
           all,
           retained,
           holds,
@@ -4480,6 +4480,7 @@ fn content_slice(
   config: &DaemonConfig,
   partition: u16,
   content: Option<&mut slates_mem::SparseObject>,
+  fresh_segment: bool,
 ) -> (
   (usize, usize),
   Option<crate::write_log::WriteLog>,
@@ -4507,7 +4508,13 @@ fn content_slice(
       len: deltas.1.saturating_sub(deltas.0),
     },
   );
-  match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
+  match crate::write_log::WriteLog::open_with_freshness(
+    object,
+    log_start,
+    log_bytes,
+    generation,
+    fresh_segment,
+  ) {
     Some((log, recovered)) => (images, Some(log), recovered),
     None => (images, None, crate::write_log::Recovered::default()),
   }
@@ -4592,7 +4599,12 @@ async fn start_shard(
   config: DaemonConfig,
   env: Vec<(String, String)>,
   identity: Identity,
-  (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
+  (partition, sealing, learning, fresh_segment): (
+    u16,
+    crate::seal_keys::RootState,
+    ShardLearning,
+    bool,
+  ),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
   holds: ShardHolds,
@@ -4610,7 +4622,7 @@ async fn start_shard(
     &config,
     &env,
     &identity,
-    (partition, sealing, learning),
+    (partition, sealing, learning, fresh_segment),
     &all,
     retained,
     holds,
@@ -4836,7 +4848,12 @@ async fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
   identity: &Identity,
-  (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
+  (partition, sealing, learning, fresh_segment): (
+    u16,
+    crate::seal_keys::RootState,
+    ShardLearning,
+    bool,
+  ),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
   holds: ShardHolds,
@@ -4953,7 +4970,7 @@ async fn init_shard(
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let mut content = AnchorSegment::open_content(env).transpose()?;
   let (content_range, write_log, recovered_writes) =
-    content_slice(config, partition, content.as_mut());
+    content_slice(config, partition, content.as_mut(), fresh_segment);
   // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
   let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   slices
@@ -5009,7 +5026,11 @@ async fn init_shard(
     give_back_rate: GiveBackRate::default(),
     content_range,
     delta_range: delta_range(config, partition, content_range),
-    journal: slates_vfs::checkpoint_log::Journal::default(),
+    journal: if fresh_segment {
+      slates_vfs::checkpoint_log::Journal::fresh()
+    } else {
+      slates_vfs::checkpoint_log::Journal::default()
+    },
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
     deferred_kept: false,

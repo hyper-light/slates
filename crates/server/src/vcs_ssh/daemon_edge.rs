@@ -151,7 +151,11 @@ pub(crate) fn start(
   let mut per_shard: Vec<(ShardId, Option<TcpListener>, HostSeed)> =
     Vec::with_capacity(shards.len());
   for shard in shards.iter().copied().filter(|shard| *shard != control) {
-    per_shard.push((shard, listener.try_clone().ok(), HostSeed(seed.0)));
+    per_shard.push((
+      shard,
+      listener.share_for_shard(bounds.backlog()).ok(),
+      HostSeed(seed.0),
+    ));
   }
   per_shard.push((control, Some(listener), seed));
   for (shard, shard_listener, shard_seed) in per_shard {
@@ -219,7 +223,7 @@ fn fingerprint_of(seed: &HostSeed) -> Option<String> {
 /// daemon's own, and the one a supervising anchor binds once and holds for every daemon it starts
 /// (`crate::daemon::bind_vcs_ssh_listener`), so both queue alike.
 pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpListener, RtError> {
-  TcpListener::bind(address, crate::vcs_http::bounds_of(config).backlog())
+  TcpListener::bind_shared(address, crate::vcs_http::bounds_of(config).backlog())
 }
 
 /// Logs why the edge did not start: no edge to report. Logged, not counted: the shards' counters are not yet serving.

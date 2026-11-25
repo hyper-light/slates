@@ -294,8 +294,20 @@ impl StoreOwner {
   /// Opens the store in `root` on a thread of its own (the store recovers there before the first request is served),
   /// with room for `waiting` requests at once.
   pub fn start(root: StoreRoot, sizing: Sizing, waiting: usize) -> Result<Self, OwnerError> {
+    Self::start_with_waiters(root, sizing, waiting, waiting)
+  }
+
+  /// Opens the store in `root` with channel capacity `waiting` (also sizing its read cache) and places for
+  /// `waiters` concurrent read tasks waiting asynchronously for room when the channel is momentarily full.
+  pub fn start_with_waiters(
+    root: StoreRoot,
+    sizing: Sizing,
+    waiting: usize,
+    waiters: usize,
+  ) -> Result<Self, OwnerError> {
     let grant = crate::store::grant_id(root.grant().target.device, root.grant().target.inode);
-    let (requests, incoming) = sync::channel(waiting).map_err(|_| OwnerError::Busy)?;
+    let (requests, incoming) =
+      sync::channel_with(waiting, waiters.max(waiting)).map_err(|_| OwnerError::Busy)?;
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-store".to_owned()),
       move || serve(root, sizing, incoming, waiting),
@@ -689,13 +701,34 @@ impl StoreHandle {
     self.grant
   }
 
-  /// Sends `request` and waits for its answer on `answers`, as a task.
+  /// Sends `request` without waiting and awaits its answer on `answers` (for landings, where full = `Busy`).
   async fn ask<T>(
     &self,
     request: Request,
     mut answers: ChannelReceiver<Result<T, StoreError>>,
   ) -> Result<T, OwnerError> {
     match self.requests.try_send(request) {
+      Ok(()) => {}
+      Err(SyncError::Full(_)) => return Err(OwnerError::Busy),
+      Err(SyncError::Closed(_)) => return Err(OwnerError::Gone),
+      Err(SyncError::NotOnShardThread(_)) => return Err(OwnerError::NotOnShard),
+    }
+    match answers.recv().await {
+      Ok(Err(StoreError::Held)) => Err(OwnerError::Busy),
+      Ok(answer) => answer.map_err(OwnerError::Store),
+      Err(SyncError::NotOnShardThread(())) => Err(OwnerError::NotOnShard),
+      Err(_) => Err(OwnerError::Gone),
+    }
+  }
+
+  /// Sends a read `request`, waiting asynchronously for a channel slot up to the owner's waiter bound
+  /// instead of failing `Busy` mid-stream under bursty concurrent fetches.
+  async fn ask_read<T>(
+    &self,
+    request: Request,
+    mut answers: ChannelReceiver<Result<T, StoreError>>,
+  ) -> Result<T, OwnerError> {
+    match self.requests.send(request).await {
       Ok(()) => {}
       Err(SyncError::Full(_)) => return Err(OwnerError::Busy),
       Err(SyncError::Closed(_)) => return Err(OwnerError::Gone),
@@ -756,7 +789,7 @@ impl StoreHandle {
   ) -> Result<Option<Vec<u8>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::Piece {
           identity,
           len,
@@ -772,7 +805,9 @@ impl StoreHandle {
   /// replay reads a changeset back by.
   pub async fn sections(&self, row: Changeset) -> Result<Vec<SectionAt>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
-    self.ask(Request::Sections { row, answer }, answers).await
+    self
+      .ask_read(Request::Sections { row, answer }, answers)
+      .await
   }
 
   /// At most [`PIECE_BYTES`] of a section from `offset` (its place, as [`SectionAt`] gives it), as far as `len` reaches:
@@ -780,7 +815,7 @@ impl StoreHandle {
   pub async fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::Read {
           offset,
           len,
@@ -802,7 +837,7 @@ impl StoreHandle {
   ) -> Result<Option<Vec<u8>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::Text {
           repository,
           identity,
@@ -823,7 +858,7 @@ impl StoreHandle {
   ) -> Result<Option<TextRow>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::TextRow {
           repository,
           identity,
@@ -845,7 +880,7 @@ impl StoreHandle {
   ) -> Result<Vec<Vec<Option<(Identity, TextRow)>>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::TextsByTool {
           repository,
           logs,
@@ -859,7 +894,9 @@ impl StoreHandle {
   /// The bytes at each of `places` ([`Store::place_bytes`]), in order: a stream's chunks, read in place.
   pub async fn places(&self, places: Vec<Place>) -> Result<Vec<Vec<u8>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
-    self.ask(Request::Places { places, answer }, answers).await
+    self
+      .ask_read(Request::Places { places, answer }, answers)
+      .await
   }
 
   /// A path's history in `repository` from sequence `from` on, at most `limit` ([`Store::path_texts`]).
@@ -872,7 +909,7 @@ impl StoreHandle {
   ) -> Result<Vec<(u64, Identity)>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::PathTexts {
           repository,
           path,
@@ -910,7 +947,7 @@ impl StoreHandle {
   ) -> Result<Vec<Changeset>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
-      .ask(
+      .ask_read(
         Request::Changesets {
           repository,
           from,

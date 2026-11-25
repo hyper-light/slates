@@ -895,6 +895,52 @@ impl SparseObject {
     }
     Ok(acc)
   }
+
+  /// Like [`SparseObject::run_u64_fold_relaxed`] for a partitioned pool layout: visits only the
+  /// first `active_per_group` words of each `group_stride`-word partition slice across `groups`
+  /// partitions, skipping unused slots without per-word division.
+  #[inline]
+  pub fn run_u64_groups_fold_relaxed<B>(
+    &self,
+    id: RunId,
+    (groups, group_stride, active_per_group): (usize, usize, usize),
+    init: B,
+    mut fold: impl FnMut(B, usize, usize, u64) -> B,
+  ) -> Result<B, MemError> {
+    let active = active_per_group.min(group_stride);
+    let total = groups
+      .checked_mul(group_stride)
+      .ok_or_else(|| refused(groups, Width::U64.bytes(), LayoutRefusal::OutOfRange))?;
+    let run = self
+      .words
+      .run(id)
+      .filter(|run| run.width() == Width::U64)
+      .ok_or_else(|| refused(0, Width::U64.bytes(), LayoutRefusal::NotAWord))?;
+    let span = run
+      .span_bytes(total)
+      .ok_or_else(|| refused(total, Width::U64.bytes(), LayoutRefusal::OutOfRange))?;
+    if groups == 0 || active == 0 {
+      return Ok(init);
+    }
+    let first = run.first_offset();
+    let stride = run.stride();
+    let group_bytes = group_stride.saturating_mul(stride);
+    self.commits.commit(&self.inner, first, span)?;
+    let mut acc = init;
+    let mut group_offset = first;
+    for group in 0..groups {
+      let id_base = group.saturating_mul(group_stride);
+      let mut offset = group_offset;
+      for part in 0..active {
+        let value =
+          word_view::<AtomicU64>(&self.inner, offset)?.load(std::sync::atomic::Ordering::Relaxed);
+        acc = fold(acc, id_base.saturating_add(part), part, value);
+        offset = offset.saturating_add(stride);
+      }
+      group_offset = group_offset.saturating_add(group_bytes);
+    }
+    Ok(acc)
+  }
 }
 
 /// A copy of `len` bytes at `offset` in an object of `object_len` bytes laid out with `words`: inside the

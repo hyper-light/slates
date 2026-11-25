@@ -7,18 +7,63 @@
 //! 233 allocations in its loop); a bit set touches only its words. Its size is the region's: a 2.7 GiB region of 16
 //! KiB pages is 21 KiB of bits. Adjacent recorded units walk as one run, so the purge gives back coalesced ranges.
 
+use std::collections::BTreeMap;
+
 /// Bits per word of a [`UnitSet`].
 const WORD_BITS: usize = u64::BITS as usize;
 
-/// One bit per `unit` bytes of a region (see the module doc): set where the unit is recorded. Allocated once, at the
-/// region's size; marking, taking and walking touch only words, so the arena's hot path allocates nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Shape: words per sparse bitmap block (64 × 8 bytes = 512 bytes, covering 4,096 units = 64 MiB at
+/// 16 KiB pages), so a whole-object reusable-mark set over a 146 GiB sparse mapping allocates zero
+/// bytes at open and only 512 bytes per 64 MiB block actually written.
+const SPARSE_BLOCK_WORDS: usize = 64;
+
+/// Backing storage of a [`UnitSet`]: flat dense words for bounded arena regions (zero allocation on
+/// the arena's hot path, `crates/mem/tests/no_alloc.rs`), or a sparse block map defaulting to all
+/// units recorded for multi-gigabyte sparse objects (`UnitSet::whole`).
+#[derive(Clone, Debug)]
+enum Storage {
+  Dense(Vec<u64>),
+  Sparse(BTreeMap<usize, Box<[u64; SPARSE_BLOCK_WORDS]>>),
+}
+
+/// All valid bits set in word `word` of a set with `units` total units.
+fn full_word(word: usize, units: usize) -> u64 {
+  let start = word.saturating_mul(WORD_BITS);
+  if start >= units {
+    return 0;
+  }
+  let valid = units.saturating_sub(start).min(WORD_BITS);
+  span_mask(0, valid)
+}
+
+/// One bit per `unit` bytes of a region (see the module doc): set where the unit is recorded.
+/// `UnitSet::new` allocates dense words once at the region's size so marking, taking and walking
+/// touch only words and the arena's hot path allocates nothing; `UnitSet::whole` uses sparse blocks
+/// defaulting to all-set so opening a multi-gigabyte sparse object costs zero heap bytes until
+/// specific ranges are cleared.
+#[derive(Clone, Debug)]
 pub(crate) struct UnitSet {
-  words: Vec<u64>,
+  storage: Storage,
   unit: usize,
   units: usize,
   recorded: usize,
 }
+
+impl PartialEq for UnitSet {
+  fn eq(&self, other: &Self) -> bool {
+    if self.unit != other.unit || self.units != other.units || self.recorded != other.recorded {
+      return false;
+    }
+    let words = self.units.div_ceil(WORD_BITS);
+    match (&self.storage, &other.storage) {
+      (Storage::Dense(a), Storage::Dense(b)) => a == b,
+      (Storage::Sparse(a), Storage::Sparse(b)) => a == b,
+      _ => (0..words).all(|word| self.word_at(word) == other.word_at(word)),
+    }
+  }
+}
+
+impl Eq for UnitSet {}
 
 impl UnitSet {
   /// An empty set over `len` bytes in units of `unit` bytes.
@@ -26,30 +71,40 @@ impl UnitSet {
     let unit = unit.max(1);
     let units = len.div_ceil(unit);
     UnitSet {
-      words: vec![0; units.div_ceil(WORD_BITS)],
+      storage: Storage::Dense(vec![0; units.div_ceil(WORD_BITS)]),
       unit,
       units,
       recorded: 0,
     }
   }
 
-  /// Every unit of `len` bytes recorded, its words written whole: each full word all ones and the last word's units
-  /// alone. Every macOS open of a sparse object makes one over the whole object (its pages that may carry the reusable
-  /// mark, A-110), and a daemon's segment is about 100 GB of 16 KiB pages, 786 KB of words. Marked a span at a time, it
-  /// took 2.4 to 5.3 ms an open on a debug build, three opens a shard's start (84a, w-perf 2026-11-22).
+  /// Every unit of `len` bytes recorded, without allocating a dense bitmap over multi-gigabyte sparse
+  /// objects: an absent sparse block represents all valid bits set, so opening a 146 GiB macOS
+  /// content object costs zero heap bytes instead of 1.09 MiB per open (A-110).
   pub(crate) fn whole(len: usize, unit: usize) -> UnitSet {
-    let mut set = UnitSet::new(len, unit);
-    let full = set.units.checked_div(WORD_BITS).unwrap_or(0);
-    let tail = set.units.checked_rem(WORD_BITS).unwrap_or(0);
-    for (at, word) in set.words.iter_mut().enumerate() {
-      *word = if at < full {
-        u64::MAX
-      } else {
-        span_mask(0, tail)
-      };
+    let unit = unit.max(1);
+    let units = len.div_ceil(unit);
+    UnitSet {
+      storage: Storage::Sparse(BTreeMap::new()),
+      unit,
+      units,
+      recorded: units,
     }
-    set.recorded = set.units;
-    set
+  }
+
+  /// Word `word` of the bit set (0 past the set's length).
+  fn word_at(&self, word: usize) -> u64 {
+    match &self.storage {
+      Storage::Dense(words) => words.get(word).copied().unwrap_or(0),
+      Storage::Sparse(blocks) => {
+        let block_idx = word.checked_div(SPARSE_BLOCK_WORDS).unwrap_or(0);
+        let offset = word.checked_rem(SPARSE_BLOCK_WORDS).unwrap_or(0);
+        match blocks.get(&block_idx) {
+          Some(block) => block.get(offset).copied().unwrap_or(0),
+          None => full_word(word, self.units),
+        }
+      }
+    }
   }
 
   /// Whether no unit is recorded: the whole cost of a check against the set then.
@@ -93,21 +148,11 @@ impl UnitSet {
 
   /// Sets or clears units `first .. last` a word at a time: the units that changed.
   fn set_units(&mut self, first: usize, last: usize, on: bool) -> usize {
-    let mut changed = 0usize;
-    let mut at = first;
-    while at < last {
-      let word = at.checked_div(WORD_BITS).unwrap_or(0);
-      let bit = at.checked_rem(WORD_BITS).unwrap_or(0);
-      let span = (WORD_BITS.saturating_sub(bit)).min(last.saturating_sub(at));
-      let mask = span_mask(bit, span);
-      if let Some(slot) = self.words.get_mut(word) {
-        let before = *slot;
-        *slot = if on { before | mask } else { before & !mask };
-        let flipped = usize::try_from((before ^ *slot).count_ones()).unwrap_or(0);
-        changed = changed.saturating_add(flipped);
-      }
-      at = at.saturating_add(span.max(1));
-    }
+    let units = self.units;
+    let changed = match &mut self.storage {
+      Storage::Dense(words) => set_units_dense(words, first, last, on),
+      Storage::Sparse(blocks) => set_units_sparse(blocks, units, first, last, on),
+    };
     self.recorded = if on {
       self.recorded.saturating_add(changed)
     } else {
@@ -138,23 +183,140 @@ impl UnitSet {
     ))
   }
 
-  /// The first unit in `from .. to` whose bit is `on`, a word at a time.
+  /// The first unit in `from .. to` whose bit is `on`, a word at a time (skipping absent all-ones
+  /// sparse blocks in O(log B)).
   fn find(&self, from: usize, on: bool, to: usize) -> Option<usize> {
     let to = to.min(self.units);
     let mut at = from;
-    while at < to {
-      let word = at.checked_div(WORD_BITS).unwrap_or(0);
-      let bit = at.checked_rem(WORD_BITS).unwrap_or(0);
-      let bits = self.words.get(word).copied().unwrap_or(0);
-      let candidates = if on { bits } else { !bits } >> bit;
-      if candidates != 0 {
-        let found = at.saturating_add(usize::try_from(candidates.trailing_zeros()).unwrap_or(0));
-        return (found < to).then_some(found);
+    match &self.storage {
+      Storage::Dense(words) => {
+        while at < to {
+          let word = at.checked_div(WORD_BITS).unwrap_or(0);
+          let bit = at.checked_rem(WORD_BITS).unwrap_or(0);
+          let bits = words.get(word).copied().unwrap_or(0);
+          let candidates = if on { bits } else { !bits } >> bit;
+          if candidates != 0 {
+            let found =
+              at.saturating_add(usize::try_from(candidates.trailing_zeros()).unwrap_or(0));
+            return (found < to).then_some(found);
+          }
+          at = word.saturating_add(1).saturating_mul(WORD_BITS);
+        }
+        None
       }
-      at = word.saturating_add(1).saturating_mul(WORD_BITS);
+      Storage::Sparse(blocks) => {
+        let block_units = SPARSE_BLOCK_WORDS.saturating_mul(WORD_BITS);
+        while at < to {
+          let word = at.checked_div(WORD_BITS).unwrap_or(0);
+          let block_idx = word.checked_div(SPARSE_BLOCK_WORDS).unwrap_or(0);
+          let Some(block) = blocks.get(&block_idx) else {
+            if on {
+              return Some(at);
+            }
+            // Absent block is all-ones: jump directly to the next materialized block holding any 0 bit.
+            let (&next_block, _) = blocks.range(block_idx.saturating_add(1)..).next()?;
+            at = next_block.saturating_mul(block_units);
+            continue;
+          };
+          let block_end = block_idx
+            .saturating_add(1)
+            .saturating_mul(block_units)
+            .min(to);
+          while at < block_end {
+            let cur_word = at.checked_div(WORD_BITS).unwrap_or(0);
+            let offset = cur_word.checked_rem(SPARSE_BLOCK_WORDS).unwrap_or(0);
+            let bit = at.checked_rem(WORD_BITS).unwrap_or(0);
+            let bits = block.get(offset).copied().unwrap_or(0);
+            let candidates = if on { bits } else { !bits } >> bit;
+            if candidates != 0 {
+              let found =
+                at.saturating_add(usize::try_from(candidates.trailing_zeros()).unwrap_or(0));
+              return (found < block_end).then_some(found);
+            }
+            at = cur_word.saturating_add(1).saturating_mul(WORD_BITS);
+          }
+        }
+        None
+      }
     }
-    None
   }
+}
+
+/// Sets or clears units `first .. last` in a dense word table: the units that changed.
+fn set_units_dense(words: &mut [u64], first: usize, last: usize, on: bool) -> usize {
+  let mut changed = 0usize;
+  let mut at = first;
+  while at < last {
+    let word = at.checked_div(WORD_BITS).unwrap_or(0);
+    let bit = at.checked_rem(WORD_BITS).unwrap_or(0);
+    let span = (WORD_BITS.saturating_sub(bit)).min(last.saturating_sub(at));
+    let mask = span_mask(bit, span);
+    if let Some(slot) = words.get_mut(word) {
+      let before = *slot;
+      *slot = if on { before | mask } else { before & !mask };
+      let flipped = usize::try_from((before ^ *slot).count_ones()).unwrap_or(0);
+      changed = changed.saturating_add(flipped);
+    }
+    at = at.saturating_add(span.max(1));
+  }
+  changed
+}
+
+/// Sets or clears units `first .. last` in a sparse all-ones-default block map: the units that changed.
+fn set_units_sparse(
+  blocks: &mut BTreeMap<usize, Box<[u64; SPARSE_BLOCK_WORDS]>>,
+  units: usize,
+  first: usize,
+  last: usize,
+  on: bool,
+) -> usize {
+  let block_units = SPARSE_BLOCK_WORDS.saturating_mul(WORD_BITS);
+  let mut changed = 0usize;
+  let mut at = first;
+  while at < last {
+    let word = at.checked_div(WORD_BITS).unwrap_or(0);
+    let block_idx = word.checked_div(SPARSE_BLOCK_WORDS).unwrap_or(0);
+    let block_end = block_idx
+      .saturating_add(1)
+      .saturating_mul(block_units)
+      .min(last);
+    if on && !blocks.contains_key(&block_idx) {
+      // Every valid bit in an absent block is already set.
+      at = block_end;
+      continue;
+    }
+    let block_word_base = block_idx.saturating_mul(SPARSE_BLOCK_WORDS);
+    let block = blocks.entry(block_idx).or_insert_with(|| {
+      let mut fresh = Box::new([0u64; SPARSE_BLOCK_WORDS]);
+      for (offset, slot) in fresh.iter_mut().enumerate() {
+        *slot = full_word(block_word_base.saturating_add(offset), units);
+      }
+      fresh
+    });
+    while at < block_end {
+      let cur_word = at.checked_div(WORD_BITS).unwrap_or(0);
+      let offset = cur_word.checked_rem(SPARSE_BLOCK_WORDS).unwrap_or(0);
+      let bit = at.checked_rem(WORD_BITS).unwrap_or(0);
+      let span = (WORD_BITS.saturating_sub(bit)).min(block_end.saturating_sub(at));
+      let mask = span_mask(bit, span);
+      if let Some(slot) = block.get_mut(offset) {
+        let before = *slot;
+        *slot = if on { before | mask } else { before & !mask };
+        let flipped = usize::try_from((before ^ *slot).count_ones()).unwrap_or(0);
+        changed = changed.saturating_add(flipped);
+      }
+      at = at.saturating_add(span.max(1));
+    }
+    if on
+      && block
+        .iter()
+        .enumerate()
+        .all(|(offset, &word)| word == full_word(block_word_base.saturating_add(offset), units))
+    {
+      blocks.remove(&block_idx);
+    }
+  }
+  changed
 }
 
 /// A mask of `span` bits from bit `bit` of a word (`bit + span <= 64`).
@@ -289,5 +451,52 @@ mod tests {
     assert_eq!(set.next_run_from(120, 130), None);
     set.mark(126, 130);
     assert_eq!(set.next_run_from(120, 130), Some((126, 130)));
+  }
+
+  /// A-110 sparse whole set oracle: spans multiple 64-word (4,096-unit) sparse blocks, clearing and
+  /// re-marking ranges across block boundaries and verifying exact equivalence with a dense unit set.
+  #[test]
+  fn a_sparse_whole_set_matches_a_dense_set_across_blocks() {
+    const UNIT: usize = 16;
+    const LEN: usize = UNIT * WORD_BITS * SPARSE_BLOCK_WORDS * 3 + UNIT * 19;
+    let mut sparse = UnitSet::whole(LEN, UNIT);
+    let mut dense = UnitSet::new(LEN, UNIT);
+    dense.mark(0, LEN);
+    assert_eq!(sparse, dense);
+    let block_bytes = UNIT * WORD_BITS * SPARSE_BLOCK_WORDS;
+    let ops = [
+      (false, block_bytes - UNIT * 5, block_bytes + UNIT * 7),
+      (false, 0, UNIT * 3),
+      (false, LEN - UNIT * 4, LEN + UNIT * 2),
+      (true, block_bytes - UNIT * 5, block_bytes + UNIT * 7),
+      (
+        false,
+        block_bytes * 2 + UNIT * 10,
+        block_bytes * 2 + UNIT * 90,
+      ),
+    ];
+    for (mark, start, end) in ops {
+      if mark {
+        sparse.mark(start, end);
+        dense.mark(start, end);
+      } else {
+        assert_eq!(sparse.take(start, end), dense.take(start, end));
+      }
+      assert_eq!(sparse.recorded_bytes(), dense.recorded_bytes());
+      assert_eq!(sparse, dense);
+      let mut at = 0;
+      let mut got = Vec::new();
+      while let Some((s, e)) = sparse.next_run_from(at, LEN) {
+        got.push((s, e));
+        at = e;
+      }
+      let mut at = 0;
+      let mut want = Vec::new();
+      while let Some((s, e)) = dense.next_run_from(at, LEN) {
+        want.push((s, e));
+        at = e;
+      }
+      assert_eq!(got, want);
+    }
   }
 }

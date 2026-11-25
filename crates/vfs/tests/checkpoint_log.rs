@@ -1003,3 +1003,47 @@ fn a_volumes_committed_record_is_what_a_recovery_rebuilds_for_it() {
     "the first volume's delta was applied"
   );
 }
+
+/// A-117 / fresh segment boot. Do: start a `Journal::fresh()` over a virgin checkpoint region, commit a first
+/// checkpoint, inspect `dead_ranges()`, then commit a second checkpoint and inspect `dead_ranges()` again. Also commit
+/// a first checkpoint on `Journal::default()` (restarted daemon). Expect: a fresh journal reports 0 dead stale-slot
+/// bytes after its first checkpoint (never `madvise`ing gigabytes of untouched virtual space), then reports exactly
+/// the first checkpoint's written bytes after its second checkpoint; a default (restarted) journal still reports the
+/// whole stale slot on its first checkpoint.
+#[test]
+fn fresh_journal_first_checkpoint_has_no_stale_dead_range() {
+  let mut checkpoints = vec![0u8; MEMORY];
+  let log_len = MEMORY;
+  let mut st = store();
+  let mut vol = volume(&mut st, MEMORY as u64);
+  create(&mut vol, &mut st, "a", b"hello");
+  let image = full(&vol, &st);
+
+  let mut fresh = Journal::fresh();
+  let first_bytes = fresh.checkpoint(&mut checkpoints, &image).unwrap();
+  let dead_first = fresh.dead_ranges(checkpoints.len(), log_len).unwrap();
+  assert_eq!(
+    dead_first.stale_slot.1, 0,
+    "virgin segment's other slot was never written"
+  );
+  assert_eq!(
+    dead_first.log_past_tail.1, 0,
+    "virgin segment's delta log was never written"
+  );
+
+  let _second_bytes = fresh.checkpoint(&mut checkpoints, &image).unwrap();
+  let dead_second = fresh.dead_ranges(checkpoints.len(), log_len).unwrap();
+  assert_eq!(
+    dead_second.stale_slot.1, first_bytes,
+    "after second checkpoint, stale slot owes exactly the first checkpoint's bytes"
+  );
+
+  let mut restarted = Journal::default();
+  let _ = restarted.checkpoint(&mut checkpoints, &image).unwrap();
+  let dead_restarted = restarted.dead_ranges(checkpoints.len(), log_len).unwrap();
+  assert_eq!(
+    dead_restarted.stale_slot.1,
+    checkpoints.len() / 2,
+    "restarted daemon still gives back whole stale slot"
+  );
+}

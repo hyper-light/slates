@@ -423,9 +423,6 @@ struct Routed {
   pushkey: bool,
   /// Whether the command is `batch`, whose `pushkey` calls are landed between its others (A-758).
   batch: bool,
-  /// Whether the command streams bulk repository history (`stream_out` or `getbundle`), gated by
-  /// the repository's FIFO fetch turn so thousands of concurrent streams do not lockstep.
-  streaming_fetch: bool,
 }
 
 /// What a request's credentials came to.
@@ -517,7 +514,6 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     match HgExchange::new(self.stores.clone(), pushing, head, room) {
       Some(mut exchange) => {
         exchange.batcher = batcher;
-        exchange.streaming_fetch = routed.streaming_fetch;
         Decided {
           answer: Answer::Serve {
             fields: Fields::new(),
@@ -648,7 +644,6 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
     unbundle: command.as_deref() == Some(hg_http::UNBUNDLE),
     pushkey: command.as_deref() == Some(slates_hg::serve::keys::COMMAND),
     batch: command.as_deref() == Some(hg_http::BATCH),
-    streaming_fetch: matches!(command.as_deref(), Some(b"stream_out" | b"getbundle")),
   })
 }
 
@@ -720,12 +715,6 @@ pub(crate) struct HgExchange<S: HgStores> {
   /// Whether a push's body ran past its room: its bytes let go as they arrive, and the push refused in Mercurial's
   /// words once the body has ended (A-711).
   past_room: bool,
-  /// Whether this request is a bulk streaming fetch (`stream_out` or `getbundle`) serialized per
-  /// repository via [`crate::vcs_share::turns::take_fetch`].
-  streaming_fetch: bool,
-  /// Per-repository FIFO streaming fetch turn held while a bulk Mercurial reply runs; released on
-  /// completion, overdue write, or drop.
-  fetch_turn: Option<crate::vcs_share::turns::FetchGuard>,
   /// Write-wait tracker feeding the shard's learned compression estimator (§4.17.3).
   pacing: crate::vcs_store::upload::Pacing,
 }
@@ -776,20 +765,12 @@ impl<S: HgStores> HgExchange<S> {
       generation: None,
       request_room: room,
       past_room: false,
-      streaming_fetch: false,
-      fetch_turn: None,
       pacing: crate::vcs_store::upload::Pacing::default(),
     })
   }
 }
 
 impl<S: HgStores> Exchange for HgExchange<S> {
-  /// Releases the repository's fetch turn when the client stops draining past its learned write
-  /// bound so a slow or stalled peer never head-of-line blocks sibling streams.
-  fn reply_overdue(&mut self) {
-    self.fetch_turn = None;
-  }
-
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     if self.past_room {
       return Ok(());
@@ -848,30 +829,33 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission)
         .await
         .map(|answered| Made::Whole(answered.media_type, answered.body)),
-      None => {
-        if self.streaming_fetch {
-          self.fetch_turn = Some(crate::vcs_share::turns::take_fetch(id).await);
+      None => self.stores.lend(id, &mut answering, |store, room| {
+        match hg_http::begin(store, &request, header_line(), &mut LearnedCompressor, room) {
+          hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
+          hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
         }
-        self.stores.lend(id, &mut answering, |store, room| {
-          match hg_http::begin(store, &request, header_line(), &mut LearnedCompressor, room) {
-            hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
-            hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
-          }
-        })
-      }
+      }),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-    if let Made::Streamed(_) = made {
+    let mut made = made;
+    if let Made::Streamed(ref mut streamed) = made {
       // Taken in the turn the answer began, with no wait between, so every later turn reads what this one read.
       let mut held = Admission::new(self.request_room);
-      self.generation = Some(
-        self
+      let generation = self
+        .stores
+        .hold(id, &mut held)
+        .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+      // Answer any initial store wants before `reply_fields` commits HTTP 200 so a store refusal answers 503
+      // cleanly instead of truncating a 200 body.
+      if slates_hg::render::StoreWants::wants(&**streamed).is_some()
+        && !self
           .stores
-          .hold(id, &mut held)
-          .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?,
-      );
-    } else {
-      self.fetch_turn = None;
+          .answer_wants((&generation, id, self.request_room), &mut **streamed)
+          .await
+      {
+        return Err(Failed(Status::SERVICE_UNAVAILABLE));
+      }
+      self.generation = Some(generation);
     }
     self.answered = Some(made);
     Ok(())
@@ -920,7 +904,6 @@ impl<S: HgStores> Exchange for HgExchange<S> {
           let more = self.turn(&mut streamed, out)?;
           if !more {
             self.generation = None;
-            self.fetch_turn = None;
             return Ok(false);
           }
           let elapsed = slates_rt::futures::now_ns().saturating_sub(started);

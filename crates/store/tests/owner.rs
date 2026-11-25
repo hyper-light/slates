@@ -617,3 +617,66 @@ fn a_stop_with_a_handle_still_held_ends_the_owner_and_the_handle_is_refused_gone
   assert_eq!(listed, 1, "the changeset landed before the stop");
   owner.stop().unwrap();
 }
+
+/// Concurrent reads past the owner channel's immediate capacity wait asynchronously for room instead
+/// of failing `OwnerError::Busy` mid-stream (found at 10,000 concurrent hg getbundle-inc clients).
+/// Do: start an owner with channel capacity 1 and waiter capacity 8, land one changeset, then spawn
+/// 6 concurrent read tasks over one runtime. Expect: every read succeeds and returns the landed
+/// changeset (zero `OwnerError::Busy`).
+#[test]
+fn concurrent_reads_past_channel_capacity_wait_instead_of_failing_busy() {
+  use slates_rt::futures::{join, spawn};
+  let dir = scratch("read-waiters");
+  let grant = StoreGrant {
+    repository: 1,
+    target: StoreRoot::identify(&dir).unwrap(),
+    issued_ns: 0,
+  };
+  let sizing = Sizing {
+    memory: 512 << 10,
+    disk: 1 << 30,
+    extent_bytes: 64 << 10,
+    fanout: 8,
+  };
+  // Capacity 1 in the channel, 8 async waiters: 6 concurrent reads exceed capacity 1 and must wait.
+  let owner =
+    StoreOwner::start_with_waiters(StoreRoot::open(&dir, &grant).unwrap(), sizing, 1, 8).unwrap();
+  let handle = owner.handle();
+  let runtime = runtime();
+  let counts = runtime
+    .block_on(async move {
+      handle
+        .land(header(1), vec![(SectionKind::Record, b"heads".to_vec())])
+        .await
+        .unwrap();
+      let (tx, rx) = std::sync::mpsc::channel();
+      let mut tasks = Vec::new();
+      for _ in 0..6 {
+        let reader = handle.clone();
+        let reply = tx.clone();
+        tasks.push(
+          spawn(async move {
+            let res = reader.changesets(11, 0, 10).await.map(|rows| rows.len());
+            let _ = reply.send(res);
+          })
+          .unwrap(),
+        );
+      }
+      drop(tx);
+      for task in tasks {
+        join(task).await.unwrap();
+      }
+      rx.into_iter().collect::<Vec<_>>()
+    })
+    .unwrap();
+  assert_eq!(counts.len(), 6);
+  for result in &counts {
+    assert_eq!(
+      result.as_ref().ok().copied(),
+      Some(1),
+      "read result: {result:?}"
+    );
+  }
+  owner.stop().unwrap();
+  let _ = std::fs::remove_dir_all(&dir);
+}

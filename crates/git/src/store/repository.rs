@@ -760,6 +760,29 @@ impl Repository {
     rows::decode_commit_parents(found.payload())
   }
 
+  /// `(tree, generation, parents)` of the commit at `position` in one index lookup without heap
+  /// allocations for 0/1/2-parent commits.
+  pub(super) fn commit_tree_gen_parents_at(
+    &self,
+    store: &ContentStore,
+    position: u64,
+  ) -> Option<(u64, u64, rows::SmallParents)> {
+    let id = self.id_at(store, position)?;
+    let found = self.index.get(store, &rows::object_key(&id))?;
+    rows::decode_commit_walk(found.payload())
+  }
+
+  /// The id, row, and root content of the object at `position`.
+  pub(super) fn indexed_at(
+    &self,
+    store: &ContentStore,
+    position: u64,
+  ) -> Option<(ObjectId, ObjectRow, ContentId)> {
+    let id = self.id_at(store, position)?;
+    let (row, content) = self.indexed(store, &id)?;
+    Some((id, row, content))
+  }
+
   /// Indexed target position of the annotated tag at `position`, decoded directly without
   /// allocating.
   pub(super) fn tag_target_at(&self, store: &ContentStore, position: u64) -> Option<Option<u64>> {
@@ -1037,11 +1060,33 @@ impl Repository {
   ) -> Result<Vec<ObjectId>, StoreRefused> {
     match place.kind() {
       Kind::Blob => Ok(Vec::new()),
-      Kind::Commit => {
-        let mut named = vec![self.commit_tree(store, push, id, place)?];
-        named.extend(self.parents(store, push, id)?);
-        Ok(named)
-      }
+      Kind::Commit => match place {
+        Place::Indexed { row, .. } => {
+          let commit = row
+            .commit
+            .as_ref()
+            .ok_or(StoreRefused::Unreadable { id: *id })?;
+          let mut named = Vec::with_capacity(commit.parents.len().saturating_add(1));
+          named.push(
+            self
+              .id_at(store, commit.tree)
+              .ok_or(StoreRefused::Unreadable { id: *id })?,
+          );
+          for parent in &commit.parents {
+            named.push(
+              self
+                .id_at(store, *parent)
+                .ok_or(StoreRefused::Unreadable { id: *id })?,
+            );
+          }
+          Ok(named)
+        }
+        Place::Pushed { .. } => {
+          let mut named = vec![self.commit_tree(store, push, id, place)?];
+          named.extend(self.parents(store, push, id)?);
+          Ok(named)
+        }
+      },
       Kind::Tree => self.tree_references(store, id, place),
       Kind::Tag => self
         .tag_reference(store, id, place)
@@ -1283,6 +1328,8 @@ impl Repository {
           }
           _ => {
             drop(reading);
+            // Clear any waiting mark from reading the optional base and read `tree` alone.
+            let _ = self.waiting();
             let place = Place::Indexed {
               row: row.clone(),
               content,

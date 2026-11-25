@@ -219,6 +219,8 @@ pub struct Streamed {
   plain_bytes: u64,
   /// A slice made and not yet compressed, its bound refused: compressed first by the next step, within its room.
   pending: Option<(Vec<u8>, bool)>,
+  /// Reusable buffer for uncompressed answer slices so `Streamed::step` does not allocate per turn.
+  scratch: Vec<u8>,
   /// The answer.
   answering: session::Producing,
 }
@@ -276,14 +278,22 @@ impl Streamed {
     if let Some(head) = self.head.take() {
       out.extend_from_slice(&head);
     }
-    let (plain, more) = match self.pending.take() {
+    let (mut plain, more) = match self.pending.take() {
       Some(pending) => pending,
       None => {
-        let mut plain = Vec::new();
-        let more = self
+        let mut plain = core::mem::take(&mut self.scratch);
+        plain.clear();
+        let stepped = self
           .answering
           .step(store, room, &mut plain)
-          .map_err(Refused::Serve)?;
+          .map_err(Refused::Serve);
+        let more = match stepped {
+          Ok(more) => more,
+          Err(err) => {
+            self.scratch = plain;
+            return Err(err);
+          }
+        };
         (plain, more)
       }
     };
@@ -292,10 +302,13 @@ impl Streamed {
       return Err(Refused::from(past));
     }
     self.plain_bytes = self.plain_bytes.saturating_add(to_u64(plain.len()));
-    self
+    let put = self
       .compressor
       .put(&plain, out)
-      .map_err(Refused::Compression)?;
+      .map_err(Refused::Compression);
+    plain.clear();
+    self.scratch = plain;
+    put?;
     if !more {
       self.compressor.finish(out).map_err(Refused::Compression)?;
     }
@@ -337,6 +350,7 @@ pub fn begin(
       engine: Engine::Uncompressed,
       plain_bytes: 0,
       pending: None,
+      scratch: Vec::new(),
       answering: session::Producing::Revlogs(Box::default()),
     }));
   }
@@ -354,6 +368,7 @@ pub fn begin(
           engine: Engine::Uncompressed,
           plain_bytes: 0,
           pending: None,
+          scratch: Vec::new(),
           answering: looking,
         }));
       }
@@ -365,8 +380,15 @@ pub fn begin(
     let asked = session::getbundle_asked(&arguments);
     let (answered, refused) = match Answering::begin(store, &asked, admission) {
       Ok(answering) => {
+        let prefer_uncompressed = answering.is_stream2();
         let answering = session::Producing::Bundle(Box::new(answering));
-        return match streaming(answering, request, compressor, admission) {
+        return match streaming(
+          answering,
+          prefer_uncompressed,
+          request,
+          compressor,
+          admission,
+        ) {
           Ok(streamed) => Begun::Streamed(Box::new(streamed)),
           Err(refused) => Begun::Answered(error(refused)),
         };
@@ -385,9 +407,11 @@ pub fn begin(
 }
 
 /// A `getbundle`'s answer begun: its media and compression chosen as [`streamed`] chooses them for a stream whose
-/// length is not known, and its `0.2` header made.
+/// length is not known (or uncompressed when `prefer_uncompressed` holds, e.g. `STREAM2` stream clones whose
+/// revlog payloads are sent raw as in Mercurial 7.2), and its `0.2` header made.
 fn streaming(
   answering: session::Producing,
+  prefer_uncompressed: bool,
   request: &Request<'_>,
   compressor: &mut impl Compressor,
   admission: &mut Admission,
@@ -397,9 +421,22 @@ fn streaming(
   let (media, choice) = if caps.has(READS_V2) {
     let engines = readable(&caps, admission)?;
     if engines.is_empty() {
+      let choice = if prefer_uncompressed {
+        Compression {
+          engine: Engine::Zlib,
+          level: 0,
+        }
+      } else {
+        compressor.choose(Media::V1, &[Engine::Zlib], unknown)
+      };
+      (Media::V1, choice)
+    } else if prefer_uncompressed && engines.contains(&Engine::Uncompressed) {
       (
-        Media::V1,
-        compressor.choose(Media::V1, &[Engine::Zlib], unknown),
+        Media::V2,
+        Compression {
+          engine: Engine::Uncompressed,
+          level: 0,
+        },
       )
     } else {
       let choice = compressor.choose(Media::V2, &engines, unknown);
@@ -411,10 +448,15 @@ fn streaming(
       (Media::V2, choice)
     }
   } else {
-    (
-      Media::V1,
-      compressor.choose(Media::V1, &[Engine::Zlib], unknown),
-    )
+    let choice = if prefer_uncompressed {
+      Compression {
+        engine: Engine::Zlib,
+        level: 0,
+      }
+    } else {
+      compressor.choose(Media::V1, &[Engine::Zlib], unknown)
+    };
+    (Media::V1, choice)
   };
   if media == Media::V1 && choice.engine != Engine::Zlib {
     return Err(Refused::EngineNotRead {
@@ -442,6 +484,7 @@ fn streaming(
     engine: choice.engine,
     plain_bytes: 0,
     pending: None,
+    scratch: Vec::new(),
     answering,
   })
 }
