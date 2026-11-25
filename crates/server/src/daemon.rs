@@ -5276,6 +5276,7 @@ async fn init_shard(
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
+    give_back_keep: None,
     content_sweep: crate::content_ranges::Sweep::default(),
     push_turns: crate::git_push::PushTurns::default(),
     give_back_rate: GiveBackRate::default(),
@@ -6144,6 +6145,10 @@ async fn purge_if_idle() -> GiveBack {
         CONTENT_PURGE_KEPT_SHORT,
         u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
       );
+      if !purged.more {
+        // Every free page given back: no give-back past a keep is owed (`ShardState::give_back_keep`, goal 93 P7).
+        s.give_back_keep = None;
+      }
       // While any give-back is left, the next turn gives back another (A-226).
       Some(purged.more || recovery_left)
     })
