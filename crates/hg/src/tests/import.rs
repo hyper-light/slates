@@ -1477,6 +1477,131 @@ fn a_rendered_repository_imports_back_to_the_same_index() {
   }
 }
 
+/// Shape: stock 7.2's `_maxinline`, the data a revlog may hold before `_enforceinlinesize` splits it (`revlog.py`).
+const STOCK_MAX_INLINE: u64 = 131_072;
+/// Shape: the shortest text 7.2's zstd revlog compressor tries (`zstdrevlogcompressor.compress`, `insize < 50`).
+const STOCK_SHORTEST_COMPRESSED: usize = 50;
+/// Shape: 7.2's zstd level for revlogs (`storage.revlog.zstd.level`'s default).
+const STOCK_ZSTD_LEVEL: i32 = 3;
+
+/// A chunk as stock 7.2 stores `plain` (`revlog.compress` over `zstdrevlogcompressor`): none for an empty text; one zstd
+/// frame when the text is 50 bytes or more and the frame is shorter; the text itself when it begins with a NUL; else `u`
+/// and the text. libzstd's own one-shot call, so the oracle is not the code under test.
+fn stock_chunk(plain: &[u8]) -> Vec<u8> {
+  if plain.is_empty() {
+    return Vec::new();
+  }
+  if plain.len() >= STOCK_SHORTEST_COMPRESSED {
+    let framed = zstd::bulk::compress(plain, STOCK_ZSTD_LEVEL).unwrap();
+    if framed.len() < plain.len() {
+      return framed;
+    }
+  }
+  if plain.first() == Some(&0) {
+    plain.to_vec()
+  } else {
+    [b"u", plain].concat()
+  }
+}
+
+/// Revision `rev`'s chunk as `log`'s files store it: in the data file at its offset, or in an inline index after each
+/// entry before it and its own.
+fn stored_chunk(
+  index: &[u8],
+  data: Option<&Vec<u8>>,
+  log: &revlog::Revlog<'_>,
+  rev: u32,
+) -> Vec<u8> {
+  let entry = log.entry(rev).unwrap();
+  let offset = usize::try_from(entry.offset).unwrap();
+  let length = usize::try_from(entry.compressed).unwrap();
+  let start = match data {
+    Some(_) => offset,
+    None => offset + (usize::try_from(rev).unwrap() + 1) * 64,
+  };
+  data.map_or(index, Vec::as_slice)[start..start + length].to_vec()
+}
+
+/// Holds one rendered revlog, its index file `index` at `path` among `files`, to stock 7.2's storage
+/// ([`a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does`]): each chunk stock's, inline exactly where 7.2 keeps
+/// it, a data file exactly where split. Its zstd chunks and whether it is inline.
+fn rendered_log_as_7_2_stores_it(
+  files: &BTreeMap<Vec<u8>, Vec<u8>>,
+  path: &[u8],
+  index: &[u8],
+) -> (usize, bool) {
+  let shown = String::from_utf8_lossy(path);
+  let data = files.get(&[&path[..path.len() - 1], b"d"].concat());
+  let log = revlog::Revlog::open(index, data.map_or(&[][..], Vec::as_slice), &mut room()).unwrap();
+  let inline = log.outline().inline();
+  let (mut held, mut zstd_chunks) = (0_u64, 0);
+  for rev in 0..log.len() {
+    let stored = stored_chunk(index, data, &log, rev);
+    let plain = log.chunk(rev, &mut room()).unwrap();
+    assert_eq!(stored, stock_chunk(&plain), "{shown} revision {rev}");
+    held += u64::try_from(stored.len()).unwrap();
+    zstd_chunks += usize::from(stored.first() == Some(&b'('));
+  }
+  let may_inline = !path.ends_with(b"00changelog.i");
+  assert_eq!(
+    inline,
+    may_inline && held < STOCK_MAX_INLINE,
+    "{shown}: {held} bytes"
+  );
+  assert_eq!(
+    data.is_none(),
+    inline,
+    "{shown}: a data file exactly where split"
+  );
+  (zstd_chunks, inline)
+}
+
+/// Goal 93 perf, the stream's size (main's order of 2026-11-25; the r400 comparison streamed 1.94x stock's bytes and
+/// 1.97x its files, every chunk `u`, every log split): a rendered store is stored as stock 7.2 stores it. Do: render the
+/// `dot` repository; open every revlog it holds; read each revision's stored chunk and its plain chunk. Expect:
+/// `.hg/requires` names `revlog-compression-zstd`; each stored chunk the one stock's `revlog.compress` makes of the plain
+/// one (zstd at level 3 where shorter, raw where it begins with a NUL, else `u`); each log inline, its `.i` alone and its
+/// fncache line alone, exactly where it may be inline (any but the changelog, `may_inline=False` in 7.2's
+/// `changelog.py`) and its chunks hold under 131,072 bytes; and, so the test is not vacuous, a zstd chunk and an inline
+/// log met.
+#[test]
+fn a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does() {
+  let mut store = store();
+  let imported = import(&mut repository("dot"), &mut store, room()).unwrap();
+  let files: BTreeMap<Vec<u8>, Vec<u8>> = crate::render::render(
+    &imported.index,
+    &store,
+    (&[], &imported.phase_roots),
+    &mut room(),
+  )
+  .unwrap()
+  .into_iter()
+  .collect();
+  let requires = &files[&b".hg/requires".to_vec()];
+  assert!(
+    lines(requires).any(|line| line == b"revlog-compression-zstd"),
+    "{}",
+    String::from_utf8_lossy(requires)
+  );
+  let fncache = &files[&b".hg/store/fncache".to_vec()];
+  let (mut zstd_chunks, mut inline_logs, mut split_file_logs) = (0, 0, 0);
+  for (path, index) in files.iter().filter(|(path, _)| path.ends_with(b".i")) {
+    let (zstd, inline) = rendered_log_as_7_2_stores_it(&files, path, index);
+    zstd_chunks += zstd;
+    split_file_logs += usize::from(!inline && path.starts_with(b".hg/store/data/"));
+    inline_logs += usize::from(inline);
+  }
+  let listed_data = lines(fncache).filter(|line| line.ends_with(b".d")).count();
+  assert_eq!(
+    listed_data, split_file_logs,
+    "the fncache lists a data file for each split file log alone"
+  );
+  assert!(
+    zstd_chunks > 0 && inline_logs > 0,
+    "zstd chunks {zstd_chunks}, inline logs {inline_logs}"
+  );
+}
+
 /// Goal 93 perf (main's order of 2026-11-21 00:22: a one-changeset pull that scales with the history). An index built
 /// whole (an import, a replay) ends with its runs merged, so a lookup reads one run, not every seal's. Do: import a
 /// repository into a store whose small window seals many runs; count the runs a lookup of each changeset visits; then

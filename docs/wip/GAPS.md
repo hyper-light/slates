@@ -2576,6 +2576,20 @@
 > with the change off). Markers travel as the `OBSMARKERS` part the client asks beside the stream, not as an `obsstore`
 > file; no cache file is sent (each is optional to 7.2's client). Owed: stock `hg clone --stream` negotiating `stream2`
 > by use (`crates/cli/bench/hg_stream_compare.sh`), then the bytes (zstd chunks) and the files (small revlogs inline).
+> BUILT (2026-11-25, w-interop; main 01a20182's ruling (a)): every chunk a stream or a rendering writes is stored as 7.2
+> stores it (`slates_hg::revlog_chunk`: zstd at level 3 from 50 bytes where shorter, a leading NUL raw, else `u`; its
+> `decode` every kind 7.2 reads), every log but the changelog inline under 131,072 bytes of chunks (`_maxinline`;
+> `changelog.py`'s `may_inline=False`), and `revlog-compression-zstd` in `.hg/requires` and the stream's requirements.
+> A stream compresses twice, a count pass sizing each chunk for the head and a send pass writing it, held to the count's
+> length (`vcs_store.hg_stream_compress_count_ns`, `_send_ns`, `_send_plain_bytes`, `_send_stored_bytes`). By use at r400
+> of hg's history (debug, 2026-11-25 09:39 UTC): 99 files and 466 KB streamed against stock `hg serve`'s 102 and 470 KB
+> (0.97x and 0.99x; 195 files and 813 KB at b2888af84), each class's bytes and every chunk kind's count stock's. Held by
+> `a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does` (red: no `revlog-compression-zstd`, every chunk `u`),
+> `every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte` (stock's own zstd chunks re-encoded byte for
+> byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean, the
+> compression counters moving). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
+> piece (b) removes by keeping each chunk in its stored form from arrival; and the changelog's header, which 7.2 writes
+> without generaldelta (`changelog.py` clears it on a new changelog) where slates sets it.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

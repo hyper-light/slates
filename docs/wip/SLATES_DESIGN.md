@@ -15188,9 +15188,14 @@ rendered revlogs as 7.2's version 1 stream, refused `1\n` while a changeset is s
 Status (2026-11-25, stream clones part 3: `stream2`): `bundle2` lists `stream=v2` while a stream is served, and a
 `getbundle` asking `stream=1` is answered one `STREAM2` part (its counts and requirements mandatory, its payload the
 same rendering framed as `_emit2` frames it, a non-publishing repository's `phaseroots` after the revlogs), refused
-before anything is written for a client naming no common version or a store serving no stream. Still owed: chunks
-compressed and small revlogs inline (w-interop's comparison at r400 of hg's history: 195 files and 813 KB against
-stock's 102 files and 470 KB), then the deltas the pinned writer would choose.
+before anything is written for a client naming no common version or a store serving no stream.
+Status (2026-11-25, chunks as stock's): each chunk is stored as 7.2's `revlog.compress` stores it with its default zstd
+engine, and every log but the changelog is inline while its chunks hold under 131,072 bytes (`slates_hg::revlog_chunk`,
+the one codec the stream and, next, the changeset store's intake share); `revlog-compression-zstd` is required. A
+stream compresses at its time, a count pass and a send pass, until the store keeps each chunk in that form from its
+arrival. At r400 of hg's history the stream is 99 files and 466 KB against stock's 102 and 470 KB (before: 195 and
+813 KB). Still owed: the deltas the pinned writer would choose, and the changelog written without generaldelta as 7.2
+writes a new one.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
