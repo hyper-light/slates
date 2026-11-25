@@ -36282,7 +36282,7 @@ fn started_git_fleet_of(
     .iter()
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
-  assert_fleet_forms(&daemons, &hosts, &names);
+  assert_fleet_forms(&daemons, &hosts, names);
   ((daemons, hosts), stores, lease)
 }
 
@@ -37516,6 +37516,9 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   );
 }
 
+/// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
+type WindowRead = Result<HomingWindowReading, ObserveError>;
+
 /// One of [`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]'s deaths: every node's
 /// periods stretched, node `death` stopped, a push on top from a, every survivor's takeover of it and its unseating from
 /// the council awaited, the stretch lifted. Returns a's homing window as the death began, the push's answer, whether every survivor took it over, and a's
@@ -37524,12 +37527,7 @@ fn stretched_death(
   fleet: &mut GitFleet,
   death: usize,
   file: &str,
-) -> (
-  Result<HomingWindowReading, ObserveError>,
-  Result<(), String>,
-  bool,
-  Result<HomingWindowReading, ObserveError>,
-) {
+) -> (WindowRead, Result<(), String>, bool, WindowRead) {
   for daemon in &fleet.daemons {
     daemon.inject_period_stretch(Some(STRETCH_NS)).unwrap();
   }

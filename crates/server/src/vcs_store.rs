@@ -3119,9 +3119,9 @@ fn replay_git(
   let replayed = replay_push(content, store, &mut push, &record);
   // A committed push holds nothing, so this gives back only what a refused replay held.
   let given = push.abandon(content);
-  let unkept = replayed?;
+  replayed?;
   given.map_err(|refused| ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused))))?;
-  Ok(unkept)
+  Ok(())
 }
 
 /// [`replay_git`]'s steps over `push`: the record's deepest chain carried (every record of a push carries it, the ones
