@@ -2553,6 +2553,20 @@
 > inline (`data/a.i` alone), the changelog's `.d` before its `.i`, cache files (`branch2-served`, `rbc-names-v2`,
 > `rbc-revs-v2`, `tags2`) after; an empty `phaseroots` left out. Open before it is served: which store files a draft
 > repository's stream carries (`phaseroots`, `obsstore`), and the requirements a server without zstd revlogs names.
+> BUILT (2026-11-25, w-hg; main 01a20182's order after w-interop's comparison found 7.2's client falling back to
+> `stream_out` against slates): `bundle2` lists `stream=v2` while a stream is served, and `getbundle`'s `stream=1`
+> answers one mandatory `STREAM2` part, its `bytecount`, `filecount` and quoted `requirements` as 7.2 writes them, its
+> payload `render::Streaming` framed as `_emit2` frames it (`s`, the name's length and the size as uvarints, the store
+> path before encoding), counted before its header is written, then sent a step at a time as `stream_out` is; a
+> non-publishing repository's draft roots follow as `phaseroots` (none where no changeset is draft), since the client
+> asks no phases beside a stream; no changegroup beside it. Refused before anything is written: a client listing no
+> stream version (7.2's "no common supported version"), a store serving no stream (a secret changeset). Held by
+> `bundle2_lists_stream_v2_only_while_a_stream_is_served`,
+> `a_stream_clone_over_bundle2_sends_the_rendered_revlogs_as_a_stream2_part` (the payload `render::revlogs`' files
+> byte for byte, publishing and not) and `..._is_refused_without_a_common_version_or_a_served_stream` (all three red
+> with the change off). Markers travel as the `OBSMARKERS` part the client asks beside the stream, not as an `obsstore`
+> file; no cache file is sent (each is optional to 7.2's client). Owed: stock `hg clone --stream` negotiating `stream2`
+> by use (`crates/cli/bench/hg_stream_compare.sh`), then the bytes (zstd chunks) and the files (small revlogs inline).
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

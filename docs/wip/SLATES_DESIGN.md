@@ -15181,6 +15181,12 @@ Status (A-706, stream clones part 1): `slates_hg::render` renders the index whol
 text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
 deltas, the rendering appended as versions commit and `stream2` are later parts; `stream_out` (A-712) sends the
 rendered revlogs as 7.2's version 1 stream, refused `1\n` while a changeset is secret.
+Status (2026-11-25, stream clones part 3: `stream2`): `bundle2` lists `stream=v2` while a stream is served, and a
+`getbundle` asking `stream=1` is answered one `STREAM2` part (its counts and requirements mandatory, its payload the
+same rendering framed as `_emit2` frames it, a non-publishing repository's `phaseroots` after the revlogs), refused
+before anything is written for a client naming no common version or a store serving no stream. Still owed: chunks
+compressed and small revlogs inline (w-interop's comparison at r400 of hg's history: 195 files and 813 KB against
+stock's 102 files and 470 KB), then the deltas the pinned writer would choose.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
