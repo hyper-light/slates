@@ -1,4 +1,8 @@
 name: diag-main-lint
+# Run 43 (main 01a20182, 2026-11-25 01:15 PST): main at 5b28c312e: the content-store unlanded rule (123d8c280) with svn on it
+# (a55d7cfa6), A-915 (17548d18b), w-git's walk a unit an entry (86b057be4) and derive_ns (2dd25afe6), hg stream v2
+# (1540f62d5), w-perf's text cache walk (142256360), w-svn's bring-back give-backs (f8fd11504), main's sweep test
+# (46e718f71), all after run 42.
 # Run 42 (main 01a20182, 2026-11-25 00:04 PST): main at 4892d3cf9: w-svn's Unstored fix (d3539309d), w-git's A-911 miss counter
 # (15b4f1061), w-interop's harness fixes (67ec37368), w-hg's texts request (9a5587e78), landed after run 41.
 # Run 41 (main 01a20182, 2026-11-24 23:21 PST): run 39 found daemon_edge.rs:5529 at cognitive complexity 12/10 (3e50c0aee's
