@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -572,8 +572,8 @@ fn child_wakes() -> io::Result<OwnedFd> {
     let flags = rustix::fs::fcntl_getfl(end).map_err(io::Error::from)?;
     rustix::fs::fcntl_setfl(end, flags | rustix::fs::OFlags::NONBLOCK).map_err(io::Error::from)?;
   }
-  WAKE_WRITE.store(write.as_raw_fd(), Ordering::Relaxed);
-  std::mem::forget(write);
+  // The write end lives as long as the process: the handler writes to it by number, so it is never closed.
+  WAKE_WRITE.store(write.into_raw_fd(), Ordering::Relaxed);
   // SAFETY: a zeroed `sigaction` is a valid record; the handler is an `extern "C"` function of this signature, set with
   // `SA_RESTART` (so the loop's calls resume) and `SA_NOCLDSTOP` (an exit, not a stop, wakes it).
   let installed = unsafe {

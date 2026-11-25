@@ -200,6 +200,10 @@ fn a_running_childs_group_is_killed_when_the_daemons_end_goes() {
   let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
   let until = Instant::now() + PATIENCE;
   while rustix::process::test_kill_process(pid).is_ok() && Instant::now() < until {
+    #[allow(
+      clippy::disallowed_methods,
+      reason = "a test waits on another process's death, which no timer of ours observes; D-9 binds shipped code"
+    )]
     std::thread::sleep(Duration::from_millis(10));
   }
   assert!(status.success(), "the spawner exited cleanly: {status:?}");
