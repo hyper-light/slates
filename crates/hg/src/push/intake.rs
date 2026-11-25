@@ -6,16 +6,20 @@
 //! **A step** takes one unit: one revision, in 7.2's order (the changelog's group, the manifest log's, then each file
 //! log's), or one of the checks after them. A revision the log holds, or the push brought earlier, is passed over, as
 //! 7.2's `addgroup` passes it over. Any other is checked as verification checks it (its flags, its parents known), its
-//! text rebuilt from its delta against its base (the step [`rebuilt`]: the text before it in its group where its delta
-//! names that one, as 7.2's revision cache serves it, else the base's text read back from the fork), its node held to
-//! its text, its text read as its log's reader reads it (a changeset's manifest, a manifest's entries, a file
-//! revision's metadata block; a manifest's and a file revision's link a changeset the fork holds), and then kept: its
-//! text put into the content store once and its row appended to the fork ([`super::commit::keep_one`]). The fork holds
+//! text made from its delta against its base, its node held to its text, its text read as its log's reader reads it (a
+//! changeset's manifest, a manifest's entries, a file revision's metadata block; a manifest's and a file revision's link
+//! a changeset the fork holds), and then kept: its text put into the content store once and its row appended to the
+//! fork ([`super::commit::keep_one`]). A file revision's text is made a window a step and never whole ([`patched`]: its
+//! base read from the fork's rows a window at a time, each window made hashed, read and put as it is made; goal 93,
+//! C1 (2)); a changeset's or a manifest's is rebuilt whole (the step [`rebuilt`]: the text before it in its group where
+//! its delta names that one, as 7.2's revision cache serves it, else the base's text read back from the fork). The fork holds
 //! the repository's revisions and the push's, so a later revision's parents and base are found there. After the logs,
 //! each new changeset's manifest is held to be present, then each new manifest's changed files, a manifest a step.
 //!
-//! **Bounded.** What a step holds is its revision's delta, the base's text and the rebuilt text, charged to a copy of
-//! the push's admission, since it is let go when the step ends; only the text before it is kept to the next step. What
+//! **Bounded.** What a file revision's step holds of its text is two windows, the one it makes and the one of its base
+//! it hashes, whatever the file (`Intaken::most_text_held`). A changeset's or a manifest's step holds its delta, the
+//! base's text and the rebuilt text, charged to a copy of the push's admission, since it is let go when the step ends;
+//! only the text before it is kept to the next step (owed: the manifests a window at a time, C1 (2)'s next piece). What
 //! the intake keeps across steps is per revision and fixed in size (a node, a changeset's manifest, a manifest's first
 //! parent), charged to the admission itself. The texts are kept in the content store, charged to its budget as every
 //! store's are, never held by the intake. So its working set is one revision's texts, whatever the push's size. The
@@ -29,7 +33,7 @@
 
 use core::ops::Range;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use slates_vcs::{ContentId, ContentStore, IndexRefused, Merge, MergeStep};
 
@@ -116,11 +120,8 @@ pub struct Intaken {
   /// and memory are to grow with what it brings, not with the history under it): a delta base it did not hold as the
   /// text kept last. A new manifest's files are checked from the lines its delta wrote, rebuilding nothing.
   pub rebuilt: u64,
-  /// The file delta bases found in the push's cache of its own texts ([`BaseCache`]; A-767 C1, main's ruling (b2)).
-  pub base_hits: u64,
-  /// The file revisions rebuilt from the push's own deltas to make a base the cache did not hold ((b1), counted).
-  pub base_rebuilds: u64,
-  /// The file delta bases read from the node's changeset store between steps: a revision landed before the push.
+  /// The file delta bases asked of the node's changeset store between steps: a revision landed before the push whose
+  /// windows were let go, brought back to be read.
   pub base_store_reads: u64,
   /// The most text bytes one step hashed and kept (A-767 C1, the push spin): a revision longer than the content
   /// store's window is taken over as many steps as it has windows ([`Pending`]), so no step's work grows with a file.
@@ -139,6 +140,10 @@ pub struct Intaken {
   /// The changelog's and the manifests' texts the intake asked of the node's changeset store, their windows let go once
   /// landed (goal 93, C1 (1)): a delta's base, or the manifest a new one is kept as a delta against.
   pub log_texts_asked: u64,
+  /// The most bytes of whole text the intake held at once (goal 93, C1 (2): a revision rebuilt into one buffer, its base
+  /// read whole, the text kept last for the next delta and the push's own bases cached): what a step's working set
+  /// holds of texts, which a windowed rebuild bounds by the content store's window.
+  pub most_text_held: u64,
   /// Of [`Intaken::log_texts_asked`], the parent manifest's read-back: the manifest the fork holds last, which a new
   /// manifest's row is kept as a delta against (`HgIndex::append_revisions_after`), asked where it is not also the
   /// delta's base, so what the kept form costs is told apart from what the push's own deltas cost.
@@ -220,10 +225,9 @@ enum Stage {
 }
 
 /// The changegroup's framing as places in its bytes (`crate::framing::Framed`), so the intake borrows nothing between
-/// steps; which of its revisions a delta past the next one rests on ([`Frame::based_later`]); and which revisions are
-/// the last of their group to rest on their base ([`Frame::last_on_base`]).
+/// steps.
 #[derive(Clone, Debug, Default)]
-struct Frame(Framed, Vec<u64>, Vec<u64>);
+struct Frame(Framed);
 
 impl Frame {
   /// The framing of `payload`, a whole changegroup of `version` in memory, each plain delta checked, within
@@ -263,20 +267,7 @@ impl Frame {
     if !framed.trees.is_empty() {
       return Err(Unverified::TreeManifests.into());
     }
-    let (later, last) = later_bases(&framed);
-    Ok(Frame(framed, later, last))
-  }
-
-  /// Whether the revision at `at` of `range` is the last of its group whose delta rests on its base: once it is taken,
-  /// no delta asks for that base again, so the push's cache lets it go.
-  fn last_on_base(&self, range: &Range<usize>, at: usize) -> bool {
-    bit(&self.2, range, at)
-  }
-
-  /// Whether a delta of `range` past the next one rests on its revision at `at` (goal 93: the push's cache keeps only the
-  /// texts such a delta will ask for; the next delta's base is the text kept last).
-  fn based_later(&self, range: &Range<usize>, at: usize) -> bool {
-    bit(&self.1, range, at)
+    Ok(Frame(framed))
   }
 
   /// The revision at `at` of `range`, its delta read from `payload`, with where its delta lies there (A-767 C4: the
@@ -297,60 +288,6 @@ impl Frame {
     };
     Ok(Some((found.revision(payload)?, found.data.clone())))
   }
-}
-
-/// Format: the bits a word of [`Frame`]'s later bases holds.
-const BITS: usize = u64::BITS as usize;
-
-/// Whether the bit of `bits` for the revision at `at` of `range` is set.
-fn bit(bits: &[u64], range: &Range<usize>, at: usize) -> bool {
-  let Some(index) = range
-    .start
-    .checked_add(at)
-    .filter(|index| *index < range.end)
-  else {
-    return false;
-  };
-  bits
-    .get(index / BITS)
-    .is_some_and(|word| word & (1 << (index % BITS)) != 0)
-}
-
-/// Each revision of `framed` a delta past the next one in its group names as its base; and each revision that is the
-/// last of its group whose delta rests on its base. One bit a revision of each, in stream order (one word for each 64,
-/// beside the framing's own record a revision): a walk of each group, its nodes and their last users found by maps the
-/// walk drops as the group ends.
-fn later_bases(framed: &Framed) -> (Vec<u64>, Vec<u64>) {
-  let words = framed.revisions.len().div_ceil(BITS);
-  let mut later = vec![0_u64; words];
-  let mut last = vec![0_u64; words];
-  let groups = [framed.changelog.clone(), framed.manifests.clone()]
-    .into_iter()
-    .chain(framed.files.iter().map(|(_, revisions)| revisions.clone()));
-  for group in groups {
-    let mut at: BTreeMap<Node, usize> = BTreeMap::new();
-    let mut last_user: BTreeMap<Node, usize> = BTreeMap::new();
-    for index in group {
-      let Some(placed) = framed.revisions.get(index) else {
-        continue;
-      };
-      if let Some(base) = at.get(&placed.base).copied() {
-        if base.saturating_add(1) != index
-          && let Some(word) = later.get_mut(base / BITS)
-        {
-          *word |= 1 << (base % BITS);
-        }
-        last_user.insert(placed.base, index);
-      }
-      at.insert(placed.node, index);
-    }
-    for index in last_user.into_values() {
-      if let Some(word) = last.get_mut(index / BITS) {
-        *word |= 1 << (index % BITS);
-      }
-    }
-  }
-  (later, last)
 }
 
 /// A push's changegroup being taken into a fork of its repository's index (module docs): the changegroup's framing, as
@@ -435,11 +372,6 @@ struct Taker {
   fork: HgIndex,
   /// The buffers a revision's text is rebuilt into ([`Spares`]; goal 93, no allocation by design).
   spares: Spares,
-  /// Whether a delta past the next one rests on the revision being taken ([`Frame::based_later`]), told by its step.
-  taking_later: bool,
-  /// Whether a delta past the next one rests on the text kept last: only such a text is kept in the cache once another
-  /// is kept, every other handed to the spares.
-  last_later: bool,
   /// The unit next.
   stage: Stage,
   /// The nodes the push brought in the log being taken, to tell a revision brought earlier from one held.
@@ -453,7 +385,8 @@ struct Taker {
   /// The file revisions the push's framing brings: the most [`Taker::awaited`] may name, since a file revision neither
   /// held nor brought is missing.
   bringing: u64,
-  /// The text kept last, and its node: the next revision's base where its delta names it.
+  /// The changeset's or manifest's text kept last, and its node: the next revision's base where its delta names it. A file
+  /// revision's base is read from the fork's rows ([`patched`]).
   last: Option<(Node, Vec<u8>)>,
   /// The identity of the text kept last, so the next revision's base is named without hashing it again.
   last_identity: Option<(Node, [u8; 32])>,
@@ -464,19 +397,16 @@ struct Taker {
   path: Option<Vec<u8>>,
   /// What was brought.
   intaken: Intaken,
-  /// Each file revision the push brought in the group being taken, by node: its place in the group, from which its
-  /// text is rebuilt where a later delta names it as its base ((b1)).
-  positions: BTreeMap<Node, usize>,
-  /// The push's own file texts kept for later deltas' bases ((b2)), let go as each file group ends.
-  cache: BaseCache,
   /// A file delta's base asked of the store, and its answer.
   asked: Option<StoreAsk>,
   /// The changelog's and the manifest log's texts the store gave for the unit being taken (goal 93, C1 (1): those
   /// logs' texts let go once landed): its delta's base and, for a manifest, the one before it that its row is kept as a
   /// delta against; two at most, given up once the unit is taken whole ([`Taker::log_texts_ready`]).
   logs_given: Vec<(Node, Vec<u8>)>,
-  /// A revision longer than one window, being taken a window a step.
+  /// A changeset or manifest longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
+  /// A file revision being taken a window a step, its text never whole ([`patched`]).
+  patched: Option<Box<patched::Patched>>,
   /// The merge of the fork's newest runs the size-tiered rule named, a table a step until it ends
   /// ([`Taker::merge_step`]).
   merging: Option<Merge>,
@@ -638,8 +568,6 @@ struct Pending {
   writing: Option<slates_vcs::Writing>,
   /// The stage after it.
   after: Stage,
-  /// A file revision's position in its group, for a later delta's base.
-  position: Option<usize>,
 }
 
 /// The log of a [`Pending`] revision.
@@ -660,74 +588,6 @@ impl PendingLog {
       PendingLog::Manifest => Log::Manifest,
       PendingLog::File(path) => Log::File(path),
     }
-  }
-}
-
-/// The push's own file texts a later delta names as its base (A-767 C1, main's ruling (b2)): of the texts kept before
-/// the one kept last, those a delta past the next one in their group rests on ([`Frame::based_later`]; goal 93: kept
-/// whole, every text a file's group brought was a buffer of its own, 1.08 copies an edit at a 160 KiB file), oldest out
-/// first, at most the room the push was admitted (derived: what one step of the push may hold, so the intake's working
-/// set is at most twice its room), let go as each file group ends and with the push, each text let go handed to the
-/// [`Spares`]. A miss is rebuilt from the push's own deltas ((b1)), the one source; the cache only saves the rebuild.
-#[derive(Debug, Default)]
-struct BaseCache {
-  /// The texts, by node.
-  held: BTreeMap<Node, Vec<u8>>,
-  /// Their order of arrival, oldest first.
-  order: VecDeque<Node>,
-  /// The bytes they hold.
-  bytes: u64,
-  /// The most bytes they may hold.
-  bound: u64,
-}
-
-impl BaseCache {
-  /// The cache of a push admitted `room` bytes.
-  fn within(room: u64) -> BaseCache {
-    BaseCache {
-      bound: room,
-      ..BaseCache::default()
-    }
-  }
-
-  /// Keeps `text` as `node`'s, letting the oldest go until it fits, each text let go handed to `spares`; a text past
-  /// the bound alone is not kept, and handed to them too.
-  fn put(&mut self, node: Node, text: Vec<u8>, spares: &mut Spares) {
-    let len = to_u64(text.len());
-    if len > self.bound || self.held.contains_key(&node) {
-      spares.give(text);
-      return;
-    }
-    while self.bytes.saturating_add(len) > self.bound {
-      let Some(oldest) = self.order.pop_front() else {
-        break;
-      };
-      if let Some(gone) = self.held.remove(&oldest) {
-        self.bytes = self.bytes.saturating_sub(to_u64(gone.len()));
-        spares.give(gone);
-      }
-    }
-    self.bytes = self.bytes.saturating_add(len);
-    self.order.push_back(node);
-    self.held.insert(node, text);
-  }
-
-  /// Lets `node`'s text go, handed to `spares`, where the cache holds it (its place in the order is passed over when
-  /// the oldest are let go).
-  fn release(&mut self, node: &Node, spares: &mut Spares) {
-    if let Some(text) = self.held.remove(node) {
-      self.bytes = self.bytes.saturating_sub(to_u64(text.len()));
-      spares.give(text);
-    }
-  }
-
-  /// Lets every text go, each handed to `spares`.
-  fn clear(&mut self, spares: &mut Spares) {
-    for (_, text) in core::mem::take(&mut self.held) {
-      spares.give(text);
-    }
-    self.order.clear();
-    self.bytes = 0;
   }
 }
 
@@ -845,19 +705,6 @@ enum ReadAs {
   File,
 }
 
-/// What a file delta's base came to ([`Taker::file_base`]).
-enum Based {
-  /// Its text.
-  Text(Vec<u8>),
-  /// Its text as the push's cache holds it: read there by the step ([`Taker::base_text`]), never copied out (goal 93,
-  /// C1: each base the cache held was copied whole for its step, 1.08 copies a revision of a 160 KiB file).
-  Cached,
-  /// The changegroup's bytes the rebuild needs: put them in and step again.
-  Wanted(Range<u64>),
-  /// The store is asked: answer it and step again.
-  Store,
-}
-
 /// The log a text asked of the store is kept under (a file's path, or [`CHANGELOG_PATH`] or [`MANIFEST_PATH`]), as a
 /// refusal names it.
 fn log_of_path(path: &[u8]) -> LogOf {
@@ -943,14 +790,6 @@ impl crate::render::StoreWants for Intake {
 }
 
 impl Intake {
-  /// The intake with its cache of the push's own texts bounded at `bound` bytes ((b2)): zero leaves (b1) alone, the
-  /// A/B's other arm and a test's rebuilds.
-  #[cfg(test)]
-  pub(crate) fn with_base_cache(mut self, bound: u64) -> Self {
-    self.taker.cache = BaseCache::within(bound);
-    self
-  }
-
   /// Answers the store's want from the fork's own texts, as a test's stand-in for the node's changeset store (the tests
   /// keep no store): the base the step asked for, read back from the fork's content store.
   #[cfg(test)]
@@ -1051,17 +890,14 @@ impl Intake {
         bringing,
         last: None,
         spares: Spares::within(room),
-        taking_later: false,
-        last_later: false,
         last_identity: None,
         logged: false,
         path: None,
         intaken: Intaken::default(),
-        positions: BTreeMap::new(),
-        cache: BaseCache::within(room),
         asked: None,
         logs_given: Vec::new(),
         pending: None,
+        patched: None,
         merging: None,
         cutting: None,
       },
@@ -1123,6 +959,9 @@ impl Intake {
     if taker.pending.is_some() {
       return taker.advance_pending(store, admission);
     }
+    if taker.patched.is_some() {
+      return taker.advance_patched((frame, payload), store, admission);
+    }
     if let Some(stepped) = taker.merge_step(store)? {
       return Ok(stepped);
     }
@@ -1165,7 +1004,7 @@ impl Intake {
   /// `manifests-present`, `files-present`, `done`). What a caller timing its steps reads to tell which unit a long one
   /// took.
   pub fn unit(&self) -> &'static str {
-    if self.taker.pending.is_some() {
+    if self.taker.pending.is_some() || self.taker.patched.is_some() {
       return "pending";
     }
     if self.taker.merging.is_some() {
@@ -1227,13 +1066,7 @@ impl Taker {
       return Ok(stepped);
     }
     // A revision longer than a window is taken over the steps after this one ([`Pending`]), which move the stage on.
-    if self.take(
-      log,
-      (&revision, place),
-      None,
-      (store, admission),
-      (after, None),
-    )? {
+    if self.take(log, (&revision, place), None, (store, admission), after)? {
       self.stage = after;
       self.logs_given.clear();
     }
@@ -1354,83 +1187,33 @@ impl Taker {
       });
       return Ok(Stepped::More);
     };
-    // A file delta's base other than the text kept last: rebuilt from the push's own deltas, read from its cache, or
-    // read from the store between steps for a revision landed before the push (A-767 C1).
-    let kept_before = self.brought.contains(&revision.node)
-      || self
-        .fork
-        .rev(store, Log::File(&path), &revision.node)
-        .is_some();
-    let names_last = self
-      .last
-      .as_ref()
-      .is_some_and(|(node, _)| *node == revision.base);
-    let given = if kept_before || revision.base == NULL_NODE || names_last {
-      None
-    } else {
-      let mut room = *admission;
-      match self.file_base(
-        (frame, payload),
-        (&path, &revisions),
-        revision.base,
-        (store, &mut room),
-      ) {
-        Ok(Based::Text(text)) => Some(text),
-        Ok(Based::Cached) => None,
-        Ok(Based::Wanted(range)) => {
-          self.path = Some(path);
-          return Ok(Stepped::Wanted(range));
-        }
-        Ok(Based::Store) => {
-          self.path = Some(path);
-          return Ok(Stepped::Store);
-        }
-        Err(refused) => {
-          self.path = Some(path);
-          return Err(refused);
-        }
-      }
-    };
+    // Taken a window a step, its base read from the fork's rows ([`patched`]): begun, then its first window made in this
+    // same step, so a revision of one window is taken in one step as before.
     let after = Stage::Files {
       file,
       at: at.saturating_add(1),
     };
-    let position = (!kept_before).then_some(at);
-    self.taking_later = frame.based_later(&revisions, at);
-    let taken = self.take(
-      Log::File(&path),
-      (&revision, place),
-      given,
+    let begun = self.begin_patched(
+      (&path, &revision, place),
+      (&revisions, at, after),
       (store, admission),
-      (after, position),
     );
     self.path = Some(path);
-    // A revision longer than a window is taken over the steps after this one ([`Pending`]), which move the stage on.
-    if taken? {
-      if let Some(position) = position {
-        self.positions.insert(revision.node, position);
-      }
-      // No delta after this one rests on its base: the cache lets the base go, its buffer a later rebuild's.
-      if frame.last_on_base(&revisions, at) {
-        self.cache.release(&revision.base, &mut self.spares);
-      }
+    if begun? {
       self.stage = after;
+      return Ok(Stepped::More);
     }
-    Ok(Stepped::More)
+    self.advance_patched((frame, payload), store, admission)
   }
 
   /// Moves to `stage`, a new log's: what the last one brought is let go.
   fn enter(&mut self, stage: Stage) {
     self.path = None;
-    self.positions.clear();
-    self.cache.clear(&mut self.spares);
     self.asked = None;
     self.brought.clear();
     if let Some((_, text)) = self.last.take() {
       self.spares.give(text);
     }
-    self.taking_later = false;
-    self.last_later = false;
     self.last_identity = None;
     self.logged = false;
     self.stage = stage;
@@ -1535,7 +1318,7 @@ impl Taker {
     (revision, place): (&Revision<'_>, Range<u64>),
     given: Option<Vec<u8>>,
     (store, admission): (&mut ContentStore, &mut Admission),
-    (after, position): (Stage, Option<usize>),
+    after: Stage,
   ) -> Result<bool, Refused> {
     if self.already_brought(log, revision.node, store, admission)? {
       return Ok(true);
@@ -1556,10 +1339,14 @@ impl Taker {
       (None, _) => None,
     };
     let text = rebuilt(base_text.as_deref(), revision, log, (&mut room, into))?;
+    let held = to_u64(text.len())
+      .saturating_add(base_text.as_deref().map_or(0, |base| to_u64(base.len())))
+      .saturating_add(self.last.as_ref().map_or(0, |(_, last)| to_u64(last.len())));
     // A base read whole for this step alone is a later rebuild's buffer.
     if let Some(Cow::Owned(base)) = base_text {
       self.spares.give(base);
     }
+    self.intaken.most_text_held = self.intaken.most_text_held.max(held);
     if base_rebuilt {
       self.intaken.rebuilt = self.intaken.rebuilt.saturating_add(1);
     }
@@ -1575,7 +1362,7 @@ impl Taker {
     };
     let window = store.window();
     if text.len() > window {
-      self.begin_pending(log, revision, (text, base, place), (after, position))?;
+      self.begin_pending(log, revision, (text, base, place), after)?;
       return Ok(false);
     }
     self.intaken.longest_step_bytes = self.intaken.longest_step_bytes.max(to_u64(text.len()));
@@ -1590,7 +1377,7 @@ impl Taker {
       log,
       revision,
       (text, base, place),
-      (None, None),
+      (None, None, None),
       (store, admission),
     )?;
     Ok(true)
@@ -1603,7 +1390,7 @@ impl Taker {
     log: Log<'_>,
     revision: &Revision<'_>,
     (text, base, place): (Vec<u8>, Option<[u8; 32]>, Range<u64>),
-    (after, position): (Stage, Option<usize>),
+    after: Stage,
   ) -> Result<(), Refused> {
     let (pending_log, bytes_from) = match log {
       Log::Changelog => (PendingLog::Changelog, None),
@@ -1631,7 +1418,6 @@ impl Taker {
       bytes_from,
       writing: None,
       after,
-      position,
     }));
     Ok(())
   }
@@ -1685,7 +1471,6 @@ impl Taker {
       identity,
       writing,
       after,
-      position,
       ..
     } = *pending;
     let log = log.log();
@@ -1732,12 +1517,9 @@ impl Taker {
       log,
       &revision,
       (text, base, place),
-      (kept, Some(identity)),
+      (kept, Some(identity), None),
       (store, admission),
     )?;
-    if let Some(position) = position {
-      self.positions.insert(node, position);
-    }
     self.stage = after;
     self.logs_given.clear();
     Ok(Stepped::More)
@@ -1751,7 +1533,7 @@ impl Taker {
     log: Log<'_>,
     revision: &Revision<'_>,
     (text, base, place): (Vec<u8>, Option<[u8; 32]>, Range<u64>),
-    (kept, identity): (Option<ContentId>, Option<[u8; 32]>),
+    (kept, identity, whole): (Option<ContentId>, Option<[u8; 32]>, Option<u64>),
     (store, admission): (&mut ContentStore, &mut Admission),
   ) -> Result<(), Refused> {
     // Every charge first, to a trial of the admission, then the keep, then every note and the trial taken: a refusal
@@ -1768,6 +1550,8 @@ impl Taker {
     trial.charge_items::<Node>(1)?;
     trial.charge_items::<KeptText>(1)?;
     trial.charge(to_u64(path.len()))?;
+    // A file revision taken a window a step carries its framing alone: its length is the whole text's.
+    let len = whole.unwrap_or_else(|| to_u64(text.len()));
     let mut room = *admission;
     let arrived = Arrived {
       node: revision.node,
@@ -1796,7 +1580,7 @@ impl Taker {
       store,
       log,
       (&arrived, previous),
-      kept,
+      (kept, whole),
       &mut room,
     )?;
     *admission = trial;
@@ -1804,16 +1588,13 @@ impl Taker {
     self.note_logged(logged);
     self.brought.insert(revision.node);
     self.intaken.kept = self.intaken.kept.saturating_add(1);
-    self.intaken.bytes = self
-      .intaken
-      .bytes
-      .saturating_add(to_u64(arrived.text.len()));
+    self.intaken.bytes = self.intaken.bytes.saturating_add(len);
     let identity = identity.unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
     let kept = KeptText {
       path: path.to_vec(),
       node: revision.node,
       identity,
-      len: to_u64(arrived.text.len()),
+      len,
       base,
       place,
     };
@@ -1849,19 +1630,16 @@ impl Taker {
       None => self.intaken.texts.push(kept),
     }
     self.last_identity = Some((revision.node, identity));
-    // The text kept before this one may be a later delta's base: the push's cache keeps a file's ((b2)). A changeset's or
-    // a manifest's is no later delta's base once this one is kept (each rests on the one before), so its buffer is the
-    // next rebuild's.
-    // Only a text a delta past the next one rests on is kept; the next delta rests on the text kept last.
-    match (log, self.last.take()) {
-      (Log::File(_), Some((node, text))) if self.last_later => {
-        self.cache.put(node, text, &mut self.spares);
-      }
-      (_, Some((_, text))) => self.spares.give(text),
-      (_, None) => {}
+    // A changeset's or a manifest's text is the next one's base (each rests on the one before); the one before it is no
+    // later delta's, so its buffer is the next rebuild's. A file revision's later bases are read from the fork's rows
+    // ([`patched`]), so its framing is kept by no one.
+    if let Some((_, text)) = self.last.take() {
+      self.spares.give(text);
     }
-    self.last_later = core::mem::take(&mut self.taking_later);
-    self.last = Some((revision.node, arrived.text));
+    match log {
+      Log::File(_) => self.spares.give(arrived.text),
+      _ => self.last = Some((revision.node, arrived.text)),
+    }
     Ok(())
   }
 
@@ -1892,114 +1670,9 @@ impl Taker {
     }
   }
 
-  /// The text of file delta base `base` (A-767 C1, main's ruling (b2) over (b1)): from the push's cache where it holds
-  /// it; else rebuilt from the push's own deltas, walked back from `base` through the revisions the group brought to a
-  /// text in hand (the null base, the text kept last, the cache's, or a revision landed before the push, read from the
-  /// store between steps), each rebuilt text kept in the cache; refused where the base is none of those.
-  fn file_base<S: Source + ?Sized>(
-    &mut self,
-    (frame, payload): (&Frame, &S),
-    (path, revisions): (&[u8], &Range<usize>),
-    base: Node,
-    (store, room): (&ContentStore, &mut Admission),
-  ) -> Result<Based, Refused> {
-    let unknown = |node: Node| {
-      Refused::Unverified(Unverified::UnknownDeltaBase {
-        log: LogOf::File(path.to_vec()),
-        node,
-        base,
-      })
-    };
-    let mut chain: Vec<usize> = Vec::new();
-    let mut at = base;
-    let start = loop {
-      if at == NULL_NODE {
-        break Vec::new();
-      }
-      if let Some((node, text)) = &self.last
-        && *node == at
-      {
-        break text.clone();
-      }
-      if let Some(text) = self.cache.held.get(&at) {
-        self.intaken.base_hits = self.intaken.base_hits.saturating_add(1);
-        // The base itself: the step reads it where the cache holds it.
-        if chain.is_empty() {
-          return Ok(Based::Cached);
-        }
-        break text.clone();
-      }
-      if let Some(index) = self.positions.get(&at).copied() {
-        let revision = match frame.placed(payload, revisions, index) {
-          Ok(Some((revision, _))) => revision,
-          Ok(None) => return Err(unknown(at)),
-          Err(wanted) => return Ok(Based::Wanted(wanted.range)),
-        };
-        room.charge_items::<usize>(1)?;
-        chain.push(index);
-        at = revision.base;
-        continue;
-      }
-      if self.fork.rev(store, Log::File(path), &at).is_none() {
-        return Err(unknown(at));
-      }
-      // Landed before the push: its text read from the store between steps.
-      match self.asked.take() {
-        Some(asked) if asked.node == at && asked.path == path => {
-          if let Some(refused) = asked.refused {
-            return Err(refused);
-          }
-          match asked.text {
-            Some(text) => {
-              self.intaken.base_store_reads = self.intaken.base_store_reads.saturating_add(1);
-              room.charge(to_u64(text.len()))?;
-              break text;
-            }
-            None => {
-              self.asked = Some(asked);
-              return Ok(Based::Store);
-            }
-          }
-        }
-        _ => {
-          self.asked = Some(StoreAsk {
-            path: path.to_vec(),
-            node: at,
-            want: Some(crate::render::Want::Rows {
-              logs: vec![(path.to_vec(), vec![at])],
-            }),
-            most: room.left(),
-            text: None,
-            refused: None,
-          });
-          return Ok(Based::Store);
-        }
-      }
-    };
-    let mut text = start;
-    while let Some(index) = chain.pop() {
-      let revision = match frame.placed(payload, revisions, index) {
-        Ok(Some((revision, _))) => revision,
-        Ok(None) => return Err(unknown(at)),
-        Err(wanted) => return Ok(Based::Wanted(wanted.range)),
-      };
-      room.charge(to_u64(text.len()))?;
-      text = delta::apply(&text, revision.data, room).map_err(|fault| Unverified::Delta {
-        log: LogOf::File(path.to_vec()),
-        node: revision.node,
-        fault,
-      })?;
-      self.intaken.base_rebuilds = self.intaken.base_rebuilds.saturating_add(1);
-      self
-        .cache
-        .put(revision.node, text.clone(), &mut self.spares);
-    }
-    Ok(Based::Text(text))
-  }
-
-  /// The text of `revision`'s delta base: empty for the null node, the text kept last where it is that one, a file's as
-  /// the push's cache holds it where it does (read there, [`Based::Cached`]), else the fork's; `None` where the fork does
-  /// not hold it.
+  /// The text of `revision`'s delta base, a changeset's or a manifest's (a file revision's is read in ranges, [`patched`]):
+  /// empty for the null node, the text kept last where it is that one, one the store gave for the unit, else the fork's;
+  /// `None` where the fork does not hold it.
   fn base_text<'s>(
     &'s self,
     log: Log<'_>,
@@ -2018,11 +1691,6 @@ impl Taker {
       .logs_given
       .iter()
       .find(|(node, _)| *node == revision.base)
-    {
-      return Some(Cow::Borrowed(text.as_slice()));
-    }
-    if let Log::File(_) = log
-      && let Some(text) = self.cache.held.get(&revision.base)
     {
       return Some(Cow::Borrowed(text.as_slice()));
     }
@@ -2609,6 +2277,9 @@ fn log_of(log: Log<'_>) -> LogOf {
     Log::File(path) => LogOf::File(path.to_vec()),
   }
 }
+
+#[path = "intake_patched.rs"]
+mod patched;
 
 #[cfg(test)]
 #[path = "intake_tests.rs"]
