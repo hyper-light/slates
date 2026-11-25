@@ -103,8 +103,8 @@ impl Served {
     if let Some(owner) = self.owner.take() {
       owner.stop().unwrap();
     }
-    let owner = start_owner(self.base());
     let profile = super::machine_profile();
+    let owner = start_owner(self.base(), &profile);
     let config = daemon_config(&profile, &self.instance, &owner);
     let anchor = self
       .anchor
@@ -143,13 +143,20 @@ impl Served {
   }
 }
 
-/// The store's owner over the store directory under `base`, made the first time.
-fn start_owner(base: &str) -> StoreOwner {
-  start_owner_sized(base, SIZING)
+/// The store's owner over the store directory under `base`, made the first time, spinning as `profile`'s daemon's does.
+fn start_owner(base: &str, profile: &slates_machine::MachineProfile) -> StoreOwner {
+  start_owner_sized(base, SIZING, profile)
 }
 
-/// [`start_owner`] with the store sized `sizing`.
-fn start_owner_sized(base: &str, sizing: Sizing) -> StoreOwner {
+/// [`start_owner`] with the store sized `sizing`. Its owner spins for work at most the machine's measured wake before it
+/// parks, as a daemon's does (`start_store` in `crates/api/src/role/daemon.rs`). Until 2026-11-25 it never spun (a cap
+/// of 0), so the store-wait measurement over this fixture counted every wait parked (main's 57k split at b4aa00ef8:
+/// 461,484 parks, no spin), a daemon unlike the one it measures.
+fn start_owner_sized(
+  base: &str,
+  sizing: Sizing,
+  profile: &slates_machine::MachineProfile,
+) -> StoreOwner {
   let store_dir = format!("{base}/store");
   // The store's directory inside the fixture's own, in the build output (`common::target`).
   #[allow(clippy::disallowed_methods)]
@@ -163,7 +170,7 @@ fn start_owner_sized(base: &str, sizing: Sizing) -> StoreOwner {
   StoreOwner::start(
     StoreRoot::open(&store_dir, &grant).unwrap(),
     sizing,
-    (WAITING, 0),
+    (WAITING, profile.derived().spin_before_park_ns.get()),
   )
   .unwrap()
 }
@@ -199,8 +206,8 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
 pub(crate) fn serve_sized(name: &str, extra: &str, sizing: Sizing) -> Served {
   let scratch = target_dir();
   let base = scratch.path.clone();
-  let owner = start_owner_sized(&base, sizing);
   let profile = super::machine_profile();
+  let owner = start_owner_sized(&base, sizing, &profile);
   let instance = format!("{name}-{}", std::process::id());
   let config = daemon_config(&profile, &instance, &owner);
   let anchor = held_anchor(&instance, &profile, &config);

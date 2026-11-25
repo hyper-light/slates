@@ -271,6 +271,7 @@ pub(crate) fn turn_taken() {
       (MANIFEST_AT_HAND_DELTA, paths.at_hand_delta),
       (MANIFEST_AT_HAND_WHOLE, paths.at_hand_whole),
       (MANIFEST_STORED_DELTA, paths.stored_delta),
+      (MANIFEST_STORED_PARENT_DELTA, paths.stored_parent_delta),
       (MANIFEST_STORED_WHOLE, paths.stored_whole),
       (MANIFEST_STORED_FALLBACK, paths.stored_fallback),
     ] {
@@ -752,6 +753,11 @@ pub(crate) const MANIFEST_AT_HAND_WHOLE: &str = "vcs_store.hg_fetch_manifest_at_
 /// Counter: the manifests let go sent as the delta the changeset store keeps on the one sent before: no text made.
 /// Format: a counter name in the status report.
 pub(crate) const MANIFEST_STORED_DELTA: &str = "vcs_store.hg_fetch_manifest_stored_delta";
+/// Counter: the manifests let go sent as the delta the changeset store keeps on a parent sent earlier in the
+/// changegroup (a merge's p1, the client's own base; main's ruling of 2026-11-25, the rule's exact form). Format: a counter
+/// name in the status report.
+pub(crate) const MANIFEST_STORED_PARENT_DELTA: &str =
+  "vcs_store.hg_fetch_manifest_stored_parent_delta";
 /// Counter: the manifests let go sent as the whole the changeset store keeps. Format: a counter name in the status report.
 pub(crate) const MANIFEST_STORED_WHOLE: &str = "vcs_store.hg_fetch_manifest_stored_whole";
 /// Counter: the manifests let go sent whole from a text the store made, their stored delta resting on another manifest.

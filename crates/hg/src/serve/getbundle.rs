@@ -871,6 +871,9 @@ enum ManifestPath {
   AtHandWhole,
   /// Let go: as the delta the changeset store keeps on the manifest sent before it.
   StoredDelta,
+  /// Let go: as the delta the changeset store keeps on a parent sent earlier in this changegroup (a merge's p1, the
+  /// client's own base).
+  StoredParentDelta,
   /// Let go: as the whole the changeset store keeps.
   StoredWhole,
   /// Let go: whole, its text made by the store, its stored delta resting on another manifest.
@@ -886,6 +889,8 @@ pub struct ManifestPaths {
   pub at_hand_whole: u64,
   /// Let go, as the delta the store keeps.
   pub stored_delta: u64,
+  /// Let go, as the delta the store keeps on a parent sent earlier.
+  pub stored_parent_delta: u64,
   /// Let go, as the whole the store keeps.
   pub stored_whole: u64,
   /// Let go, whole from a text the store made.
@@ -899,6 +904,7 @@ std::thread_local! {
       at_hand_delta: 0,
       at_hand_whole: 0,
       stored_delta: 0,
+      stored_parent_delta: 0,
       stored_whole: 0,
       stored_fallback: 0,
     })
@@ -913,6 +919,7 @@ fn count_manifest_path(path: ManifestPath) {
       ManifestPath::AtHandDelta => &mut now.at_hand_delta,
       ManifestPath::AtHandWhole => &mut now.at_hand_whole,
       ManifestPath::StoredDelta => &mut now.stored_delta,
+      ManifestPath::StoredParentDelta => &mut now.stored_parent_delta,
       ManifestPath::StoredWhole => &mut now.stored_whole,
       ManifestPath::StoredFallback => &mut now.stored_fallback,
     };
@@ -1283,6 +1290,11 @@ pub struct Walk {
   manifest_last: Option<([u8; 32], Node)>,
   /// The manifest whose stored delta rests on another than the one sent before: sent whole, its text asked.
   manifest_whole: Option<u64>,
+  /// The parents of the manifests read ahead, asked in the same want of rows: each node's text's identity, what a
+  /// stored delta resting on a parent names (one batch's, let go with it).
+  manifest_parent_texts: BTreeMap<Node, [u8; 32]>,
+  /// Those parents' nodes, in the order asked, while their rows are awaited.
+  manifest_parents_asked: Vec<Node>,
   /// The file revisions read from the changeset store ahead of their steps ([`Ahead`]).
   files: Files,
   /// A pull's file section, once its changelog and manifests are written ([`Pull`]).
@@ -1442,6 +1454,8 @@ impl Walk {
       manifests: Files::default(),
       manifest_last: None,
       manifest_whole: None,
+      manifest_parent_texts: BTreeMap::new(),
+      manifest_parents_asked: Vec::new(),
       files: Files::default(),
       pull: None,
       logs: LogTexts::default(),
@@ -1587,7 +1601,7 @@ impl Walk {
       if self.logs.want.is_some() {
         self.logs.give(given);
       } else {
-        self.manifests.give(given);
+        self.give_manifests(given);
       }
     }
   }
@@ -1610,7 +1624,7 @@ impl Walk {
     }
     // The manifest log's reads first: the walk is in its manifests until its file section begins.
     if self.manifests.want.is_some() {
-      self.manifests.give(given);
+      self.give_manifests(given);
     } else {
       self.files.give(given);
     }
@@ -1785,13 +1799,20 @@ impl Walk {
       };
       let last = self
         .manifest_last
-        .filter(|(text, _)| Some(*text) == row.base);
+        .filter(|(text, _)| Some(*text) == row.base)
+        .map(|(_, sent)| (sent, ManifestPath::StoredDelta))
+        .or_else(|| {
+          let base = row.base?;
+          self
+            .parent_held(store, (position, node), base)
+            .map(|parent| (parent, ManifestPath::StoredParentDelta))
+        });
       if row.base.is_none() || last.is_some() {
         let plain = plain_of(&row.place, chunk.unwrap_or_default(), room.left())?;
         let entry = store.manifest_entry(&node).ok_or_else(no_manifest)?;
         match last {
-          Some((_, base)) => {
-            count_manifest_path(ManifestPath::StoredDelta);
+          Some((base, path)) => {
+            count_manifest_path(path);
             self.put_delta(
               (node, entry.parents, link, entry.flags),
               (base, &plain),
@@ -1829,6 +1850,50 @@ impl Walk {
     room.charge(to_u64(text.len()))?;
     self.put((node, entry.parents, link, entry.flags), &text, room, out)?;
     Ok(true)
+  }
+
+  /// The changeset store's answer to the manifests' want: a want of rows carries the parents' rows after the batch's
+  /// ([`Walk::ask_manifest_rows`]), kept by node for the batch; the rest is the read ahead's ([`Files::give`]).
+  fn give_manifests(&mut self, given: Given) {
+    let asked = core::mem::take(&mut self.manifest_parents_asked);
+    let given = match given {
+      Given::Rows(mut rows) if !asked.is_empty() => {
+        let parents = rows.pop().unwrap_or_default();
+        self.manifest_parent_texts.clear();
+        for (node, row) in asked.into_iter().zip(parents) {
+          if let Some(row) = row {
+            self.manifest_parent_texts.insert(node, row.text);
+          }
+        }
+        Given::Rows(rows)
+      }
+      other => other,
+    };
+    self.manifests.give(given);
+  }
+
+  /// The node of a parent of manifest `node` (at `position`) whose text is `base` and which the client holds when it
+  /// applies this one: sent earlier in this changegroup, a manifest before it a missing changeset links (main's ruling
+  /// of 2026-11-25: the rule's exact form; a fetch the links walk is a clone, so nothing is held another way). None where
+  /// no parent is that text, or the one that is was not sent here.
+  fn parent_held(
+    &self,
+    store: &impl Store,
+    (position, node): (u64, Node),
+    base: [u8; 32],
+  ) -> Option<Node> {
+    let entry = store.manifest_entry(&node)?;
+    entry.parents.into_iter().find(|parent| {
+      *parent != NULL_NODE
+        && self.manifest_parent_texts.get(parent) == Some(&base)
+        && store.manifest_entry(parent).is_some_and(|held| {
+          held.position < position
+            && store
+              .manifest_linked(held.position)
+              .and_then(|linked| linked.link)
+              .is_some_and(|link| self.missing.contains(link))
+        })
+    })
   }
 
   /// The text identity and node of the manifest at `position` sent at hand, where its stored row was read ahead (one at
@@ -1872,12 +1937,26 @@ impl Walk {
       at = at.saturating_add(1);
     }
     let path = crate::push::intake::MANIFEST_PATH.to_vec();
-    let nodes = revisions.iter().map(|(_, node)| *node).collect();
+    let nodes: Vec<Node> = revisions.iter().map(|(_, node)| *node).collect();
+    // Each one's parents too, in the same want: a stored delta names its base by its text, which a parent's row gives.
+    let mut parents: Vec<Node> = nodes
+      .iter()
+      .filter_map(|node| store.manifest_entry(node))
+      .flat_map(|entry| entry.parents)
+      .filter(|parent| *parent != NULL_NODE)
+      .collect();
+    parents.sort_unstable();
+    parents.dedup();
     self.manifests.asked = vec![(path.clone(), revisions)];
     self.manifests.room = room;
-    self.manifests.want = Some(crate::render::Want::Rows {
-      logs: vec![(path, nodes)],
-    });
+    // Asked only where there are parents: an empty log asked would come back as a second log the read ahead never asked
+    // (a batch of the root alone, whose parents are null), and [`Walk::give_manifests`] passes it on only when it asked.
+    let mut logs = vec![(path.clone(), nodes)];
+    if !parents.is_empty() {
+      logs.push((path, parents.clone()));
+    }
+    self.manifests.want = Some(crate::render::Want::Rows { logs });
+    self.manifest_parents_asked = parents;
   }
 
   /// The file revision at or after `from` where a missing changeset links it (its group's name first where it opens
